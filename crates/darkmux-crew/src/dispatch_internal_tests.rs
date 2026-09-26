@@ -9887,7 +9887,7 @@
             "finish_reason": "tool_calls",
             "usage": { "prompt_tokens": 24000, "completion_tokens": 850 },
         });
-        let payload = turn_tokens_payload(&event, "m", "ep");
+        let payload = turn_tokens_payload(&event, "coder", "m", "ep");
         assert_eq!(payload["turn_seq"], 12);
         assert_eq!(payload["prompt_tokens"], 24000);
         assert_eq!(payload["completion_tokens"], 850);
@@ -9916,7 +9916,7 @@
                 "reasoning_tokens": 1024, "cached_tokens": 64,
             },
         });
-        let payload = turn_tokens_payload(&event, "m", "ep");
+        let payload = turn_tokens_payload(&event, "coder", "m", "ep");
         assert_eq!(payload["reasoning_tokens"], 1024);
         assert_eq!(payload["cached_tokens"], 64);
         assert!(payload["reasoning_tokens"].as_u64().unwrap() <= payload["completion_tokens"].as_u64().unwrap());
@@ -9941,7 +9941,7 @@
             "seq": 4,
             "usage": { "prompt_tokens": 9970, "completion_tokens": 128, "total_tokens": 11598 },
         });
-        let payload = turn_tokens_payload(&event, "m", "ep");
+        let payload = turn_tokens_payload(&event, "coder", "m", "ep");
         assert_eq!(
             payload["total_tokens"], 11598,
             "the provider's own total must win; prompt + completion (10098) understates by 1500"
@@ -9961,7 +9961,7 @@
             "seq": 5,
             "usage": { "prompt_tokens": 300, "completion_tokens": 45 },
         });
-        let payload = turn_tokens_payload(&event, "m", "ep");
+        let payload = turn_tokens_payload(&event, "coder", "m", "ep");
         assert_eq!(payload["total_tokens"], 345, "no reported total → derive from the split");
     }
 
@@ -10196,11 +10196,11 @@
     #[test]
     fn turn_tokens_payload_marks_absent_or_null_usage_absent() {
         let absent = serde_json::json!({ "type": "model.completed", "seq": 3 });
-        assert_eq!(turn_tokens_payload(&absent, "m", "ep")["token_source"], "absent", "absent usage → an absent record, no counts");
+        assert_eq!(turn_tokens_payload(&absent, "coder", "m", "ep")["token_source"], "absent", "absent usage → an absent record, no counts");
         let null = serde_json::json!({
             "type": "model.completed", "seq": 3, "usage": serde_json::Value::Null,
         });
-        assert_eq!(turn_tokens_payload(&null, "m", "ep")["token_source"], "absent", "null usage → an absent record, no counts");
+        assert_eq!(turn_tokens_payload(&null, "coder", "m", "ep")["token_source"], "absent", "null usage → an absent record, no counts");
     }
 
     /// (#795) Defensive: a `usage` object missing a count degrades that
@@ -10213,7 +10213,7 @@
             "seq": 1,
             "usage": { "completion_tokens": 500 },
         });
-        let payload = turn_tokens_payload(&event, "m", "ep");
+        let payload = turn_tokens_payload(&event, "coder", "m", "ep");
         assert_eq!(payload["prompt_tokens"], 0);
         assert_eq!(payload["completion_tokens"], 500);
         assert_eq!(payload["total_tokens"], 500);
@@ -15799,7 +15799,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             .iter()
             .map(|e| {
                 let ev: serde_json::Value = serde_json::from_str(e).unwrap();
-                super::turn_tokens_payload(&ev, "m", "ep")["total_tokens"].as_u64().unwrap()
+                super::turn_tokens_payload(&ev, "coder", "m", "ep")["total_tokens"].as_u64().unwrap()
             })
             .sum();
         assert_eq!(per_turn_sum, 11598 + 150);

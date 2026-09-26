@@ -177,6 +177,64 @@ describe("FleetLens", () => {
     // (#2834) The cloud tile is withdrawn; one figure is the hero now.
   });
 
+  // (#2902) CACHED is a share of INPUT and UTILITY a share of ALL TOKENS, so
+  // each renders as a part line under the figure it belongs to. As peer chips
+  // they read as extra buckets to add, which double-counts.
+  it("(#2902) renders cached under input and utility under all tokens, never as peer chips", async () => {
+    const today = todayUTC();
+    const usage = (ts: string, payload: Record<string, unknown>) => ({
+      ts: `${today}T${ts}.000Z`, machine_uid: "u1", session_id: "s1", category: "telemetry", source: "tokens", action: "telemetry.tokens", payload,
+    });
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+        usage("10:00:05", { call_kind: "turn", purpose: "work", prompt_tokens: 1920, completion_tokens: 163, total_tokens: 2083, cached_tokens: 140 }),
+        usage("10:00:09", { call_kind: "compaction", purpose: "utility", prompt_tokens: 130, completion_tokens: 15, total_tokens: 145 }),
+        { ts: `${today}T10:01:00.000Z`, machine_uid: "u1", session_id: "s1", action: "dispatch.complete", payload: {} },
+      ],
+    });
+    const { container } = renderFleetLens();
+    const part = (sel: string) => Array.from(container.querySelectorAll(sel)).map((e) => e.textContent);
+    await waitFor(() => expect(part(".savc .savpart")).toEqual(["140 cached"]));
+    expect(part(".savlead .savpart")).toEqual(["145 utility"]);
+    // The part lines sit with their parents: cached inside the INPUT chip,
+    // utility beside the ALL TOKENS label. The figure is its own span so only
+    // the word is uppercased ("17.62k utility", not "17.62K").
+    const cached = container.querySelector(".savc .savpart")!;
+    expect(cached.closest(".savc")?.querySelector(".scl")?.textContent).toBe("input");
+    expect(cached.querySelector(".savpartv")?.textContent).toBe("140");
+    expect(container.querySelector(".savlead .savpart .savpartv")?.textContent).toBe("145");
+    // No chip is labeled cached or utility on its own.
+    const labels = Array.from(container.querySelectorAll(".savc .scl")).map((e) => e.textContent);
+    expect(labels).not.toContain("cached");
+    expect(labels).not.toContain("utility");
+  });
+
+  // (#2902 review) The inverse: with no utility spend and no record reporting
+  // `cached_tokens`, NO part line renders — not "0 utility", not "0 cached".
+  // Before this test only the parity golden guarded it; `{t.utility &&
+  // settled ?` mutated to `{settled ?` left vitest green.
+  it("(#2902) with utility 0 and no cached_tokens reported, no part line renders at all", async () => {
+    const today = todayUTC();
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+        {
+          ts: `${today}T10:00:05.000Z`, machine_uid: "u1", session_id: "s1", category: "telemetry", source: "tokens", action: "telemetry.tokens",
+          payload: { call_kind: "turn", purpose: "work", prompt_tokens: 1920, completion_tokens: 163, total_tokens: 2083 },
+        },
+        { ts: `${today}T10:01:00.000Z`, machine_uid: "u1", session_id: "s1", action: "dispatch.complete", payload: {} },
+      ],
+    });
+    const { container } = renderFleetLens();
+    // Wait for the window to settle (the figures are silhouetted until then,
+    // and no part line renders while unsettled either — the assertion below
+    // must run against the SETTLED hero to mean anything).
+    await waitFor(() => expect(container.querySelector(".savings")?.getAttribute("data-settled")).toBe("true"));
+    expect(container.querySelector(".savc .scv")?.textContent).toBe("1.92k");
+    expect(container.querySelectorAll(".savpart")).toHaveLength(0);
+  });
+
   it("sums a locally-run session's telemetry into local tokens, and renders its machine card", async () => {
     const today = todayUTC();
     mockFleetFetch({

@@ -8,7 +8,8 @@
 //!
 //! | field             | meaning                                                        |
 //! |-------------------|----------------------------------------------------------------|
-//! | `call_kind`       | `"turn"` · `"single_shot"` · `"map_item"` · `"compaction"` |
+//! | `call_kind`       | `"turn"` · `"single_shot"` · `"map_item"` · `"compaction"` ([`CallKind`]) |
+//! | `purpose`         | `"work"` · `"utility"` ([`UsagePurpose`], decided by [`call_purpose`], #2914) |
 //! | `requested_model` | the model id darkmux put on the wire                           |
 //! | `reported_model`  | the response's own `model` field; ABSENT when it had none      |
 //! | `endpoint`        | the endpoint darkmux called, as a fact (see below)             |
@@ -56,8 +57,13 @@ pub const USAGE_ACTION: &str = "telemetry.tokens";
 /// The flow-record telemetry `source` every usage record carries.
 pub const USAGE_SOURCE: &str = "tokens";
 
-/// Which kind of model call a usage record accounts for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Which kind of model call a usage record accounts for. Serialized into
+/// the payload's `call_kind` through serde (the variant names ARE the wire
+/// spelling), and exported to the viewer as a generated TS type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub enum CallKind {
     /// One agent-loop turn of the container runtime.
     Turn,
@@ -70,14 +76,39 @@ pub enum CallKind {
     Compaction,
 }
 
-impl CallKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            CallKind::Turn => "turn",
-            CallKind::SingleShot => "single_shot",
-            CallKind::MapItem => "map_item",
-            CallKind::Compaction => "compaction",
-        }
+/// (#2902, #2914) WHOSE job a model call was: the operator's WORK, or one of
+/// darkmux's own UTILITY jobs. Stamped on every usage record as `purpose`
+/// by [`usage_payload`], decided by [`call_purpose`] (the single definition
+/// of the utility jobs). The viewer's hero shows utility as its own chip, and
+/// an execution's own numbers (run page tiles, mission-graph step meter)
+/// exclude it (CLAUDE.md contract 8: sub-executions are never blended into
+/// the primary).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub enum UsagePurpose {
+    /// The operator's work: every call that is not a utility job.
+    Work,
+    /// darkmux's own job, run on the machine's utility model.
+    Utility,
+}
+
+/// (#2902, #2914) THE definition of darkmux's utility jobs: every runtime
+/// COMPACTOR call, and every call made by the radio ROUTING role
+/// ([`crate::loader::RADIO_ROUTER_ROLE_ID`]). Everything else is work. No
+/// other code may hard-code this list: #2914 routes exactly these jobs to
+/// the machine's one utility model, and must read the same definition.
+///
+/// `role_id` is the role the call ran for, when the call site has one (a
+/// `dispatch.single_shot`/`dispatch.map` STEP runs no role, so `None`).
+pub fn call_purpose(call_kind: CallKind, role_id: Option<&str>) -> UsagePurpose {
+    let utility = call_kind == CallKind::Compaction
+        || role_id == Some(crate::loader::RADIO_ROUTER_ROLE_ID);
+    if utility {
+        UsagePurpose::Utility
+    } else {
+        UsagePurpose::Work
     }
 }
 
@@ -103,6 +134,11 @@ impl UsageCounts {
 #[derive(Clone, Copy, Debug)]
 pub struct CallFacts<'a> {
     pub call_kind: CallKind,
+    /// (#2914) The role the call ran for, when the call site runs one (the
+    /// container path, `dispatch_remote`, `dispatch_local_single_shot`); a
+    /// `dispatch.single_shot`/`dispatch.map` STEP runs no role (`None`).
+    /// Read only by [`call_purpose`].
+    pub role_id: Option<&'a str>,
     pub requested_model: &'a str,
     pub reported_model: Option<&'a str>,
     pub endpoint: &'a str,
@@ -111,7 +147,8 @@ pub struct CallFacts<'a> {
 /// THE writer: one call's canonical `telemetry.tokens` payload.
 pub fn usage_payload(facts: &CallFacts<'_>, counts: &UsageCounts) -> serde_json::Value {
     let mut payload = serde_json::json!({
-        "call_kind": facts.call_kind.as_str(),
+        "call_kind": facts.call_kind,
+        "purpose": call_purpose(facts.call_kind, facts.role_id),
         "requested_model": facts.requested_model,
         "endpoint": facts.endpoint,
     });
@@ -178,7 +215,11 @@ pub(crate) fn assert_one_usage_record<'a>(
     let rec = usage[0];
     assert_eq!(rec["action"], USAGE_ACTION, "{path}");
     let p = &rec["payload"];
-    assert_eq!(p["call_kind"], kind.as_str(), "{path}: call_kind: {p}");
+    assert_eq!(p["call_kind"], serde_json::json!(kind), "{path}: call_kind: {p}");
+    assert!(
+        serde_json::from_value::<UsagePurpose>(p["purpose"].clone()).is_ok(),
+        "{path}: every usage record carries a `purpose`: {p}"
+    );
     assert!(
         p["requested_model"].as_str().is_some_and(|s| !s.is_empty()),
         "{path}: requested_model: {p}"
@@ -201,6 +242,7 @@ mod tests {
     fn facts(reported: Option<&'static str>) -> CallFacts<'static> {
         CallFacts {
             call_kind: CallKind::SingleShot,
+            role_id: None,
             requested_model: "m",
             reported_model: reported,
             endpoint: "http://h:1234/v1",
@@ -222,6 +264,52 @@ mod tests {
         assert_eq!(p["token_source"], "provider");
         assert_eq!(p["reported_model"], "served");
         assert_eq!(p["call_kind"], "single_shot");
+    }
+
+    /// (#2914) The utility-job rule, on the record: a compactor call and
+    /// every radio-router call are utility; everything else is work.
+    #[test]
+    fn purpose_names_darkmux_utility_jobs_and_nothing_else() {
+        let purpose = |call_kind, role_id| {
+            let f = CallFacts {
+                call_kind,
+                role_id,
+                requested_model: "m",
+                reported_model: None,
+                endpoint: "http://h:1234/v1",
+            };
+            usage_payload(&f, &UsageCounts::default())["purpose"].clone()
+        };
+        let utility = serde_json::json!(UsagePurpose::Utility);
+        let work = serde_json::json!(UsagePurpose::Work);
+        assert_eq!(purpose(CallKind::Compaction, Some("compactor")), utility, "compactor call");
+        assert_eq!(purpose(CallKind::Compaction, None), utility, "compactor call, no role");
+        assert_eq!(
+            purpose(CallKind::SingleShot, Some(crate::loader::RADIO_ROUTER_ROLE_ID)),
+            utility,
+            "radio routing (single-shot)"
+        );
+        assert_eq!(
+            purpose(CallKind::Turn, Some(crate::loader::RADIO_ROUTER_ROLE_ID)),
+            utility,
+            "radio routing (container turn)"
+        );
+        assert_eq!(purpose(CallKind::Turn, Some("coder")), work, "a coder turn");
+        assert_eq!(purpose(CallKind::SingleShot, Some("radio-host")), work, "another role's single-shot");
+        assert_eq!(purpose(CallKind::SingleShot, None), work, "a single-shot step");
+        assert_eq!(purpose(CallKind::MapItem, None), work, "a map item");
+    }
+
+    /// The wire spellings the viewer reads, pinned so a serde rename is a
+    /// visible change (the generated TS binding carries the same union).
+    #[test]
+    fn wire_spellings_are_snake_case() {
+        assert_eq!(serde_json::json!(UsagePurpose::Work), "work");
+        assert_eq!(serde_json::json!(UsagePurpose::Utility), "utility");
+        assert_eq!(serde_json::json!(CallKind::SingleShot), "single_shot");
+        assert_eq!(serde_json::json!(CallKind::MapItem), "map_item");
+        assert_eq!(serde_json::json!(CallKind::Compaction), "compaction");
+        assert_eq!(serde_json::json!(CallKind::Turn), "turn");
     }
 
     #[test]

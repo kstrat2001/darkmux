@@ -21,14 +21,10 @@ fleet
 DARKMUX TOKENS
 419,913
 ALL TOKENS · LAST 24H
+327.09k
+INPUT
 92.82k
 GENERATED
-18.81k
-FRESH INPUT
-320
-RE-READ
-307.96k
-UNCLASSIFIED
 19
 DISPATCHES
 Orchestrator note: 19 dispatches done. The fleet is humming, keep it up.

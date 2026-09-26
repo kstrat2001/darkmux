@@ -3215,13 +3215,16 @@ body {
    default is `1em`).
 
    Not rendering text also replaces a `color: transparent` that could not
-   work: it tied on specificity (0,3,0) with `.savlead.cloud .savnum`,
-   `.savlead.unknown .savnum`, `.savc.gen .scv` and `.savc.uncls .scv`, all of
-   which are declared LATER and therefore won on source order — so every tile
-   except plain local kept painting its figure, and the glyphs showed above
-   and below a skeleton that is inset inside a `line-height: 1` box. Removing
-   the text removes the whole class: there is no colour left to race, and a
-   new tile variant cannot silently reintroduce it. */
+   work: it tied on specificity (0,3,0) with the per-tile color rules of the
+   time — `.savlead.cloud .savnum`, `.savlead.unknown .savnum` and `.savc.util
+   .scv` (all since removed along with the tiles they colored; #2834 withdrew
+   the local/cloud/unknown split, #2902 the utility chip) and `.savc.gen .scv`
+   (still live) — all of which were declared LATER and therefore won on source
+   order — so every tile except plain local kept painting its figure, and the
+   glyphs showed above and below a skeleton that is inset inside a
+   `line-height: 1` box. Removing the text removes the whole class: there is
+   no color left to race, and a new tile variant cannot silently reintroduce
+   it. */
 .ph-shimmer::after {
   content: "";
   position: absolute;
@@ -3251,17 +3254,6 @@ body {
   font: 700 min(calc(48px * var(--fs-scale)), 13vw)/1 var(--font-mono);
   color: var(--good);
   letter-spacing: 0.01em;
-}
-.savlead.cloud .savnum {
-  color: var(--accent);
-}
-.savlead.unknown .savnum {
-  color: var(--dim);
-}
-/* (#2068) The tile is always mounted (see `FleetLens.tsx`); at zero it reads
-   as a quiet placeholder rather than a figure worth a glance. */
-.savlead.unknown.zero {
-  opacity: 0.45;
 }
 /* (#2068) On a phone the hero's tiles wrap by the WIDTH of their figures: a
    narrow "0" shared a row with the cloud tile and a five-digit figure took a
@@ -3358,14 +3350,51 @@ body {
      number-then-label order put a 6px gap above each label and ~15px below
      it, so the eye bound each label to the figure BENEATH it — the hero read
      "local tokens 0, cloud 342,201" for a day that was local 12.1M, cloud
-     0. Vertical proximity was the ambiguity; this removes it. */
+     0. Vertical proximity was the ambiguity; this removes it.
+
+     (#2902) This used to be `column-reverse`. With the label now wrapped
+     beside its UTILITY part line (`.savlblwrap`, so the two stay together on
+     desktop), reversing the whole column put the part line BETWEEN the label
+     and the figure — "ALL TOKENS · LAST 24H / 145 UTILITY / 2,228", the part
+     reading as the figure's caption. So the wrapper dissolves into the flex
+     column (`display: contents`) and only the label is lifted above the
+     figure (`order: -1`): label / figure / part line, the part under the
+     figure it is a share of, as on desktop. */
   .savlead {
     display: flex;
-    flex-direction: column-reverse;
+    flex-direction: column;
+  }
+  /* Two classes, not one: the base `.savlblwrap` rule further down (the
+     label-line row every other width uses) comes later in the file. */
+  .savlead .savlblwrap {
+    display: contents;
   }
   .savlead .savlbl {
+    order: -1;
     margin-top: 0;
     margin-bottom: 3px;
+  }
+  /* (#2902, layout) The UTILITY part sits BESIDE the figure, on its
+     baseline, not on a line under it: a line of its own grew the hero
+     18.5px whenever utility spend was in the window and shrank it again when
+     it scrolled out. Label / figure-and-part: the part stays with the
+     figure it is a share of and never sits between the label and the
+     figure (the ambiguity the paragraph above removes). */
+  .savlead {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-areas: "lbl lbl" "num part";
+    align-items: baseline;
+  }
+  .savlead .savlbl {
+    grid-area: lbl;
+  }
+  .savlead .savnum {
+    grid-area: num;
+  }
+  .savlead .savpart {
+    grid-area: part;
+    margin: 0 0 0 10px;
   }
 }
 .savlbl {
@@ -3379,7 +3408,11 @@ body {
   display: flex;
   gap: 10px 30px;
   flex-wrap: wrap;
-  align-items: center;
+  /* (#2902) `flex-start`, not `center`: the INPUT chip is taller than its
+     neighbours when it carries a CACHED part line, and centering the chips
+     lifted its figure ~10px above GENERATED and DISPATCHES. Top-aligned, the
+     three figures share one top edge and the part line hangs below. */
+  align-items: flex-start;
   justify-content: flex-end;
   flex: 1 1 auto;
 }
@@ -3409,8 +3442,57 @@ body {
 .savc.gen .scv {
   color: var(--good);
 }
-.savc.uncls .scv {
+/* (#2902) A share of the figure above it (cached of input, utility of all
+   tokens): quieter than the label so it never reads as a peer figure. */
+.savpart {
+  font: calc(10px * var(--fs-scale))/1.4 var(--font-mono);
   color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-top: 2px;
+  opacity: 0.8;
+}
+/* The figure keeps its own case ("17.62k", like the chips above); only the
+   word is uppercased. */
+.savpart .savpartv {
+  text-transform: none;
+}
+/* (#2902, layout) A part line never takes a line of its own: that grew the
+   hero 18.5px (INPUT's CACHED on a phone, ALL TOKENS' UTILITY everywhere)
+   whenever a provider reported it, and shrank it again when it scrolled out
+   of the window. It rides on its figure's LABEL line instead, after the
+   label, on the label's baseline, one line, clipped rather than wrapped if a
+   narrow track ever runs out of room. The label never gives up width; only
+   the part does. Line-height 1 inside the lead so the smaller part can
+   never be taller than the label line it shares. */
+.savc__lbl,
+.savlblwrap {
+  display: flex;
+  align-items: baseline;
+  gap: 0 10px;
+  white-space: nowrap;
+  min-width: 0;
+}
+.savc__lbl .scl,
+.savlblwrap .savlbl {
+  flex: 0 0 auto;
+}
+.savc__lbl .savpart,
+.savlblwrap .savpart {
+  margin-top: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Bottom-aligned, not baseline-aligned, in the lead: two fonts of different
+   sizes on one baseline measured 0.6px taller than the label alone. With
+   line-height 1 the part's box is shorter than the label's and sits inside
+   it, so the line is exactly the label's height either way. */
+.savlblwrap {
+  align-items: flex-end;
+}
+.savlblwrap .savpart {
+  line-height: 1;
 }
 .savc .scl {
   font: calc(10px * var(--fs-scale))/1.5 var(--font-mono);

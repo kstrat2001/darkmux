@@ -3583,6 +3583,7 @@ fn dispatch_remote(
         phase,
         crate::single_shot::extract_reply(&resp).usage_payload(
             crate::usage::CallKind::SingleShot,
+            Some(&opts.role_id),
             &pm.id,
             &label,
         ),
@@ -3961,6 +3962,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
         phase,
         reply.usage_payload(
             crate::usage::CallKind::SingleShot,
+            Some(&opts.role_id),
             &model_id,
             &crate::usage::lmstudio_endpoint(opts.model_base_url_override.as_deref()),
         ),
@@ -9543,6 +9545,7 @@ impl TailerState {
                 {
                     let tokens_payload = turn_tokens_payload(
                         &event,
+                        &self.role_id,
                         &self.model,
                         self.endpoint.as_deref().unwrap_or_default(),
                     );
@@ -10485,6 +10488,7 @@ fn opening_heartbeat_payload(event: &serde_json::Value) -> serde_json::Value {
 
 fn turn_tokens_payload(
     event: &serde_json::Value,
+    role_id: &str,
     requested_model: &str,
     endpoint: &str,
 ) -> serde_json::Value {
@@ -10495,6 +10499,7 @@ fn turn_tokens_payload(
     let mut payload = crate::usage::usage_payload(
         &crate::usage::CallFacts {
             call_kind: crate::usage::CallKind::Turn,
+            role_id: Some(role_id),
             requested_model,
             reported_model: event_model_id(event, "reported_model").as_deref(),
             endpoint,
@@ -10545,6 +10550,7 @@ fn compaction_call_tokens_payload(
     let mut payload = crate::usage::usage_payload(
         &crate::usage::CallFacts {
             call_kind: crate::usage::CallKind::Compaction,
+            role_id: Some(COMPACTOR_ROLE),
             requested_model: &requested_model,
             reported_model: event_model_id(event, "reported_model").as_deref(),
             endpoint,

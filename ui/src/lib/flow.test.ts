@@ -158,7 +158,6 @@ describe("buildFlowWindow dedup (#794)", () => {
     const window = buildFlowWindow([], [start, tokenRecord, { ...tokenRecord }], nowMs);
     const meter = tokensOffMeter(window);
     expect(meter.total).toBe(300);
-    expect(meter.local).toBe(300);
   });
 
   it("RED-PROVE: without the dedup filter, the same window WOULD double-count (documents what buildFlowWindow prevents)", () => {

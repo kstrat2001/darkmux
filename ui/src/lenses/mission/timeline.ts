@@ -55,7 +55,6 @@ export interface TaskAggMetrics {
   show: boolean;
   tokens: number;
   turns: number;
-  cloud: boolean;
   generating: boolean;
   /** (#2269) While any step runs: the task SPAN (earliest step start → now),
    * so the row's pulsing timer is the task's, not the running step's. `0`
@@ -78,7 +77,6 @@ export interface TaskAggMetrics {
 export function taskAggMetrics(task: GraphNode, metrics: MetricsMap, now: number): TaskAggMetrics {
   let tokens = 0,
     turns = 0,
-    cloud = false,
     generating = false,
     firstStartMs = 0,
     lastEndMs = 0,
@@ -88,7 +86,6 @@ export function taskAggMetrics(task: GraphNode, metrics: MetricsMap, now: number
     const d = stepDisplayMetrics(m);
     tokens += d.tokens;
     turns += d.turns;
-    if (d.cloud) cloud = true;
     const running = s.status === "running";
     // (#2343, post-review) The task card's pulse must mean what the step
     // row's means. `stepMeterFor` (graph.ts) refines the RAW `status ===
@@ -115,7 +112,7 @@ export function taskAggMetrics(task: GraphNode, metrics: MetricsMap, now: number
   const ai = (task.steps || []).some((s) => isAiKind(s.kind));
   const spanMs = firstStartMs && lastEndMs ? Math.max(0, lastEndMs - firstStartMs) : 0;
   const elapsedMs = generating ? spanMs : 0;
-  return { show: ai || tokens > 0 || turns > 0 || generating, tokens, turns, cloud, generating, elapsedMs, spanMs, sumMs, wallMs: spanMs };
+  return { show: ai || tokens > 0 || turns > 0 || generating, tokens, turns, generating, elapsedMs, spanMs, sumMs, wallMs: spanMs };
 }
 
 export interface TimelineStep {

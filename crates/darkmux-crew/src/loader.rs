@@ -14,6 +14,11 @@ use std::fs;
 use std::path::PathBuf;
 
 /// Roles compiled into the binary at build time. Filename = `<id>.json`.
+/// The radio interpreter's ROUTING role id (#1698). One constant, so the
+/// role table, the radio dispatch (`src/radio.rs`) and the utility-job
+/// definition ([`crate::usage::call_purpose`], #2914) name the same role.
+pub const RADIO_ROUTER_ROLE_ID: &str = "radio-router";
+
 const BUILTIN_ROLES: &[(&str, &str)] = &[
     ("coder", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/coder.json"))),
     ("scribe", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/scribe.json"))),
@@ -69,7 +74,7 @@ const BUILTIN_ROLES: &[(&str, &str)] = &[
     // (#1698 Packet A) The radio interpreter's ROUTING seat — bounded
     // classification over the currently advertised command catalog. See
     // `src/radio.rs`'s module doc for the two-seat receiver architecture.
-    ("radio-router", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/radio-router.json"))),
+    (RADIO_ROUTER_ROLE_ID, include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/radio-router.json"))),
     // (#1698 Packet B2) The radio interpreter's ANSWERING seat — dispatched
     // only when radio-router refuses. See `src/radio_answer.rs`'s module
     // doc.
@@ -125,7 +130,7 @@ pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
     ("mission-compiler", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/mission-compiler.md"))),
     // (#1698 Packet A) Frozen model-facing text (contract 6) — byte-locked
     // by `radio::tests::radio_router_role_prompt_matches_frozen_golden`.
-    ("radio-router", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/radio-router.md"))),
+    (RADIO_ROUTER_ROLE_ID, include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/radio-router.md"))),
     // (#1698 Packet B2) Frozen model-facing PERSONA template (contract 6) —
     // carries a `{{humor}}` placeholder substituted at assembly time
     // (`src/radio_answer.rs`), never resolved by the loader itself. Byte-

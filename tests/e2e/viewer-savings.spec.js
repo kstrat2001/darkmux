@@ -25,11 +25,8 @@
 //   2. the hero makes NO attribution claim. #1607's defect is unreachable by
 //      construction rather than by guard, and this pins that it stays so.
 //
-// The split itself is still COMPUTED (`tokensOffMeter()` in
-// `ui/src/lenses/fleet/savings.ts`) and still unit-tested per-defect in
-// `savings.test.ts`'s `describe("tokensOffMeter")` block — one `it` per
-// mechanism #1607 named. What is gone is the RENDER of it, which is all this
-// file ever asserted.
+// (#2902 step 2a) The split is no longer computed either: every hero figure
+// is a sum of usage records (`ui/src/lib/usageRecords.ts`, `sumUsage`).
 //
 // The fixture still uses the SPACE spelling of `dispatch start` on purpose —
 // that keeps `flowToRenderModel`'s normalizer under test, so if it ever stops
@@ -76,10 +73,12 @@ test('the hero states one total, counts the unattributable, and claims no attrib
   expect(await page.locator('.savlead.cloud, .savlead.unknown').count()).toBe(0);
   expect(await page.locator('.savlead').count()).toBe(1);
 
-  // The class row still partitions the SAME total: `sess-direct`'s spend has
-  // no prompt/completion split, so it must land in `unclassified` rather than
-  // vanishing — otherwise the headline silently exceeds the chips beneath it.
-  await expect(page.locator('.savc.uncls .scv')).toHaveText('700');
+  // (#2902 step 2a) The chips are sums of provider-reported counts only.
+  // `sess-direct`'s 700 has no prompt/completion split, so it is inside ALL
+  // TOKENS (asserted above) and in no chip: UNCLASSIFIED, the estimate that
+  // used to cover it, is gone, and no filler chip replaces it.
+  expect(await page.locator('.savc.uncls, .savc.util').count()).toBe(0);
+  await expect(page.locator('.savc .scl', { hasText: /^input$/i })).toHaveCount(1);
 
   expect(pageErrors).toEqual([]);
 });

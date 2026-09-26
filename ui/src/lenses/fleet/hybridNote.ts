@@ -9,13 +9,8 @@
  *     operator/orchestrator-authored free text.
  *  2. The latest `mission.run*` record's mission — a deterministic
  *     template naming the mission.
- *  3. A deterministic template keyed on the local/cloud run split
- *     (`t.runs`/`t.cloudRuns`/`t.unknownRuns`) — local-only, cloud-only, a
- *     mixed count, or (#2637) an all-unattributed line when neither local
- *     nor cloud has any positive evidence. Unattributed runs are otherwise
- *     left OUT of this template's local/cloud narrative rather than folded
- *     into either side — see the comment on the branching below for why
- *     silence, not a third number, is the honest choice here.
+ *  3. A deterministic template naming the dispatch count (`t.runs`). The
+ *     local/cloud split it used to be keyed on is withdrawn (#2834, #2902).
  *  4. An invitation, at zero.
  *
  * Deterministic templates only (no generation); the ONE real free-text
@@ -59,7 +54,7 @@ export interface HybridNote {
   hasHistory: boolean;
 }
 
-export function hybridNote(data: FlowRecord[], t: TokensOffMeter): HybridNote {
+export function hybridNote(data: FlowRecord[], t: Pick<TokensOffMeter, "runs">): HybridNote {
   const notes = orchNotes(data);
   const hasHistory = notes.length > 0;
 
@@ -80,30 +75,10 @@ export function hybridNote(data: FlowRecord[], t: TokensOffMeter): HybridNote {
   }
 
   if (t.runs) {
-    // (#2834) The local/cloud split is withdrawn from this line too.
-    //
-    // It counted a dispatch as "cloud" when its record named an endpoint,
-    // and an endpoint on 127.0.0.1 is a local inference server — so a run
-    // on this machine's own GPU was reported back to the operator as
-    // having gone to the cloud. Encouragement copy that tells you something
-    // false about your own machine is worse than encouragement copy that
-    // says less.
-    //
-    // The count itself is unchanged and needs no attribution: the note's
-    // job is "what the crew got done", and the crew got N dispatches done
-    // wherever they ran. `unknownRuns` also stops mattering here, since
-    // nothing is being divided.
-    const d = (n: number) => `dispatch${n === 1 ? "" : "es"}`;
-    if (t.runs) {
-      return {
-        text: `${t.runs} ${d(t.runs)} done. The fleet is humming, keep it up.`,
-        hasHistory,
-      };
-    }
-    return {
-      text: `${t.runs} ${d(t.runs)} just getting started. The fleet is warming up, keep it up.`,
-      hasHistory,
-    };
+    // (#2834) No local/cloud split: the crew got N dispatches done wherever
+    // they ran, which is the only claim this line makes.
+    const d = `dispatch${t.runs === 1 ? "" : "es"}`;
+    return { text: `${t.runs} ${d} done. The fleet is humming, keep it up.`, hasHistory };
   }
 
   return { text: "going hybrid takes nerve. the fleet is ready when you are.", hasHistory };

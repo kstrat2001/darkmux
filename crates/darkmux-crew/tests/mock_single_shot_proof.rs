@@ -157,7 +157,7 @@ fn container_free_single_shot_dispatch_round_trips_through_a_real_http_mock_serv
         // BUILT-IN role (`crates/darkmux-crew/src/loader.rs`'s
         // `BUILTIN_ROLES`/`BUILTIN_ROLE_PROMPTS`), so no on-disk role
         // manifest is needed for this test to resolve it.
-        role_id: "radio-router".to_string(),
+        role_id: darkmux_crew::loader::RADIO_ROUTER_ROLE_ID.to_string(),
         message: "the exact routing-seat user message doesn't matter here — the mock \
                   server ignores request content and returns its fixed scripted reply \
                   regardless"
@@ -245,6 +245,13 @@ fn container_free_single_shot_dispatch_round_trips_through_a_real_http_mock_serv
     assert_eq!(p["endpoint"], format!("{}/v1", server.base_url()));
     assert_eq!(p["token_source"], "provider");
     assert_eq!(p["total_tokens"], 10);
+    // (#2914) This dispatch runs the radio ROUTING role, one of darkmux's
+    // own utility jobs, so its record is `purpose: utility` end to end.
+    assert_eq!(
+        p["purpose"],
+        serde_json::json!(darkmux_crew::usage::UsagePurpose::Utility),
+        "a radio-router call is a utility job: {p}"
+    );
 
     // (#1645 inverted case) This dispatch set `phase_id: None` — the exact
     // shape RADIO's answering seat (`src/radio.rs`, `src/radio_answer.rs`)
@@ -323,7 +330,7 @@ fn container_free_single_shot_dispatch_stamps_mission_id_resolved_from_phase() {
         host_out: None,
         max_turns_override: None,
         timeout_override_seconds: None,
-        role_id: "radio-router".to_string(),
+        role_id: darkmux_crew::loader::RADIO_ROUTER_ROLE_ID.to_string(),
         message: "content doesn't matter — the mock server ignores it".to_string(),
         session_id: Some(session_id.clone()),
         timeout_seconds: 30,

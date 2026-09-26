@@ -1,0 +1,48 @@
+{
+  "_doc": "(#2902 step 2a) Expected token totals for records.jsonl. A total is a plain sum of `telemetry.tokens` usage records; the one exception is the legacy fallback: a run key (session_id, mission_id) with ZERO usage records counts each of its token-bearing `dispatch complete` records once. `purpose` absent (records before flow schema 1.59.0) reads as utility for `call_kind: compaction` and work otherwise. In the breakdowns, a record that does not carry the field (a legacy complete, a pre-1.57 turn) groups under \"(none)\". `cached` sums `cached_tokens` over the records that report it. Shared by the viewer's TS tests and step 2b's Rust aggregator.",
+  "usage_records": 12,
+  "legacy_completes_counted": 1,
+  "overall": {
+    "total": 2228,
+    "input": 1917,
+    "generated": 311,
+    "cached": 140
+  },
+  "excluding_utility": {
+    "total": 2083,
+    "input": 1792,
+    "generated": 291,
+    "cached": 140
+  },
+  "by_purpose": {
+    "work": {
+      "total": 2083,
+      "input": 1792,
+      "generated": 291
+    },
+    "utility": {
+      "total": 145,
+      "input": 125,
+      "generated": 20
+    }
+  },
+  "by_call_kind": {
+    "turn": 360,
+    "compaction": 110,
+    "single_shot": 535,
+    "map_item": 183,
+    "(none)": 1040
+  },
+  "by_endpoint": {
+    "http://127.0.0.1:1234/v1": 688,
+    "azure:example.azure.com/gpt-x": 500,
+    "(none)": 1040
+  },
+  "by_requested_model": {
+    "qwen-a": 360,
+    "util-4b": 145,
+    "gpt-x": 500,
+    "qwen-b": 183,
+    "(none)": 1040
+  }
+}

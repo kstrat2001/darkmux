@@ -282,7 +282,7 @@ fn emit_route_record(text: &str, surface: RadioSurface, decision: &RouteDecision
     let record = crate::crew::dispatch::build_dispatch_record_with_payload(
         crate::flow::Level::Info,
         "radio.route",
-        "radio-router",
+        crate::crew::loader::RADIO_ROUTER_ROLE_ID,
         &synth_session_id,
         None,
         None,
@@ -545,7 +545,7 @@ pub fn dispatch_router_call(message: &str) -> Result<String> {
         host_out: None,
         max_turns_override: None,
         timeout_override_seconds: None, // (#2480)
-        role_id: "radio-router".to_string(),
+        role_id: crate::crew::loader::RADIO_ROUTER_ROLE_ID.to_string(),
         message: message.to_string(),
         session_id: None,
         timeout_seconds: 300,

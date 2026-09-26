@@ -145,7 +145,7 @@ pub struct StepRow {
     /// honest-absent rather than mis-folding — pinned by
     /// `fold_finals_colon_era_session_ids_do_not_fold`. The SSE stream stays
     /// the LIVE-increment channel; these are only the terminal totals.
-    /// Additive camelCase (`tokensFinal`/`turnsFinal`/`cloud`); pre-#1432
+    /// Additive camelCase (`tokensFinal`/`turnsFinal`); pre-#1432
     /// consumers ignore them.
     ///
     /// **Gated on `started_ts.is_some()` (#1488 follow-up).** `review.json`'s
@@ -163,20 +163,6 @@ pub struct StepRow {
     pub tokens_final: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turns_final: Option<u64>,
-    /// `Some(true)` when any folded record for this step carried a hosted
-    /// endpoint (a remote/cloud call) — the page colors the backfilled total
-    /// the same "cloud" hue the live meter uses. Absent when local-only.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cloud: Option<bool>,
-    /// (#1626) `Some(true)` when a clean terminal with NO endpoint was folded
-    /// for this step — positive evidence it ran locally.
-    ///
-    /// `cloud` absent used to be the page's signal for "local", which conflated
-    /// "known local" with "no evidence" and credited an errored hosted seat's
-    /// tokens to the off-the-meter claim. Neither field present now means
-    /// UNKNOWN, and the meter names it rather than folding it into local.
-    #[serde(rename = "localOk", skip_serializing_if = "Option::is_none")]
-    pub local_ok: Option<bool>,
     /// (#1481) The resolved model this step's dispatch ran against, read from
     /// the persisted `Step.config` (`model`, else `model_key`). A
     /// `dispatch.map` seat stamps its launch-resolved model here, so the
@@ -974,20 +960,9 @@ fn substitute_id_placeholder_prefix(id: &str, doc_phase_id: &str, real_phase_id:
 pub(crate) struct StepFinals {
     pub tokens: Option<u64>,
     pub turns: Option<u64>,
-    pub cloud: bool,
-    /// (#1626) Positive evidence this step ran LOCALLY: a clean terminal that
-    /// carried no endpoint.
-    ///
-    /// Without it, `cloud: false` had to carry two incompatible meanings —
-    /// "known local" and "no endpoint evidence either way" — and the page
-    /// resolved that ambiguity by crediting the tokens to local, which is the
-    /// #1607 defect. A hosted seat that ERRORED never emits an endpoint, so it
-    /// is indistinguishable from a local one on `cloud` alone.
-    ///
-    /// `cloud` and `local_ok` are independent because neither implies the
-    /// other's absence: both false means UNKNOWN, and unknown must be said
-    /// rather than folded into the off-the-meter claim.
-    pub local_ok: bool,
+    // (#2902 step 2a) The `cloud`/`local_ok` endpoint-presence flags are
+    // gone: they fed only the viewer's withdrawn local/cloud split (#2834),
+    // and an endpoint says what was called, never where or at what cost.
 }
 
 /// Which step id (if any) a flow record attributes to, using the SAME three
@@ -1073,11 +1048,7 @@ fn step_for_record<'a>(
 /// `applyRecordToMetrics`. The per-turn RUNNING increments
 /// (`telemetry.tokens`, `dispatch.turn`) are deliberately NOT folded here:
 /// those stay the page's live SSE channel, so the backfill can never race
-/// ahead of or double-count the live meter. A matched dispatch/step record
-/// naming a hosted `payload.endpoint` marks its step `cloud` — terminal or
-/// not, mirroring the JS fold (which flags cloud before its action
-/// branches). A usage record's (`telemetry.tokens`) `endpoint` never does:
-/// it names what was called, LMStudio included (#2902 step 1a).
+/// ahead of or double-count the live meter.
 /// Pure + iterator-driven so the correlation/fold logic is unit-testable
 /// without touching the filesystem.
 pub(crate) fn fold_step_finals<I>(
@@ -1095,40 +1066,16 @@ where
         };
         let action = rec.get("action").and_then(|a| a.as_str()).unwrap_or("");
         let payload = rec.get("payload");
-        // (#2902 step 1a) A usage record's (`telemetry.tokens`) `endpoint`
-        // is the fact of what was called, LMStudio included, never a
-        // hosted marker; only the dispatch/step vocabulary's `endpoint`
-        // (stamped for hosted work only) marks a step cloud.
-        let endpoint = action != "telemetry.tokens"
-            && payload.and_then(|p| p.get("endpoint")).map(|v| !v.is_null()).unwrap_or(false);
         // (silent-miss audit, 2026-09-06) Was a hand-spelled literal pair —
         // exactly the drift risk `darkmux_flow::is_dispatch_complete`
         // exists to close off; see `runs.rs`'s `is_dispatch_lifecycle_
         // action`/`terminal_status_for_action` for the sibling fix.
         let is_complete = darkmux_flow::is_dispatch_complete(action);
         let is_step_result = action == "step result";
-        if !endpoint && !is_complete && !is_step_result {
-            continue;
-        }
-        let entry = out.entry(sid.to_string()).or_default();
-        if endpoint {
-            entry.cloud = true;
-        }
-        // (#1626) A clean terminal with NO endpoint is the only positive
-        // evidence of local. Mirrors the same `localSids` convention the
-        // React port's `tokensOffMeter` uses (`ui/src/lenses/fleet/
-        // savings.ts`; the legacy `viewer.html`'s original copy of this
-        // convention retired along with that file, #1806) and `localOk` in
-        // THIS page's own live fold (below), so the backfilled and live
-        // paths classify the same step identically — they did not before,
-        // so a page opened after a run finished disagreed with one watched
-        // live.
-        if is_complete && !endpoint {
-            entry.local_ok = true;
-        }
         if !is_complete && !is_step_result {
             continue;
         }
+        let entry = out.entry(sid.to_string()).or_default();
         // (#1445 gate) `total_tokens` wins when both are present; `tokens` is
         // the review-vocabulary fallback. Same precedence as the JS fold.
         let total_tokens = payload
@@ -1161,32 +1108,15 @@ where
 /// So a match found by `fold_step_finals` can legitimately belong to an
 /// unrelated, earlier mission that ran the same-named step for real — a
 /// not-yet-started step in THIS mission cannot have produced any of those
-/// tokens, so a `false` gate always answers `(None, None, None)` regardless
+/// tokens, so a `false` gate always answers `(None, None)` regardless
 /// of what the fold found (#1488 follow-up: the client already gates its
 /// live SSE fold on `startTs > 0`; this is the same invariant for the
 /// server's finalized total).
-#[allow(clippy::type_complexity)]
-fn gate_finals_by_started(
-    started: bool,
-    fin: Option<&StepFinals>,
-) -> (Option<u64>, Option<u64>, Option<bool>, Option<bool>) {
+fn gate_finals_by_started(started: bool, fin: Option<&StepFinals>) -> (Option<u64>, Option<u64>) {
     if !started {
-        return (None, None, None, None);
+        return (None, None);
     }
-    let tokens_final = fin.and_then(|f| f.tokens);
-    let turns_final = fin.and_then(|f| f.turns);
-    let cloud = match fin {
-        Some(f) if f.cloud => Some(true),
-        _ => None,
-    };
-    // (#1626) Emitted only when TRUE, so absence keeps meaning "no evidence"
-    // rather than becoming a second way to say local. A step with neither
-    // `cloud` nor `local_ok` is UNKNOWN, and the page says so.
-    let local_ok = match fin {
-        Some(f) if f.local_ok => Some(true),
-        _ => None,
-    };
-    (tokens_final, turns_final, cloud, local_ok)
+    (fin.and_then(|f| f.tokens), fin.and_then(|f| f.turns))
 }
 
 /// Days since the Unix epoch for a civil calendar date (Howard Hinnant's
@@ -1511,7 +1441,7 @@ pub fn build_mission_graph(
                     // 46832 finalized tokens folded from an unrelated,
                     // already-closed same-day mission's real verify run.
                     let started = steps.get(step_id).is_some_and(|s| s.started_ts.is_some());
-                    let (tokens_final, turns_final, cloud, local_ok) =
+                    let (tokens_final, turns_final) =
                         gate_finals_by_started(started, step_finals.get(step_id));
                     match steps.get(step_id) {
                         Some(step) => StepRow {
@@ -1523,8 +1453,6 @@ pub fn build_mission_graph(
                             completed_ts: step.completed_ts,
                             tokens_final,
                             turns_final,
-                            cloud,
-                            local_ok,
                             // (#1481) The seat's resolved model, if its config
                             // stamps one (dispatch.map seats do; procedural /
                             // Tier 3 kinds don't).
@@ -1534,7 +1462,7 @@ pub fn build_mission_graph(
                             // A synthesized (not-yet-persisted) step is by
                             // definition not started — `started` above is
                             // always false here, so `tokens_final`/
-                            // `turns_final`/`cloud`/`local_ok` are already
+                            // `turns_final` are already
                             // `None`.
                             let kind = kind_from_config_snapshot(mission_id, &task.id, step_id)
                                 .unwrap_or_default();
@@ -1547,8 +1475,6 @@ pub fn build_mission_graph(
                                 completed_ts: None,
                                 tokens_final,
                                 turns_final,
-                                cloud,
-                                local_ok,
                                 // (#1481) A synthesized step has no persisted
                                 // config yet — the model resolves at launch and
                                 // isn't recoverable from the null template
@@ -1704,7 +1630,6 @@ mod tests {
         let out = fold_step_finals(vec![rec], &step_ids, "m-this");
         assert_eq!(out["example-judge-step"].tokens, Some(4200));
         assert_eq!(out["example-judge-step"].turns, None);
-        assert!(!out["example-judge-step"].cloud);
     }
 
     /// (#1877, final wiring step, schema leniency) `darkmux-crew::
@@ -1909,14 +1834,13 @@ mod tests {
     }
 
     #[test]
-    fn fold_finals_endpoint_marks_cloud() {
+    fn fold_finals_endpoint_bearing_step_result_folds_its_total() {
         let step_ids = ids(&["s1"]);
         let rec = serde_json::json!({
             "action": "step result",
             "payload": { "step_id": "s1", "total_tokens": 50, "endpoint": "https://api.example/v1" }
         });
         let out = fold_step_finals(vec![rec], &step_ids, "m-this");
-        assert!(out["s1"].cloud);
         assert_eq!(out["s1"].tokens, Some(50));
     }
 
@@ -1967,30 +1891,24 @@ mod tests {
         assert_eq!(out["s1"].tokens, Some(900));
     }
 
-    /// (#1445 gate consider 1) Cloud parity with the JS fold: a matched
-    /// NON-TERMINAL record naming a hosted endpoint marks its step cloud
-    /// (the JS flags cloud before its action branches). Totals stay absent.
+    /// (#2902 step 2a) A matched NON-TERMINAL record folds nothing: the
+    /// endpoint-presence `cloud` flag it used to set is gone (#2834), and a
+    /// start never carries a finalized total.
     #[test]
-    fn fold_finals_cloud_marker_on_nonterminal_matched_record() {
+    fn fold_finals_nonterminal_matched_record_folds_nothing() {
         let step_ids = ids(&["s1"]);
         let rec = serde_json::json!({
             "action": "dispatch start", "handle": "s1",
             "payload": { "step_id": "s1", "endpoint": "azure:example.azure.com/gpt" }
         });
         let out = fold_step_finals(vec![rec], &step_ids, "m-this");
-        assert!(out["s1"].cloud, "non-terminal endpoint record still marks cloud (JS parity)");
-        assert_eq!(out["s1"].tokens, None, "a start never folds a total");
-        assert_eq!(out["s1"].turns, None);
+        assert!(!out.contains_key("s1"), "a start folds no entry: {out:?}");
     }
 
-    /// (#2902 step 1a) A usage record's `endpoint` is the fact of what was
-    /// called (an LMStudio base URL included), not a hosted marker, so it
-    /// never marks a step cloud. Before 1a no `telemetry.tokens` carried the
-    /// field, so this changes nothing already displayed; after it, a LOCAL
-    /// step's usage records would otherwise flip it to cloud. Same rule in
-    /// the JS fold (`ui/src/lenses/mission/graph.ts`).
+    /// (#2902 step 1a) A usage record folds nothing into the finalized
+    /// totals: the running per-call sum stays the page's live channel.
     #[test]
-    fn fold_finals_usage_record_endpoint_never_marks_cloud() {
+    fn fold_finals_usage_record_folds_nothing() {
         let step_ids = ids(&["s1"]);
         let rec = serde_json::json!({
             "action": "telemetry.tokens", "handle": "s1",
@@ -2037,30 +1955,27 @@ mod tests {
         // Simulates the confirmed collision: `fold_step_finals` found a
         // real sibling/earlier mission's finalized total under this step's
         // literal id, but the step itself never started.
-        let collided = StepFinals { tokens: Some(46_832), turns: Some(12), cloud: false, local_ok: false };
-        let (tokens, turns, cloud, _lok) = gate_finals_by_started(false, Some(&collided));
+        let collided = StepFinals { tokens: Some(46_832), turns: Some(12) };
+        let (tokens, turns) = gate_finals_by_started(false, Some(&collided));
         assert_eq!(tokens, None, "a not-started step must never show a collided total");
         assert_eq!(turns, None);
-        assert_eq!(cloud, None);
     }
 
     #[test]
     fn gate_finals_by_started_keeps_a_started_steps_real_total() {
-        let real = StepFinals { tokens: Some(133_785), turns: Some(9), cloud: true, local_ok: false };
-        let (tokens, turns, cloud, _lok) = gate_finals_by_started(true, Some(&real));
+        let real = StepFinals { tokens: Some(133_785), turns: Some(9) };
+        let (tokens, turns) = gate_finals_by_started(true, Some(&real));
         assert_eq!(tokens, Some(133_785), "a genuinely started step keeps its real total");
         assert_eq!(turns, Some(9));
-        assert_eq!(cloud, Some(true));
     }
 
     #[test]
     fn gate_finals_by_started_started_with_no_fold_is_honest_absent() {
         // Started, but the backfill found nothing for it (mixed-era or
         // truly never-dispatched) — absent, not a manufactured zero.
-        let (tokens, turns, cloud, _lok) = gate_finals_by_started(true, None);
+        let (tokens, turns) = gate_finals_by_started(true, None);
         assert_eq!(tokens, None);
         assert_eq!(turns, None);
-        assert_eq!(cloud, None);
     }
 
     // ─── (#1445 gate must-fix) bounded backfill scan ────────────────────

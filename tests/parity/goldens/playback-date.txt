@@ -19,14 +19,10 @@ fleet
 DARKMUX TOKENS
 584,118
 ALL TOKENS
+295.26k
+INPUT
 288.86k
 GENERATED
-18.57k
-FRESH INPUT
-0
-RE-READ
-276.69k
-UNCLASSIFIED
 38
 DISPATCHES
 Orchestrator note: First editor-embedded review shipped tonight — the crew reviewed a real ticket inside Zed, end to end on local models, and the report rendered beautifully. Four feature findings captured for the real integration. Great night. · 03:06:54 history →
