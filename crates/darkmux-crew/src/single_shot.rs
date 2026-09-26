@@ -209,7 +209,7 @@ pub fn hosted_chat_body(
 /// that already ends in `/v1` (operators carrying the pre-#661 full-URL
 /// habit) is tolerated too — the suffix is trimmed before this appends
 /// its own.
-fn local_chat_url(base_url: Option<&str>) -> String {
+pub(crate) fn local_chat_url(base_url: Option<&str>) -> String {
     let base = base_url
         .map(str::to_string)
         .unwrap_or_else(darkmux_types::config_access::lmstudio_url);

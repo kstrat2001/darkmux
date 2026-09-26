@@ -171,6 +171,8 @@ pub mod sleep_assertion;
 // run_step_graph shape.
 pub mod scheduler;
 pub mod single_shot;
+// (#2902 step 3) The one endpoint/model resolver.
+pub mod target;
 pub mod usage;
 pub mod utility;
 // (#1230 Packet 2) Step-kind registry — the execution contract
