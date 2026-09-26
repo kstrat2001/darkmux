@@ -37,14 +37,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const INACTIVITY_TIMEOUT_MARKER: &str = "darkmux dispatch: INACTIVITY TIMEOUT";
 
 /// Local Docker image tag for the internal runtime, built from
-/// `runtime/Dockerfile` by a source checkout (`docker build -t darkmux-runtime
-/// runtime/`). Preferred when present — it's the dev workflow.
-pub const RUNTIME_IMAGE: &str = "darkmux-runtime:latest";
-
-/// GHCR repository for the published runtime image (#759). When no local
-/// `RUNTIME_IMAGE` exists (the common case for a `brew install` user with no
-/// source checkout), darkmux pulls the version-pinned tag from here on demand.
-const RUNTIME_IMAGE_GHCR_REPO: &str = "ghcr.io/kstrat2001/darkmux-runtime";
+/// `runtime/Dockerfile` by a source checkout (`docker build --build-arg
+/// DARKMUX_VERSION=<version> -t darkmux-runtime:latest runtime/`). Preferred
+/// when present AND its version label matches this darkmux (#2923); an
+/// unlabeled or mismatched one is skipped for the version-pinned GHCR image.
+/// Resolution lives in [`crate::runtime_image`].
+pub use crate::runtime_image::RUNTIME_IMAGE;
 
 // (#839) Docker security hardening constants. The container runs untrusted LLM
 // output (the agent's bash tool), so Docker is the boundary — drop all Linux
@@ -72,25 +70,17 @@ const DOCKER_MEMORY: &str = "4g";
 /// skewed binary/image pair never runs (#759). Public so `darkmux doctor` can
 /// show the exact ref it would pull.
 pub fn ghcr_runtime_image() -> String {
-    format!("{RUNTIME_IMAGE_GHCR_REPO}:{}", env!("CARGO_PKG_VERSION"))
+    crate::runtime_image::pinned_runtime_image(env!("CARGO_PKG_VERSION"))
 }
 
-/// True if `tag` is one of darkmux's own runtime images (the local dev tag or
-/// any GHCR-published tag). Such images have the runtime binary baked in, so
-/// they run directly with NO `--image` injection. An operator-supplied
-/// `--image` (e.g. `rust:slim`) is everything else → injection.
+/// True if `tag` is one of darkmux's own runtime images: the local
+/// `darkmux-runtime` repository under ANY tag (`darkmux-runtime:4.0-rc`, #2923)
+/// or any GHCR-published tag. Such images have the runtime binary baked in, so
+/// they run directly with NO `--image` injection, after their version label is
+/// checked against this darkmux. An operator-supplied `--image` (e.g.
+/// `rust:slim`) is everything else → injection.
 fn is_darkmux_runtime_image(tag: &str) -> bool {
-    tag == RUNTIME_IMAGE || tag.starts_with(&format!("{RUNTIME_IMAGE_GHCR_REPO}:"))
-}
-
-/// `docker images -q <tag>` prints an image id iff the image is present
-/// locally (exits 0 either way; empty stdout = absent). Daemon-down is treated
-/// as absent here — callers run this only after a daemon check.
-fn image_present_locally(tag: &str) -> bool {
-    matches!(
-        Command::new("docker").args(["images", "-q", tag]).output(),
-        Ok(out) if out.status.success() && !out.stdout.is_empty()
-    )
+    crate::runtime_image::is_darkmux_runtime_ref(tag)
 }
 
 /// `docker pull` the version-pinned GHCR runtime image (#759). Streams docker's
@@ -108,27 +98,33 @@ fn pull_runtime_image(image: &str) -> Result<()> {
             "failed to pull the runtime image `{image}` from GHCR.\n\
              Options:\n  \
              - Check network / `docker login ghcr.io` if the package is private, OR\n  \
-             - Build it locally from a darkmux source checkout:\n      \
-             docker build -t {RUNTIME_IMAGE} runtime/"
+             - Build it locally from a darkmux {version} source checkout:\n      \
+             docker build --build-arg DARKMUX_VERSION={version} -t {RUNTIME_IMAGE} runtime/",
+            version = env!("CARGO_PKG_VERSION"),
         );
     }
     Ok(())
 }
 
-/// Resolve + ensure a darkmux runtime image is present, pulling the
-/// version-pinned GHCR image on demand if neither the local dev tag nor a
-/// previously-pulled GHCR image exists (#759). Returns the ref to use. The
-/// caller has already confirmed the Docker daemon is reachable.
-fn ensure_darkmux_image_present() -> Result<String> {
-    if image_present_locally(RUNTIME_IMAGE) {
-        return Ok(RUNTIME_IMAGE.to_string());
+/// Resolve + ensure a darkmux runtime image built for THIS darkmux is present
+/// (#2923): a local `darkmux-runtime:latest` only when its version label
+/// matches, else the version-pinned GHCR image, pulled on demand (#759).
+/// `explicit` is an operator-named darkmux runtime image (`--image
+/// darkmux-runtime:4.0-rc`), checked the same way and refused on mismatch.
+/// Returns the ref to use. The caller has already confirmed the Docker daemon
+/// is reachable.
+fn ensure_darkmux_image_present(explicit: Option<&str>) -> Result<String> {
+    use crate::runtime_image::{resolve_default_image, resolve_explicit_image, DockerImageInspector};
+    let host = env!("CARGO_PKG_VERSION");
+    match explicit {
+        Some(image) => resolve_explicit_image(&DockerImageInspector, image, host, &pull_runtime_image),
+        None => resolve_default_image(
+            &DockerImageInspector,
+            host,
+            &pull_runtime_image,
+            &emit_preflight_warning_once,
+        ),
     }
-    let ghcr = ghcr_runtime_image();
-    if image_present_locally(&ghcr) {
-        return Ok(ghcr);
-    }
-    pull_runtime_image(&ghcr)?;
-    Ok(ghcr)
 }
 
 /// Add the two host→container bind mounts to the docker run command:
@@ -5068,10 +5064,17 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // exists (#759), so a `brew install` user with no source checkout can
     // dispatch. Bails loud + operator-actionable BEFORE the role-load /
     // model-probe / workspace-setup work below.
+    //
+    // (#2923) A darkmux runtime image named with `--image` (e.g.
+    // `darkmux-runtime:4.0-rc`) IS the image that runs, so it is the one
+    // checked against this darkmux's version and refused on mismatch; the
+    // default image is then never resolved or pulled. A non-darkmux `--image`
+    // still resolves the default image, as the source of the injected binary.
+    let explicit_darkmux_image = opts.image.as_deref().filter(|_| !inject);
     let darkmux_image = if opts.skip_preflight {
         RUNTIME_IMAGE.to_string()
     } else {
-        check_docker_preflight()?
+        check_docker_preflight(explicit_darkmux_image)?
     };
 
     // The image we actually run: the operator's `--image` if given, else the
@@ -11363,10 +11366,16 @@ pub fn docker_runtime_status() -> DockerRuntimeStatus {
     // (#759). `Ready` means at least one is present (no pull needed); otherwise
     // `ImageMissing`, which the dispatch preflight resolves by pulling GHCR.
     // (Daemon-unreachable cases were caught in Step 1.)
-    if image_present_locally(RUNTIME_IMAGE) || image_present_locally(&ghcr_runtime_image()) {
-        DockerRuntimeStatus::Ready
-    } else {
-        DockerRuntimeStatus::ImageMissing
+    //
+    // (#2923) "Present" means a USABLE image: one whose version matches this
+    // darkmux. A stale or unlabeled local `:latest` next to an absent pin is
+    // `ImageMissing`, because the dispatch will pull.
+    match crate::runtime_image::plan_default_image(
+        &crate::runtime_image::DockerImageInspector,
+        env!("CARGO_PKG_VERSION"),
+    ) {
+        Ok(plan) if !plan.needs_pull => DockerRuntimeStatus::Ready,
+        _ => DockerRuntimeStatus::ImageMissing,
     }
 }
 
@@ -11376,12 +11385,12 @@ pub fn docker_runtime_status() -> DockerRuntimeStatus {
 /// role-load / model-probe / workspace setup so a new user without Docker gets
 /// a clean, operator-actionable bail, and a `brew install` user without a
 /// local image gets a one-time pull instead of a "build from source" dead-end.
-fn check_docker_preflight() -> Result<String> {
+fn check_docker_preflight(explicit: Option<&str>) -> Result<String> {
     match docker_runtime_status() {
         // Daemon up (image present OR absent) — resolve the darkmux image,
         // pulling the version-pinned GHCR image on demand if none is local.
         DockerRuntimeStatus::Ready | DockerRuntimeStatus::ImageMissing => {
-            ensure_darkmux_image_present()
+            ensure_darkmux_image_present(explicit)
         }
         // Docker missing / daemon unreachable / probe error → actionable bail
         // (reuse the pure mapper, which returns Err for all of these). The
@@ -11407,11 +11416,12 @@ fn preflight_result_for(status: DockerRuntimeStatus) -> Result<()> {
              Install Docker Desktop (https://www.docker.com/products/docker-desktop) and retry."
         ),
         DockerRuntimeStatus::ImageMissing => bail!(
-            "no darkmux runtime image found locally. darkmux pulls the \
+            "no darkmux runtime image for darkmux {version} found locally. darkmux pulls the \
              version-pinned image `{}` from GHCR on demand; if that pull \
-             can't run, build it once from a darkmux source checkout:\n  \
-             docker build -t {RUNTIME_IMAGE} runtime/",
-            ghcr_runtime_image()
+             can't run, build it once from a darkmux {version} source checkout:\n  \
+             docker build --build-arg DARKMUX_VERSION={version} -t {RUNTIME_IMAGE} runtime/",
+            ghcr_runtime_image(),
+            version = env!("CARGO_PKG_VERSION"),
         ),
         DockerRuntimeStatus::ProbeError(e) => {
             Err(anyhow!("running `docker images` to check for runtime image: {e}"))

@@ -3351,6 +3351,186 @@ fn dispatch_host_side_unset_compactor_disclosure_fires_on_the_local_path() {
         );
 }
 
+// ─── #2923: a runtime image built for another darkmux is refused before it runs ──
+
+/// A fake `docker` on PATH that answers the image questions dispatch asks and
+/// logs every invocation. `labels` maps an image ref to the version label it
+/// reports (`""` = present but unlabeled); a ref not listed is absent. `pull`
+/// always fails, and `run`/`create` are logged so a test can prove nothing
+/// ran. Returns (fake-bin dir, log path).
+fn fake_docker_for_runtime_image(
+    tmp: &std::path::Path,
+    labels: &[(&str, &str)],
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let fake_bin = tmp.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let log = tmp.join("docker.log");
+    let mut inspect_cases = String::new();
+    for (image, label) in labels {
+        inspect_cases.push_str(&format!("    '{image}') echo '{label}'; exit 0 ;;\n"));
+    }
+    let script = format!(
+        "#!/bin/sh\n\
+         echo \"$*\" >> '{log}'\n\
+         if [ \"$1\" = \"version\" ]; then echo 27.0.0; exit 0; fi\n\
+         if [ \"$1\" = \"image\" ] && [ \"$2\" = \"inspect\" ]; then\n\
+         for last; do :; done\n\
+         case \"$last\" in\n{inspect_cases}\
+         esac\n\
+         echo \"Error response from daemon: No such image: $last\" >&2; exit 1\n\
+         fi\n\
+         if [ \"$1\" = \"pull\" ]; then echo 'pull denied' >&2; exit 1; fi\n\
+         exit 0\n",
+        log = log.display(),
+    );
+    let docker = fake_bin.join("docker");
+    fs::write(&docker, script).unwrap();
+    // A fake `lms` too, pinned by DARKMUX_LMS_BIN, so nothing on this path
+    // can reach a real LM Studio.
+    let lms = fake_bin.join("lms");
+    fs::write(&lms, "#!/bin/sh\necho '[]'\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for p in [&docker, &lms] {
+            let mut perms = fs::metadata(p).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(p, perms).unwrap();
+        }
+    }
+    (fake_bin, log)
+}
+
+fn dispatch_with_fake_docker(
+    tmp: &std::path::Path,
+    fake_bin: &std::path::Path,
+    extra: &[&str],
+) -> assert_cmd::assert::Assert {
+    let profiles_path = tmp.join("profiles.json");
+    fs::write(
+        &profiles_path,
+        r#"{"profiles":{"fast":{"models":[{"id":"model-a","n_ctx":32000,"role":"primary"}]}},"default_profile":"fast"}"#,
+    )
+    .unwrap();
+    let ack_dir = tmp.join("ack");
+    fs::create_dir_all(&ack_dir).unwrap();
+    let real_path = std::env::var("PATH").unwrap_or_default();
+    let mut args = vec!["dispatch", "coder"];
+    args.extend_from_slice(extra);
+    args.push("smoke");
+    darkmux_cmd()
+        .env("DARKMUX_ACK_DIR", &ack_dir)
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_LMS_BIN", fake_bin.join("lms"))
+        .env("PATH", format!("{}:{real_path}", fake_bin.display()))
+        .args(&args)
+        .assert()
+}
+
+/// Nothing beyond inspecting images may have happened: no container, no
+/// extraction. (A pull may be attempted on the default path; it fails here.)
+fn assert_no_container_ran(log: &std::path::Path) {
+    let calls = fs::read_to_string(log).unwrap_or_default();
+    for line in calls.lines() {
+        assert!(
+            !(line.starts_with("run ") || line.starts_with("create ")),
+            "a container was started before the refusal: {line}\nall calls:\n{calls}"
+        );
+    }
+}
+
+#[test]
+fn dispatch_refuses_an_explicit_unlabeled_darkmux_runtime_tag_before_running() {
+    // The operator's side-by-side case: `--image darkmux-runtime:4.0-rc`,
+    // built with no DARKMUX_VERSION build-arg. It must be checked (not treated
+    // as a BYO image and injected), and refused naming the image and the fix.
+    let tmp = TempDir::new().unwrap();
+    let (fake_bin, log) =
+        fake_docker_for_runtime_image(tmp.path(), &[("darkmux-runtime:4.0-rc", "")]);
+    let version = env!("CARGO_PKG_VERSION");
+    dispatch_with_fake_docker(tmp.path(), &fake_bin, &["--image", "darkmux-runtime:4.0-rc"])
+        .failure()
+        .stderr(
+            predicate::str::contains("refusing to dispatch")
+                .and(predicate::str::contains("`darkmux-runtime:4.0-rc`"))
+                .and(predicate::str::contains("no version label"))
+                .and(predicate::str::contains(format!(
+                    "docker build --build-arg DARKMUX_VERSION={version} -t darkmux-runtime:4.0-rc runtime/"
+                ))),
+        );
+    assert_no_container_ran(&log);
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.contains("pull"),
+        "an explicit tag is never replaced by a pull:\n{calls}"
+    );
+}
+
+#[test]
+fn dispatch_refuses_an_explicit_mismatched_darkmux_runtime_tag_naming_both_versions() {
+    let tmp = TempDir::new().unwrap();
+    let (fake_bin, log) =
+        fake_docker_for_runtime_image(tmp.path(), &[("darkmux-runtime:4.0-rc", "0.0.1")]);
+    let version = env!("CARGO_PKG_VERSION");
+    dispatch_with_fake_docker(tmp.path(), &fake_bin, &["--image", "darkmux-runtime:4.0-rc"])
+        .failure()
+        .stderr(
+            predicate::str::contains("built for darkmux 0.0.1")
+                .and(predicate::str::contains(format!("this darkmux is {version}"))),
+        );
+    assert_no_container_ran(&log);
+}
+
+#[test]
+fn dispatch_skips_a_stale_unlabeled_latest_and_refuses_when_the_pin_cannot_be_pulled() {
+    // The Studio's shape (#2923): an unlabeled local `darkmux-runtime:latest`
+    // and no pinned image. The local image must not run; with the pull
+    // failing, the refusal names the skipped image, this version, and the fix.
+    let tmp = TempDir::new().unwrap();
+    let (fake_bin, log) =
+        fake_docker_for_runtime_image(tmp.path(), &[("darkmux-runtime:latest", "")]);
+    let version = env!("CARGO_PKG_VERSION");
+    let pinned = format!("ghcr.io/kstrat2001/darkmux-runtime:{version}");
+    dispatch_with_fake_docker(tmp.path(), &fake_bin, &[])
+        .failure()
+        .stderr(
+            predicate::str::contains("`darkmux-runtime:latest` carries no version label")
+                .and(predicate::str::contains(format!("this darkmux is {version}")))
+                .and(predicate::str::contains(format!("DARKMUX_VERSION={version}")))
+                .and(predicate::str::contains("failed to pull")),
+        );
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(calls.contains(&format!("pull {pinned}")), "the pin was tried:\n{calls}");
+    assert_no_container_ran(&log);
+}
+
+#[test]
+fn dispatch_byo_image_takes_its_injected_runtime_from_the_matching_image_not_a_stale_latest() {
+    // (#703 + #2923) `--image rust:slim` injects darkmux's runtime binary,
+    // extracted from a darkmux image. That source must be the image built
+    // for this darkmux, not a stale local `:latest`, or the injected runtime
+    // is stale and the #1730 cache stamps it as current.
+    let tmp = TempDir::new().unwrap();
+    let version = env!("CARGO_PKG_VERSION");
+    let pinned = format!("ghcr.io/kstrat2001/darkmux-runtime:{version}");
+    let (fake_bin, log) = fake_docker_for_runtime_image(
+        tmp.path(),
+        &[("darkmux-runtime:latest", ""), (pinned.as_str(), version)],
+    );
+    // The fake `docker create` prints no container id, so extraction stops
+    // right there; what matters is which image it was asked to extract from.
+    let _ = dispatch_with_fake_docker(tmp.path(), &fake_bin, &["--image", "rust:slim"]);
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls.contains(&format!("create -- {pinned}")),
+        "the injected runtime comes from the pinned image:\n{calls}"
+    );
+    assert!(
+        !calls.contains("create -- darkmux-runtime:latest"),
+        "never from the stale local tag:\n{calls}"
+    );
+}
+
 // ─── #2124: SIGTERM mid-probe leaves a terminal record + no orphaned curl ──
 
 /// A tiny local server that ACCEPTS every connection and never responds —

@@ -561,8 +561,13 @@
             .to_string();
         assert!(msg.contains("GHCR"), "{msg}");
         assert!(msg.contains("ghcr.io/kstrat2001/darkmux-runtime:"), "{msg}");
+        // (#2923) The build fix stamps the version label, or dispatch would
+        // skip the image it just told the operator to build.
         assert!(
-            msg.contains("docker build -t darkmux-runtime:latest runtime/"),
+            msg.contains(&format!(
+                "docker build --build-arg DARKMUX_VERSION={} -t darkmux-runtime:latest runtime/",
+                env!("CARGO_PKG_VERSION")
+            )),
             "{msg}"
         );
     }
@@ -586,6 +591,11 @@
         assert!(is_darkmux_runtime_image(
             "ghcr.io/kstrat2001/darkmux-runtime:1.2.3"
         ));
+        // (#2923) Any tag of the local repo is darkmux's own image — an
+        // operator's `darkmux-runtime:4.0-rc` runs directly (and is version
+        // checked), never gets a second runtime injected into it.
+        assert!(is_darkmux_runtime_image("darkmux-runtime:4.0-rc"));
+        assert!(!is_darkmux_runtime_image("darkmux-runtime-bun:local"));
         assert!(!is_darkmux_runtime_image("rust:slim"));
         assert!(!is_darkmux_runtime_image("ubuntu:24.04"));
         // A lookalike repo prefix without the `:tag` separator must not match.
