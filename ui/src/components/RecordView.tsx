@@ -30,7 +30,7 @@
  * collapse problem is a single 46KB string in an otherwise 463-byte median
  * record, which is what `LongText` handles.
  */
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { escapeBidiControls } from "../lib/recordDetail";
 
 /** Envelope fields measured as effectively constant within a session. Not a
@@ -235,9 +235,34 @@ function Group({ name, obj }: { name: string; obj: Record<string, unknown> }) {
   );
 }
 
-export function RecordView({ record }: { record: Record<string, unknown> }) {
+/** (#2921 follow-up) What a `machine_uid` renders as in this inspector.
+ *
+ *  The hardware uid identifies the physical machine, and this panel lands in
+ *  screenshots. "hidden" rather than a tail such as the last 4 characters:
+ *  a tail still hands out part of the identifier and tells the reader
+ *  nothing they need here, since the record's own `machine_id` already says
+ *  which machine wrote it. The field stays listed so the record's shape does
+ *  not change. */
+export const MASKED_UID = "hidden";
+
+/** The record with every `machine_uid` (at any depth) replaced by
+ *  `MASKED_UID`, for the rows and the raw JSON alike. */
+function maskUids(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(maskUids);
+  if (v && typeof v === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
+      out[k] = k === "machine_uid" && x != null && x !== "" ? MASKED_UID : maskUids(x);
+    }
+    return out;
+  }
+  return v;
+}
+
+export function RecordView({ record: raw }: { record: Record<string, unknown> }) {
   const [showConstants, setShowConstants] = useState(false);
   const [showRaw, setShowRaw] = useState(false);
+  const record = useMemo(() => maskUids(raw) as Record<string, unknown>, [raw]);
 
   const entries = Object.entries(record);
   const constants = entries.filter(([k]) => CONSTANT_FIELDS.has(k));
