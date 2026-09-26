@@ -190,7 +190,11 @@ darkmux release.
   machine's own daemon and loopback entries skip it. A peer that fails the
   check is shown as `unverified` in `machine list --deep`. Everything a
   peer sends back is printed with control characters, bidirectional
-  overrides and zero-width characters removed. Machine names are
+  overrides and zero-width characters removed; a field shown in a table
+  or on one line also loses newlines and tabs and is cut to its column,
+  so a peer cannot print a forged row or warning. The token is never sent
+  to a loopback address (this machine's own daemon does not need it; a
+  loopback port can be held by another process). Machine names are
   case-insensitive everywhere and may not contain `-from-`. The listener reads
   the allow-list per request, so both take effect with no restart.
 - **The fleet listener** (#2916): with `fleet.listener.enabled`,

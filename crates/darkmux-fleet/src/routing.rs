@@ -511,8 +511,28 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             if let Ok((mut s, _)) = listener.accept() {
+                // Read the WHOLE request (headers, then Content-Length bytes)
+                // before answering, or the client may still be writing.
+                let mut got = Vec::new();
                 let mut b = [0u8; 65536];
-                let _ = s.read(&mut b);
+                s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                loop {
+                    let n = s.read(&mut b).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(&b[..n]);
+                    let text = String::from_utf8_lossy(&got).to_string();
+                    if let Some(h) = text.find("\r\n\r\n") {
+                        let len = text[..h]
+                            .lines()
+                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                            .unwrap_or(0);
+                        if got.len() >= h + 4 + len {
+                            break;
+                        }
+                    }
+                }
                 let body = r#"{"status":"completed","session_id":"x\u001b]0;pwned\u0007","exit_code":0,"stdout":"ok"}"#;
                 let _ = s.write_all(
                     format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())

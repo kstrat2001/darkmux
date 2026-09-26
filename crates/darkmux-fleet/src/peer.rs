@@ -32,8 +32,13 @@ pub struct PeerTarget {
     /// The host name used in the URL and the Host header.
     pub host: String,
     pub port: u16,
-    /// The verified address every connection is made to; `None` only for a
-    /// loopback target (this machine).
+    /// The verified address every connection is made to. `None` only for a
+    /// loopback target (this machine), and a target without one NEVER gets
+    /// the fleet token (#2916 round 3 C1): a port squatter on 127.0.0.1 (a
+    /// process of another user, a sandboxed app, the far end of an ssh
+    /// tunnel) must not collect it, and this machine's own daemon exempts
+    /// loopback callers anyway. Reaching a peer through a loopback tunnel
+    /// with the token would need an explicit opt-in; there is none.
     pub pinned_ip: Option<IpAddr>,
     /// The node id pinned by THIS lookup (first contact), for the caller to
     /// persist; `None` when the entry was already pinned or is loopback.
@@ -76,7 +81,10 @@ pub fn split_address(address: &str, default_port: u16) -> Result<(String, String
 /// Resolve where a token-bearing request for roster entry `name` may go.
 ///
 /// - `local_addr: Some(addr)`: the entry is THIS machine; dial its own
-///   daemon at `addr` (loopback), no verification needed.
+///   daemon at `addr`. A loopback address needs no verification (and gets
+///   no token); a non-loopback one (a daemon bound to its tailnet address)
+///   must be one of THIS node's own overlay addresses as the provider
+///   reports them, and is pinned to it.
 /// - An entry whose address is loopback (a same-host test fleet): dialed as
 ///   written, since it can only reach this machine, when `loopback_ok`.
 ///   Work submission passes `false`: it verifies every address.
@@ -94,11 +102,18 @@ pub fn peer_target(
 ) -> Result<PeerTarget> {
     if let Some(addr) = local_addr {
         let (scheme, host, p) = split_address(addr, default_port)?;
-        let ip = host.parse::<IpAddr>().ok();
-        if !ip.is_some_and(|ip| ip.is_loopback()) && host != "localhost" {
-            return Err(anyhow!("this machine's own daemon address `{addr}` is not loopback"));
+        let ip = host.parse::<IpAddr>().ok().map(|i| i.to_canonical());
+        if ip.is_some_and(|ip| ip.is_loopback()) || host == "localhost" {
+            return Ok(PeerTarget { scheme, host, port: port.unwrap_or(p), pinned_ip: None, newly_pinned: None });
         }
-        return Ok(PeerTarget { scheme, host, port: port.unwrap_or(p), pinned_ip: None, newly_pinned: None });
+        let own = provider.local_node().map(|n| n.addresses).unwrap_or_default();
+        return match ip.filter(|ip| own.contains(ip)) {
+            Some(ip) => Ok(PeerTarget { scheme, host, port: port.unwrap_or(p), pinned_ip: Some(ip), newly_pinned: None }),
+            None => Err(anyhow!(
+                "this machine's own daemon address `{addr}` is neither loopback nor one of this \
+                 machine's tailnet addresses (check `serve.bind`)"
+            )),
+        };
     }
     let (scheme, host, p) = split_address(&entry.address, default_port)?;
     if loopback_ok && crate::roster::address_host_is_loopback(&entry.address) {
@@ -125,10 +140,16 @@ pub fn persist_pin(id: &str, target: &PeerTarget) -> Result<()> {
     })
 }
 
-fn agent_for(target: &PeerTarget, timeout: Duration) -> ureq::Agent {
-    let mut b = ureq::AgentBuilder::new().timeout(timeout).redirects(0);
+/// The ONE agent builder for token-bearing requests (#2916 round 3 C3):
+/// redirects never followed, and a pinned target's every connection goes to
+/// its verified address whatever DNS says now.
+fn build_agent(target: &PeerTarget, connect: Duration, read: Duration, write: Duration) -> ureq::Agent {
+    let mut b = ureq::AgentBuilder::new()
+        .timeout_connect(connect)
+        .timeout_read(read)
+        .timeout_write(write)
+        .redirects(0);
     if let Some(ip) = target.pinned_ip {
-        // Dial the VERIFIED address, whatever DNS says now.
         b = b.resolver(move |netloc: &str| -> std::io::Result<Vec<SocketAddr>> {
             let port = netloc.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).unwrap_or(80);
             Ok(vec![SocketAddr::new(ip, port)])
@@ -137,11 +158,12 @@ fn agent_for(target: &PeerTarget, timeout: Duration) -> ureq::Agent {
     b.build()
 }
 
-/// The fleet token, attached HERE and nowhere else.
-fn with_fleet_token(req: ureq::Request, token: Option<&str>) -> ureq::Request {
-    match token {
-        Some(t) => req.set("Authorization", &format!("Bearer {t}")),
-        None => req,
+/// The fleet token, attached HERE and nowhere else, and only to a target
+/// pinned to a verified address (see [`PeerTarget::pinned_ip`]).
+fn with_fleet_token(req: ureq::Request, target: &PeerTarget, token: Option<&str>) -> ureq::Request {
+    match (token, target.pinned_ip) {
+        (Some(t), Some(_)) => req.set("Authorization", &format!("Bearer {t}")),
+        _ => req,
     }
 }
 
@@ -154,11 +176,11 @@ pub fn fleet_get(
     headers: &[(&str, &str)],
 ) -> std::result::Result<ureq::Response, ureq::Error> {
     let token = darkmux_flow::serve_token();
-    let mut req = agent_for(target, timeout).get(&format!("{}{path}", target.base()));
+    let mut req = build_agent(target, timeout, timeout, timeout).get(&format!("{}{path}", target.base()));
     for (k, v) in headers {
         req = req.set(k, v);
     }
-    with_fleet_token(req, token.as_ref().map(|t| t.expose_for_compare())).call()
+    with_fleet_token(req, target, token.as_ref().map(|t| t.expose_for_compare())).call()
 }
 
 /// POST a JSON body to a verified target with the fleet token.
@@ -179,24 +201,11 @@ fn post_json_with(
     read_timeout: Duration,
     token: Option<&str>,
 ) -> std::result::Result<ureq::Response, ureq::Error> {
-    let agent = {
-        let mut b = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(5))
-            .timeout_read(read_timeout)
-            .timeout_write(Duration::from_secs(30))
-            .redirects(0);
-        if let Some(ip) = target.pinned_ip {
-            b = b.resolver(move |netloc: &str| -> std::io::Result<Vec<SocketAddr>> {
-                let port = netloc.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).unwrap_or(80);
-                Ok(vec![SocketAddr::new(ip, port)])
-            });
-        }
-        b.build()
-    };
+    let agent = build_agent(target, Duration::from_secs(5), read_timeout, Duration::from_secs(30));
     let req = agent
         .post(&format!("{}{path}", target.base()))
         .set("Content-Type", "application/json");
-    with_fleet_token(req, token).send_string(body)
+    with_fleet_token(req, target, token).send_string(body)
 }
 
 /// Tests only: POST with an explicit token to an unverified target.
@@ -211,11 +220,14 @@ pub fn post_json_with_token_for_test(
     post_json_with(target, path, body, read_timeout, Some(token))
 }
 
-/// Tests only: a target at `base` (`http://host:port`), unverified.
+/// Tests only: a target at `base` (`http://host:port`), not verified by
+/// any provider, pinned to its host when that is an IP literal (so a test
+/// talking to its own fixture listener still exercises the pinned path).
 #[cfg(any(test, feature = "test-support"))]
 pub fn unverified_target_for_test(url_base: &str) -> PeerTarget {
     let (scheme, host, port) = split_address(url_base, 80).unwrap();
-    PeerTarget { scheme, host, port, pinned_ip: None, newly_pinned: None }
+    let pinned_ip = host.parse::<IpAddr>().ok();
+    PeerTarget { scheme, host, port, pinned_ip, newly_pinned: None }
 }
 
 #[cfg(test)]
@@ -266,7 +278,95 @@ mod tests {
         assert_eq!(lo.pinned_ip, None);
         let me = peer_target("studio", &entry("100.64.0.2", None), Some("127.0.0.1:8765"), None, 8765, true, &p).unwrap();
         assert_eq!(me.base(), "http://127.0.0.1:8765");
+        assert_eq!(me.pinned_ip, None, "loopback: no pin, so no token");
+        // (#2916 round 3 C2) A daemon bound to this node's own tailnet
+        // address is this machine, pinned to that address.
+        let me_ts = peer_target("laptop", &entry("x", None), Some("100.64.0.7:8765"), None, 8765, true, &p).unwrap();
+        assert_eq!(me_ts.pinned_ip, Some("100.64.0.7".parse().unwrap()));
         assert!(peer_target("studio", &entry("x", None), Some("100.64.0.9:8765"), None, 8765, true, &p).is_err());
+    }
+
+    /// A one-shot HTTP fixture that records the request it received.
+    fn recording_fixture() -> (u16, std::sync::mpsc::Receiver<String>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut s, _)) = l.accept() {
+                // Read the whole request (headers + Content-Length body).
+                let mut got = Vec::new();
+                let mut b = [0u8; 4096];
+                s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                loop {
+                    let n = s.read(&mut b).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(&b[..n]);
+                    let text = String::from_utf8_lossy(&got).to_string();
+                    if let Some(h) = text.find("\r\n\r\n") {
+                        let len = text[..h]
+                            .lines()
+                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                            .unwrap_or(0);
+                        if got.len() >= h + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let _ = tx.send(String::from_utf8_lossy(&got).into_owned());
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            }
+        });
+        (port, rx)
+    }
+
+    /// (#2916 round 3 C1) The token rides only to a PINNED target; a
+    /// loopback target (whoever squats the port) gets nothing.
+    #[test]
+    #[serial_test::serial]
+    fn the_token_goes_only_to_a_pinned_target() {
+        let prev = std::env::var("DARKMUX_SERVE_TOKEN").ok();
+        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", "tok-peer-test") };
+        let run = |pinned: bool| {
+            let (port, rx) = recording_fixture();
+            let t = PeerTarget {
+                scheme: "http".into(),
+                host: "127.0.0.1".into(),
+                port,
+                pinned_ip: pinned.then(|| "127.0.0.1".parse().unwrap()),
+                newly_pinned: None,
+            };
+            let _ = fleet_get(&t, "/x", Duration::from_secs(5), &[]);
+            rx.recv_timeout(Duration::from_secs(5)).unwrap().to_ascii_lowercase()
+        };
+        let pinned = run(true);
+        let loopback = run(false);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_SERVE_TOKEN", v),
+                None => std::env::remove_var("DARKMUX_SERVE_TOKEN"),
+            }
+        }
+        assert!(pinned.contains("authorization: bearer tok-peer-test"), "{pinned}");
+        assert!(!loopback.contains("authorization"), "{loopback}");
+    }
+
+    /// (#2916 round 3 C3) The POST path dials the pinned address too.
+    #[test]
+    fn a_verified_post_is_dialed_at_its_pinned_address_not_by_dns() {
+        let (port, rx) = recording_fixture();
+        let t = PeerTarget {
+            scheme: "http".into(),
+            host: "does-not-resolve.invalid".into(),
+            port,
+            pinned_ip: Some("127.0.0.1".parse().unwrap()),
+            newly_pinned: None,
+        };
+        let r = fleet_post_json(&t, "/fleet/work", "{}", Duration::from_secs(5));
+        assert!(r.is_ok(), "{r:?}");
+        assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap().starts_with("POST /fleet/work"));
     }
 
     /// (#2916 re-review C1) The request dials the VERIFIED address, never a

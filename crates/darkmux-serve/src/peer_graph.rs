@@ -685,7 +685,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn bearer_token_is_sent_when_configured() {
+    fn bearer_token_is_never_sent_to_a_loopback_peer() {
         // A listener that inspects the request line/headers it received
         // rather than a canned one_shot_http reply — proves the token
         // actually rides the Authorization header, not just that SOME
@@ -724,8 +724,9 @@ mod tests {
             }
         }
         assert!(out.is_some());
-        let header = seen_auth.lock().unwrap().clone().expect("Authorization header must be sent");
-        assert!(header.contains("Bearer sk-shared-token"), "{header}");
+        // (#2916 round 3 C1) A loopback address is whoever holds the port;
+        // the token goes only to a pinned, verified peer.
+        assert_eq!(seen_auth.lock().unwrap().clone(), None, "the token must not be sent to a loopback peer");
     }
 
     #[test]

@@ -465,10 +465,17 @@ pub fn resolve_host_addrs(address: &str) -> Vec<std::net::IpAddr> {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return vec![ip.to_canonical()];
     }
-    match resolve_with_timeout(&format!("{host}:0")) {
-        Ok(Some(a)) => vec![a.ip().to_canonical()],
-        _ => Vec::new(),
-    }
+    use std::net::ToSocketAddrs;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let q = format!("{host}:0");
+    let _ = std::thread::Builder::new().name("darkmux-dns-resolve".into()).spawn(move || {
+        let r: Vec<std::net::IpAddr> =
+            q.to_socket_addrs().map(|it| it.map(|a| a.ip().to_canonical()).collect()).unwrap_or_default();
+        let _ = tx.send(r);
+    });
+    let mut ips = rx.recv_timeout(DNS_RESOLUTION_TIMEOUT).unwrap_or_default();
+    ips.dedup();
+    ips
 }
 
 /// Remove a machine from the roster. Returns the removed entry (so the

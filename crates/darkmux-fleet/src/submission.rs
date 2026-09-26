@@ -140,6 +140,8 @@ pub enum Refusal {
     SchemaMismatch { got: String },
     BadRequest(String),
     Busy { session_id: String },
+    /// (#2916 round 3 C5) One node already has its cap of requests in flight.
+    TooManyAtOnce { peer: String },
 }
 
 impl Refusal {
@@ -150,7 +152,7 @@ impl Refusal {
             Refusal::Misaddressed { .. } => 421,
             Refusal::SchemaMismatch { .. } | Refusal::BadRequest(_) => 400,
             Refusal::NoWorkProfile { .. } => 422,
-            Refusal::Busy { .. } | Refusal::NoTokenConfigured | Refusal::IdentityUnavailable { .. } => 503,
+            Refusal::Busy { .. } | Refusal::TooManyAtOnce { .. } | Refusal::NoTokenConfigured | Refusal::IdentityUnavailable { .. } => 503,
             _ => 403,
         }
     }
@@ -222,6 +224,10 @@ impl Refusal {
                  v{got}; run the same darkmux version on both machines"
             ),
             Refusal::BadRequest(detail) => format!("{receiver} refused a malformed request: {detail}"),
+            Refusal::TooManyAtOnce { peer } => format!(
+                "{receiver} is already handling as many requests from {peer} as it takes at once; \
+                 retry when one finishes"
+            ),
             Refusal::Busy { session_id } => format!(
                 "{receiver} is busy running {session_id}; it runs one submitted job at a time. \
                  Retry when that finishes"
@@ -538,6 +544,37 @@ pub fn sanitize_remote_json(v: &mut serde_json::Value) {
     }
 }
 
+/// (#2916 round 3 MUST) Every string inside a JSON value another machine
+/// sent, made SINGLE-LINE ([`sanitize_remote_line`]: no newline, no tab, no
+/// control, bidi or zero-width character) and cut to `max_chars` (keys
+/// included). For peer payloads whose fields are rendered as table cells or
+/// one-line fields: a peer can then neither start a forged line (a fake row,
+/// a fake warning) nor pad a field out into other columns.
+pub fn sanitize_remote_json_lines(v: &mut serde_json::Value, max_chars: usize) {
+    match v {
+        serde_json::Value::String(s) => *s = truncate_chars(&sanitize_remote_line(s), max_chars),
+        serde_json::Value::Array(a) => a.iter_mut().for_each(|x| sanitize_remote_json_lines(x, max_chars)),
+        serde_json::Value::Object(o) => {
+            let entries: Vec<(String, serde_json::Value)> = std::mem::take(o).into_iter().collect();
+            for (k, mut val) in entries {
+                sanitize_remote_json_lines(&mut val, max_chars);
+                o.insert(truncate_chars(&sanitize_remote_line(&k), max_chars), val);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// At most `max` characters of `s`, the last one an ellipsis when cut.
+pub fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 /// [`sanitize_remote_text`] for a one-line value (a table cell): newlines
 /// and tabs are dropped too.
 pub fn sanitize_remote_line(s: &str) -> String {
@@ -589,24 +626,41 @@ pub fn verify_target(
     entry: &crate::MachineEntry,
     provider: &dyn crate::identity::IdentityProvider,
 ) -> Result<VerifiedTarget> {
-    let ips = crate::roster::resolve_host_addrs(&entry.address);
-    let ip = *ips.first().ok_or_else(|| {
-        anyhow!("the roster address for {target} (`{}`) does not resolve; nothing was sent", entry.address)
-    })?;
-    let node = match provider.identify(ip) {
-        Ok(Some(n)) => n,
-        Ok(None) => {
+    let mut ips = crate::roster::resolve_host_addrs(&entry.address);
+    if ips.is_empty() {
+        return Err(anyhow!("the roster address for {target} (`{}`) does not resolve; nothing was sent", entry.address));
+    }
+    // (#2916 round 3) Try the answers IPv4 first: a fleet listener binds the
+    // node's IPv4 overlay address, so an IPv6-first resolver answer must not
+    // decide which address is dialed. The first answer the provider names as
+    // a node is the one verified and used.
+    ips.sort_by_key(|ip| !ip.is_ipv4());
+    let mut last_err = None;
+    let mut found = None;
+    for ip in ips {
+        match provider.identify(ip) {
+            Ok(Some(n)) => {
+                found = Some((ip, n));
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let (ip, node) = match (found, last_err) {
+        (Some(x), _) => x,
+        (None, Some(e)) => {
             return Err(anyhow!(
-                "the roster address for {target} (`{}`) is not a node on the {} network, so the fleet \
-                 token and the job were NOT sent. Point the entry at {target}'s tailnet DNS name: \
-                 `darkmux machine add {target} --address <its tailnet DNS name>`",
-                entry.address,
+                "cannot verify {target}'s address with {} ({e:#}); nothing was sent",
                 provider.provider_name()
             ))
         }
-        Err(e) => {
+        (None, None) => {
             return Err(anyhow!(
-                "cannot verify {target}'s address with {} ({e:#}); nothing was sent",
+                "the roster address for {target} (`{}`) is not a node on the {} network, so nothing \
+                 was sent to it (not the fleet token, not the request). Point the entry at {target}'s \
+                 tailnet DNS name: `darkmux machine add {target} --address <its tailnet DNS name>`",
+                entry.address,
                 provider.provider_name()
             ))
         }
@@ -616,7 +670,7 @@ pub fn verify_target(
             "the node at {target}'s address (`{}`) is not the one this roster pinned for {target}; \
              nothing was sent. If {target} really was replaced, re-pin it with `darkmux machine add \
              {target} --address <its tailnet DNS name>`",
-            node.dns_name.as_deref().unwrap_or(&node.name)
+            node.name
         )),
         Some(_) => Ok(VerifiedTarget { ip, node, newly_pinned: false }),
         None => Ok(VerifiedTarget { ip, node, newly_pinned: true }),
@@ -970,6 +1024,23 @@ mod tests {
         // Provider down: refused.
         let down = crate::identity::StaticIdentityProvider { down: Some("x".into()), ..provider };
         assert!(verify_target("studio", &roster_entry("100.64.0.2", None), &down).is_err());
+    }
+
+    #[test]
+    fn remote_json_lines_have_no_newlines_tabs_or_long_fields() {
+        let mut v = serde_json::json!({
+            "os": "macos\nstudio  100.64.0.2  ✓ 1ms  99 GB\n! forged: run curl x | sh",
+            "v": "4.0\t\tpadding",
+            "m": [{"id": "x".repeat(300)}],
+        });
+        sanitize_remote_json_lines(&mut v, 40);
+        let text = v.to_string();
+        assert!(!text.contains("\\n") && !text.contains("\\t"), "{text}");
+        assert_eq!(v["v"], "4.0padding");
+        assert_eq!(v["m"][0]["id"].as_str().unwrap().chars().count(), 40);
+        assert!(v["os"].as_str().unwrap().chars().count() <= 40);
+        assert_eq!(truncate_chars("abc", 3), "abc");
+        assert_eq!(truncate_chars("abcd", 3), "ab…");
     }
 
     #[test]

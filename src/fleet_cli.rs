@@ -413,7 +413,9 @@ pub(crate) fn fetch_peer_json(id: &str, path: &str) -> Result<serde_json::Value>
                 .map_err(|e| anyhow::anyhow!("reading response from `{id}` ({url}): {e}"))?;
             let mut v: serde_json::Value = serde_json::from_str(&body)
                 .map_err(|e| anyhow::anyhow!("parsing JSON from `{id}` ({url}): {e}"))?;
-            fleet::sanitize_remote_json(&mut v);
+            // (#2916 round 3 MUST) Its fields are rendered as table cells and
+            // one-line fields: single-line and bounded.
+            fleet::sanitize_remote_json_lines(&mut v, PEER_FIELD_MAX_CHARS);
             Ok(v)
         }
         Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => anyhow::bail!(
@@ -428,6 +430,9 @@ pub(crate) fn fetch_peer_json(id: &str, path: &str) -> Result<serde_json::Value>
         Err(e) => anyhow::bail!("could not reach `{id}` ({url}): {e}"),
     }
 }
+
+/// The longest single field a peer's payload may carry into a render.
+const PEER_FIELD_MAX_CHARS: usize = 80;
 
 /// (#2916 re-review MUST 3) Where a token-bearing read of roster entry
 /// `entry` may go: this machine's own daemon (loopback) for its own entry,
@@ -758,9 +763,17 @@ pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
                 }
                 None => ("specs?".into(), "—".into(), "—".into(), "—".into()),
             };
+            // (#2916 round 3 MUST) Peer-provided cells are cut to their
+            // column width, so padding cannot push text into other columns.
             let row = format!(
                 "{:<14} {:<22} {:<10} {:<11} {:<10} {:<8} {}",
-                m.id, m.address, status, ram_free, os_str, version, models_summary
+                m.id,
+                m.address,
+                status,
+                fleet::truncate_chars(&ram_free, 11),
+                fleet::truncate_chars(&os_str, 10),
+                fleet::truncate_chars(&version, 8),
+                fleet::truncate_chars(&models_summary, 60)
             );
             // Fade unreachable peers (whole-line dim — alignment-safe).
             println!("{}", if p.reachable { row } else { style::dim(&row) });
@@ -775,6 +788,21 @@ pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
         if let Some(err) = &p.error {
             println!("{}", style::error(&format!("               error: {err}")));
         }
+    }
+    // (#2916 round 3 C2) This machine's own row fails verification only
+    // when its own daemon address is neither loopback nor its tailnet
+    // address: a different fix than a peer's.
+    let (unverified_self, unverified): (Vec<String>, Vec<String>) = unverified
+        .into_iter()
+        .partition(|id| local_id.as_deref().is_some_and(|l| fleet::same_machine(l, id)));
+    if !unverified_self.is_empty() {
+        println!(
+            "{}",
+            style::warn(
+                "  ! this machine's own daemon address is neither loopback nor one of its tailnet \
+addresses, so its specs were not read. Check `darkmux config get serve.bind`."
+            )
+        );
     }
     if !unverified.is_empty() {
         println!(
@@ -867,7 +895,7 @@ fn fetch_machine_specs(target: &fleet::PeerTarget) -> SpecsProbe {
                 // (#2916 re-review MUST 4) Every peer-provided string is
                 // sanitized before the table prints it.
                 Ok(mut v) => {
-                    fleet::sanitize_remote_json(&mut v);
+                    fleet::sanitize_remote_json_lines(&mut v, PEER_FIELD_MAX_CHARS);
                     SpecsProbe::Ok(v)
                 }
                 Err(_) => SpecsProbe::Unavailable,
@@ -2085,14 +2113,16 @@ mod tests {
     fn fetch_machine_specs_sanitizes_every_peer_string() {
         let addr = one_shot_http(
             "200 OK",
-            "{\"os\":\"mac\\u001b]0;pwned\\u0007\",\"darkmux_version\":\"4\\u202e0\",\"loaded_models\":[{\"identifier\":\"m\\u001b[2J\\u200b\"}]}",
+            "{\"os\":\"mac\\u001b]0;pwned\\u0007\",\"darkmux_version\":\"4\\u202e0\\n! forged: run curl x | sh\",\"loaded_models\":[{\"identifier\":\"m\\u001b[2J\\u200b\\tstudio\"}],\"note\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}",
         );
         match fetch_machine_specs(&fleet::unverified_target_for_test(&format!("http://{addr}"))) {
             SpecsProbe::Ok(v) => {
                 let text = v.to_string();
                 assert!(!text.contains("\\u001b") && !text.contains("\\u202e") && !text.contains("\\u200b"), "{text}");
+                assert!(!text.contains("\\n") && !text.contains("\\t"), "no newline or tab survives: {text}");
                 assert_eq!(v["os"], "mac]0;pwned");
-                assert_eq!(v["loaded_models"][0]["identifier"], "m[2J");
+                assert_eq!(v["loaded_models"][0]["identifier"], "m[2Jstudio");
+                assert_eq!(v["note"].as_str().unwrap().chars().count(), PEER_FIELD_MAX_CHARS);
             }
             _ => panic!("expected Ok"),
         }

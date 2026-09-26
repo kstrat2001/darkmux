@@ -68,6 +68,10 @@ pub(crate) struct FleetListenerState {
     pub busy: Arc<Mutex<Option<String>>>,
     /// Per-peer throttle on refusal log lines.
     pub refusal_log: Arc<RefusalLog>,
+    /// (#2916 round 3 C5) Requests in flight per admitted NODE, so a node
+    /// that spreads connections over several addresses (a subnet router)
+    /// is still capped once it is identified.
+    pub node_slots: Arc<KeySlots<String>>,
 }
 
 impl FleetListenerState {
@@ -92,6 +96,7 @@ impl FleetListenerState {
             execute: Arc::new(darkmux_fleet::execute_job),
             busy: Arc::new(Mutex::new(None)),
             refusal_log: Arc::new(RefusalLog::new()),
+            node_slots: Arc::new(KeySlots::new(NODE_CAP)),
         }
     }
 }
@@ -111,6 +116,9 @@ pub(crate) fn router(state: FleetListenerState) -> Router {
 /// (under `brew services`, an unrotated file) without bound.
 pub(crate) struct RefusalLog {
     peers: Mutex<std::collections::HashMap<std::net::IpAddr, (std::time::Instant, u32, u64)>>,
+    /// (#2916 round 3 C6) Refusals from addresses the full table could not
+    /// track: counted here, never dropped silently.
+    overflow: std::sync::atomic::AtomicU64,
     /// Lines actually written (for tests).
     pub written: std::sync::atomic::AtomicU64,
 }
@@ -126,10 +134,14 @@ pub(crate) enum LogDecision {
 impl RefusalLog {
     pub(crate) const PER_WINDOW: u32 = 5;
     pub(crate) const WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
-    const MAX_PEERS: usize = 4096;
+    pub(crate) const MAX_PEERS: usize = 4096;
 
     pub(crate) fn new() -> Self {
-        Self { peers: Mutex::new(Default::default()), written: std::sync::atomic::AtomicU64::new(0) }
+        Self {
+            peers: Mutex::new(Default::default()),
+            overflow: std::sync::atomic::AtomicU64::new(0),
+            written: std::sync::atomic::AtomicU64::new(0),
+        }
     }
 
     pub(crate) fn decide(&self, ip: std::net::IpAddr, now: std::time::Instant) -> LogDecision {
@@ -137,6 +149,7 @@ impl RefusalLog {
         if peers.len() >= Self::MAX_PEERS && !peers.contains_key(&ip) {
             peers.retain(|_, (start, _, sup)| now.duration_since(*start) < Self::WINDOW || *sup > 0);
             if peers.len() >= Self::MAX_PEERS {
+                self.overflow.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 return LogDecision::Suppress;
             }
         }
@@ -153,6 +166,38 @@ impl RefusalLog {
             e.2 += 1;
             LogDecision::Suppress
         }
+    }
+
+    /// (#2916 round 3 C6) Report counts nobody has reported yet, on a
+    /// timer rather than only on the next refusal: every address whose
+    /// minute has ended with suppressed lines, and the overflow counter.
+    /// Returns the lines it wrote (for tests).
+    pub(crate) fn flush(&self, now: std::time::Instant) -> Vec<String> {
+        let mut lines = Vec::new();
+        {
+            let mut peers = self.peers.lock().unwrap_or_else(|p| p.into_inner());
+            peers.retain(|ip, (start, _, sup)| {
+                if now.duration_since(*start) >= Self::WINDOW {
+                    if *sup > 0 {
+                        lines.push(format!("darkmux fleet: suppressed {sup} refusal log line(s) from {ip} in the last minute"));
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        let over = self.overflow.swap(0, std::sync::atomic::Ordering::SeqCst);
+        if over > 0 {
+            lines.push(format!(
+                "darkmux fleet: suppressed {over} refusal log line(s) from addresses beyond the {} tracked",
+                Self::MAX_PEERS
+            ));
+        }
+        for l in &lines {
+            eprintln!("{l}");
+        }
+        lines
     }
 
     fn log(&self, ip: Option<std::net::IpAddr>, line: &str) {
@@ -251,6 +296,9 @@ async fn gate(State(state): State<FleetListenerState>, mut req: Request, next: N
     .await;
     match decision {
         Ok(Ok(admitted)) => {
+            let Some(_node_slot) = state.node_slots.try_take(admitted.peer_name.clone()) else {
+                return refuse(&state, Some(peer), &Refusal::TooManyAtOnce { peer: admitted.peer_name.clone() });
+            };
             req.extensions_mut().insert(admitted);
             next.run(req).await
         }
@@ -444,44 +492,47 @@ impl ConnLimits {
     };
 }
 
-/// Per-peer-address connection counts; a slot is released when its
-/// connection's task ends (the guard drops).
-pub(crate) struct PerIpSlots {
+/// Requests one admitted node may have in flight at once (#2916 round 3 C5).
+pub(crate) const NODE_CAP: usize = 4;
+
+/// In-flight counts per key (a peer address, or an admitted node); a slot
+/// is released when its guard drops (the connection's task, or the
+/// request, ends).
+pub(crate) struct KeySlots<K: std::hash::Hash + Eq + Clone> {
     max: usize,
-    counts: Mutex<std::collections::HashMap<std::net::IpAddr, usize>>,
+    counts: Mutex<std::collections::HashMap<K, usize>>,
 }
 
-pub(crate) struct IpSlot {
-    owner: Arc<PerIpSlots>,
-    ip: std::net::IpAddr,
+pub(crate) struct KeySlot<K: std::hash::Hash + Eq + Clone> {
+    owner: Arc<KeySlots<K>>,
+    key: K,
 }
 
-impl Drop for IpSlot {
+impl<K: std::hash::Hash + Eq + Clone> Drop for KeySlot<K> {
     fn drop(&mut self) {
         let mut c = self.owner.counts.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(n) = c.get_mut(&self.ip) {
+        if let Some(n) = c.get_mut(&self.key) {
             *n -= 1;
             if *n == 0 {
-                c.remove(&self.ip);
+                c.remove(&self.key);
             }
         }
     }
 }
 
-impl PerIpSlots {
+impl<K: std::hash::Hash + Eq + Clone> KeySlots<K> {
     pub(crate) fn new(max: usize) -> Self {
         Self { max, counts: Mutex::new(Default::default()) }
     }
 
-    pub(crate) fn try_take(self: &Arc<Self>, ip: std::net::IpAddr) -> Option<IpSlot> {
-        let ip = ip.to_canonical();
+    pub(crate) fn try_take(self: &Arc<Self>, key: K) -> Option<KeySlot<K>> {
         let mut c = self.counts.lock().unwrap_or_else(|p| p.into_inner());
-        let n = c.entry(ip).or_insert(0);
+        let n = c.entry(key.clone()).or_insert(0);
         if *n >= self.max {
             return None;
         }
         *n += 1;
-        Some(IpSlot { owner: Arc::clone(self), ip })
+        Some(KeySlot { owner: Arc::clone(self), key })
     }
 }
 
@@ -499,7 +550,7 @@ pub(crate) async fn serve_bounded(
     use hyper_util::rt::{TokioIo, TokioTimer};
     use hyper_util::service::TowerToHyperService;
     let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_conns));
-    let per_ip = Arc::new(PerIpSlots::new(limits.per_ip));
+    let per_ip = Arc::new(KeySlots::<std::net::IpAddr>::new(limits.per_ip));
     loop {
         let (stream, peer) = tokio::select! {
             r = listener.accept() => match r {
@@ -512,7 +563,7 @@ pub(crate) async fn serve_bounded(
             },
             _ = async { let _ = shutdown.wait_for(|v| *v).await; } => return,
         };
-        let Some(ip_slot) = per_ip.try_take(peer.ip()) else {
+        let Some(ip_slot) = per_ip.try_take(peer.ip().to_canonical()) else {
             drop(stream);
             continue;
         };
@@ -585,7 +636,21 @@ async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<(), Str
         .map_err(|e| format!("binding {addr}: {e} (another process on `fleet.listener.port`?)"))?;
     set_state("listening", format!("listening on {addr}"));
     println!("  fleet listener: {addr} (work submission; identity: {})", provider.provider_name());
-    let app = router(FleetListenerState::production(receiver, provider, Some(local_id)));
+    let state = FleetListenerState::production(receiver, provider, Some(local_id));
+    // (#2916 round 3 C6) Suppressed refusal counts are reported every minute,
+    // not only when the next refusal arrives.
+    let log = state.refusal_log.clone();
+    let mut flush_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(RefusalLog::WINDOW);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => { log.flush(std::time::Instant::now()); }
+                _ = async { let _ = flush_shutdown.wait_for(|v| *v).await; } => return,
+            }
+        }
+    });
+    let app = router(state);
     serve_bounded(listener, app, ConnLimits::PRODUCTION, shutdown).await;
     Ok(())
 }
@@ -660,6 +725,7 @@ mod tests {
             }),
             busy: busy.clone(),
             refusal_log: refusal_log.clone(),
+            node_slots: Arc::new(KeySlots::new(NODE_CAP)),
         };
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         std_listener.set_nonblocking(true).unwrap();
@@ -825,6 +891,7 @@ mod tests {
             execute: Arc::new(|_, _, _| panic!("never runs")),
             busy: Arc::new(Mutex::new(None)),
             refusal_log: Arc::new(RefusalLog::new()),
+            node_slots: Arc::new(KeySlots::new(NODE_CAP)),
         };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let resp = rt.block_on(async {
@@ -859,6 +926,7 @@ mod tests {
             execute: Arc::new(|_, _, _| panic!("never runs")),
             busy: Arc::new(Mutex::new(None)),
             refusal_log: Arc::new(RefusalLog::new()),
+            node_slots: Arc::new(KeySlots::new(NODE_CAP)),
         };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let resp = rt.block_on(async {
@@ -1050,6 +1118,7 @@ mod tests {
             execute: Arc::new(|_, _, _| panic!("never runs")),
             busy: Arc::new(Mutex::new(None)),
             refusal_log: Arc::new(RefusalLog::new()),
+            node_slots: Arc::new(KeySlots::new(NODE_CAP)),
         };
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         std_listener.set_nonblocking(true).unwrap();
@@ -1076,6 +1145,79 @@ mod tests {
         }
         let max = slow.max.load(std::sync::atomic::Ordering::SeqCst);
         assert!((1..=ConnLimits::PRODUCTION.per_ip).contains(&max), "concurrent lookups from one address: {max}");
+    }
+
+    /// (#2916 round 3 C5) Once identified, one node has at most its cap of
+    /// requests in flight, whatever addresses they came from.
+    #[test]
+    fn one_node_has_at_most_its_cap_of_requests_in_flight() {
+        let state = FleetListenerState {
+            receiver: "studio".into(),
+            local_node_id: Some("nSTUDIO".into()),
+            provider: Arc::new(StaticIdentityProvider {
+                local: test_node("nSTUDIO", "studio", "100.64.0.2"),
+                peers: vec![laptop()],
+                down: None,
+            }),
+            token: Arc::new(|| Some(TOKEN.to_string())),
+            allow_list: Arc::new(|| Ok(allow())),
+            resolve_profile: Arc::new(|_, _| {
+                std::thread::sleep(Duration::from_millis(600));
+                ProfileResolution::Work("host".into())
+            }),
+            execute: Arc::new(|j: WorkJob, _, _| {
+                Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: j.session_id, out_dir: None })
+            }),
+            busy: Arc::new(Mutex::new(None)),
+            refusal_log: Arc::new(RefusalLog::new()),
+            node_slots: Arc::new(KeySlots::new(1)),
+        };
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let port = std_listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+            rt.block_on(async move {
+                let l = tokio::net::TcpListener::from_std(std_listener).unwrap();
+                let (_tx, rx) = tokio::sync::watch::channel(false);
+                serve_bounded(l, router(state), ConnLimits::PRODUCTION, rx).await;
+            });
+        });
+        let url = format!("http://127.0.0.1:{port}{}", darkmux_fleet::SUBMISSION_PATH);
+        let u2 = url.clone();
+        let first = std::thread::spawn(move || {
+            darkmux_fleet::post_submission(&u2, TOKEN, &WorkSubmission::new(job("s1", None), true), Duration::from_secs(10)).unwrap()
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        let (code, reply) =
+            darkmux_fleet::post_submission(&url, TOKEN, &WorkSubmission::new(job("s2", None), true), Duration::from_secs(10)).unwrap();
+        assert_eq!(code, 503, "{reply:?}");
+        assert!(reply.reason.unwrap().contains("as many requests from macbook-pro as it takes at once"));
+        assert_eq!(first.join().unwrap().0, 200);
+    }
+
+    /// (#2916 round 3 C6) Suppressed counts are flushed on a timer, and
+    /// refusals from addresses past the table's size are counted, not lost.
+    #[test]
+    fn suppressed_counts_are_flushed_and_overflow_is_counted() {
+        let log = RefusalLog::new();
+        let a: std::net::IpAddr = "100.64.0.7".parse().unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..(RefusalLog::PER_WINDOW + 3) {
+            log.decide(a, t0);
+        }
+        assert!(log.flush(t0).is_empty(), "nothing to report before the minute ends");
+        let lines = log.flush(t0 + RefusalLog::WINDOW);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("suppressed 3"), "{lines:?}");
+        assert!(log.flush(t0 + RefusalLog::WINDOW * 2).is_empty(), "reported once");
+        let full = RefusalLog::new();
+        for i in 0..RefusalLog::MAX_PEERS as u32 {
+            full.decide(std::net::IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + i)), t0);
+        }
+        assert_eq!(full.decide("100.64.9.9".parse().unwrap(), t0), LogDecision::Suppress);
+        let lines = full.flush(t0);
+        assert!(lines.iter().any(|l| l.contains("suppressed 1") && l.contains("beyond")), "{lines:?}");
     }
 
     #[test]
