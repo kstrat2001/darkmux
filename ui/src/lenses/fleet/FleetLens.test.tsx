@@ -6,6 +6,7 @@ import { render, screen, waitFor, fireEvent, act } from "@testing-library/react"
 import { QueryClientProvider, QueryClient } from "@tanstack/react-query";
 import { FleetLens } from "./FleetLens";
 import type { FlowRecord } from "../../types/handwritten";
+import { pepperAt, pepperRecords } from "../../testing/pepperGrinderRun";
 import { todayUTC, prevDateUTC, FLOW_LIVE_TTL_MS, __sessionIndexBuilds, __asOfFilterRuns } from "../../lib/flow";
 import { tokensOffMeter } from "./savings";
 import { closeOpenModal } from "../../lib/dialogManager";
@@ -2162,5 +2163,52 @@ describe("(#2911) a record stamped ahead of the viewer's clock", () => {
     expect(__asOfFilterRuns()).toBe(filters);
     expect(vi.mocked(tokensOffMeter).mock.calls.length).toBe(calls);
     expect(document.querySelector(".savings .savnum")?.textContent).toBe("0");
+  });
+});
+
+// (#2926) The fleet card over the same real run, in playback: the rate line
+// under the tube is where its live text lives.
+describe("(#2926) fleet card: THINK opener and TOOL GEN, from the real run", () => {
+  function renderAt(records: FlowRecord[], playhead: number) {
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={records} tMax={playhead} tMin={pepperAt("10:51:00")} playhead={playhead} historical />
+      </QueryClientProvider>,
+    );
+  }
+  const rateLine = () =>
+    waitFor(() => {
+      const el = document.querySelector(".mach-scope__rate");
+      expect(el, "the rate line should be mounted").toBeTruthy();
+      return el as HTMLElement;
+    });
+  const extra = { machine_uid: "u1" };
+  // The real crew dispatch opens with `dispatch start` (spaced), and the
+  // card's `machActive` (`cards.ts`) only recognizes `dispatch.start`, so the
+  // real records alone leave the card idle in playback (a separate defect,
+  // reported with #2926, not fixed here). Dotted here so the card is active.
+  const dotted = (rs: FlowRecord[]) => rs.map((r) => (r.action === "dispatch start" ? { ...r, action: "dispatch.start" } : r));
+
+  it("turn 7's stream-open chunk: the previous turn's rate, dimmed, never ~1 think tok/s", async () => {
+    renderAt(dotted(pepperRecords({ extra })), pepperAt("10:51:33"));
+    const rate = await rateLine();
+    expect(rate.getAttribute("data-thinking")).toBe("true");
+    expect(rate.getAttribute("data-carried")).toBe("true");
+    expect(Number(rate.textContent?.split(" ")[0])).toBeGreaterThan(50);
+    expect(latestTokenScopeProps()).toMatchObject({ state: "generating", thinking: true, centerCarried: true });
+  });
+
+  it("the same opener on a session's first turn: '— think tok/s', no figure", async () => {
+    renderAt(dotted(pepperRecords({ minTurn: 7, extra })), pepperAt("10:51:33"));
+    const rate = await rateLine();
+    expect(rate.textContent).toBe("— think tok/s");
+    expect(latestTokenScopeProps()).toMatchObject({ state: "generating", centerLabel: "—" });
+  });
+
+  it("turn 10 writing a `write` call: 'tool gen · write · 18s' on the rate line, the tube keeps just 'tool gen'", async () => {
+    renderAt(dotted(pepperRecords({ extra })), pepperAt("10:52:48.500"));
+    const rate = await rateLine();
+    expect(rate.textContent).toBe("tool gen · write · 18s");
+    expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolName: "write", toolWriting: true, centerLabel: null, centerUnit: "tool gen" });
   });
 });

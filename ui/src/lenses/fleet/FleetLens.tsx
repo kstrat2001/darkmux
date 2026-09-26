@@ -1041,6 +1041,9 @@ export function FleetLens({
                         : liveStateLabel({
                             state: selectedExec.state,
                             restSecondsLeft: selectedExec.restSecondsLeft,
+                            // (#2926) "tool gen · write · 18s": the tool
+                            // being written, on this line, never in the tube.
+                            toolName: selectedExec.toolName,
                             writing: selectedExec.writing,
                             writingSeconds: selectedExec.writingSeconds,
                           })}
@@ -1186,7 +1189,7 @@ export function FleetLens({
                     state={scopeStateOf({ state: selectedExec.state, noSignal: selectedExec.state === null })}
                     toolName={selectedExec.toolName}
                     // (#2889) The writing cue; the status line under the
-                    // tube carries the live "tool gen · N s".
+                    // tube carries the live "tool gen · <tool> · Ns" (#2926).
                     toolWriting={selectedExec.writing === true}
                     // (#2890) Thinking tints the ring and shimmers the rate;
                     // the words and number stay as they are.

@@ -333,10 +333,31 @@ export function currentTokenRate(records: FlowRecord[]): TokenRateReading | null
  *  jumping 41 -> 148 tok/s once nothing at all was left to carry from — so
  *  the fix is a TRUST WINDOW, not a blanket skip). Non-opener pairs
  *  (`prev.chars !== 0`) are always trusted here; this only narrows the
- *  opener case. */
+ *  opener case.
+ *
+ *  (#2926) A fast opener must also MEASURE something: one whose later
+ *  sample holds only the stream-open chunk (`STREAM_OPEN_MAX_CHARS`) is not
+ *  a rate, fast or slow, so it falls through to the carry (or "—" with
+ *  nothing to carry) exactly like a slow opener. The first pair after it
+ *  (`prev.chars` = the chunk, not 0) is an ordinary pair and measures the
+ *  real output. */
 const OPENER_TRUST_WINDOW_MS = 2_500;
+/** (#2926) The most chars an opener's second sample may hold and still be
+ *  only the stream-open chunk. Every turn's stream opens with a tiny chunk
+ *  before any real output (`generated_chars` 0 -> 2..3); a FAST one landed
+ *  inside the trust window and read ~1 tok/s under a lit THINK lamp until
+ *  the next heartbeat. Measured on 173 opener pairs (every heartbeat day
+ *  from 2026-09-12 to 09-26): the second sample held 1-5 chars 145 times
+ *  and at least 235 chars the other 28, nothing in between. 16 sits three
+ *  times above the largest chunk seen and far under the smallest real
+ *  output, and is about four tokens: too few to measure a rate from over
+ *  one heartbeat interval in any case. */
+const STREAM_OPEN_MAX_CHARS = 16;
 function openerPairTrusted(prev: HeartbeatSample, next: HeartbeatSample): boolean {
-  return prev.chars !== 0 || next.atMs - prev.atMs <= OPENER_TRUST_WINDOW_MS;
+  if (prev.chars !== 0) return true;
+  // (#2926) Only the stream-open chunk: nothing measured yet.
+  if (next.chars <= STREAM_OPEN_MAX_CHARS) return false;
+  return next.atMs - prev.atMs <= OPENER_TRUST_WINDOW_MS;
 }
 
 /** (#2885) Scans backward from the end of `samples` for the most recent
@@ -480,7 +501,7 @@ interface StateMarker {
  * (#2889) A fresh WRITING heartbeat (the model is writing a named tool call)
  * reads `"tools"` with `writing`, never `"stalled"`: the runtime ticks for as
  * long as it waits on that call. So an endpoint that hangs after naming a
- * tool reads "tool gen · N s" until the host's inactivity watchdog ends the
+ * tool reads "tool gen · <tool> · Ns" until the host's inactivity watchdog ends the
  * dispatch (600 s by default), never STALL. */
 export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveStateReading {
   // Cut ONCE, up front — every downstream read (`heartbeatSamples`,
@@ -719,7 +740,13 @@ export function liveStateLabel(reading: LiveStateReading): string {
       // (#2889) Elapsed since the call's name arrived, while the model
       // generates its arguments. (#2890, operator) "tool gen", LM Studio's
       // "tool call generation": "writing" read as the edit/write tools.
-      return reading.writing ? `tool gen · ${reading.writingSeconds ?? 0} s` : "tools";
+      // (#2926) With the tool being written when the heartbeat names it
+      // ("tool gen · write · 18s"). LM Studio sends nothing while it
+      // generates the arguments, so there is no rate; the elapsed seconds
+      // are the honest progress signal.
+      return reading.writing
+        ? ["tool gen", ...(reading.toolName ? [reading.toolName] : []), `${reading.writingSeconds ?? 0}s`].join(" · ")
+        : "tools";
     case "stalled":
       return "stalled";
     case "generating":

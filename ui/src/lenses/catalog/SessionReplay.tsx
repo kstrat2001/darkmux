@@ -87,7 +87,7 @@ export function ScopeLamps({
   noSignal = false,
   finished = false,
 }: {
-  reading: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; writing?: true; writingSeconds?: number; thinking?: boolean };
+  reading: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; toolName?: string; writing?: true; writingSeconds?: number; thinking?: boolean };
   /** (#2886 pass 3) `state: null` is ALSO what a disconnection-downgraded
    *  stall reads as (`liveStateWhileConnected`) — visually identical
    *  (every lamp off) but a different fact, so the aria text says which. */
@@ -112,6 +112,7 @@ export function ScopeLamps({
         : liveStateLabel({
             state: reading.state,
             restSecondsLeft: reading.restSecondsLeft,
+            toolName: reading.toolName,
             writing: reading.writing,
             writingSeconds: reading.writingSeconds,
           } as LiveStateReading);
@@ -156,7 +157,7 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
   centerLabel: string | null;
   centerUnit: string | null;
   centerCarried: boolean;
-  lamps: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; writing?: true; writingSeconds?: number; thinking?: boolean };
+  lamps: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; toolName?: string; writing?: true; writingSeconds?: number; thinking?: boolean };
   note: string | null;
 } | null {
   const live = view.liveTokScope;
@@ -190,11 +191,22 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
       lamps: {
         state: live.state,
         restSecondsLeft: live.restSecondsLeft,
+        toolName: state === "tools" ? live.toolName : undefined,
         writing: live.writing,
         writingSeconds: live.writingSeconds,
         thinking: generating && live.thinking === true,
       },
-      note: state === "nosignal" ? "no signal" : null,
+      // (#2926) While the model generates a tool call, the readout line
+      // under the lamps says which tool and for how long ("tool gen · write
+      // · 18s"): LM Studio streams nothing for the arguments, so there is no
+      // rate, and the lit lamp and the tube center carry no live data. The
+      // seconds tick with the page's clock (the playhead in playback).
+      note:
+        state === "nosignal"
+          ? "no signal"
+          : writing
+            ? liveStateLabel({ state: "tools", toolName: live.toolName, writing: true, writingSeconds: live.writingSeconds })
+            : null,
     };
   }
   const fin = view.finishedTokRate;

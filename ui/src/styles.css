@@ -5944,11 +5944,14 @@ body {
   order: 0;
   margin-top: 0;
 }
-/* The "no signal" words, or a finished average's qualifier, under the lamps. */
+/* The "no signal" words, a finished average's qualifier, or (#2926) the tool
+   being generated and its elapsed seconds, under the lamps. Tabular figures
+   so the ticking seconds do not shift the line. */
 .session-run .modelbox__note {
   font-size: calc(11px * var(--fs-scale));
   letter-spacing: 0.1em;
   color: var(--dim);
+  font-variant-numeric: tabular-nums;
 }
 .session-run .metrics.modelbox__figs {
   grid-template-columns: repeat(3, minmax(0, 1fr));

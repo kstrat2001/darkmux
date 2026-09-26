@@ -12,7 +12,7 @@ import type { ScopeState } from "./scopeMorph";
  *    it while the model generates the call (LM Studio's "tool call
  *    generation"; not "writing", which read as the edit/write tools' own
  *    action). No seconds: a growing number made the caption variable-width
- *    and it overran the ring; the status line keeps "tool gen · N s";
+ *    and it overran the ring; the status line keeps "tool gen · <tool> · Ns";
  *  - PROMPT: nothing; `TokenScope` draws the brain for the whole phase
  *    (#2890, operator: a size estimate in the center made one phase look
  *    like two; the size is in the event detail and the run page);

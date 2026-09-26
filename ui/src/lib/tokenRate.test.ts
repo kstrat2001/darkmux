@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { FlowRecord } from "../types/handwritten";
+import { PEPPER_SID, pepperAt, pepperRecords } from "../testing/pepperGrinderRun";
 import {
   DEFAULT_CHARS_PER_TOKEN,
   STALL_AFTER_MS,
@@ -1023,7 +1024,10 @@ describe("(#2889) writing a tool call", () => {
   });
 
   it("labels the writing stretch with its elapsed seconds; running a tool keeps the old word", () => {
-    expect(liveStateLabel({ state: "tools", toolName: "edit", writing: true, writingSeconds: 70 })).toBe("tool gen · 70 s");
+    // (#2926) With the tool being written, and just "tool gen" when the
+    // heartbeat names none; the seconds stay the honest progress signal.
+    expect(liveStateLabel({ state: "tools", toolName: "edit", writing: true, writingSeconds: 70 })).toBe("tool gen · edit · 70s");
+    expect(liveStateLabel({ state: "tools", writing: true, writingSeconds: 3 })).toBe("tool gen · 3s");
     expect(liveStateLabel({ state: "tools", toolName: "edit" })).toBe("tools");
   });
 
@@ -1146,3 +1150,64 @@ describe("(#2890) executionTokenReading carries thinking", () => {
   });
 });
 
+
+// (#2926) Every turn's stream opens with a tiny chunk: `generated_chars` 0 ->
+// 2..3 about 0.5-3 s after the turn's first heartbeat. Measured across every
+// heartbeat day on the operator's machine (2026-09-12..26, 173 opener pairs):
+// the second sample of an opener held 1-5 chars 145 times and at least 235
+// chars the other 28 times, nothing in between. The fast ones landed inside
+// the 2.5 s opener trust window, so 3 chars over 577 ms read as ~1 tok/s
+// under a lit THINK lamp until the next heartbeat.
+describe("(#2926) the stream-open chunk is not a rate", () => {
+  const cut = (records: FlowRecord[], nowMs: number) => records.filter((r) => Date.parse(r.ts) <= nowMs);
+
+  it("turn 7's opener (0 -> 2 chars in 970 ms) carries the last real rate instead of reading ~1 tok/s", () => {
+    // Turn 7's 2-char sample (ts 10:51:32) is the latest; the next lands at :34.
+    const now = pepperAt("10:51:33");
+    const records = cut(pepperRecords(), now);
+    expect(deriveLiveState(records, now)).toEqual({ state: "generating", thinking: true });
+    const reading = currentTokenRate(records);
+    expect(reading).not.toBeNull();
+    expect(reading!.carried).toBe(true);
+    // Turn 6's last pair (764 -> 1,530 chars over 2.3 s), not an opener.
+    expect(reading!.tokensPerSec).toBeGreaterThan(50);
+  });
+
+  it("the same opener as a session's FIRST turn has nothing to carry: no figure at all", () => {
+    const now = pepperAt("10:51:33");
+    const records = cut(pepperRecords({ minTurn: 7 }), now);
+    expect(currentTokenRate(records)).toBeNull();
+    expect(executionTokenReading(records, now)).toMatchObject({ state: "generating", thinking: true, tokensPerSec: null });
+  });
+
+  it("the first pair past the opener measures real reasoning, fresh (turn 2: 3 -> 887 chars, ~100 tok/s)", () => {
+    const now = pepperAt("10:51:13");
+    const records = cut(pepperRecords(), now);
+    const reading = currentTokenRate(records);
+    expect(reading!.carried).toBeUndefined();
+    // (887 - 3) chars over 1,908 ms at the session's measured ~3.8 chars/token.
+    expect(reading!.tokensPerSec).toBeGreaterThan(90);
+    expect(reading!.tokensPerSec).toBeLessThan(140);
+  });
+
+  it("no moment of the real run reads a stream-open figure: a generating reading is the real rate or none", () => {
+    // Just after every heartbeat of the two minutes (their own `ts` is whole
+    // seconds, so step the page clock to the next second).
+    const all = pepperRecords();
+    for (const b of heartbeatSamples(all)) {
+      const nowMs = Math.ceil(b.atMs / 1000) * 1000 + 500;
+      const reading = executionTokenReading(cut(all, nowMs), nowMs);
+      if (reading.state === "generating" && reading.tokensPerSec != null) {
+        expect(reading.tokensPerSec, `at ${new Date(nowMs).toISOString()}`).toBeGreaterThan(20);
+      }
+    }
+  });
+
+  it("a fast opener with real output is still trusted (the #2886 fast-opener rule stands)", () => {
+    const hbT = (atMs: number, chars: number): FlowRecord =>
+      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: PEPPER_SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: 1 } }) as unknown as FlowRecord;
+    // 17 chars is the smallest opener chunk that counts; 16 is still stream-open.
+    expect(currentTokenRate([hbT(0, 0), hbT(1_000, 17)])).not.toBeNull();
+    expect(currentTokenRate([hbT(0, 0), hbT(1_000, 16)])).toBeNull();
+  });
+});
