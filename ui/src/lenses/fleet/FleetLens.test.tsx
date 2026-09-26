@@ -2273,3 +2273,39 @@ describe("(#2921) fleet page: no hardware uid is ever rendered as a label", () =
     expect(uidShapedText()).toEqual([]);
   });
 });
+
+describe("(#2921 follow-up) fleet page: roster names and unnamed ordinals", () => {
+  const A = "0A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
+  const B = "1B2C3D4E-5F60-4182-93A4-B5C6D7E8F9A0";
+  const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+  const start = (uid: string, sid: string, agoMs: number) => ({
+    ts: new Date(Date.now() - agoMs).toISOString(),
+    action: "dispatch start",
+    session_id: sid,
+    machine_uid: uid,
+    handle: "coder",
+  });
+  const names = (sel: string) => [...document.querySelectorAll(sel)].map((el) => el.textContent ?? "");
+
+  it("a uid-only machine with a roster entry reads its roster id on card and lane", async () => {
+    mockFleetFetch({ flowToday: [start(A, "s-a", 60_000)], roster: [{ id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000, machine_uid: A }] });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".lane .lname")?.textContent).toBe("studio"));
+    expect(names(".mach-name").join(" ")).toContain("studio");
+    expect(UUID_RE.test(document.body.textContent ?? "")).toBe(false);
+  });
+
+  it("two unnamed machines: distinct ordinals, and each machine's card and lane agree", async () => {
+    mockFleetFetch({ flowToday: [start(B, "s-b", 120_000), start(A, "s-a", 60_000)] });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".lane .lname")).toHaveLength(2));
+    const lanes = names(".lane .lname");
+    expect(new Set(lanes)).toEqual(new Set(["unnamed machine", "unnamed machine 2"]));
+    const cards = [...document.querySelectorAll<HTMLElement>(".mach[data-arg]")];
+    const cardName = (uid: string) => cards.find((c) => c.getAttribute("data-arg") === uid)?.querySelector(".mach-name")?.textContent;
+    // B was seen first.
+    expect(cardName(B)).toBe("unnamed machine");
+    expect(cardName(A)).toBe("unnamed machine 2");
+    expect(new Set(names(".mach-name"))).toEqual(new Set(lanes));
+  });
+});

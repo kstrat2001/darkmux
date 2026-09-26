@@ -360,6 +360,10 @@ export const uidOf = (r: FlowRecord): string => r.machine_uid || "unknown";
  * a uid lands in screenshots and identifies the physical machine. */
 export const UNNAMED_MACHINE = "unnamed machine";
 
+/** Whether a label is `UNNAMED_MACHINE`, with or without its ordinal. */
+export const isUnnamedMachineLabel = (name: string): boolean =>
+  name === UNNAMED_MACHINE || /^unnamed machine \d+$/.test(name);
+
 /** `nameOf()` — viewer.html:1112. The newest `machine_id` a record carried
  * for this uid, then the presence beat's `display_name`, then
  * `UNNAMED_MACHINE` — never the uid itself (#2921; legacy fell back to it). */
@@ -517,11 +521,103 @@ export function displayNameOf(
   liveMachines: Map<string, PresenceBeat>,
   specs: SelfIdentity | null,
   m: string,
+  /** (#2921 follow-up) The operator's declared roster. An entry whose
+   *  `machine_uid` is `m` names a machine nothing else does. Empty (a replay,
+   *  a static build, a caller with no roster) skips that step. */
+  roster: readonly RosterName[] = NO_ROSTER,
 ): string {
+  const own = ownName(data, liveMachines, specs, roster, m);
+  return own ?? unnamedLabel(data, liveMachines, specs, roster, m);
+}
+
+/** A stable empty roster, so the default never defeats `unnamedLabel`'s cache. */
+const NO_ROSTER: readonly RosterName[] = [];
+
+/** The structural slice of a roster entry `displayNameOf` reads. */
+export interface RosterName {
+  id: string;
+  machine_uid?: string | null;
+}
+
+/** A name `m` has of its own, in precedence order: an observed one
+ *  (`nameOf`), this daemon's specs name when `m` is this daemon, the roster
+ *  id declared for `m`. `null` when it has none. */
+function ownName(
+  data: FlowRecord[],
+  liveMachines: Map<string, PresenceBeat>,
+  specs: SelfIdentity | null,
+  roster: readonly RosterName[],
+  m: string,
+): string | null {
   const derived = nameOf(data, liveMachines, m);
   if (derived !== UNNAMED_MACHINE) return derived;
-  if (!specs?.machine_id) return derived;
-  return isSelfMachine(data, liveMachines, specs, m) ? specs.machine_id : derived;
+  if (specs?.machine_id && isSelfMachine(data, liveMachines, specs, m)) return specs.machine_id;
+  const declared = roster.find((e) => e.machine_uid === m)?.id;
+  return declared || null;
+}
+
+/** (#2921 follow-up) `UNNAMED_MACHINE`, with an ordinal from the second one
+ *  on ("unnamed machine 2"), so two nameless machines never read alike.
+ *
+ *  The order is FIRST-SEEN in `data` (earliest record `ts`; a uid known only
+ *  from a presence beat comes after every recorded one; ties by uid), not
+ *  render order, so every surface handed the same window — the machine's
+ *  card and its activity lane — gives the same machine the same ordinal,
+ *  and a machine appearing later takes a higher number rather than
+ *  renumbering the ones already shown. Only machines with no name of their
+ *  own (see `ownName`) take a number, and the number says nothing about the
+ *  hardware. */
+function unnamedLabel(
+  data: FlowRecord[],
+  liveMachines: Map<string, PresenceBeat>,
+  specs: SelfIdentity | null,
+  roster: readonly RosterName[],
+  m: string,
+): string {
+  if (m === "unknown") return "unknown";
+  // One ordering per (window, beats, specs, roster), shared by every label
+  // asked of it: a fleet page names each machine twice (card and lane) plus
+  // the lane-width pass, and each ordering costs a scan per machine.
+  const cached = unnamedOrderCache.get(data);
+  let order =
+    cached && cached.liveMachines === liveMachines && cached.specs === specs && cached.roster === roster ? cached.order : null;
+  if (!order) {
+    order = unnamedOrder(data, liveMachines, specs, roster);
+    unnamedOrderCache.set(data, { liveMachines, specs, roster, order });
+  }
+  const i = order.indexOf(m);
+  // A uid outside the window and the beats (a roster-only card's id) sorts
+  // after every one in it.
+  const at = i >= 0 ? i : order.length;
+  return at === 0 ? UNNAMED_MACHINE : `${UNNAMED_MACHINE} ${at + 1}`;
+}
+
+const unnamedOrderCache = new WeakMap<
+  FlowRecord[],
+  { liveMachines: Map<string, PresenceBeat>; specs: SelfIdentity | null; roster: readonly RosterName[]; order: string[] }
+>();
+
+/** The uids with no name of their own, in first-seen order. */
+function unnamedOrder(
+  data: FlowRecord[],
+  liveMachines: Map<string, PresenceBeat>,
+  specs: SelfIdentity | null,
+  roster: readonly RosterName[],
+): string[] {
+  const firstSeen = new Map<string, number>();
+  for (const r of data) {
+    const uid = r.machine_uid;
+    if (!uid) continue;
+    const t = T(r.ts);
+    const at = Number.isFinite(t) ? t : Infinity;
+    const prev = firstSeen.get(uid);
+    if (prev === undefined || at < prev) firstSeen.set(uid, at);
+  }
+  for (const uid of liveMachines.keys()) if (!firstSeen.has(uid)) firstSeen.set(uid, Infinity);
+  return [...firstSeen.entries()]
+    .filter(([uid]) => ownName(data, liveMachines, specs, roster, uid) === null)
+    .sort(([ua, ta], [ub, tb]) => (ta !== tb ? (ta < tb ? -1 : 1) : ua < ub ? -1 : ua > ub ? 1 : 0))
+    .map(([uid]) => uid);
 }
 
 /** `localMachineUid()` — viewer.html:2642-2644. Which uid IS this daemon,

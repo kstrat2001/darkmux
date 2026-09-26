@@ -10,10 +10,10 @@ import { getSource, labRunsSrc, runsSrc } from "../../lib/source";
 import { useDay } from "../../hooks/useDay";
 import { RUNS_KINDS, type RunsKind } from "../../lib/route";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
-import { useLiveMachines } from "../../hooks/useLiveMachines";
+import { useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
 import { machineNames, displayNameOf } from "../../lib/flow";
 import { LabRunDetail } from "./LabRunDetail";
-import type { RunsResponse, LabRunsResponse } from "../../types/handwritten";
+import type { RunsResponse, LabRunsResponse, MachineSpecs } from "../../types/handwritten";
 import type { Run } from "../../types/generated/Run";
 import {
   RUNS_CAP,
@@ -411,6 +411,18 @@ export function RunsBoard({
     queryFn: () => fetchJson<LabRunsResponse>(labRunsSrc()),
     refetchInterval: daemonBacked ? PRESENCE_POLL_MS : false,
   });
+  // (#2921 follow-up) What the machine pin needs to name a machine the way
+  // its fleet card does: this daemon's own specs (the same cached query the
+  // app shell reads) and the declared roster (read once, no poller). Only
+  // while a machine is pinned, and only against a daemon.
+  const pinNeedsName = daemonBacked && machineUid != null;
+  const pinSpecsQuery = useQuery({
+    enabled: pinNeedsName,
+    queryKey: queryKeys.machineSpecs(),
+    queryFn: () => fetchJson<MachineSpecs>("/machine/specs"),
+  });
+  const pinSpecs = pinNeedsName && pinSpecsQuery.data?.ok ? pinSpecsQuery.data.data : null;
+  const { machines: pinRoster } = useFleetRoster(pinNeedsName, false);
 
   // (#2860) A `run=<dir>` deep link (bookmarks, and the retired series view
   // used to write these too) follows the SAME rule as a list-row click: a
@@ -545,9 +557,9 @@ export function RunsBoard({
   // — see `format.ts::runsForMachine`'s own doc for the alias-matching
   // rationale and the "50 missions + 15 dispatches carry no machine at all"
   // exclusion it names.
-  // (#2921) The shared machine label; this board has no `/machine/specs`
-  // reading of its own, so no self floor (never the uid either way).
-  const pinnedMachineName = machineUid != null ? displayNameOf(pinRecords, liveMachines, null, machineUid) : null;
+  // (#2921) The shared machine label, with the same specs and roster the
+  // machine's fleet card is named from, so the pin and the card agree.
+  const pinnedMachineName = machineUid != null ? displayNameOf(pinRecords, liveMachines, pinSpecs, machineUid, pinRoster) : null;
   const scopedRuns = machineUid != null ? runsForMachine(runs, machineNames(pinRecords, liveMachines, machineUid)) : runs;
 
   function selectKind(k: RunsKind) {

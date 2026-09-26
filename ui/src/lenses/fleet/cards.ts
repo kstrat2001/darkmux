@@ -40,6 +40,7 @@ import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from 
 // second copy of it is how the two surfaces disagree about which machine
 // they are on.
 import { machineNames, machineUids, isSelfMachine, displayNameOf } from "../../lib/flow";
+import type { RosterName } from "../../lib/flow";
 import type { Run } from "../../types/generated/Run";
 
 /** `machActive()` — viewer.html:1342-1349. A machine is "in flight" iff one
@@ -607,6 +608,9 @@ export function buildFleetCard(
    * `liveStateWhileConnected` is skipped and only `connected` governs, same
    * as before this parameter existed. */
   lastContactMs: number | null = null,
+  /** (#2921 follow-up) The declared roster, so a machine nothing else names
+   *  takes its roster id — the same `displayNameOf` its activity lane uses. */
+  roster: readonly RosterName[] = [],
 ): FleetCard {
   const flowActive = machActive(data, liveSet, m, t);
   const labRunning = runningLabRunCount(machineRuns);
@@ -780,7 +784,7 @@ export function buildFleetCard(
   // doc for why a card titled with a raw 36-character UUID is the display
   // half of "self is unknown", and why the floor can never outvote a name the
   // window actually observed.
-  const name = displayNameOf(data, liveMachines, specs, m);
+  const name = displayNameOf(data, liveMachines, specs, m, roster);
   return {
     uid: m,
     name,

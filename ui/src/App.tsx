@@ -24,7 +24,7 @@ import { SessionReplay } from "./lenses/catalog/SessionReplay";
 import { PlaybackLens } from "./lenses/catalog/PlaybackLens";
 import { useFlowWindow } from "./hooks/useFlowWindow";
 import { useRouteRecords } from "./hooks/useRouteRecords";
-import { useLiveMachines } from "./hooks/useLiveMachines";
+import { useFleetRoster, useLiveMachines } from "./hooks/useLiveMachines";
 import { useLiveTail } from "./hooks/useLiveTail";
 import type { LiveTailStatus } from "./hooks/useLiveTail";
 import { computeMetaLines, readyParts } from "./lib/metaLine";
@@ -502,10 +502,13 @@ export function App() {
   // uid-generic (works for a remote uid too, via its presence beat or flow
   // records — see `lib/flow.ts`), so this is the same lookup `MachineLens`
   // itself does for its header, not a second implementation.
+  // (#2921 follow-up) The roster names a drilled machine nothing else does,
+  // exactly as it names that machine's fleet card. Read once, no poller.
+  const { machines: roster } = useFleetRoster(isLiveRoute(route) && route.kind === "machine" && route.uid != null, false);
   const targetMachineName =
     route.kind === "machine"
       ? route.uid != null
-        ? displayNameOf(flowWindow.data, liveMachines, specs, route.uid)
+        ? displayNameOf(flowWindow.data, liveMachines, specs, route.uid, roster)
         : localName
       : null;
 

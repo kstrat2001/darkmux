@@ -73,7 +73,7 @@ import {
   lastTs,
   displayNameOf,
 } from "../../lib/flow";
-import type { SelfIdentity } from "../../lib/flow";
+import type { RosterName, SelfIdentity } from "../../lib/flow";
 import { clkhm } from "../../lib/format";
 import type { FlowRecord, PresenceBeat } from "../../types/handwritten";
 
@@ -132,8 +132,8 @@ export interface ActivityTimeline {
 /** `renderMachine()`'s lane-label width math (viewer.html:1733-1734) — sizes
  * the `.lname` column to the longest machine name so short names don't leave
  * a fixed gap. Visual-only (no text-parity effect). */
-function labelWidthPx(uids: string[], data: FlowRecord[], liveMachines: Map<string, PresenceBeat>, specs: SelfIdentity | null): number {
-  const maxLen = uids.length ? Math.max(...uids.map((m) => displayNameOf(data, liveMachines, specs, m).length)) : 8;
+function labelWidthPx(uids: string[], data: FlowRecord[], liveMachines: Map<string, PresenceBeat>, specs: SelfIdentity | null, roster: readonly RosterName[]): number {
+  const maxLen = uids.length ? Math.max(...uids.map((m) => displayNameOf(data, liveMachines, specs, m, roster).length)) : 8;
   return Math.round(Math.min(170, Math.max(54, maxLen * 7.4 + 10)));
 }
 
@@ -188,6 +188,8 @@ export function buildActivityTimeline(
   /** (#2921) This daemon's own identity, so the lane label is the same
    *  `displayNameOf` title the machine's card carries. */
   specs: SelfIdentity | null = null,
+  /** (#2921 follow-up) The declared roster, for the same reason. */
+  roster: readonly RosterName[] = [],
 ): ActivityTimeline {
   const winMs = windowMinutes * 60000;
   const tlMax = fixedRange ? fixedRange[1] : playheadT;
@@ -240,7 +242,7 @@ export function buildActivityTimeline(
       const key = missionId ? `${sid}\x1f${missionId}` : sid;
       bars.push({ sid, key, leftPct, widthPct, cls, title: `${role} · ${sid} · ${lbl}` });
     }
-    return { uid: m, name: displayNameOf(data, liveMachines, specs, m), bars };
+    return { uid: m, name: displayNameOf(data, liveMachines, specs, m, roster), bars };
   });
 
   return {
@@ -254,6 +256,6 @@ export function buildActivityTimeline(
     lanes,
     axis: [clkhm(tlMin), clkhm(tlMin + span / 2), clkhm(tlMax)],
     playheadPct: pct(playheadT),
-    labelWidthPx: labelWidthPx(uids, data, liveMachines, specs),
+    labelWidthPx: labelWidthPx(uids, data, liveMachines, specs, roster),
   };
 }

@@ -748,6 +748,7 @@ export function FleetLens({
           runsForMachine(runs, machineNames(flowWindow.data, liveMachines, m)),
           connected,
           lastContactMs,
+          roster,
         );
         // (#2768, corrected by the #2802 regression fix) A roster entry
         // whose declared hardware identity matches this uid still prevents a
@@ -826,8 +827,9 @@ export function FleetLens({
         playheadT,
         fixedRange,
         specs,
+        roster,
       ),
-    [flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, windowMinutesNum, liveMode, tMin, playheadT, fixedRange?.[0], fixedRange?.[1], specs],
+    [flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, windowMinutesNum, liveMode, tMin, playheadT, fixedRange?.[0], fixedRange?.[1], specs, roster],
   );
 
   return (

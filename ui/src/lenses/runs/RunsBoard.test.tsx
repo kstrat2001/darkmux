@@ -720,6 +720,10 @@ describe("RunsBoard — the machine pin (#1809)", () => {
      * mapping — used by the multi-alias test to add a SECOND name for the
      * same uid. */
     extraFlowToday?: unknown[];
+    /** (#2921 follow-up) Replace the default `u1 -> MacBook-Pro` record. */
+    flowToday?: unknown[];
+    specs?: unknown;
+    roster?: unknown[];
   } = {}) {
     const today = todayUTC();
     vi.stubGlobal(
@@ -737,7 +741,7 @@ describe("RunsBoard — the machine pin (#1809)", () => {
         if (path === `/flow/${today}`) {
           return Promise.resolve(
             new Response(
-              JSON.stringify([{ ts: `${today}T00:00:00Z`, machine_uid: "u1", machine_id: "MacBook-Pro" }, ...(opts.extraFlowToday ?? [])]),
+              JSON.stringify(opts.flowToday ?? [{ ts: `${today}T00:00:00Z`, machine_uid: "u1", machine_id: "MacBook-Pro" }, ...(opts.extraFlowToday ?? [])]),
               { status: 200 },
             ),
           );
@@ -748,10 +752,30 @@ describe("RunsBoard — the machine pin (#1809)", () => {
             new Response(JSON.stringify({ machines: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }),
           );
         }
+        if (path === "/machine/specs" && opts.specs) return Promise.resolve(new Response(JSON.stringify(opts.specs), { status: 200 }));
+        if (path === "/fleet/roster" && opts.roster) {
+          return Promise.resolve(new Response(JSON.stringify({ machines: opts.roster, error: null }), { status: 200 }));
+        }
         return Promise.resolve(new Response("not found", { status: 404 }));
       }),
     );
   }
+
+  // (#2921 follow-up) A pinned machine the window knows only by uid is named
+  // the way its fleet card is: this daemon's specs name, else its roster id.
+  const FAKE_UID = "0A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
+  const uidOnlyToday = () => [{ ts: `${todayUTC()}T00:00:00Z`, machine_uid: FAKE_UID }];
+  it("(#2921) a uid-only pinned machine that is THIS daemon reads its specs name", async () => {
+    mockPinnedFetch({ flowToday: uidOnlyToday(), specs: { machine_id: "scratch-box", machine_uid: FAKE_UID } });
+    renderBoard("all", null, FAKE_UID);
+    await waitFor(() => expect(screen.getByText(/machine: scratch-box/)).toBeInTheDocument());
+  });
+  it("(#2921) a uid-only pinned remote machine reads its roster id", async () => {
+    mockPinnedFetch({ flowToday: uidOnlyToday(), roster: [{ id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1, machine_uid: FAKE_UID }] });
+    renderBoard("all", null, FAKE_UID);
+    await waitFor(() => expect(screen.getByText(/machine: studio/)).toBeInTheDocument());
+    expect(document.body.textContent).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+  });
 
   it("filters the flat row list to the pinned machine's alias set", async () => {
     mockPinnedFetch();

@@ -99,7 +99,14 @@ export interface FleetRosterResult {
  * roster genuinely being empty. `FleetLens.tsx`'s `RosterUnreadableNotice`
  * is the one consumer that renders this; every other read of the roster
  * (`rosterOnlyEntries`) only ever needs `machines`. */
-export function useFleetRoster(enabled = true): FleetRosterResult {
+export function useFleetRoster(
+  enabled = true,
+  /** (#2921 follow-up) `false` for a reader that only needs the roster to
+   *  NAME a machine (the machine page, the runs board's pin, the title): it
+   *  reads the shared cache (fetching once if empty) without adding a
+   *  poller of its own. The fleet lens keeps polling. */
+  poll = true,
+): FleetRosterResult {
   const query = useQuery({
     enabled,
     queryKey: queryKeys.fleetRoster(),
@@ -108,7 +115,7 @@ export function useFleetRoster(enabled = true): FleetRosterResult {
     // for the tight presence cadence. Polling at all (rather than fetching
     // once) is what makes a `darkmux machine add` show up on an already-open
     // page without a reload, same convenience `/runs` gives the lab count.
-    refetchInterval: PRESENCE_POLL_MS,
+    refetchInterval: poll ? PRESENCE_POLL_MS : false,
   });
   return useMemo(() => {
     // `?? []` guards a malformed/shape-mismatched 200 the same way `runs`'s
