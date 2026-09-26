@@ -880,14 +880,21 @@ pub fn launch(
     // call site).
     stamp_unit_timeout(&mut all_steps, timeout_seconds);
 
-    // (#2914) A task never runs on the machine's utility model. Refused
-    // HERE, before a single task record is persisted, so a mis-staffed
-    // config leaves nothing behind. Every selection path sets the utility
-    // model aside on its own (`select::select_model`); this is the same
-    // rule applied to the whole graph at once, with the task named.
-    refuse_utility_staffed_tasks(&tasks, &all_steps, &loaded_registry_for_staffing(&collected)?, &|role| {
+    // (#2914) A task never runs on the machine's utility model. Every
+    // selection path sets the utility model aside on its own
+    // (`select::select_model`); this is the same rule applied to the whole
+    // graph at once, with the task named, before a single task record is
+    // persisted. It needs the INTERPRETED graph, which needs the minted
+    // phase ids, so it cannot run before the mint: a refusal here is a
+    // post-mint strand window like the interpret error above and gets the
+    // same reconcile (the minted mission closes to a terminal status, never
+    // left Active with no envelope; #2914 review M1).
+    if let Err(e) = refuse_utility_staffed_tasks(&tasks, &all_steps, &loaded_registry_for_staffing(&collected)?, &|role| {
         darkmux_types::config_access::role_profile(role)
-    })?;
+    }) {
+        reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &tasks, &mut all_steps, &e);
+        return Err(e);
+    }
 
     for task in &tasks {
         if let Err(e) = crew::lifecycle::save_task(&mission_id, task) {
@@ -4630,7 +4637,7 @@ fn refuse_utility_staffed_tasks(
                 if !profile.models.is_empty() && crew::select::work_models(profile, Some(utility)).is_empty() {
                     bail!(
                         "mission launch: task `{}` (role `{role}`) is staffed on profile `{}`, and {} \
-                         Nothing was minted.",
+                         The minted mission is closed as errored.",
                         task.id,
                         resolved.profile_name,
                         crew::select::utility_only_error(utility),
@@ -4648,7 +4655,7 @@ fn refuse_utility_staffed_tasks(
                 bail!(
                     "mission launch: step `{}` of task `{}` names `{model}`, the machine's utility \
                      model (`internal.utility`), and a task never runs on the utility model. Name a \
-                     work model in the step's config. Nothing was minted. (#2914)",
+                     work model in the step's config. The minted mission is closed as errored. (#2914)",
                     step.id,
                     task.id,
                 );
@@ -4709,6 +4716,57 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    const UTIL_PROBE_CONFIG: &str = r#"{
+        "id": "util-probe",
+        "name": "Utility Probe",
+        "schema_version": "2.3",
+        "phases": [{
+            "id": "p1",
+            "tasks": [{
+                "id": "t1",
+                "steps": [{
+                    "id": "s1",
+                    "kind": "dispatch.single_shot",
+                    "config": { "model": "darkmux:stub-util", "model_key": "stub-util", "system": "s", "user": "u" }
+                }]
+            }]
+        }]
+    }"#;
+
+    /// (#2914 review, M1) The staffing gate runs AFTER the mint (it needs the
+    /// interpreted graph, which needs the minted phase ids), so a refusal is
+    /// a strand window like every other post-mint `?`: the mission must be
+    /// closed to a terminal status, never left Active with no envelope. This
+    /// drives `launch()` end to end through a config whose one step names
+    /// the utility model outright.
+    #[test]
+    #[serial_test::serial]
+    fn launch_refusal_on_the_utility_model_closes_the_minted_mission() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("util-probe", UTIL_PROBE_CONFIG);
+        let registry_dir = TempDir::new().unwrap();
+        let pf = registry_dir.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"work":{"models":[{"id":"stub-worker","n_ctx":8000}]}},"default_profile":"work","internal":{"utility":{"id":"stub-util","n_ctx":8000}}}"#,
+        )
+        .unwrap();
+
+        let err = launch("util-probe", None, &[format!("profiles={}", pf.display())], None)
+            .expect_err("a step naming the utility model must be refused");
+        assert!(err.to_string().contains("stub-util"), "{err}");
+        assert!(!err.to_string().contains("Nothing was minted"), "the mint already happened; do not claim otherwise: {err}");
+
+        let ids = all_mission_ids();
+        assert_eq!(ids.len(), 1, "the mint happened before the gate: {ids:?}");
+        assert_eq!(
+            mission_status_on_disk(&ids[0]),
+            MissionStatus::Finalized,
+            "a refused launch closes the minted mission; it must never stay Active with no terminal"
+        );
+        drop(guard);
     }
 
     /// (#2914) The launch refuses, before minting anything, a task whose
