@@ -84,12 +84,11 @@ describe("taskAggMetrics", () => {
   it("aggregates a task's own step metrics and generating state", () => {
     const now = 10_000;
     const metrics: MetricsMap = {
-      "b-step": { tokRun: 40, tokFinal: 0, turnRun: 2, turnFinal: 0, toolRun: 0, toolFinal: 0, cloud: true, localOk: false, startTs: now - 5000, endTs: 0, lastTs: now - 1000 },
+      "b-step": { tokRun: 40, tokFinal: 0, turnRun: 2, turnFinal: 0, toolRun: 0, toolFinal: 0, usageSeen: true, startTs: now - 5000, endTs: 0, lastTs: now - 1000 },
     };
     const agg = taskAggMetrics(TASK_B, metrics, now);
     expect(agg.tokens).toBe(40);
     expect(agg.turns).toBe(2);
-    expect(agg.cloud).toBe(true);
     expect(agg.generating).toBe(true);
     expect(agg.elapsedMs).toBe(5000);
   });
@@ -212,7 +211,7 @@ describe("taskAggMetrics task-level duration (#2269)", () => {
     const now = T0 + 100_000;
     const task = seq({ startedTs: T0 + 5_000 }, { startedTs: T0 + 70_000 });
     const metrics: MetricsMap = {
-      s1: { tokRun: 0, tokFinal: 0, turnRun: 0, turnFinal: 0, toolRun: 0, toolFinal: 0, cloud: false, localOk: false, startTs: T0, endTs: T0 + 50_000, lastTs: T0 + 50_000 },
+      s1: { tokRun: 0, tokFinal: 0, turnRun: 0, turnFinal: 0, toolRun: 0, toolFinal: 0, usageSeen: false, startTs: T0, endTs: T0 + 50_000, lastTs: T0 + 50_000 },
     };
     const agg = taskAggMetrics(task, metrics, now);
     expect(agg.spanMs).toBe(100_000);

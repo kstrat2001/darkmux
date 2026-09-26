@@ -58,7 +58,7 @@ import { fmtElapsed, clk, fmtC } from "../../lib/format";
 import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
 import { aggregateLiveState, aggregateTokenRate, averageGenerationRate, lastHeartbeatMs, liveStateWhileConnected } from "../../lib/tokenRate";
 import type { LiveState } from "../../lib/tokenRate";
-import { countsInExecutionTokenSums } from "../../lib/usageRecords";
+import { PURPOSE, sumUsage, type UsageRecordLike } from "../../lib/usageRecords";
 import type { FlowRecord, DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
 import { toolOutcome } from "../../lib/recordDetail";
 
@@ -405,18 +405,17 @@ function pushKv(rows: BriefEntry[], label: string, value: string | null | undefi
   }
 }
 
-/** (#2759) The utility/sub-execution role family CLAUDE.md's "Role families"
- *  section names — compactor / scribe / estimator / mission-compiler — plus
- *  the generic `utility` tag `telemetry.lms` records already use
- *  (`isUtilitySeat` above, for the SAME family at the load-track level).
- *  Never rolled into a run's MODEL total: contract 8 requires a sub-
- *  execution keep its own role/model attribution, and blending a 4B
- *  compactor's tokens into a specialist's total is exactly the violation
- *  that rule exists to stop. */
-function isUtilityRoleHandle(handle: string | null | undefined): boolean {
-  if (!handle) return false;
-  const bare = String(handle).replace(/^darkmux\//, "").toLowerCase();
-  return bare === "compactor" || bare === "scribe" || bare === "estimator" || bare === "mission-compiler" || bare === "utility";
+/** (#2902 step 2a) An execution's OWN token numbers: the plain sum of its
+ *  usage records (the one `sumUsage`, legacy fallback included), minus
+ *  darkmux's utility jobs (compaction, radio routing): a sub-execution is
+ *  never blended into the primary (CLAUDE.md contract 8). A session whose
+ *  ONLY calls are utility jobs (a radio-routing dispatch) IS that job, so its
+ *  page shows them. `null` when nothing was measured (the tile shows "—").
+ *  Replaces #2759's hardcoded utility-role handle list. */
+function executionTokens(records: readonly UsageRecordLike[]): { prompt: number; completion: number } | null {
+  const own = sumUsage(records, { exclude: PURPOSE.utility });
+  const s = own.usageRecords + own.legacyCompletes > 0 ? own : sumUsage(records);
+  return s.reported > 0 ? { prompt: s.prompt, completion: s.completion } : null;
 }
 
 interface MissionModelRollup {
@@ -472,13 +471,10 @@ function rollUpMissionModelWork(data: FlowRecord[], missionId: string, excludeSi
   let hasEvidence = false;
   for (const csid of candidateSids) {
     const own = data.filter((r) => r.session_id === csid);
-    const cStart = own.find((r) => r.action === "dispatch.start") ?? null;
-    if (isUtilityRoleHandle(cStart?.handle)) continue; // sub-execution — never blended in
     const tel = own.filter((r) => r.category === "telemetry");
     const rt = tel.filter((r) => r.source === "runtime").slice(-1)[0] ?? null;
-    // (#2902 step 1a) The records this rollup read before per-call usage records;
-    // (#2902 step 1b) never the compactor's calls (contract 8).
-    const toks = tel.filter((r) => r.source === "tokens" && countsInExecutionTokenSums(r.fields as Record<string, unknown>));
+    // (#2902 step 2a) This inner execution's own tokens, utility excluded.
+    const cTok = executionTokens(own);
     const cx = tel
       .filter((r) => r.source === "context")
       .slice()
@@ -487,12 +483,8 @@ function rollUpMissionModelWork(data: FlowRecord[], missionId: string, excludeSi
       (r) => r.source === "lms" && (r.fields as Record<string, unknown> | undefined)?.event === "load",
     );
     const cTurns = rt ? Number((rt.fields as Record<string, unknown>).turns) : null;
-    const cTokIn = toks.length
-      ? toks.reduce((a, r) => a + (Number((r.fields as Record<string, unknown>)?.prompt_tokens) || 0), 0)
-      : null;
-    const cTokOut = toks.length
-      ? toks.reduce((a, r) => a + (Number((r.fields as Record<string, unknown>)?.completion_tokens) || 0), 0)
-      : null;
+    const cTokIn = cTok ? cTok.prompt : null;
+    const cTokOut = cTok ? cTok.completion : null;
     const cCx0Max = cx.length ? Number((cx[0].fields as Record<string, unknown>)?.max) : NaN;
     const cNctx = cx.length && Number.isFinite(cCx0Max) && cCx0Max > 0 ? cCx0Max : 0;
     const cCtxPeak = cx.length ? Math.max(...cx.map((r) => Number((r.fields as Record<string, unknown>)?.used) || 0)) : 0;
@@ -774,17 +766,12 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   const remoteEp = sp.endpoint || dp.endpoint;
   const model = d?.model ? d.model : remoteEp ? remoteEp.slice(remoteEp.lastIndexOf("/") + 1) : (distinct[0] as string | undefined) ?? null;
 
-  // (#2902 step 1a) The records these tiles read before per-call usage
-  // records; a single-shot run's tiles keep reading its `dispatch complete`.
-  // (#2902 step 1b) A compactor call is a sub-execution, never blended into
-  // this execution's own tiles (contract 8).
-  const toks = tel.filter((r) => r.source === "tokens" && countsInExecutionTokenSums(r.fields as Record<string, unknown>));
-  const tokIn = toks.length
-    ? toks.reduce((a, r) => a + (Number((r.fields as Record<string, unknown>)?.prompt_tokens) || 0), 0)
-    : (dp.prompt_tokens ?? null);
-  const tokOut = toks.length
-    ? toks.reduce((a, r) => a + (Number((r.fields as Record<string, unknown>)?.completion_tokens) || 0), 0)
-    : (dp.completion_tokens ?? null);
+  // (#2902 step 2a) The plain sum of this attempt's usage records, utility
+  // excluded; a legacy run with none reads its `dispatch complete` through
+  // the same function's legacy fallback.
+  const ownTok = executionTokens(c ? [...tel, c] : tel);
+  const tokIn = ownTok ? ownTok.prompt : null;
+  const tokOut = ownTok ? ownTok.completion : null;
 
   // ── brief ──────────────────────────────────────────────────────────
   // (#2011) Same `runWallMs` the WALL CLOCK tile shows. The two lines report

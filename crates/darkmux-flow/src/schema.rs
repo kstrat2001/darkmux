@@ -77,8 +77,19 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.58.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.59.0";
 // Version history:
+//   1.59.0 (#2902 step 2a, #2914): additive. Every `telemetry.tokens` usage
+//           record gains `purpose`: `"work"` or `"utility"`
+//           (`darkmux_crew::usage::UsagePurpose`), WHOSE job the call was.
+//           Utility is darkmux's own jobs, defined once by
+//           `darkmux_crew::usage::call_purpose`: every runtime compactor call
+//           (`call_kind: "compaction"`) and every call made by the radio
+//           routing role (`radio-router`). Everything else is work. The
+//           viewer totals utility as its own chip and keeps it out of an
+//           execution's own numbers (contract 8). Records from before 1.59.0
+//           carry no `purpose`; readers treat a compaction record as utility
+//           and anything else as work.
 //   1.58.0 (#2902 step 1b, the runtime's model calls): additive.
 //           Completes 1.57.0's "one `telemetry.tokens` per model call" for
 //           the calls made INSIDE the container runtime.

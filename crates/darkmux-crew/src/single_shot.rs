@@ -98,15 +98,20 @@ impl SingleShotReply {
     /// ([`crate::usage::usage_payload`]). `reported_model` is this reply's
     /// own `model` field, absent when the response carried none. Every
     /// caller of either single-shot transport emits one record built here.
+    ///
+    /// `role_id` is the role the call ran for (`None` for a step kind that
+    /// runs no role); it decides the record's `purpose` (#2914).
     pub fn usage_payload(
         &self,
         call_kind: crate::usage::CallKind,
+        role_id: Option<&str>,
         requested_model: &str,
         endpoint: &str,
     ) -> serde_json::Value {
         crate::usage::usage_payload(
             &crate::usage::CallFacts {
                 call_kind,
+                role_id,
                 requested_model,
                 reported_model: self.model.as_deref(),
                 endpoint,

@@ -1174,7 +1174,9 @@ impl DispatchSingleShotStepKind {
             Some(wire_model.as_ref()),
             None,
             None,
-            reply.usage_payload(crate::usage::CallKind::SingleShot, wire_model.as_ref(), &usage_endpoint),
+            // A step runs no role (#2914: `None` → the call's `purpose` is decided
+            // by its kind alone).
+            reply.usage_payload(crate::usage::CallKind::SingleShot, None, wire_model.as_ref(), &usage_endpoint),
         );
         match ctx {
             Some(c) => c.emit(usage_record),
@@ -2343,6 +2345,7 @@ fn map_call_token_payload(
     let mut payload = crate::usage::usage_payload(
         &crate::usage::CallFacts {
             call_kind: crate::usage::CallKind::MapItem,
+            role_id: None,
             requested_model,
             reported_model: call.reported_model.as_deref(),
             endpoint,

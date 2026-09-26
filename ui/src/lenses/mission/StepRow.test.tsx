@@ -25,7 +25,6 @@ const meter = (over: Partial<StepMeter>): StepMeter => ({
   tokens: 0,
   turns: 0,
   tools: 0,
-  cloud: false,
   generating: false,
   elapsedMs: 0,
   wallMs: 0,

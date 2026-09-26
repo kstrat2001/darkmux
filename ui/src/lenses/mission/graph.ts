@@ -25,7 +25,7 @@
  */
 import type { FlowRecord } from "../../types/handwritten";
 import { fmtElapsed } from "../../lib/format";
-import { countsInExecutionTokenSums } from "../../lib/usageRecords";
+import { PURPOSE, stepTokensWithLegacyFallback, usageContribution } from "../../lib/usageRecords";
 
 // ─── wire types (crates/darkmux-serve/src/mission_graph.rs) ────────────────
 
@@ -39,8 +39,6 @@ export interface GraphStep {
   tokensFinal?: number;
   turnsFinal?: number;
   toolsFinal?: number;
-  cloud?: boolean;
-  localOk?: boolean;
   model?: string;
 }
 
@@ -379,8 +377,10 @@ export interface StepMetrics {
   turnFinal: number;
   toolRun: number;
   toolFinal: number;
-  cloud: boolean;
-  localOk: boolean;
+  /** (#2902 step 2a) Whether any usage record for this step has been folded.
+   *  Once one has, `tokRun` (their plain sum) IS the step's figure; before
+   *  that (legacy data), the finalized `tokFinal` is. */
+  usageSeen: boolean;
   startTs: number;
   endTs: number;
   /** Newest record ts (ms) correlated to this step — this port's derived
@@ -396,8 +396,7 @@ const EMPTY_METRICS: StepMetrics = {
   turnFinal: 0,
   toolRun: 0,
   toolFinal: 0,
-  cloud: false,
-  localOk: false,
+  usageSeen: false,
   startTs: 0,
   endTs: 0,
   lastTs: 0,
@@ -569,12 +568,12 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: FlowRecord, idx: 
   const next: StepMetrics = { ...cur, lastTs: Math.max(cur.lastTs, recMs) };
 
   const action = rec.action || "";
+  // (#2902 step 2a) The step's running figure is the plain sum of its usage
+  // records through the one sum's per-record half, darkmux's utility jobs
+  // excluded: a step's meter is its own execution's numbers, never a
+  // sub-execution's (contract 8). `null` for a non-usage record.
+  const usage = usageContribution(rec, { exclude: PURPOSE.utility });
   const isUsage = (rec.category === "telemetry" && rec.source === "tokens") || action === "telemetry.tokens";
-  // (#2902 step 1a) The new single-shot and count-less usage records stay out
-  // of the running sum, so it reads what it read before them. (#2902 step 1b)
-  // So do the compactor's calls: a step's meter is its own execution's
-  // numbers, never a sub-execution's (contract 8).
-  const isTok = isUsage && countsInExecutionTokenSums(p as Record<string, unknown>);
   const isTurn = action === "dispatch.turn";
   const isTool = action === "dispatch.tool";
   const isComplete = action === "dispatch complete" || action === "dispatch.complete";
@@ -591,21 +590,11 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: FlowRecord, idx: 
   if (isStart && recMs) next.startTs = next.startTs ? Math.min(next.startTs, recMs) : recMs;
   if (isTerminal && recMs) next.endTs = Math.max(next.endTs, recMs);
 
-  // Three-state local/cloud/unknown attribution — see mission-graph.html's
-  // #1626 comment: `local` requires POSITIVE evidence (a clean terminal
-  // with no endpoint), never a bare absence-of-endpoint default.
-  // (#2902 step 1a) A usage record's `endpoint` is the fact of what was
-  // called (an LMStudio base URL included), never a hosted marker. Same rule
-  // as `fold_step_finals` in crates/darkmux-serve/src/mission_graph.rs.
-  if (p.endpoint && !isUsage) next.cloud = true;
-  if (action === "dispatch complete" || action === "dispatch.complete") {
-    if (!p.endpoint) next.localOk = true;
-  }
-
   const finalTok = (typeof p.total_tokens === "number" ? p.total_tokens : 0) || (typeof p.tokens === "number" ? p.tokens : 0);
   const started = next.startTs > 0;
-  if (isTok && started) {
-    next.tokRun += typeof p.total_tokens === "number" ? p.total_tokens : 0;
+  if (isUsage && started) {
+    next.usageSeen = true;
+    next.tokRun += usage ? usage.total : 0;
   } else if (isTurn && started) {
     next.turnRun = typeof p.turns_so_far === "number" ? Math.max(next.turnRun, p.turns_so_far) : next.turnRun + 1;
   } else if (isTool && started) {
@@ -624,8 +613,7 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: FlowRecord, idx: 
     next.turnFinal === cur.turnFinal &&
     next.toolRun === cur.toolRun &&
     next.toolFinal === cur.toolFinal &&
-    next.cloud === cur.cloud &&
-    next.localOk === cur.localOk &&
+    next.usageSeen === cur.usageSeen &&
     next.startTs === cur.startTs &&
     next.endTs === cur.endTs &&
     next.lastTs === cur.lastTs
@@ -641,10 +629,9 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: FlowRecord, idx: 
  * three adjacent numbers and two adjacent booleans would be easy to pass
  * in the wrong order positionally. */
 export function hasNoMetricsData(m: {
-  tokensFinal: number; turnsFinal: number; toolsFinal: number;
-  cloud: boolean; localOk: boolean; startedMs: number;
+  tokensFinal: number; turnsFinal: number; toolsFinal: number; startedMs: number;
 }): boolean {
-  return !m.tokensFinal && !m.turnsFinal && !m.toolsFinal && !m.cloud && !m.localOk && !m.startedMs;
+  return !m.tokensFinal && !m.turnsFinal && !m.toolsFinal && !m.startedMs;
 }
 
 /** `seedMetricsFromGraph` — mission-graph.html. Seeds the accumulator from
@@ -657,23 +644,19 @@ export function seedMetricsFromGraph(metrics: MetricsMap, g: { nodes: GraphNode[
       const tf = typeof s.tokensFinal === "number" ? s.tokensFinal : 0;
       const nf = typeof s.turnsFinal === "number" ? s.turnsFinal : 0;
       const cf = typeof s.toolsFinal === "number" ? s.toolsFinal : 0;
-      const cl = !!s.cloud;
-      const lok = !!s.localOk;
       const st = tsToMs(s.startedTs);
-      if (hasNoMetricsData({ tokensFinal: tf, turnsFinal: nf, toolsFinal: cf, cloud: cl, localOk: lok, startedMs: st })) continue;
+      if (hasNoMetricsData({ tokensFinal: tf, turnsFinal: nf, toolsFinal: cf, startedMs: st })) continue;
       const cur = out[s.id] || EMPTY_METRICS;
       const ntf = Math.max(cur.tokFinal, tf);
       const nnf = Math.max(cur.turnFinal, nf);
       const ncf = Math.max(cur.toolFinal, cf);
-      const ncl = cur.cloud || cl;
-      const nlok = cur.localOk || lok;
       const curSt = cur.startTs || 0;
       const nst = curSt ? (st ? Math.min(curSt, st) : curSt) : st;
-      if (ntf === cur.tokFinal && nnf === cur.turnFinal && ncf === cur.toolFinal && ncl === cur.cloud && nlok === cur.localOk && nst === curSt) {
+      if (ntf === cur.tokFinal && nnf === cur.turnFinal && ncf === cur.toolFinal && nst === curSt) {
         continue;
       }
       if (out === metrics) out = { ...metrics };
-      out[s.id] = { ...cur, tokFinal: ntf, turnFinal: nnf, toolFinal: ncf, cloud: ncl, localOk: nlok, startTs: nst };
+      out[s.id] = { ...cur, tokFinal: ntf, turnFinal: nnf, toolFinal: ncf, startTs: nst };
     }
   }
   return out;
@@ -683,40 +666,35 @@ export interface DisplayMetrics {
   tokens: number;
   turns: number;
   tools: number;
-  cloud: boolean;
-  localOk: boolean;
   has: boolean;
 }
 
 export function stepDisplayMetrics(m: StepMetrics | undefined): DisplayMetrics {
-  if (!m) return { tokens: 0, turns: 0, tools: 0, cloud: false, localOk: false, has: false };
-  const tokens = m.tokFinal || m.tokRun || 0;
+  if (!m) return { tokens: 0, turns: 0, tools: 0, has: false };
+  // (#2902 step 2a) The usage records' plain sum once any has been folded;
+  // the legacy fallback (no usage records) reads the finalized total.
+  const tokens = stepTokensWithLegacyFallback(m.tokRun, m.usageSeen, m.tokFinal) || 0;
   const turns = m.turnFinal || m.turnRun || 0;
   const tools = m.toolFinal || m.toolRun || 0;
-  return { tokens, turns, tools, cloud: !!m.cloud, localOk: !!m.localOk, has: tokens > 0 || turns > 0 || tools > 0 };
+  return { tokens, turns, tools, has: tokens > 0 || turns > 0 || tools > 0 };
 }
 
 export interface MissionTotals {
-  local: number;
-  cloud: number;
-  unknown: number;
   total: number;
   turns: number;
 }
 
+/** The mission meter: every step's own figure, summed. (#2902 step 2a) The
+ *  withdrawn local/cloud/unknown split (#2834) is gone from the data too. */
 export function missionTotals(metrics: MetricsMap): MissionTotals {
-  let local = 0,
-    cloud = 0,
-    unknown = 0,
+  let total = 0,
     turns = 0;
   for (const k of Object.keys(metrics)) {
     const d = stepDisplayMetrics(metrics[k]);
-    if (d.cloud) cloud += d.tokens;
-    else if (d.localOk) local += d.tokens;
-    else unknown += d.tokens;
+    total += d.tokens;
     turns += d.turns;
   }
-  return { local, cloud, unknown, total: local + cloud + unknown, turns };
+  return { total, turns };
 }
 
 // ─── status transitions from flow records (mission-graph.html: STATUS_ACTIONS,
@@ -930,7 +908,6 @@ export interface StepMeter {
   tokens: number;
   turns: number;
   tools: number;
-  cloud: boolean;
   generating: boolean;
   elapsedMs: number;
   /** (#2269) The step's own wall time: start → end once finished, start →
@@ -955,7 +932,7 @@ export function stepMeterFor(step: GraphStep, metrics: MetricsMap, now: number):
   const elapsedMs = generating && startMs && now ? Math.max(0, now - startMs) : 0;
   const endMs = stepEndMs(step, m) || (step.status === "running" && now ? now : 0);
   const wallMs = startMs && endMs ? Math.max(0, endMs - startMs) : 0;
-  return { show: show || generating, tokens: d.tokens, turns: d.turns, tools: d.tools, cloud: d.cloud, generating, elapsedMs, wallMs };
+  return { show: show || generating, tokens: d.tokens, turns: d.turns, tools: d.tools, generating, elapsedMs, wallMs };
 }
 
 // ─── step row vocabulary (mission-graph.html: stepLead, stepSeat) ──────────

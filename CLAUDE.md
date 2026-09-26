@@ -297,9 +297,12 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    Two consequences that new code inherits:
 
    - **A role execution has exactly one SPECIALIST role.** Utility invocations inside it
-     (compaction, scribe, estimator) are SUB-EXECUTIONS — themselves role executions, of a
-     utility role — attributed to their OWN role and model, never blended into the primary's
-     metrics. Naming the unit for the role is what makes this compose rather than needing a
+     are SUB-EXECUTIONS — themselves role executions, of a utility role — attributed to their
+     OWN role and model, never blended into the primary's metrics. What counts as utility has
+     ONE definition, `darkmux_crew::usage::call_purpose` (compaction and the radio router —
+     darkmux's own jobs, run on the machine's one utility model, #2914; the scribe and
+     mission-compiler roles this entry used to list are retiring under #2912/#2913), and every
+     consumer that splits work from utility reads it rather than keeping its own list. Naming the unit for the role is what makes this compose rather than needing a
      special case: a sub-execution is the same kind of thing as its parent, one level in. The compactor's per-call usage record
      (`telemetry.tokens`, `call_kind: "compaction"`) conforms since #2902 step 1b: its `handle` is `compactor`
      and its `model` the compactor's. The `dispatch.compaction` and `telemetry.compaction` records still carry
@@ -819,7 +822,7 @@ The recursive shape is the point: **darkmux uses local-AI to manage your local-A
 
 Two role families compose to make this work, and the distinction matters when picking models or proposing additions to a profile:
 
-- **Utility agents** — small model (4B-class), bounded I/O, high throughput, structured output. Compactor, scribe, task estimator, mission-compiler. Each capability is asymmetric to its compute cost — one small model can fill several utility roles. darkmux dispatches utility agents internally for its own operations; the operator rarely invokes them directly. Defined by: bounded inputs + structured outputs + low per-call failure cost + throughput matters + bounded reasoning rather than strategy.
+- **Utility agents** — small model (4B-class), bounded I/O, high throughput, structured output. darkmux's own jobs on the machine's one utility model (#2914): today compaction and the radio router, and the one definition of which calls those are is `darkmux_crew::usage::call_purpose` (the scribe and mission-compiler roles that used to sit here are retiring under #2912/#2913). Each capability is asymmetric to its compute cost — one small model fills every utility job. darkmux dispatches utility agents internally for its own operations; the operator rarely invokes them directly. Defined by: bounded inputs + structured outputs + low per-call failure cost + throughput matters + bounded reasoning rather than strategy.
 - **Specialist agents** — larger model (35B-class+), judgment-dependent, lower throughput, free-form output. Coder, code-reviewer, analyst. Operator's call: which specialist for which phase, with what tilt. darkmux makes them addressable via `dispatch <role>` but doesn't substitute its judgment for the operator's.
 
 CLI primitives stay small and composable; the AI-built-in verbs (`mission propose`, `notebook draft`) compose those primitives with utility-agent dispatches so the operator gets structured output without authoring JSON by hand. Both surfaces are part of the same project — the dual posture (small primitives + AI-built-in verbs) is deliberate.

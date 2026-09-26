@@ -108,11 +108,17 @@ function machineRunsHash(uid: string, runningSessionIds: string[]): string | nul
  * own doc in `styles.css`). `.scv` is a `<div>`, matching `.savnum`'s own
  * block-fills-its-track sizing, so only a height floor (`minHeight="1.1em"`,
  * `.savc .scv`'s own line-height) is needed. */
-function Chip({ value, label, cls, loading }: { value?: string | number; label: string; cls?: string; loading?: boolean }) {
+function Chip({ value, label, cls, loading, part }: { value?: string | number; label: string; cls?: string; loading?: boolean; part?: { value: string; label: string } | null }) {
   return (
     <div className={`savc${cls ? ` ${cls}` : ""}`}>
       {loading ? <Shimmer as="div" className="scv" minHeight="1.1em" /> : <div className="scv">{value}</div>}
-      <div className="scl">{label}</div>
+      {/* (#2902, layout) The part line rides on the label's own line, never
+          a line of its own: the hero keeps one height whether a provider
+          reported cached tokens or not (see `.savc__lbl` in `styles.css`). */}
+      <div className="savc__lbl">
+        <div className="scl">{label}</div>
+        {part && !loading ? <div className="savpart"><span className="savpartv">{part.value}</span> {part.label}</div> : null}
+      </div>
     </div>
   );
 }
@@ -124,12 +130,14 @@ function Chip({ value, label, cls, loading }: { value?: string | number; label: 
  * hiding it made it pop in late on the legacy mobile client — see that
  * source's own comment).
  *
- * TOKENS ONLY — class labels, no rates, no currency, no savings formula.
- * The `unknown` chip is the honesty-about-incomplete-data surface: it
- * renders (with its explanatory `title`) only when `t.unknown` is nonzero,
- * and is EXCLUDED from `t.local` rather than folded into it — see
- * `savings.ts`'s module doc for why that exclusion is load-bearing, not
- * incidental.
+ * TOKENS ONLY — no rates, no currency, no savings formula. (#2902) Facts
+ * only, too: every figure is a plain sum of provider-reported counts from
+ * the window's usage records (`tokensOffMeter`). One lead figure (ALL
+ * TOKENS) with UTILITY as a part line under it, and three chips (INPUT with
+ * CACHED as its part line, GENERATED, DISPATCHES). Nothing here classifies
+ * where a token ran or what it cost, and no chip is invented to make the
+ * parts add up — see `savings.ts`'s module doc for what was withdrawn and
+ * why.
  */
 function SavingsHero({
   tokens: t,
@@ -148,8 +156,9 @@ function SavingsHero({
   data: FlowRecord[];
   nowMs: number;
   /** (#2817) False while the flow window is still loading. A zero is a
-   *  MEASUREMENT — "this fleet used no cloud tokens" — and rendering one
-   *  before the window has arrived states a fact nobody has established.
+   *  MEASUREMENT — "darkmux dispatched no tokens in this window" — and
+   *  rendering one before the window has arrived states a fact nobody has
+   *  established.
    *  The figures are silhouetted until this is true.
    *
    *  `settled && 0` stays a literal "0": a fresh fleet with no dispatches
@@ -166,7 +175,7 @@ function SavingsHero({
   // an ADVANCE (a play tick, or a live poll) tweens in both modes now,
   // which is the parity fix (finding #5: a 30s advance tweened live and
   // jumped in playback for the identical figure).
-  const heroTotal = useCountUp(settled ? t.local + t.cloud + t.unknown : null, (n) => (n === null ? "" : fmtN(n)), undefined, {
+  const heroTotal = useCountUp(settled ? t.total : null, (n) => (n === null ? "" : fmtN(n)), undefined, {
     upOnly: true,
   });
 
@@ -224,13 +233,35 @@ function SavingsHero({
               total counts up on new work. The count-up hook is hoisted above
               the return (hooks cannot sit in a conditional branch). */}
           {settled ? <div className="savnum">{heroTotal}</div> : <Shimmer as="div" className="savnum" minHeight="1em" />}
-          <div className="savlbl">all tokens{liveMode ? ` · last ${hours}h` : ""}</div>
+          {/* (#2902) UTILITY is a PART of all tokens, not a peer figure, so
+              it sits with the total it belongs to; a peer chip read as a
+              third bucket to add. (layout) It takes no line of its own: on
+              the label's line under the figure on a desktop, beside the
+              figure on a phone (`.savlblwrap` in `styles.css`), so the hero
+              is the same height with or without it. */}
+          <div className="savlblwrap">
+            <div className="savlbl">all tokens{liveMode ? ` · last ${hours}h` : ""}</div>
+            {t.utility && settled ? <div className="savpart"><span className="savpartv">{fmtC(t.utility)}</span> utility</div> : null}
+          </div>
         </div>
         <div className="savclasses">
-          <Chip value={fmtC(t.completion)} loading={!settled} label="generated" cls="gen" />
-          <Chip value={fmtC(t.fresh)} loading={!settled} label="fresh input" />
-          <Chip value={fmtC(t.reread)} loading={!settled} label="re-read" />
-          {t.uncls ? <Chip value={fmtC(t.uncls)} loading={!settled} label="unclassified" cls="uncls" /> : null}
+          {/* (#2902 step 2a) Every chip is a sum of provider-reported
+              counts from the usage records (`tokensOffMeter`). CACHED is
+              absent when no record in the window reports `cached_tokens`
+              (a 0 there would be an assumption, not a measurement); a
+              REPORTED 0 renders "0 cached" by design — hosted providers
+              report `cached_tokens: 0` on every reply, and that is a
+              measurement worth showing. UTILITY (darkmux's own jobs —
+              compaction and the radio router, `call_purpose`) is hidden at
+              0: it is a part line, not a chip, and a "0 utility" line under
+              the total would read as a third figure. CACHED and UTILITY are
+              shares of INPUT and ALL TOKENS, so each renders as a part line
+              under the figure it belongs to, never as a peer chip. INPUT +
+              GENERATED equal ALL TOKENS whenever providers report total =
+              prompt + completion; no filler chip covers a provider total
+              above it. */}
+          <Chip value={fmtC(t.input)} loading={!settled} label="input" part={t.cached != null ? { value: fmtC(t.cached), label: "cached" } : null} />
+          <Chip value={fmtC(t.generated)} loading={!settled} label="generated" cls="gen" />
           <Chip value={t.runs} loading={!settled} label={`dispatch${t.runs === 1 ? "" : "es"}`} />
         </div>
       </div>
