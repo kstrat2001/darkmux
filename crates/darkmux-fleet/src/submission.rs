@@ -604,6 +604,12 @@ pub(crate) mod test_sender_provider {
     }
 }
 
+/// Order resolver answers IPv4 first (stable otherwise): a fleet listener
+/// binds its node's IPv4 overlay address.
+pub(crate) fn prefer_ipv4(ips: &mut [IpAddr]) {
+    ips.sort_by_key(|ip| !ip.is_ipv4());
+}
+
 /// What the sender verified about the target before sending anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedTarget {
@@ -634,7 +640,7 @@ pub fn verify_target(
     // node's IPv4 overlay address, so an IPv6-first resolver answer must not
     // decide which address is dialed. The first answer the provider names as
     // a node is the one verified and used.
-    ips.sort_by_key(|ip| !ip.is_ipv4());
+    prefer_ipv4(&mut ips);
     let mut last_err = None;
     let mut found = None;
     for ip in ips {
@@ -1021,6 +1027,10 @@ mod tests {
         // Not a node on the overlay (a LAN address): refused.
         let err = verify_target("studio", &roster_entry("192.168.1.20", None), &provider).unwrap_err();
         assert!(err.to_string().contains("not a node on the"), "{err}");
+        assert!(err.to_string().contains("nothing was sent to it (not the fleet token, not the request)"), "{err}");
+        let mut ips: Vec<IpAddr> = vec!["fd7a::2".parse().unwrap(), "100.64.0.2".parse().unwrap(), "fd7a::3".parse().unwrap()];
+        prefer_ipv4(&mut ips);
+        assert_eq!(ips[0], "100.64.0.2".parse::<IpAddr>().unwrap(), "IPv4 answers are tried first");
         // Provider down: refused.
         let down = crate::identity::StaticIdentityProvider { down: Some("x".into()), ..provider };
         assert!(verify_target("studio", &roster_entry("100.64.0.2", None), &down).is_err());
