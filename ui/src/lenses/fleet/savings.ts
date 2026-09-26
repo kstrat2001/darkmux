@@ -53,7 +53,11 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
  * The DISPATCHES chip: how many dispatches ran, from the dispatch bookends.
  * (#2902 step 2a) Behavior-identical to the run count #2659/#2709 settled
  * (measured: zero differences at every prefix of both parity corpora and the
- * demo replay); only the local/cloud labels it used to carry are gone.
+ * demo replay); only the local/cloud labels it used to carry are gone. That
+ * claim holds for numeric, `null` and absent token fields, which is every
+ * value a producer writes. A NON-numeric count (`true`, `"7"`) now reads as
+ * not-reported where the old count coerced it truthy — hardening, since no
+ * producer writes one.
  *
  * Keyed on `runKey`, `(session_id, mission_id)`: a deterministic session id
  * recurs across unrelated runs (#2709). Per run key:

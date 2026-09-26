@@ -188,7 +188,16 @@ export function hasAnyTokenCounts(p: UsagePayload): boolean {
  *  call emitted no usage record, so its complete was the only place its
  *  tokens were written; a run with any usage record (even an `absent` one)
  *  is fully described by its records and its complete is never read.
- *  `runsWithUsage` is the set of run keys that hold a usage record. */
+ *  `runsWithUsage` is the set of run keys that hold a usage record.
+ *
+ *  At the live window's lower edge this rule has a known exposure: a MODERN
+ *  run whose usage records have scrolled out of the window but whose
+ *  `dispatch complete` is still inside holds zero usage records here, so it
+ *  reads its complete (the writer's whole-run total). The CLI's `--since`
+ *  handles the same edge by registering runs from out-of-window usage
+ *  records (#2902 step 2b); the viewer's window is a moving 24h, so a run
+ *  sits in that state for seconds, and the sum is corrected on the next
+ *  poll when the complete scrolls out too. */
 function isLegacyFallbackComplete(r: UsageRecordLike, runsWithUsage: ReadonlySet<string>, key: (r: UsageRecordLike) => string): boolean {
   return isDispatchComplete(r.action) && hasAnyTokenCounts(payloadOf(r)) && !runsWithUsage.has(key(r));
 }
