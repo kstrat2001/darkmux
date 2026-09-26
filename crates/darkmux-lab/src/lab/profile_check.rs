@@ -52,9 +52,9 @@ pub(crate) fn envelope_warnings(
     // load-bearing for the measurement envelope.
     let default_id = profile.default_model_id();
     for pm in &profile.models {
-        // (#1282) Endpoint-bearing models are served remotely — there is no
-        // local LMStudio envelope to validate for them.
-        if pm.is_remote() {
+        // (#1282, #2902) Only a model darkmux manages has a loaded LM Studio
+        // envelope to validate.
+        if !pm.is_managed() {
             continue;
         }
         match loaded.iter().find(|lm| loaded_matches(lm, pm)) {

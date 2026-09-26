@@ -409,14 +409,40 @@ fn resolve_role(
         error: Some(error),
     };
 
-    let Some(model_id) = resolved.profile.default_model_id() else {
-        return bound_but_unusable(format!("profile \"{}\" declares no models", resolved.profile_name));
-    };
-    let Some(pm) = resolved.profile.models.iter().find(|m| m.id == model_id) else {
-        return bound_but_unusable(format!(
-            "profile \"{}\" names default model \"{model_id}\", absent from its own models[]",
-            resolved.profile_name
-        ));
+    // (#2902 step 3) The model the dispatch will RUN: the one resolver's
+    // selection within this profile (capability scoring, the utility model
+    // set aside), not simply the profile's default. A role this binary does
+    // not know, or a profile selection cannot resolve, keeps the default
+    // model's line and its named reasons below.
+    let selected: Option<darkmux_types::ProfileModel> = crate::crew::loader::load_roles()
+        .ok()
+        .and_then(|roles| roles.into_iter().find(|r| r.id == role_id))
+        .and_then(|role| {
+            crate::crew::target::select_in_profile(
+                &ctx.registry,
+                &role,
+                resolved.profile_name.clone(),
+                resolved.profile,
+                false,
+            )
+            .ok()
+        })
+        .and_then(crate::crew::target::Resolution::target)
+        .map(|t| t.model);
+    let pm = match &selected {
+        Some(m) => m,
+        None => {
+            let Some(model_id) = resolved.profile.default_model_id() else {
+                return bound_but_unusable(format!("profile \"{}\" declares no models", resolved.profile_name));
+            };
+            let Some(pm) = resolved.profile.models.iter().find(|m| m.id == model_id) else {
+                return bound_but_unusable(format!(
+                    "profile \"{}\" names default model \"{model_id}\", absent from its own models[]",
+                    resolved.profile_name
+                ));
+            };
+            pm
+        }
     };
 
     // (merge-gate MUST-FIX 1) The SAME gate every real dispatch path
@@ -426,7 +452,7 @@ fn resolve_role(
     // non-remote model before staffing it. Without this, a local model
     // missing `n_ctx` rendered here as a healthy `not loaded` while
     // `mission launch` would refuse the whole run.
-    if !pm.is_remote() {
+    if pm.is_managed() {
         if let Err(e) = pm.require_n_ctx() {
             return bound_but_unusable(format!("{e:#}"));
         }
@@ -439,7 +465,7 @@ fn resolve_role(
         provenance: Some(provenance),
         model: Some(ModelJson {
             id: pm.id.clone(),
-            remote: pm.is_remote(),
+            remote: !pm.is_managed(),
             n_ctx: pm.n_ctx,
         }),
         residency,
@@ -462,7 +488,7 @@ fn model_residency(
     pm: &darkmux_types::ProfileModel,
     loaded_models: Result<&[LoadedModel], &str>,
 ) -> (String, Option<String>) {
-    if pm.is_remote() {
+    if !pm.is_managed() {
         return ("remote".to_string(), None);
     }
     match loaded_models {

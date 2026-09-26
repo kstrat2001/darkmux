@@ -18,7 +18,7 @@
 //!
 //! `endpoint` is what darkmux INVOKED, never a classification: for a hosted
 //! call it is the same label string the dispatch bookends carry
-//! (`remote_endpoint_label`), for an LMStudio call the resolved LMStudio
+//! (`target::endpoint_route_label`), for an LMStudio call the resolved LMStudio
 //! base URL ([`lmstudio_endpoint`]). Nothing here decides whether an
 //! endpoint is local, off-machine, metered or free, and no vendor is inferred
 //! from a dialect.
@@ -223,7 +223,7 @@ pub fn lmstudio_endpoint(base_override: Option<&str>) -> String {
     let base = base_override
         .map(str::to_string)
         .unwrap_or_else(darkmux_types::config_access::lmstudio_url);
-    crate::single_shot::lmstudio_v1_base(&base)
+    darkmux_types::endpoint::lmstudio_v1_base(&base)
 }
 
 /// (tests) The canonical-record check every conformance test shares:

@@ -4667,7 +4667,15 @@ fn refuse_utility_staffed_tasks(
             let Some(step) = steps.get(step_id) else { continue };
             // (C2) A hosted step's `config.model` is the provider's own
             // deployment name, never the local utility instance.
-            if step.config.get("endpoint").is_some() {
+            // (#2902) Through the one resolver: an unmanaged endpoint (or one
+            // that cannot be resolved, which `run` refuses) skips the check.
+            if !matches!(
+                crew::target::step_unmanaged_endpoint(
+                    &step.config,
+                    step.config.get("config_path").and_then(|v| v.as_str())
+                ),
+                Ok(None)
+            ) {
                 continue;
             }
             let named = ["model_key", "model"]

@@ -1,12 +1,245 @@
 //! (#2902 step 3) The one endpoint/model resolver.
 //!
-//! Characterization first: the table below pins what every profile shape
-//! this repo ships or tests resolves to on the wire, so the consolidation
-//! that follows can be shown not to move any of it.
+//! Every path that turns (role, profile) into "this model, at this endpoint,
+//! with this window" goes through [`resolve_in`]: the dispatch's remote
+//! branch decision, the container path's model selection and residency, the
+//! compaction window, the scheduler's seat placement, radio's boundary and
+//! busy checks. Before it there were three resolvers with three copies of
+//! the precedence rules, and the compaction window came from the profile's
+//! DEFAULT model even when selection picked another one (#2902). A
+//! [`Target`] carries the SELECTED model with its own endpoint and its own
+//! `n_ctx`, so the two can no longer come apart.
+//!
+//! The endpoint rules themselves (classification, chat URL, dialect, host,
+//! credential source) live on `darkmux_types::ModelEndpoint`; this module
+//! applies them to a selection. `step_kinds::endpoint_conformance` fails if
+//! a new call site builds a chat URL or decides "remote" on its own.
+
+use anyhow::{bail, Result};
+use darkmux_types::{Dialect, EndpointKind, ModelEndpoint, Profile, ProfileModel, ProfileRegistry};
+
+/// A resolved dispatch target: the selected model together with its own
+/// endpoint, and the facts every caller needs about where the request goes.
+#[derive(Debug, Clone)]
+pub struct Target {
+    /// The profile the model came from (after `--profile` > `role_profiles`
+    /// > `default_profile`).
+    pub profile_name: String,
+    pub profile: Profile,
+    /// The SELECTED model (`select_model`), never simply the profile default.
+    pub model: ProfileModel,
+    /// The model's endpoint, or the managed default when it declares none.
+    pub endpoint: ModelEndpoint,
+    pub kind: EndpointKind,
+    pub dialect: Dialect,
+    /// The chat-completions URL (`ModelEndpoint::chat_url`), resolved once.
+    pub chat_url: String,
+}
+
+impl Target {
+    /// Whether darkmux manages this model's residency.
+    pub fn is_managed(&self) -> bool {
+        self.kind.is_managed()
+    }
+
+    /// The SELECTED model's own declared window: the compaction trigger's
+    /// window, and the load size on a managed endpoint.
+    pub fn n_ctx(&self) -> Option<u32> {
+        self.model.n_ctx
+    }
+
+    /// The model id on the wire: darkmux's own namespaced instance on a
+    /// managed endpoint (#2240: `darkmux:<key>`, or the profile's explicit
+    /// `identifier` opt-out), the model id as written on an unmanaged one.
+    pub fn wire_model(&self) -> String {
+        match self.kind {
+            EndpointKind::Managed(_) => crate::dispatch_internal::managed_wire_model(&self.model),
+            EndpointKind::Unmanaged => self.model.id.clone(),
+        }
+    }
+
+    /// The route label for records (`<protocol>:<host>/<model>`), for an
+    /// unmanaged endpoint. `None` on a managed one: its records carry the LM
+    /// Studio base instead (`usage::lmstudio_endpoint`).
+    pub fn route_label(&self) -> Option<String> {
+        (!self.is_managed()).then(|| endpoint_route_label(&self.endpoint, &self.model.id))
+    }
+}
+
+/// The route label for an unmanaged endpoint and the model requested there:
+/// the host (never the path, never credentials) and the model id, through
+/// `darkmux_flow::remote_route_label`.
+pub fn endpoint_route_label(ep: &ModelEndpoint, model_id: &str) -> String {
+    darkmux_flow::remote_route_label(ep.host().as_deref().unwrap_or("remote"), model_id)
+}
+
+/// What [`resolve_in`] found.
+#[derive(Debug, Clone)]
+pub enum Resolution {
+    Target(Box<Target>),
+    /// No `--profile` match, no `role_profiles` binding and no usable
+    /// `default_profile`: the container path's `probe_loaded_model` fallback.
+    NoProfile,
+    /// A profile resolved but `select_model` returned no model.
+    NoModel { profile_name: String, profile: Box<Profile>, error: String },
+}
+
+impl Resolution {
+    pub fn target(self) -> Option<Target> {
+        match self {
+            Resolution::Target(t) => Some(*t),
+            _ => None,
+        }
+    }
+}
+
+/// (#2905) The `role_profiles.<role>` binding a resolution honors: read live
+/// from `config_access`, and only when no explicit `--profile` override was
+/// given (the override always wins, so the map is not even consulted).
+pub(crate) fn role_profile_binding(role_id: Option<&str>, profile_override: Option<&str>) -> Option<String> {
+    match (role_id, profile_override) {
+        (Some(role_id), None) => darkmux_types::config_access::role_profile(role_id),
+        _ => None,
+    }
+}
+
+/// (#1547) The profile precedence, in one place: an explicit `--profile`
+/// (a name undefined here falls to `default_profile`, the #1054
+/// machine-agnostic-caller contract), else the `role_profiles.<role>` binding
+/// (`mapped`; a binding naming an undefined profile is a LOUD error,
+/// contract 7), else `default_profile`. `mapped` is supplied rather than read
+/// so every arm is unit-testable (`config_access` is hard-empty under test
+/// builds, #811); production passes [`role_profile_binding`].
+pub(crate) fn resolve_role_aware_profile_with<'a>(
+    role_id: &str,
+    profile_override: Option<&str>,
+    mapped: Option<String>,
+    registry: &'a ProfileRegistry,
+) -> Result<Option<(String, &'a Profile)>> {
+    if profile_override.is_none() {
+        if let Some(mapped) = mapped {
+            let binding = darkmux_profiles::profiles::RoleBinding::Mapped(mapped);
+            let resolved = darkmux_profiles::profiles::resolve_role_profile_with(role_id, &binding, registry)?;
+            return Ok(Some((resolved.profile_name, resolved.profile)));
+        }
+    }
+    Ok(registry.resolve_active(profile_override).map(|(name, profile)| (name.to_string(), profile)))
+}
+
+/// THE resolver: role + profile precedence + `select_model` + the selected
+/// model's endpoint, against an already-loaded registry.
+///
+/// - A quarantined requested (or default) profile is an error (#1282): never
+///   a silent fall to a different profile.
+/// - The machine utility model is set aside unless `allow_utility_model`
+///   (the lab's benchmark opt-in, #2914).
+/// - A selected model whose endpoint cannot be classified (an id no
+///   `endpoints` entry defines) is an error naming the id: a request is never
+///   sent to the managed default on a guess.
+pub fn resolve_in(
+    registry: &ProfileRegistry,
+    role: &crate::types::Role,
+    profile_override: Option<&str>,
+    mapped: Option<String>,
+    allow_utility_model: bool,
+) -> Result<Resolution> {
+    if let Some(req) = profile_override {
+        if let Some(msg) = registry.quarantine_error_for(req) {
+            bail!(msg);
+        }
+    }
+    let Some((profile_name, profile)) =
+        resolve_role_aware_profile_with(&role.id, profile_override, mapped, registry)?
+    else {
+        if let Some(default_name) = registry.default_profile.as_deref() {
+            if let Some(msg) = registry.quarantine_error_for(default_name) {
+                bail!(msg);
+            }
+        }
+        return Ok(Resolution::NoProfile);
+    };
+    select_in_profile(registry, role, profile_name, profile, allow_utility_model)
+}
+
+/// The lower half of [`resolve_in`], for a caller that resolved the PROFILE
+/// by its own precedence (the mission launcher's strict `--param` bindings,
+/// which refuse an undefined name rather than falling to the default):
+/// `select_model` with the utility set-aside, then the selected model's
+/// endpoint.
+pub fn select_in_profile(
+    registry: &ProfileRegistry,
+    role: &crate::types::Role,
+    profile_name: String,
+    profile: &Profile,
+    allow_utility_model: bool,
+) -> Result<Resolution> {
+    let skill_index: std::collections::HashMap<String, crate::types::Skill> = crate::loader::load_skills()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| (s.id.clone(), s))
+        .collect();
+    let set_aside = if allow_utility_model { None } else { registry.utility_model_id() };
+    let id = match crate::select::select_model(role, profile, |id| skill_index.get(id), set_aside) {
+        Ok(id) => id,
+        Err(e) => {
+            return Ok(Resolution::NoModel {
+                profile_name,
+                profile: Box::new(profile.clone()),
+                error: e.to_string(),
+            })
+        }
+    };
+    let Some(model) = profile.models.iter().find(|m| m.id == id).cloned() else {
+        return Ok(Resolution::NoModel {
+            profile_name,
+            profile: Box::new(profile.clone()),
+            error: format!("selected model `{id}` is not in the profile's models[]"),
+        });
+    };
+    Ok(Resolution::Target(Box::new(target_for(profile_name, profile.clone(), model)?)))
+}
+
+/// The [`Target`] for an already-selected model.
+pub fn target_for(profile_name: String, profile: Profile, model: ProfileModel) -> Result<Target> {
+    let endpoint = model.endpoint.clone().unwrap_or_default();
+    let kind = endpoint.kind()?;
+    let dialect = endpoint.resolved_dialect()?;
+    let chat_url = endpoint.chat_url()?;
+    Ok(Target { profile_name, profile, model, endpoint, kind, dialect, chat_url })
+}
+
+/// A step's `config.endpoint`, resolved (#2902 step 3; the step kinds'
+/// "is this hosted?" test). `Ok(Some(ep))` when it names an UNMANAGED
+/// endpoint (the step's hosted arm); `Ok(None)` when absent or managed (the
+/// local arm). The value is an inline object, or an `endpoints` id looked up
+/// in the registry at `config_path` (one registry read, only for the id
+/// form). An unparseable object or an undefined id is an error.
+pub fn step_unmanaged_endpoint(
+    config: &serde_json::Value,
+    config_path: Option<&str>,
+) -> Result<Option<ModelEndpoint>> {
+    let Some(v) = config.get("endpoint") else { return Ok(None) };
+    let ep: ModelEndpoint = match v {
+        serde_json::Value::String(id) => {
+            let loaded = darkmux_profiles::profiles::load_registry(config_path)?;
+            match loaded.registry.endpoints.get(id) {
+                Some(def) => ModelEndpoint {
+                    source: darkmux_types::EndpointSource::Named(id.clone()),
+                    ..def.clone()
+                },
+                None => ModelEndpoint::reference(id.clone()),
+            }
+        }
+        other => serde_json::from_value(other.clone())?,
+    };
+    Ok(match ep.kind()? {
+        EndpointKind::Managed(_) => None,
+        EndpointKind::Unmanaged => Some(ep),
+    })
+}
 
 #[cfg(test)]
 mod equivalence_tests {
-    use darkmux_types::ProfileModel;
 
     /// One profile model shape, and what a dispatch against it puts on the
     /// wire. `auth` is `(header name, credential source)` where the source
@@ -120,59 +353,47 @@ mod equivalence_tests {
         n_ctx: Option<u32>,
     }
 
-    fn observe(model_json: &str, pf: &std::path::Path) -> Observed {
-        let pm: ProfileModel = serde_json::from_str(model_json).unwrap();
-        let managed = !pm.is_remote();
-        let chat_url = if managed {
-            crate::single_shot::local_chat_url(None)
-        } else {
-            crate::dispatch_internal::remote_chat_url(pm.endpoint.as_ref().unwrap())
-        };
-        let wire_model = if managed {
-            darkmux_gestalt::namespaced_identifier(
-                crate::dispatch_internal::bare_model_key(&pm.id),
-                pm.identifier.as_deref(),
-            )
-        } else {
-            pm.id.clone()
-        };
-        let body = if managed {
+    /// Through the one resolver (#2902 step 3): the same rows, observed on
+    /// the consolidated code, must read exactly as they did before it.
+    fn observe(pf: &std::path::Path) -> Observed {
+        let role: crate::types::Role = serde_json::from_str(
+            r#"{"id":"r","description":"d","tool_palette":{"allow":[],"deny":[]},"escalation_contract":"bail-with-explanation"}"#,
+        )
+        .unwrap();
+        let loaded = darkmux_profiles::profiles::load_registry(pf.to_str()).unwrap();
+        let t = super::resolve_in(&loaded.registry, &role, Some("p"), None, false).unwrap().target().unwrap();
+        let wire_model = t.wire_model();
+        let body = if t.is_managed() {
             crate::single_shot::local_chat_body(&wire_model, "s", "u", 0.7, 10)
         } else {
-            crate::single_shot::hosted_chat_body(&wire_model, "s", "u", 10, None)
+            crate::single_shot::chat_body(&crate::single_shot::ChatBody {
+                dialect: t.dialect,
+                model: &wire_model,
+                messages: crate::single_shot::chat_messages("s", "u"),
+                max_tokens: 10,
+                temperature: None,
+                reasoning_effort: None,
+            })
         };
         let cap_field = if body.get("max_tokens").is_some() { "max_tokens" } else { "max_completion_tokens" };
-        let auth = if managed {
-            None
-        } else {
-            let ep = pm.endpoint.as_ref().unwrap();
-            match ep.auth.as_ref() {
-                Some(a) if a.auth_type.is_some() => {
-                    // Only an env-sourced credential is resolved for real
-                    // here; a Keychain item is never read by a test.
-                    let env_present = a.key_env.as_deref().is_some_and(|v| std::env::var(v).is_ok());
-                    let header = if env_present {
-                        crate::dispatch_internal::remote_auth_header(ep).ok().flatten().map(|(h, _)| h)
-                    } else {
-                        None
-                    };
-                    let source = match a.key_env.as_deref() {
-                        Some(v) if std::env::var(v).is_ok() => format!("env:{v}"),
-                        _ => format!("keychain:{}", a.keychain.clone().unwrap_or_default()),
-                    };
-                    // A keychain-only row is never read here: the header
-                    // name follows from the declared type alone.
-                    let header = header.unwrap_or_else(|| match a.auth_type {
-                        Some(darkmux_types::EndpointAuthType::ApiKey) => "api-key".to_string(),
-                        _ => "Authorization".to_string(),
-                    });
-                    Some((header, source))
-                }
-                _ => None,
-            }
-        };
-        let n_ctx = crate::dispatch_internal::resolve_context_window_internal(None, Some("p"), pf.to_str()).unwrap();
-        Observed { chat_url, wire_model, managed, cap_field, auth, n_ctx }
+        assert_eq!(cap_field, t.dialect.cap_field(), "the body and the resolved dialect agree");
+        let auth = t.endpoint.auth.as_ref().and_then(|a| {
+            let header = a.auth_type?.header_name().to_string();
+            let source = match a.credential_source() {
+                darkmux_types::CredentialSource::Env(v) => format!("env:{v}"),
+                darkmux_types::CredentialSource::Keychain(k) => format!("keychain:{k}"),
+                other => format!("{other:?}"),
+            };
+            Some((header, source))
+        });
+        Observed {
+            chat_url: t.chat_url.clone(),
+            wire_model,
+            managed: t.is_managed(),
+            cap_field,
+            auth,
+            n_ctx: t.n_ctx(),
+        }
     }
 
     #[test]
@@ -192,8 +413,27 @@ mod equivalence_tests {
                 format!(r#"{{"profiles":{{"p":{{"models":[{}]}}}},"default_profile":"p"}}"#, row.model),
             )
             .unwrap();
-            let got = observe(row.model, &pf);
+            let got = observe(&pf);
             let want_auth = row.auth.map(|(h, s)| (h.to_string(), s.to_string()));
+            // (#2902 step 4) The same endpoint named by id from an
+            // `endpoints` entry must resolve to the same facts as inline.
+            let mut model: serde_json::Value = serde_json::from_str(row.model).unwrap();
+            if let Some(ep) = model.as_object_mut().unwrap().remove("endpoint") {
+                model["endpoint"] = serde_json::json!("e");
+                let named = serde_json::json!({
+                    "profiles": { "p": { "models": [model] } },
+                    "default_profile": "p",
+                    "endpoints": { "e": ep },
+                });
+                let pf_named = tmp.path().join("profiles-named.json");
+                std::fs::write(&pf_named, named.to_string()).unwrap();
+                let by_id = observe(&pf_named);
+                if (by_id.chat_url.as_str(), by_id.wire_model.as_str(), by_id.managed, by_id.cap_field, &by_id.auth, by_id.n_ctx)
+                    != (got.chat_url.as_str(), got.wire_model.as_str(), got.managed, got.cap_field, &got.auth, got.n_ctx)
+                {
+                    failures.push(format!("{} (named by id) resolves differently from inline", row.name));
+                }
+            }
             if got.chat_url != row.chat_url
                 || got.wire_model != row.wire_model
                 || got.managed != row.managed

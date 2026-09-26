@@ -169,6 +169,10 @@ fn parse_registry_lenient(raw: &str) -> Result<ProfileRegistry> {
 
     let mut registry: ProfileRegistry = serde_json::from_value(root)?;
     registry.quarantined = quarantined;
+    // (#2902 step 4) `"endpoint": "<id>"` references carry their definition
+    // from here on; an undefined id stays unresolved (refused at use, named
+    // by doctor), never a silent fall to the managed default.
+    registry.materialize_endpoints();
     Ok(registry)
 }
 
@@ -657,7 +661,7 @@ mod tests {
         assert!(loaded.registry.quarantined.is_empty());
         let prof = get_profile(&loaded.registry, "azure-x").unwrap();
         assert_eq!(prof.models[0].n_ctx, None);
-        assert!(prof.models[0].is_remote());
+        assert!(!prof.models[0].is_managed());
 
         // Round-trip through real file I/O: the absent field stays absent.
         let round = tmp.path().join("profiles-round.json");
@@ -666,6 +670,33 @@ mod tests {
         let prof2 = get_profile(&reloaded.registry, "azure-x").unwrap();
         assert_eq!(prof2.models[0].n_ctx, None);
         assert!(!fs::read_to_string(&round).unwrap().contains("n_ctx"));
+    }
+
+    /// (#2902 step 4) The loader materializes `"endpoint": "<id>"` from the
+    /// `endpoints` map, so every consumer downstream of `load_registry` sees
+    /// the definition's fields; an id the map does not define stays
+    /// unresolved and loads (lenient, contract 7), refused at use.
+    #[test]
+    fn loader_materializes_named_endpoints_and_keeps_a_dangling_id_unresolved() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        write(
+            &p,
+            r#"{"profiles":{
+                    "named":{"models":[{"id":"gpt-4o","endpoint":"azure"}]},
+                    "dangling":{"models":[{"id":"gpt-4o","endpoint":"nope"}]}},
+                "endpoints":{"azure":{"url":"https://example.azure.com/openai"}}}"#,
+        );
+        let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
+        assert!(loaded.registry.quarantined.is_empty());
+        let named = &get_profile(&loaded.registry, "named").unwrap().models[0];
+        assert_eq!(
+            named.endpoint.as_ref().unwrap().url.as_deref(),
+            Some("https://example.azure.com/openai")
+        );
+        assert_eq!(named.endpoint_kind().unwrap(), darkmux_types::EndpointKind::Unmanaged);
+        let dangling = &get_profile(&loaded.registry, "dangling").unwrap().models[0];
+        assert!(dangling.endpoint_kind().unwrap_err().to_string().contains("nope"));
     }
 
     /// A LOCAL model without `n_ctx` is also legal AT PARSE (lenient-on-read

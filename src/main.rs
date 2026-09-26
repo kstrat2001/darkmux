@@ -2263,7 +2263,7 @@ fn profile_matches(profile: &types::Profile, loaded: &[types::LoadedModel]) -> b
     // registered profile". Any local load means the state isn't this
     // profile's.
     let local: Vec<&types::ProfileModel> =
-        profile.models.iter().filter(|m| !m.is_remote()).collect();
+        profile.models.iter().filter(|m| m.is_managed()).collect();
     if local.len() != loaded.len() {
         return false;
     }
@@ -2317,10 +2317,31 @@ fn cmd_profiles(config: Option<&str>, json: bool) -> Result<i32> {
             // local context to declare) — show what the entry actually says.
             let ctx = match m.n_ctx {
                 Some(n) => format!("ctx {n}"),
-                None if m.is_remote() => "endpoint".to_string(),
+                // (#2902) What darkmux does at the endpoint, and its id when
+                // it is named from `endpoints`.
+                None if !m.is_managed() => match (m.endpoint.as_ref().and_then(|e| e.named_id()), m.endpoint_kind()) {
+                    (Some(id), Ok(_)) => format!("endpoint `{id}`"),
+                    (Some(id), Err(_)) => format!("endpoint `{id}` (not defined in `endpoints`)"),
+                    (None, _) => "endpoint".to_string(),
+                },
                 None => "ctx unset".to_string(),
             };
             println!("  - {} {} @ {}", darkmux_types::style::dim(&format!("{:<10}", marker)), m.id, ctx);
+        }
+    }
+    // (#2902 step 4) The endpoints profiles name by id: what darkmux does
+    // there and where requests go (host only, never the path or a credential).
+    if !loaded.registry.endpoints.is_empty() {
+        println!("\n{}", darkmux_types::style::accent("endpoints"));
+        for (id, ep) in &loaded.registry.endpoints {
+            let what = match ep.kind() {
+                Ok(darkmux_types::EndpointKind::Managed(_)) => "managed (lmstudio)".to_string(),
+                Ok(darkmux_types::EndpointKind::Unmanaged) => {
+                    format!("unmanaged @ {}", ep.host().unwrap_or_else(|| "?".to_string()))
+                }
+                Err(e) => format!("unusable: {e}"),
+            };
+            println!("  - {id}: {what}");
         }
     }
     Ok(0)

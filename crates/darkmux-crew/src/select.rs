@@ -142,7 +142,7 @@ pub fn work_models<'a>(profile: &'a Profile, utility_model: Option<&str>) -> Vec
 /// binding. A hosted model that happens to share the id is served
 /// elsewhere and is never the utility instance, so it stays a work model.
 pub fn is_local_utility_model(model: &ProfileModel, utility_model: Option<&str>) -> bool {
-    !model.is_remote() && utility_model.is_some_and(|u| names_utility_model(&model.id, u))
+    model.is_managed() && utility_model.is_some_and(|u| names_utility_model(&model.id, u))
 }
 
 /// (#2914) Whether `candidate` names the machine's utility model, in either
