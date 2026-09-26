@@ -1269,10 +1269,13 @@ impl WorkloadProvider for ToolBenchProvider {
             model: envelope_model.unwrap_or_else(|| "(unknown)".to_string()),
             quant: None,
             backend: None,
-            n_ctx: profile
-                .default_model_id()
-                .and_then(|id| profile.models.iter().find(|m| m.id == id))
-                .and_then(|m| m.n_ctx.map(u64::from)),
+            // (#2902 review M2) The window of the model the dispatches RAN on
+            // (the one resolver's selection, with the lab's utility opt-in),
+            // not the profile's default model's.
+            n_ctx: darkmux_crew::dispatch_internal::dispatch_window(&role, Some(profile_name), config_path, true)
+                .ok()
+                .flatten()
+                .map(u64::from),
         };
         let rows = build_rows(&trial_refs, trials_per_task, &artifact);
         let machine_id = darkmux_types::config_access::machine_id()
@@ -2549,6 +2552,35 @@ not json — tolerated
 
     fn run_and_capture_timeout_overrides(extras: serde_json::Value) -> Result<Vec<Option<u32>>> {
         run_and_capture_timeout_overrides_with_run_dir(extras).map(|(seen, _run_dir)| seen)
+    }
+
+    /// (#2902 review M2) The scores' `ArtifactKey.n_ctx` is the window of
+    /// the model the dispatches RAN on (the resolver's selection), not the
+    /// profile's default model's. `coder` (skills `coding`) selects the
+    /// code-weighted `codestar` (128000) over the declared default (32000).
+    #[test]
+    fn scores_record_the_selected_models_window() {
+        let dir = TempDir::new().unwrap();
+        let pf = dir.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"mixed":{"default_model":"generalist","models":[
+                    {"id":"generalist","n_ctx":32000,"capabilities":{"reasoning":1.0}},
+                    {"id":"codestar","n_ctx":128000,"capabilities":{"code":1.0}}]}},
+                "default_profile":"mixed"}"#,
+        )
+        .unwrap();
+        let loaded = loaded_workload(serde_json::json!({ "chainDepths": [2], "role": "coder" }));
+        let run_dir = TempDir::new().unwrap();
+        let sandbox_dir = TempDir::new().unwrap();
+        let provider = ToolBenchProvider::with_dispatch(Arc::new(|_opts: DispatchOpts| mock_ok_result()));
+        let profile = darkmux_profiles::profiles::load_registry(pf.to_str()).unwrap().registry.profiles["mixed"].clone();
+        provider
+            .run(&loaded, run_dir.path(), sandbox_dir.path(), &profile, "mixed", pf.to_str(), None, &mut |_sid: &str| {})
+            .expect("run completes");
+        let doc = scores::read_scores(&run_dir.path().join("scores.json")).expect("the run wrote scores.json");
+        assert!(!doc.rows.is_empty());
+        assert!(doc.rows.iter().all(|r| r.artifact.n_ctx == Some(128_000)), "{:?}", doc.rows[0].artifact);
     }
 
     /// (#2685) Pins the WIRING, not just the predicate: `run()` must hand

@@ -11784,6 +11784,30 @@ fn resolve_dispatch_compaction(
 // compaction window. They share the resolver; a profile that declares no
 // `context_window` falls back independently on each side (the budget to its own
 // default), so they agree whenever the profile actually declares a window.
+/// (#2902 review M2) The compaction window a dispatch of `role_id` on
+/// `profile_override` RUNS with: the selected model's own `n_ctx`, through
+/// the same resolver and the same utility set-aside the dispatch uses.
+/// `allow_utility_model` is the lab's benchmark opt-in, as on
+/// `DispatchOpts`. A role this binary does not know falls back to the
+/// profile-level answer, as [`resolve_context_window_internal`] does.
+pub fn dispatch_window(
+    role_id: &str,
+    profile_override: Option<&str>,
+    config_path: Option<&str>,
+    allow_utility_model: bool,
+) -> Result<Option<u32>> {
+    match load_roles().ok().and_then(|roles| roles.into_iter().find(|r| r.id == role_id)) {
+        Some(role) => {
+            let mapped = role_profile_binding(Some(role_id), profile_override);
+            resolve_dispatch_windows_with(&role, profile_override, mapped, config_path, allow_utility_model)
+        }
+        None => {
+            let profile = resolve_active_profile_internal(Some(role_id), profile_override, config_path)?;
+            Ok(profile.as_ref().and_then(profile_context_window))
+        }
+    }
+}
+
 pub fn resolve_context_window_internal(
     role_id: Option<&str>,
     profile_override: Option<&str>,
@@ -11793,10 +11817,7 @@ pub fn resolve_context_window_internal(
     // own (`resolve_dispatch_windows_with`), the same one the dispatch runs.
     // A role id this binary does not know keeps the profile-level answer.
     if let Some(role_id) = role_id {
-        if let Some(role) = load_roles().ok().and_then(|roles| roles.into_iter().find(|r| r.id == role_id)) {
-            let mapped = role_profile_binding(Some(role_id), profile_override);
-            return resolve_dispatch_windows_with(&role, profile_override, mapped, config_path, false);
-        }
+        return dispatch_window(role_id, profile_override, config_path, false);
     }
     let profile = resolve_active_profile_internal(role_id, profile_override, config_path)?;
     Ok(profile.as_ref().and_then(profile_context_window))
@@ -11864,9 +11885,10 @@ fn resolve_active_profile_with(
 }
 
 /// (#632) The compaction-trigger window of a resolved profile: its default
-/// model's declared `n_ctx`, via `CompactionDispatchArgs::from_profile`.
+/// model's declared `n_ctx` (`dispatch::profile_default_window`). Only for a
+/// caller with no role, or a profile with no selectable model.
 fn profile_context_window(profile: &darkmux_types::Profile) -> Option<u32> {
-    crate::dispatch::CompactionDispatchArgs::from_profile(profile).context_window
+    crate::dispatch::profile_default_window(profile)
 }
 
 // (#2914) `profile_model_n_ctx` — the #1616 lookup of the compactor's `n_ctx`

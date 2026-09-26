@@ -1925,6 +1925,20 @@
         opts.config_path = Some(pf.to_str().unwrap().to_string());
         let resolved = resolve_dispatch_compaction(&role, &opts).unwrap();
         assert_eq!(resolved.compaction.context_window, Some(128_000), "dispatch() compacts at the same window");
+
+        // (#2902 review M2) The lab providers hand `dispatch()` compaction
+        // args built from the PROFILE (`CompactionDispatchArgs::from_profile`,
+        // for the operator's threshold/strategy settings). That prefill must
+        // not smuggle the default model's window back in.
+        let reg = darkmux_profiles::profiles::load_registry(pf.to_str()).unwrap().registry;
+        opts.compaction = crate::dispatch::CompactionDispatchArgs::from_profile(&reg.profiles["mixed"]);
+        let prefilled = resolve_dispatch_compaction(&role, &opts).unwrap();
+        assert_eq!(prefilled.compaction.context_window, Some(128_000), "a profile-prefilled args still compacts at the selected model's window");
+        // An EXPLICIT window (the loop lab's override) still wins.
+        opts.compaction.context_window = Some(50_000);
+        assert_eq!(resolve_dispatch_compaction(&role, &opts).unwrap().compaction.context_window, Some(50_000));
+        // The lab's artifact key reads the same window the dispatch used.
+        assert_eq!(dispatch_window("coder", Some("mixed"), pf.to_str(), true).unwrap(), Some(128_000));
     }
 
     #[test]
@@ -6499,8 +6513,7 @@
             runtime: None,
             use_when: None,
         };
-        let args = crate::dispatch::CompactionDispatchArgs::from_profile(&profile);
-        assert_eq!(args.context_window, None, "no declared n_ctx ⇒ no window");
+        assert_eq!(crate::dispatch::profile_default_window(&profile), None, "no declared n_ctx ⇒ no window");
     }
 
     /// (#377) Per-role override wins over profile fallback. Operator
@@ -6636,7 +6649,8 @@
         };
         let args = crate::dispatch::CompactionDispatchArgs::from_profile(&profile);
         assert_eq!(args.threshold_tokens, Some(40_000));
-        assert_eq!(args.context_window, Some(100_000), "primary n_ctx");
+        assert_eq!(args.context_window, None, "(#2902) the window is the selected model's, filled at dispatch");
+        assert_eq!(crate::dispatch::profile_default_window(&profile), Some(100_000), "primary n_ctx");
     }
 
     #[test]
@@ -6690,7 +6704,8 @@
             "clean break: openclaw extras `model` must NOT auto-populate compactor_model \
              (would pass `lmstudio/<id>` prefix to LMStudio's direct API → HTTP 400)"
         );
-        assert_eq!(args.context_window, Some(101_000));
+        assert_eq!(args.context_window, None);
+        assert_eq!(crate::dispatch::profile_default_window(&profile), Some(101_000));
     }
 
     /// (#368 clean break invariant) When ONLY `extras["maxHistoryShare"]`
@@ -6863,8 +6878,9 @@
         assert!(args.threshold_tokens.is_none());
         assert!(args.compactor_model.is_none());
         assert!(args.threshold_ratio.is_none());
-        // Primary n_ctx still captured even without compaction block.
-        assert_eq!(args.context_window, Some(50_000));
+        // Primary n_ctx is the profile's default window, not the args'.
+        assert_eq!(args.context_window, None);
+        assert_eq!(crate::dispatch::profile_default_window(&profile), Some(50_000));
     }
 
     // ─── #363, #457: inactivity timeout (formerly wall-clock deadline) ─

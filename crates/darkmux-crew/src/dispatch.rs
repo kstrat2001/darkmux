@@ -598,8 +598,9 @@ pub struct DispatchOpts {
 /// `darkmux dispatch` CLI path (`src/main.rs`) and a few other callers
 /// (`lab`'s `prompt` provider, `review_bench.rs`, `crawl/unit_step.rs`)
 /// build a `default()` — every field `None`, including `threshold_tokens` —
-/// and separately patch in only `context_window` from the profile's `n_ctx`
-/// as a fallback (`dispatch_internal::ensure_context_window`). Only
+/// and `dispatch()` patches in only `context_window`: the SELECTED model's
+/// `n_ctx` (`dispatch_internal::ensure_context_window`; #2902 — every
+/// constructor, [`Self::from_profile`] included, leaves it unset). Only
 /// [`Self::from_profile`] reads `threshold_tokens`, so a claim that the
 /// threshold-only trigger is "reachable whenever the primary is
 /// endpoint-bearing" is true on the `from_profile` paths (the lab providers
@@ -659,11 +660,22 @@ pub struct CompactionDispatchArgs {
     pub custom_instructions: Option<String>,
 }
 
+/// (#590/#1282) A profile's DEFAULT model's declared `n_ctx`: the window a
+/// caller with no role (so no selection) sizes against. `None` when the
+/// default model declares none. A dispatch never uses this for its own
+/// compaction; it uses the selected model's window (#2902).
+pub fn profile_default_window(profile: &darkmux_types::Profile) -> Option<u32> {
+    profile
+        .default_model_id()
+        .and_then(|id| profile.models.iter().find(|m| m.id == id))
+        .and_then(|m| m.n_ctx)
+}
+
 impl CompactionDispatchArgs {
     /// Derive from a profile (operator's tuning source-of-truth).
     /// Reads the typed fields under `profile.runtime.compaction.*`.
-    /// Picks the primary model's `n_ctx` as the context_window (needed
-    /// for formula trigger).
+    /// Leaves `context_window` unset (#2902): `dispatch()` fills it with the
+    /// SELECTED model's window.
     pub fn from_profile(profile: &darkmux_types::Profile) -> Self {
         let comp = profile.runtime.as_ref().and_then(|r| r.compaction.as_ref());
         let threshold_tokens = comp
@@ -683,14 +695,17 @@ impl CompactionDispatchArgs {
         // Operators wanting the adaptive trigger set
         // `profile.runtime.compaction.threshold_ratio` directly.
         let threshold_ratio = comp.and_then(|c| c.threshold_ratio).map(|f| f as f32);
-        // (#590) Context window for the compaction trigger comes from the
-        // profile's default model (default_model, or first model). (#1282)
-        // A model with no declared `n_ctx` (endpoint-bearing) yields `None` —
-        // the formula trigger is disabled, same as any window-less profile.
-        let context_window = profile
-            .default_model_id()
-            .and_then(|id| profile.models.iter().find(|m| m.id == id))
-            .and_then(|m| m.n_ctx);
+        // (#2902 review M2) The window is NOT taken from the profile here.
+        // It belongs to the model the dispatch SELECTS, which a profile alone
+        // cannot name (selection needs the role): `dispatch()` fills it from
+        // the one resolver (`resolve_dispatch_compaction`). Prefilling the
+        // DEFAULT model's `n_ctx` here made every caller that builds args
+        // from a profile (the lab providers) compact a non-default selection
+        // at the wrong window, because a set window is never overwritten. An
+        // explicit window (the loop lab's override) is still set by its caller
+        // and still wins. The profile's default-model window, for the one
+        // role-less caller that needs it, is [`profile_default_window`].
+        let context_window = None;
         // (#372 T2-A/T2-C) Strategy is a typed field on the schema;
         // read directly. When operator hasn't set it, runtime falls
         // back to Narrative default.

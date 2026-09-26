@@ -98,7 +98,9 @@ darkmux release.
   model. One resolver now returns the selected model with its own endpoint
   and window, and every path (dispatch, the container path, seat placement,
   radio's boundary and busy checks, `mission config show`, the crawl's
-  provenance stamp) goes through it. Single-model profiles, and every
+  provenance stamp, the lab's `coding-task` and `tool-bench` runs, whose
+  profile-built compaction settings no longer carry the default model's
+  window, and `tool-bench`'s scores `n_ctx`) goes through it. Single-model profiles, and every
   profile shape `profiles.example.json` and the guide ship, resolve to the
   same URL, model id, credential source and window as before (pinned by a
   table-driven test). Two edge shapes change: a step `config.endpoint`
