@@ -115,8 +115,8 @@ pub struct Role {
     pub escalation_posture: Option<String>,
     /// (#425) Role family — a **scope** distinction (#590): `"specialist"`
     /// roles work the mission/phases (the deliverable); `"utility"` roles
-    /// support the runtime outside mission scope (radio-router, the compactor,
-    /// and — once #590 lands it — the compactor). The split also drives
+    /// support the runtime outside mission scope (radio-router today; the
+    /// compactor joins the family once #590 lands it). The split also drives
     /// dispatch shape: specialists run the multi-turn agent loop and get the
     /// autonomous-dispatch preamble prepended; utility roles are bounded-I/O
     /// transformers with no agent loop, no asking-mode failure shape, and no

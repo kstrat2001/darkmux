@@ -660,7 +660,7 @@ jobs:
           # emptiness test below; the FIRST grep's status is what gates, above.
           bad=$(printf '%s\n' "$raw" | grep -v '\*\*v[0-9]*\.' || true)
           if [ -n "$bad" ]; then
-            echo "::error::Retired verb spelling in user-facing docs (#1426/#1463/#1465/#2912/#2913) — use machine status / machine resources / machine list / machine add / profile list / profile scan / lab notebook / mission launch review / dispatch (not crew dispatch; the crew family retired entirely) / init (not skills) / mission launch coder-phase (not mission run) / memory lesson (not lessons) / mission finalize (not mission close/ship — the frontier does git/gh by hand) / mission abort or mission finalize (not the retired phase family) / lab run list|inspect|compare (not lab runs/inspect/compare) / lab workload list (not lab workloads) / lab fixture list|register|unregister (not lab fixtures/register/unregister) / lab eval (not lab review-bench); swap + recommendations retired; mission propose + lab notebook removed in 4.0 (write the config by hand / the darkmux-lab-notebook skill):"
+            echo "::error::Retired verb spelling in user-facing docs (#1426/#1463/#1465/#2912/#2913) — use machine status / machine resources / machine list / machine add / profile list / profile scan / the darkmux-lab-notebook skill (not notebook or lab notebook) / mission launch review / dispatch (not crew dispatch; the crew family retired entirely) / init (not skills) / mission launch coder-phase (not mission run) / memory lesson (not lessons) / mission finalize (not mission close/ship — the frontier does git/gh by hand) / mission abort or mission finalize (not the retired phase family) / lab run list|inspect|compare (not lab runs/inspect/compare) / lab workload list (not lab workloads) / lab fixture list|register|unregister (not lab fixtures/register/unregister) / lab eval (not lab review-bench); swap + recommendations retired; mission propose + lab notebook removed in 4.0 (write the config by hand / the darkmux-lab-notebook skill):"
             echo "$bad"
             exit 1
           fi
@@ -673,7 +673,10 @@ jobs:
           # narrates the removal itself legitimately names the term; those
           # lines carry the issue number, so `#2912`/`#2913` lines are
           # excluded, same shape as the release-notes exclusion above.
-          RETIREDPAT='mission propose|notebook draft|notebook list|mission-compiler'
+          # The source-file and skill spellings (`mission_propose`,
+          # `notebook.rs`, `mission-compiling`) are here too: a doc that cites
+          # a deleted file or the deleted skill descriptor is the same drift.
+          RETIREDPAT='mission propose|notebook draft|notebook list|mission-compiler|mission-compiling|mission_propose|notebook\.rs'
           RETIRED_ERRF=$(mktemp)
           trap 'rm -f "$PAT_ERRF" "$VERB_ERRF" "$IDENTITY_ERRF" "$RETIRED_ERRF"' EXIT
           set +e

@@ -57,7 +57,7 @@ division of labor concrete.
 darkmux defines exactly **two** crew role families. The defining axis is
 **scope**: a *specialist* works the **mission/phases** (the deliverable); a
 *utility* role supports the **runtime**, outside mission scope (compaction,
-mission-compiling, estimation). The family also governs **how a role is
+radio routing). The family also governs **how a role is
 dispatched** (the table below). Bias toward utility for as much outside-mission
 work as possible, so the runtime isn't loading extra models for support
 tasks.
@@ -68,14 +68,15 @@ tasks.
 | **utility** | Supports the runtime, outside mission scope: `radio-router` today, plus compaction (a runtime function, #590). Bounded I/O, structured output, no agent loop. | A single bounded transform; no preamble. |
 
 - The family is carried by the optional `role_family` field on a role manifest
-  (`crates/darkmux-crew/src/types.rs:161-174`).
+  (`crates/darkmux-crew/src/types.rs:116-129`).
 - `is_specialist()` returns `true` for any role whose `role_family` is **not**
   explicitly `"utility"`; an absent field defaults to specialist
-  (`crates/darkmux-crew/src/types.rs:213-214`).
+  (`crates/darkmux-crew/src/types.rs:168-170`).
 - **radio-router is the single built-in utility role today** (the
   `mission-compiler` and `scribe` roles were removed in 4.0, #2912/#2913). It
-  is the only built-in with `role_family: "utility"`; all other built-ins omit
-  the field and default to specialist
+  is the only built-in with `role_family: "utility"`; every other built-in
+  declares `role_family: "specialist"` explicitly (the absent-field default
+  only matters for operator-authored roles)
   (`templates/builtin/roles/radio-router.json`; `crates/darkmux-crew/src/loader.rs`).
 
 ### "utility" is a role *family*, not "the compaction role"
@@ -138,7 +139,7 @@ A mission groups a body of work. Its fields
 There is **no `scope` field and no `goal` field**: a mission carries a
 `description`, not a separate goal/scope pair. "Scope" appears in the codebase
 only in comments, referring to the filesystem working directory (`--workdir`),
-never as a mission attribute (`src/mission_propose.rs:196-197`). This is
+never as a mission attribute. This is
 deliberate: per `CLAUDE.md`, engagement context (the *why*, local-vs-fleet
 framing, nuance) lives in the frontier orchestrator and the input prose. It is
 **by design not a CLI field**. The mission carries structure the local tier can
