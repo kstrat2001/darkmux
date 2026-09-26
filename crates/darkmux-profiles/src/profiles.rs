@@ -168,7 +168,9 @@ fn parse_registry_lenient(raw: &str) -> Result<ProfileRegistry> {
     }
     // (#2902 review M1) The `endpoints` map, one entry at a time, the same
     // way: a structurally broken entry is quarantined alone, so one typo
-    // never stops every dispatch. A model naming it reads as unresolved
+    // never stops every dispatch. Like a quarantined profile, it is then
+    // absent from the loaded registry (`profile list --json` does not show
+    // it; nothing writes profiles.json back today). A model naming it reads as unresolved
     // (refused at use; `validate` names the quarantine). Unknown VALUES in
     // `managed`/`dialect`/`limits` never reach here: those fields read
     // leniently and are refused at use.

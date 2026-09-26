@@ -78,9 +78,10 @@ darkmux release.
   new `endpoints` check names the move to an id (as advice; it passes). An
   id that `endpoints` does not define is refused when used, never sent to
   LM Studio on a guess. The registry stays lenient: a value this darkmux
-  does not know in `managed`, `dialect` or `limits` loads and round-trips,
-  and is refused when used (and named by doctor); any other broken
-  `endpoints` entry is quarantined alone. A `"managed": "lmstudio"`
+  does not know in `managed`, `dialect` or `limits` loads and is refused
+  when used (and named by doctor); any other broken `endpoints` entry, or
+  an `endpoints` value that is not an object, is quarantined (and then
+  absent from the loaded registry, like a quarantined profile). A `"managed": "lmstudio"`
   endpoint that also declares a `url`, an `api_version` or another dialect
   is refused when used: its address is `lmstudio_url`.
   `profiles.example.json` (what `darkmux init` writes) uses the id form.

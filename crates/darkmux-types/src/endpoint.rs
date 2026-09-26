@@ -191,7 +191,10 @@ fn is_period(p: &str) -> bool {
 /// written when it does not match (a newer darkmux's value, a typo). An
 /// unknown value never fails the registry parse (contract 7); the consumer
 /// that needs the value refuses it by name, and `darkmux doctor` reports it.
-/// It serializes back exactly as read.
+/// It serializes back as the JSON value that was read (a string or object
+/// verbatim; a number outside the integer range comes back in float form,
+/// e.g. `1e+23`). Nothing writes `profiles.json` today, so this matters only
+/// to `profile list --json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Lenient<T> {
@@ -582,8 +585,9 @@ impl EndpointAuth {
 
 /// `serde(with)` for `ProfileModel.endpoint`: a string names an `endpoints`
 /// entry by id; an object is the inline (pre-4.0) spelling. A named endpoint
-/// serializes back as its id, so a registry round-trips in the shape it was
-/// written.
+/// serializes back as its id, so a model's endpoint keeps the spelling it
+/// was written in (a quarantined `endpoints` entry is not in the loaded
+/// registry at all, like a quarantined profile).
 pub(crate) mod endpoint_field {
     use super::*;
 
@@ -843,7 +847,7 @@ mod tests {
     /// (#2902 review M1) The three new fields read leniently: a value this
     /// binary does not know (a NEWER darkmux's `"managed": "machine"`, a
     /// typo'd dialect, a limit written as a string) never fails the parse,
-    /// round-trips as written, and is refused where it matters: at use for
+    /// serializes back as the value read, and is refused where it matters: at use for
     /// `managed`/`dialect` (they decide routing), in `validate` for all three.
     #[test]
     fn unknown_values_in_the_new_fields_read_leniently_and_are_refused_at_use() {
