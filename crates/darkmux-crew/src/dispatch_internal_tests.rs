@@ -5948,6 +5948,46 @@
         );
     }
 
+    /// (#2902 review C3) What reaches an agentic HOSTED container's argv
+    /// config: the target's chat URL and its declared dialect; nothing for a
+    /// managed dispatch.
+    #[test]
+    fn agentic_brain_flags_carry_the_hosted_targets_url_and_dialect() {
+        let pm: darkmux_types::ProfileModel = serde_json::from_value(serde_json::json!({
+            "id": "m", "endpoint": { "url": "https://h.example/v1", "dialect": "chat-completions-max-tokens" }
+        }))
+        .unwrap();
+        let t = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
+        let (url, dialect) = super::agentic_brain_flags(Some(&t));
+        assert_eq!(url.as_deref(), Some("https://h.example/v1/chat/completions"));
+        assert_eq!(dialect, Some(darkmux_types::Dialect::ChatCompletionsMaxTokens));
+        assert_eq!(super::agentic_brain_flags(None), (None, None));
+        let mut config = base_argv_config();
+        (config.remote_chat_url, config.dialect) = super::agentic_brain_flags(Some(&t));
+        let argv = build_docker_run_argv(&config);
+        assert!(argv.windows(2).any(|w| w[0] == "--dialect" && w[1] == "chat-completions-max-tokens"), "{argv:?}");
+    }
+
+    /// (#2902 review C3) `mission launch` sizes the coder brief through the
+    /// role branch: with a role, the SELECTED model's window; with none,
+    /// the profile default's.
+    #[test]
+    #[serial]
+    fn the_context_window_with_a_role_is_the_selected_models() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let pf = state.join("profiles-2902-brief.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"mixed":{"default_model":"generalist","models":[
+                    {"id":"generalist","n_ctx":32000,"capabilities":{"reasoning":1.0}},
+                    {"id":"codestar","n_ctx":128000,"capabilities":{"code":1.0}}]}},
+                "default_profile":"mixed"}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_context_window_internal(Some("coder"), None, pf.to_str()).unwrap(), Some(128_000));
+        assert_eq!(resolve_context_window_internal(None, None, pf.to_str()).unwrap(), Some(32_000));
+    }
+
     #[test]
     fn build_docker_run_argv_emits_chat_url_without_stdin_flags_when_no_auth() {
         let mut config = base_argv_config();

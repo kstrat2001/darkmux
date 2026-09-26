@@ -2190,6 +2190,19 @@ pub(crate) fn container_dialect_flag(t: &crate::target::Target) -> Option<darkmu
     (t.dialect != t.kind.default_dialect()).then_some(t.dialect)
 }
 
+/// (#2902 review C3) What an agentic-hosted target puts on the container's
+/// argv: its chat URL (`--chat-url`) and, when declared and non-default, its
+/// dialect (`--dialect`). `(None, None)` for a managed dispatch, whose
+/// container dials `--base-url`.
+pub(crate) fn agentic_brain_flags(
+    agentic: Option<&crate::target::Target>,
+) -> (Option<String>, Option<darkmux_types::Dialect>) {
+    match agentic {
+        Some(t) => (Some(t.chat_url.clone()), container_dialect_flag(t)),
+        None => (None, None),
+    }
+}
+
 /// Rewrite a host that means "this machine" in `url` to
 /// `host.docker.internal` (Docker Desktop's name for the host, which the
 /// runtime's baked-in default already relies on), because inside the
@@ -5732,6 +5745,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     let (inactivity_timeout_seconds, inactivity_timeout_seconds_source) =
         effective_inactivity_timeout_seconds(opts.timeout_override_seconds);
 
+    // (#2902) The container's hosted-brain flags, from the resolved target.
+    let agentic_brain = agentic_brain_flags(agentic_pm.as_ref());
     let argv_config = DockerRunConfig {
         container_name: container_name.clone(),
         workspace: workspace.clone(),
@@ -5798,11 +5813,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // checkpoint into `host_out` when `opts.resume_from` is `Some` —
         // this just tells the container to reload it.
         resume_checkpoint: opts.resume_from.is_some(),
-        remote_chat_url: agentic_pm.as_ref().map(|t| t.chat_url.clone()),
+        remote_chat_url: agentic_brain.0,
         // (#2902) Only a declared dialect that differs from what the runtime
         // already assumes for this kind reaches argv, so every existing
         // config's argv is byte-identical.
-        dialect: agentic_pm.as_ref().and_then(container_dialect_flag),
+        dialect: agentic_brain.1,
         remote_needs_auth,
         base_url_override: container_lmstudio_base_url(opts.model_base_url_override.as_deref()),
         workspace_read_only: opts.workspace_read_only,
