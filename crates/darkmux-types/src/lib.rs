@@ -490,19 +490,78 @@ impl RuntimeCompactionConfig {
 /// compaction model. (#590)
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegistryInternal {
-    /// The machine's **utility model** — the standing support model the
-    /// runtime summons for built-in utility tasks (compaction today;
-    /// estimation / mission-compile later). The operator registers it from
-    /// lab work; it is **not** capability-scored (a score could re-pick a
-    /// large model for compaction and reintroduce the per-beat tax). One
-    /// global util model serves all utility hooks. Absent ⇒ (#2571) NOT a
-    /// fallback to a built-in default compactor — there is no runtime
-    /// default any more. `CompactionDispatchArgs::apply_utility_model`
-    /// leaves `compactor_model` unset, and an unset compactor means
-    /// compaction is OFF outright for the dispatch (disclosed loudly at
-    /// dispatch time, not silently defaulted).
+    /// The machine's **utility model** — the standing support model darkmux
+    /// runs its OWN jobs on (compaction, radio routing; #2914). The operator
+    /// registers it from lab work; it is **not** capability-scored (a score
+    /// could re-pick a large model for compaction and reintroduce the
+    /// per-beat tax), and (#2914) it is NEVER selectable for a task: every
+    /// task/step selection path excludes it, so a profile's `models[]` are
+    /// work models only. One global utility model serves every utility job.
+    ///
+    /// Either a bare model id or `{ "id": .., "n_ctx": .. }`
+    /// ([`UtilityBinding`]). The window is declared HERE, since #2914 the
+    /// only place the compactor's own context comes from — not from a
+    /// profile's `models[]` entry, which would make the utility model a work
+    /// model. Absent ⇒ (#2571) NOT a fallback to a built-in default compactor
+    /// — there is no runtime default any more.
+    /// `CompactionDispatchArgs::apply_utility_model` leaves `compactor_model`
+    /// unset, and an unset compactor means compaction is OFF outright for the
+    /// dispatch (disclosed loudly at dispatch time, not silently defaulted).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub utility: Option<String>,
+    pub utility: Option<UtilityBinding>,
+}
+
+/// (#2914) The `internal.utility` value: a bare model id (the original
+/// spelling, still read) or an object declaring the model's own context
+/// window. Untagged so both spellings parse from the same key; the object
+/// form serializes back as an object, the bare form as a string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum UtilityBinding {
+    /// `"utility": "<model-id>"` — no window declared. Consumers that need
+    /// one fall back to a NAMED default and say so (never silently).
+    Id(String),
+    /// `"utility": { "id": "<model-id>", "n_ctx": <u32> }`.
+    Declared(UtilityModel),
+}
+
+/// (#2914) The object form of [`UtilityBinding`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UtilityModel {
+    pub id: String,
+    /// The window the utility model is loaded at, and the size a compaction
+    /// payload is bounded by. `None` ⇒ undeclared (same as the bare form).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_ctx: Option<u32>,
+    /// Forward-compat overflow — unknown keys land here and re-serialize
+    /// flat (a newer registry read by an older binary).
+    #[serde(flatten)]
+    pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+impl UtilityBinding {
+    /// The bare-form constructor, for callers that only have an id.
+    pub fn id(id: impl Into<String>) -> Self {
+        UtilityBinding::Id(id.into())
+    }
+
+    /// The declared model id, untrimmed (see
+    /// [`ProfileRegistry::utility_model_id`] for the trimmed, blank-is-unset
+    /// view every consumer should use).
+    pub fn raw_id(&self) -> &str {
+        match self {
+            UtilityBinding::Id(id) => id,
+            UtilityBinding::Declared(m) => &m.id,
+        }
+    }
+
+    /// The declared window, if the object form declared one.
+    pub fn n_ctx(&self) -> Option<u32> {
+        match self {
+            UtilityBinding::Id(_) => None,
+            UtilityBinding::Declared(m) => m.n_ctx,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -584,7 +643,18 @@ impl Profile {
 // holding an endpoint's API key — the headless-runner escape hatch, resolved
 // ahead of the Keychain). Minor bump: every 1.4 registry parses unchanged (the
 // field is `Option`, absent on read), per the lenient-read doctrine.
-pub const PROFILES_SCHEMA_VERSION: &str = "1.5";
+// 2.0 (#2914, darkmux 4.0): `internal.utility` also accepts the object form
+// `{ "id": <model-id>, "n_ctx": <u32> }` (`UtilityBinding`), declaring the
+// utility model's own context window where the binding lives. The bare
+// string form still reads (no window declared), so every 1.5 registry
+// parses unchanged. MAJOR bump all the same: this RETYPES a value, and an
+// older binary (`utility: Option<String>`) given the object form fails the
+// whole registry's typed parse (`internal` is a typed field, not a
+// quarantined per-entry one), which is a hard stop on every dispatch
+// (#1269). Alongside it, the utility model stopped being a legal work
+// model: no profile's `models[]` should list it (`darkmux doctor` flags
+// one that does), and every task/step selection path excludes it.
+pub const PROFILES_SCHEMA_VERSION: &str = "2.0";
 
 /// Scopes a review probe seat's draws to a subset of fact families, and
 /// optionally caps how many bundles it considers. Carried on
@@ -693,9 +763,20 @@ impl ProfileRegistry {
     pub fn utility_model_id(&self) -> Option<&str> {
         self.internal
             .as_ref()
-            .and_then(|i| i.utility.as_deref())
-            .map(str::trim)
+            .and_then(|i| i.utility.as_ref())
+            .map(|u| u.raw_id().trim())
             .filter(|s| !s.is_empty())
+    }
+
+    /// (#2914) The utility model's declared context window
+    /// (`internal.utility.n_ctx`), when the object form declared one. `None`
+    /// for the bare form, for an undeclared window, and whenever
+    /// [`Self::utility_model_id`] is `None` (a window with no model is not a
+    /// binding). Since #2914 this is the ONLY source of the compactor's own
+    /// window; a profile's `models[]` is never consulted for it.
+    pub fn utility_model_n_ctx(&self) -> Option<u32> {
+        self.utility_model_id()?;
+        self.internal.as_ref().and_then(|i| i.utility.as_ref()).and_then(UtilityBinding::n_ctx)
     }
 
     /// (#1054) Resolve which profile a dispatch should use, given an optional
@@ -1148,6 +1229,43 @@ mod tests {
         let json = r#"{ "profiles": {}, "internal": { "utility": "  darkmux:util-4b  " } }"#;
         let reg: ProfileRegistry = serde_json::from_str(json).unwrap();
         assert_eq!(reg.utility_model_id(), Some("darkmux:util-4b"));
+    }
+
+    /// (#2914) `internal.utility` also accepts `{id, n_ctx}`: the utility
+    /// model declares its own context window HERE, never in a profile's
+    /// `models[]` (the compactor's window used to be looked up there, which
+    /// made the utility model a work model). A bare string still reads.
+    #[test]
+    fn registry_internal_utility_accepts_id_and_n_ctx_object() {
+        let json = r#"{
+            "profiles": {},
+            "internal": { "utility": { "id": "darkmux:util-4b", "n_ctx": 120000 } }
+        }"#;
+        let reg: ProfileRegistry = serde_json::from_str(json).unwrap();
+        assert_eq!(reg.utility_model_id(), Some("darkmux:util-4b"));
+        assert_eq!(reg.utility_model_n_ctx(), Some(120_000));
+        // Round-trips as the object form, window kept.
+        let back: ProfileRegistry =
+            serde_json::from_str(&serde_json::to_string(&reg).unwrap()).unwrap();
+        assert_eq!(back.utility_model_id(), Some("darkmux:util-4b"));
+        assert_eq!(back.utility_model_n_ctx(), Some(120_000));
+
+        // The bare form declares no window.
+        let bare: ProfileRegistry =
+            serde_json::from_str(r#"{ "profiles": {}, "internal": { "utility": "util-4b" } }"#).unwrap();
+        assert_eq!(bare.utility_model_id(), Some("util-4b"));
+        assert_eq!(bare.utility_model_n_ctx(), None);
+
+        // A blank/padded id in the object form gets the same treatment as a
+        // blank/padded bare string.
+        let blank: ProfileRegistry =
+            serde_json::from_str(r#"{ "profiles": {}, "internal": { "utility": { "id": "  " } } }"#).unwrap();
+        assert_eq!(blank.utility_model_id(), None);
+        assert_eq!(blank.utility_model_n_ctx(), None, "no id, no binding, no window");
+        let padded: ProfileRegistry =
+            serde_json::from_str(r#"{ "profiles": {}, "internal": { "utility": { "id": " util-4b ", "n_ctx": 8 } } }"#).unwrap();
+        assert_eq!(padded.utility_model_id(), Some("util-4b"));
+        assert_eq!(padded.utility_model_n_ctx(), Some(8));
     }
 
     // ─── RuntimeCompactionConfig (v0.1 schema extension, #357) ──────────

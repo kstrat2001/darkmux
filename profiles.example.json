@@ -1,7 +1,7 @@
 {
-  "_comment": "darkmux profile registry — example. Three worker profiles in increasing capacity order (fast → balanced → deep), plus one hosted-endpoint example. A profile's `models[]` are WORKER models; the machine's standing utility/compactor model lives once in the top-level `internal.utility`. `n_ctx` is required for LOCAL models (it is the load parameter) and omitted for endpoint-bearing models. `darkmux init` fills the `<your-worker-model-id>` slots from a model you have downloaded; run `lms ls` to see them, and `darkmux config set role_profiles.<role> <profile>` to staff a mission seat. Profiles for the review mission's `reviewer` seat are in the guide, not here.",
+  "_comment": "darkmux profile registry — example. Three worker profiles in increasing capacity order (fast → balanced → deep), plus one hosted-endpoint example. A profile's `models[]` are WORKER models; the machine's one utility model (compaction, radio routing) lives once in the top-level `internal.utility` with its own `n_ctx`, and is never selectable for a task. `n_ctx` is required for LOCAL models (it is the load parameter) and omitted for endpoint-bearing models. `darkmux init` fills the `<your-worker-model-id>` slots from a model you have downloaded; run `lms ls` to see them, and `darkmux config set role_profiles.<role> <profile>` to staff a mission seat. Profiles for the review mission's `reviewer` seat are in the guide, not here.",
 
-  "schema_version": "1.5",
+  "schema_version": "2.0",
 
   "profiles": {
     "fast": {
@@ -42,6 +42,6 @@
   "default_profile": "balanced",
 
   "internal": {
-    "utility": "qwen/qwen3-4b-instruct-2507"
+    "utility": { "id": "qwen/qwen3-4b-instruct-2507", "n_ctx": 120000 }
   }
 }

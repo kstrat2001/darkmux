@@ -13440,7 +13440,7 @@ mod tests {
     #[test]
     fn unreachable_residents_utility_binding_counts_as_addressable() {
         let mut registry = registry_with(&[("balanced", &[("qwen/qwen3.8-27b", None)])]);
-        registry.internal = Some(darkmux_types::RegistryInternal { utility: Some("util-4b".to_string()) });
+        registry.internal = Some(darkmux_types::RegistryInternal { utility: Some(darkmux_types::UtilityBinding::id("util-4b")) });
         let loaded = vec![
             lm("darkmux:qwen/qwen3.8-27b", "qwen/qwen3.8-27b"),
             lm("darkmux:util-4b", "util-4b"),

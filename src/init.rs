@@ -292,27 +292,53 @@ pub fn choose_utility_model(current: &str, available: &[darkmux_profiles::lms::M
         .map(|m| m.model_key.clone())
 }
 
-/// Locate the value of the registry's `"utility": "<id>"` binding in the
-/// raw text: the byte range of `<id>`. A hand-rolled scan rather than a
-/// regex dependency (the dep set is small on purpose). `None` when the key
-/// is absent or not followed by a string.
+/// Locate the model id of the registry's `internal.utility` binding in the
+/// raw text: the byte range of `<id>` in either `"utility": "<id>"` or
+/// (#2914) `"utility": { "id": "<id>", "n_ctx": N }`. A hand-rolled scan
+/// rather than a regex dependency (the dep set is small on purpose). `None`
+/// when the key is absent, or not followed by a string or an object with a
+/// string `id`.
 fn utility_value_span(registry_json: &str) -> Option<(usize, usize)> {
-    let key = "\"utility\"";
-    let k = registry_json.find(key)?;
-    let rest = &registry_json[k + key.len()..];
+    let value_at = string_value_after_key(registry_json, 0, "\"utility\"")?;
+    match value_at {
+        ValueAt::Str(start, end) => Some((start, end)),
+        ValueAt::Object(open) => {
+            // The object form: the first `"id"` string inside the object.
+            let close = open + registry_json[open..].find('}')?;
+            match string_value_after_key(&registry_json[..close], open, "\"id\"")? {
+                ValueAt::Str(start, end) => Some((start, end)),
+                ValueAt::Object(_) => None,
+            }
+        }
+    }
+}
+
+/// What follows `key:` in `text`, searching from `from`: a string's byte
+/// range (exclusive of its quotes) or the byte offset of an object's `{`.
+enum ValueAt {
+    Str(usize, usize),
+    Object(usize),
+}
+
+fn string_value_after_key(text: &str, from: usize, key: &str) -> Option<ValueAt> {
+    let k = from + text[from..].find(key)?;
+    let rest = &text[k + key.len()..];
     let colon = rest.find(':')?;
     if !rest[..colon].trim().is_empty() {
         return None;
     }
     let after = &rest[colon + 1..];
     let ws = after.len() - after.trim_start().len();
-    let quote = k + key.len() + colon + 1 + ws;
-    if !registry_json[quote..].starts_with('"') {
+    let value = k + key.len() + colon + 1 + ws;
+    if text[value..].starts_with('{') {
+        return Some(ValueAt::Object(value));
+    }
+    if !text[value..].starts_with('"') {
         return None;
     }
-    let start = quote + 1;
-    let end = start + registry_json[start..].find('"')?;
-    Some((start, end))
+    let start = value + 1;
+    let end = start + text[start..].find('"')?;
+    Some(ValueAt::Str(start, end))
 }
 
 /// (#2053) Rewrite `internal.utility`'s value, and only that: a profile model
@@ -1156,6 +1182,20 @@ mod tests {
         assert_eq!(fill_utility_binding(&out, "qwen/qwen3-4b-instruct-2507", "x"), None, "nothing to replace");
     }
 
+    /// (#2914) The object form `"utility": { "id": .., "n_ctx": .. }` — the
+    /// shape the example now ships — rewrites only the `id`, keeping the
+    /// window and the operator's file shape. A profile model with the same
+    /// id (a leftover from before #2914) is still not the binding.
+    #[test]
+    fn fill_utility_binding_rewrites_the_id_inside_the_object_form() {
+        let reg = r#"{"internal":{"utility":{"id":"qwen/qwen3-4b-instruct-2507","n_ctx":120000}},"profiles":{"fast":{"models":[{"id":"qwen/qwen3-4b-instruct-2507","n_ctx":32000}]}}}"#;
+        let out = fill_utility_binding(reg, "qwen/qwen3-4b-instruct-2507", "qwen3-4b-instruct-2507").expect("binding present");
+        assert!(out.contains(r#""utility":{"id":"qwen3-4b-instruct-2507","n_ctx":120000}"#), "{out}");
+        assert!(out.contains(r#""models":[{"id":"qwen/qwen3-4b-instruct-2507""#), "the profile model keeps its id: {out}");
+        // An object with no `id` string is not a binding the scanner can fill.
+        assert_eq!(utility_value_span(r#"{"internal":{"utility":{"n_ctx":1}}}"#), None);
+    }
+
     /// The scanner reads the shipped example's own binding, so the gate that
     /// protects an operator's hand-set value compares against the real
     /// shipped string, not a copy that could drift.
@@ -1163,6 +1203,9 @@ mod tests {
     fn the_shipped_utility_binding_is_readable_from_the_example() {
         let (a, b) = utility_value_span(EXAMPLE_PROFILES_JSON).expect("example registry declares internal.utility");
         assert_eq!(&EXAMPLE_PROFILES_JSON[a..b], "qwen/qwen3-4b-instruct-2507");
+        // (#2914) The example ships the object form, window included.
+        let reg: darkmux_types::ProfileRegistry = serde_json::from_str(EXAMPLE_PROFILES_JSON).unwrap();
+        assert_eq!(reg.utility_model_n_ctx(), Some(120_000), "the shipped binding declares its window");
     }
 }
 
