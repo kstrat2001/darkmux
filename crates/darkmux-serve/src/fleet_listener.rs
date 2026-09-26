@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex};
 
 type AllowList = BTreeMap<String, AcceptWorkEntry>;
 type ResolveProfile = dyn Fn(&str, Option<&str>) -> ProfileResolution + Send + Sync;
-type ExecuteJob = dyn Fn(WorkJob, String) -> anyhow::Result<DispatchResult> + Send + Sync;
+type ExecuteJob = dyn Fn(WorkJob, String, String) -> anyhow::Result<DispatchResult> + Send + Sync;
 
 /// Everything the listener needs, injectable so tests drive the real router
 /// over a real socket with a fake provider and a fake executor.
@@ -54,6 +54,8 @@ pub(crate) struct FleetListenerState {
     /// This machine's name (its `machine_id`).
     pub receiver: String,
     pub provider: Arc<dyn IdentityProvider>,
+    /// This machine's own node id: a request from it is refused.
+    pub local_node_id: Option<String>,
     /// The expected fleet token, read per request (`None` = not configured).
     pub token: Arc<dyn Fn() -> Option<String> + Send + Sync>,
     /// The allow-list, read per request. An error refuses everything.
@@ -70,11 +72,16 @@ impl FleetListenerState {
     /// Production wiring: the configured provider, the serve token, the
     /// allow-list from `config.json`, this machine's registry, and
     /// `darkmux_fleet::execute_job`.
-    pub(crate) fn production(receiver: String, provider: Arc<dyn IdentityProvider>) -> Self {
+    pub(crate) fn production(
+        receiver: String,
+        provider: Arc<dyn IdentityProvider>,
+        local_node_id: Option<String>,
+    ) -> Self {
         let resolve_receiver = receiver.clone();
         Self {
             receiver,
             provider,
+            local_node_id,
             token: Arc::new(|| darkmux_flow::serve_token().map(|t| t.expose_for_compare().to_string())),
             allow_list: Arc::new(darkmux_fleet::read_user_allow_list),
             resolve_profile: Arc::new(move |role, requested| {
@@ -159,12 +166,14 @@ async fn gate(State(state): State<FleetListenerState>, mut req: Request, next: N
     // token matched: `admit` calls this closure after its token check.
     let provider = state.provider.clone();
     let provider_name = provider.provider_name().to_string();
+    let local_id = state.local_node_id.clone();
     let decision = tokio::task::spawn_blocking(move || {
         darkmux_fleet::admit(
             token,
             || provider.identify(peer).map_err(|e| format!("{e:#}")),
             &provider_name,
             peer,
+            local_id.as_deref(),
             &allow,
         )
     })
@@ -206,7 +215,7 @@ async fn submit_handler(
         Ok(s) => s,
         Err(r) => return refuse(&receiver, &r),
     };
-    let job = sub.job;
+    let mut job = sub.job;
     let resolve = state.resolve_profile.clone();
     let (role, requested) = (job.role_id.clone(), job.profile.clone());
     let resolution = match tokio::task::spawn_blocking(move || resolve(&role, requested.as_deref())).await {
@@ -217,6 +226,10 @@ async fn submit_handler(
         Ok(p) => p,
         Err(r) => return refuse(&receiver, &r),
     };
+
+    // (#2916 review C2) The receiver's own id for this run, never the
+    // sender's verbatim.
+    job.session_id = darkmux_fleet::receiver_session_id(&job.session_id, &admitted.peer_name);
 
     // One submitted job at a time; a second is answered "busy" at once.
     {
@@ -236,12 +249,13 @@ async fn submit_handler(
     let (tx, rx) = tokio::sync::oneshot::channel();
     let execute = state.execute.clone();
     let run_profile = profile.clone();
+    let origin = admitted.peer_name.clone();
     // A dedicated OS thread, not the async runtime: a dispatch blocks for
     // minutes. The guard moves in, so the slot frees when the work ends,
     // even if the sender stopped waiting.
     let spawned = std::thread::Builder::new().name("darkmux-fleet-job".into()).spawn(move || {
         let _guard = guard;
-        let result = execute(job, run_profile);
+        let result = execute(job, run_profile, origin);
         let _ = tx.send(result);
     });
     if let Err(e) = spawned {
@@ -302,16 +316,100 @@ pub(crate) fn listen_addr(local: &darkmux_fleet::NodeIdentity, port: u16) -> Res
     Ok(SocketAddr::new(ip, port))
 }
 
+/// What the listener is doing, for `/health` and so for `darkmux doctor`
+/// (#2916 review C8): a daemon started by launchd can fail where a shell
+/// succeeds, and the reason used to live only in the daemon's log. Coarse
+/// phrases only: no provider output, no ids.
+static LISTENER_STATE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn set_state(s: impl Into<String>) {
+    if let Ok(mut g) = LISTENER_STATE.lock() {
+        *g = Some(s.into());
+    }
+}
+
+/// The listener's state for `/health` (`None` = the listener is off).
+pub(crate) fn listener_state() -> Option<String> {
+    LISTENER_STATE.lock().ok().and_then(|g| g.clone())
+}
+
+/// Bounds on the listener's connections (#2916 review M1). A tokenless
+/// peer could open hundreds of half-sent requests and exhaust the daemon's
+/// file descriptors, taking the VIEWER port down with the listener.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ConnLimits {
+    /// Connections served at once; one more is closed on accept.
+    pub max_conns: usize,
+    /// Time allowed to send the request headers.
+    pub header_read_timeout: std::time::Duration,
+    /// Longest a connection may live: a waiting submission holds its
+    /// connection for the whole job, so this is the job cap plus slack.
+    pub conn_deadline: std::time::Duration,
+}
+
+impl ConnLimits {
+    pub(crate) const PRODUCTION: ConnLimits = ConnLimits {
+        max_conns: 32,
+        header_read_timeout: std::time::Duration::from_secs(10),
+        conn_deadline: std::time::Duration::from_secs(60 * 60 + 300),
+    };
+}
+
+/// Serve `app` on `listener` with [`ConnLimits`]: a connection past the cap
+/// is closed at once (so the listener never holds more than `max_conns`
+/// descriptors), headers must arrive within `header_read_timeout`, one
+/// request per connection, and no connection outlives `conn_deadline`. The
+/// peer address is attached as `ConnectInfo` for the gate.
+pub(crate) async fn serve_bounded(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    limits: ConnLimits,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    use hyper_util::service::TowerToHyperService;
+    let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_conns));
+    loop {
+        let (stream, peer) = tokio::select! {
+            r = listener.accept() => match r {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("darkmux fleet: accept failed ({e}); pausing 100ms");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            },
+            _ = async { let _ = shutdown.wait_for(|v| *v).await; } => return,
+        };
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            drop(stream);
+            continue;
+        };
+        let svc = TowerToHyperService::new(app.clone().layer(Extension(ConnectInfo(peer))));
+        tokio::spawn(async move {
+            let _permit = permit;
+            let conn = hyper::server::conn::http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(limits.header_read_timeout)
+                .keep_alive(false)
+                .serve_connection(TokioIo::new(stream), svc);
+            let _ = tokio::time::timeout(limits.conn_deadline, conn).await;
+        });
+    }
+}
+
 /// Start the listener if `fleet.listener.enabled`. Never fails the daemon:
-/// each reason it cannot start is logged, and `darkmux doctor` reports it.
-/// Waits for the provider to come up (it may start after the daemon at
-/// boot), retrying every 30 s.
+/// each reason it cannot start is logged, recorded for `/health`, and
+/// reported by `darkmux doctor`. Waits for the provider to come up (it may
+/// start after the daemon at boot), retrying every 30 s.
 pub(crate) fn spawn_if_enabled(shutdown: tokio::sync::watch::Receiver<bool>) {
     if !darkmux_types::config_access::fleet_listener_enabled() {
         return;
     }
+    set_state("starting");
     tokio::spawn(async move {
         if let Err(e) = run(shutdown).await {
+            set_state(format!("not started: {e}"));
             eprintln!("{}", darkmux_types::style::warn(&format!("darkmux fleet: listener not started: {e}")));
         }
     });
@@ -328,32 +426,32 @@ async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<(), Str
     let receiver = darkmux_flow::resolve_machine_id()
         .ok_or_else(|| "this machine has no machine_id, so it cannot tell a misaddressed job".to_string())?;
     let port = darkmux_types::config_access::fleet_listener_port();
-    let addr = loop {
+    let (addr, local_id) = loop {
         let p = provider.clone();
         match tokio::task::spawn_blocking(move || p.local_node()).await {
-            Ok(Ok(local)) => break listen_addr(&local, port)?,
-            Ok(Err(e)) => eprintln!(
-                "darkmux fleet: the {} network is not answering ({e:#}); retrying in 30s",
-                provider.provider_name()
-            ),
+            Ok(Ok(local)) => break (listen_addr(&local, port)?, local.node_id.clone()),
+            Ok(Err(e)) => {
+                set_state(format!("waiting for the {} network to answer (retrying every 30s)", provider.provider_name()));
+                eprintln!(
+                    "darkmux fleet: the {} network is not answering ({e:#}); retrying in 30s",
+                    provider.provider_name()
+                )
+            }
             Err(e) => eprintln!("darkmux fleet: identity check failed ({e}); retrying in 30s"),
         }
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
-            _ = shutdown.wait_for(|v| *v) => return Ok(()),
+            _ = async { let _ = shutdown.wait_for(|v| *v).await; } => return Ok(()),
         }
     };
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| format!("binding {addr}: {e} (another process on `fleet.listener.port`?)"))?;
+    set_state(format!("listening on {addr}"));
     println!("  fleet listener: {addr} (work submission; identity: {})", provider.provider_name());
-    let app = router(FleetListenerState::production(receiver, provider));
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(async move {
-            let _ = shutdown.wait_for(|v| *v).await;
-        })
-        .await
-        .map_err(|e| format!("{e}"))
+    let app = router(FleetListenerState::production(receiver, provider, Some(local_id)));
+    serve_bounded(listener, app, ConnLimits::PRODUCTION, shutdown).await;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -371,6 +469,8 @@ mod tests {
             AcceptWorkEntry {
                 node_id: Some("nLAPTOP".into()),
                 profiles: Some(vec!["host".into()]),
+                roles: Some(vec!["radio-host".into()]),
+                images: None,
                 workspace: Some(false),
                 extras: Default::default(),
             },
@@ -400,6 +500,7 @@ mod tests {
         let state = FleetListenerState {
             receiver: "studio".into(),
             provider: Arc::new(provider),
+            local_node_id: Some("nSTUDIO".into()),
             token: Arc::new(|| Some(TOKEN.to_string())),
             allow_list: Arc::new(|| Ok(allow())),
             resolve_profile: Arc::new(|_role, requested| match requested {
@@ -407,7 +508,7 @@ mod tests {
                 Some(p) => ProfileResolution::Work(p.to_string()),
                 None => ProfileResolution::Work("host".into()),
             }),
-            execute: Arc::new(move |job: WorkJob, profile: String| {
+            execute: Arc::new(move |job: WorkJob, profile: String, _origin: String| {
                 std::thread::sleep(Duration::from_millis(job_ms));
                 ran_c.lock().unwrap().push((job.session_id.clone(), profile.clone()));
                 Ok(DispatchResult {
@@ -427,9 +528,8 @@ mod tests {
             let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
             rt.block_on(async move {
                 let l = tokio::net::TcpListener::from_std(std_listener).unwrap();
-                axum::serve(l, router(state).into_make_service_with_connect_info::<SocketAddr>())
-                    .await
-                    .unwrap();
+                let (_tx, rx) = tokio::sync::watch::channel(false);
+                serve_bounded(l, router(state), ConnLimits::PRODUCTION, rx).await;
             });
         });
         Harness { url: format!("http://127.0.0.1:{port}{}", darkmux_fleet::SUBMISSION_PATH), ran, busy }
@@ -467,7 +567,8 @@ mod tests {
         assert_eq!(reply.exit_code, Some(0));
         assert_eq!(reply.stdout.as_deref(), Some("ran radio-host on host"));
         assert_eq!(reply.profile.as_deref(), Some("host"));
-        assert_eq!(h.ran.lock().unwrap().as_slice(), &[("s-ok".to_string(), "host".to_string())]);
+        assert_eq!(reply.session_id.as_deref(), Some("s-ok-from-macbook-pro"), "the receiver's own session id");
+        assert_eq!(h.ran.lock().unwrap().as_slice(), &[("s-ok-from-macbook-pro".to_string(), "host".to_string())]);
     }
 
     /// Every refusal over real HTTP: immediate, with the reason, and nothing
@@ -481,6 +582,8 @@ mod tests {
             (TOKEN, job("s3", Some("utility")), 403, "utility model"),
             (TOKEN, { let mut j = job("s4", None); j.workdir = Some("/x".into()); j }, 403, "working directory"),
             (TOKEN, { let mut j = job("s5", None); j.target_machine = "mini".into(); j }, 421, "this is studio, not mini"),
+            (TOKEN, { let mut j = job("s6", None); j.role_id = "coder".into(); j }, 403, "not in the allow-list scope: role coder"),
+            (TOKEN, { let mut j = job("s7", None); j.image = Some("evil.example/x".into()); j }, 403, "not in the allow-list scope: image"),
         ];
         for (token, j, want_code, want_reason) in cases {
             let (code, reply) = post(&h, token, j, true);
@@ -534,7 +637,7 @@ mod tests {
         let started = std::time::Instant::now();
         let (code, reply) = post(&h, TOKEN, job("s-second", None), true);
         assert_eq!(code, 503);
-        assert!(reply.reason.unwrap().contains("busy running s-long"));
+        assert!(reply.reason.unwrap().contains("busy running s-long-from-macbook-pro"));
         assert!(started.elapsed() < Duration::from_millis(500), "busy is answered at once, not queued");
         // The slot frees when the first job ends.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -560,13 +663,14 @@ mod tests {
         let state = FleetListenerState {
             receiver: "studio".into(),
             provider: Arc::new(provider),
+            local_node_id: Some("nSTUDIO".into()),
             token: Arc::new(|| Some(TOKEN.to_string())),
             allow_list: Arc::new(move || {
                 r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(allow())
             }),
             resolve_profile: Arc::new(|_, _| ProfileResolution::Work("host".into())),
-            execute: Arc::new(|_, _| panic!("never runs")),
+            execute: Arc::new(|_, _, _| panic!("never runs")),
             busy: Arc::new(Mutex::new(None)),
         };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -590,6 +694,7 @@ mod tests {
     fn a_request_without_a_peer_address_is_refused() {
         let h_state = FleetListenerState {
             receiver: "studio".into(),
+            local_node_id: Some("nSTUDIO".into()),
             provider: Arc::new(StaticIdentityProvider {
                 local: test_node("nSTUDIO", "studio", "100.64.0.2"),
                 peers: vec![laptop()],
@@ -598,7 +703,7 @@ mod tests {
             token: Arc::new(|| Some(TOKEN.to_string())),
             allow_list: Arc::new(|| Ok(allow())),
             resolve_profile: Arc::new(|_, _| ProfileResolution::Work("host".into())),
-            execute: Arc::new(|_, _| panic!("never runs")),
+            execute: Arc::new(|_, _, _| panic!("never runs")),
             busy: Arc::new(Mutex::new(None)),
         };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -612,6 +717,68 @@ mod tests {
             router(h_state).oneshot(req).await.unwrap()
         });
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// (#2916 review M1) Bounded connections: a half-sent request is closed
+    /// once the header deadline passes, connections past the cap are closed
+    /// on accept, and once the slots free a real request is served.
+    #[test]
+    fn half_open_connections_are_bounded_and_timed_out() {
+        use std::io::{Read, Write};
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let addr = std_listener.local_addr().unwrap();
+        let limits = ConnLimits {
+            max_conns: 4,
+            header_read_timeout: Duration::from_millis(800),
+            conn_deadline: Duration::from_secs(30),
+        };
+        let app = Router::new().route("/ok", axum::routing::get(|| async { "ok" }));
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+            rt.block_on(async move {
+                let l = tokio::net::TcpListener::from_std(std_listener).unwrap();
+                let (_tx, rx) = tokio::sync::watch::channel(false);
+                serve_bounded(l, app, limits, rx).await;
+            });
+        });
+        let closed_within = |s: &mut std::net::TcpStream, d: Duration| -> bool {
+            s.set_read_timeout(Some(d)).unwrap();
+            let mut b = [0u8; 256];
+            loop {
+                match s.read(&mut b) {
+                    Ok(0) => return true,
+                    Ok(_) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return true,
+                    Err(_) => return false,
+                }
+            }
+        };
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            let mut s = std::net::TcpStream::connect(addr).unwrap();
+            s.write_all(b"POST /fleet/work HTTP/1.1\r\nHost: x\r\n").unwrap();
+            held.push(s);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        // A fifth connection is past the cap: closed at once.
+        let mut extra = std::net::TcpStream::connect(addr).unwrap();
+        let _ = extra.write_all(b"GET /ok HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(closed_within(&mut extra, Duration::from_millis(500)), "a connection past the cap must be closed on accept");
+        // The half-sent ones are closed by the header deadline.
+        for s in held.iter_mut() {
+            assert!(closed_within(s, Duration::from_secs(3)), "a half-sent request must be closed after the header deadline");
+        }
+        // Slots are free again: a real request is served.
+        std::thread::sleep(Duration::from_millis(100));
+        let body = ureq::get(&format!("http://{addr}/ok")).call().unwrap().into_string().unwrap();
+        assert_eq!(body, "ok");
+    }
+
+    #[test]
+    fn the_open_file_limit_is_raised_never_lowered() {
+        let (old, new) = crate::raise_open_file_limit(1).expect("getrlimit works");
+        assert_eq!(new, old, "a target below the current soft limit changes nothing");
     }
 
     #[test]

@@ -119,6 +119,15 @@ pub struct MachineEntry {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub loopback_intended: bool,
 
+    /// (#2916 review C1) The overlay network's stable id for the node this
+    /// entry's address reached, pinned by `machine add` or on the first
+    /// work submission. Every later submission checks the node at the
+    /// address is still this one before sending the fleet token or the
+    /// prompt, so a changed DNS answer or a LAN impostor gets nothing.
+    /// Cleared when `machine add` changes the address. Never printed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+
     /// Fields this binary does not know, preserved verbatim on rewrite.
     #[serde(flatten)]
     pub extras: BTreeMap<String, serde_json::Value>,
@@ -404,6 +413,8 @@ pub fn add_machine(
     let existing_added_at = existing.map(|m| m.added_unix_ms);
     let existing_uid = existing.and_then(|m| m.machine_uid.clone());
     let existing_extras = existing.map(|m| m.extras.clone()).unwrap_or_default();
+    // A pin belongs to the address it was made for.
+    let existing_node = existing.filter(|m| m.address == address).and_then(|m| m.node_id.clone());
     let entry = MachineEntry {
         id: id.to_string(),
         address: address.to_string(),
@@ -411,10 +422,34 @@ pub fn add_machine(
         added_unix_ms: existing_added_at.unwrap_or(now),
         machine_uid: uid.map(String::from).or(existing_uid),
         loopback_intended: false,
+        node_id: existing_node,
         extras: existing_extras,
     };
     roster.machines.insert(id.to_string(), entry);
     Ok(())
+}
+
+/// (#2916) The roster entry for `name`, compared case-insensitively
+/// (machine names are ASCII case-insensitive); the entry's own key keeps
+/// its case.
+pub fn find_machine<'a>(roster: &'a FleetRoster, name: &str) -> Option<&'a MachineEntry> {
+    roster
+        .machines
+        .get(name)
+        .or_else(|| roster.machines.values().find(|m| m.id.eq_ignore_ascii_case(name)))
+}
+
+/// (#2916 review C1) Resolve a roster address's host to its IP addresses,
+/// bounded like every roster lookup. Empty when it does not resolve.
+pub fn resolve_host_addrs(address: &str) -> Vec<std::net::IpAddr> {
+    let Some(host) = address_host(address) else { return Vec::new() };
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return vec![ip.to_canonical()];
+    }
+    match resolve_with_timeout(&format!("{host}:0")) {
+        Ok(Some(a)) => vec![a.ip().to_canonical()],
+        _ => Vec::new(),
+    }
 }
 
 /// Remove a machine from the roster. Returns the removed entry (so the

@@ -4169,84 +4169,13 @@ fn wait_for_serve_health(port: u16, timeout: std::time::Duration) {
 /// this test fail — the job's `curl` child is never signaled.
 #[test]
 fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
-    // The listener binds only a specific, non-loopback address; use this
-    // machine's own outbound one (a UDP `connect` sends nothing).
-    let lan_ip = std::net::UdpSocket::bind("0.0.0.0:0")
-        .and_then(|s| s.connect("192.0.2.1:9").map(|_| s))
-        .and_then(|s| s.local_addr())
-        .map(|a| a.ip())
-        .ok()
-        .filter(|ip| !ip.is_loopback() && !ip.is_unspecified());
-    let Some(lan_ip) = lan_ip else {
+    let stub = HangingStubServer::start();
+    let Some(daemon) = spawn_fleet_daemon(&hanging_endpoint_profiles_json(stub.port), None) else {
         eprintln!("skipping: this machine has no non-loopback address to bind the fleet listener to");
         return;
     };
-
-    let stub = HangingStubServer::start();
-    let (home, darkmux_home) = isolated_roots();
-
-    let profiles_path = darkmux_home.join("profiles.json");
-    fs::write(&profiles_path, hanging_endpoint_profiles_json(stub.port)).unwrap();
-    let flows_dir = darkmux_home.join("flows");
-    fs::create_dir_all(&flows_dir).unwrap();
-    // The allow-list trusts the fake provider's node for the `hang` profile.
-    fs::write(
-        darkmux_home.join("config.json"),
-        r#"{"fleet":{"accept_work":{"self-test":{"node_id":"nSELFTEST","profiles":["hang"]}}}}"#,
-    )
-    .unwrap();
-    // A fake provider tool: `status` reports this machine at `lan_ip`,
-    // `whois <lan_ip>` names the trusted node.
-    let fake_bin = darkmux_home.join("fake-bin");
-    fs::create_dir_all(&fake_bin).unwrap();
-    let tool = fake_bin.join("tailscale");
-    fs::write(
-        &tool,
-        format!(
-            "#!/bin/sh\ncase \"$1\" in\n  status) echo '{{\"BackendState\":\"Running\",\"Self\":{{\"ID\":\"nSELFTEST\",\"DNSName\":\"studio.tailnet-example.ts.net.\",\"TailscaleIPs\":[\"{lan_ip}\"]}},\"Peer\":{{}}}}' ;;\n  whois) case \"$3\" in {lan_ip}*) echo '{{\"Node\":{{\"StableID\":\"nSELFTEST\",\"Name\":\"studio.tailnet-example.ts.net.\",\"Addresses\":[\"{lan_ip}/32\"]}}}}' ;; *) echo 'peer not found' >&2; exit 1 ;; esac ;;\n  *) exit 2 ;;\nesac\n"
-        ),
-    )
-    .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    let path = format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap_or_default());
-
-    let free_port = || {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("binding an ephemeral port");
-        l.local_addr().unwrap().port()
-    };
-    let serve_port = free_port();
-    let fleet_port = free_port();
-
-    let serve_child_raw = darkmux_std_cmd()
-        .env("HOME", &home)
-        .env("DARKMUX_HOME", &darkmux_home)
-        .env("PATH", &path)
-        .env("DARKMUX_MACHINE_ID", "cli-test-serve-node")
-        .env("DARKMUX_SERVE_TOKEN", "cli-test-fleet-token")
-        .env("DARKMUX_FLEET_LISTENER_ENABLED", "true")
-        .env("DARKMUX_FLEET_LISTENER_PORT", fleet_port.to_string())
-        .env("DARKMUX_PROFILES", &profiles_path)
-        .env("DARKMUX_FLOWS_DIR", &flows_dir)
-        .args(["serve", "--bind", "127.0.0.1", "--port", &serve_port.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawning darkmux serve");
-    // A panicked assertion before this test's own explicit SIGTERM+wait
-    // would otherwise leak a live `darkmux serve` daemon.
-    let mut serve_child = DirectChildGuard(serve_child_raw);
+    let FleetDaemon { child: mut serve_child, serve_port: _, fleet_addr } = daemon;
     let serve_pid = serve_child.id();
-
-    wait_for_serve_health(serve_port, std::time::Duration::from_secs(15));
-    let fleet_addr = std::net::SocketAddr::new(lan_ip, fleet_port);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while std::net::TcpStream::connect_timeout(&fleet_addr, std::time::Duration::from_millis(200)).is_err() {
-        assert!(std::time::Instant::now() < deadline, "the fleet listener never came up on {fleet_addr}");
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
 
     let job = darkmux_fleet::build_work_job(
         "cli-test-serve-node".to_string(),
@@ -4371,6 +4300,146 @@ fn serve_no_longer_takes_work_off_the_redis_queue() {
         !format!("{groups:?}").contains("darkmux-runners"),
         "the daemon created the retired consumer group: {groups:?}"
     );
+}
+
+/// (#2916) A running `darkmux serve` with its fleet listener on, the gate
+/// wired end to end: the fleet token, then a fake `tailscale` tool first on
+/// PATH (its `status` reports this machine at its own non-loopback address,
+/// `whois` of that address names a PEER node, `nPEERTEST`), then the
+/// allow-list (`config.json`) trusting that node for profile `hang` and role
+/// `dialectic-judge`. `nofile` pins the daemon's open-file limit (soft AND
+/// hard) before exec. `None` when the machine has no non-loopback address.
+struct FleetDaemon {
+    child: DirectChildGuard,
+    serve_port: u16,
+    fleet_addr: std::net::SocketAddr,
+}
+
+fn spawn_fleet_daemon(profiles_json: &str, nofile: Option<u64>) -> Option<FleetDaemon> {
+    // A UDP `connect` sends nothing; it only picks the outbound address.
+    let lan_ip = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| s.connect("192.0.2.1:9").map(|_| s))
+        .and_then(|s| s.local_addr())
+        .map(|a| a.ip())
+        .ok()
+        .filter(|ip| !ip.is_loopback() && !ip.is_unspecified())?;
+    let (home, darkmux_home) = isolated_roots();
+    let profiles_path = darkmux_home.join("profiles.json");
+    fs::write(&profiles_path, profiles_json).unwrap();
+    let flows_dir = darkmux_home.join("flows");
+    fs::create_dir_all(&flows_dir).unwrap();
+    fs::write(
+        darkmux_home.join("config.json"),
+        r#"{"fleet":{"accept_work":{"peer-test":{"node_id":"nPEERTEST","profiles":["hang"],"roles":["dialectic-judge"]}}}}"#,
+    )
+    .unwrap();
+    let fake_bin = darkmux_home.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let tool = fake_bin.join("tailscale");
+    fs::write(
+        &tool,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n  status) echo '{{\"BackendState\":\"Running\",\"Self\":{{\"ID\":\"nSELFTEST\",\"DNSName\":\"studio.tailnet-example.ts.net.\",\"TailscaleIPs\":[\"{lan_ip}\"]}},\"Peer\":{{}}}}' ;;\n  whois) case \"$3\" in {lan_ip}*) echo '{{\"Node\":{{\"StableID\":\"nPEERTEST\",\"Name\":\"peer.tailnet-example.ts.net.\",\"Addresses\":[\"{lan_ip}/32\"]}}}}' ;; *) echo 'peer not found' >&2; exit 1 ;; esac ;;\n  *) exit 2 ;;\nesac\n"
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}:{}",
+        fake_bin.display(),
+        docker_shim_dir().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let free_port = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("binding an ephemeral port");
+        l.local_addr().unwrap().port()
+    };
+    let serve_port = free_port();
+    let fleet_port = free_port();
+    let mut cmd = darkmux_std_cmd();
+    cmd.env("HOME", &home)
+        .env("DARKMUX_HOME", &darkmux_home)
+        .env("PATH", &path)
+        .env("DARKMUX_MACHINE_ID", "cli-test-serve-node")
+        .env("DARKMUX_SERVE_TOKEN", "cli-test-fleet-token")
+        .env("DARKMUX_FLEET_LISTENER_ENABLED", "true")
+        .env("DARKMUX_FLEET_LISTENER_PORT", fleet_port.to_string())
+        .env("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "0")
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_FLOWS_DIR", &flows_dir)
+        .args(["serve", "--bind", "127.0.0.1", "--port", &serve_port.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(n) = nofile {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: only async-signal-safe setrlimit between fork and exec.
+        unsafe {
+            cmd.pre_exec(move || {
+                let lim = libc::rlimit { rlim_cur: n as libc::rlim_t, rlim_max: n as libc::rlim_t };
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let child = DirectChildGuard(cmd.spawn().expect("spawning darkmux serve"));
+    wait_for_serve_health(serve_port, std::time::Duration::from_secs(15));
+    let fleet_addr = std::net::SocketAddr::new(lan_ip, fleet_port);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::net::TcpStream::connect_timeout(&fleet_addr, std::time::Duration::from_millis(200)).is_err() {
+        assert!(std::time::Instant::now() < deadline, "the fleet listener never came up on {fleet_addr}");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Some(FleetDaemon { child, serve_port, fleet_addr })
+}
+
+/// (#2916 review M1) A tokenless peer flooding the fleet listener with
+/// half-sent requests must not take the daemon down: under an open-file
+/// limit of 256 (launchd's default; pinned soft AND hard so the daemon
+/// cannot raise it), 300 half-open connections leave the VIEWER port
+/// answering `/health`, and the listener closes a half-sent request once
+/// its header deadline passes.
+#[test]
+fn a_flooded_fleet_listener_leaves_the_viewer_answering() {
+    use std::io::{Read, Write};
+    let Some(daemon) = spawn_fleet_daemon(&hanging_endpoint_profiles_json(1), Some(256)) else {
+        eprintln!("skipping: this machine has no non-loopback address to bind the fleet listener to");
+        return;
+    };
+    let mut held = Vec::new();
+    for _ in 0..300 {
+        match std::net::TcpStream::connect_timeout(&daemon.fleet_addr, std::time::Duration::from_millis(500)) {
+            Ok(mut s) => {
+                let _ = s.write_all(b"POST /fleet/work HTTP/1.1\r\nHost: x\r\n");
+                held.push(s);
+            }
+            Err(_) => break,
+        }
+    }
+    // The viewer still answers while the flood is held open.
+    let health = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .get(&format!("http://127.0.0.1:{}/health", daemon.serve_port))
+        .call();
+    assert!(health.is_ok(), "the viewer's /health stopped answering under a listener flood: {health:?}");
+    // The first half-sent connection (holding a slot) is closed by the
+    // header deadline (10s in production), not held forever.
+    let first = &mut held[0];
+    first.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+    let mut b = [0u8; 64];
+    let closed = match first.read(&mut b) {
+        Ok(0) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::ConnectionReset,
+        Ok(_) => false,
+    };
+    assert!(closed, "a half-sent request was not closed by the header deadline");
+    drop(held);
+    drop(daemon);
 }
 
 /// Best-effort cleanup for a `Child` this test spawned and holds

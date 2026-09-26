@@ -1022,9 +1022,21 @@ pub struct AcceptWorkEntry {
     /// may run here. A profile outside this list is refused, and so is a
     /// profile that resolves only to the machine's utility model.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub profiles: Option<Vec<String>>,
-    /// Whether the peer may name a working directory on this machine
-    /// (#755, the workspace handoff). `false` or absent: a job carrying a
-    /// `workdir` is refused.
+    /// The roles (this machine's role ids) the peer may dispatch here. An
+    /// explicit list, and absent or empty means NONE: a role is a tool
+    /// palette and a system prompt, so granting "any role" would grant every
+    /// tool palette this machine has.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub roles: Option<Vec<String>>,
+    /// Docker images the peer may name with `--image`, matched exactly. A
+    /// job naming no image runs on darkmux's own pinned runtime image and is
+    /// always allowed; any other image (a custom one, or a pull from an
+    /// arbitrary registry) must be listed. Absent = none.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub images: Option<Vec<String>>,
+    /// Whether the peer may name a working directory on this machine.
+    /// `true` lets a job mount any directory under this machine's darkmux
+    /// worktrees base READ-WRITE as its workspace (symlinks resolved; nothing
+    /// outside the base). `false` or absent: a job carrying a `workdir` is
+    /// refused. The workspace handoff (#755) builds on this.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub workspace: Option<bool>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }

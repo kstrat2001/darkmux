@@ -57,6 +57,36 @@ pub(crate) fn cmd_machine_add(
     })?;
     let verb = if was_present { "updated" } else { "added" };
     println!("machine: {verb} {id} (address={address})");
+    // (#2916 review C1) Pin the node at the address, so work submission can
+    // check it before sending the fleet token; warn when the address is not
+    // a node on the overlay at all.
+    if !loopback_intended {
+        let pin = match fleet::configured_provider() {
+            Ok(p) => pin_address(p.as_ref(), address),
+            Err(e) => PinOutcome::Unverified(format!("{e:#}")),
+        };
+        match pin {
+            PinOutcome::Pinned { node_id, shown } => {
+                fleet::mutate_roster(|r| {
+                    if let Some(e) = r.machines.get_mut(id) {
+                        e.node_id = Some(node_id.clone());
+                    }
+                    Ok(())
+                })?;
+                println!("  pinned to the network node `{shown}`; work sent to {id} checks it every time");
+            }
+            PinOutcome::NotANode => eprintln!(
+                "{}",
+                darkmux_types::style::warn(&format!(
+                    "machine: `{address}` is not a node on the tailnet. Fleet work refuses to go there \
+                     (the fleet token would cross a network nobody vouches for); use {id}'s tailnet DNS name."
+                ))
+            ),
+            PinOutcome::Unverified(why) => println!(
+                "  not pinned yet ({why}); the first work sent to {id} pins its node"
+            ),
+        }
+    }
     if let Some(d) = description {
         println!("  description: {d}");
     }
@@ -66,6 +96,26 @@ pub(crate) fn cmd_machine_add(
     }
     println!("  roster: {}", fleet::roster_path().display());
     Ok(0)
+}
+
+/// (#2916 review C1) What `machine add` learned about the node at an
+/// address.
+#[derive(Debug, PartialEq, Eq)]
+enum PinOutcome {
+    Pinned { node_id: String, shown: String },
+    NotANode,
+    Unverified(String),
+}
+
+fn pin_address(provider: &dyn fleet::IdentityProvider, address: &str) -> PinOutcome {
+    let Some(ip) = fleet::resolve_host_addrs(address).first().copied() else {
+        return PinOutcome::Unverified("the address does not resolve from here".into());
+    };
+    match provider.identify(ip) {
+        Ok(Some(n)) => PinOutcome::Pinned { shown: n.dns_name.clone().unwrap_or(n.name.clone()), node_id: n.node_id },
+        Ok(None) => PinOutcome::NotANode,
+        Err(e) => PinOutcome::Unverified(format!("{} could not answer: {e:#}", provider.provider_name())),
+    }
 }
 
 /// (#2924) The refusal `machine add` prints for a loopback address, or `None`
@@ -853,51 +903,110 @@ fn resolve_trust_node(
     )
 }
 
-/// The pure-ish core of `machine trust`: resolve the node, check the
-/// profiles, write `fleet.accept_work.<name>` into the config.json at
-/// `config_path`. Returns the confirmation text. Touches nothing but that
-/// one key.
-#[allow(clippy::too_many_arguments)]
+/// What `machine trust` was asked to grant.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TrustRequest<'a> {
+    pub name: &'a str,
+    pub node_hint: Option<&'a str>,
+    pub profiles: &'a [String],
+    pub roles: &'a [String],
+    pub images: Option<&'a [String]>,
+    pub workspace: Option<bool>,
+}
+
+/// The allow-list key already naming `name` (machine names are ASCII
+/// case-insensitive), else `name` itself.
+fn existing_key(root: &serde_json::Value, name: &str) -> String {
+    root.get("fleet")
+        .and_then(|f| f.get("accept_work"))
+        .and_then(|a| a.as_object())
+        .and_then(|a| a.keys().find(|k| k.eq_ignore_ascii_case(name)).cloned())
+        .unwrap_or_else(|| name.to_string())
+}
+
+fn string_list(v: Option<&serde_json::Value>) -> Option<Vec<String>> {
+    v.and_then(|p| serde_json::from_value::<Vec<String>>(p.clone()).ok()).filter(|p| !p.is_empty())
+}
+
+fn clean_list(v: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for x in v.iter().map(|p| p.trim()).filter(|p| !p.is_empty()) {
+        if !out.iter().any(|o| o == x) {
+            out.push(x.to_string());
+        }
+    }
+    out
+}
+
+/// The pure-ish core of `machine trust`: resolve the node, check the scope,
+/// write `fleet.accept_work.<name>` into the config.json at `config_path`.
+/// Returns the confirmation text. Touches nothing but that one key.
+/// `known_roles` is this machine's role library as (id, is_utility).
 pub(crate) fn trust_at(
     config_path: &std::path::Path,
-    name: &str,
-    node_hint: Option<&str>,
-    profiles: &[String],
-    workspace: Option<bool>,
+    req: &TrustRequest<'_>,
     provider: &dyn fleet::IdentityProvider,
     registry: &darkmux_types::ProfileRegistry,
+    known_roles: &[(String, bool)],
     roster_host: Option<&str>,
 ) -> Result<String> {
-    fleet::validate_identifier("machine name", name)?;
+    fleet::validate_machine_name("machine name", req.name)?;
     let mut root = crate::config_cmd::load_object(config_path)?;
-    let existing = root
-        .get("fleet")
-        .and_then(|f| f.get("accept_work"))
-        .and_then(|a| a.get(name))
-        .cloned();
-    let profiles: Vec<String> = if profiles.is_empty() {
-        existing
-            .as_ref()
-            .and_then(|e| e.get("profiles"))
-            .and_then(|p| serde_json::from_value::<Vec<String>>(p.clone()).ok())
-            .filter(|p| !p.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "name the profiles `{name}` may run on this machine: `darkmux machine trust {name} \
-                     --profiles <profile>[,<profile>...]` (`darkmux profile list` shows them)"
-                )
-            })?
-    } else {
-        let mut v: Vec<String> = profiles.iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect();
-        v.dedup();
-        v
+    let key = existing_key(&root, req.name);
+    let existing = root.get("fleet").and_then(|f| f.get("accept_work")).and_then(|a| a.get(&key)).cloned();
+    let name = key.as_str();
+    let from_existing = |field: &str| string_list(existing.as_ref().and_then(|e| e.get(field)));
+    let profiles = if req.profiles.is_empty() { from_existing("profiles") } else { Some(clean_list(req.profiles)) }
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "name the profiles `{name}` may run on this machine: `darkmux machine trust {name} \
+                 --profiles <profile>[,...] --roles <role>[,...]` (`darkmux profile list` shows them)"
+            )
+        })?;
+    let roles = if req.roles.is_empty() { from_existing("roles") } else { Some(clean_list(req.roles)) }
+        .filter(|r| !r.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "name the roles `{name}` may dispatch on this machine: `--roles <role>[,...]` \
+                 (`darkmux role list` shows them). There is no \"any role\": a role is a tool palette."
+            )
+        })?;
+    let images = match req.images {
+        Some(i) => clean_list(i),
+        None => from_existing("images").unwrap_or_default(),
     };
-    let problems: Vec<String> = profiles.iter().filter_map(|p| grantable_profile(registry, p).err()).collect();
+    let mut problems: Vec<String> = profiles.iter().filter_map(|p| grantable_profile(registry, p).err()).collect();
+    for r in &roles {
+        match known_roles.iter().find(|(id, _)| id == r) {
+            None => problems.push(format!("role `{r}` is not defined on this machine")),
+            Some((_, true)) => problems.push(format!(
+                "role `{r}` is a utility role; utility work is never taken from another machine (#2914)"
+            )),
+            Some(_) => {}
+        }
+    }
+    for i in &images {
+        if let Err(e) = fleet::validate_image_ref(i) {
+            problems.push(format!("image `{i}`: {e:#}"));
+        }
+    }
     if !problems.is_empty() {
         anyhow::bail!("not trusting `{name}`: {}", problems.join("; "));
     }
-    let node = resolve_trust_node(provider, name, node_hint, roster_host)?;
-    let workspace = workspace
+    let node = resolve_trust_node(provider, name, req.node_hint, roster_host)?;
+    // A machine never trusts its own node: it would let a local process
+    // pass as a peer (#2916 review C4).
+    if let Ok(me) = provider.local_node() {
+        if me.node_id == node.node_id {
+            anyhow::bail!(
+                "`{}` is THIS machine's own node; a machine does not take fleet work from itself",
+                node.dns_name.as_deref().unwrap_or(&node.name)
+            );
+        }
+    }
+    let workspace = req
+        .workspace
         .or_else(|| existing.as_ref().and_then(|e| e.get("workspace")).and_then(|w| w.as_bool()))
         .unwrap_or(false);
 
@@ -905,6 +1014,12 @@ pub(crate) fn trust_at(
     let mut entry = existing.and_then(|e| e.as_object().cloned()).unwrap_or_default();
     entry.insert("node_id".into(), serde_json::Value::String(node.node_id.clone()));
     entry.insert("profiles".into(), serde_json::json!(profiles));
+    entry.insert("roles".into(), serde_json::json!(roles));
+    if images.is_empty() {
+        entry.remove("images");
+    } else {
+        entry.insert("images".into(), serde_json::json!(images));
+    }
     entry.insert("workspace".into(), serde_json::Value::Bool(workspace));
     {
         let obj = root.as_object_mut().expect("load_object returns an object");
@@ -922,14 +1037,26 @@ pub(crate) fn trust_at(
         .map_err(|e| anyhow::anyhow!("the resulting config.json would not parse ({e}); nothing written"))?;
     std::fs::write(config_path, serde_json::to_string_pretty(&root)? + "\n")
         .map_err(|e| anyhow::anyhow!("writing {}: {e}", config_path.display()))?;
+    let state = match node.online {
+        Some(true) => "online",
+        Some(false) => "offline",
+        None => "online state unknown",
+    };
     Ok(format!(
-        "machine: this machine now accepts work from `{name}` (the {} node `{}`)\n  \
-         may run: {}\n  workspace: {}\n  \
+        "machine: this machine now accepts work from `{name}`: the {} node `{}` ({state}; owner: {})\n  \
+         may run profiles: {}\n  roles: {}\n  images: {}\n  workspace: {}\n  \
          written to {} (fleet.accept_work.{name}); the daemon reads it per request, no restart",
         provider.provider_name(),
         node.dns_name.as_deref().unwrap_or(&node.name),
+        node.owner.as_deref().unwrap_or("not reported"),
         profiles.join(", "),
-        if workspace { "yes" } else { "no" },
+        roles.join(", "),
+        if images.is_empty() { "darkmux's own runtime only".to_string() } else { images.join(", ") },
+        if workspace {
+            "yes (may mount any directory under this machine's worktrees base read-write)"
+        } else {
+            "no"
+        },
         config_path.display(),
     ))
 }
@@ -938,11 +1065,12 @@ pub(crate) fn trust_at(
 /// nothing else. `Ok(false)` when there was no such entry.
 pub(crate) fn untrust_at(config_path: &std::path::Path, name: &str) -> Result<bool> {
     let mut root = crate::config_cmd::load_object(config_path)?;
+    let key = existing_key(&root, name);
     let removed = root
         .get_mut("fleet")
         .and_then(|f| f.get_mut("accept_work"))
         .and_then(|a| a.as_object_mut())
-        .and_then(|a| a.remove(name))
+        .and_then(|a| a.remove(&key))
         .is_some();
     if removed {
         std::fs::write(config_path, serde_json::to_string_pretty(&root)? + "\n")
@@ -994,6 +1122,14 @@ pub(crate) fn fleet_submission_doctor_checks() -> Vec<crate::doctor::Check> {
         None
     };
     let registry = darkmux_profiles::profiles::load_registry(None).ok().map(|l| l.registry);
+    let known_roles: Option<Vec<(String, bool)>> = crate::crew::loader::load_roles().ok().map(|rs| {
+        rs.into_iter()
+            .map(|r| {
+                let utility = !r.is_specialist();
+                (r.id, utility)
+            })
+            .collect()
+    });
     let trusted = fleet::read_user_allow_list().map(|allow| {
         allow
             .into_iter()
@@ -1003,10 +1139,20 @@ pub(crate) fn fleet_submission_doctor_checks() -> Vec<crate::doctor::Check> {
                     .as_deref()
                     .and_then(|id| nodes.as_ref().and_then(|ns| ns.iter().find(|n| n.node_id == id)));
                 let profiles = e.profiles.clone().unwrap_or_default();
-                let profile_problems = match &registry {
+                let roles = e.roles.clone().unwrap_or_default();
+                let mut profile_problems: Vec<String> = match &registry {
                     Some(r) => profiles.iter().filter_map(|p| grantable_profile(r, p).err()).collect(),
                     None => vec!["this machine's profile registry could not be read".to_string()],
                 };
+                if let Some(known) = &known_roles {
+                    for r in &roles {
+                        match known.iter().find(|(id, _)| id == r) {
+                            None => profile_problems.push(format!("role `{r}` is not defined here")),
+                            Some((_, true)) => profile_problems.push(format!("role `{r}` is a utility role")),
+                            Some(_) => {}
+                        }
+                    }
+                }
                 TrustView {
                     name,
                     has_node_id: node_id.is_some(),
@@ -1015,12 +1161,15 @@ pub(crate) fn fleet_submission_doctor_checks() -> Vec<crate::doctor::Check> {
                     // Only claim "gone" when the provider actually listed nodes.
                     node_on_network: nodes.is_none() || node.is_some(),
                     profiles,
+                    roles,
+                    images: e.images.clone().unwrap_or_default(),
                     profile_problems,
                     workspace: e.workspace.unwrap_or(false),
                 }
             })
             .collect()
     });
+    let retired = retired_queue_streams();
     let facts = FleetSubmissionFacts {
         listener_enabled,
         port,
@@ -1028,19 +1177,43 @@ pub(crate) fn fleet_submission_doctor_checks() -> Vec<crate::doctor::Check> {
         provider: provider_report,
         listener_bound,
         trusted,
-        retired_streams: retired_queue_streams(),
+        retired_streams: retired.0,
+        queue_consumers: retired.1,
+        daemon_listener_state: if listener_enabled && listener_bound != Some(true) {
+            daemon_listener_state()
+        } else {
+            None
+        },
     };
     crate::doctor::fleet_submission_checks(&facts)
 }
 
+/// (#2916 review C8) What the local daemon says about its fleet listener
+/// (`/health`'s `fleet_listener`), when it answers within 500 ms.
+fn daemon_listener_state() -> Option<String> {
+    let port = darkmux_types::config_access::serve_port();
+    let v: serde_json::Value = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+        .get(&format!("http://127.0.0.1:{port}/health"))
+        .call()
+        .ok()?
+        .into_string()
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())?;
+    v.get("fleet_listener").and_then(|s| s.as_str()).map(str::to_string)
+}
+
 /// The retired work-queue streams (`darkmux:work`, `darkmux:work:<tier>`)
-/// still in Redis, when Redis is configured and answers within the usual
-/// bounded connect. Empty otherwise: this row only ever adds a cleanup hint.
-fn retired_queue_streams() -> Vec<String> {
-    let Some(url) = darkmux_flow::redis_url() else { return Vec::new() };
-    let Ok(client) = redis::Client::open(url.expose_for_probe()) else { return Vec::new() };
+/// still in Redis, and the consumers still registered on them (name, idle
+/// ms), when Redis is configured and answers within the usual bounded
+/// connect. Empty otherwise: these rows only ever add a cleanup hint or
+/// name a 3.x daemon still claiming queue work (#2916 review C6).
+fn retired_queue_streams() -> (Vec<String>, Vec<(String, u64)>) {
+    let Some(url) = darkmux_flow::redis_url() else { return (Vec::new(), Vec::new()) };
+    let Ok(client) = redis::Client::open(url.expose_for_probe()) else { return (Vec::new(), Vec::new()) };
     let Ok(mut conn) = darkmux_flow::open_redis_connection_bounded(&client, darkmux_flow::REDIS_CONNECT_TIMEOUT) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     darkmux_flow::bound_redis_response(&conn);
     let mut found = Vec::new();
@@ -1064,7 +1237,30 @@ fn retired_queue_streams() -> Vec<String> {
     }
     found.sort();
     found.dedup();
-    found
+    let mut consumers = Vec::new();
+    for stream in &found {
+        let groups: Vec<std::collections::HashMap<String, redis::Value>> =
+            redis::cmd("XINFO").arg("GROUPS").arg(stream).query(&mut conn).unwrap_or_default();
+        for g in groups {
+            let Some(group) = g.get("name").and_then(|v| redis::from_redis_value::<String>(v).ok()) else {
+                continue;
+            };
+            let cs: Vec<std::collections::HashMap<String, redis::Value>> = redis::cmd("XINFO")
+                .arg("CONSUMERS")
+                .arg(stream)
+                .arg(&group)
+                .query(&mut conn)
+                .unwrap_or_default();
+            for c in cs {
+                let name = c.get("name").and_then(|v| redis::from_redis_value::<String>(v).ok());
+                let idle = c.get("idle").and_then(|v| redis::from_redis_value::<u64>(v).ok());
+                if let (Some(n), Some(i)) = (name, idle) {
+                    consumers.push((n, i));
+                }
+            }
+        }
+    }
+    (found, consumers)
 }
 
 /// `darkmux machine trust <name>` (#2916).
@@ -1072,21 +1268,29 @@ pub(crate) fn cmd_machine_trust(
     name: &str,
     node: Option<&str>,
     profiles: &[String],
+    roles: &[String],
+    images: Option<&[String]>,
     workspace: Option<bool>,
 ) -> Result<i32> {
     let provider = fleet::configured_provider()?;
     let loaded = darkmux_profiles::profiles::load_registry(None)?;
+    let known_roles: Vec<(String, bool)> = crate::crew::loader::load_roles()?
+        .into_iter()
+        .map(|r| {
+            let utility = !r.is_specialist();
+            (r.id, utility)
+        })
+        .collect();
     let roster_host = fleet::load_roster()
         .ok()
-        .and_then(|r| r.machines.get(name).and_then(|e| fleet::address_host(&e.address)));
+        .and_then(|r| fleet::find_machine(&r, name).and_then(|e| fleet::address_host(&e.address)));
+    let req = TrustRequest { name, node_hint: node, profiles, roles, images, workspace };
     let msg = trust_at(
         &user_config_path(),
-        name,
-        node,
-        profiles,
-        workspace,
+        &req,
         provider.as_ref(),
         &loaded.registry,
+        &known_roles,
         roster_host.as_deref(),
     )?;
     println!("{msg}");
@@ -1864,6 +2068,37 @@ mod trust_tests {
         .unwrap()
     }
 
+    fn roles() -> Vec<(String, bool)> {
+        vec![("radio-host".into(), false), ("coder".into(), false), ("radio-router".into(), true)]
+    }
+
+    #[test]
+    fn machine_add_pins_an_overlay_node_and_flags_a_lan_address() {
+        assert_eq!(
+            pin_address(&provider(), "100.64.0.7:8765"),
+            PinOutcome::Pinned { node_id: "nLAPTOP".into(), shown: "laptop.tailnet-example.ts.net".into() }
+        );
+        assert_eq!(pin_address(&provider(), "192.168.1.20"), PinOutcome::NotANode);
+        let mut down = provider();
+        down.down = Some("x".into());
+        assert!(matches!(pin_address(&down, "100.64.0.7"), PinOutcome::Unverified(_)));
+    }
+
+    /// `trust_at` with the common test scope: role `radio-host`, no images.
+    fn ta(
+        p: &std::path::Path,
+        name: &str,
+        node: Option<&str>,
+        profiles: &[String],
+        workspace: Option<bool>,
+        provider: &dyn fleet::IdentityProvider,
+        roster_host: Option<&str>,
+    ) -> Result<String> {
+        let roles_arg = vec!["radio-host".to_string()];
+        let req = TrustRequest { name, node_hint: node, profiles, roles: &roles_arg, images: None, workspace };
+        trust_at(p, &req, provider, &registry(), &roles(), roster_host)
+    }
+
     fn cfg(dir: &tempfile::TempDir, body: &str) -> std::path::PathBuf {
         let p = dir.path().join("config.json");
         std::fs::write(&p, body).unwrap();
@@ -1882,7 +2117,7 @@ mod trust_tests {
         let before: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
         // The roster names the laptop `laptop` at its tailnet DNS name; the
         // node is found by that host, never typed.
-        let out = trust_at(&p, "workbook", None, &["host".into()], None, &provider(), &registry(), Some("laptop.tailnet-example.ts.net")).unwrap();
+        let out = ta(&p, "workbook", None, &["host".into()], None, &provider(), Some("laptop.tailnet-example.ts.net")).unwrap();
         assert!(out.contains("accepts work from `workbook`"), "{out}");
         assert!(!out.contains("nLAPTOP"), "the node id is never printed: {out}");
         let e = entry(&p, "workbook");
@@ -1899,24 +2134,66 @@ mod trust_tests {
     fn trust_refuses_utility_and_unknown_profiles_and_requires_a_scope() {
         let d = tempfile::TempDir::new().unwrap();
         let p = cfg(&d, "{}");
-        let err = trust_at(&p, "laptop", None, &["utility".into()], None, &provider(), &registry(), None).unwrap_err();
+        let err = ta(&p, "laptop", None, &["utility".into()], None, &provider(), None).unwrap_err();
         assert!(err.to_string().contains("utility model"), "{err}");
-        let err = trust_at(&p, "laptop", None, &["nope".into()], None, &provider(), &registry(), None).unwrap_err();
+        let err = ta(&p, "laptop", None, &["nope".into()], None, &provider(), None).unwrap_err();
         assert!(err.to_string().contains("not defined"), "{err}");
-        let err = trust_at(&p, "laptop", None, &[], None, &provider(), &registry(), None).unwrap_err();
+        let err = ta(&p, "laptop", None, &[], None, &provider(), None).unwrap_err();
         assert!(err.to_string().contains("name the profiles"), "{err}");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "{}", "a refused trust writes nothing");
+    }
+
+    /// (#2916 review C4/C5/M2) Self is refused; the OS host name never
+    /// resolves a node; utility and unknown roles are refused; the
+    /// confirmation shows online state and owner; names are
+    /// case-insensitive; images are validated and listed.
+    #[test]
+    fn trust_refuses_self_utility_roles_and_host_names_and_shows_owner() {
+        let d = tempfile::TempDir::new().unwrap();
+        let p = cfg(&d, "{}");
+        let err = ta(&p, "studio", None, &["host".into()], None, &provider(), None).unwrap_err();
+        assert!(err.to_string().contains("THIS machine's own node"), "{err}");
+        let mut hostnamed = provider();
+        hostnamed.peers[0].host_name = Some("Evil Host".into());
+        let err = ta(&p, "evil", Some("Evil Host"), &["host".into()], None, &hostnamed, None).unwrap_err();
+        assert!(err.to_string().contains("no node"), "the OS host name must not resolve a node: {err}");
+        let profiles = vec!["host".to_string()];
+        for (r, want) in [("radio-router", "utility role"), ("nope", "not defined")] {
+            let roles_arg = vec![r.to_string()];
+            let req = TrustRequest { name: "laptop", profiles: &profiles, roles: &roles_arg, ..Default::default() };
+            let err = trust_at(&p, &req, &provider(), &registry(), &roles(), None).unwrap_err();
+            assert!(err.to_string().contains(want), "{err}");
+        }
+        let no_roles: Vec<String> = vec![];
+        let req = TrustRequest { name: "laptop", profiles: &profiles, roles: &no_roles, ..Default::default() };
+        let err = trust_at(&p, &req, &provider(), &registry(), &roles(), None).unwrap_err();
+        assert!(err.to_string().contains("name the roles"), "{err}");
+        let coder = vec!["coder".to_string()];
+        let bad_images = vec!["-v /:/x".to_string()];
+        let req = TrustRequest { name: "laptop", profiles: &profiles, roles: &coder, images: Some(&bad_images), ..Default::default() };
+        assert!(trust_at(&p, &req, &provider(), &registry(), &roles(), None).is_err(), "an invalid image reference is refused");
+        let images = vec!["rust:slim".to_string()];
+        let req = TrustRequest { name: "laptop", profiles: &profiles, roles: &coder, images: Some(&images), ..Default::default() };
+        let out = trust_at(&p, &req, &provider(), &registry(), &roles(), None).unwrap();
+        assert!(out.contains("(online; owner: operator)"), "{out}");
+        assert!(out.contains("roles: coder") && out.contains("images: rust:slim"), "{out}");
+        assert_eq!(entry(&p, "laptop")["images"], serde_json::json!(["rust:slim"]));
+        // Re-trust by another spelling updates the same entry.
+        ta(&p, "LAPTOP", Some("laptop"), &["coder-studio".into()], None, &provider(), None).unwrap();
+        assert_eq!(entry(&p, "laptop")["profiles"], serde_json::json!(["coder-studio"]));
+        assert!(entry(&p, "LAPTOP").is_null());
+        assert!(untrust_at(&p, "Laptop").unwrap(), "untrust is case-insensitive too");
     }
 
     #[test]
     fn trust_refuses_a_name_the_network_does_not_know_and_names_what_it_does() {
         let d = tempfile::TempDir::new().unwrap();
         let p = cfg(&d, "{}");
-        let err = trust_at(&p, "ghost", None, &["host".into()], None, &provider(), &registry(), None).unwrap_err();
+        let err = ta(&p, "ghost", None, &["host".into()], None, &provider(), None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("no node") && msg.contains("laptop") && msg.contains("peer"), "{msg}");
         // --node overrides the name.
-        trust_at(&p, "ghost", Some("peer"), &["host".into()], None, &provider(), &registry(), None).unwrap();
+        ta(&p, "ghost", Some("peer"), &["host".into()], None, &provider(), None).unwrap();
         assert_eq!(entry(&p, "ghost")["node_id"], "nPHONE");
     }
 
@@ -1926,7 +2203,7 @@ mod trust_tests {
         let p = cfg(&d, "{}");
         let mut down = provider();
         down.down = Some("daemon not running".into());
-        let err = trust_at(&p, "laptop", None, &["host".into()], None, &down, &registry(), None).unwrap_err();
+        let err = ta(&p, "laptop", None, &["host".into()], None, &down, None).unwrap_err();
         assert!(err.to_string().contains("could not list"), "{err}");
     }
 
@@ -1934,9 +2211,9 @@ mod trust_tests {
     fn retrust_keeps_the_scope_unless_given_and_untrust_removes_only_that_entry() {
         let d = tempfile::TempDir::new().unwrap();
         let p = cfg(&d, "{}");
-        trust_at(&p, "laptop", None, &["host".into(), "coder-studio".into()], Some(true), &provider(), &registry(), None).unwrap();
-        trust_at(&p, "peer", None, &["host".into()], None, &provider(), &registry(), None).unwrap();
-        trust_at(&p, "laptop", None, &[], None, &provider(), &registry(), None).unwrap();
+        ta(&p, "laptop", None, &["host".into(), "coder-studio".into()], Some(true), &provider(), None).unwrap();
+        ta(&p, "peer", None, &["host".into()], None, &provider(), None).unwrap();
+        ta(&p, "laptop", None, &[], None, &provider(), None).unwrap();
         let e = entry(&p, "laptop");
         assert_eq!(e["profiles"], serde_json::json!(["host", "coder-studio"]));
         assert_eq!(e["workspace"], true);
@@ -1969,7 +2246,7 @@ mod trust_tests {
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(
             home.join("config.json"),
-            r#"{"fleet":{"accept_work":{"workbook":{"node_id":"nLAPTOP","profiles":["host","nope"]},"gone":{"node_id":"nGONE","profiles":["host"]}}}}"#,
+            r#"{"fleet":{"accept_work":{"workbook":{"node_id":"nLAPTOP","profiles":["host","nope"],"roles":["radio-host"]},"gone":{"node_id":"nGONE","profiles":["host"]}}}}"#,
         )
         .unwrap();
         let profiles = d.path().join("profiles.json");
@@ -1999,7 +2276,7 @@ mod trust_tests {
         assert!(find("fleet listener").message.starts_with("off"), "{rows:?}");
         let t = find("fleet trust");
         assert_eq!(t.status, crate::doctor::Status::Warn);
-        assert!(t.message.contains("workbook may run host, nope (workspace: no)"), "{}", t.message);
+        assert!(t.message.contains("workbook may run host, nope (roles: radio-host; images: runtime only; workspace: no)"), "{}", t.message);
         assert!(t.message.contains("node `laptop`, online"), "{}", t.message);
         assert!(t.message.contains("`nope` is not defined"), "{}", t.message);
         assert!(t.message.contains("gone may run host") && t.message.contains("no longer on the network"), "{}", t.message);

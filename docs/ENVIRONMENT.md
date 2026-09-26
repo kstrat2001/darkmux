@@ -157,7 +157,7 @@ A rejected citation (a wrong line number, an unresolvable path, a budget already
 | `DARKMUX_MACHINE_ID` | `machine_id` |
 | `DARKMUX_FLEET_MODE` | `fleet.mode` |
 | `DARKMUX_FLEET_LISTENER_ENABLED` / `DARKMUX_FLEET_LISTENER_PORT` | `fleet.listener.enabled` / `fleet.listener.port` |
-| *(no env var, on purpose)* | `fleet.identity.provider` (`"tailscale"`), `fleet.identity.bin` (the provider's tool when it is not on the daemon's `PATH`), `fleet.accept_work.<machine>` (`node_id` / `profiles` / `workspace`, written only by `darkmux machine trust` / `untrust`). Which network vouches for a caller, and who is trusted, are security-bearing and have no per-shell override (#2916). |
+| *(no env var, on purpose)* | `fleet.identity.provider` (`"tailscale"`), `fleet.identity.bin` (the provider's tool when it is not on the daemon's `PATH`), `fleet.accept_work.<machine>` (`node_id` / `profiles` / `roles` / `images` / `workspace`, written only by `darkmux machine trust` / `untrust`). Which network vouches for a caller, and who is trusted, are security-bearing and have no per-shell override (#2916). |
 | `DARKMUX_LMS_BIN` / `DARKMUX_LMSTUDIO_URL` | `lms_bin` / `lmstudio_url` (base URL; callers append `/v1/...`) |
 | `DARKMUX_FLOWS_DIR` / `DARKMUX_CREW_DIR` / … | `dirs.flows` / `dirs.crew` / … |
 | `DARKMUX_FINDINGS_DIR` | `dirs.findings` |

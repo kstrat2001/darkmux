@@ -453,6 +453,7 @@ pub(crate) fn phase_review_output_at(
     let dispatch_opts = crate::crew::dispatch::DispatchOpts {
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
+        remote_origin: None,
         brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,

@@ -103,11 +103,17 @@ darkmux release.
   add-generic-password -U -a "$USER" -s darkmux-serve-token -w`, same value
   everywhere, plus `darkmux config set runtime.daemon_auth_enabled true`),
   trust each sender (`darkmux machine trust <sender> --profiles
-  <profile>,...`), `darkmux config set fleet.listener.enabled true`, and
+  <profile>,... --roles <role>,...`), `darkmux config set fleet.listener.enabled true`, and
   restart `darkmux serve`. On the hub, delete the dead streams: `redis-cli
   DEL darkmux:work darkmux:work:inference` (`darkmux doctor` names any that
-  remain). Run the same darkmux version on both ends: a v4 sender is told
-  the schema versions differ.
+  remain) once every machine runs 4.0. **Mixed versions:** a 3.x daemon
+  still consumes `darkmux:work` (and re-creates the stream when it
+  starts), so the queue stays an open, unauthenticated way to make that
+  machine run work until it is upgraded; `darkmux doctor` names any daemon
+  still consuming it. A 4.0 sender reaching a 3.x machine gets "no answer"
+  (3.x has no fleet listener); a 3.x `--machine` dispatch publishes to the
+  queue, no 4.0 machine reads it, and it waits silently until its timeout.
+  Two 4.0 builds on different wire schemas are told so by name.
 
 - **One machine utility model, declared once with its window, never a
   task's model** (#2914; finishes #590, supersedes the open parts of #70).
@@ -163,9 +169,15 @@ darkmux release.
   touches nothing else): the peer's node is looked up through the identity
   provider by the name the network reports (`--node`, else the host of the
   peer's roster address, else `<name>`) and its stable node id is stored,
-  never typed; `--profiles` sets the work-class profiles it may run here
-  (refused if undefined or utility-only); `--workspace` is reserved for the
-  workspace handoff (#755). Untrust removes the entry. The listener reads
+  never typed; a machine's own node is refused, and the OS host name a node
+  reports about itself never matches. `--profiles` sets the work-class
+  profiles it may run here (refused if undefined or utility-only);
+  `--roles` the roles it may dispatch (required, explicit, utility roles
+  refused); `--images` the Docker images it may name (default: only
+  darkmux's own runtime image); `--workspace true` lets its jobs mount any
+  directory under this machine's worktrees base read-write. A submitted job
+  never mounts this machine's shared toolchain cache. The confirmation shows
+  the node's online state and owner. Untrust removes the entry. The listener reads
   the allow-list per request, so both take effect with no restart.
 - **The fleet listener** (#2916): with `fleet.listener.enabled`,
   `darkmux serve` opens a second port bound only to the address the

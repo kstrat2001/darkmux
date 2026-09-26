@@ -49,17 +49,34 @@ impl Drop for DispatchInFlightGuard {
 
 /// Run one admitted, in-scope job on THIS machine, on `profile` (the
 /// profile the scope check resolved and approved; never re-resolved here, so
-/// what runs is what was checked).
+/// what runs is what was checked), for the peer `origin`.
 ///
 /// The shape is re-validated, and a `workdir` must resolve (symlinks and
 /// all) under this machine's darkmux worktrees base (#840): a sender can
 /// never bind-mount an arbitrary directory of this machine as `/workspace`.
 /// The validated CANONICAL path is what gets mounted, closing the TOCTOU
-/// window a re-resolution would reopen.
+/// window a re-resolution would reopen. The dispatch is marked
+/// remote-origin, so it never mounts this machine's shared toolchain cache.
 ///
 /// A dispatch that panics is caught and returned as an error, so one bad
 /// job cannot take the listener's worker down.
-pub fn execute_job(mut job: WorkJob, profile: String) -> Result<DispatchResult> {
+pub fn execute_job(job: WorkJob, profile: String, origin: String) -> Result<DispatchResult> {
+    // (#2628) `dispatch_reconciled`, not the raw primitive: the listener runs
+    // one submitted job at a time, the single-writer shape its lease-write
+    // contract requires, so a submitted job gets the same Exclusive-reconcile
+    // + #1487 residency-lease protection a `darkmux dispatch` gets.
+    execute_job_with(job, profile, origin, darkmux_crew::dispatch_reconciled::dispatch_reconciled)
+}
+
+/// [`execute_job`] with the dispatch primitive injected, so what reaches
+/// dispatch (the resolved profile, the remote origin, the validated
+/// workdir) is testable without a container.
+pub fn execute_job_with(
+    mut job: WorkJob,
+    profile: String,
+    origin: String,
+    dispatch: impl FnOnce(darkmux_crew::dispatch::DispatchOpts) -> Result<DispatchResult>,
+) -> Result<DispatchResult> {
     job.validate().context("the job failed its shape check")?;
     if let Some(workdir_str) = &job.workdir {
         let canonical = darkmux_types::workdir::validate_remote_workdir(std::path::Path::new(workdir_str))
@@ -68,13 +85,10 @@ pub fn execute_job(mut job: WorkJob, profile: String) -> Result<DispatchResult> 
     }
     let mut opts = job.into_dispatch_opts();
     opts.profile_name = Some(profile);
-    // (#2628) `dispatch_reconciled`, not the raw primitive: the listener runs
-    // one submitted job at a time, the single-writer shape its lease-write
-    // contract requires, so a submitted job gets the same Exclusive-reconcile
-    // + #1487 residency-lease protection a `darkmux dispatch` gets.
+    opts.remote_origin = Some(origin);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _in_flight = DispatchInFlightGuard::new();
-        darkmux_crew::dispatch_reconciled::dispatch_reconciled(opts)
+        dispatch(opts)
     }));
     match result {
         Ok(r) => r,
@@ -90,6 +104,7 @@ impl WorkJob {
         DispatchOpts {
             // (#2914) Work never runs on the utility model.
             allow_utility_model: false,
+            remote_origin: None,
             // (#2265) A cross-machine job carries its brief as TEXT, so a
             // `--finding`-briefed dispatch still reaches the runner with the
             // finding's record inside `message`; only the keys field — this
@@ -199,7 +214,7 @@ mod tests {
     fn execute_job_refuses_a_malformed_job_before_dispatch() {
         let mut j = job();
         j.role_id = "../x".into();
-        let err = execute_job(j, "host".into()).unwrap_err();
+        let err = execute_job_with(j, "host".into(), "laptop".into(), |_| panic!("never dispatched")).unwrap_err();
         assert!(format!("{err:#}").contains("shape check"), "{err:#}");
         assert!(!dispatch_in_flight());
     }
@@ -209,7 +224,28 @@ mod tests {
     fn execute_job_refuses_a_workdir_outside_the_worktrees_base() {
         let mut j = job();
         j.workdir = Some("/etc".into());
-        let err = execute_job(j, "host".into()).unwrap_err();
+        let err = execute_job_with(j, "host".into(), "laptop".into(), |_| panic!("never dispatched")).unwrap_err();
         assert!(format!("{err:#}").contains("workdir"), "{err:#}");
+    }
+
+    /// (#2916 review C3/M2) What reaches dispatch: the RESOLVED profile
+    /// (not the job's own request), the remote origin, never a forward.
+    #[test]
+    fn execute_job_hands_dispatch_the_resolved_profile_and_the_origin() {
+        let mut seen = None;
+        let r = execute_job_with(job(), "resolved-host".into(), "laptop".into(), |o| {
+            seen = Some((o.profile_name.clone(), o.remote_origin.clone(), o.machine.clone()));
+            Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: "s".into(), out_dir: None })
+        });
+        assert!(r.is_ok());
+        assert_eq!(seen, Some((Some("resolved-host".into()), Some("laptop".into()), None)));
+    }
+
+    /// A panicking dispatch is caught, reported, and the in-flight flag clears.
+    #[test]
+    fn execute_job_survives_a_panicking_dispatch() {
+        let err = execute_job_with(job(), "host".into(), "laptop".into(), |_| panic!("boom")).unwrap_err();
+        assert!(format!("{err:#}").contains("panicked"));
+        assert!(!dispatch_in_flight());
     }
 }

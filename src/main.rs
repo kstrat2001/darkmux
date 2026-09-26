@@ -988,7 +988,7 @@ fn cmd_mission_dispatch(
              phase here, `darkmux dispatch <role> <message> --phase-id <phase>`."
         );
     };
-    fleet::validate_identifier("--machine", machine)?;
+    fleet::validate_machine_name("--machine", machine)?;
 
     // 1. Validate the mission exists.
     let missions = load_missions()?;
@@ -1305,6 +1305,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
     let opts = crew::dispatch::DispatchOpts {
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
+        remote_origin: None,
         // (#2774 review F2) Operator-settable now, so a checkpoint written
         // under a read-only mount (every crawl unit) can actually be
         // resumed — the resume gate refuses an origin-read-only checkpoint
@@ -1475,8 +1476,8 @@ fn cmd_machine(sub: Option<MachineCmd>) -> Result<i32> {
             allow_loopback,
         }) => fleet_cli::cmd_machine_add(&id, &address, description.as_deref(), allow_loopback),
         Some(MachineCmd::Remove { id }) => fleet_cli::cmd_machine_remove(&id),
-        Some(MachineCmd::Trust { name, node, profiles, workspace }) => {
-            fleet_cli::cmd_machine_trust(&name, node.as_deref(), &profiles, workspace)
+        Some(MachineCmd::Trust { name, node, profiles, roles, images, workspace }) => {
+            fleet_cli::cmd_machine_trust(&name, node.as_deref(), &profiles, &roles, images.as_deref(), workspace)
         }
         Some(MachineCmd::Untrust { name }) => fleet_cli::cmd_machine_untrust(&name),
     }

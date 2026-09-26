@@ -1236,9 +1236,22 @@ pub(crate) enum MachineCmd {
         /// given again, it replaces the list.
         #[arg(long, value_delimiter = ',', value_name = "PROFILE,...")]
         profiles: Vec<String>,
-        /// Whether the peer may name a working directory here (#755,
-        /// the workspace handoff). Default false; given again, it
-        /// replaces the setting.
+        /// Roles (this machine's role ids) the peer may dispatch here
+        /// (comma-separated). Required when first trusting a machine;
+        /// given again, it replaces the list. There is no "any role": a
+        /// role is a tool palette, and utility roles are refused.
+        #[arg(long, value_delimiter = ',', value_name = "ROLE,...")]
+        roles: Vec<String>,
+        /// Docker images the peer may name with `--image`, matched exactly
+        /// (comma-separated). Without it the peer runs only on darkmux's
+        /// own runtime image. Given again, it replaces the list; pass an
+        /// empty value (`--images ''`) to clear it.
+        #[arg(long, value_delimiter = ',', value_name = "IMAGE,...")]
+        images: Option<Vec<String>>,
+        /// Whether the peer may name a working directory here: `true`
+        /// lets a job mount any directory under this machine's darkmux
+        /// worktrees base READ-WRITE. Default false; given again, it
+        /// replaces the setting. (#755 builds the workspace handoff on it.)
         #[arg(long, value_name = "true|false")]
         workspace: Option<bool>,
     },

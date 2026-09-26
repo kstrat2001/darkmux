@@ -111,7 +111,7 @@ darkmux dispatch coder "implement the X feature"</code></pre>
     <h2>Part 2: Run it as a fleet worker</h2>
     <p>A fleet worker takes work from other machines over its <strong>fleet listener</strong>: a second port the daemon opens on the machine's own tailnet address (never <code>0.0.0.0</code>, never loopback, and not behind Tailscale Serve, which would make every caller look like the machine itself). A request is run only when <strong>both</strong> checks pass:</p>
     <ul>
-      <li><strong>The fleet token.</strong> It is the serve token (Keychain item <code>darkmux-serve-token</code>, or <code>DARKMUX_SERVE_TOKEN</code>), one value shared by every machine in the fleet. It proves the caller is darkmux and not just any process on an allowed machine: an agent container can reach tailnet addresses, but not the Keychain.</li>
+      <li><strong>The fleet token.</strong> It is the serve token (Keychain item <code>darkmux-serve-token</code>, or <code>DARKMUX_SERVE_TOKEN</code>), one value shared by every machine in the fleet. The check is that the caller holds that shared token. That keeps out something on an allowed machine that cannot read it (an agent container can reach tailnet addresses, but not the Keychain). It is not proof the caller is darkmux: any process running as your user can read the Keychain item, and <code>machine list --deep</code> sends the same token to every machine in the roster.</li>
       <li><strong>The sending machine, as the network reports it.</strong> The worker asks Tailscale which node is on the other end of the connection (<code>tailscale whois</code>), and accepts only a node on its own allow-list, <code>fleet.accept_work</code>. Deny by default: a node that is not listed runs nothing, token or not.</li>
     </ul>
     <p>Each allow-list entry also has a <strong>scope</strong>: the profiles (on the worker) that machine may run. A profile outside it is refused, and so is a profile that runs on the worker's utility model: utility work (compaction, radio routing) always stays on the machine it serves.</p>
@@ -119,9 +119,9 @@ darkmux dispatch coder "implement the X feature"</code></pre>
 security add-generic-password -U -a "$USER" -s darkmux-serve-token -w   <span class="comment"># same value on every machine</span>
 darkmux config set runtime.daemon_auth_enabled true
 
-<span class="comment"># Trust the laptop for two profiles. The node is looked up on the tailnet by name</span>
+<span class="comment"># Trust the laptop for two profiles and two roles. The node is looked up on the tailnet by name</span>
 <span class="comment"># (the laptop's roster address, or --node &lt;its tailnet name&gt;); you never type its id.</span>
-darkmux machine trust laptop --profiles host,coder-studio
+darkmux machine trust laptop --profiles host,coder-studio --roles radio-host,coder
 
 <span class="comment"># Open the listener (port 8766 by default; use the same port on every machine).</span>
 darkmux config set fleet.listener.enabled true
@@ -131,6 +131,11 @@ darkmux doctor 2&gt;&amp;1 | grep -i fleet   <span class="comment"># fleet token
     <p>Then, from the laptop (the fleet token in its Keychain too, and the studio in its roster, below):</p>
     <pre><code>darkmux dispatch radio-host "summarize today's runs" --machine studio --profile host</code></pre>
     <p>With <code>--wait</code> (the default) the command returns when the studio's dispatch finishes, with its exit code and output. <code>--no-wait</code> returns as soon as the studio accepts the job. A refusal comes back immediately, naming the reason: <code>studio does not accept work from macbook-pro</code>, <code>not in the allow-list scope: profile coder-big</code>, or <code>studio is busy running &lt;session&gt;</code> (a worker runs one submitted job at a time). <code>darkmux machine untrust laptop</code> takes the laptop back off the list; both verbs take effect on the next request, with no restart. Removing a machine from the tailnet revokes it everywhere, and rotating the fleet token is one secret to redistribute.</p>
+    <p>What an entry grants, exactly. <strong>Roles:</strong> only the roles listed (a role is a tool palette; there is no "any role", and utility roles are refused). <strong>Images:</strong> the job runs on darkmux's own runtime image unless it names one the entry lists with <code>--images</code>. <strong>Workspace:</strong> <code>--workspace true</code> lets the peer mount any directory under this machine's darkmux worktrees base read-write as the job's workspace; the default is none. A submitted job never mounts this machine's shared toolchain cache, so nothing it writes is run by your own later dispatches. <strong>One job at a time:</strong> a trusted peer that keeps resubmitting can keep the slot busy; that is accepted in a model where every trusted peer is yours.</p>
+    <div class="callout warn">
+      <strong>Upgrade every machine.</strong> A 3.x daemon still claims work off the old Redis queue (<code>darkmux:work</code>) and re-creates it when it starts, so the unauthenticated queue stays open until no machine runs 3.x. <code>darkmux doctor</code> names any daemon still consuming it. Mixed versions also do not talk: a 4.0 machine sending to a 3.x one gets "no answer" (3.x has no fleet listener), and a 3.x machine's <code>--machine</code> dispatch waits on a queue no 4.0 machine reads, until its timeout.
+    </div>
+    <p>The sender checks the receiver too. Before the token or the prompt leaves your machine, <code>--machine</code> resolves the roster address, asks Tailscale which node is there, and refuses unless it is a tailnet node; the first send pins that node in the roster (as <code>machine add</code> does), and every later send checks it is the same node. Output that comes back has its control characters removed before it is printed.</p>
     <div class="callout">
       <strong>Fail closed.</strong> If Tailscale cannot say who is calling (it is stopped, logged out, or the connection came over the office LAN rather than the tailnet), the request is refused. A hardware id is never used to decide: every flow record carries one, so any machine could repeat it.
     </div>

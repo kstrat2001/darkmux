@@ -755,6 +755,7 @@ fn dispatch_case(
     let d = DispatchOpts {
         // (#2914) The lab benchmarks candidate utility models.
         allow_utility_model: true,
+        remote_origin: None,
         brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,

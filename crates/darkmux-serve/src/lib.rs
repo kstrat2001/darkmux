@@ -1239,6 +1239,8 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
     // would return the mtime of the new binary and report a stale daemon as
     // fresh — the exact false negative this check exists to prevent.
     let _ = STARTUP_EXE_MTIME.set(current_exe_mtime());
+    // (#2916 review M1) 10240 is macOS's per-process ceiling (OPEN_MAX).
+    let _ = raise_open_file_limit(10_240);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1492,7 +1494,37 @@ async fn health() -> axum::Json<serde_json::Value> {
         "build": darkmux_types::build_version(),
         "binary_mtime": STARTUP_EXE_MTIME.get().copied().flatten(),
         "flow_schema_version": darkmux_flow::FLOW_SCHEMA_VERSION,
+        // (#2916 review C8) What the fleet listener is doing (`null` when it
+        // is off), so `darkmux doctor` reads the DAEMON's view rather than
+        // re-deriving it from a shell whose PATH may differ.
+        "fleet_listener": fleet_listener::listener_state(),
     }))
+}
+
+/// (#2916 review M1) Raise the soft open-file limit toward the hard one at
+/// daemon start. launchd starts a daemon at 256, and every open connection,
+/// flow file and child pipe costs one; running out is what let a flood of
+/// half-open fleet connections take the viewer down. Returns the (old, new)
+/// soft limits. Never lowers anything, never exceeds the hard limit.
+#[allow(clippy::unnecessary_cast)] // `rlim_t` is not u64 on every target
+pub fn raise_open_file_limit(target: u64) -> Option<(u64, u64)> {
+    // SAFETY: plain getrlimit/setrlimit on a stack struct.
+    unsafe {
+        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return None;
+        }
+        let old = lim.rlim_cur as u64;
+        let want = target.min(lim.rlim_max as u64);
+        if want <= old {
+            return Some((old, old));
+        }
+        lim.rlim_cur = want as libc::rlim_t;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+            return Some((old, old));
+        }
+        Some((old, want))
+    }
 }
 
 /// Validate a base ref string: must match `^[A-Za-z0-9][A-Za-z0-9_/.-]*$`.

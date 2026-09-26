@@ -55,20 +55,24 @@ pub struct NodeIdentity {
     /// Whether the provider currently sees the node online (`None` when it
     /// does not say, as for the local node or a whois answer).
     pub online: Option<bool>,
+    /// The account that owns the node on the network, as the provider
+    /// names it (a display name or login), when reported. Shown by
+    /// `machine trust` so the operator can see WHOSE node they trusted.
+    pub owner: Option<String>,
 }
 
 impl NodeIdentity {
-    /// Whether `query` names this node: its short name, its full DNS name
-    /// (with or without a trailing dot), or its OS host name, compared
-    /// case-insensitively.
+    /// Whether `query` names this node: its short network name or its full
+    /// DNS name (with or without a trailing dot), compared
+    /// case-insensitively. Both are assigned by the network. The OS host
+    /// name is deliberately NOT matched (#2916 review): a node reports its
+    /// own host name, so any node could claim another's.
     pub fn answers_to(&self, query: &str) -> bool {
         let q = query.trim().trim_end_matches('.').to_ascii_lowercase();
         if q.is_empty() {
             return false;
         }
-        self.name == q
-            || self.dns_name.as_deref().map(str::to_ascii_lowercase).as_deref() == Some(q.as_str())
-            || self.host_name.as_deref().map(str::to_ascii_lowercase).as_deref() == Some(q.as_str())
+        self.name == q || self.dns_name.as_deref().map(str::to_ascii_lowercase).as_deref() == Some(q.as_str())
     }
 }
 
@@ -93,12 +97,47 @@ pub trait IdentityProvider: Send + Sync {
 /// caller treats "no provider" as "refuse everything".
 pub fn provider_for(value: &str, bin: Option<&str>) -> Result<Box<dyn IdentityProvider>> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "tailscale" => Ok(Box::new(WhoisCli::new("tailscale", bin.unwrap_or("tailscale")))),
+        "tailscale" => {
+            let bin = match bin {
+                Some(b) => b.to_string(),
+                None => default_tool_path("tailscale", TAILSCALE_TOOL_PATHS, std::env::var_os("PATH").as_deref()),
+            };
+            Ok(Box::new(WhoisCli::new("tailscale", &bin)))
+        }
         other => bail!(
             "unknown identity provider `{other}` (fleet.identity.provider) — valid: {}",
             KNOWN_IDENTITY_PROVIDERS.join(", ")
         ),
     }
+}
+
+/// Where the `tailscale` tool usually lives on macOS, tried in order when
+/// `fleet.identity.bin` is unset and the name is not on `PATH` (#2916
+/// review): a daemon started by launchd gets a short `PATH` without
+/// `/usr/local/bin`, while `darkmux doctor` from a shell finds the tool,
+/// so the two disagreed about whether the provider was up.
+const TAILSCALE_TOOL_PATHS: &[&str] = &[
+    "/usr/local/bin/tailscale",
+    "/opt/homebrew/bin/tailscale",
+    "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+];
+
+/// `name` found on `path_var`, else the first of `known` that exists, else
+/// `name` (so the error names the tool).
+fn default_tool_path(name: &str, known: &[&str], path_var: Option<&std::ffi::OsStr>) -> String {
+    if let Some(p) = path_var {
+        for dir in std::env::split_paths(p) {
+            let cand = dir.join(name);
+            if cand.is_file() {
+                return cand.to_string_lossy().into_owned();
+            }
+        }
+    }
+    known
+        .iter()
+        .find(|k| std::path::Path::new(k).is_file())
+        .map(|k| k.to_string())
+        .unwrap_or_else(|| name.to_string())
 }
 
 /// The configured provider: `fleet.identity.provider` + `fleet.identity.bin`.
@@ -114,15 +153,23 @@ pub fn configured_provider() -> Result<Box<dyn IdentityProvider>> {
 pub struct WhoisCli {
     provider: String,
     bin: String,
+    timeout: Duration,
 }
 
 impl WhoisCli {
     pub fn new(provider: &str, bin: &str) -> Self {
-        Self { provider: provider.to_string(), bin: bin.to_string() }
+        Self { provider: provider.to_string(), bin: bin.to_string(), timeout: PROVIDER_CALL_TIMEOUT }
+    }
+
+    /// A different per-call bound. Tests use a long one: macOS scans a
+    /// freshly written executable on its first run, which can take seconds.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     fn run(&self, args: &[&str]) -> Result<(bool, Vec<u8>, String)> {
-        run_with_timeout(&self.bin, args, PROVIDER_CALL_TIMEOUT)
+        run_with_timeout(&self.bin, args, self.timeout)
             .with_context(|| format!("running `{} {}`", self.bin, args.join(" ")))
     }
 
@@ -253,10 +300,13 @@ pub(crate) fn parse_whois_json(raw: &[u8]) -> Result<NodeIdentity> {
         .map(|a| a.iter().filter_map(|x| x.as_str()).filter_map(parse_addr).collect())
         .unwrap_or_default();
     let host_name = node.get("Hostinfo").and_then(|h| str_field(h, "Hostname"));
-    Ok(NodeIdentity { node_id, name, dns_name, host_name, addresses, online: None })
+    let owner = v
+        .get("UserProfile")
+        .and_then(|u| str_field(u, "DisplayName").or_else(|| str_field(u, "LoginName")));
+    Ok(NodeIdentity { node_id, name, dns_name, host_name, addresses, online: None, owner })
 }
 
-fn status_node(v: &serde_json::Value) -> Option<NodeIdentity> {
+fn status_node(v: &serde_json::Value, users: Option<&serde_json::Value>) -> Option<NodeIdentity> {
     let node_id = str_field(v, "ID")?;
     let dns_name = str_field(v, "DNSName").map(|n| n.trim_end_matches('.').to_string());
     let host_name = str_field(v, "HostName");
@@ -271,7 +321,12 @@ fn status_node(v: &serde_json::Value) -> Option<NodeIdentity> {
         .map(|a| a.iter().filter_map(|x| x.as_str()).filter_map(parse_addr).collect())
         .unwrap_or_default();
     let online = v.get("Online").and_then(|o| o.as_bool());
-    Some(NodeIdentity { node_id, name, dns_name, host_name, addresses, online })
+    let owner = v
+        .get("UserID")
+        .map(|id| id.to_string())
+        .and_then(|id| users.and_then(|u| u.get(id.as_str())))
+        .and_then(|u| str_field(u, "DisplayName").or_else(|| str_field(u, "LoginName")));
+    Some(NodeIdentity { node_id, name, dns_name, host_name, addresses, online, owner })
 }
 
 /// Parse `status --json`: `{ "BackendState", "Self": {..}, "Peer": { k: {..} } }`,
@@ -284,14 +339,15 @@ pub(crate) fn parse_status_json(raw: &[u8]) -> Result<(NodeIdentity, Vec<NodeIde
             bail!("the overlay network is not running on this machine (state: {state})");
         }
     }
+    let users = v.get("User");
     let me = v
         .get("Self")
-        .and_then(status_node)
+        .and_then(|n| status_node(n, users))
         .ok_or_else(|| anyhow!("the provider's status has no usable Self node"))?;
     let mut peers: Vec<NodeIdentity> = v
         .get("Peer")
         .and_then(|p| p.as_object())
-        .map(|m| m.values().filter_map(status_node).collect())
+        .map(|m| m.values().filter_map(|n| status_node(n, users)).collect())
         .unwrap_or_default();
     peers.sort_by(|a, b| a.name.cmp(&b.name));
     Ok((me, peers))
@@ -346,6 +402,7 @@ pub fn test_node(node_id: &str, name: &str, addr: &str) -> NodeIdentity {
         host_name: None,
         addresses: vec![addr.parse().unwrap()],
         online: Some(true),
+        owner: Some("operator".to_string()),
     }
 }
 
@@ -360,7 +417,8 @@ mod tests {
     const STATUS: &str = r#"{"BackendState":"Running",
         "Self":{"ID":"nSELF","DNSName":"studio.tailnet-example.ts.net.","HostName":"Studio",
                 "TailscaleIPs":["100.64.0.2","fd7a:115c:a1e0::2"],"Online":true},
-        "Peer":{"nodekey:a":{"ID":"nSTABLE1","DNSName":"laptop.tailnet-example.ts.net.","HostName":"MacBook Pro",
+        "User":{"7":{"LoginName":"op@example.com","DisplayName":"Op Erator"}},
+        "Peer":{"nodekey:a":{"ID":"nSTABLE1","UserID":7,"DNSName":"laptop.tailnet-example.ts.net.","HostName":"MacBook Pro",
                 "TailscaleIPs":["100.64.0.7"],"Online":false},
                 "nodekey:b":{"ID":"nPHONE","DNSName":"peer.tailnet-example.ts.net.","HostName":"phone","TailscaleIPs":["100.64.0.9"]}}}"#;
 
@@ -390,7 +448,9 @@ mod tests {
         let mbp = peers.iter().find(|p| p.node_id == "nSTABLE1").unwrap();
         assert_eq!(mbp.online, Some(false));
         assert!(mbp.answers_to("laptop"));
-        assert!(mbp.answers_to("MacBook Pro"), "the OS host name, case-insensitively");
+        assert!(mbp.answers_to("LAPTOP"), "case-insensitively");
+        assert!(!mbp.answers_to("MacBook Pro"), "never the self-reported OS host name");
+        assert_eq!(mbp.owner.as_deref(), Some("Op Erator"), "the owner from the status's User map");
         assert!(mbp.answers_to("laptop.tailnet-example.ts.net."));
         assert!(!mbp.answers_to("lap"));
     }
@@ -400,6 +460,27 @@ mod tests {
         let raw = r#"{"BackendState":"Stopped","Self":{"ID":"n","DNSName":"a.b.","TailscaleIPs":[]}}"#;
         let err = parse_status_json(raw.as_bytes()).unwrap_err();
         assert!(err.to_string().contains("not running"), "{err}");
+    }
+
+    /// With no `fleet.identity.bin`, the tool is found on PATH, else at a
+    /// known absolute path, else its bare name (the error then names it).
+    #[test]
+    fn the_tool_is_found_off_path_at_a_known_location() {
+        let d = tempfile::TempDir::new().unwrap();
+        let known = d.path().join("known-tailscale");
+        std::fs::write(&known, "").unwrap();
+        let known_s = known.to_string_lossy().into_owned();
+        let empty_path = d.path().join("empty");
+        std::fs::create_dir_all(&empty_path).unwrap();
+        assert_eq!(default_tool_path("tailscale", &[&known_s], Some(empty_path.as_os_str())), known_s);
+        let on_path = d.path().join("bin");
+        std::fs::create_dir_all(&on_path).unwrap();
+        std::fs::write(on_path.join("tailscale"), "").unwrap();
+        assert_eq!(
+            default_tool_path("tailscale", &[&known_s], Some(on_path.as_os_str())),
+            on_path.join("tailscale").to_string_lossy()
+        );
+        assert_eq!(default_tool_path("tailscale", &["/nonexistent/x"], Some(empty_path.as_os_str())), "tailscale");
     }
 
     #[test]
@@ -430,14 +511,14 @@ mod tests {
             p.to_string_lossy().into_owned()
         };
         let nf = script("nf", "echo '2026/09/27 01:05:12 peer not found' >&2; exit 1");
-        assert_eq!(WhoisCli::new("t", &nf).identify("100.64.0.7".parse().unwrap()).unwrap(), None);
+        assert_eq!(WhoisCli::new("t", &nf).with_timeout(Duration::from_secs(60)).identify("100.64.0.7".parse().unwrap()).unwrap(), None);
         let down = script("down", "echo 'failed to connect to local daemon' >&2; exit 1");
-        assert!(WhoisCli::new("t", &down).identify("100.64.0.7".parse().unwrap()).is_err());
+        assert!(WhoisCli::new("t", &down).with_timeout(Duration::from_secs(60)).identify("100.64.0.7".parse().unwrap()).is_err());
         // An answer for a different address is not an answer.
         let other = script("other", &format!("cat <<'EOF'\n{WHOIS}\nEOF"));
-        assert!(WhoisCli::new("t", &other).identify("100.64.0.99".parse().unwrap()).is_err());
+        assert!(WhoisCli::new("t", &other).with_timeout(Duration::from_secs(60)).identify("100.64.0.99".parse().unwrap()).is_err());
         assert_eq!(
-            WhoisCli::new("t", &other).identify("100.64.0.7".parse().unwrap()).unwrap().unwrap().node_id,
+            WhoisCli::new("t", &other).with_timeout(Duration::from_secs(60)).identify("100.64.0.7".parse().unwrap()).unwrap().unwrap().node_id,
             "nSTABLE1"
         );
         // A hung tool is cut off and is an error.

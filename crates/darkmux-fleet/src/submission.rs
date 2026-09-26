@@ -4,9 +4,12 @@
 //!
 //! 1. the request carries the **fleet token** (the serve token, #881: one
 //!    shared secret, Keychain item `darkmux-serve-token` or
-//!    `DARKMUX_SERVE_TOKEN`). It proves the caller is darkmux, not merely
-//!    something running on an allowed machine: an agent container on an
-//!    allowed laptop can reach overlay addresses, but not the Keychain.
+//!    `DARKMUX_SERVE_TOKEN`). The check is that the caller HOLDS the shared
+//!    token. That keeps out something on an allowed machine that cannot
+//!    read it (an agent container, which reaches overlay addresses but not
+//!    the Keychain); any process running as the operator's user can read it
+//!    (`security find-generic-password`), and `machine list --deep` sends it
+//!    to every roster peer.
 //! 2. the connection comes from a **node on the receiver's allow-list**
 //!    (`fleet.accept_work`), as the overlay network itself reports it
 //!    ([`crate::identity`]). A leaked token is useless from a node that is not
@@ -127,6 +130,10 @@ pub enum Refusal {
     /// Addressed to another machine name.
     Misaddressed { target: String },
     WorkspaceOutOfScope { peer: String },
+    RoleOutOfScope { peer: String, role: String, allowed: Vec<String> },
+    ImageOutOfScope { peer: String, image: String },
+    /// The connection came from THIS machine's own node.
+    FromSelf,
     ProfileOutOfScope { peer: String, profile: String, allowed: Vec<String> },
     UtilityProfile { profile: String },
     NoWorkProfile { role: String, detail: String },
@@ -180,9 +187,20 @@ impl Refusal {
                 names.join(", ")
             ),
             Refusal::Misaddressed { target } => format!(
-                "this is {receiver}, not {target}: the sender's roster entry for {target} points at \
-                 {receiver}'s address (fix it with `darkmux machine add {target} --address <its \
-                 tailnet DNS name>` on the sender)"
+                "this is {receiver}, not {target}: the address the sender used for {target} reaches \
+                 {receiver}. On the sender, `darkmux machine list` shows the entry; point {target} at \
+                 {target}'s own tailnet DNS name, or send the job to {receiver} by that name"
+            ),
+            Refusal::RoleOutOfScope { peer, role, allowed } => format!(
+                "not in the allow-list scope: role {role} ({receiver} lets {peer} run roles: {})",
+                if allowed.is_empty() { "none".to_string() } else { allowed.join(", ") }
+            ),
+            Refusal::ImageOutOfScope { peer, image } => format!(
+                "not in the allow-list scope: image {image} ({receiver} lets {peer} use only darkmux's own \
+                 runtime image unless the entry lists others)"
+            ),
+            Refusal::FromSelf => format!(
+                "{receiver} does not take fleet work from itself; run it locally (drop --machine)"
             ),
             Refusal::WorkspaceOutOfScope { peer } => format!(
                 "not in the allow-list scope: {receiver} does not let {peer} name a working \
@@ -227,6 +245,8 @@ pub struct Admitted {
     /// The allow-list key (the peer's machine name).
     pub peer_name: String,
     pub profiles: Vec<String>,
+    pub roles: Vec<String>,
+    pub images: Vec<String>,
     pub workspace: bool,
 }
 
@@ -244,6 +264,7 @@ pub fn admit(
     identity: impl FnOnce() -> std::result::Result<Option<NodeIdentity>, String>,
     provider: &str,
     peer_addr: IpAddr,
+    local_node_id: Option<&str>,
     allow: &BTreeMap<String, AcceptWorkEntry>,
 ) -> std::result::Result<Admitted, Refusal> {
     match token {
@@ -258,6 +279,12 @@ pub fn admit(
         }
         Err(detail) => return Err(Refusal::IdentityUnavailable { provider: provider.to_string(), detail }),
     };
+    // A machine never takes fleet work from its own node: an allow-list
+    // entry naming itself (by mistake) must not turn a local process into a
+    // "trusted peer" that skips the local dispatch path.
+    if local_node_id.is_some_and(|me| !me.is_empty() && me == node.node_id) {
+        return Err(Refusal::FromSelf);
+    }
     let matches: Vec<(&String, &AcceptWorkEntry)> = allow
         .iter()
         .filter(|(_, e)| e.node_id.as_deref().is_some_and(|id| !id.is_empty() && id == node.node_id))
@@ -267,6 +294,8 @@ pub fn admit(
         [(name, entry)] => Ok(Admitted {
             peer_name: (*name).clone(),
             profiles: entry.profiles.clone().unwrap_or_default(),
+            roles: entry.roles.clone().unwrap_or_default(),
+            images: entry.images.clone().unwrap_or_default(),
             workspace: entry.workspace.unwrap_or(false),
         }),
         many => Err(Refusal::AmbiguousEntry { names: many.iter().map(|(n, _)| (*n).clone()).collect() }),
@@ -294,6 +323,14 @@ pub fn read_user_allow_list() -> std::result::Result<BTreeMap<String, AcceptWork
     read_allow_list(&darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config)
 }
 
+/// (#2916 review C2) The session id the RECEIVER runs a submitted job
+/// under: the sender's id with the peer's name appended, so a peer can
+/// never reuse (and so write into the records of) one of this machine's own
+/// sessions. The reply carries it back to the sender.
+pub fn receiver_session_id(sender_session: &str, peer: &str) -> String {
+    format!("{sender_session}-from-{peer}")
+}
+
 /// What the receiver's profile resolution made of a job's (role, profile).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProfileResolution {
@@ -313,8 +350,20 @@ pub fn check_scope(
     job: &WorkJob,
     resolution: ProfileResolution,
 ) -> std::result::Result<String, Refusal> {
-    if job.target_machine != receiver {
+    if !crate::job::same_machine(&job.target_machine, receiver) {
         return Err(Refusal::Misaddressed { target: job.target_machine.clone() });
+    }
+    if !admitted.roles.iter().any(|r| r == &job.role_id) {
+        return Err(Refusal::RoleOutOfScope {
+            peer: admitted.peer_name.clone(),
+            role: job.role_id.clone(),
+            allowed: admitted.roles.clone(),
+        });
+    }
+    if let Some(image) = &job.image {
+        if !admitted.images.iter().any(|i| i == image) {
+            return Err(Refusal::ImageOutOfScope { peer: admitted.peer_name.clone(), image: image.clone() });
+        }
     }
     if job.workdir.is_some() && !admitted.workspace {
         return Err(Refusal::WorkspaceOutOfScope { peer: admitted.peer_name.clone() });
@@ -444,14 +493,103 @@ pub fn post_submission(
     Ok((code, reply))
 }
 
+/// (#2916 review C1) Text that came back from another machine, safe to
+/// print: every control character except newline and tab is dropped, so a
+/// reply cannot move the cursor, rewrite earlier lines or set the terminal
+/// title with escape sequences.
+pub fn sanitize_remote_text(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').collect()
+}
+
+/// The provider the SENDER verifies a target with. Tests in this crate may
+/// substitute one; production always uses the configured provider.
+fn sender_provider() -> Result<Box<dyn crate::identity::IdentityProvider>> {
+    #[cfg(test)]
+    if let Some(p) = test_sender_provider::take() {
+        return Ok(p);
+    }
+    crate::identity::configured_provider()
+}
+
+#[cfg(test)]
+pub(crate) mod test_sender_provider {
+    use crate::identity::IdentityProvider;
+    use std::sync::Mutex;
+    static NEXT: Mutex<Option<Box<dyn IdentityProvider>>> = Mutex::new(None);
+    pub(crate) fn set(p: Box<dyn IdentityProvider>) {
+        *NEXT.lock().unwrap() = Some(p);
+    }
+    pub(crate) fn take() -> Option<Box<dyn IdentityProvider>> {
+        NEXT.lock().unwrap().take()
+    }
+}
+
+/// What the sender verified about the target before sending anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedTarget {
+    /// The overlay address to dial (the one that was verified; the name is
+    /// not re-resolved, so a DNS change between check and send cannot
+    /// redirect the request).
+    pub ip: IpAddr,
+    pub node: NodeIdentity,
+    /// True when this send pinned the node for the first time.
+    pub newly_pinned: bool,
+}
+
+/// (#2916 review C1) Check the target BEFORE the fleet token or the prompt
+/// leaves this machine: the roster address must resolve to an address the
+/// overlay network says is a node, and that node must be the one pinned for
+/// the entry (pinned now, if the entry has no pin yet). Anything else is
+/// refused: a LAN host, a public address, a changed DNS answer.
+pub fn verify_target(
+    target: &str,
+    entry: &crate::MachineEntry,
+    provider: &dyn crate::identity::IdentityProvider,
+) -> Result<VerifiedTarget> {
+    let ips = crate::roster::resolve_host_addrs(&entry.address);
+    let ip = *ips.first().ok_or_else(|| {
+        anyhow!("the roster address for {target} (`{}`) does not resolve; nothing was sent", entry.address)
+    })?;
+    let node = match provider.identify(ip) {
+        Ok(Some(n)) => n,
+        Ok(None) => {
+            return Err(anyhow!(
+                "the roster address for {target} (`{}`) is not a node on the {} network, so the fleet \
+                 token and the job were NOT sent. Point the entry at {target}'s tailnet DNS name: \
+                 `darkmux machine add {target} --address <its tailnet DNS name>`",
+                entry.address,
+                provider.provider_name()
+            ))
+        }
+        Err(e) => {
+            return Err(anyhow!(
+                "cannot verify {target}'s address with {} ({e:#}); nothing was sent",
+                provider.provider_name()
+            ))
+        }
+    };
+    match entry.node_id.as_deref().filter(|p| !p.is_empty()) {
+        Some(pinned) if pinned != node.node_id => Err(anyhow!(
+            "the node at {target}'s address (`{}`) is not the one this roster pinned for {target}; \
+             nothing was sent. If {target} really was replaced, re-pin it with `darkmux machine add \
+             {target} --address <its tailnet DNS name>`",
+            node.dns_name.as_deref().unwrap_or(&node.name)
+        )),
+        Some(_) => Ok(VerifiedTarget { ip, node, newly_pinned: false }),
+        None => Ok(VerifiedTarget { ip, node, newly_pinned: true }),
+    }
+}
+
 /// Submit `job` to the machine it is addressed to: look the machine up in
-/// this machine's roster, dial its fleet listener, present the fleet token.
-/// A refusal comes back as `Err` carrying the receiver's reason.
+/// this machine's roster (case-insensitively), verify the node at its
+/// address ([`verify_target`]), then dial that verified address's fleet
+/// listener with the fleet token. A refusal comes back as `Err` carrying
+/// the receiver's reason (control characters removed).
 pub fn submit_work(job: WorkJob, wait: bool) -> Result<SubmissionReply> {
     job.validate().context("validating the job before it leaves")?;
     let target = job.target_machine.clone();
     let roster = crate::load_roster().context("reading the fleet roster")?;
-    let entry = roster.machines.get(&target).ok_or_else(|| {
+    let entry = crate::find_machine(&roster, &target).cloned().ok_or_else(|| {
         anyhow!(
             "machine `{target}` is not in this machine's roster ({}); add it with \
              `darkmux machine add {target} --address <its tailnet DNS name>`",
@@ -464,8 +602,26 @@ pub fn submit_work(job: WorkJob, wait: bool) -> Result<SubmissionReply> {
              (Keychain item `darkmux-serve-token` or DARKMUX_SERVE_TOKEN), the same value {target} holds"
         )
     })?;
+    let provider = sender_provider()?;
+    let verified = verify_target(&target, &entry, provider.as_ref())?;
+    if verified.newly_pinned {
+        let id = entry.id.clone();
+        let node_id = verified.node.node_id.clone();
+        crate::mutate_roster(|r| {
+            if let Some(e) = r.machines.get_mut(&id) {
+                e.node_id = Some(node_id);
+            }
+            Ok(())
+        })
+        .context("pinning the target's node in the roster")?;
+        eprintln!(
+            "darkmux dispatch: pinned {target} to the {} node `{}` (first contact); later sends check it",
+            provider.provider_name(),
+            verified.node.dns_name.as_deref().unwrap_or(&verified.node.name)
+        );
+    }
     let port = darkmux_types::config_access::fleet_listener_port();
-    let url = submission_url(&entry.address, port)?;
+    let url = submission_url(&verified.ip.to_string(), port)?;
     let read_timeout = if wait {
         Duration::from_secs(u64::from(job.timeout_seconds).saturating_add(120))
     } else {
@@ -477,11 +633,15 @@ pub fn submit_work(job: WorkJob, wait: bool) -> Result<SubmissionReply> {
         "completed" | "accepted" => Ok(reply),
         "error" => Err(anyhow!(
             "{target} accepted the job but the dispatch failed: {}",
-            reply.reason.as_deref().unwrap_or("no reason given")
+            sanitize_remote_text(reply.reason.as_deref().unwrap_or("no reason given"))
         )),
         _ => Err(anyhow!(
             "{}",
-            reply.reason.clone().unwrap_or_else(|| format!("{target} refused the job (HTTP {code})"))
+            reply
+                .reason
+                .as_deref()
+                .map(sanitize_remote_text)
+                .unwrap_or_else(|| format!("{target} refused the job (HTTP {code})"))
         )),
     }
 }
@@ -495,6 +655,8 @@ mod tests {
         AcceptWorkEntry {
             node_id: node_id.map(str::to_string),
             profiles: Some(profiles.iter().map(|s| s.to_string()).collect()),
+            roles: Some(vec!["radio-host".into()]),
+            images: Some(vec!["rust:slim".into()]),
             workspace: Some(workspace),
             extras: Default::default(),
         }
@@ -548,7 +710,7 @@ mod tests {
             Node::NotOnOverlay => Ok(None),
             Node::Unresolvable => Err("daemon not running".to_string()),
         };
-        let admitted = admit(token, identity, "tailscale", peer, &allow())?;
+        let admitted = admit(token, identity, "tailscale", peer, Some("nSTUDIO"), &allow())?;
         let resolution = match prof {
             Prof::InScope => ProfileResolution::Work("host".into()),
             Prof::OutOfScope => ProfileResolution::Work("coder-big".into()),
@@ -600,7 +762,7 @@ mod tests {
     fn the_identity_lookup_never_runs_without_the_token() {
         let peer: IpAddr = "100.64.0.7".parse().unwrap();
         for t in [TokenCheck::Mismatch, TokenCheck::NotConfigured] {
-            let r = admit(t, || panic!("identity looked up without a token"), "tailscale", peer, &allow());
+            let r = admit(t, || panic!("identity looked up without a token"), "tailscale", peer, Some("nSTUDIO"), &allow());
             assert!(r.is_err());
         }
     }
@@ -616,7 +778,7 @@ mod tests {
         // A hand-edited entry with an EMPTY id must not match a node the
         // provider reports with an empty id either.
         a.insert("blank".into(), entry(Some(""), &["host"], false));
-        let r = admit(TokenCheck::Match, || Ok(Some(n)), "tailscale", peer, &a);
+        let r = admit(TokenCheck::Match, || Ok(Some(n)), "tailscale", peer, Some("nSTUDIO"), &a);
         assert!(matches!(r, Err(Refusal::NotAllowed { .. })), "{r:?}");
     }
 
@@ -625,13 +787,54 @@ mod tests {
         let mut a = allow();
         a.insert("laptop".into(), entry(Some("nLAPTOP"), &["host"], true));
         let peer: IpAddr = "100.64.0.7".parse().unwrap();
-        let r = admit(TokenCheck::Match, || Ok(Some(test_node("nLAPTOP", "macbook-pro", "100.64.0.7"))), "tailscale", peer, &a);
+        let r = admit(TokenCheck::Match, || Ok(Some(test_node("nLAPTOP", "macbook-pro", "100.64.0.7"))), "tailscale", peer, Some("nSTUDIO"), &a);
         assert!(matches!(r, Err(Refusal::AmbiguousEntry { ref names }) if names.len() == 2), "{r:?}");
+    }
+
+    /// (#2916 review) A machine never admits its own node; the role must be
+    /// listed; a named image must be listed; machine names compare
+    /// case-insensitively; the receiver's session id always carries the peer.
+    #[test]
+    fn self_role_image_and_case_are_scoped() {
+        let peer: IpAddr = "100.64.0.2".parse().unwrap();
+        let mut a = allow();
+        a.insert("studio".into(), entry(Some("nSTUDIO"), &["host"], false));
+        let r = admit(TokenCheck::Match, || Ok(Some(test_node("nSTUDIO", "studio", "100.64.0.2"))), "tailscale", peer, Some("nSTUDIO"), &a);
+        assert_eq!(r, Err(Refusal::FromSelf));
+
+        let admitted = Admitted {
+            peer_name: "laptop".into(),
+            profiles: vec!["host".into()],
+            roles: vec!["radio-host".into()],
+            images: vec!["rust:slim".into()],
+            workspace: false,
+        };
+        let work = || ProfileResolution::Work("host".into());
+        let mut j = job(None);
+        j.role_id = "coder".into();
+        assert!(matches!(check_scope("studio", &admitted, &j, work()), Err(Refusal::RoleOutOfScope { ref role, .. }) if role == "coder"));
+        let no_roles = Admitted { roles: vec![], ..admitted.clone() };
+        assert!(matches!(check_scope("studio", &no_roles, &job(None), work()), Err(Refusal::RoleOutOfScope { .. })), "absent roles = none");
+        let mut j = job(None);
+        j.image = Some("evil.example/x:latest".into());
+        assert!(matches!(check_scope("studio", &admitted, &j, work()), Err(Refusal::ImageOutOfScope { .. })));
+        j.image = Some("rust:slim".into());
+        assert_eq!(check_scope("studio", &admitted, &j, work()).unwrap(), "host");
+        let mut j = job(None);
+        j.target_machine = "Studio".into();
+        assert_eq!(check_scope("studio", &admitted, &j, work()).unwrap(), "host", "case-insensitive");
+        assert_eq!(receiver_session_id("s-1", "laptop"), "s-1-from-laptop");
     }
 
     #[test]
     fn scope_refuses_a_misaddressed_job_and_a_workdir_without_workspace() {
-        let admitted = Admitted { peer_name: "macbook-pro".into(), profiles: vec!["host".into()], workspace: false };
+        let admitted = Admitted {
+            peer_name: "macbook-pro".into(),
+            profiles: vec!["host".into()],
+            roles: vec!["radio-host".into()],
+            images: vec![],
+            workspace: false,
+        };
         let mut j = job(None);
         j.target_machine = "mini".into();
         assert!(matches!(
@@ -687,6 +890,49 @@ mod tests {
         let mut v: serde_json::Value = serde_json::from_slice(&good).unwrap();
         v["job"]["role_id"] = "../etc".into();
         assert!(matches!(WorkSubmission::parse(&serde_json::to_vec(&v).unwrap()), Err(Refusal::BadRequest(_))));
+    }
+
+    fn roster_entry(address: &str, node_id: Option<&str>) -> crate::MachineEntry {
+        crate::MachineEntry {
+            id: "studio".into(),
+            address: address.into(),
+            description: None,
+            added_unix_ms: 1,
+            machine_uid: None,
+            loopback_intended: false,
+            node_id: node_id.map(str::to_string),
+            extras: Default::default(),
+        }
+    }
+
+    /// (#2916 review C1) The sender verifies the node at the target's
+    /// address before anything is sent.
+    #[test]
+    fn the_sender_verifies_the_target_node_before_sending() {
+        let provider = crate::identity::StaticIdentityProvider {
+            local: test_node("nLAPTOP", "laptop", "100.64.0.7"),
+            peers: vec![test_node("nSTUDIO", "studio", "100.64.0.2")],
+            down: None,
+        };
+        // Pinned and matching.
+        let v = verify_target("studio", &roster_entry("100.64.0.2", Some("nSTUDIO")), &provider).unwrap();
+        assert_eq!((v.ip, v.newly_pinned), ("100.64.0.2".parse().unwrap(), false));
+        // First contact pins.
+        assert!(verify_target("studio", &roster_entry("100.64.0.2", None), &provider).unwrap().newly_pinned);
+        // A different node at the address: refused.
+        let err = verify_target("studio", &roster_entry("100.64.0.2", Some("nOTHER")), &provider).unwrap_err();
+        assert!(err.to_string().contains("not the one this roster pinned"), "{err}");
+        // Not a node on the overlay (a LAN address): refused.
+        let err = verify_target("studio", &roster_entry("192.168.1.20", None), &provider).unwrap_err();
+        assert!(err.to_string().contains("not a node on the"), "{err}");
+        // Provider down: refused.
+        let down = crate::identity::StaticIdentityProvider { down: Some("x".into()), ..provider };
+        assert!(verify_target("studio", &roster_entry("100.64.0.2", None), &down).is_err());
+    }
+
+    #[test]
+    fn remote_text_loses_its_control_characters() {
+        assert_eq!(sanitize_remote_text("ok\x1b[2J\x1b]0;pwned\x07done\r\nline2\tx"), "ok[2J]0;pwneddone\nline2\tx");
     }
 
     #[test]

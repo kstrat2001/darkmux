@@ -35,7 +35,9 @@ pub struct TrustView {
     /// False when the provider answered and the node is not on the network.
     pub node_on_network: bool,
     pub profiles: Vec<String>,
-    /// Profiles in scope that cannot run here, each with why.
+    pub roles: Vec<String>,
+    pub images: Vec<String>,
+    /// Profiles or roles in scope that cannot run here, each with why.
     pub profile_problems: Vec<String>,
     pub workspace: bool,
 }
@@ -54,6 +56,13 @@ pub struct FleetSubmissionFacts {
     /// The retired `darkmux:work` streams still present in Redis, when Redis
     /// was configured and could be read.
     pub retired_streams: Vec<String>,
+    /// Consumers still registered on those streams (`XINFO CONSUMERS`), by
+    /// name (a machine id), with how long each has been idle. A consumer
+    /// idle for seconds is a 3.x daemon still claiming queue work.
+    pub queue_consumers: Vec<(String, u64)>,
+    /// What the running daemon reports about its listener (`/health`'s
+    /// `fleet_listener`), when the daemon answered.
+    pub daemon_listener_state: Option<String>,
 }
 
 fn check(name: &str, status: Status, message: String, hint: Option<String>) -> Check {
@@ -73,19 +82,39 @@ pub fn fleet_submission_checks(f: &FleetSubmissionFacts) -> Vec<Check> {
         rows.push(trust_row(f));
     }
     if !f.retired_streams.is_empty() {
-        rows.push(check(
-            "retired work queue",
-            Status::Warn,
-            format!(
-                "Redis still holds the retired work queue ({}); nothing reads it any more (#2916)",
-                f.retired_streams.join(", ")
-            ),
-            Some(format!(
-                "Delete it on the hub: `redis-cli DEL {}`. Work now goes machine to machine \
-                 over the fleet listener.",
-                f.retired_streams.join(" ")
-            )),
-        ));
+        let live: Vec<String> = f
+            .queue_consumers
+            .iter()
+            .filter(|(_, idle)| *idle < 60_000)
+            .map(|(n, idle)| format!("{n} (idle {}s)", idle / 1000))
+            .collect();
+        let (status, message, hint) = if live.is_empty() {
+            (
+                Status::Warn,
+                format!(
+                    "Redis still holds the retired work queue ({}); no 4.0 daemon reads it (#2916)",
+                    f.retired_streams.join(", ")
+                ),
+                format!(
+                    "Delete it on the hub once every machine runs 4.0: `redis-cli DEL {}`. A 3.x \
+                     daemon still consumes it (and re-creates it when it starts).",
+                    f.retired_streams.join(" ")
+                ),
+            )
+        } else {
+            (
+                Status::Fail,
+                format!(
+                    "3.x daemons are still consuming the retired work queue: {}. Any node that can \
+                     write this Redis can make them run work, unauthenticated",
+                    live.join(", ")
+                ),
+                "Upgrade those machines to 4.0 (or stop their `darkmux serve`), then delete the \
+                 streams: the queue hole closes only when no 3.x daemon is left."
+                    .to_string(),
+            )
+        };
+        rows.push(check("retired work queue", status, message, Some(hint)));
     }
     rows
 }
@@ -156,10 +185,14 @@ fn listener_row(f: &FleetSubmissionFacts) -> Check {
         Some(false) => check(
             "fleet listener",
             Status::Warn,
-            format!("enabled, but nothing is listening on {addr}"),
+            match &f.daemon_listener_state {
+                Some(state) => format!("enabled, but nothing is listening on {addr}; the daemon says: {state}"),
+                None => format!("enabled, but nothing is listening on {addr}"),
+            },
             Some(
-                "Is `darkmux serve` running, and was it restarted after enabling the listener? Its \
-                 log names why the listener did not start."
+                "Is `darkmux serve` running, and was it restarted after enabling the listener? A \
+                 daemon started by launchd has a short PATH: `darkmux config set fleet.identity.bin \
+                 <path to tailscale>` if the daemon cannot find it."
                     .into(),
             ),
         ),
@@ -217,10 +250,17 @@ fn trust_row(f: &FleetSubmissionFacts) -> Check {
             worst = Status::Warn;
             notes.extend(e.profile_problems.iter().cloned());
         }
+        if e.roles.is_empty() {
+            worst = Status::Warn;
+            notes.push("no roles listed, so nothing can run".to_string());
+            hints.push(format!("`darkmux machine trust {} --roles <role>[,...]`", e.name));
+        }
         lines.push(format!(
-            "{} may run {} (workspace: {}){}",
+            "{} may run {} (roles: {}; images: {}; workspace: {}){}",
             e.name,
             if e.profiles.is_empty() { "nothing".to_string() } else { e.profiles.join(", ") },
+            if e.roles.is_empty() { "none".to_string() } else { e.roles.join(", ") },
+            if e.images.is_empty() { "runtime only".to_string() } else { e.images.join(", ") },
             if e.workspace { "yes" } else { "no" },
             if notes.is_empty() { String::new() } else { format!(" — {}", notes.join("; ")) }
         ));
@@ -252,6 +292,8 @@ mod tests {
             online: Some(true),
             node_on_network: true,
             profiles: vec!["host".into(), "coder-studio".into()],
+            roles: vec!["radio-host".into()],
+            images: vec![],
             profile_problems: vec![],
             workspace: false,
         }
@@ -266,6 +308,8 @@ mod tests {
             listener_bound: Some(true),
             trusted: Ok(vec![trusted()]),
             retired_streams: vec![],
+            queue_consumers: vec![],
+            daemon_listener_state: None,
         }
     }
 
@@ -280,7 +324,7 @@ mod tests {
         assert!(rows.iter().all(|c| c.status == Status::Pass), "{rows:?}");
         let t = row(&rows, "fleet trust");
         assert!(t.message.contains("verified by tailscale"), "{}", t.message);
-        assert!(t.message.contains("laptop may run host, coder-studio (workspace: no)"), "{}", t.message);
+        assert!(t.message.contains("laptop may run host, coder-studio (roles: radio-host; images: runtime only; workspace: no)"), "{}", t.message);
         assert!(t.message.contains("node `laptop`, online"), "{}", t.message);
         assert_eq!(row(&rows, "fleet listener").message, "listening on 100.64.0.2:8766");
         assert!(row(&rows, "fleet identity").message.contains("this machine is `studio`"));
@@ -346,6 +390,33 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, Status::Warn);
         assert!(rows[0].hint.as_deref().unwrap().contains("redis-cli DEL darkmux:work darkmux:work:inference"));
+    }
+
+    /// (#2916 review C6) A 3.x daemon still consuming the queue is named and
+    /// fails; the listener row carries the daemon's own reason.
+    #[test]
+    fn live_queue_consumers_fail_and_the_daemon_reason_shows() {
+        let f = FleetSubmissionFacts {
+            listener_enabled: false,
+            trusted: Ok(vec![]),
+            retired_streams: vec!["darkmux:work".into()],
+            queue_consumers: vec![("studio".into(), 1_500), ("old-box".into(), 9_000_000)],
+            ..facts()
+        };
+        let rows = fleet_submission_checks(&f);
+        assert_eq!(rows[0].status, Status::Fail);
+        assert!(rows[0].message.contains("studio (idle 1s)") && !rows[0].message.contains("old-box"), "{}", rows[0].message);
+        let f = FleetSubmissionFacts {
+            listener_bound: Some(false),
+            daemon_listener_state: Some("waiting for the tailscale network to answer".into()),
+            ..facts()
+        };
+        let rows = fleet_submission_checks(&f);
+        assert!(row(&rows, "fleet listener").message.contains("the daemon says: waiting for the tailscale network"));
+        let mut noroles = trusted();
+        noroles.roles.clear();
+        let f = FleetSubmissionFacts { trusted: Ok(vec![noroles]), ..facts() };
+        assert_eq!(row(&fleet_submission_checks(&f), "fleet trust").status, Status::Warn);
     }
 
     #[test]

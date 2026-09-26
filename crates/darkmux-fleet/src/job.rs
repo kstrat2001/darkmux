@@ -119,8 +119,9 @@ impl WorkJob {
     /// - `message` ≤ 256 KiB, `workdir` ≤ 4 KiB, `timeout_seconds` in
     ///   1..=3600, `image` a conservative image reference.
     pub fn validate(&self) -> Result<()> {
-        validate_work_identifier("target_machine", &self.target_machine)?;
+        validate_machine_name("WorkJob.target_machine", &self.target_machine)?;
         validate_work_identifier("role_id", &self.role_id)?;
+        validate_session_id(&self.session_id)?;
         if let Some(p) = &self.profile {
             if p.is_empty() || p.len() > MAX_WORK_IDENTIFIER_LEN || !p.chars().all(|c| c.is_ascii_graphic()) {
                 return Err(anyhow!(
@@ -194,6 +195,41 @@ pub fn validate_identifier(label: &str, value: &str) -> Result<()> {
         return Err(anyhow!(
             "{label} contains invalid char {c:?} (allowlist [a-z0-9_-]): {value:?}"
         ));
+    }
+    Ok(())
+}
+
+/// (#2916) A machine name (`machine_id`): `[A-Za-z0-9_-]`, 1..=64. Machine
+/// names are ASCII case-INSENSITIVE everywhere (`--machine MacBook-Pro`
+/// and `--machine macbook-pro` are the same machine; compare with
+/// [`same_machine`]); the displayed name keeps its case. Capitals are
+/// allowed because a hostname-derived `machine_id` has them.
+pub fn validate_machine_name(label: &str, value: &str) -> Result<()> {
+    if value.is_empty() || value.len() > MAX_WORK_IDENTIFIER_LEN {
+        return Err(anyhow!("{label} must be 1..={MAX_WORK_IDENTIFIER_LEN} characters: {value:?}"));
+    }
+    if let Some(c) = value.chars().find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_')) {
+        return Err(anyhow!("{label} contains invalid char {c:?} (allowlist [A-Za-z0-9_-]): {value:?}"));
+    }
+    Ok(())
+}
+
+/// (#2916) Whether two machine names name the same machine.
+pub fn same_machine(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+/// Max length of a submitted `session_id`.
+pub(crate) const MAX_SESSION_ID_LEN: usize = 128;
+
+/// (#2916) A submitted session id: `[A-Za-z0-9._-]{1,128}`. It becomes part
+/// of file names and flow-record join keys on the receiver.
+pub fn validate_session_id(value: &str) -> Result<()> {
+    if value.is_empty() || value.len() > MAX_SESSION_ID_LEN {
+        return Err(anyhow!("WorkJob.session_id must be 1..={MAX_SESSION_ID_LEN} characters"));
+    }
+    if let Some(c) = value.chars().find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))) {
+        return Err(anyhow!("WorkJob.session_id contains invalid char {c:?} (allowlist [A-Za-z0-9._-])"));
     }
     Ok(())
 }
@@ -275,14 +311,33 @@ mod tests {
     #[test]
     fn validate_checks_target_machine_and_profile() {
         let mut job = make_valid_job();
-        job.target_machine = "Studio".into();
+        job.target_machine = "MacBook-Pro".into();
+        assert!(job.validate().is_ok(), "machine names may carry capitals (#2916)");
+        job.target_machine = "studio.lan".into();
         assert!(job.validate().unwrap_err().to_string().contains("target_machine"));
+        assert!(same_machine("MacBook-Pro", "macbook-pro"));
+        assert!(!same_machine("macbook-pro", "macbook-pr0"));
         let mut job = make_valid_job();
         job.profile = Some("Coder.Studio-v2".into());
         assert!(job.validate().is_ok());
         for bad in ["", "has space", "tab\t", "x".repeat(65).as_str()] {
             job.profile = Some(bad.to_string());
             assert!(job.validate().unwrap_err().to_string().contains("profile"), "{bad:?}");
+        }
+    }
+
+    /// (#2916) A session id is a join key and part of file names on the
+    /// receiver: a restricted charset and length.
+    #[test]
+    fn validate_checks_the_session_id() {
+        let mut job = make_valid_job();
+        for good in ["radio-host-1790000000-0", "a.b_c-D"] {
+            job.session_id = good.into();
+            assert!(job.validate().is_ok(), "{good}");
+        }
+        for bad in ["", "../x", "a b", "a/b", "x\u{1b}[2J", &"a".repeat(129)] {
+            job.session_id = bad.to_string();
+            assert!(job.validate().unwrap_err().to_string().contains("session_id"), "{bad:?}");
         }
     }
 

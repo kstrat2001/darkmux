@@ -237,10 +237,11 @@ pub(crate) fn reply_to_dispatch_result(
             out_dir: None,
         };
     }
+    // (#2916 review C1) Remote output never reaches the terminal raw.
     DispatchResult {
         exit_code: reply.exit_code.unwrap_or(1),
-        stdout: reply.stdout.unwrap_or_default(),
-        stderr: reply.stderr.unwrap_or_default(),
+        stdout: crate::sanitize_remote_text(&reply.stdout.unwrap_or_default()),
+        stderr: crate::sanitize_remote_text(&reply.stderr.unwrap_or_default()),
         session_id,
         out_dir: None,
     }
@@ -291,12 +292,12 @@ mod tests {
             status: "completed".into(),
             session_id: Some("s-remote".into()),
             exit_code: Some(42),
-            stdout: Some("out".into()),
+            stdout: Some("out\x1b[2J".into()),
             stderr: Some("err".into()),
             ..Default::default()
         };
         let r = reply_to_dispatch_result(reply, "s-local", "studio");
-        assert_eq!((r.exit_code, r.stdout.as_str(), r.stderr.as_str(), r.session_id.as_str()), (42, "out", "err", "s-remote"));
+        assert_eq!((r.exit_code, r.stdout.as_str(), r.stderr.as_str(), r.session_id.as_str()), (42, "out[2J", "err", "s-remote"), "the ESC byte is stripped");
         let accepted = crate::SubmissionReply { status: "accepted".into(), ..Default::default() };
         let r = reply_to_dispatch_result(accepted, "s-local", "studio");
         assert_eq!(r.exit_code, 0);
@@ -313,6 +314,7 @@ mod tests {
         DispatchOpts {
             // (#2914) Work never runs on the utility model.
             allow_utility_model: false,
+            remote_origin: None,
             brief_refs: Vec::new(),
             workspace_read_only: false,
             record_context: None,
@@ -506,6 +508,13 @@ mod tests {
     fn without_a_resume_the_same_setup_does_submit_to_the_peer() {
         let (port, rx) = spawn_connection_counting_peer();
         let _env = PeerEnv::new(port);
+        // The sender verifies the node at 127.0.0.1 before sending (#2916
+        // review C1): say it is `peer-b`'s node.
+        crate::submission::test_sender_provider::set(Box::new(crate::identity::StaticIdentityProvider {
+            local: crate::identity::test_node("nLOCAL", "local-a", "100.64.0.1"),
+            peers: vec![crate::identity::test_node("nPEERB", "peer-b", "127.0.0.1")],
+            down: None,
+        }));
         let mut opts = local_opts("pr-reviewer");
         opts.machine = Some("peer-b".to_string());
         let err = dispatch_routed_via(opts, |_opts| panic!("never local")).unwrap_err();

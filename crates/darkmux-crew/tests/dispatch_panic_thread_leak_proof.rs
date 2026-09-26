@@ -249,6 +249,7 @@ fn dispatch_panic_mid_run_leaves_no_tailer_sampler_watchdog_thread() {
     let opts = DispatchOpts {
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
+        remote_origin: None,
         brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,

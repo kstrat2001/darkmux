@@ -399,6 +399,14 @@ pub struct DispatchOpts {
     /// lists it before it is registered as the binding. Not a general
     /// override: no CLI flag or config key sets it.
     pub allow_utility_model: bool,
+    /// (#2916) The machine that submitted this dispatch over the fleet
+    /// listener, when it came from another machine; `None` for work
+    /// started here. A remote-origin dispatch never mounts this machine's
+    /// shared toolchain cache (`/darkmux-cache`): that cache is writable
+    /// and every later LOCAL dispatch runs what it holds, so a peer that
+    /// may not touch this machine's workspaces could otherwise plant code
+    /// in it. The job's own container keeps its default (ephemeral) caches.
+    pub remote_origin: Option<String>,
     /// (#1959 packet 2) Mount `/workspace` read-only (`-v <ws>:/workspace:ro`)
     /// instead of the default read-write bind. The crawler role reads a
     /// workspace tree it must never modify — a role holding only `read`/`exec`/
@@ -1119,7 +1127,9 @@ pub fn routing_decision(machine: Option<&str>, local_machine_id: Option<&str>) -
         (None, _) => RoutingDecision::Local {
             matches_was_explicit: false,
         },
-        (Some(t), Some(l)) if t == l => RoutingDecision::Local {
+        // (#2916) Machine names are ASCII case-insensitive: `--machine
+        // MacBook-Pro` on the machine named `macbook-pro` runs here.
+        (Some(t), Some(l)) if t.eq_ignore_ascii_case(l) => RoutingDecision::Local {
             matches_was_explicit: true,
         },
         (Some(t), Some(_)) => RoutingDecision::Remote {
@@ -1490,6 +1500,14 @@ mod tests {
     }
 
     // ─── routing_decision (Wave-E.7 #255) ─────────────────────────────
+
+    #[test]
+    fn routing_decision_compares_machine_names_case_insensitively() {
+        assert_eq!(
+            routing_decision(Some("MacBook-Pro"), Some("macbook-pro")),
+            RoutingDecision::Local { matches_was_explicit: true }
+        );
+    }
 
     #[test]
     fn routing_decision_no_machine_is_local() {

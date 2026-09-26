@@ -21,7 +21,7 @@ Before walking through join, confirm the operator's mental model lines up with w
 
 - **Per-machine roster.** Each machine has its OWN `~/.darkmux/fleet.json`. Adding this new machine to the fleet means: (a) configure this machine's env vars + roster to know about its peers, AND (b) run `darkmux machine add <this-machine-id>` on EACH of the operator's other existing machines so they see it too. Cross-machine roster replication is filed as [#280](https://github.com/kstrat2001/darkmux/issues/280) but not yet shipped — for now, the per-machine roster is the operator's hand-managed reality.
 - **Tailnet trust boundary.** darkmux assumes everyone reachable on the same `DARKMUX_REDIS_URL` is the same operator. No per-machine auth beyond the mesh VPN (Tailscale, etc.). See [README — "Who darkmux is for"](https://github.com/kstrat2001/darkmux#who-darkmux-is-for).
-- **Work goes machine to machine, and only to machines that trust the sender (#2916).** `darkmux dispatch <role> --machine <id>` is sent straight to that machine's fleet listener with the fleet token (the serve token, one value on every machine). The receiver runs it only if its own allow-list (`darkmux machine trust <sender> --profiles ...`, run ON the receiver) names the sending node as the tailnet reports it, and only for a profile in that entry's scope. There is no shared work queue any more; Redis carries flow records only.
+- **Work goes machine to machine, and only to machines that trust the sender (#2916).** `darkmux dispatch <role> --machine <id>` is sent straight to that machine's fleet listener with the fleet token (the serve token, one value on every machine). The receiver runs it only if its own allow-list (`darkmux machine trust <sender> --profiles ... --roles ...`, run ON the receiver) names the sending node as the tailnet reports it, and only for a profile in that entry's scope. There is no shared work queue any more; Redis carries flow records only.
 
 Tell the operator these points up-front, then continue.
 
@@ -182,7 +182,7 @@ The skill does NOT auto-create the launchd plist — operator-sovereignty; syste
 Only if the operator wants this machine to RUN work other machines send it. Propose, operator runs, on THIS machine:
 
 ```bash
-darkmux machine trust <sender-machine-id> --profiles <profile>[,<profile>]   # node resolved via tailscale, never typed
+darkmux machine trust <sender-machine-id> --profiles <profile>[,...] --roles <role>[,...]   # node resolved via tailscale, never typed
 darkmux config set fleet.listener.enabled true                             # port 8766 unless fleet.listener.port says otherwise
 brew services restart darkmux
 darkmux doctor 2>&1 | grep -i fleet
