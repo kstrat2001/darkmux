@@ -414,21 +414,25 @@ fn resolve_role(
     // set aside), not simply the profile's default. A role this binary does
     // not know, or a profile selection cannot resolve, keeps the default
     // model's line and its named reasons below.
-    let selected: Option<darkmux_types::ProfileModel> = crate::crew::loader::load_roles()
-        .ok()
-        .and_then(|roles| roles.into_iter().find(|r| r.id == role_id))
-        .and_then(|role| {
-            crate::crew::target::select_in_profile(
-                &ctx.registry,
-                &role,
-                resolved.profile_name.clone(),
-                resolved.profile,
-                false,
-            )
-            .ok()
-        })
-        .and_then(crate::crew::target::Resolution::target)
-        .map(|t| t.model);
+    //
+    // (#2902 review C1) A resolution ERROR (the selected model names an
+    // endpoint the registry cannot resolve) is the seat's error, shown; it
+    // is never swallowed into the default-model fallback, which would render
+    // it as a healthy hosted seat.
+    let role_def = crate::crew::loader::load_roles().ok().and_then(|roles| roles.into_iter().find(|r| r.id == role_id));
+    let selected: Option<darkmux_types::ProfileModel> = match role_def {
+        None => None,
+        Some(role) => match crate::crew::target::select_in_profile(
+            &ctx.registry,
+            &role,
+            resolved.profile_name.clone(),
+            resolved.profile,
+            false,
+        ) {
+            Ok(r) => r.target().map(|t| t.model),
+            Err(e) => return bound_but_unusable(format!("{e:#}")),
+        },
+    };
     let pm = match &selected {
         Some(m) => m,
         None => {
@@ -444,6 +448,12 @@ fn resolve_role(
             pm
         }
     };
+
+    // (#2902 review C1) The default-model fallback (a role this binary does
+    // not know) applies the same endpoint rule the resolver does.
+    if let Err(e) = pm.endpoint_kind() {
+        return bound_but_unusable(e.to_string());
+    }
 
     // (merge-gate MUST-FIX 1) The SAME gate every real dispatch path
     // applies before trusting a local `ProfileModel` — see
@@ -1202,6 +1212,24 @@ mod tests {
     /// resolver's selection within the bound profile, not simply its
     /// default. `coder` (skills `coding`, `test-designing`) selects the
     /// code-weighted model over the declared default.
+    /// (#2902 review C1) A seat whose selected model names an endpoint the
+    /// registry cannot resolve is shown as unusable with the reason, never
+    /// as a healthy hosted seat.
+    #[test]
+    fn show_surfaces_a_seat_on_an_unresolvable_endpoint() {
+        let mut registry: ProfileRegistry = serde_json::from_str(
+            r#"{"profiles":{"p":{"models":[{"id":"gpt","endpoint":"nope"}]}},"default_profile":"p"}"#,
+        )
+        .unwrap();
+        registry.materialize_endpoints();
+        let pctx = ctx(registry);
+        let r = resolve_role("coder", Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]));
+        assert!(r.model.is_none(), "{:?}", r.model);
+        assert!(r.error.as_deref().is_some_and(|e| e.contains("nope")), "{:?}", r.error);
+        let unknown_role = resolve_role("role-a", Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]));
+        assert!(unknown_role.error.as_deref().is_some_and(|e| e.contains("nope")), "{:?}", unknown_role.error);
+    }
+
     #[test]
     fn show_names_the_selected_model_not_simply_the_profile_default() {
         let model = |id: &str, cap: &str| {
