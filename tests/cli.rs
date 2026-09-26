@@ -3323,7 +3323,17 @@ fn dispatch_host_side_unset_compactor_disclosure_fires_on_the_local_path() {
     )
     .unwrap();
     let fake_docker = fake_bin.join("docker");
-    fs::write(&fake_docker, "#!/bin/sh\nexit 0\n").unwrap();
+    // (#2923) `--skip-preflight` skips only the daemon probe; the runtime
+    // image is still checked, so `image inspect` answers with one built for
+    // this darkmux.
+    fs::write(
+        &fake_docker,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = image ] && [ \"$2\" = inspect ]; then echo 'sha256:fake|{}'; fi\nexit 0\n",
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -3367,7 +3377,8 @@ fn fake_docker_for_runtime_image(
     let log = tmp.join("docker.log");
     let mut inspect_cases = String::new();
     for (image, label) in labels {
-        inspect_cases.push_str(&format!("    '{image}') echo '{label}'; exit 0 ;;\n"));
+        // `{{.Id}}|<label>`, the shape dispatch asks for.
+        inspect_cases.push_str(&format!("    '{image}') echo 'sha256:id-of-{image}|{label}'; exit 0 ;;\n"));
     }
     let script = format!(
         "#!/bin/sh\n\
@@ -3505,6 +3516,40 @@ fn dispatch_skips_a_stale_unlabeled_latest_and_refuses_when_the_pin_cannot_be_pu
 }
 
 #[test]
+fn dispatch_skip_preflight_still_refuses_a_stale_unlabeled_latest() {
+    // (#2923 review C1) `--skip-preflight` (and the `skip_preflight` mission
+    // step key) skips the daemon probe only. It used to return
+    // `darkmux-runtime:latest` unchecked, so the Studio's stale image ran.
+    let tmp = TempDir::new().unwrap();
+    let (fake_bin, log) =
+        fake_docker_for_runtime_image(tmp.path(), &[("darkmux-runtime:latest", "")]);
+    dispatch_with_fake_docker(tmp.path(), &fake_bin, &["--skip-preflight"])
+        .failure()
+        .stderr(predicate::str::contains("`darkmux-runtime:latest` carries no version label"));
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.lines().any(|l| l.starts_with("version")),
+        "the daemon probe is what --skip-preflight skips:\n{calls}"
+    );
+    assert_no_container_ran(&log);
+}
+
+#[test]
+fn dispatch_says_pulling_the_pinned_image_not_that_none_is_local_after_a_skip() {
+    // (#2923 review C8) Right after "local `darkmux-runtime:latest` … not
+    // using it", the pull line must not claim there is no local image.
+    let tmp = TempDir::new().unwrap();
+    let (fake_bin, _log) =
+        fake_docker_for_runtime_image(tmp.path(), &[("darkmux-runtime:latest", "0.0.1")]);
+    dispatch_with_fake_docker(tmp.path(), &fake_bin, &[])
+        .failure()
+        .stderr(
+            predicate::str::contains("pulling the version-pinned runtime image")
+                .and(predicate::str::contains("no local runtime image").not()),
+        );
+}
+
+#[test]
 fn dispatch_byo_image_takes_its_injected_runtime_from_the_matching_image_not_a_stale_latest() {
     // (#703 + #2923) `--image rust:slim` injects darkmux's runtime binary,
     // extracted from a darkmux image. That source must be the image built
@@ -3521,12 +3566,14 @@ fn dispatch_byo_image_takes_its_injected_runtime_from_the_matching_image_not_a_s
     // right there; what matters is which image it was asked to extract from.
     let _ = dispatch_with_fake_docker(tmp.path(), &fake_bin, &["--image", "rust:slim"]);
     let calls = fs::read_to_string(&log).unwrap_or_default();
+    // By the id the gate checked (#2923 review C6), never by a tag.
     assert!(
-        calls.contains(&format!("create -- {pinned}")),
+        calls.contains(&format!("create -- sha256:id-of-{pinned}")),
         "the injected runtime comes from the pinned image:\n{calls}"
     );
     assert!(
-        !calls.contains("create -- darkmux-runtime:latest"),
+        !calls.contains("create -- darkmux-runtime:latest")
+            && !calls.contains("create -- sha256:id-of-darkmux-runtime:latest"),
         "never from the stale local tag:\n{calls}"
     );
 }

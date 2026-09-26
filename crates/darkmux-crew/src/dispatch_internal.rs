@@ -87,8 +87,9 @@ fn is_darkmux_runtime_image(tag: &str) -> bool {
 /// own progress to stderr so a multi-second first-dispatch pull isn't a silent
 /// hang. Bails with an actionable message (auth / network / build-locally) on
 /// failure.
+#[cfg_attr(test, allow(dead_code))]
 fn pull_runtime_image(image: &str) -> Result<()> {
-    eprintln!("darkmux dispatch: no local runtime image — pulling `{image}` from GHCR (one-time, #759)…");
+    eprintln!("darkmux dispatch: pulling the version-pinned runtime image `{image}` from GHCR (one-time, #759)…");
     let status = Command::new("docker")
         .args(["pull", image])
         .status()
@@ -113,18 +114,44 @@ fn pull_runtime_image(image: &str) -> Result<()> {
 /// darkmux-runtime:4.0-rc`), checked the same way and refused on mismatch.
 /// Returns the ref to use. The caller has already confirmed the Docker daemon
 /// is reachable.
-fn ensure_darkmux_image_present(explicit: Option<&str>) -> Result<String> {
-    use crate::runtime_image::{resolve_default_image, resolve_explicit_image, DockerImageInspector};
+fn ensure_darkmux_image_present(
+    explicit: Option<&str>,
+) -> Result<crate::runtime_image::ResolvedImage> {
+    #[cfg(not(test))]
+    use crate::runtime_image::DockerImageInspector;
+    use crate::runtime_image::{host_dev_build, resolve_default_image, resolve_explicit_image};
     let host = env!("CARGO_PKG_VERSION");
+    // This crate's own unit tests drive `dispatch()` end to end by the
+    // hundred and must never reach the host's Docker (or pull from GHCR):
+    // under `cfg(test)` the SAME resolver runs against a fixed image store
+    // holding one matching `:latest`. The resolver's decisions are unit-tested
+    // in `runtime_image`; the wired binary is tested with a fake `docker` on
+    // PATH (`tests/cli.rs`). Release builds only ever see `DockerImageInspector`.
+    #[cfg(test)]
+    let (inspector, pull): (&dyn crate::runtime_image::ImageInspector, &dyn Fn(&str) -> Result<()>) = (
+        &crate::runtime_image::UnitTestMatchingLatest,
+        &|image| bail!("unit tests never pull `{image}`"),
+    );
+    #[cfg(not(test))]
+    let (inspector, pull): (&dyn crate::runtime_image::ImageInspector, &dyn Fn(&str) -> Result<()>) =
+        (&DockerImageInspector::default(), &pull_runtime_image);
     match explicit {
-        Some(image) => resolve_explicit_image(&DockerImageInspector, image, host, &pull_runtime_image),
+        Some(image) => resolve_explicit_image(inspector, image, host, pull),
         None => resolve_default_image(
-            &DockerImageInspector,
+            inspector,
             host,
-            &pull_runtime_image,
+            host_dev_build().as_deref(),
+            pull,
             &emit_preflight_warning_once,
         ),
     }
+}
+
+
+/// `sha256:0123456789ab…` → `sha256:0123456789ab`, for a one-line notice.
+fn short_image_id(id: &str) -> &str {
+    let end = id.find(':').map_or(0, |i| i + 1) + 12;
+    id.get(..end).unwrap_or(id)
 }
 
 /// Add the two host→container bind mounts to the docker run command:
@@ -5070,22 +5097,38 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // checked against this darkmux's version and refused on mismatch; the
     // default image is then never resolved or pulled. A non-darkmux `--image`
     // still resolves the default image, as the source of the injected binary.
+    //
+    // (#2923 review C1) `skip_preflight` skips only the daemon probe. The
+    // image is resolved and version-checked either way: the gate is what
+    // keeps a mismatched runtime from running, and a debug flag (or the
+    // `skip_preflight` mission step key) must not open it.
     let explicit_darkmux_image = opts.image.as_deref().filter(|_| !inject);
     let darkmux_image = if opts.skip_preflight {
-        RUNTIME_IMAGE.to_string()
+        ensure_darkmux_image_present(explicit_darkmux_image)?
     } else {
         check_docker_preflight(explicit_darkmux_image)?
     };
 
-    // The image we actually run: the operator's `--image` if given, else the
-    // resolved (possibly just-pulled) darkmux image.
-    let image = opts.image.clone().unwrap_or_else(|| darkmux_image.clone());
+    // The image we actually run: the operator's `--image` if given (injected),
+    // else the checked darkmux image. (#2923 review C6) A darkmux image runs
+    // by the content id that was checked, not by its tag, so a tag re-pointed
+    // between the check and `docker run` cannot swap in an unchecked image.
+    // `image` stays the human-readable ref for records and messages.
+    let image = opts
+        .image
+        .clone()
+        .unwrap_or_else(|| darkmux_image.reference.clone());
+    let run_image = if inject {
+        image.clone()
+    } else {
+        darkmux_image.id.clone()
+    };
     eprintln!(
         "darkmux dispatch: runtime=internal — image: {image}{}",
         if inject {
-            " (darkmux-runtime binary injected)"
+            " (darkmux-runtime binary injected)".to_string()
         } else {
-            ""
+            format!(" ({})", short_image_id(&darkmux_image.id))
         }
     );
 
@@ -5841,11 +5884,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         )?,
         inject,
         runtime_binary: if inject {
-            Some(ensure_runtime_binary_cached(&darkmux_image)?)
+            Some(ensure_runtime_binary_cached(&darkmux_image.id)?)
         } else {
             None
         },
-        image: image.clone(),
+        image: run_image.clone(),
         role_id: opts.role_id.clone(),
         // (#2386) The SAME id `materialize_finding` keys stored findings by.
         session_id: session_id.clone(),
@@ -11336,8 +11379,15 @@ pub enum DockerRuntimeStatus {
     /// `docker` is present but `docker version` failed (daemon not running).
     /// Carries the trimmed stderr for diagnostics.
     DaemonUnreachable(String),
-    /// Docker is up but `RUNTIME_IMAGE` isn't built locally.
+    /// Docker is up but no runtime image built for this darkmux is local —
+    /// the dispatch pulls the version-pinned one.
     ImageMissing,
+    /// (#2923) Docker is up and a runtime image is present where dispatch
+    /// would take it from, but it does not match this darkmux and dispatch
+    /// refuses it rather than pulling (a present pinned image with a
+    /// contradicting or missing label, or one that could not be inspected).
+    /// Carries the refusal dispatch would print.
+    ImageRefused(String),
     /// Couldn't run the image probe even though the daemon answered (rare —
     /// same binary as the version probe). Carries the error string.
     ProbeError(String),
@@ -11370,12 +11420,22 @@ pub fn docker_runtime_status() -> DockerRuntimeStatus {
     // (#2923) "Present" means a USABLE image: one whose version matches this
     // darkmux. A stale or unlabeled local `:latest` next to an absent pin is
     // `ImageMissing`, because the dispatch will pull.
-    match crate::runtime_image::plan_default_image(
-        &crate::runtime_image::DockerImageInspector,
+    // (#2923 review C8) A plan dispatch would REFUSE is reported as such, so
+    // doctor never says "will pull" where dispatch refuses.
+    status_for_plan(crate::runtime_image::plan_default_image(
+        &crate::runtime_image::DockerImageInspector::default(),
         env!("CARGO_PKG_VERSION"),
-    ) {
+        None,
+    ))
+}
+
+/// Pure: the default-image plan → the status doctor shows. A plan dispatch
+/// would refuse is `ImageRefused`, never `ImageMissing` ("will pull").
+fn status_for_plan(plan: Result<crate::runtime_image::DefaultImagePlan>) -> DockerRuntimeStatus {
+    match plan {
         Ok(plan) if !plan.needs_pull => DockerRuntimeStatus::Ready,
-        _ => DockerRuntimeStatus::ImageMissing,
+        Ok(_) => DockerRuntimeStatus::ImageMissing,
+        Err(e) => DockerRuntimeStatus::ImageRefused(e.to_string()),
     }
 }
 
@@ -11385,19 +11445,21 @@ pub fn docker_runtime_status() -> DockerRuntimeStatus {
 /// role-load / model-probe / workspace setup so a new user without Docker gets
 /// a clean, operator-actionable bail, and a `brew install` user without a
 /// local image gets a one-time pull instead of a "build from source" dead-end.
-fn check_docker_preflight(explicit: Option<&str>) -> Result<String> {
+fn check_docker_preflight(explicit: Option<&str>) -> Result<crate::runtime_image::ResolvedImage> {
     match docker_runtime_status() {
         // Daemon up (image present OR absent) — resolve the darkmux image,
         // pulling the version-pinned GHCR image on demand if none is local.
-        DockerRuntimeStatus::Ready | DockerRuntimeStatus::ImageMissing => {
-            ensure_darkmux_image_present(explicit)
-        }
+        // `ImageRefused` resolves too: an explicitly named image may still be
+        // fine, and on the default path the resolver produces the refusal.
+        DockerRuntimeStatus::Ready
+        | DockerRuntimeStatus::ImageMissing
+        | DockerRuntimeStatus::ImageRefused(_) => ensure_darkmux_image_present(explicit),
         // Docker missing / daemon unreachable / probe error → actionable bail
         // (reuse the pure mapper, which returns Err for all of these). The
-        // `.map` only adapts the Ok type so the `Result<String>` signature
-        // lines up — these variants never produce Ok, so the `String` is never
-        // built.
-        other => preflight_result_for(other).map(|()| String::new()),
+        // `.and_then` only adapts the Ok type so the signature lines up —
+        // these variants never produce Ok.
+        other => preflight_result_for(other)
+            .and_then(|()| Err(anyhow!("docker preflight produced no runtime image"))),
     }
 }
 
@@ -11426,6 +11488,7 @@ fn preflight_result_for(status: DockerRuntimeStatus) -> Result<()> {
         DockerRuntimeStatus::ProbeError(e) => {
             Err(anyhow!("running `docker images` to check for runtime image: {e}"))
         }
+        DockerRuntimeStatus::ImageRefused(refusal) => Err(anyhow!(refusal)),
     }
 }
 

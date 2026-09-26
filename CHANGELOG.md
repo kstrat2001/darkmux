@@ -84,8 +84,15 @@ darkmux release.
   the version-pinned `ghcr.io/kstrat2001/darkmux-runtime:<version>`, pulling
   it if absent, and says which local image it skipped. If no matching image
   can be had, it refuses before starting a container, naming both versions
-  and the rebuild command. An image with no label counts as a mismatch; a
-  GHCR version tag stands in for a missing label. **Behavior change for
+  and the rebuild command. An image with no label counts as a mismatch (a
+  GHCR version tag can explain a mismatch, never vouch for a match). The
+  check runs under `--skip-preflight` and the `skip_preflight` mission step
+  key too, which now skip only the Docker daemon probe. The container runs
+  by the checked image id, not the tag. A development build that falls back
+  to the release image for its version number says so, with the command
+  that builds a matching one. `darkmux doctor`'s `docker runtime` row
+  reports an image dispatch would refuse as refused, not "will pull".
+  **Behavior change for
   source builds:** a local runtime image must now be built with
   `docker build --build-arg DARKMUX_VERSION=<version> -t darkmux-runtime:latest runtime/`
   to be used. `--image darkmux-runtime:<any tag>` (e.g. `:4.0-rc`) is now
@@ -94,15 +101,6 @@ darkmux release.
   the matching image too. `darkmux doctor`'s `runtime image freshness`
   warns on an unlabeled `:latest` (it used to pass) and lists other
   unlabeled local tags.
-
-  Release notes: update the formula caveat. In
-  `packaging/homebrew/darkmux.rb`, in the pin PR after the tag exists,
-  replace "(`docker build -t darkmux-runtime:latest runtime/` from a source
-  checkout is the offline/dev alternative.)" with "(`docker build
-  --build-arg DARKMUX_VERSION=<version> -t darkmux-runtime:latest runtime/`
-  from a source checkout at the same version is the offline/dev
-  alternative; an image built for another version, or with no version
-  label, is not used.)".
 
 - **radio says the model is busy instead of queueing behind it** (#2917).
   One LM Studio instance serves one request at a time, and darkmux caps

@@ -6555,6 +6555,16 @@ fn docker_status_to_check(status: darkmux_crew::dispatch_internal::DockerRuntime
             message: format!("couldn't probe the Docker runtime image: {e}"),
             hint: None,
         },
+        // (#2923) Dispatch would refuse this image rather than pull, so doctor
+        // says the same thing dispatch will.
+        S::ImageRefused(refusal) => Check {
+            name,
+            status: Status::Warn,
+            message: "Docker is up, but the runtime image dispatch would use does not match this \
+                      darkmux — dispatches will be refused"
+                .to_string(),
+            hint: Some(refusal),
+        },
     }
 }
 
@@ -12237,6 +12247,20 @@ mod tests {
             "docker build --build-arg DARKMUX_VERSION={} -t darkmux-runtime:latest runtime/",
             env!("CARGO_PKG_VERSION")
         )));
+    }
+
+    #[test]
+    fn docker_status_refused_image_says_refused_not_will_pull() {
+        // (#2923 review C8) A present pinned image whose label contradicts its
+        // tag is refused by dispatch; doctor must not promise a pull.
+        use darkmux_crew::dispatch_internal::DockerRuntimeStatus;
+        let c = docker_status_to_check(DockerRuntimeStatus::ImageRefused(
+            "refusing to dispatch: runtime image `x` was built for darkmux 1.0.0".into(),
+        ));
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("will be refused"), "{}", c.message);
+        assert!(!c.message.contains("will pull"), "{}", c.message);
+        assert!(c.hint.unwrap().contains("built for darkmux 1.0.0"));
     }
 
     #[test]

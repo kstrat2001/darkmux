@@ -251,9 +251,14 @@ pub(crate) enum Cmd {
         /// dispatches (those are always synchronous).
         #[arg(long)]
         no_wait: bool,
-        /// (#703) Dispatch into a specific Docker image. Default:
-        /// `darkmux-runtime:latest` (slim — python + node). Pass ANY Linux
-        /// image (e.g. `rust:slim`, your project's own CI image) and darkmux
+        /// (#703) Dispatch into a specific Docker image. Default: the
+        /// darkmux runtime image built for this version (slim — python +
+        /// node): a local `darkmux-runtime:latest` whose version label
+        /// matches, else `ghcr.io/kstrat2001/darkmux-runtime:<version>`,
+        /// pulled on first use (#2923). Naming a `darkmux-runtime:<tag>`
+        /// runs that image after the same version check, refusing a
+        /// mismatch. Pass any OTHER Linux image (e.g. `rust:slim`, your
+        /// project's own CI image) and darkmux
         /// injects its static runtime binary into it, so the coder runs in
         /// that environment and can `cargo check`/`test` in-sandbox — the
         /// inner verify loop. No per-language darkmux images. The image needs

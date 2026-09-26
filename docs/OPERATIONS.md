@@ -273,8 +273,13 @@ binary's version. Otherwise it runs the version-pinned
 prints which local image it skipped. An image with no label counts as a
 mismatch. `--image darkmux-runtime:<tag>` names darkmux's own image and is
 checked the same way: a mismatched or unlabeled one is refused before any
-container starts, with the rebuild command. `darkmux doctor`'s
-`runtime image freshness` row shows what is on the machine.
+container starts, with the rebuild command. The container runs by the
+checked image's id, so re-tagging during a dispatch cannot swap in another
+image. A development build (a git checkout; `darkmux --version` shows a SHA)
+shares its version number with the release, so when it falls back to the
+release image it says so and names the build command for a matching one.
+`darkmux doctor`'s `runtime image freshness` row shows what is on the
+machine.
 
 The `lab` subcommand mirrors `dispatch`'s contract: the internal runtime, no external agent runtime to install or configure. The `machine` / `profile` subcommands don't depend on any runtime at all. They read LMStudio and the registry directly.
 

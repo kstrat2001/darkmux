@@ -305,7 +305,9 @@ release commit, stamped with NEW: `docker build --build-arg DARKMUX_VERSION=NEW
 prior release's image no longer works even when `runtime/` did not change: its
 version label names the prior release, and dispatch skips a local image whose
 label does not match the binary (#2923). The rebuild is cheap when `runtime/`
-is unchanged; only the label layer differs.
+is unchanged and the machine has built it before: the Dockerfile declares the
+version build-arg after its last `RUN`, so with a warm layer cache only the
+label layer is new.
 
 **A trivial message is the FLOOR, not the gate.** It proves the container ran
 and the loop executed. It does NOT prove the release's features work — #1135

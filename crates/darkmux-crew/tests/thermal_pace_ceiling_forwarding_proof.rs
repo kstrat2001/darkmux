@@ -106,7 +106,15 @@ fn install_fake_docker_and_lms(dir: &Path, record: &Path, lms_ps_json: &str) -> 
     let fake_docker = dir.join("docker");
     fs::write(
         &fake_docker,
-        format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n", record.display()),
+        // (#2923) `image inspect` answers with a runtime image built for this
+        // darkmux (id|version label), so the dispatch's image gate passes and
+        // the `docker run` argv under test is reached.
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n\
+             if [ \"$1\" = image ] && [ \"$2\" = inspect ]; then echo 'sha256:fake|{}'; fi\nexit 0\n",
+            record.display(),
+            env!("CARGO_PKG_VERSION")
+        ),
     )
     .expect("writing fake docker");
 
@@ -300,5 +308,22 @@ fn a_configured_lmstudio_url_reaches_the_container_translated_for_docker() {
     assert!(
         recorded.contains("--base-url http://host.docker.internal:4321/v1"),
         "the configured lmstudio_url must reach the container as its --base-url: {recorded}"
+    );
+}
+
+/// (#2923 review C6) The container runs by the content id the image gate
+/// checked, never by a tag that could be re-pointed between the check and
+/// `docker run`. The shim's `image inspect` answers `sha256:fake` for a
+/// matching `darkmux-runtime:latest`, so that id, and not the tag, must be
+/// the image `docker run` is handed.
+#[test]
+#[serial_test::serial] // mutates PATH, DARKMUX_HOME, DARKMUX_LMS_BIN and the thermal knob
+fn the_container_runs_by_the_checked_image_id_not_by_tag() {
+    let recorded = captured_docker_argv("1000");
+    let run_line = docker_run_line(&recorded);
+    assert!(run_line.contains(" -- sha256:fake "), "runs by id: {run_line}");
+    assert!(
+        !run_line.contains("darkmux-runtime:latest"),
+        "a tag can be re-pointed after the check: {run_line}"
     );
 }

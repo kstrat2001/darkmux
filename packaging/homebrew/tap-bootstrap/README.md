@@ -65,17 +65,17 @@ leave a dangling launchd plist until the next reboot.
 `fleet`, `flow`, `init`), the `serve` daemon, the keychain wrapper, and
 the bundled skills.
 
-**Not included:** the `darkmux-runtime` Docker image that `darkmux
-dispatch` and `darkmux lab run` need — that requires a source checkout
-of darkmux + `docker build --build-arg DARKMUX_VERSION=<version> -t darkmux-runtime:latest runtime/`. A
-published image is tracked in
-[darkmux#618](https://github.com/kstrat2001/darkmux/issues/618).
+**Not bundled, but not a manual step:** the `darkmux-runtime` Docker image
+that `darkmux dispatch` and `darkmux lab run` run in. On the first dispatch,
+darkmux pulls the image built for its own version,
+`ghcr.io/kstrat2001/darkmux-runtime:<version>` (#759); you need Docker
+running. From a source checkout at the same version you can build it instead
+with `docker build --build-arg DARKMUX_VERSION=<version> -t
+darkmux-runtime:latest runtime/`; an image built for another version, or
+without the build-arg, is not used (#2923).
 
-`brew install darkmux` is the complete install for the **hub posture**
-(coordinator running Redis + serve, no local dispatches) and for the
-`swap` / `status` / `profiles` flows. For local dispatches on the same
-machine, supplement with a runtime image from a source checkout, or
-clone darkmux directly and use `cargo install --path .`.
+So `brew install darkmux` is a complete install: the **hub posture**
+(coordinator running Redis + serve) and local dispatches alike.
 
 ## Privacy / telemetry
 
