@@ -670,9 +670,16 @@ export function FleetLens({
   // `PlaybackLens`'s `onPlayheadChange` reporting the same `playheadT` this
   // line reads up to `App`, which threads it into `EventLogColumn`. See
   // `App.tsx`'s own `eventLogRecords` doc for that half.
+  //
+  // (#2911) Live, it IS the window, by reference: the filter only ever
+  // removed a record stamped after the viewer's own clock (a peer's clock
+  // running ahead), and running it on the live clock made the hero's token
+  // sums and note recompute every second while an execution ticks the lens.
+  // A record the daemon has already delivered is counted; the playhead gate
+  // stays exactly as it was in a replay, where it is the point.
   const scopedData = useMemo(
-    () => flowWindow.data.filter((r) => T(r.ts) <= playheadT),
-    [flowWindow.data, playheadT],
+    () => (playhead == null ? flowWindow.data : flowWindow.data.filter((r) => T(r.ts) <= playhead)),
+    [flowWindow.data, playhead],
   );
   const tokens = useMemo(() => tokensOffMeter(scopedData), [scopedData]);
   const note = useMemo(() => hybridNote(scopedData, tokens), [scopedData, tokens]);

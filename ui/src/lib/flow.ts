@@ -612,13 +612,59 @@ export function sessionRunsOn(data: FlowRecord[], m: string): MachineSessionRun[
   return out;
 }
 
+/** (#2911) One window's records grouped by `session_id`, each group in the
+ * window's own order. Built once per window ARRAY (a `WeakMap` keyed on its
+ * identity) and reused by every per-session lookup below.
+ *
+ * Why it exists: those lookups (`dispatchRec`, `sessEnd`, `sessionRunning`)
+ * used to scan the whole window per session, and the fleet cards, the
+ * flow-derived liveness set and the activity timeline ask them for every
+ * session on every render. That was affordable while the lens only
+ * re-rendered on new records; once a live execution re-renders it every
+ * second (#2911's countdown tick) it was the bulk of a ~100 ms hitch per
+ * second on a busy day. The window array is stable across those ticks
+ * (`useFlowWindow` keys it on a coarse edge), so the index is built once
+ * per new window and each tick's lookups touch one session's records.
+ *
+ * The contract this relies on: a window array is never mutated after it is
+ * first read. Every producer builds a new array (`buildFlowWindow`, the
+ * playback slices), so that already holds; a caller that appended to an
+ * array in place after reading it would get the stale grouping. */
+const sessionIndexCache = new WeakMap<readonly FlowRecord[], Map<string, FlowRecord[]>>();
+const NO_RECORDS: FlowRecord[] = [];
+let sessionIndexBuilds = 0;
+
+/** Test-only: how many session indexes have been built. A test that ticks a
+ *  lens asserts this does NOT move, which pins both halves of the #2911 cost
+ *  fix at once: the window array stayed the same object across the tick,
+ *  and the per-session lookups went through the index built for it. */
+export function __sessionIndexBuilds(): number {
+  return sessionIndexBuilds;
+}
+
+export function sessionRecords(data: readonly FlowRecord[], sid: string): FlowRecord[] {
+  let index = sessionIndexCache.get(data);
+  if (!index) {
+    index = new Map();
+    for (const r of data) {
+      if (!r || typeof r.session_id !== "string") continue;
+      const group = index.get(r.session_id);
+      if (group) group.push(r);
+      else index.set(r.session_id, [r]);
+    }
+    sessionIndexCache.set(data, index);
+    sessionIndexBuilds++;
+  }
+  return index.get(sid) ?? NO_RECORDS;
+}
+
 /** `dispatch()` — viewer.html:1125. `missionId` (#2125), when given, scopes
  * the match to records naming that mission — see `sessionRunsOn`'s own doc
  * for why a bare `session_id` match is unsafe for a review-shaped session.
  * `undefined` (every pre-existing caller) preserves the exact prior
  * session_id-only behavior. */
 export function dispatchRec(data: FlowRecord[], sid: string, act: string, missionId?: string): FlowRecord | undefined {
-  return data.find(
+  return sessionRecords(data, sid).find(
     (r) => r.session_id === sid && r.action === "dispatch." + act && (missionId === undefined || !r.mission_id || r.mission_id === missionId),
   );
 }
@@ -638,7 +684,7 @@ export const dispatchKilled = (rec: FlowRecord | undefined): boolean =>
 /** `sessEnd()` — viewer.html:1149. `missionId` (#2125) — see `dispatchRec`'s
  * own doc. */
 export function sessEnd(data: FlowRecord[], sid: string, missionId?: string): FlowRecord | undefined {
-  return data.find(
+  return sessionRecords(data, sid).find(
     (r) => r.session_id === sid && r.action === "session.end" && (missionId === undefined || !r.mission_id || r.mission_id === missionId),
   );
 }
@@ -701,9 +747,10 @@ export function sessionRunning(
   if (liveSet.has(sid)) return true;
   const close = sessionCloseEdge(data, sid, missionId);
   if (close && T(close.ts) <= t) return false;
-  const started = data.some((r) => r.session_id === sid && isDispatchStart(r.action) && T(r.ts) <= t);
+  const own = sessionRecords(data, sid);
+  const started = own.some((r) => isDispatchStart(r.action) && T(r.ts) <= t);
   if (!started) return false;
-  const activityTimes = data.filter((r) => r.session_id === sid && T(r.ts) <= t).map((r) => T(r.ts));
+  const activityTimes = own.filter((r) => T(r.ts) <= t).map((r) => T(r.ts));
   const lastActivity = activityTimes.length ? Math.max(...activityTimes) : -Infinity;
   return t - lastActivity <= FLOW_LIVE_TTL_MS;
 }

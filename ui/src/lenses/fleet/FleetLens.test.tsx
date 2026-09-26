@@ -6,7 +6,7 @@ import { render, screen, waitFor, fireEvent, act } from "@testing-library/react"
 import { QueryClientProvider, QueryClient } from "@tanstack/react-query";
 import { FleetLens } from "./FleetLens";
 import type { FlowRecord } from "../../types/handwritten";
-import { todayUTC, prevDateUTC, FLOW_LIVE_TTL_MS } from "../../lib/flow";
+import { todayUTC, prevDateUTC, FLOW_LIVE_TTL_MS, __sessionIndexBuilds } from "../../lib/flow";
 import { closeOpenModal } from "../../lib/dialogManager";
 import { queryKeys } from "../../lib/queryKeys";
 import { __clockDebug } from "../../lib/clock";
@@ -1920,6 +1920,53 @@ describe("(#2911) the fleet card ticks while an execution is live", () => {
     expect(latestTokenScopeProps()).toMatchObject({ state: "rest", centerLabel: "17s", centerUnit: "resting" });
     r.unmount();
     expect(__clockDebug().running).toBe(false);
+  });
+
+  it("a tick recomputes the card, not the flow window", async () => {
+    // The tick exists to move the card's clock-bound state (a REST
+    // countdown, a stall, the live TTL). The window merge and the
+    // per-session index built over it depend only on records, and a tick
+    // brings none: rebuilding them every second was a ~100 ms hitch per
+    // second on a busy day. Measured here as "no new session index is built
+    // across ticks", which holds only while the window array is the same
+    // object AND the card's session lookups go through its index.
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    vi.setSystemTime(new Date(FROZEN_NOW));
+    mockFleetFetch({
+      flowToday: [
+        { ts: ago(20_000), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s-rest", action: "dispatch.start", handle: "darkmux/coder" },
+        { ts: ago(10_000), machine_uid: "u1", session_id: "s-rest", action: "dispatch.rest", payload: { ms: 30_000 } },
+      ],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach-scope__rate")?.textContent).toBe("rest 20s"));
+    const builds = __sessionIndexBuilds();
+    for (let i = 0; i < 3; i++) {
+      act(() => {
+        vi.advanceTimersByTime(1_000);
+      });
+    }
+    // The card DID recompute: the countdown moved three seconds.
+    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("rest 17s");
+    expect(__sessionIndexBuilds()).toBe(builds);
+  });
+
+  it("the flow-derived live TTL expires on the tick, with no new record", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    vi.setSystemTime(new Date(FROZEN_NOW));
+    mockFleetFetch({
+      flowToday: [
+        { ts: ago(FLOW_LIVE_TTL_MS - 500), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s-old", action: "dispatch.start", handle: "darkmux/coder" },
+        { ts: ago(FLOW_LIVE_TTL_MS - 1_500), machine_uid: "u1", session_id: "s-old", action: "dispatch.rest", payload: { ms: 600_000 } },
+      ],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")?.textContent).toContain("dispatch in flight"));
+    act(() => {
+      vi.advanceTimersByTime(2_000);
+    });
+    expect(document.querySelector(".mach")!.textContent).not.toContain("dispatch in flight");
+    expect(document.querySelector(".mach")!.textContent).toContain("idle");
   });
 
   it("an online machine with nothing running drives no clock at all", async () => {

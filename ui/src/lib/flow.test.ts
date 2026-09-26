@@ -13,6 +13,9 @@ import {
   bodyTruncated,
   asRecordArray,
   missionReplayDate,
+  sessionRecords,
+  dispatchEnd,
+  __sessionIndexBuilds,
 } from "./flow";
 import { tokensOffMeter } from "../lenses/fleet/savings";
 import type { FlowRecord } from "../types/handwritten";
@@ -450,5 +453,37 @@ describe("missionReplayDate (header owns liveness — a RUNNING mission is live,
   });
   it("is null for an empty slice", () => {
     expect(missionReplayDate([])).toBeNull();
+  });
+});
+
+describe("(#2911) sessionRecords — the per-window session index", () => {
+  const rec = (sid: string | undefined, action: string, ts: string) => ({ ts, session_id: sid, action }) as FlowRecord;
+  const data: FlowRecord[] = [
+    rec("a", "dispatch.start", "2026-09-26T10:00:00Z"),
+    rec("b", "dispatch.start", "2026-09-26T10:00:01Z"),
+    rec(undefined, "machine.telemetry", "2026-09-26T10:00:02Z"),
+    // An empty id is still a string, and the scan matched it for `""`.
+    rec("", "dispatch.start", "2026-09-26T10:00:02Z"),
+    rec("a", "dispatch.complete", "2026-09-26T10:00:03Z"),
+  ];
+
+  it("is exactly the whole-window scan it replaces, in window order", () => {
+    for (const sid of ["a", "b", "missing", ""]) {
+      expect(sessionRecords(data, sid)).toEqual(data.filter((r) => r.session_id === sid));
+    }
+    expect(dispatchEnd(data, "a")).toBe(data[4]);
+    expect(dispatchEnd(data, "b")).toBeUndefined();
+  });
+
+  it("indexes a window once, and a new window array gets its own index", () => {
+    const win = [...data];
+    const before = __sessionIndexBuilds();
+    const first = sessionRecords(win, "a");
+    expect(sessionRecords(win, "a")).toBe(first);
+    sessionRecords(win, "b");
+    expect(__sessionIndexBuilds()).toBe(before + 1);
+    const next = [...win, rec("a", "dispatch.turn", "2026-09-26T10:00:04Z")];
+    expect(sessionRecords(next, "a")).toHaveLength(3);
+    expect(__sessionIndexBuilds()).toBe(before + 2);
   });
 });
