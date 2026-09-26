@@ -2182,6 +2182,14 @@ pub(crate) fn container_lmstudio_base_url(override_url: Option<&str>) -> Option<
     Some(loopback_to_docker_host(&base))
 }
 
+/// (#2902) The `--dialect` the container gets for a target: only a declared
+/// dialect that differs from what the runtime already assumes for the kind
+/// (`chat-completions` for a `--chat-url` brain), so every existing config's
+/// argv is byte-identical.
+pub(crate) fn container_dialect_flag(t: &crate::target::Target) -> Option<darkmux_types::Dialect> {
+    (t.dialect != t.kind.default_dialect()).then_some(t.dialect)
+}
+
 /// Rewrite a host that means "this machine" in `url` to
 /// `host.docker.internal` (Docker Desktop's name for the host, which the
 /// runtime's baked-in default already relies on), because inside the
@@ -5782,7 +5790,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // (#2902) Only a declared dialect that differs from what the runtime
         // already assumes for this kind reaches argv, so every existing
         // config's argv is byte-identical.
-        dialect: agentic_pm.as_ref().and_then(|t| (t.dialect != t.kind.default_dialect()).then_some(t.dialect)),
+        dialect: agentic_pm.as_ref().and_then(container_dialect_flag),
         remote_needs_auth,
         base_url_override: container_lmstudio_base_url(opts.model_base_url_override.as_deref()),
         workspace_read_only: opts.workspace_read_only,

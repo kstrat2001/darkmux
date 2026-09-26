@@ -239,6 +239,39 @@ pub fn step_unmanaged_endpoint(
 }
 
 #[cfg(test)]
+mod step_endpoint_tests {
+    use super::step_unmanaged_endpoint;
+    use serde_json::json;
+
+    /// A step's `config.endpoint`: only an UNMANAGED endpoint takes the
+    /// hosted arm; absent and managed ones run locally; an undefined id is
+    /// an error (never the managed default).
+    #[test]
+    fn a_step_endpoint_is_hosted_only_when_unmanaged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pf = tmp.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":1}]}},
+                "endpoints":{"hosted":{"url":"https://h.example/v1"},"lms":{"managed":"lmstudio"}}}"#,
+        )
+        .unwrap();
+        let path = pf.to_str();
+        assert!(step_unmanaged_endpoint(&json!({}), path).unwrap().is_none());
+        assert!(step_unmanaged_endpoint(&json!({"endpoint": {}}), path).unwrap().is_none(), "no url: managed");
+        assert!(step_unmanaged_endpoint(&json!({"endpoint": {"managed": "lmstudio"}}), path).unwrap().is_none());
+        let inline = step_unmanaged_endpoint(&json!({"endpoint": {"url": "https://i.example/v1"}}), path).unwrap();
+        assert_eq!(inline.unwrap().url.as_deref(), Some("https://i.example/v1"));
+        let named = step_unmanaged_endpoint(&json!({"endpoint": "hosted"}), path).unwrap().unwrap();
+        assert_eq!(named.named_id(), Some("hosted"));
+        assert_eq!(named.url.as_deref(), Some("https://h.example/v1"));
+        assert!(step_unmanaged_endpoint(&json!({"endpoint": "lms"}), path).unwrap().is_none());
+        let err = step_unmanaged_endpoint(&json!({"endpoint": "nope"}), path).unwrap_err();
+        assert!(format!("{err:#}").contains("nope"), "{err:#}");
+    }
+}
+
+#[cfg(test)]
 mod equivalence_tests {
 
     /// One profile model shape, and what a dispatch against it puts on the

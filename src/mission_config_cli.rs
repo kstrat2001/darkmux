@@ -1198,6 +1198,28 @@ mod tests {
     // with no declared n_ctx before staffing it. `show` must refuse the
     // same way, not render it as a healthy `not loaded`.
 
+    /// (#2902 step 3) `show` names the model the dispatch will RUN: the one
+    /// resolver's selection within the bound profile, not simply its
+    /// default. `coder` (skills `coding`, `test-designing`) selects the
+    /// code-weighted model over the declared default.
+    #[test]
+    fn show_names_the_selected_model_not_simply_the_profile_default() {
+        let model = |id: &str, cap: &str| {
+            serde_json::from_value::<ProfileModel>(serde_json::json!({
+                "id": id, "n_ctx": 32000, "capabilities": { cap: 1.0 }
+            }))
+            .unwrap()
+        };
+        let mut profiles = reg(vec![("mixed", vec![model("generalist", "reasoning"), model("codestar", "code")])], Some("mixed"));
+        profiles.profiles.get_mut("mixed").unwrap().default_model = Some("generalist".to_string());
+        let pctx = ctx(profiles);
+        let r = resolve_role("coder", Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]));
+        assert_eq!(r.model.as_ref().map(|m| m.id.as_str()), Some("codestar"), "{:?}", r.error);
+        // A role this binary does not know keeps the profile default.
+        let unknown = resolve_role("role-a", Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]));
+        assert_eq!(unknown.model.as_ref().map(|m| m.id.as_str()), Some("generalist"));
+    }
+
     #[test]
     fn local_model_without_n_ctx_is_refused_like_launch_would_refuse_it() {
         let registry = StepKindRegistry::new();

@@ -5909,6 +5909,31 @@
         );
     }
 
+    /// (#2902) The container's `--dialect` is derived from the resolved
+    /// target only when the endpoint DECLARES a dialect other than its
+    /// kind's default: an agentic-remote dispatch on any existing config
+    /// (no `dialect`) gets no flag.
+    #[test]
+    fn container_dialect_flag_is_set_only_for_a_declared_non_default_dialect() {
+        let target = |ep: serde_json::Value| {
+            let pm: darkmux_types::ProfileModel =
+                serde_json::from_value(serde_json::json!({ "id": "m", "endpoint": ep })).unwrap();
+            crate::target::target_for("p".into(), Default::default(), pm).unwrap()
+        };
+        assert_eq!(super::container_dialect_flag(&target(serde_json::json!({ "url": "https://h/v1" }))), None);
+        assert_eq!(
+            super::container_dialect_flag(&target(serde_json::json!({ "url": "https://h/v1", "dialect": "chat-completions" }))),
+            None,
+            "declaring the default changes nothing"
+        );
+        assert_eq!(
+            super::container_dialect_flag(&target(
+                serde_json::json!({ "url": "https://h/v1", "dialect": "chat-completions-max-tokens" })
+            )),
+            Some(darkmux_types::Dialect::ChatCompletionsMaxTokens)
+        );
+    }
+
     #[test]
     fn build_docker_run_argv_emits_chat_url_without_stdin_flags_when_no_auth() {
         let mut config = base_argv_config();
