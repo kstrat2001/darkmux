@@ -775,8 +775,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         // A fifth connection is past the cap: closed at once.
         let mut extra = std::net::TcpStream::connect(addr).unwrap();
-        let _ = extra.write_all(b"GET /ok HTTP/1.1\r\nHost: x\r\n\r\n");
-        assert!(closed_within(&mut extra, Duration::from_millis(500)), "a connection past the cap must be closed on accept");
+        // A half-sent request: served, it would be held until the 800 ms
+        // header deadline; past the cap, it is closed at once.
+        let _ = extra.write_all(b"GET /ok HTTP/1.1\r\nHost: x\r\n");
+        assert!(closed_within(&mut extra, Duration::from_millis(400)), "a connection past the cap must be closed on accept");
         // The half-sent ones are closed by the header deadline.
         for s in held.iter_mut() {
             assert!(closed_within(s, Duration::from_secs(3)), "a half-sent request must be closed after the header deadline");
