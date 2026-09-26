@@ -2159,12 +2159,32 @@ pub(crate) fn epoch_to_hhmmss(epochs: i64) -> (u8, u8, u8) {
 ///    hazard for tests that mutate env without `#[serial_test::serial]`.
 /// 3. `None` — extremely rare (CI in a sandbox without `hostname`).
 pub fn resolve_machine_id() -> Option<String> {
+    resolve_machine_id_with_source().map(|(id, _)| id)
+}
+
+/// Which tier of `DARKMUX_MACHINE_ID > config.json machine_id > hostname`
+/// produced the resolved machine id (#2924). The machine id is the ONE name a
+/// machine goes by across flow records, presence beats and the fleet roster,
+/// so where it came from is operator-facing: `darkmux doctor` prints it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineIdSource {
+    Env,
+    Config,
+    Hostname,
+}
+
+/// [`resolve_machine_id`] plus the tier that won. `None` only when no tier
+/// resolves (no env, no config, no `hostname(1)`).
+pub fn resolve_machine_id_with_source() -> Option<(String, MachineIdSource)> {
     // env(DARKMUX_MACHINE_ID) > config.machine_id (#661 Slice 4). config_access
     // reads the env LIVE per-call, so a `set_var` in tests / operator shells
     // still takes effect without a process restart — the property this hot path
     // (and the serial tests) rely on. The hostname fallback below is unchanged.
-    if let Some(id) = darkmux_types::config_access::machine_id() {
-        return Some(id);
+    use darkmux_types::config_access::{machine_id_with_source, Source};
+    match machine_id_with_source() {
+        (Some(id), Source::Env) => return Some((id, MachineIdSource::Env)),
+        (Some(id), _) => return Some((id, MachineIdSource::Config)),
+        (None, _) => {}
     }
     static HOSTNAME: OnceLock<Option<String>> = OnceLock::new();
     HOSTNAME
@@ -2178,6 +2198,7 @@ pub fn resolve_machine_id() -> Option<String> {
             })
         })
         .clone()
+        .map(|h| (h, MachineIdSource::Hostname))
 }
 
 

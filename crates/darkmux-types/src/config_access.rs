@@ -320,7 +320,15 @@ fn pick_dir(
 /// `resolve_machine_id` (the write-time caller), so this returns `None` when
 /// neither layer is set.
 pub fn machine_id() -> Option<String> {
-    pick_string("DARKMUX_MACHINE_ID", config().machine_id.as_deref(), None)
+    machine_id_with_source().0
+}
+
+/// [`machine_id`] plus WHICH tier resolved it (#2924). `Source::BuiltIn` with
+/// a `None` value means neither tier is set, and the caller's hostname
+/// fallback applies — `darkmux_flow::resolve_machine_id_with_source` names
+/// that tier itself.
+pub fn machine_id_with_source() -> (Option<String>, Source) {
+    pick_string_with_source("DARKMUX_MACHINE_ID", config().machine_id.as_deref(), None)
 }
 
 // ── Fleet position (#933) ──

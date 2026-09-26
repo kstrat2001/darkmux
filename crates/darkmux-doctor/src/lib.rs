@@ -1903,36 +1903,43 @@ fn role_profiles_status(
 }
 
 /// Surface the machine_id that flow records will be tagged with. Always
-/// passes — this is informational, since the operator can leave it at
-/// the hostname default. The check names the source (env vs hostname
-/// vs unknown) so operators can see whether their `DARKMUX_MACHINE_ID`
-/// override is taking effect. (#167)
+/// passes when a value resolves — this is informational. The check names the
+/// tier the value actually came from (`DARKMUX_MACHINE_ID` env >
+/// `config.json` `machine_id` > hostname), so operators can see which layer
+/// is in effect. (#167; #2924 fixed a config value being labeled "from
+/// hostname".)
+///
+/// The machine_id is the ONE name a machine goes by: flow records, presence
+/// beats, and — by #2924 — the fleet roster all key on it.
 fn check_machine_id_resolution() -> Check {
-    let env_set = std::env::var("DARKMUX_MACHINE_ID")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
-    let resolved = darkmux_flow::resolve_machine_id();
-    match (env_set, resolved) {
-        (Some(_), Some(id)) => Check {
+    use darkmux_flow::MachineIdSource;
+    match darkmux_flow::resolve_machine_id_with_source() {
+        Some((id, MachineIdSource::Env)) => Check {
             name: "machine_id".into(),
             status: Status::Pass,
             message: format!("`{id}` (from DARKMUX_MACHINE_ID env)"),
             hint: None,
         },
-        (None, Some(id)) => Check {
+        Some((id, MachineIdSource::Config)) => Check {
+            name: "machine_id".into(),
+            status: Status::Pass,
+            message: format!("`{id}` (from config.json machine_id)"),
+            hint: None,
+        },
+        Some((id, MachineIdSource::Hostname)) => Check {
             name: "machine_id".into(),
             status: Status::Pass,
             message: format!("`{id}` (from hostname)"),
             hint: Some(
-                "Set DARKMUX_MACHINE_ID for a logical fleet name (e.g. `studio`, `mini-1`) — operator-named identifiers read better in the topology view than DNS-style hostnames.".into(),
+                "Set a logical fleet name (e.g. `studio`, `mini-1`) with `darkmux config set machine_id <name>` — this name is what flow records, presence and the fleet roster all join on, and an operator-chosen one survives a hostname change.".into(),
             ),
         },
-        (_, None) => Check {
+        None => Check {
             name: "machine_id".into(),
             status: Status::Warn,
             message: "could not resolve a machine_id — flow records will lack machine provenance".into(),
             hint: Some(
-                "Set DARKMUX_MACHINE_ID to a logical fleet name (e.g. `studio`, `mini-1`), or install `hostname(1)` on PATH.".into(),
+                "Set a logical fleet name with `darkmux config set machine_id <name>` (e.g. `studio`, `mini-1`), or install `hostname(1)` on PATH.".into(),
             ),
         },
     }
@@ -16789,5 +16796,79 @@ mod roster_identity_tests {
     fn an_empty_roster_passes_without_claiming_anything() {
         let check = check_roster_identity(&[], &known(&[], &[]));
         assert_eq!(check.status, Status::Pass);
+    }
+}
+
+#[cfg(test)]
+mod machine_id_provenance_tests {
+    //! (#2924) The `machine_id` row must name the tier the value actually came
+    //! from. It used to print `(from hostname)` whenever the env var was unset,
+    //! so a value written to `config.json` (the Studio's
+    //! `m1-max-32gb-studio`, hostname `Kains-Mac-Studio.local`) was labeled as
+    //! the hostname.
+    use super::*;
+    use darkmux_types::config::DarkmuxConfig;
+
+    /// Run `check_machine_id_resolution` with the env tier pinned to `env`
+    /// and the config tier to `cfg_id`, restoring the env afterward.
+    fn run_with(env: Option<&str>, cfg_id: Option<&str>) -> Check {
+        let prev = std::env::var("DARKMUX_MACHINE_ID").ok();
+        unsafe {
+            match env {
+                Some(v) => std::env::set_var("DARKMUX_MACHINE_ID", v),
+                None => std::env::remove_var("DARKMUX_MACHINE_ID"),
+            }
+        }
+        let cfg = DarkmuxConfig { machine_id: cfg_id.map(str::to_string), ..Default::default() };
+        let guard = darkmux_types::config_access::set_config_for_test(cfg);
+        let check = check_machine_id_resolution();
+        drop(guard);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_MACHINE_ID", v),
+                None => std::env::remove_var("DARKMUX_MACHINE_ID"),
+            }
+        }
+        check
+    }
+
+    /// The live defect: config set, env unset. The label must say config.
+    #[serial_test::serial]
+    #[test]
+    fn a_config_json_machine_id_is_labeled_as_config_not_hostname() {
+        let check = run_with(None, Some("from-config-id"));
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("`from-config-id`"), "{}", check.message);
+        assert!(check.message.contains("config.json"), "{}", check.message);
+        assert!(!check.message.contains("hostname"), "{}", check.message);
+        assert!(check.hint.is_none(), "a named id needs no nudge: {:?}", check.hint);
+    }
+
+    /// Env outranks config, and says so.
+    #[serial_test::serial]
+    #[test]
+    fn the_env_tier_wins_over_config_and_is_labeled_env() {
+        let check = run_with(Some("from-env-id"), Some("from-config-id"));
+        assert!(check.message.contains("`from-env-id`"), "{}", check.message);
+        assert!(check.message.contains("DARKMUX_MACHINE_ID"), "{}", check.message);
+        assert!(!check.message.contains("config.json"), "{}", check.message);
+    }
+
+    /// Neither tier set: the value is the hostname, and the hint names the
+    /// visible config field as the way to set a logical name.
+    #[serial_test::serial]
+    #[test]
+    fn with_neither_tier_set_the_value_is_labeled_hostname() {
+        let check = run_with(None, None);
+        if check.status == Status::Warn {
+            // A sandbox without `hostname(1)`: nothing resolves at all.
+            return;
+        }
+        assert!(check.message.contains("(from hostname)"), "{}", check.message);
+        assert!(
+            check.hint.as_deref().is_some_and(|h| h.contains("darkmux config set machine_id")),
+            "{:?}",
+            check.hint
+        );
     }
 }
