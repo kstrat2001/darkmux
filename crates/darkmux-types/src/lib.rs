@@ -781,10 +781,18 @@ impl ProfileRegistry {
                 if let Some(ep) = &m.endpoint {
                     match &ep.source {
                         EndpointSource::Unresolved(id) => {
+                            // The entry itself, else (re-review MF1) the whole
+                            // `endpoints` value, when that was not an object.
                             let why = match self
                                 .quarantined
                                 .iter()
-                                .find(|q| q.kind == QuarantinedEntryKind::Endpoint && &q.name == id)
+                                .filter(|q| q.kind == QuarantinedEntryKind::Endpoint)
+                                .find(|q| &q.name == id)
+                                .or_else(|| {
+                                    self.quarantined
+                                        .iter()
+                                        .find(|q| q.kind == QuarantinedEntryKind::Endpoint && q.name == "endpoints")
+                                })
                             {
                                 Some(q) => format!("whose `endpoints` entry is quarantined ({})", q.error),
                                 None => "which `endpoints` does not define".to_string(),
