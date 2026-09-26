@@ -5368,10 +5368,171 @@ fn radio_answers_at_once_that_the_answering_model_is_busy_instead_of_queueing() 
     assert!(stdout.contains("darkmux:stub-worker"), "…naming the instance:\n{stdout}");
     assert!(stdout.contains("generating"), "…with what LM Studio reports:\n{stdout}");
     assert!(
-        stdout.contains("did not start"),
-        "no lease and no live run name the occupant, so the copy must say the work is not darkmux's:\n{stdout}"
+        stdout.contains("darkmux has no live run or process on record using it"),
+        "no lease and no live run name the occupant, so the copy says exactly that — and never claims whose \
+         work it is:\n{stdout}"
     );
+    assert!(stdout.contains("generating a reply"), "LM Studio's word in plain English:\n{stdout}");
     assert_eq!(output.status.code(), Some(1), "a busy answer is not an answer: exit 1\n{stdout}\n{stderr}");
+}
+
+/// (#2917) A fake `lms` whose `ps --json` prints `ps_json` verbatim —
+/// several residents, each with LM Studio's own `status` and `queued`.
+fn write_fake_lms_ps(dir: &std::path::Path, ps_json: &str) -> std::path::PathBuf {
+    let ps_file = dir.join("ps.json");
+    fs::write(&ps_file, ps_json).unwrap();
+    let fake = dir.join("lms");
+    fs::write(
+        &fake,
+        format!("#!/bin/sh\nif [ \"$1\" = \"ps\" ]; then cat '{}'; fi\nexit 0\n", ps_file.display()),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&fake).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake, perms).unwrap();
+    }
+    fake
+}
+
+/// (#2917 review C2) The busy check reads the instance the answering
+/// dispatch would ACTUALLY use. With `radio.answerer_profile` naming a
+/// second profile, only that profile's instance is busy (the default
+/// profile's model is idle), so radio must answer at once that
+/// `darkmux:stub-answer` is busy and never send: were the check to read the
+/// default profile's instance instead, it would find it idle and send.
+#[test]
+fn the_busy_check_reads_the_instance_radio_answerer_profile_points_at() {
+    let (port, connections) = start_counting_refusal_stub();
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let os_home = TempDir::new().unwrap();
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(
+        &profiles_path,
+        r#"{
+            "profiles": {
+                "work": { "models": [ {"id": "stub-worker", "n_ctx": 8000} ] },
+                "answer": { "models": [ {"id": "stub-answer", "n_ctx": 8000} ] }
+            },
+            "default_profile": "work",
+            "internal": { "utility": { "id": "stub-util", "n_ctx": 8000 } }
+        }"#,
+    )
+    .unwrap();
+    let fake_lms = write_fake_lms_ps(
+        home.path(),
+        r#"[{"identifier":"darkmux:stub-worker","modelKey":"stub-worker","status":"idle","queued":0,"sizeBytes":1,"contextLength":8000},
+            {"identifier":"darkmux:stub-answer","modelKey":"stub-answer","status":"generating","queued":0,"sizeBytes":1,"contextLength":8000},
+            {"identifier":"darkmux:stub-util","modelKey":"stub-util","status":"idle","queued":0,"sizeBytes":1,"contextLength":8000}]"#,
+    );
+    let output = darkmux_std_cmd()
+        .env("HOME", os_home.path())
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_LMSTUDIO_URL", format!("http://127.0.0.1:{port}"))
+        .env("DARKMUX_LMS_BIN", &fake_lms)
+        .env("DARKMUX_RADIO_ANSWERER_PROFILE", "answer")
+        .args(["radio", "what's the weather like on mars?"])
+        .output()
+        .expect("running darkmux radio");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("`darkmux:stub-answer`, is busy"), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        connections.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "only the router is sent to; the busy answering seat is not\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
+}
+
+/// (#2917 review M1 + C3) The router-wait notice on the CLI surface, the
+/// review's case A: the routing call is slow and the ONLY request on the
+/// utility instance is radio's own (LM Studio reports it generating,
+/// nothing queued). Past the notice bound (shortened by the test hook)
+/// radio says so on stderr — and says that no other request is ahead,
+/// never that the work is someone else's. The routing call still
+/// completes and radio carries on to an answer.
+#[test]
+fn a_slow_router_notice_on_the_cli_does_not_call_its_own_call_other_work() {
+    let (port, connections) = start_slow_first_refusal_stub(std::time::Duration::from_millis(1500));
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let os_home = TempDir::new().unwrap();
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(&profiles_path, utility_binding_profiles_json()).unwrap();
+    let fake_lms = write_fake_lms_ps(
+        home.path(),
+        r#"[{"identifier":"darkmux:stub-worker","modelKey":"stub-worker","status":"idle","queued":0,"sizeBytes":1,"contextLength":8000},
+            {"identifier":"darkmux:stub-util","modelKey":"stub-util","status":"generating","queued":0,"sizeBytes":1,"contextLength":8000}]"#,
+    );
+    let output = darkmux_std_cmd()
+        .env("HOME", os_home.path())
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_LMSTUDIO_URL", format!("http://127.0.0.1:{port}"))
+        .env("DARKMUX_LMS_BIN", &fake_lms)
+        .env("DARKMUX_TEST_RADIO_NOTICE_AFTER_MS", "100")
+        .args(["radio", "what's the weather like on mars?"])
+        .output()
+        .expect("running darkmux radio");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("radio: still routing after")
+            && stderr.contains("`darkmux:stub-util` generating a reply with nothing waiting, so no other request is ahead of this call"),
+        "the notice must print, and say only what LM Studio reported:\nstderr:\n{stderr}\nstdout:\n{stdout}"
+    );
+    assert!(!stderr.contains("did not start") && !stderr.contains("sharing"), "{stderr}");
+    assert!(!stdout.contains("still routing"), "the notice is stderr only; stdout carries the answer:\n{stdout}");
+    assert_eq!(
+        connections.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "router once, then the (idle) answering seat once\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// (#2917) [`start_counting_refusal_stub`] whose FIRST request (the
+/// router's) is held for `delay` before it answers.
+fn start_slow_first_refusal_stub(delay: std::time::Duration) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binding the slow refusal stub");
+    let port = listener.local_addr().unwrap().port();
+    let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = connections.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let nth = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut buf = vec![0u8; 64 * 1024];
+                let _ = stream.read(&mut buf);
+                if nth == 0 {
+                    std::thread::sleep(delay);
+                }
+                let body = serde_json::json!({
+                    "choices": [{ "message": { "content": "```json\n{\"refuse\": \"outside my scope\"}\n```" } }],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+                })
+                .to_string();
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = stream.flush();
+            });
+        }
+    });
+    (port, connections)
 }
 
 /// (#2917) A stub LM Studio whose every chat completion is a router-shaped

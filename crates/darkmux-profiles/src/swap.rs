@@ -207,6 +207,7 @@ mod tests {
             status: "loaded".to_string(),
             size: "18GB".to_string(),
             context: 100_000,
+            queued: None,
         }
     }
 

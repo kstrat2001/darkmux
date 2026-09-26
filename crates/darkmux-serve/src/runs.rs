@@ -407,7 +407,23 @@ pub fn build_runs(
     lab_dir: Option<&StdPath>,
     fleet: &[serde_json::Value],
 ) -> Vec<Run> {
-    build_runs_in(flows_dir, lab_dir, fleet, &ScanWindow::default_window()).runs
+    build_runs_within(flows_dir, lab_dir, fleet, RUNS_FLOW_SCAN_WINDOW_DAYS)
+}
+
+/// [`build_runs`] over a NARROWER flow window than the board's own
+/// [`RUNS_FLOW_SCAN_WINDOW_DAYS`]: day files (and fleet records) older than
+/// `window_days` are not read. For a caller that only wants what is live
+/// NOW (radio's busy check, #2917): a live run writes records today, so
+/// reading two weeks of archive to find it only costs time. A run whose
+/// identifying records fall outside the window carries less (no model, no
+/// role), never something wrong. The board itself never calls this.
+pub fn build_runs_within(
+    flows_dir: &StdPath,
+    lab_dir: Option<&StdPath>,
+    fleet: &[serde_json::Value],
+    window_days: i64,
+) -> Vec<Run> {
+    build_runs_in(flows_dir, lab_dir, fleet, &ScanWindow::within_days(window_days)).runs
 }
 
 fn build_runs_in(
@@ -622,8 +638,8 @@ pub fn peer_mission_runs(
     fleet: &[serde_json::Value],
     known_mission_ids: &HashSet<String>,
 ) -> Vec<Run> {
-    let flow_index = build_flow_session_index(flows_dir, fleet);
-    let flow_missions = build_flow_mission_index(flows_dir, fleet);
+    let flow_index = build_flow_session_index(flows_dir, fleet, RUNS_FLOW_SCAN_WINDOW_DAYS);
+    let flow_missions = build_flow_mission_index(flows_dir, fleet, RUNS_FLOW_SCAN_WINDOW_DAYS);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -666,7 +682,7 @@ pub(crate) fn mission_owner_machine(
     fleet: &[serde_json::Value],
     mission_id: &str,
 ) -> Option<String> {
-    build_flow_mission_index(flows_dir, fleet)
+    build_flow_mission_index(flows_dir, fleet, RUNS_FLOW_SCAN_WINDOW_DAYS)
         .get(mission_id)
         .and_then(|agg| agg.machine.clone())
 }
@@ -705,8 +721,9 @@ struct FlowMissionAgg {
 fn build_flow_mission_index(
     flows_dir: &StdPath,
     fleet: &[serde_json::Value],
+    window_days: i64,
 ) -> HashMap<String, FlowMissionAgg> {
-    build_flow_mission_index_in(flows_dir, fleet, &ScanWindow::default_window())
+    build_flow_mission_index_in(flows_dir, fleet, &ScanWindow::within_days(window_days))
 }
 
 /// [`build_flow_mission_index`] over an explicit [`ScanWindow`] (#2902
@@ -1757,7 +1774,7 @@ pub fn local_dispatch_status(
     flows_dir: &StdPath,
     fleet: &[serde_json::Value],
 ) -> HashMap<String, (RunStatus, Option<DispatchSessionEvidence>)> {
-    let flow_index = build_flow_session_index(flows_dir, fleet);
+    let flow_index = build_flow_session_index(flows_dir, fleet, RUNS_FLOW_SCAN_WINDOW_DAYS);
     let mission_id_index = build_mission_id_index(&flow_index);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2176,7 +2193,14 @@ pub(crate) struct ScanWindow {
 
 impl ScanWindow {
     pub(crate) fn default_window() -> Self {
-        Self { cutoff_date: cutoff_date_string(RUNS_FLOW_SCAN_WINDOW_DAYS), since_iso: None }
+        Self::within_days(RUNS_FLOW_SCAN_WINDOW_DAYS)
+    }
+
+    /// A window reaching `window_days` back, with no usage bound — the
+    /// shape `build_runs_within` (#2917, radio's narrow busy check) and the
+    /// per-caller `window_days` wrappers need.
+    pub(crate) fn within_days(window_days: i64) -> Self {
+        Self { cutoff_date: cutoff_date_string(window_days), since_iso: None }
     }
 
     /// The default window, widened to reach `since_secs` (a Unix epoch
@@ -2297,8 +2321,9 @@ impl SessionAgg {
 fn build_flow_session_index(
     flows_dir: &StdPath,
     fleet: &[serde_json::Value],
+    window_days: i64,
 ) -> HashMap<String, SessionAgg> {
-    build_flow_session_index_in(flows_dir, fleet, &ScanWindow::default_window(), None)
+    build_flow_session_index_in(flows_dir, fleet, &ScanWindow::within_days(window_days), None)
 }
 
 /// [`build_flow_session_index`] over an explicit [`ScanWindow`], optionally
@@ -4187,6 +4212,32 @@ mod tests {
         assert_eq!(evidence, Some(DispatchSessionEvidence::StaleNoTerminal));
     }
 
+    /// (#2917) `build_runs_within` reads only the narrower window: a
+    /// session whose records sit in a day file older than it is not read at
+    /// all, while the board's own `build_runs` (14 days) still sees it.
+    /// radio's busy check relies on this to find what is live NOW without
+    /// parsing two weeks of archive.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_within_reads_only_its_own_window() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let record = |sid: &str| {
+            serde_json::json!({"ts": "2026-01-01T09:00:00Z", "action": "dispatch start", "session_id": sid, "handle": "coder"})
+        };
+        write_day_file(flows.path(), &today(), &[record("s-today")]);
+        write_day_file(flows.path(), &cutoff_date_string(5), &[record("s-five-days-ago")]);
+        let ids = |runs: Vec<Run>| -> Vec<String> {
+            runs.into_iter().filter_map(|r| r.session_id.or(Some(r.id))).collect()
+        };
+        let board = ids(build_runs(flows.path(), None, &[]));
+        assert!(board.iter().any(|i| i.contains("s-today")), "{board:?}");
+        assert!(board.iter().any(|i| i.contains("s-five-days-ago")), "the board keeps its 14 days: {board:?}");
+        let narrow = ids(build_runs_within(flows.path(), None, &[], 1));
+        assert!(narrow.iter().any(|i| i.contains("s-today")), "{narrow:?}");
+        assert!(!narrow.iter().any(|i| i.contains("s-five-days-ago")), "outside the window is not read: {narrow:?}");
+    }
+
     // ── lab normalization ───────────────────────────────────────────────
 
     fn minimal_lab_summary(dir: &str, finished: bool, degenerate: bool) -> LabRunSummary {
@@ -4711,7 +4762,7 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path(), &[]);
+        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS);
         let agg = idx.get("task-__panel_args__").expect("session indexed");
         assert!(
             agg.is_ambiguous(),
@@ -4747,7 +4798,7 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path(), &[]);
+        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS);
         let agg = idx.get("crew-dispatch-coder-1").expect("session indexed");
         assert!(
             !agg.is_ambiguous(),
@@ -4780,7 +4831,7 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path(), &[]);
+        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS);
         let agg = idx.get("sess-1").expect("session indexed");
         assert_eq!(agg.endpoint.as_deref(), Some("azure:host/gpt-4o"));
         assert_eq!(agg.terminal_status, Some(RunStatus::Complete));
@@ -4807,7 +4858,7 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path(), &[]);
+        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS);
         assert_eq!(idx["sess-2"].terminal_status, Some(RunStatus::Abandoned));
     }
 
@@ -4854,7 +4905,7 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path(), &[]);
+        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS);
         assert_eq!(idx["sess-3"].terminal_status, Some(RunStatus::Error));
     }
 
@@ -4874,7 +4925,7 @@ mod tests {
                 "handle": "coder",
             })],
         );
-        let idx = build_flow_session_index(tmp.path(), &[]);
+        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS);
         assert!(
             !idx.contains_key("ancient-orphan-sess"),
             "a session older than the scan window must never be indexed at all"
@@ -4907,7 +4958,7 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path(), &[]);
+        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS);
         let agg = idx.get("ticking-sess").expect("session indexed");
         assert_eq!(
             agg.last_activity_ts.as_deref(),
@@ -4952,7 +5003,7 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path(), &[]);
+        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS);
         let agg = idx.get("outoforder-sess").expect("session indexed");
         assert_eq!(
             agg.last_activity_ts.as_deref(),
@@ -7638,7 +7689,7 @@ mod tests {
         // written to both.
         let rec = peer_record("dispatch start", &darkmux_flow::ts_utc_now());
         write_day_file(flows.path(), &today(), std::slice::from_ref(&rec));
-        let idx = build_flow_session_index(flows.path(), std::slice::from_ref(&rec));
+        let idx = build_flow_session_index(flows.path(), std::slice::from_ref(&rec), RUNS_FLOW_SCAN_WINDOW_DAYS);
         let agg = idx.get("peer-session-1").expect("session present");
         assert!(agg.has_start);
         // The dedup is what this asserts: two sources, one session, and the

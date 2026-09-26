@@ -63,20 +63,21 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
     //
     // (#2917) …bounded: the router waits behind whatever occupies the one
     // utility instance (a compaction, by decision), but past
-    // `ROUTER_SLOW_NOTICE_AFTER` it says so — what LM Studio reports the
-    // instance doing and, when darkmux knows, for which run — then keeps
-    // waiting to the call's ceiling. stderr, so a script capturing stdout
+    // `radio::router_slow_notice_after()` it says so — what LM Studio
+    // reports for the instance (requests waiting on it, nothing ahead, or
+    // that darkmux cannot tell) — then keeps waiting to the call's ceiling. stderr, so a script capturing stdout
     // still gets only the answer.
+    let notice_after = radio::router_slow_notice_after();
     let decision = match radio::route_and_record_bounded(
         text.to_string(),
         catalog.clone(),
         radio::RadioSurface::Cli,
         radio::dispatch_router_call,
-        radio::ROUTER_SLOW_NOTICE_AFTER,
+        notice_after,
     ) {
         radio::RouteWait::Done(decision) => decision,
         radio::RouteWait::Slow(pending) => {
-            eprintln!("radio: {}", crate::radio_busy::router_wait_notice_live(radio::ROUTER_SLOW_NOTICE_AFTER));
+            eprintln!("radio: {}", crate::radio_busy::router_wait_notice_live(notice_after));
             pending.recv().unwrap_or_else(|_| radio::routing_thread_ended_early())
         }
     };

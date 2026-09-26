@@ -269,6 +269,20 @@ pub fn route_and_record(
 /// what happens; this changes only when the operator is told.
 pub const ROUTER_SLOW_NOTICE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The notice bound the surfaces actually use: [`ROUTER_SLOW_NOTICE_AFTER`],
+/// unless the TEST hook `DARKMUX_TEST_RADIO_NOTICE_AFTER_MS` names a
+/// shorter one. Not an operator knob (see the constant's doc for why not):
+/// the hook exists so a CLI test can drive the real binary past the bound
+/// in well under a second instead of ten, the same pattern as the other
+/// `DARKMUX_TEST_*` hooks. An unparseable value is ignored.
+pub fn router_slow_notice_after() -> std::time::Duration {
+    std::env::var("DARKMUX_TEST_RADIO_NOTICE_AFTER_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(ROUTER_SLOW_NOTICE_AFTER)
+}
+
 /// The routing call's hard ceiling (the curl `-m`) — [`dispatch_router_call`]
 /// has always bounded the call here; named so the slow-notice copy can say
 /// how long "keep waiting" is.

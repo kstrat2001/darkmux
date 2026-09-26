@@ -844,6 +844,15 @@ pub struct LoadedModel {
     pub status: String,
     pub size: String,
     pub context: u64,
+    /// (#2917) How many requests LM Studio reports WAITING on this
+    /// instance (`lms ps --json`'s `queued`, from its CLI's
+    /// `modelProcessingStateSchema = {status, queued}`). `None` when the
+    /// listing did not carry the field (an older `lms`, or the text
+    /// fallback): absent is "not reported", never "zero". Optional on the
+    /// wire both ways, so `/machine/status` stays readable by an older peer
+    /// and an older peer's payload stays readable here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued: Option<u64>,
 }
 
 #[cfg(test)]
@@ -1550,6 +1559,7 @@ mod tests {
             status: "idle".into(),
             size: "1G".into(),
             context: 1000,
+            queued: None,
         };
         let mut b = a.clone();
         assert_eq!(a, b);

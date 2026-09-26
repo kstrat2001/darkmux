@@ -240,12 +240,16 @@ fn model_from_json(v: &serde_json::Value) -> LoadedModel {
         .or_else(|| v.get("context"))
         .and_then(|x| x.as_u64())
         .unwrap_or(0);
+    // (#2917) Requests waiting on the instance. Absent stays `None`: an
+    // older `lms` that does not report a queue has not reported zero.
+    let queued = v.get("queued").and_then(|x| x.as_u64());
     LoadedModel {
         identifier,
         model,
         status,
         size,
         context,
+        queued,
     }
 }
 
@@ -290,6 +294,7 @@ fn parse_text_ps(text: &str) -> Vec<LoadedModel> {
             status: cols.get(2).copied().unwrap_or("").to_string(),
             size: cols.get(3).copied().unwrap_or("").to_string(),
             context,
+            queued: None,
         });
     }
     out
@@ -536,6 +541,20 @@ mod tests {
         });
         let m = model_from_json(&v);
         assert_eq!(m.size, "5.00 GB");
+    }
+
+    /// (#2917) LM Studio's `queued` (its CLI's `modelProcessingStateSchema
+    /// = {status, queued: number}`) is read through; an absent field stays
+    /// `None` — an older `lms` that reports no queue has not reported zero,
+    /// and radio's busy check words those two cases differently.
+    #[test]
+    fn parses_json_queued_and_keeps_absent_as_not_reported() {
+        let v = json!({"identifier": "darkmux:x", "modelKey": "x", "status": "generating", "queued": 2});
+        assert_eq!(model_from_json(&v).queued, Some(2));
+        let v = json!({"identifier": "darkmux:x", "modelKey": "x", "status": "idle", "queued": 0});
+        assert_eq!(model_from_json(&v).queued, Some(0));
+        let v = json!({"identifier": "darkmux:x", "modelKey": "x", "status": "idle"});
+        assert_eq!(model_from_json(&v).queued, None, "absent is not zero");
     }
 
     #[test]

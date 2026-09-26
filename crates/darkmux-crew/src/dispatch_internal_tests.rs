@@ -12575,6 +12575,7 @@ fn loaded(model: &str, gb: &str) -> darkmux_types::LoadedModel {
         status: "loaded".to_string(),
         size: format!("{gb} GB"),
         context: 65536,
+        queued: None,
     }
 }
 
@@ -12933,6 +12934,13 @@ fn local_target_names_the_instance_a_dispatch_would_send_to_and_none_for_a_hoste
     assert!(target.matches_recorded_model("worker-35b"));
     assert!(!target.matches_recorded_model("darkmux:util-4b"));
     assert!(!aliased.matches_recorded_model("my-other-alias"));
+    // A custom-identifier target is a DIFFERENT instance from the
+    // namespaced copy of the same key: a run recorded on `darkmux:worker-35b`
+    // is not on `my-alias`, and a bare-key record cannot be told apart, so
+    // neither names it (#2917 review C7).
+    assert!(aliased.matches_recorded_model("my-alias"));
+    assert!(!aliased.matches_recorded_model("darkmux:worker-35b"), "a different instance of the same key");
+    assert!(!aliased.matches_recorded_model("worker-35b"), "an ambiguous bare key says less");
 }
 
 /// RED on the "delete the assignment" mutation. A real LMStudio dispatch
@@ -16061,6 +16069,7 @@ fn ps_row_2318() -> darkmux_types::LoadedModel {
         status: "idle".to_string(),
         size: "16.08 GB".to_string(),
         context: 262144,
+        queued: None,
     }
 }
 

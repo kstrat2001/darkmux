@@ -1701,20 +1701,24 @@ async fn run_no_slash_route(
     });
     // (#2917) The router waits behind whatever occupies the one utility
     // instance (a compaction, by decision), but past
-    // `ROUTER_SLOW_NOTICE_AFTER` the panel says so — what LM Studio reports
-    // the instance doing and, when darkmux knows, for which run — then
-    // keeps waiting to the call's ceiling. The notice is gathered on its
+    // `radio::router_slow_notice_after()` the panel says so — what LM
+    // Studio reports for the instance (requests waiting on it, nothing
+    // ahead, or that darkmux cannot tell) — then keeps waiting to the call's ceiling. The notice is gathered on its
     // own blocking task (it shells to `lms ps`), never on this event loop;
     // the routing task keeps running underneath the timeout, so nothing is
     // restarted or lost when it fires.
-    let decision = match tokio::time::timeout(crate::radio::ROUTER_SLOW_NOTICE_AFTER, &mut routing).await {
+    //
+    // The chunk ends in a blank line: the editor concatenates a turn's
+    // chunks into one message, and the answer that follows must start its
+    // own paragraph rather than run on from the notice's last sentence.
+    let waited = crate::radio::router_slow_notice_after();
+    let decision = match tokio::time::timeout(waited, &mut routing).await {
         Ok(joined) => joined.context("joining the radio routing task")?,
         Err(_still_routing) => {
-            let waited = crate::radio::ROUTER_SLOW_NOTICE_AFTER;
             let notice = tokio::task::spawn_blocking(move || crate::radio_busy::router_wait_notice_live(waited))
                 .await
                 .context("joining the radio busy-notice task")?;
-            cx.send_notification(agent_chunk(session_id, format!("darkmux: {notice}")))?;
+            cx.send_notification(agent_chunk(session_id, format!("darkmux: {notice}\n\n")))?;
             routing.await.context("joining the radio routing task")?
         }
     };
@@ -3247,11 +3251,67 @@ mod tests {
         let reply = recv_json(&mut reader).await;
         let text = chunk_text(&reply);
         assert!(text.contains("`darkmux:qwen3.6-35b-a3b`, is busy"), "{text}");
-        assert!(text.contains("LM Studio reports it generating for mission `pepper-refresh-rotation` (coder)"), "{text}");
+        assert!(text.contains("LM Studio reports it generating a reply for mission `pepper-refresh-rotation` (coder)"), "{text}");
         assert!(text.contains("Radio did not queue behind it"), "{text}");
 
         let final_response = recv_json(&mut reader).await;
         assert_end_turn(&final_response);
+    }
+
+    /// (#2917 review C4) The panel's router-wait notice, end to end: a
+    /// routing call that outlives the (test-shortened) notice bound makes
+    /// the panel send the notice chunk FIRST — ending in a blank line so
+    /// the answer does not run on from it — then the answer, then end of
+    /// turn; the routing call itself is made exactly once (the notice
+    /// waits on it, never restarts it). `lms` points at a path that does
+    /// not exist, so the notice says it could not read the model list —
+    /// never "idle".
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_slow_router_gets_one_notice_chunk_then_the_answer_and_is_called_once() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let flows_tmp = tempfile::TempDir::new().unwrap();
+        let _flows_guard = EnvGuard::set("DARKMUX_FLOWS_DIR", flows_tmp.path());
+        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
+        let profiles = crew_tmp.path().join("profiles.json");
+        std::fs::write(
+            &profiles,
+            r#"{"profiles":{"work":{"models":[{"id":"stub-worker","n_ctx":8000}]}},
+                "default_profile":"work","internal":{"utility":{"id":"stub-util","n_ctx":8000}}}"#,
+        )
+        .unwrap();
+        let _profiles_guard = EnvGuard::set("DARKMUX_PROFILES", &profiles);
+        let _lms_guard = EnvGuard::set("DARKMUX_LMS_BIN", &crew_tmp.path().join("no-such-lms"));
+        let _home_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
+        let _bound_guard = EnvGuard::set("DARKMUX_TEST_RADIO_NOTICE_AFTER_MS", Path::new("50"));
+
+        let router_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = router_calls.clone();
+        let router = move |_msg: &str| -> Result<String> {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            Ok("```json\n{\"refuse\": \"outside the scope of mission comms\"}\n```".to_string())
+        };
+        let answerer = |_msg: &str, _overrides: &crate::radio_answer::AnswererOverrides| -> Result<String> {
+            Ok("RADIO: the answer.".to_string())
+        };
+        let (mut writer, mut reader) = spawn_test_agent(router, answerer);
+        let cwd = std::env::temp_dir();
+        let session_id = handshake(&mut writer, &mut reader, &cwd).await;
+
+        send_prompt(&mut writer, &session_id, "what's the weather like on mars?").await;
+
+        let notice_msg = recv_json(&mut reader).await;
+        let notice = chunk_text(&notice_msg);
+        assert!(notice.starts_with("darkmux: still routing after"), "the notice arrives first: {notice}");
+        assert!(notice.contains("could not read LM Studio's model list"), "{notice}");
+        assert!(notice.ends_with("\n\n"), "the notice ends its own paragraph: {notice:?}");
+        let answer_msg = recv_json(&mut reader).await;
+        let answer = chunk_text(&answer_msg);
+        assert!(answer.contains("RADIO: the answer."), "then the answer: {answer}");
+        assert_end_turn(&recv_json(&mut reader).await);
+        assert_eq!(router_calls.load(std::sync::atomic::Ordering::SeqCst), 1, "the routing call is made once");
     }
 
     /// (#1698 Packet B2, scope C — the shelf round trip) A command's

@@ -379,6 +379,7 @@ mod tests {
                 status: "idle".into(),
                 size: "18,45 GB".into(), // localized comma → unparseable
                 context: 32_768,
+                queued: None,
             }]),
             available_models: None,
             total_ram_gb: 32,
@@ -416,6 +417,7 @@ mod tests {
             status: "idle".into(),
             size: size.into(),
             context,
+            queued: None,
         }
     }
 

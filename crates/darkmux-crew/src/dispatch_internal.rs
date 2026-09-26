@@ -2781,12 +2781,19 @@ pub struct LocalTarget {
 }
 
 impl LocalTarget {
-    /// Whether a model string RECORDED elsewhere (a flow record's `model`,
-    /// which carries the wire identifier since #2240 but a bare key on
-    /// older archives) names this instance. Namespace-insensitive on the
-    /// recorded side only: the target is always the exact instance.
+    /// Whether a model string RECORDED elsewhere (a flow record's `model`)
+    /// names this instance. Since #2240 a record carries the wire
+    /// identifier, so that is matched exactly: a record naming
+    /// `darkmux:<key>` is a DIFFERENT instance from a target with a custom
+    /// `identifier` loaded from the same key, and must not match it.
+    /// Older archives recorded the bare key; darkmux then addressed only
+    /// the namespaced instance, so a bare key matches a `darkmux:<key>`
+    /// target — and never a custom-identifier one, which it cannot be
+    /// told apart from (saying less beats naming the wrong run).
     pub fn matches_recorded_model(&self, recorded: &str) -> bool {
-        recorded == self.identifier || bare_model_key(recorded) == self.model_key
+        recorded == self.identifier
+            || (recorded == self.model_key
+                && self.identifier == darkmux_gestalt::namespaced_identifier(&self.model_key, None))
     }
 }
 

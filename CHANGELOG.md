@@ -80,15 +80,26 @@ darkmux release.
   concurrency only within one process, so `darkmux radio` fired while a
   coder ran queued inside LM Studio, silently, until the 300s ceiling. The
   answering seat now checks the instance it would send to BEFORE sending:
-  if `lms ps` reports it `generating`/`processingPrompt`/`computingEmbedding`,
-  or another live darkmux process holds it loaded and in use (the
-  residency-lease registry), radio answers at once that the model is busy,
-  names the run when darkmux knows it (from the runs board), and otherwise
-  says the work is not darkmux's. Facts only, never a guess; a hosted seat
-  is not checked. Same copy on the CLI (exit 1: no answer was given) and
-  in the editor panel. The router still waits behind a compaction on the
-  utility instance (#2914's decision), but after 10s both surfaces say
-  what it is waiting on and keep waiting to the ceiling.
+  if `lms ps` reports it reading a prompt, generating a reply or computing
+  embeddings, or another live darkmux process holds it loaded and in use
+  (the residency-lease registry), radio answers at once that the model is
+  busy and names the run when darkmux knows it (from the runs board), else
+  the darkmux process holding it by pid, else says darkmux has no run or
+  process on record using it. Facts only, never a guess about whose work
+  it is; a hosted seat is not checked. The check is made just before the
+  send, so work that starts in between still queues the question. Same
+  copy on the CLI (exit 1: no answer was given) and in the editor panel.
+  The router still waits behind a compaction on the utility instance
+  (#2914's decision), but after 10s both surfaces say what LM Studio
+  reports: requests waiting on the utility model (`lms ps`'s `queued`),
+  nothing ahead of the routing call, or that darkmux cannot tell (an older
+  `lms` with no queue count, the model not listed, or `lms ps`
+  unreadable). Then it keeps waiting to the ceiling.
+- **A residency lease left by a crashed darkmux process no longer outlives
+  its pid being reused** (#2917). Leases now carry their writer's process
+  start time; a lease whose pid is alive but started at a different time
+  (a reboot, then a reused pid) is swept like a dead one, and only a
+  verified lease can make radio say a darkmux process is using a model.
 
 ## [3.13.0] - 2026-09-25
 
