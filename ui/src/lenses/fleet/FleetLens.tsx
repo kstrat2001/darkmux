@@ -932,7 +932,7 @@ export function FleetLens({
             key={card.uid}
             className={`mach${card.active && !card.absent ? " active" : ""}${card.absent ? " absent" : ""}`}
             data-act="machine"
-            data-arg={card.uid}
+            data-arg={encodeMachineKey(machineKeyCtx, card.uid)}
             role="button"
             tabIndex={0}
             // (#1903 QA fix) Explicit, so the card's computed accessible

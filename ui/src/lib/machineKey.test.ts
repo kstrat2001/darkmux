@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { UID_SHAPED, decodeMachineKey, encodeMachineKey, type MachineKeyContext } from "./machineKey";
-import { displayNameOf } from "./flow";
+import {
+  MACHINE_NOT_FOUND_KEY,
+  UID_SHAPED,
+  decodeMachineKey,
+  encodeMachineKey,
+  machineKeyHash,
+  machineLabel,
+  type MachineKeyContext,
+} from "./machineKey";
 import type { FlowRecord, PresenceBeat } from "../types/handwritten";
 
 // FAKE hardware uids — UUID-shaped so the no-uid assertions below have
@@ -8,6 +15,7 @@ import type { FlowRecord, PresenceBeat } from "../types/handwritten";
 const UID_A = "0A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
 const UID_B = "1b2c3d4e-5f60-4172-9384-b5c6d7e8f9a0";
 const UID_C = "2C3D4E5F-6071-4283-A495-C6D7E8F9A0B1";
+const UID_D = "3D4E5F60-7182-4394-A5B6-D7E8F9A0B1C2";
 
 const rec = (uid: string, ts: string, machine_id?: string): FlowRecord =>
   ({ ts, machine_uid: uid, ...(machine_id ? { machine_id } : {}) }) as FlowRecord;
@@ -16,49 +24,112 @@ function ctx(data: FlowRecord[], extra: Partial<MachineKeyContext> = {}): Machin
   return { data, liveMachines: new Map<string, PresenceBeat>(), specs: null, roster: [], ...extra };
 }
 
+const h = (uid: string) => machineKeyHash(uid).slice(0, 6);
+const NOT_FOUND = { uid: null, key: null, stale: false };
+
 describe("(#2929) machine keys — what the URL hash carries instead of the hardware uid", () => {
-  it("UID_SHAPED matches a uuid in either case, and not a name", () => {
+  it("UID_SHAPED matches a uuid in either case, and not a key", () => {
     expect(UID_SHAPED.test(UID_A)).toBe(true);
     expect(UID_SHAPED.test(UID_A.toLowerCase())).toBe(true);
     expect(UID_SHAPED.test("MacBook-Pro")).toBe(false);
-    expect(UID_SHAPED.test("unnamed-2")).toBe(false);
+    expect(UID_SHAPED.test(`unnamed-${h(UID_A)}`)).toBe(false);
   });
 
-  it("a named machine is keyed by its name, and the key resolves back to its uid", () => {
+  it("the uid hash is short, case-insensitive, distinct per uid, and not a piece of the uid", () => {
+    expect(machineKeyHash(UID_A)).toBe(machineKeyHash(UID_A.toLowerCase()));
+    expect(machineKeyHash(UID_A)).not.toBe(machineKeyHash(UID_B));
+    expect(UID_A.toLowerCase()).not.toContain(h(UID_A));
+  });
+
+  it("a uniquely named machine is keyed by its bare name, and resolves back", () => {
     const c = ctx([rec(UID_A, "2026-09-27T01:00:00Z", "studio")]);
     expect(encodeMachineKey(c, UID_A)).toBe("studio");
-    expect(decodeMachineKey(c, "studio")).toEqual({ uid: UID_A, key: "studio", legacy: false });
+    expect(decodeMachineKey(c, "studio")).toEqual({ uid: UID_A, key: "studio", stale: false });
   });
 
-  it("two unnamed machines get distinct keys matching their labels' ordinals", () => {
+  it("an unnamed machine's key carries a hash of its uid, not its ordinal; the label keeps the ordinal", () => {
     const c = ctx([rec(UID_A, "2026-09-27T01:00:00Z"), rec(UID_B, "2026-09-27T02:00:00Z")]);
-    const ka = encodeMachineKey(c, UID_A);
-    const kb = encodeMachineKey(c, UID_B);
-    expect(ka).toBe("unnamed-1");
-    expect(kb).toBe("unnamed-2");
-    // The key mirrors what the page shows: "unnamed machine" / "unnamed machine 2".
-    expect(displayNameOf(c.data, c.liveMachines, null, UID_B)).toBe("unnamed machine 2");
-    expect(decodeMachineKey(c, ka).uid).toBe(UID_A);
-    expect(decodeMachineKey(c, kb).uid).toBe(UID_B);
+    expect(encodeMachineKey(c, UID_A)).toBe(`unnamed-${h(UID_A)}`);
+    expect(encodeMachineKey(c, UID_B)).toBe(`unnamed-${h(UID_B)}`);
+    expect(decodeMachineKey(c, `unnamed-${h(UID_B)}`).uid).toBe(UID_B);
+    expect(machineLabel(c, UID_B)).toBe("unnamed machine 2");
   });
 
-  it("two machines sharing a name get distinct keys, first-seen keeps the bare name", () => {
-    const c = ctx([rec(UID_B, "2026-09-27T02:00:00Z", "mac"), rec(UID_A, "2026-09-27T01:00:00Z", "mac")]);
-    expect(encodeMachineKey(c, UID_A)).toBe("mac");
-    expect(encodeMachineKey(c, UID_B)).toBe("mac~2");
-    expect(decodeMachineKey(c, "mac").uid).toBe(UID_A);
-    expect(decodeMachineKey(c, "mac~2").uid).toBe(UID_B);
+  it("machines sharing a name are all disambiguated, and the bare name then opens neither", () => {
+    const c = ctx([rec(UID_A, "2026-09-27T01:00:00Z", "mac"), rec(UID_B, "2026-09-27T02:00:00Z", "mac")]);
+    expect(encodeMachineKey(c, UID_A)).toBe(`mac~${h(UID_A)}`);
+    expect(encodeMachineKey(c, UID_B)).toBe(`mac~${h(UID_B)}`);
+    expect(decodeMachineKey(c, `mac~${h(UID_B)}`).uid).toBe(UID_B);
+    expect(decodeMachineKey(c, "mac")).toEqual(NOT_FOUND);
   });
 
-  it("a uid-only machine is keyed by its roster id, or by this daemon's specs name", () => {
-    const data = [rec(UID_A, "2026-09-27T01:00:00Z"), rec(UID_B, "2026-09-27T02:00:00Z")];
-    const c = ctx(data, {
-      roster: [{ id: "studio", machine_uid: UID_A }],
-      specs: { machine_id: "laptop", machine_uid: UID_B },
+  describe("MUST 1: no two machines ever share a key", () => {
+    function assertBijective(c: MachineKeyContext, uids: string[]) {
+      const keys = uids.map((u) => encodeMachineKey(c, u));
+      expect(new Set(keys).size, keys.join(" ")).toBe(uids.length);
+      uids.forEach((u, i) => expect(decodeMachineKey(c, keys[i]).uid, keys[i]).toBe(u));
+    }
+    it("a machine literally named like another's unnamed key — either order", () => {
+      const fake = `unnamed-${h(UID_B)}`;
+      assertBijective(ctx([rec(UID_A, "2026-09-27T01:00:00Z", fake), rec(UID_B, "2026-09-27T02:00:00Z")]), [UID_A, UID_B]);
+      assertBijective(ctx([rec(UID_B, "2026-09-27T01:00:00Z"), rec(UID_A, "2026-09-27T02:00:00Z", fake)]), [UID_A, UID_B]);
     });
-    expect(encodeMachineKey(c, UID_A)).toBe("studio");
-    expect(encodeMachineKey(c, UID_B)).toBe("laptop");
-    expect(decodeMachineKey(c, "laptop").uid).toBe(UID_B);
+    it("a machine literally named like another's disambiguated key — either order", () => {
+      const fake = `mac~${h(UID_B)}`;
+      const three = (fakeFirst: boolean) =>
+        ctx(
+          fakeFirst
+            ? [rec(UID_C, "2026-09-27T00:00:00Z", fake), rec(UID_A, "2026-09-27T01:00:00Z", "mac"), rec(UID_B, "2026-09-27T02:00:00Z", "mac")]
+            : [rec(UID_A, "2026-09-27T01:00:00Z", "mac"), rec(UID_B, "2026-09-27T02:00:00Z", "mac"), rec(UID_C, "2026-09-27T03:00:00Z", fake)],
+        );
+      assertBijective(three(true), [UID_A, UID_B, UID_C]);
+      assertBijective(three(false), [UID_A, UID_B, UID_C]);
+    });
+    it("a roster-only id that matches another machine's generated key", () => {
+      const c = ctx([rec(UID_B, "2026-09-27T02:00:00Z")], { roster: [{ id: `unnamed-${h(UID_B)}` }] });
+      assertBijective(c, [UID_B, `unnamed-${h(UID_B)}`]);
+    });
+    it("a machine named the not-found marker never takes the marker", () => {
+      const c = ctx([rec(UID_A, "2026-09-27T01:00:00Z", MACHINE_NOT_FOUND_KEY)]);
+      expect(encodeMachineKey(c, UID_A)).not.toBe(MACHINE_NOT_FOUND_KEY);
+      expect(decodeMachineKey(c, encodeMachineKey(c, UID_A)).uid).toBe(UID_A);
+      expect(decodeMachineKey(c, MACHINE_NOT_FOUND_KEY)).toEqual(NOT_FOUND);
+    });
+  });
+
+  describe("C2: a saved key opens the SAME machine or not-found — never another", () => {
+    it("the machine gained a name since the key was minted", () => {
+      const before = ctx([rec(UID_A, "2026-09-27T01:00:00Z"), rec(UID_B, "2026-09-27T02:00:00Z")]);
+      const key = encodeMachineKey(before, UID_B);
+      const after = ctx([rec(UID_A, "2026-09-27T01:00:00Z"), rec(UID_B, "2026-09-27T02:00:00Z", "studio")]);
+      expect(decodeMachineKey(after, key)).toEqual({ uid: UID_B, key: "studio", stale: true });
+    });
+    it("an earlier unnamed machine entered the window (or another viewer numbers differently)", () => {
+      const key = encodeMachineKey(ctx([rec(UID_B, "2026-09-27T02:00:00Z")]), UID_B);
+      const after = ctx([rec(UID_A, "2026-09-27T01:00:00Z"), rec(UID_B, "2026-09-27T02:00:00Z")]);
+      expect(decodeMachineKey(after, key).uid).toBe(UID_B);
+    });
+    it("duplicate-name order flipped (a day rollover)", () => {
+      const day1 = ctx([rec(UID_A, "2026-09-27T01:00:00Z", "mac"), rec(UID_B, "2026-09-27T02:00:00Z", "mac")]);
+      const kb = encodeMachineKey(day1, UID_B);
+      const day2 = ctx([rec(UID_B, "2026-09-28T01:00:00Z", "mac"), rec(UID_A, "2026-09-28T02:00:00Z", "mac")]);
+      expect(decodeMachineKey(day2, kb).uid).toBe(UID_B);
+    });
+    it("a disambiguated machine whose twin left: the key still opens it", () => {
+      const day1 = ctx([rec(UID_A, "2026-09-27T01:00:00Z", "mac"), rec(UID_B, "2026-09-27T02:00:00Z", "mac")]);
+      const kb = encodeMachineKey(day1, UID_B);
+      expect(decodeMachineKey(ctx([rec(UID_B, "2026-09-28T01:00:00Z", "mac")]), kb)).toEqual({ uid: UID_B, key: "mac", stale: true });
+    });
+    it("the machine left the window: not-found, not the machine that took its place", () => {
+      const ka = encodeMachineKey(ctx([rec(UID_A, "2026-09-27T01:00:00Z"), rec(UID_B, "2026-09-27T02:00:00Z")]), UID_A);
+      const after = ctx([rec(UID_B, "2026-09-27T02:00:00Z"), rec(UID_C, "2026-09-27T03:00:00Z")]);
+      expect(decodeMachineKey(after, ka)).toEqual(NOT_FOUND);
+    });
+    it("a uniquely-named key whose name another machine now shares: not-found", () => {
+      const ka = encodeMachineKey(ctx([rec(UID_A, "2026-09-27T01:00:00Z", "mac")]), UID_A);
+      const after = ctx([rec(UID_A, "2026-09-27T01:00:00Z", "mac"), rec(UID_D, "2026-09-27T00:00:00Z", "mac")]);
+      expect(decodeMachineKey(after, ka)).toEqual(NOT_FOUND);
+    });
   });
 
   it("a presence-only machine is keyed by its beat's display name", () => {
@@ -68,32 +139,48 @@ describe("(#2929) machine keys — what the URL hash carries instead of the hard
     expect(decodeMachineKey(c, "mini").uid).toBe(UID_C);
   });
 
-  it("a roster-only card (declared, never seen) is keyed by, and resolves to, its roster id", () => {
+  it("a uid-only machine is keyed by its roster id, or by this daemon's specs name", () => {
+    const c = ctx([rec(UID_A, "2026-09-27T01:00:00Z"), rec(UID_B, "2026-09-27T02:00:00Z")], {
+      roster: [{ id: "studio", machine_uid: UID_A }],
+      specs: { machine_id: "laptop", machine_uid: UID_B },
+    });
+    expect(encodeMachineKey(c, UID_A)).toBe("studio");
+    expect(encodeMachineKey(c, UID_B)).toBe("laptop");
+  });
+
+  it("C3: a roster-only card is keyed by, resolves to, and is labeled with its roster id", () => {
     const c = ctx([], { roster: [{ id: "garage-mac" }] });
     expect(encodeMachineKey(c, "garage-mac")).toBe("garage-mac");
-    expect(decodeMachineKey(c, "garage-mac")).toEqual({ uid: "garage-mac", key: "garage-mac", legacy: false });
+    expect(decodeMachineKey(c, "garage-mac")).toEqual({ uid: "garage-mac", key: "garage-mac", stale: false });
+    expect(machineLabel(c, "garage-mac")).toBe("garage-mac");
   });
 
-  it("an old link carrying the uid still resolves, in any case, and names the key to rewrite to", () => {
+  it("an old uid link resolves, in any case, and names the key to rewrite to", () => {
     const c = ctx([rec(UID_A, "2026-09-27T01:00:00Z", "studio"), rec(UID_B, "2026-09-27T02:00:00Z")]);
-    expect(decodeMachineKey(c, UID_A)).toEqual({ uid: UID_A, key: "studio", legacy: true });
-    expect(decodeMachineKey(c, UID_A.toLowerCase())).toEqual({ uid: UID_A, key: "studio", legacy: true });
-    expect(decodeMachineKey(c, UID_B.toUpperCase())).toEqual({ uid: UID_B, key: "unnamed-1", legacy: true });
+    expect(decodeMachineKey(c, UID_A)).toEqual({ uid: UID_A, key: "studio", stale: true });
+    expect(decodeMachineKey(c, UID_A.toLowerCase())).toEqual({ uid: UID_A, key: "studio", stale: true });
+    expect(decodeMachineKey(c, UID_B.toUpperCase())).toEqual({ uid: UID_B, key: `unnamed-${h(UID_B)}`, stale: true });
   });
 
-  it("a key nothing in the window matches resolves to nothing (the caller's not-found state)", () => {
+  it("C4: an old uid link to a roster-declared machine never seen opens its roster card", () => {
+    const c = ctx([], { roster: [{ id: "garage-mac", machine_uid: UID_D }] });
+    expect(decodeMachineKey(c, UID_D.toLowerCase())).toEqual({ uid: "garage-mac", key: "garage-mac", stale: true });
+  });
+
+  it("keys nothing matches resolve to nothing (the caller's not-found state)", () => {
     const c = ctx([rec(UID_A, "2026-09-27T01:00:00Z", "studio")]);
-    expect(decodeMachineKey(c, "gone-machine")).toEqual({ uid: null, key: null, legacy: false });
-    expect(decodeMachineKey(c, "unnamed-3")).toEqual({ uid: null, key: null, legacy: false });
-    expect(decodeMachineKey(c, UID_C)).toEqual({ uid: null, key: null, legacy: false });
+    expect(decodeMachineKey(c, "gone-machine")).toEqual(NOT_FOUND);
+    expect(decodeMachineKey(c, "unnamed-3")).toEqual(NOT_FOUND);
+    expect(decodeMachineKey(c, `unnamed-${h(UID_C)}`)).toEqual(NOT_FOUND);
+    expect(decodeMachineKey(c, UID_C)).toEqual(NOT_FOUND);
+    expect(decodeMachineKey(c, MACHINE_NOT_FOUND_KEY)).toEqual(NOT_FOUND);
   });
 
   it("never encodes a uid — every machine in a mixed window, and one outside it", () => {
     const beats = new Map<string, PresenceBeat>([[UID_C, { machine_uid: UID_C } as PresenceBeat]]);
     const c = ctx([rec(UID_A, "2026-09-27T01:00:00Z"), rec(UID_B, "2026-09-27T02:00:00Z", "b")], { liveMachines: beats });
-    const outside = "3D4E5F60-7182-4394-A5B6-D7E8F9A0B1C2";
-    const keys = [UID_A, UID_B, UID_C, outside].map((u) => encodeMachineKey(c, u));
+    const keys = [UID_A, UID_B, UID_C, UID_D].map((u) => encodeMachineKey(c, u));
     for (const k of keys) expect(UID_SHAPED.test(k), k).toBe(false);
-    expect(new Set(keys.slice(0, 3)).size).toBe(3);
+    expect(new Set(keys).size).toBe(4);
   });
 });

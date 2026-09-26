@@ -7,7 +7,7 @@ import { usePlaybackTransport, type PlaybackFocus } from "./hooks/usePlaybackTra
 import { SeekSignalContext } from "./lib/seekSignal";
 import { Scrubber } from "./lenses/catalog/Scrubber";
 import { useSyncHash, writeHash, canonicalHash } from "./lib/hashSync";
-import { decodeMachineKey } from "./lib/machineKey";
+import { MACHINE_NOT_FOUND_LABEL, decodeMachineKey, machineLabel } from "./lib/machineKey";
 import { FleetLens } from "./lenses/fleet/FleetLens";
 import { LensPlaceholder } from "./components/LensPlaceholder";
 import { NavChrome } from "./components/NavChrome";
@@ -510,16 +510,16 @@ export function App() {
   // (#2929) The route carries a machine KEY, not the uid; resolve it the way
   // `MachineLens` does (an unresolved key names no machine, and labels as
   // one nothing knows — the same not-found title an unknown uid got).
-  const drilledUid = useMemo(() => {
+  const drilledName = useMemo(() => {
     if (drilledKey == null) return null;
-    return decodeMachineKey({ data: flowWindow.data, liveMachines, specs, roster }, drilledKey).uid ?? drilledKey;
-  }, [drilledKey, flowWindow.data, liveMachines, specs, roster]);
-  const targetMachineName =
-    route.kind === "machine"
-      ? drilledUid != null
-        ? displayNameOf(flowWindow.data, liveMachines, specs, drilledUid, roster)
-        : localName
-      : null;
+    const keyCtx = { data: flowWindow.data, liveMachines, specs, roster };
+    const uid = decodeMachineKey(keyCtx, drilledKey).uid;
+    // A key naming no machine says so once the window has landed, rather
+    // than inventing a label no card shows; blank while it is still loading.
+    if (uid == null) return flowWindow.settled ? MACHINE_NOT_FOUND_LABEL : "";
+    return machineLabel(keyCtx, uid);
+  }, [drilledKey, flowWindow.data, flowWindow.settled, liveMachines, specs, roster]);
+  const targetMachineName = route.kind === "machine" ? (drilledKey != null ? drilledName : localName) : null;
 
   // (#1800) `#meta` takes legacy's REPLAY branch on a replay. Until now it
   // computed from `flowWindow` (the live rolling window) on every route, so a

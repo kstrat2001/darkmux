@@ -1,3 +1,4 @@
+import { machineKeyHash } from "./lib/machineKey";
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen, waitFor, fireEvent, cleanup, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -1834,7 +1835,7 @@ describe("(#2921) machine route chrome names a uid-only machine", () => {
     mount([]);
     await waitFor(() => expect(document.getElementById("logscope")?.textContent).toBe("unnamed machine"));
     expect(UUID_RE.test(document.body.textContent ?? "")).toBe(false);
-    await waitFor(() => expect(window.location.hash).toBe("#lens=machine&machine=unnamed-1"));
+    await waitFor(() => expect(window.location.hash).toBe(`#lens=machine&machine=unnamed-${machineKeyHash(FAKE_UID).slice(0, 6)}`));
     // Rewritten in place: the title still names the same machine.
     expect(document.getElementById("logscope")?.textContent).toBe("unnamed machine");
   });

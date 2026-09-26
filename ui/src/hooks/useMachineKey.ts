@@ -2,7 +2,7 @@ import { useEffect, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../lib/fetcher";
 import { queryKeys } from "../lib/queryKeys";
-import { decodeMachineKey, type DecodedMachineKey, type MachineKeyContext } from "../lib/machineKey";
+import { MACHINE_NOT_FOUND_KEY, UID_SHAPED, decodeMachineKey, type DecodedMachineKey, type MachineKeyContext } from "../lib/machineKey";
 import type { FleetMachinesLiveResponse, FleetRosterResponse, FlowRecord, MachineSpecs } from "../types/handwritten";
 import { useFleetRoster, useLiveMachines } from "./useLiveMachines";
 
@@ -12,8 +12,8 @@ import { useFleetRoster, useLiveMachines } from "./useLiveMachines";
  * the caller's records, and whether every one of them has SETTLED.
  *
  * `settled` matters because the answer can change as inputs land: a beat's
- * `display_name` or a roster entry can name a machine that was `unnamed-1`
- * a moment earlier, which renumbers the rest. So a legacy uid link is
+ * `display_name` or a roster entry can name a machine that was unnamed
+ * a moment earlier. So an old uid link is
  * rewritten to its key only once everything the key depends on is in. */
 export function useMachineKeyContext(
   data: FlowRecord[],
@@ -64,7 +64,17 @@ export function useDecodedMachineKey(
   rewrite: (canonicalKey: string) => void,
 ): DecodedMachineKey | null {
   const decoded = useMemo(() => (key == null ? null : decodeMachineKey(ctx, key)), [key, ctx]);
-  const rewriteTo = settled && decoded?.legacy && decoded.key ? decoded.key : null;
+  // An old uid link or an outgrown key rewrites to the machine's current key;
+  // (C4) a uid-shaped value that still names nothing once everything has
+  // landed rewrites to the not-found marker, so the uid does not sit in the
+  // address bar for as long as the tab stays open.
+  const rewriteTo = !settled || decoded == null
+    ? null
+    : decoded.stale && decoded.key
+      ? decoded.key
+      : decoded.uid == null && key != null && UID_SHAPED.test(key)
+        ? MACHINE_NOT_FOUND_KEY
+        : null;
   useEffect(() => {
     if (!rewriteTo) return undefined;
     // After the commit, not inside it. A lens mounts in the SAME commit as the

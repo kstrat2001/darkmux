@@ -1,13 +1,5 @@
 import type { FlowRecord, PresenceBeat } from "../types/handwritten";
-import {
-  T,
-  UNNAMED_MACHINE,
-  displayNameOf,
-  machineUids,
-  ownMachineName,
-  type RosterName,
-  type SelfIdentity,
-} from "./flow";
+import { T, displayNameOf, machineUids, ownMachineName, type RosterName, type SelfIdentity } from "./flow";
 
 /**
  * (#2929) The machine identity the URL hash carries, and the ONE place that
@@ -19,31 +11,34 @@ import {
  * rendered label; the URL was the remaining exit). The hash carries a KEY
  * instead:
  *
- * - the machine's own name (`ownMachineName`: an observed `machine_id`, this
- *   daemon's specs name, then the roster id) when it has one — the same name
- *   its fleet card is titled with;
- * - `<name>~<n>` for the n-th machine (first-seen order) sharing a name
- *   another machine already holds, so two machines never share a key;
- * - `unnamed-<n>` for a machine with no name, where `<n>` is the ordinal its
- *   label already shows ("unnamed machine 2" is `unnamed-2`; the first,
- *   labeled plain "unnamed machine", is `unnamed-1`);
+ * - a machine whose name (`ownMachineName`: an observed `machine_id`, this
+ *   daemon's specs name, then the roster id) no other machine holds is keyed
+ *   by that bare name — what its fleet card is titled with;
+ * - a machine whose name another machine also holds is `<name>~<hash>`, and
+ *   a machine with no name is `unnamed-<hash>`, where `<hash>` is a short
+ *   one-way hash of its uid (`machineKeyHash`, 6 hex by default);
  * - a roster-only card (declared, never seen) is keyed by its roster id,
  *   which is also the identity that card has always carried.
  *
- * None of those says anything about the hardware. The page resolves a key
- * back to the uid from its own window, presence beats, specs and roster
- * (`decodeMachineKey`), so everything downstream of the URL still keys on
- * the uid.
+ * Why a hash and not the "unnamed machine 2" ordinal the label shows: an
+ * ordinal names a POSITION, and positions move — a machine gains a name, an
+ * earlier unnamed one enters the window, a day rollover flips which twin was
+ * seen first, another viewer's window numbers differently. A saved or shared
+ * ordinal key would then open a DIFFERENT machine, which is worse than
+ * opening none. A hash names the machine itself: `decodeMachineKey` matches
+ * it against the uids in the page's context, so a stale key opens the same
+ * machine (and is rewritten to its current key) or nothing. The hash is
+ * short and one-way; it cannot be turned back into the uid.
+ *
+ * No two machines ever share a key: generated keys are assigned first, and a
+ * name that equals one already taken (a machine literally named
+ * `unnamed-3fa1c2`, or `studio~3fa1c2`), or the not-found marker, is
+ * disambiguated with its own hash instead.
  *
  * Old links carried the uid itself. `decodeMachineKey` still resolves those
- * (a lenient read) and reports `legacy`, so the caller can rewrite the hash
- * to the key.
- *
- * Known limit, stated rather than hidden: an ordinal key is only as stable as
- * the window it was minted over. A machine that gains a name, or an unnamed
- * machine seen EARLIER in a later window, can shift which machine
- * `unnamed-2` names. A named key does not have this problem, which is why
- * the name always wins when there is one.
+ * (a lenient read, case-insensitive, including a roster entry's declared uid
+ * for a machine never seen) and reports `stale`, so the caller rewrites the
+ * hash to the key.
  */
 export interface MachineKeyContext {
   data: FlowRecord[];
@@ -57,26 +52,53 @@ export interface MachineKeyContext {
  *  carries one. */
 export const UID_SHAPED = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
-const UNNAMED_KEY_PREFIX = "unnamed-";
+/** What an unresolvable old uid link is rewritten to once the page's inputs
+ *  have settled, so the uid does not stay in the address bar. Never assigned
+ *  to a machine. */
+export const MACHINE_NOT_FOUND_KEY = "not-found";
 
-/** Every uid the page could draw a card for, mapped to its key, plus the
- *  reverse. Cached per context (the same identity-checked shape `flow.ts`'s
- *  label ordering uses), so a fleet page asking once per card pays once. */
+/** The label a pinned or drilled key shows when it names no machine. */
+export const MACHINE_NOT_FOUND_LABEL = "machine not found";
+
+const UNNAMED_PREFIX = "unnamed-";
+const HASH_MIN = 6;
+
+/** A short one-way hash of a uid, as 14 hex digits (cyrb53, over the
+ *  lower-cased uid so a re-cased link names the same machine). Keys use a
+ *  prefix of it. Not cryptographic: it only has to be distinct among the
+ *  machines one page knows, and not be the uid. */
+export function machineKeyHash(uid: string): string {
+  const str = uid.toLowerCase();
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  const n = 4294967296 * (2097151 & h2) + (h1 >>> 0);
+  return n.toString(16).padStart(14, "0");
+}
+
+/** A generated key's hash part: `unnamed-<hex>` or `<anything>~<hex>`. */
+const HASHED_KEY = /^(?:unnamed-|.*~)([0-9a-f]{6,14})$/;
+
 interface KeyTable {
   keyOf: Map<string, string>;
   uidOf: Map<string, string>;
+  /** Roster-only card ids (their card, key and label are the roster id). */
+  rosterOnly: Set<string>;
+  /** A roster entry's declared uid for a machine never seen -> its card id. */
+  declaredUid: Map<string, string>;
 }
 
 const tableCache = new WeakMap<FlowRecord[], { ctx: MachineKeyContext; table: KeyTable }>();
 
 function keyTable(ctx: MachineKeyContext): KeyTable {
   const hit = tableCache.get(ctx.data);
-  if (
-    hit &&
-    hit.ctx.liveMachines === ctx.liveMachines &&
-    hit.ctx.specs === ctx.specs &&
-    hit.ctx.roster === ctx.roster
-  ) {
+  if (hit && hit.ctx.liveMachines === ctx.liveMachines && hit.ctx.specs === ctx.specs && hit.ctx.roster === ctx.roster) {
     return hit.table;
   }
   const table = buildKeyTable(ctx);
@@ -84,19 +106,10 @@ function keyTable(ctx: MachineKeyContext): KeyTable {
   return table;
 }
 
-/** The label-derived key: `unnamed-<n>` for an unnamed label, the name
- *  otherwise. Never the uid, because `displayNameOf` never answers with one. */
-function keyFromLabel(label: string): string {
-  if (label === UNNAMED_MACHINE) return `${UNNAMED_KEY_PREFIX}1`;
-  const m = /^unnamed machine (\d+)$/.exec(label);
-  return m ? `${UNNAMED_KEY_PREFIX}${m[1]}` : label;
-}
-
 function buildKeyTable(ctx: MachineKeyContext): KeyTable {
   const { data, liveMachines, specs, roster } = ctx;
-  // First-seen order — the same ordering `flow.ts` numbers unnamed machines
-  // by (earliest record; presence-only and specs-only uids after; ties by
-  // uid), so a duplicate name's `~n` suffix is as stable as the ordinal is.
+  // First-seen order (earliest record; presence-only and specs-only uids
+  // after; ties by uid) — only used to make assignment deterministic.
   const firstSeen = new Map<string, number>();
   for (const r of data) {
     const uid = r.machine_uid;
@@ -108,70 +121,129 @@ function buildKeyTable(ctx: MachineKeyContext): KeyTable {
   }
   for (const uid of machineUids(data, liveMachines)) if (!firstSeen.has(uid)) firstSeen.set(uid, Infinity);
   if (specs?.machine_uid && !firstSeen.has(specs.machine_uid)) firstSeen.set(specs.machine_uid, Infinity);
-  const ordered = [...firstSeen.entries()]
+  const seen = [...firstSeen.entries()]
     .sort(([ua, ta], [ub, tb]) => (ta !== tb ? (ta < tb ? -1 : 1) : ua < ub ? -1 : ua > ub ? 1 : 0))
     .map(([uid]) => uid);
 
+  // Roster-only cards: an entry whose declared uid is not one of the seen
+  // machines, and whose id is not already a seen machine's own name (the
+  // fleet lens folds that one into the seen machine's card).
+  const seenSet = new Set(seen);
+  const names = new Map(seen.map((uid) => [uid, ownMachineName(data, liveMachines, specs, roster, uid)] as const));
+  const seenNames = new Set([...names.values()].filter((n): n is string => n !== null));
+  const rosterOnly: string[] = [];
+  const declaredUid = new Map<string, string>();
+  for (const entry of roster) {
+    if (!entry.id) continue;
+    if (entry.machine_uid && seenSet.has(entry.machine_uid)) continue;
+    if (seenNames.has(entry.id) || rosterOnly.includes(entry.id)) continue;
+    rosterOnly.push(entry.id);
+    if (entry.machine_uid) declaredUid.set(entry.machine_uid.toLowerCase(), entry.id);
+  }
+
+  // Every identity a key can name, and its hash; the hash length is the
+  // shortest (>= 6) that tells them all apart.
+  const identities = [...seen, ...rosterOnly];
+  const full = new Map(identities.map((id) => [id, machineKeyHash(id)] as const));
+  let len = HASH_MIN;
+  while (len < 14 && new Set([...full.values()].map((x) => x.slice(0, len))).size < full.size) len += 1;
+
   const keyOf = new Map<string, string>();
   const uidOf = new Map<string, string>();
-  const nameCount = new Map<string, number>();
-  for (const uid of ordered) {
-    const name = ownMachineName(data, liveMachines, specs, roster, uid);
-    let key: string;
-    if (name === null) {
-      key = keyFromLabel(displayNameOf(data, liveMachines, specs, uid, roster));
-    } else {
-      const n = (nameCount.get(name) ?? 0) + 1;
-      nameCount.set(name, n);
-      key = n === 1 ? name : `${name}~${n}`;
+  const taken = new Set<string>([MACHINE_NOT_FOUND_KEY]);
+  const assign = (id: string, key: string) => {
+    keyOf.set(id, key);
+    uidOf.set(key, id);
+    taken.add(key);
+  };
+  /** `<base><hash>`, lengthening the hash until the key is free. */
+  const hashed = (id: string, base: string): string => {
+    const hx = full.get(id) ?? machineKeyHash(id);
+    for (let l = len; l <= 14; l++) {
+      const k = `${base}${hx.slice(0, l)}`;
+      if (!taken.has(k)) return k;
     }
-    keyOf.set(uid, key);
-    if (!uidOf.has(key)) uidOf.set(key, uid);
+    // Unreachable in practice (a full 53-bit collision on one page); still
+    // never share a key.
+    let i = 2;
+    while (taken.has(`${base}${hx}.${i}`)) i += 1;
+    return `${base}${hx}.${i}`;
+  };
+
+  const nameCount = new Map<string, number>();
+  for (const n of names.values()) if (n !== null) nameCount.set(n, (nameCount.get(n) ?? 0) + 1);
+  for (const id of rosterOnly) nameCount.set(id, (nameCount.get(id) ?? 0) + 1);
+
+  // 1. Generated keys first (unnamed, and names held by several machines),
+  //    so a machine whose NAME happens to spell one never takes it.
+  for (const uid of seen) {
+    const name = names.get(uid) ?? null;
+    if (name === null) assign(uid, hashed(uid, UNNAMED_PREFIX));
+    else if ((nameCount.get(name) ?? 0) > 1) assign(uid, hashed(uid, `${name}~`));
   }
-  // Roster-only cards (declared, never seen) carry their roster id as their
-  // identity (`FleetLens`'s `rosterOnly` cards), so the id is both the key
-  // and what the key resolves to. An entry whose declared uid is already
-  // known is that machine, keyed above.
-  for (const entry of roster) {
-    if (entry.machine_uid && keyOf.has(entry.machine_uid)) continue;
-    if (!entry.id || uidOf.has(entry.id) || keyOf.has(entry.id)) continue;
-    keyOf.set(entry.id, entry.id);
-    uidOf.set(entry.id, entry.id);
+  // 2. Unique names, bare when free; otherwise disambiguated like a shared
+  //    one. Then roster-only ids, the same way.
+  for (const uid of seen) {
+    if (keyOf.has(uid)) continue;
+    const name = names.get(uid) as string;
+    assign(uid, taken.has(name) ? hashed(uid, `${name}~`) : name);
   }
-  return { keyOf, uidOf };
+  for (const id of rosterOnly) {
+    assign(id, taken.has(id) || (nameCount.get(id) ?? 0) > 1 ? hashed(id, `${id}~`) : id);
+  }
+  return { keyOf, uidOf, rosterOnly: new Set(rosterOnly), declaredUid };
 }
 
 /** The key to put in the hash for the machine `uid`. Never the uid: a uid
- *  outside the context falls back to the key its label implies. */
+ *  outside the context gets its name, or an `unnamed-<hash>` key. */
 export function encodeMachineKey(ctx: MachineKeyContext, uid: string): string {
-  return keyTable(ctx).keyOf.get(uid) ?? keyFromLabel(displayNameOf(ctx.data, ctx.liveMachines, ctx.specs, uid, ctx.roster));
+  const known = keyTable(ctx).keyOf.get(uid);
+  if (known !== undefined) return known;
+  const own = ownMachineName(ctx.data, ctx.liveMachines, ctx.specs, ctx.roster, uid);
+  return own ?? `${UNNAMED_PREFIX}${machineKeyHash(uid).slice(0, HASH_MIN)}`;
 }
 
 export interface DecodedMachineKey {
-  /** The uid the key names, or `null` when nothing in the context matches
-   *  (the caller shows its not-found state). */
+  /** The machine (uid, or a roster-only card's id) the key names, or `null`
+   *  when nothing in the context matches — the caller's not-found state. */
   uid: string | null;
   /** The key the hash SHOULD carry for that machine; `null` when unresolved. */
   key: string | null;
-  /** The hash carried the uid itself (an old link); rewrite it to `key`. */
-  legacy: boolean;
+  /** The hash carried an old uid, or a key the machine has since outgrown
+   *  (it gained a name, its twin left); rewrite it to `key`. */
+  stale: boolean;
 }
 
-/** Resolve a hash key (or an old link's uid) to the machine's uid. */
+const NOT_FOUND: DecodedMachineKey = { uid: null, key: null, stale: false };
+
+/** Resolve a hash key (or an old link's uid) to the machine it names. */
 export function decodeMachineKey(ctx: MachineKeyContext, key: string): DecodedMachineKey {
-  const { keyOf, uidOf } = keyTable(ctx);
-  const byKey = uidOf.get(key);
-  if (byKey !== undefined) return { uid: byKey, key, legacy: false };
-  // An old link: the hash carried the uid. Compared case-insensitively for a
-  // uid-shaped value, since a hand-typed or re-cased link names the same
-  // hardware.
-  const exact = keyOf.get(key);
-  if (exact !== undefined) return { uid: key, key: exact, legacy: true };
-  if (UID_SHAPED.test(key)) {
-    const lower = key.toLowerCase();
-    for (const [uid, k] of keyOf) {
-      if (uid.toLowerCase() === lower) return { uid, key: k, legacy: true };
-    }
+  const { keyOf, uidOf, declaredUid } = keyTable(ctx);
+  const current = uidOf.get(key);
+  if (current !== undefined) return { uid: current, key, stale: false };
+  if (key === MACHINE_NOT_FOUND_KEY) return NOT_FOUND;
+  // An old link: the hash carried the uid (any case). A roster entry's
+  // declared uid names its card even before that machine is ever seen.
+  const lower = key.toLowerCase();
+  for (const [id, k] of keyOf) {
+    if (id.toLowerCase() === lower) return { uid: id, key: k, stale: true };
   }
-  return { uid: null, key: null, legacy: false };
+  const declared = declaredUid.get(lower);
+  if (declared !== undefined) return { uid: declared, key: keyOf.get(declared) ?? declared, stale: true };
+  // A generated key minted over another window: match the machine by its
+  // hash, never by position. Exactly one match, or not found.
+  const m = HASHED_KEY.exec(key);
+  if (m) {
+    const hx = m[1];
+    const hits = [...keyOf.keys()].filter((id) => machineKeyHash(id).startsWith(hx));
+    if (hits.length === 1) return { uid: hits[0], key: keyOf.get(hits[0]) as string, stale: true };
+  }
+  return NOT_FOUND;
+}
+
+/** The label for a machine a key resolved to: a roster-only card's roster
+ *  id, else the shared label (`displayNameOf`). */
+export function machineLabel(ctx: MachineKeyContext, uid: string): string {
+  if (keyTable(ctx).rosterOnly.has(uid)) return uid;
+  return displayNameOf(ctx.data, ctx.liveMachines, ctx.specs, uid, ctx.roster);
 }

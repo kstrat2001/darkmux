@@ -11,7 +11,8 @@ import { useDay } from "../../hooks/useDay";
 import { RUNS_KINDS, type RunsKind } from "../../lib/route";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useDecodedMachineKey, useMachineKeyContext } from "../../hooks/useMachineKey";
-import { machineNames, displayNameOf } from "../../lib/flow";
+import { MACHINE_NOT_FOUND_LABEL, machineLabel } from "../../lib/machineKey";
+import { machineNames } from "../../lib/flow";
 import { LabRunDetail } from "./LabRunDetail";
 import type { RunsResponse, LabRunsResponse } from "../../types/handwritten";
 import type { Run } from "../../types/generated/Run";
@@ -477,15 +478,15 @@ export function RunsBoard({
   // roster — read only while a machine is pinned, and only against a
   // daemon). An old link carrying the uid itself still resolves, and is
   // rewritten to the key once those inputs have settled. A key that
-  // resolves to nothing stands in as its own identity: it matches no run
-  // and no record, which is the not-found state an unknown uid always got.
+  // resolves to nothing, once they have, pins nothing: no rows, and the chip
+  // says "machine not found" rather than inventing a label no card shows.
   const pinKey = useMachineKeyContext(pinRecords, daemonBacked ? flowWindow.settled : !day.loading, daemonBacked && machineKey != null);
   const pinDecoded = useDecodedMachineKey(machineKey, pinKey.ctx, pinKey.settled, (k) => {
     setMachineKey(k);
     writeHash(canonicalHash({ kind: "runs", runsKind: kind, run: labRunDir, machine: k }));
   });
-  const pinUid = machineKey == null ? null : (pinDecoded?.uid ?? machineKey);
-  const pinResolving = machineKey != null && pinDecoded?.uid == null && !pinKey.settled;
+  const pinUid = pinDecoded?.uid ?? null;
+  const pinResolving = machineKey != null && pinUid == null && !pinKey.settled;
 
   // The lab-run detail pane is its own top-level render, reached without
   // waiting on the two queries above and independent of `kind` (see
@@ -564,9 +565,10 @@ export function RunsBoard({
   // exclusion it names.
   // (#2921) The shared machine label, with the same specs and roster the
   // machine's fleet card is named from, so the pin and the card agree.
-  const { liveMachines, specs: pinSpecs, roster: pinRoster } = pinKey.ctx;
-  const pinnedMachineName = pinUid != null ? displayNameOf(pinRecords, liveMachines, pinSpecs, pinUid, pinRoster) : null;
-  const scopedRuns = pinUid != null ? runsForMachine(runs, machineNames(pinRecords, liveMachines, pinUid)) : runs;
+  const pinNotFound = machineKey != null && pinUid == null;
+  const pinnedMachineName = machineKey == null ? null : pinUid == null ? MACHINE_NOT_FOUND_LABEL : machineLabel(pinKey.ctx, pinUid);
+  const scopedRuns =
+    machineKey == null ? runs : pinUid == null ? [] : runsForMachine(runs, machineNames(pinRecords, pinKey.ctx.liveMachines, pinUid));
 
   function selectKind(k: RunsKind) {
     setKind(k);
@@ -594,6 +596,7 @@ export function RunsBoard({
       kind={kind}
       onKind={selectKind}
       pinnedMachineName={pinnedMachineName}
+      pinNotFound={pinNotFound}
       onClearMachine={clearMachinePin}
     />
   );
@@ -666,6 +669,7 @@ function RunsBar({
   kind,
   onKind,
   pinnedMachineName,
+  pinNotFound = false,
   onClearMachine,
 }: {
   counts: Record<string, number>;
@@ -673,6 +677,8 @@ function RunsBar({
   onKind: (k: RunsKind) => void;
   /** `null` = no machine pin — the pre-existing "every machine" board. */
   pinnedMachineName: string | null;
+  /** (#2929) The pin's key names no machine: the chip says so, same slot. */
+  pinNotFound?: boolean;
   onClearMachine: () => void;
 }) {
   return (
@@ -701,7 +707,7 @@ function RunsBar({
           onKeyDown={onActivateKeyDown(onClearMachine)}
           title="clear the machine filter — show runs from every machine"
         >
-          machine: {pinnedMachineName} ✕
+          {pinNotFound ? MACHINE_NOT_FOUND_LABEL : `machine: ${pinnedMachineName}`} ✕
         </span>
       )}
     </div>

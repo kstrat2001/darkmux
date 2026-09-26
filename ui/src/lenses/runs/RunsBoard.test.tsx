@@ -1,3 +1,4 @@
+import { machineKeyHash } from "../../lib/machineKey";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor, fireEvent, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -834,7 +835,7 @@ describe("RunsBoard — the machine pin (#1809)", () => {
     expect(window.location.hash).toBe("#lens=runs&kind=mission&machine=MacBook-Pro");
   });
 
-  it("(#2929) two unnamed machines: unnamed-2 pins the second one, not the first", async () => {
+  it("(#2929) two unnamed machines: the second's key pins the second one, not the first", async () => {
     const OTHER = "1B2C3D4E-5F60-4172-9384-B5C6D7E8F9A0";
     mockPinnedFetch({
       flowToday: [
@@ -842,22 +843,69 @@ describe("RunsBoard — the machine pin (#1809)", () => {
         { ts: `${todayUTC()}T01:00:00Z`, machine_uid: OTHER },
       ],
     });
-    renderBoard("all", null, "unnamed-2");
+    renderBoard("all", null, `unnamed-${machineKeyHash(OTHER).slice(0, 6)}`);
     await waitFor(() => expect(screen.getByText(/machine: unnamed machine 2/)).toBeInTheDocument());
     expect(window.location.hash).not.toMatch(UUID_RE);
   });
 
-  it("(#2929) a key nothing resolves shows the same not-found page an unknown uid does", async () => {
+  it("(#2929) a key nothing resolves says 'machine not found' in the chip's slot, with no rows", async () => {
     mockPinnedFetch();
-    const unknownKey = renderBoard("all", null, "no-such-machine");
+    const { container } = renderBoard("all", null, "no-such-machine");
     await waitFor(() => expect(screen.getByText(/runs recorded yet/)).toBeInTheDocument());
-    const keyText = unknownKey.container.textContent;
-    unknownKey.unmount();
-    const unknownUid = renderBoard("all", null, "3D4E5F60-7182-4394-A5B6-D7E8F9A0B1C2");
-    await waitFor(() => expect(screen.getByText(/runs recorded yet/)).toBeInTheDocument());
-    expect(keyText).toBe(unknownUid.container.textContent);
-    expect(keyText).toMatch(/machine: unnamed machine/);
-    expect(keyText).not.toMatch(UUID_RE);
+    const chip = container.querySelector('[data-act="clearmachine"]');
+    expect(chip?.textContent).toBe("machine not found ✕");
+    expect(container.textContent).not.toMatch(/unnamed machine/);
+    expect(screen.queryByText("m1")).not.toBeInTheDocument();
+    // A plain unknown key is left as typed: it identifies nothing.
+    expect(window.location.hash).not.toContain("not-found");
+  });
+
+  it("(#2929 C4) an old uid link that resolves to nothing is rewritten to the not-found marker once settled", async () => {
+    mockPinnedFetch();
+    const gone = "3D4E5F60-7182-4394-A5B6-D7E8F9A0B1C2".toLowerCase();
+    window.location.hash = `#lens=runs&machine=${gone}`;
+    const { container } = renderBoard("all", null, gone);
+    await waitFor(() => expect(window.location.hash).toBe("#lens=runs&machine=not-found"));
+    await waitFor(() => expect(container.querySelector('[data-act="clearmachine"]')?.textContent).toBe("machine not found ✕"));
+    expect(UUID_RE.test(window.location.hash)).toBe(false);
+  });
+
+  it("(#2929 C4) an old uid link to a roster-declared machine never seen opens its roster card by name", async () => {
+    const DECLARED = "4E5F6071-8293-44A5-B6C7-E8F9A0B1C2D3";
+    mockPinnedFetch({ roster: [{ id: "garage-mac", address: "a:1", added_unix_ms: 1, machine_uid: DECLARED }] });
+    window.location.hash = `#lens=runs&machine=${DECLARED}`;
+    const { container } = renderBoard("all", null, DECLARED);
+    await waitFor(() => expect(window.location.hash).toBe("#lens=runs&machine=garage-mac"));
+    // (C3) A roster-only card is labeled with its roster id.
+    await waitFor(() => expect(container.querySelector('[data-act="clearmachine"]')?.textContent).toBe("machine: garage-mac ✕"));
+  });
+
+  it("(#2929 C5) while the inputs are still landing, an unresolved key shows the loading rows, not 'machine not found'", async () => {
+    let releaseRoster: () => void = () => {};
+    const rosterGate = new Promise<void>((r) => {
+      releaseRoster = r;
+    });
+    mockPinnedFetch({ flowToday: uidOnlyToday() });
+    const base = vi.mocked(fetch).getMockImplementation()!;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) =>
+        String(url) === "/fleet/roster"
+          ? rosterGate.then(
+              () =>
+                new Response(JSON.stringify({ machines: [{ id: "studio", address: "a:1", added_unix_ms: 1, machine_uid: FAKE_UID }], error: null }), {
+                  status: 200,
+                }),
+            )
+          : base(url),
+      ),
+    );
+    const { container } = renderBoard("all", null, "studio");
+    await new Promise((r) => setTimeout(r, 300));
+    expect(container.querySelector('[data-state="pending"]')).not.toBeNull();
+    expect(container.textContent).not.toMatch(/not found/);
+    releaseRoster();
+    await waitFor(() => expect(container.querySelector('[data-act="clearmachine"]')?.textContent).toBe("machine: studio ✕"));
   });
 
   it("filters the flat row list to the pinned machine's alias set", async () => {

@@ -1,5 +1,6 @@
 import { useDecodedMachineKey, useMachineKeyContext } from "../../hooks/useMachineKey";
 import { canonicalHash, writeHash } from "../../lib/hashSync";
+import { MACHINE_NOT_FOUND_LABEL, machineLabel } from "../../lib/machineKey";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
@@ -222,8 +223,8 @@ export function MachineLens({
   // (#2929) The route names the drilled machine by KEY; resolve it to the
   // uid from the same inputs its fleet card was named from, and rewrite an
   // old uid link to the key once they have settled. An unresolved key
-  // stands in as its own identity — it matches no record, which is the
-  // not-found page an unknown uid always got.
+  // stands in as its own identity so the page never falls back to THIS
+  // machine; it matches no record, and the page names it "machine not found".
   const drillKey = useMachineKeyContext(flowWindow.data, flowWindow.settled, daemonBacked && machineKey != null);
   const drillDecoded = useDecodedMachineKey(machineKey, drillKey.ctx, drillKey.settled, (k) =>
     writeHash(canonicalHash({ kind: "machine", machine: k })),
@@ -382,7 +383,17 @@ export function MachineLens({
   // cross-lens link this used to label — "runs on <machine> →" — was
   // removed 2026-09-23; `label` still feeds `MachineHealthRegion`'s
   // `machineName` prop below, used for the remote-machine placeholder.)
-  const label = targetUid != null ? displayNameOf(flowWindow.data, liveMachines, specs, targetUid, roster) : "this machine";
+  const drillNotFound = machineKey != null && drillDecoded?.uid == null;
+  const label =
+    drillNotFound
+      ? drillKey.settled
+        ? MACHINE_NOT_FOUND_LABEL
+        : ""
+      : drillDecoded?.uid != null
+        ? machineLabel(drillKey.ctx, drillDecoded.uid)
+        : targetUid != null
+          ? displayNameOf(flowWindow.data, liveMachines, specs, targetUid, roster)
+          : "this machine";
   // `specOf()` (viewer.html:1124-1129, ported in `lenses/fleet/cards.ts` —
   // reused rather than re-derived here) — the local daemon's own
   // `/machine/specs` probe (cpu + RAM) when this page IS that machine;

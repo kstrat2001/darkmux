@@ -11,6 +11,7 @@ import { todayUTC, prevDateUTC, FLOW_LIVE_TTL_MS, __sessionIndexBuilds, __asOfFi
 import { tokensOffMeter } from "./savings";
 import { closeOpenModal } from "../../lib/dialogManager";
 import { queryKeys } from "../../lib/queryKeys";
+import { machineKeyHash } from "../../lib/machineKey";
 import { __clockDebug } from "../../lib/clock";
 
 // (#2886 pass 5, MUST — fresh-reviewer finding F5) Several fixes in this
@@ -2302,7 +2303,10 @@ describe("(#2921 follow-up) fleet page: roster names and unnamed ordinals", () =
     const lanes = names(".lane .lname");
     expect(new Set(lanes)).toEqual(new Set(["unnamed machine", "unnamed machine 2"]));
     const cards = [...document.querySelectorAll<HTMLElement>(".mach[data-arg]")];
-    const cardName = (uid: string) => cards.find((c) => c.getAttribute("data-arg") === uid)?.querySelector(".mach-name")?.textContent;
+    // (#2929) `data-arg` carries the machine key, never the uid.
+    const cardName = (uid: string) =>
+      cards.find((c) => c.getAttribute("data-arg") === `unnamed-${machineKeyHash(uid).slice(0, 6)}`)?.querySelector(".mach-name")?.textContent;
+    for (const c of cards) expect(UUID_RE.test(c.getAttribute("data-arg") ?? "")).toBe(false);
     // B was seen first.
     expect(cardName(B)).toBe("unnamed machine");
     expect(cardName(A)).toBe("unnamed machine 2");
@@ -2349,9 +2353,14 @@ describe("(#2929) fleet-card links carry a machine key, never the hardware uid",
       hashes[name] = [byClick, window.location.hash];
     }
     expect(hashes["studio"]).toEqual(["#lens=runs&machine=studio", "#lens=runs&machine=studio"]);
-    expect(hashes["unnamed machine"]).toEqual(["#lens=runs&machine=unnamed-1", "#lens=runs&machine=unnamed-1"]);
-    expect(hashes["unnamed machine 2"]).toEqual(["#lens=runs&machine=unnamed-2", "#lens=runs&machine=unnamed-2"]);
+    const k1 = `unnamed-${machineKeyHash(UNNAMED_1).slice(0, 6)}`;
+    const k2 = `unnamed-${machineKeyHash(UNNAMED_2).slice(0, 6)}`;
+    expect(hashes["unnamed machine"]).toEqual([`#lens=runs&machine=${k1}`, `#lens=runs&machine=${k1}`]);
+    expect(hashes["unnamed machine 2"]).toEqual([`#lens=runs&machine=${k2}`, `#lens=runs&machine=${k2}`]);
     for (const h of Object.values(hashes).flat()) expect(UUID_RE.test(h), h).toBe(false);
+    // (C6) The card's `data-arg` hook is the same key, never the uid.
+    expect(cardNamed("unnamed machine 2").getAttribute("data-arg")).toBe(k2);
+    for (const c of document.querySelectorAll(".mach[data-arg]")) expect(UUID_RE.test(c.getAttribute("data-arg") ?? "")).toBe(false);
   });
 
   it("the running-count tap (2 live runs) carries the key too", async () => {
@@ -2362,7 +2371,7 @@ describe("(#2929) fleet-card links carry a machine key, never the hardware uid",
     expect(count).not.toBeNull();
     window.location.hash = "";
     fireEvent.click(count!);
-    expect(window.location.hash).toBe("#lens=runs&machine=unnamed-1");
+    expect(window.location.hash).toBe(`#lens=runs&machine=unnamed-${machineKeyHash(UNNAMED_1).slice(0, 6)}`);
     expect(UUID_RE.test(window.location.hash)).toBe(false);
   });
 });
