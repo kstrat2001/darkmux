@@ -72,6 +72,43 @@ darkmux release.
 
 ### Changed (breaking, 4.0)
 
+- **Fleet work no longer travels through Redis; `--machine` submits
+  straight to the target machine, which checks who is asking** (#2916,
+  stage 1). The `darkmux:work` queue could not say who wrote an entry and
+  every node that could write the hub's Redis could fill it, and every
+  `darkmux serve` with Redis configured ran whatever it claimed. The queue
+  is retired outright: the daemon no longer consumes `darkmux:work` (no
+  `darkmux-runners` consumer group, no claim loop), and nothing publishes to
+  it. `darkmux dispatch --machine <id>` now sends the job to that machine's
+  **fleet listener** (the roster host of `<id>` on `fleet.listener.port`,
+  default 8766) with the fleet token (the serve token, #881, one value on
+  every machine). The receiver runs it only when the overlay network
+  (`fleet.identity.provider`, `"tailscale"`: `whois` on the connection)
+  names the sending node as one on its allow-list, and only on a profile in
+  that entry's scope (never one that runs on the utility model, #2914; a
+  `--workdir` only with `workspace`). Deny by default; no identity answer
+  is a refusal. `--machine` is no longer an advisory hint: the named
+  machine runs the job or answers at once with the reason ("studio does not
+  accept work from macbook-pro", "not in the allow-list scope: profile
+  X", "studio is busy running <session>": one submitted job at a time).
+  With `--wait` (the default) the reply carries the remote exit code and
+  output instead of a synthetic line read back off the flow stream, so a
+  cross-machine `--wait` no longer needs Redis at all. `--profile` now
+  crosses (it names a profile on the target). `darkmux mission dispatch`
+  requires `--machine` (there is no "any machine claims it" any more) and
+  runs the mission's next phase there. The job wire shape is schema v5:
+  `target_machine` required, `profile` added, `attempt` and
+  `published_by_orchestrator` removed. **Migration:** on every machine
+  that should take work, store the fleet token if it has none (`security
+  add-generic-password -U -a "$USER" -s darkmux-serve-token -w`, same value
+  everywhere, plus `darkmux config set runtime.daemon_auth_enabled true`),
+  trust each sender (`darkmux machine trust <sender> --profiles
+  <profile>,...`), `darkmux config set fleet.listener.enabled true`, and
+  restart `darkmux serve`. On the hub, delete the dead streams: `redis-cli
+  DEL darkmux:work darkmux:work:inference` (`darkmux doctor` names any that
+  remain). Run the same darkmux version on both ends: a v4 sender is told
+  the schema versions differ.
+
 - **One machine utility model, declared once with its window, never a
   task's model** (#2914; finishes #590, supersedes the open parts of #70).
   `internal.utility` in `profiles.json` now also accepts
@@ -120,6 +157,34 @@ darkmux release.
   doctor` lists each one.
 
 ### Added
+
+- **`darkmux machine trust <name>` / `machine untrust <name>`** (#2916).
+  Trust adds `fleet.accept_work.<name>` to THIS machine's config.json (and
+  touches nothing else): the peer's node is looked up through the identity
+  provider by the name the network reports (`--node`, else the host of the
+  peer's roster address, else `<name>`) and its stable node id is stored,
+  never typed; `--profiles` sets the work-class profiles it may run here
+  (refused if undefined or utility-only); `--workspace` is reserved for the
+  workspace handoff (#755). Untrust removes the entry. The listener reads
+  the allow-list per request, so both take effect with no restart.
+- **The fleet listener** (#2916): with `fleet.listener.enabled`,
+  `darkmux serve` opens a second port bound only to the address the
+  identity provider reports for this machine (never `0.0.0.0`, loopback or
+  a LAN address, and not behind `tailscale serve`, which makes every peer
+  arrive as loopback). One route, `POST /fleet/work`; every request on the
+  port passes the token, then the network identity, then the allow-list.
+  The token is checked before the provider runs. CONFIG 1.29 adds
+  `fleet.identity{provider,bin}`, `fleet.listener{enabled,port}` and
+  `fleet.accept_work`; env `DARKMUX_FLEET_LISTENER_ENABLED` /
+  `DARKMUX_FLEET_LISTENER_PORT` (the identity provider and the allow-list
+  have no env tier, on purpose).
+- **`darkmux doctor` fleet rows** (#2916): `fleet token` (resolves or not),
+  `fleet identity` (what the provider reports for this machine),
+  `fleet listener` (bound or not, and where), `fleet trust` (each trusted
+  machine by name with its scope, the node the provider reports for it now
+  and whether it is online, and any profile in scope that cannot run here),
+  and `retired work queue` when `darkmux:work` streams are still in Redis.
+  No row prints a node id or the token.
 
 - **Endpoints are declared once and named by id** (#2902 step 4).
   `profiles.json` gains a top-level `endpoints` map; each entry has a
