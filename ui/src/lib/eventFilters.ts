@@ -14,6 +14,7 @@
  */
 import type { FlowRecord } from "../types/handwritten";
 import { isPlainObject } from "./guards";
+import { isDispatchStart, isDispatchComplete, isDispatchError } from "./flow";
 
 /** `activityOf()` — viewer.html:1014-1042, the FULL mapping (every branch,
  * including session end / machine online-offline / note, which the port's
@@ -27,9 +28,9 @@ export function activityOf(r: FlowRecord): string {
   if (a === "dispatch.turn.heartbeat") return "heartbeat";
   // (#1221) The harness deciding mid-turn whether the model keeps thinking.
   if (a === "dispatch.checkpoint") return "checkpoint";
-  if (a === "dispatch.start" || a === "dispatch start") return "dispatch start";
-  if (a === "dispatch.complete" || a === "dispatch complete") return "dispatch end";
-  if (a === "dispatch.error" || a === "dispatch error") return "dispatch error";
+  if (isDispatchStart(a)) return "dispatch start";
+  if (isDispatchComplete(a)) return "dispatch end";
+  if (isDispatchError(a)) return "dispatch error";
   if (a === "dispatch.feedback.injected") return "feedback";
   if (a === "tier-decision") return "routing";
   if (a === "dispatch.compaction" || r.source === "compaction") return "compaction";

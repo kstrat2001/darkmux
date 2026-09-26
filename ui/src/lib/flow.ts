@@ -742,9 +742,12 @@ export function recordsAsOf(data: FlowRecord[], now: number): FlowRecord[] {
  * for why a bare `session_id` match is unsafe for a review-shaped session.
  * `undefined` (every pre-existing caller) preserves the exact prior
  * session_id-only behavior. */
-export function dispatchRec(data: FlowRecord[], sid: string, act: string, missionId?: string): FlowRecord | undefined {
+export function dispatchRec(data: FlowRecord[], sid: string, act: "start" | "complete" | "error", missionId?: string): FlowRecord | undefined {
+  // (#2927) Either producer spelling: a raw record carrying the spaced form
+  // must match here too, or a spaced run never closes (or never starts).
+  const is = DISPATCH_ACT[act];
   return sessionRecords(data, sid).find(
-    (r) => r.session_id === sid && r.action === "dispatch." + act && (missionId === undefined || !r.mission_id || r.mission_id === missionId),
+    (r) => r.session_id === sid && is(r.action) && (missionId === undefined || !r.mission_id || r.mission_id === missionId),
   );
 }
 
@@ -753,8 +756,10 @@ export function dispatchEnd(data: FlowRecord[], sid: string, missionId?: string)
   return dispatchRec(data, sid, "complete", missionId) ?? dispatchRec(data, sid, "error", missionId);
 }
 
+const DISPATCH_ACT = { start: isDispatchStart, complete: isDispatchComplete, error: isDispatchError } as const;
+
 /** `dispatchErrored()` — viewer.html:1132. */
-export const dispatchErrored = (rec: FlowRecord | undefined): boolean => !!rec && rec.action === "dispatch.error";
+export const dispatchErrored = (rec: FlowRecord | undefined): boolean => !!rec && isDispatchError(rec.action);
 
 /** `dispatchKilled()` — viewer.html:1133. Watchdog kill = exit 137. */
 export const dispatchKilled = (rec: FlowRecord | undefined): boolean =>
@@ -952,7 +957,7 @@ export function flowLiveSessions(data: FlowRecord[], nowMs: number, liveMode = t
     const t = T(r.ts);
     const prev = lastBySid.get(r.session_id);
     if (prev === undefined || t > prev) lastBySid.set(r.session_id, t);
-    if (r.action === "dispatch.start") started.add(r.session_id);
+    if (isDispatchStart(r.action)) started.add(r.session_id);
   }
   const out = new Set<string>();
   for (const sid of started) {

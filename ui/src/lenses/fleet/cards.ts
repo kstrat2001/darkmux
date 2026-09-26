@@ -22,7 +22,7 @@
  * honored for its own "hasn't started yet" guard; see its own doc.
  */
 
-import { uidOf, sessionsOn, sessionRunning, sessionRecords, T } from "../../lib/flow";
+import { uidOf, sessionsOn, sessionRunning, sessionRecords, T, isDispatchStart } from "../../lib/flow";
 import {
   aggregateLiveState,
   aggregateTokenRate,
@@ -69,7 +69,7 @@ export function machActive(
     (r) =>
       T(r.ts) <= t &&
       uidOf(r) === m &&
-      r.action === "dispatch.start" &&
+      isDispatchStart(r.action) &&
       sessionRunning(data, liveSet, r.session_id ?? "", t),
   );
 }

@@ -17,7 +17,7 @@
  * not per-lens.
  */
 
-import { T} from "./flow";
+import { T, isDispatchStart } from "./flow";
 import { relAgoFrom } from "./format";
 import type { FlowRecord, PresenceBeat } from "../types/handwritten";
 
@@ -25,7 +25,7 @@ import type { FlowRecord, PresenceBeat } from "../types/handwritten";
 function idleHeadline(data: FlowRecord[], liveMachines: Map<string, PresenceBeat>, nowMs: number): string {
   const n = liveMachines.size;
   if (!n) return "○ waiting for a machine";
-  const starts = data.filter((r) => r.action === "dispatch.start");
+  const starts = data.filter((r) => isDispatchStart(r.action));
   const last = starts.length ? Math.max(...starts.map((r) => T(r.ts))) : null;
   const known = last != null && nowMs - last >= 0;
   const ago = known ? relAgoFrom(nowMs, last as number) : "";
@@ -56,7 +56,7 @@ export function readyParts(data: FlowRecord[], liveMachines: Map<string, Presenc
   // heartbeats stream continuously and it would read "just now" forever.
   // A dispatch START is the honest activity signal: it says when work last
   // BEGAN, counts in-flight work, and cannot be kept warm by telemetry.
-  const starts = data.filter((r) => r.action === "dispatch.start");
+  const starts = data.filter((r) => isDispatchStart(r.action));
   const last = starts.length ? Math.max(...starts.map((r) => T(r.ts))) : null;
   const known = last != null && nowMs - last >= 0;
   return { kind: "ready", n, ago: known ? relAgoFrom(nowMs, last as number) : "" };

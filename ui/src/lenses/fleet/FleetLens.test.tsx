@@ -2183,14 +2183,11 @@ describe("(#2926) fleet card: THINK opener and TOOL GEN, from the real run", () 
       return el as HTMLElement;
     });
   const extra = { machine_uid: "u1" };
-  // The real crew dispatch opens with `dispatch start` (spaced), and the
-  // card's `machActive` (`cards.ts`) only recognizes `dispatch.start`, so the
-  // real records alone leave the card idle in playback (a separate defect,
-  // reported with #2926, not fixed here). Dotted here so the card is active.
-  const dotted = (rs: FlowRecord[]) => rs.map((r) => (r.action === "dispatch start" ? { ...r, action: "dispatch.start" } : r));
+  // The real crew dispatch opens with `dispatch start` (spaced); these feed
+  // it verbatim (#2927: the card used to read idle on that spelling).
 
   it("turn 7's stream-open chunk: the previous turn's rate, dimmed, never ~1 think tok/s", async () => {
-    renderAt(dotted(pepperRecords({ extra })), pepperAt("10:51:33"));
+    renderAt(pepperRecords({ extra }), pepperAt("10:51:33"));
     const rate = await rateLine();
     expect(rate.getAttribute("data-thinking")).toBe("true");
     expect(rate.getAttribute("data-carried")).toBe("true");
@@ -2199,14 +2196,14 @@ describe("(#2926) fleet card: THINK opener and TOOL GEN, from the real run", () 
   });
 
   it("the same opener on a session's first turn: '— think tok/s', no figure", async () => {
-    renderAt(dotted(pepperRecords({ minTurn: 7, extra })), pepperAt("10:51:33"));
+    renderAt(pepperRecords({ minTurn: 7, extra }), pepperAt("10:51:33"));
     const rate = await rateLine();
     expect(rate.textContent).toBe("— think tok/s");
     expect(latestTokenScopeProps()).toMatchObject({ state: "generating", centerLabel: "—" });
   });
 
   it("turn 10 writing a `write` call: 'tool gen · write · 18s' on the rate line, the tube keeps just 'tool gen'", async () => {
-    renderAt(dotted(pepperRecords({ extra })), pepperAt("10:52:48.500"));
+    renderAt(pepperRecords({ extra }), pepperAt("10:52:48.500"));
     const rate = await rateLine();
     expect(rate.textContent).toBe("tool gen · write · 18s");
     expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolName: "write", toolWriting: true, centerLabel: null, centerUnit: "tool gen" });

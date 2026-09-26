@@ -507,6 +507,14 @@ describe("applyRecordToMetrics", () => {
     expect(stepDisplayMetrics(m["a-step"]).tokens).toBe(500);
   });
 
+  // (#2927) Either producer spelling closes the step's span.
+  it.each(["dispatch error", "dispatch.error", "dispatch complete", "dispatch.complete"])("a `%s` terminal sets the step's end", (action) => {
+    let m: MetricsMap = {};
+    m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch start" }), idx, "m1");
+    m = applyRecordToMetrics(m, rec({ handle: "a-step", action, ts: "2026-08-19T00:00:09Z" }), idx, "m1");
+    expect(m["a-step"].endTs).toBe(Date.parse("2026-08-19T00:00:09Z"));
+  });
+
   it("returns the SAME map reference when a record changes nothing", () => {
     let m: MetricsMap = {};
     m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch start" }), idx, "m1");
