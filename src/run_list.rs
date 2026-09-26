@@ -8,30 +8,74 @@
 //! `--json` follows `mission status --json`'s posture (per #1905's design):
 //! never paginated. A machine reader gets every row the kind filter
 //! selected; `--limit`/`--all` only shape the human table.
+//!
+//! (#2902 step 2b) Tokens ride the same union: every row's `tokens` and
+//! the `--usage` breakdown come from `darkmux_serve::usage_sum`, the one
+//! fold `build_runs_with_usage` runs over the same records, so this verb
+//! renders counts and never sums anything itself. `--since` bounds both.
 
 use anyhow::Result;
+use darkmux_serve::usage_sum::{UsageBreakdown, UsageSplit};
 use darkmux_serve::{AbandonReason, Run, RunKind, RunStatus};
 use darkmux_types::style;
 
 use crate::cli::RunKindArg;
 
-pub(crate) fn run(kind: RunKindArg, limit: usize, all: bool, json: bool) -> Result<i32> {
+pub(crate) fn run(
+    kind: RunKindArg,
+    limit: usize,
+    all: bool,
+    json: bool,
+    usage: bool,
+    since: Option<&str>,
+) -> Result<i32> {
     let flows_dir = darkmux_types::config_access::flows_dir();
     let lab_dir = darkmux_types::config_access::lab_dir();
+    let since_secs = match since {
+        Some(spec) => Some(
+            darkmux_serve::usage_sum::parse_since(spec, now_unix()).map_err(|e| anyhow::anyhow!(e))?,
+        ),
+        None => None,
+    };
     // (#1905) The SAME three inputs `runs_handler` assembles for `GET
     // /runs` — `fleet_records_for_runs()` degrades to an empty vec on a
     // standalone install (no `DARKMUX_REDIS_URL`), same as the handler.
     let fleet = darkmux_serve::fleet_records_for_runs();
-    let all_rows = darkmux_serve::build_runs(&flows_dir, Some(&lab_dir), &fleet.records);
-    let filtered = filter_by_kind(all_rows, kind);
+    let built = darkmux_serve::build_runs_with_usage(&flows_dir, Some(&lab_dir), &fleet.records, since_secs);
+    let filtered = filter_since(filter_by_kind(built.runs, kind), since_secs);
+    let report = usage.then(|| UsageReport {
+        since: built.since.clone(),
+        default_window: built.default_window,
+        breakdown: built.usage,
+    });
 
+    // The bound to name, whenever the operator gave one.
+    let since_label = since.map(|_| built.since.as_str());
     if json {
-        return run_json(&filtered, kind, &fleet.state);
+        let payload = json_payload(&filtered, kind, &fleet.state, since_label, report.as_ref());
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(0);
     }
 
     let selection = select_rows(filtered, limit, all);
-    render_text(&selection, kind, &fleet.state);
+    render_text(&selection, kind, &fleet.state, since_label);
+    if let Some(report) = &report {
+        println!();
+        for line in usage_lines(report, style::terminal_width()) {
+            println!("{line}");
+        }
+    }
     Ok(0)
+}
+
+/// (#2902) `--since`: keep the rows active at or after the bound — the
+/// same activity stamp [`select_rows`] orders by, so the window and the
+/// ordering agree on what "recent" means. `None` keeps everything.
+fn filter_since(rows: Vec<Run>, since: Option<u64>) -> Vec<Run> {
+    match since {
+        Some(bound) => rows.into_iter().filter(|r| run_activity(r) >= bound).collect(),
+        None => rows,
+    }
 }
 
 /// One line naming an INCOMPLETE fleet read, or `None` when the answer is
@@ -203,6 +247,46 @@ fn relative_age(now: u64, then: u64) -> String {
     }
 }
 
+/// (#2902) The TOKENS cell: the row's ALL-tokens sum, compact the way the
+/// viewer's `fmtC` (`ui/src/lib/format.ts`) prints a tile — exact below
+/// 1000, two decimals in the thousands (so a difference of a few hundred
+/// tokens between two rows stays visible), one in the millions, none from
+/// 10M. `-` when nothing was measured; never a `0` standing in for
+/// "unknown".
+///
+/// One deliberate difference: from 999,995 the millions arm takes over,
+/// because two decimals of thousands round that to `1000.00k`, a cell one
+/// column too wide that also spells a million as a thousand. (`fmtC` has
+/// the same boundary and renders it that way today.)
+fn tokens_cell(tokens: Option<u64>) -> String {
+    let Some(n) = tokens else {
+        return "-".to_string();
+    };
+    if n >= 10_000_000 {
+        format!("{:.0}M", n as f64 / 1e6)
+    } else if n >= 999_995 {
+        format!("{:.1}M", n as f64 / 1e6)
+    } else if n >= 1000 {
+        format!("{:.2}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Thousands-grouped integer (the viewer's `fmtN`), for the breakdown's
+/// exact counts.
+fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, chunk) in digits.as_bytes().rchunks(3).rev().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(std::str::from_utf8(chunk).expect("ascii digits"));
+    }
+    out
+}
+
 fn started_cell(now: u64, r: &Run) -> String {
     match r.started_ts {
         Some(ts) => format!("{} ago", relative_age(now, ts)),
@@ -348,6 +432,8 @@ const KIND_COLS: usize = 8; // "dispatch"
 const STATUS_COLS: usize = 11; // "unparseable"
 const STARTED_COLS: usize = 10;
 const DURATION_COLS: usize = 10;
+/// (#2902) `999.99k` is the widest [`tokens_cell`] below a billion tokens.
+const TOKENS_COLS: usize = 7;
 /// The two-space gap between DURATION and ID (every other gap is one).
 const ID_GAP_COLS: usize = 2;
 /// (#1929) MACHINE is a real column, not a subtitle field. It is present on
@@ -376,6 +462,8 @@ const FIXED_COLS: usize = INDENT_COLS
     + STARTED_COLS
     + 1
     + DURATION_COLS
+    + 1
+    + TOKENS_COLS
     + ID_GAP_COLS;
 
 /// (#1929) What the MACHINE column costs when shown: the column plus its
@@ -460,12 +548,13 @@ fn id_width(rows: &[Run], width: Option<usize>) -> usize {
 
 fn header_line(id_w: usize, machine_col: bool) -> String {
     format!(
-        "{:i$}{:<k$} {:<s$} {:<t$} {:<d$}{:g$}{:<id_w$}{}",
+        "{:i$}{:<k$} {:<s$} {:<t$} {:<d$} {:>n$}{:g$}{:<id_w$}{}",
         "",
         "KIND",
         "STATUS",
         "STARTED",
         "DURATION",
+        "TOKENS",
         "",
         "ID",
         if machine_col { format!(" {:<w$}", "MACHINE", w = MACHINE_COLS) } else { String::new() },
@@ -474,6 +563,7 @@ fn header_line(id_w: usize, machine_col: bool) -> String {
         s = STATUS_COLS,
         t = STARTED_COLS,
         d = DURATION_COLS,
+        n = TOKENS_COLS,
         g = ID_GAP_COLS,
     )
 }
@@ -484,12 +574,13 @@ fn header_line(id_w: usize, machine_col: bool) -> String {
 fn format_row(now: u64, r: &Run, id_w: usize, width: Option<usize>, machine_col: bool) -> String {
     let id_cell = format!("{:<id_w$}", ellipsize(&r.id, id_w));
     let base = format!(
-        "{:i$}{:<k$} {:<s$} {:<t$} {:<d$}{:g$}{}{}",
+        "{:i$}{:<k$} {:<s$} {:<t$} {:<d$} {:>n$}{:g$}{}{}",
         "",
         kind_label(r.kind),
         status_label(r.status),
         started_cell(now, r),
         duration_cell(now, r),
+        tokens_cell(r.tokens),
         "",
         id_cell,
         if machine_col {
@@ -502,6 +593,7 @@ fn format_row(now: u64, r: &Run, id_w: usize, width: Option<usize>, machine_col:
         s = STATUS_COLS,
         t = STARTED_COLS,
         d = DURATION_COLS,
+        n = TOKENS_COLS,
         g = ID_GAP_COLS,
     );
     // (#1929) When the column is shed, machine rejoins the subtitle so the
@@ -524,7 +616,24 @@ fn format_row(now: u64, r: &Run, id_w: usize, width: Option<usize>, machine_col:
     }
 }
 
-fn render_text(sel: &Selection, kind: RunKindArg, fleet: &darkmux_serve::source_state::SourceState) {
+/// The empty state. With `--since` it names the bound (review CONSIDER
+/// 6): "nothing recorded yet" would be a claim about all history, and a
+/// bounded question deserves a bounded answer.
+fn empty_state_line(kind: RunKindArg, since: Option<&str>) -> String {
+    match (kind, since) {
+        (RunKindArg::All, None) => "no recorded run activity yet".to_string(),
+        (_, None) => format!("no recorded {} runs yet", kind_arg_label(kind)),
+        (RunKindArg::All, Some(bound)) => format!("no run activity since {bound}"),
+        (_, Some(bound)) => format!("no {} runs since {bound}", kind_arg_label(kind)),
+    }
+}
+
+fn render_text(
+    sel: &Selection,
+    kind: RunKindArg,
+    fleet: &darkmux_serve::source_state::SourceState,
+    since: Option<&str>,
+) {
     // Printed BEFORE the table (and before the empty-state line) — an
     // incomplete answer has to be qualified where the reader meets it, not
     // in a footnote under rows they have already believed.
@@ -532,12 +641,7 @@ fn render_text(sel: &Selection, kind: RunKindArg, fleet: &darkmux_serve::source_
         eprintln!("{}", style::warn(&warning));
     }
     if sel.rows.is_empty() {
-        let msg = if matches!(kind, RunKindArg::All) {
-            "no recorded run activity yet".to_string()
-        } else {
-            format!("no recorded {} runs yet", kind_arg_label(kind))
-        };
-        println!("{}", style::dim(&msg));
+        println!("{}", style::dim(&empty_state_line(kind, since)));
         return;
     }
 
@@ -556,17 +660,33 @@ fn render_text(sel: &Selection, kind: RunKindArg, fleet: &darkmux_serve::source_
     }
 }
 
-fn run_json(
+/// (#2902) What `--usage` reports: the breakdown and the bound it covers.
+struct UsageReport {
+    /// The inclusive bound, in the flow schema's own `ts` spelling: the
+    /// operator's `--since`, else the default window's first day.
+    since: String,
+    /// True when no `--since` was given and the bound is the default
+    /// 14-day scan window.
+    default_window: bool,
+    breakdown: UsageBreakdown,
+}
+
+/// The `--json` document. The top-level `since` appears whenever `--since`
+/// was given, `usage` only with `--usage`; every row carries its own
+/// `tokens` regardless.
+fn json_payload(
     rows: &[Run],
     kind: RunKindArg,
     fleet: &darkmux_serve::source_state::SourceState,
-) -> Result<i32> {
+    since: Option<&str>,
+    usage: Option<&UsageReport>,
+) -> serde_json::Value {
     // (#1905, matching `mission status --json`'s posture) NEVER paginated —
     // a machine reader gets every row the kind filter selected;
     // `--limit`/`--all` only shape the human table above.
     let mut sorted: Vec<&Run> = rows.iter().collect();
     sorted.sort_by_key(|r| std::cmp::Reverse(run_activity(r)));
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "kind": kind_arg_label(kind),
         "runs": sorted,
         "total": sorted.len(),
@@ -574,14 +694,166 @@ fn run_json(
         // able to tell an incomplete answer from a quiet fleet.
         "fleet": fleet,
     });
-    println!("{}", serde_json::to_string_pretty(&payload)?);
-    Ok(0)
+    if let Some(bound) = since {
+        payload["since"] = serde_json::json!(bound);
+    }
+    if let Some(report) = usage {
+        payload["usage"] = serde_json::json!({
+            "since": report.since,
+            "default_window": report.default_window,
+            "overall": report.breakdown.overall,
+            "groups": report.breakdown.groups,
+        });
+    }
+    payload
+}
+
+// ── (#2902) the --usage breakdown ────────────────────────────────────
+
+const USAGE_INDENT: usize = 2;
+const CALLS_COLS: usize = 5;
+const COUNT_COLS: usize = 11; // "999,999,999"
+/// `GENERATED` is the widest numeric header.
+const GENERATED_COLS: usize = 10;
+/// Endpoint and model columns are sized to their content, capped so one
+/// long deployment label cannot push the counts off a pane.
+const ENDPOINT_MAX_COLS: usize = 40;
+const MODEL_MAX_COLS: usize = 28;
+
+fn none_or(s: Option<&str>) -> &str {
+    s.unwrap_or("(none)")
+}
+
+fn count_cell(n: Option<u64>) -> String {
+    match n {
+        Some(n) => grouped(n),
+        None => "-".to_string(),
+    }
+}
+
+/// One numeric row of the breakdown: `CALLS INPUT CACHED GENERATED TOTAL`,
+/// right-aligned, `-` for a cached count nothing reported.
+fn usage_numbers(s: &UsageSplit) -> String {
+    format!(
+        "{:>c$} {:>w$} {:>w$} {:>g$} {:>w$}",
+        grouped(s.calls),
+        grouped(s.input),
+        count_cell(s.cached),
+        grouped(s.generated),
+        grouped(s.total),
+        c = CALLS_COLS,
+        w = COUNT_COLS,
+        g = GENERATED_COLS,
+    )
+}
+
+fn merged(a: &UsageSplit, b: &UsageSplit) -> UsageSplit {
+    UsageSplit {
+        calls: a.calls + b.calls,
+        total: a.total + b.total,
+        input: a.input + b.input,
+        cached: match (a.cached, b.cached) {
+            (None, None) => None,
+            (x, y) => Some(x.unwrap_or(0) + y.unwrap_or(0)),
+        },
+        generated: a.generated + b.generated,
+    }
+}
+
+/// The `--usage` section, as lines. One line per endpoint + requested
+/// model carrying the group's ALL tokens; beneath it, `utility` when
+/// darkmux's own calls (compaction, radio routing) landed there, and
+/// `reported model:` when the reply named a model other than the one
+/// requested — each a fact off the records, nothing inferred. Then the
+/// totals. Endpoint and model cells are ellipsized only against a KNOWN
+/// width; piped output stays complete and greppable, the same rule the
+/// table above follows.
+fn usage_lines(report: &UsageReport, width: Option<usize>) -> Vec<String> {
+    let b = &report.breakdown;
+    let o = &b.overall;
+    let mut lines = Vec::new();
+    let window = if report.default_window { "the default 14-day window" } else { "--since" };
+    let legacy = match o.legacy_completes {
+        0 => String::new(),
+        1 => " · 1 legacy complete".to_string(),
+        n => format!(" · {n} legacy completes"),
+    };
+    lines.push(style::header(&format!(
+        "usage since {} ({window}) · {} calls{legacy}",
+        report.since,
+        grouped(o.usage_records)
+    )));
+
+    let ep_w = b
+        .groups
+        .iter()
+        .map(|g| none_or(g.endpoint.as_deref()).chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("ENDPOINT".len());
+    let model_w = b
+        .groups
+        .iter()
+        .map(|g| none_or(g.requested_model.as_deref()).chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("MODEL".len());
+    let (ep_w, model_w) = match width {
+        Some(_) => (ep_w.min(ENDPOINT_MAX_COLS), model_w.min(MODEL_MAX_COLS)),
+        None => (ep_w, model_w),
+    };
+    let label = |ep: &str, model: &str| {
+        format!("{:i$}{:<e$} {:<m$} ", "", ellipsize(ep, ep_w), ellipsize(model, model_w), i = USAGE_INDENT, e = ep_w, m = model_w)
+    };
+    lines.push(format!(
+        "{}{:>c$} {:>w$} {:>w$} {:>g$} {:>w$}",
+        label("ENDPOINT", "MODEL"),
+        "CALLS",
+        "INPUT",
+        "CACHED",
+        "GENERATED",
+        "TOTAL",
+        c = CALLS_COLS,
+        w = COUNT_COLS,
+        g = GENERATED_COLS,
+    ));
+    let sub_indent = " ".repeat(USAGE_INDENT + 2);
+    for g in &b.groups {
+        lines.push(format!(
+            "{}{}",
+            label(none_or(g.endpoint.as_deref()), none_or(g.requested_model.as_deref())),
+            usage_numbers(&merged(&g.work, &g.utility))
+        ));
+        if g.utility.calls > 0 {
+            lines.push(format!(
+                "{sub_indent}{:<u$} {}",
+                "utility",
+                usage_numbers(&g.utility),
+                u = ep_w + 1 + model_w - 2,
+            ));
+        }
+        if let Some(served) = &g.reported_model {
+            lines.push(style::dim(&format!("{sub_indent}reported model: {served}")));
+        }
+    }
+    let (mut work, mut utility) = (UsageSplit::default(), UsageSplit::default());
+    for g in &b.groups {
+        work = merged(&work, &g.work);
+        utility = merged(&utility, &g.utility);
+    }
+    let all = merged(&work, &utility);
+    lines.push(format!("{}{}", label("all", ""), usage_numbers(&all)));
+    if utility.calls > 0 {
+        lines.push(format!("{}{}", label("utility", ""), usage_numbers(&utility)));
+    }
+    lines
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::ValueEnum;
+    use darkmux_serve::usage_sum::UsageGroup;
 
     fn mk_run(id: &str, kind: RunKind, status: RunStatus, updated_ts: u64) -> Run {
         Run {
@@ -605,6 +877,7 @@ mod tests {
             // `runs.rs` tests, where every construction site lives. This
             // helper's rows are never `Abandoned` in the existing suite.
             abandoned_reason: None,
+            tokens: None,
         }
     }
 
@@ -1100,6 +1373,197 @@ mod tests {
         r.started_ts = None;
         assert_eq!(started_cell(200, &r), "-");
         assert_eq!(duration_cell(200, &r), "-");
+    }
+
+    // ── #2902 step 2b: the TOKENS column, --since, --usage ────────────
+
+    /// The cell mirrors the viewer's `fmtC` (`ui/src/lib/format.ts`):
+    /// exact below 1000, two decimals in the thousands, one in the
+    /// millions, none from 10M — and `-` when nothing was measured.
+    #[test]
+    fn tokens_cell_is_compact_like_the_viewer_and_dashes_when_absent() {
+        assert_eq!(tokens_cell(None), "-");
+        assert_eq!(tokens_cell(Some(0)), "0");
+        assert_eq!(tokens_cell(Some(984)), "984");
+        assert_eq!(tokens_cell(Some(999)), "999");
+        assert_eq!(tokens_cell(Some(1000)), "1.00k");
+        assert_eq!(tokens_cell(Some(29_180)), "29.18k");
+        assert_eq!(tokens_cell(Some(999_600)), "999.60k");
+        assert_eq!(tokens_cell(Some(999_994)), "999.99k");
+        assert_eq!(tokens_cell(Some(999_995)), "1.0M", "rounds into the millions arm, never 1000.00k");
+        assert_eq!(tokens_cell(Some(1_234_567)), "1.2M");
+        assert_eq!(tokens_cell(Some(12_345_678)), "12M");
+        for n in [0u64, 999, 1000, 999_999, 1_000_000, 9_999_999, 10_000_000, 999_999_999] {
+            assert!(tokens_cell(Some(n)).chars().count() <= TOKENS_COLS, "{n} overflows TOKENS_COLS");
+        }
+    }
+
+    /// TOKENS sits between DURATION and ID, right-aligned under its header
+    /// so a column of counts lines up on the last digit.
+    #[test]
+    fn header_and_row_carry_the_tokens_column_between_duration_and_id() {
+        let header = header_line(12, false);
+        let d = header.find("DURATION").expect("DURATION header");
+        let t = header.find("TOKENS").expect("TOKENS header");
+        let i = header.find("ID").expect("ID header");
+        assert!(d < t && t < i, "{header:?}");
+        let mut r = mk_run("run-1", RunKind::Dispatch, RunStatus::Complete, 100);
+        r.tokens = Some(29_180);
+        let row = format_row(200, &r, 12, None, false);
+        let cell_end = row.find("29.18k").expect("the cell") + "29.18k".len();
+        assert_eq!(cell_end, t + "TOKENS".len(), "right-aligned under the header:\n{header}\n{row}");
+        r.tokens = None;
+        let row = format_row(200, &r, 12, None, false);
+        assert_eq!(row.find(" -  ").map(|p| p + 2), Some(t + "TOKENS".len()), "absent reads as a dash:\n{header}\n{row}");
+    }
+
+    /// `--since` keeps the rows active at or after the bound (the same
+    /// activity stamp the table sorts by), in the order they came.
+    #[test]
+    fn filter_since_keeps_rows_active_at_or_after_the_bound() {
+        let rows = vec![
+            mk_run("old", RunKind::Mission, RunStatus::Complete, 99),
+            mk_run("at", RunKind::Mission, RunStatus::Complete, 100),
+            mk_run("new", RunKind::Dispatch, RunStatus::Running, 150),
+        ];
+        let kept: Vec<String> = filter_since(rows.clone(), Some(100)).into_iter().map(|r| r.id).collect();
+        assert_eq!(kept, vec!["at", "new"]);
+        assert_eq!(filter_since(rows, None).len(), 3, "no bound keeps everything");
+    }
+
+    fn split(calls: u64, total: u64, input: u64, cached: Option<u64>, generated: u64) -> UsageSplit {
+        UsageSplit { calls, total, input, cached, generated }
+    }
+
+    fn sample_report() -> UsageReport {
+        UsageReport {
+            since: "2026-09-12T00:00:00Z".to_string(),
+            default_window: true,
+            breakdown: UsageBreakdown {
+                // The sum of the four groups below, field by field.
+                overall: darkmux_serve::usage_sum::UsageSum {
+                    total: 2045,
+                    prompt: 1755,
+                    completion: 290,
+                    cached: Some(140),
+                    utility: 145,
+                    usage_records: 8,
+                    reported: 9,
+                    legacy_completes: 1,
+                },
+                groups: vec![
+                    UsageGroup {
+                        endpoint: Some("http://127.0.0.1:1234/v1".into()),
+                        requested_model: Some("qwen-a".into()),
+                        reported_model: None,
+                        work: split(3, 360, 300, Some(40), 60),
+                        utility: split(0, 0, 0, None, 0),
+                    },
+                    UsageGroup {
+                        endpoint: Some("azure:example.azure.com/gpt-x".into()),
+                        requested_model: Some("gpt-x".into()),
+                        reported_model: Some("gpt-x-2026-01".into()),
+                        work: split(1, 500, 400, Some(100), 100),
+                        utility: split(1, 35, 30, None, 5),
+                    },
+                    UsageGroup {
+                        endpoint: Some("http://127.0.0.1:1234/v1".into()),
+                        requested_model: Some("util-4b".into()),
+                        reported_model: None,
+                        work: split(0, 0, 0, None, 0),
+                        utility: split(2, 110, 95, None, 15),
+                    },
+                    UsageGroup {
+                        endpoint: None,
+                        requested_model: None,
+                        reported_model: None,
+                        work: split(2, 1040, 930, None, 110),
+                        utility: split(0, 0, 0, None, 0),
+                    },
+                ],
+            },
+        }
+    }
+
+    /// One line per endpoint + requested model with the group's ALL
+    /// tokens; a `utility` line under it when darkmux's own calls landed
+    /// there; the served model as a fact under the line when it differs;
+    /// `-` for cached wherever nothing reported it; and the totals.
+    #[test]
+    fn usage_lines_render_each_endpoint_model_with_utility_split_and_reported_model_as_a_fact() {
+        let lines = usage_lines(&sample_report(), None);
+        let text = lines.join("\n");
+        assert!(lines[0].starts_with("usage since 2026-09-12T00:00:00Z"), "{text}");
+        assert!(lines[0].contains("8 calls") && lines[0].contains("1 legacy complete"), "{text}");
+        let header = &lines[1];
+        for col in ["ENDPOINT", "MODEL", "CALLS", "INPUT", "CACHED", "GENERATED", "TOTAL"] {
+            assert!(header.contains(col), "{col} missing from {header:?}");
+        }
+        // Every group line carries its endpoint, model and ALL-tokens total.
+        let qwen = lines.iter().find(|l| l.contains("qwen-a")).expect("qwen-a line");
+        assert!(qwen.contains("http://127.0.0.1:1234/v1") && qwen.ends_with("360"), "{qwen:?}");
+        assert!(qwen.contains(" 40 "), "cached reported: {qwen:?}");
+        let gpt = lines.iter().position(|l| l.contains("gpt-x ") || l.ends_with("gpt-x")).expect("gpt-x line");
+        assert!(lines[gpt].ends_with("535"), "work + utility: {:?}", lines[gpt]);
+        assert!(lines[gpt + 1].trim_start().starts_with("utility") && lines[gpt + 1].ends_with("35"), "{:?}", lines[gpt + 1]);
+        assert!(lines[gpt + 2].contains("reported model: gpt-x-2026-01"), "{:?}", lines[gpt + 2]);
+        assert_eq!(text.matches("reported model:").count(), 1, "only the differing group says so");
+        // A utility-only group is one line with its total plus the split.
+        let util = lines.iter().position(|l| l.contains("util-4b")).expect("util-4b line");
+        assert!(lines[util].ends_with("110") && lines[util + 1].trim_start().starts_with("utility"), "{text}");
+        // Cached absent renders `-`, never 0.
+        assert!(lines[util].contains(" - "), "{:?}", lines[util]);
+        // Records with no endpoint/model are still shown, labeled.
+        assert!(text.contains("(none)"), "{text}");
+        // Totals: all tokens, and utility's share.
+        let all = lines.iter().find(|l| l.trim_start().starts_with("all")).expect("all line");
+        assert!(all.contains("1,755") && all.contains("140") && all.contains("290") && all.ends_with("2,045"), "{all:?}");
+        let util_total = lines.iter().rev().find(|l| l.trim_start().starts_with("utility")).unwrap();
+        assert!(util_total.ends_with("145"), "{util_total:?}");
+        // Nothing here prices, classifies or estimates anything.
+        for word in ["$", "cost", "local", "cloud", "metered", "saved"] {
+            assert!(!text.to_lowercase().contains(word), "{word:?} in {text}");
+        }
+    }
+
+    /// (review CONSIDER 5) `--since` alone still names its bound in the
+    /// JSON, and the empty state names it in text (CONSIDER 6).
+    #[test]
+    fn since_without_usage_still_reports_its_bound() {
+        let rows = vec![mk_run("m1", RunKind::Mission, RunStatus::Complete, 100)];
+        let fleet = darkmux_serve::source_state::SourceState::Off;
+        let payload = json_payload(&rows, RunKindArg::All, &fleet, Some("2026-09-12T00:00:00Z"), None);
+        assert_eq!(payload["since"], "2026-09-12T00:00:00Z");
+        assert!(payload.get("usage").is_none());
+        assert_eq!(empty_state_line(RunKindArg::All, None), "no recorded run activity yet");
+        assert_eq!(empty_state_line(RunKindArg::Lab, None), "no recorded lab runs yet");
+        assert_eq!(empty_state_line(RunKindArg::All, Some("2026-09-12T00:00:00Z")), "no run activity since 2026-09-12T00:00:00Z");
+        assert_eq!(empty_state_line(RunKindArg::Lab, Some("2026-09-12T00:00:00Z")), "no lab runs since 2026-09-12T00:00:00Z");
+    }
+
+    /// The same breakdown, structurally, plus the bound it covers.
+    #[test]
+    fn usage_json_carries_the_same_breakdown_structurally() {
+        let rows = vec![mk_run("m1", RunKind::Mission, RunStatus::Complete, 100)];
+        let fleet = darkmux_serve::source_state::SourceState::Off;
+        let report = sample_report();
+        let payload = json_payload(&rows, RunKindArg::All, &fleet, Some(&report.since), Some(&report));
+        assert_eq!(payload["usage"]["since"], "2026-09-12T00:00:00Z");
+        assert_eq!(payload["usage"]["default_window"], true);
+        assert_eq!(payload["usage"]["overall"]["total"], 2045);
+        assert_eq!(payload["usage"]["overall"]["cached"], 140);
+        let groups = payload["usage"]["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 4);
+        assert_eq!(groups[1]["reported_model"], "gpt-x-2026-01");
+        assert_eq!(groups[1]["work"]["cached"], 100);
+        assert!(groups[1]["utility"].get("cached").is_none(), "absent, never 0: {}", groups[1]);
+        assert!(groups[3].get("endpoint").is_none(), "absent on the wire: {}", groups[3]);
+        assert_eq!(payload["since"], "2026-09-12T00:00:00Z");
+        // Without --usage there is no usage key at all, and rows still
+        // carry their own `tokens`.
+        let plain = json_payload(&rows, RunKindArg::All, &fleet, None, None);
+        assert!(plain.get("usage").is_none() && plain.get("since").is_none());
+        assert_eq!(plain["runs"][0]["id"], "m1");
     }
 
     // ── cross-language kind-vocabulary drift guard ───────────────────

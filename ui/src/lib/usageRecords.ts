@@ -77,8 +77,24 @@ function payloadOf(r: UsageRecordLike): UsagePayload {
   return ((r.payload ?? r.fields) as UsagePayload | null | undefined) ?? {};
 }
 
+/** The largest count either side holds exactly: 2^53, the edge of a JS
+ *  number's integer range. The Rust twin (`usage_sum::MAX_COUNT`) clamps to
+ *  the same edge, so a sum of clamped counts is one arithmetic on both
+ *  sides. */
+export const MAX_COUNT = 2 ** 53;
+
+/** THE value domain, shared with the Rust twin's `num`: a finite number is
+ *  floored to an integer and clamped to [0, MAX_COUNT]; anything else (a
+ *  string, a bool, null, a negative) reads as 0. "Reported" is judged by
+ *  this same reading everywhere, so a negative count is not a count. */
 function num(v: unknown): number {
-  return typeof v === "number" && Number.isFinite(v) ? v : 0;
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.min(Math.floor(v), MAX_COUNT) : 0;
+}
+
+/** The presence test for `cached_tokens`: a finite number at all (a
+ *  reported `-3` is a reported 0, not an absence). */
+function isFiniteNumber(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v);
 }
 
 /** True for a usage record (`telemetry.tokens`), in either spelling the
@@ -134,7 +150,7 @@ function amountOf(p: UsagePayload, opts: SumOptions): UsageAmount | null {
   const prompt = num(p.prompt_tokens);
   const completion = num(p.completion_tokens);
   const total = num(p.total_tokens) || prompt + completion || num(p.remote_tokens);
-  const cached = typeof p.cached_tokens === "number" && Number.isFinite(p.cached_tokens) ? p.cached_tokens : null;
+  const cached = isFiniteNumber(p.cached_tokens) ? num(p.cached_tokens) : null;
   return { total, prompt, completion, cached, purpose };
 }
 
@@ -254,7 +270,7 @@ export function sumUsage(records: readonly UsageRecordLike[], opts: SumOptions =
     out.total += total;
     out.prompt += prompt;
     out.completion += completion;
-    if (typeof p.cached_tokens === "number" && Number.isFinite(p.cached_tokens)) out.cached = (out.cached ?? 0) + p.cached_tokens;
+    if (isFiniteNumber(p.cached_tokens)) out.cached = (out.cached ?? 0) + num(p.cached_tokens);
     if (purpose === PURPOSE.utility) out.utility += total;
     if (hasAnyTokenCounts(p)) out.reported++;
     return true;

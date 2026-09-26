@@ -227,8 +227,22 @@ const RUN_LIST_KIND_OPT: PanelOpt = PanelOpt {
     ],
 };
 
+/// (#2902 step 2b) `run list`'s `--usage` toggle: default `off` contributes
+/// no argv, `on` contributes the literal flag, so the token breakdown by
+/// endpoint and model appears under the table. Same shape as [`ALL_OPT`]
+/// (`isBooleanFlagToggle` on the client renders it as one `[--usage]`
+/// token). The client twin is `RUN_LIST_USAGE_OPT` in
+/// `ui/src/lenses/console/panels.ts`, pinned by that file's drift guard.
+const RUN_LIST_USAGE_OPT: PanelOpt = PanelOpt {
+    name: "usage",
+    values: &[
+        PanelOptValue { value: "off", argv: &[] },
+        PanelOptValue { value: "on", argv: &["--usage"] },
+    ],
+};
+
 const MISSION_STATUS_OPTS: &[PanelOpt] = &[ALL_OPT];
-const RUN_LIST_OPTS: &[PanelOpt] = &[RUN_LIST_KIND_OPT, ALL_OPT];
+const RUN_LIST_OPTS: &[PanelOpt] = &[RUN_LIST_KIND_OPT, ALL_OPT, RUN_LIST_USAGE_OPT];
 
 /// One allowlist entry: the argv after the binary, whether the viewer may
 /// auto-refresh it, the cache TTL applied, and the closed option space (if
@@ -1128,8 +1142,8 @@ mod tests {
 
     /// The cache-growth guard #1911 calls for: a bound on the TOTAL variant
     /// cross-product, not just the base-verb count layer 3 already guards.
-    /// Today: `mission-status` (2) + `run-list` (4×2=8) + six no-opt panels
-    /// (1 each) = 16.
+    /// Today: `mission-status` (2) + `run-list` (4×2×2=16, #2902 added the
+    /// `usage` toggle) + six no-opt panels (1 each) = 24.
     #[test]
     fn variant_cross_product_stays_bounded() {
         let mut total = 0usize;
@@ -1152,7 +1166,7 @@ mod tests {
         let spec = panel_spec("run-list").unwrap();
         let requested = HashMap::new();
         let resolved = resolve_opts(&spec, &requested).unwrap();
-        assert_eq!(resolved.len(), 2, "one resolved entry per DECLARED opt, defaulted");
+        assert_eq!(resolved.len(), 3, "one resolved entry per DECLARED opt, defaulted");
         assert_eq!(resolved[0].name, "kind");
         assert_eq!(resolved[0].value, "all");
         assert!(resolved[0].argv.is_empty());
@@ -1161,6 +1175,11 @@ mod tests {
         assert_eq!(resolved[1].value, "recent");
         assert!(resolved[1].argv.is_empty());
         assert!(resolved[1].is_default);
+        // (#2902) The usage toggle, off by default.
+        assert_eq!(resolved[2].name, "usage");
+        assert_eq!(resolved[2].value, "off");
+        assert!(resolved[2].argv.is_empty());
+        assert!(resolved[2].is_default);
     }
 
     #[test]
@@ -1249,6 +1268,28 @@ mod tests {
         }
     }
 
+    /// (#2902 step 2b) `run-list` declares `usage` as a flag toggle:
+    /// default `off` contributes nothing, `on` contributes the literal
+    /// `--usage`, in declaration order AFTER `--kind` and `--all` — so the
+    /// console's command line shows the flag the CLI actually receives.
+    #[test]
+    fn run_list_declares_the_usage_toggle_as_its_last_opt() {
+        let spec = panel_spec("run-list").unwrap();
+        let usage = spec.opts.iter().find(|o| o.name == "usage").expect("run-list declares a usage opt");
+        assert_eq!(usage.values.len(), 2);
+        assert_eq!((usage.values[0].value, usage.values[0].argv), ("off", &[][..]));
+        assert_eq!((usage.values[1].value, usage.values[1].argv), ("on", &["--usage"][..]));
+        assert_eq!(spec.opts.last().map(|o| o.name), Some("usage"), "declared last, so argv order is kind, all, usage");
+        let mut requested = HashMap::new();
+        requested.insert("usage".to_string(), "on".to_string());
+        requested.insert("all".to_string(), "all".to_string());
+        let resolved = resolve_opts(&spec, &requested).unwrap();
+        assert_eq!(compose_argv(&spec, &resolved), vec!["run", "list", "--all", "--usage"]);
+        assert_eq!(variant_key(spec.id, &resolved), "run-list?all=all&usage=on");
+        // The other panel with opts does NOT grow the flag.
+        assert!(panel_spec("mission-status").unwrap().opts.iter().all(|o| o.name != "usage"));
+    }
+
     // ── variant_key: cache-key canonicalization (#1911) ───────────────
 
     #[test]
@@ -1304,7 +1345,7 @@ mod tests {
         let spec = panel_spec("run-list").unwrap();
         let resolved = resolve_opts(&spec, &HashMap::new()).unwrap();
         let json = opts_json(&resolved);
-        assert_eq!(json, serde_json::json!({"kind": "all", "all": "recent"}));
+        assert_eq!(json, serde_json::json!({"kind": "all", "all": "recent", "usage": "off"}));
     }
 
     #[test]

@@ -5841,6 +5841,104 @@ fn run_list_binary_agrees_with_the_shared_union_it_calls() {
     );
 }
 
+/// (#2902 step 2b) The verb end to end: the TOKENS column, `--usage`'s
+/// breakdown (text and `--json`), `--since` as a duration and as a date,
+/// and a bad `--since` refused by name. Two dispatch sessions in today's
+/// day file: one with usage records (its complete is NOT read), one legacy
+/// with tokens only on its complete (read once, the legacy rule).
+#[test]
+fn run_list_usage_breakdown_end_to_end() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let lab = TempDir::new().unwrap();
+    let crew = TempDir::new().unwrap();
+    let day = darkmux_flow::day_utc_now();
+    let now = darkmux_flow::ts_utc_now();
+    let usage = |sid: &str, payload: serde_json::Value| {
+        serde_json::json!({ "ts": now, "action": "telemetry.tokens", "category": "telemetry", "source": "tokens", "session_id": sid, "handle": "coder", "payload": payload })
+    };
+    let records = [
+        serde_json::json!({ "ts": now, "action": "dispatch start", "session_id": "sess-modern", "handle": "coder" }),
+        usage("sess-modern", serde_json::json!({ "call_kind": "turn", "purpose": "work", "requested_model": "qwen-a", "reported_model": "qwen-a-served", "endpoint": "http://127.0.0.1:1234/v1", "token_source": "provider", "prompt_tokens": 1000, "completion_tokens": 200, "total_tokens": 1200, "cached_tokens": 300 })),
+        usage("sess-modern", serde_json::json!({ "call_kind": "compaction", "purpose": "utility", "requested_model": "util-4b", "endpoint": "http://127.0.0.1:1234/v1", "token_source": "provider", "prompt_tokens": 80, "completion_tokens": 10, "total_tokens": 90 })),
+        serde_json::json!({ "ts": now, "action": "dispatch complete", "session_id": "sess-modern", "handle": "coder", "payload": { "total_tokens": 99_999 } }),
+        serde_json::json!({ "ts": now, "action": "dispatch start", "session_id": "sess-legacy", "handle": "reviewer" }),
+        serde_json::json!({ "ts": now, "action": "dispatch complete", "session_id": "sess-legacy", "handle": "reviewer", "payload": { "total_tokens": 700, "prompt_tokens": 600, "completion_tokens": 100 } }),
+    ];
+    let body: String = records.iter().map(|r| format!("{r}\n")).collect();
+    fs::write(flows.path().join(format!("{day}.jsonl")), body).unwrap();
+
+    let run = |args: &[&str]| {
+        darkmux_cmd()
+            .args(args)
+            .env("DARKMUX_HOME", home.path())
+            .env("DARKMUX_FLOWS_DIR", flows.path())
+            .env("DARKMUX_LAB_DIR", lab.path())
+            .env("DARKMUX_CREW_DIR", crew.path())
+            .env_remove("DARKMUX_REDIS_URL")
+            .output()
+            .unwrap()
+    };
+
+    // --json --usage: every row's tokens plus the breakdown.
+    let out = run(&["run", "list", "--json", "--usage", "--all"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let tokens = |id: &str| json["runs"].as_array().unwrap().iter().find(|r| r["id"] == id).unwrap_or_else(|| panic!("{id} in {json}"))["tokens"].clone();
+    assert_eq!(tokens("sess-modern"), 1290, "work + utility; the complete's 99,999 is never read");
+    assert_eq!(tokens("sess-legacy"), 700, "the legacy rule reads the complete once");
+    let usage = &json["usage"];
+    assert_eq!(usage["default_window"], true);
+    assert_eq!(usage["overall"]["total"], 1990);
+    assert_eq!(usage["overall"]["cached"], 300);
+    assert_eq!(usage["overall"]["utility"], 90);
+    assert_eq!(usage["overall"]["legacy_completes"], 1);
+    let groups = usage["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 3, "{groups:#?}");
+    assert_eq!(groups[0]["work"]["total"], 1200);
+    assert_eq!(groups[0]["reported_model"], "qwen-a-served");
+    assert!(groups[1].get("endpoint").is_none(), "the legacy complete carries no endpoint: {}", groups[1]);
+    assert_eq!(groups[2]["utility"]["total"], 90);
+
+    // Text: the TOKENS column and the breakdown under the table.
+    let out = run(&["run", "list", "--usage", "--all"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(text.contains("TOKENS"), "{text}");
+    assert!(text.contains("1.29k") && text.contains(" 700 "), "{text}");
+    assert!(text.contains("usage since ") && text.contains("the default 14-day window"), "{text}");
+    assert!(text.contains("reported model: qwen-a-served"), "{text}");
+    assert!(text.contains("1,990"), "{text}");
+
+    // --since as a duration keeps today's rows; as a far-future date it
+    // keeps none and the breakdown is empty.
+    let out = run(&["run", "list", "--json", "--usage", "--since", "1h"]);
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["total"], 2, "{json}");
+    assert_eq!(json["usage"]["default_window"], false);
+    assert_eq!(json["usage"]["overall"]["total"], 1990);
+    let out = run(&["run", "list", "--json", "--usage", "--since", "2999-01-01"]);
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["total"], 0, "{json}");
+    assert_eq!(json["usage"]["overall"]["total"], 0);
+    assert_eq!(json["since"], "2999-01-01T00:00:00Z");
+    // (review CONSIDER 5/6) --since without --usage still names its bound,
+    // in JSON and in the text empty state.
+    let out = run(&["run", "list", "--json", "--since", "2999-01-01"]);
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["since"], "2999-01-01T00:00:00Z", "{json}");
+    assert!(json.get("usage").is_none(), "{json}");
+    let out = run(&["run", "list", "--since", "2999-01-01"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("no run activity since 2999-01-01T00:00:00Z"), "{text}");
+
+    // A bound the verb cannot read is refused by name, not defaulted.
+    let out = run(&["run", "list", "--since", "yesterday"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--since") && err.contains("24h") && err.contains("YYYY-MM-DD"), "{err}");
+}
+
 // ── crawl --dry-run (#1959) ──
 //
 // Migrated from the retired `darkmux crawl plan` verb (deleted alongside

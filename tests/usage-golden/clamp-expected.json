@@ -1,0 +1,12 @@
+{
+  "_doc": "(#2902 step 2b review) The upper edge of the shared value domain: every count is clamped to 2^53 (the largest integer both a u64 sum and a JS number hold exactly), whether it arrives as an integer literal, an exponent, or a value past f64's integer range. Kept in its own fixture so the other goldens' sums stay below the edge and exactly representable on both sides.",
+  "usage_records": 1,
+  "legacy_completes_counted": 0,
+  "reported_entries": 1,
+  "overall": {
+    "total": 9007199254740992,
+    "input": 9007199254740992,
+    "generated": 9007199254740992,
+    "cached": null
+  }
+}

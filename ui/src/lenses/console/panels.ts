@@ -85,6 +85,17 @@ const RUN_LIST_KIND_OPT: PanelOpt = {
   ],
 };
 
+/** (#2902 step 2b) `run list`'s `--usage` toggle — the client twin of
+ * `panel.rs`'s `RUN_LIST_USAGE_OPT`, same name and shape as `ALL_OPT`
+ * (`isBooleanFlagToggle` renders it as one `[--usage]` token). */
+const RUN_LIST_USAGE_OPT: PanelOpt = {
+  name: "usage",
+  values: [
+    { value: "off", argv: [] },
+    { value: "on", argv: ["--usage"] },
+  ],
+};
+
 /** One panel's base argv plus its declared option space — the client twin
  * of `panel.rs`'s `PanelSpec` (minus `auto_refresh`/`cache_ttl`, which
  * `MANUAL_PANELS` below already covers and the client never needs to
@@ -111,7 +122,7 @@ export const PANEL_OPTS: Record<PanelId, PanelOptsEntry> = {
   "lab-fixture-list": { argv: ["lab", "fixture", "list"], opts: [] },
   // (#1911) The CLI twin of the RUNS lens's union — see `src/run_list.rs`'s
   // own module doc.
-  "run-list": { argv: ["run", "list"], opts: [RUN_LIST_KIND_OPT, ALL_OPT] },
+  "run-list": { argv: ["run", "list"], opts: [RUN_LIST_KIND_OPT, ALL_OPT, RUN_LIST_USAGE_OPT] },
   doctor: { argv: ["doctor"], opts: [] },
 };
 

@@ -1045,6 +1045,20 @@ pub(crate) enum RunFamilyCmd {
         /// Show every run, ignoring `--limit`.
         #[arg(long)]
         all: bool,
+        /// (#2902) Also print the token usage breakdown: by endpoint and
+        /// model (requested, and the served model when the reply named a
+        /// different one), with input, cached (only where the endpoint
+        /// reported it), generated, and darkmux's own utility calls split
+        /// out. A plain sum of the usage records in the window — the same
+        /// sum the TOKENS column and the viewer show.
+        #[arg(long)]
+        usage: bool,
+        /// (#2902) Only runs active, and usage records emitted, since this
+        /// bound: a duration back from now (`24h`, `7d`, `2w`; units s, m,
+        /// h, d, w) or a UTC date (`YYYY-MM-DD`). Reaches past the default
+        /// 14-day window when asked. Default: the 14-day window.
+        #[arg(long)]
+        since: Option<String>,
         #[command(flatten)]
         json: JsonFlag,
     },

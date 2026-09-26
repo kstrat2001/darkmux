@@ -54,10 +54,13 @@ mod panel;
 mod peer_graph;
 mod runs;
 pub use runs::{
-    build_runs, local_dispatch_status, peer_mission_runs, AbandonReason, DispatchSessionEvidence,
-    Run, RunKind, RunStatus,
+    build_runs, build_runs_with_usage, local_dispatch_status, peer_mission_runs, AbandonReason,
+    DispatchSessionEvidence, Run, RunKind, RunStatus, RunsWithUsage,
 };
 pub mod source_state;
+/// (#2902 step 2b) The one token sum, shared by `run list` and `/runs` —
+/// see the module's own doc.
+pub mod usage_sum;
 // (#1637) Golden-file generation for the wire types the browser specs consume.
 // Test-only: it exists so a Playwright fixture cannot drift from the shape the
 // server actually emits.
@@ -3427,7 +3430,7 @@ pub(crate) fn for_each_flow_record_across_days(
 /// `YYYY-MM-DD`, string-comparable — filenames sort the same as their
 /// dates). A SEPARATE, smaller primitive rather than adding an optional
 /// range param to the unbounded walker — matching this crate's existing
-/// precedent (`runs::for_each_recent_flow_record`) of keeping a bounded
+/// precedent (`runs::for_each_flow_record_from`) of keeping a bounded
 /// scan physically distinct from the full-history one its OTHER callers
 /// still need (`/flow-mission/:id`, the catalog endpoints' own
 /// `collect_records_by_field` walk).

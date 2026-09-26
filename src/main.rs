@@ -186,8 +186,8 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Mod { sub } => cmd_mod(sub),
         Cmd::Mission { sub } => cmd_mission(sub),
         Cmd::Run { sub } => match sub {
-            cli::RunFamilyCmd::List { kind, limit, all, json } => {
-                run_list::run(kind, limit, all, json.json)
+            cli::RunFamilyCmd::List { kind, limit, all, usage, since, json } => {
+                run_list::run(kind, limit, all, json.json, usage, since.as_deref())
             }
         },
         Cmd::Flow { sub } => {

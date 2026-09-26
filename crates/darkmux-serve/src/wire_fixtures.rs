@@ -109,6 +109,8 @@ mod tests {
             // leniently, the same "lenient-on-read WIRE shape" this module's
             // own header doc names for every other optional field.
             abandoned_reason: None,
+            // (#2902 step 2b) Populated, like every other optional field here.
+            tokens: Some(48_120),
         };
         golden("runs-row.json", &run);
     }
