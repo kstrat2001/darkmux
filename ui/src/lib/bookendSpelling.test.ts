@@ -1,9 +1,11 @@
 /**
  * (#2927) Both producer spellings of the dispatch bookends — `dispatch start`
- * (crew, CLI) and `dispatch.start` (lab, runtime) — must mean the same thing
- * to every consumer that reads RAW records (playback, the fleet card, the
- * run page). `buildFlowWindow` dots them, but not every path goes through it,
- * so each consumer here is fed the spaced spelling verbatim and must read it
+ * (crew, CLI) and `dispatch.start` (lab, runtime) — mean the same thing to
+ * every consumer (#1852). The app's ingest paths (`normalizeRecords`,
+ * `buildFlowWindow`) dot them before any lens sees them, so in the running
+ * viewer these consumers get the dotted form; reading both here is defense in
+ * depth for a consumer handed RAW records (unit fixtures, the mission graph's
+ * stream). Each consumer is fed the spaced spelling verbatim and must read it
  * exactly as it reads the dotted one.
  */
 import { describe, expect, it } from "vitest";

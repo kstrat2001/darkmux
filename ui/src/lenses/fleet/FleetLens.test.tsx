@@ -2184,7 +2184,9 @@ describe("(#2926) fleet card: THINK opener and TOOL GEN, from the real run", () 
     });
   const extra = { machine_uid: "u1" };
   // The real crew dispatch opens with `dispatch start` (spaced); these feed
-  // it verbatim (#2927: the card used to read idle on that spelling).
+  // it verbatim. The app normalizes it to dotted on ingest, but this fixture
+  // hands the lens raw records, and the card reads either spelling (#2927,
+  // defense in depth).
 
   it("turn 7's stream-open chunk: the previous turn's rate, dimmed, never ~1 think tok/s", async () => {
     renderAt(pepperRecords({ extra }), pepperAt("10:51:33"));

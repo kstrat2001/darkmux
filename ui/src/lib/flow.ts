@@ -753,8 +753,10 @@ export function recordsAsOf(data: FlowRecord[], now: number): FlowRecord[] {
  * `undefined` (every pre-existing caller) preserves the exact prior
  * session_id-only behavior. */
 export function dispatchRec(data: FlowRecord[], sid: string, act: "start" | "complete" | "error", missionId?: string): FlowRecord | undefined {
-  // (#2927) Either producer spelling: a raw record carrying the spaced form
-  // must match here too, or a spaced run never closes (or never starts).
+  // (#2927) Either producer spelling. Every app ingest path dots the action
+  // first (`normalizeRecords`/`buildFlowWindow`), so this is defense in depth
+  // for a consumer handed raw records (unit fixtures, the mission graph's
+  // stream), per the #1852 contract.
   const is = DISPATCH_ACT[act];
   return sessionRecords(data, sid).find(
     (r) => r.session_id === sid && is(r.action) && (missionId === undefined || !r.mission_id || r.mission_id === missionId),
