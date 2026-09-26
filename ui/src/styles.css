@@ -3216,7 +3216,7 @@ body {
 
    Not rendering text also replaces a `color: transparent` that could not
    work: it tied on specificity (0,3,0) with `.savlead.cloud .savnum`,
-   `.savlead.unknown .savnum`, `.savc.gen .scv` and `.savc.uncls .scv`, all of
+   `.savlead.unknown .savnum`, `.savc.gen .scv` and `.savc.util .scv`, all of
    which are declared LATER and therefore won on source order — so every tile
    except plain local kept painting its figure, and the glyphs showed above
    and below a skeleton that is inset inside a `line-height: 1` box. Removing
@@ -3409,7 +3409,7 @@ body {
 .savc.gen .scv {
   color: var(--good);
 }
-.savc.uncls .scv {
+.savc.util .scv {
   color: var(--dim);
 }
 .savc .scl {

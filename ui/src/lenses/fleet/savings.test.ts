@@ -1,8 +1,16 @@
+// (#2902 step 2a) The hero no longer computes a local/cloud/unknown split
+// or the fresh/re-read estimate (withdrawn, #2834; every figure is now a sum
+// of usage records, `lib/usageRecords.test.ts`). The fixtures below were
+// built for that split; they now pin what survives it: ALL TOKENS, INPUT,
+// GENERATED and the DISPATCHES count, which is behavior-identical to the
+// #2659/#2709 run count. Test names and comments that describe a tier are
+// the fixture's history, not a claim this file still asserts.
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { tokensOffMeter, hasAnyTokenCounts, isRemoteOnlyTokens } from "./savings";
+import { tokensOffMeter } from "./savings";
+import { hasAnyTokenCounts } from "../../lib/usageRecords";
 import { hybridNote } from "./hybridNote";
 import { isDispatchComplete, T } from "../../lib/flow";
 import type { FlowRecord } from "../../types/handwritten";
@@ -60,16 +68,8 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.total).toBe(300);
-    expect(t.cloud).toBe(0);
-    expect(t.unknown).toBe(0);
-    expect(t.local).toBe(300);
-    expect(t.completion).toBe(50);
+    expect(t.generated).toBe(50);
     // turn 2's prompt (150) overlaps turn 1's prompt (100) by min(150,100)=100
-    expect(t.reread).toBe(100);
-    expect(t.fresh).toBe(150); // (100+150) - 100
-    expect(t.runs).toBe(1);
-    expect(t.cloudRuns).toBe(0);
-    expect(t.unknownRuns).toBe(0);
   });
 
   it("counts a session with an endpoint-bearing dispatch bookend as cloud, not local", () => {
@@ -80,11 +80,6 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.total).toBe(240);
-    expect(t.cloud).toBe(240);
-    expect(t.local).toBe(0);
-    expect(t.unknown).toBe(0);
-    expect(t.cloudRuns).toBe(1);
-    expect(t.unknownRuns).toBe(0);
   });
 
   it("excludes a session with NO dispatch bookend at all from the local claim — unknown, not free (#1607)", () => {
@@ -93,48 +88,18 @@ describe("tokensOffMeter", () => {
     const data: FlowRecord[] = [tokenRec("s3", 1, 500, 10)];
     const t = tokensOffMeter(data);
     expect(t.total).toBe(510);
-    expect(t.unknown).toBe(510);
-    expect(t.cloud).toBe(0);
     // The load-bearing invariant: local is what's LEFT after cloud AND
     // unknown are removed — never a residual that silently absorbs the
     // unproven tokens as "off the meter".
-    expect(t.local).toBe(0);
     // Still counted as a real dispatch for the run count, just not credited
     // as free.
     expect(t.runs).toBe(1);
     // (#2637) And the run-count analog of `unknown` above: this run is
     // unattributed, not silently folded into "local" the way a bare
     // `runs - cloudRuns` subtraction would.
-    expect(t.unknownRuns).toBe(1);
-    expect(t.cloudRuns).toBe(0);
   });
 
-  it("a dispatch.error (died before classifying itself) does NOT count its session as local", () => {
-    const data: FlowRecord[] = [
-      rec({ session_id: "s4", action: "dispatch.start", handle: "coder" }),
-      tokenRec("s4", 1, 80, 5),
-      rec({ session_id: "s4", action: "dispatch.error", payload: { exit_code: 1 } }),
-    ];
-    const t = tokensOffMeter(data);
-    // dispatch.error is excluded from localSids by construction (only a
-    // CLEAN dispatch.complete with no endpoint proves local) — this session
-    // has no endpoint either, so it's unknown, not local.
-    expect(t.unknown).toBe(85);
-    expect(t.local).toBe(0);
-    expect(t.unknownRuns).toBe(1);
-  });
 
-  it("a session missing turn_seq on any of its records falls into `uncls`, not fresh/reread", () => {
-    const data: FlowRecord[] = [
-      rec({ session_id: "s5", action: "dispatch.start", handle: "coder" }),
-      tokenRec("s5", undefined, 300, 60),
-      rec({ session_id: "s5", action: "dispatch.complete", payload: { total_tokens: 360 } }),
-    ];
-    const t = tokensOffMeter(data);
-    expect(t.uncls).toBe(300);
-    expect(t.fresh).toBe(0);
-    expect(t.reread).toBe(0);
-  });
 
   it("the single-shot remote fallback (no telemetry family, dispatch.complete carries the totals) counts as cloud", () => {
     const data: FlowRecord[] = [
@@ -147,11 +112,6 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.total).toBe(900);
-    expect(t.cloud).toBe(900);
-    expect(t.fresh).toBe(800); // one turn = the whole prompt is first-read
-    expect(t.runs).toBe(1);
-    expect(t.cloudRuns).toBe(1);
-    expect(t.unknownRuns).toBe(0);
   });
 
   it("(#1853) the single-shot LOCAL fallback (no telemetry family, no endpoint, dispatch.complete carries the totals) counts as local — not invisible", () => {
@@ -165,15 +125,8 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.total).toBe(970);
-    expect(t.local).toBe(970);
-    expect(t.cloud).toBe(0);
-    expect(t.unknown).toBe(0);
-    expect(t.fresh).toBe(900); // one turn = the whole prompt is first-read
-    expect(t.runs).toBe(1);
     // A local direct run must not inflate the cloud run count — hybridNote
     // (#2637) derives local runs as `t.runs - t.cloudRuns - t.unknownRuns`.
-    expect(t.cloudRuns).toBe(0);
-    expect(t.unknownRuns).toBe(0);
   });
 
   it("(#1853, inverted) a session with BOTH a telemetry family AND a token-bearing local dispatch.complete is not double-counted", () => {
@@ -192,11 +145,7 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.total).toBe(120); // NOT 240
-    expect(t.local).toBe(120);
-    expect(t.cloud).toBe(0);
-    expect(t.unknown).toBe(0);
     expect(t.runs).toBe(1); // NOT 2 (no phantom directRun for s9)
-    expect(t.unknownRuns).toBe(0);
   });
 
   it("(#1853, inverted) a cloud single-shot session is still classified cloud, never local, once collection is endpoint-blind", () => {
@@ -210,11 +159,6 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.total).toBe(500);
-    expect(t.cloud).toBe(500);
-    expect(t.local).toBe(0);
-    expect(t.unknown).toBe(0);
-    expect(t.cloudRuns).toBe(1);
-    expect(t.unknownRuns).toBe(0);
   });
 
   // (#2635) `dispatch.single_shot`'s session id is deliberately TASK-scoped
@@ -240,12 +184,7 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.total).toBe(1200);
-    expect(t.cloud).toBe(700);
-    expect(t.local).toBe(500);
-    expect(t.unknown).toBe(0);
-    expect(t.cloudRuns).toBe(1);
     expect(t.runs).toBe(2);
-    expect(t.unknownRuns).toBe(0);
   });
 
   it("(#2635) task-scoped session collision — local-then-hosted — same totals regardless of order", () => {
@@ -259,12 +198,7 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.total).toBe(1200);
-    expect(t.cloud).toBe(700);
-    expect(t.local).toBe(500);
-    expect(t.unknown).toBe(0);
-    expect(t.cloudRuns).toBe(1);
     expect(t.runs).toBe(2);
-    expect(t.unknownRuns).toBe(0);
   });
 
   it("(#2635) task-scoped session collision — two local seats — both counted, neither dropped", () => {
@@ -274,38 +208,9 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.total).toBe(1200);
-    expect(t.local).toBe(1200);
-    expect(t.cloud).toBe(0);
-    expect(t.unknown).toBe(0);
-    expect(t.cloudRuns).toBe(0);
     expect(t.runs).toBe(2);
-    expect(t.unknownRuns).toBe(0);
   });
 
-  // (CONSIDER 3, #2635) Documents a currently-inert gap rather than fixing
-  // it: a completion that carries no `endpoint` of its own is credited to
-  // `local` even when the endpoint-bearing `dispatch.start` that would have
-  // proven it hosted has scrolled outside the caller's playhead window (see
-  // `tokensOffMeter`'s module doc on the playhead gate). Every producer
-  // today stamps `endpoint` on BOTH bookends of a hosted call
-  // (builtins.rs's `bookend_record`), so this can't happen from live data —
-  // this test pins today's behavior so a future producer that stops
-  // double-stamping makes the gap LOUD (a failing test) instead of a
-  // silent misclassification.
-  it("(CONSIDER 3, #2635) a lone endpoint-less completion is credited to local, even though its hosted start may be off-window — known gap, pinned", () => {
-    const data: FlowRecord[] = [
-      rec({
-        session_id: "s11",
-        action: "dispatch.complete",
-        payload: { total_tokens: 640, prompt_tokens: 600, completion_tokens: 40 },
-      }),
-    ];
-    const t = tokensOffMeter(data);
-    expect(t.local).toBe(640);
-    expect(t.cloud).toBe(0);
-    expect(t.unknown).toBe(0);
-    expect(t.unknownRuns).toBe(0);
-  });
 
   // (#2637) The issue's own reproduction shape: five sessions where only
   // one is POSITIVELY local, two are positively cloud, and two carry token
@@ -336,13 +241,10 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(5);
-    expect(t.cloudRuns).toBe(2);
-    expect(t.unknownRuns).toBe(2);
     // The implicit local-run count a consumer derives is runs - cloudRuns -
     // unknownRuns = 5 - 2 - 2 = 1, matching the ONE session with positive
     // local evidence (local1) — not 3, which is what the pre-fix
     // `runs - cloudRuns` subtraction would have produced.
-    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(1);
   });
 
   // (#2659) The issue's own reproduction shape: a single session id closes
@@ -367,8 +269,6 @@ describe("tokensOffMeter", () => {
     // Two real completions under one session id — this is what the fix is
     // for. The pre-fix behavior was `t.runs === 1` here.
     expect(t.runs).toBe(2);
-    expect(t.cloudRuns).toBe(0);
-    expect(t.unknownRuns).toBe(0);
     // Total tokens are unaffected — this bug was never a token-counting
     // bug, only a run-COUNT bug.
     expect(t.total).toBe(330);
@@ -389,8 +289,6 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(1);
-    expect(t.cloudRuns).toBe(0);
-    expect(t.unknownRuns).toBe(0);
   });
 
   // (#2659) The classification MUST move with the run count, per the
@@ -413,13 +311,10 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(2);
-    expect(t.cloudRuns).toBe(1);
-    expect(t.unknownRuns).toBe(0);
     // Implicit local run count: 2 - 1 - 0 = 1, matching the ONE genuinely
     // local bookend — not 0 (which the old session-wide `epBySid.has(k)`
     // aggregate check would have produced, since the session DOES have an
     // endpoint-bearing bookend somewhere).
-    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(1);
     // (post-review, pinning a KNOWN gap; UNCHANGED by #2690) The RUN split
     // is per-bookend-exact (1 local + 1 cloud, asserted above), but the
     // aggregate TOKEN split is NOT — a `telemetry.tokens` record carries no
@@ -433,8 +328,6 @@ describe("tokensOffMeter", () => {
     // `remote`; a record carrying one never reaches this rule (see the
     // `1.49.0 wire` tests above). This pins the fallback, which every
     // archived record and every non-map lineage still takes.
-    expect(t.cloud).toBe(330);
-    expect(t.local).toBe(0);
   });
 
   // (#2690, SUPERSEDES a #2687 test) The predecessor of this test asserted
@@ -492,16 +385,10 @@ describe("tokensOffMeter", () => {
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(1);
     // The run: classified by its own terminal, which named no endpoint.
-    expect(t.cloudRuns).toBe(0);
-    expect(t.unknownRuns).toBe(0);
     // Implicit local — never a residual, computed the way every consumer
     // must compute it.
-    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(1);
     // The tokens: this run's own start named an endpoint, so spend
     // arriving under its key is hosted until its terminal says otherwise.
-    expect(t.cloud).toBe(110);
-    expect(t.local).toBe(0);
-    expect(t.unknown).toBe(0);
   });
 
   // (#2690) The case the retired lookup WAS right about, and which this fix
@@ -516,11 +403,6 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(1);
-    expect(t.cloudRuns).toBe(1);
-    expect(t.unknownRuns).toBe(0);
-    expect(t.cloud).toBe(110);
-    expect(t.local).toBe(0);
-    expect(t.unknown).toBe(0);
   });
 
   // (#2690, the STEADY-STATE measurement from the issue) A hosted reasoning
@@ -569,16 +451,10 @@ describe("tokensOffMeter", () => {
     const t = tokensOffMeter(data);
     // The #2690 fix, intact: the local seat's dispatch counts local.
     expect(t.runs).toBe(1);
-    expect(t.cloudRuns).toBe(0);
-    expect(t.unknownRuns).toBe(0);
-    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(1);
     // The tokens: with no seat on the record, unseparable under one key with
     // a live hosted seat, so they over-claim CLOUD rather than crediting
     // hosted spend as free.
     expect(t.total).toBe(100);
-    expect(t.cloud).toBe(100);
-    expect(t.local).toBe(0);
-    expect(t.unknown).toBe(0);
   });
 
   // (#2690, steady state — the 1.49.0 wire.) Byte-for-byte the shape above,
@@ -604,12 +480,7 @@ describe("tokensOffMeter", () => {
     // telemetry records, only the bookends (#2690's run half, closed by
     // #2712).
     expect(t.runs).toBe(1);
-    expect(t.cloudRuns).toBe(0);
-    expect(t.unknownRuns).toBe(0);
     expect(t.total).toBe(100);
-    expect(t.local).toBe(100);
-    expect(t.cloud).toBe(0);
-    expect(t.unknown).toBe(0);
     // And the sentence the operator reads is no longer "1 dispatch via cloud".
     expect(hybridNote(data, t).text).toBe("1 dispatch done. The fleet is humming, keep it up.");
   });
@@ -654,16 +525,10 @@ describe("tokensOffMeter", () => {
     const t = tokensOffMeter(data);
     // The #2690 fix, intact: an error never makes a local dispatch cloud.
     expect(t.runs).toBe(1);
-    expect(t.cloudRuns).toBe(0);
-    expect(t.unknownRuns).toBe(0);
-    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(1);
     // The tokens: with no seat on the record, a hosted endpoint was called
     // under this key, so they over-claim CLOUD rather than being credited
     // free. See the 1.49.0 twin below for the same shape on today's wire.
     expect(t.total).toBe(1000);
-    expect(t.cloud).toBe(1000);
-    expect(t.local).toBe(0);
-    expect(t.unknown).toBe(0);
   });
 
   // (#2690, K1 — the 1.49.0 wire.) The same window shape with the local
@@ -681,12 +546,7 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(1);
-    expect(t.cloudRuns).toBe(0);
-    expect(t.unknownRuns).toBe(0);
     expect(t.total).toBe(1000);
-    expect(t.local).toBe(1000);
-    expect(t.cloud).toBe(0);
-    expect(t.unknown).toBe(0);
   });
 
   // (#2690, shape K2) The same window shape with TWO local siblings closed.
@@ -734,18 +594,11 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(2);
-    expect(t.cloudRuns).toBe(0);
-    expect(t.unknownRuns).toBe(0);
     expect(t.total).toBe(2000);
     // A hosted endpoint was called under this key, so the spend that cannot
     // be separated from it over-claims CLOUD (see K1 above).
-    expect(t.cloud).toBe(2000);
-    expect(t.local).toBe(0);
     // THE CONTRADICTION, pinned rather than described: the derived local
     // dispatch count is 2 while the local token tile is 0.
-    const localRuns = t.runs - t.cloudRuns - t.unknownRuns;
-    expect(localRuns).toBe(2);
-    expect(t.local).toBe(0);
     // And the sentence an operator actually reads, beside CLOUD 2,000.
     // This is the archived-record case and it stays this way: an
     // append-only archive cannot grow a field it was written without.
@@ -770,15 +623,9 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(2);
-    expect(t.cloudRuns).toBe(0);
-    expect(t.unknownRuns).toBe(0);
     expect(t.total).toBe(2000);
-    expect(t.local).toBe(2000);
-    expect(t.cloud).toBe(0);
-    expect(t.unknown).toBe(0);
     // The two halves of the screen now agree: 2 local dispatches, 2,000
     // local tokens.
-    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(2);
     expect(hybridNote(data, t).text).toBe("2 dispatches done. The fleet is humming, keep it up.");
   });
 
@@ -801,59 +648,8 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.total).toBe(1000);
-    expect(t.cloud).toBe(1000);
-    expect(t.local).toBe(0);
-    expect(t.unknown).toBe(0);
   });
 
-  // (#2690) A malformed `remote` is NOT a tier. The producer writes a JSON
-  // boolean; anything else on the wire (a string, a number, `null`) is a
-  // producer nobody has seen, and reading it by TRUTHINESS is how a
-  // `"false"` string would credit hosted spend as local — or, in the other
-  // direction, how a `0` would credit hosted spend as free. Strict
-  // `=== true` / `=== false` sends every other value to the pre-#2690
-  // per-key fallback.
-  //
-  // BOTH key shapes are exercised deliberately, because one alone cannot
-  // fail. An earlier revision of this test used only the cloud-evidence key
-  // — where the fallback ALSO answers cloud — so relaxing `=== true` to a
-  // truthiness test left it green (measured, during this change's own
-  // red-prove). The local-evidence half is what gives the first assertion
-  // teeth, and the cloud half is what gives the second its own.
-  it("(#2690) a non-boolean `remote` falls through to the per-key rule rather than deciding a tier", () => {
-    const hostile = (sid: string, value: unknown, ts: string): FlowRecord => {
-      const base = tokenRec(sid, 1, 90, 10, ts);
-      return { ...base, payload: { ...(base.payload as object), remote: value } };
-    };
-    for (const value of ["false", 0, null, "true", 1, "remote", {}]) {
-      const label = `remote: ${JSON.stringify(value)}`;
-
-      // (a) The key's own evidence is LOCAL. A truthiness read of a
-      // `"false"`/`"true"`/`1`/`"remote"`/`{}` value would put these tokens
-      // on the CLOUD tile — inventing hosted spend out of a malformed field.
-      const localSid = "task:hostile-local";
-      const onLocalKey = tokensOffMeter([
-        rec({ session_id: localSid, action: "dispatch.start", handle: "seat" }),
-        hostile(localSid, value, "2026-08-08T00:01:00Z"),
-        rec({ session_id: localSid, action: "dispatch.complete", payload: { total_tokens: 100 } }),
-      ]);
-      expect(onLocalKey.local, `${label} must not invent cloud spend on a local key`).toBe(100);
-      expect(onLocalKey.cloud, label).toBe(0);
-
-      // (b) The key's own evidence is CLOUD. A falsy read of a `0`/`null`
-      // value would treat it as a declared LOCAL seat and take real hosted
-      // spend off the cloud tile — the one direction this function may
-      // never take.
-      const cloudSid = "task:hostile-cloud";
-      const onCloudKey = tokensOffMeter([
-        rec({ session_id: cloudSid, action: "dispatch.start", handle: "judge-hosted", payload: { endpoint: "azure-foundry" } }),
-        hostile(cloudSid, value, "2026-08-08T00:01:00Z"),
-        rec({ session_id: cloudSid, action: "dispatch.complete", payload: { total_tokens: 100 } }),
-      ]);
-      expect(onCloudKey.cloud, `${label} must not take hosted spend off the cloud tile`).toBe(100);
-      expect(onCloudKey.local, label).toBe(0);
-    }
-  });
 
   // (#2690, the ARITY-1 half of the `(CONSIDER 3)` gap #2687 named and
   // could not close) One hosted seat whose endpoint omits `usage` (so its
@@ -888,10 +684,7 @@ describe("tokensOffMeter", () => {
     // Two seats, two runs: the hosted one that reported no usage, and the
     // local one that did.
     expect(t.runs).toBe(2);
-    expect(t.cloudRuns).toBe(1);
-    expect(t.unknownRuns).toBe(0);
     // THE INVARIANT: the local seat is still local. Nothing floated.
-    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(1);
     // The TOKEN split is a different question and this fixture's wire does
     // not answer it: `tokenRec` is the pre-1.49.0 shape, with no endpoint
     // and no seat of its own, this session does hold a hosted completion,
@@ -902,9 +695,6 @@ describe("tokensOffMeter", () => {
     // only claiming they are. On the 1.49.0 wire the seat's own `remote`
     // decides instead (#2690).
     expect(t.total).toBe(100);
-    expect(t.cloud).toBe(100);
-    expect(t.local).toBe(0);
-    expect(t.unknown).toBe(0);
   });
 
   // (#2690) The zero-token-bearing-bookend branch's OWN cloud term. A
@@ -927,13 +717,9 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(1);
-    expect(t.cloudRuns).toBe(1);
-    expect(t.unknownRuns).toBe(0);
     // The token split reads the same evidence, so the tiles agree with the
     // dispatches line rather than contradicting it.
     expect(t.total).toBe(100);
-    expect(t.cloud).toBe(100);
-    expect(t.local).toBe(0);
   });
 
   // (#2690) The telemetry-present / telemetry-absent pair for LOCAL work,
@@ -975,72 +761,10 @@ describe("tokensOffMeter", () => {
     const tAbsent = tokensOffMeter(dataAbsent);
 
     expect(tPresent.runs).toBe(tAbsent.runs);
-    expect(tPresent.cloudRuns).toBe(tAbsent.cloudRuns);
-    expect(tPresent.unknownRuns).toBe(tAbsent.unknownRuns);
     expect(tPresent.total).toBe(tAbsent.total);
-    expect(tPresent.cloud).toBe(tAbsent.cloud);
-    expect(tPresent.local).toBe(tAbsent.local);
-    expect(tPresent.unknown).toBe(tAbsent.unknown);
     // And the value both agree on is the truthful one.
-    expect(tPresent.local).toBe(100);
-    expect(tPresent.cloud).toBe(0);
-    expect(tPresent.cloudRuns).toBe(0);
   });
 
-  // (fix-pass) The documented divergence the test above used to hide. With
-  // a hosted seat live under the same key, the two forms answer
-  // DIFFERENTLY, and each is right given what it can see:
-  //
-  //   telemetry-present — token records name no seat, so the run's own
-  //   hosted start decides, and the spend reads CLOUD.
-  //
-  //   telemetry-absent — the tokens are the local completion's OWN
-  //   payload, which is self-describing, so they read LOCAL.
-  //
-  // Pinned so that a future change which "restores parity" here has to
-  // decide WHICH way, deliberately, instead of discovering it by accident.
-  // On the 1.49.0 wire the divergence does not arise for a `dispatch.map`
-  // seat — its token record names its own tier, so both forms answer from
-  // the seat (#2690). This pins the two forms for every record that does
-  // NOT carry one.
-  //
-  // (adversarial-review follow-up) Worth naming precisely, because the
-  // comment on the token split calls cloud-over-local "the direction this
-  // function is allowed to err in": THREE sites read this evidence and the
-  // `directRuns` site does NOT apply that precedence. Under a key with a
-  // hosted seat in flight, the telemetry-ABSENT form credits LOCAL while
-  // the telemetry-PRESENT form credits CLOUD. Defensible (there, the tokens
-  // ARE the local completion's own self-describing payload) but it is a
-  // divergence, not a uniform rule, and the comment now says so.
-  it("(fix-pass) with a live hosted seat under the same key, the two forms diverge by design", () => {
-    const hostedStart = (sid: string) =>
-      rec({ session_id: sid, action: "dispatch.start", handle: "hosted-sibling", payload: { endpoint: "azure-foundry" } });
-
-    const tPresent = tokensOffMeter([
-      hostedStart("task:mixed-present"),
-      tokenRec("task:mixed-present", 1, 90, 10, "2026-08-08T00:01:00Z"),
-      rec({ session_id: "task:mixed-present", action: "dispatch.complete", payload: { total_tokens: 100 } }),
-    ]);
-    const tAbsent = tokensOffMeter([
-      hostedStart("task:mixed-absent"),
-      rec({
-        session_id: "task:mixed-absent",
-        action: "dispatch.complete",
-        payload: { total_tokens: 100, prompt_tokens: 90, completion_tokens: 10 },
-      }),
-    ]);
-
-    // No seat identity on a token record ⇒ the hosted start decides.
-    expect(tPresent.cloud).toBe(100);
-    expect(tPresent.local).toBe(0);
-    // A self-describing completion payload ⇒ classified on itself.
-    expect(tAbsent.cloud).toBe(0);
-    expect(tAbsent.local).toBe(100);
-    // The DISPATCH count agrees across both forms regardless — it always
-    // reads a terminal, which is self-describing in both.
-    expect(tPresent.cloudRuns).toBe(0);
-    expect(tAbsent.cloudRuns).toBe(0);
-  });
 
   // (#2690) MONOTONICITY over the WHOLE arrival sequence, not just one
   // transition. A cloud count that goes DOWN as a real cloud dispatch lands
@@ -1050,7 +774,7 @@ describe("tokensOffMeter", () => {
   // cloudRuns=1 (floored by A's endpoint through `epBySid`) and then
   // dropped to 0 as C arrived. Every prefix of the four-seat sequence is
   // now non-decreasing, with no carve-out.
-  it("(#2690) cloudRuns is non-decreasing across EVERY prefix of the four-seat arrival sequence", () => {
+  it("(#2690) the dispatch count is non-decreasing across EVERY prefix of the four-seat arrival sequence", () => {
     const sid = "task:review-probe-monotone";
     const arrivals: FlowRecord[] = [
       rec({ session_id: sid, action: "dispatch.start", handle: "reviewer-A", payload: { endpoint: "azure-foundry" } }),
@@ -1068,14 +792,12 @@ describe("tokensOffMeter", () => {
 
     const observed: number[] = [];
     for (let i = 1; i <= arrivals.length; i++) {
-      observed.push(tokensOffMeter(arrivals.slice(0, i)).cloudRuns);
+      observed.push(tokensOffMeter(arrivals.slice(0, i)).runs);
     }
     for (let i = 1; i < observed.length; i++) {
       expect(observed[i]).toBeGreaterThanOrEqual(observed[i - 1]);
     }
-    // And the sequence itself: 0 until D's own hosted completion lands.
-    expect(observed[observed.length - 1]).toBe(1);
-    expect(Math.max(...observed.slice(0, observed.length - 1))).toBe(0);
+    expect(observed[observed.length - 1]).toBe(3);
   });
 
   // (post-adversarial-review correction, #2659/#2687 follow-up) An earlier
@@ -1098,8 +820,6 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(2);
-    expect(t.cloudRuns).toBe(0);
-    expect(t.unknownRuns).toBe(0);
   });
 
   // (MUST FIX 1, #2659/#2687 follow-up — the FALSIFYING measurement) The
@@ -1125,10 +845,7 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(2);
-    expect(t.cloudRuns).toBe(0);
     // Implicit local = runs - cloudRuns - unknownRuns.
-    expect(t.unknownRuns).toBe(0);
-    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(2);
   });
 
   // (MUST FIX 1 continued) Extending the same four-seat sequence to D's
@@ -1159,8 +876,6 @@ describe("tokensOffMeter", () => {
       tokenRec(sid, 1, 180, 20, "2026-08-08T00:02:00Z"),
       rec({ session_id: sid, action: "dispatch.complete", payload: { total_tokens: 200 } }),
     ];
-    const afterC = tokensOffMeter(throughC);
-    expect(afterC.cloudRuns).toBe(0);
 
     const throughD: FlowRecord[] = [
       ...throughC,
@@ -1169,10 +884,8 @@ describe("tokensOffMeter", () => {
     ];
     const afterD = tokensOffMeter(throughD);
     expect(afterD.runs).toBe(3);
-    expect(afterD.cloudRuns).toBe(1);
     // Non-decreasing across THIS transition (0 -> 1), unlike the floored
     // code's 2 -> 1 drop for the equivalent transition.
-    expect(afterD.cloudRuns).toBeGreaterThanOrEqual(afterC.cloudRuns);
   });
 
   // (MUST FIX 1, second independent producer) A hosted seat whose endpoint
@@ -1201,10 +914,7 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(3);
-    expect(t.cloudRuns).toBe(1);
-    expect(t.unknownRuns).toBe(0);
     // THE INVARIANT: both local siblings are still local.
-    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(2);
     // (#2690) The TOKEN split for this same group, asserted so the arity-1
     // form of it can be SHOWN to match rather than merely claimed to. The
     // hosted sibling's completion DOES name an endpoint, and for a record
@@ -1214,8 +924,6 @@ describe("tokensOffMeter", () => {
     // put the coordinate on the record instead, and the `1.49.0 wire`
     // tests above are the same shapes with it.
     expect(t.total).toBe(300);
-    expect(t.cloud).toBe(300);
-    expect(t.local).toBe(0);
   });
 
   // (MUST FIX 1) The telemetry-present and telemetry-absent forms of the
@@ -1240,8 +948,6 @@ describe("tokensOffMeter", () => {
     const tPresent = tokensOffMeter(dataPresent);
 
     expect(tAbsent.runs).toBe(tPresent.runs);
-    expect(tAbsent.cloudRuns).toBe(tPresent.cloudRuns);
-    expect(tAbsent.cloud).toBe(tPresent.cloud);
     expect(tAbsent.total).toBe(tPresent.total);
   });
 
@@ -1268,8 +974,6 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(3);
-    expect(t.cloudRuns).toBe(0);
-    expect(t.unknownRuns).toBe(0);
     expect(t.total).toBe(600);
   });
 
@@ -1329,8 +1033,6 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(1);
-    expect(t.cloudRuns).toBe(0);
-    expect(t.unknownRuns).toBe(0);
   });
 
   it("a remote_tokens-only completion (the review path's own spelling) counts as cloud AND unclassified", () => {
@@ -1340,190 +1042,17 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.total).toBe(1200);
-    expect(t.cloud).toBe(1200);
     // No prompt/completion split to decompose — it has to land somewhere
     // visible, or the headline would silently exceed the row beneath it.
-    expect(t.uncls).toBe(1200);
-    expect(t.cloudRuns).toBe(1);
-    expect(t.unknownRuns).toBe(0);
   });
 
-  // (#1856, mechanism corrected in the fix-pass review) A session id can
-  // legitimately be shared by TWO SEPARATE DISPATCHES: `mission_run(
-  // mission_id, phase_id)` (`crates/darkmux-types/src/session_id.rs`) is
-  // DETERMINISTIC, so re-launching or retrying the same mission phase
-  // inside the viewer's 24h window reuses the identical session id, and
-  // each launch's own coder dispatch restarts its turn counter at 1. (An
-  // earlier version of this comment attributed the spanning shape to a
-  // single launch's worktree/coder/verify steps all dispatching under one
-  // session id — that's wrong on inspection: the worktree step makes no
-  // model dispatch at all (`SeatClaim::NoModel`), and the verify step
-  // mints its OWN `phase-review-<secs>` session id
-  // (`phase_review_output_at`, `src/phase_cli.rs`) rather than reusing the
-  // shared one. Only the coder step ever dispatches under the shared
-  // `mission_run` id — so within ONE launch there is exactly one
-  // turn-bearing dispatch, never a spanning shape. The restart only
-  // appears across separate launches of the same phase.)
-  //
-  // Sorting by `turn_seq` alone (the pre-fix behavior) interleaves the two
-  // launches' turns — turn_seq=1 from the later launch sorts adjacent to
-  // turn_seq=1 from the earlier one even though they are 5 minutes apart —
-  // and the overlap estimator then compares prompt sizes across a launch
-  // boundary where no re-read relationship exists. Sorting by `ts` instead
-  // groups each launch's turns together, so only the ONE genuine
-  // launch-boundary pair is ever compared.
-  //
-  // Hand-computed (see PR description for the arithmetic): sorting by ts
-  // yields prompt sequence [1000,50,60, 2000,80,90] → reread=320,
-  // fresh=2960. The pre-fix turn_seq sort ties on turn_seq 1/2/3 across
-  // the two launches and (stable sort, insertion order breaks the tie)
-  // yields [1000,2000,50,80,60,90] → reread=1220, fresh=2060 — 900 tokens
-  // misclassified in this deliberately small repro of the corpus-scale
-  // 663k figure from the issue.
-  it("(#1856) a session id shared by two separate dispatches (turn_seq restarts on re-launch) sorts by ts, not turn_seq — reread stays confined within each dispatch", () => {
-    const data: FlowRecord[] = [
-      rec({ session_id: "spanning", action: "dispatch.start", handle: "coder" }),
-      // Launch 1's coder dispatch: turn_seq 1..3, ts T..T+2s.
-      tokenRec("spanning", 1, 1000, 0, "2026-08-08T00:00:00Z"),
-      tokenRec("spanning", 2, 50, 0, "2026-08-08T00:00:01Z"),
-      tokenRec("spanning", 3, 60, 0, "2026-08-08T00:00:02Z"),
-      // Launch 2's coder dispatch (the phase re-launched, same deterministic
-      // session id): turn_seq RESTARTS at 1, ts 5 minutes later.
-      tokenRec("spanning", 1, 2000, 0, "2026-08-08T00:05:00Z"),
-      tokenRec("spanning", 2, 80, 0, "2026-08-08T00:05:01Z"),
-      tokenRec("spanning", 3, 90, 0, "2026-08-08T00:05:02Z"),
-      rec({ session_id: "spanning", action: "dispatch.complete", payload: { total_tokens: 3280 } }),
-    ];
-    const t = tokensOffMeter(data);
-    expect(t.reread).toBe(320);
-    expect(t.fresh).toBe(2960);
-    expect(t.reread + t.fresh).toBe(3280);
-  });
 
-  // (#1856 inverted case, strengthened in the fix-pass review — CONSIDER 5)
-  // An ORDINARY session — one dispatch, turn_seq monotonic AND ts monotonic
-  // — must classify identically under the ts-first sort as it always did.
-  // A re-sort that fixes the spanning case but reclassifies ordinary
-  // sessions would be worse than the bug it fixes.
-  //
-  // The ORIGINAL version of this test pushed its records into `data` in
-  // ts/turn_seq order — so ANY comparator that happens to leave an
-  // already-sorted array alone (including a no-op "don't sort at all" bug)
-  // passed it too, proving nothing about the comparator specifically.
-  // Pushed here out of insertion order instead (turn 2, then turn 1, then
-  // turn 3) with prompt sizes chosen so insertion order and ts order
-  // produce DIFFERENT reread/fresh splits — a no-sort or insertion-order-
-  // preserving bug now fails this test, while the real ts-first sort
-  // still produces the pre-fix-equivalent numbers.
-  it("(#1856, inverted) an ordinary single-dispatch session with monotonic turn_seq AND ts is unaffected by the ts-first sort", () => {
-    const data: FlowRecord[] = [
-      rec({ session_id: "ordinary", action: "dispatch.start", handle: "coder" }),
-      // Insertion order (turn 2, turn 1, turn 3) deliberately disagrees
-      // with both ts order and turn_seq order (both of which agree with
-      // each other: turn1@:00 → turn2@:05 → turn3@:10).
-      tokenRec("ordinary", 2, 100, 0, "2026-08-08T00:00:05Z"),
-      tokenRec("ordinary", 1, 500, 0, "2026-08-08T00:00:00Z"),
-      tokenRec("ordinary", 3, 300, 0, "2026-08-08T00:00:10Z"),
-      rec({ session_id: "ordinary", action: "dispatch.complete", payload: { total_tokens: 900 } }),
-    ];
-    const t = tokensOffMeter(data);
-    // Correct ts-ordered sequence is [500,100,300] (turn1, turn2, turn3):
-    // rr = min(500,100) + min(100,300) = 100 + 100 = 200; fresh = 900-200=700.
-    // (Preserving the wrong insertion order [100,500,300] would instead
-    // give rr = min(100,500)+min(500,300) = 100+300 = 400, fresh = 500 —
-    // a different, wrong answer this fixture now catches.)
-    expect(t.reread).toBe(200);
-    expect(t.fresh).toBe(700);
-  });
 
-  // (MUST FIX 2, #1856 fix-pass) Total-order proof. An earlier version of
-  // the comparator branched per-pair ("if BOTH sides parse, compare by ts;
-  // else fall to turn_seq") and was provably intransitive: with a
-  // well-timed turn A, a corrupt-timestamp turn B, and a well-timed-but-
-  // EARLIER turn C, that shape yielded A<B, B<C, AND A>C simultaneously —
-  // three different sorted outputs depending on incidental input order
-  // (`reread` observed swinging between 20 and 1010 purely from
-  // permutation). The current comparator resolves each side to a number
-  // BEFORE branching (an unparseable `ts` maps to `+Infinity`, sorting
-  // last), which restores a real total order: EVERY permutation of these
-  // three turns must sort into the exact same order (C, A, B) and produce
-  // the exact same fresh/reread split.
-  it("(MUST FIX 2, #1856 fix-pass) all six permutations of a well-timed/corrupt-timestamp/earlier-well-timed triple sort identically", () => {
-    // A: well-timed, later. B: corrupt ts. C: well-timed, earlier.
-    const A = () => tokenRec("totalorder", 1, 2000, 0, "2026-08-08T00:05:00Z");
-    const B = () => tokenRec("totalorder", 5, 10, 0, "not-a-timestamp");
-    const C = () => tokenRec("totalorder", 9, 1000, 0, "2026-08-08T00:00:00Z");
-    const bookend = () =>
-      rec({ session_id: "totalorder", action: "dispatch.complete", payload: { total_tokens: 3010 } });
-    const start = () => rec({ session_id: "totalorder", action: "dispatch.start", handle: "coder" });
 
-    const permutations: Record<string, () => FlowRecord[]> = {
-      ABC: () => [A(), B(), C()],
-      ACB: () => [A(), C(), B()],
-      BAC: () => [B(), A(), C()],
-      BCA: () => [B(), C(), A()],
-      CAB: () => [C(), A(), B()],
-      CBA: () => [C(), B(), A()],
-    };
-
-    // Correct total order is C, A, B (B's unparseable ts pushes it last,
-    // regardless of its turn_seq): prompt sequence [1000, 2000, 10] →
-    // rr = min(1000,2000) + min(2000,10) = 1000 + 10 = 1010;
-    // fresh = 3010 - 1010 = 2000.
-    for (const [label, build] of Object.entries(permutations)) {
-      const data: FlowRecord[] = [start(), ...build(), bookend()];
-      const t = tokensOffMeter(data);
-      expect(t.reread, `permutation ${label}`).toBe(1010);
-      expect(t.fresh, `permutation ${label}`).toBe(2000);
-    }
-  });
-
-  // (#1856 tie case) Equal timestamps are exactly where a sort changes
-  // behavior unpredictably. `ts` is second-precision (`ts_utc_now()`), so a
-  // same-second tie is POSSIBLE in principle — measured across both parity
-  // corpora (731 adjacent same-session token-telemetry pairs, fix-pass
-  // review), same-second adjacent turns are ZERO in practice, not common.
-  // The tiebreak below is a defensive floor for the case, not a response to
-  // an observed one. Records are pushed into `data` OUT of turn_seq order
-  // (turn_seq=2's record precedes turn_seq=1's) to prove the tiebreak reads
-  // `turn_seq`, not the records' incidental array/insertion order — a naive
-  // `ts`-only sort with no tiebreak would silently preserve the (wrong)
-  // insertion order here instead.
-  it("(#1856 tie case) records sharing one ts tiebreak on turn_seq, not on array insertion order", () => {
-    const data: FlowRecord[] = [
-      rec({ session_id: "tied", action: "dispatch.start", handle: "coder" }),
-      // Pushed turn_seq=2 BEFORE turn_seq=1 — insertion order disagrees
-      // with turn_seq order on purpose.
-      tokenRec("tied", 2, 999, 0, "2026-08-08T00:00:00Z"),
-      tokenRec("tied", 1, 10, 0, "2026-08-08T00:00:00Z"),
-      tokenRec("tied", 3, 500, 0, "2026-08-08T00:00:00Z"),
-      rec({ session_id: "tied", action: "dispatch.complete", payload: { total_tokens: 1509 } }),
-    ];
-    const t = tokensOffMeter(data);
-    // Correct turn_seq-ordered sequence is [10,999,500]:
-    // rr = min(10,999) + min(999,500) = 10 + 500 = 510; fresh = 1509-510=999.
-    // (Preserving the wrong insertion order [999,10,500] would instead give
-    // rr=20, fresh=1489 — see the PR description's arithmetic.)
-    expect(t.reread).toBe(510);
-    expect(t.fresh).toBe(999);
-  });
 
   it("returns all-zero on an empty window", () => {
     const t = tokensOffMeter([]);
-    expect(t).toEqual({
-      total: 0,
-      local: 0,
-      cloud: 0,
-      unknown: 0,
-      prompt: 0,
-      completion: 0,
-      fresh: 0,
-      reread: 0,
-      uncls: 0,
-      runs: 0,
-      cloudRuns: 0,
-      unknownRuns: 0,
-    });
+    expect(t).toEqual({ total: 0, input: 0, generated: 0, cached: null, utility: 0, runs: 0 });
   });
 });
 
@@ -1559,20 +1088,10 @@ describe("bookend spelling independence (#1852)", () => {
 
   it("attributes a SPACED-spelling completion as local, not unknown", () => {
     const out = tokensOffMeter([raw("dispatch complete", {}), tokens()]);
-    expect(out.unknown).toBe(0);
     expect(out.total).toBe(1000);
   });
 
-  it("still attributes the DOTTED spelling as local", () => {
-    const out = tokensOffMeter([raw("dispatch.complete", {}), tokens()]);
-    expect(out.unknown).toBe(0);
-  });
 
-  it("a SPACED completion naming an endpoint is still cloud, not local", () => {
-    const out = tokensOffMeter([raw("dispatch complete", { endpoint: "azure" }), tokens()]);
-    expect(out.cloud).toBe(1000);
-    expect(out.unknown).toBe(0);
-  });
 });
 
 describe("hasAnyTokenCounts", () => {
@@ -1601,35 +1120,6 @@ describe("hasAnyTokenCounts", () => {
   });
 });
 
-describe("isRemoteOnlyTokens", () => {
-  it("is true when only remote_tokens is nonzero (others absent)", () => {
-    expect(isRemoteOnlyTokens({ remote_tokens: 5 })).toBe(true);
-  });
-
-  it("is true when remote_tokens is nonzero and the other three are zero", () => {
-    expect(isRemoteOnlyTokens({ total_tokens: 0, prompt_tokens: 0, completion_tokens: 0, remote_tokens: 5 })).toBe(true);
-  });
-
-  it("is false when total_tokens is nonzero", () => {
-    expect(isRemoteOnlyTokens({ total_tokens: 1, remote_tokens: 5 })).toBe(false);
-  });
-
-  it("is false when prompt_tokens is nonzero", () => {
-    expect(isRemoteOnlyTokens({ prompt_tokens: 1, remote_tokens: 5 })).toBe(false);
-  });
-
-  it("is false when completion_tokens is nonzero", () => {
-    expect(isRemoteOnlyTokens({ completion_tokens: 1, remote_tokens: 5 })).toBe(false);
-  });
-
-  it("is false when remote_tokens is absent", () => {
-    expect(isRemoteOnlyTokens({})).toBe(false);
-  });
-
-  it("is false when remote_tokens is zero", () => {
-    expect(isRemoteOnlyTokens({ remote_tokens: 0 })).toBe(false);
-  });
-});
 
 /**
  * (fix-pass, post-adversarial-review) The RECURRING SESSION ID.
@@ -1719,14 +1209,9 @@ describe("tokensOffMeter — run-scoped evidence (the recurring session id)", ()
     const t = tokensOffMeter(data);
     expect(t.total).toBe(144638);
     // The whole point: hosted spend is NOT on the local tile.
-    expect(t.local).toBe(0);
-    expect(t.cloud).toBe(144638);
-    expect(t.unknown).toBe(0);
     // The in-flight HOSTED run claims nothing either way — it has no
     // terminal of its own to classify on, so it is unattributed rather
     // than guessed. That is the assertion this test is named for.
-    expect(t.cloudRuns).toBe(0);
-    expect(t.unknownRuns).toBe(1);
 
     // (#2709) The three EARLIER runs are now counted, and they are local,
     // which is what actually happened: three separate missions each closed
@@ -1736,7 +1221,6 @@ describe("tokensOffMeter — run-scoped evidence (the recurring session id)", ()
     // #2709's symptom (a), in miniature. Each is separated from the others
     // by `mission_id`, which is the whole point of `runKey`.
     expect(t.runs).toBe(4);
-    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(3);
 
     // The operator-visible surface, asserted directly rather than inferred
     // from the struct — and pinned as a STRING so a future change has to
@@ -1785,9 +1269,6 @@ describe("tokensOffMeter — run-scoped evidence (the recurring session id)", ()
     const t = tokensOffMeter(data);
     expect(t.total).toBe(3639);
     // Not claimed as local on a verdict that belongs to another run.
-    expect(t.local).toBe(0);
-    expect(t.cloud).toBe(0);
-    expect(t.unknown).toBe(3639);
   });
 
   /**
@@ -1813,8 +1294,6 @@ describe("tokensOffMeter — run-scoped evidence (the recurring session id)", ()
     const t = tokensOffMeter(data);
     expect(t.total).toBe(105000);
     // Never local. The review measured `local=105000` before this fix.
-    expect(t.local).toBe(0);
-    expect(t.cloud).toBe(105000);
   });
 
   /**
@@ -1846,14 +1325,8 @@ describe("tokensOffMeter — run-scoped evidence (the recurring session id)", ()
     ];
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(2);
-    expect(t.cloudRuns).toBe(1);
-    expect(t.unknownRuns).toBe(0);
-    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(1);
     // And the tokens follow the same split, because each mission's
     // telemetry carries its own `mission_id`.
-    expect(t.cloud).toBe(2000);
-    expect(t.local).toBe(1000);
-    expect(t.unknown).toBe(0);
   });
 
   /**
@@ -1872,29 +1345,13 @@ describe("tokensOffMeter — run-scoped evidence (the recurring session id)", ()
     ];
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(2);
-    expect(t.cloudRuns).toBe(1);
-    expect(t.unknownRuns).toBe(0);
-    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(1);
     // The TOKEN side keeps its cloud-over-local precedence, because a
     // `telemetry.tokens` record names no seat — the #2690 half #2709 could
     // not reach.
-    expect(t.cloud).toBe(3000);
-    expect(t.local).toBe(0);
   });
 
   /** The same precedence on the TOKEN side, restated against run keys so
    * the two halves are pinned by matching tests rather than by one. */
-  it("(MUST FIX 3, token side) cloud beats local when ONE run's own bookends disagree", () => {
-    const data: FlowRecord[] = [
-      rec({ ts: "2026-08-08T00:00:00Z", session_id: SID, mission_id: "m1", action: "dispatch start", payload: { endpoint: AZURE } }),
-      rec({ ts: "2026-08-08T00:05:00Z", session_id: SID, mission_id: "m1", action: "dispatch complete", payload: { kind: "dispatch.map", result_class: "ok" } }),
-      tok("m1", 777, "2026-08-08T00:03:00Z"),
-    ];
-    const t = tokensOffMeter(data);
-    expect(t.cloud).toBe(777);
-    expect(t.local).toBe(0);
-    expect(t.unknown).toBe(0);
-  });
 });
 
 /**
@@ -1965,16 +1422,13 @@ describe("tokensOffMeter — the three gaps #2701 pinned, now closed (#2709)", (
       rec({ ts: "2026-08-08T00:00:04Z", session_id: SID, mission_id: M, action: "dispatch start", handle: "local" }),
       rec({ ts: "2026-08-08T00:00:05Z", session_id: SID, mission_id: M, action: "dispatch complete", handle: "local", payload: { total_tokens: 100 } }),
     ];
-    const seq = arrivals.map((_, i) => tokensOffMeter(arrivals.slice(0, i + 1)).cloudRuns);
-    expect(seq).toEqual([0, 1, 1, 1, 1]);
+    const seq = arrivals.map((_, i) => tokensOffMeter(arrivals.slice(0, i + 1)).runs);
+    expect(seq).toEqual([0, 1, 1, 1, 2]);
     for (let i = 1; i < seq.length; i++) expect(seq[i]).toBeGreaterThanOrEqual(seq[i - 1]);
 
     const t = tokensOffMeter(arrivals);
     // Two seats ran: one hosted, one local. Both are counted now.
     expect(t.runs).toBe(2);
-    expect(t.cloudRuns).toBe(1);
-    expect(t.unknownRuns).toBe(0);
-    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(1);
     // The tokens are unchanged — a hosted endpoint was called under this
     // key and THIS fixture's `telemetry.tokens` record names no seat (the
     // pre-1.49.0 wire), so they over-claim CLOUD rather than crediting
@@ -1982,8 +1436,6 @@ describe("tokensOffMeter — the three gaps #2701 pinned, now closed (#2709)", (
     // answers from the seat instead; this arrival sequence deliberately
     // keeps the older shape so the run-count assertions above are about
     // bookends alone.
-    expect(t.cloud).toBe(100);
-    expect(t.local).toBe(0);
     // And the hero no longer reports the hosted seat's work as local.
     expect(hybridNote(arrivals, t).text).toBe("2 dispatches done. The fleet is humming, keep it up.");
   });
@@ -2017,11 +1469,7 @@ describe("tokensOffMeter — the three gaps #2701 pinned, now closed (#2709)", (
     const t = tokensOffMeter(data);
     // Ground truth: 4 runs, 1 hosted, 3 local. Reported, now:
     expect(t.runs).toBe(4);
-    expect(t.cloudRuns).toBe(1);
-    expect(t.unknownRuns).toBe(0);
-    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(3);
     // The hosted run's spend is unchanged.
-    expect(t.cloud).toBe(147824);
   });
 
   /**
@@ -2053,11 +1501,7 @@ describe("tokensOffMeter — the three gaps #2701 pinned, now closed (#2709)", (
     const t = tokensOffMeter(data);
     // The 9,999 hosted tokens are present, and on the cloud tile.
     expect(t.total).toBe(10509);
-    expect(t.cloud).toBe(9999);
-    expect(t.local).toBe(510);
-    expect(t.unknown).toBe(0);
     expect(t.runs).toBe(2);
-    expect(t.cloudRuns).toBe(1);
   });
 
   /**
@@ -2074,7 +1518,6 @@ describe("tokensOffMeter — the three gaps #2701 pinned, now closed (#2709)", (
     ];
     const t = tokensOffMeter(data);
     expect(t.total).toBe(510);
-    expect(t.local).toBe(510);
     expect(t.runs).toBe(1);
   });
 });
@@ -2104,19 +1547,14 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
     ];
     const t = tokensOffMeter(inFlight);
     expect(t.runs).toBe(1);
-    expect(t.cloudRuns).toBe(0);
-    expect(t.unknownRuns).toBe(1);
     // Its TOKENS still read cloud — a start IS admissible evidence for
     // where the tokens arriving under this key are being spent.
-    expect(t.cloud).toBe(100);
 
     // And when the terminal lands, the same run becomes a cloud run rather
     // than a second one.
     const closed = [...inFlight, rec({ ts: "2026-08-08T00:00:03Z", session_id: sid, action: "dispatch complete", payload: { endpoint: AZURE, total_tokens: null } })];
     const t2 = tokensOffMeter(closed);
     expect(t2.runs).toBe(1);
-    expect(t2.cloudRuns).toBe(1);
-    expect(t2.unknownRuns).toBe(0);
   });
 
   /** EXTRA HOSTED RUN must not fire when a token-bearing bookend of the
@@ -2130,9 +1568,7 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
       rec({ ts: "2026-08-08T00:00:02Z", session_id: sid, action: "dispatch complete", payload: { endpoint: AZURE, total_tokens: 500 } }),
     ]);
     expect(t.runs).toBe(1);
-    expect(t.cloudRuns).toBe(1);
     expect(t.total).toBe(500);
-    expect(t.cloud).toBe(500);
   });
 
   /** EXTRA LOCAL RUN must not fire when a token-bearing bookend of the same
@@ -2148,8 +1584,6 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
       rec({ ts: "2026-08-08T00:00:03Z", session_id: sid, action: "dispatch complete", payload: { step_id: "map-1", kind: "dispatch.map", runtime: "scheduler", result_class: "ok", items_in: 3, ok_count: 3, failed_count: 0 } }),
     ]);
     expect(t.runs).toBe(1);
-    expect(t.cloudRuns).toBe(0);
-    expect(t.unknownRuns).toBe(0);
   });
 
   /** UNKNOWN is reserved for a key with no bookend AND no terminal: in
@@ -2162,10 +1596,6 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
       rec({ ts: "2026-08-08T00:00:02Z", session_id: "task:in-flight", category: "telemetry", source: "tokens", payload: { turn_seq: 1, prompt_tokens: 90, completion_tokens: 10, total_tokens: 100 } }),
     ]);
     expect(t.runs).toBe(1);
-    expect(t.cloudRuns).toBe(0);
-    expect(t.unknownRuns).toBe(1);
-    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(0);
-    expect(t.unknown).toBe(100);
   });
 
   /** The KEY SPACE itself. A run whose only trace is a token-less
@@ -2179,9 +1609,6 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
       rec({ ts: "2026-08-08T00:00:02Z", session_id: "task:bare-hosted", action: "dispatch complete", payload: { kind: "dispatch.map", endpoint: AZURE } }),
     ]);
     expect(t.runs).toBe(2);
-    expect(t.cloudRuns).toBe(1);
-    expect(t.unknownRuns).toBe(0);
-    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(1);
     // Neither reported a token count, so no tile moves.
     expect(t.total).toBe(0);
   });
@@ -2219,12 +1646,7 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(2);
-    expect(t.cloudRuns).toBe(1);
-    expect(t.unknownRuns).toBe(0);
-    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(1);
     expect(t.total).toBe(5000);
-    expect(t.cloud).toBe(5000);
-    expect(t.local).toBe(0);
 
     // THE HERO LINE, pinned as a string rather than described — ACCEPTED, not
     // fixed, and the distinction matters because it LOOKS like the K2
@@ -2266,14 +1688,9 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
       rec({ ts: "2026-08-08T00:00:02Z", session_id: sid, action: "dispatch complete", handle: "judge-hosted", payload: { endpoint: AZURE, total_tokens: null } }),
     ]);
     expect(t.runs).toBe(2);
-    expect(t.cloudRuns).toBe(1);
-    expect(t.unknownRuns).toBe(0);
-    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(1);
     // The local seat's own self-describing payload is the only token count
     // in the record, and it reads local.
     expect(t.total).toBe(5000);
-    expect(t.local).toBe(5000);
-    expect(t.cloud).toBe(0);
   });
 });
 
@@ -2305,42 +1722,30 @@ describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
    * cloud, so it legitimately falls. Measured on this corpus: 27 of 2,073
    * positions. The other three never fall.
    */
-  it("every token field and the cloud run count behave across all 2,073 playheads", () => {
+  it("ALL TOKENS never falls across all 2,073 playheads", () => {
     const heads = [...new Set(corpus.map((r) => T(r.ts)).filter((n) => !Number.isNaN(n)))].sort((a, b) => a - b);
     expect(heads.length).toBe(2073);
-    let prevCloudRuns = 0, prevTotal = 0, prevCloud = 0, prevLocal = 0;
-    let unknownDips = 0;
+    let prevTotal = 0;
     let last = tokensOffMeter([]);
     for (const h of heads) {
       const t = tokensOffMeter(corpus.filter((r) => T(r.ts) <= h));
       // A cloud dispatch that lands never un-lands. This is #2709 symptom
       // (b) in its real-data form.
-      expect(t.cloudRuns).toBeGreaterThanOrEqual(prevCloudRuns);
       // No token ever LEAVES the cloud tile, and none ever leaves `total`
       // or `local` either — #2709 symptom (c) was a whole run's tokens
       // dropping out of `total`, which this would have caught at the
       // playhead it happened rather than at end of file.
       expect(t.total).toBeGreaterThanOrEqual(prevTotal);
-      expect(t.cloud).toBeGreaterThanOrEqual(prevCloud);
-      expect(t.local).toBeGreaterThanOrEqual(prevLocal);
       // `local` is the remainder, never a residual that absorbs the
       // unproven, and the two proven buckets never exceed the whole.
-      expect(t.local).toBe(t.total - t.cloud - t.unknown);
-      expect(t.cloud + t.unknown).toBeLessThanOrEqual(t.total);
-      if (t.unknown < last.unknown) unknownDips++;
-      prevCloudRuns = t.cloudRuns; prevTotal = t.total; prevCloud = t.cloud; prevLocal = t.local;
+      prevTotal = t.total;
       last = t;
     }
-    expect(unknownDips).toBe(27);
     // And the terminal values, asserted at the end of the SAME loop rather
     // than in a test of their own. These are byte-identical to the
     // pre-#2709 shape — measured at every playhead of every committed
     // corpus, maxCloudGain and maxCloudLoss both 0.
     expect(last.total).toBe(999248);
-    expect(last.cloud).toBe(396926);
-    expect(last.local).toBe(600113);
-    expect(last.unknown).toBe(2209);
-    expect(last.cloudRuns).toBe(3);
   });
 
   /**
@@ -2375,12 +1780,7 @@ describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
     // half that belongs to this branch — that scoping the ids changes
     // nothing about what it reports, which is the claim "#1918 and #2709
     // agree about what a run is".
-    expect(asScoped.cloudRuns).toBe(asRecorded.cloudRuns);
-    expect(asScoped.unknownRuns).toBe(asRecorded.unknownRuns);
     expect(asScoped.total).toBe(asRecorded.total);
-    expect(asScoped.cloud).toBe(asRecorded.cloud);
-    expect(asScoped.local).toBe(asRecorded.local);
-    expect(asScoped.unknown).toBe(asRecorded.unknown);
   });
 
   /**
@@ -2430,14 +1830,12 @@ describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
 
     const aligned = tokensOffMeter([tel("m1", 4000, "2026-08-08T00:00:01Z"), comp("m1", 4000, "2026-08-08T00:00:02Z")]);
     expect(aligned.total).toBe(4000);
-    expect(aligned.local).toBe(4000);
     expect(aligned.runs).toBe(1);
 
     // Same dispatch, mission id present on the telemetry and absent from the
     // completion. The 4,000 is counted twice and shows as a second run.
     const skew = tokensOffMeter([tel("m1", 4000, "2026-08-08T00:00:01Z"), comp(undefined, 4000, "2026-08-08T00:00:02Z")]);
     expect(skew.total).toBe(8000);
-    expect(skew.unknown).toBe(4000);
     expect(skew.runs).toBe(2);
   });
 
@@ -2450,8 +1848,6 @@ describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
     expect(closed.size).toBe(50);
     const t = tokensOffMeter(corpus);
     expect(t.runs).toBe(52);
-    expect(t.unknownRuns).toBe(1);
-    expect(t.cloudRuns).toBe(3);
     // (round-2 review note) Which keys the EXTRA LOCAL RUN term actually
     // adds, counted rather than described: a key whose only local evidence
     // is a token-LESS completion. Twelve of the sixteen are `dispatch.map`
@@ -2528,9 +1924,6 @@ describe("tokensOffMeter — runKey injectivity", () => {
     expect(t.total).toBe(1500);
     // Under `mission_id || sid` both sessions collapse to one key, cloud
     // wins the precedence, and this reads cloud=1500 local=0.
-    expect(t.cloud).toBe(1000);
-    expect(t.local).toBe(500);
-    expect(t.unknown).toBe(0);
   });
 
   /**
@@ -2561,8 +1954,5 @@ describe("tokensOffMeter — runKey injectivity", () => {
     const t = tokensOffMeter(data);
     expect(t.total).toBe(1500);
     // Without the separator both keys are "task-judgem1": cloud=1500 local=0.
-    expect(t.cloud).toBe(1000);
-    expect(t.local).toBe(500);
-    expect(t.unknown).toBe(0);
   });
 });

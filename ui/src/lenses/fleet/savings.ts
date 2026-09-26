@@ -1,970 +1,107 @@
-import { isDispatchComplete, isDispatchStart, isDispatchError, T } from "../../lib/flow";
-import { countsInLegacyTokenSums, isCompactionUsage } from "../../lib/usageRecords";
-/**
- * `tokensOffMeter()` — viewer.html:1416-1531 (#783, #1186, #1607). The
- * savings hero's summing logic: tokens kept off the (frontier) meter, split
- * local vs cloud vs unknown, plus the fresh/re-read/generated class
- * decomposition. Sums ONLY `telemetry.tokens` records (category=telemetry,
- * source=tokens) — `dispatch.complete` ALSO carries totals in its payload,
- * so summing both would double-count.
- *
- * Playhead-aware in legacy (`ts<=state.t`, so the odometer accumulates as
- * playback scrubs) — but this function itself carries NO playhead
- * parameter, and still doesn't after #1869 restored the scrubber. The gate
- * lives at the CALL SITE instead: `FleetLens` filters `data` to `ts <=
- * playhead` (its `scopedData`, built from the SAME `tMax` prop it already
- * threads through `cards.ts`/`timeline.ts`) before handing it to this
- * function, so every record `tokensOffMeter` ever sees is already
- * "visible as of the playhead" — no record here needs its own ts check
- * because none of them are in the future.
- *
- * That caller-side gate is a REAL behavior now, where before #1869 it was
- * vacuous: `/next`'s fleet lens was always the live rolling window
- * (`useFlowWindow`'s `nowMs - LIVE_WINDOW_MS` boundary already applied
- * before this function ever saw `data`), and `PlaybackLens` always passed
- * `computeTMax(records)` — the day's own true max — so `data` and
- * `data.filter(ts<=tMax)` were the same array either way. Scrubbing before
- * the day's end is what makes the filter load-bearing: a session's
- * `dispatch.complete` (the ONLY positive evidence a run stayed local — see
- * `localKeys` below) sliding past the playhead is exactly how "moving the
- * playhead back drops a session's tokens from the hero" happens — its
- * telemetry can stay in `data` while its completion falls out, which
- * reclassifies the session from local to unattributed. Live mode's filter
- * stays the same no-op it always was — `flowWindow.tMax` there is
- * `computeTMax(flowWindow.data)` by definition, so every record already
- * satisfies `ts <= tMax`. This function's own body is unchanged by any of
- * this; the caller does the work.
- *
- * TOKENS ONLY — never a currency figure (the operator multiplies by their
- * own per-token rate; darkmux supplies no rate and makes no $ claim, on
- * EITHER tier).
- *
- * (#1607) THREE states, not two: a session with no endpoint-bearing bookend
- * is UNKNOWN and is EXCLUDED from the savings claim rather than credited to
- * it as "local" — `local` is what's left after both `cloud` and `unknown`
- * are removed, never a residual that absorbs everything unproven. This is
- * the honesty-about-incomplete-data contract this function exists to
- * protect: a number that silently under-counts (or over-credits) is the
- * failure mode the whole viewer-port arc is fixing, so don't "simplify" this
- * away.
- *
- * (#2637) The RUN count gets the same three-way treatment, not just a
- * `runs`/`cloudRuns` pair — `unknownRuns` is the run-level analog of
- * `unknown`. Before this, no consumer could tell "positively local" from
- * "unattributed" among runs, and `hybridNote` derived local runs as
- * `runs - cloudRuns` — the exact residual-absorbs-everything mistake #1607
- * already ruled out for tokens, recurring one field over. Same rule here: a
- * run counts as `cloudRuns` when its own bookend named an endpoint,
- * `unknownRuns` when it has no positive evidence either way, and is
- * otherwise implicitly local (`runs - cloudRuns - unknownRuns` — never a
- * residual credited by default).
- *
- * (#2659) The run count is NOT one per `sess` key. A deterministic
- * `mission_run` session id is reused across a re-launch or retry of the
- * same mission phase inside the viewer's window (#1856), and a task-scoped
- * id is shared by every sibling seat in one task — so one key legitimately
- * closes with more than one real completion, and counting `sess.size`
- * undercounted that population to 1. Every token-bearing completion is its
- * own run, classified on its OWN endpoint rather than on the key's
- * aggregate evidence, so a key holding a mixed local+cloud pair does not
- * paint both cloud. (The TOKEN split a few dozen lines down IS keyed on the
- * key's aggregate evidence, because a `telemetry.tokens` record names no
- * seat — see its own comment, and #2690.)
- *
- * (#2690) TWO rules for WHERE work ran, and the first one is what four
- * previous passes at this function all missed:
- *
- * **1. Every verdict is keyed on a RUN, never on a session id.** See
- * `runKey` below for the measurement. `darkmux_types::session_id`'s `task`
- * and `mission_run` constructors are DETERMINISTIC — byte-identical across
- * every launch of the same config, as their own doc says at
- * `crates/darkmux-types/src/session_id.rs:70-80` — so a session id names a
- * SHAPE of work, not an occurrence of it. #2635, #2687, #2688 and #2690 all
- * reasoned about one failure of that fact (sibling seats fanned out inside
- * ONE task share the key) and none of them about the other: the same key
- * also RECURS across entirely unrelated mission runs, and the viewer's
- * 24-hour window routinely holds several at once. A flat `Set<session_id>`
- * of verdicts therefore accumulates verdicts from runs that have nothing to
- * do with each other, and whichever one is consulted first wins.
- *
- * **2. Within a run, a `dispatch.complete` classifies itself.** One naming
- * an `endpoint` is cloud, one naming none is local. A `dispatch.start`
- * naming an endpoint is ALSO cloud evidence for its own run — hosted
- * billing begins at the start, and the per-turn `telemetry.tokens` family
- * streams for the whole call before any completion lands. A start naming no
- * endpoint proves nothing (that is also what an unclassified hosted start
- * looks like), and `dispatch.error` proves nothing either way.
- *
- * Rule 2 is deliberately ASYMMETRIC, and #2690 got that part right: a start
- * can prove cloud but never local. What #2690 got wrong was concluding that
- * the fix was to stop reading starts. `epBySid`'s defect was its KEY, not
- * its evidence — dropping the evidence while keeping the key made the
- * failure worse rather than better, because a stale LOCAL verdict from a
- * different mission run then had nothing left to out-vote it. Measured on
- * the committed corpus: `task-review-probe-high-task` completes locally
- * under three missions on 2026-08-07 and runs hosted under a fourth on
- * 2026-08-08, and 144,638 tokens of live Azure spend rendered on the LOCAL
- * tile for 17m14s with `cloudRuns=0`, so `hybridNote` read "the hybrid loop
- * is humming, keep it up" while an endpoint billed.
- *
- * What #2690 DID fix, and this pass keeps unchanged: the run count
- * classifies every token-bearing bookend on its OWN `endpoint`, at every
- * arity, consulting no set at all. That is where #2690's measured
- * `runs=1 cloudRuns=1 unknownRuns=0` defect lived — a local seat reported
- * as cloud because a hosted sibling's start was read through a
- * session-wide map.
- *
- * (#2709) SCOPE — #2701 re-keyed only the VERDICTS and said so; this pass
- * finishes the job by re-keying the GROUPING (`dcTok` and `sess`) onto the
- * same `runKey`, and by counting a run from the RUN KEY's own evidence
- * instead of from whichever collection happened to hold a bookend. The
- * three failures #2701 pinned as "known gaps" are what that closes:
- *
- *   (a) `runs` under-counted. Every run key that closed with a
- *       `dispatch.complete` is now a run. Measured on the committed
- *       two-day corpus: 50 run keys carry a completion while `runs`
- *       reported 40.
- *
- *       SIZE OF THAT, stated so nobody expects the wrong thing on live
- *       data: 40 -> 52 measures ids recorded BEFORE #1918, which is
- *       already on main. `session_id::scope_to_run` composes the run id
- *       into every `task-`/`step-`-prefixed session id AT THE LAUNCHER, so
- *       post-#1918 ids are already run-unique. Replaying that transform
- *       over the same corpus: base 50 -> branch 52, a delta of +2, not
- *       +12. On the 24h window the viewer actually loads the number does
- *       not move at all (19 -> 19). Eleven of the twelve is a
- *       retrospective correction for archived records; every token field
- *       is identical either way. Pinned in savings.test.ts.
- *   (b) `cloudRuns` was not monotonic — measured `[0,0,1,1,0]` across an
- *       arrival sequence, resting on "1 local dispatch" beside a 100%-cloud
- *       token tile. A hosted terminal that reported no usage never entered
- *       `dcTok`, so the moment a local sibling's token-bearing completion
- *       joined the group, the hosted run stopped being counted at all.
- *       It is counted as its own run now (the EXTRA HOSTED RUN term in the
- *       run loop), so the same sequence reads `[0,0,1,1,1]`.
- *   (c) A whole run's tokens vanished: the double-count guard
- *       (`sess.has(...)`) was keyed on the bare session id, so a run was
- *       skipped because a DIFFERENT run under the same session id had
- *       telemetry. Measured: 9,999 hosted tokens absent from `total`
- *       entirely. The guard is run-scoped now, so it only ever skips the
- *       run it is actually about.
- *
- * (#2690, TOKEN half — FIXED AT THE PRODUCER, not in this file's
- * precedence; live verification still owed, see the end of this block.)
- * #2709 left this open and recorded why: sibling seats fanned
- * out within one task share the session id AND the mission id by
- * construction, so `runKey` is identical for them and no coordinate on the
- * `telemetry.tokens` record separated them. FOUR were measured on the
- * committed corpora and all four failed, which is why the fix is upstream:
- *
- *   `payload.step_id` — stamped only by the container path's
- *   `stamp_step_id` (`crates/darkmux-crew/src/dispatch_internal.rs`) and
- *   only for a graph step. ZERO of the 774 `telemetry.tokens` records
- *   across all four corpora carry one.
- *
- *   `work_id` — `None` on every crew record builder.
- *
- *   `record.model` — present on 774 of 774, but it is not a SEAT identity:
- *   a probe fan-out is k draws on ONE model. Measured: ZERO run keys whose
- *   telemetry spans more than one model, so it separates nothing; and 3
- *   telemetry models match no completion model under their own key, so it
- *   would orphan.
- *
- *   `handle` — NOT uniformly the role id. The map-item emitter passes
- *   `&step.id` as the role_id argument (`builtins.rs`, beside
- *   `map_item_token_payload`), so a map item's telemetry carries a STEP
- *   handle while the container path's carries a ROLE handle. Measured
- *   anyway, and it fails harder than the others: ZERO keys whose telemetry
- *   spans more than one handle, and 163 of the 364 two-day telemetry
- *   records (45%) carry a handle matching no bookend handle under their own
- *   key. (162 of those 163 carry handle `review`, from the bespoke review
- *   launcher deleted in #2310 P4d — the corpus predates that deletion, so
- *   read those as history, not as a current producer.) Keying on it would
- *   move 45% of the corpus's telemetry into `unknown`, including the
- *   144,638-token Azure run, which is the one direction this function may
- *   never take.
- *
- * So the record gained the coordinate instead. `map_item_token_payload`
- * (`crates/darkmux-crew/src/step_kinds/builtins.rs`, FLOW_SCHEMA_VERSION
- * 1.49.0) now stamps `remote` — the seat's own hosted-or-local verdict,
- * the SAME `endpoint.is_some()` that item's `step result` record already
- * carried — and `index`. The split below reads `remote` FIRST and falls
- * back to the run-key precedence only when it is absent. See that branch's
- * own comment for why absence is meaningful rather than a gap.
- *
- * WHY A PRODUCER CHANGE AND NOT A CONSUMER-SIDE JOIN. `item_record`'s
- * `payload.remote` was already on the wire for the same item, so a consumer
- * COULD have joined the two records. Measured, that join is
- * `(session_id, ts, total_tokens)`: it pairs 180 of 364 two-day telemetry
- * records 1:1 with zero ambiguous multi-hits, and its collision case is k
- * identical draws of one prompt closing inside one second — the normal
- * shape of a probe stage. A field costs one key and cannot collide.
- *
- * SCOPE, because "it covers half the population" was the measurement that
- * declined this twice and it answers a different question than it looks
- * like. 180-of-364 is the JOIN's reach across EVERY `telemetry.tokens`
- * record. The DEFECT's population is narrower: only a record under a
- * seat-SHARING session id can be misattributed at all. `session_id::task`
- * is minted by exactly two step kinds — `dispatch.single_shot` and
- * `dispatch.map` — and only `dispatch.map` emits `telemetry.tokens`
- * (`dispatch.single_shot`'s tokens ride its own `dispatch complete`
- * bookend, which the run loop below already classifies per completion).
- * The other live emitter, the container path's per-turn tailer
- * (`dispatch_internal.rs`'s `emit_telemetry`), runs under
- * `session_id::step(&step.id)`, unique per step; `crawl.unit` mints
- * `crawl-<mission>-<rule>-<unit>` plus a per-draw suffix. Neither can share
- * a key with a second seat. One emitter is the whole live population, and
- * it is the one that changed.
- *
- * WHAT IS STILL OWED, stated rather than implied: a LIVE dispatch. The
- * payload shape, the two records' agreement on one seat's tier, and this
- * function's behavior on both the present and absent forms are unit-pinned
- * — but this repo's release gate is explicit that a green test proves the
- * pieces and only a live run proves the thing (#975, #1135). Nothing
- * committed can stand in: ZERO run keys in either corpus hold both a hosted
- * and an endpoint-less completion, so the corpora cannot exercise a mixed
- * task at all, and every corpus record predates 1.49.0 so none carries
- * `remote`. Both facts are why this change moves NOTHING on the goldens,
- * which is the correct outcome and not evidence of anything.
- *
- * WHAT IT DOES MOVE, once records carry the field. Measured by replaying
- * the two-day corpus with each map item's own `step result` `remote`
- * copied onto its paired `telemetry.tokens` record (180 of 364 pair 1:1) —
- * a MODEL of the 1.49.0 wire, not live data — at every playhead position:
- *
- *   terminal snapshot            : identical
- *   playhead positions diverged  : 392 of 2,073
- *   max cloud GAIN / LOSS        : 0 / 0
- *   max local GAIN               : 62,218 (all of it out of `unknown`)
- *
- * No token moves onto or off the CLOUD tile in either direction. What moves
- * is UNKNOWN -> LOCAL, and only mid-scrub: a map seat whose own
- * `dispatch.complete` has not landed yet at that playhead has no entry in
- * `localKeys`, so it used to read unattributed until its terminal arrived.
- * Its own record now says local the moment the tokens do. Note the terminal
- * snapshot is IDENTICAL while a fifth of the scrub positions are not —
- * which is why a comparison taken at end-of-file would have reported this
- * change as a no-op.
- *
- * Producer note, still true and still load-bearing: `endpoint` is stamped
- * from one `endpoint_label` onto start/error/complete alike by
- * `DispatchSingleShotStepKind::bookend_record` and
- * `DispatchMapStepKind::bookend_record` (`builtins.rs:826-867`,
- * `:1626-1669`), by `dispatch_remote`
- * (`dispatch_internal.rs:3217/3239/3303/3331`), and by the container path
- * from a single `remote_endpoint_raw_label` (`dispatch_internal.rs:5193`
- * start, `:7531` terminal). No producer names an endpoint on a start
- * without naming it on that run's own terminal, so reading starts adds
- * EARLINESS — the in-flight window — and never a verdict the terminal
- * would later contradict.
- */
-
+import { isDispatchComplete } from "../../lib/flow";
+import {
+  CALL_KIND,
+  hasAnyTokenCounts,
+  runKeyMemo,
+  sumUsage,
+  type UsagePayload,
+} from "../../lib/usageRecords";
 import type { FlowRecord } from "../../types/handwritten";
 
-/** The subset of a flow record's `payload` this function reads — token
- * telemetry (`category=telemetry,source=tokens`) and `dispatch.complete`'s
- * own totals both use this shape. Loose on purpose, same as the wire. */
-interface TokenPayload {
-  total_tokens?: number;
-  prompt_tokens?: number;
-  completion_tokens?: number;
-  remote_tokens?: number;
-  turn_seq?: number;
-  endpoint?: string;
-  /** (#2690, FLOW_SCHEMA_VERSION 1.49.0) The SEAT's own hosted-or-local
-   * verdict, on a `telemetry.tokens` record emitted by `dispatch.map`'s
-   * per-item emitter (`map_item_token_payload`,
-   * `crates/darkmux-crew/src/step_kinds/builtins.rs`).
-   *
-   * Optional here and forever: it is absent on every record written before
-   * 1.49.0, and absent by design on every OTHER `telemetry.tokens` lineage
-   * (the container path's per-turn tailer emits none). The producer stamps
-   * it UNCONDITIONALLY, `false` included, so absence means "not that
-   * producer" — never "that producer had nothing to say". The split below
-   * depends on that distinction; see its own comment. */
-  remote?: boolean;
-  /** (#2690) The item's position within its `dispatch.map` fan-out. Not read
-   * by this function — two seats are separated by `remote` alone, since a
-   * step's items are uniformly one tier. Declared so the field is
-   * documented where the payload is, rather than looking like drift the
-   * next time somebody diffs the wire against this interface. */
-  index?: number;
-}
-
-/** A `sess`-grouped turn, carrying the record's own `ts` alongside its
- * payload — needed to sort turns chronologically (#1856) rather than by
- * `turn_seq` alone, which restarts at 1 on every dispatch — including a
- * RE-LAUNCH of the same mission phase under the same deterministic
- * `mission_run` session id (see the sort comment below for the corrected
- * mechanism). */
-interface SessTurn extends TokenPayload {
-  ts: string;
-}
-
-/** A token-bearing `dispatch.complete` payload. (#2709) It carries no key
- * of its own any more: `dcTok` is keyed by `runKey`, so the map key IS the
- * run key and a per-bookend copy would be a second spelling of the same
- * fact. (#2701 needed the copy because the grouping was still keyed on a
- * bare session id while the verdicts were keyed by run.) */
-type Bookend = TokenPayload;
-
-/** (#2690 fix-pass) The identity of ONE RUN, which is what every
- * where-did-this-run verdict in this function has to be keyed on.
+/**
+ * `tokensOffMeter()` — the fleet hero's numbers (#783, #1186, #1607, #2902).
  *
- * A bare `session_id` is NOT that identity. `darkmux_types::session_id`'s
- * `task(...)` and `mission_run(...)` constructors are DETERMINISTIC — their
- * own doc (`crates/darkmux-types/src/session_id.rs:70-80`) says the id is
- * byte-identical across every launch of the same config — so one session id
- * legitimately belongs to many unrelated runs, and a flat `Set<session_id>`
- * of verdicts accumulates them all. Measured on the committed corpus
- * (`tests/parity/corpus/flow-{yesterday,today}.json` +
- * `flow-session-task-list.json`): 14 distinct session ids each span more
- * than one mission — `task-review-probe-high-task` spans 5, and the ACP
- * panel's `task-list` / `task-__panel_args__` span 24 and 23 respectively.
- * Inside the viewer's 24-hour window those are concurrent members of the
- * same `Set`, so an earlier run's verdict out-votes a later run's evidence.
+ * (#2902 step 2a) Every figure is a SUM OF FACTS from usage records, through
+ * the one `sumUsage` (`lib/usageRecords.ts`): ALL TOKENS (`total_tokens`),
+ * INPUT (`prompt_tokens`), GENERATED (`completion_tokens`), CACHED (the
+ * provider's `cached_tokens`, over the records that report it; `null`, so no
+ * chip, when none does) and UTILITY (the `purpose: utility` records:
+ * darkmux's own compaction and radio routing). Legacy runs with no usage
+ * records count their `dispatch complete` inside `sumUsage`; nothing here
+ * special-cases them.
  *
- * `mission_id` is exactly the coordinate the deterministic session id drops,
- * so `(session_id, mission_id)` restores it. Verified on the same corpus:
- * ZERO session ids recur without a `mission_id` to separate them (the 43
- * mission-less session ids are all per-dispatch forms like
- * `crew-dispatch-<role>-<micros>-internal`, which are unique by
- * construction), and ZERO `telemetry.tokens` records carry a `mission_id`
- * that matches no completion of their own session — so the composite key
- * neither fails to separate a recurring run nor orphans a record that used
- * to classify.
+ * GONE, deliberately: the local/cloud/unknown split and its run counts
+ * (withdrawn in #2834: an endpoint says what was called, never where or at
+ * what cost), and the FRESH INPUT / RE-READ / UNCLASSIFIED tiles (an
+ * estimate from turn order, not a count any provider reported). Where a
+ * provider's total exceeds prompt + completion (reasoning counted
+ * separately), ALL TOKENS is larger than INPUT + GENERATED and no filler
+ * chip is invented for the difference.
  *
- * The sessionless fallback is the SAME composite the `sess` grouping uses,
- * so a record with no `session_id` cannot collide with another one. The
- * separator is `\u0000`, which cannot occur inside a session or mission id,
- * so no pair of ids can spell another pair's key. */
-function runKey(r: FlowRecord): string {
-  const sid = r.session_id || `ts:${r.ts}:${r.handle || ""}:${r.machine_uid || ""}`;
-  return `${sid}\u0000${r.mission_id || ""}`;
-}
-
+ * Playhead: this function takes no playhead. `FleetLens` filters `data` to
+ * `ts <= playhead` before calling it (#1869), so every record here is
+ * already visible as of the playhead.
+ *
+ * TOKENS ONLY, never a currency figure.
+ */
 export interface TokensOffMeter {
   total: number;
-  local: number;
-  cloud: number;
-  unknown: number;
-  prompt: number;
-  completion: number;
-  fresh: number;
-  reread: number;
-  uncls: number;
+  input: number;
+  generated: number;
+  /** `null` when no record in the window reports `cached_tokens`. */
+  cached: number | null;
+  utility: number;
   runs: number;
-  cloudRuns: number;
-  /** (#2637) Runs with no positive evidence either way — same "unknown,
-   * not free" honesty as `unknown` above, at run granularity. Excluded from
-   * both `cloudRuns` and the implicit local count; never guessed. */
-  unknownRuns: number;
-}
-
-/** (#2206/#2207, slop-chop pilot) Does this dispatch payload carry ANY
- * token count? Extracted from the `dispatch.complete` guard below — the
- * parenthesised half only; `isDispatchComplete` stays at the call site
- * (the unit of extraction is the concept, not the condition). The `!!`
- * is the one added token, forced by the boolean return; equivalence over
- * the full field space is pinned in savings.test.ts. */
-export function hasAnyTokenCounts(p: {
-  total_tokens?: number; prompt_tokens?: number;
-  completion_tokens?: number; remote_tokens?: number;
-}): boolean {
-  return !!(p.total_tokens || p.prompt_tokens || p.completion_tokens || p.remote_tokens);
-}
-
-/** (#2206/#2207, slop-chop pilot) A review-path remote complete: remote
- * tokens present and NO local counts. Extracted from the classifier
- * below; same `!!` note as `hasAnyTokenCounts`. */
-export function isRemoteOnlyTokens(p: {
-  total_tokens?: number; prompt_tokens?: number;
-  completion_tokens?: number; remote_tokens?: number;
-}): boolean {
-  return !p.total_tokens && !p.prompt_tokens && !p.completion_tokens && !!p.remote_tokens;
 }
 
 export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
-  // (#1607, rewritten #2690, re-scoped #2690 fix-pass) Evidence of WHERE a
-  // RUN ran, keyed on `runKey` — `(session_id, mission_id)` — and never on
-  // a bare session id. See `runKey`'s own doc for why the bare id cannot
-  // express this: it is deterministic, so it recurs across unrelated runs,
-  // and a flat set of verdicts keyed on it accumulates every run's answer
-  // into one bucket that the wrong run then reads.
-  //
-  // The two sides are NOT symmetric, and the asymmetry is the point:
-  //
-  //   `cloudKeys` — ANY bookend of this run (`dispatch.start`,
-  //   `dispatch.complete` or `dispatch.error`) named an `endpoint`. One
-  //   uniform rule, no carve-outs: if a run ever named a hosted endpoint,
-  //   the tokens arriving under its key are hosted spend. A START counts
-  //   because billing begins there, not at the completion, and the
-  //   per-turn `telemetry.tokens` family streams throughout a multi-minute
-  //   hosted call. An ERROR counts because a hosted attempt that died
-  //   still burned hosted tokens. Refusing either leaves real spend
-  //   creditable to LOCAL, which is the one direction this function must
-  //   never take — and the carve-out for errors was measurably such a
-  //   hole (a mixed run whose hosted seat's only in-view bookend is an
-  //   error, beside a local seat's clean completion, credited the whole
-  //   key LOCAL).
-  //
-  //   `localKeys` — a run's OWN clean `dispatch.complete` naming no
-  //   endpoint, and nothing else. No bookend can prove LOCAL except that
-  //   one: the ABSENCE of an endpoint on a start or an error is also what
-  //   an unstamped or not-yet-classified hosted bookend looks like, so
-  //   only a clean terminal that named no endpoint positively proves the
-  //   work stayed on the operator's own hardware.
-  //
-  // `cloudKeys` WINS when one run lands in both (sibling seats sharing a
-  // task-scoped id, one hosted and one local). That is over-claiming CLOUD,
-  // never crediting hosted spend as local: if any seat in a task is hosted,
-  // that task really did bill.
-  //
-  // (#2690) That precedence is now the FALLBACK, not the only rule. A
-  // `telemetry.tokens` record carrying `payload.remote` names its own
-  // seat's tier and is read before these sets are consulted at all — see
-  // the token split below. These sets still decide every record that does
-  // NOT carry it, which is every record written before
-  // FLOW_SCHEMA_VERSION 1.49.0 and every record from a lineage other than
-  // `dispatch.map`'s per-item emitter.
-  //
-  // (#2690) What this KEEPS from #2690 is the run-count fix a few dozen
-  // lines down — every token-bearing bookend classifies on its OWN
-  // `endpoint` at every arity, consulting no set at all. That is where
-  // #2690's measured defect (`runs=1 cloudRuns=1` for a local seat beside
-  // an in-flight hosted sibling) actually lived, and it is untouched here.
-  // What this RESTORES is start-as-cloud-evidence for the token split,
-  // which #2690 removed along with `epBySid`. Removing it was measured to
-  // move 144,638 tokens of live Azure spend onto the LOCAL tile for 17m14s
-  // (see the fix-pass test in savings.test.ts); the actual defect in
-  // `epBySid` was never that it read starts, but that it was keyed on a
-  // recurring session id.
-  //
-  // `dcTok` is the single-shot fallback's own totals (sessions with no
-  // `telemetry.tokens` family at all) — REGARDLESS of endpoint (#1853). A
-  // local single-shot dispatch (radio-router, radio-host) is exactly the
-  // endpoint-less case: gating collection on `p.endpoint` (as this loop did
-  // before #1853) meant its tokens never entered `dcTok` at all, so they
-  // landed in no bucket — not even `unknown`. Collection stays
-  // endpoint-blind; classification happens below, per completion.
-  //
-  // (#2635 follow-up) `dcTok` holds an ARRAY per session id, not one
-  // payload — `dispatch.single_shot`'s `dispatch_session_id` is
-  // deliberately TASK-scoped ("sibling seats fanned out within one task
-  // share this key", builtins.rs), so two sibling steps — one hosted, one
-  // local — can legitimately complete under the SAME session id. A single
-  // Map entry per sid (as this used to be) silently dropped every
-  // completion but the last, and could paint one seat's tokens on the
-  // other seat's tile at classification time. Accumulating means every
-  // completion survives to be classified on its own terms below.
-  //
-  // (#2659) The run count below groups by DISTINCT `dcTok` BOOKEND, not by
-  // `sess`'s one-entry-per-key shape — reusing `dcTok` itself rather than a
-  // parallel collection, so "what counts as a real dispatch bookend" stays
-  // ONE definition (`isDispatchComplete` + `hasAnyTokenCounts`) instead of
-  // two that could drift apart. `mission_run(mission_id, phase_id)`
-  // (`crates/darkmux-types/src/session_id.rs`) is a DETERMINISTIC session
-  // id, so re-launching or retrying the same mission phase inside the
-  // viewer's window reuses the identical id, and each launch closes with
-  // its OWN token-bearing `dispatch.complete`. Before this fix the run
-  // count was `sess.size` — one per distinct KEY, regardless of how many
-  // real completions happened under it — so a session that legitimately
-  // spans two (or more) dispatches undercounted to 1.
-  //
-  // `hasAnyTokenCounts` is what keeps `dcTok` to bookends that actually
-  // reported a token count. It is NOT a step-vs-dispatch filter (a HOSTED
-  // `dispatch.map` step passes it and always has) — it is exactly what its
-  // name says. A LOCAL `dispatch.map` step's own `dispatch complete`
-  // bookend (`DispatchMapStepKind::bookend_record`,
-  // `crates/darkmux-crew/src/step_kinds/builtins.rs`) reports NO token
-  // field at all, because `stamp_remote_classification` is called there
-  // only `if endpoint_label.is_some()` — so it fails the bar and never
-  // enters `dcTok`.
-  //
-  // (#2709) That bookend is still real model work, and it is counted as a
-  // run now — by the EXTRA LOCAL RUN term in the run loop, off `localKeys`,
-  // NOT by loosening `hasAnyTokenCounts`. The distinction matters and is
-  // why #2659 reverted "count every `isDispatchComplete` record": that
-  // shape counts a token-less local map-step completion sharing a key with
-  // a seat's genuine token-bearing completion as a SECOND run, which it is
-  // not. A per-KEY presence term cannot double-count that way — the MUST
-  // FIX 2 test pins it, and the `TERM:` tests pin each half separately.
-  //
-  // (#2709) `dcTok` is keyed by `runKey`, the SAME key the verdict sets
-  // use. #2701 left it on the bare session id on purpose — re-keying it
-  // moves `runs` itself — and pinned the three consequences as tests.
-  // This is that measured change; the module doc above lists what each of
-  // the three was and what closed it. The practical effect here is that a
-  // group is now one RUN's bookends rather than the union of every run
-  // that happened to reuse a deterministic session id.
-  const dcTok = new Map<string, Bookend[]>();
-  // RUNS positively known cloud / positively known local, keyed by
-  // `runKey`. See the long comment at the top of this function for why the
-  // two sides take different evidence, and `runKey`'s own doc for why the
-  // key is `(session_id, mission_id)` and not a bare session id.
-  //
-  // TWO cloud sets, because the two consumers ask different questions and
-  // a start is admissible evidence for exactly one of them:
-  //
-  //   `cloudKeys` (ANY endpoint-naming bookend) answers "are the tokens
-  //   ARRIVING under this key hosted spend?" — asked by the token split,
-  //   which has to decide about tokens that exist NOW, possibly mid-call
-  //   and possibly after a failure.
-  //
-  //   `cloudTerminalKeys` (complete only) answers "where did this finished
-  //   RUN run?" — asked by the run-count branch, which is counting runs and
-  //   so has a terminal to read by definition. Keeping starts AND errors
-  //   out of it is what preserves #2690's fix (an errored hosted sibling
-  //   must not make a local sibling's dispatch read cloud) as well as
-  //   monotonicity.
-  //
-  // Keeping starts and errors OUT of the run-count set is what stops a
-  // hosted seat's START from counting as a finished run: a start says
-  // billing has begun, not that a dispatch completed.
-  //
-  // (#2709) `cloudTerminalKeys` is ALSO what makes `cloudRuns` monotonic.
-  // #2701 measured it falling — `[0,0,1,1,0]` — because `cloudRuns` had two
-  // writers that OVERRODE each other: a zero-bookend group read this set,
-  // and the moment one token-bearing completion joined the group the
-  // per-bookend branch took over and re-decided the whole group from the
-  // bookends it happened to hold. A hosted seat whose endpoint omits
-  // `usage` emits `{endpoint, result_class: "ok", total_tokens: null}`
-  // (`SingleShotReply::total_tokens` is `Option<u64>`,
-  // `crates/darkmux-crew/src/single_shot.rs:51`, serialized at
-  // `step_kinds/builtins.rs:1165-1175` while `endpoint_label` is stamped
-  // unconditionally at `:844`), so it fails `hasAnyTokenCounts`, never
-  // enters `dcTok`, and was invisible to that branch. The run loop below
-  // ADDS the two sources instead of letting one replace the other, so a
-  // hosted terminal that reported no usage keeps its own run. Pinned as an
-  // arrival-sequence test in savings.test.ts on both a synthetic shape and
-  // the committed corpus.
-  const cloudKeys = new Set<string>();
-  const cloudTerminalKeys = new Set<string>();
-  const localKeys = new Set<string>();
+  const s = sumUsage(data);
+  return { total: s.total, input: s.prompt, generated: s.completion, cached: s.cached, utility: s.utility, runs: dispatchCount(data) };
+}
 
-  for (const r of data) {
-    const p = r.payload as TokenPayload | undefined;
-    if (!r.session_id || !p) continue;
-    const isComplete = isDispatchComplete(r.action);
-    const rkey = runKey(r);
-    // ANY bookend of this run naming an endpoint proves CLOUD; none of them
-    // can prove LOCAL. See above for the asymmetry.
-    if (p.endpoint && (isComplete || isDispatchStart(r.action) || isDispatchError(r.action))) cloudKeys.add(rkey);
-    if (!isComplete) continue;
-    if (p.endpoint) cloudTerminalKeys.add(rkey);
-    if (!p.endpoint) localKeys.add(rkey);
-    if (hasAnyTokenCounts(p)) {
-      const arr = dcTok.get(rkey);
-      if (arr) arr.push(p);
-      else dcTok.set(rkey, [p]);
-    }
-  }
-
-  let total = 0;
-  let prompt = 0;
-  let completion = 0;
-  let cloud = 0;
-  let unknown = 0;
-  const sess = new Map<string, SessTurn[]>();
-
-  // (#2902 step 1b) Compactor calls' input tokens, outside the turn sequence.
-  let compactionPrompt = 0;
-  for (const r of data) {
-    if (r.category === "telemetry" && r.source === "tokens") {
-      const p = (r.payload as TokenPayload) || {};
-      // (#2902 step 1a) Only the records this sum read before per-call usage
-      // records existed. A single-shot run's tokens keep coming from its
-      // `dispatch complete` (the fallback below), and a count-less
-      // `token_source: "absent"` record must not register its run in `sess`
-      // (that would suppress the fallback and drop the run's total).
-      if (!countsInLegacyTokenSums(p as Record<string, unknown>)) continue;
-      total += p.total_tokens || 0;
-      prompt += p.prompt_tokens || 0;
-      completion += p.completion_tokens || 0;
-      // A `telemetry.tokens` record's `endpoint` (#2902 step 1a) names what
-      // was CALLED, an LMStudio base URL included; it is not the hosted
-      // marker the bookends carry, so this split never reads it. Without a
-      // seat verdict of its own (`remote`, below) the finest grain available
-      // is the RUN the record itself belongs to. Which is precisely why the
-      // key has to be `runKey` and not a bare session id: this record names
-      // its own `mission_id`, so joining on `(session_id, mission_id)` reads
-      // the verdict of the run that actually emitted it.
-      //
-      // The bare-session-id version of this line is what shipped the defect
-      // this fix-pass exists to remove. `task-review-probe-high-task`
-      // completes LOCALLY under three separate missions on 2026-08-07 and
-      // then runs HOSTED under a fourth on 2026-08-08; keyed on the bare id,
-      // the three stale local verdicts sat in the local set and swallowed the
-      // hosted run's live telemetry — 144,638 tokens of Azure spend rendered
-      // on the LOCAL tile for the 17m14s between the hosted start and its
-      // own completion, with `cloudRuns=0` so the hero read "the hybrid loop
-      // is humming" while an endpoint billed. Keyed on `runKey` the stale
-      // verdicts live under their own missions' keys and cannot be reached.
-      //
-      // Precedence, for a record with no seat of its own: CLOUD beats LOCAL
-      // when one run's own evidence disagrees with itself (sibling seats
-      // sharing a task-scoped id, one hosted and one local). That
-      // over-claims cloud for a genuinely mixed task and never credits
-      // hosted spend as local. Pinned by name in savings.test.ts, here AND
-      // on its run-level twin below. A record that DOES name its seat
-      // (`payload.remote`, #2690) never reaches this rule.
-      //
-      // TWO sites read this evidence and they do NOT agree. The run loop's
-      // per-bookend token sum (the telemetry-ABSENT path, at the bottom of
-      // this function) classifies each completion on its OWN payload and
-      // never consults `cloudKeys`. That is deliberate — there the tokens
-      // ARE the completion's own payload, which is self-describing, where a
-      // `telemetry.tokens` record names no seat and no endpoint — but it
-      // means the same mixed run answers differently depending on whether
-      // it emitted a telemetry family. Measured: `local=0 cloud=110` with
-      // telemetry, `local=110 cloud=0` without. Pinned in savings.test.ts
-      // so the divergence is a decision a future change has to make
-      // deliberately, not discover.
-      //
-      // (#2709, SUPERSEDED by #2690's producer change.) This is the one
-      // place #2690's TOKEN half had to be fixed, and #2709 recorded that
-      // it could not be fixed from the records that existed THEN: sibling
-      // seats fanned out within one task share the session id AND the
-      // mission id, so `runKey` is identical for them by construction, and
-      // none of `payload.step_id`, `handle` or `work_id` could separate
-      // them (measurements in this file's module doc). The record now
-      // carries the coordinate — `payload.remote`, FLOW_SCHEMA_VERSION
-      // 1.49.0 — and the branch immediately below reads it. The precedence
-      // above is what remains for records that do not carry it.
-      const rk = runKey(r);
-      // (#2690) THE SEAT'S OWN VERDICT WINS, when the record carries one.
-      //
-      // `payload.remote` (FLOW_SCHEMA_VERSION 1.49.0) is `dispatch.map`'s
-      // per-item emitter reporting the tier of the seat that spent these
-      // tokens — the SAME `endpoint.is_some()` it stamps on that item's own
-      // `step result` record, pushed from the same `MapItemResult` in the
-      // same loop iteration. It is strictly better evidence than anything
-      // below it: the run key's aggregate describes a TASK, this describes
-      // the SEAT, and the whole of #2690 is that those are not the same
-      // thing when a task fans out.
-      //
-      // `=== true` / `=== false` rather than a truthiness test, so a hostile
-      // or malformed value falls through to the fallback instead of
-      // silently deciding a tier.
-      //
-      // A `false` seat contributes to NEITHER `cloud` NOR `unknown`, which
-      // is how it lands in `local` — `local` is the remainder
-      // (`total - cloud - unknown`) and is never added to directly. That is
-      // the one direction this function is normally forbidden to guess in,
-      // and the reason it is allowed here is that this is not a guess: the
-      // producer only reaches `map_local_item` when the step resolved NO
-      // endpoint, so `remote: false` is the same class of positive local
-      // evidence as an endpoint-less `dispatch.complete` (what `localKeys`
-      // is built from), one grain finer.
-      //
-      // WHY THE FALLBACK STAYS. Absence is meaningful, not a gap to paper
-      // over: the producer stamps the key unconditionally, so a record
-      // WITHOUT it is either pre-1.49.0 (archives are append-only and are
-      // never rewritten) or from another lineage — the container path's
-      // per-turn tailer, which cannot share a run key with a second seat
-      // anyway (`session_id::step(&step.id)`, unique per step). Those
-      // records keep exactly the pre-#2690 behavior, unchanged, and
-      // `savings.test.ts` pins both forms side by side so neither can move
-      // without the other being considered.
-      if (p.remote === true) {
-        cloud += p.total_tokens || 0;
-      } else if (p.remote !== false) {
-        if (cloudKeys.has(rk)) {
-          cloud += p.total_tokens || 0;
-        } else if (!localKeys.has(rk)) {
-          unknown += p.total_tokens || 0;
-        }
-      }
-      // (#2709) Grouped by `runKey`, the same key the verdicts use — so a
-      // group is ONE run's turns. `runKey` already carries the composite
-      // fallback for a sessionless record (two sessionless records sharing
-      // a ts must not merge into one pseudo-session; it would corrupt the
-      // turn_seq decomposition below), so there is one key expression here
-      // rather than two that have to be kept in step.
-      // (#2902 step 1b) A compactor call counts in the totals and the split
-      // above, but it is not a TURN: grouped with the run's turns it would
-      // break the turn re-read sequence below (no `turn_seq`) and demote the
-      // whole run to unclassified. Its input is its own, so it lands there.
-      if (isCompactionUsage(p as Record<string, unknown>)) {
-        compactionPrompt += p.prompt_tokens || 0;
-        continue;
-      }
-      const arr = sess.get(rk);
-      if (arr) arr.push({ ...p, ts: r.ts });
-      else sess.set(rk, [{ ...p, ts: r.ts }]);
-    }
-  }
-
-  // The class decomposition (fresh/re-read/generated) stays COMBINED across
-  // tiers (one breakdown, not one per tier) — only the headline split above
-  // is per-tier.
-  let fresh = 0;
-  let reread = 0;
-  let uncls = compactionPrompt;
-  for (const [, recs] of sess) {
-    const sp = recs.reduce((a, p) => a + (p.prompt_tokens || 0), 0);
-    if (recs.every((p) => p.turn_seq != null)) {
-      // (#1856) Sort by TIME, turn_seq only as a tiebreak — not the reverse.
-      // `mission_run(mission_id, phase_id)` mints a DETERMINISTIC session id
-      // (`crates/darkmux-types/src/session_id.rs`) — the same phase
-      // re-launched or retried inside the viewer's 24h window reuses the
-      // identical session id, and each launch's own coder dispatch restarts
-      // its turn counter at 1. Sorting by `turn_seq` alone interleaves
-      // chronologically unrelated turns from different launches: turn_seq=1
-      // from a later launch sorts next to turn_seq=1 from an earlier one
-      // even though they may be minutes (or longer) apart, and the overlap
-      // estimator below then compares prompt sizes across a launch boundary
-      // where no re-read relationship exists. Sorting by `ts` groups each
-      // launch's turns together (only the ONE true launch-boundary pair is
-      // ever compared, not every same-turn_seq pair), matching what
-      // actually happened.
-      //
-      // (MUST FIX 2, #1856 fix-pass) The comparator below resolves BOTH
-      // sides to a number BEFORE branching — never mixes a ts-comparison on
-      // one pair with a turn_seq-comparison on another, which is what makes
-      // this a genuine total order. An earlier version of this comparator
-      // branched per-pair ("if both sides parse, compare by ts; else fall
-      // to turn_seq") and was provably intransitive: with a well-timed A, a
-      // corrupt-timestamp B, and a well-timed-but-earlier C, that shape
-      // produced A<B, B<C, and A>C simultaneously — three different sorted
-      // outputs depending on incidental input order. Mapping an unparseable
-      // `ts` to `+Infinity` up front (sorting those turns LAST, never used
-      // to decide an ordering relative to a well-timed turn by anything
-      // other than "is it well-timed") restores a real total order: turns
-      // compare on `(resolvedTs, turn_seq)` lexicographically, always.
-      //
-      // `ts` is second-precision (`ts_utc_now()`), so a same-`ts` tie is
-      // POSSIBLE in principle and turn_seq is the correct tiebreak for it —
-      // but measured across both parity corpora (731 adjacent same-session
-      // token-telemetry pairs, `tests/parity/corpus/flow-{today,yesterday}.json`
-      // + `docs/demo/demo-flow.jsonl`), same-second adjacent turns are ZERO,
-      // not common. The tiebreak stays as a defensive floor (and as the
-      // resolution for the corrupt-timestamp case above), not because ties
-      // are expected in practice.
-      //
-      // (Known-narrower alternative, not adopted here — tracked as
-      // #2665) Grouping turns by `session_id` PLUS `payload.step_id`
-      // (stamped on every per-event flow record a graph-bound dispatch
-      // emits, `crates/darkmux-crew/src/dispatch_internal.rs`'s
-      // `TailerState::step_id` doc) would be exact and immune to clock
-      // resolution for the worktree/coder/verify-in-one-launch shape —
-      // but it does NOT disambiguate two SEPARATE launches of the SAME
-      // step (the actual mechanism above): both stamp the identical
-      // `(session_id, step_id)` pair, so grouping alone can't tell them
-      // apart either. Adopting it would also mean changing the OUTER
-      // `sess` grouping key that `runs`/`cloudRuns`/`unknownRuns` are
-      // derived from too — the exact same shape of problem #2659 already
-      // owns. Filed as #2665 rather than folded in here.
-      const turns = recs
-        .slice()
-        .sort((a, b) => {
-          const ta = T(a.ts);
-          const tb = T(b.ts);
-          const na = Number.isNaN(ta) ? Infinity : ta;
-          const nb = Number.isNaN(tb) ? Infinity : tb;
-          if (na !== nb) return na - nb;
-          // A non-numeric `turn_seq` reaching this point is a pre-existing,
-          // unrelated gap (this branch only runs turn_seq!=null records —
-          // see the `recs.every` guard above); not addressed here.
-          return (a.turn_seq as number) - (b.turn_seq as number);
-        });
-      let rr = 0;
-      let prev: number | null = null;
-      for (const p of turns) {
-        const pi = p.prompt_tokens || 0;
-        if (prev != null) rr += Math.min(pi, prev);
-        prev = pi;
-      }
-      reread += rr;
-      fresh += sp - rr;
-    } else {
-      uncls += sp;
-    }
-  }
-
-  // (#2709) ONE run loop over ONE key space, replacing the two loops that
-  // used to split it (a `sess`-keyed branch that decided a whole group, and
-  // a `dcTok`-keyed `directRuns` fallback for groups the first had skipped).
-  // Splitting the decision across two collections is what made `cloudRuns`
-  // fall: whichever loop reached a key LAST re-decided it from the evidence
-  // that loop happened to hold. Here, every run key contributes its terms
-  // ADDITIVELY, so no source of evidence can cancel another.
-  //
-  // The key space is every run key ANY evidence named. `sess` and `dcTok`
-  // alone are not enough: a run whose only trace is a token-less
-  // `dispatch.complete` (a LOCAL `dispatch.map` step's summary bookend —
-  // `DispatchMapStepKind::bookend_record`, which reports a token total only
-  // when the step is hosted) appears in neither, and was counted nowhere.
-  // Measured on the committed two-day corpus: 50 run keys carry a
-  // completion, `runs` reported 40.
-  //
-  // The four terms, and what each one is for:
-  //
-  //   PER-BOOKEND — every token-bearing completion is one run, classified
-  //   on its OWN `endpoint` and on nothing else. Unchanged since #2635/
-  //   #2690: a sibling with no endpoint of its own is positive LOCAL
-  //   evidence, never floored by another sibling's endpoint. This is where
-  //   #2690's measured `runs=1 cloudRuns=1`-for-a-local-seat defect lived.
-  //
-  //   EXTRA HOSTED RUN — a run key whose terminal named an endpoint while
-  //   NO token-bearing bookend of that key did. That is a completed hosted
-  //   dispatch whose endpoint omitted `usage` (`single_shot.rs:51`'s
-  //   `total_tokens: null` shape), so it can never enter `dcTok`. Counting
-  //   it here is what makes `cloudRuns` monotonic: before, it was counted
-  //   only while the key had no token-bearing bookend at all, so a local
-  //   sibling's completion landing LATER silently removed it.
-  //
-  //   EXTRA LOCAL RUN — the same term on the local side: a terminal naming
-  //   no endpoint while no token-bearing bookend of that key is
-  //   endpoint-less. The token-less local map-step completion above is
-  //   exactly this. It is deliberately NOT "one run per completion record":
-  //   a key holding a token-bearing local completion AND a token-less local
-  //   map-step completion still counts ONE local run, which is what #2659's
-  //   `hasAnyTokenCounts` conjunct has always protected and what the MUST
-  //   FIX 2 test pins.
-  //
-  //   UNKNOWN — no bookend and no terminal at all: in flight, closed
-  //   outside the window, errored, or a sessionless composite key. The
-  //   #1607 bucket. Crediting it cloud would misreport the operator's own
-  //   hardware; crediting it local would credit hosted spend as free.
-  //
-  // The TOKEN sum for a key's bookends is gated on `!sess.has(k)` — the
-  // telemetry-exclusive rule that stops a run with both a telemetry family
-  // and a token-bearing completion from being counted twice. (#2709) That
-  // guard is keyed by RUN now. Keyed on the bare session id it fired across
-  // RUNS, skipping run B because a DIFFERENT run A under the same session
-  // id had telemetry: measured, 9,999 hosted tokens absent from `total`
-  // entirely — under-reported, not misattributed, which is what made it
-  // easy to miss.
-  //
-  // (#2709) THE INVARIANT THAT GUARD NOW DEPENDS ON, named because it is
-  // load-bearing for the headline number and was not before:
-  //
-  //   **A dispatch's `telemetry.tokens` records and that same dispatch's
-  //   `dispatch.complete` must carry the SAME `mission_id`.**
-  //
-  // Keyed on the bare session id the guard was immune to this by
-  // construction — a session id is a session id on every record of a
-  // dispatch. Keyed by run, a producer that stamps a mission id on the
-  // telemetry but not on the completion (or a different one) puts the two
-  // under different keys, `sess.has(k)` stops firing for the completion's
-  // key, and its totals are added ON TOP of the telemetry that already
-  // counted them. Measured cost of that skew: 4,000 tokens counted twice on
-  // the ordinary shape, and GAP C's 9,999 becoming 19,998.
-  //
-  // Checked, not assumed. BOTH live `telemetry.tokens` producers take
-  // `mission_id` from the same dispatch-scoped value that the terminal
-  // bookend takes it from — the container tailer's `self.mission_id`
-  // (`dispatch_internal.rs:8539`, used by `emit` and `emit_telemetry`
-  // alike), and the map-item emitter (`builtins.rs:2011`, which passes
-  // `None` for BOTH, so both land under the same empty mission).
-  // (#2902 step 1a) The single-shot producers (`dispatch_remote`,
-  // `dispatch_local_single_shot`, the `dispatch.single_shot` step) now emit
-  // `source: "tokens"` too, stamped with the same mission id as their own
-  // bookends; this sum skips them (`countsInLegacyTokenSums`) and keeps
-  // counting those runs from their `dispatch.complete`. And on the corpora:
-  // ZERO sessions where a telemetry mission id matches no completion
-  // mission id of the same session, in either the two-day corpus or the
-  // demo replay.
-  //
-  // No conformance test expresses it, because it is a cross-producer
-  // alignment and the subsystem tests exercise each producer alone — the
-  // class of contract the repo's own registry says unit tests structurally
-  // cannot catch. #1918's comment records that its producer inventory had
-  // to be widened twice, so a fourth emitter arriving without this property
-  // is the realistic failure. If one does, `darkmux doctor` and a
-  // double-counted `total` are where it will surface.
-  //
-  // Classification of a bookend's tokens is PER-COMPLETION (#2635), not
-  // per-key: each `dcTok` payload IS the `dispatch.complete` record that
-  // proves its own tier, so it needs no lookup. The `unknown` arm is a
-  // defensive floor only — a payload lacking `endpoint` satisfies the exact
-  // criterion `localKeys` used to add this same record's run key, so
-  // `!localKeys.has(k)` cannot fire today. It is kept for the same reason
-  // it always was: a floor against that invariant drifting.
+/**
+ * The DISPATCHES chip: how many dispatches ran, from the dispatch bookends.
+ * (#2902 step 2a) Behavior-identical to the run count #2659/#2709 settled
+ * (measured: zero differences at every prefix of both parity corpora and the
+ * demo replay); only the local/cloud labels it used to carry are gone.
+ *
+ * Keyed on `runKey`, `(session_id, mission_id)`: a deterministic session id
+ * recurs across unrelated runs (#2709). Per run key:
+ *
+ *   - every token-bearing `dispatch complete` is one run (#2659: a re-launch
+ *     under the same deterministic id closes with its own completion);
+ *   - a token-LESS completion is one more run unless a token-bearing
+ *     completion of the same LINEAGE already counted it. The lineage is
+ *     whether the bookend names an `endpoint` (two seats sharing a
+ *     task-scoped id, one on a named endpoint and one not, are two runs; a
+ *     local `dispatch.map` step's token-less summary beside its seat's
+ *     token-bearing completion is one, the MUST FIX 2 shape). This is a
+ *     dedup of bookends, not a classification of where anything ran;
+ *   - a key with no completion but with per-turn usage is one run in flight.
+ *     Which usage records open a run is the pre-2a set (turn and map-item
+ *     records with counts): a single-shot's record lands with its own
+ *     completion, and a compactor call is not a dispatch.
+ */
+function dispatchCount(data: FlowRecord[]): number {
+  // Per run key, a bit set over its completions (one pass, one key string
+  // per relevant record): which lineages it closed on, and which of those
+  // closed with a token-bearing completion.
+  const WITH_EP = 1, WITHOUT_EP = 2, TOK_WITH_EP = 4, TOK_WITHOUT_EP = 8;
+  const closed = new Map<string, number>();
+  const inFlight = new Set<string>();
+  const runKey = runKeyMemo();
   let runs = 0;
-  let cloudRuns = 0;
-  let unknownRuns = 0;
-  const runKeys = new Set<string>([...sess.keys(), ...dcTok.keys(), ...cloudTerminalKeys, ...localKeys]);
-  for (const k of runKeys) {
-    const bookends = dcTok.get(k) ?? [];
-    const countTokens = !sess.has(k);
-    let sawCloudBookend = false;
-    let sawLocalBookend = false;
-    for (const p of bookends) {
-      runs++;
-      if (p.endpoint) {
-        cloudRuns++;
-        sawCloudBookend = true;
-      } else if (localKeys.has(k)) {
-        sawLocalBookend = true;
-      } else {
-        // Unreachable floor (see above); deliberately does NOT set
-        // `sawLocalBookend`, so the EXTRA LOCAL RUN term below stays
-        // consistent with it if the invariant ever does drift.
-        unknownRuns++;
-      }
-      if (!countTokens) continue;
-      // `remote_tokens` is the review path's spelling for its own spend; the
-      // other three are null there. Last in the chain so it never overrides
-      // a record that reported the standard fields.
-      const tt = p.total_tokens || (p.prompt_tokens || 0) + (p.completion_tokens || 0) || p.remote_tokens || 0;
-      total += tt;
-      if (p.endpoint) cloud += tt;
-      else if (!localKeys.has(k)) unknown += tt;
-      // The gap this used to name — "a completion with no `endpoint` whose
-      // endpoint-bearing `dispatch.start` has scrolled outside the playhead
-      // window is credited local rather than unknown" — is narrow: a start
-      // that IS in the window registers its own run key into `cloudKeys`,
-      // and `cloudKeys` beats local on the token split. Only a start that
-      // has genuinely fallen out of the window leaves this completion
-      // looking local. Every current producer stamps `endpoint` on BOTH
-      // bookends of a hosted call (see `bookend_record` in builtins.rs), so
-      // no live data hits it today; pinned in savings.test.ts so a future
-      // producer that stops double-stamping makes the gap loud.
-      prompt += p.prompt_tokens || 0;
-      completion += p.completion_tokens || 0;
-      // One turn means the whole prompt is first-read, so this is exact
-      // here, not an approximation.
-      fresh += p.prompt_tokens || 0;
-      // A `remote_tokens`-only payload has no prompt/completion split to
-      // decompose, so without this its spend joins `total` while appearing
-      // in NO class chip.
-      if (isRemoteOnlyTokens(p)) uncls += tt;
+  for (const r of data) {
+    const p = r.payload as (UsagePayload & { endpoint?: unknown }) | undefined;
+    if (r.category === "telemetry" && r.source === "tokens") {
+      const u = p ?? {};
+      if (u.call_kind !== CALL_KIND.single_shot && u.call_kind !== CALL_KIND.compaction && u.token_source !== "absent") inFlight.add(runKey(r));
+      continue;
     }
-    // EXTRA HOSTED RUN. `cloudTerminalKeys`, never `cloudKeys` — a run is
-    // counted by its own TERMINAL, and a hosted START is not one. Reading
-    // starts here would count an in-flight hosted seat as a finished
-    // dispatch, and a `dispatch.error` is not a completion either.
-    if (cloudTerminalKeys.has(k) && !sawCloudBookend) {
+    if (!p || !r.session_id || !isDispatchComplete(r.action)) continue;
+    const k = runKey(r);
+    const ep = !!p.endpoint;
+    let bits = (closed.get(k) ?? 0) | (ep ? WITH_EP : WITHOUT_EP);
+    if (hasAnyTokenCounts(p)) {
       runs++;
-      cloudRuns++;
+      bits |= ep ? TOK_WITH_EP : TOK_WITHOUT_EP;
     }
-    // EXTRA LOCAL RUN. No `cloudRuns`/`unknownRuns` term: an endpoint-less
-    // terminal is positive local evidence, and local is the implicit
-    // remainder `runs - cloudRuns - unknownRuns`, never a residual that
-    // absorbs the unproven.
-    if (localKeys.has(k) && !sawLocalBookend) runs++;
-    if (bookends.length === 0 && !cloudTerminalKeys.has(k) && !localKeys.has(k)) {
-      runs++;
-      unknownRuns++;
-    }
+    closed.set(k, bits);
   }
-
-  // `local` is what is LEFT after both `cloud` and `unknown` are removed —
-  // never a residual that absorbs everything unproven.
-  return {
-    total,
-    local: total - cloud - unknown,
-    cloud,
-    unknown,
-    prompt,
-    completion,
-    fresh,
-    reread,
-    uncls,
-    runs,
-    cloudRuns,
-    unknownRuns,
-  };
+  for (const bits of closed.values()) {
+    if (bits & WITH_EP && !(bits & TOK_WITH_EP)) runs++;
+    if (bits & WITHOUT_EP && !(bits & TOK_WITHOUT_EP)) runs++;
+  }
+  for (const k of inFlight) if (!closed.has(k)) runs++;
+  return runs;
 }

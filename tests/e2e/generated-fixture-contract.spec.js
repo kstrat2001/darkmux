@@ -71,19 +71,15 @@ test('the generated graph fixture renders — the shape is the server\'s, not mi
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
-test('the generated graph carries every attribution state a spec needs', async () => {
-  // The exemplar is not a happy path. #1626 needs all three of cloud /
-  // local_ok / neither to exist, and #1481 needs a planned step that shows no
-  // tokens. If a future edit trims the exemplar to something tidier, the specs
-  // that depend on those states would silently stop exercising them — so the
-  // states are asserted here rather than assumed.
+test('the generated graph carries every step state a spec needs', async () => {
+  // The exemplar is not a happy path. #1481 needs a planned step that shows
+  // no tokens. If a future edit trims the exemplar to something tidier, the
+  // specs that depend on those states would silently stop exercising them —
+  // so the states are asserted here rather than assumed. (#2902 step 2a) The
+  // endpoint-presence `cloud` / `localOk` fields are gone from the wire.
   const steps = graphFixture.nodes.flatMap((n) => n.steps || []);
-  expect(steps.some((s) => s.cloud === true), 'a hosted step').toBe(true);
-  expect(steps.some((s) => s.localOk === true), 'a definitively-local step').toBe(true);
-  expect(
-    steps.some((s) => s.cloud === undefined && s.localOk === undefined && s.tokensFinal),
-    'a step with tokens and NO attribution evidence — the errored-hosted shape'
-  ).toBe(true);
+  expect(steps.some((s) => 'cloud' in s || 'localOk' in s), 'no endpoint-presence attribution on the wire').toBe(false);
+  expect(steps.some((s) => s.tokensFinal), 'a step with tokens').toBe(true);
   expect(
     steps.some((s) => s.status === 'planned' && s.tokensFinal === undefined),
     'a planned step with no tokens'

@@ -117,11 +117,10 @@ mod tests {
     /// different states.
     ///
     /// The step states are not decoration. A planned step must show no tokens
-    /// (#1481's phantom-token gate), a running one must show a live clock, and
-    /// the local/cloud/unknown attribution (#1626) needs all three of `cloud:
-    /// Some(true)`, `local_ok: Some(true)`, and neither — so an exemplar that
-    /// only carried a happy step would let a spec build a graph that cannot
-    /// exercise the thing it means to test.
+    /// (#1481's phantom-token gate) and a running one must show a live clock,
+    /// so an exemplar that only carried a happy step would let a spec build a
+    /// graph that cannot exercise the thing it means to test. (#2902 step 2a:
+    /// the `cloud`/`localOk` fields are gone from the wire.)
     #[test]
     fn mission_graph_wire_shape() {
         let graph = MissionGraph {
@@ -184,8 +183,6 @@ mod tests {
                             completed_ts: Some(1_785_404_600),
                             tokens_final: Some(5_000),
                             turns_final: Some(1),
-                            cloud: Some(true),
-                            local_ok: None,
                             model: Some("gpt-oss-120b".to_string()),
                         },
                         StepRow {
@@ -197,8 +194,6 @@ mod tests {
                             completed_ts: Some(1_785_404_610),
                             tokens_final: Some(3_000),
                             turns_final: Some(1),
-                            cloud: None,
-                            local_ok: Some(true),
                             model: Some("qwen3.6-35b-a3b".to_string()),
                         },
                         StepRow {
@@ -213,8 +208,6 @@ mod tests {
                             completed_ts: None,
                             tokens_final: Some(7_000),
                             turns_final: None,
-                            cloud: None,
-                            local_ok: None,
                             model: None,
                         },
                         StepRow {
@@ -227,8 +220,6 @@ mod tests {
                             completed_ts: None,
                             tokens_final: None,
                             turns_final: None,
-                            cloud: None,
-                            local_ok: None,
                             model: None,
                         },
                     ],

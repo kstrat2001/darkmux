@@ -4973,8 +4973,6 @@
             completed_ts: None,
             tokens_final: None,
             turns_final: None,
-            cloud: None,
-            local_ok: None,
             model: None,
         };
         let v = serde_json::to_value(&row).unwrap();
@@ -4983,7 +4981,10 @@
         // (#1432 item 4) Backfill fields are absent when None (lenient wire).
         assert!(v.get("tokensFinal").is_none());
         assert!(v.get("turnsFinal").is_none());
+        // (#2902 step 2a) The endpoint-presence `cloud`/`localOk` fields
+        // are gone from the wire entirely.
         assert!(v.get("cloud").is_none());
+        assert!(v.get("localOk").is_none());
         // (#1481) `model` is absent when None so a modelless step (procedural
         // / Tier 3) never renders an empty chip on the page.
         assert!(v.get("model").is_none());
@@ -5004,8 +5005,6 @@
             completed_ts: None,
             tokens_final: None,
             turns_final: None,
-            cloud: None,
-            local_ok: None,
             model: Some("darkmux:qwen/qwen3.6-27b".to_string()),
         };
         let v = serde_json::to_value(&row).unwrap();

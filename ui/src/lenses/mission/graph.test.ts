@@ -494,18 +494,17 @@ describe("applyRecordToMetrics", () => {
     m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "telemetry.tokens", category: "telemetry", source: "tokens", payload: { total_tokens: 120 } }), idx, "m1");
     m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch complete", payload: { total_tokens: 500, total_turns: 3 } }), idx, "m1");
     const d = stepDisplayMetrics(m["a-step"]);
-    expect(d.tokens).toBe(500); // finalized total wins over the running sum
+    // (#2902 step 2a) The usage records' plain sum IS the step's figure once
+    // any has been seen; the complete's total is only the legacy fallback.
+    expect(d.tokens).toBe(120);
     expect(d.turns).toBe(3);
-    expect(d.localOk).toBe(true); // clean terminal, no endpoint -> positive local evidence
   });
 
-  it("three-state attribution: an endpoint marks cloud; absence alone never implies local", () => {
+  it("(legacy) a step with no usage record reads its finalized total", () => {
     let m: MetricsMap = {};
-    m = applyRecordToMetrics(m, rec({ handle: "b-step", action: "dispatch start" }), idx, "m1");
-    m = applyRecordToMetrics(m, rec({ handle: "b-step", action: "dispatch.turn", payload: { endpoint: "https://x" } }), idx, "m1");
-    m = applyRecordToMetrics(m, rec({ handle: "b-step", action: "dispatch error", payload: { endpoint: "https://x" } }), idx, "m1");
-    expect(m["b-step"].cloud).toBe(true);
-    expect(m["b-step"].localOk).toBe(false); // errored, no clean terminal -> no local claim
+    m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch start" }), idx, "m1");
+    m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch complete", payload: { total_tokens: 500, total_turns: 3 } }), idx, "m1");
+    expect(stepDisplayMetrics(m["a-step"]).tokens).toBe(500);
   });
 
   it("returns the SAME map reference when a record changes nothing", () => {
@@ -555,8 +554,8 @@ describe("applyRecordToMetrics", () => {
 
 describe("seedMetricsFromGraph", () => {
   it("seeds finalized totals and takes the max against a live value already climbing", () => {
-    const g: MissionGraph = { ...baseGraph(), nodes: [PHASE, { ...TASK_A, steps: [{ ...TASK_A.steps![0], tokensFinal: 900, turnsFinal: 4, cloud: true }] }, TASK_B] };
-    let m: MetricsMap = { "a-step": { tokRun: 950, tokFinal: 0, turnRun: 0, turnFinal: 0, toolRun: 0, toolFinal: 0, cloud: false, localOk: false, startTs: 0, endTs: 0, lastTs: 0 } };
+    const g: MissionGraph = { ...baseGraph(), nodes: [PHASE, { ...TASK_A, steps: [{ ...TASK_A.steps![0], tokensFinal: 900, turnsFinal: 4 }] }, TASK_B] };
+    let m: MetricsMap = { "a-step": { tokRun: 950, tokFinal: 0, turnRun: 0, turnFinal: 0, toolRun: 0, toolFinal: 0, usageSeen: false, startTs: 0, endTs: 0, lastTs: 0 } };
     m = seedMetricsFromGraph(m, g);
     expect(m["a-step"].tokFinal).toBe(900);
     // the live running sum is untouched, but `stepDisplayMetrics` prefers
@@ -573,22 +572,16 @@ describe("seedMetricsFromGraph", () => {
 });
 
 describe("hasNoMetricsData", () => {
-  it("returns true for exactly one of the 64 falsy/truthy combinations — all six falsy", () => {
-    // Truthy samples match each field's type: nonzero numbers for the three
-    // counters and startedMs, true for the two booleans. Bit i selects the
-    // truthy sample for field i; the original expression
-    // `!tf && !nf && !cf && !cl && !lok && !st` is true only when every
-    // operand is falsy, i.e. bits === 0.
-    const TRUTHY = { tokensFinal: 123, turnsFinal: 7, toolsFinal: 3, cloud: true, localOk: true, startedMs: 1_700_000_000_000 };
-    const FALSY = { tokensFinal: 0, turnsFinal: 0, toolsFinal: 0, cloud: false, localOk: false, startedMs: 0 };
-    for (let bits = 0; bits < 64; bits++) {
+  it("returns true for exactly one of the 16 falsy/truthy combinations — all four falsy", () => {
+    // Bit i selects the truthy sample for field i; the expression
+    // `!tf && !nf && !cf && !st` is true only when every operand is falsy.
+    const TRUTHY = { tokensFinal: 123, turnsFinal: 7, toolsFinal: 3, startedMs: 1_700_000_000_000 };
+    for (let bits = 0; bits < 16; bits++) {
       const m = {
-        tokensFinal: bits & 1 ? TRUTHY.tokensFinal : FALSY.tokensFinal,
-        turnsFinal: bits & 2 ? TRUTHY.turnsFinal : FALSY.turnsFinal,
-        toolsFinal: bits & 4 ? TRUTHY.toolsFinal : FALSY.toolsFinal,
-        cloud: bits & 8 ? TRUTHY.cloud : FALSY.cloud,
-        localOk: bits & 16 ? TRUTHY.localOk : FALSY.localOk,
-        startedMs: bits & 32 ? TRUTHY.startedMs : FALSY.startedMs,
+        tokensFinal: bits & 1 ? TRUTHY.tokensFinal : 0,
+        turnsFinal: bits & 2 ? TRUTHY.turnsFinal : 0,
+        toolsFinal: bits & 4 ? TRUTHY.toolsFinal : 0,
+        startedMs: bits & 8 ? TRUTHY.startedMs : 0,
       };
       expect(hasNoMetricsData(m)).toBe(bits === 0);
     }
@@ -596,14 +589,14 @@ describe("hasNoMetricsData", () => {
 });
 
 describe("missionTotals", () => {
-  it("splits local / cloud / unknown, never folding unknown into local", () => {
+  it("sums every step's own figure (no local/cloud/unknown split)", () => {
     const m: MetricsMap = {
-      a: { tokRun: 0, tokFinal: 100, turnRun: 0, turnFinal: 1, toolRun: 0, toolFinal: 0, cloud: false, localOk: true, startTs: 0, endTs: 0, lastTs: 0 },
-      b: { tokRun: 0, tokFinal: 50, turnRun: 0, turnFinal: 1, toolRun: 0, toolFinal: 0, cloud: true, localOk: false, startTs: 0, endTs: 0, lastTs: 0 },
-      c: { tokRun: 0, tokFinal: 30, turnRun: 0, turnFinal: 1, toolRun: 0, toolFinal: 0, cloud: false, localOk: false, startTs: 0, endTs: 0, lastTs: 0 },
+      a: { tokRun: 0, tokFinal: 100, turnRun: 0, turnFinal: 1, toolRun: 0, toolFinal: 0, usageSeen: false, startTs: 0, endTs: 0, lastTs: 0 },
+      b: { tokRun: 0, tokFinal: 50, turnRun: 0, turnFinal: 1, toolRun: 0, toolFinal: 0, usageSeen: false, startTs: 0, endTs: 0, lastTs: 0 },
+      c: { tokRun: 0, tokFinal: 30, turnRun: 0, turnFinal: 1, toolRun: 0, toolFinal: 0, usageSeen: false, startTs: 0, endTs: 0, lastTs: 0 },
     };
     const tot = missionTotals(m);
-    expect(tot).toEqual({ local: 100, cloud: 50, unknown: 30, total: 180, turns: 3 });
+    expect(tot).toEqual({ total: 180, turns: 3 });
   });
 });
 
@@ -647,7 +640,7 @@ describe("formatting helpers", () => {
 // token counts with no idea which step took the hour.
 describe("stepMeterFor wall time (#2269)", () => {
   const T0 = 1_756_900_000_000;
-  const base = { tokRun: 0, tokFinal: 10, turnRun: 0, turnFinal: 1, toolRun: 0, toolFinal: 0, cloud: false, localOk: true };
+  const base = { tokRun: 0, tokFinal: 10, turnRun: 0, turnFinal: 1, toolRun: 0, toolFinal: 0, usageSeen: false };
   it("a completed step carries its wall time (end − start) and is not generating", () => {
     const step = { id: "s", label: "u-0001", kind: "dispatch.internal", status: "complete" };
     const m = { ...base, startTs: T0, endTs: T0 + 335_000, lastTs: T0 + 335_000 };
@@ -679,14 +672,14 @@ describe("stepMeterFor liveness", () => {
 
   it("shows a generating pulse while the last signal is within the liveness window", () => {
     const now = 10_000_000;
-    const m: MetricsMap = { "a-step": { tokRun: 0, tokFinal: 0, turnRun: 0, turnFinal: 0, toolRun: 0, toolFinal: 0, cloud: false, localOk: false, startTs: now - 5000, endTs: 0, lastTs: now - 1000 } };
+    const m: MetricsMap = { "a-step": { tokRun: 0, tokFinal: 0, turnRun: 0, turnFinal: 0, toolRun: 0, toolFinal: 0, usageSeen: false, startTs: now - 5000, endTs: 0, lastTs: now - 1000 } };
     expect(stepMeterFor(step, m, now).generating).toBe(true);
   });
 
   it("stops claiming 'generating' once the last signal is older than the liveness window (a hard-killed dispatch)", () => {
     const now = 10_000_000;
     const m: MetricsMap = {
-      "a-step": { tokRun: 0, tokFinal: 0, turnRun: 0, turnFinal: 0, toolRun: 0, toolFinal: 0, cloud: false, localOk: false, startTs: now - STEP_LIVENESS_WINDOW_MS - 5000, endTs: 0, lastTs: now - STEP_LIVENESS_WINDOW_MS - 1000 },
+      "a-step": { tokRun: 0, tokFinal: 0, turnRun: 0, turnFinal: 0, toolRun: 0, toolFinal: 0, usageSeen: false, startTs: now - STEP_LIVENESS_WINDOW_MS - 5000, endTs: 0, lastTs: now - STEP_LIVENESS_WINDOW_MS - 1000 },
     };
     expect(stepMeterFor(step, m, now).generating).toBe(false);
   });

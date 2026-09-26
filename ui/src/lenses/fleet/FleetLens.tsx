@@ -166,7 +166,7 @@ function SavingsHero({
   // an ADVANCE (a play tick, or a live poll) tweens in both modes now,
   // which is the parity fix (finding #5: a 30s advance tweened live and
   // jumped in playback for the identical figure).
-  const heroTotal = useCountUp(settled ? t.local + t.cloud + t.unknown : null, (n) => (n === null ? "" : fmtN(n)), undefined, {
+  const heroTotal = useCountUp(settled ? t.total : null, (n) => (n === null ? "" : fmtN(n)), undefined, {
     upOnly: true,
   });
 
@@ -227,10 +227,18 @@ function SavingsHero({
           <div className="savlbl">all tokens{liveMode ? ` · last ${hours}h` : ""}</div>
         </div>
         <div className="savclasses">
-          <Chip value={fmtC(t.completion)} loading={!settled} label="generated" cls="gen" />
-          <Chip value={fmtC(t.fresh)} loading={!settled} label="fresh input" />
-          <Chip value={fmtC(t.reread)} loading={!settled} label="re-read" />
-          {t.uncls ? <Chip value={fmtC(t.uncls)} loading={!settled} label="unclassified" cls="uncls" /> : null}
+          {/* (#2902 step 2a) Every chip is a sum of provider-reported
+              counts from the usage records (`tokensOffMeter`). CACHED is
+              absent when no record in the window reports `cached_tokens`
+              (a 0 there would be an assumption, not a measurement), and
+              UTILITY (darkmux's own compaction and radio routing) is
+              hidden at 0 (the chip UNCLASSIFIED used, dim). INPUT + GENERATED equal
+              ALL TOKENS whenever providers report total = prompt +
+              completion; no filler chip covers a provider total above it. */}
+          <Chip value={fmtC(t.input)} loading={!settled} label="input" />
+          {t.cached != null ? <Chip value={fmtC(t.cached)} loading={!settled} label="cached" /> : null}
+          <Chip value={fmtC(t.generated)} loading={!settled} label="generated" cls="gen" />
+          {t.utility ? <Chip value={fmtC(t.utility)} loading={!settled} label="utility" cls="util" /> : null}
           <Chip value={t.runs} loading={!settled} label={`dispatch${t.runs === 1 ? "" : "es"}`} />
         </div>
       </div>
