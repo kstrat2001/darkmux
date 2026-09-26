@@ -2078,6 +2078,26 @@ mod tests {
         }
     }
 
+    /// (#2916 re-review MUST 4) A peer's specs are sanitized before the
+    /// table prints them: no escape sequence, bidi override or zero-width
+    /// character survives in any field.
+    #[test]
+    fn fetch_machine_specs_sanitizes_every_peer_string() {
+        let addr = one_shot_http(
+            "200 OK",
+            "{\"os\":\"mac\\u001b]0;pwned\\u0007\",\"darkmux_version\":\"4\\u202e0\",\"loaded_models\":[{\"identifier\":\"m\\u001b[2J\\u200b\"}]}",
+        );
+        match fetch_machine_specs(&fleet::unverified_target_for_test(&format!("http://{addr}"))) {
+            SpecsProbe::Ok(v) => {
+                let text = v.to_string();
+                assert!(!text.contains("\\u001b") && !text.contains("\\u202e") && !text.contains("\\u200b"), "{text}");
+                assert_eq!(v["os"], "mac]0;pwned");
+                assert_eq!(v["loaded_models"][0]["identifier"], "m[2J");
+            }
+            _ => panic!("expected Ok"),
+        }
+    }
+
     #[test]
     fn fetch_machine_specs_bad_json_is_unavailable_not_route_missing() {
         // Inverted case: a generic failure (malformed body on a 200) must
