@@ -75,6 +75,25 @@ pub struct UtilityReply {
 /// `internal.utility` is the fix, and `darkmux doctor` says so.
 pub const UNDECLARED_UTILITY_WINDOW: u32 = 16_384;
 
+/// The window a host-side utility job loads the binding at, and the
+/// disclosure to print when it is the fallback: the binding's declared
+/// `n_ctx` (no disclosure), else [`UNDECLARED_UTILITY_WINDOW`] with a line
+/// naming the binding, the window, the job, and the fix. Pure, so the
+/// fallback and its wording are pinned by a test (#2914 review, C7).
+pub(crate) fn utility_load_window(binding_id: &str, declared_n_ctx: Option<u32>, role_id: &str) -> (u32, Option<String>) {
+    match declared_n_ctx {
+        Some(n) => (n, None),
+        None => (
+            UNDECLARED_UTILITY_WINDOW,
+            Some(format!(
+                "darkmux: utility model `{binding_id}` declares no `n_ctx` in `internal.utility`; \
+                 loading it at {UNDECLARED_UTILITY_WINDOW} for `{role_id}` as a fallback. Declare it once: \
+                 `\"internal\": {{ \"utility\": {{ \"id\": \"{binding_id}\", \"n_ctx\": N }} }}`. (#2914)"
+            )),
+        ),
+    }
+}
+
 /// Run one utility job on the machine's utility model, lean (see the
 /// module doc for what lean means and why).
 ///
@@ -128,20 +147,18 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
     let wire_model = match job.base_url_override {
         Some(_) => binding_id.clone(),
         None => {
-            let window = match declared_n_ctx {
-                Some(n) => n,
-                None => {
-                    eprintln!(
-                        "darkmux: utility model `{binding_id}` declares no `n_ctx` in `internal.utility`; \
-                         loading it at {UNDECLARED_UTILITY_WINDOW} for `{}` as a fallback. Declare it once: \
-                         `\"internal\": {{ \"utility\": {{ \"id\": \"{binding_id}\", \"n_ctx\": N }} }}`. (#2914)",
-                        job.role_id
-                    );
-                    UNDECLARED_UTILITY_WINDOW
-                }
+            let (window, disclosure) = utility_load_window(&binding_id, declared_n_ctx, job.role_id);
+            if let Some(line) = disclosure {
+                eprintln!("{line}");
+            }
+            let source = if declared_n_ctx.is_some() {
+                crate::dispatch_internal::WindowSource::UtilityBinding
+            } else {
+                crate::dispatch_internal::WindowSource::UtilityFallback
             };
-            crate::dispatch_internal::ensure_model_loaded_at_ctx(
+            crate::dispatch_internal::ensure_model_loaded_at_ctx_from(
                 &crate::dispatch_internal::utility_residency_pm(&binding_id, window),
+                source,
             )
             .with_context(|| format!("loading the utility model `{binding_id}` for `{}`", job.role_id))?;
             crate::dispatch_internal::compactor_wire_model_id(&binding_id)
@@ -180,4 +197,23 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
     let _ = darkmux_flow::record(crate::usage::utility_usage_record(job.role_id, &wire_model, payload));
 
     Ok(UtilityReply { content: reply.content })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (#2914 review, C7) The window a host-side utility job loads at: the
+    /// binding's declared `n_ctx`, silently; else `UNDECLARED_UTILITY_WINDOW`
+    /// with a disclosure naming the binding, the window, the job and the
+    /// fix (operator sovereignty, #44: a fallback is never silent).
+    #[test]
+    fn utility_load_window_declares_the_fallback() {
+        assert_eq!(utility_load_window("util-4b", Some(120_000), "radio-router"), (120_000, None));
+        let (window, disclosure) = utility_load_window("darkmux:util-4b", None, "radio-router");
+        assert_eq!(window, UNDECLARED_UTILITY_WINDOW);
+        let text = disclosure.expect("an undeclared window is disclosed");
+        assert!(text.contains("darkmux:util-4b") && text.contains("16384") && text.contains("radio-router"), "{text}");
+        assert!(text.contains("n_ctx") && text.contains("internal.utility"), "names the fix: {text}");
+    }
 }

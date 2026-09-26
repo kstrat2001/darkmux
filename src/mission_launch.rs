@@ -4603,13 +4603,16 @@ fn loaded_registry_for_staffing(
 /// here with the SAME predicate the selection paths use
 /// (`darkmux_crew::select::work_models`):
 ///
-/// - a task whose staffing resolves (task `profile_name` > `role_profiles`
-///   binding > `default_profile`) to a profile with no work model once the
-///   utility model is set aside, so the dispatch's own selection would
-///   refuse it anyway, minutes later and with the run half-minted;
-/// - a model-naming step (`dispatch.single_shot`/`dispatch.map`, which
+/// - a task whose staffing (the task's `role_id`/`profile_name`, else a
+///   `dispatch.internal` step's own `config.role_id`/`config.profile_name`)
+///   resolves (`profile_name` > `role_profiles` binding > `default_profile`)
+///   to a profile with no work model once the utility model is set aside,
+///   so the dispatch's own selection would refuse it anyway, minutes later
+///   and with the run half-minted;
+/// - a LOCAL model-naming step (`dispatch.single_shot`/`dispatch.map`, which
 ///   select nothing and put `config.model` on the wire as given) whose
-///   `config.model_key`/`config.model` names the utility model.
+///   `config.model_key`/`config.model` names the utility model; a hosted
+///   step (`config.endpoint`) names a deployment, never the local instance.
 ///
 /// A binding to a profile the registry lacks is NOT reported here (the
 /// scheduler raises that one, loudly, on its own); `Ok` when no utility
@@ -4626,8 +4629,23 @@ fn refuse_utility_staffed_tasks(
         return Ok(());
     };
     for task in tasks {
-        if let Some(role) = task.role_id.as_deref() {
-            let binding = match (task.profile_name.as_deref(), mapped(role)) {
+        // (C7) `dispatch.internal` resolves its role and profile from the
+        // task, else from the step's own `config.role_id`/`config.
+        // profile_name` (`task_or_config_str`); the gate reads the same two
+        // sources so a config-authored staffing is checked too.
+        let step_staffing = task.step_ids.iter().filter_map(|id| steps.get(id)).find_map(|step| {
+            (step.kind == "dispatch.internal")
+                .then(|| step.config.get("role_id").and_then(|v| v.as_str()).map(str::to_string))
+                .flatten()
+                .map(|role| (role, step.config.get("profile_name").and_then(|v| v.as_str()).map(str::to_string)))
+        });
+        let (role, profile_name) = match (task.role_id.as_deref(), step_staffing) {
+            (Some(role), _) => (Some(role.to_string()), task.profile_name.clone()),
+            (None, Some((role, profile))) => (Some(role), profile),
+            (None, None) => (None, None),
+        };
+        if let Some(role) = role.as_deref() {
+            let binding = match (profile_name.as_deref(), mapped(role)) {
                 (Some(p), _) => RoleBinding::Overridden(p.to_string()),
                 (None, Some(p)) => RoleBinding::Mapped(p),
                 (None, None) => RoleBinding::Unmapped,
@@ -4647,6 +4665,11 @@ fn refuse_utility_staffed_tasks(
         }
         for step_id in &task.step_ids {
             let Some(step) = steps.get(step_id) else { continue };
+            // (C2) A hosted step's `config.model` is the provider's own
+            // deployment name, never the local utility instance.
+            if step.config.get("endpoint").is_some() {
+                continue;
+            }
             let named = ["model_key", "model"]
                 .iter()
                 .filter_map(|k| step.config.get(k).and_then(|v| v.as_str()))
@@ -4815,6 +4838,33 @@ mod tests {
         .into();
         let err = refuse_utility_staffed_tasks(&named, &steps, &registry, &no_binding).unwrap_err().to_string();
         assert!(err.contains("s-named") && err.contains("util-4b"), "{err}");
+
+        // (C7) `dispatch.internal` resolves its role and profile from the
+        // step's own config when the task names none; the gate reads the
+        // same two keys.
+        let step_staffed = [staffed_task("t-step", None, None, &["s-step"])];
+        let steps: BTreeMap<String, Step> = [(
+            "s-step".to_string(),
+            configured_step("s-step", "t-step", "dispatch.internal", serde_json::json!({ "role_id": "coder", "profile_name": "radio", "message": "hi" })),
+        )]
+        .into();
+        let err = refuse_utility_staffed_tasks(&step_staffed, &steps, &registry, &no_binding).unwrap_err().to_string();
+        assert!(err.contains("t-step") && err.contains("radio"), "{err}");
+
+        // (C2) A hosted step naming a deployment that happens to share the
+        // utility id is not the local utility instance.
+        let hosted = [staffed_task("t-hosted", None, None, &["s-hosted"])];
+        let steps: BTreeMap<String, Step> = [(
+            "s-hosted".to_string(),
+            configured_step(
+                "s-hosted",
+                "t-hosted",
+                "dispatch.single_shot",
+                serde_json::json!({ "model": "util-4b", "endpoint": { "url": "https://provider.example/v1" }, "system": "s", "user": "u" }),
+            ),
+        )]
+        .into();
+        refuse_utility_staffed_tasks(&hosted, &steps, &registry, &no_binding).expect("a hosted deployment is never the utility instance");
 
         // No utility model registered: nothing to set aside, nothing refused.
         let mut unbound = utility_gate_registry();

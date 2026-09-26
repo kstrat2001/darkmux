@@ -170,3 +170,90 @@ fn a_utility_job_with_no_binding_is_a_loud_error_naming_the_fix() {
     assert!(msg.contains("internal.utility"), "names the fix: {msg}");
     assert!(all_flow_records(flows_dir.path()).is_empty(), "nothing recorded for a job that never ran");
 }
+
+/// (#2914 review, C7) The REAL arm: no base-URL override, so the binding is
+/// ensured resident through `lms` and the darkmux-NAMESPACED identifier goes
+/// on the wire (#2240), exactly as the compactor's own residency does. The
+/// mock server stands in as LMStudio (`DARKMUX_LMSTUDIO_URL`) and a fake
+/// `lms` (`DARKMUX_LMS_BIN`) reports the binding already resident at its
+/// window, so the preflight reuses it and never loads anything.
+#[test]
+#[serial_test::serial]
+fn the_residency_arm_puts_the_namespaced_binding_on_the_wire() {
+    let server = MockServer::start();
+    let mock = server.mock(|when, then| {
+        when.method(POST)
+            .path("/v1/chat/completions")
+            .json_body_partial(r#"{ "model": "darkmux:mock-util" }"#);
+        then.status(200).header("content-type", "application/json").json_body(serde_json::json!({
+            "id": "mock-2",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "mock-util",
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ok" }, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 },
+        }));
+    });
+
+    let registry_dir = tempfile::tempdir().unwrap();
+    let profiles_path = write_registry(registry_dir.path());
+    let flows_dir = tempfile::tempdir().unwrap();
+    // A fake `lms`: `ps --json` says the binding is resident under darkmux's
+    // own namespaced identifier at its declared window; anything else is a
+    // no-op. Reaching `load`/`unload` would mean the preflight did not
+    // recognize its own instance.
+    let bin_dir = tempfile::tempdir().unwrap();
+    let fake_lms = bin_dir.path().join("lms");
+    std::fs::write(
+        &fake_lms,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"ps\" ]; then\n\
+         echo '[{\"identifier\":\"darkmux:mock-util\",\"modelKey\":\"mock-util\",\"status\":\"loaded\",\"contextLength\":4096}]'\n\
+         exit 0\n\
+         fi\n\
+         echo \"unexpected lms call: $*\" >&2\n\
+         exit 1\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_lms, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let prev_url = std::env::var("DARKMUX_LMSTUDIO_URL").ok();
+    let prev_lms = std::env::var("DARKMUX_LMS_BIN").ok();
+    unsafe {
+        std::env::set_var("DARKMUX_LMSTUDIO_URL", server.base_url());
+        std::env::set_var("DARKMUX_LMS_BIN", &fake_lms);
+    }
+    let reply = with_isolated_flows(flows_dir.path(), || {
+        run_utility_single_shot(&UtilityJob {
+            role_id: darkmux_crew::loader::RADIO_ROUTER_ROLE_ID,
+            message: "anything",
+            timeout_seconds: 30,
+            max_tokens: 64,
+            config_path: Some(profiles_path.to_str().unwrap()),
+            base_url_override: None,
+        })
+    });
+    unsafe {
+        match prev_url {
+            Some(v) => std::env::set_var("DARKMUX_LMSTUDIO_URL", v),
+            None => std::env::remove_var("DARKMUX_LMSTUDIO_URL"),
+        }
+        match prev_lms {
+            Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+            None => std::env::remove_var("DARKMUX_LMS_BIN"),
+        }
+    }
+    let reply = reply.expect("the residency arm round-trips through the mock LMStudio");
+    assert_eq!(reply.content, "ok");
+    // The request carried `darkmux:mock-util`, or this never matched.
+    mock.assert();
+
+    let records = all_flow_records(flows_dir.path());
+    assert_eq!(records.len(), 1, "{records:#?}");
+    assert_eq!(records[0]["payload"]["requested_model"], "darkmux:mock-util", "the usage record names the wire id");
+    assert_eq!(records[0]["model"], "darkmux:mock-util");
+}

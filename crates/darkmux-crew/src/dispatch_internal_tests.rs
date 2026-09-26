@@ -12510,7 +12510,7 @@ fn bare_model_key_strips_only_the_namespace() {
 #[test]
 fn tag_lms_role_stamps_role_and_baseline_on_a_load() {
     let payload = serde_json::json!({"event": "load", "model": "primary-35b", "gb": 20});
-    let tagged = super::tag_lms_role(payload, "primary-35b", Some("compactor-4b"), true);
+    let tagged = super::tag_lms_role(payload, "primary-35b", &["compactor-4b".to_string()], true);
     assert_eq!(tagged["role"], "primary");
     assert_eq!(tagged["baseline"], true);
 }
@@ -12521,7 +12521,7 @@ fn tag_lms_role_stamps_role_and_baseline_on_a_load() {
 #[test]
 fn tag_lms_role_omits_baseline_when_not_the_seed() {
     let payload = serde_json::json!({"event": "load", "model": "compactor-4b", "gb": 2});
-    let tagged = super::tag_lms_role(payload, "primary-35b", Some("compactor-4b"), false);
+    let tagged = super::tag_lms_role(payload, "primary-35b", &["compactor-4b".to_string()], false);
     assert_eq!(tagged["role"], "utility");
     assert!(tagged.get("baseline").is_none(), "baseline must be ABSENT, not `false`: {tagged:?}");
 }
@@ -12532,7 +12532,7 @@ fn tag_lms_role_omits_baseline_when_not_the_seed() {
 #[test]
 fn tag_lms_role_tags_an_unload_by_the_same_rule_as_a_load() {
     let payload = serde_json::json!({"event": "unload", "model": "utility-4b"});
-    let tagged = super::tag_lms_role(payload, "primary-35b", Some("utility-4b"), false);
+    let tagged = super::tag_lms_role(payload, "primary-35b", &["utility-4b".to_string()], false);
     assert_eq!(tagged["role"], "utility");
 }
 
@@ -12552,12 +12552,12 @@ fn tag_lms_role_tags_an_unload_by_the_same_rule_as_a_load() {
 /// per snapshot in `ticks` and return every payload emitted, in order.
 fn drive_lms_tracker(
     primary: &str,
-    utility: Option<&str>,
+    utility: &[String],
     ticks: Vec<Vec<darkmux_types::LoadedModel>>,
 ) -> Vec<serde_json::Value> {
     use std::cell::RefCell;
     let emitted: RefCell<Vec<serde_json::Value>> = RefCell::new(Vec::new());
-    let mut tracker = super::LmsTelemetryTracker::new(primary.to_string(), utility.map(str::to_string));
+    let mut tracker = super::LmsTelemetryTracker::new(primary.to_string(), utility.to_vec());
     for snapshot in ticks {
         let snapshot = RefCell::new(Some(snapshot));
         tracker.tick(
@@ -12578,13 +12578,50 @@ fn loaded(model: &str, gb: &str) -> darkmux_types::LoadedModel {
     }
 }
 
+/// (#2914 review, C5) The residency load message says WHERE the window
+/// came from: a profile's `n_ctx` for a work model, the `internal.utility`
+/// binding for the utility model, or the named fallback when the binding
+/// declares none. "The profile's declared context" was wrong two ways for
+/// a utility load.
+#[test]
+fn residency_load_message_names_the_window_source() {
+    use super::WindowSource;
+    let profile = super::loading_message("worker-35b", 65_536, WindowSource::Profile);
+    assert!(profile.contains("profile") && profile.contains("65536"), "{profile}");
+    let binding = super::loading_message("util-4b", 120_000, WindowSource::UtilityBinding);
+    assert!(binding.contains("internal.utility") && !binding.contains("profile"), "{binding}");
+    let fallback = super::loading_message("util-4b", 16_384, WindowSource::UtilityFallback);
+    assert!(fallback.contains("fallback") && !fallback.contains("profile"), "{fallback}");
+}
+
+/// (#2914 review, C7) The utility SEAT is one model declared two ways at a
+/// dispatch: the compactor this dispatch bound (normally the binding's own
+/// wire id) and the binding itself. A caller that pinned a DIFFERENT
+/// compactor must not turn a mid-run load of the binding (a radio routing
+/// call landing during the dispatch) into a "resident", which the
+/// jit-model-swap detector would read as a swap. Both ids tag `utility`.
+#[test]
+fn lms_tracker_tags_both_a_pinned_compactor_and_the_binding_as_the_utility_seat() {
+    let emitted = drive_lms_tracker(
+        "darkmux:primary-35b",
+        &["darkmux:pinned-compactor".to_string(), "util-4b".to_string()],
+        vec![
+            vec![loaded("primary-35b", "20.00")],
+            vec![loaded("primary-35b", "20.00"), loaded("pinned-compactor", "2.00"), loaded("util-4b", "2.00")],
+        ],
+    );
+    let by_model = |m: &str| emitted.iter().find(|p| p["model"] == m).unwrap_or_else(|| panic!("no payload for {m}: {emitted:?}"));
+    assert_eq!(by_model("pinned-compactor")["role"], "utility");
+    assert_eq!(by_model("util-4b")["role"], "utility", "the binding's own load is the utility seat, never a resident");
+}
+
 /// The seed tick emits every already-resident model as a `load`, each tagged
 /// with its seat AND with `baseline: true` — the starting lineup.
 #[test]
 fn lms_tracker_seed_tick_tags_every_resident_as_a_baseline_load() {
     let emitted = drive_lms_tracker(
         "darkmux:primary-35b",
-        Some("compactor-4b"),
+        &["compactor-4b".to_string()],
         vec![vec![loaded("primary-35b", "20.00"), loaded("compactor-4b", "2.00")]],
     );
     assert_eq!(emitted.len(), 2, "one payload per resident model: {emitted:?}");
@@ -12605,7 +12642,7 @@ fn lms_tracker_seed_tick_tags_every_resident_as_a_baseline_load() {
 fn lms_tracker_later_loads_are_not_baseline() {
     let emitted = drive_lms_tracker(
         "primary-35b",
-        None,
+        &[],
         vec![
             vec![loaded("primary-35b", "20.00")],
             vec![loaded("primary-35b", "20.00"), loaded("other-specialist-14b", "14.00")],
@@ -12629,7 +12666,7 @@ fn lms_tracker_later_loads_are_not_baseline() {
 fn lms_tracker_tags_an_unload_with_its_seat() {
     let emitted = drive_lms_tracker(
         "primary-35b",
-        Some("compactor-4b"),
+        &["compactor-4b".to_string()],
         vec![
             vec![loaded("primary-35b", "20.00"), loaded("compactor-4b", "2.00")],
             vec![loaded("primary-35b", "20.00")],
@@ -12650,7 +12687,7 @@ fn lms_tracker_tags_an_unload_with_its_seat() {
 fn lms_tracker_skips_a_failed_probe_without_consuming_the_seed() {
     use std::cell::RefCell;
     let emitted: RefCell<Vec<serde_json::Value>> = RefCell::new(Vec::new());
-    let mut tracker = super::LmsTelemetryTracker::new("primary-35b".to_string(), None);
+    let mut tracker = super::LmsTelemetryTracker::new("primary-35b".to_string(), Vec::new());
     tracker.tick(&|| anyhow::bail!("lms ps timed out"), &|p| emitted.borrow_mut().push(p));
     assert!(emitted.borrow().is_empty(), "a failed probe emits nothing: {:?}", emitted.borrow());
     let snapshot = RefCell::new(Some(vec![loaded("primary-35b", "20.00")]));

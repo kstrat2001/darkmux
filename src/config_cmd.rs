@@ -325,8 +325,10 @@ fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
         bail!(
             "`role_profiles.radio-router` has no effect: radio routing runs on the machine's \
              utility model, declared once as `internal.utility` in ~/.darkmux/profiles.json, \
-             never on a profile. Set that binding instead (`darkmux doctor` shows it). The \
-             answering seat is still a profile binding: `role_profiles.radio-host`. (#2914)"
+             never on a profile. Set that binding instead (`darkmux doctor` shows it). A leftover \
+             `radio-router` entry is removed by hand, from the `role_profiles` block in \
+             ~/.darkmux/config.json (no `config` verb removes a binding). The answering seat is \
+             still a profile binding: `role_profiles.radio-host`. (#2914)"
         );
     }
     let Some(ty) = key_type(key) else {
@@ -840,6 +842,10 @@ mod tests {
         assert!(err.contains("unknown config key"), "{err}");
         let err = set_at(p, "role_profiles.radio-router", "radio").unwrap_err().to_string();
         assert!(err.contains("utility model") && err.contains("internal.utility"), "names the fix: {err}");
+        // (C6) A leftover binding is removed by hand: no `config unset`
+        // exists, and a blank value is refused like any other value.
+        let err = set_at(p, "role_profiles.radio-router", "").unwrap_err().to_string();
+        assert!(err.contains("~/.darkmux/config.json") && err.contains("by hand"), "says how to remove it: {err}");
         // The answering seat is still ordinary work, still a profile binding.
         set_at(p, "role_profiles.radio-host", "deep").unwrap();
         set_at(p, "radio.answerer_profile", "deep").unwrap();

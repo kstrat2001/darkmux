@@ -1287,7 +1287,7 @@ fn utility_binding_status(
                       dispatch on this machine (no runtime fallback since #2571)"
                 .into(),
             hint: Some(
-                "If you're deliberately running without compaction, no action needed. To enable it: register a small fast model as this machine's utility model in ~/.darkmux/profiles.json — `\"internal\": { \"utility\": { \"id\": \"<model-id>\", \"n_ctx\": <window> } }`. It serves compaction and radio routing for every role, decoupled from your profiles, and is never selectable for a task — without it, long dispatches run without compaction and `darkmux radio` cannot route. (#590, #2571, #2914)".into(),
+                "No action needed for compaction if you are deliberately running without it; radio and ACP routing NEED this binding (a message cannot be routed without a utility model). To set it: register a small fast model as this machine's utility model in ~/.darkmux/profiles.json — `\"internal\": { \"utility\": { \"id\": \"<model-id>\", \"n_ctx\": <window> } }`. It serves compaction and radio routing for every role, decoupled from your profiles, and is never selectable for a task. (#590, #2571, #2914)".into(),
             ),
         };
     };
@@ -1344,7 +1344,7 @@ fn utility_binding_status(
                     // What remains true is only that a hand-load moves the
                     // cost earlier. Say that and nothing more.
                     hint: Some(
-                        "No verb needs this loaded first — the binding's only job is to name the compactor, and every dispatch path self-loads it at its declared `n_ctx` under the `darkmux:` namespace (#1616). Loading it by hand just pays that cost now instead of during the first dispatch; if you do, keep the namespace and the context — `lms load <id> --context-length <n> --identifier darkmux:<id>` — since a bare `lms load` creates a resident darkmux won't reuse and `machine eject` can't reclaim. (#590, #1616, #1675)".into(),
+                        "No verb needs this loaded first — the binding names the model darkmux's own jobs run on (compaction, and radio/ACP routing since #2914), and every path that uses it self-loads it at the binding's `n_ctx` under the `darkmux:` namespace (#1616). Loading it by hand just pays that cost now instead of during the first dispatch or route; if you do, keep the namespace and the context — `lms load <id> --context-length <n> --identifier darkmux:<id>` — since a bare `lms load` creates a resident darkmux won't reuse and `machine eject` can't reclaim. (#590, #1616, #1675, #2914)".into(),
                     ),
                 }
             }
@@ -1400,10 +1400,12 @@ fn utility_in_profiles_status(registry: &darkmux_types::ProfileRegistry) -> Chec
         .profiles
         .iter()
         .filter_map(|(profile_name, profile)| {
+            // (C2) A hosted model sharing the id is served elsewhere, never
+            // the local utility instance: not a leftover.
             profile
                 .models
                 .iter()
-                .find(|m| bare(&m.id) == utility_key)
+                .find(|m| !m.is_remote() && bare(&m.id) == utility_key)
                 .map(|m| (profile_name.clone(), m.n_ctx))
         })
         .collect();
@@ -1481,8 +1483,13 @@ fn removed_radio_router_staffing_status(
         leftovers.push("config.json has `radio.router_profile` — removed in CONFIG 1.28; delete it".into());
     }
     if let Some(profile) = role_binding {
+        // (C6) No CLI removes a `role_profiles` binding (`config set`
+        // refuses a blank value like any other, and there is no `config
+        // unset`), so this is a hand edit, the way every other removed key's
+        // check says: name the file and the block.
         leftovers.push(format!(
-            "config.json binds `role_profiles.radio-router` to `{profile}` — the router has no profile; delete the entry"
+            "config.json binds `role_profiles.radio-router` to `{profile}` — the router has no profile; \
+             delete the `radio-router` entry from the `role_profiles` block in ~/.darkmux/config.json by hand"
         ));
     }
     if env_set {
@@ -13328,6 +13335,32 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "profiles": { "radio": { "models": [{ "id": "util-4b", "n_ctx": 16000 }] } } }))
                 .unwrap();
         assert_eq!(super::utility_in_profiles_status(&unbound).status, Status::Pass, "no binding, nothing to compare");
+    }
+
+    /// (#2914 review, C2) A hosted model sharing the utility id is not a
+    /// leftover: it is served elsewhere, never the local utility instance,
+    /// so the check does not name it.
+    #[test]
+    fn utility_in_profiles_ignores_a_hosted_model_sharing_the_id() {
+        let registry: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
+            "internal": { "utility": { "id": "util-4b", "n_ctx": 120000 } },
+            "profiles": {
+                "hosted": { "models": [{ "id": "util-4b", "endpoint": { "url": "https://provider.example/v1" } }] }
+            }
+        }))
+        .unwrap();
+        let c = super::utility_in_profiles_status(&registry);
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+    }
+
+    /// (#2914 review, C6) There is no CLI removal for a `role_profiles`
+    /// binding, so the leftover message says to edit config.json by hand
+    /// and names the path, the way every other removed key's check does.
+    #[test]
+    fn removed_radio_router_binding_says_to_edit_config_json_by_hand() {
+        let c = super::removed_radio_router_staffing_status(false, Some("radio"), false);
+        assert!(c.message.contains("~/.darkmux/config.json"), "names the file: {}", c.message);
+        assert!(c.message.contains("by hand"), "{}", c.message);
     }
 
     /// (#2914) The removed routing-seat staffing: `radio.router_profile`,

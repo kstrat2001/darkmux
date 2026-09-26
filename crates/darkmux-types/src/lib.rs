@@ -533,8 +533,11 @@ pub struct UtilityModel {
     /// payload is bounded by. `None` ⇒ undeclared (same as the bare form).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub n_ctx: Option<u32>,
-    /// Forward-compat overflow — unknown keys land here and re-serialize
-    /// flat (a newer registry read by an older binary).
+    /// Overflow for keys this binary does not know, re-serialized flat: a
+    /// registry written by a NEWER binary that added a field to this object
+    /// still reads here without losing the field. (It does not help the
+    /// other direction: a binary from before 2.0 cannot read the object at
+    /// all, see `PROFILES_SCHEMA_VERSION`.)
     #[serde(flatten)]
     pub extras: serde_json::Map<String, serde_json::Value>,
 }

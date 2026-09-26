@@ -133,8 +133,16 @@ pub fn work_models<'a>(profile: &'a Profile, utility_model: Option<&str>) -> Vec
     profile
         .models
         .iter()
-        .filter(|m| !utility_model.is_some_and(|u| names_utility_model(&m.id, u)))
+        .filter(|m| !is_local_utility_model(m, utility_model))
         .collect()
+}
+
+/// (#2914 review, C2) Whether a profile model IS the machine's local
+/// utility instance: a LOCAL model (no endpoint) whose bare id matches the
+/// binding. A hosted model that happens to share the id is served
+/// elsewhere and is never the utility instance, so it stays a work model.
+pub fn is_local_utility_model(model: &ProfileModel, utility_model: Option<&str>) -> bool {
+    !model.is_remote() && utility_model.is_some_and(|u| names_utility_model(&model.id, u))
 }
 
 /// (#2914) Whether `candidate` names the machine's utility model, in either
@@ -431,6 +439,20 @@ mod tests {
     fn select_allows_the_utility_model_when_no_exclusion_is_supplied() {
         let profile = profile_with_primary("util-4b");
         assert_eq!(select_model(&make_role("coder", &[]), &profile, no_skills, None).unwrap(), "util-4b");
+    }
+
+    /// (#2914 review, C2) A HOSTED profile model whose bare id happens to
+    /// match the utility id is never the local utility instance: it stays a
+    /// work model, is selectable, and is not set aside.
+    #[test]
+    fn a_hosted_model_sharing_the_utility_id_is_still_a_work_model() {
+        let hosted = ProfileModel {
+            endpoint: Some(darkmux_types::ModelEndpoint { url: Some("https://provider.example/v1".into()), ..Default::default() }),
+            ..model_with("util-4b", &[])
+        };
+        let profile = Profile { models: vec![hosted], ..Default::default() };
+        assert_eq!(work_models(&profile, Some("util-4b")).len(), 1, "a hosted model is never the local utility instance");
+        assert_eq!(select_model(&make_role("coder", &[]), &profile, no_skills, Some("util-4b")).unwrap(), "util-4b");
     }
 
     /// (#2914) The pure predicate the mission launcher refuses on: a profile

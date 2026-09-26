@@ -229,15 +229,14 @@ const SOURCE_TEXT_RECORD_CAP: usize = 512;
 /// The record carries the source text (capped, see
 /// [`SOURCE_TEXT_RECORD_CAP`]), the chosen command id + args on a
 /// [`RouteDecision::Route`], or the refusal reason on a
-/// [`RouteDecision::Refuse`] — emitted AFTER the decision is known (a
-/// single record per invocation, not a start/complete bookend pair: the
-/// underlying model call already gets its own `dispatch.start`/
-/// `dispatch.complete` bookends via [`dispatch_router_call`]'s
-/// `dispatch_routed_via` call, so this is a HIGHER-LEVEL record about the
-/// routing OUTCOME, not a second liveness pair for the same call — the
-/// same "outer record wraps an inner dispatch's own bookends" shape
-/// `mission_propose.rs`'s `mission.compile.start`/`.complete` uses around
-/// its own `dispatch_routed` call).
+/// [`RouteDecision::Refuse`] — emitted AFTER the decision is known, a
+/// single record per invocation, not a start/complete pair. (#2914) The
+/// underlying model call is a UTILITY job on the lean path
+/// ([`dispatch_router_call`] -> `crate::crew::utility::run_utility_single_shot`):
+/// it leaves its `telemetry.tokens` usage record and NO dispatch bookends,
+/// so this record is the only routing-level record there is — a record
+/// about the routing OUTCOME, never a liveness pair (the amended contract
+/// 2: bookends are for work executions).
 pub fn route_and_record(
     text: &str,
     catalog: &[CatalogEntry],

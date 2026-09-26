@@ -5665,11 +5665,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 // integration test this crate does not have — and the mock-model
                 // harness cannot supply one, since the enclosing
                 // `model_base_url_override.is_none()` gate skips this block.
+                // (#2914 review, C5) The compactor's window is the binding's
+                // (or the named fallback); the load message says which.
+                let source = if used_fallback { WindowSource::UtilityFallback } else { WindowSource::UtilityBinding };
                 if let Some(warning) = apply_compactor_residency(
                     &mut compaction,
                     &compactor_id,
                     window,
-                    ensure_model_loaded_at_ctx,
+                    |pm| ensure_model_loaded_at_ctx_from(pm, source),
                 ) {
                     eprintln!("{warning}");
                 }
@@ -8286,11 +8289,19 @@ fn tier5_eject_on_critical(host_out: &Path, trip_wall: SystemTime, emit: &dyn Fn
 fn tag_lms_role(
     mut payload: serde_json::Value,
     primary: &str,
-    utility: Option<&str>,
+    utility: &[String],
     baseline: bool,
 ) -> serde_json::Value {
     if let Some(model_id) = payload.get("model").and_then(|v| v.as_str()) {
-        let role = crate::telemetry_sampler::role_for_load(model_id, primary, utility);
+        // (#2914 review, C7) The utility SEAT can be declared under two ids
+        // at one dispatch (a pinned compactor and the binding itself); a
+        // load matching either is the seat. First non-resident answer wins;
+        // `role_for_load`'s primary-first order holds for each.
+        let role = utility
+            .iter()
+            .map(|u| crate::telemetry_sampler::role_for_load(model_id, primary, Some(u)))
+            .find(|r| *r != "resident")
+            .unwrap_or_else(|| crate::telemetry_sampler::role_for_load(model_id, primary, None));
         payload["role"] = serde_json::json!(role);
     }
     if baseline {
@@ -8326,9 +8337,11 @@ struct LmsTelemetryTracker {
     /// This dispatch's own wire model id (namespaced since #2240 —
     /// `role_for_load` normalizes, so it is stored as given).
     primary: String,
-    /// (#2914) The machine's one utility model: the compactor's wire id when
-    /// this dispatch bound one, else the binding itself.
-    utility: Option<String>,
+    /// (#2914) The machine's one utility SEAT, under every id this dispatch
+    /// declared for it: the compactor's wire id when one is bound, and the
+    /// binding itself (the same model in either spelling, normally; a
+    /// pinned compactor that differs still shares the seat, #2914 review C7).
+    utility: Vec<String>,
     /// The previous SUCCESSFUL `list_loaded` snapshot. A failed probe leaves
     /// this intact so a transient `lms` hiccup can't emit a flurry of
     /// spurious unloads.
@@ -8339,7 +8352,7 @@ struct LmsTelemetryTracker {
 }
 
 impl LmsTelemetryTracker {
-    fn new(primary: String, utility: Option<String>) -> Self {
+    fn new(primary: String, utility: Vec<String>) -> Self {
         Self { primary, utility, prev: Vec::new(), seeded: false }
     }
 
@@ -8366,7 +8379,7 @@ impl LmsTelemetryTracker {
             crate::telemetry_sampler::lms_diff(prev, &cur)
         };
         for payload in payloads {
-            emit(tag_lms_role(payload, &self.primary, self.utility.as_deref(), baseline));
+            emit(tag_lms_role(payload, &self.primary, &self.utility, baseline));
         }
         self.prev = cur;
         self.seeded = true;
@@ -8633,9 +8646,13 @@ fn run_telemetry_sampler(
     // (#1934, review round 2) `prev`/`seeded` and the role/baseline tagging
     // all moved into `LmsTelemetryTracker` — see its doc for why the state
     // machine lives behind an injected-effect seam instead of inline here.
-    // (#2914) One utility seat: the compactor IS the utility model, so its
-    // resolved wire id names the seat when bound, the binding otherwise.
-    let mut lms_tracker = LmsTelemetryTracker::new(model.clone(), compactor_model.clone().or_else(|| utility_model.clone()));
+    // (#2914) One utility seat, under every id this dispatch declared for
+    // it: the compactor's resolved wire id and the binding (normally the same
+    // model; a pinned compactor that differs still shares the seat).
+    let mut lms_tracker = LmsTelemetryTracker::new(
+        model.clone(),
+        [compactor_model.clone(), utility_model.clone()].into_iter().flatten().collect(),
+    );
     // (N1 of the #2110/#2109 review) The REAL wall-clock gap since the
     // last thermal sample — NOT a hardcoded per-tick constant. A tick can
     // block far longer than TELEMETRY_SAMPLE_INTERVAL_MS (the
@@ -12273,9 +12290,47 @@ pub(crate) fn identifier_already_resident(detail: &str) -> bool {
 }
 
 pub(crate) fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
+    ensure_model_loaded_at_ctx_from(pm, WindowSource::Profile)
+}
+
+/// (#2914 review, C5) Where the `n_ctx` a residency load is asked for came
+/// from, so the load message can say so: a work model's window is its
+/// profile entry's; the utility model's is the `internal.utility` binding,
+/// or the named fallback when the binding declares none. Wording only; the
+/// load itself is identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowSource {
+    Profile,
+    UtilityBinding,
+    UtilityFallback,
+}
+
+impl WindowSource {
+    fn describe(self) -> &'static str {
+        match self {
+            WindowSource::Profile => "the profile's declared context",
+            WindowSource::UtilityBinding => "the `internal.utility` binding's declared context",
+            WindowSource::UtilityFallback => "the fallback window, since `internal.utility` declares none",
+        }
+    }
+}
+
+/// The one line printed before a fresh residency load. Pure, so the wording
+/// per [`WindowSource`] is pinned by a test.
+pub(crate) fn loading_message(model_key: &str, n_ctx: u32, source: WindowSource) -> String {
+    format!(
+        "darkmux dispatch: loading `{model_key}` at n_ctx={n_ctx} ({}) before dispatch. (#1135)",
+        source.describe()
+    )
+}
+
+/// [`ensure_model_loaded_at_ctx`] with the window's source named in the
+/// load messages (#2914 review, C5).
+pub(crate) fn ensure_model_loaded_at_ctx_from(pm: &darkmux_types::ProfileModel, source: WindowSource) -> Result<()> {
     use darkmux_profiles::lms;
-    ensure_model_resident(
+    ensure_model_resident_from(
         pm,
+        source,
         &|| lms::list_loaded().unwrap_or_default(),
         &|identifier| lms::unload(identifier),
         &|model_key, identifier, n_ctx| load_at_ctx_bounded(model_key, identifier, n_ctx),
@@ -12284,8 +12339,21 @@ pub(crate) fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Re
 
 /// (#1135/#2318) The residency preflight, pure over its host effects so the
 /// concurrency + recovery contracts are unit-testable without LMStudio.
+/// (#2914 review, C5) Test-facing shorthand for [`ensure_model_resident_from`]
+/// with the profile as the window's source; production callers name theirs.
+#[cfg(test)]
 fn ensure_model_resident(
     pm: &darkmux_types::ProfileModel,
+    list: &dyn Fn() -> Vec<darkmux_types::LoadedModel>,
+    unload: &dyn Fn(&str) -> Result<()>,
+    load: &dyn Fn(&str, &str, u32) -> Result<()>,
+) -> Result<()> {
+    ensure_model_resident_from(pm, WindowSource::Profile, list, unload, load)
+}
+
+fn ensure_model_resident_from(
+    pm: &darkmux_types::ProfileModel,
+    source: WindowSource,
     list: &dyn Fn() -> Vec<darkmux_types::LoadedModel>,
     unload: &dyn Fn(&str) -> Result<()>,
     load: &dyn Fn(&str, &str, u32) -> Result<()>,
@@ -12347,10 +12415,13 @@ fn ensure_model_resident(
         Some(m) if m.context >= u64::from(n_ctx) => return Ok(()),
         Some(m) => {
             eprintln!(
-                "darkmux dispatch: `{}` is resident at context {} but the profile \
-                 declares n_ctx={}; reloading at {} so the dispatch gets the declared \
-                 context. (#1135)",
-                model_key, m.context, n_ctx, n_ctx
+                "darkmux dispatch: `{}` is resident at context {} but n_ctx={} is wanted \
+                 ({}); reloading at {} so the dispatch gets that context. (#1135)",
+                model_key,
+                m.context,
+                n_ctx,
+                source.describe(),
+                n_ctx
             );
             unload(&m.identifier).with_context(|| {
                 format!("unloading `{}` to reload at n_ctx={}", m.identifier, n_ctx)
@@ -12371,11 +12442,7 @@ fn ensure_model_resident(
                     model_key, foreign.identifier, n_ctx, foreign.identifier
                 );
             } else {
-                eprintln!(
-                    "darkmux dispatch: loading `{}` at n_ctx={} (the profile's declared \
-                     context) before dispatch. (#1135)",
-                    model_key, n_ctx
-                );
+                eprintln!("{}", loading_message(model_key, n_ctx, source));
             }
         }
     }

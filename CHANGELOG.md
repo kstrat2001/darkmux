@@ -27,7 +27,10 @@ darkmux release.
   `radio-router` entry from `role_profiles`, and the env var from your
   shell); a profile that existed only for the router (a 16K `radio`
   profile, typically) can be deleted. `radio.answerer_profile` and
-  `role_profiles.radio-host` stay: answering the user is work.
+  `role_profiles.radio-host` stay: answering the user is work. Radio and
+  ACP routing now REQUIRE `internal.utility`: with no utility model
+  registered, a message cannot be routed (the router returns a refusal
+  naming the fix), where before it fell through to `default_profile`.
 - **The compactor's window is no longer read from a profile's `models[]`**
   (#2914). It comes from `internal.utility` alone (below). A profile entry
   for the utility model is inert: `darkmux doctor` names each such profile
