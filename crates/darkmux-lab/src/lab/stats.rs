@@ -1,9 +1,9 @@
 //! (#2855) Derived run metrics — computed once, in the lab, with the
 //! reconciliation checks that say whether each number may be quoted.
 //!
-//! A run's artifacts already carry everything: `metrics.json` has the raw
-//! counters, `trajectory.jsonl` has per-turn events, and the flow stream has
-//! host telemetry. What did not exist was the DERIVATION. Every analysis
+//! A run's artifacts already carry everything: `trajectory.jsonl` has every
+//! event (read through the one fold, `darkmux_trajectory::TrajectoryFold`),
+//! and the flow stream has host telemetry. What did not exist was the DERIVATION. Every analysis
 //! wrote its own, outside the lab, and every one of them got some of it
 //! wrong — not by arithmetic slips, but because the naive reading of these
 //! artifacts is wrong in ways nothing in the data warns you about.
@@ -56,55 +56,15 @@
 //! is the argument for deriving on demand rather than freezing a computed
 //! number into the artifact at run time.
 
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use anyhow::Result;
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Data-shape semver for [`RunStats`], per the repo's additive-minor rule.
-pub const RUN_STATS_SCHEMA_VERSION: &str = "1.1.0";
+pub const RUN_STATS_SCHEMA_VERSION: &str = "2.0.0";
 
-/// How far AFTER the run's OWN identity — `lifecycle.json`'s `started_at_ms`
-/// when present, else the epoch embedded in the run id itself
-/// (`<workload>-<profile>-<epoch_secs>-<n>`, see `lab::run::run_id`) —
-/// `metrics.json`'s own `started_at_unix_ms` may land before the file is
-/// read as describing a DIFFERENT run entirely, not a late write of this
-/// one. Deliberately a separate constant from [`WINDOW_SLACK_MS`], which
-/// bounds file SELECTION for telemetry — a different question from file
-/// IDENTITY.
-///
-/// **One-sided on purpose (review, 2026-09-23).** The runtime mints the run
-/// id, THEN stamps `started_at_unix_ms` once its own clock reads "now" —
-/// container spin-up and model-load variance can push that stamp well AFTER
-/// the id's epoch (measured legitimate spread on disk: about -1.2s to
-/// +22.8s), so generous slack on the AFTER side is real jitter, not
-/// staleness. A stamp BEFORE the id's epoch has no such story — a run
-/// cannot have started generating before it was minted — so that side uses
-/// the much tighter [`EARLY_CLOCK_TOLERANCE_MS`] instead. A symmetric
-/// `abs_diff` bound here previously let a `metrics.json` starting 90s
-/// BEFORE its own run's id pass as identity
-/// (`medium-coding-deep-1779688920-1`, a byte-identical copy of
-/// `…-1779688829-1`'s metrics), because 90s sits comfortably inside a
-/// symmetric 10-minute window in either direction.
-pub const STALE_METRICS_SLACK_MS: u64 = 10 * 60 * 1000;
-
-/// How far BEFORE the run's own identity `metrics.json`'s claimed start may
-/// land and still be read as clock jitter rather than a different run's
-/// file. See [`STALE_METRICS_SLACK_MS`]'s doc for why this side is so much
-/// tighter: the measured legitimate range never went more than about 1.2s
-/// early.
-pub const EARLY_CLOCK_TOLERANCE_MS: u64 = 5_000;
-
-/// Uniqueness ratio below which a slice is degenerate.
-///
-/// **Mirrors `runtime/src/reasoning_loop.rs`'s `DEGENERATE_TAIL_RATIO`**, and
-/// cannot import it — the runtime crate is not a workspace member. A copied
-/// constant drifts silently, so it is never trusted on its own: the
-/// [`RunChecks::verdict_matches_ratio`] check re-derives the degenerate set
-/// from this threshold and compares it against the runtime's OWN recorded
-/// judgment. False means this constant no longer matches the build that
-/// produced the run, and the derived set is the one to distrust.
-pub const DEGENERATE_TAIL_RATIO: f64 = 0.25;
+use darkmux_trajectory::DEGENERATE_TAIL_RATIO;
 
 /// GPU utilization at or above which a telemetry sample counts as BUSY.
 ///
@@ -126,15 +86,6 @@ pub const TAIL_RATIO_DISPLAY_DP: usize = 6;
 /// the two counters is measuring something other than what its name says, and
 /// the turn is listed rather than silently averaged in.
 pub const PLAUSIBLE_CHARS_PER_TOKEN: (f64, f64) = (2.0, 8.0);
-
-/// Event names a run that produced any turns must carry. Their absence means
-/// this module is reading a stream that does not use its vocabulary — a typo
-/// here, not a quiet zero in the data.
-const REQUIRED_EVENTS: [&str; 3] = [
-    "model.streaming.start",
-    "model.streaming.end",
-    "model.completed",
-];
 
 fn round(v: f64, dp: i32) -> f64 {
     let f = 10f64.powi(dp);
@@ -215,19 +166,6 @@ pub struct SuspectTurn {
 /// renderer prints next to the figures.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RunChecks {
-    /// Per-turn tokens sum to the run total. This is what caught the 15x
-    /// undercount; it fails the moment frames are assigned instead of summed.
-    pub tokens_reconcile: Option<bool>,
-    pub metrics_totals_zeroed: bool,
-    /// `metrics.json`'s own clock is outside this run's own window (by
-    /// identity — [`STALE_METRICS_SLACK_MS`] — not by content), or the
-    /// trajectory shows more generation time than `metrics.json` claims as
-    /// wall time. Either way this `metrics.json` belongs to a different run.
-    /// Wall, rest, active time and anything built from them (energy, cost
-    /// per success) must not be quoted.
-    pub metrics_stale: bool,
-    pub rest_matches_trajectory: Option<bool>,
-    pub turns_match_trajectory: Option<bool>,
     pub telemetry_covers_run: bool,
     /// The policy the checkpoint records say RAN agrees with the one
     /// `dispatch start.bounds` says the host RESOLVED. They can differ: the
@@ -241,18 +179,10 @@ pub struct RunChecks {
     /// no power arm for this run, not that it drew no power.
     pub have_telemetry_samples: bool,
     pub have_flow_records: bool,
-    /// Event names keyed on here that the trajectory never uses. Non-empty
-    /// means this module is reading a vocabulary the producer does not speak.
-    pub missing_required_events: Vec<String>,
-    pub checkpoint_events_seen: bool,
-    /// False = checkpoint records are demonstrably in the trajectory and the
-    /// parse counted none. The contradiction gets its own boolean rather
-    /// than being left for a reader to spot across two fields; a mutation
-    /// that repoints the parse at a wrong name flips exactly this.
-    pub checkpoint_parse_consistent: bool,
     /// The runtime's own `would_conclude` verdicts and the threshold
-    /// comparison name the same turns. False = [`DEGENERATE_TAIL_RATIO`] here
-    /// does not match the build that produced the run.
+    /// comparison name the same turns. False = the run was recorded by a
+    /// runtime build judging with a different threshold than this build's
+    /// [`DEGENERATE_TAIL_RATIO`].
     pub verdict_matches_ratio: bool,
     /// Every stream returned a usage frame. False = `tok_per_s` is a rate
     /// over the BILLED subset only, and must be quoted with
@@ -297,11 +227,13 @@ pub struct RunStats {
     pub ok: Option<bool>,
 
     // --- time -------------------------------------------------------------
-    /// `metrics.json`'s own start, kept so a SET can detect two runs whose
-    /// windows overlap (host telemetry is matched by time window only, and
-    /// cannot be apportioned between them). Absent for a run whose
-    /// `metrics.json` never recorded one.
+    /// The clock of the run's first event (`dispatch.start`), kept so a SET
+    /// can detect two runs whose windows overlap (host telemetry is matched
+    /// by time window only, and cannot be apportioned between them). Absent
+    /// for a run whose trajectory has no start.
     pub started_at_unix_ms: Option<u64>,
+    /// The runtime's own wall clock (`dispatch.complete`); for a run killed
+    /// before that, the span its events cover.
     pub wall_ms: u64,
     pub rest_ms: u64,
     /// `wall_ms - rest_ms`. The cross-engine time figure; wall carries a
@@ -405,36 +337,8 @@ impl RunStats {
     pub fn unreconciled(&self) -> Vec<&'static str> {
         let c = &self.checks;
         let mut out = Vec::new();
-        if c.metrics_totals_zeroed {
-            out.push(
-                "metrics.json totals were zeroed by the runtime's error path; turns and rest \
-                 come from the trajectory, and tokens cannot be reconciled",
-            );
-        }
-        if c.metrics_stale {
-            out.push(
-                "metrics.json does not belong to this run (its clock is outside the run's own \
-                 window, or it claims less wall time than was spent generating); wall, rest, \
-                 active time and anything built from them must not be quoted",
-            );
-        }
-        if c.tokens_reconcile == Some(false) {
-            out.push("per-turn tokens do not sum to the run total");
-        }
-        if c.turns_match_trajectory == Some(false) {
-            out.push("metrics.json turns and the trajectory's turns disagree");
-        }
-        if c.rest_matches_trajectory == Some(false) {
-            out.push("metrics.json rest and the trajectory's rests disagree");
-        }
         if !c.rest_within_wall {
             out.push("rest exceeds wall");
-        }
-        if !c.missing_required_events.is_empty() {
-            out.push("the trajectory is missing events this reading keys on");
-        }
-        if !c.checkpoint_parse_consistent {
-            out.push("checkpoint records present but none were parsed");
         }
         if !c.verdict_matches_ratio {
             out.push("the recorded verdicts and the tail-ratio threshold disagree");
@@ -473,60 +377,6 @@ impl RunStats {
 // Parsed inputs
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default, Deserialize)]
-pub(crate) struct RuntimeMetrics {
-    model: Option<String>,
-    result: Option<String>,
-    started_at_unix_ms: Option<u64>,
-    wall_ms: Option<u64>,
-    rest_ms: Option<u64>,
-    turns: Option<u64>,
-    compactions: Option<u64>,
-    total_completion_tokens: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct Span {
-    seq: Option<u64>,
-    t0: Option<u64>,
-    t1: Option<u64>,
-    /// Content chars this stream produced. `model.partial.cumulative_chars`
-    /// restarts with every stream, so a retried turn's content is the SUM
-    /// over its streams, never the per-turn maximum.
-    content: u64,
-}
-
-impl Span {
-    fn ms(&self) -> u64 {
-        match (self.t0, self.t1) {
-            (Some(a), Some(b)) if b >= a => b - a,
-            _ => 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct Turn {
-    completion_tokens: u64,
-    reasoning_tokens: u64,
-    reasoning_chars: u64,
-    content_chars: u64,
-}
-
-#[derive(Debug, Clone, Default)]
-struct Checkpoint {
-    tail_ratio: Option<f64>,
-    concluded: bool,
-    would_conclude: bool,
-}
-
-#[derive(Debug, Clone, Default)]
-struct Rest {
-    ms: u64,
-    reason: String,
-    state: String,
-}
-
 /// The `thermal-duty-cycle` reason string the governor stamps on the rests
 /// its own tier-3 escalation drives (`thermal_governor.rs`). Rests with any
 /// other reason (a pace-file pause, etc.) don't carry ratchet evidence and
@@ -539,33 +389,13 @@ const THERMAL_DUTY_CYCLE_REASON: &str = "thermal-duty-cycle";
 /// it out — the ratchet only ever multiplies the delay, so a decrease can
 /// only mean two different, unrelated delay settings landed in the same
 /// run, not an escalation.
-fn thermal_delay_escalated(rests: &[Rest]) -> bool {
-    let thermal: Vec<u64> =
-        rests.iter().filter(|r| r.reason == THERMAL_DUTY_CYCLE_REASON).map(|r| r.ms).collect();
+fn thermal_delay_escalated(rests: &[darkmux_trajectory::RestTaken]) -> bool {
+    let thermal: Vec<u64> = rests
+        .iter()
+        .filter(|r| matches!(&r.reason, darkmux_trajectory::RestReason::Paced(p) if p == THERMAL_DUTY_CYCLE_REASON))
+        .map(|r| r.ms)
+        .collect();
     thermal.windows(2).all(|w| w[1] >= w[0]) && thermal.windows(2).any(|w| w[1] > w[0])
-}
-
-/// Everything one pass over `trajectory.jsonl` yields.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct Trajectory {
-    spans: Vec<Span>,
-    /// One entry per `model.completed`, IN ORDER. `None` is an unbilled
-    /// stream (the gate ended the call before the endpoint's final usage
-    /// frame), not a zero.
-    frames: Vec<Option<u64>>,
-    turns: BTreeMap<u64, Turn>,
-    stream_observations: usize,
-    stream_degenerate: BTreeSet<u64>,
-    stream_aborts: BTreeSet<u64>,
-    /// Abort RECORDS, not aborted turns: a retry can be aborted too, and the
-    /// seq set above collapses the two.
-    stream_abort_events: usize,
-    stream_min_ratio: Option<f64>,
-    checkpoints: BTreeMap<u64, Vec<Checkpoint>>,
-    policy: Option<String>,
-    rests: Vec<Rest>,
-    tools: Vec<(String, bool)>,
-    seen_types: BTreeSet<String>,
 }
 
 fn as_u64(v: Option<&serde_json::Value>) -> Option<u64> {
@@ -574,139 +404,6 @@ fn as_u64(v: Option<&serde_json::Value>) -> Option<u64> {
 
 fn as_f64(v: Option<&serde_json::Value>) -> Option<f64> {
     v.and_then(|v| v.as_f64())
-}
-
-/// One pass over a trajectory. Lenient by construction: an unparsable line is
-/// skipped rather than failing the read, because a run killed mid-write ends
-/// in a partial line and its earlier events are still good data.
-pub(crate) fn parse_trajectory(raw: &str) -> Trajectory {
-    let mut t = Trajectory::default();
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        let Some(kind) = ev.get("type").and_then(|v| v.as_str()) else { continue };
-        t.seen_types.insert(kind.to_string());
-        // Trajectory records are flat; the same events ride the flow stream
-        // wrapped in a `payload`. Read either, so this module works against
-        // both without a second parser.
-        let body = ev.get("payload").unwrap_or(&ev);
-        let seq = as_u64(body.get("seq")).or_else(|| as_u64(body.get("turn_seq")));
-
-        match kind {
-            "tool.completed" => {
-                let name = body
-                    .get("tool_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?")
-                    .to_string();
-                let ok = body.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
-                t.tools.push((name, ok));
-            }
-            "runtime.rest" => t.rests.push(Rest {
-                ms: as_u64(body.get("ms")).unwrap_or(0),
-                reason: body.get("reason").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
-                state: body.get("state").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
-            }),
-            // The STREAMING gate. `degenerate` is the gate's own verdict and
-            // is recorded whether or not the policy let it act.
-            "dispatch.gate.observation" => {
-                t.stream_observations += 1;
-                if body.get("degenerate").and_then(|v| v.as_bool()) == Some(true) {
-                    if let Some(s) = seq {
-                        t.stream_degenerate.insert(s);
-                    }
-                }
-                if let Some(r) = as_f64(body.get("tail_ratio")) {
-                    t.stream_min_ratio = Some(t.stream_min_ratio.map_or(r, |m: f64| m.min(r)));
-                }
-            }
-            "dispatch.gate.abort" => {
-                t.stream_abort_events += 1;
-                if let Some(s) = seq {
-                    t.stream_aborts.insert(s);
-                }
-            }
-            // The per-call-cap gate.
-            // flow-action-guard:allow — a runtime trajectory event type, not a flow action
-            "dispatch.checkpoint" => {
-                if let Some(p) = body.get("policy").and_then(|v| v.as_str()) {
-                    t.policy = Some(p.to_string());
-                }
-                let verdict = body.get("verdict").and_then(|v| v.as_str()).unwrap_or("");
-                let concluded = verdict == "conclude";
-                t.checkpoints.entry(seq.unwrap_or(0)).or_default().push(Checkpoint {
-                    tail_ratio: as_f64(body.get("tail_ratio")),
-                    concluded,
-                    // Under `record`/`warn` (`observe` before 4.0) the runtime records a degenerate
-                    // finding as `would_conclude` while the verdict stays
-                    // `continue`. Reading the VERDICT as the judgment makes
-                    // every observing run look clean; reading
-                    // `would_conclude` is what separates the finding from
-                    // the action. Older records carry no such field, so a
-                    // conclusion still counts as one.
-                    would_conclude: body
-                        .get("would_conclude")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(concluded),
-                });
-            }
-            "model.streaming.start" => t.spans.push(Span { seq, t0: as_u64(body.get("ts")), t1: None, content: 0 }),
-            "model.streaming.end" => {
-                // Close the most recent OPEN span on this seq. A seq can
-                // carry more than one stream — an aborted turn is retried
-                // under the same seq — so keying spans by seq collapses the
-                // pair and mis-times both (measured: an 87.1s abort and its
-                // 8.8s retry, both seq 2).
-                if let Some(sp) = t
-                    .spans
-                    .iter_mut()
-                    .rev()
-                    .find(|sp| sp.seq == seq && sp.t1.is_none())
-                {
-                    sp.t1 = as_u64(body.get("ts"));
-                }
-            }
-            "model.completed" => {
-                let usage = body.get("usage");
-                let ct = usage.and_then(|u| u.get("completion_tokens")).and_then(|v| v.as_u64());
-                t.frames.push(ct);
-                if let Some(s) = seq {
-                    let e = t.turns.entry(s).or_default();
-                    // ACCUMULATE. Every checkpoint continuation is the same
-                    // logical turn resuming and reports its own frame.
-                    e.completion_tokens += ct.unwrap_or(0);
-                    e.reasoning_tokens += usage
-                        .and_then(|u| u.get("reasoning_tokens"))
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                }
-            }
-            "model.reasoning" => {
-                if let Some(s) = seq {
-                    t.turns.entry(s).or_default().reasoning_chars +=
-                        as_u64(body.get("reasoning_chars")).unwrap_or(0);
-                }
-            }
-            "model.partial" => {
-                // The CONTENT channel only; reasoning is not in it (measured:
-                // 6,743 streamed chars against 43,263 reasoning chars on one
-                // turn). Cumulative within ONE stream, so it is attributed to
-                // the latest stream on this seq and summed across streams.
-                let n = as_u64(body.get("cumulative_chars")).unwrap_or(0);
-                if let Some(sp) = t.spans.iter_mut().rev().find(|sp| sp.seq == seq) {
-                    sp.content = sp.content.max(n);
-                } else if let Some(s) = seq {
-                    let e = t.turns.entry(s).or_default();
-                    e.content_chars = e.content_chars.max(n);
-                }
-            }
-            _ => {}
-        }
-    }
-    t
 }
 
 /// One host telemetry sample, already narrowed to the run's window.
@@ -1010,18 +707,13 @@ pub fn compute_from_dir(run_dir: &Path, flows_dir: &Path) -> Result<RunStats> {
             darkmux_types::config_access::lab_dir().display()
         );
     }
-    let metrics_path = run_dir.join("metrics.json");
-    let raw = std::fs::read_to_string(&metrics_path).with_context(|| {
-        format!(
-            "reading {}: a run without runtime metrics has no derivable numbers",
-            metrics_path.display()
-        )
-    })?;
-    let m: RuntimeMetrics = serde_json::from_str(&raw)
-        .with_context(|| format!("parsing {}", metrics_path.display()))?;
-
-    let traj_raw = std::fs::read_to_string(run_dir.join("trajectory.jsonl")).unwrap_or_default();
-    let t = parse_trajectory(&traj_raw);
+    let fold = crate::lab::inspect::run_trajectory(run_dir);
+    if fold.events == 0 {
+        anyhow::bail!(
+            "no trajectory events in {}: a run without a trajectory has no derivable numbers",
+            run_dir.display()
+        );
+    }
 
     let side = |name: &str, key: &str| -> Option<serde_json::Value> {
         let raw = std::fs::read_to_string(run_dir.join(name)).ok()?;
@@ -1065,289 +757,55 @@ pub fn compute_from_dir(run_dir: &Path, flows_dir: &Path) -> Result<RunStats> {
                 .is_some())
             .unwrap_or(false);
 
-    let wall_ms = m.wall_ms.unwrap_or(0);
-    let started = m.started_at_unix_ms.unwrap_or(0);
+    let wall_ms = fold.wall_ms().unwrap_or(0);
+    let started = fold.started_at_ms().unwrap_or(0);
     let flows = read_flows(flows_dir, session_id.as_deref(), started, started.saturating_add(wall_ms));
 
     let run_id = run_dir.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
-    // The run's own identity clock, checked against what `metrics.json`
-    // CLAIMS its start was — never the other way around, since the claim is
-    // the thing under test. `lifecycle.json` carries it directly on newer
-    // runs; older runs only have the epoch embedded in the run id itself.
-    let identity_started_ms = side("lifecycle.json", "started_at_ms")
-        .and_then(|v| v.as_u64())
-        .or_else(|| run_id_epoch_ms(&run_id));
-    let identity_mismatch = match (m.started_at_unix_ms, identity_started_ms) {
-        // One-sided: see STALE_METRICS_SLACK_MS's doc for why the two
-        // directions get very different budgets.
-        (Some(claimed), Some(identity)) => {
-            claimed.saturating_add(EARLY_CLOCK_TOLERANCE_MS) < identity
-                || claimed > identity.saturating_add(STALE_METRICS_SLACK_MS)
-        }
-        _ => false,
-    };
-
-    let mut stats = derive_stats(run_id, m, t, flows, verify, ok);
-    stats.checks.metrics_stale = stats.checks.metrics_stale || identity_mismatch;
+    let mut stats = derive_stats(run_id, &fold, flows, verify, ok);
     stats.verify_ungated = verify_ungated;
     Ok(stats)
 }
 
-/// The epoch seconds embedded in a run id
-/// (`<workload>-<profile>-<epoch_secs>-<n>`, see `lab::run::run_id`), read
-/// from the right by position so a workload or profile name containing its
-/// own dashes (e.g. `long-agentic-balanced`) cannot be mistaken for the
-/// stamp. `None` for a name that doesn't have this shape at all.
-pub(crate) fn run_id_epoch_ms(run_id: &str) -> Option<u64> {
-    let mut parts = run_id.rsplit('-');
-    let _index = parts.next()?;
-    parts.next()?.parse::<u64>().ok().map(|secs| secs.saturating_mul(1000))
-}
-
 pub(crate) fn derive_stats(
     run: String,
-    m: RuntimeMetrics,
-    t: Trajectory,
+    fold: &darkmux_trajectory::TrajectoryFold,
     flows: FlowFacts,
     verify: Option<String>,
     ok: Option<bool>,
 ) -> RunStats {
-    let wall_ms = m.wall_ms.unwrap_or(0);
-    let run_from = m.started_at_unix_ms.unwrap_or(0);
+    let wall_ms = fold.wall_ms().unwrap_or(0);
+    let run_from = fold.started_at_ms().unwrap_or(0);
     let run_to = run_from.saturating_add(wall_ms);
-
-    // --- turn and rest counters -------------------------------------------
-    // `metrics.json` is the runtime's own count and normally matches the
-    // trajectory exactly (verified on every completed run measured). But the
-    // runtime's ERROR path writes it with turns and rest hardcoded to zero,
-    // and says in its own comment that the real totals live only in the
-    // trajectory. Reading metrics there printed "rest 0s, 0 turns" beside
-    // three rests and 234k tokens, and overstated active time by the hidden
-    // rest. So: metrics where they are real, the trajectory where they are
-    // known not to be, and a check wherever both exist.
-    let traj_turns = t
-        .spans
-        .iter()
-        .filter_map(|s| s.seq)
-        .chain(t.turns.keys().copied())
-        .collect::<BTreeSet<u64>>()
-        .len() as u64;
-    let traj_rest: u64 = t.rests.iter().map(|r| r.ms).sum();
-    let has_trajectory = !t.seen_types.is_empty();
-    let zeroed = has_trajectory && m.result.as_deref() == Some("error");
-    let (turns, rest_ms) = if zeroed {
-        (traj_turns, traj_rest)
-    } else {
-        (m.turns.unwrap_or(0), m.rest_ms.unwrap_or(0))
-    };
-    let turns_match = (!zeroed && traj_turns > 0).then(|| traj_turns == m.turns.unwrap_or(0));
-    let rest_match = (!zeroed && has_trajectory).then(|| traj_rest == m.rest_ms.unwrap_or(0));
-
-    // --- which streams were billed ----------------------------------------
-    // Frames and spans arrive 1:1 in the same order, so span i is unbilled
-    // iff frame i is null. That pairing is only safe while the counts match,
-    // which `frames_match_streams` asserts; when it does not, fall back to
-    // the gate's own abort records rather than mapping by a broken index.
-    let frames_match = t.frames.len() == t.spans.len();
-    let mut unbilled: BTreeSet<usize> = BTreeSet::new();
-    if frames_match {
-        for (i, f) in t.frames.iter().enumerate() {
-            if f.is_none() {
-                unbilled.insert(i);
-            }
-        }
-    }
-    // Only when the null frames could NOT identify the unbilled streams:
-    // guess that the aborted span on an aborted seq is the LONGEST one. That
-    // holds on every abort measured so far, but nothing in the producer
-    // guarantees it — a gate firing at its first observation leaves a short
-    // abort before a long billed retry — so it never overrides an exact
-    // pairing. Running it anyway marked a billed 60 s retry as unbilled and
-    // reported 700 tok/s against a true 100.
-    for seq in t.stream_aborts.iter().filter(|_| !frames_match) {
-        if let Some((i, _)) = t
-            .spans
-            .iter()
-            .enumerate()
-            .filter(|(_, sp)| sp.seq.as_ref() == Some(seq))
-            .max_by_key(|(_, sp)| sp.ms())
-        {
-            unbilled.insert(i);
-        }
-    }
-
-    let gen_ms_all: u64 = t.spans.iter().map(|s| s.ms()).sum();
-    let gen_ms_billed: u64 = t
-        .spans
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !unbilled.contains(i))
-        .map(|(_, s)| s.ms())
-        .sum();
-    let unterminated = t.spans.iter().filter(|s| s.t1.is_none()).count();
-
-    // `metrics.json` claiming less wall time than the trajectory spent
-    // generating is a fingerprint of a metrics file that belongs to a
-    // DIFFERENT (shorter) run — measured: wall 439s beside "1234s of 1234s"
-    // of generation. A tolerance is required: spans and `wall_ms` come from
-    // two different clocks (the trajectory's stream timestamps vs the
-    // runtime's own wall-clock stamp), so a real, honest run can show
-    // generation a few ms past its own wall time — measured on disk,
-    // `long-agentic-balanced-1779702243-1` (wall 23605ms, gen 23606ms) and
-    // `…-1779802198-1` (1219ms vs 1220ms) are each 1ms over and own their
-    // metrics outright. `max(1s, 5% of wall)` comfortably absorbs that
-    // while still catching the actual bug (1234s of generation against a
-    // 439s claimed wall is nowhere near the boundary).
-    let generation_vs_wall_tolerance_ms = wall_ms / 20;
-    let generation_vs_wall_tolerance_ms = if generation_vs_wall_tolerance_ms < 1_000 {
-        1_000
-    } else {
-        generation_vs_wall_tolerance_ms
-    };
-    let generation_exceeds_wall =
-        wall_ms > 0 && gen_ms_all > wall_ms.saturating_add(generation_vs_wall_tolerance_ms);
-
-    let completion_tokens: u64 = t.turns.values().map(|e| e.completion_tokens).sum();
-    let reasoning_tokens: u64 = t.turns.values().map(|e| e.reasoning_tokens).sum();
-    let reasoning_chars: u64 = t.turns.values().map(|e| e.reasoning_chars).sum();
-    let content_chars: u64 = t.spans.iter().map(|s| s.content).sum::<u64>()
-        + t.turns.values().map(|e| e.content_chars).sum::<u64>();
-
-    let tok_per_s = if gen_ms_billed > 0 && completion_tokens > 0 {
-        Some(round(completion_tokens as f64 / (gen_ms_billed as f64 / 1000.0), 1))
-    } else {
-        None
-    };
-    let reasoning_chars_per_s = if gen_ms_all > 0 && reasoning_chars > 0 {
-        Some(round(reasoning_chars as f64 / (gen_ms_all as f64 / 1000.0), 1))
-    } else {
-        None
-    };
-    let billed_gen_fraction = if gen_ms_all > 0 {
-        Some(round(gen_ms_billed as f64 / gen_ms_all as f64, 2))
-    } else {
-        None
-    };
-
-    // Compare reasoning CHARS against reasoning TOKENS. An earlier reading
-    // divided by TOTAL completion tokens, which made any turn with large
-    // tool-call arguments and little prose look implausible — three healthy
-    // turns flagged as suspect.
-    let suspect_turns: Vec<SuspectTurn> = t
-        .turns
-        .iter()
-        .filter_map(|(seq, e)| {
-            if e.reasoning_tokens == 0 || e.reasoning_chars == 0 {
-                return None;
-            }
-            let cpt = e.reasoning_chars as f64 / e.reasoning_tokens as f64;
-            (cpt < PLAUSIBLE_CHARS_PER_TOKEN.0 || cpt > PLAUSIBLE_CHARS_PER_TOKEN.1).then(|| SuspectTurn {
-                seq: *seq,
-                reasoning_chars_per_token: round(cpt, 1),
-            })
-        })
-        .collect();
-
+    let turns = u64::from(fold.turns());
+    let rest_ms = fold.rest_ms();
+    let billing = StreamBilling::of(fold);
+    let completion_tokens = fold.tokens.completion;
+    let reasoning_chars: u64 = fold.turn_detail.values().map(|e| e.reasoning_chars).sum();
+    let content_chars: u64 = fold.streams.iter().map(|s| s.content_chars).sum::<u64>()
+        + fold.turn_detail.values().map(|e| e.content_chars).sum::<u64>();
     let bounds_policy = flows
         .bounds
         .get("detection_degeneracy_policy")
         .and_then(|b| b.get("value"))
         .and_then(|v| v.as_str())
         .map(|v| v.to_string());
-
-    // --- the two gates ----------------------------------------------------
-    let mut cp_min: BTreeMap<u64, f64> = BTreeMap::new();
-    let mut concluded: Vec<u64> = Vec::new();
-    let mut judged: Vec<u64> = Vec::new();
-    let mut cp_observations = 0usize;
-    for (seq, obs) in &t.checkpoints {
-        cp_observations += obs.len();
-        for o in obs {
-            // A checkpoint with no ratio carries no evidence either way; it
-            // must not count as a perfectly unique 1.0.
-            if let Some(r) = o.tail_ratio {
-                let e = cp_min.entry(*seq).or_insert(r);
-                *e = e.min(r);
-            }
-        }
-        if obs.iter().any(|o| o.concluded) {
-            concluded.push(*seq);
-        }
-        if obs.iter().any(|o| o.would_conclude) {
-            judged.push(*seq);
-        }
-    }
-    let by_ratio: Vec<u64> = cp_min
-        .iter()
-        .filter(|(_, r)| **r < DEGENERATE_TAIL_RATIO)
-        .map(|(s, _)| *s)
-        .collect();
-
-    let gates = Gates {
-        stream: StreamGate {
-            observations: t.stream_observations,
-            degenerate_turns: t.stream_degenerate.iter().copied().collect(),
-            aborts: t.stream_abort_events,
-            min_tail_ratio: t.stream_min_ratio,
-        },
-        checkpoint: CheckpointGate {
-            observations: cp_observations,
-            degenerate_turns: judged.clone(),
-            concluded_turns: concluded,
-            degenerate_turns_by_ratio: by_ratio.clone(),
-            min_tail_ratio: cp_min
-                .values()
-                .copied()
-                .fold(None, |a: Option<f64>, r| Some(a.map_or(r, |m| m.min(r)))),
-            policy: t.policy.clone().or_else(|| bounds_policy.clone()),
-        },
-    };
-
-    // --- host -------------------------------------------------------------
-    let busy: Vec<&Sample> = flows.samples.iter().filter(|s| s.busy()).collect();
-    let idle = flows.samples.len() - busy.len();
-    let pkg_w = mean(busy.iter().map(|s| s.w_total));
-    let cover = telemetry_coverage(&flows.samples, run_from, run_to);
-    // Duty weighs each sample by the time it stands for. The sampler runs at
-    // ~5 s while busy and ~51 s while idle, so a COUNT of samples
-    // over-weights busy time by up to 10x.
-    let duty = (cover.weight_all > 0).then(|| round(100.0 * cover.weight_busy as f64 / cover.weight_all as f64, 1));
-    // Busy time and the energy built on it extrapolate from the samples to
-    // the whole run, so they are only reported when the samples cover it.
-    // Two samples in the last ten seconds of a ten-minute run extrapolated
-    // to 600 s busy and 27 kJ, with no caveat.
-    let busy_ms = duty
-        .filter(|_| cover.covers_run)
-        .map(|d| (wall_ms as f64 * d / 100.0).round() as u64);
-    let mut thermal_states_busy: BTreeMap<String, usize> = BTreeMap::new();
-    for s in &busy {
-        if let Some(st) = &s.thermal_state {
-            *thermal_states_busy.entry(st.clone()).or_insert(0) += 1;
-        }
-    }
-
+    let checkpoint = checkpoint_gate(fold, bounds_policy.clone());
+    let verdict_matches_ratio = checkpoint.degenerate_turns == checkpoint.degenerate_turns_by_ratio;
+    let host = HostFigures::of(&flows, run_from, run_to, wall_ms);
     let mut tool_calls: BTreeMap<String, usize> = BTreeMap::new();
-    for (name, _) in &t.tools {
-        *tool_calls.entry(name.clone()).or_insert(0) += 1;
+    for t in &fold.tools {
+        *tool_calls.entry(t.name.clone()).or_insert(0) += 1;
     }
-
-    let rest_delays: Vec<u64> = t.rests.iter().map(|r| r.ms).collect::<BTreeSet<_>>().into_iter().collect();
-    let thermal_ratchet_fired = thermal_delay_escalated(&t.rests);
-    let missing_required: Vec<String> = if t.seen_types.is_empty() {
-        Vec::new()
-    } else {
-        REQUIRED_EVENTS
-            .iter()
-            .filter(|e| !t.seen_types.contains(**e))
-            .map(|e| e.to_string())
-            .collect()
+    let rest_strings = |f: fn(&darkmux_trajectory::RestTaken) -> String| -> Vec<String> {
+        fold.rests.iter().map(f).collect::<BTreeSet<_>>().into_iter().collect()
     };
 
     RunStats {
         schema_version: RUN_STATS_SCHEMA_VERSION,
         run,
-        model: m.model.clone(),
-        result: m.result.clone(),
+        model: fold.start.as_ref().map(|s| s.model.clone()).filter(|m| !m.is_empty()),
+        result: fold.complete.as_ref().map(|c| c.result.clone()),
         verify,
         // Overwritten by `compute_from_dir` right after this call returns —
         // `derive_stats` has no fixture path to check, so it can't compute
@@ -1356,102 +814,228 @@ pub(crate) fn derive_stats(
         // which exercise a baselined fixture.
         verify_ungated: false,
         ok,
-        started_at_unix_ms: m.started_at_unix_ms,
+        started_at_unix_ms: fold.started_at_ms(),
         wall_ms,
         rest_ms,
         active_ms: wall_ms.saturating_sub(rest_ms),
-        rest_events: t.rests.len(),
-        thermal_ratchet_fired,
-        rest_delays_ms: rest_delays,
-        rest_reasons: t.rests.iter().map(|r| r.reason.clone()).collect::<BTreeSet<_>>().into_iter().collect(),
-        rest_states: t.rests.iter().map(|r| r.state.clone()).collect::<BTreeSet<_>>().into_iter().collect(),
+        rest_events: fold.rests.len(),
+        thermal_ratchet_fired: thermal_delay_escalated(&fold.rests),
+        rest_delays_ms: fold.rests.iter().map(|r| r.ms).collect::<BTreeSet<_>>().into_iter().collect(),
+        rest_reasons: rest_strings(|r| String::from(r.reason.clone())),
+        rest_states: rest_strings(|r| r.state.clone().unwrap_or_else(|| "?".to_string())),
         rest_ms_per_turn: (turns > 0).then(|| round(rest_ms as f64 / turns as f64, 1)),
         turns,
-        compactions: m.compactions.unwrap_or(0),
+        compactions: u64::from(fold.compactions()),
         reasoning_chars,
         content_chars,
         completion_tokens,
-        reasoning_tokens,
-        suspect_turns,
+        reasoning_tokens: fold.tokens.reasoning.unwrap_or(0),
+        suspect_turns: suspect_turns(fold),
         tool_calls,
-        tool_calls_total: t.tools.len(),
-        tool_calls_failed: t.tools.iter().filter(|(_, ok)| !ok).count(),
-        streams: t.spans.len(),
-        streams_unbilled: unbilled.len(),
-        streams_unterminated: unterminated,
-        turns_with_stream_abort: t.stream_aborts.iter().copied().collect(),
-        gen_ms_billed,
-        gen_ms_all,
-        unbilled_gen_ms: gen_ms_all.saturating_sub(gen_ms_billed),
-        billed_gen_fraction,
-        tok_per_s,
-        reasoning_chars_per_s,
-        gates,
+        tool_calls_total: fold.tools.len(),
+        tool_calls_failed: fold.tools.iter().filter(|t| !t.ok).count(),
+        streams: fold.streams.len(),
+        streams_unbilled: billing.unbilled.len(),
+        streams_unterminated: billing.unterminated,
+        turns_with_stream_abort: fold.gate.aborted_turns.iter().copied().collect(),
+        gen_ms_billed: billing.gen_ms_billed,
+        gen_ms_all: billing.gen_ms_all,
+        unbilled_gen_ms: billing.gen_ms_all.saturating_sub(billing.gen_ms_billed),
+        billed_gen_fraction: (billing.gen_ms_all > 0)
+            .then(|| round(billing.gen_ms_billed as f64 / billing.gen_ms_all as f64, 2)),
+        tok_per_s: rate(completion_tokens, billing.gen_ms_billed),
+        reasoning_chars_per_s: rate(reasoning_chars, billing.gen_ms_all),
+        gates: Gates {
+            stream: StreamGate {
+                observations: usize::try_from(fold.gate.observations).unwrap_or(usize::MAX),
+                degenerate_turns: fold.gate.degenerate_turns.iter().copied().collect(),
+                aborts: usize::try_from(fold.gate.abort_events).unwrap_or(usize::MAX),
+                min_tail_ratio: fold.gate.min_tail_ratio,
+            },
+            checkpoint,
+        },
         bounds: flows.bounds.clone(),
-        gpu_w_busy: mean(busy.iter().map(|s| s.w_gpu)).map(|v| round(v, 1)),
-        cpu_w_busy: mean(busy.iter().map(|s| s.w_cpu)).map(|v| round(v, 1)),
-        pkg_w_busy: pkg_w.map(|v| round(v, 1)),
-        gpu_duty_pct: duty,
-        samples_busy: busy.len(),
-        samples_idle: idle,
-        busy_ms,
-        pkg_j_busy: match (pkg_w, busy_ms) {
-            (Some(w), Some(ms)) => Some(round(w * ms as f64 / 1000.0, 1)),
-            _ => None,
-        },
-        pkg_j_per_1k_tokens: match pkg_w {
-            Some(w) if gen_ms_billed > 0 && completion_tokens > 0 => Some(round(
-                w * (gen_ms_billed as f64 / 1000.0) / (completion_tokens as f64 / 1000.0),
-                1,
-            )),
-            _ => None,
-        },
-        pkg_j_per_1k_reasoning_chars: match pkg_w {
-            Some(w) if gen_ms_all > 0 && reasoning_chars > 0 => Some(round(
-                w * (gen_ms_all as f64 / 1000.0) / (reasoning_chars as f64 / 1000.0),
-                1,
-            )),
-            _ => None,
-        },
-        thermal_states_busy,
-        cpu_speed_limit_min: busy.iter().map(|s| s.cpu_speed_limit_pct).min(),
-        throttled_samples: busy.iter().filter(|s| s.cpu_speed_limit_pct < 100).count(),
-        mem_pct_busy_max: busy.iter().map(|s| s.mem_pct).max(),
-        telemetry_max_gap_ms: cover.max_gap_ms,
+        gpu_w_busy: host.gpu_w_busy,
+        cpu_w_busy: host.cpu_w_busy,
+        pkg_w_busy: host.pkg_w.map(|v| round(v, 1)),
+        gpu_duty_pct: host.duty,
+        samples_busy: host.samples_busy,
+        samples_idle: flows.samples.len() - host.samples_busy,
+        busy_ms: host.busy_ms,
+        pkg_j_busy: host.pkg_w.zip(host.busy_ms).map(|(w, ms)| round(w * ms as f64 / 1000.0, 1)),
+        pkg_j_per_1k_tokens: per_1k(host.pkg_w, billing.gen_ms_billed, completion_tokens),
+        pkg_j_per_1k_reasoning_chars: per_1k(host.pkg_w, billing.gen_ms_all, reasoning_chars),
+        thermal_states_busy: host.thermal_states_busy,
+        cpu_speed_limit_min: host.cpu_speed_limit_min,
+        throttled_samples: host.throttled_samples,
+        mem_pct_busy_max: host.mem_pct_busy_max,
+        telemetry_max_gap_ms: host.max_gap_ms,
         flow_records_in_window: flows.records_for_session,
         flow_scan: flows.scan.clone(),
         checks: RunChecks {
-            // Nothing to reconcile against when the runtime zeroed its own
-            // totals: `None` says "not checkable", which is not a pass.
-            tokens_reconcile: (!zeroed)
-                .then(|| completion_tokens == m.total_completion_tokens.unwrap_or(0)),
-            metrics_totals_zeroed: zeroed,
-            metrics_stale: generation_exceeds_wall,
-            rest_matches_trajectory: rest_match,
-            turns_match_trajectory: turns_match,
-            telemetry_covers_run: cover.covers_run,
-            policy_consistent: match (&t.policy, &bounds_policy) {
+            telemetry_covers_run: host.covers_run,
+            policy_consistent: match (&fold.checkpoint_policy, &bounds_policy) {
                 (Some(ran), Some(resolved)) => Some(ran == resolved),
                 _ => None,
             },
             rest_within_wall: rest_ms <= wall_ms,
             have_telemetry_samples: !flows.samples.is_empty(),
             have_flow_records: flows.records_for_session > 0,
-            missing_required_events: missing_required,
-            // flow-action-guard:allow — a runtime trajectory event type, not a flow action
-            checkpoint_events_seen: t.seen_types.contains("dispatch.checkpoint"),
-            // The mutation that proves this guard: repoint the parse at a
-            // name that does not exist and `checkpoint_events_seen` stays
-            // true while the count drops to zero. That CONTRADICTION is the
-            // signal.
-            // flow-action-guard:allow — a runtime trajectory event type, not a flow action
-            checkpoint_parse_consistent: !(t.seen_types.contains("dispatch.checkpoint")
-                && cp_observations == 0),
-            verdict_matches_ratio: judged == by_ratio,
-            all_streams_billed: unbilled.is_empty(),
-            frames_match_streams: frames_match,
-            streams_terminated: unterminated == 0,
+            verdict_matches_ratio,
+            all_streams_billed: billing.unbilled.is_empty(),
+            frames_match_streams: billing.frames_match,
+            streams_terminated: billing.unterminated == 0,
         },
+    }
+}
+
+/// `n` per second over `ms`, to one decimal; `None` when either is zero.
+fn rate(n: u64, ms: u64) -> Option<f64> {
+    (ms > 0 && n > 0).then(|| round(n as f64 / (ms as f64 / 1000.0), 1))
+}
+
+/// Joules per thousand of `n`, from mean busy watts over `ms`; `None` when
+/// there is no power reading, no time, or nothing to divide by.
+fn per_1k(watts: Option<f64>, ms: u64, n: u64) -> Option<f64> {
+    let w = watts?;
+    (ms > 0 && n > 0).then(|| round(w * (ms as f64 / 1000.0) / (n as f64 / 1000.0), 1))
+}
+
+/// Which streams were billed, and the generation time on each side.
+struct StreamBilling {
+    unbilled: BTreeSet<usize>,
+    frames_match: bool,
+    gen_ms_all: u64,
+    gen_ms_billed: u64,
+    unterminated: usize,
+}
+
+impl StreamBilling {
+    fn of(fold: &darkmux_trajectory::TrajectoryFold) -> Self {
+        let streams = &fold.streams;
+        // Frames and streams arrive 1:1 in the same order, so stream i is
+        // unbilled iff frame i is null. That pairing is only safe while the
+        // counts match, which `frames_match_streams` asserts; when it does
+        // not, fall back to the gate's own abort records rather than mapping
+        // by a broken index.
+        let frames_match = fold.frames.len() == streams.len();
+        let mut unbilled: BTreeSet<usize> = if frames_match {
+            fold.frames.iter().enumerate().filter(|(_, f)| f.is_none()).map(|(i, _)| i).collect()
+        } else {
+            BTreeSet::new()
+        };
+        // Only when the null frames could NOT identify the unbilled streams:
+        // guess that the aborted stream on an aborted seq is the LONGEST one.
+        // That holds on every abort measured so far, but nothing in the
+        // producer guarantees it — a gate firing at its first observation
+        // leaves a short abort before a long billed retry — so it never
+        // overrides an exact pairing. Running it anyway marked a billed 60 s
+        // retry as unbilled and reported 700 tok/s against a true 100.
+        for seq in fold.gate.aborted_turns.iter().filter(|_| !frames_match) {
+            if let Some((i, _)) = streams.iter().enumerate().filter(|(_, sp)| sp.seq == *seq).max_by_key(|(_, sp)| sp.ms()) {
+                unbilled.insert(i);
+            }
+        }
+        let gen_ms_all = streams.iter().map(|s| s.ms()).sum();
+        let gen_ms_billed = streams.iter().enumerate().filter(|(i, _)| !unbilled.contains(i)).map(|(_, s)| s.ms()).sum();
+        let unterminated = streams.iter().filter(|s| s.end_ms.is_none()).count();
+        Self { unbilled, frames_match, gen_ms_all, gen_ms_billed, unterminated }
+    }
+}
+
+/// Compare reasoning CHARS against reasoning TOKENS. An earlier reading
+/// divided by TOTAL completion tokens, which made any turn with large
+/// tool-call arguments and little prose look implausible — three healthy
+/// turns flagged as suspect.
+fn suspect_turns(fold: &darkmux_trajectory::TrajectoryFold) -> Vec<SuspectTurn> {
+    fold.turn_detail
+        .iter()
+        .filter(|(_, e)| e.reasoning_tokens > 0 && e.reasoning_chars > 0)
+        .filter_map(|(seq, e)| {
+            let cpt = e.reasoning_chars as f64 / e.reasoning_tokens as f64;
+            (cpt < PLAUSIBLE_CHARS_PER_TOKEN.0 || cpt > PLAUSIBLE_CHARS_PER_TOKEN.1)
+                .then(|| SuspectTurn { seq: *seq, reasoning_chars_per_token: round(cpt, 1) })
+        })
+        .collect()
+}
+
+/// The per-call-cap gate, per turn: the worst ratio each turn's checkpoints
+/// measured, the turns the runtime judged degenerate, and the turns it cut.
+fn checkpoint_gate(fold: &darkmux_trajectory::TrajectoryFold, bounds_policy: Option<String>) -> CheckpointGate {
+    let mut worst: BTreeMap<u64, f64> = BTreeMap::new();
+    let mut concluded: BTreeSet<u64> = BTreeSet::new();
+    let mut judged: BTreeSet<u64> = BTreeSet::new();
+    for c in &fold.checkpoints {
+        // A checkpoint with no ratio carries no evidence either way; it must
+        // not count as a perfectly unique 1.0.
+        if let Some(r) = c.tail_ratio {
+            let e = worst.entry(c.seq).or_insert(r);
+            *e = e.min(r);
+        }
+        if c.verdict == darkmux_trajectory::Verdict::Conclude {
+            concluded.insert(c.seq);
+        }
+        if c.judged_degenerate {
+            judged.insert(c.seq);
+        }
+    }
+    CheckpointGate {
+        observations: fold.checkpoints.len(),
+        degenerate_turns: judged.into_iter().collect(),
+        concluded_turns: concluded.into_iter().collect(),
+        degenerate_turns_by_ratio: worst.iter().filter(|(_, r)| **r < DEGENERATE_TAIL_RATIO).map(|(s, _)| *s).collect(),
+        min_tail_ratio: worst.values().copied().reduce(f64::min),
+        policy: fold.checkpoint_policy.clone().or(bounds_policy),
+    }
+}
+
+/// What the host telemetry inside the run's window says.
+struct HostFigures {
+    samples_busy: usize,
+    pkg_w: Option<f64>,
+    gpu_w_busy: Option<f64>,
+    cpu_w_busy: Option<f64>,
+    duty: Option<f64>,
+    busy_ms: Option<u64>,
+    thermal_states_busy: BTreeMap<String, usize>,
+    cpu_speed_limit_min: Option<u64>,
+    throttled_samples: usize,
+    mem_pct_busy_max: Option<u64>,
+    max_gap_ms: Option<u64>,
+    covers_run: bool,
+}
+
+impl HostFigures {
+    fn of(flows: &FlowFacts, run_from: u64, run_to: u64, wall_ms: u64) -> Self {
+        let busy: Vec<&Sample> = flows.samples.iter().filter(|s| s.busy()).collect();
+        let cover = telemetry_coverage(&flows.samples, run_from, run_to);
+        // Duty weighs each sample by the time it stands for. The sampler runs
+        // at ~5 s while busy and ~51 s while idle, so a COUNT of samples
+        // over-weights busy time by up to 10x.
+        let duty = (cover.weight_all > 0).then(|| round(100.0 * cover.weight_busy as f64 / cover.weight_all as f64, 1));
+        // Busy time and the energy built on it extrapolate from the samples
+        // to the whole run, so they are only reported when the samples cover
+        // it. Two samples in the last ten seconds of a ten-minute run
+        // extrapolated to 600 s busy and 27 kJ, with no caveat.
+        let busy_ms = duty.filter(|_| cover.covers_run).map(|d| (wall_ms as f64 * d / 100.0).round() as u64);
+        let mut thermal_states_busy: BTreeMap<String, usize> = BTreeMap::new();
+        for st in busy.iter().filter_map(|s| s.thermal_state.as_ref()) {
+            *thermal_states_busy.entry(st.clone()).or_insert(0) += 1;
+        }
+        Self {
+            samples_busy: busy.len(),
+            pkg_w: mean(busy.iter().map(|s| s.w_total)),
+            gpu_w_busy: mean(busy.iter().map(|s| s.w_gpu)).map(|v| round(v, 1)),
+            cpu_w_busy: mean(busy.iter().map(|s| s.w_cpu)).map(|v| round(v, 1)),
+            duty,
+            busy_ms,
+            thermal_states_busy,
+            cpu_speed_limit_min: busy.iter().map(|s| s.cpu_speed_limit_pct).min(),
+            throttled_samples: busy.iter().filter(|s| s.cpu_speed_limit_pct < 100).count(),
+            mem_pct_busy_max: busy.iter().map(|s| s.mem_pct).max(),
+            max_gap_ms: cover.max_gap_ms,
+            covers_run: cover.covers_run,
+        }
     }
 }
 

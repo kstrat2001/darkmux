@@ -7,11 +7,9 @@ use crate::lab::stats::{RunChecks, RunStats};
 
 fn clean_checks() -> RunChecks {
     RunChecks {
-        tokens_reconcile: Some(true),
         rest_within_wall: true,
         have_telemetry_samples: true,
         have_flow_records: true,
-        checkpoint_parse_consistent: true,
         verdict_matches_ratio: true,
         all_streams_billed: true,
         frames_match_streams: true,

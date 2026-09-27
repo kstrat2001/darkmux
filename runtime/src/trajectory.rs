@@ -1,30 +1,27 @@
-//! Trajectory + metrics recording.
+//! Trajectory recording.
 //!
-//! Gives post-dispatch visibility. Writes a line-per-event JSONL trace
-//! to `<RUNTIME_OUT_BASE>/.darkmux-runtime/trajectory.jsonl` (i.e.
-//! `/darkmux-out/.darkmux-runtime/` — the out-dir, SEPARATE from the
-//! agent's `/workspace`) plus a top-line `metrics.json` at exit.
-//! Operators inspect these after the container is gone (the `--rm`
-//! mode otherwise loses everything except stderr).
-//!
-//! The shape of each event mirrors openclaw's trajectory format
-//! closely enough that a side-by-side diff between the two runtimes
-//! is feasible — same `type` field, same `seq`, same `usage` shape
-//! on model.completed events.
+//! Writes a line-per-event JSONL trace to
+//! `<RUNTIME_OUT_BASE>/.darkmux-runtime/trajectory.jsonl` (i.e.
+//! `/darkmux-out/.darkmux-runtime/`, the out-dir, SEPARATE from the agent's
+//! `/workspace`) as events happen. It is the execution's only record of its
+//! turns, rests and per-call usage: the host tails it live and the lab reads
+//! it after the container is gone, both through `darkmux_trajectory`'s one
+//! fold. Every event is a [`darkmux_trajectory::TrajectoryEvent`], the one
+//! definition the writer here and those readers share.
 //!
 //! Failure mode: if the trajectory directory can't be created or the
 //! file can't be opened, the recorder degrades to a silent no-op so
 //! the dispatch itself isn't blocked by an instrumentation problem.
 //! Operator-visible stderr line announces success/failure.
 
-use anyhow::Result;
-use serde::Serialize;
+use darkmux_trajectory as dt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::lmstudio::{ToolCall, Usage};
+use crate::lmstudio::ToolCall;
+use darkmux_trajectory::UsageCounts;
 
 /// Container mount point for darkmux's OWN bookkeeping — SEPARATE from
 /// /workspace so the runtime never writes its logs into the tree it's
@@ -33,19 +30,6 @@ use crate::lmstudio::{ToolCall, Usage};
 /// (lost on --rm) but /workspace stays clean either way.
 /// MUST match the mount point in darkmux-crew's dispatch_internal.rs.
 pub const RUNTIME_OUT_BASE: &str = "/darkmux-out";
-
-/// Subdir (under the out-base) where trajectory + metrics land. The
-/// dot-prefix is a soft signal that this is runtime metadata rather
-/// than agent content; agents that respect "don't muck with dotfiles"
-/// conventions will leave it alone.
-const TRAJECTORY_SUBDIR: &str = ".darkmux-runtime";
-const TRAJECTORY_FILE: &str = "trajectory.jsonl";
-const METRICS_FILE: &str = "metrics.json";
-
-/// (#2889) The `phase` value naming "the model is writing a tool call". The
-/// host forwards it on `dispatch.turn.heartbeat`, and the viewer matches the
-/// literal (`ui/src/lib/tokenRate.ts`), so it is spelled once here.
-pub const WRITING_TOOL_CALL_PHASE: &str = "writing_tool_call";
 
 /// Cap on the recorded tool-argument string. A search pattern, file path, or
 /// shell command is far under this; only a `write`/`edit` file-content arg
@@ -56,14 +40,6 @@ const MAX_TOOL_ARGS_CHARS: usize = 512;
 /// `MAX_TRAJ_FIELD_BYTES` for a short flow field. A longer path is left out
 /// rather than clipped, since a clipped path names a different file.
 const MAX_TOOL_PATH_BYTES: usize = 4 * 1024;
-
-/// (#2963) The `model.completed` keys the host reads to build
-/// `dispatch.turn`'s `tool_names` / `tool_paths`, spelled once here and
-/// pinned as literals by a test on each side: `runs` (`false` on a call
-/// that will not run) and `calls_planned` (`true` on a record whose calls
-/// carry those marks; the host lists a turn's calls only when it is there).
-pub const RUNS_KEY: &str = "runs";
-pub const CALLS_PLANNED_KEY: &str = "calls_planned";
 
 /// (#2963) The `path` argument of one tool call, for a tool that takes one
 /// (`Tool::takes_path`). `None` for any other tool or an unknown name, when
@@ -94,89 +70,21 @@ fn cap_chars(s: &str, max: usize) -> String {
     out
 }
 
-/// The runtime's bookkeeping directory: `<RUNTIME_OUT_BASE>/<TRAJECTORY_SUBDIR>`.
-/// Both runtime write sites (trajectory/metrics in `main.rs`, structured
-/// compaction output in `loop_runner.rs`) consume this so the two can't
-/// drift to different paths.
+/// The runtime's bookkeeping directory: `<RUNTIME_OUT_BASE>/.darkmux-runtime`.
+/// Every runtime write site (the trajectory in `main.rs`, structured
+/// compaction output in `loop_runner.rs`, findings and mods in `tools`)
+/// consumes this so they can't drift to different paths.
 pub fn runtime_dir() -> std::path::PathBuf {
-    std::path::Path::new(RUNTIME_OUT_BASE).join(TRAJECTORY_SUBDIR)
+    std::path::Path::new(RUNTIME_OUT_BASE).join(dt::TRAJECTORY_SUBDIR)
 }
 
-/// Trajectory + metrics recorder. Open at dispatch start; methods
-/// append events as they occur; `save_metrics()` writes the final
-/// summary at exit.
+/// Trajectory recorder. Open at dispatch start; methods append events as
+/// they occur.
 pub struct Trajectory {
     /// `None` when recording is disabled (open() failed; degraded
     /// silently). All append methods become no-ops in that case.
     file: Option<File>,
-    metrics_path: Option<PathBuf>,
     started: Instant,
-}
-
-/// Top-line summary written to metrics.json at dispatch exit.
-#[derive(Debug, Serialize)]
-pub struct Metrics {
-    pub runtime: &'static str,
-    pub version: &'static str,
-    pub model: String,
-    pub started_at_unix_ms: u64,
-    pub wall_ms: u128,
-    pub result: String,
-    pub turns: u32,
-    pub compactions: u32,
-    pub total_prompt_tokens: u32,
-    pub total_completion_tokens: u32,
-    /// (#2263) THIS invocation's own contribution to `turns` above — on a
-    /// resumed dispatch, `turns` is seeded from the checkpoint (the whole
-    /// dispatch's cumulative count, across every resume), so it is the
-    /// WRONG number to attribute to `model` above. This field is never
-    /// seeded: `0` on the first call of a fresh dispatch, and equal to
-    /// `turns` exactly on a dispatch that was never resumed (seed is
-    /// `0`). A consumer attributing cost or turn count to `model` reads
-    /// these `_this_run` fields, never the whole-dispatch ones.
-    pub turns_this_run: u32,
-    /// (#2263) This invocation's own contribution to `total_prompt_tokens`
-    /// above. See `turns_this_run`'s doc.
-    pub total_prompt_tokens_this_run: u32,
-    /// (#2263) This invocation's own contribution to
-    /// `total_completion_tokens` above. See `turns_this_run`'s doc.
-    pub total_completion_tokens_this_run: u32,
-    /// (#2263) This invocation's own contribution to `compactions` above.
-    /// See `turns_this_run`'s doc.
-    pub compactions_this_run: u32,
-    /// (#1444) Sum of every turn's reported reasoning tokens. Whether they
-    /// are a SUBSET of `total_completion_tokens` above or a third class
-    /// outside it is PROVIDER-SPECIFIC — OpenAI and Azure document the
-    /// subset relation; other OpenAI-compatible layers do not, and 284
-    /// blocks in this machine's recorded corpus report a `total_tokens`
-    /// exceeding prompt + completion (see
-    /// `lmstudio::CompletionTokensDetails::reasoning_tokens`). `None` when
-    /// no turn this dispatch ever reported the field (a local LMStudio
-    /// dispatch, or a hosted non-reasoning model); serializes as JSON
-    /// `null`, distinct from a fabricated `0`.
-    pub total_reasoning_tokens: Option<u32>,
-    /// (#1444) Sum of every turn's reported cached prompt tokens. Same
-    /// tri-state contract as `total_reasoning_tokens` above.
-    pub total_cached_tokens: Option<u32>,
-    pub total_messages: usize,
-    pub max_turns_reached: bool,
-    /// (#2094) Sum of every inter-turn rest this dispatch took, in
-    /// milliseconds — the AFTER-clamp duration actually slept. `wall_ms`
-    /// above INCLUDES this time (wall stays wall); a caller wanting
-    /// model-only time subtracts `rest_ms` from `wall_ms` itself.
-    pub rest_ms: u64,
-    /// (#2094) How many inter-turn rests fired during this dispatch.
-    pub rests: u32,
-    /// (#2094 finding 8) The POST-CLAMP `turn_delay_ms` cadence this
-    /// dispatch actually applied (`resolve_turn_delay_ms`'s output) — the
-    /// effective knob, known even on a dispatch that took zero rests.
-    /// Read back host-side (`dispatch_internal.rs`) and surfaced on the
-    /// `dispatch.complete` flow payload as `turn_delay_effective_ms`.
-    pub turn_delay_effective_ms: u64,
-    /// First 400 chars of the final assistant message (for at-a-glance
-    /// "what did the agent end up saying"). Truncated to keep
-    /// metrics.json human-readable in a terminal.
-    pub final_assistant_preview: String,
 }
 
 /// (#2836) What a checkpoint verdict was, and what it was computed OVER.
@@ -197,14 +105,14 @@ pub struct Metrics {
 pub struct CheckpointVerdict<'a> {
     pub slice_tokens: Option<u32>,
     pub tail_ratio: Option<f32>,
-    pub verdict: &'a str,
+    pub verdict: dt::Verdict,
     pub judged_chars: usize,
     /// (#2846) Which detection policy this checkpoint ran under. Stamped so
     /// a run is self-describing: an artifact that does not say whether its
     /// gate was armed cannot be compared against one that does.
     pub policy: &'a str,
     /// (#2846) What the detector FOUND, independent of whether it was
-    /// allowed to act. Under `conclude` this equals `verdict == "conclude"`.
+    /// allowed to act. Under `conclude` this equals `verdict == Conclude`.
     /// Under `record` (and `warn`) it is the counterfactual the policy exists to
     /// provide. Under `off` nothing was measured, so it is `None`.
     pub would_conclude: Option<bool>,
@@ -217,9 +125,8 @@ impl Trajectory {
     /// tempdir. If the directory can't be created (permission, missing
     /// path, etc.) returns a degraded no-op recorder rather than failing.
     pub fn open(base_dir: &Path) -> Self {
-        let dir = base_dir.join(TRAJECTORY_SUBDIR);
-        let trajectory_path = dir.join(TRAJECTORY_FILE);
-        let metrics_path = dir.join(METRICS_FILE);
+        let dir = base_dir.join(dt::TRAJECTORY_SUBDIR);
+        let trajectory_path = dir.join(dt::TRAJECTORY_FILE);
 
         match try_open(&dir, &trajectory_path) {
             Ok(file) => {
@@ -229,7 +136,6 @@ impl Trajectory {
                 );
                 Self {
                     file: Some(file),
-                    metrics_path: Some(metrics_path),
                     started: Instant::now(),
                 }
             }
@@ -240,7 +146,6 @@ impl Trajectory {
                 );
                 Self {
                     file: None,
-                    metrics_path: None,
                     started: Instant::now(),
                 }
             }
@@ -257,14 +162,12 @@ impl Trajectory {
         prompt_chars: usize,
         tools: &[&str],
     ) {
-        self.write_event(&serde_json::json!({
-            // flow-action-guard:allow — a trajectory event type, not a flow action
-            "type": "dispatch.start",
-            "ts": unix_ms(),
-            "model": model,
-            "system_chars": system_chars,
-            "prompt_chars": prompt_chars,
-            "tools": tools,
+        self.write_event(dt::TrajectoryEvent::DispatchStart(dt::DispatchStart {
+            ts: unix_ms(),
+            model: model.to_string(),
+            system_chars: system_chars as u64,
+            prompt_chars: prompt_chars as u64,
+            tools: tools.iter().map(|t| t.to_string()).collect(),
         }));
     }
 
@@ -275,7 +178,7 @@ impl Trajectory {
         &mut self,
         seq: u32,
         finish_reason: &str,
-        usage: Option<&Usage>,
+        usage: Option<&UsageCounts>,
         tool_calls: Option<&[ToolCall]>,
         // (#2963) Aligned with `tool_calls`: whether each call will run
         // (`loop_runner::plan_tool_calls`). A call that will not is marked
@@ -284,47 +187,33 @@ impl Trajectory {
         runs: Option<&[bool]>,
         reported_model: Option<&str>,
     ) {
-        let usage_json = usage_event_json(usage);
-        let tool_calls_json = tool_calls.map(|calls| {
+        let tool_calls = tool_calls.map(|calls| {
             calls
                 .iter()
                 .enumerate()
-                .map(|(i, c)| {
-                    let mut entry = serde_json::json!({
-                        "id": c.id,
-                        "name": c.function.name,
-                        "arguments_chars": c.function.arguments.len(),
-                    });
+                .map(|(i, c)| dt::ToolCallEntry {
+                    id: c.id.clone(),
+                    name: c.function.name.clone(),
+                    arguments_chars: c.function.arguments.len() as u64,
                     // (#2963) The path argument only, never the content.
-                    if let Some(path) = tool_call_path(&c.function.name, &c.function.arguments) {
-                        entry["path"] = serde_json::json!(path);
-                    }
-                    if runs.and_then(|r| r.get(i)) == Some(&false) {
-                        entry[RUNS_KEY] = serde_json::json!(false);
-                    }
-                    entry
+                    path: tool_call_path(&c.function.name, &c.function.arguments),
+                    runs: (runs.and_then(|r| r.get(i)) == Some(&false)).then_some(false),
                 })
-                .collect::<Vec<_>>()
+                .collect()
         });
-        let mut event = serde_json::json!({
-            "type": "model.completed",
-            "seq": seq,
-            "ts": unix_ms(),
-            "finish_reason": finish_reason,
-            "usage": usage_json,
-            "tool_calls": tool_calls_json,
-        });
-        // (#2902 step 1b) The model the server says answered this turn, so
-        // the host's per-turn usage record can carry `reported_model`.
-        // ABSENT when the server named none; never copied from the request.
-        if let Some(m) = reported_model {
-            event["reported_model"] = serde_json::json!(m);
-        }
-        // (#2963) The calls carry their `runs` marks: the host lists them.
-        if runs.is_some() {
-            event[CALLS_PLANNED_KEY] = serde_json::json!(true);
-        }
-        self.write_event(&event);
+        self.write_event(dt::TrajectoryEvent::ModelCompleted(dt::ModelCompleted {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            finish_reason: finish_reason.to_string(),
+            usage: usage.map(dt::Usage::from),
+            tool_calls,
+            // (#2902 step 1b) The model the server says answered this turn,
+            // so the host's per-turn usage record can carry
+            // `reported_model`. Never copied from the request.
+            reported_model: reported_model.map(str::to_string),
+            // (#2963) The calls carry their `runs` marks: the host lists them.
+            calls_planned: runs.is_some(),
+        }));
     }
 
     /// (#2915) `compaction.start` — written BEFORE a compaction calls its
@@ -338,15 +227,11 @@ impl Trajectory {
     /// `requested_model` is the compactor model id the host resolved, ABSENT
     /// (never null) when the runtime was given none.
     pub fn append_compaction_start(&mut self, generation: u32, requested_model: Option<&str>) {
-        let mut event = serde_json::json!({
-            "type": "compaction.start",
-            "generation": generation,
-            "ts": unix_ms(),
-        });
-        if let Some(m) = requested_model {
-            event["requested_model"] = serde_json::json!(m);
-        }
-        self.write_event(&event);
+        self.write_event(dt::TrajectoryEvent::CompactionStart(dt::CompactionStart {
+            generation: u64::from(generation),
+            ts: unix_ms(),
+            requested_model: requested_model.map(str::to_string),
+        }));
     }
 
     /// (#2902 step 1b) `compaction.call` — one per compactor model call that
@@ -364,17 +249,13 @@ impl Trajectory {
     /// same object shape `model.completed` writes (`null` when the reply
     /// carried no usage block).
     pub fn append_compaction_call(&mut self, call: &crate::compaction::CompactorCall) {
-        let mut event = serde_json::json!({
-            "type": "compaction.call",
-            "generation": call.generation,
-            "ts": unix_ms(),
-            "requested_model": call.requested_model,
-            "usage": usage_event_json(call.usage.as_ref()),
-        });
-        if let Some(m) = &call.reported_model {
-            event["reported_model"] = serde_json::json!(m);
-        }
-        self.write_event(&event);
+        self.write_event(dt::TrajectoryEvent::CompactionCall(dt::CompactionCall {
+            generation: u64::from(call.generation),
+            ts: unix_ms(),
+            requested_model: call.requested_model.clone(),
+            usage: call.usage.as_ref().map(dt::Usage::from),
+            reported_model: call.reported_model.clone(),
+        }));
     }
 
     /// model.reasoning — one per turn where the model emitted reasoning
@@ -399,13 +280,12 @@ impl Trajectory {
         reasoning_text: &str,
         format: &str,
     ) {
-        self.write_event(&serde_json::json!({
-            "type": "model.reasoning",
-            "seq": seq,
-            "ts": unix_ms(),
-            "reasoning_text": reasoning_text,
-            "reasoning_chars": reasoning_text.chars().count(),
-            "reasoning_format": format,
+        self.write_event(dt::TrajectoryEvent::Reasoning(dt::Reasoning {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            reasoning_text: reasoning_text.to_string(),
+            reasoning_chars: reasoning_text.chars().count() as u64,
+            reasoning_format: Some(format.to_string()),
         }));
     }
 
@@ -428,18 +308,14 @@ impl Trajectory {
         code_hash: Option<&str>,
         failure_count: u32,
     ) {
-        let mut event = serde_json::json!({
-            "type": "dispatch.tool.repeated_failure",
-            "seq": seq,
-            "ts": unix_ms(),
-            "tool_name": tool_name,
-            "canonical_args": canonical_args,
-            "failure_count": failure_count,
-        });
-        if let Some(h) = code_hash {
-            event["code_hash"] = serde_json::Value::String(h.to_string());
-        }
-        self.write_event(&event);
+        self.write_event(dt::TrajectoryEvent::RepeatedToolFailure(dt::RepeatedToolFailure {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            tool_name: tool_name.to_string(),
+            canonical_args: canonical_args.to_string(),
+            code_hash: code_hash.map(str::to_string),
+            failure_count: u64::from(failure_count),
+        }));
     }
 
     /// dispatch.cycle.suspected — fires (edge-triggered) when the
@@ -488,28 +364,19 @@ impl Trajectory {
         bound: crate::bounds::BoundRef,
     ) {
         let CheckpointVerdict { slice_tokens, tail_ratio, verdict, judged_chars, policy, would_conclude } = v;
-        let slice = slice_tokens
-            .map(serde_json::Value::from)
-            .unwrap_or(serde_json::Value::Null);
-        // `null` rather than a number when the slice was too short to judge —
-        // a 0.0 would read as "maximally repetitive", the exact opposite.
-        let ratio = tail_ratio
-            .and_then(|r| serde_json::Number::from_f64(r as f64))
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null);
-        self.write_event(&serde_json::json!({
-            // flow-action-guard:allow — a trajectory event type, not a flow action
-            "type": "dispatch.checkpoint",
-            "seq": seq,
-            "ts": unix_ms(),
-            "checkpoint": checkpoint,
-            "slice_tokens": slice,
-            "tail_ratio": ratio,
-            "verdict": verdict,
-            "judged_chars": judged_chars,
-            "policy": policy,
-            "would_conclude": would_conclude,
-            "bound": bound,
+        self.write_event(dt::TrajectoryEvent::Checkpoint(dt::Checkpoint {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            checkpoint: u64::from(checkpoint),
+            slice_tokens: slice_tokens.map(u64::from),
+            // `null` rather than a number when the slice was too short to
+            // judge: a 0.0 would read as "maximally repetitive".
+            tail_ratio: tail_ratio.map(f64::from),
+            verdict,
+            judged_chars: Some(judged_chars as u64),
+            policy: Some(policy.to_string()),
+            would_conclude,
+            bound: Some(bound_value(bound)),
         }));
     }
 
@@ -527,21 +394,16 @@ impl Trajectory {
         // The event's analytic purpose is to discriminate per-call-cap
         // stalls (completion_tokens ≈ MAX_TOKENS_PER_CALL) from
         // context-overflow stalls (count well below cap). When the
-        // upstream response omits `usage` (rare but possible), emit
-        // the field as null so consumers see "unknown" rather than a
-        // misleading 0 that reads identical to a real small count.
-        let completion_tokens_value = completion_tokens
-            .map(serde_json::Value::from)
-            .unwrap_or(serde_json::Value::Null);
-        self.write_event(&serde_json::json!({
-            "type": "dispatch.intra_turn_stall.recovered",
-            "seq": seq,
-            "ts": unix_ms(),
-            "completion_tokens": completion_tokens_value,
-            "recoveries_used": recoveries_used,
-            "recoveries_budget": recoveries_budget,
-            "bound": bound,
-        }));
+        // upstream response omits `usage` (rare but possible), the field
+        // is null so consumers see "unknown" rather than a misleading 0
+        // that reads identical to a real small count.
+        self.write_event(dt::TrajectoryEvent::IntraTurnStallRecovered(stall_recovered(
+            seq,
+            completion_tokens,
+            recoveries_used,
+            recoveries_budget,
+            bound,
+        )));
     }
 
     /// (#2190) dispatch.empty_tool_calls.recovered — sibling of
@@ -562,18 +424,13 @@ impl Trajectory {
         recoveries_budget: u32,
         bound: crate::bounds::BoundRef,
     ) {
-        let completion_tokens_value = completion_tokens
-            .map(serde_json::Value::from)
-            .unwrap_or(serde_json::Value::Null);
-        self.write_event(&serde_json::json!({
-            "type": "dispatch.empty_tool_calls.recovered",
-            "seq": seq,
-            "ts": unix_ms(),
-            "completion_tokens": completion_tokens_value,
-            "recoveries_used": recoveries_used,
-            "recoveries_budget": recoveries_budget,
-            "bound": bound,
-        }));
+        self.write_event(dt::TrajectoryEvent::EmptyToolCallsRecovered(stall_recovered(
+            seq,
+            completion_tokens,
+            recoveries_used,
+            recoveries_budget,
+            bound,
+        )));
     }
 
     /// (#2190) dispatch.escalation.triggered — fires once, at the exact
@@ -596,21 +453,20 @@ impl Trajectory {
         model: &str,
         prompt_tokens: u32,
     ) {
-        self.write_event(&serde_json::json!({
-            "type": "dispatch.escalation.triggered",
-            "seq": seq,
-            "ts": unix_ms(),
-            "reason": reason,
-            "model": model,
-            "prompt_tokens": prompt_tokens,
+        self.write_event(dt::TrajectoryEvent::EscalationTriggered(dt::EscalationTriggered {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            reason: reason.to_string(),
+            model: model.to_string(),
+            prompt_tokens: u64::from(prompt_tokens),
         }));
     }
 
     /// (#2094) One event per turn-delay rest the loop took — harness-owned
     /// idle time between inference turns, never a stall. `ms` is the actual
-    /// sleep duration AFTER clamping (see `loop_runner.rs`'s clamp logic),
-    /// so a consumer summing `ms` across every `runtime.rest` event gets
-    /// exactly `Metrics.rest_ms`.
+    /// sleep duration AFTER clamping (see `loop_runner.rs`'s clamp logic);
+    /// the sum of `ms` over every `runtime.rest` event is the execution's
+    /// rest total (`TrajectoryFold::rest_ms`).
     ///
     /// (2026-08-30 fleet-observability finding) `reason` is always
     /// `"turn_delay"` — every OTHER cause of a `runtime.rest` event routes
@@ -622,12 +478,12 @@ impl Trajectory {
     /// held) — a fragile, undocumented signal for a remote reader to have
     /// to reverse-engineer.
     pub fn append_rest(&mut self, seq: u32, ms: u64) {
-        self.write_event(&serde_json::json!({
-            "type": "runtime.rest",
-            "seq": seq,
-            "ts": unix_ms(),
-            "ms": ms,
-            "reason": "turn_delay",
+        self.write_event(dt::TrajectoryEvent::Rest(dt::Rest {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            ms,
+            reason: dt::RestReason::TurnDelay,
+            state: None,
         }));
     }
 
@@ -651,13 +507,12 @@ impl Trajectory {
     /// than omitting the key — the reader should never have to distinguish
     /// "not asked" from "genuinely unknown."
     pub fn append_paced_rest(&mut self, seq: u32, ms: u64, reason: &str, state: Option<&str>) {
-        self.write_event(&serde_json::json!({
-            "type": "runtime.rest",
-            "seq": seq,
-            "ts": unix_ms(),
-            "ms": ms,
-            "reason": reason,
-            "state": state,
+        self.write_event(dt::TrajectoryEvent::Rest(dt::Rest {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            ms,
+            reason: dt::RestReason::from(reason.to_string()),
+            state: state.map(str::to_string),
         }));
     }
 
@@ -672,19 +527,15 @@ impl Trajectory {
         count: usize,
         window_size: usize,
     ) {
-        let mut event = serde_json::json!({
-            "type": "dispatch.cycle.suspected",
-            "seq": seq,
-            "ts": unix_ms(),
-            "tool_name": tool_name,
-            "canonical_args": canonical_args,
-            "count": count,
-            "window_size": window_size,
-        });
-        if let Some(h) = code_hash {
-            event["code_hash"] = serde_json::Value::String(h.to_string());
-        }
-        self.write_event(&event);
+        self.write_event(dt::TrajectoryEvent::CycleSuspected(dt::CycleSuspected {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            tool_name: tool_name.to_string(),
+            canonical_args: canonical_args.to_string(),
+            code_hash: code_hash.map(str::to_string),
+            count: count as u64,
+            window_size: window_size as u64,
+        }));
     }
 
     /// dispatch.per_turn_cap.salvaged — fires when the runtime
@@ -717,14 +568,13 @@ impl Trajectory {
         salvaged_tool_calls: usize,
         bound: crate::bounds::BoundRef,
     ) {
-        self.write_event(&serde_json::json!({
-            "type": "dispatch.per_turn_cap.salvaged",
-            "seq": seq,
-            "ts": unix_ms(),
-            "completion_tokens": completion_tokens,
-            "cap": cap,
-            "salvaged_tool_calls": salvaged_tool_calls,
-            "bound": bound,
+        self.write_event(dt::TrajectoryEvent::PerTurnCapSalvaged(dt::PerTurnCapSalvaged {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            completion_tokens: u64::from(completion_tokens),
+            cap: u64::from(cap),
+            salvaged_tool_calls: salvaged_tool_calls as u64,
+            bound: Some(bound_value(bound)),
         }));
     }
 
@@ -772,13 +622,12 @@ impl Trajectory {
         arguments_chars: usize,
         cut: &str,
     ) {
-        self.write_event(&serde_json::json!({
-            "type": "dispatch.tool_call.discarded",
-            "seq": seq,
-            "ts": unix_ms(),
-            "name": name,
-            "arguments_chars": arguments_chars,
-            "cut": cut,
+        self.write_event(dt::TrajectoryEvent::ToolCallDiscarded(dt::ToolCallDiscarded {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            name: name.to_string(),
+            arguments_chars: arguments_chars as u64,
+            cut: cut.to_string(),
         }));
     }
 
@@ -832,17 +681,16 @@ impl Trajectory {
         policy: &str,
         acted: bool,
     ) {
-        self.write_event(&serde_json::json!({
-            "type": "dispatch.gate.observation",
-            "seq": seq,
-            "ts": unix_ms(),
-            "observation": observation,
-            "slice_chars": slice_chars,
-            "tail_ratio": ratio,
-            "interval_tokens": interval_tokens,
-            "degenerate": degenerate,
-            "policy": policy,
-            "acted": acted,
+        self.write_event(dt::TrajectoryEvent::GateObservation(dt::GateObservation {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            observation: u64::from(observation),
+            slice_chars: slice_chars as u64,
+            tail_ratio: ratio.map(f64::from),
+            interval_tokens: u64::from(interval_tokens),
+            degenerate,
+            policy: Some(policy.to_string()),
+            acted: Some(acted),
         }));
     }
 
@@ -891,17 +739,16 @@ impl Trajectory {
         // which event type arrived.
         policy: &str,
     ) {
-        self.write_event(&serde_json::json!({
-            "type": "dispatch.gate.abort",
-            "tool_call_in_flight": tool_call_in_flight,
-            "seq": seq,
-            "ts": unix_ms(),
-            "observation": observation,
-            "slice_chars": slice_chars,
-            "generated_chars": generated_chars,
-            "interval_tokens": interval_tokens,
-            "policy": policy,
-            "acted": true,
+        self.write_event(dt::TrajectoryEvent::GateAbort(dt::GateAbort {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            observation: u64::from(observation),
+            slice_chars: slice_chars as u64,
+            generated_chars: generated_chars as u64,
+            interval_tokens: u64::from(interval_tokens),
+            tool_call_in_flight,
+            policy: Some(policy.to_string()),
+            acted: true,
         }));
     }
 
@@ -941,16 +788,15 @@ impl Trajectory {
         count: u32,
         model: &str,
         sample_name_prefix: &str,
-        reason: &str,
+        reason: dt::MalformedReason,
     ) {
-        self.write_event(&serde_json::json!({
-            "type": "dispatch.tool.malformed_names",
-            "seq": seq,
-            "ts": unix_ms(),
-            "count": count,
-            "model": model,
-            "sample_name_prefix": sample_name_prefix,
-            "reason": reason,
+        self.write_event(dt::TrajectoryEvent::MalformedToolNames(dt::MalformedToolNames {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            count: u64::from(count),
+            model: model.to_string(),
+            sample_name_prefix: sample_name_prefix.to_string(),
+            reason,
         }));
     }
 
@@ -967,12 +813,11 @@ impl Trajectory {
         count: usize,
         window_size: usize,
     ) {
-        self.write_event(&serde_json::json!({
-            "type": "dispatch.reasoning_loop.suspected",
-            "seq": seq,
-            "ts": unix_ms(),
-            "count": count,
-            "window_size": window_size,
+        self.write_event(dt::TrajectoryEvent::ReasoningLoopSuspected(dt::ReasoningLoopSuspected {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            count: count as u64,
+            window_size: window_size as u64,
         }));
     }
 
@@ -990,10 +835,9 @@ impl Trajectory {
     /// about the dispatch's behavior changes when this fires; it explains a
     /// decision the runtime already made.
     pub fn append_reasoning_bound_not_applied(&mut self, seq: u32) {
-        self.write_event(&serde_json::json!({
-            "type": "dispatch.reasoning_bound.not_applied",
-            "seq": seq,
-            "ts": unix_ms(),
+        self.write_event(dt::TrajectoryEvent::ReasoningBoundNotApplied(dt::ReasoningBoundNotApplied {
+            seq: u64::from(seq),
+            ts: unix_ms(),
         }));
     }
 
@@ -1012,13 +856,11 @@ impl Trajectory {
         message_count: usize,
         signal_kinds: &[&str],
     ) {
-        self.write_event(&serde_json::json!({
-            // flow-action-guard:allow — a trajectory event type, not a flow action
-            "type": "dispatch.feedback.injected",
-            "seq": seq,
-            "ts": unix_ms(),
-            "message_count": message_count,
-            "signal_kinds": signal_kinds,
+        self.write_event(dt::TrajectoryEvent::FeedbackInjected(dt::FeedbackInjected {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            message_count: message_count as u64,
+            signal_kinds: signal_kinds.iter().map(|k| k.to_string()).collect(),
         }));
     }
 
@@ -1039,14 +881,13 @@ impl Trajectory {
         estimate: u32,
         message_count: usize,
     ) {
-        self.write_event(&serde_json::json!({
-            "type": "dispatch.context.stale_tokens",
-            "seq": seq,
-            "ts": unix_ms(),
-            "frozen_value": frozen_value,
-            "frozen_turns": frozen_turns,
-            "estimate": estimate,
-            "message_count": message_count,
+        self.write_event(dt::TrajectoryEvent::StaleContextTokens(dt::StaleContextTokens {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            frozen_value: u64::from(frozen_value),
+            frozen_turns: u64::from(frozen_turns),
+            estimate: u64::from(estimate),
+            message_count: message_count as u64,
         }));
     }
 
@@ -1082,14 +923,13 @@ impl Trajectory {
         promoted_call_count: usize,
         xml_openers_skipped_as_fenced: usize,
     ) {
-        self.write_event(&serde_json::json!({
-            "type": "tool_call.promoted",
-            "seq": seq,
-            "ts": unix_ms(),
-            "source": source,
-            "format": format,
-            "promoted_call_count": promoted_call_count,
-            "xml_openers_skipped_as_fenced": xml_openers_skipped_as_fenced,
+        self.write_event(dt::TrajectoryEvent::ToolCallPromoted(dt::ToolCallPromoted {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            source: source.to_string(),
+            format: format.to_string(),
+            promoted_call_count: promoted_call_count as u64,
+            xml_openers_skipped_as_fenced: xml_openers_skipped_as_fenced as u64,
         }));
     }
 
@@ -1113,11 +953,10 @@ impl Trajectory {
         seq: u32,
         xml_openers_skipped_as_fenced: usize,
     ) {
-        self.write_event(&serde_json::json!({
-            "type": "tool_call.promotion_suppressed",
-            "seq": seq,
-            "ts": unix_ms(),
-            "xml_openers_skipped_as_fenced": xml_openers_skipped_as_fenced,
+        self.write_event(dt::TrajectoryEvent::PromotionSuppressed(dt::PromotionSuppressed {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            xml_openers_skipped_as_fenced: xml_openers_skipped_as_fenced as u64,
         }));
     }
 
@@ -1166,48 +1005,41 @@ impl Trajectory {
         // field's whole job (#2007) is to make a future cap's truncation
         // visible rather than silent.
         let result_chars = result.chars().count();
-        self.write_event(&serde_json::json!({
-            "type": "tool.completed",
-            "seq": seq,
-            "tool_seq": tool_seq,
-            "tool_name": tool_name,
+        self.write_event(dt::TrajectoryEvent::ToolCompleted(dt::ToolCompleted {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            tool_seq: u64::from(tool_seq),
+            tool_name: tool_name.to_string(),
             // The actual arguments, char-boundary-safe truncation to keep a
             // pathological write/edit payload from bloating the trajectory
             // (search/read/exec args are tiny; only file-content args hit this).
             // A viewer PREVIEW, and only that: cut at MAX_TOOL_ARGS_CHARS.
-            "args": cap_chars(args, MAX_TOOL_ARGS_CHARS),
-            "args_chars": args_chars,
+            args: cap_chars(args, MAX_TOOL_ARGS_CHARS),
+            args_chars: args_chars as u64,
             // (#2272) An accepted `create_finding`'s emission — the model's
             // arguments verbatim, an opaque value darkmux never interprets —
             // and its 1-based ordinal in this dispatch. `null` for every
             // other tool and every rejected report. The crawl's product
             // never rides the preview above.
-            "emitted": emitted,
-            "emit_seq": emit_seq,
-            "result_chars": result_chars,
-            "result": result,
+            emitted: emitted.cloned(),
+            emit_seq: emit_seq.map(|n| n as u64),
+            result_chars: result_chars as u64,
+            result: result.to_string(),
             // (#2008) The three-way outcome beside the boolean. `ok` answers
             // "did the tool work" (true for a red test); `outcome`
             // distinguishes a clean run from one that reported non-zero from
-            // one that never ran, which are three different things three
-            // different consumers need to tell apart.
-            "outcome": outcome.as_str(),
-            // Flat additive keys rather than a nested tagged enum: every
-            // reader of this file is lenient-on-read, and a flat key is the
-            // shape they already tolerate. `exit_code` is what lets a viewer
-            // render "exit 1" instead of a bare cross.
-            "exit_code": match outcome {
-                crate::failure_rate::ToolOutcome::Reported { exit_code } => {
-                    serde_json::json!(exit_code)
-                }
-                _ => serde_json::Value::Null,
+            // one that never ran. `exit_code` is what lets a viewer render
+            // "exit 1" instead of a bare cross.
+            outcome: Some(outcome.kind()),
+            exit_code: match outcome {
+                crate::failure_rate::ToolOutcome::Reported { exit_code } => Some(i64::from(*exit_code)),
+                crate::failure_rate::ToolOutcome::Ok | crate::failure_rate::ToolOutcome::Failed { .. } => None,
             },
-            "failure_reason": match outcome {
-                crate::failure_rate::ToolOutcome::Failed { reason } => serde_json::json!(reason),
-                _ => serde_json::Value::Null,
+            failure_reason: match outcome {
+                crate::failure_rate::ToolOutcome::Failed { reason } => Some(reason.clone()),
+                crate::failure_rate::ToolOutcome::Ok | crate::failure_rate::ToolOutcome::Reported { .. } => None,
             },
-            "ok": outcome.tool_worked(),
-            "ts": unix_ms(),
+            ok: outcome.tool_worked(),
         }));
     }
 
@@ -1216,12 +1048,12 @@ impl Trajectory {
     /// `max` is the configured context window (n_ctx), None when unconfigured.
     /// The #557 Slice-3 sawtooth: occupancy climbs each turn, drops at compaction.
     pub fn append_context_window(&mut self, seq: u32, used: u32, max: Option<u32>) {
-        self.write_event(&serde_json::json!({
-            "type": "dispatch.context",
-            "seq": seq,
-            "ts": unix_ms(),
-            "used": used,
-            "max": max,   // serde_json renders None as null; the viewer treats null max as "unknown window"
+        self.write_event(dt::TrajectoryEvent::Context(dt::Context {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            used: u64::from(used),
+            // `None` renders as null; the viewer reads it as "unknown window".
+            max: max.map(u64::from),
         }));
     }
 
@@ -1246,15 +1078,14 @@ impl Trajectory {
         tokens_before: u32,
         tokens_after: u32,
     ) {
-        self.write_event(&serde_json::json!({
-            "type": "compaction",
-            "generation": generation,
-            "ts": unix_ms(),
-            "before_messages": before_message_count,
-            "after_messages": after_message_count,
-            "summary_chars": summary_chars,
-            "tokens_before": tokens_before,
-            "tokens_after": tokens_after,
+        self.write_event(dt::TrajectoryEvent::Compaction(dt::Compaction {
+            generation: u64::from(generation),
+            ts: unix_ms(),
+            before_messages: before_message_count as u64,
+            after_messages: after_message_count as u64,
+            summary_chars: summary_chars as u64,
+            tokens_before: Some(u64::from(tokens_before)),
+            tokens_after: Some(u64::from(tokens_after)),
         }));
     }
 
@@ -1276,13 +1107,12 @@ impl Trajectory {
         message_count: usize,
         reason: &str,
     ) {
-        self.write_event(&serde_json::json!({
-            "type": "compaction.skipped",
-            "turn": turn,
-            "attempted_generation": attempted_generation,
-            "ts": unix_ms(),
-            "messages": message_count,
-            "reason": reason,
+        self.write_event(dt::TrajectoryEvent::CompactionSkipped(dt::CompactionSkipped {
+            turn: u64::from(turn),
+            attempted_generation: u64::from(attempted_generation),
+            ts: unix_ms(),
+            messages: message_count as u64,
+            reason: reason.to_string(),
         }));
     }
 
@@ -1303,13 +1133,12 @@ impl Trajectory {
         tokens_after: u32,
         trigger_tokens: u32,
     ) {
-        self.write_event(&serde_json::json!({
-            "type": "compaction.unproductive",
-            "turn": turn,
-            "ts": unix_ms(),
-            "consecutive": consecutive,
-            "tokens_after": tokens_after,
-            "trigger_tokens": trigger_tokens,
+        self.write_event(dt::TrajectoryEvent::CompactionUnproductive(dt::CompactionUnproductive {
+            turn: u64::from(turn),
+            ts: unix_ms(),
+            consecutive: u64::from(consecutive),
+            tokens_after: u64::from(tokens_after),
+            trigger_tokens: u64::from(trigger_tokens),
         }));
     }
 
@@ -1331,27 +1160,32 @@ impl Trajectory {
         window: u32,
         trimmed: usize,
     ) {
-        self.write_event(&serde_json::json!({
-            "type": "dispatch.pre_send_bound",
-            "turn": turn,
-            "ts": unix_ms(),
-            "tokens_before": tokens_before,
-            "tokens_after": tokens_after,
-            "declared_window": window,
-            "results_trimmed": trimmed,
-            "fits": tokens_after <= window,
+        self.write_event(dt::TrajectoryEvent::PreSendBound(dt::PreSendBound {
+            turn: u64::from(turn),
+            ts: unix_ms(),
+            tokens_before: u64::from(tokens_before),
+            tokens_after: u64::from(tokens_after),
+            declared_window: u64::from(window),
+            results_trimmed: trimmed as u64,
+            fits: tokens_after <= window,
         }));
     }
 
     /// dispatch.complete — last event in the trajectory. Records the
-    /// terminal outcome + wall time.
-    pub fn append_dispatch_complete(&mut self, result: &str, wall_ms: u128) {
-        self.write_event(&serde_json::json!({
-            // flow-action-guard:allow — a trajectory event type, not a flow action
-            "type": "dispatch.complete",
-            "ts": unix_ms(),
-            "result": result,
-            "wall_ms": wall_ms,
+    /// terminal outcome, wall time, and (#2094 finding 8) the POST-CLAMP
+    /// turn delay the loop applied, which only the runtime knows (`None`
+    /// when the loop returned an error).
+    pub fn append_dispatch_complete(
+        &mut self,
+        result: &str,
+        wall_ms: u128,
+        turn_delay_effective_ms: Option<u64>,
+    ) {
+        self.write_event(dt::TrajectoryEvent::DispatchComplete(dt::DispatchComplete {
+            ts: unix_ms(),
+            result: result.to_string(),
+            wall_ms: u64::try_from(wall_ms).unwrap_or(u64::MAX),
+            turn_delay_effective_ms,
         }));
     }
 
@@ -1372,12 +1206,11 @@ impl Trajectory {
         system_chars: usize,
         prompt_chars: usize,
     ) {
-        self.write_event(&serde_json::json!({
-            "type": "model.streaming.start",
-            "seq": seq,
-            "ts": unix_ms(),
-            "system_chars": system_chars,
-            "prompt_chars": prompt_chars,
+        self.write_event(dt::TrajectoryEvent::StreamingStart(dt::StreamingStart {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            system_chars: system_chars as u64,
+            prompt_chars: prompt_chars as u64,
         }));
     }
 
@@ -1411,21 +1244,17 @@ impl Trajectory {
         // absence is the "not writing" reading.
         writing_tool: Option<&str>,
     ) {
-        let mut event = serde_json::json!({
-            "type": "model.partial",
-            "seq": seq,
-            "partial_index": partial_index,
-            "delta_chars": delta_chars,
-            "cumulative_chars": cumulative_chars,
-            "tool_calls_present": tool_calls_present,
-            "generated_chars": generated_chars,
-            "ts": unix_ms(),
-        });
-        if let Some(name) = writing_tool {
-            event["phase"] = serde_json::json!(WRITING_TOOL_CALL_PHASE);
-            event["tool_name"] = serde_json::json!(name);
-        }
-        self.write_event(&event);
+        self.write_event(dt::TrajectoryEvent::Partial(dt::Partial {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            partial_index: u64::from(partial_index),
+            delta_chars: delta_chars as u64,
+            cumulative_chars: cumulative_chars as u64,
+            tool_calls_present,
+            generated_chars: Some(generated_chars as u64),
+            phase: writing_tool.map(|_| dt::StreamPhase::WritingToolCall),
+            tool_name: writing_tool.map(str::to_string),
+        }));
     }
 
     /// model.tool_call.writing — (#2889) fires once per stream tick while the
@@ -1446,15 +1275,14 @@ impl Trajectory {
         generated_chars: usize,
         tool_name: &str,
     ) {
-        self.write_event(&serde_json::json!({
-            "type": "model.tool_call.writing",
-            "seq": seq,
-            "partial_index": partial_index,
-            "cumulative_chars": cumulative_chars,
-            "generated_chars": generated_chars,
-            "phase": WRITING_TOOL_CALL_PHASE,
-            "tool_name": tool_name,
-            "ts": unix_ms(),
+        self.write_event(dt::TrajectoryEvent::ToolCallWriting(dt::ToolCallWriting {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            partial_index: u64::from(partial_index),
+            cumulative_chars: cumulative_chars as u64,
+            generated_chars: Some(generated_chars as u64),
+            phase: dt::StreamPhase::WritingToolCall,
+            tool_name: tool_name.to_string(),
         }));
     }
 
@@ -1489,27 +1317,15 @@ impl Trajectory {
         // checkable against reality instead of assumed. `None` when the
         // endpoint reported no usage, or on a runtime abort, where no final
         // usage chunk ever arrives.
-        self.write_event(&serde_json::json!({
-            "type": "model.streaming.end",
-            "seq": seq,
-            "partial_count": partial_count,
-            "total_content_chars": total_content_chars,
-            "tool_calls_count": tool_calls_count,
-            "observations": observations,
-            "chars_per_token": chars_per_token,
-            "ts": unix_ms(),
+        self.write_event(dt::TrajectoryEvent::StreamingEnd(dt::StreamingEnd {
+            seq: u64::from(seq),
+            ts: unix_ms(),
+            partial_count: u64::from(partial_count),
+            total_content_chars: total_content_chars as u64,
+            tool_calls_count: tool_calls_count as u64,
+            observations: Some(u64::from(observations)),
+            chars_per_token: chars_per_token.map(f64::from),
         }));
-    }
-
-    /// Save the metrics.json summary. Called once at dispatch exit.
-    pub fn save_metrics(&mut self, metrics: &Metrics) -> Result<()> {
-        let Some(path) = self.metrics_path.as_ref() else {
-            return Ok(());
-        };
-        let json = serde_json::to_string_pretty(metrics)?;
-        fs::write(path, json)?;
-        eprintln!("darkmux-runtime: metrics → {}", path.display());
-        Ok(())
     }
 
     /// Wall time since the trajectory was opened. Useful for the
@@ -1523,11 +1339,11 @@ impl Trajectory {
     /// Append errors are emitted to stderr but don't propagate up —
     /// the dispatch shouldn't fail because of an instrumentation
     /// problem.
-    fn write_event(&mut self, event: &serde_json::Value) {
+    fn write_event(&mut self, event: dt::TrajectoryEvent) {
         let Some(file) = self.file.as_mut() else {
             return;
         };
-        let mut line = serde_json::to_string(event).unwrap_or_default();
+        let mut line = serde_json::to_string(&event).unwrap_or_default();
         line.push('\n');
         if let Err(e) = file.write_all(line.as_bytes()) {
             eprintln!("darkmux-runtime: trajectory write failed: {e}");
@@ -1551,40 +1367,41 @@ pub(crate) fn unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// The `usage` object a model-call event carries (`model.completed`,
-/// `compaction.call`): one shape, so the host reads both with one mapper.
-fn usage_event_json(usage: Option<&Usage>) -> Option<serde_json::Value> {
-    usage.map(|u| {
-        serde_json::json!({
-            "prompt_tokens": u.prompt_tokens,
-            "completion_tokens": u.completion_tokens,
-            "total_tokens": u.total_tokens,
-            // (#1444) `null` — not a fabricated `0` — when the provider
-            // didn't report a details object/field at all. Present on
-            // hosted reasoning-family models (Azure/OpenAI o-series,
-            // GPT-5.1-class); always `null` for LMStudio-local calls
-            // today. Whether `reasoning_tokens` sits INSIDE
-            // `completion_tokens` or outside it is provider-specific —
-            // see `Usage::reasoning_tokens`'s doc; do not derive one
-            // from the other here or downstream.
-            //
-            // This writer is the ONLY producer of these two keys in the
-            // trajectory, and the host's `turn_tokens_payload` reads
-            // them straight back out — so
-            // `model_completed_usage_carries_reasoning_and_cached_tokens`
-            // below pins them here rather than relying on the host-side
-            // test, which feeds a hand-written fixture and would stay
-            // green forever if this emission were deleted.
-            "reasoning_tokens": u.reasoning_tokens(),
-            "cached_tokens": u.cached_tokens(),
-        })
-    })
+/// The bound a record names, as the opaque value the host forwards.
+fn bound_value(bound: crate::bounds::BoundRef) -> serde_json::Value {
+    serde_json::to_value(bound).unwrap_or_default()
+}
+
+/// The two stall-recovery events share one shape.
+fn stall_recovered(
+    seq: u32,
+    completion_tokens: Option<u32>,
+    recoveries_used: u32,
+    recoveries_budget: u32,
+    bound: crate::bounds::BoundRef,
+) -> dt::StallRecovered {
+    dt::StallRecovered {
+        seq: u64::from(seq),
+        ts: unix_ms(),
+        completion_tokens: completion_tokens.map(u64::from),
+        recoveries_used: u64::from(recoveries_used),
+        recoveries_budget: u64::from(recoveries_budget),
+        bound: Some(bound_value(bound)),
+    }
+}
+
+/// What a test's trajectory recorded, through the one fold every reader
+/// uses: the counts a loop test asserts are the counts the host reports.
+#[cfg(test)]
+pub(crate) fn recorded(base_dir: &Path) -> dt::TrajectoryFold {
+    dt::TrajectoryFold::from_path(&dt::trajectory_path(base_dir))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::failure_rate::ToolOutcome;
+    use darkmux_trajectory::{TRAJECTORY_FILE, TRAJECTORY_SUBDIR};
 
     #[test]
     fn open_creates_dot_dir_and_file() {
@@ -1691,12 +1508,9 @@ mod tests {
     /// (#2963 review) A record whose calls were planned says so at the turn
     /// level, and the host lists a turn's calls only when it does: a runtime
     /// older than the `runs` marks would otherwise read as "every call runs",
-    /// the bug the marks exist to fix. The two key names are pinned as
-    /// literals here and on the host side, so a rename on one side fails.
+    /// the bug the marks exist to fix.
     #[test]
     fn model_completed_says_its_calls_were_planned() {
-        assert_eq!(CALLS_PLANNED_KEY, "calls_planned");
-        assert_eq!(RUNS_KEY, "runs");
         use crate::lmstudio::FunctionCall;
         let calls = vec![ToolCall {
             id: "c1".into(),
@@ -1725,23 +1539,20 @@ mod tests {
     /// the emission site.
     #[test]
     fn model_completed_usage_carries_reasoning_and_cached_tokens() {
-        use crate::lmstudio::{CompletionTokensDetails, PromptTokensDetails};
         let ws = tempfile::Builder::new().prefix("traj-reasoning").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
-        let usage = Usage {
-            prompt_tokens: 100,
-            completion_tokens: 600,
-            total_tokens: 700,
-            completion_tokens_details: Some(CompletionTokensDetails {
-                reasoning_tokens: Some(500),
-            }),
-            prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: Some(20) }),
+        let usage = UsageCounts {
+            prompt: Some(100),
+            completion: Some(600),
+            total: Some(700),
+            reasoning: Some(500),
+            cached: Some(20),
         };
         t.append_model_completed(1, "stop", Some(&usage), None, None, None);
 
         // A second turn whose provider reported NO details object at all —
         // both keys must be JSON `null`, never a fabricated `0`.
-        let bare = Usage { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12, ..Default::default() };
+        let bare = UsageCounts { prompt: Some(10), completion: Some(2), total: Some(12), ..Default::default() };
         t.append_model_completed(2, "stop", Some(&bare), None, None, None);
         drop(t);
 
@@ -1998,48 +1809,22 @@ mod tests {
         assert!(line["max"].is_null(), "None max must serialize as JSON null");
     }
 
-    /// (#2094 finding 8) The runtime writes `turn_delay_effective_ms` into
-    /// metrics.json under exactly that key — the host-side
-    /// `read_turn_delay_effective_ms` (`dispatch_internal.rs`) reads it
-    /// back by this literal name, so a rename here silently breaks that
-    /// reader without either side's own compiler catching it.
+    /// (#2094 finding 8) The post-clamp turn delay rides the trajectory's
+    /// closing event, the only record the host reads it from; `None` (an
+    /// errored loop) is null, not a fabricated 0.
     #[test]
-    fn save_metrics_writes_turn_delay_effective_ms_under_its_own_key() {
-        let ws = tempfile::Builder::new().prefix("traj-metrics-tdem").tempdir().unwrap();
+    fn dispatch_complete_carries_the_effective_turn_delay() {
+        let ws = tempfile::Builder::new().prefix("traj-tdem").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
-        let m = Metrics {
-            runtime: "darkmux-runtime",
-            version: "0.1.0",
-            model: "test".into(),
-            started_at_unix_ms: 0,
-            wall_ms: 3000,
-            result: "stop".into(),
-            turns: 3,
-            compactions: 0,
-            total_prompt_tokens: 0,
-            total_completion_tokens: 0,
-            turns_this_run: 3,
-            total_prompt_tokens_this_run: 0,
-            total_completion_tokens_this_run: 0,
-            compactions_this_run: 0,
-            total_reasoning_tokens: None,
-            total_cached_tokens: None,
-            total_messages: 0,
-            max_turns_reached: false,
-            rest_ms: 1000,
-            rests: 2,
-            turn_delay_effective_ms: 500,
-            final_assistant_preview: "".into(),
-        };
-        t.save_metrics(&m).unwrap();
+        t.append_dispatch_complete("stop", 3000, Some(500));
+        t.append_dispatch_complete("error", 10, None);
         drop(t);
-
-        let body = fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(METRICS_FILE))
-            .unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["turn_delay_effective_ms"], 500);
-        assert_eq!(parsed["rest_ms"], 1000);
-        assert_eq!(parsed["rests"], 2);
+        let body = fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
+        let lines: Vec<serde_json::Value> = body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines[0]["type"], "dispatch.complete");
+        assert_eq!(lines[0]["turn_delay_effective_ms"], 500);
+        assert_eq!(lines[0]["wall_ms"], 3000);
+        assert!(lines[1]["turn_delay_effective_ms"].is_null(), "{}", lines[1]);
     }
 
     #[test]
@@ -2050,32 +1835,7 @@ mod tests {
         let mut t = Trajectory::open(bad);
         // This shouldn't panic or fail:
         t.append_dispatch_start("model", 0, 0, &[]);
-        // metrics save should also be a no-op:
-        let m = Metrics {
-            runtime: "darkmux-runtime",
-            version: "0.1.0",
-            model: "test".into(),
-            started_at_unix_ms: 0,
-            wall_ms: 0,
-            result: "stop".into(),
-            turns: 0,
-            compactions: 0,
-            total_prompt_tokens: 0,
-            total_completion_tokens: 0,
-            turns_this_run: 0,
-            total_prompt_tokens_this_run: 0,
-            total_completion_tokens_this_run: 0,
-            compactions_this_run: 0,
-            total_reasoning_tokens: None,
-            total_cached_tokens: None,
-            total_messages: 0,
-            max_turns_reached: false,
-            rest_ms: 0,
-            rests: 0,
-            turn_delay_effective_ms: 0,
-            final_assistant_preview: "".into(),
-        };
-        t.save_metrics(&m).unwrap();
+        t.append_dispatch_complete("stop", 0, None);
     }
 
     /// (#2902 step 1b) A turn names the model that answered it, when the
@@ -2126,7 +1886,7 @@ mod tests {
     fn compaction_call_event_records_one_compactor_call() {
         let ws = tempfile::Builder::new().prefix("traj-compaction-call").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
-        let usage = Usage { prompt_tokens: 500, completion_tokens: 80, total_tokens: 580, ..Default::default() };
+        let usage = UsageCounts { prompt: Some(500), completion: Some(80), total: Some(580), ..Default::default() };
         t.append_compaction_call(&crate::compaction::CompactorCall {
             generation: 3,
             requested_model: "darkmux:compactor-4b".into(),

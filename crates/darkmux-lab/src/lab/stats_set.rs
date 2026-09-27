@@ -117,15 +117,6 @@ pub fn flags(s: &RunStats) -> Vec<&'static str> {
         Some(r) if r.starts_with("escalation") => f.push("ESCALATED"),
         _ => {}
     }
-    if c.metrics_stale {
-        f.push("STALE-METRICS");
-    }
-    if c.tokens_reconcile == Some(false) {
-        f.push("TOKENS");
-    }
-    if !c.checkpoint_parse_consistent || !c.missing_required_events.is_empty() {
-        f.push("PARSE");
-    }
     if !c.verdict_matches_ratio {
         f.push("VERDICT");
     }
@@ -137,9 +128,6 @@ pub fn flags(s: &RunStats) -> Vec<&'static str> {
     }
     if !c.rest_within_wall {
         f.push("REST");
-    }
-    if c.turns_match_trajectory == Some(false) || c.rest_matches_trajectory == Some(false) {
-        f.push("COUNTS");
     }
     if !c.have_telemetry_samples {
         f.push("NO-TELEM");
@@ -178,17 +166,14 @@ pub fn flags(s: &RunStats) -> Vec<&'static str> {
 /// this only detects the condition; the caller withholds the figures it
 /// would corrupt rather than dividing them up.
 ///
-/// `metrics_stale` runs are excluded before windows are even built (review,
-/// 2026-09-23): a STALE-METRICS run's window is `metrics.json`'s claim
-/// about SOME run's clock, not necessarily this one's — using it to accuse
-/// a genuine, clean run of overlapping is exactly what a byte-identical
-/// stale copy did on disk. All 17 real OVERLAP hits before this fix were
-/// stale copies or the clean owner they were copied from; zero were
-/// independent concurrent runs.
+/// Each window is the run's own clock (its trajectory's first event and the
+/// runtime's wall time). Before 4.0 it came from `metrics.json`, and a stale
+/// copy of another run's file put a clean run in the dock: all 17 OVERLAP
+/// hits measured then were stale copies or the clean owner they were copied
+/// from.
 pub fn overlapping(runs: &[RunStats]) -> std::collections::BTreeSet<String> {
     let mut windows: Vec<(&str, u64, u64)> = runs
         .iter()
-        .filter(|s| !s.checks.metrics_stale)
         .filter_map(|s| s.started_at_unix_ms.map(|from| (s.run.as_str(), from, from.saturating_add(s.wall_ms))))
         .collect();
     windows.sort_by_key(|(_, from, _)| *from);
@@ -222,24 +207,22 @@ pub fn summarize(runs: &[RunStats]) -> SetSummary {
     let passed = runs.iter().filter(|s| verified(s) == Some(true)).count();
     let failed = runs.iter().filter(|s| verified(s) == Some(false)).count();
     let overlap = overlapping(runs);
-    let stale: std::collections::BTreeSet<&str> =
-        runs.iter().filter(|s| s.checks.metrics_stale).map(|s| s.run.as_str()).collect();
+    // An OVERLAP run's host power is the whole host's draw, claimed twice.
+    let energy_excl: std::collections::BTreeSet<&str> = overlap.iter().map(String::as_str).collect();
 
     let mut models: Vec<String> = runs.iter().filter_map(|s| s.model.clone()).collect();
     models.sort();
     models.dedup();
 
     let r = |f: fn(&RunStats) -> Option<f64>| Range::of(runs.iter().filter_map(f));
-    // (Review, 2026-09-23) A STALE-METRICS run's wall/rest/active time is
-    // built on another run's clock, and a STALE-METRICS or OVERLAP run's
-    // power/energy is either the same suspect window or the whole host's
-    // draw claimed twice — either way a wrong number, not merely an
-    // uncertain one, so these SET-level figures exclude the run rather than
-    // averaging it in. This is narrower than the module's general "never
-    // drop a run" rule: that rule is for CHECKS that leave the figure
-    // itself untouched (TOKENS, UNBILLED, …); these two conditions mean the
-    // figure is actively wrong. The per-run TABLE ROW still prints the
-    // run's own number, flagged — only the aggregate excludes it.
+    // (Review, 2026-09-23) An OVERLAP run's power/energy is the whole
+    // host's draw claimed twice — a wrong number, not merely an uncertain
+    // one, so these SET-level figures exclude the run rather than averaging
+    // it in. This is narrower than the module's general "never drop a run"
+    // rule: that rule is for CHECKS that leave the figure itself untouched
+    // (UNBILLED, …); this condition means the figure is actively wrong. The
+    // per-run TABLE ROW still prints the run's own number, flagged — only
+    // the aggregate excludes it.
     let r_excl = |excl: &std::collections::BTreeSet<&str>, f: fn(&RunStats) -> Option<f64>| {
         Range::of(runs.iter().filter(|s| !excl.contains(s.run.as_str())).filter_map(f))
     };
@@ -264,12 +247,11 @@ pub fn summarize(runs: &[RunStats]) -> SetSummary {
             }
         }
     };
-    // A figure built from `wall_ms`/`active_ms` for a STALE-METRICS run is
-    // built on another run's clock; a figure built from host telemetry for
-    // an OVERLAP run is the whole host's power, claimed twice. Neither can be
-    // apportioned, so the run's contribution is excluded rather than summed
-    // — which, like a run that never recorded the value, withholds the
-    // WHOLE set's total instead of reading low.
+    // A figure built from host telemetry for an OVERLAP run is the whole
+    // host's power, claimed twice. It cannot be apportioned, so the run's
+    // contribution is excluded rather than summed — which, like a run that
+    // never recorded the value, withholds the WHOLE set's total instead of
+    // reading low.
     let sum_all_excluding = |excl: &std::collections::BTreeSet<&str>, f: fn(&RunStats) -> Option<f64>| -> Option<f64> {
         runs.iter()
             .map(|s| if excl.contains(s.run.as_str()) { None } else { f(s) })
@@ -278,29 +260,14 @@ pub fn summarize(runs: &[RunStats]) -> SetSummary {
     if passed == 0 && n > 0 {
         withheld.push("no run in the set passed verify, so there is no success to cost".into());
     }
-    // Both conditions can make a host-telemetry figure unreliable for the
-    // same run; union them once rather than excluding twice.
-    let energy_excl: std::collections::BTreeSet<&str> = stale.union(&overlap.iter().map(|s| s.as_str()).collect()).copied().collect();
-    let stale_reason = (!stale.is_empty()).then(|| {
-        format!("{} run(s) have a metrics.json that does not belong to them (STALE-METRICS)", stale.len())
-    });
-    let overlap_reason = (!overlap.is_empty()).then(|| {
+    let energy_reason = (!overlap.is_empty()).then(|| {
         format!("{} run(s) have overlapping host-telemetry windows (OVERLAP) and cannot be apportioned", overlap.len())
     });
-    // The energy reason is the CONCATENATION of whichever of the two
-    // conditions applies — a run can be excluded from energy for both at
-    // once, and each reason is independently true.
-    let energy_reason: Option<String> = match (&stale_reason, &overlap_reason) {
-        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
-        (Some(a), None) => Some(a.clone()),
-        (None, Some(b)) => Some(b.clone()),
-        (None, None) => None,
-    };
     let cost_per_success = CostPerSuccess {
         active_ms: per_success(
-            sum_all_excluding(&stale, |s| Some(s.active_ms as f64)),
+            sum_all_excluding(&std::collections::BTreeSet::new(), |s| Some(s.active_ms as f64)),
             "active time",
-            stale_reason.as_deref(),
+            None,
             &mut withheld,
         ),
         gpu_busy_ms: per_success(
@@ -328,9 +295,9 @@ pub fn summarize(runs: &[RunStats]) -> SetSummary {
             .filter(|s| verified(s) == Some(true) && s.result.as_deref() == Some("error"))
             .count(),
         models,
-        active_ms: r_excl(&stale, |s| Some(s.active_ms as f64)),
-        wall_ms: r_excl(&stale, |s| Some(s.wall_ms as f64)),
-        rest_ms: r_excl(&stale, |s| Some(s.rest_ms as f64)),
+        active_ms: r(|s| Some(s.active_ms as f64)),
+        wall_ms: r(|s| Some(s.wall_ms as f64)),
+        rest_ms: r(|s| Some(s.rest_ms as f64)),
         turns: r(|s| Some(s.turns as f64)),
         completion_tokens: r(|s| Some(s.completion_tokens as f64)),
         tok_per_s: r(|s| s.tok_per_s),

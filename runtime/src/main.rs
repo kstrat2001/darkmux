@@ -8,7 +8,7 @@
 //!   (echo retained for sanity-check unit tests; not in the production
 //!   dispatch palette — see `runtime/src/main.rs::run_dispatch`)
 //! - Token-count-aware compaction (`compaction` module)
-//! - Per-dispatch trajectory + metrics recorder (`trajectory` module)
+//! - Per-dispatch trajectory recorder (`trajectory` module)
 //!
 //! Subcommands:
 //!
@@ -16,7 +16,7 @@
 //! - `--version`          → version
 //! - `run --model <id> --system <text> --prompt <text>` →
 //!   run a single tool-call loop to completion; print the final
-//!   assistant message + metrics
+//!   assistant message and the run's counts (read back from its trajectory)
 //!
 //! See `README.md` for the architectural context.
 
@@ -84,7 +84,7 @@ fn main() -> ExitCode {
             println!();
             println!("Flags:");
             println!("  --json       Emit structured envelope on stdout (status to stderr).");
-            println!("               Schema: {{ result, final_assistant, metrics, trajectory_path }}");
+            println!("               Schema: {{ result, final_assistant, trajectory_path }}");
             ExitCode::SUCCESS
         }
     }
@@ -966,16 +966,11 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    // Open trajectory + metrics recorder against the mounted out-dir
-    // (SEPARATE from /workspace so the runtime never writes its own
-    // bookkeeping into the tree it's operating on). Phase 7: gives
-    // post-dispatch visibility because the container is --rm and
-    // otherwise everything except stderr is lost.
+    // Open the trajectory recorder against the mounted out-dir (SEPARATE
+    // from /workspace so the runtime never writes its own bookkeeping into
+    // the tree it's operating on). The container is --rm, so this is what
+    // survives it.
     let mut traj = trajectory::Trajectory::open(Path::new(trajectory::RUNTIME_OUT_BASE));
-    let started_at_unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
     let system_chars = initial_messages[0].content.as_deref().map(str::len).unwrap_or(0);
     let prompt_chars = initial_messages[1].content.as_deref().map(str::len).unwrap_or(0);
     traj.append_dispatch_start(&model, system_chars, prompt_chars, &tool_names);
@@ -1101,9 +1096,15 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         None => "error",
     };
 
-    // Whether success or failure, write the trajectory close + metrics.
+    // Whether success or failure, close the trajectory. Every count of this
+    // execution (turns, tokens, rests) is in the trajectory already, written
+    // as it happened; the host folds it, so nothing here restates a total.
     let wall_ms = traj.elapsed_ms();
-    traj.append_dispatch_complete(result_str, wall_ms);
+    traj.append_dispatch_complete(
+        result_str,
+        wall_ms,
+        outcome.as_ref().map(|o| o.turn_delay_effective_ms),
+    );
 
     if let Some(o) = &outcome {
         // (#1221) Prefer the answer the LOOP identified. "Last assistant
@@ -1123,20 +1124,8 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             })
             .unwrap_or_else(|| "<empty>".into());
 
-        let preview: String = final_assistant.chars().take(400).collect();
-        let metrics =
-            metrics_from_outcome(o, &model, started_at_unix_ms, wall_ms, result_str, preview);
-        let _ = traj.save_metrics(&metrics);
-
         if json_mode {
-            let mut envelope = envelope_from_outcome(
-                result_str,
-                Some(&final_assistant),
-                &model,
-                started_at_unix_ms,
-                wall_ms,
-                o,
-            );
+            let mut envelope = build_json_envelope(result_str, Some(&final_assistant));
             // (#799) Stamp the verifier-fabrication backstop: the bash commands
             // that FAILED TO RUN this dispatch. The gate cross-checks a SIGNOFF's
             // verification claims against this; empty on an honest run.
@@ -1147,9 +1136,9 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                         .unwrap_or_else(|_| serde_json::json!([])),
                 );
                 // (#2114) `resumed_from`: path + the checkpoint's OWN turn
-                // index (where the dispatch resumed FROM, not `o.turns`
-                // which is where it ended up) — present only when this
-                // dispatch actually reloaded a checkpoint.
+                // index (where the dispatch resumed FROM, not where it ended
+                // up) — present only when this dispatch actually reloaded a
+                // checkpoint.
                 if let (Some(path), Some(turn_index)) =
                     (&resume_checkpoint_path, resumed_from_turn_index)
                 {
@@ -1164,116 +1153,19 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             println!("--- final assistant message ---");
             println!("{final_assistant}");
             println!();
-            println!("--- metrics ---");
-            println!("turns:             {}", o.turns);
-            println!("compactions:       {}", o.compactions);
-            println!("prompt tokens:     {}", o.total_prompt_tokens);
-            println!("completion tokens: {}", o.total_completion_tokens);
-            // (#1444) Only printed when at least one turn reported it —
-            // "not shown" reads honestly as "unknown", never a fabricated 0.
-            //
-            // (#1444 review) Deliberately carries NO "(subset of completion
-            // tokens above)" gloss. Whether reasoning tokens sit inside
-            // `completion_tokens` is provider-specific, and this line has no
-            // idea which provider answered — on a Gemini or xAI artifact the
-            // gloss would print "completion tokens: 128" directly above
-            // "reasoning tokens: 1500", contradicting itself on its face.
-            // The relation belongs in the provider-scoped doc
-            // (`lmstudio::CompletionTokensDetails::reasoning_tokens`), not in
-            // an unconditional label.
-            if let Some(rt) = o.total_reasoning_tokens {
-                println!("reasoning tokens:  {rt}");
-            }
-            if let Some(ct) = o.total_cached_tokens {
-                println!("cached tokens:     {ct}");
-            }
-            println!("total messages:    {}", o.messages.len());
-            println!("wall:              {wall_ms}ms");
+            print_run_summary(result_str, wall_ms);
         }
     } else {
-        // Loop returned an error — still write a minimal metrics file
-        // so the operator has a record of the failure.
-        let metrics = trajectory::Metrics {
-            runtime: "darkmux-runtime",
-            version: VERSION,
-            model: model.clone(),
-            started_at_unix_ms,
-            wall_ms,
-            result: result_str.into(),
-            turns: 0,
-            compactions: 0,
-            total_prompt_tokens: 0,
-            total_completion_tokens: 0,
-            // (#2263) Same "no LoopOutcome survives an Err return" gap as
-            // every other hardcoded 0 in this arm.
-            turns_this_run: 0,
-            total_prompt_tokens_this_run: 0,
-            total_completion_tokens_this_run: 0,
-            compactions_this_run: 0,
-            // (#1444) No `LoopOutcome` survives an `Err` return (same gap
-            // this file's own `rest_ms`/`rests` comment already names for
-            // this arm) — `None`, not `Some(0)`: nothing was measured, not
-            // "zero was measured".
-            total_reasoning_tokens: None,
-            total_cached_tokens: None,
-            total_messages: 0,
-            // (#884) An error returned from the loop is an infrastructure
-            // failure, NOT a turn-cap termination. Hardcoding `true` here
-            // mislabeled every infra failure as max-turns and corrupted
-            // the #325 three-way result discrimination that downstream
-            // consumers branch on.
-            max_turns_reached: false,
-            // (#2094) No `LoopOutcome` survives an `Err` return — any rests
-            // taken before the failure aren't recoverable HERE without
-            // threading rest counters through the error path too (the same
-            // reason turns/compactions above are hardcoded 0, not a new
-            // gap). This IS recoverable on the HOST side, though: every
-            // `runtime.rest` this dispatch took before the crash was
-            // already durably streamed to `trajectory.jsonl` as it
-            // happened (`Trajectory::append_rest`), independent of this
-            // (now-zeroed) `metrics.json` write. The host's
-            // `dispatch_internal.rs` reconciles this zeroed metrics.json
-            // against its own live tailer's accumulation
-            // (`reconcile_rest_totals`, #2094 second round finding 1)
-            // precisely so a dispatch.error terminal still reports the
-            // real totals rather than these hardcoded zeros.
-            rest_ms: 0,
-            rests: 0,
-            turn_delay_effective_ms: 0,
-            final_assistant_preview: String::new(),
-        };
-        let _ = traj.save_metrics(&metrics);
-
         if json_mode {
-            let envelope = build_json_envelope(
-                "error", None, &model, started_at_unix_ms, wall_ms,
-                // turns, compactions, prompt_tokens, completion_tokens
-                0, 0, 0, 0,
-                // (#2263) this_run — same "no LoopOutcome survives an Err
-                // return" limit as everything else on this path.
-                ThisRunCounters::default(),
-                // (#1444) reasoning_tokens, cached_tokens — `None`, not
-                // `Some(0)`: no `LoopOutcome` survives an `Err` return, so
-                // nothing was measured here at all.
-                None, None,
-                // total_messages
-                0,
-                // (#2094) Same "no LoopOutcome survives an Err return"
-                // limit as the `trajectory::Metrics` write above — the
-                // host reconciles the real totals from the trajectory,
-                // this envelope's own rest fields stay 0 like every
-                // other counter on this path.
-                0, 0, 0,
-            );
+            let envelope = build_json_envelope("error", None);
             println!("{}", serde_json::to_string(&envelope).unwrap_or_else(|_| "{}".into()));
         } else {
             // (#905) Human mode was silent on failure while the success path
             // is verbose — print a failure summary so a non-JSON dispatch
             // doesn't just vanish with a bare exit code.
             println!("--- dispatch failed ---");
-            println!("result: {result_str}");
             println!("model:  {model}");
-            println!("wall:   {wall_ms}ms");
+            print_run_summary(result_str, wall_ms);
         }
         return ExitCode::from(1);
     }
@@ -1287,226 +1179,58 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// (#1444 review) The ONE place a completed [`loop_runner::LoopOutcome`] is
-/// projected onto [`trajectory::Metrics`].
-///
-/// Extracted from `run_dispatch`'s body specifically so this wiring is
-/// unit-testable. `run_dispatch` takes raw argv and drives a real container
-/// dispatch, so nothing in the suite ever executed the struct literal that
-/// used to live there — nulling `total_reasoning_tokens`/`total_cached_tokens`
-/// at that call site left all 660 runtime tests green while the entire
-/// internal-runtime contribution silently evaporated. metrics.json is the
-/// ONLY channel by which these totals reach the host (`read_token_totals`
-/// parses this file), so an unpinned assignment here is a whole-feature
-/// failure, not a gap.
-fn metrics_from_outcome(
-    o: &loop_runner::LoopOutcome,
-    model: &str,
-    started_at_unix_ms: u64,
-    wall_ms: u128,
-    result: &str,
-    final_assistant_preview: String,
-) -> trajectory::Metrics {
-    trajectory::Metrics {
-        runtime: "darkmux-runtime",
-        version: VERSION,
-        model: model.to_string(),
-        started_at_unix_ms,
-        wall_ms,
-        result: result.into(),
-        turns: o.turns,
-        compactions: o.compactions,
-        total_prompt_tokens: o.total_prompt_tokens,
-        total_completion_tokens: o.total_completion_tokens,
-        // (#2263) See `LoopOutcome::turns_this_run`'s doc — this invocation's
-        // own contribution, distinct from the whole-dispatch cumulative
-        // fields above.
-        turns_this_run: o.turns_this_run,
-        total_prompt_tokens_this_run: o.total_prompt_tokens_this_run,
-        total_completion_tokens_this_run: o.total_completion_tokens_this_run,
-        compactions_this_run: o.compactions_this_run,
-        total_reasoning_tokens: o.total_reasoning_tokens,
-        total_cached_tokens: o.total_cached_tokens,
-        total_messages: o.messages.len(),
-        max_turns_reached: matches!(o.terminal_reason, loop_runner::TerminalReason::MaxTurns),
-        rest_ms: o.rest_ms,
-        rests: o.rests,
-        turn_delay_effective_ms: o.turn_delay_effective_ms,
-        final_assistant_preview,
-    }
-}
-
-/// (#1444 review) The ONE place a completed [`loop_runner::LoopOutcome`] is
-/// projected onto the `--json` envelope — same reason as
-/// [`metrics_from_outcome`] above.
-///
-/// [`build_json_envelope`] takes fifteen positional scalars, which is exactly
-/// the shape that lets a wiring mistake hide: its own tests call it directly
-/// with literals, so they pin the envelope SHAPE and say nothing about which
-/// `LoopOutcome` field reaches which argument. Passing `None, None` for the
-/// two token arguments at the success call site kept the whole runtime suite
-/// green. Funnelling the projection through here gives that mapping a single
-/// testable home.
-fn envelope_from_outcome(
-    result: &str,
-    final_assistant: Option<&str>,
-    model: &str,
-    started_at_unix_ms: u64,
-    wall_ms: u128,
-    o: &loop_runner::LoopOutcome,
-) -> serde_json::Value {
-    build_json_envelope(
-        result,
-        final_assistant,
-        model,
-        started_at_unix_ms,
-        wall_ms,
-        o.turns,
-        o.compactions,
-        o.total_prompt_tokens,
-        o.total_completion_tokens,
-        ThisRunCounters {
-            turns: o.turns_this_run,
-            compactions: o.compactions_this_run,
-            prompt_tokens: o.total_prompt_tokens_this_run,
-            completion_tokens: o.total_completion_tokens_this_run,
-        },
-        o.total_reasoning_tokens,
-        o.total_cached_tokens,
-        o.messages.len(),
-        o.rest_ms,
-        o.rests,
-        o.turn_delay_effective_ms,
-    )
-}
-
-/// (#2263) This invocation's own contribution to the four whole-dispatch
-/// counters `build_json_envelope` also takes, bundled into one struct
-/// rather than four more positional `u32`s. `build_json_envelope`'s own
-/// doc already names "many same-typed positional scalars" as exactly the
-/// shape that lets a wiring mistake hide silently; four more adjacent
-/// `u32`s of the SAME meaning-family as the four already there would make
-/// that risk worse, not better. See `LoopOutcome::turns_this_run`'s doc
-/// for what "this run" means and why it differs from the cumulative
-/// fields on a resumed dispatch.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ThisRunCounters {
-    turns: u32,
-    compactions: u32,
-    prompt_tokens: u32,
-    completion_tokens: u32,
-}
-
 /// Construct the `--json` envelope. Pure function — extracted so the
 /// schema is tested independently of the dispatch shell-out (which
 /// requires LMStudio + Docker). Same shape for success + error paths so
-/// consumers (qa-review skill, lab harness adapter) parse uniformly.
+/// consumers parse uniformly.
 ///
-/// `final_assistant = None` produces a JSON `null` for the field —
-/// error envelopes use this; success envelopes always carry a string.
+/// `final_assistant = None` produces a JSON `null` for the field — the
+/// error envelope uses this; a success envelope always carries a string.
 ///
-/// Arg types mirror the source types in `trajectory::Metrics` +
-/// `loop_runner::Outcome` so callers don't need casts.
-///
-/// (#2094 second round, finding 3 CONSIDER) `rest_ms`/`rests`/
-/// `turn_delay_effective_ms` join the metrics block so a `--json`
-/// consumer reading `wall_ms` sees the rest right there in the same
-/// object, instead of having to cross-reference `metrics.json` /
-/// `trajectory.jsonl` separately the way the host's own enrichment
-/// (`dispatch_internal.rs`'s `dispatch.complete` payload) already does.
-///
-/// (#1444 review) Success-path callers go through
-/// [`envelope_from_outcome`] rather than calling this directly, so the
-/// `LoopOutcome`-to-argument mapping has one testable home. The error path
-/// still calls it with literals — there is no outcome to project there.
-#[allow(clippy::too_many_arguments)]
-fn build_json_envelope(
-    result: &str,
-    final_assistant: Option<&str>,
-    model: &str,
-    started_at_unix_ms: u64,
-    wall_ms: u128,
-    turns: u32,
-    compactions: u32,
-    prompt_tokens: u32,
-    completion_tokens: u32,
-    // (#2263) This invocation's own contribution to the four counters
-    // above — see `ThisRunCounters`'s doc. On a dispatch that was never
-    // resumed this is byte-for-byte the same as `turns`/`compactions`/
-    // `prompt_tokens`/`completion_tokens` above (the checkpoint seed is
-    // `0`), which is exactly what keeps the never-resumed envelope shape
-    // unchanged apart from the new key.
-    this_run: ThisRunCounters,
-    // (#1444) `None` when no turn this dispatch ever reported the field —
-    // serializes as JSON `null`, distinct from a fabricated `0`.
-    reasoning_tokens: Option<u32>,
-    cached_tokens: Option<u32>,
-    total_messages: usize,
-    rest_ms: u64,
-    rests: u32,
-    turn_delay_effective_ms: u64,
-) -> serde_json::Value {
+/// Carries no counts. Turns, tokens and rests are in the trajectory the
+/// envelope points at, written as they happened; the host folds that one
+/// log (`darkmux_trajectory::TrajectoryFold`) and adds the `metrics` block
+/// its callers read, so no second tally exists to disagree with it.
+fn build_json_envelope(result: &str, final_assistant: Option<&str>) -> serde_json::Value {
     serde_json::json!({
         "result": result,
         "final_assistant": match final_assistant {
             Some(s) => serde_json::Value::String(s.to_string()),
             None => serde_json::Value::Null,
         },
-        "metrics": {
-            "runtime": "darkmux-runtime",
-            "version": VERSION,
-            "model": model,
-            "started_at_unix_ms": started_at_unix_ms,
-            // u128 wall_ms is safe to narrow for JSON numeric encoding —
-            // u64 covers 584 million years of milliseconds.
-            "wall_ms": wall_ms as u64,
-            // (#2263) These four are the WHOLE dispatch's cumulative
-            // counters — on a resumed dispatch, seeded from the
-            // checkpoint, so they cover every resume that ever touched
-            // this task, not just `model` above. Attributing cost or turn
-            // count to `model` from these is the exact corruption #2263
-            // exists to fix — read `this_run` below instead for that.
-            "turns": turns,
-            "compactions": compactions,
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            // (#2263) THIS invocation's own contribution — the honest
-            // "what did `model` above actually do" numbers. Equal to the
-            // four cumulative fields above whenever this dispatch was
-            // never resumed.
-            "this_run": {
-                "turns": this_run.turns,
-                "compactions": this_run.compactions,
-                "prompt_tokens": this_run.prompt_tokens,
-                "completion_tokens": this_run.completion_tokens,
-            },
-            // (#1444) Billed reasoning burn from hosted reasoning-family
-            // models. `null` when the provider never reported it (every
-            // local LMStudio dispatch today). Whether it sits INSIDE
-            // `completion_tokens` above is provider-specific — see
-            // `lmstudio::CompletionTokensDetails::reasoning_tokens`; a
-            // consumer must not derive one from the other.
-            "reasoning_tokens": reasoning_tokens,
-            "cached_tokens": cached_tokens,
-            "total_messages": total_messages,
-            // (#2094) Surfaced NEXT TO wall_ms, same framing as the host's
-            // dispatch.complete payload — a rested run's wall clock must
-            // never be misread as a slow model. `wall_ms` above INCLUDES
-            // this time (wall stays wall).
-            "rest_ms": rest_ms,
-            "rests": rests,
-            "turn_delay_effective_ms": turn_delay_effective_ms,
-        },
         // Container-internal path where the runtime's own bookkeeping
-        // landed — now the out-dir (SEPARATE from /workspace) per the
-        // out-of-band bookkeeping change. Built from the shared
-        // trajectory module constants so it can't drift from the actual
-        // write site.
-        "trajectory_path": trajectory::runtime_dir()
-            .join("trajectory.jsonl")
+        // landed — the out-dir (SEPARATE from /workspace). Built from the
+        // shared trajectory constants so it can't drift from the write site.
+        "trajectory_path": darkmux_trajectory::trajectory_path(Path::new(trajectory::RUNTIME_OUT_BASE))
             .display()
             .to_string(),
     })
+}
+
+/// Human mode's closing summary: this execution's counts, read back from
+/// its own trajectory through the one fold the host uses.
+fn print_run_summary(result: &str, wall_ms: u128) {
+    let fold = darkmux_trajectory::TrajectoryFold::from_path(&darkmux_trajectory::trajectory_path(
+        Path::new(trajectory::RUNTIME_OUT_BASE),
+    ));
+    println!("--- run ---");
+    println!("result:            {result}");
+    println!("turns:             {}", fold.turns());
+    println!("compactions:       {}", fold.compactions());
+    println!("prompt tokens:     {}", fold.tokens.prompt);
+    println!("completion tokens: {}", fold.tokens.completion);
+    // (#1444) Only printed when at least one call reported it: "not shown"
+    // reads as "unknown", never a fabricated 0. No "(subset of completion
+    // tokens)" gloss: whether reasoning sits inside completion is
+    // provider-specific, and this line does not know the provider.
+    if let Some(rt) = fold.tokens.reasoning {
+        println!("reasoning tokens:  {rt}");
+    }
+    if let Some(ct) = fold.tokens.cached {
+        println!("cached tokens:     {ct}");
+    }
+    println!("rest:              {}ms over {} rest(s)", fold.rest_ms(), fold.rest_count());
+    println!("wall:              {wall_ms}ms");
 }
 
 /// (#1187) Read the auth-header JSON from stdin ONCE and parse it. Reads to
@@ -1615,109 +1339,6 @@ fn filter_tools_by_allowed(tools: &[Tool], allowed: Option<&[String]>) -> Vec<To
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ─── LoopOutcome → metrics/envelope projection (#1444 review) ──────
-
-    /// A `LoopOutcome` with the reasoning/cached totals a hosted
-    /// reasoning-family dispatch would have accumulated. Only the fields
-    /// these two projections read are meaningful; the rest are inert.
-    fn outcome_with_detail_tokens(
-        reasoning: Option<u32>,
-        cached: Option<u32>,
-    ) -> loop_runner::LoopOutcome {
-        loop_runner::LoopOutcome {
-            terminal_reason: loop_runner::TerminalReason::Stop,
-            messages: vec![
-                lmstudio::Message::system("s"),
-                lmstudio::Message::user("u"),
-                lmstudio::Message::assistant("a"),
-            ],
-            turns: 2,
-            total_prompt_tokens: 300,
-            total_completion_tokens: 950,
-            // (#2263) Same values as the cumulative fields above — this
-            // helper is shared by tests that predate `_this_run` and don't
-            // exercise it; the dedicated resume-vs-fresh assertions live
-            // in their own test below instead of disturbing this one.
-            turns_this_run: 2,
-            total_prompt_tokens_this_run: 300,
-            total_completion_tokens_this_run: 950,
-            compactions_this_run: 1,
-            total_reasoning_tokens: reasoning,
-            total_cached_tokens: cached,
-            final_answer: None,
-            compactions: 1,
-            rest_ms: 1000,
-            rests: 2,
-            turn_delay_effective_ms: 500,
-            failed_to_run: Vec::new(),
-        }
-    }
-
-    /// (#1444 review) metrics.json is the ONLY channel by which the internal
-    /// runtime's accumulated reasoning/cached totals reach the host — the
-    /// host's `read_token_totals` parses this file and nothing else. Before
-    /// this assertion existed, replacing both fields with `None` at the
-    /// (then inline) construction site left all 660 runtime tests green
-    /// while the entire internal-runtime contribution evaporated silently.
-    #[test]
-    fn metrics_from_outcome_forwards_reasoning_and_cached_totals() {
-        let o = outcome_with_detail_tokens(Some(800), Some(20));
-        let m = metrics_from_outcome(&o, "darkmux:m", 1700000000000, 2135, "stop", "p".into());
-        assert_eq!(m.total_reasoning_tokens, Some(800));
-        assert_eq!(m.total_cached_tokens, Some(20));
-        // The neighbors this projection also owns, so a positional slip
-        // between them cannot pass either.
-        assert_eq!(m.total_prompt_tokens, 300);
-        assert_eq!(m.total_completion_tokens, 950);
-        assert_eq!(m.turns, 2);
-        assert_eq!(m.compactions, 1);
-        assert_eq!(m.total_messages, 3);
-        assert!(!m.max_turns_reached, "a Stop terminal_reason is not a turn-cap exit");
-    }
-
-    /// (#1444 review) The absent case travels too: a local LMStudio dispatch
-    /// reports neither field, and `None` must survive as `None` rather than
-    /// being collapsed to a fabricated `0` on the way into metrics.json.
-    #[test]
-    fn metrics_from_outcome_preserves_absent_detail_totals_as_none() {
-        let o = outcome_with_detail_tokens(None, None);
-        let m = metrics_from_outcome(&o, "darkmux:m", 0, 0, "stop", String::new());
-        assert_eq!(m.total_reasoning_tokens, None);
-        assert_eq!(m.total_cached_tokens, None);
-        let json = serde_json::to_value(&m).expect("metrics serializes");
-        assert!(json["total_reasoning_tokens"].is_null(), "absent must be null, never 0");
-        assert!(json["total_cached_tokens"].is_null());
-    }
-
-    /// (#1444 review) `build_json_envelope` takes fifteen positional
-    /// scalars, so its own tests pin the envelope SHAPE and say nothing
-    /// about which `LoopOutcome` field lands in which argument. Passing
-    /// `None, None` at the success call site was green before this test.
-    #[test]
-    fn envelope_from_outcome_forwards_reasoning_and_cached_totals() {
-        let o = outcome_with_detail_tokens(Some(800), Some(20));
-        let env = envelope_from_outcome("stop", Some("done"), "darkmux:m", 1700000000000, 2135, &o);
-        assert_eq!(env["metrics"]["reasoning_tokens"], 800);
-        assert_eq!(env["metrics"]["cached_tokens"], 20);
-        // Positional-slip guard: the neighbors must land where they belong.
-        assert_eq!(env["metrics"]["prompt_tokens"], 300);
-        assert_eq!(env["metrics"]["completion_tokens"], 950);
-        assert_eq!(env["metrics"]["turns"], 2);
-        assert_eq!(env["metrics"]["compactions"], 1);
-        assert_eq!(env["metrics"]["total_messages"], 3);
-        assert_eq!(env["metrics"]["rest_ms"], 1000);
-        assert_eq!(env["metrics"]["rests"], 2);
-        assert_eq!(env["metrics"]["turn_delay_effective_ms"], 500);
-    }
-
-    #[test]
-    fn envelope_from_outcome_preserves_absent_detail_totals_as_null() {
-        let o = outcome_with_detail_tokens(None, None);
-        let env = envelope_from_outcome("stop", Some("done"), "darkmux:m", 0, 0, &o);
-        assert!(env["metrics"]["reasoning_tokens"].is_null(), "absent must be null, never 0");
-        assert!(env["metrics"]["cached_tokens"].is_null());
-    }
 
     // ─── tool catalog filter (runtime-side enforcement of role tool_palette) ──
 
@@ -1848,88 +1469,33 @@ mod tests {
     }
 
     #[test]
-    fn json_envelope_success_carries_final_assistant_and_metrics() {
-        let env = build_json_envelope(
-            "stop",
-            Some("hello world"),
-            "darkmux:qwen3.6-35b-a3b",
-            1700000000000,
-            2135,
-            1,
-            0,
-            2970,
-            112,
-            // (#2263) this_run — a fresh (never-resumed) dispatch, so
-            // identical to the cumulative fields above.
-            ThisRunCounters { turns: 1, compactions: 0, prompt_tokens: 2970, completion_tokens: 112 },
-            // (#1444) reasoning_tokens, cached_tokens — a hosted
-            // reasoning-family model reported both this turn.
-            Some(80),
-            Some(64),
-            3,
-            1000,
-            2,
-            500,
-        );
+    fn json_envelope_success_carries_final_assistant_and_no_counts() {
+        let env = build_json_envelope("stop", Some("hello world"));
         // Top-level contract — qa-review + lab adapter parse these.
         assert_eq!(env["result"], "stop");
         assert_eq!(env["final_assistant"], "hello world");
         assert_eq!(env["trajectory_path"], "/darkmux-out/.darkmux-runtime/trajectory.jsonl");
-        // Metrics block — mirrors trajectory::Metrics field names so the
-        // two surfaces stay aligned.
-        assert_eq!(env["metrics"]["runtime"], "darkmux-runtime");
-        assert_eq!(env["metrics"]["model"], "darkmux:qwen3.6-35b-a3b");
-        assert_eq!(env["metrics"]["wall_ms"], 2135);
-        assert_eq!(env["metrics"]["turns"], 1);
-        assert_eq!(env["metrics"]["prompt_tokens"], 2970);
-        assert_eq!(env["metrics"]["completion_tokens"], 112);
-        // (#1444) Both details fields reach the envelope's metrics block.
-        // No subset claim asserted here — that relation is provider-scoped
-        // (see `lmstudio::CompletionTokensDetails::reasoning_tokens`).
-        assert_eq!(env["metrics"]["reasoning_tokens"], 80);
-        assert_eq!(env["metrics"]["cached_tokens"], 64);
-        assert_eq!(env["metrics"]["total_messages"], 3);
-        // (#2263) A never-resumed dispatch's `this_run` block equals the
-        // cumulative fields above, field for field.
-        assert_eq!(env["metrics"]["this_run"]["turns"], 1);
-        assert_eq!(env["metrics"]["this_run"]["compactions"], 0);
-        assert_eq!(env["metrics"]["this_run"]["prompt_tokens"], 2970);
-        assert_eq!(env["metrics"]["this_run"]["completion_tokens"], 112);
-        // (#2094 second round, finding 3 CONSIDER) The rest fields live
-        // right next to wall_ms in the same metrics object.
-        assert_eq!(env["metrics"]["rest_ms"], 1000);
-        assert_eq!(env["metrics"]["rests"], 2);
-        assert_eq!(env["metrics"]["turn_delay_effective_ms"], 500);
+        // The counts live in the trajectory, which the host folds into the
+        // `metrics` block it hands its callers. A second tally here is the
+        // metrics.json this replaced.
+        assert!(env.get("metrics").is_none(), "{env}");
     }
 
     #[test]
     fn json_envelope_error_carries_null_final_assistant() {
         // Failure path emits same envelope shape so consumers can parse
         // uniformly without branching on success/error.
-        let env = build_json_envelope(
-            "error", None, "darkmux:foo", 1700000000000, 500, 0, 0, 0, 0,
-            ThisRunCounters::default(), None, None, 0, 0, 0, 0,
-        );
+        let env = build_json_envelope("error", None);
         assert_eq!(env["result"], "error");
         assert!(env["final_assistant"].is_null(), "error envelope must have null final_assistant");
-        assert_eq!(env["metrics"]["model"], "darkmux:foo");
-        assert_eq!(env["metrics"]["wall_ms"], 500);
-        assert_eq!(env["metrics"]["turns"], 0);
-        // (#1444) Nothing was measured on this path — `null`, not `0`.
-        assert!(env["metrics"]["reasoning_tokens"].is_null());
-        assert!(env["metrics"]["cached_tokens"].is_null());
-        assert_eq!(env["metrics"]["rest_ms"], 0);
-        assert_eq!(env["metrics"]["rests"], 0);
-        assert_eq!(env["metrics"]["turn_delay_effective_ms"], 0);
+        assert!(env.get("metrics").is_none(), "{env}");
     }
 
     #[test]
     fn json_envelope_serializes_as_single_line() {
         // qa-review parses with `jq -c` — verify the serialized form is
         // single-line + valid JSON. (No surprise whitespace, etc.)
-        let env = build_json_envelope(
-            "stop", Some("x"), "m", 0, 0, 0, 0, 0, 0, ThisRunCounters::default(), None, None, 0, 0, 0, 0,
-        );
+        let env = build_json_envelope("stop", Some("x"));
         let s = serde_json::to_string(&env).unwrap();
         assert!(!s.contains('\n'), "envelope must serialize on one line; got: {s}");
         // Round-trip must produce identical structure.
@@ -1944,9 +1510,7 @@ mod tests {
         // stays parseable. Regression guard for "naive println escaping"
         // mistakes that would tempt a future refactor.
         let tricky = "line1\nline2\twith \"quotes\" and \\backslash";
-        let env = build_json_envelope(
-            "stop", Some(tricky), "m", 0, 0, 0, 0, 0, 0, ThisRunCounters::default(), None, None, 0, 0, 0, 0,
-        );
+        let env = build_json_envelope("stop", Some(tricky));
         let s = serde_json::to_string(&env).unwrap();
         let back: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(back["final_assistant"], tricky);

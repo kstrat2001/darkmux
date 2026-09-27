@@ -234,7 +234,7 @@ pub fn rebuild_command(image: &str, host_version: &str) -> String {
         _ => RUNTIME_IMAGE.to_string(),
     };
     format!(
-        "docker build --build-arg DARKMUX_VERSION={host_version} -t {target} runtime/"
+        "docker build --build-arg DARKMUX_VERSION={host_version} -f runtime/Dockerfile -t {target} ."
     )
 }
 
@@ -666,7 +666,7 @@ mod tests {
         assert!(notices[0].contains("development build (3.13.0 (2c3ee0fdd✱))"), "{}", notices[0]);
         assert!(notices[0].contains("may predate this source tree"), "{}", notices[0]);
         assert!(
-            notices[0].contains(&format!("--build-arg DARKMUX_VERSION={HOST} -t darkmux-runtime:latest")),
+            notices[0].contains(&format!("--build-arg DARKMUX_VERSION={HOST} -f runtime/Dockerfile -t darkmux-runtime:latest .")),
             "{}",
             notices[0]
         );
@@ -789,7 +789,7 @@ mod tests {
         assert!(msg.contains("no version label"), "{msg}");
         assert!(
             msg.contains(&format!(
-                "docker build --build-arg DARKMUX_VERSION={HOST} -t darkmux-runtime:4.0-rc runtime/"
+                "docker build --build-arg DARKMUX_VERSION={HOST} -f runtime/Dockerfile -t darkmux-runtime:4.0-rc ."
             )),
             "{msg}"
         );

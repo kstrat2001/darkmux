@@ -258,11 +258,6 @@ pub(crate) struct RunResult {
     pub error: Option<String>,
 }
 
-/// `summary_chars` is the per-turn summary-length series collected
-/// during inspection. Public-API surface for tools that want to plot
-/// summary-size dynamics; the CLI's inspect summary doesn't use it
-/// directly, hence the dead-code lint.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct InspectionReport {
     pub run_id: String,
@@ -271,12 +266,11 @@ pub struct InspectionReport {
     pub turns: u32,
     pub compactions: u32,
     /// (#2094) Sum of the internal runtime's inter-turn rests for this run,
-    /// read from `metrics.json` alongside `turns`/`compactions`. `0` when
-    /// the run predates the feature or `metrics.json` is absent — the
-    /// runtime's own default-off behavior, not a read failure.
+    /// from its trajectory. `0` when the run took no rests.
     pub rest_ms: u64,
+    /// The prompt-token count each compaction of an openclaw-era run was
+    /// triggered at (empty for every current run).
     pub tokens_before: Vec<u64>,
-    pub summary_chars: Vec<u64>,
     pub mode: Option<RunMode>,
     /// (#2494) The workload's own verify outcome, read back from the run
     /// manifest. `None` is a THIRD state, distinct from pass and fail: the

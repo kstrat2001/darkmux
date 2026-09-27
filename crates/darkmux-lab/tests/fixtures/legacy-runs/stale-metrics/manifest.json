@@ -1,0 +1,17 @@
+{
+  "durationMs": 294907,
+  "final_hash": "blake3:bfd0cb53c59667e756114f8b27594f9045a4da72b38c0c13691aa046d1c71ef7",
+  "fixture": {
+    "baseline_hash": "blake3:3fbff55c449da827058de31d84106f18e80a84ca84d223e7b45e8b330eb34db3",
+    "source_path": "/Users/operator/de-projects/darkmux-lab-fixtures/pepper-grinder"
+  },
+  "ok": false,
+  "profile": "deep",
+  "profileDescription": "Long agentic tasks. Maximum primary context for fewer compactions; companion compactor as a safety net.",
+  "provider": "coding-task",
+  "runId": "long-agentic-deep-1780159339-1",
+  "sandbox": "/nonexistent/sandbox",
+  "schemaVersion": 4,
+  "sessionId": "darkmux-coding-long-agentic-1780159347453",
+  "workload": "long-agentic"
+}

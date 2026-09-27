@@ -3530,7 +3530,7 @@ fn dispatch_refuses_an_explicit_unlabeled_darkmux_runtime_tag_before_running() {
                 .and(predicate::str::contains("`darkmux-runtime:4.0-rc`"))
                 .and(predicate::str::contains("no version label"))
                 .and(predicate::str::contains(format!(
-                    "docker build --build-arg DARKMUX_VERSION={version} -t darkmux-runtime:4.0-rc runtime/"
+                    "docker build --build-arg DARKMUX_VERSION={version} -f runtime/Dockerfile -t darkmux-runtime:4.0-rc ."
                 ))),
         );
     assert_no_container_ran(&log);
@@ -11974,16 +11974,13 @@ fn stats_run_dir(parent: &std::path::Path, name: &str) -> std::path::PathBuf {
     let d = parent.join(name);
     std::fs::create_dir_all(&d).unwrap();
     std::fs::write(
-        d.join("metrics.json"),
-        r#"{"model":"m","result":"stop","started_at_unix_ms":1000,"wall_ms":10000,"rest_ms":0,"turns":1,"compactions":0,"total_completion_tokens":300}"#,
-    )
-    .unwrap();
-    std::fs::write(
         d.join("trajectory.jsonl"),
         concat!(
+            r#"{"type":"dispatch.start","ts":1000,"model":"m"}"#, "\n",
             r#"{"type":"model.streaming.start","seq":1,"ts":1000}"#, "\n",
             r#"{"type":"model.streaming.end","seq":1,"ts":4000}"#, "\n",
             r#"{"type":"model.completed","seq":1,"usage":{"completion_tokens":300}}"#, "\n",
+            r#"{"type":"dispatch.complete","ts":11000,"result":"stop","wall_ms":10000}"#, "\n",
         ),
     )
     .unwrap();

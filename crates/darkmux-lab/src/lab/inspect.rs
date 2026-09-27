@@ -9,75 +9,45 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone)]
-pub struct CompactionSummary {
-    pub turn_index: usize,
-    pub tokens_before: u64,
-    pub summary_chars: usize,
-    pub summary_text: String,
+/// A lab run directory's trajectory, folded: THE way every lab reader
+/// (`stats`, `inspect`, `loop`, the compaction-summary view) reads a
+/// recorded run's turns, tokens, rests and detector firings.
+///
+/// The trajectory is `<run>/trajectory.jsonl`, copied there when the run
+/// finished (#364). A run recorded before that copy existed has it only in
+/// its sandbox, at `<sandbox>/.darkmux-runtime/trajectory.jsonl`, the
+/// sandbox its `manifest.json` names; that is the one legacy location, read
+/// only when the run's own copy is absent. A run directory's `metrics.json`
+/// (written until 4.0) is never read: its numbers are all in the trajectory,
+/// and where the two disagreed the file was the one that was wrong.
+///
+/// The sandbox is model-writable, so the legacy read goes through the
+/// contained out-dir reader (#2869): a planted symlink or FIFO there is
+/// refused, not followed. The run's own copy is host-written.
+pub fn run_trajectory(run_dir: &Path) -> darkmux_trajectory::TrajectoryFold {
+    let own = run_dir.join(darkmux_trajectory::TRAJECTORY_FILE);
+    if own.exists() {
+        return darkmux_trajectory::TrajectoryFold::from_path(&own);
+    }
+    legacy_sandbox(run_dir)
+        .map(|sandbox| darkmux_crew::dispatch_internal::out_dir_trajectory(&sandbox))
+        .unwrap_or_default()
 }
 
-/// Read the trajectory file for a run and extract every unique
-/// `compactionSummary` message. Each entry includes the raw summary text
-/// the compaction model wrote, the LMStudio-reported tokensBefore, and the
-/// turn index where the summary first appeared.
-///
-/// Returns an empty vec if no trajectory.jsonl exists (e.g. for prompt
-/// provider runs which don't snapshot a trajectory). The caller can use
-/// that to render "(no trajectory recorded)" rather than an error.
-pub fn read_compaction_summaries(run_dir: &Path) -> Result<Vec<CompactionSummary>> {
-    let traj = run_dir.join("trajectory.jsonl");
-    if !traj.exists() {
-        return Ok(Vec::new());
-    }
-    let raw = fs::read_to_string(&traj)
-        .with_context(|| format!("reading {}", traj.display()))?;
-    let mut out: Vec<CompactionSummary> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut turn_idx = 0usize;
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(ev) = serde_json::from_str::<Value>(line) else { continue };
-        if ev.get("type").and_then(|t| t.as_str()) != Some("prompt.submitted") {
-            continue;
-        }
-        turn_idx += 1;
-        let Some(msgs) = ev.get("data").and_then(|d| d.get("messages")).and_then(|m| m.as_array()) else {
-            continue;
-        };
-        for m in msgs {
-            if m.get("role").and_then(|r| r.as_str()) != Some("compactionSummary") {
-                continue;
-            }
-            let summary_text = m
-                .get("summary")
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string();
-            if summary_text.is_empty() {
-                continue;
-            }
-            // Dedup by 80-char prefix — same summary persists across turns
-            // until the next compaction overrides it.
-            let key: String = summary_text.chars().take(80).collect();
-            if !seen.insert(key) {
-                continue;
-            }
-            out.push(CompactionSummary {
-                turn_index: turn_idx,
-                tokens_before: m.get("tokensBefore").and_then(|v| v.as_u64()).unwrap_or(0),
-                // (#906) char count, not byte count — the field is named
-                // `summary_chars` and multi-byte summaries would otherwise
-                // over-report.
-                summary_chars: summary_text.chars().count(),
-                summary_text,
-            });
-        }
-    }
-    Ok(out)
+/// The sandbox a run's `manifest.json` names, if any.
+fn legacy_sandbox(run_dir: &Path) -> Option<PathBuf> {
+    fs::read_to_string(run_dir.join("manifest.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|m| m.get("sandbox").and_then(Value::as_str).map(PathBuf::from))
+}
+
+/// The distinct compaction summaries a run's trajectory recorded (the
+/// retired openclaw runtime wrote its compactions only as summary messages
+/// inside the thread; see `darkmux_trajectory::legacy`). Empty for a run
+/// with no trajectory, or none of that shape.
+pub fn read_compaction_summaries(run_dir: &Path) -> Vec<darkmux_trajectory::legacy::LegacyCompaction> {
+    run_trajectory(run_dir).legacy.compactions
 }
 
 pub fn resolve_run_path(run_path: &str) -> PathBuf {
@@ -316,7 +286,7 @@ mod tests {
     #[test]
     fn read_compaction_summaries_empty_when_no_trajectory() {
         let tmp = TempDir::new().unwrap();
-        let summaries = read_compaction_summaries(tmp.path()).unwrap();
+        let summaries = read_compaction_summaries(tmp.path());
         assert!(summaries.is_empty());
     }
 
@@ -331,13 +301,56 @@ mod tests {
 {"type":"prompt.submitted","data":{"messages":[{"role":"compactionSummary","summary":"beta summary newer","tokensBefore":60000}]}}
 "#;
         std::fs::write(tmp.path().join("trajectory.jsonl"), traj).unwrap();
-        let summaries = read_compaction_summaries(tmp.path()).unwrap();
+        let summaries = read_compaction_summaries(tmp.path());
         // Two unique summaries (alpha + beta), even though alpha repeats
         assert_eq!(summaries.len(), 2);
         assert_eq!(summaries[0].tokens_before, 48000);
         assert_eq!(summaries[1].tokens_before, 60000);
-        assert!(summaries[0].summary_text.contains("alpha"));
-        assert!(summaries[1].summary_text.contains("beta"));
+        assert!(summaries[0].summary.contains("alpha"));
+        assert!(summaries[1].summary.contains("beta"));
+        assert_eq!((summaries[0].turn, summaries[1].turn), (2, 4), "the turn that first carried each");
+    }
+
+    /// The one legacy location: a run recorded before its trajectory was
+    /// copied into the run directory (#364) is read from the sandbox its
+    /// manifest names. The run's own copy wins when both exist. A
+    /// `metrics.json` in the run directory is never read.
+    #[test]
+    fn a_run_trajectory_is_its_own_copy_else_the_sandbox_its_manifest_names() {
+        let run = TempDir::new().unwrap();
+        let sandbox = TempDir::new().unwrap();
+        let rt = sandbox.path().join(".darkmux-runtime");
+        std::fs::create_dir_all(&rt).unwrap();
+        std::fs::write(rt.join("trajectory.jsonl"), "{\"type\":\"model.completed\",\"seq\":1}\n{\"type\":\"model.completed\",\"seq\":2}\n").unwrap();
+        std::fs::write(
+            run.path().join("manifest.json"),
+            serde_json::json!({ "sandbox": sandbox.path() }).to_string(),
+        )
+        .unwrap();
+        std::fs::write(run.path().join("metrics.json"), r#"{"turns":9,"total_prompt_tokens":175557}"#).unwrap();
+        assert_eq!(run_trajectory(run.path()).turns(), 2, "the sandbox copy, not metrics.json");
+
+        std::fs::write(run.path().join("trajectory.jsonl"), "{\"type\":\"model.completed\",\"seq\":1}\n").unwrap();
+        assert_eq!(run_trajectory(run.path()).turns(), 1, "the run's own copy wins");
+    }
+
+    /// (#2869) The sandbox is model-writable: a legacy sandbox trajectory
+    /// that is a symlink to a host file is refused, not folded.
+    #[test]
+    fn a_symlinked_legacy_sandbox_trajectory_is_refused() {
+        let run = TempDir::new().unwrap();
+        let sandbox = TempDir::new().unwrap();
+        let rt = sandbox.path().join(".darkmux-runtime");
+        std::fs::create_dir_all(&rt).unwrap();
+        let host = sandbox.path().join("host-trajectory.jsonl");
+        std::fs::write(&host, "{\"type\":\"model.completed\",\"seq\":1}\n").unwrap();
+        std::os::unix::fs::symlink(&host, rt.join("trajectory.jsonl")).unwrap();
+        std::fs::write(
+            run.path().join("manifest.json"),
+            serde_json::json!({ "sandbox": sandbox.path() }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(run_trajectory(run.path()).turns(), 0, "the symlinked host file was folded");
     }
 
     #[test]
@@ -346,7 +359,7 @@ mod tests {
         let traj = r#"{"type":"prompt.submitted","data":{"messages":[{"role":"compactionSummary","summary":"","tokensBefore":1000}]}}
 "#;
         std::fs::write(tmp.path().join("trajectory.jsonl"), traj).unwrap();
-        let summaries = read_compaction_summaries(tmp.path()).unwrap();
+        let summaries = read_compaction_summaries(tmp.path());
         assert!(summaries.is_empty());
     }
 }

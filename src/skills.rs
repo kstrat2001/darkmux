@@ -1464,7 +1464,7 @@ mod tests {
         // Non-vacuity: the extractor found the list, including the nested
         // gate fields, rather than passing on an empty set.
         assert!(paths.len() >= 30, "expected the full field list, got {paths:?}");
-        for must in ["gates.stream.aborts", "gates.checkpoint.policy", "checks.tokens_reconcile"] {
+        for must in ["gates.stream.aborts", "gates.checkpoint.policy", "checks.all_streams_billed"] {
             assert!(paths.iter().any(|p| p == must), "extractor missed `{must}`: {paths:?}");
         }
         let json = serde_json::to_value(crate::lab::stats::RunStats::default()).unwrap();

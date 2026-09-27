@@ -32,15 +32,10 @@ use std::rc::Rc;
 /// bundled into a step kind this one didn't touch.
 pub const PLAN_SCHEMA_VERSION: &str = "1.1";
 
-/// `ceil(chars / 4)` — the ONE place this project-wide token-estimate
-/// heuristic lives. Deliberately crude: real tokenization is model-specific
-/// and not worth doing at plan time; good enough to size a unit against a
-/// chunk budget.
-pub const CHARS_PER_TOKEN: usize = 4;
-
-pub fn estimate_tokens(text: &str) -> usize {
-    text.chars().count().div_ceil(CHARS_PER_TOKEN)
-}
+/// The project-wide token estimate (`ceil(chars / 4)`), owned by
+/// `darkmux-trajectory` so the hosted budget's charge for an unreported
+/// prompt estimates the same way a crawl unit is sized.
+pub use darkmux_trajectory::{estimate_tokens, CHARS_PER_TOKEN};
 
 /// Files at or under this size are read; larger files are skipped (recorded
 /// in `totals.skipped`) rather than silently truncated.

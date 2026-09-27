@@ -33,21 +33,18 @@ fn stream(seq: u64, t0: u64, t1: Option<u64>) -> String {
     s
 }
 
-fn metrics(wall_ms: u64, rest_ms: u64, turns: u64, total_ct: u64) -> RuntimeMetrics {
-    RuntimeMetrics {
-        model: Some("test-model".into()),
-        result: Some("stop".into()),
-        started_at_unix_ms: Some(1_000_000),
-        wall_ms: Some(wall_ms),
-        rest_ms: Some(rest_ms),
-        turns: Some(turns),
-        compactions: Some(0),
-        total_completion_tokens: Some(total_ct),
-    }
+/// `traj` between the run's bookends — `dispatch.start` at 1,000,000 ms
+/// and a clean `dispatch.complete` after `wall_ms` — through the one fold.
+fn run_fold(traj: &str, wall_ms: u64) -> darkmux_trajectory::TrajectoryFold {
+    let start = line(serde_json::json!({"type": "dispatch.start", "ts": 1_000_000u64, "model": "test-model"}));
+    let end = line(serde_json::json!({
+        "type": "dispatch.complete", "ts": 1_000_000 + wall_ms, "result": "stop", "wall_ms": wall_ms
+    }));
+    darkmux_trajectory::TrajectoryFold::from_lines(&format!("{start}{traj}{end}"))
 }
 
-fn stats(traj: &str, m: RuntimeMetrics) -> RunStats {
-    derive_stats("t".into(), m, parse_trajectory(traj), FlowFacts::default(), None, None)
+fn stats(traj: &str, wall_ms: u64) -> RunStats {
+    derive_stats("t".into(), &run_fold(traj, wall_ms), FlowFacts::default(), None, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -67,21 +64,11 @@ fn usage_frames_accumulate_within_one_turn_and_are_not_assigned() {
         completed(1, Some(1_488), 20),
         completed(1, Some(1_881), 30),
     );
-    let s = stats(&traj, metrics(20_000, 0, 1, 3_606));
+    let s = stats(&traj, 20_000);
     assert_eq!(s.completion_tokens, 3_606, "sum, not the last frame (1,881)");
     assert_eq!(s.reasoning_tokens, 60);
-    assert_eq!(s.checks.tokens_reconcile, Some(true), "the per-turn sum must equal the run total");
 }
 
-/// The check that caught the undercount: it fails the moment the per-turn
-/// sum stops matching `metrics.json`.
-#[test]
-fn tokens_reconcile_is_false_when_the_run_total_disagrees() {
-    let traj = format!("{}{}", stream(1, 0, Some(1_000)), completed(1, Some(100), 0));
-    let s = stats(&traj, metrics(2_000, 0, 1, 999));
-    assert_eq!(s.checks.tokens_reconcile, Some(false));
-    assert!(s.unreconciled().iter().any(|r| r.contains("sum to the run total")));
-}
 
 // ---------------------------------------------------------------------------
 // Billing
@@ -101,7 +88,7 @@ fn a_null_usage_frame_is_an_unbilled_stream_not_a_zero() {
         stream(2, 80_000, Some(100_000)),
         completed(2, Some(2_000), 0),
     );
-    let s = stats(&traj, metrics(120_000, 0, 2, 2_000));
+    let s = stats(&traj, 120_000);
 
     assert_eq!(s.streams, 2);
     assert_eq!(s.streams_unbilled, 1);
@@ -130,7 +117,7 @@ fn energy_per_token_uses_billed_seconds_not_all_generation() {
         samples: vec![Sample { gpu_pct: 95, w_gpu: 30.0, w_cpu: 5.0, w_total: 40.0, ..Default::default() }],
         ..Default::default()
     };
-    let s = derive_stats("t".into(), metrics(120_000, 0, 2, 2_000), parse_trajectory(&traj), flows, None, None);
+    let s = derive_stats("t".into(), &run_fold(&traj, 120_000), flows, None, None);
     // 40 W x 20 billed seconds / 2 thousand tokens = 400 J per 1k tokens.
     // Over all 100 generation seconds it would read 2,000 — five times high,
     // exactly the unbilled fraction.
@@ -149,7 +136,7 @@ fn two_streams_under_one_seq_are_timed_separately() {
         stream(2, 90_000, Some(98_800)),
         completed(2, Some(500), 0),
     );
-    let s = stats(&traj, metrics(120_000, 0, 1, 500));
+    let s = stats(&traj, 120_000);
     assert_eq!(s.streams, 2, "one seq, two streams");
     assert_eq!(s.gen_ms_all, 95_900, "87.1s + 8.8s, not one collapsed span");
     assert_eq!(s.gen_ms_billed, 8_800, "the retry is what was billed");
@@ -161,7 +148,7 @@ fn two_streams_under_one_seq_are_timed_separately() {
 #[test]
 fn an_unterminated_stream_is_reported_not_silently_zero() {
     let traj = format!("{}{}", stream(1, 0, Some(1_000)), stream(2, 2_000, None));
-    let s = stats(&traj, metrics(10_000, 0, 2, 0));
+    let s = stats(&traj, 10_000);
     assert_eq!(s.streams, 2);
     assert_eq!(s.streams_unterminated, 1);
     assert!(!s.checks.streams_terminated);
@@ -186,7 +173,7 @@ fn both_gates_are_counted_and_never_conflated() {
         line(serde_json::json!({"type":"dispatch.checkpoint","seq":4,"tail_ratio":0.42,
                                 "verdict":"continue","would_conclude":false,"policy":"enforce"})),
     );
-    let s = stats(&traj, metrics(10_000, 0, 4, 0));
+    let s = stats(&traj, 10_000);
 
     assert_eq!(s.gates.stream.observations, 2);
     assert_eq!(s.gates.stream.degenerate_turns, vec![2]);
@@ -209,7 +196,7 @@ fn observe_separates_the_finding_from_the_action() {
         "type":"dispatch.checkpoint","seq":3,"tail_ratio":0.21,
         "verdict":"continue","would_conclude":true,"policy":"observe"
     }));
-    let s = stats(&traj, metrics(10_000, 0, 3, 0));
+    let s = stats(&traj, 10_000);
     assert_eq!(s.gates.checkpoint.degenerate_turns, vec![3], "the finding is recorded");
     assert!(s.gates.checkpoint.concluded_turns.is_empty(), "and nothing was cut");
     assert!(s.checks.verdict_matches_ratio, "the ratio agrees with the finding");
@@ -225,7 +212,7 @@ fn a_tail_ratio_is_not_rounded_into_the_threshold() {
         "type":"dispatch.checkpoint","seq":1,"tail_ratio":0.2499837,
         "verdict":"conclude","would_conclude":true
     }));
-    let s = stats(&traj, metrics(10_000, 0, 1, 0));
+    let s = stats(&traj, 10_000);
     let r = s.gates.checkpoint.min_tail_ratio.unwrap();
     assert_eq!(r, 0.2499837, "carried as measured, not rounded");
     assert!(r < DEGENERATE_TAIL_RATIO);
@@ -246,7 +233,7 @@ fn a_verdict_the_threshold_does_not_reproduce_is_surfaced() {
         "type":"dispatch.checkpoint","seq":1,"tail_ratio":0.9,
         "verdict":"conclude","would_conclude":true
     }));
-    let s = stats(&traj, metrics(10_000, 0, 1, 0));
+    let s = stats(&traj, 10_000);
     assert!(!s.checks.verdict_matches_ratio);
     assert!(s.unreconciled().iter().any(|r| r.contains("disagree")));
 }
@@ -258,36 +245,12 @@ fn a_checkpoint_without_a_ratio_does_not_count_as_healthy() {
     let traj = line(serde_json::json!({
         "type":"dispatch.checkpoint","seq":1,"verdict":"continue","would_conclude":false
     }));
-    let s = stats(&traj, metrics(10_000, 0, 1, 0));
+    let s = stats(&traj, 10_000);
     assert_eq!(s.gates.checkpoint.observations, 1);
     assert_eq!(s.gates.checkpoint.min_tail_ratio, None, "no ratio, no claim");
 }
 
-/// The guard that catches a typo in THIS module: checkpoint records are
-/// demonstrably in the trajectory and the parse counted none. Repointing the
-/// parse at a name the producer does not emit flips exactly this, while
-/// `checkpoint_events_seen` stays true — the contradiction is the signal.
-#[test]
-fn checkpoint_parse_consistency_catches_a_reader_keyed_on_the_wrong_name() {
-    let mut t = Trajectory::default();
-    t.seen_types.insert("dispatch.checkpoint".into());
-    let s = derive_stats("t".into(), metrics(1, 0, 0, 0), t, FlowFacts::default(), None, None);
-    assert!(s.checks.checkpoint_events_seen);
-    assert!(!s.checks.checkpoint_parse_consistent);
-    assert!(s.unreconciled().iter().any(|r| r.contains("none were parsed")));
-}
 
-/// A run that produced turns but carries none of the events this reading
-/// keys on is a vocabulary mismatch, not a quiet zero.
-#[test]
-fn missing_required_events_are_named() {
-    let traj = line(serde_json::json!({"type":"model.partial","seq":1,"cumulative_chars":10}));
-    let s = stats(&traj, metrics(1_000, 0, 1, 0));
-    assert_eq!(
-        s.checks.missing_required_events,
-        vec!["model.streaming.start", "model.streaming.end", "model.completed"]
-    );
-}
 
 // ---------------------------------------------------------------------------
 // Channels, time, rest
@@ -304,7 +267,7 @@ fn reasoning_and_content_chars_are_counted_as_separate_channels() {
         line(serde_json::json!({"type":"model.partial","seq":1,"cumulative_chars":3_000})),
         line(serde_json::json!({"type":"model.partial","seq":1,"cumulative_chars":6_743})),
     );
-    let s = stats(&traj, metrics(20_000, 0, 1, 0));
+    let s = stats(&traj, 20_000);
     assert_eq!(s.reasoning_chars, 43_263);
     assert_eq!(s.content_chars, 6_743, "cumulative within the turn, so the max");
     assert_eq!(s.reasoning_chars_per_s, Some(4326.3));
@@ -315,7 +278,7 @@ fn reasoning_and_content_chars_are_counted_as_separate_channels() {
 /// cross-engine comparison uses (#2848).
 #[test]
 fn active_time_excludes_rest() {
-    let s = stats("", metrics(400_000, 120_000, 8, 0));
+    let s = stats(&rest(120_000), 400_000);
     assert_eq!(s.active_ms, 280_000);
     assert!(s.checks.rest_within_wall);
 }
@@ -325,13 +288,14 @@ fn active_time_excludes_rest() {
 /// otherwise read as the run-index trend a blocked design looks for.
 #[test]
 fn distinct_rest_delays_expose_the_thermal_ratchet() {
+    let turns: String = (1..=4).map(|seq| completed(seq, Some(10), 0)).collect();
     let traj = format!(
-        "{}{}{}",
+        "{turns}{}{}{}",
         line(serde_json::json!({"type":"runtime.rest","ms":15_000,"reason":"thermal-duty-cycle","state":"fair"})),
         line(serde_json::json!({"type":"runtime.rest","ms":15_000,"reason":"thermal-duty-cycle","state":"fair"})),
         line(serde_json::json!({"type":"runtime.rest","ms":30_000,"reason":"thermal-duty-cycle","state":"serious"})),
     );
-    let s = stats(&traj, metrics(200_000, 60_000, 4, 0));
+    let s = stats(&traj, 200_000);
     assert_eq!(s.rest_events, 3);
     assert_eq!(s.rest_delays_ms, vec![15_000, 30_000]);
     assert!(s.thermal_ratchet_fired);
@@ -351,7 +315,7 @@ fn a_repeated_identical_rest_delay_does_not_fire_the_ratchet() {
         line(serde_json::json!({"type":"runtime.rest","ms":15_000,"reason":"thermal-duty-cycle","state":"fair"})),
         line(serde_json::json!({"type":"runtime.rest","ms":15_000,"reason":"thermal-duty-cycle","state":"fair"})),
     );
-    let s = stats(&traj, metrics(200_000, 30_000, 4, 0));
+    let s = stats(&traj, 200_000);
     assert_eq!(s.rest_events, 2);
     assert_eq!(s.rest_delays_ms, vec![15_000], "one DISTINCT delay, paid twice");
     assert!(!s.thermal_ratchet_fired);
@@ -369,7 +333,7 @@ fn a_decreasing_thermal_delay_does_not_fire_the_ratchet() {
         line(serde_json::json!({"type":"runtime.rest","ms":30_000,"reason":"thermal-duty-cycle","state":"serious"})),
         line(serde_json::json!({"type":"runtime.rest","ms":15_000,"reason":"thermal-duty-cycle","state":"fair"})),
     );
-    let s = stats(&traj, metrics(200_000, 45_000, 4, 0));
+    let s = stats(&traj, 200_000);
     assert_eq!(s.rest_delays_ms, vec![15_000, 30_000], "distinct values are still reported for display");
     assert!(!s.thermal_ratchet_fired, "a decrease is not the one-way ratchet");
 }
@@ -384,7 +348,7 @@ fn a_non_thermal_rest_with_a_different_delay_does_not_fire_the_ratchet() {
         line(serde_json::json!({"type":"runtime.rest","ms":15_000,"reason":"thermal-duty-cycle","state":"fair"})),
         line(serde_json::json!({"type":"runtime.rest","ms":90_000,"reason":"paused","state":"operator-hold"})),
     );
-    let s = stats(&traj, metrics(200_000, 105_000, 4, 0));
+    let s = stats(&traj, 200_000);
     assert_eq!(s.rest_delays_ms, vec![15_000, 90_000]);
     assert!(!s.thermal_ratchet_fired, "only one thermal-duty-cycle delay exists; nothing escalated");
 }
@@ -401,7 +365,7 @@ fn an_implausible_chars_per_token_turn_is_listed() {
         completed(1, Some(500), 10),
         line(serde_json::json!({"type":"model.reasoning","seq":1,"reasoning_chars":9_000})),
     );
-    let s = stats(&traj, metrics(2_000, 0, 1, 500));
+    let s = stats(&traj, 2_000);
     assert_eq!(s.suspect_turns.len(), 1);
     assert_eq!(s.suspect_turns[0].seq, 1);
     assert_eq!(s.suspect_turns[0].reasoning_chars_per_token, 900.0);
@@ -445,7 +409,7 @@ fn power_is_averaged_over_busy_samples_only_with_a_duty_cycle() {
     let raw = format!("{}{}{}{}", at(25_000, 96, 40.0), at(50_000, 97, 44.0), at(75_000, 0, 0.0), at(100_000, 1, 0.04));
     let mut flows = FlowFacts::default();
     scan_flow_lines(raw.as_bytes(), from, from + 100_000, None, &mut flows);
-    let s = derive_stats("t".into(), metrics(100_000, 0, 1, 0), Trajectory::default(), flows, None, None);
+    let s = derive_stats("t".into(), &run_fold("", 100_000), flows, None, None);
 
     assert_eq!(s.samples_busy, 2);
     assert_eq!(s.samples_idle, 2);
@@ -476,7 +440,7 @@ fn telemetry_outside_the_run_window_is_ignored() {
 /// reported as zero watts.
 #[test]
 fn absent_telemetry_reads_as_absent_not_as_zero_watts() {
-    let s = stats("", metrics(1_000, 0, 1, 0));
+    let s = stats("", 1_000);
     assert_eq!(s.gpu_w_busy, None);
     assert_eq!(s.pkg_j_per_1k_tokens, None);
     assert!(!s.checks.have_telemetry_samples);
@@ -496,20 +460,15 @@ fn a_run_that_crossed_midnight_reads_both_days_files() {
     let run = tempfile::TempDir::new().unwrap();
     let flows = tempfile::TempDir::new().unwrap();
     std::fs::write(
-        run.path().join("metrics.json"),
-        serde_json::json!({
-            "model": "m", "result": "stop", "started_at_unix_ms": 1_000,
-            "wall_ms": 10_000, "rest_ms": 2_000, "turns": 1,
-            "compactions": 0, "total_completion_tokens": 300
-        })
-        .to_string(),
-    )
-    .unwrap();
-    std::fs::write(
         run.path().join("trajectory.jsonl"),
-        // The 2 s of rest in metrics.json is recorded in the trajectory too;
-        // the cross-check requires both to say it.
-        format!("{}{}{}", stream(1, 1_000, Some(4_000)), completed(1, Some(300), 0), rest(2_000)),
+        format!(
+            "{}{}{}{}{}",
+            line(serde_json::json!({"type": "dispatch.start", "ts": 1_000, "model": "m"})),
+            stream(1, 1_000, Some(4_000)),
+            completed(1, Some(300), 0),
+            rest(2_000),
+            line(serde_json::json!({"type": "dispatch.complete", "ts": 11_000, "result": "stop", "wall_ms": 10_000})),
+        ),
     )
     .unwrap();
     std::fs::write(
@@ -549,198 +508,23 @@ fn a_run_that_crossed_midnight_reads_both_days_files() {
     assert_eq!(s.samples_busy, 1, "today's telemetry");
     assert_eq!(s.flow_records_in_window, 1, "yesterday's session record");
     assert!(s.bounds.contains_key("max_tokens_per_call"), "bounds from yesterday's file");
-    assert_eq!(s.checks.tokens_reconcile, Some(true));
     assert!(s.unreconciled().is_empty(), "a clean run quotes cleanly: {:?}", s.unreconciled());
 }
 
 // ---------------------------------------------------------------------------
-// Stale metrics.json (#2855 review)
+// A run directory with no trajectory
 // ---------------------------------------------------------------------------
 
-/// `metrics.json` claiming less wall time than the trajectory spent
-/// generating is a metrics file for a DIFFERENT, shorter run — measured:
-/// wall 439s printed beside "1234s of 1234s" of generation.
+/// A run without a trajectory has no derivable numbers, and says so rather
+/// than returning a page of zeros. A `metrics.json` beside it (written
+/// until 4.0) changes nothing: it is never read.
 #[test]
-fn stale_metrics_is_flagged_when_generation_exceeds_the_claimed_wall_time() {
-    let traj = format!("{}{}", stream(1, 0, Some(500_000)), completed(1, Some(100), 5));
-    // wall_ms claims 100s but the stream alone ran 500s.
-    let s = stats(&traj, metrics(100_000, 0, 1, 100));
-    assert!(s.checks.metrics_stale);
-    assert!(s.unreconciled().iter().any(|c| c.contains("does not belong to this run")));
-}
-
-/// The ordinary case — generation comfortably inside the claimed wall time —
-/// must not be flagged.
-#[test]
-fn a_run_whose_generation_fits_inside_its_wall_time_is_not_flagged_stale() {
-    let traj = format!("{}{}", stream(1, 0, Some(5_000)), completed(1, Some(100), 5));
-    let s = stats(&traj, metrics(100_000, 0, 1, 100));
-    assert!(!s.checks.metrics_stale);
-}
-
-/// The other half of the detection: `metrics.json`'s own clock disagrees
-/// with the run's OWN identity (the epoch embedded in its run id) by more
-/// than the slack. This is the shape actually found on disk — 11 run dirs
-/// with a `metrics.json` that started before the run's own id timestamp, 4
-/// of them byte-identical copies from days earlier.
-#[test]
-fn stale_metrics_is_flagged_when_its_clock_disagrees_with_the_runs_own_id() {
-    let flows = tempfile::TempDir::new().unwrap();
-    let runs = tempfile::TempDir::new().unwrap();
-    // The run's OWN identity: epoch 1_780_000 seconds.
-    let run_dir = runs.path().join("long-agentic-balanced-1780000000-1");
-    std::fs::create_dir(&run_dir).unwrap();
-    std::fs::write(
-        run_dir.join("metrics.json"),
-        // metrics.json's clock: ~5 days EARLIER than the run's own id.
-        serde_json::json!({
-            "started_at_unix_ms": 1_779_570_000_000u64, "wall_ms": 10_000, "rest_ms": 0,
-            "turns": 1, "total_completion_tokens": 0
-        })
-        .to_string(),
-    )
-    .unwrap();
-    let s = compute_from_dir(&run_dir, flows.path()).unwrap();
-    assert!(s.checks.metrics_stale, "checks: {:?}", s.checks);
-}
-
-/// A `metrics.json` clock a few seconds off its run's own id (ordinary
-/// dispatch-startup latency) stays within slack and is not flagged.
-#[test]
-fn a_metrics_clock_within_slack_of_the_runs_own_id_is_not_flagged() {
-    let flows = tempfile::TempDir::new().unwrap();
-    let runs = tempfile::TempDir::new().unwrap();
-    let run_dir = runs.path().join("long-agentic-balanced-1780000000-1");
-    std::fs::create_dir(&run_dir).unwrap();
-    std::fs::write(
-        run_dir.join("metrics.json"),
-        serde_json::json!({
-            // 3 seconds after the id's own stamp — ordinary startup lag.
-            "started_at_unix_ms": 1_780_000_003_000u64, "wall_ms": 10_000, "rest_ms": 0,
-            "turns": 1, "total_completion_tokens": 0
-        })
-        .to_string(),
-    )
-    .unwrap();
-    let s = compute_from_dir(&run_dir, flows.path()).unwrap();
-    assert!(!s.checks.metrics_stale, "checks: {:?}", s.checks);
-}
-
-/// (Frontier review, 2026-09-23) A 1ms gap between generation and claimed
-/// wall time is clock jitter between two different clocks (trajectory
-/// stream timestamps vs the runtime's own wall-clock stamp), not a
-/// different run's metrics file. Pinned to the exact real numbers measured
-/// on disk for `long-agentic-balanced-1779702243-1` (wall 23605ms, gen
-/// 23606ms) — it owns its own metrics and must not be flagged.
-#[test]
-fn a_one_millisecond_generation_jitter_over_wall_is_not_flagged_stale() {
-    let traj = format!("{}{}", stream(1, 0, Some(23_606)), completed(1, Some(100), 5));
-    let s = stats(&traj, metrics(23_605, 0, 1, 100));
-    assert!(!s.checks.metrics_stale, "checks: {:?}", s.checks);
-}
-
-/// Same shape, the other real example: wall 1219ms, gen 1220ms
-/// (`long-agentic-balanced-1779802198-1`).
-#[test]
-fn a_one_millisecond_generation_jitter_on_a_short_run_is_not_flagged_stale() {
-    let traj = format!("{}{}", stream(1, 0, Some(1_220)), completed(1, Some(100), 5));
-    let s = stats(&traj, metrics(1_219, 0, 1, 100));
-    assert!(!s.checks.metrics_stale, "checks: {:?}", s.checks);
-}
-
-/// (Frontier review, 2026-09-23) A symmetric slack let a `metrics.json`
-/// starting ~90s BEFORE its own run's id pass as identity, because 90s sits
-/// comfortably inside a 10-minute window either direction. That is exactly
-/// `medium-coding-deep-1779688920-1` on disk — a byte-identical copy of
-/// `…-1779688829-1`'s metrics, un-flagged before this fix. A clock claiming
-/// a start before the run was even minted is impossible, so the tolerance
-/// on that side must be tight, not symmetric with the generous AFTER side.
-#[test]
-fn a_metrics_clock_90_seconds_before_its_own_id_is_flagged_stale() {
-    let flows = tempfile::TempDir::new().unwrap();
-    let runs = tempfile::TempDir::new().unwrap();
-    let run_dir = runs.path().join("medium-coding-deep-1779688920-1");
-    std::fs::create_dir(&run_dir).unwrap();
-    std::fs::write(
-        run_dir.join("metrics.json"),
-        serde_json::json!({
-            // 89.843s BEFORE the id's own stamp (1_779_688_920_000) —
-            // the exact real gap measured on disk.
-            "started_at_unix_ms": 1_779_688_830_157u64, "wall_ms": 68_953, "rest_ms": 0,
-            "turns": 1, "total_completion_tokens": 0
-        })
-        .to_string(),
-    )
-    .unwrap();
-    let s = compute_from_dir(&run_dir, flows.path()).unwrap();
-    assert!(s.checks.metrics_stale, "checks: {:?}", s.checks);
-}
-
-/// The genuine owner of that same metrics content (id
-/// `…-1779688829-1`, whose own epoch is only ~1.157s before the metrics
-/// clock) must NOT be flagged — the fix is one-sided, not just tighter.
-#[test]
-fn the_genuine_owner_of_an_early_metrics_clock_is_not_flagged() {
-    let flows = tempfile::TempDir::new().unwrap();
-    let runs = tempfile::TempDir::new().unwrap();
-    let run_dir = runs.path().join("medium-coding-deep-1779688829-1");
-    std::fs::create_dir(&run_dir).unwrap();
-    std::fs::write(
-        run_dir.join("metrics.json"),
-        serde_json::json!({
-            "started_at_unix_ms": 1_779_688_830_157u64, "wall_ms": 68_953, "rest_ms": 0,
-            "turns": 1, "total_completion_tokens": 0
-        })
-        .to_string(),
-    )
-    .unwrap();
-    let s = compute_from_dir(&run_dir, flows.path()).unwrap();
-    assert!(!s.checks.metrics_stale, "checks: {:?}", s.checks);
-}
-
-/// (#2855 review) `lifecycle.json`'s `started_at_ms`, when present, is the
-/// run's identity — NOT the id-embedded epoch, even when they disagree.
-/// Rigged so the two sources give OPPOSITE verdicts: the id epoch alone
-/// would call this run clean, but lifecycle.json (which must win) calls it
-/// stale. Pins the precedence rather than just exercising the fallback.
-#[test]
-fn lifecycle_started_at_wins_over_the_id_epoch_when_they_disagree() {
-    let flows = tempfile::TempDir::new().unwrap();
-    let runs = tempfile::TempDir::new().unwrap();
-    // Id epoch: 1_780_000_000s. metrics.json claims 500s later — well
-    // within slack of the ID ALONE, so if the id epoch were used this run
-    // reads clean.
-    let run_dir = runs.path().join("long-agentic-balanced-1780000000-1");
-    std::fs::create_dir(&run_dir).unwrap();
-    std::fs::write(
-        run_dir.join("metrics.json"),
-        serde_json::json!({
-            "started_at_unix_ms": 1_780_000_500_000u64, "wall_ms": 10_000, "rest_ms": 0,
-            "turns": 1, "total_completion_tokens": 0
-        })
-        .to_string(),
-    )
-    .unwrap();
-    // lifecycle.json's own identity is ~1000s EARLIER than metrics.json's
-    // claim — if lifecycle wins, that puts metrics.json's claim well past
-    // lifecycle's own `STALE_METRICS_SLACK_MS` budget.
-    std::fs::write(
-        run_dir.join("lifecycle.json"),
-        serde_json::json!({"started_at_ms": 1_779_000_000_000u64}).to_string(),
-    )
-    .unwrap();
-    let s = compute_from_dir(&run_dir, flows.path()).unwrap();
-    assert!(s.checks.metrics_stale, "lifecycle.json must win over the id epoch: {:?}", s.checks);
-}
-
-/// A run without metrics has no derivable numbers, and says so
-/// rather than returning a page of zeros.
-#[test]
-fn a_run_without_metrics_is_an_error_not_a_page_of_zeros() {
+fn a_run_without_a_trajectory_is_an_error_not_a_page_of_zeros() {
     let run = tempfile::TempDir::new().unwrap();
     let flows = tempfile::TempDir::new().unwrap();
+    std::fs::write(run.path().join("metrics.json"), r#"{"wall_ms":1000,"turns":3}"#).unwrap();
     let err = compute_from_dir(run.path(), flows.path()).unwrap_err();
-    assert!(err.to_string().contains("metrics.json"), "got: {err}");
+    assert!(err.to_string().contains("no trajectory events"), "got: {err}");
 }
 
 /// A missing flow directory is not an error — it means no power arm.
@@ -748,8 +532,8 @@ fn a_run_without_metrics_is_an_error_not_a_page_of_zeros() {
 fn a_missing_flow_directory_is_not_an_error() {
     let run = tempfile::TempDir::new().unwrap();
     std::fs::write(
-        run.path().join("metrics.json"),
-        serde_json::json!({"wall_ms": 1_000, "turns": 0}).to_string(),
+        run.path().join("trajectory.jsonl"),
+        line(serde_json::json!({"type": "dispatch.complete", "result": "stop", "wall_ms": 1_000})),
     )
     .unwrap();
     let s = compute_from_dir(run.path(), Path::new("/nonexistent-flows")).unwrap();
@@ -778,12 +562,12 @@ fn flow_file(dir: &Path, name: &str, body: &str, mtime_ms: u64) {
 fn run_at(start: u64, wall: u64) -> tempfile::TempDir {
     let run = tempfile::TempDir::new().unwrap();
     std::fs::write(
-        run.path().join("metrics.json"),
-        serde_json::json!({
-            "started_at_unix_ms": start, "wall_ms": wall, "rest_ms": 0,
-            "turns": 1, "total_completion_tokens": 0
-        })
-        .to_string(),
+        run.path().join("trajectory.jsonl"),
+        format!(
+            "{}{}",
+            line(serde_json::json!({"type": "dispatch.start", "ts": start})),
+            line(serde_json::json!({"type": "dispatch.complete", "ts": start + wall, "result": "stop", "wall_ms": wall})),
+        ),
     )
     .unwrap();
     run
@@ -899,7 +683,7 @@ fn the_window_slack_keeps_session_records_but_not_outside_telemetry() {
 fn every_abort_counts_not_every_aborted_turn() {
     let abort = |seq: u64| line(serde_json::json!({"type": "dispatch.gate.abort", "seq": seq}));
     let traj = format!("{}{}{}", abort(2), abort(6), abort(6));
-    let s = stats(&traj, metrics(10_000, 0, 6, 0));
+    let s = stats(&traj, 10_000);
     assert_eq!(s.gates.stream.aborts, 3);
     assert_eq!(s.turns_with_stream_abort, vec![2, 6]);
 }
@@ -908,42 +692,7 @@ fn rest(ms: u64) -> String {
     line(serde_json::json!({"type": "runtime.rest", "ms": ms, "reason": "thermal-duty-cycle", "state": "fair"}))
 }
 
-/// Review MF2: the runtime's error path writes `metrics.json` with turns and
-/// rest hardcoded to zero, so an errored run printed "rest 0s, 0 turns"
-/// beside three rests and 234k tokens, active time overstated by the rest it
-/// hid, and no caveat. The trajectory holds the real counts.
-#[test]
-fn an_errored_run_takes_turns_and_rest_from_the_trajectory() {
-    let traj = format!(
-        "{}{}{}{}{}{}",
-        stream(1, 0, Some(10_000)),
-        completed(1, Some(100), 0),
-        rest(15_000),
-        stream(2, 30_000, Some(40_000)),
-        completed(2, Some(200), 0),
-        rest(15_000),
-    );
-    let mut m = metrics(100_000, 0, 0, 0);
-    m.result = Some("error".into());
-    let s = stats(&traj, m);
-    assert_eq!(s.turns, 2);
-    assert_eq!(s.rest_ms, 30_000);
-    assert_eq!(s.active_ms, 70_000);
-    assert!(s.checks.metrics_totals_zeroed);
-    assert_eq!(s.checks.tokens_reconcile, None, "there is no total to reconcile against");
-    assert!(s.unreconciled().iter().any(|r| r.contains("zeroed")));
-}
 
-/// Outside the error path the two sources must agree; when they do not, the
-/// run says so instead of quietly picking one.
-#[test]
-fn a_run_whose_metrics_disagree_with_its_trajectory_is_flagged() {
-    let traj = format!("{}{}{}", stream(1, 0, Some(1_000)), completed(1, Some(10), 0), rest(15_000));
-    let s = stats(&traj, metrics(100_000, 0, 1, 10));
-    assert_eq!(s.checks.rest_matches_trajectory, Some(false));
-    assert_eq!(s.checks.turns_match_trajectory, Some(true));
-    assert!(s.unreconciled().iter().any(|r| r.contains("rest")));
-}
 
 /// Review MF3: the "longest span on an aborted seq" guess ran even when null
 /// frames had already identified the unbilled span exactly, so a SHORT abort
@@ -961,7 +710,7 @@ fn a_short_abort_then_a_long_retry_keeps_the_retry_billed() {
         stream(3, 70_000, Some(80_000)),
         completed(3, Some(1_000), 0),
     );
-    let s = stats(&traj, metrics(100_000, 0, 3, 7_000));
+    let s = stats(&traj, 100_000);
     assert_eq!(s.streams_unbilled, 1);
     assert_eq!(s.gen_ms_billed, 70_000);
     assert_eq!(s.tok_per_s, Some(100.0));
@@ -978,7 +727,7 @@ fn a_null_frame_is_not_paired_by_index_when_counts_differ() {
         stream(2, 10_000, Some(20_000)),
         stream(3, 20_000, Some(30_000)),
     );
-    let s = stats(&traj, metrics(40_000, 0, 3, 0));
+    let s = stats(&traj, 40_000);
     assert!(!s.checks.frames_match_streams);
     assert_eq!(s.streams_unbilled, 0, "index pairing is off when the counts differ");
 }
@@ -1003,7 +752,7 @@ fn sparse_telemetry_withholds_busy_time_and_energy() {
     let raw = format!("{}{}", telem_at(from + 595_000, 96, 5_000), telem_at(from + 600_000, 96, 5_000));
     let mut flows = FlowFacts::default();
     scan_flow_lines(raw.as_bytes(), from, from + 600_000, None, &mut flows);
-    let s = derive_stats("t".into(), metrics(600_000, 0, 1, 0), Trajectory::default(), flows, None, None);
+    let s = derive_stats("t".into(), &run_fold("", 600_000), flows, None, None);
     assert!(!s.checks.telemetry_covers_run);
     assert!(s.telemetry_max_gap_ms.unwrap() >= 590_000);
     assert_eq!(s.busy_ms, None);
@@ -1024,7 +773,7 @@ fn duty_is_weighted_by_time_not_by_sample_count() {
     raw.push_str(&telem_at(from + 60_000, 0, 30_000)); // 30 s idle, one sample
     let mut flows = FlowFacts::default();
     scan_flow_lines(raw.as_bytes(), from, from + 60_000, None, &mut flows);
-    let s = derive_stats("t".into(), metrics(60_000, 0, 1, 0), Trajectory::default(), flows, None, None);
+    let s = derive_stats("t".into(), &run_fold("", 60_000), flows, None, None);
     assert_eq!(s.gpu_duty_pct, Some(50.0), "by count it would read 85.7%");
     assert!(s.checks.telemetry_covers_run);
 }
@@ -1041,7 +790,7 @@ fn content_chars_sum_across_streams_on_one_seq() {
         stream(1, 1_000, Some(2_000)),
         partial(2_000),
     );
-    let s = stats(&traj, metrics(5_000, 0, 1, 0));
+    let s = stats(&traj, 5_000);
     assert_eq!(s.content_chars, 5_000);
 }
 
@@ -1112,7 +861,7 @@ fn suspect_turns_and_missing_flow_records_are_caveats() {
         completed(1, Some(500), 10),
         line(serde_json::json!({"type": "model.reasoning", "seq": 1, "reasoning_chars": 9_000})),
     );
-    let s = stats(&traj, metrics(2_000, 0, 1, 500));
+    let s = stats(&traj, 2_000);
     let u = s.unreconciled();
     assert!(u.iter().any(|r| r.contains("chars per token")), "{u:?}");
     assert!(u.iter().any(|r| r.contains("flow records")), "{u:?}");
@@ -1123,14 +872,14 @@ fn suspect_turns_and_missing_flow_records_are_caveats() {
 #[test]
 fn an_older_checkpoint_without_would_conclude_still_counts_its_conclusion() {
     let traj = line(serde_json::json!({"type": "dispatch.checkpoint", "seq": 1, "tail_ratio": 0.1, "verdict": "conclude"}));
-    let s = stats(&traj, metrics(1_000, 0, 1, 0));
+    let s = stats(&traj, 1_000);
     assert_eq!(s.gates.checkpoint.degenerate_turns, vec![1]);
 }
 
 /// Review M9: rest longer than wall is impossible; the check must fail.
 #[test]
 fn rest_longer_than_wall_fails_its_check() {
-    let s = stats("", metrics(1_000, 5_000, 1, 0));
+    let s = stats(&rest(5_000), 1_000);
     assert!(!s.checks.rest_within_wall);
 }
 
@@ -1142,7 +891,7 @@ fn a_duplicate_end_does_not_re_time_a_closed_stream() {
         stream(1, 0, Some(1_000)),
         line(serde_json::json!({"type": "model.streaming.end", "seq": 1, "ts": 9_000})),
     );
-    let s = stats(&traj, metrics(10_000, 0, 1, 0));
+    let s = stats(&traj, 10_000);
     assert_eq!(s.gen_ms_all, 1_000);
 }
 
@@ -1154,7 +903,7 @@ fn a_ratio_exactly_at_the_threshold_is_not_degenerate() {
         "type": "dispatch.checkpoint", "seq": 1, "tail_ratio": DEGENERATE_TAIL_RATIO,
         "verdict": "continue", "would_conclude": false
     }));
-    let s = stats(&traj, metrics(1_000, 0, 1, 0));
+    let s = stats(&traj, 1_000);
     assert!(s.gates.checkpoint.degenerate_turns_by_ratio.is_empty());
     assert!(s.checks.verdict_matches_ratio);
 }
@@ -1181,7 +930,7 @@ fn without_a_pairing_the_longest_span_on_an_aborted_seq_is_the_unbilled_one() {
         stream(3, 60_000, Some(70_000)),
         completed(3, Some(1_000), 0),
     );
-    let s = stats(&traj, metrics(80_000, 0, 3, 1_500));
+    let s = stats(&traj, 80_000);
     assert!(!s.checks.frames_match_streams, "three streams, two frames");
     assert_eq!(s.streams_unbilled, 1);
     assert_eq!(s.gen_ms_billed, 15_000, "the 5 s retry and the 10 s turn");
@@ -1203,7 +952,7 @@ fn with_policy_bound(value: &str) -> FlowFacts {
 /// `observe` run with no checkpoints.
 #[test]
 fn the_policy_is_read_from_the_bounds_when_no_checkpoint_recorded_it() {
-    let s = derive_stats("t".into(), metrics(1_000, 0, 0, 0), Trajectory::default(), with_policy_bound("off"), None, None);
+    let s = derive_stats("t".into(), &run_fold("", 1_000), with_policy_bound("off"), None, None);
     assert_eq!(s.gates.checkpoint.policy.as_deref(), Some("off"));
     assert_eq!(s.checks.policy_consistent, None, "one source, nothing to compare");
 }
@@ -1217,7 +966,7 @@ fn a_policy_the_runtime_did_not_run_is_flagged() {
         "type": "dispatch.checkpoint", "seq": 1, "tail_ratio": 0.9,
         "verdict": "continue", "would_conclude": false, "policy": "observe"
     }));
-    let s = derive_stats("t".into(), metrics(1_000, 0, 1, 0), parse_trajectory(&traj), with_policy_bound("enforce"), None, None);
+    let s = derive_stats("t".into(), &run_fold(&traj, 1_000), with_policy_bound("enforce"), None, None);
     assert_eq!(s.gates.checkpoint.policy.as_deref(), Some("observe"), "what ran wins");
     assert_eq!(s.checks.policy_consistent, Some(false));
     assert!(s.unreconciled().iter().any(|r| r.contains("policy")));
@@ -1232,7 +981,7 @@ fn coverage_of(raw: &str, wall: u64) -> RunStats {
     let from = 1_000_000; // `metrics()`'s start
     let mut flows = FlowFacts::default();
     scan_flow_lines(raw.as_bytes(), from, from + wall, None, &mut flows);
-    derive_stats("t".into(), metrics(wall, 0, 1, 0), Trajectory::default(), flows, None, None)
+    derive_stats("t".into(), &run_fold("", wall), flows, None, None)
 }
 
 fn old_telem(off: u64, gpu: u64) -> String {
@@ -1357,8 +1106,8 @@ fn a_pre_gate_run_on_a_baselined_fixture_is_flagged_ungated() {
     )
     .unwrap();
     std::fs::write(
-        run.path().join("metrics.json"),
-        serde_json::json!({"wall_ms": 1_000, "turns": 1}).to_string(),
+        run.path().join("trajectory.jsonl"),
+        line(serde_json::json!({"type": "dispatch.complete", "result": "stop", "wall_ms": 1_000})),
     )
     .unwrap();
     std::fs::write(
@@ -1388,8 +1137,8 @@ fn a_gated_run_on_the_same_fixture_is_not_flagged_ungated() {
     )
     .unwrap();
     std::fs::write(
-        run.path().join("metrics.json"),
-        serde_json::json!({"wall_ms": 1_000, "turns": 1}).to_string(),
+        run.path().join("trajectory.jsonl"),
+        line(serde_json::json!({"type": "dispatch.complete", "result": "stop", "wall_ms": 1_000})),
     )
     .unwrap();
     std::fs::write(
@@ -1419,8 +1168,8 @@ fn a_pre_gate_run_on_an_unbaselined_fixture_is_not_flagged_ungated() {
     )
     .unwrap();
     std::fs::write(
-        run.path().join("metrics.json"),
-        serde_json::json!({"wall_ms": 1_000, "turns": 1}).to_string(),
+        run.path().join("trajectory.jsonl"),
+        line(serde_json::json!({"type": "dispatch.complete", "result": "stop", "wall_ms": 1_000})),
     )
     .unwrap();
     std::fs::write(

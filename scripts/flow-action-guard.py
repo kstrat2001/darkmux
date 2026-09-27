@@ -21,13 +21,17 @@
 # drift from it. The one-word old spellings (`note`, `catch`) are left out:
 # as literals they are ordinary words far more often than actions.
 #
-# Tests are not scanned: `tests/` directories, `*_tests.rs`, and each
-# `#[cfg(test)] mod <name> { ... }` block, found by brace matching, so code
-# AFTER a test module is still scanned. Comment lines are skipped.
+# Tests are not scanned: `tests/` directories, `*_tests.rs`, a `tests.rs`
+# module, and each `#[cfg(test)] mod <name> { ... }` block, found by brace
+# matching, so code AFTER a test module is still scanned. Comment lines are
+# skipped. Nor is the trajectory event vocabulary
+# (`crates/darkmux-trajectory/src/event.rs`), the one place a runtime
+# trajectory event type is spelled; some of those share a spelling with a
+# flow action (`dispatch.checkpoint`).
 #
-# A literal that shares a spelling with an action but is NOT one (a runtime
-# trajectory event type, which `dispatch.checkpoint` also names) is allowed
-# with a marker on its line or the line above; one marker covers ONE hit:
+# Any other literal that shares a spelling with an action but is NOT one is
+# allowed with a marker on its line or the line above; one marker covers ONE
+# hit:
 #   // flow-action-guard:allow — <reason>
 #
 # Stdlib only. `--self-test` proves each shape can fail before trusting a pass.
@@ -39,6 +43,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ACTION_RS = "crates/darkmux-flow/src/action.rs"
 LEGACY_RS = "crates/darkmux-flow/src/legacy.rs"
+TRAJECTORY_EVENTS_RS = "crates/darkmux-trajectory/src/event.rs"
 SCAN_DIRS = ["crates", "src", "runtime", "plugins"]
 ALLOW = "flow-action-guard:allow"
 TEST_MOD = re.compile(r"#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{")
@@ -163,12 +168,12 @@ def violations(text, vocab):
 
 def scan(root, vocab):
     found = []
-    skip = {os.path.normpath(ACTION_RS), os.path.normpath(LEGACY_RS)}
+    skip = {os.path.normpath(p) for p in (ACTION_RS, LEGACY_RS, TRAJECTORY_EVENTS_RS)}
     for d in SCAN_DIRS:
         for dirpath, dirnames, filenames in os.walk(os.path.join(root, d)):
             dirnames[:] = [n for n in dirnames if n not in ("target", "tests", "node_modules")]
             for name in filenames:
-                if not name.endswith(".rs") or name.endswith("_tests.rs"):
+                if not name.endswith(".rs") or name.endswith("_tests.rs") or name == "tests.rs":
                     continue
                 path = os.path.join(dirpath, name)
                 rel = os.path.normpath(os.path.relpath(path, root))

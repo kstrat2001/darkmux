@@ -189,7 +189,9 @@ pub enum Metric {
     Calls,
 }
 
-/// How far into a budget the spend is.
+/// How far into a budget the KNOWN spend is. Ordered: a higher level is
+/// news. Whether the spend is fully known is a separate fact
+/// ([`Breach::unmetered`]), never a level, so neither masks the other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BreachLevel {
@@ -202,10 +204,60 @@ pub enum BreachLevel {
 /// One measured breach.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Breach {
-    pub level: BreachLevel,
+    /// `None`: the known spend is under every threshold, and the breach is
+    /// only that the window is not fully metered.
+    pub level: Option<BreachLevel>,
     pub metric: Metric,
+    /// The known spend: every call's full total where it is known, and the
+    /// halves it did report where it is not. A lower bound when
+    /// `unmetered > 0`.
     pub spent: u64,
     pub limit: u64,
+    /// Calls in the window whose full spend is unknown (no prompt count, or
+    /// no usage at all).
+    pub unmetered: u64,
+}
+
+/// What a warning for one budget already said, so it is said again only
+/// when it says more: a higher level, or a window newly not fully metered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Surfaced {
+    pub level: Option<BreachLevel>,
+    pub unmetered: bool,
+}
+
+impl Surfaced {
+    pub fn of(br: &Breach) -> Self {
+        Surfaced { level: br.level, unmetered: br.unmetered > 0 }
+    }
+
+    /// Whether this says something `before` did not.
+    pub fn is_news_after(&self, before: Option<Surfaced>) -> bool {
+        let before = before.unwrap_or_default();
+        self.level > before.level || (self.unmetered && !before.unmetered)
+    }
+}
+
+/// One call's spend as the window counts it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spend {
+    /// The call's full total when known, else the halves it reported: never
+    /// more than it spent.
+    pub known: u64,
+    /// True when `known` is the call's full spend
+    /// ([`darkmux_trajectory::UsageCounts::total_tokens`] was known).
+    pub metered: bool,
+}
+
+impl Spend {
+    pub fn full(tokens: u64) -> Self {
+        Spend { known: tokens, metered: true }
+    }
+
+    /// A call whose full spend is unknown; `known` is what it did report.
+    pub fn partial(known: u64) -> Self {
+        Spend { known, metered: false }
+    }
 }
 
 /// What the pure evaluation says about the next call.
@@ -220,20 +272,33 @@ pub enum Verdict {
     Wait { breach: Breach, resume_at: Option<i64> },
 }
 
-/// Spend inside the window: `(epoch second, tokens)` per usage record,
+/// Spend inside the window: `(epoch second, spend)` per usage record,
 /// oldest first.
-pub type WindowEntries = Vec<(i64, u64)>;
+pub type WindowEntries = Vec<(i64, Spend)>;
 
 /// THE decision, pure: `entries` are this endpoint's records, `now` the
 /// injected clock. A record at second `t` is inside the window while
 /// `now < t + period`, so it leaves the window at exactly `t + period`.
-pub fn evaluate(b: &EndpointBudget, entries: &[(i64, u64)], now: i64) -> Verdict {
+///
+/// An unknown spend is never read as small. Its known halves count toward
+/// the budget like any spend, so a window they fill still warns or waits;
+/// and under a token budget, a window holding one is surfaced as not fully
+/// metered (`unmetered`), on the same warning as any level it reaches. A
+/// calls budget is never unmetered: a call count is exact.
+///
+/// The limit, stated plainly: a call whose provider reported NO usage at
+/// all adds 0 to the known spend. Under a token `wait` budget such calls
+/// warn "not fully metered" but never, on their own, make the window
+/// wait. The conservative charge ([`conservative_hosted_spend`]) feeds
+/// only a step's own per-step bucket, never this ledger.
+pub fn evaluate(b: &EndpointBudget, entries: &[(i64, Spend)], now: i64) -> Verdict {
     if !b.policy.counts() {
         return Verdict::Proceed;
     }
     let period = b.window.period_secs as i64;
-    let inside: Vec<(i64, u64)> = entries.iter().copied().filter(|(t, _)| now < t + period && *t <= now).collect();
-    let tokens: u64 = inside.iter().map(|(_, n)| *n).fold(0u64, u64::saturating_add);
+    let inside: Vec<(i64, Spend)> = entries.iter().copied().filter(|(t, _)| now < t + period && *t <= now).collect();
+    let tokens: u64 = inside.iter().map(|(_, s)| s.known).fold(0u64, u64::saturating_add);
+    let unmetered = inside.iter().filter(|(_, s)| !s.metered).count() as u64;
     let calls = inside.len() as u64;
     let measured = [(Metric::Tokens, tokens, b.window.tokens), (Metric::Calls, calls, b.window.calls)];
 
@@ -241,12 +306,17 @@ pub fn evaluate(b: &EndpointBudget, entries: &[(i64, u64)], now: i64) -> Verdict
     let mut early: Option<Breach> = None;
     for (metric, spent, limit) in measured {
         let Some(limit) = limit else { continue };
+        // A call count is always exact: only a token metric can be unmetered.
+        let unmetered = match metric {
+            Metric::Tokens => unmetered,
+            Metric::Calls => 0,
+        };
         if spent >= limit {
-            at_limit.push(Breach { level: BreachLevel::AtLimit, metric, spent, limit });
+            at_limit.push(Breach { level: Some(BreachLevel::AtLimit), metric, spent, limit, unmetered });
         } else if let Some(f) = b.warn_at {
             let threshold = ((limit as f64) * f).ceil() as u64;
             if spent >= threshold && early.is_none() {
-                early = Some(Breach { level: BreachLevel::Early, metric, spent, limit });
+                early = Some(Breach { level: Some(BreachLevel::Early), metric, spent, limit, unmetered });
             }
         }
     }
@@ -266,23 +336,26 @@ pub fn evaluate(b: &EndpointBudget, entries: &[(i64, u64)], now: i64) -> Verdict
         }
         return Verdict::Warn(first);
     }
-    match early {
-        Some(br) => Verdict::Warn(br),
-        None => Verdict::Proceed,
+    match (early, unmetered > 0, b.window.tokens) {
+        (Some(br), _, _) => Verdict::Warn(br),
+        (None, true, Some(limit)) => {
+            Verdict::Warn(Breach { level: None, metric: Metric::Tokens, spent: tokens, limit, unmetered })
+        }
+        _ => Verdict::Proceed,
     }
 }
 
 /// When the oldest records have left the window far enough for `br`'s
 /// metric to be under its limit again. `None` for a limit of 0 (there is
 /// never room).
-fn resume_at_for(inside: &[(i64, u64)], br: &Breach, period: i64) -> Option<i64> {
+fn resume_at_for(inside: &[(i64, Spend)], br: &Breach, period: i64) -> Option<i64> {
     if br.limit == 0 {
         return None;
     }
     let mut remaining = br.spent;
     for (t, n) in inside {
         remaining = remaining.saturating_sub(match br.metric {
-            Metric::Tokens => *n,
+            Metric::Tokens => n.known,
             Metric::Calls => 1,
         });
         if remaining < br.limit {
@@ -290,6 +363,22 @@ fn resume_at_for(inside: &[(i64, u64)], br: &Breach, period: i64) -> Option<i64>
         }
     }
     None
+}
+
+/// (#1442 gate C4) What one hosted call SPENDS from a step's bucket: its
+/// total ([`darkmux_trajectory::UsageCounts::total_tokens`], the amount its
+/// usage record carries) when the spend is known. When it is not (the reply
+/// reported no usage, or a split without its prompt half), the charge is
+/// the `max_tokens` the call was granted, which bounds its completion, PLUS
+/// the prompt it sent, estimated from `request` (the body actually posted)
+/// by the project's one estimate ([`darkmux_trajectory::estimate_tokens`]).
+/// Charging 0, the completion alone, or the cap alone would let such an
+/// endpoint run off the meter; over-counting is the safe direction.
+pub fn conservative_hosted_spend(total_tokens: Option<u64>, granted_max_tokens: u32, request: &serde_json::Value) -> u64 {
+    total_tokens.unwrap_or_else(|| {
+        let prompt = darkmux_trajectory::estimate_tokens(&request.to_string()) as u64;
+        u64::from(granted_max_tokens).saturating_add(prompt)
+    })
 }
 
 // ── The window ledger ───────────────────────────────────────────────────
@@ -306,9 +395,9 @@ struct DayFile {
     inode: u64,
     head: Vec<u8>,
     tail: Vec<u8>,
-    /// `(endpoint id, epoch second, tokens)` for every usage record in the
+    /// `(endpoint id, epoch second, spend)` for every usage record in the
     /// bytes read that carries an `endpoint_id`.
-    entries: Vec<(String, i64, u64)>,
+    entries: Vec<(String, i64, Spend)>,
 }
 
 /// How many bytes of a day file's start, and of the bytes just before the
@@ -425,7 +514,7 @@ fn read_at(file: &mut std::fs::File, at: u64, len: u64) -> Option<Vec<u8>> {
 /// One line to a ledger entry: a usage record that carries an
 /// `endpoint_id` and a parseable `ts`. A cheap substring test first, so the
 /// JSON of every OTHER record (the vast majority) is never parsed.
-fn parse_entry(line: &[u8]) -> Option<(String, i64, u64)> {
+fn parse_entry(line: &[u8]) -> Option<(String, i64, Spend)> {
     const NEEDLE: &[u8] = b"\"endpoint_id\"";
     if line.len() < NEEDLE.len() || !line.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
         return None;
@@ -434,7 +523,9 @@ fn parse_entry(line: &[u8]) -> Option<(String, i64, u64)> {
     let amount = crate::usage::usage_contribution(&v)?;
     let id = crate::usage::payload_of(&v).get("endpoint_id")?.as_str()?.to_string();
     let ts = crate::records_emitted::parse_ts_secs(v.get("ts")?.as_str()?)?;
-    Some((id, ts, amount.total))
+    // `total` is the record's full total when known, else the halves it
+    // reported; `spend` says which.
+    Some((id, ts, Spend { known: amount.total, metered: amount.spend.is_some() }))
 }
 
 /// The process's ledger over the configured flows dir.
@@ -471,17 +562,17 @@ pub trait BudgetEnv {
     fn say(&self, line: &str);
     /// Record deliberate pause time ([`darkmux_types::run_pause`]).
     fn paused(&self, ms: u64);
-    /// The highest breach level already surfaced for `key` in this process.
-    fn last_level(&self, key: &str) -> Option<BreachLevel>;
-    fn set_last_level(&self, key: &str, level: Option<BreachLevel>);
+    /// What was already surfaced for `key` in this process.
+    fn last_surfaced(&self, key: &str) -> Option<Surfaced>;
+    fn set_surfaced(&self, key: &str, surfaced: Option<Surfaced>);
 }
 
 /// The production environment: the system clock, the configured flows dir,
 /// the live profile registry, the mission store, the process-wide flow sink.
 pub struct LiveEnv;
 
-fn warned_levels() -> &'static Mutex<HashMap<String, BreachLevel>> {
-    static LEVELS: std::sync::OnceLock<Mutex<HashMap<String, BreachLevel>>> = std::sync::OnceLock::new();
+fn warned_levels() -> &'static Mutex<HashMap<String, Surfaced>> {
+    static LEVELS: std::sync::OnceLock<Mutex<HashMap<String, Surfaced>>> = std::sync::OnceLock::new();
     LEVELS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -585,10 +676,10 @@ impl BudgetEnv for LiveEnv {
     fn paused(&self, ms: u64) {
         darkmux_types::run_pause::add(ms);
     }
-    fn last_level(&self, key: &str) -> Option<BreachLevel> {
+    fn last_surfaced(&self, key: &str) -> Option<Surfaced> {
         warned_levels().lock().unwrap_or_else(|p| p.into_inner()).get(key).copied()
     }
-    fn set_last_level(&self, key: &str, level: Option<BreachLevel>) {
+    fn set_surfaced(&self, key: &str, level: Option<Surfaced>) {
         let mut m = warned_levels().lock().unwrap_or_else(|p| p.into_inner());
         match level {
             Some(l) => {
@@ -657,15 +748,15 @@ pub fn admit_with(mut b: EndpointBudget, caller: &BudgetCaller<'_>, env: &dyn Bu
                 return Err(stopped_wait(&b, why, waited_ms, announced.is_some(), caller, env));
             }
             Verdict::Proceed => {
-                env.set_last_level(&key, None);
+                env.set_surfaced(&key, None);
                 resume_if_waited(&b, caller, env, waited_ms);
                 return Ok(());
             }
             Verdict::Warn(br) => {
-                if env.last_level(&key).is_none_or(|l| l < br.level) {
+                if Surfaced::of(&br).is_news_after(env.last_surfaced(&key)) {
                     warn(&b, &br, caller, env);
                 }
-                env.set_last_level(&key, Some(br.level));
+                env.set_surfaced(&key, Some(Surfaced::of(&br)));
                 resume_if_waited(&b, caller, env, waited_ms);
                 return Ok(());
             }
@@ -677,7 +768,7 @@ pub fn admit_with(mut b: EndpointBudget, caller: &BudgetCaller<'_>, env: &dyn Bu
                     announce_wait(&b, &breach, resume_at, now, caller, env);
                     announced = Some(resume_at);
                 }
-                env.set_last_level(&key, Some(BreachLevel::AtLimit));
+                env.set_surfaced(&key, Some(Surfaced::of(&breach)));
                 // Sleep to the resume second (+1: a record leaves the window
                 // AT `t + period`), in bounded slices so a stopped run is
                 // seen and a raised budget is noticed.
@@ -814,11 +905,21 @@ fn record(
 
 fn warn(b: &EndpointBudget, br: &Breach, caller: &BudgetCaller<'_>, env: &dyn BudgetEnv) {
     let what = match br.level {
-        BreachLevel::AtLimit => "has reached its budget".to_string(),
-        BreachLevel::Early => format!("is at {}% of its budget", (br.spent.saturating_mul(100)) / br.limit.max(1)),
+        Some(BreachLevel::AtLimit) => "has reached its budget".to_string(),
+        Some(BreachLevel::Early) => format!("is at {}% of its budget", (br.spent.saturating_mul(100)) / br.limit.max(1)),
+        None => "is not fully metered".to_string(),
+    };
+    // (N4) Not fully metered is its own fact, said beside any level: the
+    // spend shown is a floor.
+    let (floor, unmetered) = match br.unmetered {
+        0 => ("", String::new()),
+        n => (
+            "at least ",
+            format!("; {n} call(s) reported no complete token count (no prompt count, or no usage)"),
+        ),
     };
     let message = format!(
-        "darkmux: ⚠ endpoint `{}` {what}: {} of {} {} in the last {} ({})",
+        "darkmux: ⚠ endpoint `{}` {what}: {floor}{} of {} {} in the last {}{unmetered} ({})",
         b.endpoint_id,
         br.spent,
         br.limit,
@@ -844,6 +945,7 @@ fn warn(b: &EndpointBudget, br: &Breach, caller: &BudgetCaller<'_>, env: &dyn Bu
             "metric": br.metric,
             "spent": br.spent,
             "limit": br.limit,
+            "unmetered_calls": br.unmetered,
             "period": b.period,
             "warn_at": b.warn_at,
             "message": message,
@@ -871,8 +973,9 @@ fn announce_wait(
         Some(mid) => format!("`darkmux mission abort {mid}` ends the wait without sending"),
         None => "Ctrl-C ends the wait without sending".to_string(),
     };
+    let floor = if br.unmetered > 0 { "at least " } else { "" };
     let message = format!(
-        "darkmux: endpoint `{}` has reached its budget ({} of {} {} in the last {}); calls to it are \
+        "darkmux: endpoint `{}` has reached its budget ({floor}{} of {} {} in the last {}); calls to it are \
          waiting, {when}. {how_to_stop}.",
         b.endpoint_id,
         br.spent,
@@ -892,6 +995,7 @@ fn announce_wait(
             "metric": br.metric,
             "spent": br.spent,
             "limit": br.limit,
+            "unmetered_calls": br.unmetered,
             "period": b.period,
             "resume_at": resume_at.map(darkmux_flow::ts_utc_at),
             "wait_seconds": resume_at.map(|r| (r - now).max(0)),
@@ -1084,7 +1188,7 @@ impl BudgetPacer {
                     announce_wait(&self.budget, &breach, resume_at, now, caller, env);
                     self.announced = Some(resume_at);
                 }
-                env.set_last_level(&key, Some(BreachLevel::AtLimit));
+                env.set_surfaced(&key, Some(Surfaced::of(&breach)));
                 let state = self.state();
                 if !others.pausing {
                     crate::pace_file::write(host_out, true, PACE_REASON, &state);
@@ -1096,14 +1200,14 @@ impl BudgetPacer {
                 None
             }
             Verdict::Warn(br) => {
-                if env.last_level(&key).is_none_or(|l| l < br.level) {
+                if Surfaced::of(&br).is_news_after(env.last_surfaced(&key)) {
                     warn(&self.budget, &br, caller, env);
                 }
-                env.set_last_level(&key, Some(br.level));
+                env.set_surfaced(&key, Some(Surfaced::of(&br)));
                 self.release(host_out, others, caller, env)
             }
             Verdict::Proceed => {
-                env.set_last_level(&key, None);
+                env.set_surfaced(&key, None);
                 self.release(host_out, others, caller, env)
             }
         }

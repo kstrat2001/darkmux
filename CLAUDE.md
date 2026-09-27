@@ -577,6 +577,7 @@ src/                          CLI command layer (clap)
   conventions.rs              Shared CLI helpers
 crates/
   darkmux-types/              Profile / ProfileRegistry / config / flow record schemas + config_access
+  darkmux-trajectory/         Trajectory events (the one definition the runtime writes) + the one fold every host reader counts turns, tokens and rests from; a leaf crate the runtime also depends on
   darkmux-profiles/           Registry loader + lookup
   darkmux-gestalt/            Residency arbiter (ResourceProbe/pools; loads what each dispatch's staffing declares)
   darkmux-crew/               Roles, dispatch core, the Task/Step scheduler + step_kinds/ (builtins/patterns), lessons

@@ -299,8 +299,8 @@ impl WorkloadProvider for CodingTaskProvider {
             fs::write(run_dir.join("qa-reply.err"), &stderr)?;
         }
 
-        // (#364) Per-run preservation of the runtime's trajectory +
-        // metrics.json. The runtime writes both into the out-of-band
+        // (#364) Per-run preservation of the runtime's trajectory. The
+        // runtime writes it into the out-of-band
         // bookkeeping dir (`<out_dir>/.darkmux-runtime/`) — but that dir
         // is reused across all dispatches of the same workload, so the
         // NEXT dispatch overwrites these files. Copy them into run_dir
@@ -321,22 +321,20 @@ impl WorkloadProvider for CodingTaskProvider {
             // The host-code change and the darkmux-runtime image rebuild
             // must land atomically.
             let out_dir = dispatch_out_dir.as_deref().unwrap_or(sandbox_dir);
-            // `src.exists()` gate is intentional: a #363-timeout
-            // dispatch may have written partial trajectory but no
-            // metrics.json. Copying what's there preserves forensic
-            // data; missing files just don't copy. Don't "fix" this
-            // by aborting when either is absent.
+            // A missing file just doesn't copy: a dispatch killed before
+            // it wrote one leaves it absent, and copying what's there
+            // preserves forensic data. Don't "fix" this by aborting.
             // `findings.jsonl` (#1959) is the crawler role's actual PRODUCT,
             // and it lived only in a temp dir the OS reclaims — so a crawl's
             // run artifact recorded that a dispatch happened and not what it
-            // found. Same reasoning as the two above, with more at stake:
+            // found. Same reasoning as the trajectory, with more at stake:
             // losing a trajectory costs forensics, losing this costs the
             // result. Absent for every role that never calls `create_finding`,
             // which the `exists()` gate below already handles.
             let preserved = preserve_runtime_artifacts(
                 out_dir,
                 run_dir,
-                &["trajectory.jsonl", "metrics.json", "findings.jsonl"],
+                &["trajectory.jsonl", "findings.jsonl"],
             );
             if preserved.copied.iter().any(|n| n == "trajectory.jsonl") {
                 trajectory_path = Some(run_dir.join("trajectory.jsonl"));
@@ -429,7 +427,12 @@ impl WorkloadProvider for CodingTaskProvider {
             // whose tests failed. `null` here is a THIRD state, distinct
             // from pass and fail: the workload declared no verify command,
             // so nothing was checked.
-            "schema_version": 5,
+            // v6 is minted by the work gate (`verify_gate`), never here.
+            // v7 (4.0) is written here: the run directory carries no
+            // `metrics.json`; every count is in `trajectory.jsonl`, read
+            // through `lab::inspect::run_trajectory`. The enrichers only ever
+            // RAISE the version, so a v7 run stays v7.
+            "schema_version": 7,
             "run_id": run_id,
             "workload": loaded.manifest.workload.id,
             "provider": self.id(),
@@ -448,9 +451,8 @@ impl WorkloadProvider for CodingTaskProvider {
             // the manifest non-portable: `darkmux lab inspect`
             // resolving the path against ITS cwd (different from the
             // dispatch cwd) silently failed to find the runtime's
-            // metrics.json, falling back to the trajectory-derived
-            // counts with turns=0 (the very bug #359 fixes). Always-
-            // absolute makes the manifest cwd-independent.
+            // trajectory. Always-absolute makes the manifest
+            // cwd-independent.
             // (#906 INFO) Best-effort canonicalization: if the sandbox dir
             // can't be canonicalized (rare — e.g. a component vanished mid-run)
             // we fall back to the non-canonical path so the manifest still
@@ -488,144 +490,22 @@ impl WorkloadProvider for CodingTaskProvider {
         } else {
             serde_json::Value::Null
         };
-        let traj_path = run_dir.join("trajectory.jsonl");
-        let events = if traj_path.exists() {
-            read_jsonl(&traj_path)
-        } else {
-            Vec::new()
-        };
-
-        // Internal-runtime dispatches write a metrics.json next to the
-        // trajectory inside the sandbox dir. When present, it's the
-        // source-of-truth for turns + compactions — the runtime counts
-        // them directly. Trajectory-derived counts (below) work for the
-        // openclaw shell-out path which emits `prompt.submitted` events
-        // but not for the internal-runtime which emits `model.streaming.
-        // start` / `model.completed` and never writes `prompt.submitted`.
-        // Pre-fix (#359) the openclaw-shape consumer silently dropped
-        // turn counts to 0 on every internal-runtime dispatch.
-        //
-        // Preference order (after #364):
-        //   1. `<run_dir>/metrics.json` — per-run preserved copy. Safe
-        //      against subsequent dispatches that would overwrite the
-        //      sandbox source.
-        //   2. `<sandbox>/.darkmux-runtime/metrics.json` — live source.
-        //      Backward-compat for runs predating #364 that don't have
-        //      the per-run copy yet. Old-run-only once the runtime writes
-        //      out-of-band (#611): new runs no longer leave metrics in the
-        //      sandbox, so tier 1 is always authoritative for them.
-        let runtime_metrics = read_metrics_json(run_dir, Path::new("metrics.json")).or_else(|| {
-            meta.get("sandbox")
-                .and_then(|v| v.as_str())
-                .and_then(|sandbox| {
-                    // (#2869) The sandbox is model-writable: read with no-follow.
-                    read_metrics_json(
-                        Path::new(sandbox),
-                        &Path::new(".darkmux-runtime").join("metrics.json"),
-                    )
-                })
-        });
-
-        let prompt_submitted: Vec<&serde_json::Value> = events
-            .iter()
-            .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("prompt.submitted"))
-            .collect();
-        let trajectory_turns = prompt_submitted.len() as u32;
-
-        let mut tokens_before: Vec<u64> = Vec::new();
-        let mut summary_chars: Vec<u64> = Vec::new();
-        let mut seen_summaries = std::collections::HashSet::new();
-        for ev in &prompt_submitted {
-            if let Some(msgs) = ev
-                .get("data")
-                .and_then(|d| d.get("messages"))
-                .and_then(|m| m.as_array())
-            {
-                for m in msgs {
-                    if m.get("role").and_then(|r| r.as_str()) == Some("compactionSummary") {
-                        let summary_str = m.get("summary").and_then(|s| s.as_str()).unwrap_or("");
-                        if summary_str.is_empty() {
-                            continue;
-                        }
-                        let key: String = summary_str.chars().take(80).collect();
-                        if seen_summaries.insert(key) {
-                            tokens_before
-                                .push(m.get("tokensBefore").and_then(|v| v.as_u64()).unwrap_or(0));
-                            summary_chars.push(summary_str.len() as u64);
-                        }
-                    }
-                }
-            }
-        }
-
+        // Every count is the fold of the run's trajectory: the one reading
+        // `lab run stats` and the live tailer use too. An openclaw-era run's
+        // turns and compactions are its `prompt.submitted` events and the
+        // distinct compaction summaries in them (`darkmux_trajectory::legacy`).
+        let fold = crate::lab::inspect::run_trajectory(run_dir);
+        let turns = fold.turns();
+        let compactions = fold.compactions();
+        let rest_ms = fold.rest_ms();
         let walltime_ms = meta.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0) as u128;
-        // (#2094 finding 7) Computed once here — used both for the
-        // classification below and the report's own `rest_ms` field /
-        // notes line, so all three readings agree.
-        //
-        // (#2094 second round, finding 5 CONSIDER) `max()` against the
-        // trajectory-derived sum, the same reconcile shape `turns`/
-        // `compactions` already get via `reconcile_count` — a
-        // zeroed-but-present metrics.json (the exit-time write raced a
-        // crash, same shape `darkmux-crew`'s `reconcile_rest_totals`
-        // fixes host-side) must not undercut a trajectory that actually
-        // recorded rests.
-        let rest_ms: u64 = runtime_metrics
-            .as_ref()
-            .map(|m| m.rest_ms)
-            .unwrap_or(0)
-            .max(sum_rest_ms_from_events(&events));
         // Classify on MODEL time, not raw wall clock. Fast/Slow is a claim
         // about the MODEL's speed; a rested run's wall clock includes real
         // idle time (GPU thermal/power relief between turns, #2094) that
-        // has nothing to do with how fast the model itself ran. Without
-        // this, a heavily-rested run can misclassify as Slow purely
-        // because of the pacing knob, not the model. The DISPLAYED
-        // walltime stays the raw wall clock (below) — only the
-        // classification input changes.
+        // has nothing to do with how fast the model itself ran. The DISPLAYED
+        // walltime stays the raw wall clock (below).
         let model_time_ms = walltime_ms.saturating_sub(u128::from(rest_ms));
         let mode = classify_mode(model_time_ms, loaded);
-
-        // Prefer runtime metrics when present (internal-runtime path);
-        // fall back to trajectory-derived counts (openclaw shell-out
-        // path or any other dispatch source).
-        // (#371) Reconcile runtime metrics with trajectory-derived
-        // counts via `max`. The trajectory is append-only ground truth,
-        // so a `metrics.json` that under-reports — absent, partial, or
-        // not-yet-finalized when the runtime hard-errors mid-dispatch
-        // (SSE timeout / kill / panic) — must never drag the count BELOW
-        // what the trajectory actually recorded. Pre-fix, a stale/partial
-        // `turns: 0` won over an 84-turn trajectory (Beat 40).
-        //
-        // Trajectory turns: the openclaw path emits `prompt.submitted`;
-        // the internal runtime emits `model.completed` (and never
-        // `prompt.submitted`), so take the max of both shapes.
-        //
-        // (#1947) The internal runtime does NOT emit one `model.completed`
-        // per turn — a reasoning checkpoint (#1221) closes one
-        // chat-completion call early and re-opens a new one for the SAME
-        // logical turn, and that continuation still emits its own
-        // `model.completed`. `loop_runner.rs` dispatches the continuation
-        // with the SAME `seq` as the turn it resumes (`next_seq = turns`,
-        // unincremented) and only stamps a genuinely NEW turn with
-        // `next_seq = turns + 1`. Counting EVENTS therefore counted "how
-        // many times this turn got interrupted to check in" as if each
-        // interruption were its own turn — one long checkpointed turn
-        // inflated the count 5-13x. Counting DISTINCT `seq` values among
-        // those events recovers the runtime's own notion of a turn (a
-        // missing `seq` — malformed/pre-seq legacy line — still counts on
-        // its own rather than being silently dropped).
-        //
-        // Compactions: `compactionSummary` dedup (openclaw) vs
-        // `compaction` events (internal runtime).
-        let trajectory_turns = trajectory_turns.max(count_distinct_model_turns(&events));
-        let trajectory_compactions =
-            (tokens_before.len() as u32).max(count_event_type(&events, "compaction"));
-        let turns = reconcile_count(runtime_metrics.as_ref().and_then(|m| m.turns), trajectory_turns);
-        let compactions = reconcile_count(
-            runtime_metrics.as_ref().and_then(|m| m.compactions),
-            trajectory_compactions,
-        );
         let mut notes = vec![
             format!("turns={}", turns),
             format!("compactions={}", compactions),
@@ -685,15 +565,10 @@ impl WorkloadProvider for CodingTaskProvider {
             walltime_ms,
             turns,
             compactions,
-            // (#2094) Taken directly from metrics.json — unlike turns/
-            // compactions there's no trajectory-derived series to
-            // reconcile against; `0` means "no rests" or "no metrics.json"
-            // and either reading is correct (the runtime's own default).
             // (#2094 finding 7) Same variable the classification above and
             // the notes line use — can't drift from either.
             rest_ms,
-            tokens_before,
-            summary_chars,
+            tokens_before: fold.legacy.compactions.iter().map(|c| c.tokens_before).collect(),
             mode,
             verify,
             notes,
@@ -933,7 +808,7 @@ fn dispatch_via_internal(
     };
     let result = dispatch(opts).context("internal-runtime dispatch via lab harness")?;
     // `out_dir` is the host path where the runtime wrote its
-    // `.darkmux-runtime/` bookkeeping (trajectory + metrics). Threaded
+    // `.darkmux-runtime/` bookkeeping (trajectory, findings). Threaded
     // back to the copy-into-run_dir site. `None` pre-image-rebuild ⇒
     // caller falls back to the legacy sandbox_dir location.
     Ok((
@@ -1269,156 +1144,6 @@ fn classify_mode(walltime_ms: u128, loaded: &LoadedWorkload) -> Option<RunMode> 
     None
 }
 
-/// Snapshot of the internal runtime's per-dispatch metrics.json
-/// (written by `runtime/src/main.rs` next to trajectory.jsonl inside
-/// the sandbox dir). Only the fields the lab inspect surface consumes
-/// — the runtime writes more (model id, version, finish reason, etc.)
-/// but inspect doesn't need them.
-///
-/// Optional fields use `None` rather than `0` to discriminate
-/// "runtime didn't report this" from "runtime reported zero." Lets
-/// the consumer prefer runtime data only when it's actually present.
-#[derive(Debug, Clone, Default)]
-struct InternalRuntimeMetrics {
-    turns: Option<u32>,
-    compactions: Option<u32>,
-    /// (#2094) Sum of inter-turn rests, in milliseconds — `0` (not
-    /// `None`) when absent. (#2094 second round, finding 5 CONSIDER:
-    /// this field DOES now have a trajectory-derived fallback to
-    /// reconcile against, the same shape `turns`/`compactions` have via
-    /// `reconcile_count` — see the call site in `inspect`, which takes
-    /// `max(this field, sum_rest_ms_from_events(&events))` so a
-    /// zeroed-but-present metrics.json can't undercut a trajectory that
-    /// actually recorded rests.)
-    rest_ms: u64,
-}
-
-/// Read a runtime-emitted `metrics.json` from a specific path.
-/// Returns `None` if the file doesn't exist (some run dirs don't yet
-/// have the per-run copy from #364, or predate the internal runtime)
-/// or if it can't be parsed (older runtime versions may emit a
-/// different shape). The fallback in the caller is to derive counts
-/// from the trajectory (#359).
-///
-/// Caller-chooses the path so the preference chain (per-run copy
-/// first, sandbox-live fallback) lives at the consumer, not split
-/// across multiple helpers.
-/// Count trajectory events of a given `"type"`. (#371)
-fn count_event_type(events: &[serde_json::Value], ty: &str) -> u32 {
-    events
-        .iter()
-        .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some(ty))
-        .count() as u32
-}
-
-/// (#1947) Count LOGICAL turns from `model.completed` events — distinct
-/// `seq` values, not raw event count. A reasoning checkpoint (#1221) closes
-/// one chat-completion call early and re-opens a new one for the SAME
-/// logical turn; the runtime stamps that continuation with the SAME `seq`
-/// as the turn it resumes (`loop_runner.rs`: `next_seq = turns` when
-/// `resuming_after_checkpoint`, only `turns + 1` for a genuinely new turn).
-/// `count_event_type(events, "model.completed")` counts every one of those
-/// interruptions as its own turn, inflating the count 5-13x on a
-/// heavily-checkpointed turn. A `model.completed` missing `seq`
-/// (malformed/pre-seq legacy line) still counts on its own rather than
-/// being silently dropped.
-///
-/// SECOND IMPLEMENTATION OF THE SAME RULE — keep in sync, don't drift.
-/// `darkmux_crew::dispatch_internal`'s trajectory tailer applies this rule
-/// host-side while streaming (`match "model.completed"`, `last_counted_turn_seq`)
-/// to derive `dispatch.complete`'s `total_turns`. It can only hold ONE prior
-/// seq because it sees the stream a line at a time, so it tests adjacency
-/// (`seq != last_counted_turn_seq`) where this reads the whole file and can
-/// hold a set. They agree on every trajectory the runtime actually emits
-/// (seq is non-decreasing, so equal-seq events are adjacent) and diverge only
-/// on a non-monotone file — `[seq 1, no seq, seq 1]` is 3 there, 2 here.
-/// Deliberately NOT unified: the streaming side cannot buffer a set, and the
-/// divergent input is unreachable from the runtime's writer.
-fn count_distinct_model_turns(events: &[serde_json::Value]) -> u32 {
-    let mut seqs = std::collections::HashSet::new();
-    let mut without_seq: u32 = 0;
-    for e in events {
-        if e.get("type").and_then(|t| t.as_str()) != Some("model.completed") {
-            continue;
-        }
-        match e.get("seq").and_then(|s| s.as_u64()) {
-            Some(seq) => {
-                seqs.insert(seq);
-            }
-            None => without_seq += 1,
-        }
-    }
-    seqs.len() as u32 + without_seq
-}
-
-/// (#371) Reconcile a runtime-reported count with the trajectory-derived
-/// count. The trajectory is append-only ground truth, so the metric can
-/// never legitimately be LOWER than what the trajectory recorded — a
-/// missing (`None`) or stale/partial metric (e.g. `turns: 0` written
-/// before a hard-error exit) is corrected upward to the trajectory
-/// count. When the metric is complete it wins (and ties are a no-op);
-/// when the trajectory itself is truncated, the higher metric is kept.
-fn reconcile_count(metric: Option<u32>, trajectory: u32) -> u32 {
-    metric.unwrap_or(0).max(trajectory)
-}
-
-/// (#2094 second round, finding 5 CONSIDER) Sum every `runtime.rest`
-/// event's `ms` out of an already-parsed trajectory. Mirrors
-/// `darkmux_crew::dispatch_internal::sum_rest_totals_from_trajectory`
-/// (cited here rather than called directly: that helper re-reads
-/// `trajectory.jsonl` from disk given a directory, but `inspect` already
-/// has the events parsed into memory as `events` by the time `rest_ms`
-/// is computed — re-reading the file here would be a redundant disk pass
-/// over identical data).
-fn sum_rest_ms_from_events(events: &[serde_json::Value]) -> u64 {
-    events
-        .iter()
-        .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("runtime.rest"))
-        .map(|e| e.get("ms").and_then(|n| n.as_u64()).unwrap_or(0))
-        .fold(0u64, u64::saturating_add)
-}
-
-/// Read `root/rel` as runtime metrics. (#2869) A no-follow, regular-file
-/// read: `root` may be a model-writable sandbox. A refusal is warned and
-/// treated as absent, so `inspect` falls back to the trajectory counts.
-fn read_metrics_json(root: &Path, rel: &Path) -> Option<InternalRuntimeMetrics> {
-    use darkmux_crew::contained_file::{read_contained_to_string, SMALL_FILE_MAX_BYTES};
-    let raw = match read_contained_to_string(root, rel, SMALL_FILE_MAX_BYTES) {
-        Ok(raw) => raw,
-        Err(e) => {
-            if e.is_refused() {
-                eprintln!(
-                    "{}",
-                    darkmux_types::style::warn(&format!(
-                        "darkmux: {} not read — {e}",
-                        root.join(rel).display()
-                    ))
-                );
-            }
-            return None;
-        }
-    };
-    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    Some(InternalRuntimeMetrics {
-        turns: v.get("turns").and_then(|x| x.as_u64()).map(|n| n as u32),
-        compactions: v
-            .get("compactions")
-            .and_then(|x| x.as_u64())
-            .map(|n| n as u32),
-        rest_ms: v.get("rest_ms").and_then(|x| x.as_u64()).unwrap_or(0),
-    })
-}
-
-fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
-    let raw = match fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    raw.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect()
-}
 
 /// (#2869) One runtime bookkeeping file the host declined to copy out of
 /// the dispatch's out-dir, and why. Recorded in the run's `manifest.json`
@@ -1462,16 +1187,14 @@ pub(crate) struct PreservedArtifacts {
 /// (#364/#2869) Copy the runtime's bookkeeping files (`names`, each a bare
 /// file name) from `<out_dir>/.darkmux-runtime/` into
 /// `run_dir` under the same name. A missing file is not an error: a
-/// #363-timeout dispatch may have written a partial trajectory and no
-/// metrics.json, and copying what is there preserves the forensic data.
+/// dispatch killed before it wrote a file leaves it absent, and copying
+/// what is there preserves the forensic data.
 pub(crate) fn preserve_runtime_artifacts(
     out_dir: &Path,
     run_dir: &Path,
     names: &[&str],
 ) -> PreservedArtifacts {
-    use darkmux_crew::contained_file::{
-        copy_contained, ContainedFileError, DEFAULT_MAX_BYTES, SMALL_FILE_MAX_BYTES,
-    };
+    use darkmux_crew::contained_file::{copy_contained, ContainedFileError, DEFAULT_MAX_BYTES};
     let mut out = PreservedArtifacts::default();
     for name in names {
         // (#2869) `out_dir` is writable by the model's tools, so `fs::copy`
@@ -1480,10 +1203,7 @@ pub(crate) fn preserve_runtime_artifacts(
         // `.darkmux-runtime/<name>` with O_NOFOLLOW at every component and
         // copies only a regular file, bounded in size.
         let rel = Path::new(".darkmux-runtime").join(name);
-        // metrics.json is a few hundred bytes when genuine; the streams
-        // (trajectory, findings) get the default cap.
-        let cap = if *name == "metrics.json" { SMALL_FILE_MAX_BYTES } else { DEFAULT_MAX_BYTES };
-        match copy_contained(out_dir, &rel, &run_dir.join(name), cap) {
+        match copy_contained(out_dir, &rel, &run_dir.join(name), DEFAULT_MAX_BYTES) {
             Ok(_) => out.copied.push((*name).to_string()),
             Err(ContainedFileError::NotFound) => {}
             Err(ContainedFileError::Refused(reason)) => {
@@ -1543,107 +1263,6 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use tempfile::TempDir;
-
-    // ── (#371) metrics ↔ trajectory reconciliation ──────────────────
-
-    #[test]
-    fn reconcile_count_corrects_stale_metric_upward() {
-        // The Beat-40 case: a stale/partial metrics.json says turns=0
-        // but the trajectory recorded 84 model.completed events.
-        assert_eq!(reconcile_count(Some(0), 84), 84);
-    }
-
-    #[test]
-    fn reconcile_count_falls_back_to_trajectory_when_metric_absent() {
-        // Hard error before metrics.json was written at all.
-        assert_eq!(reconcile_count(None, 84), 84);
-    }
-
-    #[test]
-    fn reconcile_count_keeps_complete_metric() {
-        // Metrics complete and at least the trajectory count: metric wins
-        // (covers a truncated trajectory where the metric is higher).
-        assert_eq!(reconcile_count(Some(90), 84), 90);
-        assert_eq!(reconcile_count(Some(84), 84), 84);
-    }
-
-    #[test]
-    fn reconcile_count_zero_when_neither_has_data() {
-        assert_eq!(reconcile_count(None, 0), 0);
-    }
-
-    #[test]
-    fn count_event_type_counts_internal_runtime_turns() {
-        let events: Vec<serde_json::Value> = vec![
-            serde_json::json!({"type": "dispatch.start"}),
-            serde_json::json!({"type": "model.completed"}),
-            serde_json::json!({"type": "tool.completed"}),
-            serde_json::json!({"type": "model.completed"}),
-            serde_json::json!({"type": "compaction"}),
-            serde_json::json!({"type": "model.completed"}),
-        ];
-        assert_eq!(count_event_type(&events, "model.completed"), 3);
-        assert_eq!(count_event_type(&events, "compaction"), 1);
-        assert_eq!(count_event_type(&events, "nonexistent"), 0);
-    }
-
-    /// (#1947) A reasoning checkpoint mid-turn closes one chat-completion
-    /// call and re-opens another for the SAME logical turn — the runtime
-    /// stamps every `model.completed` from that turn with the SAME `seq`.
-    /// Five events, one turn: naive event-counting (the pre-fix bug) would
-    /// say 5.
-    #[test]
-    fn count_distinct_model_turns_dedupes_a_checkpointed_turn() {
-        let events: Vec<serde_json::Value> = vec![
-            serde_json::json!({"type": "dispatch.start"}),
-            serde_json::json!({"type": "model.completed", "seq": 1}),
-            serde_json::json!({"type": "model.completed", "seq": 1}),
-            serde_json::json!({"type": "model.completed", "seq": 1}),
-            serde_json::json!({"type": "model.completed", "seq": 1}),
-            serde_json::json!({"type": "model.completed", "seq": 1}),
-        ];
-        assert_eq!(count_distinct_model_turns(&events), 1);
-    }
-
-    /// Inverted case: genuinely separate turns (distinct `seq`) must still
-    /// count separately — a fixture using only single-emission turns
-    /// couldn't fail against the dedup bug, so this must NOT collapse to 1.
-    #[test]
-    fn count_distinct_model_turns_counts_genuinely_separate_turns() {
-        let events: Vec<serde_json::Value> = vec![
-            serde_json::json!({"type": "model.completed", "seq": 1}),
-            serde_json::json!({"type": "model.completed", "seq": 2}),
-            serde_json::json!({"type": "model.completed", "seq": 3}),
-        ];
-        assert_eq!(count_distinct_model_turns(&events), 3);
-    }
-
-    /// A checkpointed turn (seq 1 x3) followed by two genuinely new turns
-    /// (seq 2, seq 3) — the realistic shape: mostly-1 turn count inflation
-    /// mixed with real turns that must not get swallowed by the dedup.
-    #[test]
-    fn count_distinct_model_turns_mixes_checkpointed_and_genuine_turns() {
-        let events: Vec<serde_json::Value> = vec![
-            serde_json::json!({"type": "model.completed", "seq": 1}),
-            serde_json::json!({"type": "model.completed", "seq": 1}),
-            serde_json::json!({"type": "model.completed", "seq": 1}),
-            serde_json::json!({"type": "model.completed", "seq": 2}),
-            serde_json::json!({"type": "model.completed", "seq": 3}),
-        ];
-        assert_eq!(count_distinct_model_turns(&events), 3);
-    }
-
-    /// A `model.completed` missing `seq` (malformed/pre-seq legacy line)
-    /// counts on its own rather than being silently dropped.
-    #[test]
-    fn count_distinct_model_turns_keeps_events_missing_seq() {
-        let events: Vec<serde_json::Value> = vec![
-            serde_json::json!({"type": "model.completed"}),
-            serde_json::json!({"type": "model.completed"}),
-            serde_json::json!({"type": "model.completed", "seq": 1}),
-        ];
-        assert_eq!(count_distinct_model_turns(&events), 3);
-    }
 
     fn make_loaded(spec: WorkloadSpec, base_dir: PathBuf) -> LoadedWorkload {
         LoadedWorkload {
@@ -1893,19 +1512,19 @@ mod tests {
     #[test]
     fn preserve_runtime_artifacts_refuses_a_file_symlink_to_a_host_secret() {
         let (_tmp, out, run, secret) = out_dir_with_secret();
-        std::os::unix::fs::symlink(&secret, out.join(".darkmux-runtime/metrics.json")).unwrap();
+        std::os::unix::fs::symlink(&secret, out.join(".darkmux-runtime/findings.jsonl")).unwrap();
 
-        let got = preserve_runtime_artifacts(&out, &run, &["metrics.json"]);
+        let got = preserve_runtime_artifacts(&out, &run, &["findings.jsonl"]);
 
-        let copied = fs::read_to_string(run.join("metrics.json")).unwrap_or_default();
+        let copied = fs::read_to_string(run.join("findings.jsonl")).unwrap_or_default();
         assert!(
             !copied.contains("HOST-SECRET-2869"),
             "the host secret was copied through the model's symlink"
         );
-        assert!(!run.join("metrics.json").exists(), "nothing may land for a refused file");
+        assert!(!run.join("findings.jsonl").exists(), "nothing may land for a refused file");
         assert!(got.copied.is_empty(), "copied: {:?}", got.copied);
         assert_eq!(got.refused.len(), 1, "the refusal must be recorded: {:?}", got.refused);
-        assert_eq!(got.refused[0].file, "metrics.json");
+        assert_eq!(got.refused[0].file, "findings.jsonl");
         assert!(got.refused[0].reason.contains("symlink"), "reason: {}", got.refused[0].reason);
     }
 
@@ -1935,11 +1554,11 @@ mod tests {
     #[test]
     fn preserve_runtime_artifacts_refuses_a_fifo_without_hanging() {
         let (_tmp, out, run, _secret) = out_dir_with_secret();
-        let fifo = out.join(".darkmux-runtime/metrics.json");
+        let fifo = out.join(".darkmux-runtime/findings.jsonl");
         let st = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
         assert!(st.success(), "mkfifo");
 
-        let got = preserve_runtime_artifacts(&out, &run, &["metrics.json"]);
+        let got = preserve_runtime_artifacts(&out, &run, &["findings.jsonl"]);
 
         assert!(got.copied.is_empty(), "copied: {:?}", got.copied);
         assert_eq!(got.refused.len(), 1, "refused: {:?}", got.refused);
@@ -1955,12 +1574,12 @@ mod tests {
         let (_tmp, out, run, _secret) = out_dir_with_secret();
         fs::write(out.join(".darkmux-runtime/trajectory.jsonl"), "{\"t\":1}\n").unwrap();
 
-        let got = preserve_runtime_artifacts(&out, &run, &["trajectory.jsonl", "metrics.json"]);
+        let got = preserve_runtime_artifacts(&out, &run, &["trajectory.jsonl", "findings.jsonl"]);
 
         assert_eq!(got.copied, vec!["trajectory.jsonl".to_string()]);
         assert!(got.refused.is_empty(), "an absent file is not a refusal: {:?}", got.refused);
         assert_eq!(fs::read_to_string(run.join("trajectory.jsonl")).unwrap(), "{\"t\":1}\n");
-        assert!(!run.join("metrics.json").exists());
+        assert!(!run.join("findings.jsonl").exists());
     }
 
     #[test]
@@ -1970,9 +1589,9 @@ mod tests {
         assert!(m.get("refused_artifacts").is_none(), "a clean run's manifest is unchanged");
         record_refused_artifacts(
             &mut m,
-            &[RefusedArtifact { file: "metrics.json".into(), reason: "`metrics.json` is a symlink (not followed)".into() }],
+            &[RefusedArtifact { file: "findings.jsonl".into(), reason: "`findings.jsonl` is a symlink (not followed)".into() }],
         );
-        assert_eq!(m["refused_artifacts"][0]["file"], "metrics.json");
+        assert_eq!(m["refused_artifacts"][0]["file"], "findings.jsonl");
         assert!(m["refused_artifacts"][0]["reason"].as_str().unwrap().contains("symlink"));
     }
 
@@ -1989,31 +1608,6 @@ mod tests {
         assert!(abs.to_string().contains("absolute"), "got: {abs}");
     }
 
-    #[test]
-    fn read_jsonl_skips_blanks_and_malformed() {
-        let tmp = TempDir::new().unwrap();
-        let p = tmp.path().join("trace.jsonl");
-        fs::write(
-            &p,
-            r#"{"a":1}
-not-valid-json
-{"b":2}
-
-{"c":3}
-"#,
-        )
-        .unwrap();
-        let parsed = read_jsonl(&p);
-        assert_eq!(parsed.len(), 3);
-        assert_eq!(parsed[0]["a"], 1);
-        assert_eq!(parsed[2]["c"], 3);
-    }
-
-    #[test]
-    fn read_jsonl_returns_empty_on_missing() {
-        let parsed = read_jsonl(Path::new("/nonexistent/path.jsonl"));
-        assert!(parsed.is_empty());
-    }
 
     #[test]
     fn classify_mode_fast() {
@@ -2408,19 +2002,9 @@ not-valid-json
         assert_eq!(report.tokens_before, vec![48000, 50000]);
     }
 
-    /// (#1947) The seq-dedup must be WIRED INTO the analyze path, not just
-    /// live correctly in an isolated helper. Beat-40 shape: `metrics.json`
-    /// is present but stale at `turns: 0` (the exit-time write raced a
-    /// mid-dispatch hard error), so `reconcile_count`'s max() hands the
-    /// decision to the trajectory recount — the branch this fix changed.
-    /// Five `model.completed` events all stamped `seq: 1` are ONE logical
-    /// turn that a reasoning checkpoint (#1221) re-opened four times.
-    ///
-    /// Red-proves against a plausible "be safe, take the max of both
-    /// counts" edit at the call site
-    /// (`.max(count_event_type(&events, "model.completed"))`), which
-    /// fully reinstates #1947 while every helper-level unit test stays
-    /// green: that edit makes this report 5.
+    /// (#1947) Five `model.completed` events all stamped `seq: 1` are ONE
+    /// logical turn that a reasoning checkpoint (#1221) re-opened four
+    /// times; inspect reads the fold, which counts distinct seqs.
     #[test]
     fn inspect_reports_one_turn_for_a_checkpointed_turn() {
         let tmp = TempDir::new().unwrap();
@@ -2429,12 +2013,6 @@ not-valid-json
         fs::write(
             run_dir.join("manifest.json"),
             r#"{"session_id":"sess","duration_ms":300000}"#,
-        )
-        .unwrap();
-        // Present-but-zeroed: forces the trajectory branch to decide.
-        fs::write(
-            run_dir.join("metrics.json"),
-            r#"{"turns":0,"compactions":0}"#,
         )
         .unwrap();
         let trajectory = r#"{"type":"model.completed","seq":1}
@@ -2475,11 +2053,6 @@ not-valid-json
             r#"{"session_id":"sess","duration_ms":300000}"#,
         )
         .unwrap();
-        fs::write(
-            run_dir.join("metrics.json"),
-            r#"{"turns":0,"compactions":0}"#,
-        )
-        .unwrap();
         let trajectory = r#"{"type":"model.completed","seq":1}
 {"type":"model.completed","seq":1}
 {"type":"model.completed","seq":1}
@@ -2492,61 +2065,12 @@ not-valid-json
         assert_eq!(report.turns, 3);
     }
 
-    /// (#359) Internal-runtime dispatches write `metrics.json` to
-    /// `<sandbox>/.darkmux-runtime/metrics.json`. Inspect must read it
-    /// as the source-of-truth for turns + compactions — the
-    /// trajectory's `prompt.submitted` events that the openclaw path
-    /// emits are absent on the internal-runtime path, so the
-    /// trajectory-derived fallback would report turns=0 by mistake.
+    /// A run dir with no trajectory of its own (an older run whose copy
+    /// was never made) reads the sandbox's `.darkmux-runtime/trajectory.jsonl`
+    /// named by the manifest. A `metrics.json` beside it is never read: its
+    /// 99 turns are the stale-copy shape the archive probe found.
     #[test]
-    fn inspect_prefers_runtime_metrics_json_when_present() {
-        let tmp = TempDir::new().unwrap();
-        let run_dir = tmp.path().join("run");
-        let sandbox = tmp.path().join("sandbox");
-        let runtime_dir = sandbox.join(".darkmux-runtime");
-        fs::create_dir_all(&run_dir).unwrap();
-        fs::create_dir_all(&runtime_dir).unwrap();
-        // Manifest points at the sandbox so inspect can locate metrics.json.
-        fs::write(
-            run_dir.join("manifest.json"),
-            format!(
-                r#"{{"session_id":"sess","duration_ms":60000,"sandbox":"{}"}}"#,
-                sandbox.display()
-            ),
-        )
-        .unwrap();
-        // Runtime metrics: 10 turns, 2 compactions — what the runtime
-        // counted directly. No `prompt.submitted` events anywhere in
-        // the trajectory because internal-runtime emits a different
-        // shape; this is the pre-fix failure mode.
-        fs::write(
-            runtime_dir.join("metrics.json"),
-            r#"{"runtime":"darkmux-runtime","version":"0.1.0","turns":10,"compactions":2}"#,
-        )
-        .unwrap();
-        // Trajectory has zero `prompt.submitted` events on purpose —
-        // representative of an internal-runtime dispatch.
-        fs::write(
-            run_dir.join("trajectory.jsonl"),
-            r#"{"type":"model.streaming.start","seq":1,"system_chars":1000,"prompt_chars":2000}
-{"type":"model.completed","seq":1}
-"#,
-        )
-        .unwrap();
-        let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
-        let report = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap();
-        // Pre-fix: turns=0, compactions=0. Post-fix: runtime values flow through.
-        assert_eq!(report.turns, 10);
-        assert_eq!(report.compactions, 2);
-        // (#2094) No rest_ms key in this fixture's metrics.json — absent
-        // means zero, not an error.
-        assert_eq!(report.rest_ms, 0);
-    }
-
-    /// (#2094) `rest_ms` flows through from metrics.json exactly like
-    /// `turns`/`compactions` — same fixture shape, one more key.
-    #[test]
-    fn inspect_surfaces_rest_ms_from_runtime_metrics() {
+    fn inspect_reads_the_sandbox_trajectory_and_never_metrics_json() {
         let tmp = TempDir::new().unwrap();
         let run_dir = tmp.path().join("run");
         let sandbox = tmp.path().join("sandbox");
@@ -2561,15 +2085,18 @@ not-valid-json
             ),
         )
         .unwrap();
+        fs::write(runtime_dir.join("metrics.json"), r#"{"turns":99,"compactions":99,"rest_ms":99}"#).unwrap();
         fs::write(
-            runtime_dir.join("metrics.json"),
-            r#"{"runtime":"darkmux-runtime","version":"0.1.0","turns":3,"compactions":0,"rest_ms":1000,"rests":2}"#,
+            runtime_dir.join("trajectory.jsonl"),
+            "{\"type\":\"model.completed\",\"seq\":1}\n\
+             {\"type\":\"compaction\",\"seq\":1}\n\
+             {\"type\":\"model.completed\",\"seq\":2}\n\
+             {\"type\":\"runtime.rest\",\"seq\":2,\"ts\":2,\"ms\":1000}\n",
         )
         .unwrap();
-        fs::write(run_dir.join("trajectory.jsonl"), "").unwrap();
         let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
         let report = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap();
-        assert_eq!(report.rest_ms, 1000);
+        assert_eq!((report.turns, report.compactions, report.rest_ms), (2, 1, 1000));
     }
 
     /// (#2094 finding 7) `classify_mode` must judge MODEL time
@@ -2600,11 +2127,11 @@ not-valid-json
         // 450s of that 700s was rest, not inference — model time is
         // 250s, squarely inside fast_cluster_seconds (197,280).
         fs::write(
-            runtime_dir.join("metrics.json"),
-            r#"{"runtime":"darkmux-runtime","version":"0.1.0","turns":3,"compactions":0,"rest_ms":450000,"rests":5}"#,
+            run_dir.join("trajectory.jsonl"),
+            "{\"type\":\"runtime.rest\",\"seq\":1,\"ts\":1,\"ms\":200000}\n\
+             {\"type\":\"runtime.rest\",\"seq\":2,\"ts\":2,\"ms\":250000}\n",
         )
         .unwrap();
-        fs::write(run_dir.join("trajectory.jsonl"), "").unwrap();
 
         let mut spec = basic_spec();
         spec.expected = Some(ExpectedSpec {
@@ -2625,13 +2152,10 @@ not-valid-json
         );
     }
 
-    /// (#2094 second round, finding 5 CONSIDER) The same "zeroed-but-present
-    /// metrics.json" gap `darkmux-crew`'s `reconcile_rest_totals` fixes on
-    /// the host side, reproduced here: `rest_ms: 0` in metrics.json must
-    /// not be trusted as an authoritative zero when the trajectory
-    /// recorded real `runtime.rest` events — fall back to summing them.
+    /// The run dir's own trajectory wins over the sandbox's: the sandbox
+    /// is overwritten by the next dispatch into it (#364).
     #[test]
-    fn inspect_falls_back_to_trajectory_rest_when_metrics_rest_ms_is_zero() {
+    fn inspect_prefers_the_run_dir_trajectory_over_the_sandbox() {
         let tmp = TempDir::new().unwrap();
         let run_dir = tmp.path().join("run");
         let sandbox = tmp.path().join("sandbox");
@@ -2646,78 +2170,21 @@ not-valid-json
             ),
         )
         .unwrap();
-        // metrics.json IS present with the key, but zeroed — the same
-        // "exit-time write raced a crash" shape as the host-side finding.
+        fs::write(run_dir.join("trajectory.jsonl"), "{\"type\":\"model.completed\",\"seq\":1}\n").unwrap();
         fs::write(
-            runtime_dir.join("metrics.json"),
-            r#"{"runtime":"darkmux-runtime","version":"0.1.0","turns":3,"compactions":0,"rest_ms":0,"rests":0}"#,
-        )
-        .unwrap();
-        fs::write(
-            run_dir.join("trajectory.jsonl"),
-            "{\"type\":\"runtime.rest\",\"seq\":1,\"ts\":1,\"ms\":400}\n\
-             {\"type\":\"runtime.rest\",\"seq\":2,\"ts\":2,\"ms\":600}\n",
+            runtime_dir.join("trajectory.jsonl"),
+            "{\"type\":\"model.completed\",\"seq\":1}\n{\"type\":\"model.completed\",\"seq\":2}\n",
         )
         .unwrap();
         let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
         let report = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap();
-        assert_eq!(report.rest_ms, 1000, "sum of both runtime.rest ms fields from the trajectory");
+        assert_eq!(report.turns, 1);
     }
 
-    // ─── #364: inspect prefers run_dir/metrics.json over sandbox ──
-
-    /// When both `<run_dir>/metrics.json` (per-run preserved) AND
-    /// `<sandbox>/.darkmux-runtime/metrics.json` (live source) exist,
-    /// inspect prefers the run_dir copy — that's the one not subject
-    /// to sandbox-overwrite by subsequent dispatches. The live source
-    /// remains as a backward-compat fallback for runs predating #364
-    /// (no per-run copy yet).
+    /// A leftover malformed `metrics.json` is never opened, so it cannot
+    /// abort inspect.
     #[test]
-    fn inspect_prefers_run_dir_metrics_over_sandbox() {
-        let tmp = TempDir::new().unwrap();
-        let run_dir = tmp.path().join("run");
-        let sandbox = tmp.path().join("sandbox");
-        let runtime_dir = sandbox.join(".darkmux-runtime");
-        fs::create_dir_all(&run_dir).unwrap();
-        fs::create_dir_all(&runtime_dir).unwrap();
-        fs::write(
-            run_dir.join("manifest.json"),
-            format!(
-                r#"{{"session_id":"sess","duration_ms":60000,"sandbox":"{}"}}"#,
-                sandbox.display()
-            ),
-        )
-        .unwrap();
-        // Per-run copy: 7 turns, 1 compaction. Should be picked.
-        fs::write(
-            run_dir.join("metrics.json"),
-            r#"{"turns":7,"compactions":1}"#,
-        )
-        .unwrap();
-        // Sandbox live source: 99 turns, 99 compactions. Should be
-        // IGNORED in favor of the per-run copy.
-        fs::write(
-            runtime_dir.join("metrics.json"),
-            r#"{"turns":99,"compactions":99}"#,
-        )
-        .unwrap();
-        fs::write(run_dir.join("trajectory.jsonl"), "").unwrap();
-        let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
-        let report = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap();
-        // Per-run copy wins.
-        assert_eq!(report.turns, 7);
-        assert_eq!(report.compactions, 1);
-    }
-
-    /// (#359 QA follow-up) When `.darkmux-runtime/metrics.json` exists
-    /// but is malformed, inspect must fall back to trajectory-derived
-    /// counts rather than surfacing a parse error. The
-    /// `read_internal_runtime_metrics` helper uses `.ok()` short-
-    /// circuits at every step; this test locks that contract so a
-    /// future refactor doesn't accidentally start propagating the
-    /// error.
-    #[test]
-    fn inspect_falls_back_when_runtime_metrics_is_malformed() {
+    fn inspect_ignores_a_malformed_leftover_metrics_json() {
         let tmp = TempDir::new().unwrap();
         let run_dir = tmp.path().join("run");
         let sandbox = tmp.path().join("sandbox");
@@ -2742,28 +2209,19 @@ not-valid-json
         let report = CodingTaskProvider
             .inspect(&loaded, &run_dir)
             .expect("malformed runtime metrics must not abort inspect");
-        // Trajectory-derived counts kick in; matches the existing
-        // `inspect_counts_turns_and_compactions` shape.
         assert_eq!(report.turns, 2);
         assert_eq!(report.compactions, 1);
     }
 
-    /// Backward-compat: when no runtime metrics.json exists (the
-    /// openclaw shell-out path), inspect falls back to deriving
-    /// turns + compactions from the trajectory's `prompt.submitted`
-    /// events. The existing
-    /// `inspect_counts_turns_and_compactions` test covers the happy
-    /// path; this one specifically asserts the fallback fires when
-    /// `manifest.sandbox` points at a directory with no
-    /// `.darkmux-runtime/metrics.json`.
+    /// An openclaw-era run (its turns are `prompt.submitted` events) whose
+    /// manifest names a sandbox with no runtime dir reads its own trajectory.
     #[test]
-    fn inspect_falls_back_to_trajectory_when_no_runtime_metrics() {
+    fn inspect_reads_an_openclaw_run_dir_trajectory() {
         let tmp = TempDir::new().unwrap();
         let run_dir = tmp.path().join("run");
         let sandbox = tmp.path().join("sandbox");
         fs::create_dir_all(&run_dir).unwrap();
         fs::create_dir_all(&sandbox).unwrap();
-        // sandbox exists but no .darkmux-runtime subdir — fallback path.
         fs::write(
             run_dir.join("manifest.json"),
             format!(
@@ -2778,8 +2236,8 @@ not-valid-json
         fs::write(run_dir.join("trajectory.jsonl"), trajectory).unwrap();
         let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
         let report = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap();
-        assert_eq!(report.turns, 2, "trajectory-derived fallback");
-        assert_eq!(report.compactions, 1, "trajectory-derived fallback");
+        assert_eq!(report.turns, 2);
+        assert_eq!(report.compactions, 1);
     }
 
     #[test]

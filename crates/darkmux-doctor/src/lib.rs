@@ -3963,11 +3963,18 @@ fn endpoint_budget_note(
         },
         Ok(Some(b)) => {
             let entries = spend(&b);
-            let tokens: u64 = entries.iter().map(|(_, n)| *n).sum();
+            let tokens: u64 = entries.iter().map(|(_, s)| s.known).sum();
+            // A call with an unknown spend is never read as small: the
+            // figure becomes a floor, and says why.
+            let unmetered = entries.iter().filter(|(_, s)| !s.metered).count();
+            let spent = match unmetered {
+                0 => format!("spent {tokens} tokens"),
+                n => format!("spent at least {tokens} tokens ({n} with an unknown spend)"),
+            };
             let policy = darkmux_types::config_enum::ConfigEnum::token(b.policy);
             let warn_at = b.warn_at.map(|f| format!(", early warning at {:.0}%", f * 100.0)).unwrap_or_default();
             format!(
-                "; budget {policy}{warn_at}: spent {tokens} tokens in {} calls over the last {}{unenforced}",
+                "; budget {policy}{warn_at}: {spent} in {} calls over the last {}{unenforced}",
                 entries.len(),
                 b.period
             )
@@ -6391,10 +6398,11 @@ fn docker_status_to_check(status: darkmux_crew::dispatch_internal::DockerRuntime
             ),
             hint: Some(format!(
                 "darkmux pulls `{}` from GHCR on demand (#759). Pre-pull now with \
-                 `docker pull {}`, or build locally from a darkmux {version} source checkout: \
-                 `docker build --build-arg DARKMUX_VERSION={version} -t {RUNTIME_IMAGE} runtime/`.",
+                 `docker pull {}`, or build locally from the root of a darkmux {version} \
+                 source checkout: `{}`.",
                 ghcr_runtime_image(),
                 ghcr_runtime_image(),
+                darkmux_crew::runtime_image::rebuild_command(RUNTIME_IMAGE, env!("CARGO_PKG_VERSION")),
                 version = env!("CARGO_PKG_VERSION"),
             )),
         },
@@ -11036,7 +11044,7 @@ mod tests {
         let hint = c.hint.as_deref().unwrap();
         assert!(
             hint.contains(
-                "docker build --build-arg DARKMUX_VERSION=3.13.0 -t darkmux-runtime:latest runtime/"
+                "docker build --build-arg DARKMUX_VERSION=3.13.0 -f runtime/Dockerfile -t darkmux-runtime:latest ."
             ),
             "{hint}"
         );
@@ -11348,7 +11356,7 @@ mod tests {
         assert_eq!(c.status, Status::Warn);
         // (#2923) The build fix stamps the label, or dispatch skips the image.
         assert!(c.hint.unwrap().contains(&format!(
-            "docker build --build-arg DARKMUX_VERSION={} -t darkmux-runtime:latest runtime/",
+            "docker build --build-arg DARKMUX_VERSION={} -f runtime/Dockerfile -t darkmux-runtime:latest .",
             env!("CARGO_PKG_VERSION")
         )));
     }
@@ -11648,7 +11656,7 @@ mod tests {
         let mut asked = Vec::new();
         let c = endpoints_status(&r, &mut |b| {
             asked.push(b.endpoint_id.clone());
-            vec![(1, 1_200_000), (2, 300_000)]
+            vec![(1, darkmux_crew::budget::Spend::full(1_200_000)), (2, darkmux_crew::budget::Spend::full(300_000))]
         });
         assert_eq!(c.status, Status::Pass, "{}", c.message);
         assert!(c.message.contains("`azure`: unmanaged, r.example"), "host only, userinfo stripped: {}", c.message);
@@ -11663,6 +11671,12 @@ mod tests {
         assert!(c.message.contains("shown, not enforced"), "{}", c.message);
         assert!(c.message.contains("`lms`: managed (lmstudio), chat-completions-max-tokens"), "{}", c.message);
         assert_eq!(asked, vec!["azure".to_string()], "only a counting budget reads the window");
+        let floor = endpoints_status(&r, &mut |_| vec![(1, darkmux_crew::budget::Spend::full(1_200_000)), (2, darkmux_crew::budget::Spend::partial(500))]);
+        assert!(
+            floor.message.contains("spent at least 1200500 tokens (1 with an unknown spend) in 2 calls"),
+            "an unknown spend is a floor, never a small number: {}",
+            floor.message
+        );
     }
 
     /// (#2902 step 5) An unregistered budget policy is Fail, naming the raw

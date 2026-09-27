@@ -2545,7 +2545,7 @@ fn build_lab_run_summary(
     // `funnels.json`, `funnel-events.jsonl` — and every one of them is
     // written only by a REVIEW-FUNNEL workload. A `coding-task` or `prompt`
     // run writes none of them (`lifecycle.json`, `manifest.json`,
-    // `metrics.json`, `trajectory.jsonl` are its artifacts), so `mtime_ms`
+    // `trajectory.jsonl` are its artifacts), so `mtime_ms`
     // stayed 0 for such a run's entire life. Downstream that is not a
     // missing nicety, it is two defects at once:
     //

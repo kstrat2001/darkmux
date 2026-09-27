@@ -260,14 +260,16 @@ Supporting mechanisms, all shipped:
 
 ### What is measured per dispatch
 
-The runtime records per-dispatch metrics: a top-line summary in `metrics.json`
-(the `Metrics` struct) plus per-event detail (including token `usage`) in
-`trajectory.jsonl` (`runtime/src/trajectory.rs:32-58`;
-`runtime/src/loop_runner.rs:181-194`):
+The runtime records every event of a dispatch, including each call's token
+`usage`, in `trajectory.jsonl` (`runtime/src/trajectory.rs`). There is no
+separate summary file: every count is a fold of that log
+(`darkmux_trajectory::TrajectoryFold`, `crates/darkmux-trajectory/src/fold.rs`),
+the one reading the host tailer, `lab run stats` and `lab run inspect` share:
 
-- **turns** (model-completion count)
-- **`total_prompt_tokens`** and **`total_completion_tokens`**: **absolute token
-  counts**, not a percentage of the context window
+- **turns** (distinct model-call `seq`s; a checkpoint continuation is the same turn)
+- **prompt, completion and total tokens**: **absolute token counts**, not a
+  percentage of the context window. A call's total is the provider's own
+  total when it sent one, else prompt + completion (`UsageCounts::total_tokens`)
 - **compaction count**
 
 > Context-usage *as a percentage of the loaded model's window* is **not** a
