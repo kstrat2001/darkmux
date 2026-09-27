@@ -738,6 +738,19 @@ describe("SessionReplay", () => {
 
   // ── (#1973 audit) accessibility ────────────────────────────────────
 
+  it("a session that recorded its end with nothing opened: the pulse reads finished, as the status does", async () => {
+    // The crash shape: only the reconciler's `session.end` is here. It is no
+    // run, but its session recorded how it ended, and the pill's status says
+    // so; its description must not call it "may be abandoned".
+    const records = [{ ts: "2026-01-01T00:00:00Z", action: "session.end", session_id: "s-ended", machine_id: "M", payload: {} }];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    renderReplay("s-ended");
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    const pillEl = document.querySelector(".session-run__header .pill");
+    expect(pillEl?.textContent?.toLowerCase()).toContain("no ending recorded");
+    expect(pillEl?.getAttribute("title")).toBe("finished");
+  });
+
   it("(#1973) the pill and the pulse never tell CONTRADICTORY stories about the same run", async () => {
     // A run that opened and went silent for weeks has no terminal record. It
     // has stopped with no ending recorded (`lib/lifecycle.ts`: silent past

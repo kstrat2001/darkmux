@@ -2141,8 +2141,13 @@ fn any_dispatch_live_in(dir: &std::path::Path, day: &str, now_ms: u64, max_age_m
 /// (#2902 step 5) An open budget wait holds the session live until it
 /// lapses (the quiet clock starts at the lapse, which is still ahead), and
 /// past that the staleness clock runs from the lapse.
+///
+/// A terminal always wins over liveness: a session that recorded its end
+/// (a terminal of its current attempt, or `RunFold::recorded_end`) is not
+/// live however recent that record is.
 fn session_is_live(agg: &SessionAgg, now_ms: u64) -> bool {
-    crate::run_lifecycle::quiet_clock_live(agg.last_activity_ts.as_deref(), agg.wait_until_ms, now_ms, stale_after_ms())
+    agg.terminal_status.is_none()
+        && crate::run_lifecycle::quiet_clock_live(agg.last_activity_ts.as_deref(), agg.wait_until_ms, now_ms, stale_after_ms())
 }
 
 /// Representative role/model/route for a lab run's `/runs` row, off its
@@ -3975,6 +3980,30 @@ mod tests {
         assert_eq!(verdict, RunStatus::Abandoned, "m went quiet; the other mission's fresh step is not its activity");
         assert_eq!(evidence, Some(DispatchSessionEvidence::StaleNoTerminal));
         assert_eq!(row, RunStatus::Abandoned, "/runs must not borrow the other mission's activity either");
+    }
+
+    /// A fleet-only mission (no mission record here, `flow_mission_to_run`)
+    /// whose one session recorded its end a minute ago: a terminal always
+    /// wins over liveness, so the row reads ended, as `mission status` and
+    /// the viewer read it, not Running for the next 20 minutes.
+    #[test]
+    #[serial_test::serial]
+    fn a_flow_mission_row_whose_session_recorded_its_end_reads_ended() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let now = now_unix();
+        let at = |secs_ago: u64| darkmux_flow::ts_utc_at(now.saturating_sub(secs_ago) as i64);
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({ "ts": at(300), "action": "dispatch start", "session_id": "fleet-ended", "mission_id": "fleet-only", "handle": "coder" }),
+                serde_json::json!({ "ts": at(60), "action": "session.end", "session_id": "fleet-ended", "mission_id": "fleet-only" }),
+            ],
+        );
+        let runs = build_runs(flows.path(), None, &[]);
+        let row = runs.iter().find(|r| r.id == "fleet-only").unwrap_or_else(|| panic!("no row: {runs:?}"));
+        assert_eq!(row.status, RunStatus::Abandoned, "its session recorded its end a minute ago: {row:?}");
     }
 
     /// A session shared by two missions the mission store does not know

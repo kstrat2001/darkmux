@@ -54,7 +54,7 @@
  */
 
 import { statusLabel, computeTMax, type RunState } from "../../lib/flow";
-import { DEFAULT_POLICY, NO_PRESENCE, endMs, isRunning, lifecycleAt, recordedWallMs, toRunState, type Close, type CloseEdge, type Lifecycle, type LifecyclePhase, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
+import { DEFAULT_POLICY, NO_PRESENCE, endMs, isRunning, lifecycleAt, recordedWallMs, toRunState, type Close, type CloseEdge, type Lifecycle, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
 import { runIndex, sessionRun, type RunGroup, type RunRecords } from "../../lib/runRef";
 import { fmtElapsed, clk, clkAt, fmtC } from "../../lib/format";
 import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
@@ -279,9 +279,11 @@ export interface SessionRunView {
    *  impossible. */
   hasModelWork: boolean;
   live: boolean;
-  /** Where the run stands (`lib/lifecycle.ts`): the pulse tells a finished
-   *  run (`closed`) from one that went silent with no ending (`stale`). */
-  phase: LifecyclePhase;
+  /** Whether the run recorded an ending (`lib/lifecycle.ts`'s `close`: a
+   *  closed run, or a session that recorded its end with nothing opened):
+   *  the fact the status reads, so the pulse says "finished" exactly when
+   *  the pill states a verdict, never "may be abandoned" beside one. */
+  ended: boolean;
   /** (#1972) When the most recent proof-of-life record landed, or `null` if
    *  none has. The pulse pauses when this goes quiet — see `LivenessPulse`. */
   lastBeatMs: number | null;
@@ -1738,7 +1740,7 @@ export function runRegions(
     // and never shown.
     hasModelWork: effHasModelWork,
     live: !done,
-    phase: l?.phase ?? "not_started",
+    ended: l?.close != null,
     lastBeatMs,
     signalsLabel,
     signalGroups,

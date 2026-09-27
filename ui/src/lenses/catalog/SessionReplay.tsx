@@ -800,7 +800,7 @@ export function SessionReplay({
   // in playback regardless of whether the run was actually still going as
   // of the playhead. `plausiblyRunning` is computed from `clockNow` above,
   // so it answers the SAME question live and replayed.
-  const liveness = livenessState({ done: view.phase === "closed", animate: plausiblyRunning, lastBeatMs: view.lastBeatMs, nowMs: clockNow });
+  const liveness = livenessState({ done: view.ended, animate: plausiblyRunning, lastBeatMs: view.lastBeatMs, nowMs: clockNow });
   const scopeHero = modelScopeHero(view);
 
   return (
