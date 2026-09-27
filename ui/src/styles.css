@@ -3709,8 +3709,8 @@ body {
    spec-guaranteed rule, not a browser quirk, is that an absolutely
    positioned child contributes NOTHING to its container's own size — so
    this container's height is set ONLY by its in-flow text children
-   (`.stat`/`.mach-scope__rate`/`.mach-scope__pager`/`.runs`, however many of
-   those a given card has), before the tube's size is computed at all. */
+   (`.stat`/`.mach-scope__pager`/`.runs`, however many of those a given card
+   has; a live reading is the `.stat` line itself since #2955), before the tube's size is computed at all. */
 .mach-body--scope {
   position: relative;
   /* Reserves the tube's own gutter so the text never renders under it,
@@ -3805,8 +3805,7 @@ body {
    wrapped line never changes the card's height under it. */
 .mach-name,
 .mach:has(> .mach-body--scope) > .spec,
-.mach:has(> .mach-body--scope) .stat,
-.mach:has(> .mach-body--scope) .mach-scope__rate {
+.mach:has(> .mach-body--scope) .stat {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3843,9 +3842,6 @@ body {
   .mach .runs {
     font-size: calc(13px * var(--fs-scale));
   }
-  .mach-scope__rate {
-    font-size: calc(14px * var(--fs-scale));
-  }
   .mach:has(> .mach-body--scope) {
     --tube: 150px;
     min-height: 0;
@@ -3869,11 +3865,19 @@ body {
   }
 }
 
-.mach-scope__rate {
-  margin-top: 5px;
-  font: 600 calc(13px * var(--fs-scale)) var(--font-mono);
-  color: var(--scope-phosphor);
+/* (#2955, operator 2026-09-27: the card is one height in every state) The
+   live reading IS the status line (`.stat.mach-scope__rate`), so it takes
+   the line's own margin and size and changes only its color and weight: a
+   bigger font or a margin of its own here would move the card again. */
+.mach .stat.mach-scope__rate {
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
+}
+/* The color stays on the single class: the state tones and the thinking
+   shimmer (`.mach-scope__rate[data-tone]` / `[data-thinking]`, further down)
+   must outrank it. */
+.mach-scope__rate {
+  color: var(--scope-phosphor);
 }
 /* (#2950, operator 2026-09-27) A resting card's line says why. Both forms
    are always in the line; the viewport's width picks one, the same 561px
