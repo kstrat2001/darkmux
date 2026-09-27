@@ -87,9 +87,19 @@ darkmux release.
   unparsable timestamp closes the run on the fleet card too. A hosted call
   held by its endpoint's budget is running while it waits, on `/runs` as
   well (it no longer reads Abandoned after 20 minutes of a longer wait), and
-  a wait the operator stopped reads **aborted**. `/runs` gains
+  a wait the operator stopped reads **aborted**. A wait that lapses (its
+  announced resume time plus a minute of grace passes with no resume)
+  now stays running for a further 20 minutes before it reads stopped,
+  matching `/runs`; before, the viewer called it stopped the moment the
+  grace ran out. The mission graph's step meter follows the same rule, so
+  a step held by a budget wait keeps its pulse. A link to a run's detail
+  view carries its mission (`#dispatch=<sid>&dispatch.mission=<id>`), so a
+  session id several missions share opens the run that was clicked, and
+  the event log beside it lists that run alone; a link naming only the
+  session still opens the run that started last. `/runs` gains
   `policy: {stale_after_ms, budget_wait_grace_ms}`, the numbers it judged
-  by (additive). **Migration:** none.
+  by, and `/health` gains the same object as `lifecycle_policy`, which is
+  where the viewer reads it (both additive). **Migration:** none.
 - **The per-step cap on hosted tokens is renamed, has no default, and
   never stops a step: a step that used to stop at 500,000 hosted tokens now
   runs to completion unless you set a cap** (#2902 step 5).
