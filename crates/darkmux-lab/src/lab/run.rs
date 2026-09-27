@@ -3,6 +3,7 @@
 use crate::lab::artifact_dirs;
 use crate::lab::cow_clone::cow_clone_dir_excluding;
 use crate::lab::lifecycle;
+use darkmux_types::session_id::{RunId, SessionId};
 use crate::lab::paths::{self, ResolveScope};
 use crate::lab::sandbox_hash::hash_sandbox_dir;
 use darkmux_profiles::profiles::{get_profile, load_registry};
@@ -204,7 +205,8 @@ impl OneRun<'_> {
         let per_run_sandbox_dir = run_dir.join("sandbox");
         let baseline_hash = materialize_sandbox(&source_sandbox_dir, &per_run_sandbox_dir, self.opts.quiet)?;
         let started = std::time::Instant::now();
-        let (mut result, lifecycle) = match self.run_provider(&run_dir, &per_run_sandbox_dir, lifecycle)? {
+        let run = RunId::lab(run_id.clone())?;
+        let (mut result, lifecycle) = match self.run_provider(&run, &run_dir, &per_run_sandbox_dir, lifecycle)? {
             ProviderRun::Completed(done) => *done,
             ProviderRun::Errored(e) => {
                 let provider_id = &self.workload.manifest.workload.provider;
@@ -285,6 +287,7 @@ impl OneRun<'_> {
     /// as interrupted rather than as a provider failure (#2462).
     fn run_provider(
         &self,
+        run: &RunId,
         run_dir: &Path,
         sandbox: &Path,
         mut lifecycle: lifecycle::RunLifecycle,
@@ -302,7 +305,8 @@ impl OneRun<'_> {
                 // (#2511) Called right after the provider mints its dispatch
                 // session id, before the dispatch fires, so a live run is
                 // joinable to its flow session for its whole dispatch phase.
-                &mut |sid: &str| lifecycle.set_session_id(sid),
+                run,
+                &mut |sid: &SessionId| lifecycle.set_session_id(sid),
             )
         })
         .and_then(|r| r);
@@ -794,7 +798,8 @@ mod tests {
                 _: &str,
                 _: Option<&str>,
                 _: Option<&crate::lab::loop_report::LoopCompactionOverride>,
-                _: &mut dyn FnMut(&str),
+                _: &darkmux_types::session_id::RunId,
+                _: &mut dyn FnMut(&darkmux_types::session_id::SessionId),
             ) -> anyhow::Result<RunResult> {
                 unreachable!("never run")
             }
@@ -1875,11 +1880,12 @@ mod tests {
                 _: &str,
                 _: Option<&str>,
                 _: Option<&crate::lab::loop_report::LoopCompactionOverride>,
-                on_session_id: &mut dyn FnMut(&str),
+                run: &darkmux_types::session_id::RunId,
+                on_session_id: &mut dyn FnMut(&darkmux_types::session_id::SessionId),
             ) -> Result<RunResult> {
                 // Mirrors what `coding-task`/`prompt` do for real: mint,
                 // report, THEN would dispatch. No real dispatch here.
-                on_session_id("darkmux-stub-2511-session-join-test");
+                on_session_id(&darkmux_types::session_id::SessionId::adhoc(run.clone(), "stub", "darkmux-stub-2511-session-join-test"));
                 Ok(RunResult {
                     ok: true,
                     duration_ms: 1,
@@ -1932,7 +1938,7 @@ mod tests {
         assert_eq!(rec.status, lifecycle::LifecycleStatus::Complete);
         assert_eq!(
             rec.session_id.as_deref(),
-            Some("darkmux-stub-2511-session-join-test"),
+            Some(darkmux_types::session_id::SessionId::adhoc(darkmux_types::session_id::RunId::lab(rec.run_id.clone()).unwrap(), "stub", "darkmux-stub-2511-session-join-test").wire().as_str()),
             "lab_run must wire the provider's on_session_id callback through to the \
              lifecycle record: {rec:?}"
         );
@@ -1996,13 +2002,14 @@ mod tests {
                 _: &str,
                 _: Option<&str>,
                 _: Option<&crate::lab::loop_report::LoopCompactionOverride>,
-                on_session_id: &mut dyn FnMut(&str),
+                run: &darkmux_types::session_id::RunId,
+                on_session_id: &mut dyn FnMut(&darkmux_types::session_id::SessionId),
             ) -> Result<RunResult> {
                 // Mirrors the REAL order in `coding_task.rs`/`prompt.rs`:
                 // mint + report, THEN dispatch. The block below stands in
                 // for the dispatch — real code would be calling into
                 // `dispatch_via_internal` at exactly this point.
-                on_session_id("darkmux-stub-2511-ordering-test");
+                on_session_id(&darkmux_types::session_id::SessionId::adhoc(run.clone(), "stub", "darkmux-stub-2511-ordering-test"));
                 let (lock, cvar) = gate();
                 let released = lock.lock().unwrap();
                 let (_released, timeout) =
@@ -2107,7 +2114,7 @@ mod tests {
             lifecycle::LifecycleStatus::Running,
             "the record must still read Running at the moment the session id is observed: {mid_flight:?}"
         );
-        assert_eq!(mid_flight.session_id.as_deref(), Some("darkmux-stub-2511-ordering-test"));
+        assert_eq!(mid_flight.session_id.as_deref(), Some(darkmux_types::session_id::SessionId::adhoc(darkmux_types::session_id::RunId::lab(mid_flight.run_id.clone()).unwrap(), "stub", "darkmux-stub-2511-ordering-test").wire().as_str()));
 
         // Release the stub so it can finish and the background thread joins.
         *gate().0.lock().unwrap() = true;

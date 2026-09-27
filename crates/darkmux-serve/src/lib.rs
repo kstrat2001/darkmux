@@ -2382,8 +2382,7 @@ pub(crate) struct LabRunSummary {
     /// used — read from `manifest.json` when it exists (a completed run),
     /// falling back to `lifecycle.json`'s own `session_id` (#2511) when it
     /// doesn't (a LIVE run). Exists so `runs::build_runs` can claim this
-    /// session the same way `collect_mission_step_sessions` claims a
-    /// mission's own step sessions — an absent value claims nothing and the
+    /// session for the lab run — an absent value claims nothing and the
     /// ghost persists, which is the honest degradation.
     ///
     /// SCOPE, stated exactly, because the field is easy to over-read as "a

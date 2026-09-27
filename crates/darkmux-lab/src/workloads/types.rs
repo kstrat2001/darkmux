@@ -6,6 +6,7 @@
 //! document-analysis, creative-writing, etc.).
 
 use darkmux_types::Profile;
+use darkmux_types::session_id::{RunId, SessionId};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -356,7 +357,10 @@ pub(crate) trait WorkloadProvider: Send + Sync {
         // governing dispatch session (`tool-bench` fans out into many, one
         // per task × trial) never calls it — `None` stays the honest
         // answer for that case, not a fabricated representative id.
-        on_session_id: &mut dyn FnMut(&str),
+        // The lab run this is: every dispatch the provider makes is a
+        // session in it.
+        run: &RunId,
+        on_session_id: &mut dyn FnMut(&SessionId),
     ) -> Result<RunResult>;
     fn inspect(&self, loaded: &LoadedWorkload, run_dir: &Path) -> Result<InspectionReport>;
     fn teardown(&self, _run_dir: &Path, _sandbox_dir: &Path) -> Result<()> {

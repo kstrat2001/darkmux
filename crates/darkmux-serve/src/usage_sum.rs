@@ -95,8 +95,9 @@ pub use darkmux_crew::usage::{is_usage_record, usage_contribution, usage_purpose
 use darkmux_crew::usage::{amount_of, has_any_token_counts, payload_of};
 
 /// The identity of ONE RUN, `(session_id, mission_id)`: the twin of
-/// `runKey`. A bare session id is not one (`session_id::task` is
-/// deterministic, so the same id recurs across unrelated runs, #2690/#2709).
+/// `runKey`. A bare session id is not one in a pre-4.0 archive (a task
+/// session named only its task, so the same id recurs across unrelated
+/// runs, #2690/#2709).
 /// A sessionless record gets a composite of its own; `\0` cannot occur
 /// inside either id.
 fn run_key(v: &serde_json::Value) -> String {

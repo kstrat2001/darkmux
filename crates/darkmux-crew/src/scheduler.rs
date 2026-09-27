@@ -48,8 +48,9 @@ use crate::run_record::StepRecord;
 use crate::step_kinds::StepKindRegistry;
 use crate::types::{NodeStatus, Step, Task};
 use anyhow::{anyhow, Result};
-use darkmux_flow::{Category, FlowRecord, Level, Stage, Tier};
+use darkmux_flow::{Category, FlowRecord, Level, Stage};
 use darkmux_gestalt::{Facts, FootprintEstimator, ModelHost};
+use darkmux_types::session_id::{RunId, SessionId};
 use std::collections::{BTreeMap, HashSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -554,6 +555,9 @@ pub struct SchedulerReport {
 /// runs stay in place as a cheap idempotent reconcile, not the only write.
 #[allow(clippy::too_many_arguments)]
 pub fn run_step_graph(
+    // The run this graph is: every record the scheduler emits, and every
+    // session a step dispatches under, is minted in it.
+    run: &RunId,
     steps: &mut BTreeMap<String, Step>,
     tasks: &BTreeMap<String, Task>,
     kinds: &StepKindRegistry,
@@ -806,6 +810,7 @@ pub fn run_step_graph(
                     None | Some(crate::gate::GateDecision::Approved) => approved.push(id),
                     Some(crate::gate::GateDecision::Declined { reason }) => {
                         apply_step_terminal(
+                            run,
                             steps,
                             tasks,
                             &mut report,
@@ -1045,6 +1050,7 @@ pub fn run_step_graph(
                 // through a wave channel that does not exist yet) and no
                 // shared remote bucket (nothing is spending tokens here).
                 let ctx = crate::step_kinds::StepRunCtx::new(
+                    run.clone(),
                     None,
                     None,
                     dispatch_override.clone(),
@@ -1057,6 +1063,7 @@ pub fn run_step_graph(
                 };
                 if let Err(e) = ack_result {
                     apply_step_terminal(
+                        run,
                         steps,
                         tasks,
                         &mut report,
@@ -1078,6 +1085,7 @@ pub fn run_step_graph(
                     Ok(()) => approved.push(id),
                     Err(e) => {
                         apply_step_terminal(
+                            run,
                             steps,
                             tasks,
                             &mut report,
@@ -1202,6 +1210,7 @@ pub fn run_step_graph(
                 }
             };
             let ctx = crate::step_kinds::StepRunCtx::new(
+                run.clone(),
                 Some(tx.clone()),
                 remote_bucket,
                 dispatch_override.clone(),
@@ -1232,12 +1241,13 @@ pub fn run_step_graph(
                      reconcile could evict its model mid-generation.",
                     step_snapshot.id, step_snapshot.kind
                 );
-                emit(seat_unresolved_record(&step_snapshot, reason));
+                emit(seat_unresolved_record(run, &step_snapshot, reason));
             }
             // (#2394) The step's own start bookend, stamped with what it
             // consumes. Paired with `persist` exactly as it was when both
             // lived in the status-flip loop above.
             emit(step_lifecycle_record_with_payload(
+                run,
                 &step_snapshot,
                 darkmux_flow::FlowAction::StepStart,
                 Some(serde_json::json!({ "seat_class": seat.label() })),
@@ -1276,7 +1286,7 @@ pub fn run_step_graph(
                     // duration, not the wave's.
                     let step_t0 = Instant::now();
                     let result =
-                        kind.run_streaming(&step_snapshot, &task_snapshot, &input, &ctx);
+                        kind.run(&step_snapshot, &task_snapshot, &input, &ctx);
                     let wall_ms = step_t0.elapsed().as_millis() as u64;
                     // That step's OWN finish time — not the wave's flush time.
                     let at = now_unix();
@@ -1384,6 +1394,7 @@ pub fn run_step_graph(
                     }
                     crate::step_kinds::WaveSignal::StepTerminal { index, at, wall_ms, result, flow_records } => {
                         apply_step_terminal(
+                            run,
                             steps,
                             tasks,
                             &mut report,
@@ -1424,6 +1435,7 @@ pub fn run_step_graph(
                 Err(e) => (Err(format!("{e:#}")), Vec::new()),
             };
             apply_step_terminal(
+                run,
                 steps,
                 tasks,
                 &mut report,
@@ -1477,6 +1489,7 @@ pub fn run_step_graph(
 /// per-step-measured duration, never a fabricated one.
 #[allow(clippy::too_many_arguments)]
 fn apply_step_terminal(
+    run: &RunId,
     steps: &mut BTreeMap<String, Step>,
     // (#2310 P4a) Needed ONLY for the cascade-abandon check at the bottom
     // of this function — every existing transition above it is unchanged
@@ -1509,7 +1522,7 @@ fn apply_step_terminal(
         // (#1877, final wiring step) Stream the companion "step timing"
         // record NOW, alongside the in-memory push below, never batched to
         // the end of `run_step_graph`. See `step_timing_record`'s own doc.
-        emit(step_timing_record(step, &rec));
+        emit(step_timing_record(run, step, &rec));
         report.step_records.push(rec);
     }
     // (#2310 P4a review fix M1) Captured alongside `errored_task_id` so
@@ -1528,7 +1541,7 @@ fn apply_step_terminal(
             step.status = NodeStatus::Complete;
             step.completed_ts = Some(at);
             step.output = Some(output);
-            emit(step_lifecycle_record(step, darkmux_flow::FlowAction::StepComplete));
+            emit(step_lifecycle_record(run, step, darkmux_flow::FlowAction::StepComplete));
             persist(step);
             report.completed.push(id.to_string());
         }
@@ -1536,7 +1549,7 @@ fn apply_step_terminal(
             step.status = NodeStatus::Error;
             step.completed_ts = Some(at);
             step.output = Some(message.clone());
-            emit(step_lifecycle_record(step, darkmux_flow::FlowAction::StepError));
+            emit(step_lifecycle_record(run, step, darkmux_flow::FlowAction::StepError));
             persist(step);
             report.errored.push(id.to_string());
             errored = Some((id.to_string(), message));
@@ -1968,8 +1981,8 @@ pub const STEP_LIFECYCLE_ACTIONS: [darkmux_flow::FlowAction; 3] = [
 /// the mission config, e.g. `task-review-probe-mid-task`) — identical
 /// across every mission launched from the same config, so two concurrent
 /// runs collide in the viewer with no `mission_id` to tell them apart.
-fn step_lifecycle_record(step: &Step, action: darkmux_flow::FlowAction) -> FlowRecord {
-    step_lifecycle_record_with_payload(step, action, None)
+fn step_lifecycle_record(run: &RunId, step: &Step, action: darkmux_flow::FlowAction) -> FlowRecord {
+    step_lifecycle_record_with_payload(run, step, action, None)
 }
 
 
@@ -1984,35 +1997,17 @@ fn step_lifecycle_record(step: &Step, action: darkmux_flow::FlowAction) -> FlowR
 /// (`role \`x\` not found`, `no profile resolves for role \`x\``, `model \`m\` has no declared
 /// n_ctx`) — carried verbatim so the operator fixes the actual cause rather
 /// than guessing from a category.
-fn seat_unresolved_record(step: &Step, reason: &str) -> FlowRecord {
+fn seat_unresolved_record(run: &RunId, step: &Step, reason: &str) -> FlowRecord {
     FlowRecord {
-        ts: darkmux_flow::ts_utc_now(),
-        level: Level::Warn,
-        category: Category::Work,
-        tier: Tier::Local,
-        stage: Stage::Dispatch,
-        action: darkmux_flow::FlowAction::StepSeatUnresolved,
-        handle: step.id.clone(),
-        phase_id: None,
-        session_id: Some(darkmux_types::session_id::task(&step.task_id)),
         source: Some("scheduler".to_string()),
-        model: None,
-        reasoning: None,
-        mission_id: None,
-        machine_id: None,
-        machine_uid: None,
-        prev_hash: None,
-        hash: None,
         payload: Some(serde_json::json!({
             "step_id": step.id,
             "kind": step.kind,
             "seat_class": "local_model_unresolved",
             "reason": reason,
-            // Said in the record, not only in the docs: what was LOST.
             "lost": "wave load + #1487 residency lease",
         })),
-        work_id: None,
-        attempt: None,
+        ..FlowRecord::for_session(&SessionId::task(run.clone(), &step.task_id), Level::Warn, Category::Work, Stage::Dispatch, darkmux_flow::FlowAction::StepSeatUnresolved, step.id.clone())
     }
 }
 
@@ -2030,29 +2025,17 @@ fn seat_unresolved_record(step: &Step, reason: &str) -> FlowRecord {
 /// own. A caller outside `run_step_graph`'s own backfill wrap (like the
 /// crawl launcher) sets `.mission_id` on the returned record directly
 /// before emitting it.
-pub fn step_lifecycle_record_with_payload(step: &Step, action: darkmux_flow::FlowAction, payload: Option<serde_json::Value>) -> FlowRecord {
+fn step_lifecycle_record_with_payload(
+    run: &RunId,
+    step: &Step,
+    action: darkmux_flow::FlowAction,
+    payload: Option<serde_json::Value>,
+) -> FlowRecord {
     let level = if action == darkmux_flow::FlowAction::StepError { Level::Warn } else { Level::Info };
     FlowRecord {
-        ts: darkmux_flow::ts_utc_now(),
-        level,
-        category: Category::Work,
-        tier: Tier::Local,
-        stage: Stage::Dispatch,
-        action,
-        handle: step.id.clone(),
-        phase_id: None,
-        session_id: Some(darkmux_types::session_id::task(&step.task_id)),
         source: Some("scheduler".to_string()),
-        model: None,
-        reasoning: None,
-        mission_id: None,
-        machine_id: None,
-        machine_uid: None,
-        prev_hash: None,
-        hash: None,
-        payload,
-        work_id: None,
-        attempt: None,
+        payload: payload,
+        ..FlowRecord::for_session(&SessionId::task(run.clone(), &step.task_id), level, Category::Work, Stage::Dispatch, action, step.id.clone())
     }
 }
 
@@ -2084,28 +2067,11 @@ pub fn step_lifecycle_record_with_payload(step: &Step, action: darkmux_flow::Flo
 /// SAME `session_id::task(&step.task_id)` convention as the lifecycle
 /// records for this step, so a consumer can join "step start"/"step
 /// complete"/"step timing" for one step by `session_id` + `handle`.
-fn step_timing_record(step: &Step, rec: &StepRecord) -> FlowRecord {
+fn step_timing_record(run: &RunId, step: &Step, rec: &StepRecord) -> FlowRecord {
     FlowRecord {
-        ts: darkmux_flow::ts_utc_now(),
-        level: Level::Info,
-        category: Category::Work,
-        tier: Tier::Local,
-        stage: Stage::Dispatch,
-        action: darkmux_flow::FlowAction::StepTiming,
-        handle: step.id.clone(),
-        phase_id: None,
-        session_id: Some(darkmux_types::session_id::task(&step.task_id)),
         source: Some("scheduler".to_string()),
-        model: None,
-        reasoning: None,
-        mission_id: None,
-        machine_id: None,
-        machine_uid: None,
-        prev_hash: None,
-        hash: None,
         payload: Some(serde_json::to_value(rec).expect("StepRecord always serializes")),
-        work_id: None,
-        attempt: None,
+        ..FlowRecord::for_session(&SessionId::task(run.clone(), &step.task_id), Level::Info, Category::Work, Stage::Dispatch, darkmux_flow::FlowAction::StepTiming, step.id.clone())
     }
 }
 
@@ -2148,6 +2114,7 @@ mod tests {
     fn step_lifecycle_record_with_payload_carries_the_payload_and_the_canonical_action() {
         let step = bare_step("s-0001");
         let rec = step_lifecycle_record_with_payload(
+            &darkmux_types::session_id::RunId::mission("m-test").unwrap(),
             &step,
             darkmux_flow::FlowAction::StepStart,
             Some(json!({"workspace": "acme", "unit": "u-0001", "source": "app", "sha": "abc123"})),
@@ -2157,10 +2124,10 @@ mod tests {
         let payload = rec.payload.expect("payload set");
         assert_eq!(payload["workspace"], "acme");
         assert_eq!(payload["unit"], "u-0001");
-        // mission_id is deliberately None here — the caller stamps it
-        // (see the function's own doc); this test pins that it does NOT
-        // silently get set.
-        assert!(rec.mission_id.is_none());
+        // Under the step's task session in its run: the mission comes from
+        // that one session.
+        assert_eq!(rec.session_id.as_deref(), Some("m-test.task.t-1"));
+        assert_eq!(rec.mission_id.as_deref(), Some("m-test"));
     }
 
     /// The 2-arg in-crate wrapper (every `run_step_graph` call site) must
@@ -2169,7 +2136,7 @@ mod tests {
     #[test]
     fn step_lifecycle_record_two_arg_wrapper_emits_no_payload() {
         let step = bare_step("s-0002");
-        let rec = step_lifecycle_record(&step, darkmux_flow::FlowAction::StepComplete);
+        let rec = step_lifecycle_record(&darkmux_types::session_id::RunId::mission("m-test").unwrap(), &step, darkmux_flow::FlowAction::StepComplete);
         assert!(rec.payload.is_none());
     }
 
@@ -3016,6 +2983,7 @@ mod tests {
         let est = FixedEstimator::default();
         let mut emitted = Vec::new();
         run_step_graph(
+            &crate::test_run(),
             steps,
             tasks,
             &kinds,
@@ -3059,6 +3027,7 @@ mod tests {
             crate::gate::GateDecision::Approved
         };
         let report = run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &kinds,
@@ -3089,6 +3058,7 @@ mod tests {
         let est = FixedEstimator::default();
         let mut handler = |_s: &Step, _f: &BTreeMap<String, String>| crate::gate::GateDecision::Approved;
         let report = run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &kinds,
@@ -3123,6 +3093,7 @@ mod tests {
             reason: "operator declined".to_string(),
         };
         let report = run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &kinds,
@@ -3198,6 +3169,7 @@ mod tests {
             crate::gate::GateDecision::Approved
         };
         let report = run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &kinds,
@@ -3235,6 +3207,7 @@ mod tests {
             crate::gate::GateDecision::Approved
         };
         run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &kinds,
@@ -3368,6 +3341,7 @@ mod tests {
                 _step: &Step,
                 _task: &Task,
                 _input: &BTreeMap<String, String>,
+                _ctx: &StepRunCtx,
             ) -> Result<StepOutcome> {
                 panic!("test.panic: intentional panic in run");
             }
@@ -3383,6 +3357,7 @@ mod tests {
         let facts = Facts::default();
         let est = FixedEstimator::default();
         let report = run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &kinds,
@@ -3612,6 +3587,7 @@ mod tests {
         let est = FixedEstimator::default();
         let mut emitted = Vec::new();
         let err = run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &kinds,
@@ -3642,6 +3618,7 @@ mod tests {
         let est = FixedEstimator::default();
         let mut emitted: Vec<FlowRecord> = Vec::new();
         run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &kinds,
@@ -3717,6 +3694,7 @@ mod tests {
         let mut emitted: Vec<FlowRecord> = Vec::new();
         let mut persisted: Vec<Step> = Vec::new();
         run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &kinds,
@@ -3767,6 +3745,7 @@ mod tests {
         let mut emitted: Vec<FlowRecord> = Vec::new();
         let mut persisted: Vec<Step> = Vec::new();
         run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &kinds,
@@ -3844,10 +3823,7 @@ mod tests {
         fn id(&self) -> &'static str {
             "test.bucket-probe"
         }
-        fn run(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>) -> Result<StepOutcome> {
-            Ok(StepOutcome { output: "ctx-free".to_string(), flow_records: vec![] })
-        }
-        fn run_streaming(
+        fn run(
             &self,
             step: &Step,
             _t: &Task,
@@ -3884,6 +3860,7 @@ mod tests {
         let est = FixedEstimator::default();
         let mut emitted = Vec::new();
         run_step_graph(
+            &crate::test_run(),
             steps,
             tasks,
             &kinds,
@@ -3992,10 +3969,7 @@ mod tests {
             )];
             &PORTS
         }
-        fn run(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>) -> Result<StepOutcome> {
-            panic!("ArtifactWriterKind is only ever exercised through run_streaming in this test");
-        }
-        fn run_streaming(
+        fn run(
             &self,
             step: &Step,
             _t: &Task,
@@ -4040,10 +4014,7 @@ mod tests {
         fn id(&self) -> &'static str {
             "test.artifact-reader"
         }
-        fn run(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>) -> Result<StepOutcome> {
-            panic!("ArtifactReaderKind is only ever exercised through run_streaming in this test");
-        }
-        fn run_streaming(
+        fn run(
             &self,
             _s: &Step,
             _t: &Task,
@@ -4077,6 +4048,7 @@ mod tests {
         let facts = Facts::default();
         let est = FixedEstimator::default();
         run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &kinds,
@@ -4133,7 +4105,7 @@ mod tests {
         fn id(&self) -> &'static str {
             "test.sleep"
         }
-        fn run(&self, step: &Step, _t: &Task, _i: &BTreeMap<String, String>) -> Result<StepOutcome> {
+        fn run(&self, step: &Step, _t: &Task, _i: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
             let ms = step.config.get("sleep_ms").and_then(|v| v.as_u64()).unwrap_or(0);
             std::thread::sleep(std::time::Duration::from_millis(ms));
             Ok(StepOutcome { output: step.id.clone(), flow_records: vec![] })
@@ -4271,6 +4243,7 @@ mod tests {
         let est = FixedEstimator::default();
         let mut emitted: Vec<FlowRecord> = Vec::new();
         let report = run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &kinds,
@@ -4345,6 +4318,7 @@ mod tests {
         let facts = Facts::default();
         let est = FixedEstimator::default();
         let report = run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &kinds,
@@ -4374,7 +4348,7 @@ mod tests {
 
     /// (#1877 item 3) Concurrency correctness, the QUEUEING form — the
     /// actual reason this has to be timed strictly around
-    /// `kind.run_streaming(...)` inside each job's own closure rather than
+    /// `kind.run(...)` inside each job's own closure rather than
     /// from `step.started_ts` (stamped on the main thread, for every ready
     /// step, BEFORE that wave's jobs are even built — see the wave loop's
     /// own comment on why `remote_cap` can force a ready step to wait
@@ -4414,6 +4388,7 @@ mod tests {
         let facts = Facts::default();
         let est = FixedEstimator::default();
         let report = run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &kinds,
@@ -4486,6 +4461,7 @@ mod tests {
         let facts = Facts::default();
         let est = FixedEstimator::default();
         run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &kinds,
@@ -4554,6 +4530,7 @@ mod tests {
         let est = FixedEstimator::default();
         let t0 = Instant::now();
         let report = run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &kinds,
@@ -4609,7 +4586,7 @@ mod tests {
         ) -> SeatClaim {
             (self.0)()
         }
-        fn run(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>) -> Result<StepOutcome> {
+        fn run(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
             Ok(StepOutcome { output: "declared".to_string(), flow_records: vec![] })
         }
     }
@@ -4625,6 +4602,7 @@ mod tests {
         let est = FixedEstimator::default();
         let mut emitted = Vec::new();
         run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &kinds,
@@ -4764,6 +4742,7 @@ mod tests {
             crate::gate::GateDecision::Declined { reason: "operator said no".to_string() }
         };
         let report = run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &kinds,
@@ -4838,7 +4817,7 @@ mod tests {
             fn id(&self) -> &'static str {
                 "test.fail-sleep"
             }
-            fn run(&self, step: &Step, _t: &Task, _i: &BTreeMap<String, String>) -> Result<StepOutcome> {
+            fn run(&self, step: &Step, _t: &Task, _i: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
                 let ms = step.config.get("sleep_ms").and_then(|v| v.as_u64()).unwrap_or(0);
                 std::thread::sleep(std::time::Duration::from_millis(ms));
                 Err(anyhow!("boom: {}", step.id))
@@ -4855,6 +4834,7 @@ mod tests {
         let est = FixedEstimator::default();
         let mut emitted: Vec<FlowRecord> = Vec::new();
         let report = run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &kinds,
@@ -4968,7 +4948,7 @@ mod tests {
                     seat: "step:needs-model".into(),
                 })
             }
-            fn run(&self, step: &Step, _t: &Task, _i: &BTreeMap<String, String>) -> Result<StepOutcome> {
+            fn run(&self, step: &Step, _t: &Task, _i: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
                 // Never reached — the wave loader must fail before this runs.
                 panic!("run() must not be called for {}: the wave load should have failed first", step.id);
             }
@@ -5018,6 +4998,7 @@ mod tests {
         let factory = || -> Box<dyn ModelHost> { Box::new(FailingLoadHost) };
 
         let report = run_step_graph(
+            &crate::test_run(),
             &mut steps, &tasks, &kinds, &facts, &est, 8, &factory,
             &mut |_r| {}, &mut |_s| {}, None, None, &[],
         )
@@ -5113,7 +5094,7 @@ mod tests {
         ) -> Option<String> {
             Self::role_of(step, task)
         }
-        fn run(&self, _step: &Step, _task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+        fn run(&self, _step: &Step, _task: &Task, _input: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
             Ok(StepOutcome { output: "ok".to_string(), flow_records: vec![] })
         }
         /// (#2614 review, MUST FIX) Stands in for `dispatch.internal`'s
@@ -5228,7 +5209,7 @@ mod tests {
         ) -> Option<String> {
             Self::role_of(ctx)
         }
-        fn run(&self, _step: &Step, _task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+        fn run(&self, _step: &Step, _task: &Task, _input: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
             Ok(StepOutcome { output: "ok".to_string(), flow_records: vec![] })
         }
     }
@@ -5317,6 +5298,7 @@ mod tests {
         };
 
         let report = run_step_graph(
+            &crate::test_run(),
             &mut steps, &tasks, &kinds, &facts, &est, 8, &factory,
             &mut |_r| {}, &mut |_s| {}, None, None, seed,
         )
@@ -5717,10 +5699,7 @@ mod tests {
         fn id(&self) -> &'static str {
             "test.self-timed"
         }
-        fn run(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>) -> Result<StepOutcome> {
-            panic!("SelfTimedKind only runs through run_streaming")
-        }
-        fn run_streaming(
+        fn run(
             &self,
             _step: &Step,
             _task: &Task,
@@ -5765,6 +5744,7 @@ mod tests {
         let facts = Facts::default();
         let est = FixedEstimator::default();
         let report = run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &kinds,
@@ -5844,6 +5824,7 @@ mod tests {
         let facts = Facts::default();
         let est = FixedEstimator(Default::default());
         run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &kinds,
@@ -5905,10 +5886,7 @@ mod tests {
         fn id(&self) -> &'static str {
             "test.streaming"
         }
-        fn run(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>) -> Result<StepOutcome> {
-            Ok(StepOutcome { output: "ctx-free".to_string(), flow_records: vec![] })
-        }
-        fn run_streaming(
+        fn run(
             &self,
             step: &Step,
             _t: &Task,
@@ -5916,7 +5894,7 @@ mod tests {
             ctx: &StepRunCtx,
         ) -> Result<StepOutcome> {
             for i in 0..self.n {
-                let mut rec = step_lifecycle_record(step, darkmux_flow::FlowAction::StepResult);
+                let mut rec = step_lifecycle_record(&darkmux_types::session_id::RunId::mission("m-test").unwrap(), step, darkmux_flow::FlowAction::StepResult);
                 rec.payload = Some(json!({ "i": i }));
                 ctx.emit(rec);
             }
@@ -5988,7 +5966,7 @@ mod tests {
         fn id(&self) -> &'static str {
             "test.emit-collection"
         }
-        fn run(&self, step: &Step, _t: &Task, _i: &BTreeMap<String, String>) -> Result<StepOutcome> {
+        fn run(&self, step: &Step, _t: &Task, _i: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
             let out = step
                 .config
                 .get("output_json")
@@ -6071,7 +6049,7 @@ mod tests {
         kinds.register(Arc::new(EmitCollectionKind)).unwrap();
         let facts = Facts { budget: darkmux_gestalt::Budget { max_darkmux_bytes: Some(20_000_000_000) }, ..Default::default() };
         let est = FixedEstimator(BTreeMap::from([("map-model".to_string(), 5_000_000_000)]));
-        run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &factory, &mut |_r| {}, &mut |_s| {},
+        run_step_graph(&crate::test_run(), &mut steps, &tasks, &kinds, &facts, &est, 8, &factory, &mut |_r| {}, &mut |_s| {},
             None, None, &[]).unwrap();
 
         assert!(loads.lock().unwrap().is_empty(), "empty-collection dispatch.map loads no model");
@@ -6116,7 +6094,7 @@ mod tests {
         kinds.register(Arc::new(EmitCollectionKind)).unwrap();
         let facts = Facts { budget: darkmux_gestalt::Budget { max_darkmux_bytes: Some(20_000_000_000) }, ..Default::default() };
         let est = FixedEstimator(BTreeMap::from([("map-model".to_string(), 5_000_000_000)]));
-        run_step_graph(&mut steps, &tasks, &kinds, &facts, &est, 8, &factory, &mut |_r| {}, &mut |_s| {},
+        run_step_graph(&crate::test_run(), &mut steps, &tasks, &kinds, &facts, &est, 8, &factory, &mut |_r| {}, &mut |_s| {},
             None, None, &[]).unwrap();
 
         unsafe {
@@ -6173,6 +6151,7 @@ mod tests {
             _s: &Step,
             _t: &Task,
             _i: &BTreeMap<String, String>,
+            _ctx: &StepRunCtx,
         ) -> anyhow::Result<StepOutcome> {
             Ok(StepOutcome { output: String::new(), flow_records: Vec::new() })
         }
@@ -6189,6 +6168,7 @@ mod tests {
         let factory = || -> Box<dyn ModelHost> { Box::new(RecordingHost::default()) };
 
         let err = run_step_graph(
+            &crate::test_run(),
             &mut steps, &tasks, &kinds, &facts, &est, 1, &factory,
             &mut |_r| {}, &mut |_s| {},
             None, None, &[])
@@ -6225,6 +6205,7 @@ mod tests {
             vec![("test.absent", std::sync::Arc::new(String::from("seeded")))];
 
         run_step_graph(
+            &crate::test_run(),
             &mut steps, &tasks, &kinds, &facts, &est, 1, &factory,
             &mut |_r| {}, &mut |_s| {},
             None, None, &seed)

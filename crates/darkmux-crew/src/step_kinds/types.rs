@@ -4,6 +4,7 @@ use crate::remote_budget::RemoteBudget;
 use crate::types::{Step, Task};
 use anyhow::Result;
 use darkmux_flow::FlowRecord;
+use darkmux_types::session_id::{RunId, SessionId, SessionScope};
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -262,6 +263,10 @@ impl ArtifactBus {
 ///    unified with seam 4 below — see [`ArtifactBus`]'s doc for why.
 /// 3. **The caller-supplied dispatch interceptor** for `dispatch.map` items
 ///    (`None` on every production path — see [`MapDispatchOverride`]).
+/// 0. **The run this step belongs to.** Every session a step's records
+///    land under is minted in this run ([`StepRunCtx::run_id`],
+///    [`StepKind::session_scope`]), so two launches of one config never
+///    share one. It comes from whoever runs the graph, never from the kind.
 /// 4. **The run-scoped [`ArtifactBus`] (#1530 Packet 0).** Materialized
 ///    once by the scheduler before the graph's wave loop starts, shared by
 ///    reference into every step for the WHOLE run. A step reads its
@@ -270,6 +275,7 @@ impl ArtifactBus {
 ///    `Artifact` port), so no `Option` wrapping is needed at this layer —
 ///    a lookup by name is the "is it there" check.
 pub struct StepRunCtx {
+    run: RunId,
     emitter: Option<std::sync::mpsc::Sender<WaveSignal>>,
     remote_bucket: Option<Arc<Mutex<RemoteBudget>>>,
     dispatch_override: Option<MapDispatchOverride>,
@@ -339,22 +345,53 @@ pub enum WaveSignal {
 impl StepRunCtx {
     /// `pub` (not `pub(crate)`) since #1530 Packet 1 — a `StepKind` that
     /// migrated its bespoke `Arc<Mutex<_>>` handles onto the [`ArtifactBus`]
-    /// (e.g. `darkmux-lab`'s review pipeline) now needs its OWN unit tests,
-    /// outside this crate, to exercise `StepKind::run_streaming` directly
-    /// with a hand-built context rather than only through a full
-    /// `run_step_graph` call — the same reason `ArtifactBus`/`Port` were
-    /// already `pub`. Every production caller still goes through
-    /// `run_step_graph`, which is the only place that assembles the OTHER
-    /// scheduler-owned seams (the live emitter, a `bucket_group`'s shared
-    /// bucket) correctly; a hand-built `StepRunCtx` in a test typically
-    /// passes `None`/`None` for those two and only a real `ArtifactBus`.
+    /// now needs its OWN unit tests, outside this crate, to exercise
+    /// `StepKind::run` directly with a hand-built context rather than only
+    /// through a full `run_step_graph` call. Every production caller still
+    /// goes through `run_step_graph`, which is the only place that assembles
+    /// the OTHER scheduler-owned seams (the live emitter, a `bucket_group`'s
+    /// shared bucket) correctly.
     pub fn new(
+        run: RunId,
         emitter: Option<std::sync::mpsc::Sender<WaveSignal>>,
         remote_bucket: Option<Arc<Mutex<RemoteBudget>>>,
         dispatch_override: Option<MapDispatchOverride>,
         artifacts: Arc<ArtifactBus>,
     ) -> Self {
-        Self { emitter, remote_bucket, dispatch_override, artifacts }
+        Self { run, emitter, remote_bucket, dispatch_override, artifacts }
+    }
+
+    /// A context in `run` with no emitter, no shared bucket, no dispatch
+    /// interceptor and an empty [`ArtifactBus`]: a step run on its own,
+    /// outside a scheduler.
+    pub fn solo(run: RunId) -> Self {
+        Self::new(run, None, None, None, Arc::new(ArtifactBus::new()))
+    }
+
+    /// This context when it streams live (the scheduler's, which has an
+    /// emitter), `None` for a step run on its own: a kind batches its
+    /// records into its outcome instead.
+    pub(crate) fn live(&self) -> Option<&StepRunCtx> {
+        self.emitter.as_ref().map(|_| self)
+    }
+
+    /// A solo context in a fixed test run, for unit tests that run a step
+    /// on its own.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self::solo(RunId::mission("m-test").expect("a literal run id is never empty"))
+    }
+
+    /// The run this step belongs to.
+    pub fn run_id(&self) -> &RunId {
+        &self.run
+    }
+
+    /// The session `kind`'s own dispatch records for `step` land under in
+    /// this run: its declared [`StepKind::session_scope`], composed with
+    /// the run. `None` for a kind that never dispatches.
+    pub fn session(&self, kind: &dyn StepKind, step: &Step) -> Option<SessionId> {
+        kind.session_scope().session(&self.run, &step.task_id, &step.id)
     }
 
     /// Emit one flow record LIVE through the scheduler's emission seam
@@ -569,29 +606,15 @@ pub enum CwdPolicy {
 /// `procedural.*` kind ignores `task` entirely.
 pub trait StepKind: Send + Sync {
     fn id(&self) -> &'static str;
-    fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome>;
-
-    /// (#1442) The scheduler's ACTUAL entry point — `run` with the
-    /// scheduler-supplied [`StepRunCtx`] (live emitter + shared remote
-    /// bucket) threaded in. Defaults to ignoring the context and delegating
-    /// to [`StepKind::run`], so every existing kind keeps its exact behavior
-    /// (records batched into [`StepOutcome::flow_records`], a step-scoped
-    /// bucket) with no change. A kind that wants LIVE per-item emission or a
-    /// scheduler-shared `bucket_group` (`dispatch.map`) overrides THIS and
-    /// leaves `run` as the ctx-free path unit tests still drive directly.
+    /// Run the step. `ctx` is what the scheduler supplies from outside the
+    /// step: the run it belongs to, the live emitter, a `bucket_group`'s
+    /// shared remote bucket, the dispatch interceptor and the run-scoped
+    /// [`ArtifactBus`] (see [`StepRunCtx`]). A kind that emits nothing live
+    /// and dispatches nothing ignores it.
     ///
     /// The context is Arc/channel-backed and `Send` so it crosses the
     /// `run_bounded` worker-thread boundary alongside the job closure.
-    fn run_streaming(
-        &self,
-        step: &Step,
-        task: &Task,
-        input: &BTreeMap<String, String>,
-        ctx: &StepRunCtx,
-    ) -> Result<StepOutcome> {
-        let _ = ctx;
-        self.run(step, task, input)
-    }
+    fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>, ctx: &StepRunCtx) -> Result<StepOutcome>;
 
     /// (#1402) A short, human-facing name for this kind — the graph lens,
     /// the viewer's mission drill-down, and `mission status` all render
@@ -609,53 +632,28 @@ pub trait StepKind: Send + Sync {
         self.id()
     }
 
-    /// (#1979) The `session_id` this kind's own DISPATCH records land under —
-    /// the FORWARD direction (step -> session), which only the kind can
-    /// answer, because the kind is what chooses it at dispatch time.
+    /// (#1979) Which session this kind's own DISPATCH records land under,
+    /// as the kind DECLARES it. The run is the scheduler's
+    /// ([`StepRunCtx::session`] composes the two), so the same step of two
+    /// launches lands under two sessions.
     ///
-    /// **Do not confuse this with attribution.** Mapping a record BACK to its
-    /// step is the reverse direction, and it needs no kind knowledge at all:
-    /// `darkmux-serve`'s `step_for_record` and the viewer's `stepForRecord`
-    /// resolve it from the record alone via `payload.step_id` -> a
-    /// step-scoped `session_id` -> `handle`. A consumer that switches on
-    /// `step.kind` to attribute a record is a bug. This method exists only
-    /// because ghost-suppression must predict a step's session BEFORE any
-    /// record for it exists.
+    /// Declared rather than matched on `step.kind` by a consumer: when a
+    /// consumer re-derived it, a new dispatching kind fell into its
+    /// catch-all and its records surfaced as a duplicate "ghost" run. Every
+    /// dispatching kind in this crate builds its session through
+    /// [`StepRunCtx::session`] with its own declaration, so the declaration
+    /// and the emission cannot disagree.
     ///
-    /// Why it has to be asked rather than matched: `darkmux-serve`'s
-    /// `step_session_id` used to re-derive this with `match
-    /// step.kind.as_str()` and a `_ => None` arm, so the convention lived in
-    /// two files that nothing kept agreeing. A new DISPATCHING kind fell into
-    /// the catch-all, its session went unclaimed, and its records surfaced as
-    /// a duplicate untracked "ghost" row on the runs board — with no test, no
-    /// doctor check and no compile error to say so. The failure needed an
-    /// operator to notice a doubled row.
+    /// Defaults to [`SessionScope::Step`]: a solo dispatch owns its own
+    /// session. [`SessionScope::None`] ONLY for a kind that genuinely never
+    /// dispatches (`procedural.*`); the registry conformance test in
+    /// `step_kinds::registry` pins every registered kind's value.
     ///
-    /// Defaults to `session_id::step(&step.id)`, matching that helper's own
-    /// documented role as "the step-scoped default dispatch session id", so a
-    /// new dispatching kind is claimed by construction. An explicit
-    /// `config["session_id"]` always wins — a caller that names the session
-    /// owns it.
-    ///
-    /// Return `None` ONLY for a kind that genuinely never dispatches
-    /// (`procedural.*`). That is a deliberate opt-out, not a fallback: the
-    /// registry conformance test in `step_kinds::registry` requires every
-    /// registered kind to either resolve a session or be named on the
-    /// documented no-dispatch list, so "nobody implemented it yet" cannot
-    /// masquerade as "there is nothing here".
-    ///
-    /// This is the kind's OWN dispatch session only. Every step ALSO has its
-    /// scheduler-emitted lifecycle records under
-    /// `session_id::task(&step.task_id)` (`scheduler::step_lifecycle_record`)
-    /// — that is the scheduler's invariant, true for every kind, so a
-    /// consumer adds it once rather than asking each kind about it.
-    fn dispatch_session_id(&self, step: &Step) -> Option<String> {
-        if let Some(sid) = step.config.get("session_id").and_then(|v| v.as_str()) {
-            if !sid.is_empty() {
-                return Some(sid.to_string());
-            }
-        }
-        Some(darkmux_types::session_id::step(&step.id))
+    /// Every step ALSO has its scheduler-emitted lifecycle records under its
+    /// task's session (`scheduler::step_lifecycle_record`) — that is the
+    /// scheduler's invariant, true for every kind.
+    fn session_scope(&self) -> SessionScope {
+        SessionScope::Step
     }
 
     /// (#2394) What this step CONSUMES — the seat it claims. **Required:

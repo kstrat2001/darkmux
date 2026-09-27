@@ -260,7 +260,7 @@ fn dispatch_panic_mid_run_leaves_no_tailer_sampler_watchdog_thread() {
         timeout_override_seconds: None,
         role_id: "analyst".to_string(),
         message: "#2642 thread-leak proof — never actually reaches a model.".to_string(),
-        session_id: Some(format!("dispatch-panic-thread-leak-proof-{}", std::process::id())),
+        session: darkmux_types::session_id::SessionId::adhoc(darkmux_types::session_id::RunId::standalone("test").unwrap(), "coder", format!("dispatch-panic-thread-leak-proof-{}", std::process::id())),
         // Large relative to this test's own bounded wait below — the
         // watchdog must never fire on ITS OWN deadline during this test;
         // it fires because `_watchdog_abandon_guard`'s Drop marks it

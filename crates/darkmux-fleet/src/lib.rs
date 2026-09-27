@@ -322,7 +322,7 @@ mod tests {
             "studio".to_string(),
             "coder".to_string(),
             "do a thing".to_string(),
-            "s-1".to_string(),
+            crate::test_session("s-1"),
             None,
             None,
             None,
@@ -430,7 +430,7 @@ mod tests {
         let json = r#"{
             "role_id": "coder",
             "message": "hi",
-            "session_id": "s-1",
+            "session_id": "m-1.adhoc.coder.s-1",
             "timeout_seconds": 300,
             "published_at_unix_ms": 0,
             "target_machine": "studio",
@@ -455,7 +455,7 @@ mod tests {
         let json = r#"{
             "role_id": "coder",
             "message": "hi",
-            "session_id": "s-1",
+            "session_id": "m-1.adhoc.coder.s-1",
             "timeout_seconds": 300,
             "published_at_unix_ms": 0,
             "target_machine": "studio"
@@ -478,7 +478,7 @@ mod tests {
             "target_tier": "inference",
             "role_id": "coder",
             "message": "hi",
-            "session_id": "s-1",
+            "session_id": "m-1.adhoc.coder.s-1",
             "timeout_seconds": 300,
             "published_at_unix_ms": 0,
             "target_machine": "studio"
@@ -489,4 +489,14 @@ mod tests {
             "legacy target_tier field must be rejected post-#590; got: {result:?}"
         );
     }
+}
+
+/// A test's session: an ad-hoc dispatch `nonce` of `coder` in mission `m-1`.
+#[cfg(test)]
+pub(crate) fn test_session(nonce: &str) -> darkmux_types::session_id::SessionId {
+    darkmux_types::session_id::SessionId::adhoc(
+        darkmux_types::session_id::RunId::mission("m-1").expect("a literal run id is never empty"),
+        "coder",
+        nonce,
+    )
 }

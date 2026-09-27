@@ -29,6 +29,7 @@
 //! rather than an error, because the injection path must never fail a dispatch
 //! over an unreadable day-file.
 
+use darkmux_types::session_id::{SessionId, SessionKind};
 use serde::Serialize;
 use std::collections::HashSet;
 
@@ -48,23 +49,68 @@ pub struct Correction {
     pub text: String,
 }
 
+/// The coder runs of some phases of one mission: each phase's
+/// [`SessionKind::Phase`] session. What the coder-brief path and a mission's
+/// debrief scope their reads to.
+#[derive(Debug, Clone)]
+pub struct PhaseSessions {
+    mission: String,
+    phases: HashSet<String>,
+}
+
+impl PhaseSessions {
+    pub fn new(mission: &str, phases: impl IntoIterator<Item = String>) -> Self {
+        Self { mission: mission.to_string(), phases: phases.into_iter().collect() }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.phases.is_empty()
+    }
+
+    /// Whether a record's `session_id` (in its current or its pre-4.0
+    /// spelling) is one of these phases' coder runs. An exact phase match,
+    /// never a prefix: a sibling mission whose id is a hyphen-extension of
+    /// this one (`auth` and `auth-v2`) never bleeds in, the #849 regression
+    /// the brief-injection path's tests pin.
+    pub fn admits(&self, session_id: &str) -> bool {
+        SessionId::parse_legacy(session_id, Some(&self.mission)).is_some_and(|s| {
+            s.mission_id() == Some(self.mission.as_str())
+                && matches!(s.kind(), SessionKind::Phase { phase } if self.phases.contains(phase))
+        })
+    }
+}
+
+/// Which corrections a scan reads.
+#[derive(Debug, Clone, Copy)]
+pub enum Scope<'a> {
+    /// Every correction in the window.
+    All,
+    /// The corrections recorded against exactly this session id.
+    Session(&'a str),
+    /// The corrections recorded against these phases' coder runs.
+    Phases(&'a PhaseSessions),
+}
+
+impl Scope<'_> {
+    fn admits(&self, session_id: &str) -> bool {
+        match self {
+            Scope::All => true,
+            Scope::Session(sid) => *sid == session_id,
+            Scope::Phases(p) => p.admits(session_id),
+        }
+    }
+}
+
 /// Scan the most-recent `days` day-files of the flow trail for adjudication
-/// corrections, returned **oldest→newest**.
-///
-/// `sessions` scopes the read:
-/// * `Some(set)` — EXACT-set match on `session_id`. Exact, never a prefix: a
-///   `mission-run-auth-` prefix would bleed a sibling mission whose id is a
-///   hyphen-extension (`mission-run-auth-v2-s1` starts with it), which is the
-///   #849 regression the brief-injection path's tests pin.
-/// * `None` — every session in the window.
+/// corrections within `scope`, returned **oldest→newest**.
 ///
 /// Best-effort: unreadable dirs/files and unparsable lines are skipped, never
 /// surfaced as an error. Neither deduped nor capped — each consumer applies its
 /// own policy on top ([`crate::lessons`]-style curation is not a thing here;
 /// the brief path dedups + budgets, the `list` verb shows what's recorded).
-pub fn scan(days: usize, sessions: Option<&HashSet<String>>) -> Vec<Correction> {
+pub fn scan(days: usize, scope: Scope<'_>) -> Vec<Correction> {
     // An empty scope can match nothing — skip the IO entirely.
-    if sessions.is_some_and(|s| s.is_empty()) {
+    if matches!(scope, Scope::Phases(p) if p.is_empty()) {
         return Vec::new();
     }
     let flows_dir = darkmux_types::config_access::flows_dir();
@@ -83,7 +129,7 @@ pub fn scan(days: usize, sessions: Option<&HashSet<String>>) -> Vec<Correction> 
             let Some(sid) = r.get("session_id").and_then(|v| v.as_str()) else {
                 continue;
             };
-            if sessions.is_some_and(|set| !set.contains(sid)) {
+            if !scope.admits(sid) {
                 continue;
             }
             let text = r

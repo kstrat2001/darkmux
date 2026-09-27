@@ -2221,6 +2221,45 @@ pub struct FlowRecord {
     pub attempt: Option<u32>,
 }
 
+impl FlowRecord {
+    /// A record under `session`, at the current time and `Tier::Local`, with
+    /// every optional field empty. `session_id` and `mission_id` are both
+    /// stamped from the one `session` here, so they can never disagree: the
+    /// wire string names the run, and `mission_id` is that run when it is a
+    /// mission. The only place a session is put on a record.
+    pub fn for_session(
+        session: &darkmux_types::session_id::SessionId,
+        level: Level,
+        category: Category,
+        stage: Stage,
+        action: crate::FlowAction,
+        handle: impl Into<String>,
+    ) -> Self {
+        FlowRecord {
+            ts: crate::ts_utc_now(),
+            level,
+            category,
+            tier: Tier::Local,
+            stage,
+            action,
+            handle: handle.into(),
+            phase_id: None,
+            session_id: Some(session.wire()),
+            source: None,
+            model: None,
+            reasoning: None,
+            mission_id: session.mission_id().map(str::to_string),
+            machine_id: None,
+            machine_uid: None,
+            prev_hash: None,
+            hash: None,
+            payload: None,
+            work_id: None,
+            attempt: None,
+        }
+    }
+}
+
 /// Resolve the flows directory. Precedence (#661 Slice 3):
 /// `env(DARKMUX_FLOWS_DIR) > config.dirs.flows > <darkmux root>/flows`, where the
 /// root is what `paths::resolve(Auto)` selects (`DARKMUX_HOME`, else a project-local
@@ -2351,6 +2390,23 @@ pub fn resolve_machine_id_with_source() -> Option<(String, MachineIdSource)> {
         .map(|h| (h, MachineIdSource::Hostname))
 }
 
+
+#[cfg(test)]
+mod for_session_tests {
+    use super::*;
+    use darkmux_types::session_id::{RunId, SessionId};
+
+    /// `session_id` and `mission_id` come from the one session: a mission
+    /// run's records carry its id as `mission_id`, a lab run's carry none.
+    #[test]
+    fn a_record_carries_its_sessions_run_and_nothing_else() {
+        let rec = |s: &SessionId| FlowRecord::for_session(s, Level::Info, Category::Work, Stage::Dispatch, crate::FlowAction::StepStart, "h");
+        let m = rec(&SessionId::task(RunId::mission("m-1").unwrap(), "t1"));
+        assert_eq!((m.session_id.as_deref(), m.mission_id.as_deref()), (Some("m-1.task.t1"), Some("m-1")));
+        let lab = rec(&SessionId::adhoc(RunId::lab("l-1").unwrap(), "coder", "n"));
+        assert_eq!((lab.session_id.as_deref(), lab.mission_id), (Some("l-1.lab.adhoc.coder.n"), None));
+    }
+}
 
 #[cfg(test)]
 mod forward_compat_tests {

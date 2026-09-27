@@ -34,6 +34,7 @@ use crate::workloads::types::{
 };
 use darkmux_types::Profile;
 use anyhow::{anyhow, ensure, Context, Result};
+use darkmux_types::session_id::{RunId, SessionId};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -961,7 +962,8 @@ impl WorkloadProvider for ToolBenchProvider {
         // run's own dispatch", so reporting any one of them here would be a
         // fabricated representative id, not the honest answer. See
         // `RunLifecycle::session_id`'s doc for the contract this upholds.
-        _on_session_id: &mut dyn FnMut(&str),
+        run: &RunId,
+        _on_session_id: &mut dyn FnMut(&SessionId),
     ) -> Result<RunResult> {
         let wl = &loaded.manifest.workload;
         // (Also consider, second-round frontier review) `trials` still
@@ -1142,12 +1144,7 @@ impl WorkloadProvider for ToolBenchProvider {
                     fs::write(&dst, content)?;
                 }
 
-                // (#1436) Through the canonical session-id helper; byte-identical shape.
-                let session_id = darkmux_types::session_id::session_id(
-                    "darkmux-toolbench",
-                    &task.id,
-                    &format!("t{trial}-{now_ms}"),
-                );
+                let session_id = SessionId::adhoc(run.clone(), &role, format!("{}-t{trial}", task.id));
                 eprintln!("darkmux: tool-bench dispatch {} (trial {trial})", task.id);
                 let (stdout, stderr, exit_code, out_dir) = dispatch_task(
                     &role,
@@ -1275,7 +1272,6 @@ impl WorkloadProvider for ToolBenchProvider {
                 "profile_description": profile.description.clone().unwrap_or_default(),
                 "duration_ms": duration_ms,
                 "ok": true,
-                "session_id": darkmux_types::session_id::session_id("darkmux-toolbench", &now_ms.to_string(), ""),
             });
         crate::providers::coding_task::record_refused_artifacts(&mut manifest_json, &refused_artifacts);
         fs::write(
@@ -1452,7 +1448,7 @@ fn extract_reply(stdout: &str) -> String {
 fn dispatch_task(
     role_id: &str,
     prompt: &str,
-    session_id: &str,
+    session_id: &SessionId,
     workdir: PathBuf,
     compaction: darkmux_crew::dispatch::CompactionDispatchArgs,
     profile_name: &str,
@@ -1485,7 +1481,7 @@ fn dispatch_task(
         timeout_override_seconds, // (#2587) routed from extras.taskTimeoutSeconds
         role_id: role_id.to_string(),
         message: prompt.to_string(),
-        session_id: Some(session_id.to_string()),
+        session: session_id.clone(),
         timeout_seconds: timeout,
         skip_preflight: false,
         json: true,
@@ -2446,7 +2442,7 @@ not json — tolerated
             })
             .to_string(),
             stderr: String::new(),
-            session_id: "s".into(),
+            session_id: darkmux_types::session_id::SessionId::adhoc(darkmux_types::session_id::RunId::lab("r").unwrap(), "coder", "s"),
             // No out_dir: `run()`'s trajectory-copy block is a no-op on
             // `None` (see its own `if let Some(out) = out_dir.as_deref()`),
             // so a mocked dispatch needs no `.darkmux-runtime/` fixture.
@@ -2500,7 +2496,8 @@ not json — tolerated
             "default",
             None,
             None,
-            &mut |_sid: &str| {},
+            &darkmux_types::session_id::RunId::lab("r").unwrap(),
+            &mut |_sid: &SessionId| {},
         )?;
         let result = seen.lock().unwrap().clone();
         Ok((result, run_dir))
@@ -2532,7 +2529,7 @@ not json — tolerated
         let provider = ToolBenchProvider::with_dispatch(Arc::new(|_opts: DispatchOpts| mock_ok_result()));
         let profile = darkmux_profiles::profiles::load_registry(pf.to_str()).unwrap().registry.profiles["mixed"].clone();
         provider
-            .run(&loaded, run_dir.path(), sandbox_dir.path(), &profile, "mixed", pf.to_str(), None, &mut |_sid: &str| {})
+            .run(&loaded, run_dir.path(), sandbox_dir.path(), &profile, "mixed", pf.to_str(), None, &darkmux_types::session_id::RunId::lab("r").unwrap(), &mut |_sid: &SessionId| {})
             .expect("run completes");
         let doc = scores::read_scores(&run_dir.path().join("scores.json")).expect("the run wrote scores.json");
         assert!(!doc.rows.is_empty());
@@ -2560,7 +2557,7 @@ not json — tolerated
             }));
             let (run_dir, sandbox_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
             provider
-                .run(&loaded, run_dir.path(), sandbox_dir.path(), &Profile::default(), "default", None, None, &mut |_sid: &str| {})
+                .run(&loaded, run_dir.path(), sandbox_dir.path(), &Profile::default(), "default", None, None, &darkmux_types::session_id::RunId::lab("r").unwrap(), &mut |_sid: &SessionId| {})
                 .expect("run completes");
             let roles = seen.lock().unwrap().clone();
             assert!(!roles.is_empty() && roles.iter().all(|r| Some(r.as_str()) == reported.as_deref()), "{roles:?}");
@@ -2587,7 +2584,7 @@ not json — tolerated
                 exit_code: 1,
                 stdout: String::new(),
                 stderr: "container exited".into(),
-                session_id: "s".into(),
+                session_id: darkmux_types::session_id::SessionId::adhoc(darkmux_types::session_id::RunId::lab("r").unwrap(), "coder", "s"),
                 out_dir: None,
                 trajectory: None,
             })
@@ -2601,7 +2598,8 @@ not json — tolerated
                 "default",
                 None,
                 None,
-                &mut |_sid: &str| {},
+                &darkmux_types::session_id::RunId::lab("r").unwrap(),
+                &mut |_sid: &SessionId| {},
             )
             .expect("run completes even when every dispatch dies");
 

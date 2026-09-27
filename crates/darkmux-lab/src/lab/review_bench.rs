@@ -20,6 +20,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
+use darkmux_types::session_id::{RunId, SessionId};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn default_true() -> bool {
@@ -303,7 +304,7 @@ pub struct ReviewBenchOpts {
 ///      layer down.
 fn default_scores_path(ts_ms: u128) -> PathBuf {
     darkmux_types::config_access::lab_dir()
-        .join(format!("review-bench-{ts_ms}"))
+        .join(bench_run_id(ts_ms))
         .join("scores.json")
 }
 
@@ -378,6 +379,8 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
     // behavior) keeps that coupling intact while additionally letting the
     // run_id reflect when the run STARTED, not when it finished.
     let ts_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    // The lab run every case dispatches in.
+    let run = RunId::lab(bench_run_id(ts_ms)).expect("a formatted run id is never empty");
     let scores_path = opts.scores_out.clone().unwrap_or_else(|| default_scores_path(ts_ms));
     // (#1465) Operator-facing console line reads `lab eval` (the current verb);
     // the internal run_id / run-dir (`review-bench-<ts>`) + scores `bench` key
@@ -453,6 +456,7 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
                     // down. The gap is exactly the one described above, not
                     // a new one.
                     dispatch_case(
+                        &run,
                         prompt,
                         &format!("{}-{}", c.id, seat.label()),
                         wd,
@@ -498,6 +502,7 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
                 opts.mode.role_id()
             };
             let (stdout, exit_code) = dispatch_case(
+                &run,
                 &prompt,
                 &c.id,
                 workdir,
@@ -691,6 +696,12 @@ fn review_from_stdout(stdout: &str, mode: BenchMode) -> Review {
     }
 }
 
+/// The bench's lab run id, from the run's start (`ts_ms`): the run every
+/// case dispatches in and the `run_id` its scores carry.
+fn bench_run_id(ts_ms: u128) -> String {
+    format!("review-bench-{ts_ms}")
+}
+
 /// Dispatch one case (or one dialectic seat) through `role_id` on the
 /// internal runtime, returning the raw `--json` envelope stdout (parsed by
 /// [`envelope_reply_text`]) alongside the dispatch's own exit code. `profile`
@@ -707,6 +718,7 @@ fn review_from_stdout(stdout: &str, mode: BenchMode) -> Review {
 /// nothing" when stdout carries no parseable envelope at all — see
 /// [`envelope_meta_with_exit`].
 fn dispatch_case(
+    run: &RunId,
     prompt: &str,
     case_id: &str,
     workdir: Option<PathBuf>,
@@ -715,16 +727,7 @@ fn dispatch_case(
     opts: &ReviewBenchOpts,
 ) -> Result<(String, i32)> {
     use darkmux_crew::dispatch::{dispatch, CompactionDispatchArgs, DispatchOpts};
-    // (#1436) Through the canonical session-id helper; byte-identical shape.
-    let session_id = darkmux_types::session_id::session_id(
-        "pr-review-bench",
-        case_id,
-        &SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-            .to_string(),
-    );
+    let session = SessionId::adhoc(run.clone(), role_id, case_id);
     let d = DispatchOpts {
         // (#2914) The lab benchmarks candidate utility models.
         allow_utility_model: true,
@@ -741,7 +744,7 @@ fn dispatch_case(
         timeout_override_seconds: None, // (#2480)
         role_id: role_id.to_string(),
         message: prompt.to_string(),
-        session_id: Some(session_id),
+        session,
         timeout_seconds: opts.timeout_seconds,
         skip_preflight: false,
         json: true,
@@ -1475,7 +1478,7 @@ fn write_scores_artifact(
         .unwrap_or_else(|| "(unknown)".to_string());
     let mut doc = scores::ScoresDoc::new(
         scores::RunProvenance {
-            run_id: format!("review-bench-{ts_ms}"),
+            run_id: bench_run_id(ts_ms),
             ts: darkmux_flow::ts_utc_now(),
             machine: scores::MachineFingerprint::detect(&machine_id),
             profile: opts.profile_name.clone(),

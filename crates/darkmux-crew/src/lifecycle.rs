@@ -75,6 +75,7 @@ use crate::loader::load_phases;
 use crate::types::{Mission, MissionStatus, NodeStatus, Phase, PhaseStatus};
 use darkmux_flow as flow;
 use darkmux_flow::{Category, FlowRecord, Level, Stage, Tier};
+use darkmux_types::session_id::{RunId, SessionId};
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::PathBuf;
@@ -553,32 +554,26 @@ fn load_mission(id: &str) -> Result<Mission> {
 
 // ─── Flow record emission ──────────────────────────────────────────────
 
+/// The mission's own run session: every lifecycle record of the mission
+/// lands under it. `None` (said on stderr) for an empty id, which names no
+/// run and so has nowhere to record.
+fn mission_session(mission_id: &str) -> Option<SessionId> {
+    match RunId::mission(mission_id) {
+        Ok(run) => Some(SessionId::run(run)),
+        Err(e) => {
+            eprintln!("darkmux: a lifecycle record was not written: {e}");
+            None
+        }
+    }
+}
+
 fn emit_phase_transition_record(phase_id: &str, mission_id: &str, action: darkmux_flow::FlowAction) {
+    let Some(session) = mission_session(mission_id) else { return };
     let _ = flow::record(FlowRecord {
-        ts: flow::ts_utc_now(),
-        level: Level::Info,
-        category: Category::Work,
         tier: Tier::Operator,
-        stage: Stage::Scope,
-        action,
-        handle: phase_id.to_string(),
         phase_id: Some(phase_id.to_string()),
-        session_id: Some(darkmux_types::session_id::mission(mission_id)),
         source: Some("phase_lifecycle".to_string()),
-        model: None,
-        reasoning: None,
-        // #136 schema 1.3: first-class mission_id. The session_id above
-        // (`session_id::mission(mission_id)`, hyphen-delimited since #1436)
-        // stays as the record-grouping key; readers should prefer this
-        // first-class field for mission lookups.
-        mission_id: Some(mission_id.to_string()),
-        machine_id: None,
-        machine_uid: None,
-        prev_hash: None,
-        hash: None,
-        payload: None,
-        work_id: None,
-        attempt: None,
+        ..FlowRecord::for_session(&session, Level::Info, Category::Work, Stage::Scope, action, phase_id.to_string())
     });
 }
 
@@ -615,27 +610,13 @@ fn emit_mission_transition_record_with_reasoning_and_payload(
     reasoning: Option<&str>,
     payload: Option<serde_json::Value>,
 ) {
+    let Some(session) = mission_session(mission_id) else { return };
     let _ = flow::record(FlowRecord {
-        ts: flow::ts_utc_now(),
-        level: Level::Info,
-        category: Category::Work,
         tier: Tier::Operator,
-        stage: Stage::Scope,
-        action,
-        handle: mission_id.to_string(),
-        phase_id: None,
-        session_id: Some(darkmux_types::session_id::mission(mission_id)),
         source: Some("mission_lifecycle".to_string()),
-        model: None,
         reasoning: reasoning.map(String::from),
-        mission_id: Some(mission_id.to_string()),
-        machine_id: None,
-        machine_uid: None,
-        prev_hash: None,
-        hash: None,
         payload,
-        work_id: None,
-        attempt: None,
+        ..FlowRecord::for_session(&session, Level::Info, Category::Work, Stage::Scope, action, mission_id.to_string())
     });
 }
 
@@ -657,27 +638,13 @@ fn emit_phase_added_record_with_reasoning(
     mission_id: &str,
     reasoning: Option<&str>,
 ) {
+    let Some(session) = mission_session(mission_id) else { return };
     let _ = flow::record(FlowRecord {
-        ts: flow::ts_utc_now(),
-        level: Level::Info,
-        category: Category::Work,
         tier: Tier::Operator,
-        stage: Stage::Scope,
-        action: darkmux_flow::FlowAction::PhaseAdded,
-        handle: phase_id.to_string(),
         phase_id: Some(phase_id.to_string()),
-        session_id: Some(darkmux_types::session_id::mission(mission_id)),
         source: Some("mission_lifecycle".to_string()),
-        model: None,
         reasoning: reasoning.map(String::from),
-        mission_id: Some(mission_id.to_string()),
-        machine_id: None,
-        machine_uid: None,
-        prev_hash: None,
-        hash: None,
-        payload: None,
-        work_id: None,
-        attempt: None,
+        ..FlowRecord::for_session(&session, Level::Info, Category::Work, Stage::Scope, darkmux_flow::FlowAction::PhaseAdded, phase_id.to_string())
     });
 }
 

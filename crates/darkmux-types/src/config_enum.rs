@@ -1053,6 +1053,9 @@ mod tests {
         /// Enums in darkmux-types that are not the value of one setting.
         const NOT_SETTINGS: &[(&str, &str)] = &[
             ("HeaderValue", "a hook header's value shape (literal string or Keychain item), not a token set"),
+            ("RunKind", "a session's run kind (`session_id`), never a setting"),
+            ("SessionKind", "a session's kind within its run (`session_id`), never a setting"),
+            ("SessionScope", "what a step kind declares about its sessions (`session_id`), never a setting"),
             ("EndpointKind", "derived from `managed` + `url`, never written"),
             ("Lenient", "the lenient-read wrapper itself"),
             ("EndpointSource", "runtime-only provenance, never serialized"),

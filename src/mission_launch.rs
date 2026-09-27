@@ -69,6 +69,7 @@ use crate::coder_phase;
 use anyhow::{anyhow, bail, Context, Result};
 use crew::mission_config::{self, FindingSeverity, LaunchParams, MissionConfig, TaskOverride};
 use crew::types::{Mission, MissionSpec, MissionStatus, NodeStatus, Phase, PhaseStatus, Step};
+use darkmux_types::session_id::{RunId, SessionId};
 use darkmux_types::style;
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -275,14 +276,14 @@ fn cli_gate_handler() -> Box<crew::gate::GateHandler<'static>> {
 fn emit_launch_cmd_audit(
     config: &MissionConfig,
     collected: &BTreeMap<String, serde_json::Value>,
-    mission_id: &str,
+    run: &RunId,
     gate_confirmed: Option<bool>,
     success: bool,
 ) {
     let Some(verb) = config.cmd.as_deref() else { return };
     let args = collected.get("args").and_then(|v| v.as_str()).unwrap_or("");
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    crate::acp_panel::emit_cmd_audit(verb, args, &cwd, gate_confirmed, success, mission_id);
+    crate::acp_panel::emit_cmd_audit(verb, args, &cwd, gate_confirmed, success, run);
 }
 
 /// (#1877 — "no blind runs" is now PRESCRIBED for the generic launch path,
@@ -313,16 +314,15 @@ pub(crate) fn mission_bookend_record(
     level: flow::Level,
     action: darkmux_flow::FlowAction,
     config_id: &str,
-    mission_id: &str,
+    run: &RunId,
     payload: serde_json::Value,
 ) -> flow::FlowRecord {
     let mut record = crew::dispatch::build_dispatch_record_with_payload(
         level,
         action,
         config_id,
-        mission_id,
+        &SessionId::run(run.clone()),
         None,
-        Some(mission_id),
         None,
         Some(payload),
     );
@@ -779,6 +779,7 @@ pub fn launch(
     // GROUPED for corpus analysis, via `Mission.spec` — a metadata field,
     // never identity. No `--mission-id` flag needed.
     let mission_id = mint_run_id(config_id)?;
+    let run = RunId::mission(mission_id.clone())?;
     let spec = MissionSpec {
         config_id: config_id.to_string(),
         inputs_fingerprint: spec_fingerprint(&collected)?,
@@ -1230,7 +1231,7 @@ pub fn launch(
     let mut dispatch_sink = |record: flow::FlowRecord| {
         let _ = flow::record(record);
     };
-    let mission_id_for_abort = mission_id.clone();
+    let run_for_abort = run.clone();
     let config_id_for_abort = config_id.to_string();
     // `BookendGuard`'s Drop fires this `on_abort` closure — building the
     // "dispatch error" abort record — for any exit between `open()` below
@@ -1256,7 +1257,7 @@ pub fn launch(
             flow::Level::Error,
             darkmux_flow::FlowAction::DispatchError,
             &config_id_for_abort,
-            &mission_id_for_abort,
+            &run_for_abort,
             serde_json::json!({
                 "runtime": "mission",
                 "result_class": "error",
@@ -1271,7 +1272,7 @@ pub fn launch(
             flow::Level::Info,
             darkmux_flow::FlowAction::DispatchStart,
             config_id,
-            &mission_id,
+            &run,
             serde_json::json!({ "runtime": "mission" }),
         ),
     );
@@ -1285,12 +1286,7 @@ pub fn launch(
     // redundant `session.end`), and otherwise at scope end after the bookend
     // has closed. The drop removes the key and suppresses the reconciler's
     // abandoned edge, same as a dispatch's.
-    let mission_presence = flow::session_presence::spawn_session_emitter(
-        mission_id.clone(),
-        None,
-        None,
-        Some(mission_id.clone()),
-    );
+    let mission_presence = flow::session_presence::spawn_session_emitter(&SessionId::run(run.clone()), None, None);
 
     // (#1503) The #1400 preflight that used to run here — warning that a
     // phase was already terminal-Complete from a prior finalized run — only
@@ -1496,7 +1492,7 @@ pub fn launch(
                         flow::Level::Info,
                         darkmux_flow::FlowAction::MissionGrow,
                         config_id,
-                        &mission_id,
+                        &run,
                         payload,
                     ));
                     for task in &grown_tasks {
@@ -1606,6 +1602,7 @@ pub fn launch(
         }
 
         graph_result = crew::scheduler::run_step_graph(
+        &run,
         &mut steps,
         &tasks_by_id,
         &registry,
@@ -1619,53 +1616,13 @@ pub fn launch(
         // change at all.
         darkmux_types::config_access::remote_concurrent_cap() as usize,
         &crew::concurrent_dispatch::lms_host_factory,
-        // (#1641) The launcher knows its own `mission_id` — stamp it onto
-        // every record this run's `run_step_graph` call produces that
-        // doesn't already carry a more specific one (`get_or_insert`, never
-        // overwrite). Without this, the scheduler's generic step-lifecycle
-        // records (`step_lifecycle_record`, `crates/darkmux-crew/src/
-        // scheduler.rs`) and any `StepKind`'s own `mission_id: None`-
-        // stamped records (e.g. `dispatch.map`'s per-item "step result")
-        // carry NO instance-scoped identity, so two missions launched from
-        // the SAME config collide on their shared CONFIG-scoped
-        // `session_id`/`handle` (e.g. `task-review-probe-mid-task` /
-        // `review-probe-mid-step`) in the viewer — one mission's step
-        // absorbing another's token counts, a dead step resurrected to
-        // "running" by the other mission's heartbeat.
-        &mut |mut record| {
-            record.mission_id.get_or_insert_with(|| mission_id.clone());
-            // (#1918) `session_id::task`/`session_id::step` carry no
-            // per-run identity of their own — see their own doc and
-            // `darkmux_types::session_id::scope_to_run`'s. Compose this
-            // run's own (now-resolved) `mission_id` into the session id
-            // right here, the SAME choke point that already backfills
-            // `mission_id` above, so every record this run's
-            // `run_step_graph` call produces — the scheduler's own
-            // step-lifecycle bookends AND any `StepKind`'s task-scoped
-            // dispatch session — stops colliding with every OTHER mission
-            // ever launched from this same config.
-            // Read-side: `darkmux-serve::runs`'s join needs no change (a
-            // scoped record always also carries `mission_id`, backfilled
-            // one line above), but `mission_graph::step_for_record` and
-            // its page-side twin DO peel this suffix — see
-            // `scope_to_run`'s own read-side inventory for why the two
-            // differ.
-            if let Some(mid) = record.mission_id.clone() {
-                record.session_id = record.session_id.map(|sid| darkmux_types::session_id::scope_to_run(&sid, &mid));
-            }
-            // (#1877, corrected #2413 round 3 MF3) Calls `flow::record`
-            // directly here (not `bookend.emit_now`) because `bookend`
-            // isn't reachable from inside this closure (it's constructed
-            // on the outer scope, and this closure is handed to `run_
-            // step_graph` by itself) — same underlying sink either way
-            // (`dispatch_sink` IS `flow::record`), so this is a
-            // borrow-driven split, not two different destinations. This
-            // used to ALSO drain a per-run `HostTelemetrySampler` right
-            // before this write, interleaving its buffered samples with
-            // the run's other records; that construction is deleted
-            // (#2413 M3) — host samples now come from the machine-scoped
-            // sampler and are joined to this run by time after the fact,
-            // so there is nothing left to drain here.
+        // Every record this run's `run_step_graph` call produces already
+        // carries this run: the scheduler and every step kind mint their
+        // sessions in the `run` handed to it.
+        &mut |record| {
+            // `flow::record` directly, not `bookend.emit_now`: the bookend
+            // is not reachable from inside this closure, and both write to
+            // the same sink.
             let _ = flow::record(record);
         },
         &mut |step| {
@@ -1760,7 +1717,7 @@ pub fn launch(
                 flow::Level::Error,
                 darkmux_flow::FlowAction::DispatchError,
                 config_id,
-                &mission_id,
+                &run,
                 serde_json::json!({
                     "runtime": "mission",
                     "result_class": "error",
@@ -1772,7 +1729,7 @@ pub fn launch(
         // operator's session tried to act as them" — audit-worthy on its
         // own (see `acp_panel::emit_cmd_audit`'s doc on why a failed
         // attempt is never silently dropped from the trail).
-        emit_launch_cmd_audit(config, &collected, &mission_id, gate_confirmed.get(), false);
+        emit_launch_cmd_audit(config, &collected, &run, gate_confirmed.get(), false);
         // (#2131) The terminal record above is already durable — a no-op
         // unless a signal was actually observed, in which case this reaps
         // every child the watchdog above may not have caught yet and
@@ -1835,9 +1792,9 @@ pub fn launch(
         // below — that one genuinely wants exit-code success, not
         // gate-reached; see `coder_branch_terminal_bookend`'s own doc for
         // why the bookend record itself keys on `reached_gate` instead.
-        let (_reached_gate, record) = coder_branch_terminal_bookend(&outcome, config_id, &mission_id);
+        let (_reached_gate, record) = coder_branch_terminal_bookend(&outcome, config_id, &run);
         bookend.close("dispatch", record);
-        emit_launch_cmd_audit(config, &collected, &mission_id, gate_confirmed.get(), success);
+        emit_launch_cmd_audit(config, &collected, &run, gate_confirmed.get(), success);
         // (#2131) A no-op unless a signal was actually observed — see the
         // scheduler-error branch above for what this does when one was.
         //
@@ -1947,7 +1904,7 @@ pub fn launch(
     // every one of them is a Tier-1-only `procedural.shell`/`procedural.noop`
     // graph, so this is where a direct `darkmux mission launch pr-merge`
     // gets its audit record in practice.
-    emit_launch_cmd_audit(config, &collected, &mission_id, gate_confirmed.get(), exit_code == 0);
+    emit_launch_cmd_audit(config, &collected, &run, gate_confirmed.get(), exit_code == 0);
     // (#1877) Explicit close on the gate-less generic finish — the third
     // and last KNOWN exit this guard covers.
     bookend.close(
@@ -1956,7 +1913,7 @@ pub fn launch(
             if exit_code == 0 { flow::Level::Info } else { flow::Level::Error },
             if exit_code == 0 { darkmux_flow::FlowAction::DispatchComplete } else { darkmux_flow::FlowAction::DispatchError },
             config_id,
-            &mission_id,
+            &run,
             serde_json::json!({
                 "runtime": "mission",
                 "result_class": if exit_code == 0 { "ok" } else { "error" },
@@ -3146,16 +3103,6 @@ fn precheck_coder_phase_inputs(
     Ok(())
 }
 
-/// The dispatch session id for a config-launched coder-phase execution.
-/// The canonical coder-phase id (#1436) — the SAME `mission-run-` prefix the
-/// retired `mission run` stamped and that `mission finalize`/`mission abort`
-/// reconstruct: the viewer's mission lens keys its per-run session grouping
-/// on that prefix, and this path emits the identical record vocabulary, so
-/// launched runs stay visible to the lens and legacy archives keep joining.
-fn launch_session_id(mission_id: &str, real_phase_id: &str) -> String {
-    darkmux_types::session_id::mission_run(mission_id, real_phase_id)
-}
-
 /// Handles `register_coder_phase_kinds` keeps back for the post-scheduler
 /// gate decision (#1284 review round 1, must-fix 1a): the two result slots
 /// the step kinds populate (the generic `StepOutcome.output: String`
@@ -3184,7 +3131,8 @@ pub(crate) struct CoderPhaseHandles {
     workdir: std::path::PathBuf,
     branch: String,
     real_phase_id: String,
-    session_id: String,
+    /// The phase's coder-run session (`SessionId::phase`).
+    session: SessionId,
 }
 
 /// Register `coder_phase.rs`'s three `coder-phase` Tier 3 kinds
@@ -3314,7 +3262,7 @@ fn register_coder_phase_kinds(
         .map(|p| p.id.clone())
         .ok_or_else(|| anyhow!("mission launch: internal error — no phase in `{}` declares a coder-phase step", config.id))?;
     let real_phase_id = real_phase_ids[&phase_doc_id].clone();
-    let session_id = launch_session_id(mission_id, &real_phase_id);
+    let session = SessionId::phase(RunId::mission(mission_id)?, &real_phase_id);
 
     // (#1546) Mission/phase records are no longer loaded here — that disk
     // read is composition's own run-time work now (see the
@@ -3379,7 +3327,6 @@ fn register_coder_phase_kinds(
         base,
         mission_id: mission_id.to_string(),
         phase_id: real_phase_id.clone(),
-        session_id: session_id.clone(),
         role,
     });
 
@@ -3390,7 +3337,7 @@ fn register_coder_phase_kinds(
         workdir,
         branch,
         real_phase_id,
-        session_id,
+        session,
     })
 }
 
@@ -3439,14 +3386,14 @@ fn gate_outcome_reached_no_gate(outcome: &Result<i32>) -> bool {
 fn coder_branch_terminal_bookend(
     outcome: &Result<i32>,
     config_id: &str,
-    mission_id: &str,
+    run: &RunId,
 ) -> (bool, flow::FlowRecord) {
     let reached_gate = !gate_outcome_reached_no_gate(outcome);
     let record = mission_bookend_record(
         if reached_gate { flow::Level::Info } else { flow::Level::Error },
         if reached_gate { darkmux_flow::FlowAction::DispatchComplete } else { darkmux_flow::FlowAction::DispatchError },
         config_id,
-        mission_id,
+        run,
         serde_json::json!({
             "runtime": "mission",
             "result_class": if reached_gate { "ok" } else { "error" },
@@ -3552,7 +3499,7 @@ fn coder_phase_gate_outcome(
     }
 
     let phase_id = &handles.real_phase_id;
-    let session_id = &handles.session_id;
+    let session_id = &handles.session;
 
     // Worktree creation failing is a hard stop — same as `mission run`'s
     // pre-migration `add_worktree(...)?` propagating out of `run()`.
@@ -3601,9 +3548,8 @@ fn coder_phase_gate_outcome(
             flow::Level::Warn,
             "mission.verify",
             &verify_step_id,
-            mission_id,
-            phase_id,
             session_id,
+            phase_id,
             serde_json::json!({ "error": err_text, "total_tokens": tokens_total }),
         );
         println!("\n{}", style::header("▶ gate — QA unavailable, manual review required"));
@@ -3664,9 +3610,8 @@ fn coder_phase_gate_outcome(
             flow::Level::Warn,
             "mission.verify",
             &verify_step_id,
-            mission_id,
-            phase_id,
             session_id,
+            phase_id,
             serde_json::json!({
                 "verdict": review.verdict,
                 "blockers": review.by_severity.block,
@@ -3711,9 +3656,8 @@ fn coder_phase_gate_outcome(
             flow::Level::Warn,
             "mission.verify",
             &verify_step_id,
-            mission_id,
-            phase_id,
             session_id,
+            phase_id,
             serde_json::json!({
                 "verdict": review.verdict,
                 "blockers": 0,
@@ -3743,9 +3687,8 @@ fn coder_phase_gate_outcome(
         flow::Level::Info,
         "mission.verify",
         &verify_step_id,
-        mission_id,
-        phase_id,
         session_id,
+        phase_id,
         serde_json::json!({
             "verdict": review.verdict,
             "blockers": 0,
@@ -4992,7 +4935,7 @@ mod tests {
                 ..Default::default()
             }),
         );
-        crew::step_kinds::StepRunCtx::new(None, None, None, std::sync::Arc::new(bus))
+        crew::step_kinds::StepRunCtx::new(crate::test_run(), None, None, None, std::sync::Arc::new(bus))
     }
 
     /// (#1511) The role each registered kind ACTUALLY dispatches, pinned by
@@ -6580,13 +6523,10 @@ mod tests {
         for kind in CODER_PHASE_TIER3_KINDS {
             assert!(registry.get(kind).is_ok(), "kind `{kind}` must be registered");
         }
-        // (#1284 review round 1, must-fix 4) The viewer's mission lens keys
-        // on the `mission-run-` session-id prefix — a config-launched run
-        // must stamp the SAME prefix or it's invisible to the lens.
-        assert!(
-            handles.session_id.starts_with("mission-run-"),
-            "session id must carry the viewer's mission-run- prefix, got {}",
-            handles.session_id
+        // The coder run's session is its phase's, in this mission.
+        assert_eq!(
+            handles.session,
+            SessionId::phase(RunId::mission(mission_id.as_str()).unwrap(), handles.real_phase_id.as_str()),
         );
         // (#1546) The build-time-stamp ↔ run-time-read seam. The launcher
         // stamps `injected_budget_chars` here; `MissionCoderStepKind::
@@ -6885,7 +6825,7 @@ mod tests {
             workdir: std::path::PathBuf::from("/tmp/gate-test-worktree"),
             branch: "gate-test-branch".to_string(),
             real_phase_id: phase_id.to_string(),
-            session_id: launch_session_id("gate-test-mission", phase_id),
+            session: SessionId::phase(RunId::mission("gate-test-mission").unwrap(), phase_id),
         };
         let mut steps = BTreeMap::new();
         for (suffix, status) in [("worktree", worktree), ("coder", coder), ("verify", verify)] {
@@ -7166,16 +7106,6 @@ mod tests {
         let id = mint_run_id("draft-blog-post").unwrap();
         assert!(id.starts_with("draft-blog-post-"), "a minted id is still config-id-prefixed, got {id}");
         assert_ne!(id, "draft-blog-post", "a minted id is never the bare config id — every launch is unique");
-    }
-
-    #[test]
-    fn launch_session_id_carries_the_viewer_mission_run_prefix() {
-        // (#1284 review round 1, must-fix 4) the viewer's mission lens keys
-        // per-run session grouping on the `mission-run-` prefix (originally
-        // the legacy `viewer.html`'s convention; that file retired #1806).
-        let sid = launch_session_id("m1", "m1-build");
-        assert_eq!(sid, "mission-run-m1-m1-build");
-        assert!(sid.starts_with("mission-run-"));
     }
 
     // ── gate-arm failure predicate (#1433 follow-up) ────────────────────
@@ -8765,12 +8695,12 @@ mod tests {
             flow::Level::Info,
             darkmux_flow::FlowAction::DispatchStart,
             "coder-phase",
-            "coder-phase-123-abcdef",
+            &RunId::mission("coder-phase-123-abcdef").unwrap(),
             serde_json::json!({ "runtime": "mission" }),
         );
         assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchStart);
         assert_eq!(rec.handle, "coder-phase");
-        assert_eq!(rec.session_id.as_deref(), Some("coder-phase-123-abcdef"));
+        assert_eq!(rec.session_id.as_deref(), Some("coder-phase-123-abcdef.run"));
         assert_eq!(rec.mission_id.as_deref(), Some("coder-phase-123-abcdef"));
         // (#1877 requirement 2) `source` must be distinct from BOTH the
         // per-model-dispatch FROZEN `"crew_dispatch"` value and review's
@@ -8797,7 +8727,7 @@ mod tests {
 
     #[test]
     fn coder_branch_terminal_bookend_ok_0_clean_reaches_the_gate() {
-        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(0), "coder-phase", "m-1");
+        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(0), "coder-phase", &RunId::mission("m-1").unwrap());
         assert!(reached_gate);
         assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchComplete);
         assert!(matches!(rec.level, flow::Level::Info), "{:?}", rec.level);
@@ -8811,7 +8741,7 @@ mod tests {
         // leaves the phase Running at the sign-off gate — real dispatch
         // work that started and FINISHED, same as clean. Must close
         // `dispatch complete`, never `dispatch error`.
-        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(2), "coder-phase", "m-2");
+        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(2), "coder-phase", &RunId::mission("m-2").unwrap());
         assert!(reached_gate, "Ok(2) (QA blockers) must still reach the gate");
         assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchComplete);
         assert!(matches!(rec.level, flow::Level::Info), "{:?}", rec.level);
@@ -8819,7 +8749,7 @@ mod tests {
 
     #[test]
     fn coder_branch_terminal_bookend_ok_3_qa_unavailable_still_reaches_the_gate() {
-        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(3), "coder-phase", "m-3");
+        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(3), "coder-phase", &RunId::mission("m-3").unwrap());
         assert!(reached_gate, "Ok(3) (QA unavailable) must still reach the gate");
         assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchComplete);
         assert!(matches!(rec.level, flow::Level::Info), "{:?}", rec.level);
@@ -8827,7 +8757,7 @@ mod tests {
 
     #[test]
     fn coder_branch_terminal_bookend_ok_1_coder_dispatch_failure_never_reaches_the_gate() {
-        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(1), "coder-phase", "m-4");
+        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(1), "coder-phase", &RunId::mission("m-4").unwrap());
         assert!(!reached_gate);
         assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchError);
         assert!(matches!(rec.level, flow::Level::Error), "{:?}", rec.level);
@@ -8837,7 +8767,7 @@ mod tests {
     #[test]
     fn coder_branch_terminal_bookend_err_worktree_failure_never_reaches_the_gate() {
         let (reached_gate, rec) =
-            coder_branch_terminal_bookend(&Err(anyhow!("worktree already exists")), "coder-phase", "m-5");
+            coder_branch_terminal_bookend(&Err(anyhow!("worktree already exists")), "coder-phase", &RunId::mission("m-5").unwrap());
         assert!(!reached_gate);
         assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchError);
         assert!(matches!(rec.level, flow::Level::Error), "{:?}", rec.level);
@@ -8854,7 +8784,7 @@ mod tests {
     /// ran, not just that SOME "dispatch error" record landed.
     #[test]
     fn coder_branch_terminal_bookend_payload_never_carries_an_error_key() {
-        let (_, rec) = coder_branch_terminal_bookend(&Err(anyhow!("boom")), "coder-phase", "m-6");
+        let (_, rec) = coder_branch_terminal_bookend(&Err(anyhow!("boom")), "coder-phase", &RunId::mission("m-6").unwrap());
         let payload = rec.payload.as_ref().unwrap();
         assert!(
             payload.get("error").is_none(),
@@ -8882,7 +8812,7 @@ mod tests {
                     flow::Level::Error,
                     darkmux_flow::FlowAction::DispatchError,
                     "panic-test-config",
-                    "panic-test-mission",
+                    &RunId::mission("panic-test-mission").unwrap(),
                     serde_json::json!({
                         "runtime": "mission",
                         "result_class": "error",
@@ -8897,7 +8827,7 @@ mod tests {
                     flow::Level::Info,
                     darkmux_flow::FlowAction::DispatchStart,
                     "panic-test-config",
-                    "panic-test-mission",
+                    &RunId::mission("panic-test-mission").unwrap(),
                     serde_json::json!({ "runtime": "mission" }),
                 ),
             );
@@ -8991,7 +8921,7 @@ mod tests {
         );
         for r in &starts {
             assert_eq!(r["mission_id"], serde_json::json!(mission_id));
-            assert_eq!(r["session_id"], serde_json::json!(mission_id));
+            assert_eq!(r["session_id"], serde_json::json!(format!("{mission_id}.run")));
         }
         drop(guard);
     }
@@ -9171,7 +9101,6 @@ mod tests {
             base: "HEAD".to_string(),
             mission_id: "m-test".to_string(),
             phase_id: "p-test".to_string(),
-            session_id: "s-test".to_string(),
             role: "coder".to_string(),
         };
         let seed_artifacts: Vec<(&'static str, Arc<dyn Any + Send + Sync>)> =
@@ -9211,6 +9140,7 @@ mod tests {
         let facts = crew::step_kinds::Facts::default();
         let est = crew::step_kinds::FixedEstimator::default();
         let report = crew::scheduler::run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &registry,

@@ -17,6 +17,7 @@ use std::fs;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use darkmux_types::session_id::SessionId;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Roles whose prompts operate in domains regulated by professional
@@ -247,7 +248,11 @@ pub struct DispatchOpts {
     /// decides which attachment directories the container gets mounted.
     /// Empty on every other path.
     pub brief_refs: Vec<crate::brief_refs::BriefRef>,
-    pub session_id: Option<String>,
+    /// The session this dispatch's records land under. Required: it names
+    /// the run, which the caller owns (a mission step's run, the crew-of-one
+    /// run a top-level `dispatch` minted, a lab run, a fleet relay), so
+    /// every record the dispatch emits carries that run without a lookup.
+    pub session: SessionId,
     /// (#2480) Despite the name, this bounds ONLY the tool-less single-call
     /// paths: `dispatch_remote`'s `curl -m <n>` on a hosted-endpoint call,
     /// and `dispatch_local_single_shot`'s equivalent (the RADIO answering
@@ -272,15 +277,11 @@ pub struct DispatchOpts {
     /// darkmux never auto-creates or auto-removes an operator-named
     /// `--workdir` — see `dispatch_internal`'s workspace setup.
     pub workdir: Option<PathBuf>,
-    /// Optional phase id binding this dispatch to a phase in a
-    /// mission. When set, the dispatch's flow records are stamped with
-    /// `phase_id` (and the owning `mission_id`, resolved via
-    /// [`resolve_mission_for_phase`]) so the viewer groups the dispatch
-    /// under its mission. Provenance stamping ONLY — no message
-    /// rewriting, no output persistence (the #146 Stage 1 cross-phase
-    /// context injection was removed in #1405; `mission run`'s
-    /// `coder_brief()` is the mechanism that carries context between
-    /// phases now). When `None`, records carry no mission/phase fields.
+    /// Optional phase id binding this dispatch to a phase of its run. When
+    /// set, the dispatch's flow records are stamped with `phase_id`.
+    /// Provenance stamping ONLY — no message rewriting, no output
+    /// persistence. The mission a record carries comes from `session`,
+    /// never from this.
     pub phase_id: Option<String>,
     /// Target machine for the dispatch (#246 PR-C.3, #2916). When
     /// `Some(<id>)` and `<id>` differs from the local machine_id, the
@@ -370,12 +371,10 @@ pub struct DispatchOpts {
     /// stamps `step_id` into every per-turn / per-tool / per-token flow
     /// record's `payload`, so the mission-graph viewer can attribute the
     /// live turn+tool+token climb to the seat card even when the dispatch's
-    /// `session_id` is NOT the `step-<id>` default. The coder-phase
-    /// `mission.coder` seat dispatches under a shared `mission-run-<…>`
-    /// session (see `session_id::mission_run`), so its live records were
-    /// previously unattributable and the agentic seat never ticked turns.
-    /// `None` for a one-off `dispatch` that isn't a graph step; such records
-    /// attribute via `session_id` alone, exactly as before.
+    /// session is not the step's own. The coder-phase `mission.coder` seat
+    /// dispatches under its phase's session ([`SessionId::phase`]), so
+    /// without this its live records were unattributable to the seat.
+    /// `None` for a one-off `dispatch` that isn't a graph step.
     pub step_id: Option<String>,
     /// (#1698 Packet B2) Use this text as the system prompt VERBATIM instead
     /// of resolving one via the role's manifest/loader —
@@ -845,12 +844,8 @@ pub struct DispatchResult {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
-    /// The session id actually used for this dispatch. Echoes back the
-    /// caller-supplied `opts.session_id` when set, or the fresh one this
-    /// dispatch generated when `opts.session_id` was `None` (closes #88 —
-    /// without an explicit `--session-id`, per-agent session reuse can
-    /// cause cross-task context pollution).
-    pub session_id: String,
+    /// The session this dispatch ran under (`opts.session`).
+    pub session_id: SessionId,
     /// Host path where the internal runtime's `.darkmux-runtime/`
     /// bookkeeping landed (the dir mounted into the container at
     /// `/darkmux-out`). `None` when the dispatch path doesn't produce
@@ -867,31 +862,22 @@ pub struct DispatchResult {
 }
 
 /// Process-local monotonic counter — guarantees uniqueness for rapid
-/// successive `fresh_session_id` calls in the same process even when the
+/// successive [`fresh_nonce`] calls in the same process even when the
 /// wall-clock micros component collides (loops faster than the system clock).
-static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
+static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Generate a fresh, unique session id for an unscoped `dispatch` call.
-/// Shape: `crew-dispatch-<role>-<unix_micros>-<process_counter>`.
-///
-/// The `crew-dispatch-` prefix is a FROZEN data-contract identifier —
-/// presence tests key on it. It predates the #1426 verb rename (`crew
-/// dispatch` -> `dispatch`); do NOT rename it in a spelling-cleanup sweep.
-///
-/// The micros component distinguishes calls across processes (different
-/// invocations of `darkmux dispatch` from a shell each get their own
-/// process start time). The counter component distinguishes calls within
-/// the same process (scripted callers or future server backends could call
-/// faster than microsecond resolution allows). Together they guarantee no
-/// two `fresh_session_id` calls return the same string, closing the
-/// per-agent session reuse this helper is meant to prevent (#88).
-pub fn fresh_session_id(role_id: &str) -> String {
+/// A fresh nonce for an ad-hoc dispatch's session
+/// ([`SessionId::adhoc`]): `<unix_micros>-<process_counter>`. The micros
+/// distinguish calls across processes, the counter calls within one, so no
+/// two calls return the same string (#88: a reused session pollutes one
+/// task with another's context).
+pub fn fresh_nonce() -> String {
     let micros = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros())
         .unwrap_or(0);
-    let counter = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("crew-dispatch-{role_id}-{micros}-{counter}")
+    let counter = NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{micros}-{counter}")
 }
 
 /// Resolve the path to the optional operator-identity file (#147).
@@ -990,24 +976,6 @@ pub(crate) fn tail_excerpt(content: &str, max: usize) -> String {
     format!("[… stderr truncated, showing last {max} of {n} chars]\n{tail}")
 }
 
-/// (#714) Resolve a phase's mission so every dispatch flow record can be
-/// stamped with `mission_id` and group under its mission in the observability
-/// view. `None` when there's no `--phase-id` or the phase manifest can't be
-/// loaded — best-effort metadata, never a reason to fail the dispatch.
-pub(crate) fn resolve_mission_for_phase(phase_id: Option<&str>) -> Option<String> {
-    let phase_id = phase_id?;
-    match crate::lifecycle::load_phase_by_id(phase_id) {
-        Ok(s) => Some(s.mission_id),
-        Err(_) => {
-            eprintln!(
-                "darkmux dispatch: phase `{phase_id}` not found; \
-                 flow records won't carry a mission_id."
-            );
-            None
-        }
-    }
-}
-
 /// Run a single dispatch end-to-end.
 ///
 /// Local dispatch entry point. Runs the role through the in-house
@@ -1079,37 +1047,24 @@ pub enum RoutingDecision {
     Remote { target: String, local_unknown: bool },
 }
 
-/// Emit a `dispatch route` flow record at the moment the routing
-/// decision is made and return the resolved session_id so the caller
-/// can re-attach it to `opts.session_id`. This ensures the route
-/// record's session_id matches the runner's subsequent `dispatch
-/// start` / `dispatch complete` records — the topology UI's pair-
-/// rendering depends on session_id continuity.
+/// Emit a `dispatch route` flow record at the moment the routing decision
+/// is made, under the dispatch's own session, so the topology UI pairs it
+/// with the dispatch's later records.
 ///
 /// After #590 the only routed path is explicit `--machine`
 /// (`target_machine: Some(id)`, `decision: "pinned"`); the tier
 /// auto-route arm was retired, so `decision: "auto"` no longer occurs.
-pub fn emit_route_record_and_resolve_session(
-    opts: &DispatchOpts,
-    target_machine: Option<&str>,
-) -> String {
-    let session_id = opts
-        .session_id
-        .clone()
-        .unwrap_or_else(|| fresh_session_id(&opts.role_id));
+pub fn emit_route_record(opts: &DispatchOpts, target_machine: Option<&str>) {
     let payload = build_route_payload(target_machine, opts.profile_name.as_deref());
-    let mission_id = resolve_mission_for_phase(opts.phase_id.as_deref());
     let _ = darkmux_flow::record(build_dispatch_record_with_payload(
         darkmux_flow::Level::Info,
         darkmux_flow::FlowAction::DispatchRoute,
         &opts.role_id,
-        &session_id,
+        &opts.session,
         None,
-        mission_id.as_deref(),
         opts.phase_id.as_deref(),
         Some(payload),
     ));
-    session_id
 }
 
 /// Construct the payload for a `dispatch route` flow record (#247
@@ -1193,36 +1148,27 @@ pub fn build_dispatch_record_with_payload(
     level: darkmux_flow::Level,
     action: darkmux_flow::FlowAction,
     role_id: &str,
-    session_id: &str,
+    session: &SessionId,
     model: Option<&str>,
-    mission_id: Option<&str>,
     phase_id: Option<&str>,
     payload: Option<serde_json::Value>,
 ) -> darkmux_flow::FlowRecord {
     darkmux_flow::FlowRecord {
-        ts: darkmux_flow::ts_utc_now(),
-        level,
-        category: darkmux_flow::Category::Work,
-        tier: darkmux_flow::Tier::Local,
-        stage: darkmux_flow::Stage::Dispatch,
-        action,
-        handle: role_id.to_string(),
         phase_id: phase_id.map(String::from),
-        session_id: Some(session_id.to_string()),
         // FROZEN data-contract value: consumed by the viewer's source join and
         // test-asserted. Predates the #1426 verb rename (`crew dispatch` ->
         // `dispatch`); do NOT rename in a spelling-cleanup sweep.
         source: Some("crew_dispatch".to_string()),
         model: model.map(String::from),
-        reasoning: None,
-        mission_id: mission_id.map(String::from),
-        machine_id: None,
-        machine_uid: None,
-        prev_hash: None,
-        hash: None,
         payload,
-        work_id: None,
-        attempt: None,
+        ..darkmux_flow::FlowRecord::for_session(
+            session,
+            level,
+            darkmux_flow::Category::Work,
+            darkmux_flow::Stage::Dispatch,
+            action,
+            role_id,
+        )
     }
 }
 
@@ -1238,33 +1184,24 @@ pub fn build_telemetry_record(
     action: darkmux_flow::FlowAction,
     source: &str,
     role_id: &str,
-    session_id: &str,
+    session: &SessionId,
     model: Option<&str>,
-    mission_id: Option<&str>,
     phase_id: Option<&str>,
     payload: serde_json::Value,
 ) -> darkmux_flow::FlowRecord {
     darkmux_flow::FlowRecord {
-        ts: darkmux_flow::ts_utc_now(),
-        level,
-        category: darkmux_flow::Category::Telemetry,
-        tier: darkmux_flow::Tier::Local,
-        stage: darkmux_flow::Stage::Dispatch,
-        action,
-        handle: role_id.to_string(),
         phase_id: phase_id.map(String::from),
-        session_id: Some(session_id.to_string()),
         source: Some(source.to_string()),
         model: model.map(String::from),
-        reasoning: None,
-        mission_id: mission_id.map(String::from),
-        machine_id: None,
-        machine_uid: None,
-        prev_hash: None,
-        hash: None,
         payload: Some(payload),
-        work_id: None,
-        attempt: None,
+        ..darkmux_flow::FlowRecord::for_session(
+            session,
+            level,
+            darkmux_flow::Category::Telemetry,
+            darkmux_flow::Stage::Dispatch,
+            action,
+            role_id,
+        )
     }
 }
 
@@ -1418,9 +1355,8 @@ mod tests {
             darkmux_flow::FlowAction::TelemetryDetector,
             "detector",
             "coder",
-            "sess-1",
+            &crate::test_session("sess-1"),
             Some("darkmux:qwen3.6"),
-            None,
             None,
             payload.clone(),
         );
@@ -1430,7 +1366,7 @@ mod tests {
         assert!(matches!(rec.tier, darkmux_flow::Tier::Local));
         assert!(matches!(rec.stage, darkmux_flow::Stage::Dispatch));
         assert_eq!(rec.handle, "coder");
-        assert_eq!(rec.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(rec.session_id, Some(crate::test_session("sess-1").wire()));
         assert_eq!(rec.model.as_deref(), Some("darkmux:qwen3.6"));
         assert_eq!(rec.payload, Some(payload));
     }
@@ -1447,8 +1383,7 @@ mod tests {
             darkmux_flow::FlowAction::TelemetryDetector,
             "detector",
             "coder",
-            "sess-1",
-            None,
+            &crate::test_session("sess-1"),
             None,
             None,
             serde_json::json!({ "kind": "cycle", "severity": "warn", "detail": "x" }),
@@ -1705,145 +1640,6 @@ mod tests {
         }
     }
 
-    #[test]
-    #[serial_test::serial]
-    fn resolve_mission_for_phase_returns_mission_for_known_phase() {
-        // (#714) The resolution heart of the fix: a known phase id maps to
-        // its mission so dispatch records can group under it.
-        let tmp = TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        unsafe {
-            std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
-        }
-        let phases_dir = tmp.path().join("missions").join("sweep").join("phases");
-        fs::create_dir_all(&phases_dir).unwrap();
-        fs::write(
-            phases_dir.join("s694.json"),
-            r#"{"id":"s694","mission_id":"sweep","description":"d","status":"planned","depends_on":[],"created_ts":0}"#,
-        ).unwrap();
-
-        assert_eq!(
-            resolve_mission_for_phase(Some("s694")).as_deref(),
-            Some("sweep")
-        );
-        // No phase id → no mission (one-off dispatch).
-        assert!(resolve_mission_for_phase(None).is_none());
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
-            }
-        }
-    }
-
-    /// (#1918) `dispatch_internal::dispatch` composes THIS SAME resolved
-    /// mission id into its own `session_id` (right beside the resolution
-    /// tested above), closing the collision for the one producer that
-    /// streams its own records directly (`dispatch start`/`dispatch.turn`/
-    /// `dispatch.tool`/`dispatch complete`/telemetry — bypassing
-    /// `StepOutcome.flow_records`/`StepRunCtx::emit`, both of which the
-    /// launcher's own `emit`-wrap already scopes). A full end-to-end proof
-    /// of `dispatch()`'s own wiring needs a real container
-    /// (`mock_dispatch_proof.rs`'s tests are `#[ignore]`d for exactly that
-    /// reason); this proves the COMPOSITION `dispatch()` applies at that
-    /// resolution point is the one two missions running the SAME config
-    /// (the `session_id::step` default, unset by config) need: distinct
-    /// per-mission session ids for the identical, config-derived default.
-    #[test]
-    #[serial_test::serial]
-    fn dispatch_internal_composes_the_resolved_mission_into_a_config_derived_session_id() {
-        // (#2718) Every darkmux write destination, pinned for this test.
-        // Measured before this line existed: a full `-p darkmux-crew --lib`
-        // run with all twelve state variables exported to a fresh root still
-        // wrote a findings file, 29 flow records across 12 (action, source,
-        // session) groups, 214 hash-chained audit records and a liveness log
-        // into that root — the operator's real tree in an ordinary shell.
-        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
-        let tmp = TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        unsafe {
-            std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
-        }
-        let phases_dir = tmp.path().join("missions").join("mission-a").join("phases");
-        fs::create_dir_all(&phases_dir).unwrap();
-        fs::write(
-            phases_dir.join("p1.json"),
-            r#"{"id":"p1","mission_id":"mission-a","description":"d","status":"planned","depends_on":[],"created_ts":0}"#,
-        )
-        .unwrap();
-        let other_phases_dir = tmp.path().join("missions").join("mission-b").join("phases");
-        fs::create_dir_all(&other_phases_dir).unwrap();
-        fs::write(
-            other_phases_dir.join("p1.json"),
-            r#"{"id":"p1","mission_id":"mission-b","description":"d","status":"planned","depends_on":[],"created_ts":0}"#,
-        )
-        .unwrap();
-
-        // The SAME `session_id::step` default a `dispatch.internal` step
-        // with no explicit `config.session_id` falls back to — literally
-        // out of the mission config document, byte-identical whichever
-        // mission runs it.
-        let raw_session_id = darkmux_types::session_id::step("s1");
-
-        // Two DIFFERENT phases (as two launches of the same config would
-        // each mint their own phase under their own mission), same phase
-        // id `p1`, same step id `s1` — the actual #1918 collision shape.
-        let mission_a = resolve_mission_for_phase(Some("p1"));
-        // Force the second resolution to hit the OTHER mission's phase by
-        // pointing `DARKMUX_CREW_DIR`'s layout differently is awkward here
-        // (both phases share the literal id `p1`, one per mission dir) —
-        // resolve each directly against its own known mission_id instead,
-        // proving the composition, not the phase-lookup collision (a
-        // SEPARATE, real limitation: two phases sharing a literal id
-        // across missions is exactly why #1918 exists at the session_id
-        // layer in the first place, and `load_phase_by_id` itself resolves
-        // by id, not by mission — out of scope for this test).
-        assert_eq!(mission_a.as_deref(), Some("mission-a"));
-
-        let scoped_a = match &mission_a {
-            Some(mid) => darkmux_types::session_id::scope_to_run(&raw_session_id, mid),
-            None => raw_session_id.clone(),
-        };
-        let scoped_b = darkmux_types::session_id::scope_to_run(&raw_session_id, "mission-b");
-
-        assert_eq!(scoped_a, "step-s1-mission-a");
-        assert_eq!(scoped_b, "step-s1-mission-b");
-        assert_ne!(
-            scoped_a, scoped_b,
-            "two missions running the identical config-derived session_id default must diverge \
-             once scoped to their own mission — the #1918 collision surface `dispatch()` itself closes"
-        );
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
-            }
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn resolve_mission_for_phase_returns_none_for_unknown_phase() {
-        // An unresolvable phase warns (stderr) and degrades to None rather
-        // than failing the dispatch — flow records just go ungrouped.
-        let tmp = TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        unsafe {
-            std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
-        }
-        // No manifests written under the crew dir.
-        assert!(resolve_mission_for_phase(Some("does-not-exist")).is_none());
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
-            }
-        }
-    }
-
     /// (#1511) The CHECK-ONLY variant the scheduler uses. It refuses
     /// without a recorded ack and passes with one, and — the property that
     /// matters — it reaches neither branch of the prompting variant's TTY
@@ -1979,64 +1775,25 @@ mod tests {
         );
     }
 
-    // ─── #88: fresh session id per dispatch ────────────────────────────────
+    // ─── #88: a fresh nonce per ad-hoc dispatch ────────────────────────────
 
     #[test]
-    fn fresh_session_id_includes_role_micros_and_counter() {
-        let id = fresh_session_id("code-reviewer");
-        // Shape: `crew-dispatch-<role>-<micros>-<counter>`
-        assert!(id.starts_with("crew-dispatch-code-reviewer-"), "got {id:?}");
-        let suffix = id.trim_start_matches("crew-dispatch-code-reviewer-");
-        // Suffix splits into <micros>-<counter>; both digit-only.
-        let parts: Vec<&str> = suffix.split('-').collect();
-        assert_eq!(
-            parts.len(),
-            2,
-            "expected <micros>-<counter>, got {suffix:?}"
-        );
+    fn fresh_nonce_is_micros_and_counter() {
+        let nonce = fresh_nonce();
+        let parts: Vec<&str> = nonce.split('-').collect();
+        assert_eq!(parts.len(), 2, "expected <micros>-<counter>, got {nonce:?}");
         let micros: u128 = parts[0].parse().expect("micros should parse as u128");
         let _counter: u64 = parts[1].parse().expect("counter should parse as u64");
         // Plausibly-recent timestamp (post-2020-01-01 in micros).
-        assert!(
-            micros > 1_577_836_800_000_000,
-            "suffix should be after 2020-01-01 (micros), got {micros}",
-        );
+        assert!(micros > 1_577_836_800_000_000, "after 2020-01-01 (micros), got {micros}");
     }
 
     #[test]
-    fn fresh_session_id_uniqueness_under_rapid_calls() {
-        // Two back-to-back calls must not collide. Microsecond resolution
-        // guards against the same-second collision the prior implementation
-        // had (would have re-introduced the per-agent session reuse #88
-        // tried to fix). Generate a batch and assert all-unique.
-        let ids: Vec<String> = (0..50).map(|_| fresh_session_id("coder")).collect();
-        let unique: std::collections::HashSet<_> = ids.iter().cloned().collect();
-        assert_eq!(
-            unique.len(),
-            ids.len(),
-            "50 rapid calls produced {} unique ids (expected 50)",
-            unique.len(),
-        );
-    }
-
-    #[test]
-    fn fresh_session_id_differs_across_roles() {
-        // Same call instant, different roles → different ids.
-        let a = fresh_session_id("coder");
-        let b = fresh_session_id("crawler");
-        assert_ne!(a, b);
-        assert!(a.contains("-coder-"));
-        assert!(b.contains("-crawler-"));
-    }
-
-    #[test]
-    fn fresh_session_id_handles_roles_with_hyphens() {
-        // `code-reviewer` is one of the production roles and contains a
-        // hyphen; the format must preserve it cleanly (no escape, no split).
-        let id = fresh_session_id("code-reviewer");
-        assert!(id.starts_with("crew-dispatch-code-reviewer-"));
-        // No double-hyphen artifact.
-        assert!(!id.contains("crew-dispatch--"));
+    fn fresh_nonce_never_repeats_under_rapid_calls() {
+        // Microsecond resolution alone collides in a tight loop; the
+        // counter is what keeps 50 back-to-back calls distinct (#88).
+        let nonces: std::collections::HashSet<String> = (0..50).map(|_| fresh_nonce()).collect();
+        assert_eq!(nonces.len(), 50, "50 rapid calls must produce 50 distinct nonces");
     }
 
     // ─── build_dispatch_record_with_payload (Phase 2 of #104) ──────────────────────────
@@ -2047,17 +1804,16 @@ mod tests {
             darkmux_flow::Level::Info,
             darkmux_flow::FlowAction::DispatchStart,
             "coder",
-            "crew-dispatch-coder-12345-1",
+            &crate::test_session("crew-dispatch-coder-12345-1"),
             Some("darkmux:qwen3.6-35b-a3b"),
-            None,
             None,
             None,
         );
         assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchStart);
         assert_eq!(rec.handle, "coder");
         assert_eq!(
-            rec.session_id.as_deref(),
-            Some("crew-dispatch-coder-12345-1")
+            rec.session_id,
+            Some(crate::test_session("crew-dispatch-coder-12345-1").wire())
         );
         assert_eq!(rec.source.as_deref(), Some("crew_dispatch"));
         assert_eq!(rec.model.as_deref(), Some("darkmux:qwen3.6-35b-a3b"));
@@ -2082,8 +1838,7 @@ mod tests {
             darkmux_flow::Level::Info,
             darkmux_flow::FlowAction::DispatchStart,
             "coder",
-            "session-no-model",
-            None,
+            &crate::test_session("session-no-model"),
             None,
             None,
             None,
@@ -2106,9 +1861,8 @@ mod tests {
             darkmux_flow::Level::Info,
             darkmux_flow::FlowAction::DispatchStart,
             "coder",
-            "crew-dispatch-coder-99-internal",
+            &crate::mission_test_session("pre-1.0-compat-sweep", "crew-dispatch-coder-99-internal"),
             Some("darkmux:qwen3.6"),
-            Some("pre-1.0-compat-sweep"),
             Some("s694-profiles-schema"),
             None,
         );
@@ -2125,9 +1879,8 @@ mod tests {
             darkmux_flow::Level::Info,
             darkmux_flow::FlowAction::DispatchStart,
             "coder",
-            "crew-dispatch-coder-99-internal",
+            &crate::test_session("crew-dispatch-coder-99-internal"),
             Some("darkmux:qwen3.6"),
-            None,
             None,
             None,
         );
@@ -2149,9 +1902,8 @@ mod tests {
             darkmux_flow::FlowAction::TelemetryRuntime,
             "runtime",
             "coder",
-            "sess-1",
+            &crate::mission_test_session("pre-1.0-compat-sweep", "sess-1"),
             Some("darkmux:qwen3.6"),
-            Some("pre-1.0-compat-sweep"),
             Some("s694-profiles-schema"),
             serde_json::json!({ "turns": 9 }),
         );
@@ -2168,9 +1920,8 @@ mod tests {
             darkmux_flow::Level::Info,
             darkmux_flow::FlowAction::DispatchComplete,
             "coder",
-            "session-abc",
+            &crate::test_session("session-abc"),
             Some("darkmux:foo"),
-            None,
             None,
             None,
         );
@@ -2178,9 +1929,8 @@ mod tests {
             darkmux_flow::Level::Error,
             darkmux_flow::FlowAction::DispatchError,
             "coder",
-            "session-abc",
+            &crate::test_session("session-abc"),
             Some("darkmux:foo"),
-            None,
             None,
             None,
         );
@@ -2207,7 +1957,7 @@ mod action_vocabulary_conformance {
             (darkmux_flow::FlowAction::DispatchError, "dispatch.error"),
         ] {
             let rec = build_dispatch_record_with_payload(
-                darkmux_flow::Level::Info, action.clone(), "coder", "sess-1", Some("m"), None, None, None,
+                darkmux_flow::Level::Info, action.clone(), "coder", &crate::test_session("sess-1"), Some("m"), None, None,
             );
             let line = serde_json::to_string(&rec).unwrap();
             let v: serde_json::Value = serde_json::from_str(&line).unwrap();

@@ -119,6 +119,18 @@ pub use darkmux_types as types;
 pub use darkmux_types::workdir;
 pub use darkmux_lab::workloads;
 
+/// A test's session: an ad-hoc `coder` dispatch `nonce` in mission `m-test`.
+#[cfg(test)]
+pub(crate) fn test_session(nonce: &str) -> darkmux_types::session_id::SessionId {
+    darkmux_types::session_id::SessionId::adhoc(test_run(), "coder", nonce)
+}
+
+/// A test's mission run.
+#[cfg(test)]
+pub(crate) fn test_run() -> darkmux_types::session_id::RunId {
+    darkmux_types::session_id::RunId::mission("m-test").expect("a literal run id is never empty")
+}
+
 fn main() -> Result<()> {
     providers::register_builtins()?;
     let cli = Cli::parse();
@@ -462,12 +474,12 @@ fn cmd_correction(sub: CorrectionCmd) -> Result<i32> {
             days,
             json: cli::JsonFlagPlain { json },
         } => {
-            // Resolve the scope. `None` = every session in the window; a
-            // mission resolves to its EXACT dispatch session ids (the same
-            // construction the brief uses — never a prefix, which would bleed a
-            // sibling mission whose id is a hyphen-extension, #849).
-            let scope: Option<std::collections::HashSet<String>> = match (&mission, &session) {
-                (Some(mid), _) => {
+            // Resolve the scope. A mission resolves to its phases' coder
+            // runs (the same scope the brief uses — an exact phase match,
+            // never a prefix, which would bleed a sibling mission whose id
+            // is a hyphen-extension, #849).
+            let phases = match &mission {
+                Some(mid) => {
                     fleet::validate_identifier("mission", mid)?;
                     let missions = crew::loader::load_missions()?;
                     let m = missions.iter().find(|m| &m.id == mid).ok_or_else(|| {
@@ -475,18 +487,17 @@ fn cmd_correction(sub: CorrectionCmd) -> Result<i32> {
                             "mission `{mid}` not found (check `darkmux mission status`)"
                         )
                     })?;
-                    Some(
-                        m.phase_ids
-                            .iter()
-                            .map(|pid| darkmux_types::session_id::mission_run(mid, pid))
-                            .collect(),
-                    )
+                    Some(crew::corrections::PhaseSessions::new(mid, m.phase_ids.iter().cloned()))
                 }
-                (None, Some(sid)) => Some(std::iter::once(sid.clone()).collect()),
-                (None, None) => None,
+                None => None,
+            };
+            let scope = match (&phases, &session) {
+                (Some(p), _) => crew::corrections::Scope::Phases(p),
+                (None, Some(sid)) => crew::corrections::Scope::Session(sid),
+                (None, None) => crew::corrections::Scope::All,
             };
 
-            let found = crew::corrections::scan(days, scope.as_ref());
+            let found = crew::corrections::scan(days, scope);
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&found)?);
@@ -1071,14 +1082,16 @@ fn cmd_mission_dispatch(
     //    (all-or-nothing, HIGH-2 from the PR-D.1 review): an oversize
     //    description is found before anything leaves this machine.
     let local_machine = flow::resolve_machine_id();
-    let dispatch_micros = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros())
-        .unwrap_or(0);
-    let mut jobs: Vec<(String, String, fleet::WorkJob)> = Vec::new(); // (phase_id, session_id, job)
-    for (idx, phase) in started.iter().enumerate() {
-        let session_id =
-            darkmux_types::session_id::mission_phase_dispatch(mission_id, &phase.id, dispatch_micros, idx);
+    let run = darkmux_types::session_id::RunId::mission(mission_id)?;
+    let mut jobs: Vec<(String, darkmux_types::session_id::SessionId, fleet::WorkJob)> = Vec::new();
+    for phase in &started {
+        // One ad-hoc dispatch of the role per phase, unique however often the
+        // phase is dispatched.
+        let session_id = darkmux_types::session_id::SessionId::adhoc(
+            run.clone(),
+            role_id,
+            format!("{}-{}", phase.id, crew::dispatch::fresh_nonce()),
+        );
         let job = fleet::build_work_job(
             machine.to_string(),
             role_id.to_string(),
@@ -1145,7 +1158,12 @@ enum PhaseOutcome {
 /// (#2916 stage 2 review M3) One phase's reply as `mission dispatch` reports
 /// it. A `queued` reply is the receiver taking the phase, not a failure: its
 /// own reason is printed.
-fn phase_outcome(reply: &fleet::SubmissionReply, phase_id: &str, session_id: &str, machine: &str) -> PhaseOutcome {
+fn phase_outcome(
+    reply: &fleet::SubmissionReply,
+    phase_id: &str,
+    session_id: &darkmux_types::session_id::SessionId,
+    machine: &str,
+) -> PhaseOutcome {
     use fleet::ReplyStatus;
     match reply.status {
         ReplyStatus::Accepted => PhaseOutcome::NotWaiting(format!(
@@ -1342,10 +1360,13 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         // resumed read-write, and tier 4's own resume hint emits this flag.
         workspace_read_only,
         record_context: None,
+        // The crew-of-one run this dispatch is, minted here so the route
+        // record, a fleet submission and the local run all carry it;
+        // `--session-id` names the dispatch within it.
+        session: crew::dispatch_as_crew_of_one::dispatch_session(&role, session_id),
         role_id: role,
         message,
         brief_refs,
-        session_id,
         // (#2480) `timeout_seconds` bounds ONLY the tool-less single-call
         // paths (remote/hosted dispatch, the RADIO single-shot path) —
         // unchanged behavior, same default as before the CLI flag became
@@ -2183,18 +2204,18 @@ mod tests {
             reason: Some("studio is busy (x is running on big); the job is queued".into()),
             ..SubmissionReply::of(ReplyStatus::Queued)
         };
-        match super::phase_outcome(&queued, "p1", "s1", "studio") {
+        match super::phase_outcome(&queued, "p1", &crate::test_session("s1"), "studio") {
             super::PhaseOutcome::NotWaiting(line) => {
                 assert!(line.contains("queued on studio") && line.contains("x is running on big"), "{line}")
             }
             other => panic!("a queued phase was reported as {other:?}"),
         }
         let accepted = SubmissionReply::of(ReplyStatus::Accepted);
-        assert!(matches!(super::phase_outcome(&accepted, "p", "s", "m"), super::PhaseOutcome::NotWaiting(_)));
+        assert!(matches!(super::phase_outcome(&accepted, "p", &crate::test_session("s"), "m"), super::PhaseOutcome::NotWaiting(_)));
         let done = SubmissionReply { exit_code: Some(0), ..SubmissionReply::of(ReplyStatus::Completed) };
-        assert!(matches!(super::phase_outcome(&done, "p", "s", "m"), super::PhaseOutcome::Finished { ok: true, .. }));
+        assert!(matches!(super::phase_outcome(&done, "p", &crate::test_session("s"), "m"), super::PhaseOutcome::Finished { ok: true, .. }));
         let failed = SubmissionReply { exit_code: Some(2), ..SubmissionReply::of(ReplyStatus::Completed) };
-        assert!(matches!(super::phase_outcome(&failed, "p", "s", "m"), super::PhaseOutcome::Finished { ok: false, .. }));
+        assert!(matches!(super::phase_outcome(&failed, "p", &crate::test_session("s"), "m"), super::PhaseOutcome::Finished { ok: false, .. }));
     }
 
     /// (#2947 review C1) `mission dispatch` refuses bad enum config before

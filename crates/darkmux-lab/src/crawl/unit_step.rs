@@ -47,6 +47,7 @@ use darkmux_crew::rules::{self, Rule};
 use darkmux_crew::step_kinds::{CwdPolicy, Port, SeatClaim, StepKind, StepKindRegistry, StepOutcome, StepRunCtx};
 use darkmux_crew::thermal_governor;
 use darkmux_crew::types::{Step, Task};
+use darkmux_types::session_id::{RunId, SessionId};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -703,27 +704,15 @@ fn readback_findings(
     out_dir: &Path,
     into: &Path,
     model: Option<&str>,
-    session_id: &str,
+    session: &SessionId,
 ) -> (usize, Vec<FindingRef>) {
     let Some(body) = darkmux_crew::dispatch_internal::read_out_dir_text(out_dir, ".darkmux-runtime/findings.jsonl") else {
         return (0, Vec::new());
     };
     // (#2302) A key's dispatch half becomes a path segment under the
-    // finding store, so a session id that could escape it produces NO refs
-    // at all rather than an unresolvable key a create-mods step would refuse on.
-    // The COUNT is unaffected: the unit observed what it observed, whether
-    // or not the observations can be addressed. The crawl mints its own
-    // session ids, so this is a backstop, not an expected path — and it is
-    // loud.
-    let addressable = darkmux_crew::findings::is_safe_dispatch_segment(session_id);
-    if !addressable {
-        eprintln!(
-            "{}",
-            darkmux_types::style::warn(&format!(
-                "crawl.unit: session id `{session_id}` is not a finding-store segment — this unit's findings are counted but not addressable"
-            ))
-        );
-    }
+    // finding store: a session's wire string always is one (its grammar
+    // keeps it inside `[A-Za-z0-9._-]` and never leading with `.`).
+    let session_id = session.wire();
     let mut refs: Vec<FindingRef> = Vec::new();
     let mut found = 0usize;
     let mut buf = String::new();
@@ -758,17 +747,15 @@ fn readback_findings(
             if let Some(m) = model {
                 obj.insert("model".to_string(), json!(m));
             }
-            if addressable {
-                let key = format!("{session_id}/{seq}");
-                refs.push(FindingRef {
-                    id: key.replace('/', "-"),
-                    key,
-                    file: obj.get(FINDING_FILE_KEY).and_then(Value::as_str).map(str::to_string),
-                    line: obj.get("line").and_then(Value::as_u64),
-                    rule: rule_id.clone(),
-                    tree_root: ctx.tree_root.display().to_string(),
-                });
-            }
+            let key = format!("{session_id}/{seq}");
+            refs.push(FindingRef {
+                id: key.replace('/', "-"),
+                key,
+                file: obj.get(FINDING_FILE_KEY).and_then(Value::as_str).map(str::to_string),
+                line: obj.get("line").and_then(Value::as_u64),
+                rule: rule_id.clone(),
+                tree_root: ctx.tree_root.display().to_string(),
+            });
         }
         buf.push_str(&serde_json::to_string(&rec).unwrap_or_default());
         buf.push('\n');
@@ -989,7 +976,7 @@ struct UnitContext {
     source: String,
     sha: String,
     rule_ids: Vec<String>,
-    session_id: String,
+    session_id: SessionId,
     /// The materialized workspace tree ROOT — the parent of this unit's
     /// own source tree, so the container's `/workspace/<source>/…` paths
     /// (which every message renders) resolve.
@@ -1000,9 +987,10 @@ struct UnitContext {
 /// tree root, and the rule ids it names. Every failure names the unit.
 /// `rule_segment` is the same rule-scoped segment the unit's on-disk dir
 /// uses (`unit_rule_dir`, #2360): a per-rule plan numbers its units from
-/// `u-0001`, so the dispatch session id — and with it the container name and
+/// `u-0001`, so the dispatch session — and with it the container name and
 /// every `<session>/<seq>` finding key — must carry the rule too (#2383).
-fn unit_context(the_plan: &Plan, unit: &Unit, mission_id: &str, rule_segment: &str) -> Result<UnitContext> {
+/// The session is an ad-hoc dispatch of `role_id` in `run`.
+fn unit_context(the_plan: &Plan, unit: &Unit, run: &RunId, role_id: &str, rule_segment: &str) -> Result<UnitContext> {
     let source = match unit {
         Unit::Site { source, .. } | Unit::Read { source, .. } | Unit::Edge { source, .. } => source.clone(),
     };
@@ -1037,7 +1025,7 @@ fn unit_context(the_plan: &Plan, unit: &Unit, mission_id: &str, rule_segment: &s
         source,
         sha: ps.sha.clone(),
         rule_ids: unit_rules(unit),
-        session_id: format!("crawl-{mission_id}-{rule_segment}-{}", unit.id()),
+        session_id: SessionId::adhoc(run.clone(), role_id, format!("{rule_segment}-{}", unit.id())),
         tree_root,
     })
 }
@@ -1212,7 +1200,7 @@ impl StepKind for CrawlUnitStepKind {
         CwdPolicy::NoAmbientDependency
     }
 
-    fn run(&self, step: &Step, task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+    fn run(&self, step: &Step, task: &Task, _input: &BTreeMap<String, String>, run_ctx: &StepRunCtx) -> Result<StepOutcome> {
         let cfg = UnitStepConfig::from_step(step)?;
         // (#2310 fix-loop E2, S5-7) Legal, honored, and said out loud: a
         // value this far above the measured range is more often a typo than
@@ -1226,8 +1214,8 @@ impl StepKind for CrawlUnitStepKind {
                 step.id, cfg.draws, cfg.draws, cfg.draws
             );
         }
-        let mission_id = mission_id_for(task)?;
-        let run_dir = darkmux_crew::loader::missions_dir().join(&mission_id);
+        let mission_id = mission_of(run_ctx)?;
+        let run_dir = darkmux_crew::loader::missions_dir().join(mission_id);
 
         // The read IS the check: the content id is verified before the
         // body, and the body is read through `Plan`.
@@ -1251,7 +1239,15 @@ impl StepKind for CrawlUnitStepKind {
         // named `u-0001` into the SAME mission (see `unit_rule_dir`'s doc for
         // the live dir collision; #2383 for the container-name one).
         let rule_dir = unit_rule_dir(cfg.rule.as_deref(), &unit_rules(unit))?;
-        let ctx = unit_context(&the_plan, unit, &mission_id, &rule_dir)?;
+        // (#2310 P4c) The Task's OWN `role_id` — `"crawler"` for every
+        // crawl.json task, unchanged from before this generalization; a
+        // review.json task instead declares `"role_id": "reviewer"`,
+        // which is what makes this ONE step kind ("Units. Already
+        // generic: a map step over units with a role that carries the
+        // finding tool" — DESIGN.md) actually reusable rather than only
+        // described as reusable.
+        let role_id = task.role_id.clone().unwrap_or_else(|| "crawler".to_string());
+        let ctx = unit_context(&the_plan, unit, run_ctx.run_id(), &role_id, &rule_dir)?;
 
         // (#2454) The thermal breaker's between-units gate: a unit that has
         // not started must not start once the breaker has tripped (#2109).
@@ -1389,14 +1385,6 @@ impl StepKind for CrawlUnitStepKind {
         std::fs::create_dir_all(&unit_dir).with_context(|| format!("creating {}", unit_dir.display()))?;
         let host_out = unit_dir.join("out");
 
-        // (#2310 P4c) The Task's OWN `role_id` — `"crawler"` for every
-        // crawl.json task, unchanged from before this generalization; a
-        // review.json task instead declares `"role_id": "reviewer"`,
-        // which is what makes this ONE step kind ("Units. Already
-        // generic: a map step over units with a role that carries the
-        // finding tool" — DESIGN.md) actually reusable rather than only
-        // described as reusable.
-        let role_id = task.role_id.clone().unwrap_or_else(|| "crawler".to_string());
         let seat = resolve_crawler_seat(&role_id);
 
         // (#2310 P4c-2b) `draws` dispatches this SAME unit `cfg.draws`
@@ -1430,7 +1418,14 @@ impl StepKind for CrawlUnitStepKind {
             let (draw_session_id, draw_host_out) = if draw == 0 {
                 (ctx.session_id.clone(), host_out.clone())
             } else {
-                (format!("{}-d{}", ctx.session_id, draw + 1), unit_dir.join(format!("out-d{}", draw + 1)))
+                (
+                    SessionId::adhoc(
+                        run_ctx.run_id().clone(),
+                        &role_id,
+                        format!("{rule_dir}-{}-d{}", ctx.unit_id, draw + 1),
+                    ),
+                    unit_dir.join(format!("out-d{}", draw + 1)),
+                )
             };
             let started = std::time::Instant::now();
             let opts = DispatchOpts {
@@ -1441,7 +1436,7 @@ impl StepKind for CrawlUnitStepKind {
                 brief_refs: Vec::new(),
                 role_id: role_id.clone(),
                 message: message.clone(),
-                session_id: Some(draw_session_id.clone()),
+                session: draw_session_id.clone(),
                 // (#2542) This field bounds ONLY the tool-less single-call
                 // paths (`dispatch_remote`'s `curl -m`, the single-shot
                 // path) — see `DispatchOpts::timeout_seconds`'s own doc.
@@ -1810,9 +1805,9 @@ impl StepKind for CrawlSummaryStepKind {
     /// name it. The mission's own step records are the one place the whole
     /// set is knowable, and they are already on disk by the time this
     /// phase runs.
-    fn run(&self, step: &Step, task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
-        let mission_id = mission_id_for(task)?;
-        let summary = summarize_mission(&mission_id)?;
+    fn run(&self, step: &Step, task: &Task, _input: &BTreeMap<String, String>, run_ctx: &StepRunCtx) -> Result<StepOutcome> {
+        let mission_id = mission_of(run_ctx)?;
+        let summary = summarize_mission(mission_id)?;
         Ok(StepOutcome {
             output: darkmux_crew::step_output::Output::wrap(
                 CRAWL_SUMMARY_OUTPUT_KIND,
@@ -2266,23 +2261,13 @@ fn plan_totals(plan_dir: &Path) -> (usize, u64, Vec<PlanSourceRef>, String) {
     (units, est_tokens, sources.into_values().collect(), workspace)
 }
 
-/// The mission a step's task belongs to, resolved through its phase
-/// record. A phase with no record is a refusal, not a guess — the same
-/// rule `plan_step::default_plan_path` applies.
-fn mission_id_for(task: &Task) -> Result<String> {
-    let phases = darkmux_crew::loader::load_phases().context("loading phase records to locate the run")?;
-    phases
-        .iter()
-        .find(|p| p.id == task.phase_id)
-        .map(|p| p.mission_id.clone())
-        .ok_or_else(|| {
-            anyhow!(
-                "crawl step: task `{}` names phase `{}`, which has no record — the run cannot be \
-                 located",
-                task.id,
-                task.phase_id
-            )
-        })
+/// The mission a crawl step's run is. A crawl runs inside a mission; a run
+/// of any other kind is refused, not guessed at.
+fn mission_of(run_ctx: &StepRunCtx) -> Result<&str> {
+    run_ctx
+        .run_id()
+        .mission_id()
+        .ok_or_else(|| anyhow!("crawl step: runs in a mission, not in run `{}`", run_ctx.run_id()))
 }
 
 /// Register the crawl's dispatch-side step kinds. Called from

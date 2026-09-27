@@ -137,7 +137,7 @@ impl WorkJob {
             timeout_override_seconds: None,
             role_id: self.role_id,
             message: self.message,
-            session_id: Some(self.session_id),
+            session: self.session_id,
             timeout_seconds: self.timeout_seconds,
             skip_preflight: false,
             // Runner-side dispatches preserve today's human-readable
@@ -190,7 +190,7 @@ mod tests {
             target_machine: "studio".into(),
             role_id: "coder".into(),
             message: "m".into(),
-            session_id: "s".into(),
+            session_id: crate::test_session("s"),
             profile: Some("host".into()),
             workdir: None,
             phase_id: Some("p".into()),
@@ -208,7 +208,7 @@ mod tests {
         let o = job().into_dispatch_opts();
         assert_eq!(o.role_id, "coder");
         assert_eq!(o.profile_name.as_deref(), Some("host"));
-        assert_eq!(o.session_id.as_deref(), Some("s"));
+        assert_eq!(o.session, crate::test_session("s"));
         assert_eq!(o.phase_id.as_deref(), Some("p"));
         assert_eq!(o.image.as_deref(), Some("rust:slim"));
         assert!(o.machine.is_none(), "a received job runs here; it is never forwarded");
@@ -241,7 +241,7 @@ mod tests {
         let mut seen = None;
         let r = execute_job_with(job(), "resolved-host".into(), "laptop".into(), |o| {
             seen = Some((o.profile_name.clone(), o.remote_origin.clone(), o.machine.clone()));
-            Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: "s".into(), out_dir: None, trajectory: None })
+            Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: crate::test_session("s"), out_dir: None, trajectory: None })
         });
         assert!(r.is_ok());
         assert_eq!(seen, Some((Some("resolved-host".into()), Some("laptop".into()), None)));
@@ -257,13 +257,13 @@ mod tests {
             execute_job_with(job(), "host".into(), "laptop".into(), |_| {
                 started_tx.send(()).unwrap();
                 release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-                Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: "s".into(), out_dir: None, trajectory: None })
+                Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: crate::test_session("s"), out_dir: None, trajectory: None })
             })
         });
         started_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         // A second job starts and finishes while the first still runs.
         let short = execute_job_with(job(), "host".into(), "laptop".into(), |_| {
-            Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: "s".into(), out_dir: None, trajectory: None })
+            Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: crate::test_session("s"), out_dir: None, trajectory: None })
         });
         assert!(short.is_ok());
         assert!(dispatch_in_flight(), "the first job is still running");

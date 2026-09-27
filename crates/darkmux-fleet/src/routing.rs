@@ -15,6 +15,7 @@
 //! claimed any job.
 
 use crate::WorkJob;
+use darkmux_types::session_id::SessionId;
 use anyhow::{anyhow, Result};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -25,7 +26,7 @@ pub fn build_work_job(
     target_machine: String,
     role_id: String,
     message: String,
-    session_id: String,
+    session_id: SessionId,
     profile: Option<String>,
     workdir: Option<String>,
     phase_id: Option<String>,
@@ -95,8 +96,6 @@ pub fn apply_profile_address(opts: &mut DispatchOpts) -> Result<()> {
     let Some(machine) = address.machine.clone() else {
         return Err(anyhow!("darkmux dispatch: profile address `{raw}` names no machine"));
     };
-    // The wire's own machine-name rule (it adds `-from-` to the parser's).
-    crate::job::validate_machine_name(&format!("the machine in `{raw}`"), &machine)?;
     if let Some(existing) = opts.machine.as_deref() {
         if !crate::job::same_machine(existing, &machine) {
             return Err(anyhow!(
@@ -187,10 +186,7 @@ pub fn dispatch_routed_via(
                 );
                 // #290 — the pinned route record, so the audit trail and
                 // topology UI see the operator-pinned routing decision.
-                let session_id =
-                    dispatch::emit_route_record_and_resolve_session(&opts, Some(&target));
-                let mut opts = opts;
-                opts.session_id = Some(session_id);
+                dispatch::emit_route_record(&opts, Some(&target));
                 return dispatch_via_submission(opts, &target);
             }
             RoutingDecision::Remote {
@@ -212,10 +208,7 @@ pub fn dispatch_routed_via(
                         opts.role_id
                     ));
                 }
-                let session_id =
-                    dispatch::emit_route_record_and_resolve_session(&opts, Some(&target));
-                let mut opts = opts;
-                opts.session_id = Some(session_id);
+                dispatch::emit_route_record(&opts, Some(&target));
                 return dispatch_via_submission(opts, &target);
             }
             RoutingDecision::Local {
@@ -243,10 +236,7 @@ pub fn dispatch_routed_via(
 /// `--timeout`'s inactivity override, `--max-completion-tokens`, compaction
 /// flags, `--json` (the receiver's human output is returned as stdout).
 fn dispatch_via_submission(opts: DispatchOpts, target: &str) -> Result<DispatchResult> {
-    let session_id = opts
-        .session_id
-        .clone()
-        .unwrap_or_else(|| dispatch::fresh_session_id(&opts.role_id));
+    let session_id = opts.session.clone();
     let job = build_work_job(
         target.to_string(),
         opts.role_id.clone(),
@@ -271,11 +261,11 @@ fn dispatch_via_submission(opts: DispatchOpts, target: &str) -> Result<DispatchR
 /// into the `DispatchResult` the CLI prints.
 pub(crate) fn reply_to_dispatch_result(
     reply: crate::SubmissionReply,
-    session_id: &str,
+    session_id: &SessionId,
     target: &str,
 ) -> DispatchResult {
     use crate::ReplyStatus;
-    let session_id = reply.session_id.clone().unwrap_or_else(|| session_id.to_string());
+    let session_id = reply.session_id.clone().unwrap_or_else(|| session_id.clone());
     let follow = format!("Follow it with `darkmux flow tail --session {session_id}` or in the viewer.");
     let stdout = match reply.status {
         // (#2916 stage 2) Queued without `--wait`: the receiver's own words,
@@ -313,7 +303,7 @@ mod tests {
             "studio".to_string(),              // target_machine
             "coder".to_string(),               // role_id
             "do the thing".to_string(),        // message
-            "sess-42".to_string(),             // session_id
+            crate::test_session("sess-42"),    // session_id
             Some("coder-studio".to_string()),  // profile
             Some("/work/repo".to_string()),    // workdir
             Some("phase-7".to_string()),       // phase_id
@@ -329,7 +319,7 @@ mod tests {
         assert_eq!(j.target_machine, "studio");
         assert_eq!(j.role_id, "coder");
         assert_eq!(j.message, "do the thing");
-        assert_eq!(j.session_id, "sess-42");
+        assert_eq!(j.session_id, crate::test_session("sess-42"));
         assert_eq!(j.profile.as_deref(), Some("coder-studio"));
         assert_eq!(j.workdir.as_deref(), Some("/work/repo"));
         assert_eq!(j.phase_id.as_deref(), Some("phase-7"));
@@ -343,18 +333,20 @@ mod tests {
     #[test]
     fn a_completed_reply_carries_the_remote_exit_code_and_output() {
         let reply = crate::SubmissionReply {
-            session_id: Some("s-remote".into()),
+            session_id: Some(crate::test_session("s-remote")),
             exit_code: Some(42),
             stdout: Some("out\x1b[2J".into()),
             stderr: Some("err".into()),
             ..crate::SubmissionReply::of(crate::ReplyStatus::Completed)
         };
-        let r = reply_to_dispatch_result(reply, "s-local", "studio");
-        assert_eq!((r.exit_code, r.stdout.as_str(), r.stderr.as_str(), r.session_id.as_str()), (42, "out[2J", "err", "s-remote"), "the ESC byte is stripped");
+        let local = crate::test_session("s-local");
+        let r = reply_to_dispatch_result(reply, &local, "studio");
+        assert_eq!((r.exit_code, r.stdout.as_str(), r.stderr.as_str()), (42, "out[2J", "err"), "the ESC byte is stripped");
+        assert_eq!(r.session_id, crate::test_session("s-remote"));
         let accepted = crate::SubmissionReply::of(crate::ReplyStatus::Accepted);
-        let r = reply_to_dispatch_result(accepted, "s-local", "studio");
+        let r = reply_to_dispatch_result(accepted, &local, "studio");
         assert_eq!(r.exit_code, 0);
-        assert!(r.stdout.contains("submitted to studio; not waiting (session_id=s-local)"), "{}", r.stdout);
+        assert!(r.stdout.contains(&format!("submitted to studio; not waiting (session_id={local})")), "{}", r.stdout);
     }
 
     // (#1509) `dispatch_routed_via`'s local-dispatch injection seam. No
@@ -378,7 +370,7 @@ mod tests {
             timeout_override_seconds: None, // (#2480)
             role_id: role_id.to_string(),
             message: "hi".to_string(),
-            session_id: None,
+            session: crate::test_session("n"),
             timeout_seconds: 60,
             skip_preflight: false,
             json: true,
@@ -408,7 +400,7 @@ mod tests {
                 exit_code: 0,
                 stdout: "injected stdout".to_string(),
                 stderr: String::new(),
-                session_id: "sess-injected".to_string(),
+                session_id: crate::test_session("sess-injected"),
                 out_dir: None,
                 trajectory: None,
             })
@@ -417,7 +409,7 @@ mod tests {
 
         assert!(*called.borrow(), "the local fall-through must call the injected closure");
         assert_eq!(result.stdout, "injected stdout");
-        assert_eq!(result.session_id, "sess-injected");
+        assert_eq!(result.session_id, crate::test_session("sess-injected"));
     }
 
     #[test]
@@ -604,8 +596,8 @@ mod tests {
         let mut opts = local_opts("pr-reviewer");
         opts.machine = Some("peer-b".to_string());
         let r = dispatch_routed_via(opts, |_| panic!("never local")).unwrap();
-        assert!(!r.session_id.contains('\u{1b}'), "{:?}", r.session_id);
-        assert!(r.session_id.starts_with("pr-reviewer") || !r.session_id.contains("pwned"), "{:?}", r.session_id);
+        // The hostile echo is not a session: the dispatch keeps its own.
+        assert_eq!(r.session_id, local_opts("pr-reviewer").session, "{:?}", r.session_id);
     }
 
     /// A peer that reads one whole request, sends its body on the channel,
@@ -685,7 +677,7 @@ mod tests {
         let mut seen = None;
         dispatch_routed_via(opts, |o| {
             seen = Some((o.profile_name.clone(), o.machine.clone()));
-            Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: "s".into(), out_dir: None, trajectory: None })
+            Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: crate::test_session("s"), out_dir: None, trajectory: None })
         })
         .unwrap();
         assert_eq!(seen, Some((Some("host".to_string()), None)));
@@ -700,7 +692,7 @@ mod tests {
     fn a_bad_address_is_refused_before_anything_is_sent() {
         let (port, rx) = spawn_connection_counting_peer();
         let env = PeerEnv::new(port);
-        for (profile, needle) in [("host@peer.b", "contains '.'"), ("@peer-b", "names no profile"), ("host@x-from-y", "may not contain `-from-`")] {
+        for (profile, needle) in [("host@peer.b", "contains '.'"), ("@peer-b", "names no profile")] {
             let mut opts = local_opts("coder");
             opts.profile_name = Some(profile.to_string());
             let err = dispatch_routed_via(opts, |_| panic!("never local")).unwrap_err();
@@ -739,7 +731,7 @@ mod tests {
     #[serial]
     fn a_queued_answer_without_wait_is_reported_verbatim() {
         let (port, _rx) = spawn_scripted_peer(
-            "{\"status\":\"queued\",\"session_id\":\"s-from-local-a\",\"reason\":\"peer-b is busy (x is running on big); the job is queued and runs when its seat frees\"}\n",
+            "{\"status\":\"queued\",\"session_id\":\"m-1.solo.relay.local-a.m-1_2Eadhoc_2Ecoder_2En\",\"reason\":\"peer-b is busy (x is running on big); the job is queued and runs when its seat frees\"}\n",
         );
         let _env = PeerEnv::new(port);
         peer_b_is_verified();
@@ -749,7 +741,7 @@ mod tests {
         let r = dispatch_routed_via(opts, |_| panic!("never local")).unwrap();
         assert_eq!(r.exit_code, 0);
         assert!(r.stdout.contains("queued on peer-b") && r.stdout.contains("x is running on big"), "{}", r.stdout);
-        assert_eq!(r.session_id, "s-from-local-a");
+        assert_eq!(r.session_id, darkmux_types::session_id::SessionId::relay(crate::test_session("n"), "local-a"));
     }
 
     /// (#2916 stage 2) Waited on: the queued lines come first, then the
@@ -791,7 +783,7 @@ mod tests {
         assert!(msg.contains("no answer from http://127.0.0.1:"), "{msg}");
         // (#2916 stage 2 review C1) The request reached the peer, so the
         // sender cannot know whether it runs: it says so, with the session.
-        assert!(msg.contains("may still be running on peer-b") && msg.contains("-from-local-a"), "{msg}");
+        assert!(msg.contains("may still be running on peer-b") && msg.contains(".relay.local-a."), "{msg}");
     }
 
     // ─── #2584 conformance: every call site of `dispatch_via_submission` must be

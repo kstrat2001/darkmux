@@ -354,22 +354,24 @@ fn emit_route_record(text: &str, surface: RadioSurface, decision: &RouteDecision
             payload["error"] = serde_json::json!(error);
         }
     }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let synth_session_id = crate::types::session_id::session_id("radio", &nanos.to_string(), "");
     let record = crate::crew::dispatch::build_dispatch_record_with_payload(
         crate::flow::Level::Info,
         darkmux_flow::FlowAction::RadioRoute,
         crate::crew::loader::RADIO_ROUTER_ROLE_ID,
-        &synth_session_id,
-        None,
+        &radio_session(crate::crew::loader::RADIO_ROUTER_ROLE_ID),
         None,
         None,
         Some(payload),
     );
     let _ = crate::flow::record(record);
+}
+
+/// A radio seat's session: an ad-hoc dispatch of `role` in the standalone
+/// `radio` run. Radio has no mission instance, so its records carry no
+/// `mission_id`; each seat's nonce keeps it unique.
+pub(crate) fn radio_session(role: &str) -> crate::types::session_id::SessionId {
+    let run = crate::types::session_id::RunId::standalone("radio").expect("a literal run id is never empty");
+    crate::types::session_id::SessionId::adhoc(run, role, crate::crew::dispatch::fresh_nonce())
 }
 
 /// Assemble the routing seat's USER message (the routing seat's SYSTEM

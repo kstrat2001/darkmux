@@ -43,6 +43,7 @@ use crate::mods::ModRecord;
 use crate::step_kinds::registry::StepKindRegistry;
 use crate::step_kinds::types::{CwdPolicy, Port, SeatClaim, StepKind, StepOutcome, StepRunCtx};
 use crate::types::{Step, Task};
+use darkmux_types::session_id::SessionScope;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1627,8 +1628,8 @@ impl StepKind for DeliverGithubReviewStepKind {
     /// (#1979) `None` — this kind performs no model work and owns no
     /// dispatch session. Same documented no-dispatch opt-out
     /// `procedural.shell`/`procedural.noop` use.
-    fn dispatch_session_id(&self, _step: &Step) -> Option<String> {
-        None
+    fn session_scope(&self) -> SessionScope {
+        SessionScope::None
     }
 
     /// (#2577 audit) `CwdPolicy::NoAmbientDependency` (the trait default,
@@ -1643,7 +1644,7 @@ impl StepKind for DeliverGithubReviewStepKind {
         CwdPolicy::NoAmbientDependency
     }
 
-    fn run(&self, step: &Step, _task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+    fn run(&self, step: &Step, _task: &Task, input: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
         let cfg = DeliverConfig::from_step(step, input)?;
         // (#2310 delivery rewrite) Titles resolve HERE, at the one impure
         // edge, so `render_github_review` stays a pure function over its
@@ -2468,7 +2469,7 @@ mod tests {
             workdir: None,
             image: None,
         };
-        DeliverGithubReviewStepKind.run(&step, &task, &BTreeMap::new()).unwrap();
+        DeliverGithubReviewStepKind.run(&step, &task, &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let emitted: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
         assert_eq!(emitted["reviewed_at_sha"], json!("abc123def456"), "{emitted}");
     }
@@ -2513,7 +2514,7 @@ mod tests {
             workdir: None,
             image: None,
         };
-        DeliverGithubReviewStepKind.run(&step, &task, &BTreeMap::new()).unwrap();
+        DeliverGithubReviewStepKind.run(&step, &task, &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let emitted: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
         assert!(emitted.get("reviewed_at_sha").is_none(), "{emitted}");
     }
@@ -3054,7 +3055,7 @@ mod tests {
             workdir: None,
             image: None,
         };
-        let outcome = DeliverGithubReviewStepKind.run(&step, &task, &BTreeMap::new()).unwrap();
+        let outcome = DeliverGithubReviewStepKind.run(&step, &task, &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         // (#2310 fix-loop E2, from the C2 post-merge review) The step's own
         // output is a promotable JSON object — `{mode, summary, emit}` —
         // NOT the bare emit path it used to be. `review.json` declares
@@ -3115,7 +3116,7 @@ mod tests {
             workdir: None,
             image: None,
         };
-        let outcome = DeliverGithubReviewStepKind.run(&step, &task, &BTreeMap::new()).unwrap();
+        let outcome = DeliverGithubReviewStepKind.run(&step, &task, &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let step_output: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
         assert_eq!(step_output["mode"], json!("degraded"), "{step_output}");
         assert!(step_output["summary"].as_str().unwrap().contains("Errored:"), "{step_output}");
@@ -3138,7 +3139,7 @@ mod tests {
             "scope": {},
             "emit": out_path.to_string_lossy(),
         });
-        let outcome = DeliverGithubReviewStepKind.run(&step, &task, &BTreeMap::new()).unwrap();
+        let outcome = DeliverGithubReviewStepKind.run(&step, &task, &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let step_output: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
         // (#2431 round 2, MF-A) `sess-a/2` sits at `src/mw.ts:9`, a path
         // `DIFF` (which touches only `src/a.ts`) never covers — an
@@ -3948,7 +3949,7 @@ mod tests {
             workdir: None,
             image: None,
         };
-        let outcome = DeliverGithubReviewStepKind.run(&step, &task, &BTreeMap::new()).unwrap();
+        let outcome = DeliverGithubReviewStepKind.run(&step, &task, &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         // (#2310 fix-loop E2) The destination is now a FIELD on the step's
         // promotable output object, not the whole output.
         let step_output: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();

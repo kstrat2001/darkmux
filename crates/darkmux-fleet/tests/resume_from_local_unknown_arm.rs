@@ -53,7 +53,7 @@ fn opts_for(role_id: &str) -> DispatchOpts {
         timeout_override_seconds: None,
         role_id: role_id.to_string(),
         message: "hi".to_string(),
-        session_id: None,
+        session: darkmux_types::session_id::SessionId::adhoc(darkmux_types::session_id::RunId::mission("m-1").unwrap(), "coder", "n"),
         timeout_seconds: 60,
         skip_preflight: false,
         json: true,
