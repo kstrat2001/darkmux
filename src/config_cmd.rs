@@ -1119,6 +1119,85 @@ mod tests {
         }
     }
 
+    /// (#2947) THE conformance test for the enum-settings rule, over every
+    /// surface at once. For EVERY registry entry, an unknown value set via
+    /// the env tier (when the entry has an env var) and via the config
+    /// file tier must:
+    ///
+    /// - make `preflight(scope)` refuse for every scope the entry lists,
+    ///   naming the raw value, where it was set, and every valid value (and
+    ///   leave every OTHER scope alone: a setting refuses only where it is
+    ///   consumed);
+    /// - make its `darkmux doctor` row Fail;
+    /// - be refused by `darkmux config set`;
+    /// - and the help block must list its values with their meanings.
+    ///
+    /// It iterates `ENUM_SETTINGS`, so a new enum setting is held to all of
+    /// it by being registered. That the ENTRY POINTS call `preflight` is
+    /// proven separately, by spawning them (`tests/enum_config_preflight.rs`)
+    /// and by calling the primitives (darkmux-crew, darkmux-lab,
+    /// darkmux-fleet), since a direct `preflight` call cannot show that.
+    #[serial_test::serial]
+    #[test]
+    fn every_enum_setting_obeys_the_rule_on_every_surface() {
+        use config_enum::{preflight, SetIn, Scope, ENUM_SETTINGS};
+        let help = config_enum::help_block();
+        for s in ENUM_SETTINGS {
+            let mut tiers: Vec<(SetIn, &str)> = vec![(SetIn::Config(s.key), "zz-bad-config")];
+            if let Some(var) = s.env {
+                tiers.push((SetIn::Env(var), "zz-bad-env"));
+            }
+            for (set_in, raw) in tiers {
+                let _guard;
+                match &set_in {
+                    SetIn::Env(var) => {
+                        _guard = None;
+                        unsafe { std::env::set_var(var, raw) };
+                    }
+                    SetIn::Config(key) => {
+                        let mut root = Value::Object(Default::default());
+                        set_path(&mut root, key, Value::String(raw.into()));
+                        let cfg: DarkmuxConfig = serde_json::from_value(root).unwrap();
+                        _guard = Some(darkmux_types::config_access::set_config_for_test(cfg));
+                    }
+                }
+                // Preflight, per scope.
+                for scope in Scope::ALL {
+                    let r = preflight(scope);
+                    if s.scopes.contains(&scope) {
+                        let msg = r.expect_err(&format!("{} via {set_in}: {scope:?} must refuse", s.key)).to_string();
+                        assert!(msg.contains(&format!("`{raw}`")), "{msg}");
+                        assert!(msg.contains(&set_in.to_string()), "names where it was set: {msg}");
+                        for (t, m) in s.values {
+                            assert!(msg.contains(t) && msg.contains(m), "{}: `{t}` missing: {msg}", s.key);
+                        }
+                    } else {
+                        assert!(r.is_ok(), "{} via {set_in}: {scope:?} does not consume it but refused: {r:?}", s.key);
+                    }
+                }
+                // Doctor.
+                let row = darkmux_doctor::check_enum_settings().into_iter().find(|c| c.name == s.key).unwrap();
+                assert_eq!(row.status, darkmux_doctor::Status::Fail, "{} via {set_in}: {row:?}", s.key);
+                assert!(row.message.contains(&format!("`{raw}`")), "{row:?}");
+                if let SetIn::Env(var) = &set_in {
+                    unsafe { std::env::remove_var(var) };
+                }
+                drop(_guard);
+            }
+            // config set refuses (the file tier's write surface).
+            let f = tmp();
+            assert!(set_at(f.path(), s.key, "zz-bad").is_err(), "{}: config set accepted a bad value", s.key);
+            // Help.
+            for (t, m) in s.values {
+                assert!(help.contains(t) && help.contains(m), "{}: help lacks `{t}`", s.key);
+            }
+            // Clean again: every scope passes.
+            for scope in Scope::ALL {
+                assert!(preflight(scope).is_ok(), "{}: {scope:?} still refusing after cleanup", s.key);
+            }
+        }
+    }
+
     /// (#2947) Help lists every registered enum setting's values with their
     /// meanings: the block `config list` prints and `config set --help` /
     /// `config list --help` carry as their long help.

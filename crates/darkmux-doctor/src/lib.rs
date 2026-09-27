@@ -1957,7 +1957,7 @@ fn check_machine_id_resolution() -> Check {
 ///
 /// A new enum setting gets this row by being registered: nothing here
 /// changes.
-fn check_enum_settings() -> Vec<Check> {
+pub fn check_enum_settings() -> Vec<Check> {
     use darkmux_types::config_enum::ENUM_SETTINGS;
     ENUM_SETTINGS
         .iter()

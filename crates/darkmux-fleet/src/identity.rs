@@ -442,6 +442,35 @@ pub fn test_node(node_id: &str, name: &str, addr: &str) -> NodeIdentity {
 
 #[cfg(test)]
 mod tests {
+    /// (#2947) The fleet-submission preflight: a hand-edited unknown
+    /// `fleet.identity.provider` is refused when either side builds its
+    /// provider, with the registry's message (value, where it was set,
+    /// valid values), before any provider tool is run.
+    #[serial_test::serial]
+    #[test]
+    fn configured_provider_refuses_an_unregistered_provider_value() {
+        let cfg = darkmux_types::config::DarkmuxConfig {
+            fleet: Some(darkmux_types::config::FleetConfig {
+                identity: Some(darkmux_types::config::FleetIdentityConfig {
+                    provider: Some("zz-bad-provider".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let _g = darkmux_types::config_access::set_config_for_test(cfg);
+        let err = match configured_provider() {
+            Ok(_) => panic!("an unknown provider built a provider"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("fleet work submission: refusing to start: bad config"), "{err}");
+        assert!(err.contains("`zz-bad-provider`") && err.contains("fleet.identity.provider"), "{err}");
+        for t in KNOWN_IDENTITY_PROVIDERS {
+            assert!(err.contains(t), "{err}");
+        }
+    }
+
     use super::*;
 
     const WHOIS: &str = r#"{"Node":{"ID":123,"StableID":"nSTABLE1","Name":"laptop.tailnet-example.ts.net.",

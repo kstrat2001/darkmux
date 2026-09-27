@@ -2725,6 +2725,44 @@
         }
     }
 
+    /// (#2947) Both host-side dispatch primitives refuse an unregistered
+    /// value in every `Dispatch`-scope setting FIRST, with the registry's
+    /// message, even with `skip_preflight` set (that flag skips the Docker
+    /// probe, never the bad-config refusal). Every model-bearing path
+    /// (radio, acp, mission steps, crawl units, lab providers, the fleet
+    /// runner) routes through one of these two.
+    #[serial_test::serial]
+    #[test]
+    fn both_dispatch_primitives_refuse_bad_enum_config_first() {
+        use darkmux_types::config_enum::{Scope, ENUM_SETTINGS};
+        let mut exercised = 0;
+        for s in ENUM_SETTINGS.iter().filter(|s| s.scopes.contains(&Scope::Dispatch)) {
+            let var = s.env.expect("every Dispatch-scope setting today has an env var");
+            let prev = std::env::var(var).ok();
+            unsafe { std::env::set_var(var, "zz-bad-dispatch") };
+            let errs = [
+                crate::dispatch_internal::dispatch(dispatch_preflight_probe_opts()).unwrap_err(),
+                crate::dispatch_internal::dispatch_local_single_shot(dispatch_preflight_probe_opts()).unwrap_err(),
+            ];
+            unsafe {
+                match &prev {
+                    Some(v) => std::env::set_var(var, v),
+                    None => std::env::remove_var(var),
+                }
+            }
+            for e in errs {
+                let msg = format!("{e:#}");
+                assert!(msg.contains("dispatch: refusing to start: bad config"), "{}: {msg}", s.key);
+                assert!(msg.contains("`zz-bad-dispatch`") && msg.contains(var), "{}: {msg}", s.key);
+                for (t, _) in s.values {
+                    assert!(msg.contains(t), "{}: `{t}` missing: {msg}", s.key);
+                }
+            }
+            exercised += 1;
+        }
+        assert!(exercised >= 3, "only {exercised} Dispatch-scope settings exercised");
+    }
+
     /// Opts that reach `dispatch()`'s workdir preflight and then bail: a
     /// role id no manifest declares, and `skip_preflight` so no Docker
     /// daemon is contacted on the way.

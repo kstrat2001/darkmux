@@ -665,6 +665,68 @@ fn run_profile_name(
 
 #[cfg(test)]
 mod tests {
+    /// (#2947) `lab run` (via `lab_run`) and `lab eval` (via
+    /// `run_review_bench`) refuse an unregistered value in every setting
+    /// the `LabRun` scope consumes, under their OWN label, before writing
+    /// anything: a refusal from the dispatch primitive further down would
+    /// read `dispatch:` and would mean a run directory was already minted.
+    #[serial_test::serial]
+    #[test]
+    fn lab_run_and_lab_eval_refuse_bad_enum_config_before_minting() {
+        use darkmux_types::config_enum::{Scope, ENUM_SETTINGS};
+        let mut exercised = 0;
+        for s in ENUM_SETTINGS.iter().filter(|s| s.scopes.contains(&Scope::LabRun)) {
+            let var = s.env.expect("every LabRun-scope setting today has an env var");
+            let state = darkmux_types::test_isolation::IsolatedState::new();
+            unsafe { std::env::set_var(var, "zz-bad-lab") };
+            let run_err = super::lab_run(super::RunOpts {
+                workload_id: "quick-q".into(),
+                profile_name: None,
+                runs: 1,
+                config_path: None,
+                quiet: true,
+                loop_override: None,
+                inject_context: None,
+            })
+            .unwrap_err()
+            .to_string();
+            let eval_err = crate::lab::review_bench::run_review_bench(crate::lab::review_bench::ReviewBenchOpts {
+                role: "pr-reviewer".into(),
+                cases_dir: state.join("no-cases"),
+                profile_name: None,
+                config_path: None,
+                timeout_seconds: 5,
+                scores_out: None,
+                mode: crate::lab::review_bench::BenchMode::Strict,
+                workdirs: None,
+                prosecutor_profile: None,
+                defender_profile: None,
+                judge_profile: None,
+                roster_profile: None,
+                exec_mode: None,
+                k_override: None,
+                bundler_cmd: None,
+            })
+            .unwrap_err()
+            .to_string();
+            unsafe { std::env::remove_var(var) };
+            for err in [&run_err, &eval_err] {
+                assert!(err.contains("lab run: refusing to start: bad config"), "{}: {err}", s.key);
+                assert!(err.contains("`zz-bad-lab`") && err.contains(var), "{}: {err}", s.key);
+            }
+            let mut written = Vec::new();
+            fn walk(d: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+                for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+                    if e.path().is_dir() { walk(&e.path(), out) } else { out.push(e.path()) }
+                }
+            }
+            walk(state.path(), &mut written);
+            assert!(written.is_empty(), "{}: lab wrote state before refusing: {written:?}", s.key);
+            exercised += 1;
+        }
+        assert!(exercised >= 3, "only {exercised} LabRun-scope settings exercised");
+    }
+
     /// (#2902 re-review C3) `lab run` picks the profile for the role the
     /// PROVIDER reports it dispatches, not the manifest role or
     /// `runtime.default_role` guessed on its behalf.
