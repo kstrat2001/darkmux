@@ -138,7 +138,12 @@ fn a_utility_job_runs_on_the_binding_and_leaves_only_its_usage_record() {
     assert!(rec["session_id"].is_null(), "a utility job mints no session: {rec}");
     let bookends: Vec<&Value> = records
         .iter()
-        .filter(|r| r["action"].as_str().is_some_and(|a| darkmux_flow::is_dispatch_start(a) || darkmux_flow::is_dispatch_terminal(a)))
+        .filter(|r| {
+            matches!(
+                darkmux_flow::reader::action_of(r),
+                Some(darkmux_flow::FlowAction::DispatchStart | darkmux_flow::FlowAction::DispatchComplete | darkmux_flow::FlowAction::DispatchError)
+            )
+        })
         .collect();
     assert!(bookends.is_empty(), "a utility job emits no dispatch bookends (contract 2, #2914): {bookends:#?}");
     assert_eq!(rec["payload"]["job"], "radio_routing", "the usage record names the job kind (#2915): {rec}");
@@ -146,7 +151,7 @@ fn a_utility_job_runs_on_the_binding_and_leaves_only_its_usage_record() {
     // and is just as lean (no session).
     assert_eq!(records.len(), 2, "the start marker and the usage record, nothing else: {records:#?}");
     let start = &records[0];
-    assert_eq!(start["action"], darkmux_crew::usage::UTILITY_START_ACTION, "the start comes first: {records:#?}");
+    assert_eq!(start["action"], "utility.start", "the start comes first: {records:#?}");
     assert_eq!(start["payload"]["job"], "radio_routing", "{start}");
     assert_eq!(start["payload"]["model"], "mock-util", "{start}");
     assert!(start["payload"].get("serves").is_none(), "routing serves no execution: {start}");
@@ -195,7 +200,7 @@ fn a_utility_job_whose_call_fails_ends_with_utility_error() {
     let actions: Vec<&str> = records.iter().filter_map(|r| r["action"].as_str()).collect();
     assert_eq!(
         actions,
-        vec![darkmux_crew::usage::UTILITY_START_ACTION, darkmux_crew::usage::UTILITY_ERROR_ACTION],
+        vec!["utility.start", "utility.error"],
         "{records:#?}"
     );
     let end = &records[1];
@@ -236,7 +241,7 @@ fn each_utility_job_mints_its_own_id() {
     let records = all_flow_records(flows_dir.path());
     let ids: std::collections::BTreeSet<String> = records
         .iter()
-        .filter(|r| r["action"] == darkmux_crew::usage::UTILITY_START_ACTION)
+        .filter(|r| r["action"] == "utility.start")
         .map(|r| r["payload"]["job_id"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(ids.len(), 2, "{records:#?}");
@@ -352,7 +357,7 @@ fn the_residency_arm_puts_the_namespaced_binding_on_the_wire() {
 
     let records = all_flow_records(flows_dir.path());
     assert_eq!(records.len(), 2, "the start marker and the usage record: {records:#?}");
-    assert_eq!(records[0]["action"], darkmux_crew::usage::UTILITY_START_ACTION);
+    assert_eq!(records[0]["action"], "utility.start");
     assert_eq!(records[0]["payload"]["model"], "darkmux:mock-util", "the start names the wire id too");
     assert_eq!(records[1]["payload"]["requested_model"], "darkmux:mock-util", "the usage record names the wire id");
     assert_eq!(records[1]["model"], "darkmux:mock-util");

@@ -8,19 +8,17 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson, type FetchResult } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useSessionLiveness } from "../../hooks/useSessionLiveness";
-import { T, flowToRenderModel, isDispatchStart } from "../../lib/flow";
+import { flowToRenderModel } from "../../lib/flow";
+import { NO_PRESENCE, isRunning, judgementAt, lifecycleAt, type Presence } from "../../lib/lifecycle";
+import { useLifecyclePolicy } from "../../hooks/useLifecyclePolicy";
+import { sessionRouteRecords, sessionRun } from "../../lib/runRef";
+import { ACTION, CATEGORY, ingest, recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { useNowMs } from "../../lib/clock";
 import { clkhm } from "../../lib/format";
 import { getSource } from "../../lib/source";
 import { useDay } from "../../hooks/useDay";
 import { injectedPlaybackDate } from "../../lib/injectedMeta";
 
-/** (#1972) How long a run may go silent before it is treated as abandoned
- *  rather than live. Mirrors the host watchdog's own default
- *  (`DARKMUX_INACTIVITY_TIMEOUT_SECONDS` = 600s): past that point the
- *  container has been hard-killed, so a still-ticking counter would be
- *  asserting something the harness has already ruled out. */
-export const STALE_AFTER_MS = 600_000;
 import { livenessState } from "../../components/LivenessPulse";
 import { TokenScope } from "../../components/TokenScope";
 import { usePlaybackClock } from "../../lib/pageClockRate";
@@ -479,11 +477,16 @@ function BriefEntryContent({ entry }: { entry: BriefEntry }) {
 
 export function SessionReplay({
   sessionId,
+  missionId = null,
   playhead = null,
   connected = true,
   lastContactMs = null,
 }: {
   sessionId: string;
+  /** The mission whose run on this session the page shows, when the route
+   *  names one (`#dispatch=<sid>&dispatch.mission=<id>`): the session's
+   *  other missions' records are left out, so every region reads that run. */
+  missionId?: string | null;
   playhead?: number | null;
   /** (#2886 pass 3, "STALL while disconnected") Whether the page has a
    *  working connection to the daemon — derived by `App.tsx` from the
@@ -528,18 +531,23 @@ export function SessionReplay({
   // a mission's run-grain session never beats itself, so without it the page
   // is never live, fetches once, and freezes on its first read.
   const [livenessMissionId, setLivenessMissionId] = useState<string | null>(null);
-  const { shouldPoll, endedByPresence } = useSessionLiveness(sessionId, livenessMissionId);
+  const { isLive, shouldPoll, endedByPresence } = useSessionLiveness(sessionId, livenessMissionId);
+  // Presence, as the lifecycle's additive input: it holds this run open
+  // against the staleness clock, never against a record that closed it. It
+  // is a fact about NOW, so a parked playhead judges without it
+  // (`judgementAt`, below: the rule the event log beside this page reads).
+  const livePresence = useMemo<Presence>(() => (isLive ? new Set([sessionId]) : NO_PRESENCE), [isLive, sessionId]);
+  const policy = useLifecyclePolicy();
 
   // (#2065) A static build has no `/flow-session/<id>` to reach — the demo's
   // dispatch-row tap 404'd here. Read the committed file instead (the same
   // `queryKeys.staticFlowSrc` slot the playback lens and `useRouteRecords`
   // fill, so this is cache reuse) and slice this session out of it, shaped
-  // like the daemon's response so nothing below has to know. RAW records,
-  // not `normalizeRecords`: `/flow-session` hands back raw records too, and
-  // `flowToRenderModel` synthesizes the per-session runtime telemetry row
-  // itself — normalizing here would add a second copy the daemon path never
-  // has. The file's schema-header line carries no `session_id`, so the
-  // slice drops it on its own.
+  // like the daemon's response so nothing below has to know. The day as
+  // INGESTED, not shaped: `/flow-session` hands back no synthesized rows,
+  // and `flowToRenderModel` synthesizes the per-session runtime telemetry
+  // row itself — slicing the shaped day would add a second copy the daemon
+  // path never has.
   const source = getSource();
   const flowSrc = source.flow;
   const query = useQuery({
@@ -551,16 +559,20 @@ export function SessionReplay({
   // (#2086) The static day comes from the one resolver (the shell already
   // holds it for the transport; same cache slot, no second download).
   const day = useDay(null);
-  const staticSlice: FlowRecordsResponse | null = useMemo(() => {
-    // RAW, not `day.records`: `/flow-session` hands back raw records and
-    // `flowToRenderModel` synthesizes the runtime row itself; the normalized
-    // day already carries one, so slicing it would double the row.
-    if (flowSrc === null || day.raw === null) return null;
-    const recs = day.raw.filter((r) => r.session_id === sessionId);
-    return { records: recs, count: recs.length, truncated: false, generated_at_ms: 0 };
-  }, [flowSrc, day.raw, sessionId]);
-  const session: FetchResult<FlowRecordsResponse> | undefined =
-    flowSrc === null ? query.data : staticSlice === null ? undefined : { ok: true, data: staticSlice };
+  const staticSlice: NormRecord[] | null = useMemo(() => {
+    if (flowSrc === null || day.ingested === null) return null;
+    return day.ingested.filter((r) => r.session_id === sessionId);
+  }, [flowSrc, day.ingested, sessionId]);
+  const daemonSlice: NormRecord[] | null = useMemo(
+    () => (query.data?.ok ? ingest(query.data.data.records) : null),
+    [query.data],
+  );
+  const session: FetchResult<{ count: number }> | undefined =
+    flowSrc === null
+      ? query.data
+      : staticSlice === null
+        ? undefined
+        : { ok: true, data: { count: staticSlice.length } };
 
   // (#2759) A run's OWN top-level session (the run-grain `dispatch start`/
   // `dispatch complete`/`mission.grow` trio a mission mints for itself)
@@ -572,20 +584,20 @@ export function SessionReplay({
   // own dispatch directly) already has real telemetry and never pays for the
   // extra fetch.
   //
-  // Checked on RAW records (pre-`flowToRenderModel`): `category` is a
-  // first-class wire field on a real telemetry record, not something the
-  // frontend normalization pass invents (`flowToRenderModel` only fills in a
-  // DEFAULT when the field is absent) — so this reads reliably before that
-  // pass runs.
-  const ownRaw = session?.ok ? session.data.records : null;
+  // Checked before `flowToRenderModel`: `category` is a first-class wire
+  // field on a real telemetry record, not something that pass invents (it
+  // only fills in a DEFAULT when the field is absent) — so this reads
+  // reliably before that pass runs.
+  const ownRaw = flowSrc === null ? daemonSlice : staticSlice;
   const ownMissionId = useMemo(() => {
     if (!ownRaw) return null;
-    const start = ownRaw.find((r) => r.session_id === sessionId && isDispatchStart(r.action));
+    if (missionId !== null) return missionId;
+    const start = ownRaw.find((r) => r.session_id === sessionId && r.action === ACTION.DispatchStart);
     return start?.mission_id ?? null;
-  }, [ownRaw, sessionId]);
+  }, [ownRaw, sessionId, missionId]);
   useEffect(() => setLivenessMissionId(ownMissionId), [ownMissionId]);
   const ownHasTelemetry = useMemo(
-    () => (ownRaw ? ownRaw.some((r) => r.session_id === sessionId && r.category === "telemetry") : false),
+    () => (ownRaw ? ownRaw.some((r) => r.session_id === sessionId && r.category === CATEGORY.Telemetry) : false),
     [ownRaw, sessionId],
   );
   const missionQuery = useQuery({
@@ -603,12 +615,12 @@ export function SessionReplay({
   // Static builds get the same enrichment from the day's own committed file
   // (below, `staticMissionSlice`) rather than this query, which never runs
   // there (`enabled: flowSrc === null`).
-  const missionRaw = missionQuery.data?.ok ? missionQuery.data.data.records : null;
+  const missionRaw = useMemo(() => (missionQuery.data?.ok ? ingest(missionQuery.data.data.records) : null), [missionQuery.data]);
   const staticMissionSlice = useMemo(() => {
-    if (flowSrc === null || day.raw === null || ownHasTelemetry || ownMissionId == null) return null;
-    const recs = day.raw.filter((r) => r.mission_id === ownMissionId);
+    if (flowSrc === null || day.ingested === null || ownHasTelemetry || ownMissionId == null) return null;
+    const recs = day.ingested.filter((r) => r.mission_id === ownMissionId);
     return recs.length ? recs : null;
-  }, [flowSrc, day.raw, ownHasTelemetry, ownMissionId]);
+  }, [flowSrc, day.ingested, ownHasTelemetry, ownMissionId]);
   // A union of the two, each record once. Neither side covers the other: the
   // session fetch carries host samples the daemon attaches by time window
   // (no mission_id), and the two queries refresh separately, so the run's
@@ -642,10 +654,10 @@ export function SessionReplay({
   // daemon route, no transport) renders the whole slice as before.
   // (#2759) `enrichedRaw` is `ownRaw` (this session's own fetch) unless a
   // mission-wide fetch found MORE — see that computation's own doc above.
-  const all = enrichedRaw;
-  const records = all && playhead !== null ? all.filter((r) => !(T(r.ts) > playhead)) : all;
+  const all = useMemo(() => (enrichedRaw ? sessionRouteRecords(enrichedRaw, sessionId, missionId) : enrichedRaw), [enrichedRaw, sessionId, missionId]);
+  const records = all && playhead !== null ? recordsAsOf(all, playhead) : all;
   const data = records ? flowToRenderModel(records) : [];
-  const base = records && records.length ? runRegions(data, sessionId) : null;
+  const hasRecords = !!records && records.length > 0;
   // Gated on PLAYBACK too, not just on the run's own liveness. A recorded
   // session that never emitted a terminal record still reads as `live`, and
   // in a static/playback build there is no wall clock it could sensibly
@@ -656,28 +668,19 @@ export function SessionReplay({
   // A run with no terminal record is not automatically LIVE. One that died in
   // January has no `dispatch.complete` either, and ticking its counter up to
   // now would read `17:51:54 so far` and climbing — abandonment rendered as
-  // liveness. The host watchdog hard-kills a dispatch after
-  // `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` (600s by default), so a run that has
-  // emitted nothing for longer than that CANNOT still be running.
+  // liveness. Whether it is still running is the run's lifecycle
+  // (`lib/lifecycle.ts`) as of the page clock, the same answer the fleet
+  // card and the timeline give: silent past the daemon's staleness window,
+  // it has stopped with no ending recorded.
   //
-  // `Date.now()` here is a plain per-render read feeding a boolean, not a
-  // `useSyncExternalStore` snapshot — the value it produces is stable once
-  // past the threshold, so it cannot drive the render loop this file's clock
-  // is careful to avoid.
-  //
-  // (#2011) `endedByPresence` is the one signal that OVERRIDES all of this.
-  // The quiet-threshold above is a heuristic standing in for knowledge we
-  // sometimes actually have: presence watching this session disappear is
-  // direct evidence the run stopped, so the counter should not spend a
-  // further ten minutes climbing toward the watchdog timeout before it
-  // admits that. It is deliberately NOT `!sessionIsLive` — a session presence
-  // never listed at all (a replay, a January run, or a machine with Redis
-  // switched off, where `/fleet/sessions/live` returns an empty set for
-  // everything) is not evidence of anything, and gating on mere absence would
-  // freeze the live clock on those machines. Only the observed transition
-  // counts. Note the counter can step BACKWARDS at that moment, from the
-  // ticked value to the last record's own elapsed time; that is the point —
-  // the run's last sign of life is a fact, and the seconds since are not.
+  // (#2011) `endedByPresence` stops the clock sooner. Presence watching this
+  // session disappear is direct evidence the run stopped, so the counter
+  // should not climb toward the staleness window before it admits that. It
+  // is deliberately NOT `!isLive` — a session presence never listed at all
+  // (a replay, a January run, or a machine with Redis switched off, where
+  // `/fleet/sessions/live` returns an empty set for everything) is not
+  // evidence of anything. Only the observed transition counts. It decides
+  // the clock and the pulse (the activity axis), never the run's status.
   // (Playback parity, Change A) `clockNow` — `playhead ?? wallNow` — is the
   // ONE "now" every render-time derivation below reads, in both modes. This
   // used to be `Date.now()` unconditionally (finding #1's `quietMs`, and
@@ -690,9 +693,10 @@ export function SessionReplay({
   // does not itself drive a re-render; see `ticking`/`useNowMs` below for
   // what does, at the live edge only.
   const wallNow = Date.now();
-  const clockNow = playhead ?? wallNow;
-  const quietMs = base?.lastBeatMs != null ? clockNow - base.lastBeatMs : Infinity;
-  const plausiblyRunning = (base?.live ?? false) && quietMs < STALE_AFTER_MS && !endedByPresence;
+  const { asOf: clockNow, presence } = judgementAt(playhead, wallNow, livePresence);
+  const pageRun = hasRecords ? sessionRun(data, sessionId, clockNow) : null;
+  const plausiblyRunning =
+    pageRun !== null && isRunning(lifecycleAt(pageRun, clockNow, policy, presence)) && !endedByPresence;
   // (#2757) `playhead === null` — a non-null playhead means the operator has
   // actively parked the shell's transport away from the live edge (`App.tsx`'s
   // `isPlayheadReady`: `transport.scrubbed && transport.t < transport.tMax`;
@@ -718,12 +722,14 @@ export function SessionReplay({
   // The override actually fed to `runRegions`: the playhead when scrubbed
   // (unconditionally — a playhead means a replay, and a replay's clock is
   // never "no override", full stop); otherwise the ticking clock's own
-  // snapshot while plausibly running, or `undefined` (record-time only) once
-  // the run is done/stale/static — `runRegions`'s own `Math.max(override,
-  // tMax)` clamp means passing nothing here is exactly equivalent to
-  // freezing at the newest record, which is what a finished/stale run
-  // should do either way.
-  const clockOverride: number | undefined = playhead ?? (ticking ? nowMs : undefined);
+  // snapshot while plausibly running, or the wall clock once it is not (so a
+  // run gone silent reads as stopped, as it does on every other surface).
+  // `undefined` is record time only (`runRegions` clamps to the newest
+  // record): for a static or injected-date build, which has no wall clock to
+  // judge a recording against, and (#2011) once presence saw the run go,
+  // where the clock stops at the run's last sign of life.
+  const frozenAtRecords = source.kind === "static" || injectedPlaybackDate() != null || endedByPresence;
+  const clockOverride: number | undefined = playhead ?? (ticking ? nowMs : frozenAtRecords ? undefined : wallNow);
 
   if (!session) {
     return <SessionPendingHeader sessionId={sessionId} />;
@@ -753,13 +759,12 @@ export function SessionReplay({
   }
 
 
-  // `base` is non-null here: the `count === 0` guard above already returned.
   // (#2071) The playhead can sit BEFORE this run's first record (rewind on
-  // a day the run started partway into): the cut slice is empty, `base` is
-  // null, and the header below would dereference it — measured as "the
+  // a day the run started partway into): the cut slice is empty, and the
+  // header below would have nothing to read — measured as "the
   // dispatch lens stopped rendering" through the error boundary. Say what
   // is true instead: at this instant the run has not started.
-  if (!base) {
+  if (!hasRecords) {
     return (
       <div data-state="before-start" role="status" aria-label={`Session ${sessionId} not started yet`}>
         <div className="stagehdr">session replay</div>
@@ -787,7 +792,7 @@ export function SessionReplay({
   // "right now", not about the playhead's moment.
   const effectiveConnected = connected || playhead !== null;
   const effectiveLastContactMs = playhead !== null ? null : lastContactMs;
-  const view = runRegions(data, sessionId, clockOverride, effectiveConnected, effectiveLastContactMs, ticking ? liveOverlay : null);
+  const view = runRegions(data, sessionId, clockOverride, effectiveConnected, effectiveLastContactMs, ticking ? liveOverlay : null, presence, policy);
   // `animate: plausiblyRunning`, not `ticking` — `ticking` is now purely the
   // "should the shared clock subscribe" perf gate (see its own doc above)
   // and is unconditionally `false` in playback (`playhead === null` fails
@@ -795,7 +800,7 @@ export function SessionReplay({
   // in playback regardless of whether the run was actually still going as
   // of the playhead. `plausiblyRunning` is computed from `clockNow` above,
   // so it answers the SAME question live and replayed.
-  const liveness = livenessState({ done: !view.live, animate: plausiblyRunning, lastBeatMs: view.lastBeatMs, nowMs: clockNow });
+  const liveness = livenessState({ done: view.ended, animate: plausiblyRunning, lastBeatMs: view.lastBeatMs, nowMs: clockNow });
   const scopeHero = modelScopeHero(view);
 
   return (

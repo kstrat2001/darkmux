@@ -29,8 +29,8 @@ const MISSION_RE = /\/flow-mission\/[^/?]+(\?.*)?$/;
 const DAY_RE = /\/flow\/\d{4}-\d{2}-\d{2}(?!\/stream)(\?.*)?$/;
 const STREAM_RE = /\/flow\/\d{4}-\d{2}-\d{2}\/stream(\?.*)?$/;
 
-// (#2416) This spec's fixtures use raw `action` strings ("step start",
-// "phase start", "mission start", "step complete") that don't map to a
+// (#2416) This spec's fixtures use raw `action` strings ("step.start",
+// "phase.start", "mission.start", "step.complete") that don't map to a
 // known `activityOf()` branch and fall through to the label itself — none
 // of them are in the event log's new default allowlist (reasoning/
 // checkpoint/tool call/turn/dispatch error). This spec is about backfill/
@@ -42,7 +42,7 @@ const SHOW_ALL_ACTIVITIES = [
   'dispatch start', 'dispatch end', 'dispatch error', 'feedback', 'routing',
   'compaction', 'note', 'machine online', 'machine offline', 'session end',
   'detector', 'runtime', 'tokens', 'lms', 'host telemetry', 'telemetry',
-  'other', 'step start', 'phase start', 'mission start', 'step complete',
+  'other', 'step.start', 'phase.start', 'mission.start', 'step.complete',
 ];
 
 test.beforeEach(async ({ page }) => {
@@ -95,10 +95,10 @@ test('EVENTS pane backfills existing mission records on load (not live-stream-on
     r.fulfill({
       contentType: 'application/json',
       body: JSON.stringify([
-        { ts: `${TODAY}T10:00:00Z`, action: 'step start', handle: 'step-1', category: 'work', level: 'info' },
-        { ts: `${TODAY}T10:00:05Z`, action: 'phase start', handle: 'phase-a', category: 'work', level: 'info' },
-        { ts: `${TODAY}T10:00:10Z`, action: 'mission start', handle: 'm', mission_id: MISSION_ID, category: 'work', level: 'info' },
-        { ts: `${TODAY}T10:00:15Z`, action: 'step start', handle: 'not-in-this-mission', category: 'work', level: 'info' },
+        { ts: `${TODAY}T10:00:00Z`, action: 'step.start', handle: 'step-1', category: 'work', level: 'info' },
+        { ts: `${TODAY}T10:00:05Z`, action: 'phase.start', handle: 'phase-a', category: 'work', level: 'info' },
+        { ts: `${TODAY}T10:00:10Z`, action: 'mission.start', handle: 'm', mission_id: MISSION_ID, category: 'work', level: 'info' },
+        { ts: `${TODAY}T10:00:15Z`, action: 'step.start', handle: 'not-in-this-mission', category: 'work', level: 'info' },
       ]),
     })
   );
@@ -130,8 +130,8 @@ test('records from a PRIOR day still backfill — the cross-day case', async ({ 
       contentType: 'application/json',
       body: JSON.stringify({
         records: [
-          { ts: `${daysAgo(3)}T10:00:00Z`, action: 'phase start', handle: 'phase-a', mission_id: MISSION_ID, category: 'work', level: 'info' },
-          { ts: `${daysAgo(2)}T11:30:00Z`, action: 'mission start', handle: 'm', mission_id: MISSION_ID, category: 'work', level: 'info' },
+          { ts: `${daysAgo(3)}T10:00:00Z`, action: 'phase.start', handle: 'phase-a', mission_id: MISSION_ID, category: 'work', level: 'info' },
+          { ts: `${daysAgo(2)}T11:30:00Z`, action: 'mission.start', handle: 'm', mission_id: MISSION_ID, category: 'work', level: 'info' },
         ],
       }),
     })
@@ -173,7 +173,7 @@ test("the events pane discloses its cap instead of printing it as a total (Event
   const N = 400;
   const records = Array.from({ length: N }, (_, i) => ({
     ts: `${TODAY}T${String(Math.floor(i / 3600)).padStart(2, '0')}:${String(Math.floor((i % 3600) / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}Z`,
-    action: 'step start', handle: 'step-1', category: 'work', level: 'info',
+    action: 'step.start', handle: 'step-1', category: 'work', level: 'info',
   }));
   await mockEmpty(page, MISSION_RE);
   await page.route(DAY_RE, (r) => r.fulfill({ contentType: 'application/json', body: JSON.stringify(records) }));
@@ -194,9 +194,9 @@ test('a live-streamed record appends without duplicating a backfilled one', asyn
 
   // X (step-1) is present in BOTH the backfill AND the live stream. Z
   // (task-1) is backfill-only; Y (phase-a) is live-only and genuinely new.
-  const recX = { ts: `${TODAY}T09:00:00Z`, action: 'step start', handle: 'step-1', category: 'work', level: 'info' };
-  const recZ = { ts: `${TODAY}T08:59:00Z`, action: 'phase start', handle: 'task-1', category: 'work', level: 'info' };
-  const recY = { ts: `${TODAY}T09:00:30Z`, action: 'step complete', handle: 'phase-a', category: 'work', level: 'info' };
+  const recX = { ts: `${TODAY}T09:00:00Z`, action: 'step.start', handle: 'step-1', category: 'work', level: 'info' };
+  const recZ = { ts: `${TODAY}T08:59:00Z`, action: 'phase.start', handle: 'task-1', category: 'work', level: 'info' };
+  const recY = { ts: `${TODAY}T09:00:30Z`, action: 'step.complete', handle: 'phase-a', category: 'work', level: 'info' };
 
   await mockEmpty(page, MISSION_RE);
   await page.route(DAY_RE, (r) => r.fulfill({ contentType: 'application/json', body: JSON.stringify([recX, recZ]) }));
@@ -216,7 +216,7 @@ test('a live-streamed record appends without duplicating a backfilled one', asyn
   const titles = await page.$$eval('.eventlog__rec', (els) => els.map((e) => e.getAttribute('title')));
   expect(titles.filter((t) => t === 'step-1')).toHaveLength(1);
   expect(titles).toContain('task-1');
-  await expect(page.locator('.eventlog__rec', { hasText: 'step complete' })).toHaveCount(1);
+  await expect(page.locator('.eventlog__rec', { hasText: 'step.complete' })).toHaveCount(1);
 
   expect(pageErrors).toEqual([]);
 });

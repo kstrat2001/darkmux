@@ -1,4 +1,5 @@
-import type { FlowRecord } from "../types/handwritten";
+import { ACTION, type NormAction, type NormRecord } from "../lib/ingest";
+import { norm } from "./records";
 
 /**
  * (#2926) A real coder execution's first two minutes, as flow records.
@@ -112,12 +113,12 @@ const ROWS: Array<[string, Kind, Record<string, unknown>]> = [
 
 export const PEPPER_SID = "darkmux-coding-refresh-rotation-fixture";
 export const PEPPER_MACHINE = "MacBook-Pro";
-const ACTION: Record<Kind, string> = {
-  start: "dispatch start",
-  beat: "dispatch.turn.heartbeat",
-  turn: "dispatch.turn",
-  tool: "dispatch.tool",
-  tokens: "telemetry.tokens",
+const KIND_ACTION: Record<Kind, NormAction> = {
+  start: ACTION.DispatchStart,
+  beat: ACTION.DispatchTurnHeartbeat,
+  turn: ACTION.DispatchTurn,
+  tool: ACTION.DispatchTool,
+  tokens: ACTION.TelemetryTokens,
 };
 
 /** Unix ms of a `HH:MM:SS(.sss)` wall time on the run's day (UTC). */
@@ -127,23 +128,23 @@ export const pepperAt = (hms: string): number => Date.parse(`2026-09-26T${hms}Z`
  *  or `>= minTurn` (a turn's `dispatch.tool` records follow its turn record,
  *  so they are kept with it). `extra` merges into every record (a fleet test
  *  adds `machine_uid`). */
-export function pepperRecords(opts: { minTurn?: number; maxTurn?: number; extra?: Record<string, unknown> } = {}): FlowRecord[] {
-  const out: FlowRecord[] = [];
+export function pepperRecords(opts: { minTurn?: number; maxTurn?: number; extra?: Record<string, unknown> } = {}): NormRecord[] {
+  const out: NormRecord[] = [];
   let turn = 0;
   for (const [hms, kind, payload] of ROWS) {
     if (typeof payload.turn_seq === "number") turn = payload.turn_seq;
     const keep = kind === "start" || ((opts.minTurn == null || turn >= opts.minTurn) && (opts.maxTurn == null || turn <= opts.maxTurn));
     if (!keep) continue;
-    out.push({
+    out.push(norm({
       ts: `2026-09-26T${hms}Z`,
-      action: ACTION[kind],
+      action: KIND_ACTION[kind],
       session_id: PEPPER_SID,
       machine_id: PEPPER_MACHINE,
       handle: "coder",
       ...(kind === "start" ? { source: "crew_dispatch", category: "work", model: "darkmux:qwen3.6-35b-a3b" } : {}),
       payload,
       ...opts.extra,
-    } as unknown as FlowRecord);
+    }));
   }
   return out;
 }

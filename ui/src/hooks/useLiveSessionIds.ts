@@ -26,8 +26,8 @@ import type { FleetSessionsLiveResponse } from "../types/handwritten";
  * claim it was getting wrong is in that hook's own doc. */
 export interface LiveSessionsResult {
   /** `LIVE_SESSIONS` as a `Set<session_id>`. Empty in the recorded corpus (no
-   * session was live at record time); `lib/flow.ts::liveSessionSet` falls
-   * back to the flow-derived heuristic when this is empty, same as legacy. */
+   * session was live at record time). An ADDITIVE input to each run's
+   * lifecycle (`lib/lifecycle.ts`): empty, the records alone decide. */
   sessions: Set<string>;
   /** The missions those sessions run under (the beat's optional
    * `mission_id`). A mission's own run-grain session never beats, so its run

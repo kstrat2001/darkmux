@@ -152,6 +152,39 @@ darkmux release.
   directory already exists now claims
   `<n>.2`, `<n>.3`, … instead of writing into it. **Migration:** a tool that
   parses the last segment of a run id as an integer must accept `<n>.<k>`.
+- **Every viewer surface judges a run the same way, by the daemon's own
+  staleness rule.** The fleet card, the activity timeline, the run page's
+  pill, clock and pulse, the live token scope, the mission graph's step
+  meter and playback all read one lifecycle (`ui/src/lib/lifecycle.ts`), so
+  the same run states the same phase on each at the same moment. A run
+  silent for twice the runtime's inactivity budget (`runtime.inactivity_
+  timeout_seconds`, 20 minutes by default, the rule `/runs` already used)
+  reads as stopped with no ending recorded everywhere: the fleet card
+  waited 5 minutes before, and the run page's pill said RUNNING forever.
+  The STALLED word is the earlier signal, after 30 seconds of silence. A
+  session id two missions share is two runs on every surface (#2125); a
+  relaunch under the same id is its own attempt; a terminal with an
+  unparsable timestamp closes the run on the fleet card too. A hosted call
+  held by its endpoint's budget is running while it waits, on `/runs` as
+  well (it no longer reads Abandoned after 20 minutes of a longer wait), and
+  a wait the operator stopped reads **aborted**. A wait that lapses (its
+  announced resume time plus a minute of grace passes with no resume)
+  now stays running for a further 20 minutes before it reads stopped,
+  matching `/runs`; before, the viewer called it stopped the moment the
+  grace ran out. The mission graph's step meter follows the same rule, so
+  a step held by a budget wait keeps its pulse. A link to a run's detail
+  view carries its mission (`#dispatch=<sid>&dispatch.mission=<id>`), so a
+  session id several missions share opens the run that was clicked, and
+  the event log beside it lists that run alone; a link naming only the
+  session still opens the run that started last. On `/runs` and in
+  radio's busy check, a mission whose task session another mission shares
+  (#1918) is judged by its own attempts on that session: it reads Running
+  while it runs, where it used to read Abandoned after 20 minutes. Its
+  role, model, machine and endpoint are still not read from a shared
+  session. `/runs` gains
+  `policy: {stale_after_ms, budget_wait_grace_ms}`, the numbers it judged
+  by, and `/health` gains the same object as `lifecycle_policy`, which is
+  where the viewer reads it (both additive). **Migration:** none.
 - **The per-step cap on hosted tokens is renamed, has no default, and
   never stops a step: a step that used to stop at 500,000 hosted tokens now
   runs to completion unless you set a cap** (#2902 step 5).
@@ -178,6 +211,52 @@ darkmux release.
   it now, so it no longer caps anything. Delete it, or, to keep a cap, run
   `darkmux config set remote.max_tokens_per_step <n>` (and rename an
   exported `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`).
+- **Flow actions have one spelling per event** (FLOW 2.0.0). Every action
+  is `<scope>.<event>[.<detail>]`: `dispatch start` is now `dispatch.start`,
+  `step result` is `step.result`, `mission close` is `mission.close`,
+  `note` is `operator.note`, `tier-decision` is `tier.decision`, and
+  `verdict: <v>` is `phase.review.verdict` with the verdict in
+  `payload.verdict` (the full list is in `crates/darkmux-flow/src/schema.rs`).
+  darkmux's own readers, the daemon routes included, upgrade pre-4.0
+  archives on read and never rewrite them. An action retired with no
+  current equivalent (`telemetry.process`, `funnel.*`, the old
+  `mission.run.*`, `crawl.*` launcher records) still reads, as retired; an
+  action this build does not know still reads and `darkmux doctor` names it. `darkmux flow record
+  --action` accepts only known actions. **Migration:** a consumer of the
+  flow stream outside darkmux (a hook receiver, a script over the day files
+  or Redis) must read the dotted spellings. A hook rule whose `match.action`
+  names an old exact spelling (`dispatch complete`) still matches: the hook
+  layer reads it as its current action, and `darkmux doctor` flags it `OLD
+  SPELLING` with what to write instead. A spaced glob is read as its dotted
+  twin only when that twin matches exactly what it used to (`step *` reads
+  as `step.*`); one that would match more (`dispatch *`, `mission *`,
+  `phase *`) matches nothing, and both `darkmux doctor` (`CANNOT MATCH`) and
+  the hook sink at startup say so.
+- **Every machine in a fleet upgrades together** (FLOW 2.0.0). A 4.0 reader
+  upgrades a 3.x peer's records, but a 3.x reader does not know the dotted
+  spellings: a 3.x hub misreads a 4.0 peer's records (its missions never
+  end, its step results aren't folded). **Migration:** upgrade every
+  machine in the fleet before relying on the hub's views.
+- **Dotted hook globs now match the bookends too** (FLOW 2.0.0). Before 4.0
+  these actions were spaced, so a dotted glob never saw them: `dispatch.*`
+  now also matches `dispatch.start` / `complete` / `error` / `route`;
+  `mission.*` also matches `mission.start` / `close` / `abort` / `pause` /
+  `resume`; `step.*` (which matched nothing before) matches `step.start` /
+  `complete` / `error` / `result` / `timing` / `seat_unresolved`; and
+  `phase.*` matches `phase.start` / `complete` / `abandon` / `added` /
+  `id_ambiguous` and `phase.review.begin` / `aborted` / `dispatch` /
+  `failed` / `verdict`. **Migration:** a receiver behind one of these globs
+  sees more records; narrow the rule (`dispatch.tool`) if it should not.
+- **The viewer matches the dotted flow vocabulary only, and says when it
+  meets anything else.** Every record enters the viewer through one module
+  (`ui/src/lib/ingest.ts`); the spaced spellings are no longer matched
+  anywhere in it. The event log's activity filter names scheduler and mission
+  records by their dotted action (`step.start`, was `step start`), and a
+  record whose action is neither current nor retired adds `· N unknown` to
+  the event count. A record whose timestamp does not parse is kept on every
+  surface: it closes its run, shows `--:--:--` for its clock, and is left
+  out of any duration or rate arithmetic. **Migration:** re-pick any saved
+  activity filter that named a spaced action.
 
 - **A profile names the machine that runs it: `profile@machine`; `dispatch
   --machine` is removed** (#2916 stage 2, no alias). `darkmux dispatch
@@ -191,7 +270,7 @@ darkmux release.
   undefined name is refused by name, never replaced by its
   `default_profile`. On a path that runs only on this machine (the lab, a
   mission step, until mission steps route), an address is refused naming
-  it, never read as an undefined local name. The sender's `dispatch route`
+  it, never read as an undefined local name. The sender's `dispatch.route`
   record carries `profile_address`; tokens are counted once, by the machine
   that runs the model, never on the sender's records. A profile name that
   contains `@` cannot be addressed. **Migration:** `darkmux dispatch <role>

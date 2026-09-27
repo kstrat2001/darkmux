@@ -12,6 +12,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ScopeLamps, SessionReplay, modelScopeHero } from "./SessionReplay";
 import { PlaybackClockContext } from "../../lib/pageClockRate";
 import { PEPPER_SID, pepperAt, pepperRecords } from "../../testing/pepperGrinderRun";
+import { ACTION } from "../../lib/ingest";
 
 // (#2886 pass 5, MUST — fresh-reviewer finding F5) Several fixes here stayed
 // green while broken in the actual render path — `effectiveConnected`/
@@ -353,14 +354,7 @@ describe("SessionReplay", () => {
     expect(system?.textContent).not.toContain("ACTIVE TIME");
   });
 
-  // Both producer lineages' bookend spellings. The space form is the one a
-  // mission's run-grain session really carries (darkmux-crew); a fixture that
-  // only used the dotted form passed while the live page never fetched the
-  // mission's records at all.
-  it.each([
-    ["space (darkmux-crew, what a mission emits)", " "],
-    ["dot (darkmux-lab and the runtime)", "."],
-  ])("(#2759) rolls the MODEL panes up from the run's INNER sessions when the run's OWN session carries no telemetry: %s spelling", async (_label, sep) => {
+  it("(#2759) rolls the MODEL panes up from the run's INNER sessions when the run's OWN session carries no telemetry", async () => {
     // The defect: a mission mints a run-grain session (`dispatch start` /
     // `dispatch complete` / `mission.grow` — bookends only) distinct from its
     // inner role-execution session, which carries the real turns/tokens/
@@ -378,7 +372,7 @@ describe("SessionReplay", () => {
       // only, exactly the shape #2759 measured on a real run.
       {
         ts: "2026-09-16T05:30:44Z",
-        action: `dispatch${sep}start`,
+        action: "dispatch.start",
         session_id: missionId,
         mission_id: missionId,
         machine_id: "M",
@@ -388,7 +382,7 @@ describe("SessionReplay", () => {
       { ts: "2026-09-16T05:31:00Z", action: "mission.grow", session_id: missionId, mission_id: missionId, machine_id: "M", payload: {} },
       {
         ts: "2026-09-16T05:31:41Z",
-        action: `dispatch${sep}complete`,
+        action: "dispatch.complete",
         session_id: missionId,
         mission_id: missionId,
         machine_id: "M",
@@ -398,7 +392,7 @@ describe("SessionReplay", () => {
       // dispatch, carrying the real telemetry.
       {
         ts: "2026-09-16T05:30:50Z",
-        action: `dispatch${sep}start`,
+        action: "dispatch.start",
         session_id: unitSid,
         mission_id: missionId,
         machine_id: "M",
@@ -437,7 +431,7 @@ describe("SessionReplay", () => {
         machine_id: "M",
         payload: { event: "load", model: "qwen3.6-35b-a3b-turboquant-mlx", gb: 20 },
       },
-      { ts: "2026-09-16T05:31:35Z", action: `dispatch${sep}complete`, session_id: unitSid, mission_id: missionId, machine_id: "M", payload: {} },
+      { ts: "2026-09-16T05:31:35Z", action: "dispatch.complete", session_id: unitSid, mission_id: missionId, machine_id: "M", payload: {} },
       // A SECOND inner execution (the crawl's coder) that saw the same model
       // resident: its own load record must not list the model twice.
       {
@@ -744,30 +738,47 @@ describe("SessionReplay", () => {
 
   // ── (#1973 audit) accessibility ────────────────────────────────────
 
-  it("(#1973) the pill and the pulse never tell CONTRADICTORY stories about the same run", async () => {
-    // A run that opened and went silent for weeks has no terminal record, so
-    // the pill says RUNNING — while liveness correctly says it cannot still
-    // be executing. Feeding ONE boolean to both made the pulse announce
-    // "finished" beside a green RUNNING pill: the same run, the same view,
-    // opposite claims, and only a screen-reader user would ever have seen the
-    // contradiction.
-    vi.useFakeTimers();
-    const t0 = 1_800_000_000_000;
-    vi.setSystemTime(t0);
-    const records = [
-      { ts: new Date(t0 - 40 * 24 * 3600_000).toISOString(), action: "dispatch.start", session_id: "s-stale", machine_id: "M", payload: { role: "coder" } },
-    ];
+  it("a session that recorded its end with nothing opened: the pulse reads finished, as the status does", async () => {
+    // The crash shape: only the reconciler's `session.end` is here. It is no
+    // run, but its session recorded how it ended, and the pill's status says
+    // so; its description must not call it "may be abandoned".
+    const records = [{ ts: "2026-01-01T00:00:00Z", action: "session.end", session_id: "s-ended", machine_id: "M", payload: {} }];
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
-    renderReplay("s-stale");
-    await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    renderReplay("s-ended");
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    const pillEl = document.querySelector(".session-run__header .pill");
+    expect(pillEl?.textContent?.toLowerCase()).toContain("no ending recorded");
+    expect(pillEl?.getAttribute("title")).toBe("finished");
+  });
 
-    const pill = document.querySelector(".session-run__header .pill")?.textContent ?? "";
-    const pulseLabel = document.querySelector(".pill[data-live]")?.getAttribute("title") ?? "";
-    expect(pill).toContain("running"); // the chip's one running word; CSS uppercases it on screen
-    // The pulse may say "may be abandoned"; it must NOT claim the run finished.
-    expect(pulseLabel).not.toContain("finished");
-    expect(document.querySelector(".pill[data-live]")?.getAttribute("data-live")).toBe("stale");
-    vi.useRealTimers();
+  it("(#1973) the pill and the pulse never tell CONTRADICTORY stories about the same run", async () => {
+    // A run that opened and went silent for weeks has no terminal record. It
+    // has stopped with no ending recorded (`lib/lifecycle.ts`: silent past
+    // the staleness window), and the pill and the pulse both say so: the
+    // pill never reads RUNNING beside a pulse that knows better, and the
+    // pulse never claims the run FINISHED.
+    vi.useFakeTimers();
+    try {
+      const t0 = 1_800_000_000_000;
+      vi.setSystemTime(t0);
+      const records = [
+        { ts: new Date(t0 - 40 * 24 * 3600_000).toISOString(), action: "dispatch.start", session_id: "s-stale", machine_id: "M", payload: { role: "coder" } },
+      ];
+      vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+      renderReplay("s-stale");
+      await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+
+      const pillEl = document.querySelector(".session-run__header .pill");
+      const pill = pillEl?.textContent ?? "";
+      expect(pill.toLowerCase()).toContain("no ending recorded");
+      expect(pill.toLowerCase()).not.toContain("running");
+      // Not a running chip, so no pulse rides it; its description says the
+      // run may be abandoned, never that it finished.
+      expect(pillEl?.getAttribute("data-live")).toBeNull();
+      expect(pillEl?.getAttribute("title")).toContain("may be abandoned");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("(#1973) signal severity is available WITHOUT sight — not only as colour, class and a data attribute", async () => {
@@ -825,7 +836,7 @@ describe("SessionReplay", () => {
     // The non-live-region requirement is unchanged and now applies to the
     // pill: its liveness rides `title` (a DESCRIPTION, so the pill keeps its
     // own accessible name from its text) and it must never announce.
-    const pulse = document.querySelector(".pill[data-live]");
+    const pulse = document.querySelector(".session-run__header .pill");
     expect(pulse?.getAttribute("title")).toBeTruthy();
     expect(pulse?.getAttribute("aria-live")).toBeNull();
   });
@@ -886,16 +897,15 @@ describe("SessionReplay", () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify(raw), { status: 200 }))));
     renderReplay("task-list");
     // The chip is the one element that says the running word; other text may too.
-    await waitFor(() => expect(document.querySelector(".session-run__header .pill")?.textContent).toContain("running"));
-    expect(screen.getByText(/FETCH-RENDER/)).toBeInTheDocument();
+    // `task-list` is ONE session id 24 missions shared (a scheduler task id).
+    // The page reads the run that opened last (`runRef.ts`'s `sessionRun`),
+    // never the 24 blended into one 17-hour "run", and its step closed.
+    await waitFor(() => expect(document.querySelector(".session-run__header .pill")?.textContent?.toLowerCase()).toContain("complete"));
+    expect(screen.getByText(/LIST-STEP/)).toBeInTheDocument();
     expect(screen.getByText(/task-list on/)).toBeInTheDocument();
     expect(screen.getByText("LMStudio · local · this machine")).toBeInTheDocument();
-    expect(screen.getByText(/07:36:48 · running/)).toBeInTheDocument();
-    // (U3-7/U5-2) Rebaselined with the golden: legacy's `fmt()` had no hour
-    // rollover, so this 17h51m run read "1071:54". One formatter now
-    // (`fmtElapsed`), and it says hours. See `tests/parity/README.md` on
-    // hand-editing a golden, and `lib/format.ts` for the divergence.
-    expect(screen.getByText("17:51:54 so far")).toBeInTheDocument();
+    expect(screen.getByText(/^\d\d:28:40 → \d\d:28:42 \(0:02\)$/)).toBeInTheDocument();
+    expect(screen.getByText("0:02")).toBeInTheDocument();
     // Same reason as the track below: this corpus did no model work, so the
     // MODEL pane is absent and TURNS with it. The SYSTEM pane still renders.
     expect(screen.queryByText("TURNS")).not.toBeInTheDocument();
@@ -1663,10 +1673,10 @@ describe("(#2926) run page: THINK opener and TOOL GEN, from the real run", () =>
     const files = (k: number) => `/workspace/src/deep/tree/file${k}.js`;
     return pepperRecords().map((r) => {
       const p = (r as unknown as { payload: Record<string, unknown> }).payload;
-      if (withPaths && r.action === "dispatch.turn" && p.turn_seq === 1) {
+      if (withPaths && r.action === ACTION.DispatchTurn && p.turn_seq === 1) {
         return { ...r, payload: { ...p, tool_names: ["read", "read", "read", "read", "read"], tool_paths: [1, 2, 3, 4, 5].map(files) } } as unknown as typeof r;
       }
-      if (r.action !== "dispatch.tool" || p.tool_name !== "read") return r;
+      if (r.action !== ACTION.DispatchTool || p.tool_name !== "read") return r;
       n += 1;
       return { ...r, payload: { ...p, args: JSON.stringify({ path: files(n), offset: 1, limit: 200 }) } } as unknown as typeof r;
     });

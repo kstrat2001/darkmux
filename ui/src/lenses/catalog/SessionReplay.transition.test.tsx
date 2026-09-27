@@ -129,8 +129,8 @@ describe("SessionReplay — the run finishing while the page is open (#2011)", (
     vi.useFakeTimers();
     vi.setSystemTime(T0);
     const M = "m-2759";
-    const mStart = { ...START, action: "dispatch start", mission_id: M };
-    const mDone = { ...DONE, action: "dispatch complete", mission_id: M };
+    const mStart = { ...START, action: "dispatch.start", mission_id: M };
+    const mDone = { ...DONE, action: "dispatch.complete", mission_id: M };
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string) => {
@@ -160,9 +160,9 @@ describe("SessionReplay — the run finishing while the page is open (#2011)", (
   it("stops the elapsed counter when presence says the run is gone, even with no terminal record", async () => {
     // The abandoned case: the host process was killed, so no clean
     // `dispatch complete` is ever written, and the reconciler's `session.end`
-    // edge may not have landed yet. Before this, the counter kept climbing for
-    // a further ten minutes (`STALE_AFTER_MS`, the watchdog's kill timeout)
-    // and then froze on whatever wrong number it had reached. Presence having
+    // edge may not have landed yet. Before this, the counter kept climbing
+    // until the run went stale and then froze on whatever wrong number it
+    // had reached. Presence having
     // SEEN the session disappear is proof the run stopped; that beats a
     // ten-minute silence heuristic.
     vi.useFakeTimers();
@@ -212,5 +212,31 @@ describe("SessionReplay — the run finishing while the page is open (#2011)", (
     // record says otherwise. Stopping the clock is not the same as claiming a
     // clean close.
     expect(pillText()).toContain("running");
+  });
+});
+
+describe("SessionReplay — presence is a fact about now, not about a scrubbed instant", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    h.liveIds = new Set<string>();
+  });
+
+  it("a playhead parked in a silent stretch reads the run stopped, whatever presence says now", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    // Silent for 30 minutes (past the 20-minute window), then beating again.
+    const early = { ...START, ts: iso(T0 - 3 * 3_600_000) };
+    const lateBeat = { ...BEAT, ts: iso(T0 - 1_000) };
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ records: [early, lateBeat], count: 2 }), { status: 200 })));
+    h.liveIds = new Set([SID]);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <SessionReplay sessionId={SID} playhead={T0 - 3 * 3_600_000 + 1_800_000} />
+      </QueryClientProvider>,
+    );
+    await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    expect(pillText().toLowerCase()).toContain("no ending recorded");
   });
 });

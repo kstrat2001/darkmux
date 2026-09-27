@@ -1,11 +1,14 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
+import { Profiler } from "react";
 import { render, screen, fireEvent, waitFor, act, within } from "@testing-library/react";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { EventLogColumn, compactCountLabel, fmtTok, fmtTurnDuration } from "./EventLogColumn";
-import type { FlowRecord } from "../types/handwritten";
+import { ingest, type NormRecord } from "../lib/ingest";
+import { norm, type RawRecord } from "../testing/records";
 import { closeOpenModal } from "../lib/dialogManager";
+import { PageJudgementContext } from "../hooks/useJudgement";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // `ui/src/components/` -> repo root is three levels up.
@@ -30,19 +33,18 @@ const REPO_ROOT = path.resolve(__dirname, "../../..");
  * uses) and a neutral `/tmp/...` path. Every other field (the prompt, the
  * diff it reviews, tool args/results, timings, turn structure) is the real
  * captured shape — only the two host-identifying values were touched. */
-function readCorpus(name: string): FlowRecord[] {
-  const raw = JSON.parse(readFileSync(path.join(REPO_ROOT, "tests/parity/corpus", name), "utf8"));
-  return raw.records as FlowRecord[];
+function readCorpus(name: string): NormRecord[] {
+  return ingest(JSON.parse(readFileSync(path.join(REPO_ROOT, "tests/parity/corpus", name), "utf8")));
 }
 
-function rec(overrides: Partial<FlowRecord>): FlowRecord {
-  return {
+function rec(overrides: RawRecord): NormRecord {
+  return norm({
     ts: "2026-08-08T12:00:00.000Z",
     category: "dispatch",
     action: "dispatch.reasoning",
     machine_id: "MacBook-Pro",
     ...overrides,
-  };
+  });
 }
 
 // `dialogManager`'s "which dialog is open" state is a module-level
@@ -109,6 +111,21 @@ describe("EventLogColumn", () => {
     const rows = document.querySelectorAll('[data-act="rec"]');
     expect(rows.length).toBe(1);
     expect(rows[0].textContent).toContain("s-alpha");
+  });
+
+  it("states vocabulary skew beside the totals: records whose action this build does not know", () => {
+    const records = [
+      rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s-alpha" }),
+      rec({ ts: "2026-08-08T12:01:00.000Z", action: "dispatch start", session_id: "s-alpha" }),
+      rec({ ts: "2026-08-08T12:02:00.000Z", action: "wibble.fired", session_id: "s-alpha" }),
+    ];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    expect(document.getElementById("qcount")?.textContent).toMatch(/ · 2 unknown$/);
+  });
+
+  it("says nothing about skew when every action is known", () => {
+    render(<EventLogColumn scopeLabel="fleet" records={[rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning" })]} visible />);
+    expect(document.getElementById("qcount")?.textContent).not.toMatch(/unknown/);
   });
 
   it("shows 'no match' in the query count when the search matches nothing", () => {
@@ -360,13 +377,13 @@ describe("EventLogColumn", () => {
   it("the modal's checkbox grid filters by category/tier/source, not just activity", () => {
     const records = [
       rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s-local", tier: "local" }),
-      rec({ ts: "2026-08-08T12:05:00.000Z", action: "dispatch.reasoning", session_id: "s-cloud", tier: "cloud" }),
+      rec({ ts: "2026-08-08T12:05:00.000Z", action: "dispatch.reasoning", session_id: "s-cloud", tier: "frontier" }),
     ];
     render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
     fireEvent.click(document.getElementById("fbtn")!);
-    // Uncheck the "cloud" tier checkbox — its own accessible label is the
+    // Uncheck the "frontier" tier checkbox — its own accessible label is the
     // literal facet value text (see FiltersDialog.tsx).
-    fireEvent.click(screen.getByLabelText("cloud"));
+    fireEvent.click(screen.getByLabelText("frontier"));
     const rows = document.querySelectorAll('[data-act="rec"]');
     expect(rows.length).toBe(1);
     expect(rows[0].textContent).toContain("s-local");
@@ -455,7 +472,7 @@ describe("EventLogColumn", () => {
   it("(#2027 dual-mount) an idle sibling pane's own reconcile never writes, so it cannot clobber a gesture made in the other", () => {
     const records = [
       rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s-local", tier: "local" }),
-      rec({ ts: "2026-08-08T12:05:00.000Z", action: "dispatch.reasoning", session_id: "s-cloud", tier: "cloud" }),
+      rec({ ts: "2026-08-08T12:05:00.000Z", action: "dispatch.reasoning", session_id: "s-cloud", tier: "frontier" }),
     ];
     const { container: paneA } = render(<EventLogColumn scopeLabel="fleet" paneId="a" records={records} visible />);
     const { rerender: rerenderB } = render(
@@ -479,7 +496,7 @@ describe("EventLogColumn", () => {
     // operator gesture of its own.
     //
     // (#2417 round 3, MF-B) The tick record carries a BRAND-NEW facet value
-    // (`tier: "edge"` — neither "local" nor "cloud" was ever offered
+    // (`tier: "operator"` — neither "local" nor "frontier" was ever offered
     // before) rather than reusing an already-seen one. `absorbNewFacetValues`
     // returns the SAME `filters` reference when nothing is new (its own
     // "no spurious re-render" guarantee — see `eventFilters.ts`'s doc), so
@@ -492,7 +509,7 @@ describe("EventLogColumn", () => {
       <EventLogColumn
         scopeLabel="mission m1"
         paneId="b"
-        records={[...records, rec({ ts: "2026-08-08T12:10:00.000Z", action: "dispatch.reasoning", session_id: "s-edge", tier: "edge" })]}
+        records={[...records, rec({ ts: "2026-08-08T12:10:00.000Z", action: "dispatch.reasoning", session_id: "s-edge", tier: "operator" })]}
         visible={false}
       />,
     );
@@ -1181,6 +1198,100 @@ describe("EventLogColumn — turns (#2863)", () => {
     r(10, "dispatch.tool", { tool_name: "edit", args: '{"path":"/workspace/a.js"}', outcome: "ok" }),
     r(11, "dispatch.rest", { ms: 15000, reason: "thermal-duty-cycle", state: "fair" }),
   ];
+
+  // (N4) A turn header states whether its run ended, judged at the page's
+  // instant and presence: the playhead when one is parked, else now, ticking.
+  describe("an unfinished turn's header is judged at the page's instant", () => {
+    const T = Date.UTC(2026, 8, 23, 1, 9, 0);
+    const at = (sec: number) => new Date(T + sec * 1000).toISOString();
+    const open = [
+      rec({ ts: at(0), action: "dispatch.start", session_id: S, machine_id: "MacBook-Pro", payload: {} } as never),
+      rec({ ts: at(5), action: "dispatch.turn", session_id: S, machine_id: "MacBook-Pro", payload: { turn_seq: 1, finish_reason: "tool_calls", tool_calls_count: 1 } } as never),
+      rec({ ts: at(10), action: "dispatch.checkpoint", session_id: S, machine_id: "MacBook-Pro", payload: { turn_seq: 2, verdict: "continue" } } as never),
+    ];
+    const why2 = () => [...document.querySelectorAll(".eventlog__rec--turn")].find((h) => h.querySelector(".eventlog__turnname")?.textContent === "Turn 2")?.querySelector(".eventlog__turnwhy")?.textContent;
+    afterEach(() => vi.useRealTimers());
+
+    it("flips to did not finish once the clock passes the window, with no new record", async () => {
+      vi.useFakeTimers({ now: T + 11_000 });
+      render(<EventLogColumn scopeLabel="runs" records={open} visible />);
+      expect(why2()).toBe("in progress");
+      await act(async () => {
+        vi.setSystemTime(T + 10_000 + 21 * 60_000);
+        vi.advanceTimersByTime(2_000);
+      });
+      expect(why2()).toBe("did not finish");
+    });
+
+    it("does not re-render on the clock's tick when it shows no turn whose state can change", async () => {
+      vi.useFakeTimers({ now: T + 11_000 });
+      const fleetOnly = [
+        rec({ ts: at(0), action: "telemetry.heartbeat", session_id: "s-a", machine_id: "MacBook-Pro", payload: {} } as never),
+        rec({ ts: at(1), action: "telemetry.heartbeat", session_id: "s-b", machine_id: "MacBook-Pro", payload: {} } as never),
+      ];
+      let renders = 0;
+      render(
+        <Profiler id="log" onRender={() => renders++}>
+          <EventLogColumn scopeLabel="fleet" records={fleetOnly} visible />
+        </Profiler>,
+      );
+      const settled = renders;
+      await act(async () => {
+        vi.advanceTimersByTime(5_000);
+      });
+      expect(renders).toBe(settled);
+    });
+
+    it("on an injected /play/<date> page judges as of the newest record, as the run page does", () => {
+      const metas = [["darkmux-mode", "play"], ["darkmux-date", "2026-09-23"]].map(([name, content]) => {
+        const m = document.createElement("meta");
+        m.setAttribute("name", name);
+        m.setAttribute("content", content);
+        document.head.appendChild(m);
+        return m;
+      });
+      try {
+        vi.useFakeTimers({ now: T + 10_000 + 60 * 60_000 });
+        render(<EventLogColumn scopeLabel="runs" records={open} visible />);
+        expect(why2()).toBe("in progress");
+      } finally {
+        metas.forEach((m) => m.remove());
+      }
+    });
+
+    it("judges records that arrive later at the time they arrive, not at mount", () => {
+      vi.useFakeTimers({ now: T + 20_000 });
+      const closed = [
+        rec({ ts: at(0), action: "dispatch.start", session_id: "s-old", machine_id: "MacBook-Pro", payload: {} } as never),
+        rec({ ts: at(5), action: "dispatch.complete", session_id: "s-old", machine_id: "MacBook-Pro", payload: {} } as never),
+      ];
+      const { rerender } = render(<EventLogColumn scopeLabel="runs" records={closed} visible />);
+      vi.setSystemTime(T + 30 * 60_000 + 11_000);
+      const later = open.map((r) => rec({ ...r, ts: new Date((r.tMs as number) + 30 * 60_000).toISOString() } as never));
+      rerender(<EventLogColumn scopeLabel="runs" records={later} visible />);
+      expect(why2()).toBe("in progress");
+    });
+
+    it("reads a parked playhead's instant, not now", () => {
+      vi.useFakeTimers({ now: T + 10_000 + 60 * 60_000 });
+      render(
+        <PageJudgementContext.Provider value={{ playhead: T + 11_000, live: new Set() }}>
+          <EventLogColumn scopeLabel="runs" records={open} visible />
+        </PageJudgementContext.Provider>,
+      );
+      expect(why2()).toBe("in progress");
+    });
+
+    it("holds a silent run in progress while presence reports its session live", () => {
+      vi.useFakeTimers({ now: T + 10_000 + 60 * 60_000 });
+      render(
+        <PageJudgementContext.Provider value={{ playhead: null, live: new Set([S]) }}>
+          <EventLogColumn scopeLabel="runs" records={open} visible />
+        </PageJudgementContext.Provider>,
+      );
+      expect(why2()).toBe("in progress");
+    });
+  });
 
   it("a turn is a header row: its number, what it did, its time, and its context", () => {
     render(<EventLogColumn scopeLabel="runs" records={records} visible />);

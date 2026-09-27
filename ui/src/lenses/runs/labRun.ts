@@ -19,7 +19,8 @@
 
 import { RUNNING_WORD } from "../../components/WorkStatus";
 import { shortModel } from "../lab/labSeries";
-import type { LabFunnelEnvelope, LabRunEvent, LabScoresDoc } from "../../types/handwritten";
+import type { LabFunnelEnvelope, LabScoresDoc } from "../../types/handwritten";
+import { ACTION, CATEGORY, type NormRecord } from "../../lib/ingest";
 
 /** `computeLabPipeline()` — viewer.html:4756-4774. Folds the event feed
  * into per-`step_id` completion payloads (in first-seen order) plus a
@@ -31,13 +32,13 @@ export interface LabPipeline {
   rulingTally: { 1: Record<string, number>; 2: Record<string, number> };
 }
 
-export function computeLabPipeline(events: LabRunEvent[]): LabPipeline {
+export function computeLabPipeline(events: NormRecord[]): LabPipeline {
   const steps: Record<string, Record<string, unknown>> = {};
   const order: string[] = [];
   const rulingTally: { 1: Record<string, number>; 2: Record<string, number> } = { 1: {}, 2: {} };
 
   for (const r of events) {
-    if (r.action !== "step result" || !r.payload) continue;
+    if (r.action !== ACTION.StepResult || !r.payload) continue;
     const p = r.payload;
     if (p.step_id === "review-ruling") {
       const pass = p.pass as 1 | 2 | undefined;
@@ -114,18 +115,18 @@ export function labFeedTs(ts: unknown): string {
 /** `labFeedRow()` — viewer.html:4807-4825, reduced to its three visible
  * lines (ts, tag, text — `.labfeedrow` is `display:flex`, each span is its
  * own `innerText` line, same convention as `labPipelineLines` above). */
-export function labFeedRowLines(r: LabRunEvent): string[] {
+export function labFeedRowLines(r: NormRecord): string[] {
   const tt = labFeedTs(r.ts);
   const f = r.payload || {};
 
-  if (r.category === "telemetry" && r.source === "process") {
+  if (r.category === CATEGORY.Telemetry && r.source === "process") {
     const cpu = f.cpu ?? "–";
     const mem = f.mem ?? "–";
     const gpu = f.gpu ?? "–";
     return [tt, "host", `cpu ${cpu}% · mem ${mem}% · gpu ${gpu}%`];
   }
 
-  if (r.action === "step result") {
+  if (r.action === ACTION.StepResult) {
     if (f.step_id === "review-ruling") {
       const stage = f.stage ? String(f.stage) : "ruling";
       const passLbl = f.pass != null ? ` pass${f.pass}` : "";
@@ -146,7 +147,7 @@ export const LAB_FEED_CAP = 500;
  * "watch it think" narrative); flattens `labFeedRowLines` per surviving
  * event into one array (matching the div-per-line convention this module
  * uses throughout). */
-export function labFeedLines(events: LabRunEvent[]): string[] {
+export function labFeedLines(events: NormRecord[]): string[] {
   if (!events.length) return [];
   return events
     .slice()

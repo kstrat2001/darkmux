@@ -52,12 +52,12 @@ function sessionRecords(id) {
       {
         ts: '2026-08-03T12:00:00Z', level: 'info', category: 'work', tier: 'local', stage: 'dispatch',
         source: 'crew_dispatch', machine_id: 'fixture-box', machine_uid: 'FIXTURE-UID',
-        action: 'dispatch start', handle: 'coder', session_id: id, payload: { runtime: 'internal' },
+        action: 'dispatch.start', handle: 'coder', session_id: id, payload: { runtime: 'internal' },
       },
       {
         ts: '2026-08-03T12:00:02Z', level: 'info', category: 'work', tier: 'local', stage: 'dispatch',
         source: 'crew_dispatch', machine_id: 'fixture-box', machine_uid: 'FIXTURE-UID',
-        action: 'dispatch complete', handle: 'coder', session_id: id,
+        action: 'dispatch.complete', handle: 'coder', session_id: id,
         payload: { runtime: 'internal', result_class: 'ok', total_turns: 1, total_tools: 0, total_tokens: 100 },
       },
     ],
@@ -127,12 +127,12 @@ async function bootLiveWithSession(page, sid) {
     {
       ts: startTs, level: 'info', category: 'work', tier: 'local', stage: 'dispatch',
       source: 'crew_dispatch', machine_id: 'fixture-box', machine_uid: 'FIXTURE-UID',
-      action: 'dispatch start', handle: 'coder', session_id: sid, payload: { runtime: 'internal' },
+      action: 'dispatch.start', handle: 'coder', session_id: sid, payload: { runtime: 'internal' },
     },
     {
       ts: completeTs, level: 'info', category: 'work', tier: 'local', stage: 'dispatch',
       source: 'crew_dispatch', machine_id: 'fixture-box', machine_uid: 'FIXTURE-UID',
-      action: 'dispatch complete', handle: 'coder', session_id: sid,
+      action: 'dispatch.complete', handle: 'coder', session_id: sid,
       payload: { runtime: 'internal', result_class: 'ok', total_turns: 1, total_tools: 0, total_tokens: 100 },
     },
     {

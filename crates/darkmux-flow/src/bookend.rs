@@ -255,15 +255,17 @@ pub fn stamp_remote_classification(
 mod tests {
     use super::*;
 
-    fn rec(action: &str, level: crate::Level) -> FlowRecord {
+    /// A record whose `handle` carries `marker`, so the recorder below can
+    /// tell the guard's records apart.
+    fn rec(marker: &str, level: crate::Level) -> FlowRecord {
         FlowRecord {
             ts: crate::ts_utc_now(),
             level,
             category: crate::Category::Work,
             tier: crate::Tier::Local,
             stage: crate::Stage::Dispatch,
-            action: action.to_string(),
-            handle: "test".to_string(),
+            action: crate::FlowAction::DispatchStart,
+            handle: marker.to_string(),
             phase_id: None,
             session_id: Some("sess".to_string()),
             source: None,
@@ -286,7 +288,7 @@ mod tests {
     }
     impl BookendSink for Recorder {
         fn emit(&mut self, record: FlowRecord) {
-            self.actions.push(record.action);
+            self.actions.push(record.handle);
         }
     }
 

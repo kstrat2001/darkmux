@@ -13,16 +13,15 @@
  * read "0 running" for the live arm of the identical instant (findings #3,
  * #4 in the parity audit). `runsCount`/`runsLabel`/`runningSessionIds`/
  * `liveTokRate`/`liveTokStalled` are now ONE derivation, run over records
- * up to `t` through `sessionRunning()` (which itself takes an optional,
- * purely ADDITIVE `liveSet` — presence, empty in every real replay call) in
- * BOTH modes: "N running" at the instant the playhead sits on, live or
+ * up to `t` through `runningRuns()` (the lifecycle of each run, with
+ * presence as an ADDITIVE input, empty in every real replay call) in BOTH
+ * modes: "N running" at the instant the playhead sits on, live or
  * replayed. `liveMode` is kept as a parameter for now (dozens of existing
  * call sites), but nothing in this file's returned `FleetCard` fields reads
  * it any more — it decides nothing here. `machActive` needs the playhead
  * honored for its own "hasn't started yet" guard; see its own doc.
  */
 
-import { uidOf, sessionsOn, sessionRunning, sessionRecords, T, isDispatchStart } from "../../lib/flow";
 import {
   aggregateLiveState,
   aggregateTokenRate,
@@ -33,50 +32,36 @@ import {
   liveStateWhileConnected,
 } from "../../lib/tokenRate";
 import type { ExecutionTokenReading, LiveState } from "../../lib/tokenRate";
-import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
+import type { MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
 // (#2814) `isSelfMachine`/`displayNameOf` live in `lib/flow.ts` beside
 // `nameOf`/`machineNames`/`localMachineUid` rather than here, because the
 // machine lens and the app shell need the identical self-identity rule and a
 // second copy of it is how the two surfaces disagree about which machine
 // they are on.
-import { machineNames, machineUids, isSelfMachine, displayNameOf } from "../../lib/flow";
+import { machineNames, machineUids, isSelfMachine, displayNameOf, uidOf } from "../../lib/flow";
 import type { RosterName } from "../../lib/flow";
 import type { Run } from "../../types/generated/Run";
 import { utilityStrip, type UtilityStrip } from "../../lib/utilityJobs";
 import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";
+import { recordsAsOf, type NormRecord } from "../../lib/ingest";
+import { DEFAULT_POLICY, isRunning, lifecycleAt, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
+import { currentRun, runIndex, type RunGroup } from "../../lib/runRef";
+
+/** A machine's runs in flight as of `t`: its run- and execution-grain runs
+ *  (`runRef.ts`) whose lifecycle (`lifecycle.ts`) is open or waiting. One
+ *  entry per `(session, mission)` run, so two missions sharing a session id
+ *  are two runs, and one mission's end never closes the other's (#2125).
+ *  `presence` only adds: it holds a silent run open, never a closed one. */
+export function runningRuns(data: NormRecord[], presence: Presence, m: string, t: number, policy: LifecyclePolicy = DEFAULT_POLICY): RunGroup[] {
+  return runIndex(data)
+    .groupsOn(m)
+    .filter((g) => g.grain !== "lifecycle" && isRunning(lifecycleAt(currentRun(g, t), t, policy, presence)));
+}
 
 /** `machActive()` — viewer.html:1342-1349. A machine is "in flight" iff one
- * of its started sessions is still running — routed through the shared
- * `sessionRunning()` (ONE algorithm over records up to `t` in both modes —
- * see that function's own doc, Playback parity Change A) so the
- * running-forever bug class can't be fixed at one site and linger at
- * another.
- *
- * (#1869) `T(r.ts) <= t` restores legacy's own `visible()` gate — legacy's
- * `machActive` reads `visible().some(...)`, `visible = () =>
- * DATA.filter(r=>T(r.ts)<=state.t)`. This port dropped the gate because,
- * before the playback transport existed, `t` was always the day's true max
- * (`computeTMax`), making it an unconditional no-op. Now that `PlaybackLens`
- * can hand this a playhead BEFORE the day's end, a `dispatch.start` that
- * hasn't happened yet as of that playhead must not read as "in flight" —
- * without this guard, scrubbing to before a machine's first session of the
- * day still rendered it active, because `sessionRunning`'s close-edge check
- * finds no close (there's nothing to close yet) and defaults to "running". */
-export function machActive(
-  data: FlowRecord[],
-  liveSet: Set<string>,
-  m: string,
-  t: number,
-): boolean {
-  return data.some(
-    (r) =>
-      T(r.ts) <= t &&
-      uidOf(r) === m &&
-      // (#2902 step 5) Or a hosted call's budget wait: its gate runs before
-      // the bookends, so while it waits there is no start to find.
-      (isDispatchStart(r.action) || r.action === "budget.wait") &&
-      sessionRunning(data, liveSet, r.session_id ?? "", t),
-  );
+ * of its runs is running as of `t` (`runningRuns`). */
+export function machActive(data: NormRecord[], presence: Presence, m: string, t: number, policy: LifecyclePolicy = DEFAULT_POLICY): boolean {
+  return runningRuns(data, presence, m, t, policy).length > 0;
 }
 
 /** `specOf()` — viewer.html:1120-1125. Returns a RAW string (JSX escapes at
@@ -84,7 +69,7 @@ export function machActive(
  * comment names). `MACH_SPEC` (a static hardcoded lookup) is empty in the
  * live viewer — dropped here entirely, matching that source comment. */
 export function specOf(
-  data: FlowRecord[],
+  data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
   specs: MachineSpecs | null,
   m: string,
@@ -128,39 +113,28 @@ export function specOf(
   return beat?.specs || "";
 }
 
-/** (#2060) Collapse a machine's set of currently-running session ids down to
- * TOP-LEVEL runs: a mission's own whole-run session and its seat/step
- * dispatches are one mission, not one-run-per-seat.
+/** (#2060) Collapse a machine's running runs down to TOP-LEVEL runs: a
+ * mission's own whole-run session and its seat/step dispatches are one
+ * mission, not one-run-per-seat.
  *
  * The distinguishing shape (`src/mission_launch.rs::mission_bookend_record`):
  * a mission's OWN bookend stamps `session_id === mission_id` (the mission id
  * doubles as its own top-level session). A seat/step dispatch the mission
  * launches carries the SAME `mission_id` but its OWN, different
- * `session_id` (`launch_session_id`/`scope_to_run`/`dispatch.map`'s per-item
- * scoping). So: group by `mission_id` when present, one run per group,
- * preferring the mission's own top-level session as the group's
- * representative id (so a single-running-item drill-in lands on the
- * mission, not on whichever seat happened to be seen first). A session with
- * no `mission_id` at all (a standalone dispatch, a lab run) always counts on
- * its own — nothing to collapse into.
- */
-export function topLevelRunSessionIds(data: FlowRecord[], sessionIds: string[]): string[] {
-  const missionIdOf = new Map<string, string | undefined>();
-  for (const r of data) {
-    if (!r.session_id || missionIdOf.has(r.session_id)) continue;
-    if (r.mission_id) missionIdOf.set(r.session_id, r.mission_id);
-  }
-  const standalone: string[] = [];
-  const repForMission = new Map<string, string>();
-  for (const sid of sessionIds) {
-    const missionId = missionIdOf.get(sid);
-    if (!missionId) {
-      standalone.push(sid);
+ * `session_id`. So: one run per mission, preferring the mission's own
+ * top-level session as its representative (so a single-running-item
+ * drill-in lands on the mission, not on whichever seat happened to be seen
+ * first). A run with no mission (a standalone dispatch, a lab run) always
+ * counts on its own. */
+export function topLevelRuns(runs: readonly RunGroup[]): RunGroup[] {
+  const standalone: RunGroup[] = [];
+  const repForMission = new Map<string, RunGroup>();
+  for (const g of runs) {
+    if (!g.missionId) {
+      standalone.push(g);
       continue;
     }
-    const isTopLevel = missionId === sid;
-    const existing = repForMission.get(missionId);
-    if (!existing || isTopLevel) repForMission.set(missionId, sid);
+    if (!repForMission.has(g.missionId) || g.sessionId === g.missionId) repForMission.set(g.missionId, g);
   }
   return [...standalone, ...repForMission.values()];
 }
@@ -176,7 +150,7 @@ export function topLevelRunSessionIds(data: FlowRecord[], sessionIds: string[]):
  * path emits the contract-2 liveness bookends through
  * `DispatchBookendGuard` and then spawns the
  * `darkmux:session-presence:<sid>` emitter — which is exactly what
- * `useLiveSessionIds` → `liveSet` reads. `lib/flow.ts`'s bookend-matcher
+ * `useLiveSessionIds` → the card's `presence` reads. `lib/flow.ts`'s bookend-matcher
  * doc names `darkmux-lab` as one of the two producer lineages, and
  * `crates/darkmux-lab/src/lab/lifecycle.rs`'s module doc says the same
  * thing from the producer side: the lab lifecycle record is "the missing
@@ -207,7 +181,7 @@ export function topLevelRunSessionIds(data: FlowRecord[], sessionIds: string[]):
  *
  * Counts `kind === "lab"` rows only. A running mission/dispatch row in
  * `/runs` is deliberately NOT counted here — that activity is already
- * accounted for by flow presence (via `topLevelRunSessionIds` above,
+ * accounted for by the flow runs (via `topLevelRuns` above,
  * post-#2060), and counting it again here would double-count it. */
 export function runningLabRunCount(machineRuns: Run[]): number {
   return machineRuns.filter((r) => r.kind === "lab" && r.status === "running").length;
@@ -271,7 +245,7 @@ function normalizeMachineAlias(name: string): string {
 }
 
 export function rosterOnlyEntries(
-  data: FlowRecord[],
+  data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
   roster: RosterMachineEntry[],
   /** (#1855 follow-up) This machine's own `/machine/specs` read, when
@@ -476,9 +450,9 @@ export interface FleetCard {
   runsLabel: string;
   /** (#1903) The machine's currently-running FLOW sessions, collapsed to
    * top-level runs — as of `t`, in BOTH modes now (Playback parity, Change
-   * A): `sessionRunning()` is one algorithm over records up to `t`, with
+   * A): `runningRuns()` is one algorithm over records up to `t`, with
    * presence as an optional additive input that a replay caller simply
-   * never has (see that function's own doc). This used to be live-mode-only,
+   * never has. This used to be live-mode-only,
    * always empty in replay — see `runsCount`'s own comment for the defect
    * that produced.
    *
@@ -576,10 +550,10 @@ export interface FleetCard {
  * (`unknown` presence renders the same as "present" for this purpose,
  * matching `absent?'offline':(act?...)`'s two-way branch). */
 export function buildFleetCard(
-  data: FlowRecord[],
+  data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
   specs: MachineSpecs | null,
-  liveSet: Set<string>,
+  presence: Presence,
   machAbsent: boolean,
   m: string,
   /** (Playback parity, Change A) No longer read by anything this function
@@ -591,8 +565,7 @@ export function buildFleetCard(
   _liveMode: boolean,
   /** The playhead — `PlaybackLens`'s scrubbable `t` (#1869), pinned to the
    * day's true max in live mode (there is no scrubber on `/next`'s default
-   * route). `sessionRunning`'s close-edge/TTL check and `machActive`'s
-   * `T(r.ts) <= t` gate are both defined against it. */
+   * route). Every run's lifecycle is read as of it. */
   t: number,
   /** (#2067) See `specOf`'s own doc — the spec source, when it is not the
    * presence beats (a static build). */
@@ -632,9 +605,11 @@ export function buildFleetCard(
    *  machine only (the channel is local-daemon only), into the utility
    *  strip. */
   live: LiveOverlay | null = null,
+  /** The daemon's lifecycle policy (`/runs.policy`). */
+  policy: LifecyclePolicy = DEFAULT_POLICY,
 ): FleetCard {
   return withLiveReadings(
-    buildFleetCardBase(data, liveMachines, specs, liveSet, machAbsent, m, _liveMode, t, specBeats, machineRuns, roster),
+    buildFleetCardBase(data, liveMachines, specs, presence, machAbsent, m, _liveMode, t, specBeats, machineRuns, roster, policy),
     t,
     connected,
     lastContactMs,
@@ -651,20 +626,23 @@ export function buildFleetCard(
 export interface FleetCardBase extends Omit<FleetCard, "liveTokRate" | "liveTokStalled" | "liveTokState" | "liveTokRestSecondsLeft" | "liveTokCarried" | "executions" | "defaultExecutionSessionId" | "utility"> {
   /** @internal The inputs the live readings need. */
   liveInputs: {
-    data: FlowRecord[];
+    data: NormRecord[];
+    /** Each running run's session id, in `durableSets`' order. */
     runningSids: string[];
-    /** Each running session's durable records, cut at the base's `t`. */
-    durableSets: FlowRecord[][];
+    /** Each running run's durable records, cut at the base's `t`. */
+    durableSets: NormRecord[][];
+    policy: LifecyclePolicy;
+    presence: Presence;
     self: boolean;
     binding: { id: string; loaded: boolean } | null;
   };
 }
 
 export function buildFleetCardBase(
-  data: FlowRecord[],
+  data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
   specs: MachineSpecs | null,
-  liveSet: Set<string>,
+  presence: Presence,
   machAbsent: boolean,
   m: string,
   _liveMode: boolean,
@@ -672,26 +650,22 @@ export function buildFleetCardBase(
   specBeats: Map<string, PresenceBeat> = liveMachines,
   machineRuns: Run[] = [],
   roster: readonly RosterName[] = [],
+  policy: LifecyclePolicy = DEFAULT_POLICY,
 ): FleetCardBase {
-  const flowActive = machActive(data, liveSet, m, t);
+  // (Playback parity, Change A, findings #3/#4) ONE question, asked the
+  // same way in both modes: which of this machine's runs are RUNNING as of
+  // `t` (`runningRuns`). This used to be the day's whole session roster in
+  // replay — the "48 specialists at 5% into the day with zero sessions
+  // started" defect.
+  const running = runningRuns(data, presence, m, t, policy);
+  const flowActive = running.length > 0;
   const labRunning = runningLabRunCount(machineRuns);
   const active = flowActive || labRunning > 0;
   const stat = machAbsent ? "offline" : active ? "dispatch in flight" : "idle";
-  const all = sessionsOn(data, m);
-  // (Playback parity, Change A, findings #3/#4) ONE question now, asked the
-  // same way in both modes: which of this machine's sessions are RUNNING as
-  // of `t` — through the shared `sessionRunning()`, whose own doc explains
-  // why an empty `liveSet` (every real replay call) simply never adds
-  // anything presence-only would have. This used to be `all.length` (the
-  // day's whole session roster) in replay — the "48 specialists at 5% into
-  // the day with zero sessions started" defect.
-  //
-  // (#2060) `topLevelRunSessionIds` then collapses a mission's own session
-  // together with any of its seat/step dispatches into ONE entry — a
-  // mission with one seat running reads "1 running", not "2 running", in
-  // both modes now.
-  const runningSids = all.filter((sid) => sessionRunning(data, liveSet, sid, t));
-  const runningSessionIds = topLevelRunSessionIds(data, runningSids);
+  // (#2060) `topLevelRuns` collapses a mission's own session together with
+  // any of its seat/step dispatches into ONE entry — a mission with one seat
+  // running reads "1 running", not "2 running", in both modes.
+  const runningSessionIds = topLevelRuns(running).map((g) => g.sessionId);
   // (#1923) The two sources OVERLAP — they are not disjoint, and summing
   // them double-counts. A lab run in its dispatch phase appears on BOTH:
   // once as its `/runs` lab row, once as the flow session its provider's
@@ -699,7 +673,7 @@ export function buildFleetCardBase(
   // Nothing joins the two ids — the lab run id carries epoch SECONDS from
   // `lab/run.rs`, the dispatch session id epoch MILLIS minted later inside
   // the provider, and the lab dispatch carries no `mission_id` for
-  // `topLevelRunSessionIds` to collapse on — so the merge here is
+  // `topLevelRuns` to collapse on — so the merge here is
   // `Math.max`, the cheapest rule that is never wrong in the direction that
   // matters:
   //
@@ -722,15 +696,15 @@ export function buildFleetCardBase(
   // (its own doc covers exactly when). This card has not been updated to
   // USE that join yet — `runningSessionIds`/`labRunning` still merge by
   // `Math.max` rather than collapsing on the shared session id the way
-  // `topLevelRunSessionIds` collapses a mission's seats — so the arithmetic
+  // `topLevelRuns` collapses a mission's seats — so the arithmetic
   // above is unchanged for now; that collapse is a follow-up to this
   // card specifically, not a producer-side gap any more.
   const runsCount = Math.max(runningSessionIds.length, labRunning);
-  // (#2877) Scoped by the RAW per-session running ids (`runningSids`), not
-  // the mission-collapsed `runningSessionIds` above: a mission's own
+  // (#2877) Scoped by the RAW running runs (`running`), not the
+  // mission-collapsed `runningSessionIds` above: a mission's own
   // top-level session never carries heartbeats (its inner role executions
   // do — same fact `sessionRun.ts::rollUpMissionModelWork`'s doc names),
-  // and `topLevelRunSessionIds` picks EITHER representative depending on
+  // and `topLevelRuns` picks EITHER representative depending on
   // which happened to land in the running set. Reading every running
   // session's own heartbeats sidesteps that ambiguity entirely: a session
   // with no heartbeats (a mission's top-level session, or one between
@@ -740,15 +714,16 @@ export function buildFleetCardBase(
   // genuinely generating reads the same "N tok/s" a live viewer saw at that
   // instant (finding #3): the tok/s scope is a fact about the recorded
   // instant, not a live-only instrument.
-  // `T(r.ts) <= t` is load-bearing here, not redundant with the LIVE
+  // The as-of cut is load-bearing here, not redundant with the LIVE
   // caller's window already being time-bounded: a REPLAY caller hands this
-  // function the WHOLE day's records (`sessionRunning`'s own doc — presence
-  // is empty, so the running verdict comes from records up to `t`), and
+  // function the WHOLE day's records (presence is empty, so the running
+  // verdict comes from records up to `t`), and
   // without this filter `currentTokenRate`'s "two most recent heartbeats"
   // would read heartbeats from AFTER the playhead too, inflating/changing
   // the rate a live viewer actually saw at `t` (measured: 122 tok/s off a
   // heartbeat 6h in the day's future vs the correct 95 tok/s as of `t`).
-  const durableSets = runningSids.map((sid) => sessionRecords(data, sid).filter((r) => T(r.ts) <= t));
+  const runningSids = running.map((g) => g.sessionId);
+  const durableSets = running.map((g) => recordsAsOf(g.records, t));
   const spec = specOf(data, liveMachines, specs, m, specBeats);
   // (#1855) `specBeats` is the SAME map `specOf` falls back to for a remote
   // machine's hardware line, so "was there anything to read" is exactly
@@ -778,7 +753,7 @@ export function buildFleetCardBase(
     // "running" (a gerund, not a count noun) never pluralizes.
     runsLabel: "running",
     runningSessionIds,
-    liveInputs: { data, runningSids, durableSets, self, binding: self ? (specs?.utility_model ?? null) : null },
+    liveInputs: { data, runningSids, durableSets, policy, presence, self, binding: self ? (specs?.utility_model ?? null) : null },
   };
 }
 
@@ -898,12 +873,12 @@ export function withLiveReadings(
   lastContactMs: number | null = null,
   live: LiveOverlay | null = null,
 ): FleetCard {
-  const { data, runningSids, durableSets, self, binding } = base.liveInputs;
+  const { data, runningSids, durableSets, policy, presence, self, binding } = base.liveInputs;
   const active = base.active;
   const m = base.uid;
   const liveTokRecordSets = runningSids.map((sid, i) => {
     const liveRecs = live?.bySession.get(sid);
-    return liveRecs ? mergeLive(durableSets[i], liveRecs.filter((r) => T(r.ts) <= t)) : durableSets[i];
+    return liveRecs ? mergeLive(durableSets[i], recordsAsOf(liveRecs, t)) : durableSets[i];
   });
   // (#2877 dogfood finding) A session can be `active` (no terminal record
   // yet — a mission genuinely stuck open, observed live: `status: "running"`
@@ -934,7 +909,7 @@ export function withLiveReadings(
   const liveTokLiveState =
     liveTokRecordSets.length > 0
       ? liveStateWhileConnected(
-          aggregateLiveState(liveTokRecordSets, t),
+          aggregateLiveState(liveTokRecordSets, t, policy, presence),
           connected,
           // Only construct the half-open evidence when this caller actually
           // HAS it — `lastContactMs === null` means "not wired for this
@@ -951,11 +926,11 @@ export function withLiveReadings(
   // running mounts no scope.
   // Only when a live EXECUTION exists: a mission between model steps (only
   // its run session beating) has no model working, so no scope and no state.
-  const hasLiveExecution = liveExecutions(liveTokRecordSets, t).length > 0;
+  const hasLiveExecution = liveExecutions(liveTokRecordSets, t, policy, presence).length > 0;
   // (#2885) `aggregateTokenRate` now returns `{tokensPerSec, carried}` —
   // `rawTokReading` is `null` exactly when there is nothing running or no
   // execution has a reading yet, same as before.
-  const rawTokReading = active && hasLiveExecution ? aggregateTokenRate(liveTokRecordSets, t) : null;
+  const rawTokReading = active && hasLiveExecution ? aggregateTokenRate(liveTokRecordSets, t, policy, presence) : null;
   const rawLiveTokRate = active && hasLiveExecution ? (rawTokReading?.tokensPerSec ?? 0) : null;
   const liveTokRate = rawLiveTokRate != null && liveTokStalled ? 0 : rawLiveTokRate;
   const liveTokState = liveTokRate !== null ? (liveTokLiveState?.state ?? null) : null;
@@ -980,7 +955,7 @@ export function withLiveReadings(
   // fresher heartbeat wrongly excuse another, quieter execution's own
   // genuine stall — the whole point of per-page state is that each page
   // answers for its OWN run, not the busiest one on the card.
-  const executions: ExecutionTokenReading[] = liveExecutions(liveTokRecordSets, t)
+  const executions: ExecutionTokenReading[] = liveExecutions(liveTokRecordSets, t, policy, presence)
     .map((recs) =>
       executionTokenReading(
         recs,

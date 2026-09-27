@@ -5,6 +5,7 @@ import type { ReactNode } from "react";
 import { useRouteRecords } from "./useRouteRecords";
 import type { Route } from "../lib/route";
 import type { FlowWindowResult } from "./useFlowWindow";
+import { normAll } from "../testing/records";
 
 /**
  * (#1800 P1) The bug this hook exists to remove: `showsEventLog()` is true for
@@ -20,7 +21,7 @@ const LIVE: FlowWindowResult = {
   settled: true,
   tMax: 0,
   failure: null,
-  data: [{ action: "LIVE-RECORD" }] as never,
+  data: normAll([{ action: "LIVE-RECORD" }]),
 };
 
 function wrapper() {
@@ -78,13 +79,13 @@ describe("useRouteRecords", () => {
   });
 
   it("gives a SESSION route that session's records, never the live window", async () => {
-    const route: Route = { kind: "dispatch", dispatchId: "s-1" };
+    const route: Route = { kind: "dispatch", dispatchId: "s-1", missionId: null };
     const { result } = renderHook(() => useRouteRecords(route, LIVE), { wrapper: wrapper() });
 
     await waitFor(() => expect(result.current.loading).toBe(false));
 
     expect(result.current.historical).toBe(true);
-    expect(result.current.records).toEqual([{ action: "HISTORICAL-RECORD" }]);
+    expect(result.current.records).toEqual([{ action: "HISTORICAL-RECORD", tMs: null }]);
     // The regression that motivated the hook: live records leaking into a
     // historical route's event log.
     expect(result.current.records).not.toEqual(LIVE.data);
@@ -97,7 +98,7 @@ describe("useRouteRecords", () => {
     await waitFor(() => expect(result.current.loading).toBe(false));
 
     expect(result.current.historical).toBe(true);
-    expect(result.current.records).toEqual([{ action: "HISTORICAL-RECORD" }]);
+    expect(result.current.records).toEqual([{ action: "HISTORICAL-RECORD", tMs: null }]);
     expect(result.current.records).not.toEqual(LIVE.data);
     // Without this a hook fetching `/flow/undefined` and receiving the canned
     // mock would pass identically — right records, wrong reason.
@@ -106,7 +107,7 @@ describe("useRouteRecords", () => {
 
   it("shows EMPTY rather than live records when a historical fetch FAILS", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 500, json: async () => ({}) }));
-    const route: Route = { kind: "dispatch", dispatchId: "missing" };
+    const route: Route = { kind: "dispatch", dispatchId: "missing", missionId: null };
     const { result } = renderHook(() => useRouteRecords(route, LIVE), { wrapper: wrapper() });
 
     await waitFor(() => expect(result.current.loading).toBe(false));
@@ -161,7 +162,7 @@ describe("useRouteRecords — the static-demo flow-src route (#1801)", () => {
     await waitFor(() => expect(result.current.loading).toBe(false));
 
     expect(result.current.historical).toBe(true);
-    expect(result.current.records).toEqual([{ ts: "2026-08-07T00:00:00Z", action: "dispatch.start" }]);
+    expect(result.current.records).toEqual([{ ts: "2026-08-07T00:00:00Z", action: "dispatch.start", tMs: Date.parse("2026-08-07T00:00:00Z") }]);
     // The regression this test guards: falling through to `/flow/<date>`
     // (or `/flow/null`) instead of the static source.
     const calls = (globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls.map((c) => String(c[0]));
@@ -182,7 +183,7 @@ describe("useRouteRecords — the static-demo flow-src route (#1801)", () => {
           .join("\n") + "\n",
       ),
     );
-    const route: Route = { kind: "dispatch", dispatchId: "s1" };
+    const route: Route = { kind: "dispatch", dispatchId: "s1", missionId: null };
 
     const { result } = renderHook(() => useRouteRecords(route, LIVE), { wrapper: wrapper() });
     await waitFor(() => expect(result.current.loading).toBe(false));
@@ -223,7 +224,7 @@ describe("useRouteRecords — the static-demo flow-src route (#1801)", () => {
 
     await waitFor(() => expect(result.current.loading).toBe(false));
 
-    expect(result.current.records).toEqual([{ action: "HISTORICAL-RECORD" }]);
+    expect(result.current.records).toEqual([{ action: "HISTORICAL-RECORD", tMs: null }]);
     expect(globalThis.fetch).toHaveBeenCalledWith("/flow/2026-08-01", undefined);
   });
 });
@@ -258,18 +259,18 @@ function mockFetchLive(opts: { liveIds: string[]; records: () => unknown[] }) {
 describe("useRouteRecords — a session that is still running", () => {
   it("is not historical while presence still reports it live", async () => {
     vi.stubGlobal("fetch", mockFetchLive({ liveIds: ["s-live"], records: () => [{ action: "a" }] }));
-    const route: Route = { kind: "dispatch", dispatchId: "s-live" };
+    const route: Route = { kind: "dispatch", dispatchId: "s-live", missionId: null };
     const { result } = renderHook(() => useRouteRecords(route, LIVE), { wrapper: wrapper() });
 
     await waitFor(() => expect(result.current.historical).toBe(false));
     // Still that session's OWN records — liveness must not silently swap in
     // the live window, which is the regression the block above guards.
-    expect(result.current.records).toEqual([{ action: "a" }]);
+    expect(result.current.records).toEqual([{ action: "a", tMs: null }]);
   });
 
   it("stays historical when presence does not list it", async () => {
     vi.stubGlobal("fetch", mockFetchLive({ liveIds: ["someone-else"], records: () => [{ action: "a" }] }));
-    const route: Route = { kind: "dispatch", dispatchId: "s-done" };
+    const route: Route = { kind: "dispatch", dispatchId: "s-done", missionId: null };
     const { result } = renderHook(() => useRouteRecords(route, LIVE), { wrapper: wrapper() });
 
     await waitFor(() => expect(result.current.loading).toBe(false));
@@ -280,15 +281,15 @@ describe("useRouteRecords — a session that is still running", () => {
     let batch = [{ action: "turn-1" }];
     vi.stubGlobal("fetch", mockFetchLive({ liveIds: ["s-live"], records: () => batch }));
 
-    const route: Route = { kind: "dispatch", dispatchId: "s-live" };
+    const route: Route = { kind: "dispatch", dispatchId: "s-live", missionId: null };
     const { result } = renderHook(() => useRouteRecords(route, LIVE), { wrapper: wrapper() });
 
-    await waitFor(() => expect(result.current.records).toEqual([{ action: "turn-1" }]));
+    await waitFor(() => expect(result.current.records).toEqual([{ action: "turn-1", tMs: null }]));
 
     // The dispatch keeps working and emits another turn.
     batch = [{ action: "turn-1" }, { action: "turn-2" }];
 
     await waitFor(() => expect(result.current.records).toHaveLength(2), { timeout: 15_000 });
-    expect(result.current.records).toEqual([{ action: "turn-1" }, { action: "turn-2" }]);
+    expect(result.current.records).toEqual([{ action: "turn-1", tMs: null }, { action: "turn-2", tMs: null }]);
   }, 20_000);
 });

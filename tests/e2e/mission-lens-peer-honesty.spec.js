@@ -39,7 +39,7 @@ async function open404(page, flowRows) {
 
 test('a peer mission names the machine it ran on', async ({ page }) => {
   const errors = await open404(page, [
-    { ts: `${TODAY}T10:00:00Z`, action: 'mission start', mission_id: MISSION_ID, machine_id: PEER },
+    { ts: `${TODAY}T10:00:00Z`, action: 'mission.start', mission_id: MISSION_ID, machine_id: PEER },
   ]);
 
   const msg = page.getByRole('alert');
@@ -57,7 +57,7 @@ test('a genuinely unattributable 404 keeps the calm original wording', async ({ 
   // cleared run. Inventing a machine name here would be worse than the vague
   // message, so the fallback must survive.
   const errors = await open404(page, [
-    { ts: `${TODAY}T10:00:00Z`, action: 'mission start', mission_id: 'some-other-mission', machine_id: PEER },
+    { ts: `${TODAY}T10:00:00Z`, action: 'mission.start', mission_id: 'some-other-mission', machine_id: PEER },
   ]);
 
   const msg = page.getByRole('alert');

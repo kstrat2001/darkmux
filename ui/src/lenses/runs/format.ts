@@ -24,6 +24,7 @@
 
 import type { Run } from "../../types/generated/Run";
 import { shortModel } from "../lab/labSeries";
+import { dispatchHash } from "../../lib/route";
 
 export { shortModel };
 
@@ -214,6 +215,13 @@ export type RunDestination =
  * session is the best this view can ever offer, not a fallback pending a
  * richer one.
  */
+/** The mission a row's run belongs to, for its detail link: a mission row
+ *  (tracked, or a remote mission) is keyed by its mission id; an untracked
+ *  dispatch row is keyed by its session and names no mission. */
+function missionOfRow(run: Run): string | null {
+  return run.tracked || run.kind === "mission" ? run.id : null;
+}
+
 export function runDestination(run: Run, graphReachable: boolean): RunDestination {
   // (#2860) A lab row with a session opens the SAME session detail view as
   // every other run, running or finished. It used to switch, once finished,
@@ -227,7 +235,7 @@ export function runDestination(run: Run, graphReachable: boolean): RunDestinatio
   // runs from before lab rows carried one (#2511).
   if (run.kind === "lab") {
     if (run.session_id) {
-      return { kind: "hash", hash: `dispatch=${encodeURIComponent(run.session_id)}` };
+      return { kind: "hash", hash: dispatchHash(run.session_id, null) };
     }
     return { kind: "lab", dir: run.id };
   }
@@ -246,14 +254,14 @@ export function runDestination(run: Run, graphReachable: boolean): RunDestinatio
   // window carries none, and falls through to the graph rather than offering
   // a link to nothing.
   if (run.kind === "dispatch" && run.session_id) {
-    return { kind: "hash", hash: `dispatch=${encodeURIComponent(run.session_id)}` };
+    return { kind: "hash", hash: dispatchHash(run.session_id, missionOfRow(run)) };
   }
   if (!run.tracked) {
     // No `graphReachable` gate here — `/flow-session/<id>` is a plain
     // daemon fetch (`SessionReplay`'s own fetch, same as the ungated
     // `#session=<sid>` bars `FleetLens.tsx`'s activity timeline already
     // navigates to), not the mission-graph lens's endpoint.
-    if (run.session_id) return { kind: "hash", hash: `dispatch=${encodeURIComponent(run.session_id)}` };
+    if (run.session_id) return { kind: "hash", hash: dispatchHash(run.session_id, missionOfRow(run)) };
     return { kind: "none" };
   }
   if (!graphReachable) return { kind: "unreachable" };

@@ -1,6 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import {
-  parseFlowJsonl,
   fetchStaticFlowRecords,
   firstRecordDate,
   machineNames,
@@ -9,23 +8,17 @@ import {
   UNNAMED_MACHINE,
   displayNameOf,
   buildFlowWindow,
-  liveSessionSet,
-  flowLiveSessions,
   bodyTruncated,
-  asRecordArray,
   missionReplayDate,
-  sessionRecords,
-  sessionRunning,
-  dispatchEnd,
-  __sessionIndexBuilds,
-  recordsAsOf,
-  __asOfFilterRuns,
 } from "./flow";
+import { ingest, ingestJsonl, recordsAsOf, __asOfFilterRuns, type NormRecord } from "./ingest";
+import { norm, normAll, type RawRecord } from "../testing/records";
 import { tokensOffMeter } from "../lenses/fleet/savings";
-import type { FlowRecord } from "../types/handwritten";
+import { DEFAULT_POLICY, lifecycleAt } from "./lifecycle";
+import { runIndex, sessionRun, __runIndexBuilds } from "./runRef";
 
 /**
- * (#1801) The static-demo record pipeline: `parseFlowJsonl` (the flowSrc
+ * (#1801) The static-demo record pipeline: `ingestJsonl` (the flowSrc
  * branch's own line-by-line parse, viewer.html:3899-3901),
  * `fetchStaticFlowRecords` (the GET + parse, its own silent-empty-on-failure
  * contract), and `firstRecordDate` (the RAW[0].ts date derivation,
@@ -35,56 +28,53 @@ import type { FlowRecord } from "../types/handwritten";
  * their own (a malformed line, a CRLF file, a schema-header-first file).
  */
 
-describe("parseFlowJsonl", () => {
+describe("ingestJsonl", () => {
+  const A = { ts: "2026-08-07T00:00:00Z", action: "a", tMs: Date.parse("2026-08-07T00:00:00Z") };
+  const B = { ts: "2026-08-07T00:00:01Z", action: "b", tMs: Date.parse("2026-08-07T00:00:01Z") };
+
   it("parses one record per line", () => {
     const text = '{"ts":"2026-08-07T00:00:00Z","action":"a"}\n{"ts":"2026-08-07T00:00:01Z","action":"b"}';
-    expect(parseFlowJsonl(text)).toEqual([
-      { ts: "2026-08-07T00:00:00Z", action: "a" },
-      { ts: "2026-08-07T00:00:01Z", action: "b" },
-    ]);
+    expect(ingestJsonl(text)).toEqual([A, B]);
   });
 
   it("drops blank lines (including a trailing newline) rather than choking on them", () => {
     const text = '{"ts":"2026-08-07T00:00:00Z","action":"a"}\n\n   \n{"ts":"2026-08-07T00:00:01Z","action":"b"}\n';
-    expect(parseFlowJsonl(text)).toHaveLength(2);
+    expect(ingestJsonl(text)).toHaveLength(2);
   });
 
   it("handles CRLF line endings the same as LF", () => {
     const text = '{"ts":"2026-08-07T00:00:00Z","action":"a"}\r\n{"ts":"2026-08-07T00:00:01Z","action":"b"}\r\n';
-    expect(parseFlowJsonl(text)).toHaveLength(2);
+    expect(ingestJsonl(text)).toHaveLength(2);
   });
 
   it("drops a line that fails to parse rather than failing the whole file", () => {
     const text = '{"ts":"2026-08-07T00:00:00Z","action":"a"}\nnot json at all\n{"ts":"2026-08-07T00:00:01Z","action":"b"}';
-    expect(parseFlowJsonl(text)).toEqual([
-      { ts: "2026-08-07T00:00:00Z", action: "a" },
-      { ts: "2026-08-07T00:00:01Z", action: "b" },
-    ]);
+    expect(ingestJsonl(text)).toEqual([A, B]);
   });
 
-  it("parses the leading {\"_type\":\"schema\"} header line fine — it is dropped downstream, not here", () => {
+  it("drops the leading {\"_type\":\"schema\"} header line at the boundary", () => {
     const text = '{"_type":"schema"}\n{"ts":"2026-08-07T00:00:00Z","action":"a"}';
-    const parsed = parseFlowJsonl(text);
-    expect(parsed).toHaveLength(2);
-    expect(parsed[0]).toEqual({ _type: "schema" });
+    expect(ingestJsonl(text)).toEqual([A]);
   });
 
   it("an empty file parses to an empty array", () => {
-    expect(parseFlowJsonl("")).toEqual([]);
+    expect(ingestJsonl("")).toEqual([]);
   });
 });
 
 describe("firstRecordDate", () => {
-  it("derives the date from the first record's ts (first 10 chars)", () => {
-    expect(firstRecordDate([{ ts: "2026-08-07T02:09:42.000Z" } as never])).toBe("2026-08-07");
+  it("derives the UTC day from the first record's parsed time, in file order", () => {
+    expect(firstRecordDate(normAll([{ ts: "2026-08-07T02:09:42.000Z" }, { ts: "2026-08-01T00:00:00Z" }]))).toBe("2026-08-07");
+    // An offset timestamp names its UTC day, not the local date in its text.
+    expect(firstRecordDate(normAll([{ ts: "2026-08-07T22:00:00-05:00" }]))).toBe("2026-08-08");
   });
 
   it("is null for an empty array — a caller supplies its own placeholder", () => {
     expect(firstRecordDate([])).toBeNull();
   });
 
-  it("is null when the first record has no ts — the schema-header-first quirk legacy also has", () => {
-    expect(firstRecordDate([{ _type: "schema" } as never, { ts: "2026-08-07T00:00:00Z" } as never])).toBeNull();
+  it("is null when the first record has no ts — it reads the first record, not the earliest", () => {
+    expect(firstRecordDate(normAll([{ action: "operator.note" }, { ts: "2026-08-07T00:00:00Z" }]))).toBeNull();
   });
 });
 
@@ -97,7 +87,7 @@ describe("fetchStaticFlowRecords", () => {
       vi.fn(async () => new Response('{"ts":"2026-08-07T00:00:00Z","action":"a"}\n', { status: 200 })),
     );
     const records = await fetchStaticFlowRecords("./demo-flow.jsonl");
-    expect(records).toEqual([{ ts: "2026-08-07T00:00:00Z", action: "a" }]);
+    expect(records).toEqual([{ ts: "2026-08-07T00:00:00Z", action: "a", tMs: Date.parse("2026-08-07T00:00:00Z") }]);
   });
 
   it("is [] on a non-2xx response — no daemon to report a status from", async () => {
@@ -137,14 +127,14 @@ describe("buildFlowWindow dedup (#794)", () => {
   const ts = "2026-08-08T00:00:00.000Z";
   const nowMs = Date.parse(ts);
 
-  const tokenRecord: FlowRecord = {
+  const tokenRecord: NormRecord = norm({
     ts,
     session_id: "s-live",
     action: "dispatch.complete",
     category: "telemetry",
     source: "tokens",
     payload: { total_tokens: 300, prompt_tokens: 250, completion_tokens: 50 },
-  };
+  });
 
   it("a record fed twice (identical recKey) collapses to one", () => {
     const result = buildFlowWindow([], [tokenRecord, { ...tokenRecord }], nowMs);
@@ -152,13 +142,13 @@ describe("buildFlowWindow dedup (#794)", () => {
   });
 
   it("distinct records (different session_id) both survive — this is dedup, not dedup-by-content", () => {
-    const other: FlowRecord = { ...tokenRecord, session_id: "s-other" };
+    const other: NormRecord = { ...tokenRecord, session_id: "s-other" };
     const result = buildFlowWindow([], [tokenRecord, other], nowMs);
     expect(result).toHaveLength(2);
   });
 
   it("tokensOffMeter over a re-delivered-record window does not double-count (#794)", () => {
-    const start: FlowRecord = { ts, session_id: "s-live", action: "dispatch.start", handle: "coder" };
+    const start = norm({ ts, session_id: "s-live", action: "dispatch.start", handle: "coder" });
     // Simulates the SSE at-least-once redelivery `startFlowTail` does nothing
     // to prevent: the identical telemetry record appears twice in what
     // `useFlowWindow` hands to `buildFlowWindow`.
@@ -168,7 +158,7 @@ describe("buildFlowWindow dedup (#794)", () => {
   });
 
   it("RED-PROVE: without the dedup filter, the same window WOULD double-count (documents what buildFlowWindow prevents)", () => {
-    const start: FlowRecord = { ts, session_id: "s-live", action: "dispatch.start", handle: "coder" };
+    const start = norm({ ts, session_id: "s-live", action: "dispatch.start", handle: "coder" });
     // The undeduped shape `startFlowTail`'s append actually produces —
     // straight concatenation, no `seen`-Set. If `buildFlowWindow` ever loses
     // its dedup filter, this is the number the savings hero would show.
@@ -200,7 +190,7 @@ describe("buildFlowWindow dedup (#794)", () => {
  */
 describe("machineNames / localMachineUid — identity is the uid, not the label", () => {
   const rec = (uid: string, name: string, ts = "2026-08-13T10:00:00Z") =>
-    ({ ts, machine_uid: uid, machine_id: name }) as never;
+    norm({ ts, machine_uid: uid, machine_id: name });
   const beat = (uid: string, display: string): [string, never] =>
     [uid, { machine_uid: uid, display_name: display, schema_version: "1.19.0", beat_ts_ms: 1 } as never];
 
@@ -308,8 +298,7 @@ describe("machineNames / localMachineUid — identity is the uid, not the label"
 // ── nameOf resolves the CURRENT name, not the first one seen (#2030) ──────
 describe("nameOf recency", () => {
   const UID = "00000000-0000-4000-8000-ABCDEF000011";
-  const rec = (ts: string, machine_id: string): FlowRecord =>
-    ({ ts, machine_id, machine_uid: UID, action: "machine.online" }) as unknown as FlowRecord;
+  const rec = (ts: string, machine_id: string): NormRecord => norm({ ts, machine_id, machine_uid: UID, action: "machine.online" });
 
   it("a single stale record cannot outvote every later one", () => {
     // The operator's actual case: one stray record naming a different machine
@@ -355,7 +344,7 @@ describe("nameOf recency", () => {
  * heartbeat) never writes a beat for ANY of its sessions. On a
  * Redis-enabled multi-machine fleet (the operator's real topology — a
  * Studio hub whose OWN `dispatch.internal` work keeps presence non-empty
- * almost continuously), the pre-fix `liveSessionSet` treated ANY non-empty
+ * almost continuously), the pre-#2123 live-set merge treated ANY non-empty
  * presence set as globally authoritative and never even looked at the
  * flow-derived fallback — so a genuinely-live review mission's own session,
  * never beaten, read as not-running. This is the fleet card's "0 running"
@@ -365,52 +354,39 @@ describe("nameOf recency", () => {
  * main; the operator's daemon was almost certainly serving a stale binary
  * built before an earlier session-liveness fix).
  */
-describe("liveSessionSet — presence coverage is partial, not all-or-nothing (#2123)", () => {
+describe("presence coverage is partial, not all-or-nothing (#2123)", () => {
   const NOW = Date.parse("2026-08-29T16:07:30Z");
 
-  /** A review-shaped session: `dispatch start` a few minutes ago, no
-   * terminal record, fresh telemetry — exactly what `flowLiveSessions`
-   * needs to call it live. Uses the space-separated `darkmux-crew`/CLI
-   * vocabulary (`buildFlowWindow`/`normalizeRecords` is what dots it in
-   * production; these fixtures are ALREADY normalized, matching how every
-   * consumer of `flowWindow.data` actually receives them). */
-  const reviewSession: FlowRecord[] = [
+  /** A review-shaped session: `dispatch.start` a few minutes ago, no
+   * terminal record, fresh telemetry: open on its own records. */
+  const reviewSession: NormRecord[] = normAll([
     { ts: "2026-08-29T15:46:31Z", session_id: "owner/repo@deadbeef", action: "dispatch.start" },
     { ts: "2026-08-29T16:07:12Z", session_id: "owner/repo@deadbeef", action: "telemetry.process" },
-  ];
+  ]);
+  const phase = (data: NormRecord[], presence: Set<string>) =>
+    lifecycleAt(sessionRun(data, "owner/repo@deadbeef", NOW)!, NOW, DEFAULT_POLICY, presence).phase;
 
-  it("BEFORE the fix would have shadowed a genuinely-live session under unrelated presence (regression guard)", () => {
+  it("unrelated presence never shadows a run its own records hold open (regression guard)", () => {
     // Presence has a beat, but for a DIFFERENT session entirely — the
     // Studio hub's own dispatch.internal work, not this machine's review
     // mission.
-    const presence = new Set(["some-other-machines-dispatch-internal-session"]);
-    const result = liveSessionSet(reviewSession, presence, NOW, true);
-    expect(result.has("owner/repo@deadbeef")).toBe(true);
-    // Presence's own coverage must still be honored, not discarded.
-    expect(result.has("some-other-machines-dispatch-internal-session")).toBe(true);
+    expect(phase(reviewSession, new Set(["some-other-machines-dispatch-internal-session"]))).toBe("open");
   });
 
-  it("still returns the flow-derived set untouched when presence is empty (Redis off/degraded)", () => {
-    const result = liveSessionSet(reviewSession, new Set(), NOW, true);
-    expect(result).toEqual(flowLiveSessions(reviewSession, NOW, true));
+  it("with presence empty (Redis off/degraded) the records alone decide", () => {
+    expect(phase(reviewSession, new Set())).toBe("open");
   });
 
-  it("still returns presence untouched when the flow-derived fallback finds nothing live (e.g. everything already terminal)", () => {
-    const terminal: FlowRecord[] = [
+  it("presence never reopens a run its records closed", () => {
+    const terminal: NormRecord[] = normAll([
       { ts: "2026-08-29T15:46:31Z", session_id: "owner/repo@deadbeef", action: "dispatch.start" },
       { ts: "2026-08-29T15:50:00Z", session_id: "owner/repo@deadbeef", action: "dispatch.complete" },
-    ];
-    const presence = new Set(["some-other-session"]);
-    expect(liveSessionSet(terminal, presence, NOW, true)).toEqual(presence);
-  });
-
-  it("replay mode stays presence-agnostic (flowLiveSessions itself gates off liveMode)", () => {
-    const presence = new Set(["a-replayed-session"]);
-    expect(liveSessionSet(reviewSession, presence, NOW, false)).toEqual(presence);
+    ]);
+    expect(phase(terminal, new Set(["owner/repo@deadbeef"]))).toBe("closed");
   });
 });
 
-describe("bodyTruncated + asRecordArray through the guard (#2206)", () => {
+describe("bodyTruncated + ingest's body shapes through the guard (#2206)", () => {
   it("bodyTruncated: only a plain-object body with a truthy flag reads truncated", () => {
     expect(bodyTruncated({ truncated: true })).toBe(true);
     expect(bodyTruncated({ truncated: false })).toBe(false);
@@ -426,121 +402,113 @@ describe("bodyTruncated + asRecordArray through the guard (#2206)", () => {
     expect(bodyTruncated(0)).toBe(false);
   });
 
-  it("asRecordArray: array passthrough, object envelope unwrap, everything else empty", () => {
+  it("ingest: bare array, object envelope unwrap, everything else empty", () => {
     const recs = [{ ts: "2026-08-19T00:00:00Z" }];
-    expect(asRecordArray(recs)).toBe(recs);
-    expect(asRecordArray({ records: recs })).toEqual(recs);
-    expect(asRecordArray({ flow: recs })).toEqual(recs);
-    expect(asRecordArray({})).toEqual([]);
-    expect(asRecordArray(null)).toEqual([]);
-    expect(asRecordArray(undefined)).toEqual([]);
-    expect(asRecordArray("nope")).toEqual([]);
-    expect(asRecordArray(42)).toEqual([]);
+    const one = [{ ts: "2026-08-19T00:00:00Z", tMs: Date.parse("2026-08-19T00:00:00Z") }];
+    expect(ingest(recs)).toEqual(one);
+    expect(ingest({ records: recs })).toEqual(one);
+    expect(ingest({ flow: recs })).toEqual(one);
+    expect(ingest({})).toEqual([]);
+    expect(ingest(null)).toEqual([]);
+    expect(ingest(undefined)).toEqual([]);
+    expect(ingest("nope")).toEqual([]);
+    expect(ingest(42)).toEqual([]);
   });
 });
 
 describe("missionReplayDate (header owns liveness — a RUNNING mission is live, not a recording)", () => {
-  const rec = (action: string, ts: string) => ({ ts, action } as unknown as FlowRecord);
+  // Mission lifecycle records ride the mission's own session (`mission-<id>`).
+  const rec = (action: string, ts: string) => norm({ ts, action, session_id: "mission-m", mission_id: "m" });
   it("is null while the mission has no terminal record, whatever day its records carry", () => {
-    const records = [rec("mission start", "2026-09-03T17:10:00Z"), rec("dispatch.start", "2026-09-03T17:11:00Z")];
+    const records = [rec("mission.start", "2026-09-03T17:10:00Z"), rec("dispatch.start", "2026-09-03T17:11:00Z")];
     expect(missionReplayDate(records)).toBeNull();
   });
   it("is the earliest record's day once the mission has closed", () => {
     const records = [
       rec("dispatch.complete", "2026-09-03T18:00:00Z"),
-      rec("mission start", "2026-09-03T17:10:00Z"),
-      rec("mission close", "2026-09-03T18:01:00Z"),
+      rec("mission.start", "2026-09-03T17:10:00Z"),
+      rec("mission.close", "2026-09-03T18:01:00Z"),
     ];
     expect(missionReplayDate(records)).toBe("2026-09-03");
   });
   it("treats an aborted mission as a recording too", () => {
-    expect(missionReplayDate([rec("mission start", "2026-09-02T01:00:00Z"), rec("mission abort", "2026-09-02T01:05:00Z")])).toBe("2026-09-02");
+    expect(missionReplayDate([rec("mission.start", "2026-09-02T01:00:00Z"), rec("mission.abort", "2026-09-02T01:05:00Z")])).toBe("2026-09-02");
   });
   it("is null for an empty slice", () => {
     expect(missionReplayDate([])).toBeNull();
   });
 });
 
-describe("(#2911) sessionRecords — the per-window session index", () => {
-  const rec = (sid: unknown, action: string, ts: string) => ({ ts, session_id: sid, action }) as FlowRecord;
+describe("(#2911) runIndex — the per-window run index", () => {
+  const rec = (sid: unknown, action: string, ts: string) => norm({ ts, session_id: sid, action } as RawRecord);
   const dup = rec("b", "dispatch.turn", "2026-09-26T10:00:04Z");
-  const data: FlowRecord[] = [
+  const data: NormRecord[] = [
     rec("a", "dispatch.start", "2026-09-26T10:00:00Z"),
     rec("b", "dispatch.start", "2026-09-26T10:00:01Z"),
     rec(undefined, "machine.telemetry", "2026-09-26T10:00:02Z"),
-    // An empty id is still a string, and the scan matched it for `""`.
     rec("", "dispatch.start", "2026-09-26T10:00:02Z"),
     rec("a", "dispatch.complete", "2026-09-26T10:00:03Z"),
-    // The same record object twice: the scan returns it twice, in place.
+    // The same record object twice: the index keeps it twice, in place.
     dup,
     rec("a", "dispatch.turn", "2026-09-26T10:00:05Z"),
     dup,
-    // A malformed id is not a string. The scan compared with `===`, so a
-    // caller holding the same value (a sid read off such a record) found it.
-    rec(42, "dispatch.start", "2026-09-26T10:00:06Z"),
-    rec(null, "note", "2026-09-26T10:00:07Z"),
-    // `NaN === NaN` is false, so the scan found nothing for it.
-    rec(Number.NaN, "note", "2026-09-26T10:00:08Z"),
   ];
+  const recordsOf = (d: readonly NormRecord[], sid: string) => runIndex(d).groupsOfSession(sid).flatMap((g) => g.records);
 
-  it("is exactly the whole-window scan it replaces, in window order", () => {
-    for (const sid of ["a", "b", "missing", "", "42", 42, undefined, null, Number.NaN] as unknown as string[]) {
-      expect(sessionRecords(data, sid)).toEqual(data.filter((r) => r.session_id === sid));
+  it("groups exactly the records a whole-window scan finds, in window order", () => {
+    for (const sid of ["a", "b", "missing"]) {
+      expect(recordsOf(data, sid)).toEqual(data.filter((r) => r.session_id === sid));
     }
-    expect(sessionRecords(data, 42 as unknown as string)).toHaveLength(1);
-    expect(sessionRecords(data, "42")).toHaveLength(0);
-    expect(sessionRecords(data, "b")).toEqual([data[1], dup, dup]);
-    expect(dispatchEnd(data, "a")).toBe(data[4]);
-    expect(dispatchEnd(data, "b")).toBeUndefined();
+    expect(recordsOf(data, "b")).toEqual([data[1], dup, dup]);
   });
 
-  it("hands out groups (and the shared miss) as readonly, so a push cannot corrupt later lookups", () => {
-    // Type-level: `bun run typecheck` fails if either return widens back to a
-    // mutable array (the directives below would then be unused). Never run.
+  it("a record with no session id belongs to no run", () => {
+    expect(runIndex(data).groups.every((g) => g.sessionId !== "")).toBe(true);
+    expect(runIndex(data).groupOf(data[2])).toBeNull();
+  });
+
+  it("hands out groups as readonly, so a push cannot corrupt later lookups", () => {
+    // Type-level: `bun run typecheck` fails if a group widens back to a
+    // mutable array (the directive below would then be unused). Never run.
     const typeOnly = () => {
-      // @ts-expect-error a session's group is readonly
-      sessionRecords(data, "a").push(data[0]);
-      // @ts-expect-error the shared miss is readonly
-      sessionRecords(data, "missing").push(data[0]);
+      // @ts-expect-error a run's records are readonly
+      runIndex(data).groupsOfSession("a")[0].records.push(data[0]);
     };
     void typeOnly;
-    expect(sessionRecords(data, "missing")).toBe(sessionRecords([...data], "other-miss"));
   });
 
-  // Pins that `sessionRunning` reads a session's records THROUGH the index
-  // (the #2911 cost fix), not with a whole-window scan that happens to agree.
-  // The instrument deliberately breaks the never-mutated-after-read contract:
-  // a record appended after the index is built is invisible to the index and
+  // Pins that a lifecycle reads a run's records THROUGH the index (the #2911
+  // cost fix), not with a whole-window scan that happens to agree. The
+  // instrument deliberately breaks the never-mutated-after-read contract: a
+  // record appended after the index is built is invisible to the index and
   // visible to any scan, so the two routes give different answers.
-  it("sessionRunning answers from the window's index, not a whole-window scan", () => {
+  it("answers from the window's index, not a whole-window scan", () => {
     const t = Date.parse("2026-09-26T10:00:10Z");
-    const win: FlowRecord[] = [rec("x", "dispatch.start", "2026-09-26T10:00:00Z")];
-    expect(sessionRunning(win, new Set(), "s", t)).toBe(false);
+    const win: NormRecord[] = [rec("x", "dispatch.start", "2026-09-26T10:00:00Z")];
+    expect(sessionRun(win, "s", t)).toBeNull();
     win.push(rec("s", "dispatch.start", "2026-09-26T10:00:09Z"));
-    expect(sessionRunning(win, new Set(), "s", t)).toBe(false);
-    // Control: a fresh array (a fresh index) does see it, so the `false`
-    // above is the index talking, not a record that never counted.
-    expect(sessionRunning([...win], new Set(), "s", t)).toBe(true);
+    expect(sessionRun(win, "s", t)).toBeNull();
+    // Control: a fresh array (a fresh index) does see it.
+    expect(lifecycleAt(sessionRun([...win], "s", t)!, t, DEFAULT_POLICY).phase).toBe("open");
   });
 
   it("indexes a window once, and a new window array gets its own index", () => {
     const win = [...data];
-    const before = __sessionIndexBuilds();
-    const first = sessionRecords(win, "a");
-    expect(sessionRecords(win, "a")).toBe(first);
-    sessionRecords(win, "b");
-    expect(__sessionIndexBuilds()).toBe(before + 1);
+    const before = __runIndexBuilds();
+    const first = runIndex(win);
+    expect(runIndex(win)).toBe(first);
+    expect(__runIndexBuilds()).toBe(before + 1);
     const next = [...win, rec("a", "dispatch.turn", "2026-09-26T10:00:04Z")];
-    expect(sessionRecords(next, "a")).toHaveLength(4);
-    expect(__sessionIndexBuilds()).toBe(before + 2);
+    expect(recordsOf(next, "a")).toHaveLength(4);
+    expect(__runIndexBuilds()).toBe(before + 2);
   });
 });
 
 describe("(#2911) recordsAsOf: the window as of now, without a filter per tick", () => {
-  const at = (ts: string, handle: string) => ({ ts, action: "note", handle }) as FlowRecord;
+  const at = (ts: string, handle: string) => norm({ ts, action: "operator.note", handle });
   const t = (ts: string) => Date.parse(ts);
 
-  it("matches filter(ts <= now) at every now, including a ts that does not parse", () => {
+  it("matches filter(ts <= now) at every now; a ts that does not parse is kept at every now (bad-timestamp policy)", () => {
     const win = [
       at("2026-09-26T10:00:00Z", "a"),
       at("2026-09-26T10:00:05Z", "b"),
@@ -550,7 +518,8 @@ describe("(#2911) recordsAsOf: the window as of now, without a filter per tick",
     ];
     for (let s = -1; s <= 11; s++) {
       const now = t("2026-09-26T10:00:00Z") + s * 1000;
-      expect(recordsAsOf(win, now)).toEqual(win.filter((r) => Date.parse(r.ts) <= now));
+      expect(recordsAsOf(win, now)).toEqual(win.filter((r) => r.tMs === null || r.tMs <= now));
+      expect(recordsAsOf(win, now).map((r) => r.handle)).toContain("bad");
     }
   });
 
@@ -599,7 +568,7 @@ describe("displayNameOf: roster and unnamed ordinals", () => {
   const A = "00000000-0000-4000-8000-ABCDEF000001";
   const B = "00000000-0000-4000-8000-ABCDEF000003";
   const C = "00000000-0000-4000-8000-ABCDEF000005";
-  const uidOnly = (uid: string, ts: string) => ({ ts, action: "dispatch.turn", machine_uid: uid }) as unknown as FlowRecord;
+  const uidOnly = (uid: string, ts: string) => norm({ ts, action: "dispatch.turn", machine_uid: uid });
   const none = new Map();
 
   it("a roster entry declared for the uid names a uid-only machine", () => {
@@ -610,7 +579,7 @@ describe("displayNameOf: roster and unnamed ordinals", () => {
   });
 
   it("an observed name and this daemon's own name both outrank the roster id", () => {
-    const named = [{ ts: "2026-09-26T10:00:00Z", machine_uid: A, machine_id: "box" } as unknown as FlowRecord];
+    const named = [norm({ ts: "2026-09-26T10:00:00Z", machine_uid: A, machine_id: "box" })];
     expect(displayNameOf(named, none, null, A, [{ id: "studio", machine_uid: A }])).toBe("box");
     const self = { machine_id: "laptop", machine_uid: A };
     expect(displayNameOf([uidOnly(A, "2026-09-26T10:00:00Z")], none, self, A, [{ id: "studio", machine_uid: A }])).toBe("laptop");
@@ -628,7 +597,7 @@ describe("displayNameOf: roster and unnamed ordinals", () => {
 
   it("named, self and rostered machines take no ordinal; a presence-only uid comes after every recorded one", () => {
     const data = [
-      { ts: "2026-09-26T09:00:00Z", machine_uid: C, machine_id: "box" } as unknown as FlowRecord,
+      norm({ ts: "2026-09-26T09:00:00Z", machine_uid: C, machine_id: "box" }),
       uidOnly(A, "2026-09-26T09:10:00Z"),
       uidOnly(B, "2026-09-26T09:20:00Z"),
     ];

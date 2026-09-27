@@ -361,7 +361,7 @@ fn emit_route_record(text: &str, surface: RadioSurface, decision: &RouteDecision
     let synth_session_id = crate::types::session_id::session_id("radio", &nanos.to_string(), "");
     let record = crate::crew::dispatch::build_dispatch_record_with_payload(
         crate::flow::Level::Info,
-        "radio.route",
+        darkmux_flow::FlowAction::RadioRoute,
         crate::crew::loader::RADIO_ROUTER_ROLE_ID,
         &synth_session_id,
         None,

@@ -1,4 +1,3 @@
-import { isDispatchComplete } from "../../lib/flow";
 import {
   CALL_KIND,
   hasAnyTokenCounts,
@@ -6,7 +5,7 @@ import {
   sumUsage,
   type UsagePayload,
 } from "../../lib/usageRecords";
-import type { FlowRecord } from "../../types/handwritten";
+import { ACTION, CATEGORY, type NormRecord } from "../../lib/ingest";
 
 /**
  * `tokensOffMeter()` — the fleet hero's numbers (#783, #1186, #1607, #2902).
@@ -44,7 +43,7 @@ export interface TokensOffMeter {
   runs: number;
 }
 
-export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
+export function tokensOffMeter(data: NormRecord[]): TokensOffMeter {
   const s = sumUsage(data);
   return { total: s.total, input: s.prompt, generated: s.completion, cached: s.cached, utility: s.utility, runs: dispatchCount(data) };
 }
@@ -76,7 +75,7 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
  *     records with counts): a single-shot's record lands with its own
  *     completion, and a compactor call is not a dispatch.
  */
-function dispatchCount(data: FlowRecord[]): number {
+function dispatchCount(data: NormRecord[]): number {
   // Per run key, a bit set over its completions (one pass, one key string
   // per relevant record): which lineages it closed on, and which of those
   // closed with a token-bearing completion.
@@ -87,12 +86,12 @@ function dispatchCount(data: FlowRecord[]): number {
   let runs = 0;
   for (const r of data) {
     const p = r.payload as (UsagePayload & { endpoint?: unknown }) | undefined;
-    if (r.category === "telemetry" && r.source === "tokens") {
+    if (r.category === CATEGORY.Telemetry && r.source === "tokens") {
       const u = p ?? {};
       if (u.call_kind !== CALL_KIND.single_shot && u.call_kind !== CALL_KIND.compaction && u.token_source !== "absent") inFlight.add(runKey(r));
       continue;
     }
-    if (!p || !r.session_id || !isDispatchComplete(r.action)) continue;
+    if (!p || !r.session_id || r.action !== ACTION.DispatchComplete) continue;
     const k = runKey(r);
     const ep = !!p.endpoint;
     let bits = (closed.get(k) ?? 0) | (ep ? WITH_EP : WITHOUT_EP);

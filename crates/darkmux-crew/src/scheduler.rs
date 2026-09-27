@@ -493,7 +493,7 @@ pub struct SchedulerReport {
     ///
     /// **(#1877, final wiring step) This in-memory summary is no longer the
     /// only surface.** `apply_step_terminal` also streams a `STEP_TIMING_
-    /// ACTION` ("step timing") flow record for each entry, at the SAME
+    /// ACTION` (darkmux_flow::FlowAction::StepTiming) flow record for each entry, at the SAME
     /// moment it is pushed here. See `step_timing_record`'s own doc for
     /// the shape and `run_record.rs`'s module doc for why the flow stream,
     /// not `MissionEnvelope`, is the destination. This closes the gap
@@ -1239,7 +1239,7 @@ pub fn run_step_graph(
             // lived in the status-flip loop above.
             emit(step_lifecycle_record_with_payload(
                 &step_snapshot,
-                "step start",
+                darkmux_flow::FlowAction::StepStart,
                 Some(serde_json::json!({ "seat_class": seat.label() })),
             ));
             persist(&step_snapshot);
@@ -1528,7 +1528,7 @@ fn apply_step_terminal(
             step.status = NodeStatus::Complete;
             step.completed_ts = Some(at);
             step.output = Some(output);
-            emit(step_lifecycle_record(step, "step complete"));
+            emit(step_lifecycle_record(step, darkmux_flow::FlowAction::StepComplete));
             persist(step);
             report.completed.push(id.to_string());
         }
@@ -1536,7 +1536,7 @@ fn apply_step_terminal(
             step.status = NodeStatus::Error;
             step.completed_ts = Some(at);
             step.output = Some(message.clone());
-            emit(step_lifecycle_record(step, "step error"));
+            emit(step_lifecycle_record(step, darkmux_flow::FlowAction::StepError));
             persist(step);
             report.errored.push(id.to_string());
             errored = Some((id.to_string(), message));
@@ -1939,7 +1939,11 @@ fn now_unix() -> u64 {
 /// `darkmux-lab::lab::review`'s cross-path conformance test, so the two
 /// test suites assert against the SAME source of truth and cannot drift
 /// apart silently.
-pub const STEP_LIFECYCLE_ACTIONS: [&str; 3] = ["step start", "step complete", "step error"];
+pub const STEP_LIFECYCLE_ACTIONS: [darkmux_flow::FlowAction; 3] = [
+    darkmux_flow::FlowAction::StepStart,
+    darkmux_flow::FlowAction::StepComplete,
+    darkmux_flow::FlowAction::StepError,
+];
 
 /// One `FlowRecord` for a step-lifecycle transition (`"step start"` /
 /// `"step complete"` / `"step error"`). Mirrors `lifecycle.rs`'s
@@ -1964,15 +1968,10 @@ pub const STEP_LIFECYCLE_ACTIONS: [&str; 3] = ["step start", "step complete", "s
 /// the mission config, e.g. `task-review-probe-mid-task`) — identical
 /// across every mission launched from the same config, so two concurrent
 /// runs collide in the viewer with no `mission_id` to tell them apart.
-fn step_lifecycle_record(step: &Step, action: &str) -> FlowRecord {
+fn step_lifecycle_record(step: &Step, action: darkmux_flow::FlowAction) -> FlowRecord {
     step_lifecycle_record_with_payload(step, action, None)
 }
 
-/// (#2394) The action a `SeatClaim::LocalModelUnresolved` warning carries.
-/// Its own action string, not a `"step start"` at `Warn`: a consumer folding
-/// step lifecycle bookends must not have to inspect `level` to know whether
-/// a record is one.
-pub const SEAT_UNRESOLVED_ACTION: &str = "step seat unresolved";
 
 /// (#2394 / #1509) The DURABLE half of the loud surface for a local seat
 /// whose placement could not be resolved — the `eprintln!` beside it reaches
@@ -1992,7 +1991,7 @@ fn seat_unresolved_record(step: &Step, reason: &str) -> FlowRecord {
         category: Category::Work,
         tier: Tier::Local,
         stage: Stage::Dispatch,
-        action: SEAT_UNRESOLVED_ACTION.to_string(),
+        action: darkmux_flow::FlowAction::StepSeatUnresolved,
         handle: step.id.clone(),
         phase_id: None,
         session_id: Some(darkmux_types::session_id::task(&step.task_id)),
@@ -2031,14 +2030,15 @@ fn seat_unresolved_record(step: &Step, reason: &str) -> FlowRecord {
 /// own. A caller outside `run_step_graph`'s own backfill wrap (like the
 /// crawl launcher) sets `.mission_id` on the returned record directly
 /// before emitting it.
-pub fn step_lifecycle_record_with_payload(step: &Step, action: &str, payload: Option<serde_json::Value>) -> FlowRecord {
+pub fn step_lifecycle_record_with_payload(step: &Step, action: darkmux_flow::FlowAction, payload: Option<serde_json::Value>) -> FlowRecord {
+    let level = if action == darkmux_flow::FlowAction::StepError { Level::Warn } else { Level::Info };
     FlowRecord {
         ts: darkmux_flow::ts_utc_now(),
-        level: if action == "step error" { Level::Warn } else { Level::Info },
+        level,
         category: Category::Work,
         tier: Tier::Local,
         stage: Stage::Dispatch,
-        action: action.to_string(),
+        action,
         handle: step.id.clone(),
         phase_id: None,
         session_id: Some(darkmux_types::session_id::task(&step.task_id)),
@@ -2056,28 +2056,6 @@ pub fn step_lifecycle_record_with_payload(step: &Step, action: &str, payload: Op
     }
 }
 
-/// (#1877, final wiring step) The action a scheduler-produced
-/// [`StepRecord`]'s companion flow record carries. See
-/// [`step_timing_record`] and `SchedulerReport::step_records`'s own doc for
-/// what this measures.
-///
-/// **Deliberately its own action, never `"step result"`.** A `StepKind`'s
-/// own business-result record (`dispatch.map`'s per-item/aggregate records,
-/// the launch-owned Tier-3 kinds) already
-/// emits under `action: "step result"`, `source: "scheduler"` or
-/// `source: "review"`, for the steps that cooperate, and that record
-/// carries real `items_in`/`items_out` this module cannot observe (see
-/// `run_record.rs`'s module doc). Stamping the SAME action here would put
-/// two records for the very same step under the same action string with
-/// different, non-overlapping payload shapes, genuinely ambiguous to any
-/// consumer that counts or folds by `action == "step result"`
-/// (`darkmux-serve`'s `mission_graph::fold_step_finals` is exactly such a
-/// consumer). A distinct action is "carry the discriminator" applied at the
-/// cheapest possible layer: the action string itself, so a reader never has
-/// to inspect `source`/`payload.step_id` to tell the two apart. See
-/// `run_record.rs`'s module doc for the full resolution of this arc's
-/// vocabulary question.
-pub const STEP_TIMING_ACTION: &str = "step timing";
 
 /// One `FlowRecord` per scheduler-produced [`StepRecord`]: the durable,
 /// live-streamed counterpart of the in-memory summary
@@ -2113,7 +2091,7 @@ fn step_timing_record(step: &Step, rec: &StepRecord) -> FlowRecord {
         category: Category::Work,
         tier: Tier::Local,
         stage: Stage::Dispatch,
-        action: STEP_TIMING_ACTION.to_string(),
+        action: darkmux_flow::FlowAction::StepTiming,
         handle: step.id.clone(),
         phase_id: None,
         session_id: Some(darkmux_types::session_id::task(&step.task_id)),
@@ -2171,11 +2149,11 @@ mod tests {
         let step = bare_step("s-0001");
         let rec = step_lifecycle_record_with_payload(
             &step,
-            "step start",
+            darkmux_flow::FlowAction::StepStart,
             Some(json!({"workspace": "acme", "unit": "u-0001", "source": "app", "sha": "abc123"})),
         );
-        assert_eq!(rec.action, "step start");
-        assert!(STEP_LIFECYCLE_ACTIONS.contains(&rec.action.as_str()));
+        assert_eq!(rec.action, darkmux_flow::FlowAction::StepStart);
+        assert!(STEP_LIFECYCLE_ACTIONS.contains(&rec.action));
         let payload = rec.payload.expect("payload set");
         assert_eq!(payload["workspace"], "acme");
         assert_eq!(payload["unit"], "u-0001");
@@ -2191,7 +2169,7 @@ mod tests {
     #[test]
     fn step_lifecycle_record_two_arg_wrapper_emits_no_payload() {
         let step = bare_step("s-0002");
-        let rec = step_lifecycle_record(&step, "step complete");
+        let rec = step_lifecycle_record(&step, darkmux_flow::FlowAction::StepComplete);
         assert!(rec.payload.is_none());
     }
 
@@ -3168,11 +3146,11 @@ mod tests {
         assert!(steps["a-step"].started_ts.is_none(), "a declined step never flips to Running");
         assert!(report.errored.contains(&"a-step".to_string()));
         assert!(
-            emitted.iter().any(|r| r.action == "step error" && r.handle == "a-step"),
+            emitted.iter().any(|r| r.action == darkmux_flow::FlowAction::StepError && r.handle == "a-step"),
             "a declined step still emits the ordinary \"step error\" lifecycle record: {emitted:?}"
         );
         assert!(
-            !emitted.iter().any(|r| r.action == "step start" && r.handle == "a-step"),
+            !emitted.iter().any(|r| r.action == darkmux_flow::FlowAction::StepStart && r.handle == "a-step"),
             "a declined step never emits \"step start\" — it never started: {emitted:?}"
         );
 
@@ -3679,16 +3657,16 @@ mod tests {
         )
         .unwrap();
 
-        let actions: Vec<&str> = emitted.iter().map(|r| r.action.as_str()).collect();
-        assert!(actions.contains(&"step start"));
-        assert!(actions.contains(&"step complete"));
+        let actions: Vec<&darkmux_flow::FlowAction> = emitted.iter().map(|r| &r.action).collect();
+        assert!(actions.contains(&&darkmux_flow::FlowAction::StepStart));
+        assert!(actions.contains(&&darkmux_flow::FlowAction::StepComplete));
         // (#1877) The companion timing record fires for every step that
         // streamed a real terminal, "step complete" here and "step error"
         // on a step that ran and failed (see
         // `errored_step_that_actually_ran_still_gets_a_record_with_real_duration`
         // below for that case). See `step_timing_record`'s own doc.
         assert_eq!(
-            actions.iter().filter(|a| **a == STEP_TIMING_ACTION).count(),
+            actions.iter().filter(|a| ***a == darkmux_flow::FlowAction::StepTiming).count(),
             1,
             "expected exactly one \"step timing\" record for the one step that ran: {actions:?}"
         );
@@ -3699,7 +3677,7 @@ mod tests {
         // onto a competing vocabulary.
         for action in &actions {
             assert!(
-                STEP_LIFECYCLE_ACTIONS.contains(action) || *action == STEP_TIMING_ACTION,
+                STEP_LIFECYCLE_ACTIONS.contains(action) || **action == darkmux_flow::FlowAction::StepTiming,
                 "scheduler emitted an action outside the canonical step-lifecycle vocabulary \
                  or the documented `step timing` companion: {action}"
             );
@@ -4184,7 +4162,7 @@ mod tests {
         let complete_pos = |handle: &str| {
             emitted
                 .iter()
-                .position(|r| r.action == "step complete" && r.handle == handle)
+                .position(|r| r.action == darkmux_flow::FlowAction::StepComplete && r.handle == handle)
                 .unwrap_or_else(|| panic!("no `step complete` emitted for {handle}"))
         };
         let fast = complete_pos("b-fast-step");
@@ -4219,15 +4197,15 @@ mod tests {
 
         let emitted = run_graph_with_kind(kind, &tasks, &mut steps);
 
-        let pos = |action: &str, handle: &str| {
+        let pos = |action: darkmux_flow::FlowAction, handle: &str| {
             emitted
                 .iter()
                 .position(|r| r.action == action && r.handle == handle)
                 .unwrap_or_else(|| panic!("no `{action}` for {handle}"))
         };
-        let dep_start = pos("step start", "c-dep-step");
-        let slow_done = pos("step complete", "a-slow-step");
-        let fast_done = pos("step complete", "b-fast-step");
+        let dep_start = pos(darkmux_flow::FlowAction::StepStart, "c-dep-step");
+        let slow_done = pos(darkmux_flow::FlowAction::StepComplete, "a-slow-step");
+        let fast_done = pos(darkmux_flow::FlowAction::StepComplete, "b-fast-step");
         assert!(
             dep_start > slow_done && dep_start > fast_done,
             "the dependent step must not start until BOTH wave-1 siblings finish \
@@ -4271,13 +4249,13 @@ mod tests {
     /// the in-memory summary a caller might or might not read.
     ///
     /// **Proved failing first**: before `apply_step_terminal` called
-    /// `emit(step_timing_record(...))`, `emitted` here carried only "step
-    /// start"/"step complete"; filtering for `STEP_TIMING_ACTION` found
+    /// `emit(step_timing_record(...))`, `emitted` here carried only
+    /// `step.start`/`step.complete`; filtering for `step.timing` found
     /// nothing, and this test failed on the `expect` below. Observed
     /// directly while writing this test.
     ///
     /// Also pins the vocabulary decision itself: the flow record's action
-    /// is `STEP_TIMING_ACTION` ("step timing"), never `"step result"`. See
+    /// is `step.timing`, never `step.result`. See
     /// `step_timing_record`'s own doc for why reusing that action would be
     /// genuinely ambiguous. Its payload is `StepRecord`'s own
     /// `serde_json::to_value`, so the wire shape a flow-stream consumer
@@ -4310,7 +4288,7 @@ mod tests {
 
         assert_eq!(report.step_records.len(), 1, "one summary record for the one step that ran");
 
-        let timing: Vec<&FlowRecord> = emitted.iter().filter(|r| r.action == STEP_TIMING_ACTION).collect();
+        let timing: Vec<&FlowRecord> = emitted.iter().filter(|r| r.action == darkmux_flow::FlowAction::StepTiming).collect();
         assert_eq!(
             timing.len(),
             1,
@@ -4328,14 +4306,14 @@ mod tests {
         // Never the business-result vocabulary. See `step_timing_record`'s
         // own doc on why the two must stay distinct actions.
         assert!(
-            !emitted.iter().any(|r| r.action == "step result"),
+            !emitted.iter().any(|r| r.action == darkmux_flow::FlowAction::StepResult),
             "a procedural.noop step never emits its own \"step result\"; this pins that this \
              test's \"step timing\" record is not accidentally the OTHER vocabulary"
         );
     }
 
     /// (#1877, final wiring step) The vocabulary decision itself, pinned
-    /// directly: `STEP_TIMING_ACTION` must never collapse onto EITHER of
+    /// directly: `step.timing` must never collapse onto EITHER of
     /// the two vocabularies it has to coexist with: the lifecycle
     /// transitions (`STEP_LIFECYCLE_ACTIONS`) or the business-result
     /// companion (`"step result"`). A future edit that renamed the
@@ -4344,11 +4322,11 @@ mod tests {
     /// fine; this is the test that catches it instead.
     #[test]
     fn step_timing_action_is_pinned_distinct_from_every_other_step_vocabulary() {
-        assert_eq!(STEP_TIMING_ACTION, "step timing");
-        assert_ne!(STEP_TIMING_ACTION, "step result");
+        assert_eq!(darkmux_flow::FlowAction::StepTiming, darkmux_flow::FlowAction::StepTiming);
+        assert_ne!(darkmux_flow::FlowAction::StepTiming, darkmux_flow::FlowAction::StepResult);
         assert!(
-            !STEP_LIFECYCLE_ACTIONS.contains(&STEP_TIMING_ACTION),
-            "STEP_TIMING_ACTION must never collide with a lifecycle transition action"
+            !STEP_LIFECYCLE_ACTIONS.contains(&darkmux_flow::FlowAction::StepTiming),
+            "darkmux_flow::FlowAction::StepTiming must never collide with a lifecycle transition action"
         );
     }
 
@@ -4667,7 +4645,7 @@ mod tests {
     fn start_seat_class(records: &[FlowRecord]) -> String {
         records
             .iter()
-            .find(|r| r.action == "step start")
+            .find(|r| r.action == darkmux_flow::FlowAction::StepStart)
             .and_then(|r| r.payload.as_ref())
             .and_then(|p| p.get("seat_class"))
             .and_then(|v| v.as_str())
@@ -4684,7 +4662,7 @@ mod tests {
     ///
     /// **Proved failing first**: dropped the `payload` argument back to
     /// `None` at the `step start` emission in `run_step_graph` (i.e. the
-    /// pre-#2394 `step_lifecycle_record(step, "step start")` call). All four
+    /// pre-#2394 `step_lifecycle_record(step, darkmux_flow::FlowAction::StepStart)` call). All four
     /// legs failed with `<missing>`. Restored before committing.
     #[test]
     #[serial_test::serial]
@@ -4720,7 +4698,7 @@ mod tests {
     /// `eprintln!` in place, and reran this test. It failed:
     /// ```text
     /// an unresolvable local seat must emit a Warn record naming the step:
-    /// ["step start", "step complete", "step timing"]
+    /// ["step start", darkmux_flow::FlowAction::StepComplete, "step timing"]
     /// ```
     /// Restored before committing.
     #[test]
@@ -4729,7 +4707,7 @@ mod tests {
         let records = records_for_seat(|| SeatClaim::LocalModelUnresolved {
             reason: "role `ghost` not found".to_string(),
         });
-        let warn = records.iter().find(|r| r.action == SEAT_UNRESOLVED_ACTION).unwrap_or_else(|| {
+        let warn = records.iter().find(|r| r.action == darkmux_flow::FlowAction::StepSeatUnresolved).unwrap_or_else(|| {
             panic!(
                 "an unresolvable local seat must emit a Warn record naming the step: {:?}",
                 records.iter().map(|r| r.action.as_str()).collect::<Vec<_>>()
@@ -4761,7 +4739,7 @@ mod tests {
         ] {
             let records = records_for_seat(claim);
             assert!(
-                !records.iter().any(|r| r.action == SEAT_UNRESOLVED_ACTION),
+                !records.iter().any(|r| r.action == darkmux_flow::FlowAction::StepSeatUnresolved),
                 "a cleanly-classified seat must not warn: {:?}",
                 records.iter().map(|r| r.action.as_str()).collect::<Vec<_>>()
             );
@@ -4912,7 +4890,7 @@ mod tests {
         // of the pairing the sibling test
         // `step_records_reach_the_flow_stream_live_under_their_own_vocabulary`
         // (Ok/"step complete" case) exercises above.
-        let timing: Vec<&FlowRecord> = emitted.iter().filter(|r| r.action == STEP_TIMING_ACTION).collect();
+        let timing: Vec<&FlowRecord> = emitted.iter().filter(|r| r.action == darkmux_flow::FlowAction::StepTiming).collect();
         assert_eq!(
             timing.len(),
             1,
@@ -5687,7 +5665,7 @@ mod tests {
         // discarding the `SchedulerReport` (and its `step_records`)
         // entirely — exactly the "mission ignores the field" shape.
         let emitted = run_graph_with_kind(kind, &tasks, &mut steps);
-        assert!(emitted.iter().any(|r| r.action == "step complete"));
+        assert!(emitted.iter().any(|r| r.action == darkmux_flow::FlowAction::StepComplete));
         assert_eq!(steps["a-step"].status, NodeStatus::Complete);
     }
 
@@ -5942,7 +5920,7 @@ mod tests {
             ctx: &StepRunCtx,
         ) -> Result<StepOutcome> {
             for i in 0..self.n {
-                let mut rec = step_lifecycle_record(step, "item");
+                let mut rec = step_lifecycle_record(step, darkmux_flow::FlowAction::StepResult);
                 rec.payload = Some(json!({ "i": i }));
                 ctx.emit(rec);
             }
@@ -5961,13 +5939,13 @@ mod tests {
         let item_positions: Vec<usize> = emitted
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.action == "item")
+            .filter(|(_, r)| r.action == darkmux_flow::FlowAction::StepResult)
             .map(|(i, _)| i)
             .collect();
         assert_eq!(item_positions.len(), 5, "all five streamed items reached emit");
         let complete_pos = emitted
             .iter()
-            .position(|r| r.action == "step complete")
+            .position(|r| r.action == darkmux_flow::FlowAction::StepComplete)
             .expect("step complete emitted");
         assert!(
             item_positions.iter().all(|&p| p < complete_pos),
@@ -5977,7 +5955,7 @@ mod tests {
         // Emission ORDER preserved: item i=0..5 in sequence.
         let item_indices: Vec<u64> = emitted
             .iter()
-            .filter(|r| r.action == "item")
+            .filter(|r| r.action == darkmux_flow::FlowAction::StepResult)
             .map(|r| r.payload.as_ref().unwrap()["i"].as_u64().unwrap())
             .collect();
         assert_eq!(item_indices, vec![0, 1, 2, 3, 4], "records visible in emission order");

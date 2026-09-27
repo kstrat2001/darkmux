@@ -33,6 +33,7 @@ mod e2e;
 
 use e2e::fixture_reaper;
 
+use darkmux_flow::FlowAction;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -44,10 +45,6 @@ use std::time::{Duration, Instant};
 const TOKEN: &str = "e2e-fleet-token-2916";
 const MOCK_REPLY: &str = "the beta seat answered";
 
-/// The flow action of a usage record (`darkmux_crew::usage::USAGE_ACTION`).
-/// Spelled here because this test drives the binary, not the library; the
-/// assertion that the receiver HAS one keeps a rename from passing silently.
-const USAGE_ACTION: &str = "telemetry.tokens";
 
 /// The binary under test: a plain `cargo build` of `darkmux` WITH the
 /// `e2e-fleet-loopback` feature, in its own target directory.
@@ -365,12 +362,12 @@ fn an_addressed_dispatch_runs_on_the_owning_machine_and_each_side_records_its_ha
     let beta = f.beta.flow_lines();
     let starts: Vec<_> = beta
         .iter()
-        .filter(|v| v["action"] == "dispatch start" && v["session_id"].as_str().is_some_and(|s| s.ends_with("-from-alpha")))
+        .filter(|v| v["action"] == FlowAction::DispatchStart.as_str() && v["session_id"].as_str().is_some_and(|s| s.ends_with("-from-alpha")))
         .collect();
     assert_eq!(starts.len(), 1, "beta's dispatch start: {:?}", actions(&beta));
     let sid = starts[0]["session_id"].as_str().unwrap();
     assert!(
-        beta.iter().any(|v| v["session_id"] == sid && v["action"] == "dispatch complete"),
+        beta.iter().any(|v| v["session_id"] == sid && v["action"] == FlowAction::DispatchComplete.as_str()),
         "beta's dispatch complete for {sid}: {:?}",
         actions(&beta)
     );
@@ -379,16 +376,16 @@ fn an_addressed_dispatch_runs_on_the_owning_machine_and_each_side_records_its_ha
     // ran the model counts them (#2916 decision 6). The mock reports usage,
     // so beta has a usage record for its session and alpha has none.
     let alpha = f.alpha.flow_lines();
-    let route = alpha.iter().find(|v| v["action"] == "dispatch route").unwrap_or_else(|| panic!("{:?}", actions(&alpha)));
+    let route = alpha.iter().find(|v| v["action"] == FlowAction::DispatchRoute.as_str()).unwrap_or_else(|| panic!("{:?}", actions(&alpha)));
     assert_eq!(route["payload"]["profile_address"], "cloud@beta", "{route}");
     assert_eq!(route["payload"]["target_machine"], "beta", "{route}");
     assert!(
-        beta.iter().any(|v| v["action"] == USAGE_ACTION && v["session_id"] == sid),
+        beta.iter().any(|v| v["action"] == FlowAction::TelemetryTokens.as_str() && v["session_id"] == sid),
         "the receiver counted the tokens of the model it ran: {:?}",
         actions(&beta)
     );
     assert!(
-        !alpha.iter().any(|v| v["action"] == USAGE_ACTION),
+        !alpha.iter().any(|v| v["action"] == FlowAction::TelemetryTokens.as_str()),
         "the sender recorded token usage for work another machine ran: {:?}",
         actions(&alpha)
     );
@@ -426,7 +423,7 @@ fn beta_dispatch_starts(f: &Fleet) -> usize {
     f.beta
         .flow_lines()
         .iter()
-        .filter(|v| v["action"] == "dispatch start" && v["session_id"].as_str().is_some_and(|s| s.ends_with("-from-alpha")))
+        .filter(|v| v["action"] == FlowAction::DispatchStart.as_str() && v["session_id"].as_str().is_some_and(|s| s.ends_with("-from-alpha")))
         .count()
 }
 

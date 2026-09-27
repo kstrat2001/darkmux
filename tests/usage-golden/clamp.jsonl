@@ -1,2 +1,2 @@
-{"action": "dispatch start", "handle": "coder", "payload": {}, "session_id": "clamp-1", "ts": "2026-09-26T12:00:00Z"}
+{"action": "dispatch.start", "handle": "coder", "payload": {}, "session_id": "clamp-1", "ts": "2026-09-26T12:00:00Z"}
 {"action": "telemetry.tokens", "category": "telemetry", "handle": "coder", "payload": {"call_kind": "turn", "completion_tokens": 1e16, "endpoint": "http://edge/v1", "prompt_tokens": 10000000000000000, "purpose": "work", "requested_model": "edge-m", "token_source": "provider", "total_tokens": 1e300}, "session_id": "clamp-1", "source": "tokens", "ts": "2026-09-26T12:01:00Z"}

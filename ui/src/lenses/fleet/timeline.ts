@@ -43,40 +43,28 @@
  * still `tMax`, unmoved by scrubbing) and takes a SEPARATE `playheadT`
  * parameter (defaulting to `tMax`, so every existing caller — anything that
  * never had a scrubber to begin with — is unaffected) for everything that
- * legacy keys on `state.t`: the bar loop's "not started yet" guard,
- * `sessionRunning`'s close-edge comparison, an open bar's `end`, and
- * `playheadPct`. `FleetLens` is the caller that now passes these as two
+ * legacy keys on `state.t`: the bar loop's "not started yet" guard, each
+ * run's lifecycle, an open bar's `end`, and `playheadPct`. `FleetLens` is the caller that now passes these as two
  * genuinely different numbers on a replay route (see its own doc for the
  * `tMax`/`playhead` prop split this traces back to).
  *
  * The bar loop's "not started yet" guard restores legacy's own
- * `bars=sessionsOn(m).map(sid=>{const s=dispatch(sid,"start");
- * if(!s||T(s.ts)>state.t)return""; ...})` — a session that hasn't started
- * yet as of the PLAYHEAD (not the axis ceiling) must not draw a bar at all;
- * without it, `sessionRunning` finds no close-edge for it (there's nothing
- * to close yet) and defaults to "running", drawing a phantom sliver. See
+ * `if(!s||T(s.ts)>state.t)return""` — a run that hasn't started yet as of
+ * the PLAYHEAD (not the axis ceiling) must not draw a bar at all; its
+ * lifecycle reads `not_started` there. See
  * `savings.ts`'s module doc for the parallel restoration applied to the
  * token sums (a caller-side gate, not a change to this file).
  */
 
-import {
-  T,
-  sessionRunsOn,
-  dispatchRec,
-  dispatchEnd,
-  dispatchErrored,
-  dispatchKilled,
-  sessEnd,
-  sessionRunning,
-  statusLabel,
-  runStateFrom,
-  lastTs,
-  displayNameOf,
-} from "../../lib/flow";
+import { statusLabel, displayNameOf } from "../../lib/flow";
 import type { RosterName, SelfIdentity } from "../../lib/flow";
 import { clkhm } from "../../lib/format";
-import type { FlowRecord, PresenceBeat } from "../../types/handwritten";
+import type { PresenceBeat } from "../../types/handwritten";
+import type { NormRecord } from "../../lib/ingest";
 import type { RunStatus } from "../../types/generated/RunStatus";
+import { DEFAULT_POLICY, endMs, lifecycleAt, spanOf, toRunState, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
+import { currentRun, runIndex, type RunGroup } from "../../lib/runRef";
+import { dispatchHash } from "../../lib/route";
 
 /** The live-only window presets (#1151) — minutes, matching legacy's
  * `[{l:'10m',m:10},{l:'1h',m:60},{l:'4h',m:240},{l:'24h',m:1440}]` verbatim.
@@ -102,6 +90,10 @@ export interface TimelineBar {
    * identity of ONE bar. Always distinct across bars in the same lane,
    * unlike `sid` alone. Use this for React `key`s / dedup, never `sid`. */
   key: string;
+  /** The bar's click-through: its run's detail view, naming the mission so
+   *  a session id several missions share opens this bar's run
+   *  (`dispatchHash`). */
+  hash: string;
   leftPct: number;
   widthPct: number;
   /** (#2813) The canonical run status: the bar's CSS class too (`.sbar.<status>`). */
@@ -134,16 +126,47 @@ export interface ActivityTimeline {
 /** `renderMachine()`'s lane-label width math (viewer.html:1733-1734) — sizes
  * the `.lname` column to the longest machine name so short names don't leave
  * a fixed gap. Visual-only (no text-parity effect). */
-function labelWidthPx(uids: string[], data: FlowRecord[], liveMachines: Map<string, PresenceBeat>, specs: SelfIdentity | null, roster: readonly RosterName[]): number {
+function labelWidthPx(uids: string[], data: NormRecord[], liveMachines: Map<string, PresenceBeat>, specs: SelfIdentity | null, roster: readonly RosterName[]): number {
   const maxLen = uids.length ? Math.max(...uids.map((m) => displayNameOf(data, liveMachines, specs, m, roster).length)) : 8;
   return Math.round(Math.min(170, Math.max(54, maxLen * 7.4 + 10)));
 }
 
+interface BarWindow {
+  tlMin: number;
+  pct: (t: number) => number;
+  playheadT: number;
+  policy: LifecyclePolicy;
+  presence: Presence;
+}
+
+/** One run's bar, or `null` when it draws none: bookkeeping-only sessions
+ *  (a mission's lifecycle, a scheduler task), a run not started as of the
+ *  playhead, and one that ended before the window. The bar spans the run's
+ *  first start to where its current attempt ends (`lifecycle.ts`'s `endMs`:
+ *  the playhead while it runs, its close, or its last sign of life). */
+function barFor(g: RunGroup, w: BarWindow): TimelineBar | null {
+  const first = g.attempts[0];
+  if (g.grain === "lifecycle" || !first) return null;
+  const l = lifecycleAt(currentRun(g, w.playheadT), w.playheadT, w.policy, w.presence);
+  if (l.phase === "not_started") return null;
+  const end = endMs(l, w.playheadT) ?? w.playheadT;
+  if (end < w.tlMin) return null;
+  // Clip a straddling start to the window edge; an untimed start draws from
+  // the edge, visible rather than dropped.
+  const cst = Math.max(spanOf(g).startMs ?? w.tlMin, w.tlMin);
+  const widthPct = Math.max(0.6, w.pct(end) - w.pct(cst));
+  const leftPct = Math.max(0, Math.min(w.pct(cst), 100 - widthPct)); // never spill past the right edge
+  const role = ((first.start ?? first.opening).handle || "").replace(/^darkmux\//, "");
+  const state = toRunState(l);
+  const key = g.missionId ? `${g.sessionId}\x1f${g.missionId}` : g.sessionId;
+  return { sid: g.sessionId, key, hash: dispatchHash(g.sessionId, g.missionId), leftPct, widthPct, status: state.status, title: `${role} · ${g.sessionId} · ${statusLabel(state)}` };
+}
+
 export function buildActivityTimeline(
-  data: FlowRecord[],
+  data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
   uids: string[],
-  liveSet: Set<string>,
+  presence: Presence,
   /** The axis CEILING — kept as a parameter for `playheadT`'s default
    * expression below (so every pre-existing caller that only ever passed
    * one clock value is unaffected), but no longer read for anything else.
@@ -192,6 +215,8 @@ export function buildActivityTimeline(
   specs: SelfIdentity | null = null,
   /** (#2921 follow-up) The declared roster, for the same reason. */
   roster: readonly RosterName[] = [],
+  /** The daemon's lifecycle policy (`/runs.policy`). */
+  policy: LifecyclePolicy = DEFAULT_POLICY,
 ): ActivityTimeline {
   const winMs = windowMinutes * 60000;
   const tlMax = fixedRange ? fixedRange[1] : playheadT;
@@ -199,50 +224,16 @@ export function buildActivityTimeline(
   const span = Math.max(1, tlMax - tlMin);
   const pct = (t: number) => ((t - tlMin) / span) * 100;
 
+  const window: BarWindow = { tlMin, pct, playheadT, policy, presence };
   const lanes: TimelineLane[] = uids.map((m) => {
+    // (#2125) One bar per RUN, a `(session, mission)` pair (`runRef.ts`),
+    // not per bare session id: a review mission's step session id is reused
+    // by every review run, and pairing one mission's start with another's
+    // end drew a 20-hour abandoned span for a 23-minute mission.
     const bars: TimelineBar[] = [];
-    // (#2125) `sessionRunsOn` — NOT `sessionsOn` — yields one entry per
-    // (session_id, mission_id) pair, not per bare session_id. A review
-    // mission's per-step session id (`task-review-probe-mid-task` etc) is a
-    // FIXED string reused by every review run; two DIFFERENT missions
-    // sharing one entry here would let `dispatchRec`/`dispatchEnd`/`sessEnd`
-    // below (unscoped `Array.find`) pair one mission's start with a
-    // DIFFERENT mission's terminal/abort — measured live as a single
-    // 20-hour abandoned span for a mission that actually ran 23 minutes.
-    // `missionId` threaded through every lookup below scopes each one to
-    // its OWN mission's records; `undefined` (a session with no mission at
-    // all) preserves the exact prior session-id-only behavior.
-    for (const { sessionId: sid, missionId } of sessionRunsOn(data, m)) {
-      const s = dispatchRec(data, sid, "start", missionId);
-      // (#1869) `T(s.ts) > playheadT` — restores legacy's
-      // `if(!s||T(s.ts)>state.t)return"";`. A session that hasn't started
-      // yet as of the PLAYHEAD (not the axis ceiling) must not draw a bar at
-      // all; without it, `sessionRunning` finds no close-edge for it
-      // (there's nothing to close) and defaults to "running", drawing a
-      // phantom sliver at the track's right edge.
-      if (!s || T(s.ts) > playheadT) continue;
-      const term = dispatchEnd(data, sid, missionId);
-      const e = sessEnd(data, sid, missionId);
-      const closeCands = [term ? T(term.ts) : null, e ? T(e.ts) : null].filter((x): x is number => x != null);
-      const closeTs = closeCands.length ? Math.min(...closeCands) : null;
-      // (#857) `done` = not currently running, through the SHARED
-      // `sessionRunning` — live keys on presence, replay on the close-edge at
-      // the playhead. (#1800 P2: this was `!liveSet.has(sid)`, the live arm
-      // inlined, which read every session of a replayed day as running.)
-      const done = !sessionRunning(data, liveSet, sid, playheadT, missionId);
-      const errored = done && dispatchErrored(term);
-      const killed = dispatchKilled(term);
-      const clean = done && !!term && !dispatchErrored(term);
-      const state = runStateFrom({ open: !done, errored, killed, clean });
-      const lbl = statusLabel(state);
-      const end = !done ? playheadT : closeTs != null ? closeTs : lastTs(data, sid, missionId) || playheadT;
-      if (end < tlMin) continue; // ended entirely before the window
-      const cst = Math.max(T(s.ts), tlMin); // clip a straddling start to the window edge
-      const widthPct = Math.max(0.6, pct(end) - pct(cst));
-      const leftPct = Math.max(0, Math.min(pct(cst), 100 - widthPct)); // never spill past the right edge
-      const role = (s.handle || "").replace(/^darkmux\//, "");
-      const key = missionId ? `${sid}\x1f${missionId}` : sid;
-      bars.push({ sid, key, leftPct, widthPct, status: state.status, title: `${role} · ${sid} · ${lbl}` });
+    for (const g of runIndex(data).groupsOn(m)) {
+      const bar = barFor(g, window);
+      if (bar) bars.push(bar);
     }
     return { uid: m, name: displayNameOf(data, liveMachines, specs, m, roster), bars };
   });

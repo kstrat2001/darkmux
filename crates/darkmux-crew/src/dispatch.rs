@@ -1093,7 +1093,7 @@ pub fn emit_route_record_and_resolve_session(
     let mission_id = resolve_mission_for_phase(opts.phase_id.as_deref());
     let _ = darkmux_flow::record(build_dispatch_record_with_payload(
         darkmux_flow::Level::Info,
-        "dispatch route",
+        darkmux_flow::FlowAction::DispatchRoute,
         &opts.role_id,
         &session_id,
         None,
@@ -1164,28 +1164,6 @@ pub fn routing_decision(machine: Option<&str>, local_machine_id: Option<&str>) -
     }
 }
 
-/// Build a flow record for a dispatch lifecycle event (`dispatch start`,
-/// `dispatch complete`, `dispatch error`). All three share the same
-/// session_id so the viewer pairs start↔end into a single wall-clock
-/// arc per dispatch. `handle` is the role id (operator-readable label);
-/// `model` is the resolved LMStudio model id (best-effort — `None` on
-/// resolution failure).
-///
-/// Legacy wrapper around `build_dispatch_record_with_payload` for the
-/// pre-#204 call shape. Emit sites now go through `_with_payload`
-/// directly to carry runtime metadata; this wrapper survives for tests
-/// + future callers that don't need payload.
-#[allow(dead_code)]
-pub fn build_dispatch_record(
-    level: darkmux_flow::Level,
-    action: &str,
-    role_id: &str,
-    session_id: &str,
-    model: Option<&str>,
-) -> darkmux_flow::FlowRecord {
-    build_dispatch_record_with_payload(level, action, role_id, session_id, model, None, None, None)
-}
-
 /// (#1127) Max prompt-text length stamped on a `dispatch.start` record. The
 /// full prompt is operator-useful run context (the viewer renders it as a
 /// collapsed block), but an unbounded paste would bloat the per-day JSONL +
@@ -1200,14 +1178,12 @@ pub(crate) fn capped_prompt(s: &str) -> String {
     s.chars().take(MAX_PROMPT_PAYLOAD_CHARS).collect()
 }
 
-/// Same as `build_dispatch_record` but with an explicit `payload` for
-/// event-specific fields (#204). The richer dispatch events (turn,
-/// tool, compaction, reasoning) use this directly; the bare
-/// `build_dispatch_record` wrapper preserves the legacy call shape.
+/// Build a dispatch-stage flow record with an explicit `payload` for
+/// event-specific fields (#204).
 #[allow(clippy::too_many_arguments)]
 pub fn build_dispatch_record_with_payload(
     level: darkmux_flow::Level,
-    action: &str,
+    action: darkmux_flow::FlowAction,
     role_id: &str,
     session_id: &str,
     model: Option<&str>,
@@ -1221,7 +1197,7 @@ pub fn build_dispatch_record_with_payload(
         category: darkmux_flow::Category::Work,
         tier: darkmux_flow::Tier::Local,
         stage: darkmux_flow::Stage::Dispatch,
-        action: action.to_string(),
+        action,
         handle: role_id.to_string(),
         phase_id: phase_id.map(String::from),
         session_id: Some(session_id.to_string()),
@@ -1251,7 +1227,7 @@ pub fn build_dispatch_record_with_payload(
 #[allow(clippy::too_many_arguments)]
 pub fn build_telemetry_record(
     level: darkmux_flow::Level,
-    action: &str,
+    action: darkmux_flow::FlowAction,
     source: &str,
     role_id: &str,
     session_id: &str,
@@ -1266,7 +1242,7 @@ pub fn build_telemetry_record(
         category: darkmux_flow::Category::Telemetry,
         tier: darkmux_flow::Tier::Local,
         stage: darkmux_flow::Stage::Dispatch,
-        action: action.to_string(),
+        action,
         handle: role_id.to_string(),
         phase_id: phase_id.map(String::from),
         session_id: Some(session_id.to_string()),
@@ -1431,7 +1407,7 @@ mod tests {
         });
         let rec = build_telemetry_record(
             darkmux_flow::Level::Info,
-            "telemetry.detector",
+            darkmux_flow::FlowAction::TelemetryDetector,
             "detector",
             "coder",
             "sess-1",
@@ -1460,7 +1436,7 @@ mod tests {
     fn telemetry_record_serializes_with_telemetry_category_and_detector_source() {
         let rec = build_telemetry_record(
             darkmux_flow::Level::Info,
-            "telemetry.detector",
+            darkmux_flow::FlowAction::TelemetryDetector,
             "detector",
             "coder",
             "sess-1",
@@ -2055,18 +2031,21 @@ mod tests {
         assert!(!id.contains("crew-dispatch--"));
     }
 
-    // ─── build_dispatch_record (Phase 2 of #104) ──────────────────────────
+    // ─── build_dispatch_record_with_payload (Phase 2 of #104) ──────────────────────────
 
     #[test]
     fn dispatch_record_carries_role_id_session_and_local_tier() {
-        let rec = build_dispatch_record(
+        let rec = build_dispatch_record_with_payload(
             darkmux_flow::Level::Info,
-            "dispatch start",
+            darkmux_flow::FlowAction::DispatchStart,
             "coder",
             "crew-dispatch-coder-12345-1",
             Some("darkmux:qwen3.6-35b-a3b"),
+            None,
+            None,
+            None,
         );
-        assert_eq!(rec.action, "dispatch start");
+        assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchStart);
         assert_eq!(rec.handle, "coder");
         assert_eq!(
             rec.session_id.as_deref(),
@@ -2077,10 +2056,8 @@ mod tests {
         assert!(matches!(rec.tier, darkmux_flow::Tier::Local));
         assert!(matches!(rec.stage, darkmux_flow::Stage::Dispatch));
         assert!(matches!(rec.category, darkmux_flow::Category::Work));
-        // The bare `build_dispatch_record` wrapper carries no mission/phase
-        // (it's the legacy/test call shape). A real phase-bound dispatch goes
-        // through `_with_payload` with the resolved mission/phase (#714); the
-        // viewer joins via session_id either way.
+        // No phase passed, none stamped. A real phase-bound dispatch passes
+        // the resolved mission/phase (#714).
         assert!(rec.phase_id.is_none());
         // ts is set to a non-empty UTC datetime string.
         assert!(!rec.ts.is_empty());
@@ -2093,11 +2070,14 @@ mod tests {
         // (per `skip_serializing_if = "Option::is_none"`). Old viewers
         // tolerate the absent field; new viewers render "model: unknown"
         // or similar.
-        let rec = build_dispatch_record(
+        let rec = build_dispatch_record_with_payload(
             darkmux_flow::Level::Info,
-            "dispatch start",
+            darkmux_flow::FlowAction::DispatchStart,
             "coder",
             "session-no-model",
+            None,
+            None,
+            None,
             None,
         );
         assert!(rec.model.is_none());
@@ -2116,7 +2096,7 @@ mod tests {
         // `mission_id`; without this the records were ungrouped.
         let rec = build_dispatch_record_with_payload(
             darkmux_flow::Level::Info,
-            "dispatch start",
+            darkmux_flow::FlowAction::DispatchStart,
             "coder",
             "crew-dispatch-coder-99-internal",
             Some("darkmux:qwen3.6"),
@@ -2135,7 +2115,7 @@ mod tests {
         // ungrouped-session rendering are untouched.
         let rec = build_dispatch_record_with_payload(
             darkmux_flow::Level::Info,
-            "dispatch start",
+            darkmux_flow::FlowAction::DispatchStart,
             "coder",
             "crew-dispatch-coder-99-internal",
             Some("darkmux:qwen3.6"),
@@ -2158,7 +2138,7 @@ mod tests {
         // group under the mission too — same wire as the work records.
         let rec = build_telemetry_record(
             darkmux_flow::Level::Info,
-            "telemetry.runtime",
+            darkmux_flow::FlowAction::TelemetryRuntime,
             "runtime",
             "coder",
             "sess-1",
@@ -2176,19 +2156,25 @@ mod tests {
         // Error-level records render differently in the viewer (red tag,
         // not green). Lock the error level on dispatch_error so the
         // failure path is visually distinct from completion.
-        let ok = build_dispatch_record(
+        let ok = build_dispatch_record_with_payload(
             darkmux_flow::Level::Info,
-            "dispatch complete",
+            darkmux_flow::FlowAction::DispatchComplete,
             "coder",
             "session-abc",
             Some("darkmux:foo"),
+            None,
+            None,
+            None,
         );
-        let err = build_dispatch_record(
+        let err = build_dispatch_record_with_payload(
             darkmux_flow::Level::Error,
-            "dispatch error",
+            darkmux_flow::FlowAction::DispatchError,
             "coder",
             "session-abc",
             Some("darkmux:foo"),
+            None,
+            None,
+            None,
         );
         assert!(matches!(ok.level, darkmux_flow::Level::Info));
         assert!(matches!(err.level, darkmux_flow::Level::Error));
@@ -2201,72 +2187,24 @@ mod tests {
 
 #[cfg(test)]
 mod action_vocabulary_conformance {
-    //! (#1852) The conformance test Contract 2 never had.
-    //!
-    //! Every other test on this seam asserts a hand-written literal on its own
-    //! side: the producer test checks the string its author typed, the consumer
-    //! test builds a fixture with the string ITS author typed. Both stay green
-    //! forever no matter how far apart the two drift, because nothing ever
-    //! takes a REAL emitted record and hands it to a REAL consumer matcher.
-    //!
-    //! That is the gap CLAUDE.md's contract registry names — "tests exercise
-    //! the subsystem, not its alignment" — and it is why five separate
-    //! consumers each had to rediscover the spelling split and patch it
-    //! locally. This test closes the loop for the dispatch bookends.
+    //! (#1852) The dispatch bookends a record this crate emits carry the ONE
+    //! wire spelling, read back through the same reader every consumer uses.
     use super::*;
 
-    /// Build through the REAL producer, match through the REAL consumer
-    /// predicate. Nothing here types a bookend literal.
-    fn emitted(action: &str) -> darkmux_flow::FlowRecord {
-        build_dispatch_record(darkmux_flow::Level::Info, action, "coder", "sess-1", Some("m"))
-    }
-
     #[test]
-    fn a_record_this_crate_emits_is_recognized_by_the_shared_matcher() {
-        let start = emitted(darkmux_flow::DISPATCH_START);
-        let complete = emitted(darkmux_flow::DISPATCH_COMPLETE);
-        let error = emitted(darkmux_flow::DISPATCH_ERROR);
-
-        assert!(darkmux_flow::is_dispatch_start(&start.action), "start: {}", start.action);
-        assert!(darkmux_flow::is_dispatch_complete(&complete.action), "complete: {}", complete.action);
-        assert!(darkmux_flow::is_dispatch_error(&error.action), "error: {}", error.action);
-        assert!(darkmux_flow::is_dispatch_terminal(&complete.action));
-        assert!(darkmux_flow::is_dispatch_terminal(&error.action));
-        assert!(!darkmux_flow::is_dispatch_terminal(&start.action), "a start is not a terminal");
-    }
-
-    /// The OTHER lineage. `darkmux-lab` and `runtime` emit the dotted form, so
-    /// a consumer sees both shapes depending on which path ran. Pin that the
-    /// matchers accept it — this is the half a literal comparison gets wrong.
-    #[test]
-    fn the_dotted_lineage_is_recognized_too() {
-        for (dotted, ok) in [
-            ("dispatch.start", darkmux_flow::is_dispatch_start as fn(&str) -> bool),
-            ("dispatch.complete", darkmux_flow::is_dispatch_complete),
-            ("dispatch.error", darkmux_flow::is_dispatch_error),
+    fn a_dispatch_bookend_serializes_dotted_and_reads_back_as_itself() {
+        for (action, wire) in [
+            (darkmux_flow::FlowAction::DispatchStart, "dispatch.start"),
+            (darkmux_flow::FlowAction::DispatchComplete, "dispatch.complete"),
+            (darkmux_flow::FlowAction::DispatchError, "dispatch.error"),
         ] {
-            assert!(ok(dotted), "the dotted lineage must be recognized: {dotted}");
-        }
-    }
-
-    /// The constants must keep their ON-DISK value. Changing them is a
-    /// data-shape change: every historical record in the per-day JSONL and in
-    /// Redis carries the spaced form, and a silent flip would strand all of it
-    /// while every test that compares constant-to-constant stayed green.
-    #[test]
-    fn the_constants_still_carry_the_value_that_is_on_disk() {
-        assert_eq!(darkmux_flow::DISPATCH_START, "dispatch start");
-        assert_eq!(darkmux_flow::DISPATCH_COMPLETE, "dispatch complete");
-        assert_eq!(darkmux_flow::DISPATCH_ERROR, "dispatch error");
-    }
-
-    /// A near-miss must NOT match. Without this the matchers could degrade to
-    /// `starts_with("dispatch")` and every test above would still pass.
-    #[test]
-    fn unrelated_dispatch_actions_are_not_bookends() {
-        for a in ["dispatch.turn", "dispatch.tool", "dispatch.reasoning", "dispatch route", "dispatch"] {
-            assert!(!darkmux_flow::is_dispatch_start(a), "{a} is not a start");
-            assert!(!darkmux_flow::is_dispatch_terminal(a), "{a} is not a terminal");
+            let rec = build_dispatch_record_with_payload(
+                darkmux_flow::Level::Info, action.clone(), "coder", "sess-1", Some("m"), None, None, None,
+            );
+            let line = serde_json::to_string(&rec).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(v["action"], wire);
+            assert_eq!(darkmux_flow::reader::parse_record(&line).unwrap().action, action);
         }
     }
 }

@@ -192,13 +192,13 @@ describe("runDestination", () => {
     });
     expect(runDestination(tracked, true)).toEqual({
       kind: "hash",
-      hash: "dispatch=crew-dispatch-analyst-1787557214045728-0",
+      hash: "dispatch=crew-dispatch-analyst-1787557214045728-0&dispatch.mission=dispatch-analyst-1787557214-f5a8-0",
     });
     // Never gated on the graph being reachable — this route is a plain
     // `/flow-session/<id>` fetch, not the graph lens's endpoint.
     expect(runDestination(tracked, false)).toEqual({
       kind: "hash",
-      hash: "dispatch=crew-dispatch-analyst-1787557214045728-0",
+      hash: "dispatch=crew-dispatch-analyst-1787557214045728-0&dispatch.mission=dispatch-analyst-1787557214-f5a8-0",
     });
   });
 
@@ -232,10 +232,10 @@ describe("runDestination", () => {
       tracked: false,
       session_id: "peer-session-1",
     });
-    expect(runDestination(peerMission, true)).toEqual({ kind: "hash", hash: "dispatch=peer-session-1" });
+    expect(runDestination(peerMission, true)).toEqual({ kind: "hash", hash: "dispatch=peer-session-1&dispatch.mission=review-on-the-hub" });
     // `graphReachable` must not matter here — a session drill is never
     // gated on it, tracked or not.
-    expect(runDestination(peerMission, false)).toEqual({ kind: "hash", hash: "dispatch=peer-session-1" });
+    expect(runDestination(peerMission, false)).toEqual({ kind: "hash", hash: "dispatch=peer-session-1&dispatch.mission=review-on-the-hub" });
   });
 
   it("an untracked dispatch ghost row drills to its own id as the session (#1900, still true after the #1915 generalization)", () => {

@@ -74,6 +74,11 @@ function installCorpusRoutes(page, meta) {
     if (p === "/fleet/roster") return json("fleet-roster.json");
     if (p === "/machine/resources") return json("machine-resources.json");
     if (p === "/machine/specs") return json("machine-specs.json");
+    // `/health`'s `lifecycle_policy`: the numbers the viewer judges a run by
+    // (`useLifecyclePolicy`). Not part of the recorded corpus (the field is
+    // newer than it); the daemon's defaults, the same the viewer falls back
+    // to, so no golden depends on it.
+    if (p === "/health") return jsonInline({ lifecycle_policy: { stale_after_ms: 1200000, budget_wait_grace_ms: 60000 } });
 
     // (#1868 packet 1) The mission-graph parity fixture's node/edge snapshot.
     // Matched explicitly: unlike every other endpoint here, NOTHING

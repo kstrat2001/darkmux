@@ -1,3 +1,5 @@
+import { judgementAt } from "../../lib/lifecycle";
+import { useLifecyclePolicy } from "../../hooks/useLifecyclePolicy";
 import { encodeMachineKey } from "../../lib/machineKey";
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { fitTubes } from "./tubeFit";
@@ -12,8 +14,8 @@ import { useCountUp } from "../../hooks/useCountUp";
 import { useFleetRoster, useLiveMachines, useStaticFleetBeats } from "../../hooks/useLiveMachines";
 import { getSource, runsSrc, runsReachable } from "../../lib/source";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
-import { machineUids, machPresent, liveSessionSet, machineNames, recordsAsOf, LIVE_WINDOW_MS, T } from "../../lib/flow";
-import type { FleetMachinesLiveResponse, FleetSessionsLiveResponse, FlowRecord, RunsResponse } from "../../types/handwritten";
+import { machineUids, machPresent, machineNames, LIVE_WINDOW_MS } from "../../lib/flow";
+import type { FleetMachinesLiveResponse, FleetSessionsLiveResponse, RunsResponse } from "../../types/handwritten";
 import { fmtN, fmtC } from "../../lib/format";
 import { MachineIcon } from "../../components/MachineIcon";
 import { Shimmer } from "../../components/Placeholder";
@@ -29,6 +31,8 @@ import { useLatch } from "../../hooks/useLatch";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
 import type { MachineSpecs } from "../../types/handwritten";
 import { runsForMachine } from "../runs/format";
+import { recordsAsOf, type NormRecord } from "../../lib/ingest";
+import { dispatchHash } from "../../lib/route";
 
 /** `ICON.machine` (viewer.html:935) — the generic processor/chip glyph
  * every fleet card renders, since `MACH_ICON` (the per-machine form-factor
@@ -101,7 +105,7 @@ function machineDrillHash(machineKey: string): string {
  * "several things running here". */
 function machineRunsHash(machineKey: string, runningSessionIds: string[]): string | null {
   if (runningSessionIds.length === 0) return null;
-  if (runningSessionIds.length === 1) return `dispatch=${encodeURIComponent(runningSessionIds[0])}`;
+  if (runningSessionIds.length === 1) return dispatchHash(runningSessionIds[0], null);
   return machineDrillHash(machineKey);
 }
 
@@ -397,12 +401,12 @@ const TimelineLanes = memo(function TimelineLanes({ timeline }: { timeline: Retu
                 role="button"
                 tabIndex={0}
                 onClick={() => {
-                  location.hash = `dispatch=${encodeURIComponent(bar.sid)}`;
+                  location.hash = bar.hash;
                 }}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" || e.key === " ") {
                     e.preventDefault();
-                    location.hash = `dispatch=${encodeURIComponent(bar.sid)}`;
+                    location.hash = bar.hash;
                   }
                 }}
               />
@@ -470,7 +474,7 @@ export function FleetLens({
   connected = true,
   lastContactMs = null,
 }: {
-  records?: FlowRecord[];
+  records?: NormRecord[];
   tMax?: number;
   tMin?: number;
   /** (#1869) The scrub PLAYHEAD — a genuinely separate value from `tMax`
@@ -522,7 +526,7 @@ export function FleetLens({
    *
    * Deliberately a SEPARATE constant from `liveMode` rather than folded into
    * it: `liveMode` also drives DISPLAY (the hero's "last Nh" eyebrow, the
-   * activity-window control, `liveSessionSet`'s live-fallback heuristic), and
+   * activity-window control), and
    * those already render correctly on the demo. This changes what is
    * REQUESTED and nothing else — every one of these three endpoints 404s on
    * a static build today, so their gated-off results were already the empty
@@ -778,12 +782,10 @@ export function FleetLens({
   // on every 1 Hz tick: with nothing ahead of now it returns the window
   // itself, the same reference each tick, so the hero's token sums do not
   // recompute; with a record ahead, it filters once and re-filters
-  // only when the window changes or now crosses that record. A replay keeps
-  // its plain playhead filter, which runs only when the playhead moves.
+  // only when the window changes or now crosses that record. A replay cuts
+  // the same way at the playhead.
   const scopedData = useMemo(
-    () => (playhead == null
-      ? recordsAsOf(flowWindow.data, wallNow)
-      : flowWindow.data.filter((r) => T(r.ts) <= playhead)),
+    () => recordsAsOf(flowWindow.data, playhead ?? wallNow),
     [flowWindow.data, playhead, wallNow],
   );
   const tokens = useMemo(() => tokensOffMeter(scopedData), [scopedData]);
@@ -801,15 +803,12 @@ export function FleetLens({
   // Measured on the busy-day fixture, recomputing both on every sample was
   // most of the feed's cost. A replay keys on the playhead itself.
   const liveEdgeClock = playhead == null ? Math.floor(playheadT / 1000) : playheadT;
-  const liveSet = useMemo(
-    // The flow-derived liveness FALLBACK inside `liveSessionSet` is itself
-    // live-only in legacy (viewer.html:3378). Without `liveMode` a replay
-    // would route around the disabled presence hooks above and re-derive
-    // "running" from the day's own records — presence-agnostic in name only.
-    () => liveSessionSet(flowWindow.data, liveSessionIds, playheadT, liveMode),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
-    [flowWindow.data, liveSessionIds, liveEdgeClock, liveMode],
-  );
+  // Session presence: an ADDITIVE input to each run's lifecycle
+  // (`lib/lifecycle.ts`), never a subtraction. It is a fact about NOW: a
+  // replay reads none (the presence hook is disabled there), and a scrubbed
+  // playhead on a live day judges from records up to the playhead alone.
+  const presence = judgementAt(playhead ?? null, playheadT, liveSessionIds).presence;
+  const policy = useLifecyclePolicy();
   // (#2814) SELF IS NEVER UNKNOWN — and before this, self could be ABSENT.
   //
   // `machineUids` unions flow-derived uids with currently-beating presence
@@ -864,7 +863,7 @@ export function FleetLens({
           flowWindow.data,
           liveMachines,
           specs,
-          liveSet,
+          presence,
           machPresent(flowWindow.data, liveMachines, playheadT, m) === false,
           m,
           liveMode,
@@ -875,6 +874,7 @@ export function FleetLens({
           // alias-set lookup `specOf`/`nameOf` already use for this uid.
           runsForMachine(runs, machineNames(flowWindow.data, liveMachines, m)),
           roster,
+          policy,
         );
         // (#2768, corrected by the #2802 regression fix) A roster entry
         // whose declared hardware identity matches this uid still prevents a
@@ -905,20 +905,22 @@ export function FleetLens({
           flowWindow.data,
           liveMachines,
           specs,
-          liveSet,
+          presence,
           /* machAbsent */ true,
           entry.id,
           liveMode,
           playheadT,
           specBeats,
           undefined,
+          undefined,
+          policy,
         ),
         name: entry.id,
         rosterOnly: true,
       })),
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
-    [uids, rosterOnly, flowWindow.data, liveEdgeClock, liveMachines, specs, liveSet, liveMode, specBeats, runs, roster],
+    [uids, rosterOnly, flowWindow.data, liveEdgeClock, liveMachines, specs, presence, liveMode, specBeats, runs, roster, policy],
   );
   const cards = useMemo(
     () => baseCards.map((b) => withLiveReadings(b, playheadT, connected, lastContactMs, liveOverlay)),
@@ -946,7 +948,7 @@ export function FleetLens({
         flowWindow.data,
         liveMachines,
         uids,
-        liveSet,
+        presence,
         // The FIXED axis ceiling — never the playhead. See timeline.ts's own
         // doc + this component's `playhead` prop doc for why the two must
         // stay separate arguments once a replay can scrub.
@@ -959,9 +961,10 @@ export function FleetLens({
         fixedRange,
         specs,
         roster,
+        policy,
       ),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
-    [flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, windowMinutesNum, liveMode, tMin, liveEdgeClock, fixedRange?.[0], fixedRange?.[1], specs, roster],
+    [flowWindow.data, liveMachines, uids, presence, flowWindow.tMax, windowMinutesNum, liveMode, tMin, liveEdgeClock, fixedRange?.[0], fixedRange?.[1], specs, roster, policy],
   );
 
   return (
@@ -1324,7 +1327,7 @@ export function FleetLens({
                   (#2886 pass 5, MUST — fresh-reviewer finding F2) `runsCount`
                   and `execs.length` (`card.executions`) are DIFFERENT counts
                   for a mission/crawl: `runsCount` is post-collapse
-                  (`topLevelRunSessionIds` folds every seat sharing one
+                  (`topLevelRuns` folds every seat sharing one
                   `mission_id` into its ONE top-level run — a mission with 9
                   crawler seats reads "1 running"), while `execs` is the
                   per-execution pager data, uncollapsed on purpose (each seat

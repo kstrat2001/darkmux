@@ -2422,7 +2422,7 @@ impl<'a> DispatchBookendGuard<'a> {
             merge_record_context(&mut payload, &record_context);
             crate::dispatch::build_dispatch_record_with_payload(
                 darkmux_flow::Level::Error,
-                "dispatch error",
+                darkmux_flow::FlowAction::DispatchError,
                 &role_id,
                 &session_id,
                 Some(&model),
@@ -3272,7 +3272,7 @@ fn emit_single_shot_usage(
 ) {
     let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
         darkmux_flow::Level::Info,
-        crate::usage::USAGE_ACTION,
+        darkmux_flow::FlowAction::TelemetryTokens,
         crate::usage::USAGE_SOURCE,
         role_id,
         session_id,
@@ -3301,7 +3301,7 @@ fn build_remote_record(
     model: &str,
     mission_id: Option<&str>,
     phase_id: Option<&str>,
-    action: &str,
+    action: darkmux_flow::FlowAction,
     payload: serde_json::Value,
 ) -> darkmux_flow::FlowRecord {
     crate::dispatch::build_dispatch_record_with_payload(
@@ -3521,7 +3521,7 @@ fn dispatch_remote(
     let on_abort = move |_id: &str, _kind: &str| {
         crate::dispatch::build_dispatch_record_with_payload(
             darkmux_flow::Level::Error,
-            "dispatch error",
+            darkmux_flow::FlowAction::DispatchError,
             &role_id_for_abort,
             &session_id_for_abort,
             Some(&model_for_abort),
@@ -3548,7 +3548,7 @@ fn dispatch_remote(
             &pm.id,
             mission_id.as_deref(),
             phase,
-            "dispatch start",
+            darkmux_flow::FlowAction::DispatchStart,
             serde_json::json!({
                 "runtime": "direct",
                 "endpoint": label,
@@ -3594,7 +3594,7 @@ fn dispatch_remote(
                     &pm.id,
                     mission_id.as_deref(),
                     phase,
-                    "dispatch error",
+                    darkmux_flow::FlowAction::DispatchError,
                     serde_json::json!({ "runtime": "direct", "endpoint": label, "wall_ms": wall_ms, "error": e.to_string() }),
                 ),
             );
@@ -3678,7 +3678,7 @@ fn dispatch_remote(
             &pm.id,
             mission_id.as_deref(),
             phase,
-            "dispatch complete",
+            darkmux_flow::FlowAction::DispatchComplete,
             complete_payload,
         ),
     );
@@ -3910,7 +3910,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     let on_abort = move |_id: &str, _kind: &str| {
         crate::dispatch::build_dispatch_record_with_payload(
             darkmux_flow::Level::Error,
-            "dispatch error",
+            darkmux_flow::FlowAction::DispatchError,
             &role_id_for_abort,
             &session_id_for_abort,
             Some(&model_for_abort),
@@ -3934,7 +3934,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
             &model_id,
             mission_id.as_deref(),
             phase,
-            "dispatch start",
+            darkmux_flow::FlowAction::DispatchStart,
             serde_json::json!({
                 "runtime": "direct",
                 "prompt": crate::dispatch::capped_prompt(&opts.message),
@@ -3999,7 +3999,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
                     &model_id,
                     mission_id.as_deref(),
                     phase,
-                    "dispatch error",
+                    darkmux_flow::FlowAction::DispatchError,
                     serde_json::json!({ "runtime": "direct", "wall_ms": wall_ms, "error": e.to_string() }),
                 ),
             );
@@ -4068,7 +4068,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
             &model_id,
             mission_id.as_deref(),
             phase,
-            "dispatch complete",
+            darkmux_flow::FlowAction::DispatchComplete,
             complete_payload,
         ),
     );
@@ -5461,7 +5461,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 // The three SPACED actions in `darkmux-crew` are the
                 // dispatch-liveness bookends, which the serve tests call
                 // the legacy spelling — a new record must not join them.
-                "dispatch.workdir_git_unavailable",
+                darkmux_flow::FlowAction::DispatchWorkdirGitUnavailable,
                 &opts.role_id,
                 &session_id,
                 Some(&model),
@@ -5671,7 +5671,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     );
     bookend.open(crate::dispatch::build_dispatch_record_with_payload(
         darkmux_flow::Level::Info,
-        "dispatch start",
+        darkmux_flow::FlowAction::DispatchStart,
         &opts.role_id,
         &session_id,
         Some(&model),
@@ -6638,9 +6638,9 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         thermal_ladder_summary,
     );
     let (action, level) = if exit_code == 0 {
-        ("dispatch complete", darkmux_flow::Level::Info)
+        (darkmux_flow::FlowAction::DispatchComplete, darkmux_flow::Level::Info)
     } else {
-        ("dispatch error", darkmux_flow::Level::Error)
+        (darkmux_flow::FlowAction::DispatchError, darkmux_flow::Level::Error)
     };
     // (#717, #1230 Packet 0) Emit the terminal record through the bookend
     // guard's `close()` — this both writes the record and disarms the
@@ -6669,7 +6669,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // Work-category complete payload.
     let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
         darkmux_flow::Level::Info,
-        "telemetry.runtime",
+        darkmux_flow::FlowAction::TelemetryRuntime,
         "runtime",
         &opts.role_id,
         &session_id,
@@ -6976,6 +6976,7 @@ pub(crate) fn degeneracy_warning(event_type: &str, event: &serde_json::Value) ->
         return None;
     }
     let (found, source) = match event_type {
+        // flow-action-guard:allow — a runtime trajectory event type, not a flow action
         "dispatch.checkpoint" => (event.get("would_conclude").and_then(|v| v.as_bool()) == Some(true), "checkpoint"),
         "dispatch.gate.observation" => (event.get("degenerate").and_then(|v| v.as_bool()) == Some(true), "stream_gate"),
         _ => return None,
@@ -8422,10 +8423,10 @@ fn battery_pause_unsupported_payload(
 /// path itself cannot be driven in-process — it shells out to `lms` to
 /// unload real residents — so wrapping is the seam that is testable.
 fn stamping_emitter<'a>(
-    emit: &'a dyn Fn(&str, serde_json::Value),
+    emit: &'a dyn Fn(darkmux_flow::FlowAction, serde_json::Value),
     provenance: &'a crate::host_source::Provenance,
-) -> impl Fn(&str, serde_json::Value) + 'a {
-    move |action: &str, payload: serde_json::Value| {
+) -> impl Fn(darkmux_flow::FlowAction, serde_json::Value) + 'a {
+    move |action: darkmux_flow::FlowAction, payload: serde_json::Value| {
         emit(action, host_derived_payload(payload, provenance));
     }
 }
@@ -8453,7 +8454,7 @@ fn stamping_emitter<'a>(
 ///
 /// Best-effort like every other sampler-thread side effect in this file: an
 /// eject failure is recorded, never panicked on.
-fn tier5_eject_on_critical(host_out: &Path, trip_wall: SystemTime, emit: &dyn Fn(&str, serde_json::Value)) {
+fn tier5_eject_on_critical(host_out: &Path, trip_wall: SystemTime, emit: &dyn Fn(darkmux_flow::FlowAction, serde_json::Value)) {
     const CHECKPOINT_WAIT_BOUND: Duration = Duration::from_secs(5);
     const POLL_INTERVAL: Duration = Duration::from_millis(250);
     // (#2779) Every record this function emits exists ONLY because a
@@ -8482,7 +8483,7 @@ fn tier5_eject_on_critical(host_out: &Path, trip_wall: SystemTime, emit: &dyn Fn
                 .map(|m| serde_json::json!({ "identifier": m.identifier, "context": m.context }))
                 .collect();
             emit(
-                "thermal.tier5_eject",
+                darkmux_flow::FlowAction::ThermalTier5Eject,
                 serde_json::json!({
                     "reached_checkpoint_boundary": reached_checkpoint_boundary,
                     "ejected": ejected,
@@ -8503,7 +8504,7 @@ fn tier5_eject_on_critical(host_out: &Path, trip_wall: SystemTime, emit: &dyn Fn
                     .map(|f| serde_json::json!({ "identifier": f.identifier, "error": f.error }))
                     .collect();
                 emit(
-                    "thermal.tier5_eject_failed",
+                    darkmux_flow::FlowAction::ThermalTier5EjectFailed,
                     serde_json::json!({
                         "reached_checkpoint_boundary": reached_checkpoint_boundary,
                         "failed": failed,
@@ -8516,7 +8517,7 @@ fn tier5_eject_on_critical(host_out: &Path, trip_wall: SystemTime, emit: &dyn Fn
             // Could not even LIST the residents — there is no per-model
             // detail to report, only the enumeration failure.
             emit(
-                "thermal.tier5_eject_failed",
+                darkmux_flow::FlowAction::ThermalTier5EjectFailed,
                 serde_json::json!({
                     "reached_checkpoint_boundary": reached_checkpoint_boundary,
                     "error": e.to_string(),
@@ -8881,7 +8882,7 @@ fn run_telemetry_sampler(
         merge_record_context(&mut payload, &record_context);
         let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record_with_payload(
             darkmux_flow::Level::Info,
-            "dispatch.rest",
+            darkmux_flow::FlowAction::DispatchRest,
             &role_id,
             &session_id,
             Some(&model),
@@ -8890,7 +8891,7 @@ fn run_telemetry_sampler(
             Some(payload),
         ));
     };
-    let emit = |source: &str, action: &str, payload: serde_json::Value| {
+    let emit = |source: &str, action: darkmux_flow::FlowAction, payload: serde_json::Value| {
         let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
             action,
@@ -8922,7 +8923,7 @@ fn run_telemetry_sampler(
             merge_record_context(&mut payload, &record_context);
             let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record_with_payload(
                 level,
-                "dispatch.rest",
+                darkmux_flow::FlowAction::DispatchRest,
                 &role_id,
                 &session_id,
                 Some(&model),
@@ -8995,7 +8996,7 @@ fn run_telemetry_sampler(
         // `LmsTelemetryTracker::tick` so they are unit-testable without a
         // live `lms` or a live flow sink. Nothing but the wiring is here.
         lms_tracker.tick(&darkmux_profiles::lms::list_loaded, &|payload| {
-            emit("lms", "telemetry.lms", payload)
+            emit("lms", darkmux_flow::FlowAction::TelemetryLms, payload)
         });
 
         // Host system load — CPU / RAM / GPU utilization%, plus (#2108) the
@@ -9088,7 +9089,7 @@ fn run_telemetry_sampler(
                         merge_record_context(&mut payload, &record_context);
                         let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
                             darkmux_flow::Level::Warn,
-                            "thermal.stop_unresolved",
+                            darkmux_flow::FlowAction::ThermalStopUnresolved,
                             "thermal",
                             &role_id,
                             &session_id,
@@ -9207,7 +9208,7 @@ fn run_telemetry_sampler(
                         merge_record_context(&mut payload, &record_context);
                         let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
                             darkmux_flow::Level::Warn,
-                            "thermal.stop_unresolved",
+                            darkmux_flow::FlowAction::ThermalStopUnresolved,
                             "thermal",
                             &role_id,
                             &session_id,
@@ -9274,7 +9275,7 @@ fn run_telemetry_sampler(
                     merge_record_context(&mut payload, &record_context);
                     let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
                         darkmux_flow::Level::Warn,
-                        "battery.pause_unsupported",
+                        darkmux_flow::FlowAction::BatteryPauseUnsupported,
                         "battery",
                         &role_id,
                         &session_id,
@@ -10222,7 +10223,7 @@ impl TailerState {
                     if let Some(names) = turn_tool_names(&event) {
                         payload["tool_names"] = names;
                     }
-                    self.emit("dispatch.turn", darkmux_flow::Level::Info, payload);
+                    self.emit(darkmux_flow::FlowAction::DispatchTurn, darkmux_flow::Level::Info, payload);
                 }
                 // (#795) Per-turn token telemetry — the live "tokens
                 // off-meter" odometer climbs DURING the dispatch, not just
@@ -10313,7 +10314,7 @@ impl TailerState {
                                 .saturating_add(u32::try_from(ct).unwrap_or(u32::MAX)),
                         );
                     }
-                    self.emit_telemetry("tokens", "telemetry.tokens", tokens_payload);
+                    self.emit_telemetry("tokens", darkmux_flow::FlowAction::TelemetryTokens, tokens_payload);
                 }
             }
             "tool.completed" => {
@@ -10427,7 +10428,7 @@ impl TailerState {
                         map.remove("emit_seq");
                     }
                 }
-                self.emit("dispatch.tool", darkmux_flow::Level::Info, payload);
+                self.emit(darkmux_flow::FlowAction::DispatchTool, darkmux_flow::Level::Info, payload);
                 // (#2265) The tailer is the LIVE producer of the finding
                 // record. `finding sync` replays the same stream for anything
                 // this missed (an older binary, a killed process); both go
@@ -10478,7 +10479,7 @@ impl TailerState {
                     COMPACTOR_ROLE,
                     Some(&model).filter(|m| !m.is_empty()).map(String::as_str),
                     crate::usage::UTILITY_SOURCE,
-                    crate::usage::UTILITY_START_ACTION,
+                    darkmux_flow::FlowAction::UtilityStart,
                     payload,
                 );
             }
@@ -10520,7 +10521,7 @@ impl TailerState {
                     COMPACTOR_ROLE,
                     model.as_deref(),
                     crate::usage::USAGE_SOURCE,
-                    crate::usage::USAGE_ACTION,
+                    darkmux_flow::FlowAction::TelemetryTokens,
                     payload,
                 );
             }
@@ -10569,7 +10570,7 @@ impl TailerState {
                     "compactor_model": self.compactor_model,
                     "parent_model": self.model,
                 });
-                self.emit("dispatch.compaction", darkmux_flow::Level::Info, payload);
+                self.emit(darkmux_flow::FlowAction::DispatchCompaction, darkmux_flow::Level::Info, payload);
                 // (#557 slice 3) Compaction token telemetry — the drop in
                 // the context-occupancy sawtooth. The runtime now carries
                 // `tokens_before` (EXACT prompt-token count that triggered
@@ -10577,7 +10578,7 @@ impl TailerState {
                 // compacted buffer) on the compaction event; forward them
                 // as a `source=compaction` telemetry record the viewer
                 // reads as `{from, to}`.
-                self.emit_telemetry("compaction", "telemetry.compaction", serde_json::json!({
+                self.emit_telemetry("compaction", darkmux_flow::FlowAction::TelemetryCompaction, serde_json::json!({
                     "from": event.get("tokens_before"),
                     "to": event.get("tokens_after"),
                     // (#2794) Same correction as the record above: the tokens
@@ -10586,6 +10587,7 @@ impl TailerState {
                     "compactor_model": self.compactor_model,
                 }));
             }
+            // flow-action-guard:allow — a runtime trajectory event type, not a flow action
             "dispatch.checkpoint" => {
                 // (#1221) A checkpoint is the harness deciding, mid-turn,
                 // whether the model keeps thinking. Without its own record the
@@ -10629,7 +10631,7 @@ impl TailerState {
                     event.get("tail_ratio").and_then(|v| v.as_f64()),
                     event.get("verdict").and_then(|v| v.as_str()) == Some("conclude"),
                 );
-                self.emit("dispatch.checkpoint", darkmux_flow::Level::Info, payload);
+                self.emit(darkmux_flow::FlowAction::DispatchCheckpoint, darkmux_flow::Level::Info, payload);
                 if let Some(w) = degeneracy_warning(event_type, &event) {
                     self.surface_degeneracy_warning(w);
                 }
@@ -10648,8 +10650,9 @@ impl TailerState {
                     "reasoning_text": reasoning_text,
                     "reasoning_format": event.get("reasoning_format").unwrap_or(&serde_json::Value::String("inline-think-tags".into())),
                 });
-                self.emit("dispatch.reasoning", darkmux_flow::Level::Info, payload);
+                self.emit(darkmux_flow::FlowAction::DispatchReasoning, darkmux_flow::Level::Info, payload);
             }
+            // flow-action-guard:allow — a runtime trajectory event type, not a flow action
             "dispatch.feedback.injected" => {
                 // (#454 feedback-injection scaffold) Forward the new
                 // runtime trajectory event into the flow stream so
@@ -10666,7 +10669,7 @@ impl TailerState {
                     "message_count": event.get("message_count"),
                     "signal_kinds": event.get("signal_kinds"),
                 });
-                self.emit("dispatch.feedback.injected", darkmux_flow::Level::Info, payload);
+                self.emit(darkmux_flow::FlowAction::DispatchFeedbackInjected, darkmux_flow::Level::Info, payload);
             }
             // (#2863) Stream bookends: accumulate each logical turn's
             // model time for its `dispatch.turn` record.
@@ -10690,7 +10693,7 @@ impl TailerState {
                 self.chunk_owed = true;
                 self.summary.heartbeats += 1;
                 self.emit(
-                    "dispatch.turn.heartbeat",
+                    darkmux_flow::FlowAction::DispatchTurnHeartbeat,
                     darkmux_flow::Level::Info,
                     opening_heartbeat_payload(&event),
                 );
@@ -10765,7 +10768,7 @@ impl TailerState {
                             Instant::now() + Duration::from_secs(self.inactivity_secs);
                     }
                     self.emit(
-                        "dispatch.turn.heartbeat",
+                        darkmux_flow::FlowAction::DispatchTurnHeartbeat,
                         darkmux_flow::Level::Info,
                         heartbeat_payload(&event),
                     );
@@ -10838,7 +10841,7 @@ impl TailerState {
                     // the viewer and the orchestrator cannot disagree about
                     // what fired.
                     self.summary.detections.push(payload.clone());
-                    self.emit_telemetry("detector", "telemetry.detector", payload);
+                    self.emit_telemetry("detector", darkmux_flow::FlowAction::TelemetryDetector, payload);
                 }
                 if event_type == "dispatch.gate.observation" {
                     if let Some(w) = degeneracy_warning(event_type, &event) {
@@ -10853,7 +10856,7 @@ impl TailerState {
             // into the one flow stream as a `source=context` telemetry
             // record the observability viewer reads as `{used, max}`.
             "dispatch.context" => {
-                self.emit_telemetry("context", "telemetry.context", serde_json::json!({
+                self.emit_telemetry("context", darkmux_flow::FlowAction::TelemetryContext, serde_json::json!({
                     "used": event.get("used"),
                     "max": event.get("max"),
                     "threshold": self.compaction_threshold,
@@ -10906,7 +10909,7 @@ impl TailerState {
                     reason,
                     crate::host_source::provenance(),
                 );
-                self.emit("dispatch.rest", darkmux_flow::Level::Info, payload);
+                self.emit(darkmux_flow::FlowAction::DispatchRest, darkmux_flow::Level::Info, payload);
             }
             _ => {
                 // Other event types (dispatch.start/complete from the
@@ -10933,10 +10936,10 @@ impl TailerState {
         }
         (self.warning_sink)(&w.line);
         self.summary.degeneracy_warnings = self.summary.degeneracy_warnings.saturating_add(1);
-        self.emit("dispatch.degeneracy.warning", darkmux_flow::Level::Warn, w.payload);
+        self.emit(darkmux_flow::FlowAction::DispatchDegeneracyWarning, darkmux_flow::Level::Warn, w.payload);
     }
 
-    fn emit(&self, action: &str, level: darkmux_flow::Level, mut payload: serde_json::Value) {
+    fn emit(&self, action: darkmux_flow::FlowAction, level: darkmux_flow::Level, mut payload: serde_json::Value) {
         self.stamp_step_id(&mut payload);
         merge_record_context(&mut payload, &self.record_context);
         let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record_with_payload(
@@ -11180,7 +11183,7 @@ impl TailerState {
     /// `emit` but routes through `build_telemetry_record` so the record
     /// lands under `category=telemetry` with a caller-supplied `source`
     /// (`"detector"`, `"runtime"`, …) the observability viewer keys on.
-    fn emit_telemetry(&self, source: &str, action: &str, payload: serde_json::Value) {
+    fn emit_telemetry(&self, source: &str, action: darkmux_flow::FlowAction, payload: serde_json::Value) {
         self.emit_telemetry_as(&self.role_id, Some(&self.model), source, action, payload);
     }
 
@@ -11194,7 +11197,7 @@ impl TailerState {
         role_id: &str,
         model: Option<&str>,
         source: &str,
-        action: &str,
+        action: darkmux_flow::FlowAction,
         mut payload: serde_json::Value,
     ) {
         self.stamp_step_id(&mut payload);

@@ -344,7 +344,7 @@ pub fn build_machine_scoped_telemetry_record_with(
         category: darkmux_flow::Category::Machinery,
         tier: darkmux_flow::Tier::Local,
         stage: darkmux_flow::Stage::Dispatch,
-        action: "machine.telemetry".to_string(),
+        action: darkmux_flow::FlowAction::MachineTelemetry,
         handle: display_name,
         phase_id: None,
         session_id: None,

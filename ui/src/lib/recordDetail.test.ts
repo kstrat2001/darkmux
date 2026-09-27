@@ -1,17 +1,18 @@
 import { describe, expect, it } from "vitest";
 import { escapeBidiControls, prettyArgs, recordDetail, recordObject, toolCallPath } from "./recordDetail";
-import type { FlowRecord } from "../types/handwritten";
+import type { NormRecord } from "./ingest";
+import { norm } from "../testing/records";
 
 /** A `dispatch.tool` record shaped exactly like the ones a live crawl emits
  * (captured from `~/.darkmux/flows/2026-08-25.jsonl`, run
  * `crawl-error-discard-deep-1787669136-1`). */
-function toolRec(payload: Record<string, unknown>): FlowRecord {
-  return { ts: "2026-08-25T14:45:41Z", action: "dispatch.tool", fields: payload } as unknown as FlowRecord;
+function toolRec(payload: Record<string, unknown>): NormRecord {
+  return norm({ ts: "2026-08-25T14:45:41Z", action: "dispatch.tool", fields: payload });
 }
 
 describe("dispatch.tool outcome (#2008)", () => {
   const rec = (fields: Record<string, unknown>) =>
-    ({ action: "dispatch.tool", fields: { tool_name: "bash", args: "{}", result_chars: 12, ...fields } }) as never;
+    norm({ action: "dispatch.tool", fields: { tool_name: "bash", args: "{}", result_chars: 12, ...fields } });
 
   it("shows the exit code for a command that RAN and reported non-zero", () => {
     // A red test is the tool working. Marking it ❌ told the operator the
@@ -90,25 +91,25 @@ describe("recordDetail", () => {
   });
 
   it("reads `payload` as well as `fields` (records that never went through flowToRenderModel)", () => {
-    const r = {
+    const r = norm({
       ts: "2026-08-25T14:45:41Z",
       action: "dispatch.tool",
       payload: { tool_name: "bash", args: '{"command":"ls"}', result_chars: 12, ok: true },
-    } as unknown as FlowRecord;
+    });
     expect(recordDetail(r)).toBe("bash command=ls → 12ch");
   });
 
   it("gives a turn its finish reason — the `length` finishes a checkpointing turn produces", () => {
-    const r = {
+    const r = norm({
       ts: "2026-08-25T14:45:41Z",
       action: "dispatch.turn",
       fields: { turn_seq: 7, finish_reason: "length" },
-    } as unknown as FlowRecord;
+    });
     expect(recordDetail(r)).toBe("turn 7 (length)");
   });
 
   it("returns nothing for a record kind with no preview", () => {
-    const r = { ts: "2026-08-25T14:45:41Z", action: "dispatch.turn.heartbeat", fields: {} } as unknown as FlowRecord;
+    const r = norm({ ts: "2026-08-25T14:45:41Z", action: "dispatch.turn.heartbeat", fields: {} });
     expect(recordDetail(r)).toBe("");
   });
 
@@ -120,11 +121,11 @@ describe("recordDetail", () => {
   // at the SOURCE (inside `recordDetail` itself) so every caller — direct
   // or through `recordObject` — gets it for free.
   it("escapes a bidi override in its own output, not just recordObject's fallback", () => {
-    const toolRecord = { ts: "2026-08-25T14:45:41Z", action: "dispatch.tool", fields: { tool_name: "bash", args: JSON.stringify({ command: "echo ok‮txt.exe" }) } } as unknown as FlowRecord;
+    const toolRecord = norm({ ts: "2026-08-25T14:45:41Z", action: "dispatch.tool", fields: { tool_name: "bash", args: JSON.stringify({ command: "echo ok‮txt.exe" }) } });
     expect(recordDetail(toolRecord)).not.toContain("‮");
     expect(recordDetail(toolRecord)).toContain("⟨U+202E⟩");
 
-    const reasoningRecord = { ts: "2026-08-25T14:45:41Z", action: "dispatch.reasoning", fields: { reasoning_text: "Let me ‮esrever siht‬." } } as unknown as FlowRecord;
+    const reasoningRecord = norm({ ts: "2026-08-25T14:45:41Z", action: "dispatch.reasoning", fields: { reasoning_text: "Let me ‮esrever siht‬." } });
     expect(recordDetail(reasoningRecord)).not.toContain("‮");
     expect(recordDetail(reasoningRecord)).toContain("⟨U+202E⟩");
   });
@@ -161,7 +162,7 @@ describe("escapeBidiControls (#2863 review, finding 7)", () => {
 
 describe("recordObject", () => {
   const tool = (fields: Record<string, unknown>) =>
-    ({ action: "dispatch.tool", fields: { result_chars: 10, ...fields } }) as never;
+    norm({ action: "dispatch.tool", fields: { result_chars: 10, ...fields } });
 
   it("names a file tool by its file, with the container prefix dropped", () => {
     const o = recordObject(tool({ tool_name: "edit", args: '{"path":"/workspace/test/tokenRotation.test.js","edits":[]}', ok: true, outcome: "ok" }));
@@ -343,7 +344,7 @@ describe("recordObject", () => {
   });
 
   it("a reasoning record with no text says so rather than showing a bare chip", () => {
-    const r = { action: "dispatch.reasoning", fields: { reasoning_text: "\n\n" } } as never;
+    const r = norm({ action: "dispatch.reasoning", fields: { reasoning_text: "\n\n" } });
     expect(recordObject(r).text).toBe("(no reasoning text)");
   });
 
@@ -376,18 +377,18 @@ describe("recordObject", () => {
   });
 
   it("(#2863 review, finding 7) escapes a bidi override in a reasoning row", () => {
-    const r = { action: "dispatch.reasoning", fields: { reasoning_text: "Let me ‮esrever siht‬ read." } } as never;
+    const r = norm({ action: "dispatch.reasoning", fields: { reasoning_text: "Let me ‮esrever siht‬ read." } });
     expect(recordObject(r).text).not.toContain("‮");
     expect(recordObject(r).text).toContain("⟨U+202E⟩");
   });
 
   it("a reasoning row is its first line, without the JSON-string quotes it sometimes carries", () => {
-    const r = { action: "dispatch.reasoning", fields: { reasoning_text: '"Let me analyze the implementation.\n\nMore."' } } as never;
+    const r = norm({ action: "dispatch.reasoning", fields: { reasoning_text: '"Let me analyze the implementation.\n\nMore."' } });
     expect(recordObject(r)).toEqual({ chip: "reasoning", kind: "think", text: "Let me analyze the implementation.", mono: false });
   });
 
   it("anything else keeps its existing one-line detail and no chip", () => {
-    const r = { action: "dispatch start", fields: { prompt_chars: 3204 } } as never;
+    const r = norm({ action: "dispatch.start", fields: { prompt_chars: 3204 } });
     expect(recordObject(r)).toEqual({ text: "start (prompt: 3204ch)", mono: false });
   });
 });
@@ -440,7 +441,7 @@ describe("toolCallPath (#2963)", () => {
 
 describe("budget records (#2902 step 5)", () => {
   const rec = (action: string, payload: Record<string, unknown>) =>
-    ({ ts: "2026-09-27T10:00:00Z", action, category: "telemetry", source: "budget", payload }) as unknown as FlowRecord;
+    ({ ts: "2026-09-27T10:00:00Z", action, category: "telemetry", source: "budget", payload }) as unknown as NormRecord;
 
   it("a wait says what it waits on and for how long, in words, never clock-shaped", () => {
     expect(recordDetail(rec("budget.wait", { scope: "endpoint", endpoint_id: "azure", wait_seconds: 843 }))).toBe(

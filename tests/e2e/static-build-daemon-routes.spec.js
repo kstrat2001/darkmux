@@ -46,7 +46,7 @@ test.beforeEach(async ({ page }) => {
 async function eventCountText(page) {
   return page.evaluate(() => {
     const el = [...document.querySelectorAll('*')].find(
-      (e) => e.children.length === 0 && /^\d+\+? (of \d+\+? )?events?( · \d+ hidden)?$/.test((e.textContent || '').trim()),
+      (e) => e.children.length === 0 && /^\d+\+? (of \d+\+? )?events?( · \d+ hidden)?( · \d+ unknown)?$/.test((e.textContent || '').trim()),
     );
     return el ? el.textContent.trim() : null;
   });
@@ -96,5 +96,5 @@ test('(U4-1) every lens shows the same committed day in the events column, at re
   // fleet lens's chip is one place that segment must actually be present —
   // pinning it here catches a future change that silently stops computing
   // or rendering it, which the permissive finder alone would not.
-  expect(counts.fleet, `fleet lens chip did not name a hidden count: ${counts.fleet}`).toMatch(/ · \d+ hidden$/);
+  expect(counts.fleet, `fleet lens chip did not name a hidden count: ${counts.fleet}`).toMatch(/ · \d+ hidden( · \d+ unknown)?$/);
 });

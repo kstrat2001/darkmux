@@ -10,7 +10,8 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import type { FlowRecord } from "../types/handwritten";
+import type { NormRecord } from "./ingest";
+import { norm, normAll, type RawRecord } from "../testing/records";
 import { tokensOffMeter } from "../lenses/fleet/savings";
 import { runRegions } from "../lenses/session/sessionRun";
 import { applyRecordToMetrics, indexGraph, stepDisplayMetrics, type MetricsMap } from "../lenses/mission/graph";
@@ -25,8 +26,8 @@ import {
   legacyCompleteCounts,
   sumUsage,
   usagePurpose,
-  type UsageRecordLike,
 } from "./usageRecords";
+import { ACTION } from "./ingest";
 
 const LMS = "http://127.0.0.1:1234/v1";
 const HOSTED = "azure:example.cognitiveservices.azure.com/gpt-5.1";
@@ -34,10 +35,12 @@ const HOSTED = "azure:example.cognitiveservices.azure.com/gpt-5.1";
 // ── the shared golden ────────────────────────────────────────────────────
 
 const GOLDEN_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../tests/usage-golden");
-const golden: UsageRecordLike[] = readFileSync(path.join(GOLDEN_DIR, "records.jsonl"), "utf8")
-  .trim()
-  .split("\n")
-  .map((l) => JSON.parse(l));
+const golden: NormRecord[] = normAll(
+  readFileSync(path.join(GOLDEN_DIR, "records.jsonl"), "utf8")
+    .trim()
+    .split("\n")
+    .map((l) => JSON.parse(l)),
+);
 const expected = JSON.parse(readFileSync(path.join(GOLDEN_DIR, "expected.json"), "utf8"));
 
 /** Group the golden's counted entries (usage records + legacy completes) by
@@ -46,7 +49,7 @@ const expected = JSON.parse(readFileSync(path.join(GOLDEN_DIR, "expected.json"),
  *  `sumUsage` alone, so the breakdown and the total share one arithmetic. */
 function breakdown(field: string): Record<string, number> {
   const out: Record<string, number> = {};
-  const counted = [...golden.filter((r) => r.action === "telemetry.tokens"), ...legacyCompleteCounts(golden)];
+  const counted = [...golden.filter((r) => r.action === ACTION.TelemetryTokens), ...legacyCompleteCounts(golden)];
   for (const r of counted) {
     const p = r.payload as Record<string, unknown>;
     const k = typeof p[field] === "string" ? (p[field] as string) : "(none)";
@@ -85,7 +88,7 @@ describe("the shared usage golden (tests/usage-golden)", () => {
   });
 
   it("the fleet hero reads the same sum", () => {
-    const t = tokensOffMeter(golden as FlowRecord[]);
+    const t = tokensOffMeter(golden);
     expect({ total: t.total, input: t.input, generated: t.generated, cached: t.cached }).toEqual(expected.overall);
     expect(t.utility).toBe(expected.by_purpose.utility.total);
   });
@@ -100,10 +103,12 @@ describe("the shared usage golden (tests/usage-golden)", () => {
     ["domain.jsonl", "domain-expected.json"],
     ["clamp.jsonl", "clamp-expected.json"],
   ])("the shared value-domain golden %s", (recordsFile, expectedFile) => {
-    const records: UsageRecordLike[] = readFileSync(path.join(GOLDEN_DIR, recordsFile), "utf8")
-      .trim()
-      .split("\n")
-      .map((l) => JSON.parse(l));
+    const records: NormRecord[] = normAll(
+      readFileSync(path.join(GOLDEN_DIR, recordsFile), "utf8")
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l)),
+    );
     const exp = JSON.parse(readFileSync(path.join(GOLDEN_DIR, expectedFile), "utf8"));
     const s = sumUsage(records);
     expect({ total: s.total, input: s.prompt, generated: s.completion, cached: s.cached }).toEqual(exp.overall);
@@ -112,7 +117,7 @@ describe("the shared usage golden (tests/usage-golden)", () => {
     expect(s.reported).toBe(exp.reported_entries);
     if (exp.by_requested_model) {
       const out: Record<string, number> = {};
-      const counted = [...records.filter((r) => r.action === "telemetry.tokens"), ...legacyCompleteCounts(records)];
+      const counted = [...records.filter((r) => r.action === ACTION.TelemetryTokens), ...legacyCompleteCounts(records)];
       for (const r of counted) {
         const p = r.payload as Record<string, unknown>;
         const k = typeof p.requested_model === "string" ? p.requested_model : "(none)";
@@ -126,16 +131,16 @@ describe("the shared usage golden (tests/usage-golden)", () => {
 // ── the legacy fallback ──────────────────────────────────────────────────
 
 let clock = 0;
-function r(o: Partial<FlowRecord> & { payload?: Record<string, unknown> }): FlowRecord {
+function r(o: RawRecord & { payload?: Record<string, unknown> }): NormRecord {
   clock += 1;
   const ts = new Date(Date.UTC(2026, 8, 26, 0, 0, clock)).toISOString();
-  return { ts, ...o, ...(o.payload ? { fields: o.payload } : {}) } as FlowRecord;
+  return norm({ ts, ...o, ...(o.payload ? { fields: o.payload } : {}) });
 }
-function usage(sid: string, handle: string, payload: Record<string, unknown>, mission?: string): FlowRecord {
+function usage(sid: string, handle: string, payload: Record<string, unknown>, mission?: string): NormRecord {
   return r({ action: "telemetry.tokens", category: "telemetry", source: "tokens", session_id: sid, handle, mission_id: mission, payload });
 }
 const complete = (sid: string, payload: Record<string, unknown>, mission?: string) =>
-  r({ action: "dispatch complete", session_id: sid, handle: "x", mission_id: mission, payload });
+  r({ action: "dispatch.complete", session_id: sid, handle: "x", mission_id: mission, payload });
 
 describe("the legacy fallback (a run with no usage records counts its complete)", () => {
   it("a run with ZERO usage records counts each token-bearing complete once", () => {
@@ -187,15 +192,15 @@ describe("purpose", () => {
 /** A container run with compactor calls (one 1.59, one 1.58 with no
  *  `purpose`), and a mission step that compacts. `withU` adds the utility
  *  records; everything else is identical. */
-function utilityStreams(): [FlowRecord[], FlowRecord[]] {
+function utilityStreams(): [NormRecord[], NormRecord[]] {
   clock = 0;
   const M = "m-2";
-  const without: FlowRecord[] = [];
-  const withU: FlowRecord[] = [];
-  const both = (x: FlowRecord) => { without.push(x); withU.push(x); };
-  const only = (x: FlowRecord) => { withU.push(x); };
+  const without: NormRecord[] = [];
+  const withU: NormRecord[] = [];
+  const both = (x: NormRecord) => { without.push(x); withU.push(x); };
+  const only = (x: NormRecord) => { withU.push(x); };
   const compaction = (sid: string, total: number, extra: Record<string, unknown> = {}, mission?: string) =>
-    ({ ...usage(sid, "compactor", { call_kind: CALL_KIND.compaction, purpose: PURPOSE.utility, requested_model: "darkmux:c4b", endpoint: LMS, token_source: "provider", prompt_tokens: total - 80, completion_tokens: 80, total_tokens: total, ...extra }, mission), model: "darkmux:c4b" }) as FlowRecord;
+    ({ ...usage(sid, "compactor", { call_kind: CALL_KIND.compaction, purpose: PURPOSE.utility, requested_model: "darkmux:c4b", endpoint: LMS, token_source: "provider", prompt_tokens: total - 80, completion_tokens: 80, total_tokens: total, ...extra }, mission), model: "darkmux:c4b" }) as NormRecord;
 
   both(r({ action: "dispatch.start", session_id: "h1", handle: "coder", model: "gpt-5.1", payload: { runtime: "internal", endpoint: HOSTED } }));
   both(r({ action: "dispatch.turn.heartbeat", session_id: "h1", payload: { turn_seq: 1, generated_chars: 20000, sampled_at_ms: 1000 } }));
@@ -207,14 +212,14 @@ function utilityStreams(): [FlowRecord[], FlowRecord[]] {
   both(usage("h1", "coder", { call_kind: CALL_KIND.turn, purpose: PURPOSE.work, requested_model: "gpt-5.1", endpoint: HOSTED, token_source: "provider", turn_seq: 2, prompt_tokens: 1100, completion_tokens: 100, total_tokens: 1200 }));
   both(r({ action: "dispatch.complete", session_id: "h1", handle: "coder", payload: { runtime: "internal", endpoint: HOSTED, result_class: "ok", total_turns: 2, prompt_tokens: 2000, completion_tokens: 200, total_tokens: 2200 } }));
 
-  both(r({ action: "dispatch start", session_id: "task-t3", handle: "cs", mission_id: M, payload: { step_id: "cs", kind: "dispatch.internal" } }));
+  both(r({ action: "dispatch.start", session_id: "task-t3", handle: "cs", mission_id: M, payload: { step_id: "cs", kind: "dispatch.internal" } }));
   both(usage("task-t3", "cs", { call_kind: CALL_KIND.turn, purpose: PURPOSE.work, requested_model: "darkmux:q", endpoint: LMS, token_source: "provider", turn_seq: 1, prompt_tokens: 400, completion_tokens: 50, total_tokens: 450, step_id: "cs" }, M));
   only(compaction("task-t3", 300, { step_id: "cs" }, M));
-  both(r({ action: "dispatch complete", session_id: "task-t3", handle: "cs", mission_id: M, payload: { step_id: "cs", kind: "dispatch.internal", total_tokens: 450, total_turns: 1 } }));
+  both(r({ action: "dispatch.complete", session_id: "task-t3", handle: "cs", mission_id: M, payload: { step_id: "cs", kind: "dispatch.internal", total_tokens: 450, total_turns: 1 } }));
   return [without, withU];
 }
 
-const tile = (recs: FlowRecord[], sid: string, label: string) =>
+const tile = (recs: NormRecord[], sid: string, label: string) =>
   runRegions(recs, sid, Date.UTC(2026, 8, 27)).metrics.find((m) => m.label === label)?.value;
 
 describe("the fleet hero (tokensOffMeter)", () => {
@@ -244,7 +249,7 @@ describe("the fleet hero (tokensOffMeter)", () => {
     const [, withU] = utilityStreams();
     const t = tokensOffMeter(withU);
     expect(t.generated + t.input).toBe(t.total);
-    const g = tokensOffMeter(golden as FlowRecord[]);
+    const g = tokensOffMeter(golden);
     expect(g.generated + g.input).toBe(g.total);
   });
 
@@ -309,28 +314,28 @@ describe("the run page and the mission graph exclude utility (contract 8)", () =
   it("the mission graph's step meter is the usage sum without utility; a legacy step reads its complete", () => {
     const [without, withU] = utilityStreams();
     const idx = indexGraph({ nodes: [{ id: "t3", kind: "task", steps: [{ id: "cs", kind: "dispatch.internal" }] }] as never });
-    const fold = (recs: FlowRecord[]) => recs.reduce<MetricsMap>((m, x) => applyRecordToMetrics(m, x, idx, "m-2"), {});
+    const fold = (recs: NormRecord[]) => recs.reduce<MetricsMap>((m, x) => applyRecordToMetrics(m, x, idx, "m-2"), {});
     expect(stepDisplayMetrics(fold(withU).cs).tokens).toBe(450);
     expect(stepDisplayMetrics(fold(without).cs).tokens).toBe(450);
     // Legacy: no usage record for the step, a finalized total on its complete.
-    const legacy = withU.filter((x) => !(x.action === "telemetry.tokens" && x.session_id === "task-t3"));
+    const legacy = withU.filter((x) => !(x.action === ACTION.TelemetryTokens && x.session_id === "task-t3"));
     expect(stepDisplayMetrics(fold(legacy).cs).tokens).toBe(450);
     // Usage records win over a complete that disagrees.
-    const bumped = withU.map((x) => (x.action === "dispatch complete" && x.session_id === "task-t3" ? { ...x, payload: { ...(x.payload as object), total_tokens: 9999 } } : x));
+    const bumped = withU.map((x) => (x.action === ACTION.DispatchComplete && x.session_id === "task-t3" ? { ...x, payload: { ...(x.payload as object), total_tokens: 9999 } } : x));
     expect(stepDisplayMetrics(fold(bumped).cs).tokens).toBe(450);
   });
 
   it("a retried map item's per-call records sum to the item's tokens on every surface", () => {
     clock = 0;
     const M = "m-1";
-    const start = r({ action: "dispatch start", session_id: "task-t9", handle: "mp", mission_id: M, payload: { step_id: "mp", kind: "dispatch.map" } });
+    const start = r({ action: "dispatch.start", session_id: "task-t9", handle: "mp", mission_id: M, payload: { step_id: "mp", kind: "dispatch.map" } });
     const per = [0, 1, 2].map(() =>
       usage("task-t9", "mp", { call_kind: CALL_KIND.map_item, purpose: PURPOSE.work, requested_model: "q", endpoint: LMS, token_source: "provider", total_tokens: 10, prompt_tokens: 8, completion_tokens: 2, remote: false, index: 0 }, M),
     );
     const recs = [
       start,
       ...per,
-      r({ action: "dispatch complete", session_id: "task-t9", handle: "mp", mission_id: M, payload: { step_id: "mp", kind: "dispatch.map", result_class: "ok" } }),
+      r({ action: "dispatch.complete", session_id: "task-t9", handle: "mp", mission_id: M, payload: { step_id: "mp", kind: "dispatch.map", result_class: "ok" } }),
     ];
     expect(tokensOffMeter(recs).total).toBe(30);
     expect(tile(recs, "task-t9", "TOKENS IN")).toBe("24");
@@ -350,7 +355,7 @@ describe("per-turn readers (rate, calibration, turn groups)", () => {
     expect(averageGenerationRate([withU])).toEqual(averageGenerationRate([without]));
     const stray = usage("h1", "compactor", { call_kind: CALL_KIND.compaction, turn_seq: 1, completion_tokens: 999, endpoint: LMS });
     expect(measuredCharsPerToken([...withU, stray])).toBe(measuredCharsPerToken(without));
-    const vis = (recs: FlowRecord[]) => recs.filter((x) => x.action !== "telemetry.tokens");
+    const vis = (recs: NormRecord[]) => recs.filter((x) => x.action !== ACTION.TelemetryTokens);
     expect(turnItems(vis(withU), withU)).toEqual(turnItems(vis(without), without));
   });
 

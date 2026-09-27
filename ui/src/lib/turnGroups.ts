@@ -1,5 +1,6 @@
-import type { FlowRecord } from "../types/handwritten";
-import { isDispatchStart, isDispatchTerminal } from "./flow";
+import { ACTION, byTime, latestByTime, type NormRecord } from "./ingest";
+import { recordsOfGroup, runIndex } from "./runRef";
+import { DEFAULT_POLICY, isRunning, lifecycleAt, NO_PRESENCE, type LifecyclePolicy, type Presence } from "./lifecycle";
 
 /** (#2863) A run's event list, grouped by the turn each event belongs to.
  *
@@ -48,13 +49,13 @@ export type TurnItem =
   // header an identity nothing else in the list can collide with; a REAL
   // header (whose `rec` genuinely IS the `dispatch.turn` record) leaves
   // this undefined and keys off `rec` exactly as before.
-  | { kind: "turn"; rec: FlowRecord; turn: TurnInfo; id?: string }
-  | { kind: "rest"; rec: FlowRecord }
-  | { kind: "rec"; rec: FlowRecord };
+  | { kind: "turn"; rec: NormRecord; turn: TurnInfo; id?: string }
+  | { kind: "rest"; rec: NormRecord }
+  | { kind: "rec"; rec: NormRecord };
 
 type Fields = Record<string, unknown>;
 
-function fields(r: FlowRecord): Fields {
+function fields(r: NormRecord): Fields {
   return ((r as unknown as { fields?: Fields }).fields || (r as unknown as { payload?: Fields }).payload || {}) as Fields;
 }
 
@@ -62,27 +63,59 @@ function num(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
+/** (#2863 review round 2, finding 2) Whether the run attempt `rec` belongs
+ *  to has ended as of `asOf` by the one lifecycle (`lib/lifecycle.ts`):
+ *  closed, gone stale, or superseded by a relaunch. It decides whether an
+ *  unfinished turn's header says "did not finish" (the run ended; this turn
+ *  has no closing record) or "in progress" (the run has not ended yet, so
+ *  "did not finish" would be a claim about the future). Read per RUN: a
+ *  session two missions share is two runs. */
+function attemptEnded(all: readonly NormRecord[], rec: NormRecord, asOf: number, policy: LifecyclePolicy, presence: Presence): boolean {
+  const group = runIndex(all).groupOf(rec);
+  const attempt = group ? group.attempts.findIndex((a) => a.records.includes(rec)) : -1;
+  if (!group || attempt < 0) return false;
+  const run = recordsOfGroup(group, { sessionId: group.sessionId, missionId: group.missionId, attempt });
+  return !isRunning(lifecycleAt(run, asOf, policy, presence));
+}
+
 /** Whether a list is one session's, with turns to group by. */
-export function groupsByTurn(all: FlowRecord[]): boolean {
+export function groupsByTurn(all: NormRecord[]): boolean {
   const sessions = new Set(all.map((r) => r.session_id).filter(Boolean));
-  return sessions.size === 1 && all.some((r) => r.action === "dispatch.turn");
+  return sessions.size === 1 && all.some((r) => r.action === ACTION.DispatchTurn);
+}
+
+/** The instant a list is read at (by default its newest record's), the
+ *  policy it is judged by (by default the built-in one) and the presence
+ *  (by default none). */
+function readClock(
+  all: readonly NormRecord[],
+  asOf: number | undefined,
+  policy: LifecyclePolicy | undefined,
+  presence: Presence | undefined,
+): { asOf: number; policy: LifecyclePolicy; presence: Presence } {
+  return { asOf: asOf ?? latestByTime(all)?.tMs ?? -Infinity, policy: policy ?? DEFAULT_POLICY, presence: presence ?? NO_PRESENCE };
 }
 
 /**
  * @param visible the rows to show, NEWEST FIRST (as the list renders them)
  * @param all every record the list was given, so a hidden record (a
  *   heartbeat, a context reading) can still inform a turn's header
+ * @param asOfArg the instant the list is read at; by default the newest
+ *   record's
+ * @param policyArg the lifecycle policy a turn's run is judged by
+ * @param presenceArg the sessions presence reports live at that instant
  */
-export function turnItems(visible: FlowRecord[], all: FlowRecord[]): TurnItem[] {
+export function turnItems(visible: NormRecord[], all: NormRecord[], asOfArg?: number, policyArg?: LifecyclePolicy, presenceArg?: Presence): TurnItem[] {
+  const { asOf, policy, presence } = readClock(all, asOfArg, policyArg, presenceArg);
   if (!groupsByTurn(all)) return visible.map((rec) => ({ kind: "rec", rec }));
 
-  const byTime = [...all].sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
+  const ordered = [...all].sort(byTime);
   // Keys are per ROLE EXECUTION, not the bare seq: each `dispatch start`
   // begins a new execution whose turns count from 1 again, and a session can
   // hold more than one (#2863 review). `null` = before any turn.
   let exec = 0;
   const key = (seq: number) => `${exec}:${seq}`;
-  const turnOf = new Map<FlowRecord, string | null>();
+  const turnOf = new Map<NormRecord, string | null>();
   const firstBeat = new Map<string, number>();
   // Per-call usage by turn. A checkpointed turn takes several calls under
   // one seq, and the turn record's own `usage` is only the LAST call's, so
@@ -106,21 +139,13 @@ export function turnItems(visible: FlowRecord[], all: FlowRecord[]): TurnItem[] 
   // (a checkpoint before the turn that would have completed it) — used to
   // synthesize that group's header below.
   const seqForKey = new Map<string, number>();
-  // (#2863 review round 2, finding 2) Whether THIS execution has emitted a
-  // terminal (`dispatch complete`/`dispatch error`) record at all, by the
-  // time the forward pass finishes — read below to decide whether an
-  // unfinished turn's header says "did not finish" (the run ended; this
-  // turn has no closing record) or "in progress" (the run has not ended
-  // yet, so "did not finish" would be a claim about the future).
-  const terminalForExec = new Map<number, boolean>();
-  for (const r of byTime) {
+  for (const r of ordered) {
     const f = fields(r);
-    if (isDispatchStart(r.action)) {
+    if (r.action === ACTION.DispatchStart) {
       exec++;
       current = null;
       currentSeqNum = null;
     }
-    if (isDispatchTerminal(r.action)) terminalForExec.set(exec, true);
     const seq = num(f.turn_seq);
     const own = seq === null ? null : key(seq);
     // (#2863 review, finding 3) ANY record naming its own `turn_seq` advances
@@ -146,29 +171,29 @@ export function turnItems(visible: FlowRecord[], all: FlowRecord[]): TurnItem[] 
       seqForKey.set(own, seq);
     }
     turnOf.set(r, own ?? current);
-    if (r.action === "dispatch.turn.heartbeat" && own !== null && !firstBeat.has(own)) {
-      firstBeat.set(own, Date.parse(r.ts));
+    if (r.action === ACTION.DispatchTurnHeartbeat && own !== null && r.tMs !== null && !firstBeat.has(own)) {
+      firstBeat.set(own, r.tMs);
     }
-    if (r.action === "telemetry.tokens" && own !== null) {
+    if (r.action === ACTION.TelemetryTokens && own !== null) {
       const out = num(f.completion_tokens);
       const think = num(f.reasoning_tokens);
       if (out !== null) callOut.set(own, (callOut.get(own) ?? 0) + out);
       if (think !== null) callThink.set(own, (callThink.get(own) ?? 0) + think);
     }
-    if (r.action === "telemetry.context") {
+    if (r.action === ACTION.TelemetryContext) {
       window = num(f.max) ?? window;
       threshold = num(f.threshold) ?? threshold;
     }
   }
 
-  const info = (r: FlowRecord): TurnInfo => {
+  const info = (r: NormRecord): TurnInfo => {
     const f = fields(r);
     const seq = num(f.turn_seq) ?? 0;
     const k = turnOf.get(r) ?? "";
     const usage = (f.usage || {}) as Fields;
     const exact = num(f.generation_ms);
     const beat = firstBeat.get(k);
-    const approxMs = beat !== undefined ? Date.parse(r.ts) - beat : null;
+    const approxMs = beat !== undefined && r.tMs !== null ? r.tMs - beat : null;
     const tools = num(f.tool_calls_count) ?? 0;
     return {
       seq,
@@ -198,8 +223,8 @@ export function turnItems(visible: FlowRecord[], all: FlowRecord[]): TurnItem[] 
       groups.set(t, []);
       order.push(t);
     }
-    if (rec.action === "dispatch.turn") headers.set(t, { kind: "turn", rec, turn: info(rec) });
-    else if (rec.action === "dispatch.rest") (rests.get(t) ?? rests.set(t, []).get(t)!).push({ kind: "rest", rec });
+    if (rec.action === ACTION.DispatchTurn) headers.set(t, { kind: "turn", rec, turn: info(rec) });
+    else if (rec.action === ACTION.DispatchRest) (rests.get(t) ?? rests.set(t, []).get(t)!).push({ kind: "rest", rec });
     else groups.get(t)!.push({ kind: "rec", rec });
   }
   const out: TurnItem[] = [];
@@ -221,8 +246,7 @@ export function turnItems(visible: FlowRecord[], all: FlowRecord[]): TurnItem[] 
         // about the PAST — the run ended and this turn has no closing
         // record. A checkpoint with no terminal record YET does not mean
         // the turn never will finish; it means the run is still going.
-        const execNum = Number(t.split(":")[0]);
-        const finished = terminalForExec.get(execNum) === true;
+        const finished = attemptEnded(all, anchor, asOf, policy, presence);
         h = {
           kind: "turn",
           rec: anchor,

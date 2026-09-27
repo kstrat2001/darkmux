@@ -86,6 +86,8 @@ use crate::LabRunSummary;
 use darkmux_crew::envelope::MissionOutcomeStatus;
 use darkmux_crew::step_kinds::StepKindRegistry;
 use darkmux_crew::types::{Mission, MissionStatus, Phase, PhaseStatus, Step, Task};
+use darkmux_flow::FlowAction;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path as StdPath, PathBuf};
 
@@ -185,7 +187,7 @@ pub enum AbandonReason {
 pub enum DispatchSessionEvidence {
     /// darkmux POSITIVELY recorded this mission's dispatch session ending —
     /// the presence reconciler's crash/kill/timeout close-edge (a
-    /// `session.end` record, see [`terminal_status_for_action`]). This is
+    /// `session.end` record, see `run_lifecycle.rs`'s `ending_of`). This is
     /// an observation, not an absence: something darkmux was watching
     /// stopped, and darkmux saw it stop.
     RecordedEnd,
@@ -777,10 +779,12 @@ fn build_flow_mission_index_in(
         // (`darkmux_crew::lifecycle`); `mission start` is the opening
         // bookend. Matching vocabulary that is never emitted would read as
         // real coverage to the next person who greps for it.
-        let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("");
-        if matches!(action, "mission close" | "mission abort") && agg.terminal_ts.is_none() {
-            agg.terminal_ts = Some(ts.to_string());
-            agg.terminal_was_abort = action == "mission abort";
+        let action = darkmux_flow::reader::action_of(v);
+        if let Some(terminal @ (FlowAction::MissionClose | FlowAction::MissionAbort)) = action {
+            if agg.terminal_ts.is_none() {
+                agg.terminal_ts = Some(ts.to_string());
+                agg.terminal_was_abort = terminal == FlowAction::MissionAbort;
+            }
         }
         if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
             if !sid.is_empty() && !agg.session_ids.iter().any(|s| s == sid) {
@@ -828,7 +832,7 @@ fn flow_mission_to_run(
         .iter()
         .filter_map(|s| flow_index.get(s.as_str()).map(|a| (s.as_str(), a)))
         .collect();
-    let any_live = sessions.iter().any(|(_, s)| session_is_live(s, now_ms));
+    let any_live = mission_status_sessions(mission_id, &sessions).iter().any(|s| session_is_live(s, now_ms));
     let status = match (&agg.terminal_ts, agg.terminal_was_abort) {
         // #1627 again: abort is teardown, not success.
         (Some(_), true) => RunStatus::Abandoned,
@@ -1323,29 +1327,19 @@ fn mission_to_run(
         .finalized_ts
         .or_else(|| terminal_ts_str.as_deref().and_then(parse_flow_ts));
 
-    // (#1979 QA gate) STATUS is computed only over sessions this mission can
+    // (#1979 QA gate) STATUS is computed only over what this mission can
     // legitimately claim. A `session_id` whose records span more than one
-    // mission is corrupt for this purpose — `session_id::task` hashes only
-    // `task_id`, which comes straight out of a mission CONFIG
-    // (`crew::scheduler`'s own doc), so every run of `coder-phase.json`
-    // shares `task-build-coder`. Feeding such an agg into
-    // `mission_run_status` lets one mission read Running off ANOTHER
-    // mission's activity clock: the agg is permanently non-terminal (its
-    // records are `step start`/`step complete`, which
-    // `terminal_status_for_action` maps to `None`), so it both disables the
-    // all-terminal branch and keeps `session_is_live` true. `is_ambiguous`
-    // is the detector that already exists for exactly this corruption.
-    // Membership (`sessions`) deliberately keeps them — claiming the
-    // session still suppresses a ghost row; only STATUS is narrowed.
-    //
-    // (#2487) Mapped off `unambiguous_sessions` rather than re-running the
-    // same `!is_ambiguous()` filter 130 lines below where it was already
-    // computed. The reason is the one `session_id`'s own doc gives above:
-    // two separately-written implementations of one guard can drift apart,
-    // and a drift here would silently split STATUS off from the attribute
-    // and ordering fields that are supposed to describe the same sessions.
-    let sessions_bare: Vec<&SessionAgg> =
-        unambiguous_sessions.iter().map(|(_, s)| *s).collect();
+    // mission is shared — `session_id::task` hashes only `task_id`, which
+    // comes straight out of a mission CONFIG (`crew::scheduler`'s own doc),
+    // so every run of `coder-phase.json` shares `task-build-coder` — and its
+    // settled fields are its CURRENT attempt's, possibly another mission's.
+    // Such a session is read through this mission's own attempts on it
+    // (`mission_status_sessions`), never refused: refusing it left a mission
+    // whose only session was shared reading Abandoned while it ran, and
+    // radio's busy check (`local_dispatch_status`, the same helper) missing
+    // that seat.
+    let status_sessions = mission_status_sessions(&mission.id, &sessions);
+    let sessions_bare: Vec<&SessionAgg> = status_sessions.iter().map(|s| s.as_ref()).collect();
     let status = mission_run_status(mission, &sessions_bare, now_ms);
     // (#1907) `mission_run_status` has exactly ONE arm that reaches
     // `Abandoned` via a deliberate teardown — `MissionStatus::Aborted =>
@@ -1440,6 +1434,19 @@ fn mission_to_run(
 /// is the activity anchor for that case.
 fn mission_run_status(mission: &Mission, sessions: &[&SessionAgg], now_ms: u64) -> RunStatus {
     mission_run_status_and_evidence(mission, sessions, now_ms).0
+}
+
+/// The sessions a mission's STATUS reads, each as that mission reads it:
+/// an unambiguous session as it is; one several missions share (#1918)
+/// through the mission's own attempts on it ([`SessionAgg::for_mission`]),
+/// dropped only when the mission has none there. Its attributes (role,
+/// model, machine, endpoint) stay refused: those are the whole session's,
+/// not per attempt.
+fn mission_status_sessions<'a>(mission_id: &str, sessions: &[(&str, &'a SessionAgg)]) -> Vec<Cow<'a, SessionAgg>> {
+    sessions
+        .iter()
+        .filter_map(|(_, s)| if s.is_ambiguous() { s.for_mission(mission_id).map(Cow::Owned) } else { Some(Cow::Borrowed(*s)) })
+        .collect()
 }
 
 /// (#2682 fix-pass) As [`mission_run_status`], but for the `Active`/`Paused`
@@ -1568,7 +1575,7 @@ fn mission_run_status_and_evidence(
                 if mission.status != MissionStatus::Paused && most_recent_terminal_is_abandoned {
                     // A `session.end` terminal really did land — darkmux
                     // OBSERVED this session stop (see
-                    // `terminal_status_for_action`), never a guess from
+                    // `run_lifecycle.rs`'s `ending_of`), never a guess from
                     // silence.
                     return (RunStatus::Abandoned, Some(DispatchSessionEvidence::RecordedEnd));
                 }
@@ -1787,13 +1794,10 @@ pub fn local_dispatch_status(
             let step_sessions = collect_mission_step_sessions(mission);
             let candidates =
                 mission_candidate_sessions(mission, &step_sessions, &mission_id_index, &flow_index);
-            // (#2487) The SAME `!is_ambiguous()` filter `mission_to_run`
-            // applies before it ever calls `mission_run_status` — see that
-            // function's own comment for why an unfiltered pool would let
-            // a session shared across missions win a verdict it has no
-            // right to.
-            let sessions_bare: Vec<&SessionAgg> =
-                candidates.iter().filter(|(_, s)| !s.is_ambiguous()).map(|(_, s)| *s).collect();
+            // The SAME pool `mission_to_run` judges its row by, so radio's
+            // busy check and `/runs` never disagree about one mission.
+            let status_sessions = mission_status_sessions(&mission.id, &candidates);
+            let sessions_bare: Vec<&SessionAgg> = status_sessions.iter().map(|s| s.as_ref()).collect();
             let verdict = mission_run_status_and_evidence(mission, &sessions_bare, now_ms);
             (mission.id.clone(), verdict)
         })
@@ -2030,12 +2034,39 @@ pub(crate) fn stale_after_ms() -> u64 {
     darkmux_types::config_access::inactivity_timeout_seconds().saturating_mul(2_000)
 }
 
+/// (#2902 step 5) How long past its announced resume time a budget wait
+/// stays open with no further word from its waiter. A waiter still held at
+/// its resume time announces again (a new `budget.wait`), and one whose
+/// window has room writes `budget.resume` within one poll; a wait silent
+/// this long past its resume time has lost its process.
+pub(crate) const BUDGET_WAIT_GRACE_MS: u64 = 60_000;
+
+/// The lifecycle policy every `/runs` row is judged by, published on the
+/// response so the viewer judges flow sessions by the same numbers
+/// (`ui/src/lib/lifecycle.ts`, one spec in `tests/lifecycle/cases.json`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct RunsPolicy {
+    /// [`stale_after_ms`]: twice the runtime's inactivity budget.
+    #[cfg_attr(test, ts(type = "number"))]
+    pub stale_after_ms: u64,
+    /// [`BUDGET_WAIT_GRACE_MS`].
+    #[cfg_attr(test, ts(type = "number"))]
+    pub budget_wait_grace_ms: u64,
+}
+
+/// The policy as the daemon resolves it now (`runtime.inactivity_timeout_seconds`
+/// follows config, like every other `/runs` staleness decision).
+pub fn runs_policy() -> RunsPolicy {
+    RunsPolicy { stale_after_ms: stale_after_ms(), budget_wait_grace_ms: BUDGET_WAIT_GRACE_MS }
+}
+
 /// (#2413) Best-effort, LOCAL-ONLY: is at least one dispatch bookend-open
 /// (a `dispatch start` with no matching `dispatch complete`/`error` yet,
 /// within [`stale_after_ms`] of `now_ms`) on THIS machine? Feeds the
 /// daemon host sampler's live-vs-idle emission cadence
-/// (`host_sampler::spawn`) — reusing the SAME dispatch-bookend vocabulary
-/// (`darkmux_flow::is_dispatch_start`/`is_dispatch_terminal`) and the SAME
+/// (`host_sampler::spawn`) — reusing the SAME dispatch bookends and the SAME
 /// staleness budget [`session_is_live`] already judges run liveness by,
 /// rather than inventing a second liveness definition.
 ///
@@ -2075,14 +2106,14 @@ fn any_dispatch_live_in(dir: &std::path::Path, day: &str, now_ms: u64, max_age_m
     // version returned `true`; this one correctly returns `false`.
     let mut open: HashSet<String> = HashSet::new();
     for line in text.lines() {
-        let Ok(rec) = serde_json::from_str::<darkmux_flow::FlowRecord>(line) else { continue };
+        let Some(rec) = darkmux_flow::reader::parse_record(line) else { continue };
         let Some(sid) = rec.session_id.clone() else { continue };
         let Some(ts_secs) = parse_flow_ts(&rec.ts) else { continue };
         let ts_ms = ts_secs.saturating_mul(1000);
-        if darkmux_flow::is_dispatch_start(&rec.action) {
+        if rec.action == FlowAction::DispatchStart {
             open.insert(sid.clone());
             last_activity_ms.insert(sid, ts_ms);
-        } else if darkmux_flow::is_dispatch_terminal(&rec.action) {
+        } else if matches!(rec.action, FlowAction::DispatchComplete | FlowAction::DispatchError) {
             open.remove(&sid);
         } else if open.contains(&sid) {
             // Any OTHER record for an ALREADY-open dispatch session is
@@ -2106,12 +2137,17 @@ fn any_dispatch_live_in(dir: &std::path::Path, day: &str, now_ms: u64, max_age_m
 /// the three `Run` kinds. A session with no activity timestamp at all
 /// (shouldn't happen for anything actually indexed, but never assume) can't
 /// be judged live — absence of evidence is not evidence of life.
+///
+/// (#2902 step 5) An open budget wait holds the session live until it
+/// lapses (the quiet clock starts at the lapse, which is still ahead), and
+/// past that the staleness clock runs from the lapse.
+///
+/// A terminal always wins over liveness: a session that recorded its end
+/// (a terminal of its current attempt, or `RunFold::recorded_end`) is not
+/// live however recent that record is.
 fn session_is_live(agg: &SessionAgg, now_ms: u64) -> bool {
-    let Some(last_activity_secs) = agg.last_activity_ts.as_deref().and_then(parse_flow_ts) else {
-        return false;
-    };
-    let idle_ms = now_ms.saturating_sub(last_activity_secs.saturating_mul(1_000));
-    idle_ms <= stale_after_ms()
+    agg.terminal_status.is_none()
+        && crate::run_lifecycle::quiet_clock_live(agg.last_activity_ts.as_deref(), agg.wait_until_ms, now_ms, stale_after_ms())
 }
 
 /// Representative role/model/route for a lab run's `/runs` row, off its
@@ -2285,7 +2321,7 @@ struct SessionAgg {
     start_ts: Option<String>,
     /// The terminal outcome this session reached, from whichever of
     /// `dispatch complete` / `dispatch error` / `session.end` landed first
-    /// (see [`terminal_status_for_action`]) — `None` while still running.
+    /// (see `run_lifecycle.rs`'s `ending_of`) — `None` while still running.
     terminal_status: Option<RunStatus>,
     terminal_ts: Option<String>,
     /// (#1642, #1633) The newest `ts` seen on ANY record for this session —
@@ -2296,9 +2332,54 @@ struct SessionAgg {
     /// terminal. Same raw-ISO-string convention as `start_ts`/`terminal_ts`
     /// — parsed via [`parse_flow_ts`] only where a numeric is needed.
     last_activity_ts: Option<String>,
+    /// (#2902 step 5) A `budget.wait` was seen: a hosted call held by its
+    /// budget before its first bookend is a run.
+    has_wait: bool,
+    /// When the session's open budget wait lapses (epoch ms: its `ts`, plus
+    /// its `wait_seconds`, plus [`BUDGET_WAIT_GRACE_MS`]); `None` while no
+    /// wait is open.
+    wait_until_ms: Option<u64>,
+    /// The session's terminal was a `budget.stop` that names why.
+    stopped_by_operator: bool,
+    /// The session's attempts (`run_lifecycle.rs`), whose current one the
+    /// attempt-scoped fields above describe once settled.
+    lifecycle: crate::run_lifecycle::RunFold,
 }
 
 impl SessionAgg {
+    /// The attempt-scoped fields, from the current attempt.
+    fn settle(&mut self) {
+        self.lifecycle.seal();
+        let latest = self.lifecycle.latest().cloned().or_else(|| self.lifecycle.recorded_end(None));
+        self.settle_from(latest.as_ref());
+    }
+
+    /// This session as `mission` reads it: its attempt-scoped fields from
+    /// that mission's own latest attempt on it (`RunFold::latest_of`), every
+    /// other field as the session's. `None` when the mission has no attempt
+    /// here. What a mission's status reads off a session several missions
+    /// share (#1918), instead of refusing it: the attempts are per mission,
+    /// so no other mission's activity or terminal reaches it.
+    fn for_mission(&self, mission: &str) -> Option<SessionAgg> {
+        let attempt = self.lifecycle.latest_of(mission).cloned().or_else(|| self.lifecycle.recorded_end(Some(mission)))?;
+        let mut scoped = self.clone();
+        scoped.settle_from(Some(&attempt));
+        Some(scoped)
+    }
+
+    fn settle_from(&mut self, attempt: Option<&crate::run_lifecycle::Attempt>) {
+        let Some(a) = attempt else { return };
+        let ending = a.ending();
+        self.has_start = a.has_start;
+        self.has_wait = a.waited;
+        self.start_ts = a.start_ts.clone();
+        self.last_activity_ts = a.last_activity_ts.clone();
+        self.wait_until_ms = a.wait_until_ms;
+        self.terminal_status = ending.map(|e| e.status);
+        self.terminal_ts = a.close.as_ref().map(|(ts, _)| ts.clone());
+        self.stopped_by_operator = ending.and_then(|e| e.reason) == Some(AbandonReason::Aborted);
+    }
+
     /// (#1918) `true` when this session's records name more than one
     /// distinct `mission_id` — the read-side detector for the scheduler
     /// defect (see [`SessionAgg::mission_ids_seen`]'s own doc). Every
@@ -2355,115 +2436,8 @@ fn build_flow_session_index_in(
 
     let fleet_seen: std::collections::HashSet<String> =
         fleet.iter().filter(|v| within_window(v)).map(crate::flow_record_identity).collect();
-    let fold = |idx: &mut HashMap<String, SessionAgg>, v: &serde_json::Value| {
-        let Some(session_id) = v.get("session_id").and_then(|s| s.as_str()) else {
-            return;
-        };
-        if session_id.is_empty() {
-            return;
-        }
-        let agg = idx.entry(session_id.to_string()).or_default();
-
-        if agg.mission_id.is_none() {
-            if let Some(mid) = v.get("mission_id").and_then(|m| m.as_str()) {
-                if !mid.is_empty() {
-                    agg.mission_id = Some(mid.to_string());
-                }
-            }
-        }
-        // (#1918) Unconditional, unlike `mission_id` above — this tracks
-        // EVERY distinct value this session has ever named, not just the
-        // first, because the ambiguity question ("does this session belong
-        // to more than one mission") can only be answered by seeing them
-        // all. A `HashSet` insert of the same value from the session's own
-        // other steps is a no-op, so an ordinary multi-step mission never
-        // trips this — only a session that genuinely spans more than one
-        // mission grows past one entry.
-        if let Some(mid) = v.get("mission_id").and_then(|m| m.as_str()) {
-            if !mid.is_empty() {
-                agg.mission_ids_seen.insert(mid.to_string());
-            }
-        }
-        if agg.role.is_none() {
-            if let Some(handle) = v.get("handle").and_then(|h| h.as_str()) {
-                if !handle.is_empty() {
-                    agg.role = Some(handle.to_string());
-                }
-            }
-        }
-        if agg.model.is_none() {
-            if let Some(model) = v.get("model").and_then(|m| m.as_str()) {
-                if !model.is_empty() {
-                    agg.model = Some(model.to_string());
-                }
-            }
-        }
-        if agg.machine.is_none() {
-            if let Some(mach) = v.get("machine_id").and_then(|m| m.as_str()) {
-                if !mach.is_empty() {
-                    agg.machine = Some(mach.to_string());
-                }
-            }
-        }
-        if agg.source.is_none() {
-            if let Some(src) = v.get("source").and_then(|s| s.as_str()) {
-                if !src.is_empty() {
-                    agg.source = Some(src.to_string());
-                }
-            }
-        }
-
-        let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("");
-        let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
-
-        // (#1642, #1633) EVERY record for this session updates the liveness
-        // clock — not just lifecycle ones (see `SessionAgg::last_activity_ts`'s
-        // doc). ISO-8601 `YYYY-MM-DDTHH:MM:SSZ` sorts correctly as a plain
-        // string (same property `earliest_by_start` relies on), so a lexical
-        // compare is enough to keep the NEWEST seen even if records are ever
-        // visited out of chronological order.
-        if !ts.is_empty() {
-            let is_newer = match agg.last_activity_ts.as_deref() {
-                Some(current) => ts > current,
-                None => true,
-            };
-            if is_newer {
-                agg.last_activity_ts = Some(ts.to_string());
-            }
-        }
-
-        // Check EVERY dispatch lifecycle record's payload for `endpoint` —
-        // not just start (#1518, applied server-side; see `SessionAgg::endpoint`'s doc).
-        if agg.endpoint.is_none() && is_dispatch_lifecycle_action(action) {
-            if let Some(ep) = v
-                .get("payload")
-                .and_then(|p| p.get("endpoint"))
-                .and_then(|e| e.as_str())
-            {
-                if !ep.is_empty() {
-                    agg.endpoint = Some(ep.to_string());
-                }
-            }
-        }
-
-        if is_dispatch_start_action(action) {
-            agg.has_start = true;
-            if agg.start_ts.is_none() && !ts.is_empty() {
-                agg.start_ts = Some(ts.to_string());
-            }
-        } else if let Some(status) = terminal_status_for_action(action) {
-            // Keep the FIRST terminal seen — a session emits at most one in
-            // practice; favoring the first keeps this deterministic if a
-            // replay/retry ever produced more than one.
-            if agg.terminal_status.is_none() {
-                agg.terminal_status = Some(status);
-                agg.terminal_ts = Some(ts.to_string());
-            }
-        }
-    };
-
     for v in fleet.iter().filter(|v| within_window(v)) {
-        fold(&mut idx, v);
+        fold_session_record(&mut idx, v);
         if let Some(u) = usage.as_deref_mut() {
             u.add(v);
         }
@@ -2472,53 +2446,107 @@ fn build_flow_session_index_in(
         if !fleet_seen.is_empty() && fleet_seen.contains(&crate::flow_record_identity(v)) {
             return std::ops::ControlFlow::Continue(());
         }
-        fold(&mut idx, v);
+        fold_session_record(&mut idx, v);
         if let Some(u) = usage.as_deref_mut() {
             u.add(v);
         }
         std::ops::ControlFlow::Continue(())
     });
+    settle_session_index(&mut idx);
     idx
 }
 
-/// The flow stream carries both the dotted (`dispatch.start`) and spaced
-/// (`dispatch start`) action forms across schema history — tolerate both,
-/// matching `scan_flow_days`/`scan_flow_missions`'s own dual-form checks.
-/// (#1852) Delegates to the shared matcher rather than re-spelling the
-/// vocabulary — this was one of five independent local defenses.
-fn is_dispatch_start_action(action: &str) -> bool {
-    darkmux_flow::is_dispatch_start(action)
+/// Fold one flow record into its session's [`SessionAgg`]: the one pass
+/// [`build_flow_session_index_in`] makes over the window.
+fn fold_session_record(idx: &mut HashMap<String, SessionAgg>, v: &serde_json::Value) {
+    let Some(session_id) = v.get("session_id").and_then(|s| s.as_str()) else {
+        return;
+    };
+    if session_id.is_empty() {
+        return;
+    }
+    let agg = idx.entry(session_id.to_string()).or_default();
+
+    if agg.mission_id.is_none() {
+        if let Some(mid) = v.get("mission_id").and_then(|m| m.as_str()) {
+            if !mid.is_empty() {
+                agg.mission_id = Some(mid.to_string());
+            }
+        }
+    }
+    // (#1918) Unconditional, unlike `mission_id` above — this tracks
+    // EVERY distinct value this session has ever named, not just the
+    // first, because the ambiguity question ("does this session belong
+    // to more than one mission") can only be answered by seeing them
+    // all. A `HashSet` insert of the same value from the session's own
+    // other steps is a no-op, so an ordinary multi-step mission never
+    // trips this — only a session that genuinely spans more than one
+    // mission grows past one entry.
+    if let Some(mid) = v.get("mission_id").and_then(|m| m.as_str()) {
+        if !mid.is_empty() {
+            agg.mission_ids_seen.insert(mid.to_string());
+        }
+    }
+    if agg.role.is_none() {
+        if let Some(handle) = v.get("handle").and_then(|h| h.as_str()) {
+            if !handle.is_empty() {
+                agg.role = Some(handle.to_string());
+            }
+        }
+    }
+    if agg.model.is_none() {
+        if let Some(model) = v.get("model").and_then(|m| m.as_str()) {
+            if !model.is_empty() {
+                agg.model = Some(model.to_string());
+            }
+        }
+    }
+    if agg.machine.is_none() {
+        if let Some(mach) = v.get("machine_id").and_then(|m| m.as_str()) {
+            if !mach.is_empty() {
+                agg.machine = Some(mach.to_string());
+            }
+        }
+    }
+    if agg.source.is_none() {
+        if let Some(src) = v.get("source").and_then(|s| s.as_str()) {
+            if !src.is_empty() {
+                agg.source = Some(src.to_string());
+            }
+        }
+    }
+
+    let action = darkmux_flow::reader::action_of(v);
+    let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
+
+    // Check EVERY dispatch lifecycle record's payload for `endpoint` —
+    // not just start (#1518, applied server-side; see `SessionAgg::endpoint`'s doc).
+    let is_bookend = matches!(
+        action,
+        Some(FlowAction::DispatchStart | FlowAction::DispatchComplete | FlowAction::DispatchError)
+    );
+    if agg.endpoint.is_none() && is_bookend {
+        if let Some(ep) = v
+            .get("payload")
+            .and_then(|p| p.get("endpoint"))
+            .and_then(|e| e.as_str())
+        {
+            if !ep.is_empty() {
+                agg.endpoint = Some(ep.to_string());
+            }
+        }
+    }
+
+    let mission = v.get("mission_id").and_then(|m| m.as_str()).filter(|m| !m.is_empty());
+    agg.lifecycle.fold(action.as_ref(), mission, ts, v);
 }
 
-fn is_dispatch_lifecycle_action(action: &str) -> bool {
-    // (silent-miss audit, 2026-09-06) Was four hand-spelled literal
-    // comparisons alongside the start check — every one a spot that could
-    // silently drift from `darkmux-flow`'s own bookend vocabulary (see
-    // `CLAUDE.md`'s "Dispatch liveness" contract), the same drift risk
-    // `mission_graph.rs`'s `is_complete` line already had before this
-    // audit. `is_dispatch_terminal` already covers BOTH spellings of
-    // BOTH complete and error.
-    is_dispatch_start_action(action) || darkmux_flow::is_dispatch_terminal(action)
-}
-
-/// The `RunStatus` a session's TERMINAL flow action implies — `None` for
-/// any non-terminal action (turns, tools, telemetry, the start itself).
-fn terminal_status_for_action(action: &str) -> Option<RunStatus> {
-    // (silent-miss audit, 2026-09-06) Hand-spelled literals replaced with
-    // the shared `darkmux_flow` matchers — see `is_dispatch_lifecycle_
-    // action`'s own comment just above.
-    if darkmux_flow::is_dispatch_complete(action) {
-        return Some(RunStatus::Complete);
-    }
-    if darkmux_flow::is_dispatch_error(action) {
-        return Some(RunStatus::Error);
-    }
-    match action {
-        // The presence reconciler's crash/kill/timeout close-edge — a
-        // session whose heartbeat disappeared with no clean dispatch
-        // terminal ever landing (`presence_reconciler.rs`'s own doc).
-        "session.end" => Some(RunStatus::Abandoned),
-        _ => None,
+/// The attempt-scoped fields of every session, from its lifecycle fold's
+/// current attempt (`run_lifecycle.rs`): what `/runs` judges a session by.
+/// Run once the fold has seen every record.
+fn settle_session_index(idx: &mut HashMap<String, SessionAgg>) {
+    for agg in idx.values_mut() {
+        agg.settle();
     }
 }
 
@@ -2569,7 +2597,7 @@ fn ghost_runs(
 ) -> Vec<Run> {
     let mut out = Vec::new();
     for (session_id, agg) in flow_index {
-        if !agg.has_start {
+        if !agg.has_start && !agg.has_wait {
             continue;
         }
         if known_session_ids.contains(session_id) {
@@ -2596,11 +2624,15 @@ fn ghost_runs(
         // (#1907) There is no per-dispatch abort action — `mission abort`
         // is mission-scoped, and a standalone session's only terminals are
         // `dispatch complete`/`dispatch error`/the presence reconciler's
-        // `session.end` crash-close-edge (see `terminal_status_for_action`'s
-        // own doc) — so an Abandoned ghost always means "no ending
+        // `session.end` crash-close-edge (see `run_lifecycle.rs`'s
+        // `ending_of`) — so an Abandoned ghost always means "no ending
         // recorded", whether it came from `session.end` or the staleness
         // gate above.
-        let abandoned_reason = (status == RunStatus::Abandoned).then_some(AbandonReason::NoTerminal);
+        let abandoned_reason = (status == RunStatus::Abandoned).then_some(if agg.stopped_by_operator {
+            AbandonReason::Aborted
+        } else {
+            AbandonReason::NoTerminal
+        });
         out.push(Run {
             id: session_id.clone(),
             kind: RunKind::Dispatch,
@@ -2692,7 +2724,7 @@ fn for_each_flow_record_from(
             if line.is_empty() {
                 continue;
             }
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            let Some(v) = darkmux_flow::reader::parse_value(line) else {
                 continue;
             };
             if v.get("_type").and_then(|t| t.as_str()) == Some("schema") {
@@ -2810,7 +2842,7 @@ pub(crate) fn day_string_from_epoch_ms(ms: u64) -> String {
 /// window bounds so it's testable without exercising the day-file walk
 /// `join_host_samples_into_session_records` (`lib.rs`) wraps this in.
 pub(crate) fn is_host_sample_in_window(v: &serde_json::Value, machine_uid: &str, start_ms: u64, end_ms: u64) -> bool {
-    if v.get("action").and_then(|a| a.as_str()) != Some("machine.telemetry") {
+    if darkmux_flow::reader::action_of(v) != Some(FlowAction::MachineTelemetry) {
         return false;
     }
     if v.get("machine_uid").and_then(|m| m.as_str()) != Some(machine_uid) {
@@ -2834,205 +2866,6 @@ mod tests {
     use darkmux_crew::types::{MissionSpec, NodeStatus, PhaseStatus};
     use std::io::Write;
     use tempfile::TempDir;
-
-    // ── literal-bookend tripwire (silent-miss audit, 2026-09-06) ────────
-
-    /// Strips every `#[cfg(test)]`-gated item out of `src` before the
-    /// tripwire below scans for hand-spelled bookend literals — test
-    /// fixtures legitimately construct raw JSON records naming BOTH
-    /// spellings on purpose (that is the whole point of a dual-spelling
-    /// fixture), and those must not trip a check aimed at PRODUCTION code
-    /// re-inventing `darkmux_flow`'s matchers. From the line AFTER each
-    /// `#[cfg(test)]` attribute, brace-depth-tracks forward through the
-    /// item it gates and drops every line up to and including whichever
-    /// closes first: the matching close brace (`mod tests { ... }`, a
-    /// `fn ... { ... }`), OR — round-2 audit, 2026-09-06, C2 — a BARE
-    /// `;`-terminated item with no braces at all (`mod wire_fixtures;`,
-    /// a `#[path = "..."] mod tests;` pair). Before this fix, a
-    /// brace-less gated item made the scan keep hunting forward for the
-    /// NEXT `{` in the file — which is ordinary PRODUCTION code's own
-    /// brace, not this item's — silently swallowing every line in
-    /// between out of the scan. `lib.rs`'s own `#[cfg(test)] mod
-    /// wire_fixtures;` (no body — the module lives in a separate file)
-    /// hit exactly this: the stripper used to hunt past it for the next
-    /// `{`, dropping a real stretch of production code from the
-    /// tripwire's coverage with nothing ever reporting it missing.
-    fn strip_cfg_test_regions(src: &str) -> String {
-        let lines: Vec<&str> = src.lines().collect();
-        let mut out = String::new();
-        let mut i = 0;
-        while i < lines.len() {
-            if lines[i].trim_start().starts_with("#[cfg(test)]") {
-                let mut depth: i32 = 0;
-                let mut opened = false;
-                // Scanning starts at the line AFTER the attribute itself
-                // — the attribute line can never open a brace or end the
-                // item, and starting here (rather than at `i`) is what
-                // lets a lone semicolon on the very next line close a
-                // brace-less item without first needing a `{` anywhere.
-                let mut j = i + 1;
-                while j < lines.len() {
-                    let line = lines[j];
-                    for ch in line.chars() {
-                        match ch {
-                            '{' => {
-                                depth += 1;
-                                opened = true;
-                            }
-                            '}' => depth -= 1,
-                            _ => {}
-                        }
-                    }
-                    // A line that never opened a brace and ends the
-                    // statement with `;` is a COMPLETE bare item on its
-                    // own — `mod wire_fixtures;`, or (when this is the
-                    // line right after a stacked `#[path = "..."]`
-                    // attribute) `mod tests;`. Stop right there instead
-                    // of continuing to hunt for a `{` that may be pages
-                    // away, in code this item has nothing to do with.
-                    let bare_semicolon_close = !opened && line.trim_end().ends_with(';');
-                    j += 1;
-                    if opened && depth <= 0 {
-                        break;
-                    }
-                    if bare_semicolon_close {
-                        break;
-                    }
-                }
-                i = j;
-                continue;
-            }
-            out.push_str(lines[i]);
-            out.push('\n');
-            i += 1;
-        }
-        out
-    }
-
-    /// (round-2 audit, 2026-09-06 — C2) A brace-less `#[cfg(test)] mod x;`
-    /// item — `lib.rs`'s real `#[cfg(test)] mod wire_fixtures;` shape —
-    /// must strip ONLY itself, never hunt forward for the next `{`
-    /// (which belongs to unrelated PRODUCTION code and would get
-    /// silently swallowed along with it). Red-proved by reverting the
-    /// scan-start back to `let mut j = i;` and dropping the
-    /// `bare_semicolon_close` check (the pre-fix behavior): this test
-    /// then fails because `"dispatch complete"` inside `fn after()`
-    /// disappears from the stripped output along with everything between
-    /// the two lines.
-    #[test]
-    fn strip_cfg_test_regions_stops_at_a_bare_semicolon_not_the_next_brace() {
-        let src = "#[cfg(test)]\nmod wire_fixtures;\n\nfn after() {\n    let x = \"dispatch complete\";\n}\n";
-        let stripped = strip_cfg_test_regions(src);
-        assert!(!stripped.contains("wire_fixtures"), "the gated bare item itself must be stripped: {stripped:?}");
-        assert!(
-            stripped.contains("dispatch complete"),
-            "production code AFTER the bare `;`-terminated gated item must survive stripping, \
-             not be swallowed while hunting for a distant unrelated `{{`: {stripped:?}"
-        );
-    }
-
-    /// The stacked-attribute form (`#[cfg(test)]` immediately followed by
-    /// another attribute, THEN the bare `;`-terminated item) — `lib.rs`'s
-    /// real `#[cfg(test)] #[path = "lib_tests.rs"] mod tests;` shape.
-    #[test]
-    fn strip_cfg_test_regions_handles_a_stacked_attribute_before_the_bare_semicolon() {
-        let src = "#[cfg(test)]\n#[path = \"lib_tests.rs\"]\nmod tests;\n\nfn after() {\n    let x = \"dispatch start\";\n}\n";
-        let stripped = strip_cfg_test_regions(src);
-        assert!(!stripped.contains("lib_tests.rs"), "{stripped:?}");
-        assert!(!stripped.contains("mod tests;"), "{stripped:?}");
-        assert!(
-            stripped.contains("dispatch start"),
-            "production code after the stacked-attribute bare item must survive: {stripped:?}"
-        );
-    }
-
-    /// The ORIGINAL brace-block form must keep working unchanged — a
-    /// `#[cfg(test)] mod tests { ... }` body (including a nested literal
-    /// that legitimately names both spellings on purpose) is stripped in
-    /// full, and code after its closing brace survives.
-    #[test]
-    fn strip_cfg_test_regions_still_strips_a_full_brace_delimited_mod() {
-        let src = "#[cfg(test)]\nmod tests {\n    fn t() {\n        let x = \"dispatch complete\";\n    }\n}\n\nfn after() {\n    let y = \"dispatch start\";\n}\n";
-        let stripped = strip_cfg_test_regions(src);
-        assert!(!stripped.contains("\"dispatch complete\""), "the test-gated body must be gone: {stripped:?}");
-        assert!(
-            stripped.contains("\"dispatch start\""),
-            "code after the closing brace must survive: {stripped:?}"
-        );
-    }
-
-    /// (silent-miss audit, 2026-09-06) `darkmux-flow`'s `is_dispatch_start`/
-    /// `is_dispatch_complete`/`is_dispatch_error`/`is_dispatch_terminal`
-    /// exist EXACTLY because a hand-spelled `action == "dispatch complete"
-    /// || action == "dispatch.complete"` silently stops matching the
-    /// instant either spelling drifts (a schema rename, a third spelling
-    /// added upstream) with no error anywhere — `mission_graph.rs`'s
-    /// `is_complete` line and two spots in this file (`runs.rs`'s
-    /// `is_dispatch_lifecycle_action`/`terminal_status_for_action`) had
-    /// exactly this shape until this audit fixed them. This test pins
-    /// that fix by scanning every non-test `.rs` file in this crate's
-    /// `src/` for the QUOTED LITERAL ANYWHERE in non-test source —
-    /// comments included, deliberately not restricted to executable code
-    /// — and failing on any (round-2 audit, 2026-09-06, C1: a re-spelled
-    /// literal sitting in a comment is just as much a drift risk as one
-    /// in a live `==` comparison — someone copies the comment's example
-    /// into new code next).
-    ///
-    /// Six literals: three bookends (start/complete/error) × two
-    /// spellings each (round-2 audit, 2026-09-06, M2 — the original list
-    /// omitted `"dispatch error"`/`"dispatch.error"`, so restoring a
-    /// hand-spelled error-bookend comparison stayed green here).
-    ///
-    /// Deliberately non-recursive (`src/` has no subdirectories today) and
-    /// deliberately excludes `lib_tests.rs` and `wire_fixtures.rs` by name
-    /// — both are ENTIRELY `#[cfg(test)]`-gated from their very first item
-    /// (verified: `lib.rs`'s `#[cfg(test)] #[path = "lib_tests.rs"] mod
-    /// tests;`, `wire_fixtures.rs`'s own leading `#[cfg(test)] mod tests`),
-    /// so `strip_cfg_test_regions` alone already empties them — named here
-    /// too so the intent doesn't rely solely on the stripper being
-    /// correct.
-    #[test]
-    fn no_hand_spelled_dispatch_bookend_literals_outside_flow_helpers() {
-        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let literals = [
-            "\"dispatch complete\"",
-            "\"dispatch.complete\"",
-            "\"dispatch start\"",
-            "\"dispatch.start\"",
-            "\"dispatch error\"",
-            "\"dispatch.error\"",
-        ];
-        let mut offenders: Vec<String> = Vec::new();
-        for entry in std::fs::read_dir(&src_dir).expect("reading darkmux-serve's own src dir") {
-            let entry = entry.expect("dir entry");
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-            if name == "lib_tests.rs" || name == "wire_fixtures.rs" {
-                continue; // entirely test-gated — see this test's own doc.
-            }
-            let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-            let production_only = strip_cfg_test_regions(&raw);
-            for (lineno, line) in production_only.lines().enumerate() {
-                for lit in literals {
-                    if line.contains(lit) {
-                        offenders.push(format!("{}:{}: {}", path.display(), lineno + 1, line.trim()));
-                    }
-                }
-            }
-        }
-        assert!(
-            offenders.is_empty(),
-            "quoted dispatch-bookend literal found ANYWHERE in non-test source (comments \
-             included) outside `darkmux_flow`'s matchers — use `is_dispatch_start`/\
-             `is_dispatch_complete`/`is_dispatch_error`/`is_dispatch_terminal` instead, or, if \
-             this really is prose naming the literal spelling on purpose, keep it out of a \
-             quoted string:\n{}",
-            offenders.join("\n")
-        );
-    }
 
     // ── parse_flow_ts / civil calendar round-trip ───────────────────────
 
@@ -4094,67 +3927,111 @@ mod tests {
 
     // ── local_dispatch_status (#2682 fix-pass MUST FIX 1/2/3) ──────────────
 
-    /// (#2682 fix-pass MUST FIX 2, review Probe E2) An ambiguous session —
-    /// shared with another mission, and carrying FRESH activity — must
-    /// never be read as "this mission's dispatch went stale without a
-    /// terminal record" (`StaleNoTerminal`). Once `is_ambiguous()` refuses
-    /// it, the pool this mission can legitimately draw from is EMPTY, so
-    /// the verdict has to fall back to the mission's own age — proving
-    /// MUST FIX 1's fix (the `sessions.is_empty()` branch) is what actually
-    /// closes MUST FIX 2, exactly as the review predicted.
-    #[test]
-    #[serial_test::serial]
-    fn local_dispatch_status_ambiguous_session_reads_no_attributable_session_not_stale() {
-        let _g = CrewGuard::new();
-        // (MUST FIX 2) 60s knob → a 120s budget. Without this pin the
-        // 90-minute distance below is measured against whatever
-        // `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` the environment exports, and
-        // this test fails outright under the documented `7200`.
-        let _budget = InactivityBudgetGuard::seconds(60);
+    /// A session `m` shares with another mission (#1918): `m` reads its OWN
+    /// attempt on it (`mission_status_sessions`), never the other mission's
+    /// activity, in `local_dispatch_status` (radio's busy check) and on its
+    /// `/runs` row alike. `m_ago`/`other_ago`: how long ago each mission's
+    /// `step start` landed. Returns both verdicts.
+    fn shared_session_verdicts(m_ago: u64, other_ago: u64) -> (RunStatus, Option<DispatchSessionEvidence>, RunStatus) {
         let flows = TempDir::new().unwrap();
-
         let mut m = minimal_mission("m-ambiguous-e2e", vec![], None);
-        // 90 minutes old — well past the pinned 120-second staleness
-        // budget, so the age branch genuinely fires once the session pool
-        // is empty (mirrors the review's Probe E2 fixture exactly).
         m.started_ts = Some(now_unix().saturating_sub(90 * 60));
         darkmux_crew::lifecycle::save_mission(&m).unwrap();
-
-        // Two DIFFERENT missions' records under the SAME session_id, both
-        // fresh (the review's "emitted AT THE CURRENT SECOND") — live work
-        // by the clock, but not ATTRIBUTABLE to `m` once ambiguity is
-        // refused.
-        let now_iso = format!("{}T00:00:00Z", today());
+        let at = |ago: u64| darkmux_flow::ts_utc_at(now_unix().saturating_sub(ago) as i64);
         write_day_file(
             flows.path(),
             &today(),
             &[
-                serde_json::json!({
-                    "ts": now_iso,
-                    "action": "step start",
-                    "session_id": "task-shared",
-                    "mission_id": "m-ambiguous-e2e",
-                    "source": "scheduler",
-                }),
-                serde_json::json!({
-                    "ts": now_iso,
-                    "action": "step start",
-                    "session_id": "task-shared",
-                    "mission_id": "some-other-mission",
-                    "source": "scheduler",
-                }),
+                serde_json::json!({ "ts": at(m_ago), "action": "step start", "session_id": "task-shared", "mission_id": "m-ambiguous-e2e", "source": "scheduler" }),
+                serde_json::json!({ "ts": at(other_ago), "action": "step start", "session_id": "task-shared", "mission_id": "some-other-mission", "source": "scheduler" }),
             ],
         );
-
         let status = local_dispatch_status(std::slice::from_ref(&m), flows.path(), &[]);
-        let (verdict, evidence) =
-            status.get(&m.id).copied().unwrap_or_else(|| panic!("no entry for {}", m.id));
-        assert_eq!(verdict, RunStatus::Abandoned, "unchanged by this fix — #1918 territory");
+        let (verdict, evidence) = status.get(&m.id).copied().unwrap_or_else(|| panic!("no entry for {}", m.id));
+        let runs = build_runs(flows.path(), None, &[]);
+        let row = runs.iter().find(|r| r.id == m.id).unwrap_or_else(|| panic!("no row for {}: {runs:?}", m.id));
+        (verdict, evidence, row.status)
+    }
+
+    /// `m`'s own step started this second; the other mission went quiet an
+    /// hour and a half ago. `m` is running.
+    #[test]
+    #[serial_test::serial]
+    fn local_dispatch_status_reads_a_shared_session_by_the_missions_own_attempts() {
+        let _g = CrewGuard::new();
+        // A 60s knob is a 120s staleness budget, whatever the environment
+        // exports.
+        let _budget = InactivityBudgetGuard::seconds(60);
+        let (verdict, evidence, row) = shared_session_verdicts(0, 90 * 60);
+        assert_eq!(verdict, RunStatus::Running, "m's own step started this second on the shared session");
+        assert_eq!(evidence, None, "a live mission names no abandonment evidence");
+        assert_eq!(row, verdict, "/runs disagreed with local_dispatch_status");
+    }
+
+    /// The borrowed case: `m`'s step went quiet an hour and a half ago while
+    /// the other mission's started this second. The other mission's activity
+    /// is not `m`'s: it reads Abandoned, on both surfaces.
+    #[test]
+    #[serial_test::serial]
+    fn a_shared_session_never_lends_another_missions_activity() {
+        let _g = CrewGuard::new();
+        let _budget = InactivityBudgetGuard::seconds(60);
+        let (verdict, evidence, row) = shared_session_verdicts(90 * 60, 0);
+        assert_eq!(verdict, RunStatus::Abandoned, "m went quiet; the other mission's fresh step is not its activity");
+        assert_eq!(evidence, Some(DispatchSessionEvidence::StaleNoTerminal));
+        assert_eq!(row, RunStatus::Abandoned, "/runs must not borrow the other mission's activity either");
+    }
+
+    /// A fleet-only mission (no mission record here, `flow_mission_to_run`)
+    /// whose one session recorded its end a minute ago: a terminal always
+    /// wins over liveness, so the row reads ended, as `mission status` and
+    /// the viewer read it, not Running for the next 20 minutes.
+    #[test]
+    #[serial_test::serial]
+    fn a_flow_mission_row_whose_session_recorded_its_end_reads_ended() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let now = now_unix();
+        let at = |secs_ago: u64| darkmux_flow::ts_utc_at(now.saturating_sub(secs_ago) as i64);
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({ "ts": at(300), "action": "dispatch start", "session_id": "fleet-ended", "mission_id": "fleet-only", "handle": "coder" }),
+                serde_json::json!({ "ts": at(60), "action": "session.end", "session_id": "fleet-ended", "mission_id": "fleet-only" }),
+            ],
+        );
+        let runs = build_runs(flows.path(), None, &[]);
+        let row = runs.iter().find(|r| r.id == "fleet-only").unwrap_or_else(|| panic!("no row: {runs:?}"));
+        assert_eq!(row.status, RunStatus::Abandoned, "its session recorded its end a minute ago: {row:?}");
+    }
+
+    /// A session shared by two missions the mission store does not know
+    /// (rows built from the flow stream, `flow_mission_to_run`): each row
+    /// reads its OWN mission's attempt on the session, never the other's.
+    #[test]
+    #[serial_test::serial]
+    fn a_flow_mission_row_reads_its_own_attempt_on_a_shared_session() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let now = now_unix();
+        let at = |secs_ago: u64| darkmux_flow::ts_utc_at(now.saturating_sub(secs_ago) as i64);
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({ "ts": at(3600), "action": "dispatch start", "session_id": "task-shared-ghost", "mission_id": "ghost-a", "handle": "coder" }),
+                serde_json::json!({ "ts": at(20), "action": "dispatch start", "session_id": "task-shared-ghost", "mission_id": "ghost-b", "handle": "coder" }),
+                serde_json::json!({ "ts": at(5), "action": "dispatch turn", "session_id": "task-shared-ghost", "mission_id": "ghost-b" }),
+            ],
+        );
+        let runs = build_runs(flows.path(), None, &[]);
+        let row = |id: &str| runs.iter().find(|r| r.id == id).unwrap_or_else(|| panic!("no row for {id}: {runs:?}")).clone();
+        assert_eq!(row("ghost-b").status, RunStatus::Running, "ghost-b is mid-turn on the shared session");
         assert_eq!(
-            evidence,
-            Some(DispatchSessionEvidence::NoAttributableSession),
-            "an ambiguous, freshly-active session must never read as a STALE one — there is no \
-             attributable session here at all"
+            row("ghost-a").status,
+            RunStatus::Abandoned,
+            "ghost-a went silent an hour ago: ghost-b's turn on the shared session is not its activity"
         );
     }
 
@@ -4755,6 +4632,103 @@ mod tests {
         assert_eq!(stale_after_ms(), 600 * 2_000, "a 20-minute staleness window by default");
     }
 
+    // ── the lifecycle corpus: one spec, two executors ────────────────────
+
+    /// What the daemon states about one corpus case's session as of `now_ms`
+    /// — `(phase, status, abandoned_reason)`, in the corpus's vocabulary —
+    /// read exactly as `/runs` reads it: the settled session's current
+    /// attempt. The daemon has no `waiting` phase of its own (a held call is
+    /// `Running`), so `open` and `waiting` both read `running` here.
+    fn daemon_judgement(agg: &SessionAgg, opened: bool, now_ms: u64) -> (&'static str, RunStatus, Option<AbandonReason>) {
+        let ended = agg.terminal_status.map(|status| {
+            let reason = (status == RunStatus::Abandoned)
+                .then_some(if agg.stopped_by_operator { AbandonReason::Aborted } else { AbandonReason::NoTerminal });
+            (status, reason)
+        });
+        // Nothing opened: not a run, though its session may have recorded
+        // its end (`RunFold::recorded_end`).
+        if !opened {
+            let (status, reason) = ended.unwrap_or((RunStatus::Planned, None));
+            return ("not_started", status, reason);
+        }
+        if let Some((status, reason)) = ended {
+            return ("closed", status, reason);
+        }
+        if session_is_live(agg, now_ms) {
+            return ("running", RunStatus::Running, None);
+        }
+        ("stale", RunStatus::Abandoned, Some(AbandonReason::NoTerminal))
+    }
+
+    /// `tests/lifecycle/cases.json`, asserted against the daemon's session
+    /// fold (`run_lifecycle.rs`) and [`session_is_live`]: the same file the
+    /// viewer's `lifecycle.corpus.test.ts` asserts against `lifecycleAt`. A
+    /// case naming its run's mission reads the session as that mission does
+    /// ([`SessionAgg::for_mission`]).
+    /// Each case's records up to its instant (an unparsable `ts` is always
+    /// in) are folded as `/runs` folds a day file; a case the daemon cannot
+    /// judge names why (`server_skip_reason`); every other case must agree,
+    /// and the corpus's policy must be the one `/runs` publishes at the
+    /// shipped default.
+    #[test]
+    #[serial_test::serial]
+    fn lifecycle_corpus() {
+        let _default = InactivityBudgetGuard::unset();
+        let doc: serde_json::Value = serde_json::from_str(include_str!("../../../tests/lifecycle/cases.json")).expect("the corpus parses");
+        let policy = runs_policy();
+        assert_eq!(doc["policy"]["stale_after_ms"].as_u64(), Some(policy.stale_after_ms), "the corpus is judged at the published policy");
+        assert_eq!(doc["policy"]["budget_wait_grace_ms"].as_u64(), Some(policy.budget_wait_grace_ms));
+        let mut judged = 0;
+        for case in doc["cases"].as_array().expect("cases") {
+            let name = case["name"].as_str().unwrap_or("?");
+            if case.get("server").and_then(|v| v.as_bool()) == Some(false) {
+                assert!(case["server_skip_reason"].as_str().is_some_and(|r| !r.is_empty()), "{name}: a skipped case says why");
+                continue;
+            }
+            let now_s = parse_flow_ts(case["as_of"].as_str().expect("as_of")).expect("as_of parses");
+            let mut idx: HashMap<String, SessionAgg> = HashMap::new();
+            for r in case["records"].as_array().expect("records") {
+                let ts = r["ts"].as_str().and_then(parse_flow_ts);
+                if ts.is_none_or(|t| t <= now_s) {
+                    fold_session_record(&mut idx, r);
+                }
+            }
+            settle_session_index(&mut idx);
+            let sid = case["run"]["session_id"].as_str().or(case["records"][0]["session_id"].as_str()).expect("session_id");
+            let Some(agg) = idx.get(sid) else {
+                assert_eq!(case["phase"], "not_started", "{name}: no record of the session is in yet");
+                judged += 1;
+                continue;
+            };
+            // A case naming its run's mission is judged as `/runs` judges
+            // that mission's row: by its own attempts on the session.
+            let scoped = case["run"]["mission_id"].as_str().map(|m| agg.for_mission(m));
+            let (phase, status, reason) = match &scoped {
+                Some(None) => ("not_started", RunStatus::Planned, None),
+                Some(Some(mine)) => daemon_judgement(mine, mine.lifecycle.latest_of(case["run"]["mission_id"].as_str().unwrap_or_default()).is_some(), now_s * 1_000),
+                None => daemon_judgement(agg, agg.lifecycle.latest().is_some(), now_s * 1_000),
+            };
+            let want_phase = match case["phase"].as_str().expect("phase") {
+                "open" | "waiting" => "running",
+                other => other,
+            };
+            assert_eq!(phase, want_phase, "{name}: phase");
+            assert_eq!(serde_json::to_value(status).unwrap(), case["status"], "{name}: status");
+            assert_eq!(reason.map(|r| serde_json::to_value(r).unwrap()), case.get("abandoned_reason").cloned(), "{name}: abandoned_reason");
+            judged += 1;
+        }
+        assert!(judged >= 30, "the daemon judges the corpus, not a token few ({judged})");
+    }
+
+    /// The policy `/runs` publishes follows the daemon's own config, the
+    /// same knob every staleness decision above reads.
+    #[test]
+    #[serial_test::serial]
+    fn the_published_policy_follows_the_inactivity_budget() {
+        let _budget = InactivityBudgetGuard::seconds(60);
+        assert_eq!(runs_policy(), RunsPolicy { stale_after_ms: 120_000, budget_wait_grace_ms: 60_000 });
+    }
+
     // ── earliest_by_start: pairs, not bare aggs (#1915) ──────────────────
 
     /// The core claim the #1915 fix rests on: the returned id genuinely
@@ -4938,12 +4912,11 @@ mod tests {
     /// 60s TTL can still let one through — the "benign edge" noted on
     /// `remove_presence_key`'s own doc) — so the schema decision not to
     /// bump `FLOW_SCHEMA_VERSION` over #2344 rests on this: even when both
-    /// records exist for the same session, `terminal_status_for_action`'s
-    /// "keep the FIRST terminal seen" (file/write order, not a timestamp
-    /// sort) already resolves to the dispatch's own terminal, because
-    /// `session.end` can only ever be written AFTER the reconciler notices
-    /// the presence key gone — strictly later than the terminal that caused
-    /// its removal.
+    /// records exist for the same session, the attempt's outcome is its
+    /// dispatch terminal whenever it has one (`run_lifecycle.rs`, rule 3),
+    /// whichever closing record came first — and `session.end` is only ever
+    /// written AFTER the reconciler notices the presence key gone, strictly
+    /// later than the terminal that caused its removal.
     #[test]
     fn build_flow_session_index_dispatch_error_wins_over_a_later_redundant_session_end() {
         let tmp = TempDir::new().unwrap();
@@ -5304,6 +5277,30 @@ mod tests {
         );
         let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), now_unix() * 1_000);
         assert!(ghosts.is_empty());
+    }
+
+    /// (#2902 step 5) A hosted call held by its budget writes its wait
+    /// before any bookend: its session is a run, running while it waits
+    /// (a long wait outlasts the staleness window), and a wait the operator
+    /// stopped reads aborted.
+    #[test]
+    fn ghost_runs_a_budget_held_call_is_a_run_before_its_start() {
+        let base_ts = "2000-01-01T00:00:00Z";
+        let base_ms = parse_flow_ts(base_ts).unwrap() * 1_000;
+        let wait = serde_json::json!({ "ts": base_ts, "action": "budget.wait", "session_id": "held", "payload": { "wait_seconds": 86_000 } });
+        let mut idx = HashMap::new();
+        fold_session_record(&mut idx, &wait);
+        settle_session_index(&mut idx);
+        let held = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), base_ms + 3 * 3_600_000);
+        assert_eq!(held.len(), 1, "a waiting session with no start yet is a run");
+        assert_eq!(held[0].status, RunStatus::Running, "running while it waits, hours past the staleness window");
+
+        let stop = serde_json::json!({ "ts": "2000-01-01T04:00:00Z", "action": "budget.stop", "session_id": "held", "payload": { "reason": "mission `m` is aborted" } });
+        fold_session_record(&mut idx, &stop);
+        settle_session_index(&mut idx);
+        let stopped = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), base_ms + 5 * 3_600_000);
+        assert_eq!(stopped[0].status, RunStatus::Abandoned);
+        assert_eq!(stopped[0].abandoned_reason, Some(AbandonReason::Aborted));
     }
 
     // ── ghost_runs: the staleness gate (#1642, #1633) ───────────────────
@@ -7852,7 +7849,7 @@ mod tests {
     /// exists only when this daemon can see the run directory.
     fn untracked_cell_is_reachable(kind: RunKind, status: RunStatus) -> bool {
         match (kind, status) {
-            // `ghost_runs`: `terminal_status_for_action` yields Complete
+            // `ghost_runs`: `run_lifecycle.rs`'s `ending_of` yields Complete
             // (`dispatch complete`), Error (`dispatch error`) and
             // Abandoned (`session.end`); the staleness gate yields Running
             // or Abandoned.
@@ -8216,5 +8213,30 @@ mod tests {
         assert_eq!(summary.lifecycle_started_at_ms, None, "this test's own premise");
         let run = lab_summary_to_run(&summary, None, FIXTURE_NOW_MS, None);
         assert_eq!(run.started_ts, None, "no record, no claim");
+    }
+
+    /// (4.0) `/runs` over a pre-4.0 day file (spaced bookends) indexes the
+    /// same completed session as its dotted twin: the fold reads through
+    /// `darkmux_flow::reader`, so no consumer sees the old spelling.
+    #[test]
+    fn a_spaced_archive_indexes_like_its_dotted_twin() {
+        let day = |start: &str, complete: &str| {
+            format!(
+                "{{\"ts\":\"2026-05-14T09:00:00Z\",\"action\":\"{start}\",\"session_id\":\"S1\",\"mission_id\":\"m1\"}}\n\
+                 {{\"ts\":\"2026-05-14T09:00:05Z\",\"action\":\"{complete}\",\"session_id\":\"S1\",\"mission_id\":\"m1\"}}\n"
+            )
+        };
+        let window = ScanWindow { cutoff_date: "2026-05-01".to_string(), since_iso: None };
+        let index = |start: &str, complete: &str| {
+            let tmp = tempfile::TempDir::new().unwrap();
+            std::fs::write(tmp.path().join("2026-05-14.jsonl"), day(start, complete)).unwrap();
+            let idx = build_flow_session_index_in(tmp.path(), &[], &window, None);
+            let s1 = idx.get("S1").expect("S1 indexed");
+            (s1.has_start, s1.terminal_status, s1.start_ts.clone(), s1.terminal_ts.clone())
+        };
+        let spaced = index("dispatch start", "dispatch complete");
+        assert_eq!(spaced, index("dispatch.start", "dispatch.complete"));
+        assert_eq!(spaced.1, Some(RunStatus::Complete));
+        assert!(spaced.0, "the spaced start opens the session");
     }
 }

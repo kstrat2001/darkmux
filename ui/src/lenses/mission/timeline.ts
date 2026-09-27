@@ -6,7 +6,7 @@
  * this module owns none of the DOM.
  */
 import type { GraphEdge, GraphNode, MetricsMap, StepMeter } from "./graph";
-import { isAiKind, stepDisplayMetrics, stepEndMs, stepMeterFor, stepStartMs } from "./graph";
+import { NO_STEP_PHASES, isAiKind, stepDisplayMetrics, stepEndMs, stepMeterFor, stepStartMs, type StepPhases } from "./graph";
 
 /** (#1404) The renderer breakpoint — kept `<= 700` to match the CSS
  * `@media (max-width:700px)` (inclusive at exactly 700px). */
@@ -74,7 +74,7 @@ export interface TaskAggMetrics {
 
 /** `taskAggMetrics` — mission-graph.html. Aggregate a task's step metrics
  * for the collapsed task-card summary. */
-export function taskAggMetrics(task: GraphNode, metrics: MetricsMap, now: number): TaskAggMetrics {
+export function taskAggMetrics(task: GraphNode, metrics: MetricsMap, now: number, phases: StepPhases = NO_STEP_PHASES): TaskAggMetrics {
   let tokens = 0,
     turns = 0,
     generating = false,
@@ -96,7 +96,7 @@ export function taskAggMetrics(task: GraphNode, metrics: MetricsMap, now: number
     // and a running clock. One fact, two looks, which is exactly what the
     // shared-indicator doctrine exists to prevent. Reuse the ONE
     // derivation; do not re-derive a second, weaker one here.
-    if (stepMeterFor(s, metrics, now).generating) generating = true;
+    if (stepMeterFor(s, metrics, now, phases).generating) generating = true;
     // (#2269) EVERY started step contributes to the task's duration — the
     // old code read the start only off RUNNING steps, so a sequential
     // task's timer restarted with each step and disappeared at the end.
@@ -140,7 +140,7 @@ export interface TimelinePhase {
  * per-step metric shaping (`stepMeterFor`) is folded in here so the view
  * component stays a pure renderer. A freeform mission with tasks but no
  * phase nodes gets one implicit "tasks" section, matching legacy. */
-export function groupTimeline(nodes: GraphNode[], edges: GraphEdge[], metrics: MetricsMap, now: number): TimelinePhase[] {
+export function groupTimeline(nodes: GraphNode[], edges: GraphEdge[], metrics: MetricsMap, now: number, stepPhases: StepPhases = NO_STEP_PHASES): TimelinePhase[] {
   const nodeLabel: Record<string, string> = {};
   const nodeStatus: Record<string, string> = {};
   for (const n of nodes) {
@@ -188,8 +188,8 @@ export function groupTimeline(nodes: GraphNode[], edges: GraphEdge[], metrics: M
       tasks: tasks.map((task) => ({
         task,
         waitsOn: waitsOn[task.id] || [],
-        agg: taskAggMetrics(task, metrics, now),
-        steps: (task.steps || []).map((step) => ({ step, meter: stepMeterFor(step, metrics, now) })),
+        agg: taskAggMetrics(task, metrics, now, stepPhases),
+        steps: (task.steps || []).map((step) => ({ step, meter: stepMeterFor(step, metrics, now, stepPhases) })),
       })),
     };
   });

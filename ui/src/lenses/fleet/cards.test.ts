@@ -1,15 +1,18 @@
 import { describe, it, expect } from "vitest";
 import { machActive, specOf, buildFleetCard, busiestExecution, isStrictlyBusier, rosterOnlyEntries, rosterAliasFor, specUnknownLabel, cardFace } from "./cards";
-import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
+import type { MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
 import type { ExecutionTokenReading } from "../../lib/tokenRate";
+import { norm, type RawRecord } from "../../testing/records";
 import type { Run } from "../../types/generated/Run";
+import type { NormRecord } from "../../lib/ingest";
+import { liveSampleToRecord, type LiveOverlay } from "../../lib/liveChannel";
 
 function run(overrides: Partial<Run> & Pick<Run, "id" | "kind" | "status">): Run {
   return { tracked: true, ...overrides };
 }
 
-function rec(overrides: Partial<FlowRecord>): FlowRecord {
-  return { ts: "2026-08-08T00:00:00.000Z", ...overrides };
+function rec(overrides: RawRecord): NormRecord {
+  return norm({ ts: "2026-08-08T00:00:00.000Z", ...overrides });
 }
 
 function beat(overrides: Partial<PresenceBeat>): PresenceBeat {
@@ -46,7 +49,7 @@ describe("machActive", () => {
   // `budget.wait` BEFORE any `dispatch start`: the machine is in flight
   // while the wait is open, live or in playback, with or without presence.
   it("is true for a machine whose only session is an open budget wait (no dispatch start yet)", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ ts: "2026-08-08T20:00:00.000Z", machine_uid: "m1", session_id: "s1", action: "budget.wait", payload: { endpoint_id: "azure", wait_seconds: 86_000 } }),
     ];
     expect(machActive(data, new Set(), "m1", T_MAX)).toBe(true);
@@ -56,17 +59,17 @@ describe("machActive", () => {
   });
 
   it("is true when a dispatch.start on the machine belongs to a live session", () => {
-    const data: FlowRecord[] = [rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start" })];
+    const data: NormRecord[] = [rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start" })];
     expect(machActive(data, new Set(["s1"]), "m1", T_MAX)).toBe(true);
   });
 
   it("is false when the session isn't in the live set", () => {
-    const data: FlowRecord[] = [rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start" })];
+    const data: NormRecord[] = [rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start" })];
     expect(machActive(data, new Set(), "m1", T_MAX)).toBe(false);
   });
 
   it("is false for a different machine's live session", () => {
-    const data: FlowRecord[] = [rec({ machine_uid: "m2", session_id: "s1", action: "dispatch.start" })];
+    const data: NormRecord[] = [rec({ machine_uid: "m2", session_id: "s1", action: "dispatch.start" })];
     expect(machActive(data, new Set(["s1"]), "m1", T_MAX)).toBe(false);
   });
 
@@ -74,7 +77,7 @@ describe("machActive", () => {
   // set is empty on a replay by construction, so a presence-keyed check would
   // report every recorded day as idle whether or not it was.
   it("replay: a session closed at or before the playhead is NOT active", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start" }),
       rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.complete" }),
     ];
@@ -86,12 +89,12 @@ describe("machActive", () => {
   // -> still active. Without this, a `machActive` hardwired to `false` in
   // replay would pass the test above and look correct. (Playback parity,
   // Change A, finding #7) The start record is now placed just before `T_MAX`
-  // — inside `FLOW_LIVE_TTL_MS` — rather than relying on the fixture's
-  // far-past default `ts`: `sessionRunning` no longer reads "no close edge"
-  // alone as running forever; see the orphan case below and
-  // `flow.sessionRunning.parity.test.ts` for the regression this guards.
+  // — inside the staleness window — rather than relying on the fixture's
+  // far-past default `ts`: the lifecycle never reads "no close edge" alone
+  // as running forever; see the orphan case below and
+  // `tests/lifecycle/cases.json` for the regression this guards.
   it("replay: a session with NO close-edge IS active, on the same empty live set", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start", ts: new Date(T_MAX - 60_000).toISOString() }),
     ];
     expect(machActive(data, new Set(), "m1", T_MAX)).toBe(true);
@@ -99,19 +102,19 @@ describe("machActive", () => {
 
   // (Playback parity, Change A, finding #7) The case the OLD replay
   // algorithm could not express at all: no close edge, but stale well past
-  // `FLOW_LIVE_TTL_MS` as of the playhead — an orphaned session the
+  // the staleness window as of the playhead — an orphaned session the
   // container's own watchdog would already have killed. The old "no close
   // edge => active" rule read this as running forever.
   it("replay: a session with NO close-edge but stale past the TTL is NOT active", () => {
-    const data: FlowRecord[] = [rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start" })];
+    const data: NormRecord[] = [rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start" })];
     expect(machActive(data, new Set(), "m1", T_MAX)).toBe(false);
   });
 
-  // `session.end` alone closes a session (`sessionCloseEdge`) — an abandoned
+  // `session.end` alone closes a session (`lib/lifecycle.ts`) — an abandoned
   // or hard-killed dispatch never emits `dispatch.complete`, and reading only
   // the dispatch terminal drew such a machine active forever.
   it("replay: session.end alone closes it, with no dispatch terminal at all", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start" }),
       rec({ machine_uid: "m1", session_id: "s1", action: "session.end" }),
     ];
@@ -123,12 +126,11 @@ describe("machActive", () => {
   // `visible()` gate (`machActive(m){return visible().some(...)}`), which
   // this port had dropped as an unconditional no-op. A scrubbable playhead
   // makes it a real case: a session that hasn't started yet as of the
-  // playhead must not read "in flight", even though `sessionRunning`'s
-  // close-edge check (finding no close, because there's nothing to close
-  // yet) would otherwise call it running.
+  // playhead must not read "in flight": its lifecycle reads `not_started`
+  // there.
   it("replay: a session that hasn't started yet as of the playhead is NOT active", () => {
     const playhead = Date.parse("2026-08-08T00:00:00.000Z"); // before the fixture's own default ts
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start", ts: "2026-08-08T00:05:00.000Z" }),
     ];
     expect(machActive(data, new Set(), "m1", playhead)).toBe(false);
@@ -152,7 +154,7 @@ describe("specOf", () => {
   };
 
   it("prefers the live /machine/specs probe for THIS machine", () => {
-    const data: FlowRecord[] = [rec({ machine_uid: "u1", machine_id: "MacBook-Pro" })];
+    const data: NormRecord[] = [rec({ machine_uid: "u1", machine_id: "MacBook-Pro" })];
     expect(specOf(data, new Map(), specs, "u1")).toBe("Apple M5 Max · 128 GB");
   });
 
@@ -162,7 +164,7 @@ describe("specOf", () => {
     // started. `nameOf` answers with the first alias it finds; specs reports
     // the current one. Comparing those two directly made the machine fail to
     // recognize its own hardware and render "hardware not reported".
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ machine_uid: "u1", machine_id: "MacBook-Pro.local" }),
       rec({ machine_uid: "u1", machine_id: "MacBook-Pro" }),
     ];
@@ -173,25 +175,25 @@ describe("specOf", () => {
     // The inverted case: a genuinely remote machine must keep falling through
     // to its own presence beat, or the fix would credit every card with the
     // local host's CPU and RAM.
-    const data: FlowRecord[] = [rec({ machine_uid: "u2", machine_id: "studio" })];
+    const data: NormRecord[] = [rec({ machine_uid: "u2", machine_id: "studio" })];
     const live = new Map([["u2", beat({ machine_uid: "u2", display_name: "studio", specs: "M1 Max · 32 GB" })]]);
     expect(specOf(data, live, specs, "u2")).toBe("M1 Max · 32 GB");
   });
 
   it("falls back to the presence beat's own spec string for a remote machine", () => {
-    const data: FlowRecord[] = [rec({ machine_uid: "u2", machine_id: "studio" })];
+    const data: NormRecord[] = [rec({ machine_uid: "u2", machine_id: "studio" })];
     const live = new Map([["u2", beat({ machine_uid: "u2", display_name: "studio", specs: "M1 Max · 32 GB" })]]);
     expect(specOf(data, live, specs, "u2")).toBe("M1 Max · 32 GB");
   });
 
   it("returns '' (renders the specdim fallback) for a remote machine with no reported hardware", () => {
-    const data: FlowRecord[] = [rec({ machine_uid: "u2", machine_id: "studio" })];
+    const data: NormRecord[] = [rec({ machine_uid: "u2", machine_id: "studio" })];
     const live = new Map([["u2", beat({ machine_uid: "u2", display_name: "studio" })]]);
     expect(specOf(data, live, specs, "u2")).toBe("");
   });
 
   it("the unknown bucket names any claimed-but-unverified machine_ids", () => {
-    const data: FlowRecord[] = [rec({ machine_id: "someones-laptop" })]; // no machine_uid -> uidOf() = "unknown"
+    const data: NormRecord[] = [rec({ machine_id: "someones-laptop" })]; // no machine_uid -> uidOf() = "unknown"
     expect(specOf(data, new Map(), null, "unknown")).toBe("unverified · claimed: someones-laptop");
   });
 
@@ -220,7 +222,7 @@ describe("specOf", () => {
     // only the old name survives in the window, so the alias set holds
     // `laptop` and specs reports `MacBook-Pro` — the name join misses, the
     // uid join cannot.
-    const data: FlowRecord[] = [rec({ machine_uid: "00000000-0000-4000-8000-ABCDEF000011", machine_id: "laptop" })];
+    const data: NormRecord[] = [rec({ machine_uid: "00000000-0000-4000-8000-ABCDEF000011", machine_id: "laptop" })];
     expect(specOf(data, new Map(), specsWithUid, "00000000-0000-4000-8000-ABCDEF000011")).toBe("Apple M5 Max · 128 GB");
   });
 
@@ -228,7 +230,7 @@ describe("specOf", () => {
     // The inverted case. A remote peer that happens to log under the same
     // NAME this daemon reports would pass the old alias join; it must not
     // pass the uid join.
-    const data: FlowRecord[] = [rec({ machine_uid: "u2", machine_id: "MacBook-Pro" })];
+    const data: NormRecord[] = [rec({ machine_uid: "u2", machine_id: "MacBook-Pro" })];
     const live = new Map([["u2", beat({ machine_uid: "u2", display_name: "MacBook-Pro", specs: "M1 Max · 32 GB" })]]);
     expect(specOf(data, live, specsWithUid, "u2")).toBe("M1 Max · 32 GB");
   });
@@ -237,20 +239,32 @@ describe("specOf", () => {
     // Non-macOS, a failed `ioreg`, or a peer/static fixture built before the
     // field existed. Absence degrades to the pre-#2814 behavior; it never
     // means "not this machine".
-    const data: FlowRecord[] = [rec({ machine_uid: "u1", machine_id: "MacBook-Pro" })];
+    const data: NormRecord[] = [rec({ machine_uid: "u1", machine_id: "MacBook-Pro" })];
     expect(specOf(data, new Map(), specs, "u1")).toBe("Apple M5 Max · 128 GB");
+  });
+});
+
+describe("runningRuns: bookkeeping is not a run", () => {
+  // A mission's own lifecycle session (`mission.start`, no close yet) and a
+  // scheduler task session are open lifecycles, but no model work: the card
+  // counts runs, not bookkeeping.
+  it("an open mission lifecycle session alone reads idle", () => {
+    const data: NormRecord[] = [rec({ machine_uid: "u1", session_id: "mission-m1", mission_id: "m1", action: "mission.start" })];
+    const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", true, Date.parse("2026-08-08T00:01:00.000Z"));
+    expect(card.runsCount).toBe(0);
+    expect(card.stat).toBe("idle");
   });
 });
 
 describe("buildFleetCard", () => {
   it("an absent machine reads 'offline' regardless of activity", () => {
-    const data: FlowRecord[] = [rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" })];
+    const data: NormRecord[] = [rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" })];
     const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), /* machAbsent */ true, "u1", true, T_MAX);
     expect(card.stat).toBe("offline");
   });
 
   it("a present machine with a live dispatch reads 'dispatch in flight'", () => {
-    const data: FlowRecord[] = [rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" })];
+    const data: NormRecord[] = [rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" })];
     const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX);
     expect(card.stat).toBe("dispatch in flight");
     expect(card.runsCount).toBe(1);
@@ -258,7 +272,7 @@ describe("buildFleetCard", () => {
   });
 
   it("a present machine with no live dispatch reads 'idle', even with completed history", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
       rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.complete" }),
     ];
@@ -279,7 +293,7 @@ describe("buildFleetCard", () => {
   // reads "0 running" — the same word and the same count a live viewer would
   // have seen at that instant, because nothing is actually running any more.
   it("replay: two finished sessions read '0 running', not '2 specialists'", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
       rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.complete" }),
       rec({ machine_uid: "u1", session_id: "s2", action: "dispatch.start" }),
@@ -296,7 +310,7 @@ describe("buildFleetCard", () => {
   // Change A's whole point is that they must NOT disagree at the same
   // instant — this is the parity check that replaces it.
   it("live and replay AGREE on the same closed-out day, probed at its end (parity)", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
       rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.complete" }),
     ];
@@ -310,7 +324,7 @@ describe("buildFleetCard", () => {
   // card's grain — one mission dispatching one seat must read "1 running",
   // not "2 running".
   it("(#2060) a mission's own session collapses with its seat/step session into ONE running run", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ machine_uid: "u1", session_id: "mission-1", mission_id: "mission-1", action: "dispatch.start" }),
       rec({ machine_uid: "u1", session_id: "seat-1", mission_id: "mission-1", action: "dispatch.start" }),
     ];
@@ -323,14 +337,14 @@ describe("buildFleetCard", () => {
   });
 
   // (#2060 review) The INVERTED order, and the only case that actually pins
-  // the `|| isTopLevel` half of the drill-in preference. `sessionsOn`
-  // preserves record order, so when the SEAT's record comes first the
+  // the "prefer the mission's own session" half of the drill-in preference.
+  // The run index preserves record order, so when the SEAT's record comes first the
   // mission's own session arrives with a representative already recorded —
   // `!existing` alone would keep the seat and drill-in would land on it.
   // With the mission-first fixture above, `!existing` picks the mission
   // regardless, so that test passes with the preference deleted.
   it("(#2060) the mission's own session wins the drill-in even when a seat's record comes FIRST", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ machine_uid: "u1", session_id: "seat-1", mission_id: "mission-1", action: "dispatch.start" }),
       rec({ machine_uid: "u1", session_id: "mission-1", mission_id: "mission-1", action: "dispatch.start" }),
     ];
@@ -342,7 +356,7 @@ describe("buildFleetCard", () => {
   // (#2060) A concurrent STANDALONE dispatch (no `mission_id`) is genuinely
   // separate activity and must still count on its own alongside the mission.
   it("(#2060) a standalone dispatch beside a running mission still counts as a second run", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ machine_uid: "u1", session_id: "mission-1", mission_id: "mission-1", action: "dispatch.start" }),
       rec({ machine_uid: "u1", session_id: "seat-1", mission_id: "mission-1", action: "dispatch.start" }),
       rec({ machine_uid: "u1", session_id: "solo-1", action: "dispatch.start" }),
@@ -355,7 +369,7 @@ describe("buildFleetCard", () => {
   // count as two runs — the collapse is per-mission, not "any mission_id
   // present collapses everything".
   it("(#2060) two different missions' seats never collapse into each other", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ machine_uid: "u1", session_id: "mission-1", mission_id: "mission-1", action: "dispatch.start" }),
       rec({ machine_uid: "u1", session_id: "mission-2", mission_id: "mission-2", action: "dispatch.start" }),
     ];
@@ -374,7 +388,7 @@ describe("buildFleetCard", () => {
     const BEAT2 = T_MAX;
 
     it("is null while idle, even with completed heartbeat history", () => {
-      const data: FlowRecord[] = [
+      const data: NormRecord[] = [
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 120 } }),
@@ -386,7 +400,7 @@ describe("buildFleetCard", () => {
     });
 
     it("a running session with fewer than two heartbeats mounts the scope at 0, not no scope", () => {
-      const data: FlowRecord[] = [
+      const data: NormRecord[] = [
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 40 } }),
       ];
@@ -398,8 +412,36 @@ describe("buildFleetCard", () => {
       expect(card.liveTokState).toBe("generating");
     });
 
+    // The playhead cut (`buildFleetCardBase`'s durable sets, `withLiveReadings`'
+    // live overlay): a heartbeat stamped AFTER the playhead must not reach
+    // the card. The rate readers cut again inside, so the reading that can
+    // tell is the half-open check, which reads the sets' latest heartbeat
+    // directly: a silent run at the playhead reads STALLED, and a leaked
+    // future heartbeat would make it read "cannot say" instead.
+    const iso = (ms: number) => new Date(ms).toISOString();
+    const SILENT_FROM = T_MAX - 60_000;
+    const silentRun = (): NormRecord[] => [
+      rec({ ts: iso(SILENT_FROM - 3_000), machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
+      rec({ ts: iso(SILENT_FROM - 2_000), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: SILENT_FROM - 2_000, generated_chars: 40 } }),
+      rec({ ts: iso(SILENT_FROM), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: SILENT_FROM, generated_chars: 120 } }),
+    ];
+    const futureBeat = { sampled_at_ms: T_MAX + 10_000, generated_chars: 4_120 };
+
+    it("reads AS OF the playhead: a durable heartbeat stamped after it does not reach the card", () => {
+      const data = [...silentRun(), rec({ ts: iso(T_MAX + 10_000), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: futureBeat })];
+      const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX, undefined, [], true, T_MAX);
+      expect(card.liveTokState).toBe("stalled");
+    });
+
+    it("reads a live sample AS OF the playhead too: one stamped after it does not reach the card", () => {
+      const future = liveSampleToRecord({ v: 1, kind: "model", at_ms: T_MAX + 10_000, session_id: "s1", role: "coder", fields: { turn_seq: 1, generated_chars: 4_120 } });
+      const live: LiveOverlay = { version: 1, bySession: new Map([["s1", [future!]]]), utility: [] };
+      const card = buildFleetCard(silentRun(), new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX, undefined, [], true, T_MAX, [], live);
+      expect(card.liveTokState).toBe("stalled");
+    });
+
     it("is a positive number once a running session has two FRESH heartbeats to derive Δchars/Δms from", () => {
-      const data: FlowRecord[] = [
+      const data: NormRecord[] = [
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 120 } }),
@@ -415,7 +457,7 @@ describe("buildFleetCard", () => {
     // heartbeat AFTER the index is built (a deliberate break of the
     // never-mutated-after-read contract): the index cannot see it, a scan can.
     it("reads a running session's heartbeats through the window's session index", () => {
-      const data: FlowRecord[] = [
+      const data: NormRecord[] = [
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
       ];
@@ -432,7 +474,7 @@ describe("buildFleetCard", () => {
       const t1a = T_MAX - 22_000;
       const t1b = T_MAX - 20_000;
       const t1c = T_MAX - 18_000;
-      const data: FlowRecord[] = [
+      const data: NormRecord[] = [
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
         // Turn 1 opens at 0 (every turn does — #2886 pass 4 finding 2), then
         // two real-progress intervals before turn 2's lone first heartbeat.
@@ -468,7 +510,7 @@ describe("buildFleetCard", () => {
     });
 
     it("sums across two concurrently running sessions on the same machine", () => {
-      const data: FlowRecord[] = [
+      const data: NormRecord[] = [
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 120 } }),
@@ -486,20 +528,20 @@ describe("buildFleetCard", () => {
     // session" — the OLD divergent behavior the audit's finding #3 named
     // directly ("live: dispatch in flight · 89 tok/s · 1 running; playback:
     // dispatch in flight · 1 specialist" for the SAME instant). A replay
-    // caller's `liveSet` is empty in practice (there is no presence to read
-    // about a past day), and the session's own freshness — via
-    // `sessionRunning`'s TTL fallback, not presence — is what makes it read
+    // caller's presence is empty in practice (there is no presence to read
+    // about a past day), and the session's own freshness — its lifecycle's
+    // staleness window, not presence — is what makes it read
     // as running, in both modes, so the tok/s scope is a fact about the
     // recorded instant rather than a live-only instrument.
     it("computes a real rate for a running-shaped session in replay too (parity)", () => {
       // Record `ts` (not just the heartbeat payload's `sampled_at_ms`) has
-      // to be FRESH as of `T_MAX` too — `sessionRunning`'s TTL fallback
-      // measures staleness off the record's own `ts`, matching a real flow
+      // to be FRESH as of `T_MAX` too — the lifecycle measures staleness off
+      // the record's own `ts`, matching a real flow
       // record where the two are close together. Both defaulted to the
       // fixture's far-past `rec()` default `ts` here would make the
       // session read as an orphan (finding #7's own fix), which is a
       // different case than the one under test.
-      const data: FlowRecord[] = [
+      const data: NormRecord[] = [
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start", ts: new Date(BEAT1).toISOString() }),
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(BEAT1).toISOString(), payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(BEAT2).toISOString(), payload: { sampled_at_ms: BEAT2, generated_chars: 120 } }),
@@ -515,7 +557,7 @@ describe("buildFleetCard", () => {
     // whatever its LAST two heartbeats measured — a fleet card reading a
     // confident "N tok/s" for a session that stopped producing hours ago.
     it("reads 0, not a stale historical rate, once the session's heartbeats go quiet", () => {
-      const data: FlowRecord[] = [
+      const data: NormRecord[] = [
         // `ts` matches the heartbeats' own (equally ancient) clock —
         // `dispatch.start`'s `ts` is the only clock it has, and a mismatched
         // one here (the old `rec()` default, 2026) would read as a NEWER
@@ -536,7 +578,7 @@ describe("buildFleetCard", () => {
     // gap — the ONLY thing that changed is the page's own connection to the
     // daemon. A false STALL claim from a disconnection must not survive.
     it("reads no state (not stalled) for the SAME stale gap when the page is disconnected", () => {
-      const data: FlowRecord[] = [
+      const data: NormRecord[] = [
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start", ts: new Date(1_000).toISOString() }),
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(1_000).toISOString(), payload: { sampled_at_ms: 1_000, generated_chars: 40 } }),
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(3_000).toISOString(), payload: { sampled_at_ms: 3_000, generated_chars: 120 } }),
@@ -557,7 +599,7 @@ describe("buildFleetCard", () => {
     // last heartbeat's own deadline passed. Same fixture as above (last
     // heartbeat at 3,000ms) — `STALL_AFTER_MS` past it is 33,000ms.
     it("downgrades a stall to no-signal via the half-open check even while connected=true", () => {
-      const data: FlowRecord[] = [
+      const data: NormRecord[] = [
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start", ts: new Date(1_000).toISOString() }),
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(1_000).toISOString(), payload: { sampled_at_ms: 1_000, generated_chars: 40 } }),
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(3_000).toISOString(), payload: { sampled_at_ms: 3_000, generated_chars: 120 } }),
@@ -576,7 +618,7 @@ describe("buildFleetCard", () => {
       // The launcher beats presence for the mission's run session during a
       // mod wait, a test gate, delivery: no model is involved, so the card
       // must not say "processing prompt" or run a scope at 0.
-      const data: FlowRecord[] = [
+      const data: NormRecord[] = [
         rec({ machine_uid: "u1", session_id: "m1", action: "dispatch.start", source: "mission", mission_id: "m1" }),
         rec({ machine_uid: "u1", session_id: "e1", action: "dispatch.start", mission_id: "m1" }),
         rec({ machine_uid: "u1", session_id: "e1", action: "dispatch.complete", mission_id: "m1" }),
@@ -592,8 +634,8 @@ describe("buildFleetCard", () => {
       // handle, and it never bookended a seat, so that record is run-grain
       // exactly like today's `source: "mission"`. Paging it read as a second
       // execution labeled `deep+diff-review+probe-4b+probe-qwen38`.
-      const data: FlowRecord[] = [
-        rec({ ts: "2026-08-08T23:59:50.000Z", machine_uid: "u1", session_id: "m1", action: "dispatch start", source: "review", handle: "deep+diff-review+probe-4b", mission_id: "m1" }),
+      const data: NormRecord[] = [
+        rec({ ts: "2026-08-08T23:59:50.000Z", machine_uid: "u1", session_id: "m1", action: "dispatch.start", source: "review", handle: "deep+diff-review+probe-4b", mission_id: "m1" }),
         rec({ ts: "2026-08-08T23:59:58.000Z", machine_uid: "u1", session_id: "e1", action: "dispatch.start", handle: "reviewer", mission_id: "m1" }),
         rec({ ts: "2026-08-08T23:59:58.000Z", machine_uid: "u1", session_id: "e1", action: "dispatch.turn.heartbeat", payload: { cumulative_chars: 10 } }),
         rec({ ts: "2026-08-09T00:00:00.000Z", machine_uid: "u1", session_id: "e1", action: "dispatch.turn.heartbeat", payload: { cumulative_chars: 30 } }),
@@ -603,7 +645,7 @@ describe("buildFleetCard", () => {
     });
 
     it("still works from an OLDER runtime's heartbeat shape (no sampled_at_ms/generated_chars)", () => {
-      const data: FlowRecord[] = [
+      const data: NormRecord[] = [
         rec({ ts: "2026-08-08T23:59:58.000Z", machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
         rec({ ts: "2026-08-08T23:59:58.000Z", machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { cumulative_chars: 10 } }),
         rec({ ts: "2026-08-09T00:00:00.000Z", machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { cumulative_chars: 30 } }),
@@ -625,7 +667,7 @@ describe("buildFleetCard", () => {
   // fleet-aware, already unions lab + flow sources server-side); nothing
   // here writes a lab run into the flow stream.
   it("(#1923) a running lab run makes the card active even with zero flow presence", () => {
-    const data: FlowRecord[] = [];
+    const data: NormRecord[] = [];
     const machineRuns: Run[] = [run({ id: "lab-1", kind: "lab", status: "running", machine: "u1" })];
     const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", true, T_MAX, new Map(), machineRuns);
     expect(card.stat).toBe("dispatch in flight");
@@ -645,11 +687,11 @@ describe("buildFleetCard", () => {
   // session id `darkmux-coding-{workload}-{epoch_millis}`
   // (`providers/coding_task.rs`, via `session_id::session_id`). They share
   // no join key, and the lab dispatch carries NO `mission_id`, so
-  // `topLevelRunSessionIds` treats it as standalone and has nothing to
+  // `topLevelRuns` treats it as standalone and has nothing to
   // collapse it into.
   it("(#1923) a lab run in its DISPATCH phase counts ONCE, not once per source", () => {
     const labSession = "darkmux-coding-long-agentic-1756000000000";
-    const data: FlowRecord[] = [rec({ machine_uid: "u1", session_id: labSession, action: "dispatch.start" })];
+    const data: NormRecord[] = [rec({ machine_uid: "u1", session_id: labSession, action: "dispatch.start" })];
     const machineRuns: Run[] = [run({ id: "long-agentic-balanced-1756000000-1", kind: "lab", status: "running", machine: "u1" })];
     const card = buildFleetCard(data, new Map(), null, new Set([labSession]), false, "u1", true, T_MAX, new Map(), machineRuns);
     expect(card.runsCount).toBe(1);
@@ -662,7 +704,7 @@ describe("buildFleetCard", () => {
   // test above and be wrong here.
   it("(#1923) flow work beyond the lab run's own dispatch still counts", () => {
     const labSession = "darkmux-coding-long-agentic-1756000000000";
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ machine_uid: "u1", session_id: labSession, action: "dispatch.start" }),
       rec({ machine_uid: "u1", session_id: "solo-1", action: "dispatch.start" }),
     ];
@@ -686,7 +728,7 @@ describe("buildFleetCard", () => {
   // Only a RUNNING lab run counts — a completed or errored one is history,
   // not current activity, same rule flow presence already applies.
   it("(#1923) a completed lab run does not count as active", () => {
-    const data: FlowRecord[] = [];
+    const data: NormRecord[] = [];
     const machineRuns: Run[] = [run({ id: "lab-1", kind: "lab", status: "complete", machine: "u1" })];
     const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", true, T_MAX, new Map(), machineRuns);
     expect(card.stat).toBe("idle");
@@ -697,7 +739,7 @@ describe("buildFleetCard", () => {
   // that machine's activity is already fully accounted for by flow
   // presence (post-#2060). Only `kind === "lab"` rows are net-new signal.
   it("(#1923) a running mission row in /runs is not double-counted against flow presence", () => {
-    const data: FlowRecord[] = [rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" })];
+    const data: NormRecord[] = [rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" })];
     const machineRuns: Run[] = [run({ id: "s1", kind: "dispatch", status: "running", machine: "u1" })];
     const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX, new Map(), machineRuns);
     expect(card.runsCount).toBe(1);
@@ -749,7 +791,7 @@ describe("buildFleetCard", () => {
   it("(#2814) a name the window actually observed still outranks the specs name", () => {
     const uid = "00000000-0000-4000-8000-ABCDEF000011";
     const specs = machineSpecs({ machine_id: "MacBook-Pro", machine_uid: uid, cpu_brand: "Apple M5 Max" });
-    const data: FlowRecord[] = [rec({ machine_uid: uid, machine_id: "MacBook-Pro.local" })];
+    const data: NormRecord[] = [rec({ machine_uid: uid, machine_id: "MacBook-Pro.local" })];
     const card = buildFleetCard(data, new Map(), specs, new Set(), false, uid, true, T_MAX);
     expect(card.name).toBe("MacBook-Pro.local");
   });
@@ -783,7 +825,7 @@ describe("rosterOnlyEntries", () => {
   // `machineUids` union and must not ALSO get a roster-only phantom card.
   it("a roster entry already covered by flow history under the same name is excluded", () => {
     const roster = [rosterEntry({ id: "studio" })];
-    const data: FlowRecord[] = [rec({ machine_uid: "u1", machine_id: "studio" })];
+    const data: NormRecord[] = [rec({ machine_uid: "u1", machine_id: "studio" })];
     expect(rosterOnlyEntries(data, new Map(), roster)).toEqual([]);
   });
 
@@ -796,7 +838,7 @@ describe("rosterOnlyEntries", () => {
   });
 
   it("an empty roster reports nothing, on an otherwise busy fleet", () => {
-    const data: FlowRecord[] = [rec({ machine_uid: "u1", machine_id: "studio" })];
+    const data: NormRecord[] = [rec({ machine_uid: "u1", machine_id: "studio" })];
     expect(rosterOnlyEntries(data, new Map(), [])).toEqual([]);
   });
 
@@ -842,7 +884,7 @@ describe("rosterOnlyEntries", () => {
 
   it("excludes a roster entry that differs from flow history only by the mDNS .local suffix", () => {
     const roster = [rosterEntry({ id: "MacBook-Pro" })];
-    const data: FlowRecord[] = [rec({ machine_uid: "u1", machine_id: "MacBook-Pro.local" })];
+    const data: NormRecord[] = [rec({ machine_uid: "u1", machine_id: "MacBook-Pro.local" })];
     expect(rosterOnlyEntries(data, new Map(), roster)).toEqual([]);
   });
 
@@ -877,7 +919,7 @@ describe("rosterOnlyEntries", () => {
   // only the presence-beat half.
   it("excludes a roster entry whose machine_uid matches flow history under a different name", () => {
     const roster = [rosterEntry({ id: "laptop", machine_uid: "00000000-0000-4000-8000-ABCDEF000020" })];
-    const data: FlowRecord[] = [rec({ machine_uid: "00000000-0000-4000-8000-ABCDEF000020", machine_id: "MacBook-Pro" })];
+    const data: NormRecord[] = [rec({ machine_uid: "00000000-0000-4000-8000-ABCDEF000020", machine_id: "MacBook-Pro" })];
     expect(rosterOnlyEntries(data, new Map(), roster)).toEqual([]);
   });
 
@@ -1133,7 +1175,7 @@ describe("buildFleetCard: executions and defaultExecutionSessionId (#2881)", () 
   });
 
   it("has exactly one entry for a single running execution, matching the aggregate fields", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start", handle: "darkmux/coder" }),
       rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
       rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 120 } }),
@@ -1147,7 +1189,7 @@ describe("buildFleetCard: executions and defaultExecutionSessionId (#2881)", () 
   });
 
   it("sorts by session id (a stable order independent of state) and defaults to the busiest", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       // s2 is RESTING.
       rec({ machine_uid: "u1", session_id: "s2", action: "dispatch.start", handle: "darkmux/reviewer" }),
       rec({ machine_uid: "u1", session_id: "s2", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
@@ -1172,10 +1214,10 @@ describe("(#2915) buildFleetCard's utility strip", () => {
   const at = (s: number) => new Date(Date.parse("2026-08-08T00:00:00.000Z") + s * 1000).toISOString();
   const tAt = (s: number) => Date.parse(at(s));
   const routeStart = (s: number, uid = "u1") =>
-    rec({ ts: at(s), machine_uid: uid, action: "utility.start", category: "telemetry", source: "utility", handle: "radio-router", model: "util-4b", payload: { job: "radio_routing", model: "util-4b", stall_after_seconds: 30 } } as Partial<FlowRecord>);
+    rec({ ts: at(s), machine_uid: uid, action: "utility.start", category: "telemetry", source: "utility", handle: "radio-router", model: "util-4b", payload: { job: "radio_routing", model: "util-4b", stall_after_seconds: 30 } });
   const routeEnd = (s: number) =>
-    rec({ ts: at(s), machine_uid: "u1", action: "telemetry.tokens", category: "telemetry", source: "tokens", handle: "radio-router", payload: { purpose: "utility", call_kind: "single_shot", job: "radio_routing", requested_model: "util-4b", total_tokens: 9 } } as Partial<FlowRecord>);
-  const card = (data: FlowRecord[], t: number, specs: MachineSpecs | null = null) => buildFleetCard(data, new Map(), specs, new Set(), false, "u1", true, t);
+    rec({ ts: at(s), machine_uid: "u1", action: "telemetry.tokens", category: "telemetry", source: "tokens", handle: "radio-router", payload: { purpose: "utility", call_kind: "single_shot", job: "radio_routing", requested_model: "util-4b", total_tokens: 9 } });
+  const card = (data: NormRecord[], t: number, specs: MachineSpecs | null = null) => buildFleetCard(data, new Map(), specs, new Set(), false, "u1", true, t);
 
   it("shows the routing job while it runs, and is quiet once its usage record lands", () => {
     expect(card([routeStart(0)], tAt(2)).utility.job).toMatchObject({ job: "radio_routing", visual: "radio", stalled: false });
@@ -1207,8 +1249,8 @@ describe("(#2915) buildFleetCard's utility strip", () => {
   });
 
   it("a compaction on this machine shows as compacting, ended by its usage record", () => {
-    const start = rec({ ts: at(0), machine_uid: "u1", session_id: "s1", action: "utility.start", payload: { job: "compaction", model: "util-4b", serves: "s1", stall_after_seconds: 600 } } as Partial<FlowRecord>);
-    const end = rec({ ts: at(4), machine_uid: "u1", session_id: "s1", action: "telemetry.tokens", category: "telemetry", source: "tokens", payload: { purpose: "utility", call_kind: "compaction", job: "compaction", total_tokens: 3 } } as Partial<FlowRecord>);
+    const start = rec({ ts: at(0), machine_uid: "u1", session_id: "s1", action: "utility.start", payload: { job: "compaction", model: "util-4b", serves: "s1", stall_after_seconds: 600 } });
+    const end = rec({ ts: at(4), machine_uid: "u1", session_id: "s1", action: "telemetry.tokens", category: "telemetry", source: "tokens", payload: { purpose: "utility", call_kind: "compaction", job: "compaction", total_tokens: 3 } });
     expect(card([start], tAt(2)).utility.job).toMatchObject({ job: "compaction", visual: "compacting" });
     expect(card([start, end], tAt(5)).utility.job).toBeNull();
   });
@@ -1217,7 +1259,7 @@ describe("(#2915) buildFleetCard's utility strip", () => {
 // (#2928) The live channel's overlay on the fleet card.
 describe("(#2928) buildFleetCard with the live overlay", () => {
   const T = Date.parse("2026-08-09T00:00:00.000Z");
-  const durable: FlowRecord[] = [
+  const durable: NormRecord[] = [
     rec({ ts: new Date(T - 60_000).toISOString(), machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
     rec({ ts: new Date(T - 2000).toISOString(), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { turn_seq: 1, sampled_at_ms: T - 2000, generated_chars: 40, cumulative_chars: 40 } }),
     rec({ ts: new Date(T).toISOString(), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { turn_seq: 1, sampled_at_ms: T, generated_chars: 120, cumulative_chars: 120 } }),

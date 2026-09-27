@@ -54,6 +54,7 @@
  *   reads the `flowTail` cache slot that mount writes. The header badge is
  *   the liveness indicator; this lens paints no pill.
  */
+import { useLifecyclePolicy } from "../../hooks/useLifecyclePolicy";
 import { clkhm, fmtElapsed } from "../../lib/format";
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient, skipToken } from "@tanstack/react-query";
@@ -62,7 +63,7 @@ import { queryKeys, RECONCILE_BACKSTOP_MS } from "../../lib/queryKeys";
 import { useDay } from "../../hooks/useDay";
 import { getSource } from "../../lib/source";
 import { WorkStatus, workStatusKind } from "../../components/WorkStatus";
-import { asRecordArray, bodyTruncated, todayUTC } from "../../lib/flow";
+import { bodyTruncated, todayUTC } from "../../lib/flow";
 import { MissionCanvas } from "./MissionCanvas";
 import { MissionTimelineView } from "./MissionTimelineView";
 import {
@@ -75,13 +76,16 @@ import {
   normalizeMissionStatus,
   recordInMission,
   seedMetricsFromGraph,
+  recordsByStep,
+  stepPhasesAt,
   type GraphStep,
   type MetricsMap,
   type MissionGraph,
   type StepHeaderField,
 } from "./graph";
 import { initMinimap, isNarrowViewport, persistMinimap, timelineActive } from "./timeline";
-import type { FlowRecord } from "../../types/handwritten";
+import { byTime, ingest, type NormRecord } from "../../lib/ingest";
+import { isHostSampleRecord } from "../../lib/machineDrawerScope";
 
 /** Dedup key — this port's counterpart to mission-graph.html's own
  * `backfillEvents` dedup (`ts + action + handle`): two sources
@@ -104,7 +108,7 @@ import type { FlowRecord } from "../../types/handwritten";
  * version of this key (`ts+action+handle` alone) silently collapsed two
  * same-mission-id-less test records issued in the same second into one,
  * dropping real tokens from the metrics fold. */
-function recKey(r: FlowRecord): string {
+function recKey(r: NormRecord): string {
   return JSON.stringify(r);
 }
 
@@ -115,7 +119,7 @@ function recKey(r: FlowRecord): string {
 async function lookupOwningMachine(missionId: string): Promise<string | null> {
   const res = await fetchJson<unknown>(`/flow/${todayUTC()}`);
   if (!res.ok) return null;
-  const rows = asRecordArray(res.data);
+  const rows = ingest(res.data);
   for (let i = rows.length - 1; i >= 0; i--) {
     const rec = rows[i];
     if (rec && rec.mission_id === missionId && rec.machine_id) return rec.machine_id;
@@ -147,21 +151,11 @@ interface ProcSample {
   rx: number;
 }
 
-/** (#2413) Recognizes BOTH the retired per-dispatch `telemetry.process` and
- * the new machine-scoped `machine.telemetry`. `telemetry.process` is fully
- * retired as of `FLOW_SCHEMA_VERSION` 1.42.0 — see its changelog entry —
- * nothing in the current binary emits it any more (mission launches' and
- * ACP sessions' `run_obs::HostTelemetrySampler` mechanism was deleted in
- * the same round); a pre-1.42.0 day file may still carry one, lenient-on-
- * read. `machine.telemetry` (`source: "host"`, no session_id): this readout was
- * already machine-level rather than mission-scoped (see this function's
- * caller's own doc), so `machine.telemetry` is a direct, complete fit. */
-function isHostSampleRecord(r: FlowRecord): boolean {
-  return (
-    (r.action === "telemetry.process" || r.action === "machine.telemetry" || (r.category === "telemetry" && r.source === "process")) &&
-    !!r.payload &&
-    typeof r.payload === "object"
-  );
+/** A host sample (`isHostSampleRecord`, the drawer's own test) that
+ * carries the payload this readout reads. Machine-level rather than
+ * mission-scoped: see this function's caller's own doc. */
+function isHostSampleWithPayload(r: NormRecord): boolean {
+  return isHostSampleRecord(r) && !!r.payload && typeof r.payload === "object";
 }
 
 /** (#1868, #1483) The header's `.mproc` host-activity readout — the OFF-
@@ -186,13 +180,14 @@ function isHostSampleRecord(r: FlowRecord): boolean {
  * MACHINE-level, not mission-scoped, matching legacy exactly: `tail` is the
  * live tail UNFILTERED by mission (`recordInMission` is never applied to
  * this source) — a host sample corroborates the whole box, not one mission. */
-function useProcReadout(tail: FlowRecord[] | undefined): ProcSample | null {
+function useProcReadout(tail: NormRecord[] | undefined): ProcSample | null {
   const latest = useMemo(() => {
     if (!tail || !tail.length) return null;
-    let found: FlowRecord | null = null;
+    let found: NormRecord | null = null;
     for (const r of tail) {
-      if (!r || typeof r !== "object" || !isHostSampleRecord(r)) continue;
-      if (!found || (r.ts ?? "") >= (found.ts ?? "")) found = r;
+      if (!isHostSampleWithPayload(r)) continue;
+      // Latest by time; an untimed sample only when nothing timed is found.
+      if (!found || (r.tMs !== null && (found.tMs === null || r.tMs >= found.tMs))) found = r;
     }
     return found;
   }, [tail]);
@@ -346,7 +341,7 @@ export function MissionGraphLens({
    * replaces — superseded now that the mainstay column can show a
    * mission's events on its own, closing the "two event logs disagreeing
    * about scope" gap #1868 used to require a second, bespoke surface for. */
-  onEvents?: (events: FlowRecord[], srvTruncated: boolean) => void;
+  onEvents?: (events: NormRecord[], srvTruncated: boolean) => void;
   /** (#2189, step drill-in) `route.stepId` — App.tsx owns the route/hash,
    * this lens only reads the selection back to highlight the right row/
    * node and to auto-expand the owning task in the timeline renderer (a
@@ -432,7 +427,7 @@ export function MissionGraphLens({
   // `useLiveTail` in `App.tsx` runs on this route now (`isLiveRoute`) and
   // writes the `flowTail` slot read below; the masthead's `#modebadge` is the
   // one liveness indicator.
-  const flowTailQuery = useQuery<FlowRecord[]>({ queryKey: queryKeys.flowTail(today), queryFn: skipToken });
+  const flowTailQuery = useQuery<NormRecord[]>({ queryKey: queryKeys.flowTail(today), queryFn: skipToken });
 
   // (C2) The static-build record source. All three queries above are
   // `enabled: daemonBacked`, so on a daemon-less build this lens folded an
@@ -503,15 +498,14 @@ export function MissionGraphLens({
 
   // All three record sources, deduped — see this module's own doc.
   const allRecords = useMemo(() => {
-    const sources: FlowRecord[] = [];
-    if (flowMissionQuery.data?.ok) sources.push(...asRecordArray(flowMissionQuery.data.data));
-    if (flowTodayQuery.data?.ok) sources.push(...asRecordArray(flowTodayQuery.data.data));
+    const sources: NormRecord[] = [];
+    if (flowMissionQuery.data?.ok) sources.push(...ingest(flowMissionQuery.data.data));
+    if (flowTodayQuery.data?.ok) sources.push(...ingest(flowTodayQuery.data.data));
     if (flowTailQuery.data?.length) sources.push(...flowTailQuery.data);
     if (staticDayRecords?.length) sources.push(...staticDayRecords);
     const seen = new Set<string>();
-    const out: FlowRecord[] = [];
+    const out: NormRecord[] = [];
     for (const r of sources) {
-      if (!r || typeof r !== "object") continue;
       const k = recKey(r);
       if (seen.has(k)) continue;
       seen.add(k);
@@ -529,7 +523,7 @@ export function MissionGraphLens({
 
   const idx = useMemo(() => (baseGraph ? indexGraph(baseGraph) : null), [baseGraph]);
 
-  const ascendingRecords = useMemo(() => [...allRecords].sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0)), [allRecords]);
+  const ascendingRecords = useMemo(() => [...allRecords].sort(byTime), [allRecords]);
 
   const graph = useMemo(() => {
     if (!baseGraph || !idx) return null;
@@ -547,7 +541,7 @@ export function MissionGraphLens({
   // events pane) expects ASCENDING input (oldest first) — it takes
   // `.slice(-LOG_CAP).reverse()` internally to show the most recent rows
   // newest-first, the same shape every other caller feeds it
-  // (`normalizeRecords`'s own ascending sort).
+  // (`shapeRecords`'s own ascending sort).
   //
   // This is built in two steps, not one ascending sort, because of a real
   // tie-break bug caught while writing the parity harness
@@ -574,7 +568,7 @@ export function MissionGraphLens({
   const events = useMemo(() => {
     if (!idx) return [];
     const scoped = allRecords.filter((r) => recordInMission(r, idx, missionId));
-    scoped.sort((a, b) => (b.ts < a.ts ? -1 : b.ts > a.ts ? 1 : 0));
+    scoped.sort((a, b) => -byTime(a, b));
     return scoped.slice().reverse();
   }, [allRecords, idx, missionId]);
 
@@ -624,6 +618,12 @@ export function MissionGraphLens({
   // status as well as the steps.
   const missionRunning = !!graph && workStatusKind(normalizeMissionStatus(graph.mission_status)) === "running";
   const now = useNow(anyRunning || missionRunning);
+  const policy = useLifecyclePolicy();
+  // Each step's run phase as of `now`, from the records attributed to it:
+  // the lifecycle every surface reads, so a step reads generating exactly
+  // while its run is in flight on the run page too.
+  const stepRecords = useMemo(() => (idx ? recordsByStep(ascendingRecords, idx, missionId) : new Map<string, Map<string, NormRecord[]>>()), [ascendingRecords, idx, missionId]);
+  const phases = useMemo(() => stepPhasesAt(stepRecords, now, policy), [stepRecords, now, policy]);
   const proc = useProcReadout(flowTailQuery.data);
 
   // Needs `now` (elapsed time for a still-running step) — computed here,
@@ -631,8 +631,8 @@ export function MissionGraphLens({
   // above.
   const stepHeaderFields = useMemo(() => {
     if (!selectedStep) return null;
-    return buildStepHeaderFields(selectedStep, metrics, now, selectedStepRecords);
-  }, [selectedStep, metrics, now, selectedStepRecords]);
+    return buildStepHeaderFields(selectedStep, metrics, now, selectedStepRecords, phases);
+  }, [selectedStep, metrics, now, selectedStepRecords, phases]);
 
   useEffect(() => {
     onStepHeader?.(stepHeaderFields);
@@ -796,6 +796,7 @@ export function MissionGraphLens({
             edges={graph.edges}
             metrics={metrics}
             now={now}
+            phases={phases}
             note={graph.note}
             expanded={expanded}
             onToggleTask={toggleTask}
@@ -808,6 +809,7 @@ export function MissionGraphLens({
             edges={graph.edges}
             metrics={metrics}
             now={now}
+            phases={phases}
             note={graph.note}
             minimapOn={minimapOn}
             selectedStepId={selectedStepId}

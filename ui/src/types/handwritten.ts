@@ -686,8 +686,9 @@ export interface MachineLoad {
 
 /** `GET /fleet/sessions/live` — `axum::Json(Vec<LiveSessionBeat>)`, the
  * session-presence twin of `PresenceBeat` above (same crate, same hand-write
- * rationale — see that type's doc comment). Only `session_id` is consumed by
- * the machine lens's `liveSessionSet()` port (`lib/flow.ts`); the daemon
+ * rationale — see that type's doc comment). Only `session_id` (and the
+ * optional `mission_id`) is consumed, as the presence input to each run's
+ * lifecycle (`lib/lifecycle.ts`); the daemon
  * sends more fields (see `tests/parity/corpus/fleet-sessions-live.json`,
  * empty in the recorded corpus — no session was live at record time), widen
  * this interface if a future lens needs them.
@@ -837,26 +838,13 @@ export interface DispatchStartPayload {
   };
 }
 
-/** One `funnel-events.jsonl` line — the lab-run detail's event feed +
- * pipeline-stage source (`viewer.html`'s `computeLabPipeline`/
- * `renderLabFeed`, ported in `lenses/runs/labRun.ts`). Loosely typed
- * (`payload` is `Record<string, unknown>`, same posture as `FlowRecord`
- * above) since its shape varies per `step_id`/`action` — the pure logic
- * narrows what it needs per case, matching legacy's own untyped JS access.
- * Source: `funnel-events.jsonl` lines, written by
- * `crates/darkmux-lab/src/lab/review.rs`'s event emitters. */
-export interface LabRunEvent {
-  ts: string;
-  action?: string;
-  category?: string;
-  source?: string;
-  payload?: Record<string, unknown>;
-}
-
 /** `GET /lab/run/events?dir=&offset=` — the poll-based tail response.
+ * `lines` are `funnel-events.jsonl` lines, flow-record-shaped (written by
+ * `crates/darkmux-lab/src/lab/review.rs`'s event emitters); the lab-run
+ * detail ingests them like any other record.
  * Source: `crates/darkmux-serve/src/lib.rs::LabRunEventsResponse`. */
 export interface LabRunEventsResponse {
-  lines: LabRunEvent[];
+  lines: FlowRecord[];
   next_offset: number;
   finished: boolean;
 }

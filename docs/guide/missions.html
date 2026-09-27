@@ -45,7 +45,7 @@
       <li><strong>Named local-AI roles</strong> with specific tool palettes and system prompts (a "coder" that can edit files; a "code-reviewer" that can only read; a "crawler" that reads a tree and records findings).</li>
       <li><strong>Multi-step plans with structure</strong>: missions that contain phases, dependencies, lifecycle state (planned/running/complete/abandoned).</li>
       <li><strong>QA-by-default discipline</strong>: every implementation phase should pass through the review mission (<code>mission launch review</code>), which dispatches a reviewer crew against the diff.</li>
-      <li><strong>Visible orchestration in the viewer</strong>: mission start, phase transitions, dispatch start/complete, verdict, all rendered as a timeline in <code>/flow</code>.</li>
+      <li><strong>Visible orchestration in the viewer</strong>: <code>mission.start</code>, phase transitions, <code>dispatch.start</code>/<code>dispatch.complete</code>, the review verdict, all rendered as a timeline in <code>/flow</code>.</li>
     </ul>
   </div>
 </section>
@@ -79,7 +79,7 @@ darkmux role show coder          <span class="comment"># full details for one ro
       <li><strong>Pre-flight</strong>: verifies Docker is reachable and resolves a runtime image built for this darkmux: a local <code>darkmux-runtime:latest</code> only when its version label matches, otherwise the version-pinned GHCR image, pulled on first use. An image built for another version, or with no label, is never run; if nothing matching can be had, it refuses before starting a container and names the fix.</li>
       <li>Spins up a fresh <code>darkmux-runtime</code> container per dispatch with a mounted workspace tempdir: kernel-enforced isolation, no cross-task context leak by construction.</li>
       <li>Streams the model's reasoning and tool calls via the in-house Rust loop; emits <code>dispatch.turn</code>, <code>dispatch.tool</code>, and <code>dispatch.reasoning</code> flow records as they happen.</li>
-      <li>Emits a final <code>dispatch complete</code> or <code>dispatch error</code> record.</li>
+      <li>Emits a final <code>dispatch.complete</code> or <code>dispatch.error</code> record.</li>
     </ol>
     <div class="callout">
       <strong>Verification boundary.</strong>

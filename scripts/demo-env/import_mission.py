@@ -407,7 +407,7 @@ def main():
     session_ids = {f"mission-{old_id}"} | {f"task-{tid}" for tid in task_ids}
     if case_id:
         # The crew-level session (`single_shot_chat` telemetry/tokens/lms +
-        # its own `dispatch start`/`dispatch complete` bookend) — the bulk
+        # its own `dispatch.start`/`dispatch.complete` bookend) — the bulk
         # of a review's host-telemetry sampling lives here, and it is named
         # by `case_id` alone (see the comment above), so it needs the same
         # treatment as the scheduler's own sessions.
@@ -452,7 +452,7 @@ def main():
         # as a generic `serde_json::Value` (`push_flow_line`) and a static
         # build parses the committed `.jsonl` client-side — an extra field
         # here survives BOTH untouched. Stamping every eligible record
-        # (rather than only the `mission start` bookend) means the viewer's
+        # (rather than only the `mission.start` bookend) means the viewer's
         # lookup — scan `data` for `r.mission_id === id && r.mission_title`
         # — finds it regardless of scan order or which records a given view
         # happens to have loaded.

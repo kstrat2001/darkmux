@@ -24,7 +24,7 @@ pub(crate) fn build_review_record(
     category: crate::flow::Category,
     tier: crate::flow::Tier,
     stage: crate::flow::Stage,
-    action: String,
+    action: darkmux_flow::FlowAction,
     handle: String,
     session_id: &str,
     phase_id: Option<&str>,
@@ -285,10 +285,32 @@ fn count_files_changed(path: &Path, base: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// The review's verdict terminal: `phase.review.verdict`, the verdict itself
+/// in `payload.verdict`, the finding counts in `handle`.
+fn verdict_record(
+    verdict: &str,
+    counts: String,
+    session_id: &str,
+    phase_id: Option<&str>,
+) -> crate::flow::FlowRecord {
+    let mut rec = build_review_record(
+        crate::flow::Level::Info,
+        crate::flow::Category::Review,
+        crate::flow::Tier::Frontier,
+        crate::flow::Stage::Review,
+        darkmux_flow::FlowAction::PhaseReviewVerdict,
+        counts,
+        session_id,
+        phase_id,
+    );
+    rec.payload = Some(serde_json::json!({ "verdict": verdict }));
+    rec
+}
+
 /// Builds the record fired by `phase_review_output_at`'s bookend guard on
 /// `Drop` when the guarded region exits without reaching one of its own
-/// named terminal emits (`verdict: clean`, `dispatch failed`, or
-/// `verdict: <verdict>`): a panic, or an early `?`-return from something
+/// named terminal emits (`phase.review.verdict` or `phase.review.failed`):
+/// a panic, or an early `?`-return from something
 /// like the `git diff` call that has no terminal record of its own today.
 /// Named separately so a test can drive the abort shape directly (#1413).
 fn phase_review_abort_record(
@@ -301,7 +323,7 @@ fn phase_review_abort_record(
         crate::flow::Category::Review,
         crate::flow::Tier::Frontier,
         crate::flow::Stage::Review,
-        "phase review aborted".to_string(),
+        darkmux_flow::FlowAction::PhaseReviewAborted,
         branch.to_string(),
         session_id,
         phase_id,
@@ -338,8 +360,8 @@ pub(crate) fn phase_review_output_at(
         std::time::UNIX_EPOCH.elapsed().unwrap_or_default().as_secs(),
     );
 
-    // (#1413) `phase review begin` / `verdict: ...` used to be plain paired
-    // writes: a panic (or an early `?`-return with no terminal of its
+    // (#1413) `phase.review.begin` / `phase.review.verdict` used to be plain
+    // paired writes: a panic (or an early `?`-return with no terminal of its
     // own, e.g. the `git diff` call below) orphaned the begin record.
     // Bookend-guard the pair so every exit path fires a matching terminal.
     let mut sink = |r: crate::flow::FlowRecord| {
@@ -362,7 +384,7 @@ pub(crate) fn phase_review_output_at(
             crate::flow::Category::Review,
             crate::flow::Tier::Frontier,
             crate::flow::Stage::Review,
-            "phase review begin".to_string(),
+            darkmux_flow::FlowAction::PhaseReviewBegin,
             branch.clone(),
             &session_id,
             phase_id,
@@ -402,16 +424,7 @@ pub(crate) fn phase_review_output_at(
         // named terminal is the only record for this exit path.
         bookend.close(
             "phase-review",
-            build_review_record(
-                crate::flow::Level::Info,
-                crate::flow::Category::Review,
-                crate::flow::Tier::Frontier,
-                crate::flow::Stage::Review,
-                "verdict: clean".to_string(),
-                "0B / 0F / 0N".to_string(),
-                &session_id,
-                phase_id,
-            ),
+            verdict_record("clean", "0B / 0F / 0N".to_string(), &session_id, phase_id),
         );
         return Ok(output);
     }
@@ -506,7 +519,7 @@ pub(crate) fn phase_review_output_at(
         crate::flow::Category::Machinery,
         crate::flow::Tier::Local,
         crate::flow::Stage::Review,
-        "dispatch code-reviewer".to_string(),
+        darkmux_flow::FlowAction::PhaseReviewDispatch,
         session_id.clone(),
         &session_id,
         phase_id,
@@ -524,7 +537,7 @@ pub(crate) fn phase_review_output_at(
                     crate::flow::Category::Machinery,
                     crate::flow::Tier::Local,
                     crate::flow::Stage::Review,
-                    "dispatch failed".to_string(),
+                    darkmux_flow::FlowAction::PhaseReviewFailed,
                     truncate(&format!("{e}"), 200),
                     &session_id,
                     phase_id,
@@ -562,12 +575,8 @@ pub(crate) fn phase_review_output_at(
     // Emit verdict flow record.
     bookend.close(
         "phase-review",
-        build_review_record(
-            crate::flow::Level::Info,
-            crate::flow::Category::Review,
-            crate::flow::Tier::Frontier,
-            crate::flow::Stage::Review,
-            format!("verdict: {}", signoff.verdict.clone()),
+        verdict_record(
+            &signoff.verdict,
             format!("{}B / {}F / {}N", signoff.block, signoff.flag, signoff.nit),
             &session_id,
             phase_id,
@@ -781,14 +790,13 @@ mod tests {
 
         // Parse each and check the first is review-start.
         let start: serde_json::Value = serde_json::from_str(&records[0]).unwrap();
-        assert_eq!(start["action"], "phase review begin");
+        assert_eq!(start["action"], "phase.review.begin");
         assert_eq!(start["category"], "review");
         assert_eq!(start["tier"], "frontier");
 
         // Second is verdict.
         let verdict: serde_json::Value = serde_json::from_str(&records[1]).unwrap();
-        let action: &str = verdict["action"].as_str().unwrap();
-        assert!(action.starts_with("verdict:"));
+        assert_eq!(verdict["action"], "phase.review.verdict");
     }
 
     #[serial_test::serial]
@@ -807,16 +815,11 @@ mod tests {
         crate::phase_cli::phase_review_output_at(repo.path(), None, Some("66")).unwrap();
 
         let records = collect_records(guard.path());
-        // Find verdict record (action starts with "verdict:").
         let verdict = records
             .iter()
             .find(|r| {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(r) {
-                    if let Some(s) = v["action"].as_str() {
-                        return s.starts_with("verdict: ");
-                    }
-                }
-                false
+                serde_json::from_str::<serde_json::Value>(r)
+                    .is_ok_and(|v| v["action"] == "phase.review.verdict")
             })
             .expect("expected verdict record");
 
@@ -837,7 +840,7 @@ mod tests {
             crate::flow::Category::Machinery,
             crate::flow::Tier::Local,
             crate::flow::Stage::Review,
-            "dispatch failed".to_string(),
+            darkmux_flow::FlowAction::PhaseReviewFailed,
             "openclaw exit 1".to_string(),
             "phase-review-12345",
             Some("66"),
@@ -848,7 +851,7 @@ mod tests {
         assert_eq!(json["category"], "machinery");
         assert_eq!(json["tier"], "local");
         assert_eq!(json["stage"], "review");
-        assert_eq!(json["action"], "dispatch failed");
+        assert_eq!(json["action"], "phase.review.failed");
         assert_eq!(json["source"], "phase_review");
         assert_eq!(json["phase_id"], "66");
         assert_eq!(json["session_id"], "phase-review-12345");
@@ -942,7 +945,7 @@ mod tests {
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut sink = |r: crate::flow::FlowRecord| actions.push(r.action);
+            let mut sink = |r: crate::flow::FlowRecord| actions.push(r.action.to_string());
             let on_abort =
                 move |_id: &str, _kind: &str| phase_review_abort_record("main", "sess-1", Some("66"));
             let mut guard = crate::flow::BookendGuard::new(&mut sink, on_abort);
@@ -954,7 +957,7 @@ mod tests {
                     crate::flow::Category::Review,
                     crate::flow::Tier::Frontier,
                     crate::flow::Stage::Review,
-                    "phase review begin".to_string(),
+                    darkmux_flow::FlowAction::PhaseReviewBegin,
                     "main".to_string(),
                     "sess-1",
                     Some("66"),
@@ -964,11 +967,12 @@ mod tests {
         }));
         std::panic::set_hook(prev_hook);
         assert!(result.is_err());
-        assert_eq!(actions, vec!["phase review begin", "phase review aborted"]);
+        assert_eq!(actions, vec!["phase.review.begin", "phase.review.aborted"]);
     }
 
     /// Happy-path action-name pin: the empty-diff `phase review` path
-    /// still emits exactly `"phase review begin"` then `"verdict: clean"`.
+    /// still emits exactly `phase.review.begin` then `phase.review.verdict`,
+    /// the verdict itself in the payload.
     /// The bookend-guard refactor (#1413) must not rename the vocabulary
     /// downstream liveness/viewer consumers key on.
     #[serial_test::serial]
@@ -989,9 +993,10 @@ mod tests {
         assert_eq!(records.len(), 2, "expected begin + verdict records only");
 
         let start: serde_json::Value = serde_json::from_str(&records[0]).unwrap();
-        assert_eq!(start["action"], "phase review begin");
+        assert_eq!(start["action"], "phase.review.begin");
 
         let verdict: serde_json::Value = serde_json::from_str(&records[1]).unwrap();
-        assert_eq!(verdict["action"], "verdict: clean");
+        assert_eq!(verdict["action"], "phase.review.verdict");
+        assert_eq!(verdict["payload"]["verdict"], "clean");
     }
 }

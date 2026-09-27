@@ -19,25 +19,16 @@
  * silent.
  */
 
-import type { FlowRecord } from "../types/handwritten";
 import type { UtilityJobKind } from "../types/generated/UtilityJobKind";
-import { isDispatchStart, isDispatchTerminal, sessionRecords, uidOf } from "./flow";
+import { uidOf } from "./flow";
+import { runIndex } from "./runRef";
 import { CALL_KIND, PURPOSE, isUsageRecord, usagePurpose, type UsagePayload } from "./usageRecords";
 import { mergeLive } from "./liveChannel";
+import { ACTION, isAsOf, isDispatchTerminal, type NormAction, type NormRecord } from "./ingest";
 
 /** Every `UtilityJobKind` variant, by name. A key missing or extra relative
  *  to the generated union is a type error. */
 export const UTILITY_JOB = { compaction: "compaction", radio_routing: "radio_routing" } as const satisfies { readonly [K in UtilityJobKind]: K };
-
-/** The flow-record action a utility job writes when it starts. */
-export const UTILITY_START_ACTION = "utility.start";
-/** The flow-record action a started job writes when its model call fails. */
-export const UTILITY_ERROR_ACTION = "utility.error";
-/** (#2928) A utility job's END as the LIVE channel delivers it (a record the
- *  viewer builds from a live sample, `lib/liveChannel.ts`; never a flow
- *  record on the wire). Its durable twin is the job's usage record or
- *  `utility.error`, which carry the same `job_id`. */
-export const LIVE_UTILITY_END_ACTION = "utility.end";
 
 /** The bound a `utility.start` that carries none is held to: the runtime's
  *  default inactivity window (`runtime.inactivity_timeout_seconds`, 600 s).
@@ -79,19 +70,19 @@ export function utilityJobWord(job: string | null): string {
 
 type Payload = Record<string, unknown>;
 
-function payloadOf(r: FlowRecord): Payload {
+function payloadOf(r: NormRecord): Payload {
   const x = r as unknown as { payload?: Payload; fields?: Payload };
   return x.payload ?? x.fields ?? {};
 }
 
-export function isUtilityStart(r: FlowRecord): boolean {
-  return r.action === UTILITY_START_ACTION;
+export function isUtilityStart(r: NormRecord): boolean {
+  return r.action === ACTION.UtilityStart;
 }
 
 /** The job a utility record names: its `job`, or, for a compactor call's
  *  usage record from before 1.61.0 (no `job`), the compaction job. `null`
  *  when it names none. */
-export function utilityJobOf(r: FlowRecord): string | null {
+export function utilityJobOf(r: NormRecord): string | null {
   const p = payloadOf(r);
   if (typeof p.job === "string" && p.job) return p.job;
   if (isUsageRecord(r) && (p as UsagePayload).call_kind === CALL_KIND.compaction) return UTILITY_JOB.compaction;
@@ -100,24 +91,26 @@ export function utilityJobOf(r: FlowRecord): string | null {
 
 /** True when `r` ENDS a utility job: a utility usage record, or a
  *  `utility.error`. */
-export function isUtilityEnd(r: FlowRecord): boolean {
-  if (r.action === UTILITY_ERROR_ACTION || r.action === LIVE_UTILITY_END_ACTION) return true;
+export function isUtilityEnd(r: NormRecord): boolean {
+  if (r.action === ACTION.UtilityError || r.action === ACTION.UtilityEnd) return true;
   return isUsageRecord(r) && usagePurpose(payloadOf(r) as UsagePayload) === PURPOSE.utility;
 }
 
 /** A served execution's records that prove it moved past a compaction whose
  *  calls all failed (no usage record comes then): its next turn's opener,
  *  a turn end, a tool, a rest, an installed compaction, or its end. */
-function executionMovedOn(action: string | undefined): boolean {
-  return (
-    action === "dispatch.turn.heartbeat" ||
-    action === "dispatch.turn" ||
-    action === "dispatch.tool" ||
-    action === "dispatch.rest" ||
-    action === "dispatch.compaction" ||
-    isDispatchStart(action) ||
-    isDispatchTerminal(action)
-  );
+const MOVED_ON: ReadonlySet<NormAction> = new Set<NormAction>([
+  ACTION.DispatchTurnHeartbeat,
+  ACTION.DispatchTurn,
+  ACTION.DispatchTool,
+  ACTION.DispatchRest,
+  ACTION.DispatchCompaction,
+  ACTION.DispatchStart,
+  ACTION.DispatchComplete,
+  ACTION.DispatchError,
+]);
+function executionMovedOn(action: NormAction | undefined): boolean {
+  return action !== undefined && MOVED_ON.has(action);
 }
 
 /** A utility job that has started and not ended, as of `nowMs`. */
@@ -155,11 +148,28 @@ function msField(p: Payload, key: string): number | null {
  *  whole-second TERMINAL is read as the END of its second: it ends
  *  everything its execution started in that second (a heartbeat without a
  *  sample time keeps its `ts`, so a same-second one does not). */
-function whenMs(r: FlowRecord, p: Payload): number {
-  const precise = msField(p, isUtilityStart(r) ? "started_at_ms" : isUtilityEnd(r) ? "ended_at_ms" : "sampled_at_ms");
-  if (precise !== null) return precise;
-  const t = Date.parse(r.ts);
-  return isDispatchTerminal(r.action) ? t + 999 : t;
+function whenMs(r: NormRecord, p: Payload): number | null {
+  const precise = preciseMs(r, p);
+  if (precise !== null || r.tMs === null) return precise;
+  return isDispatchTerminal(r.action) ? r.tMs + 999 : r.tMs;
+}
+
+function preciseMs(r: NormRecord, p: Payload): number | null {
+  return msField(p, isUtilityStart(r) ? "started_at_ms" : isUtilityEnd(r) ? "ended_at_ms" : "sampled_at_ms");
+}
+
+/** `records` as of `nowMs`, in time order, each with its payload and best
+ *  time. The as-of cut is the shared one (`isAsOf`), tightened by a precise
+ *  field when the record carries one. A record with no time at all is kept
+ *  and sequenced last (the bad-timestamp policy), with `atMs: null`. */
+function sequenced(records: readonly NormRecord[], nowMs: number): { r: NormRecord; p: Payload; atMs: number | null }[] {
+  return records
+    .map((r) => {
+      const p = payloadOf(r);
+      return { r, p, atMs: whenMs(r, p), precise: preciseMs(r, p) };
+    })
+    .filter((x) => (x.precise !== null ? x.precise <= nowMs : isAsOf(x.r, nowMs)))
+    .sort((a, b) => (a.atMs === null ? (b.atMs === null ? 0 : 1) : b.atMs === null ? -1 : a.atMs - b.atMs));
 }
 
 /** Every job open as of `nowMs` in `records` (one machine's, or one
@@ -176,21 +186,16 @@ function whenMs(r: FlowRecord, p: Payload): number {
  *  - A job that serves an execution also ends when that execution moves on
  *    (its next turn's opener, a turn end, a tool, a rest, an installed
  *    compaction) or ends (a terminal, even in the start's own second). */
-export function openUtilityJobs(records: readonly FlowRecord[], nowMs: number): LiveUtilityJob[] {
-  const ordered = records
-    .map((r) => {
-      const p = payloadOf(r);
-      const cut = msField(p, isUtilityStart(r) ? "started_at_ms" : isUtilityEnd(r) ? "ended_at_ms" : "sampled_at_ms") ?? Date.parse(r.ts);
-      return { r, p, atMs: whenMs(r, p), cut };
-    })
-    .filter((x) => Number.isFinite(x.atMs) && x.cut <= nowMs)
-    .sort((a, b) => a.atMs - b.atMs);
+export function openUtilityJobs(records: readonly NormRecord[], nowMs: number): LiveUtilityJob[] {
+  const ordered = sequenced(records, nowMs);
   let open: Open[] = [];
   const closeWithOlder = (i: number) => {
     const closed = open[i];
     open = open.filter((o, k) => k !== i && !(o.job === closed.job && o.session === closed.session && o.atMs <= closed.atMs));
   };
-  for (const { r, p, atMs } of ordered) {
+  for (const { r, p, atMs: at } of ordered) {
+    // An untimed start opens as of `nowMs`, the only instant it is known open.
+    const atMs = at ?? nowMs;
     const session = r.session_id || null;
     if (isUtilityStart(r)) {
       const job = typeof p.job === "string" && p.job ? p.job : "";
@@ -231,7 +236,7 @@ export function openUtilityJobs(records: readonly FlowRecord[], nowMs: number): 
 /** The machine's live utility job as of `nowMs` (`records` already narrowed
  *  to one machine): the most recently started open one, else `null`
  *  (quiet). */
-export function machineUtilityJob(records: readonly FlowRecord[], nowMs: number): LiveUtilityJob | null {
+export function machineUtilityJob(records: readonly NormRecord[], nowMs: number): LiveUtilityJob | null {
   const open = openUtilityJobs(records, nowMs);
   return open.length ? open[open.length - 1] : null;
 }
@@ -239,11 +244,12 @@ export function machineUtilityJob(records: readonly FlowRecord[], nowMs: number)
 /** The latest utility model a machine's records name (a start's `model`, or
  *  a utility usage record's `requested_model`), for a machine whose own
  *  binding the viewer cannot ask (a fleet peer). `null` when none. */
-export function lastUtilityModel(records: readonly FlowRecord[], nowMs: number): string | null {
+export function lastUtilityModel(records: readonly NormRecord[], nowMs: number): string | null {
   let best: { atMs: number; model: string } | null = null;
   for (const r of records) {
-    const atMs = Date.parse(r.ts);
-    if (!Number.isFinite(atMs) || atMs > nowMs) continue;
+    if (!isAsOf(r, nowMs)) continue;
+    // An untimed record wins only when nothing timed does (the bad-timestamp policy).
+    const atMs = r.tMs ?? -Infinity;
     let model: unknown = null;
     if (isUtilityStart(r)) model = payloadOf(r).model;
     else if (isUsageRecord(r) && usagePurpose(payloadOf(r) as UsagePayload) === PURPOSE.utility) model = payloadOf(r).requested_model;
@@ -269,7 +275,7 @@ function tokensOf(p: Payload): number {
 /** Each utility job's calls and tokens, from its usage records: every known
  *  job, in enum order, even at zero (so the list is the same shape whatever
  *  ran), then any job this build does not know, then the unnamed ones. */
-export function utilityUsageByJob(records: readonly FlowRecord[]): UtilityJobUsage[] {
+export function utilityUsageByJob(records: readonly NormRecord[]): UtilityJobUsage[] {
   const by = new Map<string | null, UtilityJobUsage>();
   for (const job of Object.values(UTILITY_JOB)) by.set(job, { job, known: true, calls: 0, tokens: 0 });
   for (const r of records) {
@@ -290,9 +296,9 @@ export function utilityUsageByJob(records: readonly FlowRecord[]): UtilityJobUsa
 /** Per data array: each machine's utility records (starts and ends), built
  *  once per array like `sessionRecords`' index, so a fleet card's strip is
  *  not a scan of the whole window per card per tick. */
-const machineIndexCache = new WeakMap<readonly FlowRecord[], Map<string, FlowRecord[]>>();
+const machineIndexCache = new WeakMap<readonly NormRecord[], Map<string, NormRecord[]>>();
 
-function machineUtilityRecords(data: readonly FlowRecord[], uid: string): FlowRecord[] {
+function machineUtilityRecords(data: readonly NormRecord[], uid: string): NormRecord[] {
   let index = machineIndexCache.get(data);
   if (!index) {
     index = new Map();
@@ -321,7 +327,7 @@ export interface UtilityStrip {
  *  `binding` is this machine's own `internal.utility` as `/machine/specs`
  *  reports it, when `uid` is the machine the page is served from. */
 export function utilityStrip(
-  data: readonly FlowRecord[],
+  data: readonly NormRecord[],
   uid: string,
   t: number,
   binding: { id: string; loaded: boolean } | null,
@@ -330,18 +336,19 @@ export function utilityStrip(
    *  local-daemon only. A sub-second job shows open while it runs, instead
    *  of arriving start-and-end in one durable delivery. Durable edges win
    *  (`mergeLive`). */
-  liveEdges: readonly FlowRecord[] = [],
+  liveEdges: readonly NormRecord[] = [],
 ): UtilityStrip {
   const own = mergeLive(machineUtilityRecords(data, uid), liveEdges);
   // A served execution's own records can end its compaction (the execution
   // moved on); pull them in, once each.
   const served = new Set<string>();
   for (const r of own) if (isUtilityStart(r) && r.session_id) served.add(r.session_id);
-  let recs: readonly FlowRecord[] = own;
+  let recs: readonly NormRecord[] = own;
   if (served.size) {
-    const seen = new Set<FlowRecord>(own);
-    const extra: FlowRecord[] = [];
-    for (const sid of served) for (const r of sessionRecords(data as FlowRecord[], sid)) if (!seen.has(r)) extra.push(r);
+    const seen = new Set<NormRecord>(own);
+    const extra: NormRecord[] = [];
+    const ix = runIndex(data);
+    for (const sid of served) for (const g of ix.groupsOfSession(sid)) for (const r of g.records) if (!seen.has(r)) extra.push(r);
     recs = [...own, ...extra];
   }
   const live = machineUtilityJob(recs, t);

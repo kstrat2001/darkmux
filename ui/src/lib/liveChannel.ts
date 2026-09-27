@@ -1,6 +1,5 @@
 import { useSyncExternalStore } from "react";
-import type { FlowRecord } from "../types/handwritten";
-import { LIVE_UTILITY_END_ACTION, UTILITY_START_ACTION } from "./utilityJobs";
+import { ACTION, ingestRecord, recordsSince, type NormRecord } from "./ingest";
 
 /**
  * (#2928) The LIVE channel, viewer side: sub-second model state and utility
@@ -56,8 +55,8 @@ export interface LiveRecordMark {
  *  machine's: the live channel is local-daemon only). */
 export interface LiveOverlay {
   readonly version: number;
-  readonly bySession: ReadonlyMap<string, readonly FlowRecord[]>;
-  readonly utility: readonly FlowRecord[];
+  readonly bySession: ReadonlyMap<string, readonly NormRecord[]>;
+  readonly utility: readonly NormRecord[];
 }
 
 /** (#2928) What a replayed scope says on hover: playback has only the
@@ -81,8 +80,14 @@ function isoMs(ms: number): string {
 }
 
 /** One wire sample as a record, or `null` for anything this build does not
- *  understand (an unknown version or kind, a malformed frame). */
-export function liveSampleToRecord(raw: unknown): (FlowRecord & LiveRecordMark) | null {
+ *  understand (an unknown version or kind, a malformed frame). The record is
+ *  built in wire shape and passed through `ingestRecord`, like any other. */
+export function liveSampleToRecord(raw: unknown): (NormRecord & LiveRecordMark) | null {
+  const rec = liveSampleToWire(raw);
+  return rec ? (ingestRecord(rec) as (NormRecord & LiveRecordMark) | null) : null;
+}
+
+function liveSampleToWire(raw: unknown): Record<string, unknown> | null {
   if (!raw || typeof raw !== "object") return null;
   const s = raw as Partial<LiveSampleWire>;
   if (s.v !== LIVE_WIRE_VERSION || typeof s.at_ms !== "number" || !Number.isFinite(s.at_ms)) return null;
@@ -92,14 +97,14 @@ export function liveSampleToRecord(raw: unknown): (FlowRecord & LiveRecordMark) 
     if (typeof fields.sampled_at_ms !== "number") fields.sampled_at_ms = s.at_ms;
     return {
       ts: isoMs(s.at_ms),
-      action: "dispatch.turn.heartbeat",
+      action: ACTION.DispatchTurnHeartbeat,
       session_id: s.session_id,
       handle: s.role,
       model: s.model,
       payload: fields,
       live: true,
       live_cadence_ms: s.cadence_ms,
-    } as unknown as FlowRecord & LiveRecordMark;
+    };
   }
   if (s.kind === "utility") {
     const edge = fields.event;
@@ -110,61 +115,61 @@ export function liveSampleToRecord(raw: unknown): (FlowRecord & LiveRecordMark) 
     if (edge === "end" && typeof fields.ended_at_ms !== "number") fields.ended_at_ms = s.at_ms;
     return {
       ts: isoMs(s.at_ms),
-      action: edge === "start" ? UTILITY_START_ACTION : LIVE_UTILITY_END_ACTION,
+      action: edge === "start" ? ACTION.UtilityStart : ACTION.UtilityEnd,
       session_id: edge === "start" ? serves : s.session_id,
       handle: s.role,
       model: s.model,
       source: "utility",
       payload: fields,
       live: true,
-    } as unknown as FlowRecord & LiveRecordMark;
+    };
   }
   return null;
 }
 
 type Fields = Record<string, unknown>;
-function fieldsOf(r: FlowRecord): Fields {
+function fieldsOf(r: NormRecord): Fields {
   const x = r as unknown as { payload?: Fields; fields?: Fields };
   return x.payload ?? x.fields ?? {};
 }
 
-function beatMs(r: FlowRecord): number {
+function beatMs(r: NormRecord): number | null {
   const v = fieldsOf(r).sampled_at_ms;
-  return typeof v === "number" && Number.isFinite(v) ? v : Date.parse(r.ts);
+  return typeof v === "number" && Number.isFinite(v) ? v : r.tMs;
 }
 
-function isUtilityEdge(r: FlowRecord): boolean {
-  return r.action === UTILITY_START_ACTION || r.action === LIVE_UTILITY_END_ACTION;
+function isUtilityEdge(r: NormRecord): boolean {
+  return r.action === ACTION.UtilityStart || r.action === ACTION.UtilityEnd;
 }
 
 /** A durable record's utility edge key (`start:<job_id>` / `end:<job_id>`),
  *  when it has one. A usage record or `utility.error` carrying a `job_id` is
  *  that job's end. */
-function durableEdgeKey(r: FlowRecord): string | null {
+function durableEdgeKey(r: NormRecord): string | null {
   const id = fieldsOf(r).job_id;
   if (typeof id !== "string" || !id) return null;
-  if (r.action === UTILITY_START_ACTION) return `start:${id}`;
+  if (r.action === ACTION.UtilityStart) return `start:${id}`;
   return `end:${id}`;
 }
 
-function liveEdgeKey(r: FlowRecord): string | null {
+function liveEdgeKey(r: NormRecord): string | null {
   const id = fieldsOf(r).job_id;
   if (typeof id !== "string" || !id) return null;
-  return r.action === UTILITY_START_ACTION ? `start:${id}` : `end:${id}`;
+  return r.action === ACTION.UtilityStart ? `start:${id}` : `end:${id}`;
 }
 
 /** `durable` with the live records merged in, by the precedence in the
  *  module doc. Returns `durable` itself (same reference) when there is
  *  nothing live to merge, so an idle page does no extra work. */
-export function mergeLive(durable: readonly FlowRecord[], live: readonly FlowRecord[] | undefined): FlowRecord[] {
-  if (!live || live.length === 0) return durable as FlowRecord[];
+export function mergeLive(durable: readonly NormRecord[], live: readonly NormRecord[] | undefined): NormRecord[] {
+  if (!live || live.length === 0) return durable as NormRecord[];
   const spans = liveSpans(live);
   let durableEdges: Set<string> | null = null;
-  const out: FlowRecord[] = [];
+  const out: NormRecord[] = [];
   for (const r of durable) {
-    if (r.action === "dispatch.turn.heartbeat") {
+    if (r.action === ACTION.DispatchTurnHeartbeat) {
       const at = beatMs(r);
-      if (spans.some(([a, b]) => at >= a && at <= b)) continue;
+      if (at !== null && spans.some(([a, b]) => at >= a && at <= b)) continue;
     } else {
       const k = durableEdgeKey(r);
       if (k) (durableEdges ??= new Set()).add(k);
@@ -185,10 +190,13 @@ export function mergeLive(durable: readonly FlowRecord[], live: readonly FlowRec
  *  longer than two cadences plus the host's 250 ms poll ends a stretch. A
  *  durable heartbeat is dropped only INSIDE a stretch; one in a hole (the
  *  feed dropped, the daemon restarted, the page lost its stream) stays. */
-function liveSpans(live: readonly FlowRecord[]): [number, number][] {
+function liveSpans(live: readonly NormRecord[]): [number, number][] {
   const beats = live
-    .filter((r) => r.action === "dispatch.turn.heartbeat")
-    .map((r) => ({ at: beatMs(r), gap: 2 * cadenceOf(r) + HOST_POLL_MS }))
+    .filter((r) => r.action === ACTION.DispatchTurnHeartbeat)
+    .flatMap((r) => {
+      const at = beatMs(r);
+      return at === null ? [] : [{ at, gap: 2 * cadenceOf(r) + HOST_POLL_MS }];
+    })
     .sort((a, b) => a.at - b.at);
   const spans: [number, number][] = [];
   for (const b of beats) {
@@ -202,7 +210,7 @@ function liveSpans(live: readonly FlowRecord[]): [number, number][] {
 /** The host tailer's trajectory poll: the most a sample can lag its window. */
 const HOST_POLL_MS = 250;
 
-function cadenceOf(r: FlowRecord): number {
+function cadenceOf(r: NormRecord): number {
   const c = (r as unknown as { live_cadence_ms?: unknown }).live_cadence_ms;
   return typeof c === "number" && Number.isFinite(c) && c > 0 ? c : 250;
 }
@@ -255,9 +263,9 @@ function modeAfter(prev: SessionMode | undefined, f: Record<string, unknown>): M
  *  the latest state. Fast transitions are shown as they happen, never
  *  averaged away. */
 export class LiveStore {
-  private bySession = new Map<string, FlowRecord[]>();
+  private bySession = new Map<string, NormRecord[]>();
   private lastSeen = new Map<string, number>();
-  private utility: FlowRecord[] = [];
+  private utility: NormRecord[] = [];
   private latest: LiveOverlay = EMPTY_OVERLAY;
   private frames: LiveOverlay[] = [];
   /** Frames kept per session in the current train, and the train's length. */
@@ -291,7 +299,7 @@ export class LiveStore {
     if (typeof cadence === "number" && Number.isFinite(cadence)) this.cadenceMs = Math.min(1000, Math.max(50, cadence));
     const sid = rec.session_id;
     const f = fieldsOf(rec);
-    if (rec.action === "dispatch.turn.heartbeat" && sid) {
+    if (rec.action === ACTION.DispatchTurnHeartbeat && sid) {
       const prev = this.modes.get(sid);
       const mode = modeAfter(prev, f);
       if (prev && prev.mode !== mode && this.unrenderedMode.has(sid)) this.keepFrame(sid);
@@ -308,16 +316,16 @@ export class LiveStore {
       const prevList = this.bySession.get(sid) ?? [];
       const tail = prevList[prevList.length - 1];
       const isRefresh = typeof f.refreshed_at_ms === "number";
-      const sameState = (r: FlowRecord | undefined) =>
+      const sameState = (r: NormRecord | undefined) =>
         r !== undefined && typeof fieldsOf(r).refreshed_at_ms === "number" && fieldsOf(r).sampled_at_ms === f.sampled_at_ms && fieldsOf(r).turn_seq === f.turn_seq;
       const list = isRefresh && sameState(tail) ? [...prevList.slice(0, -1), rec] : [...prevList, rec];
       this.bySession.set(sid, list.length > MAX_LIVE_PER_SESSION ? list.slice(-MAX_LIVE_PER_SESSION) : list);
       this.lastSeen.set(sid, nowMs);
     } else {
       const jobId = typeof f.job_id === "string" ? f.job_id : null;
-      if (rec.action === LIVE_UTILITY_END_ACTION && jobId !== null && this.unrenderedStart.has(jobId)) this.keepFrame(`utility:${jobId}`);
-      if (rec.action === UTILITY_START_ACTION && jobId !== null) this.unrenderedStart.add(jobId);
-      this.utility = [...this.utility, rec].filter((r) => nowMs - Date.parse(r.ts) <= LIVE_UTILITY_TTL_MS).slice(-MAX_LIVE_PER_SESSION);
+      if (rec.action === ACTION.UtilityEnd && jobId !== null && this.unrenderedStart.has(jobId)) this.keepFrame(`utility:${jobId}`);
+      if (rec.action === ACTION.UtilityStart && jobId !== null) this.unrenderedStart.add(jobId);
+      this.utility = recordsSince([...this.utility, rec], nowMs - LIVE_UTILITY_TTL_MS).slice(-MAX_LIVE_PER_SESSION);
       if (sid) {
         this.bySession.set(sid, [...(this.bySession.get(sid) ?? []), rec].slice(-MAX_LIVE_PER_SESSION));
         this.lastSeen.set(sid, nowMs);
@@ -382,7 +390,7 @@ export class LiveStore {
         changed = true;
       }
     }
-    const kept = this.utility.filter((r) => nowMs - Date.parse(r.ts) <= LIVE_UTILITY_TTL_MS);
+    const kept = recordsSince(this.utility, nowMs - LIVE_UTILITY_TTL_MS);
     if (kept.length !== this.utility.length) {
       this.utility = kept;
       changed = true;

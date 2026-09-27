@@ -5,14 +5,19 @@ import path from "node:path";
 import { render, screen, waitFor, fireEvent, act } from "@testing-library/react";
 import { QueryClientProvider, QueryClient } from "@tanstack/react-query";
 import { FleetLens } from "./FleetLens";
-import type { FlowRecord } from "../../types/handwritten";
+
 import { pepperAt, pepperRecords } from "../../testing/pepperGrinderRun";
-import { todayUTC, prevDateUTC, FLOW_LIVE_TTL_MS, __sessionIndexBuilds, __asOfFilterRuns } from "../../lib/flow";
+import { todayUTC, prevDateUTC } from "../../lib/flow";
+import { DEFAULT_POLICY } from "../../lib/lifecycle";
+import { __runIndexBuilds } from "../../lib/runRef";
+import { ACTION, __asOfFilterRuns } from "../../lib/ingest";
 import { tokensOffMeter } from "./savings";
 import { closeOpenModal } from "../../lib/dialogManager";
 import { queryKeys } from "../../lib/queryKeys";
 import { machineKeyHash } from "../../lib/machineKey";
 import { __clockDebug } from "../../lib/clock";
+import type { NormRecord } from "../../lib/ingest";
+import { norm, normAll, type RawRecord } from "../../testing/records";
 
 // (#2886 pass 5, MUST — fresh-reviewer finding F5) Several fixes in this
 // file stayed green while broken in the actual render path: the DOM-text
@@ -59,7 +64,7 @@ function latestTokenScopeProps(): Record<string, unknown> {
 }
 
 // (#1913) Every fixture below anchors its records at "T10:00" of `today`
-// (`todayUTC()`), and liveness (`flowLiveSessions`, `FLOW_LIVE_TTL_MS`) is
+// (`todayUTC()`), and liveness (each run's lifecycle, `DEFAULT_POLICY.staleAfterMs`) is
 // judged against REAL wall-clock now. Left alone, that means the suite's
 // pass/fail depended on what time of day it happened to run: before 10:00
 // UTC the fixture sits in the future (trivially "fresh"), and after
@@ -69,7 +74,7 @@ function latestTokenScopeProps(): Record<string, unknown> {
 // something inherited from the clock. `toFake: ["Date"]` leaves
 // setTimeout/setInterval alone, so `waitFor()`'s real-timer polling still
 // works.
-const FROZEN_NOW = "2026-06-15T10:02:00.000Z"; // 2 minutes after the T10:00 anchor, well inside FLOW_LIVE_TTL_MS
+const FROZEN_NOW = "2026-06-15T10:02:00.000Z"; // 2 minutes after the T10:00 anchor, well inside DEFAULT_POLICY.staleAfterMs
 
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ["Date"] });
@@ -161,6 +166,8 @@ function mockFleetFetch(opts: {
   /** (#2965) Further days that answer `200 []`: the mock names today and
    *  yesterday when it is built, so a day reached by a rollover needs this. */
   emptyDays?: string[];
+  /** Session ids `/fleet/sessions/live` reports beating. */
+  sessions?: string[];
 } = {}) {
   const today = todayUTC();
   const yesterday = prevDateUTC(today);
@@ -196,8 +203,9 @@ function mockFleetFetch(opts: {
       );
     }
     if (path === "/fleet/sessions/live") {
+      const sessions = (opts.sessions ?? []).map((session_id) => ({ session_id }));
       return Promise.resolve(
-        new Response(JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }),
+        new Response(JSON.stringify({ sessions, meta: { sources: { fleet: { state: "ok" } }, complete: true } }), { status: 200 }),
       );
     }
     if (path === "/machine/specs") {
@@ -225,6 +233,41 @@ function gate(): { promise: Promise<void>; open: () => void } {
   });
   return { promise, open };
 }
+
+describe("FleetLens: presence is a fact about now", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  // A run silent for two hours whose session presence still beats: at the
+  // live edge presence holds it running; with the playhead parked an hour
+  // in, the same card judges from the records alone.
+  const now = Date.parse(`${todayUTC()}T12:00:00.000Z`);
+  const start = now - 2 * 3_600_000;
+  const records = [{ ts: new Date(start).toISOString(), action: "dispatch.start", session_id: "s1", machine_uid: "u1", machine_id: "MacBook-Pro", handle: "coder" }];
+
+  async function cardText(playhead?: number): Promise<string> {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(now);
+    mockFleetFetch({ flowToday: records, sessions: ["s1"] });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderFleetLens(playhead === undefined ? {} : { playhead }, qc);
+    await waitFor(() => expect(qc.getQueryState(queryKeys.fleetSessionsLive())?.status).toBe("success"));
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    return document.querySelector(".mach")!.textContent ?? "";
+  }
+
+  it("at the live edge presence holds the silent run running", async () => {
+    await cardText();
+    await waitFor(() => expect(document.querySelector(".mach")!.textContent).toContain("1 running"));
+  });
+
+  it("a scrubbed playhead on a live day judges from records alone, however presence reads now", async () => {
+    const text = await cardText(start + 3_600_000);
+    expect(text).not.toContain("1 running");
+  });
+});
 
 describe("FleetLens", () => {
   it("always renders the hero, even at zero — never hides it while there's no data yet", async () => {
@@ -350,7 +393,7 @@ describe("FleetLens", () => {
   // (#1923) A machine whose lab run is BETWEEN dispatches — the COW clone,
   // the baseline hash, the verify command, scoring — has no dispatch in
   // flight, so no contract-2 bookends and no presence key: flow sees nothing
-  // and `machActive`/`sessionsOn` have nothing to read. The `/runs` lab row
+  // and `machActive` has no run to read. The `/runs` lab row
   // (written at start, RAII-guarded) is the only source that stays "running"
   // across that whole span, and without it the card reads "idle" /
   // "0 running" while the run is very much live.
@@ -452,10 +495,10 @@ describe("FleetLens", () => {
     await waitFor(() => expect(live.container.querySelector('.fleetcov[data-state="runs-unreadable"]')).toBeTruthy());
     live.unmount();
 
-    const records: FlowRecord[] = [
+    const records: NormRecord[] = normAll([
       { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: `${today}T10:01:00.000Z`, machine_uid: "u1", session_id: "s1", action: "dispatch.complete" },
-    ];
+    ]);
     const { container } = renderFleetLens(
       {
         records,
@@ -593,9 +636,9 @@ describe("FleetLens", () => {
     );
     try {
       const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-      const records = [
+      const records = normAll([
         { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m5-ultra-256gb", action: "machine.online", source: "presence-reconciler" },
-      ] as unknown as FlowRecord[];
+      ]);
       render(
         <QueryClientProvider client={queryClient}>
           <FleetLens records={records} tMax={Date.parse("2026-08-26T10:00:00.000Z")} historical />
@@ -613,14 +656,14 @@ describe("FleetLens", () => {
     // A 34-minute recording under the 24h default was a sliver at the right
     // edge of the timeline (operator, 2026-09-25: "I'm spending most of my
     // time watching nothing happen").
-    const mk = (ts: string, action: string) => ({ ts, machine_uid: "u1", machine_id: "m5", session_id: "s1", action }) as unknown as FlowRecord;
+    const mk = (ts: string, action: string) => norm({ ts, machine_uid: "u1", machine_id: "m5", session_id: "s1", action });
     const records = [mk("2026-08-26T10:00:00.000Z", "dispatch.start"), mk("2026-08-26T10:34:00.000Z", "dispatch.complete")];
     renderFleetLens({ records, tMin: Date.parse("2026-08-26T10:00:00.000Z"), tMax: Date.parse("2026-08-26T10:34:00.000Z"), historical: true });
     await waitFor(() => expect(document.querySelector(".twinb.on")?.textContent).toBe("all"));
   });
 
   it("(#2890) a picked preset replaces \"all\"; live has no \"all\" and keeps 24h", async () => {
-    const mk = (ts: string, action: string) => ({ ts, machine_uid: "u1", machine_id: "m5", session_id: "s1", action }) as unknown as FlowRecord;
+    const mk = (ts: string, action: string) => norm({ ts, machine_uid: "u1", machine_id: "m5", session_id: "s1", action });
     const records = [mk("2026-08-26T01:00:00.000Z", "dispatch.start"), mk("2026-08-26T09:00:00.000Z", "dispatch.complete")];
     const r = renderFleetLens({ records, tMin: Date.parse("2026-08-26T01:00:00.000Z"), tMax: Date.parse("2026-08-26T09:00:00.000Z"), historical: true });
     await waitFor(() => expect(document.querySelector(".twinb.on")?.textContent).toBe("all"));
@@ -896,12 +939,12 @@ describe("FleetLens", () => {
     expect(window.location.hash).toBe("#dispatch=s1");
   });
 
-  // (#1913) The two tests below pin BOTH sides of the `FLOW_LIVE_TTL_MS`
+  // (#1913) The two tests below pin BOTH sides of the `DEFAULT_POLICY.staleAfterMs`
   // boundary explicitly, rather than relying on the other tests in this
   // file happening to sit comfortably inside it. Before this fix neither
   // direction was asserted: a session's liveness was implicitly "whatever
   // real wall-clock now happened to be" relative to a `T10:00` fixture.
-  it("(#1913) a session 1s under the FLOW_LIVE_TTL_MS boundary still reads 1 running", async () => {
+  it("(#1913) a session 1s under the DEFAULT_POLICY.staleAfterMs boundary still reads 1 running", async () => {
     const today = todayUTC();
     const lastRecordMs = Date.parse(`${today}T10:00:00.000Z`);
     mockFleetFetch({
@@ -911,7 +954,7 @@ describe("FleetLens", () => {
       machines: [{ uid: "u1", name: "MacBook-Pro", last_seen_ms: lastRecordMs }],
       specs: { machine_id: "MacBook-Pro", cpu_brand: "Apple M5 Max" },
     });
-    vi.setSystemTime(new Date(lastRecordMs + FLOW_LIVE_TTL_MS - 1000));
+    vi.setSystemTime(new Date(lastRecordMs + DEFAULT_POLICY.staleAfterMs - 1000));
     renderFleetLens();
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
     const card = document.querySelector(".mach")!;
@@ -919,7 +962,7 @@ describe("FleetLens", () => {
     expect(card.querySelector(".runs--live")).not.toBeNull();
   });
 
-  it("(#1913) a session 1s past the FLOW_LIVE_TTL_MS boundary reads 0 running, not stuck live", async () => {
+  it("(#1913) a session 1s past the DEFAULT_POLICY.staleAfterMs boundary reads 0 running, not stuck live", async () => {
     const today = todayUTC();
     const lastRecordMs = Date.parse(`${today}T10:00:00.000Z`);
     mockFleetFetch({
@@ -929,7 +972,7 @@ describe("FleetLens", () => {
       machines: [{ uid: "u1", name: "MacBook-Pro", last_seen_ms: lastRecordMs }],
       specs: { machine_id: "MacBook-Pro", cpu_brand: "Apple M5 Max" },
     });
-    vi.setSystemTime(new Date(lastRecordMs + FLOW_LIVE_TTL_MS + 1000));
+    vi.setSystemTime(new Date(lastRecordMs + DEFAULT_POLICY.staleAfterMs + 1000));
     renderFleetLens();
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
     const card = document.querySelector(".mach")!;
@@ -982,10 +1025,10 @@ describe("FleetLens", () => {
     const today = todayUTC();
     const dayTMin = Date.parse(`${today}T10:00:00.000Z`);
     const dayTMax = Date.parse(`${today}T12:00:00.000Z`);
-    const records = [
+    const records = normAll([
       { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: `${today}T12:00:00.000Z`, machine_uid: "u1", session_id: "s1", action: "dispatch.complete", payload: { total_tokens: 600 } },
-    ];
+    ]);
 
     const { rerender } = render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
@@ -1037,14 +1080,14 @@ describe("FleetLens pager (#2881)", () => {
   // s1: CODER, generating (~100 tok/s, the two heartbeats 2s apart).
   // s2: REVIEWER, resting (a dispatch.rest 15s window opened at 3s).
   // s3: FETCH-RENDER, prompt (a bare dispatch.start, no heartbeat yet).
-  const threeExecutionRecords: FlowRecord[] = [
+  const threeExecutionRecords: NormRecord[] = normAll([
     { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
     { ts: at(0), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 0 } },
     { ts: at(2), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 2000, generated_chars: 800 } },
     { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s2", action: "dispatch.start", handle: "reviewer" },
     { ts: at(3), machine_uid: "u1", session_id: "s2", action: "dispatch.rest", payload: { ms: 15_000 } },
     { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s3", action: "dispatch.start", handle: "fetch-render" },
-  ] as FlowRecord[];
+  ]);
 
   function renderThree(playheadSec: number) {
     return render(
@@ -1074,13 +1117,13 @@ describe("FleetLens pager (#2881)", () => {
   });
 
   // (#2886 pass 5, MUST — fresh-reviewer finding F2) A mission's seats all
-  // collapse to ONE top-level run (`topLevelRunSessionIds`), but the pager
+  // collapse to ONE top-level run (`topLevelRuns`), but the pager
   // shows one page per seat — so `runsCount` (1) and `card.executions.length`
   // (9) genuinely disagree here, unlike the plain-dispatches case above
   // where they agree by construction.
   it("names both counts when runs and executions disagree (a mission's seats collapse to one run)", async () => {
     const missionId = "mission-1";
-    const seatRecords: FlowRecord[] = Array.from({ length: 8 }, (_, i) => ({
+    const seatRecords: RawRecord[] = Array.from({ length: 8 }, (_, i) => ({
       ts: at(0),
       machine_uid: "u1",
       machine_id: "MacBook-Pro",
@@ -1088,14 +1131,14 @@ describe("FleetLens pager (#2881)", () => {
       action: "dispatch.start",
       mission_id: missionId,
       handle: "darkmux/crawler",
-    })) as FlowRecord[];
-    const missionRecords: FlowRecord[] = [
+    }));
+    const missionRecords: NormRecord[] = normAll([
       { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: missionId, action: "dispatch.start", source: "mission", mission_id: missionId },
       { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "seat-1", action: "dispatch.start", mission_id: missionId, handle: "darkmux/crawler" },
       { ts: at(0), machine_uid: "u1", session_id: "seat-1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 0 } },
       { ts: at(2), machine_uid: "u1", session_id: "seat-1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 2000, generated_chars: 800 } },
       ...seatRecords,
-    ] as FlowRecord[];
+    ]);
     render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
         <FleetLens records={missionRecords} tMax={D0 + 5000} tMin={D0} playhead={D0 + 5000} historical />
@@ -1113,10 +1156,10 @@ describe("FleetLens pager (#2881)", () => {
       JSON.parse(document.querySelector('[data-testid="token-scope-probe"]')!.getAttribute("data-props")!);
     // One execution whose turn opener reported a 144,000-char prompt; no
     // billed turn yet, so the default 4 chars/token -> ~36k.
-    const sized: FlowRecord[] = [
+    const sized: NormRecord[] = normAll([
       { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "p1", action: "dispatch.start", handle: "coder" },
       { ts: at(1), machine_uid: "u1", session_id: "p1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 1000, generated_chars: 0, turn_seq: 1, prompt_chars: 144_000 } },
-    ] as FlowRecord[];
+    ]);
     render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
         <FleetLens records={sized} tMax={D0 + 3000} tMin={D0} playhead={D0 + 3000} historical />
@@ -1181,7 +1224,7 @@ describe("FleetLens pager (#2881)", () => {
   it("a resting execution's status line says why, with the whole reason on hover", async () => {
     const recs = threeExecutionRecords
       .filter((r) => r.session_id === "s2")
-      .map((r) => (r.action === "dispatch.rest" ? ({ ...r, payload: { ms: 15_000, reason: "thermal", state: "serious" } } as FlowRecord) : r));
+      .map((r) => (r.action === ACTION.DispatchRest ? (norm({ ...r, payload: { ms: 15_000, reason: "thermal", state: "serious" } })) : r));
     render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
         <FleetLens records={recs} tMax={D0 + 5000} tMin={D0} playhead={D0 + 5000} historical />
@@ -1232,9 +1275,9 @@ describe("FleetLens pager (#2881)", () => {
     expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("reviewer");
 
     // s2 ends; s1 (generating) and s3 (prompt) are still running.
-    const afterS2Ends: FlowRecord[] = [
+    const afterS2Ends: NormRecord[] = [
       ...threeExecutionRecords,
-      { ts: at(4), machine_uid: "u1", session_id: "s2", action: "dispatch.complete" } as FlowRecord,
+      norm({ ts: at(4), machine_uid: "u1", session_id: "s2", action: "dispatch.complete" }),
     ];
     rerender(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
@@ -1260,10 +1303,10 @@ describe("FleetLens pager (#2881)", () => {
     // (mirrors `tokenRate.test.ts`'s own fixture note) `dispatch.start` sits
     // 5s before the heartbeat so `deriveLiveState`'s same-second marker tie
     // rule doesn't fire and read this as PROMPT instead of GENERATING.
-    const oneFreshHeartbeat: FlowRecord[] = [
+    const oneFreshHeartbeat: NormRecord[] = normAll([
       { ts: at(-5), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "darkmux/coder" },
       { ts: at(0), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 40 } },
-    ] as FlowRecord[];
+    ]);
     render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
         <FleetLens records={oneFreshHeartbeat} tMax={D0} tMin={D0} playhead={D0} historical />
@@ -1287,14 +1330,14 @@ describe("FleetLens pager (#2881)", () => {
   describe("the default page does not flap on a tie, only moves on a STRICT state-class win", () => {
     // s1: CODER, generating at 100 tok/s (0 -> 800 chars over 2s).
     // s2: REVIEWER, generating at 10 tok/s (0 -> 80 chars over 2s) at first.
-    const twoGenerating = (s2Chars: number): FlowRecord[] => [
+    const twoGenerating = (s2Chars: number): NormRecord[] => normAll([
       { ts: at(-5), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "darkmux/coder" },
       { ts: at(0), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 0 } },
       { ts: at(2), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 2000, generated_chars: 800 } },
       { ts: at(-5), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s2", action: "dispatch.start", handle: "darkmux/reviewer" },
       { ts: at(0), machine_uid: "u1", session_id: "s2", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 0 } },
       { ts: at(2), machine_uid: "u1", session_id: "s2", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 2000, generated_chars: s2Chars } },
-    ] as FlowRecord[];
+    ]);
 
     it("keeps the SAME default page once s2's rate overtakes s1's — both still generating", async () => {
       const { rerender } = render(
@@ -1331,7 +1374,7 @@ describe("FleetLens pager (#2881)", () => {
       // s1 now rests (a real state-class change); s2 keeps generating.
       // s2 is STRICTLY busier now (generating beats rest) — this is a real
       // switch, not a flap, and must happen.
-      const s1Rests: FlowRecord[] = [...twoGenerating(2_000), { ts: at(3), machine_uid: "u1", session_id: "s1", action: "dispatch.rest", payload: { ms: 15_000 } } as FlowRecord];
+      const s1Rests: NormRecord[] = [...twoGenerating(2_000), norm({ ts: at(3), machine_uid: "u1", session_id: "s1", action: "dispatch.rest", payload: { ms: 15_000 } })];
       rerender(
         <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
           <FleetLens records={s1Rests} tMax={D0 + 6000} tMin={D0} playhead={D0 + 6000} historical />
@@ -1355,7 +1398,7 @@ describe("FleetLens pager (#2881)", () => {
   // s1's fresher heartbeat as the deadline for BOTH executions — would
   // wrongly downgrade s2 to "no signal" instead).
   it("downgrades a stalled execution using ITS OWN last heartbeat as the half-open deadline, not the machine-wide one", async () => {
-    const records: FlowRecord[] = [
+    const records: NormRecord[] = normAll([
       // s1: CODER, fresh — generating, last heartbeat at 95s.
       { ts: at(-5), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "darkmux/coder" },
       { ts: at(93), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 93_000, generated_chars: 0 } },
@@ -1364,7 +1407,7 @@ describe("FleetLens pager (#2881)", () => {
       // (30s) by the t=100s playhead. Its OWN deadline is 0 + 30 = 30s.
       { ts: at(-5), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s2", action: "dispatch.start", handle: "darkmux/reviewer" },
       { ts: at(0), machine_uid: "u1", session_id: "s2", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 40 } },
-    ] as FlowRecord[];
+    ]);
     render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
         {/* lastContactMs = 40s: past s2's own 30s deadline (trust s2's
@@ -1391,14 +1434,14 @@ describe("FleetLens pager (#2881)", () => {
   // behavior downgrades to "no signal" — a result "no check ran" cannot
   // produce (it would still read "stalled").
   it("downgrades to 'no signal' when contact came BEFORE the stalled execution's own deadline", async () => {
-    const records: FlowRecord[] = [
+    const records: NormRecord[] = normAll([
       { ts: at(-5), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "darkmux/coder" },
       { ts: at(93), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 93_000, generated_chars: 0 } },
       { ts: at(95), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 95_000, generated_chars: 800 } },
       // s2's own deadline is 0 + 30 = 30s.
       { ts: at(-5), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s2", action: "dispatch.start", handle: "darkmux/reviewer" },
       { ts: at(0), machine_uid: "u1", session_id: "s2", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 40 } },
-    ] as FlowRecord[];
+    ]);
     render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
         {/* lastContactMs = 20s: BEFORE s2's own 30s deadline. */}
@@ -1445,18 +1488,18 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
   });
 
   it("(#2890) the machine name and hardware line carry their full text as a tooltip", async () => {
-    const records = [
+    const records = normAll([
       { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m1-max-32gb-studio", action: "machine.online", source: "presence-reconciler" },
-    ] as unknown as FlowRecord[];
+    ]);
     renderFleetLens({ records, tMin: Date.parse("2026-08-26T09:00:00.000Z"), tMax: Date.parse("2026-08-26T10:00:00.000Z"), historical: true });
     await waitFor(() => expect(document.querySelector(".mach-name")).not.toBeNull());
     expect(document.querySelector(".mach-name")!.getAttribute("title")).toBe("m1-max-32gb-studio");
   });
 
   it("(#2890) an online machine with nothing running shows its tube idle", async () => {
-    const records = [
+    const records = normAll([
       { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m5", action: "machine.online", source: "presence-reconciler" },
-    ] as unknown as FlowRecord[];
+    ]);
     renderFleetLens({ records, tMin: Date.parse("2026-08-26T09:00:00.000Z"), tMax: Date.parse("2026-08-26T10:00:00.000Z"), historical: true });
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
     const card = document.querySelector(".mach")!;
@@ -2138,9 +2181,9 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
   });
 
   it("a replay has its records in hand and never shows 'no signal'", async () => {
-    const records = [
+    const records = normAll([
       { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m5", action: "machine.online", source: "presence-reconciler" },
-    ] as unknown as FlowRecord[];
+    ]);
     renderFleetLens({ records, tMin: Date.parse("2026-08-26T09:00:00.000Z"), tMax: Date.parse("2026-08-26T10:00:00.000Z"), historical: true });
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
     expect(stat(document.querySelector(".mach")!)).toBe("idle");
@@ -2235,9 +2278,8 @@ describe("savings hero: nothing leaks while loading (#2830)", () => {
     // timers are installed, so `todayUTC()` here would read the REAL
     // wall-clock date and build timestamps chronologically AFTER
     // FROZEN_NOW, which fails every `T(ts) <= t` liveness check silently
-    // (found live: `machActive` read false, `sessionRunning` still read
-    // true via a different path, so the card rendered "idle" with a
-    // contradictory "1 running" tap target).
+    // (found live: the card rendered "idle" with a contradictory
+    // "1 running" tap target).
     // Anchored so the LAST heartbeat sits 2s before FROZEN_NOW (10:02:00) —
     // fresh under STALL_AFTER_MS (30s).
     const t1a = "2026-06-15T10:00:00.000Z";
@@ -2301,13 +2343,13 @@ describe("FleetLens card scope: the tool icon (#2890)", () => {
   const at = (sec: number) => new Date(D0 + sec * 1000).toISOString();
   it("hands the card's scope the running call's tool while it is in TOOLS (#2963)", async () => {
     // search has completed; the turn's second call, read, runs.
-    const records: FlowRecord[] = [
+    const records: NormRecord[] = normAll([
       { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "darkmux/coder" },
       { ts: at(1), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 1_000, generated_chars: 0 } },
       { ts: at(3), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 3_000, generated_chars: 800 } },
       { ts: at(4), machine_uid: "u1", session_id: "s1", action: "dispatch.turn", payload: { turn_seq: 1, tool_calls_count: 2, tool_names: ["search", "read"] } },
       { ts: at(5), machine_uid: "u1", session_id: "s1", action: "dispatch.tool", payload: { tool_name: "search" } },
-    ] as FlowRecord[];
+    ]);
     render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
         <FleetLens records={records} tMax={D0 + 6_000} tMin={D0} playhead={D0 + 6_000} historical />
@@ -2356,8 +2398,8 @@ describe("(#2911) the fleet card ticks while an execution is live", () => {
     // across ticks", which pins the window half: the merged array stayed the
     // same object. It does NOT pin that the card's lookups use the index (a
     // lookup reverted to a whole-window scan builds nothing either); that
-    // half is pinned where each lookup lives, in `flow.test.ts`
-    // (`sessionRunning`) and `cards.test.ts` (the heartbeat reads).
+    // half is pinned where each lookup lives, in `flow.test.ts` (the run
+    // index) and `cards.test.ts` (the heartbeat reads).
     vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
     vi.setSystemTime(new Date(FROZEN_NOW));
     mockFleetFetch({
@@ -2368,7 +2410,7 @@ describe("(#2911) the fleet card ticks while an execution is live", () => {
     });
     renderFleetLens();
     await waitFor(() => expect(document.querySelector(".mach-scope__rate")?.textContent).toBe("rest 20s"));
-    const builds = __sessionIndexBuilds();
+    const builds = __runIndexBuilds();
     for (let i = 0; i < 3; i++) {
       act(() => {
         vi.advanceTimersByTime(1_000);
@@ -2376,7 +2418,7 @@ describe("(#2911) the fleet card ticks while an execution is live", () => {
     }
     // The card DID recompute: the countdown moved three seconds.
     expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("rest 17s");
-    expect(__sessionIndexBuilds()).toBe(builds);
+    expect(__runIndexBuilds()).toBe(builds);
   });
 
   it("the flow-derived live TTL expires on the tick, with no new record", async () => {
@@ -2384,8 +2426,8 @@ describe("(#2911) the fleet card ticks while an execution is live", () => {
     vi.setSystemTime(new Date(FROZEN_NOW));
     mockFleetFetch({
       flowToday: [
-        { ts: ago(FLOW_LIVE_TTL_MS - 500), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s-old", action: "dispatch.start", handle: "darkmux/coder" },
-        { ts: ago(FLOW_LIVE_TTL_MS - 1_500), machine_uid: "u1", session_id: "s-old", action: "dispatch.rest", payload: { ms: 600_000 } },
+        { ts: ago(DEFAULT_POLICY.staleAfterMs - 500), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s-old", action: "dispatch.start", handle: "darkmux/coder" },
+        { ts: ago(DEFAULT_POLICY.staleAfterMs - 1_500), machine_uid: "u1", session_id: "s-old", action: "dispatch.rest", payload: { ms: 600_000 } },
       ],
     });
     renderFleetLens();
@@ -2416,10 +2458,10 @@ describe("(#2911) the fleet card ticks while an execution is live", () => {
     render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
         <FleetLens
-          records={[
+          records={normAll([
             { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s2", action: "dispatch.start", handle: "reviewer" },
             { ts: at(3), machine_uid: "u1", session_id: "s2", action: "dispatch.rest", payload: { ms: 15_000 } },
-          ] as FlowRecord[]}
+          ])}
           tMax={D0 + 5000}
           tMin={D0}
           playhead={D0 + 5000}
@@ -2435,7 +2477,7 @@ describe("(#2911) the fleet card ticks while an execution is live", () => {
 describe("(#2911) fleet card wording", () => {
   const D0 = Date.parse("2026-08-26T10:00:00.000Z");
   const at = (sec: number) => new Date(D0 + sec * 1000).toISOString();
-  function renderAt(records: FlowRecord[], playheadSec: number) {
+  function renderAt(records: NormRecord[], playheadSec: number) {
     return render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
         <FleetLens records={records} tMax={D0 + playheadSec * 1000} tMin={D0} playhead={D0 + playheadSec * 1000} historical />
@@ -2447,10 +2489,10 @@ describe("(#2911) fleet card wording", () => {
     // One heartbeat with reasoning chars and no visible chars: thinking,
     // and (one sample) no trusted pair to rate.
     renderAt(
-      [
+      normAll([
         { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
         { ts: at(2), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 2000, generated_chars: 300, cumulative_chars: 0 } },
-      ] as FlowRecord[],
+      ]),
       4,
     );
     await waitFor(() => expect(document.querySelector(".mach-scope__rate")).not.toBeNull());
@@ -2481,11 +2523,11 @@ describe("(#2911) fleet card wording", () => {
 
   it("(#2955) a live reading rides the status line: no extra row", async () => {
     renderAt(
-      [
+      normAll([
         { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
         { ts: at(0), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 0 } },
         { ts: at(2), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 2000, generated_chars: 800 } },
-      ] as FlowRecord[],
+      ]),
       3,
     );
     await waitFor(() => expect(document.querySelector(".mach-scope__rate")).not.toBeNull());
@@ -2555,7 +2597,7 @@ describe("(#2911) a record stamped ahead of the viewer's clock", () => {
     render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
         <FleetLens
-          records={records()}
+          records={normAll(records())}
           tMax={Date.parse(`${today}T10:04:00.000Z`)}
           tMin={Date.parse(`${today}T09:00:00.000Z`)}
           playhead={Date.parse(`${today}T10:02:00.000Z`)}
@@ -2616,7 +2658,7 @@ describe("(#2911) a record stamped ahead of the viewer's clock", () => {
 // (#2926) The fleet card over the same real run, in playback: the rate line
 // under the tube is where its live text lives.
 describe("(#2926) fleet card: THINK opener and TOOL GEN, from the real run", () => {
-  function renderAt(records: FlowRecord[], playhead: number) {
+  function renderAt(records: NormRecord[], playhead: number) {
     render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
         <FleetLens records={records} tMax={playhead} tMin={pepperAt("10:51:00")} playhead={playhead} historical />
@@ -2630,10 +2672,6 @@ describe("(#2926) fleet card: THINK opener and TOOL GEN, from the real run", () 
       return el as HTMLElement;
     });
   const extra = { machine_uid: "u1" };
-  // The real crew dispatch opens with `dispatch start` (spaced); these feed
-  // it verbatim. The app normalizes it to dotted on ingest, but this fixture
-  // hands the lens raw records, and the card reads either spelling (#2927,
-  // defense in depth).
 
   it("turn 7's stream-open chunk: the previous turn's rate, dimmed, never ~1 think tok/s", async () => {
     renderAt(pepperRecords({ extra }), pepperAt("10:51:33"));
@@ -2665,7 +2703,7 @@ describe("(#2921) fleet page: no hardware uid is ever rendered as a label", () =
   // Fixture uid, uppercase like the real ones; not any real machine's.
   const FAKE_UID = "00000000-0000-4000-8000-ABCDEF000001";
   const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
-  function renderFleet(records: FlowRecord[]) {
+  function renderFleet(records: NormRecord[]) {
     const playhead = pepperAt("10:51:33");
     render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
@@ -2695,7 +2733,7 @@ describe("(#2921) fleet page: no hardware uid is ever rendered as a label", () =
   // The reported scenario: a live daemon with an empty DARKMUX_HOME (no
   // roster), whose records carry only the uid.
   const liveUidOnly = () => [
-    { ts: new Date(Date.now() - 60_000).toISOString(), action: "dispatch start", session_id: "s-live", machine_uid: FAKE_UID, handle: "coder" },
+    { ts: new Date(Date.now() - 60_000).toISOString(), action: "dispatch.start", session_id: "s-live", machine_uid: FAKE_UID, handle: "coder" },
   ];
   it("live, no roster, no specs: the lane and card read 'unnamed machine'", async () => {
     mockFleetFetch({ flowToday: liveUidOnly() });
@@ -2727,7 +2765,7 @@ describe("(#2921 follow-up) fleet page: roster names and unnamed ordinals", () =
   const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
   const start = (uid: string, sid: string, agoMs: number) => ({
     ts: new Date(Date.now() - agoMs).toISOString(),
-    action: "dispatch start",
+    action: "dispatch.start",
     session_id: sid,
     machine_uid: uid,
     handle: "coder",
@@ -2828,7 +2866,7 @@ describe("(#2929) fleet-card links carry a machine key, never the hardware uid",
 // utility strip shows the job (a radio signal while routing, the generic
 // indicator for a job this build has no visual for), quiet otherwise.
 describe("(#2915) fleet card: utility work is visible", () => {
-  function renderAt(records: FlowRecord[], playhead: number) {
+  function renderAt(records: NormRecord[], playhead: number) {
     render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
         <FleetLens records={records} tMax={playhead} tMin={pepperAt("10:51:00")} playhead={playhead} historical />
@@ -2838,7 +2876,7 @@ describe("(#2915) fleet card: utility work is visible", () => {
   const extra = { machine_uid: "u1" };
   const SID = pepperRecords({ extra })[0].session_id;
   const rec = (hms: string, action: string, payload: Record<string, unknown>, more: Record<string, unknown> = {}) =>
-    ({ ts: `2026-09-26T${hms}Z`, action, category: "telemetry", machine_uid: "u1", machine_id: "pepper", payload, ...more }) as unknown as FlowRecord;
+    norm({ ts: `2026-09-26T${hms}Z`, action, category: "telemetry", machine_uid: "u1", machine_id: "pepper", payload, ...more });
   // Turn 9's tool completes at 10:52:09; turn 10's opener is 10:52:22.
   const compactStart = rec("10:52:10", "utility.start", { job: "compaction", model: "darkmux:util-4b", serves: SID, stall_after_seconds: 600 }, { session_id: SID, source: "utility", handle: "compactor" });
   const compactEnd = rec("10:52:20", "telemetry.tokens", { purpose: "utility", call_kind: "compaction", job: "compaction", total_tokens: 900 }, { session_id: SID, source: "tokens", handle: "compactor" });
@@ -2913,11 +2951,11 @@ describe("(#2915) fleet card: utility work is visible", () => {
 // (#2928) The live channel reaches the fleet card at the live edge only.
 describe("(#2928) the live overlay on the rendered fleet card", () => {
   const at = (s: string) => `${todayUTC()}T${s}Z`;
-  const records = (): FlowRecord[] => [
+  const records = (): NormRecord[] => normAll([
     { ts: at("10:01:00.000"), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
     { ts: at("10:01:56.000"), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { turn_seq: 1, sampled_at_ms: Date.parse(at("10:01:56.000")), generated_chars: 40, cumulative_chars: 40 } },
     { ts: at("10:01:58.000"), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { turn_seq: 1, sampled_at_ms: Date.parse(at("10:01:58.000")), generated_chars: 120, cumulative_chars: 120 } },
-  ];
+  ]);
   const feedLive = async () => {
     const { liveStore } = await import("../../lib/liveChannel");
     liveStore.reset();

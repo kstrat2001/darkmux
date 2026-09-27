@@ -3,11 +3,12 @@ import { useSessionLiveness } from "./useSessionLiveness";
 import { fetchJson } from "../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../lib/queryKeys";
 import type { Route } from "../lib/route";
-import { asRecordArray, normalizeRecords } from "../lib/flow";
+import { shapeRecords } from "../lib/flow";
 import { getSource } from "../lib/source";
 import { useDay } from "./useDay";
-import type { FlowRecord } from "../types/handwritten";
 import type { FlowWindowResult } from "./useFlowWindow";
+import { ingest, type NormRecord } from "../lib/ingest";
+import { sessionRouteRecords } from "../lib/runRef";
 
 /**
  * Which records does THIS route actually mean? (#1800 P1)
@@ -34,7 +35,7 @@ import type { FlowWindowResult } from "./useFlowWindow";
  */
 export interface RouteRecords {
   /** What the event log should show for this route. */
-  records: FlowRecord[];
+  records: NormRecord[];
   /** True while a HISTORICAL slice is still loading. The live window has its
    *  own `settled`; this is only about the fetched-slice routes, so a caller
    *  can tell "empty because still loading" from "empty because empty". */
@@ -53,44 +54,34 @@ export interface RouteRecords {
   error: { status: number | null; message: string } | null;
 }
 
-/** Decodes BOTH wire shapes via the shared `asRecordArray` (`lib/flow.ts:89`),
- * the same helper `useFlowWindow` uses and legacy used at viewer.html:3920.
+/** Decodes BOTH wire shapes via the shared `ingest` (`lib/ingest.ts`), the
+ * same boundary `useFlowWindow` uses and legacy's own decode at
+ * viewer.html:3920.
  *
- * The two endpoints DIFFER and an earlier version of this file assumed they
- * did not — reading `.records` off both:
+ * The two endpoints answer different shapes, which `ingest` accepts both of:
  *
  *   GET /flow/<date>        -> a BARE JSON ARRAY   (lib.rs `flow_handler`)
  *   GET /flow-session/<id>  -> { records, ... }    (`catalog_records_response`)
  *
- * So every playback day decoded to `undefined` -> `[]` -> a permanently empty
- * log, silently. Verified against the live daemon at the merge gate, not
- * inferred. The old signature also LIED: it was annotated `FlowRecord[] | null`
- * while returning `undefined` on the array payload, and the `?? []` at the call
- * sites was load-bearing purely by accident.
- *
- * (#1800) Then SHAPED through `normalizeRecords` — legacy's own playback boot
- * is `DATA=flowToRenderModel(RAW)` (viewer.html:3894/3922), and this hook was
- * handing out `RAW`. Two consequences, both real:
- *
- *   - The flow file's leading `{"_type":"schema"}` header stayed in the set.
- *     It has no `machine_uid`, so the meta line counted a second, phantom
- *     machine, and the event log listed it as an `Invalid Date other` row.
- *   - This hook and `PlaybackLens` produced DIFFERENT record sets from the
- *     same cache entry — the lens normalized, the log and meta line did not.
- *     One source of truth was the stated property; two sets was the fact. The
- *     meta line's census is what made the gap visible, because it is the only
- *     surface that says the number out loud.
+ * (#1800) Then SHAPED through `shapeRecords`, as legacy's own playback boot
+ * is `DATA=flowToRenderModel(RAW)` (viewer.html:3894/3922), so this hook and
+ * `PlaybackLens` hand out the SAME record set from the same cache entry. The
+ * meta line's census is what made a past gap between the two visible,
+ * because it is the only surface that says the number out loud.
  *
  * Shared cache slot, shared decode, shared shaping: the stage, the event log
- * and the status bar now cannot disagree about what the day contained. */
-function recordsOf(result: { ok: true; data: unknown } | { ok: false } | undefined): FlowRecord[] | null {
+ * and the status bar cannot disagree about what the day contained. */
+function recordsOf(result: { ok: true; data: unknown } | { ok: false } | undefined): NormRecord[] | null {
   if (!result || !result.ok) return null;
-  return normalizeRecords(asRecordArray(result.data));
+  return shapeRecords(ingest(result.data));
 }
 
 export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): RouteRecords {
   const date = route.kind === "playback" ? route.date : null;
   const sessionId = route.kind === "dispatch" ? route.dispatchId : null;
+  // A link naming the run's mission lists that run alone, the one the
+  // page's header reads (`sessionRun` with the same mission).
+  const missionId = route.kind === "dispatch" ? route.missionId : null;
   // (#1801) `date` is `null` on a playback route ONLY when a static build
   // forced it (`route.ts`'s own doc) — so reading the source's flow file directly
   // here, rather than re-deriving it from `date === null`, is the "one
@@ -159,11 +150,11 @@ export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): Rou
     // that function's own doc), so there is no distinct HTTP-status error to
     // surface here the way the daemon playback branch below does: a static build
     // has no daemon to report a status FROM. Still shaped through the SAME
-    // `normalizeRecords` every other branch here uses (this hook's own
+    // `shapeRecords` every other branch here uses (this hook's own
     // module doc explains why that matters).
     const all = day.records ?? [];
     return {
-      records: sessionId !== null ? all.filter((r) => r.session_id === sessionId) : all,
+      records: sessionId !== null ? sessionRouteRecords(all.filter((r) => r.session_id === sessionId), sessionId, missionId) : all,
       loading: day.loading,
       historical: true,
       error: null,
@@ -183,7 +174,7 @@ export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): Rou
     const recs = recordsOf(sessionQuery.data);
     const err = sessionQuery.data && !sessionQuery.data.ok ? sessionQuery.data : null;
     return {
-      records: recs ?? [],
+      records: sessionRouteRecords(recs ?? [], sessionId, missionId),
       loading: sessionQuery.data === undefined,
       // A running session is not a historical slice, and saying so is what
       // lets the log keep its live affordances (the window label, the

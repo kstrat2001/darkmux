@@ -3,8 +3,8 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../lib/fetcher";
 import { queryKeys } from "../lib/queryKeys";
 import { getSource } from "../lib/source";
-import { asRecordArray, fetchStaticFlowRecords, firstRecordDate, normalizeRecords } from "../lib/flow";
-import type { FlowRecord } from "../types/handwritten";
+import { fetchStaticFlowRecords, firstRecordDate, shapeRecords } from "../lib/flow";
+import { ingest, type NormRecord } from "../lib/ingest";
 
 /** (#2086) The loaded DAY this page can replay, from wherever it comes.
  *
@@ -22,15 +22,16 @@ import type { FlowRecord } from "../types/handwritten";
  * (`queryKeys.staticFlowSrc` / `queryKeys.flowDate`), so calling this from
  * several components costs one download, not several. */
 export interface Day {
-  /** `null` when there is no day to replay (a live route). Normalized:
-   * sorted by `ts`, header line dropped, one synthetic per-session runtime
-   * row appended (`normalizeRecords`). */
-  records: FlowRecord[] | null;
-  /** The same day RAW, exactly as parsed. For consumers that synthesize
-   * their own derived rows (`flowToRenderModel` appends its own runtime
-   * row; feeding it `records` would double it — a review finding on the
-   * run detail) or that only need identity fields. */
-  raw: FlowRecord[] | null;
+  /** `null` when there is no day to replay (a live route). Shaped: sorted
+   * by time, one synthetic per-session runtime row appended
+   * (`shapeRecords`). */
+  records: NormRecord[] | null;
+  /** The same day as ingested, in file order, without the synthetic rows.
+   * For consumers that synthesize their own derived rows
+   * (`flowToRenderModel` appends its own runtime row; feeding it `records`
+   * would double it — a review finding on the run detail) or that only
+   * need identity fields. */
+  ingested: NormRecord[] | null;
   /** True while the day is still downloading; `records` is `null` then too. */
   loading: boolean;
   /** The day being replayed, once known. */
@@ -65,17 +66,17 @@ export function useDay(requestedDate: string | null): Day {
 
   return useMemo(() => {
     if (flowSrc !== null) {
-      if (staticQuery.data === undefined) return { records: null, raw: null, loading: true, date: sourceDate, error: null };
-      const records = normalizeRecords(staticQuery.data);
+      if (staticQuery.data === undefined) return { records: null, ingested: null, loading: true, date: sourceDate, error: null };
+      const records = shapeRecords(staticQuery.data);
       const date = sourceDate ?? firstRecordDate(staticQuery.data);
-      return { records, raw: staticQuery.data, loading: false, date, error: null };
+      return { records, ingested: staticQuery.data, loading: false, date, error: null };
     }
     if (daemonDate !== null) {
-      if (dayQuery.data === undefined) return { records: null, raw: null, loading: true, date: daemonDate, error: null };
-      if (!dayQuery.data.ok) return { records: null, raw: null, loading: false, date: daemonDate, error: { status: dayQuery.data.status, message: dayQuery.data.message } };
-      const raw = asRecordArray(dayQuery.data.data);
-      return { records: normalizeRecords(raw), raw, loading: false, date: daemonDate, error: null };
+      if (dayQuery.data === undefined) return { records: null, ingested: null, loading: true, date: daemonDate, error: null };
+      if (!dayQuery.data.ok) return { records: null, ingested: null, loading: false, date: daemonDate, error: { status: dayQuery.data.status, message: dayQuery.data.message } };
+      const ingested = ingest(dayQuery.data.data);
+      return { records: shapeRecords(ingested), ingested, loading: false, date: daemonDate, error: null };
     }
-    return { records: null, raw: null, loading: false, date: null, error: null };
+    return { records: null, ingested: null, loading: false, date: null, error: null };
   }, [flowSrc, daemonDate, sourceDate, staticQuery.data, dayQuery.data]);
 }

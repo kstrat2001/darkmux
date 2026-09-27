@@ -17,6 +17,10 @@ rust-version = "1.86"
 # construction in flow's (and the binary's) test build — propagated to the
 # binary's test build via its dev-dep on this crate's test-support feature.
 test-support = ["darkmux-types/test-support"]
+# Generates `ui/src/types/generated/{FlowAction,FlowScope,Level,Category,Stage,Tier}.ts`
+# from the flow schema's enums, like darkmux-crew's own `ts-export`. Test-only:
+# the release binary never pulls `ts-rs` in.
+ts-export = ["dep:ts-rs"]
 
 [dependencies]
 anyhow = "1.0"
@@ -92,6 +96,7 @@ jaq-json = "=2.0.3"
 # hooks.rs for the one behavior that couples to that version.
 unicode-width = "0.2.2"
 unicode-general-category = "1.1.0"
+ts-rs = { version = "10", optional = true }
 
 [dev-dependencies]
 tempfile = "3.10"

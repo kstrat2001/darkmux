@@ -3,6 +3,8 @@ import { renderHook, act } from "@testing-library/react";
 import { usePlaybackTransport, speedLabel, DEFAULT_SPEED, PLAY_TICK_MS } from "./usePlaybackTransport";
 import { playbackClockOf } from "../lib/pageClockRate";
 import { pageNowOf } from "../lib/restHand";
+import type { NormRecord } from "../lib/ingest";
+import { norm, normAll } from "../testing/records";
 
 /** Cycle to 1h/s. The default is real time, so a test that plays a
  *  recorded hour to its end picks the fast speed explicitly. */
@@ -10,28 +12,27 @@ function toHourPerSecond(result: { current: { speed: number; cycleSpeed: () => v
   for (let i = 0; i < 6 && result.current.speed !== 3600; i++) act(() => result.current.cycleSpeed());
   expect(result.current.speed).toBe(3600);
 }
-import type { FlowRecord } from "../types/handwritten";
 
-const DAY = [
+const DAY = normAll([
   { ts: "2026-08-07T00:00:00.000Z", action: "dispatch.start" },
   { ts: "2026-08-07T00:30:00.000Z", action: "dispatch.reasoning" },
   { ts: "2026-08-07T01:00:00.000Z", action: "dispatch.complete" },
-] as unknown as FlowRecord[];
+]);
 
 // (#2346) A day holding two dispatches and one mission, so a focus can be
 // scoped to something narrower than the whole day: `sA` runs 08:00–08:30,
 // `sB` runs 09:00–20:43 (the day's own last record — the shape of the bug
 // report: a run that ends hours before the day's last record), and `mA`
 // spans 07:00–07:20 with no dispatches of its own.
-const MIXED_DAY = [
-  { ts: "2026-08-07T07:00:00.000Z", action: "mission start", mission_id: "mA" },
-  { ts: "2026-08-07T07:20:00.000Z", action: "mission close", mission_id: "mA" },
+const MIXED_DAY = normAll([
+  { ts: "2026-08-07T07:00:00.000Z", action: "mission.start", mission_id: "mA" },
+  { ts: "2026-08-07T07:20:00.000Z", action: "mission.close", mission_id: "mA" },
   { ts: "2026-08-07T08:00:00.000Z", action: "dispatch.start", session_id: "sA" },
   { ts: "2026-08-07T08:15:00.000Z", action: "dispatch.reasoning", session_id: "sA" },
   { ts: "2026-08-07T08:30:00.000Z", action: "dispatch.complete", session_id: "sA" },
   { ts: "2026-08-07T09:00:00.000Z", action: "dispatch.start", session_id: "sB" },
   { ts: "2026-08-07T20:43:00.000Z", action: "dispatch.complete", session_id: "sB" },
-] as unknown as FlowRecord[];
+]);
 
 /** (#2071) The app-shell-owned transport. */
 describe("usePlaybackTransport", () => {
@@ -40,7 +41,7 @@ describe("usePlaybackTransport", () => {
   });
 
   it("is inactive with no day, and pinned at the day's end once one loads", () => {
-    const { result, rerender } = renderHook(({ d }) => usePlaybackTransport(d), { initialProps: { d: null as FlowRecord[] | null } });
+    const { result, rerender } = renderHook(({ d }) => usePlaybackTransport(d), { initialProps: { d: null as NormRecord[] | null } });
     expect(result.current.active).toBe(false);
     rerender({ d: DAY });
     expect(result.current.active).toBe(true);
@@ -190,10 +191,10 @@ describe("usePlaybackTransport", () => {
 
   it("speed is a real multiplier: at 1h/s one real second replays one recorded hour, at 1m/s one minute", () => {
     vi.useFakeTimers();
-    const threeHours = [
+    const threeHours = normAll([
       { ts: "2026-08-07T00:00:00.000Z", action: "dispatch.start" },
       { ts: "2026-08-07T03:00:00.000Z", action: "dispatch.complete" },
-    ] as unknown as FlowRecord[];
+    ]);
     const { result } = renderHook(() => usePlaybackTransport(threeHours));
     toHourPerSecond(result);
     act(() => result.current.togglePlay());
@@ -223,7 +224,7 @@ describe("usePlaybackTransport", () => {
       result.current.cycleSpeed();
     });
     expect(result.current.speed).toBe(5);
-    const other = [{ ts: "2026-08-09T00:00:00.000Z", action: "dispatch.start" }, { ts: "2026-08-09T02:00:00.000Z", action: "dispatch.complete" }] as unknown as FlowRecord[];
+    const other = normAll([{ ts: "2026-08-09T00:00:00.000Z", action: "dispatch.start" }, { ts: "2026-08-09T02:00:00.000Z", action: "dispatch.complete" }]);
     rerender({ d: other });
     expect(result.current.t).toBe(Date.parse("2026-08-09T02:00:00.000Z"));
     expect(result.current.speed).toBe(DEFAULT_SPEED);
@@ -296,7 +297,7 @@ describe("usePlaybackTransport", () => {
       });
       act(() => result.current.scrub(Date.parse("2026-08-07T10:00:00.000Z"))); // inside sB's 09:00-20:43 span
       // Switch focus to the whole day — 10:00 still falls inside the day's span.
-      rerender({ focus: { kind: "day" } as unknown as { kind: "dispatch"; sessionId: string; records: FlowRecord[] } });
+      rerender({ focus: { kind: "day" } as unknown as { kind: "dispatch"; sessionId: string; records: NormRecord[] } });
       expect(result.current.t).toBe(Date.parse("2026-08-07T10:00:00.000Z"));
     });
 
@@ -322,10 +323,10 @@ describe("usePlaybackTransport", () => {
         result.current.cycleSpeed();
       });
       expect(result.current.speed).toBe(5);
-      const otherDaySc = [
+      const otherDaySc = normAll([
         { ts: "2026-08-09T00:00:00.000Z", action: "dispatch.start", session_id: "sC" },
         { ts: "2026-08-09T02:00:00.000Z", action: "dispatch.complete", session_id: "sC" },
-      ] as unknown as FlowRecord[];
+      ]);
       rerender({ d: otherDaySc, focus: { kind: "dispatch", sessionId: "sC", records: otherDaySc } });
       expect(result.current.tMin).toBe(Date.parse("2026-08-09T00:00:00.000Z"));
       expect(result.current.tMax).toBe(Date.parse("2026-08-09T02:00:00.000Z"));
@@ -345,17 +346,16 @@ describe("usePlaybackTransport", () => {
   // reproduced the bug live. These fixtures deliberately put the focus's
   // own records OUTSIDE the day window, matching that shape.
   describe("focus records disjoint from dayRecords (#2346 redesign — the live-render finding)", () => {
-    const DAY_WINDOW = [
+    const DAY_WINDOW = normAll([
       { ts: "2026-09-04T02:43:00.000Z", action: "dispatch.start", session_id: "unrelated" },
       { ts: "2026-09-04T04:48:00.000Z", action: "dispatch.complete", session_id: "unrelated" },
-    ] as unknown as FlowRecord[];
-    // The operator's own run (#2346 evidence): `dispatch start`/`dispatch
-    // complete` — the SPACE-separated spelling `darkmux-crew` and the CLI
-    // actually emit — wholly before the day window's own floor above.
-    const RUN_RECORDS = [
-      { ts: "2026-09-04T00:11:48.000Z", action: "dispatch start", session_id: "s-narrow" },
-      { ts: "2026-09-04T02:06:37.000Z", action: "dispatch complete", session_id: "s-narrow", payload: { wall_ms: 6_888_067 } },
-    ] as unknown as FlowRecord[];
+    ]);
+    // The operator's own run (#2346 evidence): `dispatch.start`/
+    // `dispatch.complete`, wholly before the day window's own floor above.
+    const RUN_RECORDS = normAll([
+      { ts: "2026-09-04T00:11:48.000Z", action: "dispatch.start", session_id: "s-narrow" },
+      { ts: "2026-09-04T02:06:37.000Z", action: "dispatch.complete", session_id: "s-narrow", payload: { wall_ms: 6_888_067 } },
+    ]);
 
     it("resolves to the run's OWN span even though none of its records are in dayRecords", () => {
       const { result } = renderHook(() =>
@@ -369,8 +369,8 @@ describe("usePlaybackTransport", () => {
 
     it("falls back to the day's own range while the focus's records are still loading, then SNAPS to the run's own span the moment they arrive", () => {
       const { result, rerender } = renderHook(
-        ({ records }: { records: FlowRecord[] }) => usePlaybackTransport(DAY_WINDOW, { kind: "dispatch", sessionId: "s-narrow", records }),
-        { initialProps: { records: [] as FlowRecord[] } },
+        ({ records }: { records: NormRecord[] }) => usePlaybackTransport(DAY_WINDOW, { kind: "dispatch", sessionId: "s-narrow", records }),
+        { initialProps: { records: normAll([]) } },
       );
       // Still loading (the session fetch hasn't landed yet): the day's own
       // window is the only thing this can report, per the redesign's own
@@ -395,8 +395,8 @@ describe("usePlaybackTransport", () => {
 
     it("a scrubbed position taken while the range was the day-fallback snaps once the real (disjoint) range arrives", () => {
       const { result, rerender } = renderHook(
-        ({ records }: { records: FlowRecord[] }) => usePlaybackTransport(DAY_WINDOW, { kind: "dispatch", sessionId: "s-narrow", records }),
-        { initialProps: { records: [] as FlowRecord[] } },
+        ({ records }: { records: NormRecord[] }) => usePlaybackTransport(DAY_WINDOW, { kind: "dispatch", sessionId: "s-narrow", records }),
+        { initialProps: { records: normAll([]) } },
       );
       act(() => result.current.scrub(Date.parse("2026-09-04T03:00:00.000Z"))); // inside the day-fallback window
       expect(result.current.scrubbed).toBe(true);
@@ -423,11 +423,11 @@ describe("usePlaybackTransport", () => {
       // `dispatch complete` (#2011's grace-window poll in
       // `useRouteRecords.ts`) — same focus id, only the records (and so the
       // range) change.
-      const start = { ts: "2026-09-04T00:11:48.000Z", action: "dispatch start", session_id: "s-narrow" } as unknown as FlowRecord;
-      const reasoning = { ts: "2026-09-04T01:00:00.000Z", action: "dispatch.reasoning", session_id: "s-narrow" } as unknown as FlowRecord;
-      const complete = { ts: "2026-09-04T02:06:37.000Z", action: "dispatch complete", session_id: "s-narrow" } as unknown as FlowRecord;
+      const start = norm({ ts: "2026-09-04T00:11:48.000Z", action: "dispatch.start", session_id: "s-narrow" });
+      const reasoning = norm({ ts: "2026-09-04T01:00:00.000Z", action: "dispatch.reasoning", session_id: "s-narrow" });
+      const complete = norm({ ts: "2026-09-04T02:06:37.000Z", action: "dispatch.complete", session_id: "s-narrow" });
       const { result, rerender } = renderHook(
-        ({ records }: { records: FlowRecord[] }) => usePlaybackTransport(MIXED_DAY, { kind: "dispatch", sessionId: "s-narrow", records }),
+        ({ records }: { records: NormRecord[] }) => usePlaybackTransport(MIXED_DAY, { kind: "dispatch", sessionId: "s-narrow", records }),
         { initialProps: { records: [start, reasoning] } },
       );
       expect(result.current.scrubbed).toBe(false);
@@ -457,7 +457,7 @@ describe("usePlaybackTransport", () => {
       expect(result.current.scrubbed).toBe(false);
       expect(result.current.t).toBe(Date.parse("2026-08-07T08:30:00.000Z")); // sA's own end
 
-      rerender({ focus: { kind: "day" } as unknown as { kind: "dispatch"; sessionId: string; records: FlowRecord[] } });
+      rerender({ focus: { kind: "day" } as unknown as { kind: "dispatch"; sessionId: string; records: NormRecord[] } });
 
       expect(result.current.scrubbed).toBe(false);
       expect(result.current.t).toBe(Date.parse("2026-08-07T20:43:00.000Z")); // the DAY's own end, not sA's stale one

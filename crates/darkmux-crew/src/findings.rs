@@ -504,10 +504,10 @@ pub fn sync_at(flows_dir: &Path, store_root: &Path, since: Option<&str>) -> Resu
         for line in content.lines() {
             // Lines that don't parse as a record (the schema header, a partial
             // tail write) are skipped — the casual LocalFileSink read contract.
-            let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else {
+            let Some(rec) = darkmux_flow::reader::parse_value(line) else {
                 continue;
             };
-            if rec.get("action").and_then(|v| v.as_str()) != Some("dispatch.tool") {
+            if darkmux_flow::reader::action_of(&rec) != Some(darkmux_flow::FlowAction::DispatchTool) {
                 continue;
             }
             let payload = rec.get("payload").unwrap_or(&serde_json::Value::Null);

@@ -211,7 +211,7 @@ fn a_step_config_that_names_records_gets_their_blocks_in_the_brief() {
         }
         for line in std::fs::read_to_string(&path).unwrap().lines() {
             let Ok(rec) = serde_json::from_str::<Value>(line) else { continue };
-            if rec["action"] == "dispatch start" && rec["session_id"] == session_id.as_str() {
+            if rec["action"] == "dispatch.start" && rec["session_id"] == session_id.as_str() {
                 start = Some(rec);
             }
         }
@@ -335,7 +335,7 @@ fn a_step_whose_task_names_the_phase_stamps_it_on_the_dispatch_record() {
         for line in std::fs::read_to_string(&path).unwrap().lines() {
             let Ok(rec) = serde_json::from_str::<Value>(line) else { continue };
             seen.push(format!("{} {} phase={}", rec["action"], rec["session_id"], rec["phase_id"]));
-            if rec["action"] == "dispatch start" && rec["session_id"] == session_id.as_str() { start = Some(rec); }
+            if rec["action"] == "dispatch.start" && rec["session_id"] == session_id.as_str() { start = Some(rec); }
         }
     }
     let start = start.unwrap_or_else(|| panic!("a `dispatch start` flow record for this step; saw: {seen:?}"));

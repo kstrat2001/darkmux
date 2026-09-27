@@ -1,5 +1,5 @@
+import { DEFAULT_POLICY } from "./lifecycle";
 import { describe, expect, it } from "vitest";
-import type { FlowRecord } from "../types/handwritten";
 import { PEPPER_SID, pepperAt, pepperRecords } from "../testing/pepperGrinderRun";
 import {
   DEFAULT_CHARS_PER_TOKEN,
@@ -26,6 +26,8 @@ import {
   liveExecutions,
   reasonForLine,
 } from "./tokenRate";
+import type { NormRecord } from "./ingest";
+import { norm } from "../testing/records";
 
 const SID = "darkmux-coder-1790125784225";
 const atSec = (sec: number) => new Date(Date.UTC(2026, 8, 23, 1, 9, 0) + sec * 1000).toISOString();
@@ -33,32 +35,32 @@ const atSec = (sec: number) => new Date(Date.UTC(2026, 8, 23, 1, 9, 0) + sec * 1
 /** New-shape heartbeat: carries `sampled_at_ms` (ms) + `generated_chars`
  *  (content + reasoning), same fields dispatch_internal.rs::heartbeat_payload
  *  now forwards (#2877). */
-const beat = (sampledAtMs: number, generatedChars: number, cumulativeChars = generatedChars): FlowRecord =>
-  ({
+const beat = (sampledAtMs: number, generatedChars: number, cumulativeChars = generatedChars): NormRecord =>
+  norm({
     ts: new Date(sampledAtMs).toISOString(),
     action: "dispatch.turn.heartbeat",
     session_id: SID,
     payload: { sampled_at_ms: sampledAtMs, generated_chars: generatedChars, cumulative_chars: cumulativeChars },
-  }) as unknown as FlowRecord;
+  });
 
 /** Old-shape heartbeat, exactly what a pre-#2877 runtime forwards: no
  *  `sampled_at_ms`, no `generated_chars` — only the whole-second flow `ts`
  *  and the answer-only `cumulative_chars`. */
-const oldBeat = (sec: number, cumulativeChars: number): FlowRecord =>
-  ({
+const oldBeat = (sec: number, cumulativeChars: number): NormRecord =>
+  norm({
     ts: atSec(sec),
     action: "dispatch.turn.heartbeat",
     session_id: SID,
     payload: { cumulative_chars: cumulativeChars },
-  }) as unknown as FlowRecord;
+  });
 
-const tokensRecord = (completionTokens: number): FlowRecord =>
-  ({
+const tokensRecord = (completionTokens: number): NormRecord =>
+  norm({
     ts: atSec(0),
     action: "telemetry.tokens",
     session_id: SID,
     payload: { completion_tokens: completionTokens },
-  }) as unknown as FlowRecord;
+  });
 
 describe("heartbeatSamples", () => {
   it("reads new-shape sampled_at_ms + generated_chars", () => {
@@ -80,8 +82,8 @@ describe("heartbeatSamples", () => {
   });
 
   it("ignores non-heartbeat records and never crashes on a missing chars field", () => {
-    const weird = { ts: atSec(0), action: "dispatch.turn.heartbeat", session_id: SID, payload: {} } as unknown as FlowRecord;
-    const other = { ts: atSec(0), action: "dispatch.turn", session_id: SID, payload: { cumulative_chars: 999 } } as unknown as FlowRecord;
+    const weird = norm({ ts: atSec(0), action: "dispatch.turn.heartbeat", session_id: SID, payload: {} });
+    const other = norm({ ts: atSec(0), action: "dispatch.turn", session_id: SID, payload: { cumulative_chars: 999 } });
     expect(heartbeatSamples([weird, other])).toEqual([]);
   });
 
@@ -122,10 +124,10 @@ describe("measuredCharsPerToken", () => {
   // every turn, and the in-flight turn has chars but no billed tokens yet.
   // Taking the max chars across turns over the finished turns' tokens
   // divided turn 2's 33k chars by turn 1's 391 tokens.
-  const turnBeat = (turn: number, ms: number, chars: number): FlowRecord =>
-    ({ ...beat(ms, chars), payload: { sampled_at_ms: ms, generated_chars: chars, turn_seq: turn } }) as unknown as FlowRecord;
-  const turnTokens = (turn: number, completion: number): FlowRecord =>
-    ({ ...tokensRecord(completion), payload: { completion_tokens: completion, turn_seq: turn } }) as unknown as FlowRecord;
+  const turnBeat = (turn: number, ms: number, chars: number): NormRecord =>
+    norm({ ...beat(ms, chars), payload: { sampled_at_ms: ms, generated_chars: chars, turn_seq: turn } });
+  const turnTokens = (turn: number, completion: number): NormRecord =>
+    norm({ ...tokensRecord(completion), payload: { completion_tokens: completion, turn_seq: turn } });
 
   it("pairs each turn's chars with that turn's tokens and ignores the in-flight turn", () => {
     const ratio = measuredCharsPerToken([
@@ -151,8 +153,8 @@ describe("measuredCharsPerToken", () => {
   // (≈3.72 chars/token, close to the real measured ratio). Blended together
   // the pair calibrates to ≈40 chars/token — this must calibrate from turn
   // 3 ALONE.
-  const checkpoint = (turn: number): FlowRecord =>
-    ({ ts: atSec(0), action: "dispatch.checkpoint", session_id: SID, payload: { turn_seq: turn, checkpoint: 1, verdict: "conclude" } }) as unknown as FlowRecord;
+  const checkpoint = (turn: number): NormRecord =>
+    norm({ ts: atSec(0), action: "dispatch.checkpoint", session_id: SID, payload: { turn_seq: turn, checkpoint: 1, verdict: "conclude" } });
 
   it("excludes a checkpointed turn from calibration, keyed on the dispatch.checkpoint record (#2886)", () => {
     const ratio = measuredCharsPerToken([
@@ -177,8 +179,8 @@ describe("measuredCharsPerToken", () => {
   // truncates. Real shape, session
   // `darkmux-coding-refresh-rotation-1790243027020` turn 2: checkpointed
   // with `verdict: "continue"`, still billed normally.
-  const continueCheckpoint = (turn: number): FlowRecord =>
-    ({ ts: atSec(0), action: "dispatch.checkpoint", session_id: SID, payload: { turn_seq: turn, checkpoint: 1, verdict: "continue" } }) as unknown as FlowRecord;
+  const continueCheckpoint = (turn: number): NormRecord =>
+    norm({ ts: atSec(0), action: "dispatch.checkpoint", session_id: SID, payload: { turn_seq: turn, checkpoint: 1, verdict: "continue" } });
 
   it("does NOT exclude a turn whose checkpoint verdict is 'continue' — it billed normally", () => {
     const ratio = measuredCharsPerToken([turnBeat(2, 1_000, 8_050), continueCheckpoint(2), turnTokens(2, 2_300)]);
@@ -224,8 +226,8 @@ describe("currentTokenRate", () => {
   // (#2885, acceptance criterion) "previous turn measured, new turn with
   // one heartbeat gives a carried reading, not null."
   it("carries the last measured rate into a new turn's lone first heartbeat, marked carried", () => {
-    const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
-      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
+    const hbT = (atMs: number, chars: number, turnSeq: number): NormRecord =>
+      norm({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } });
     // Turn 1: opens at 0 (every turn does — finding 2), then 800 chars over
     // 2s, then another 800 over 2s = 400 chars/s -> 100 tok/s at the
     // default 4 chars/token. The carry must read the (800, 1600) pair, not
@@ -250,8 +252,8 @@ describe("currentTokenRate", () => {
   // carry must skip that near-zero pair and reach further back for the
   // most recent pair with real progress.
   it("never carries a pair whose earlier sample is 0 chars — reaches further back for real progress", () => {
-    const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
-      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
+    const hbT = (atMs: number, chars: number, turnSeq: number): NormRecord =>
+      norm({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } });
     const records = [
       // Turn 2: opens at 0 (every turn does), then real progress: 800 chars
       // over 2s, then another 800 over 2s = 400 chars/s -> 100 tok/s.
@@ -271,8 +273,8 @@ describe("currentTokenRate", () => {
   });
 
   it("returns null (not a near-zero carry) when the ONLY prior pair has a 0-chars earlier sample", () => {
-    const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
-      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
+    const hbT = (atMs: number, chars: number, turnSeq: number): NormRecord =>
+      norm({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } });
     const records = [hbT(0, 0, 3), hbT(13_000, 4, 3), hbT(30_000, 1, 4)];
     expect(currentTokenRate(records)).toBeNull();
   });
@@ -284,8 +286,8 @@ describe("currentTokenRate", () => {
   // turn's own last two samples), so a trusted fast opener must read fresh
   // (not carried).
   it("trusts a FAST opener pair (<= ~one heartbeat interval) as a fresh, non-carried reading", () => {
-    const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
-      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
+    const hbT = (atMs: number, chars: number, turnSeq: number): NormRecord =>
+      norm({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } });
     // 40 chars over 2s = 20 chars/s / 4 default = 5 tok/s.
     const reading = currentTokenRate([hbT(0, 0, 5), hbT(2_000, 40, 5)]);
     expect(reading).not.toBeNull();
@@ -302,8 +304,8 @@ describe("currentTokenRate", () => {
   // also warns against). Turn 4's own opening pair (0 -> 800 over 2s) is
   // exactly that: a fast opener, one turn back.
   it("rejects a SLOW opener as the current reading but still finds an earlier FAST opener to carry", () => {
-    const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
-      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
+    const hbT = (atMs: number, chars: number, turnSeq: number): NormRecord =>
+      norm({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } });
     const records = [
       // Turn 4: a FAST opener — 800 chars over 2s = 400 chars/s -> 100 tok/s.
       hbT(0, 0, 4),
@@ -326,8 +328,8 @@ describe("currentTokenRate", () => {
   // Before this fix `currentTokenRate` returned null right there without
   // ever trying the carried rate — must fall back instead.
   it("falls back to the carried rate when the current turn's own last pair has restarted (post-checkpoint) chars", () => {
-    const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
-      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
+    const hbT = (atMs: number, chars: number, turnSeq: number): NormRecord =>
+      norm({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } });
     const records = [
       // Turn 4: real progress to carry from. 800 chars/2s = 400 chars/s.
       hbT(0, 0, 4),
@@ -368,7 +370,7 @@ describe("aggregateTokenRate", () => {
 
   it("treats a stalled/fresh execution as contributing 0, not dropping the machine's total", () => {
     const generating = [beat(1_000, 40), beat(3_000, 120)];
-    const fresh: FlowRecord[] = [beat(5_000, 0)];
+    const fresh: NormRecord[] = [beat(5_000, 0)];
     expect(aggregateTokenRate([generating, fresh], 5_500)?.tokensPerSec).toBeCloseTo(10, 5);
   });
 
@@ -380,8 +382,8 @@ describe("aggregateTokenRate", () => {
   // whole aggregate carried — the caller renders a single number, dimmed or
   // not, never a per-execution split.
   it("marks the aggregate carried when any contributing execution's own reading is carried", () => {
-    const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
-      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
+    const hbT = (atMs: number, chars: number, turnSeq: number): NormRecord =>
+      norm({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } });
     // exec1: turn 1 opens at 0, then two real-progress intervals, then
     // turn 2's lone first sample — carried (from turn 1's second interval,
     // not its 0-opening one — finding 2).
@@ -405,16 +407,16 @@ describe("aggregateTokenRate", () => {
 //                  `{reason, state, pause: false, delay_ms}` carries no `ms`
 //                  and is a pacing nudge, not a rest (matches sessionRun.ts's
 //                  existing `dispatch.rest`-with-`ms` filter).
-const start = (atMs: number): FlowRecord =>
-  ({ ts: new Date(atMs).toISOString(), action: "dispatch.start", session_id: SID, payload: {} }) as unknown as FlowRecord;
-const turnEnd = (atMs: number, turnSeq: number): FlowRecord =>
-  ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn", session_id: SID, payload: { turn_seq: turnSeq } }) as unknown as FlowRecord;
-const tool = (atMs: number): FlowRecord =>
-  ({ ts: new Date(atMs).toISOString(), action: "dispatch.tool", session_id: SID, payload: { tool_name: "bash" } }) as unknown as FlowRecord;
-const rest = (atMs: number, ms: number): FlowRecord =>
-  ({ ts: new Date(atMs).toISOString(), action: "dispatch.rest", session_id: SID, payload: { ms, reason: "thermal-duty-cycle" } }) as unknown as FlowRecord;
-const restAnnounceOnly = (atMs: number): FlowRecord =>
-  ({ ts: new Date(atMs).toISOString(), action: "dispatch.rest", session_id: SID, payload: { reason: "thermal-duty-cycle", pause: false, delay_ms: 15_000 } }) as unknown as FlowRecord;
+const start = (atMs: number): NormRecord =>
+  norm({ ts: new Date(atMs).toISOString(), action: "dispatch.start", session_id: SID, payload: {} });
+const turnEnd = (atMs: number, turnSeq: number): NormRecord =>
+  norm({ ts: new Date(atMs).toISOString(), action: "dispatch.turn", session_id: SID, payload: { turn_seq: turnSeq } });
+const tool = (atMs: number): NormRecord =>
+  norm({ ts: new Date(atMs).toISOString(), action: "dispatch.tool", session_id: SID, payload: { tool_name: "bash" } });
+const rest = (atMs: number, ms: number): NormRecord =>
+  norm({ ts: new Date(atMs).toISOString(), action: "dispatch.rest", session_id: SID, payload: { ms, reason: "thermal-duty-cycle" } });
+const restAnnounceOnly = (atMs: number): NormRecord =>
+  norm({ ts: new Date(atMs).toISOString(), action: "dispatch.rest", session_id: SID, payload: { reason: "thermal-duty-cycle", pause: false, delay_ms: 15_000 } });
 
 describe("deriveLiveState", () => {
   it("is generating while a heartbeat is fresh — same threshold currentTokenRate uses", () => {
@@ -472,10 +474,10 @@ describe("deriveLiveState", () => {
     // ms-precise sampled_at_ms — real wire behavior (`toISOString` would
     // keep the ms; a real flow record's `ts` does not).
     const toolTs = new Date(Math.floor(beatAtMs / 1000) * 1000).toISOString();
-    const recs: FlowRecord[] = [
+    const recs: NormRecord[] = [
       beat(beatAtMs - 2_000, 4_483),
       beat(beatAtMs, 5_623),
-      { ts: toolTs, action: "dispatch.tool", session_id: SID, payload: { tool_name: "edit" } } as unknown as FlowRecord,
+      norm({ ts: toolTs, action: "dispatch.tool", session_id: SID, payload: { tool_name: "edit" } }),
     ];
     expect(deriveLiveState(recs, beatAtMs + STALL_AFTER_MS + 1_000)).toEqual({ state: "tools" });
   });
@@ -485,34 +487,36 @@ describe("deriveLiveState", () => {
   // counting to the announced resume, and ends at `budget.resume`/`stop`.
   it("reads a hosted budget wait as REST budget · <endpoint> until it resumes", () => {
     const at = (ms: number) => new Date(ms).toISOString();
-    const wait = { ts: at(1_000), action: "budget.wait", session_id: SID, payload: { endpoint_id: "azure", wait_seconds: 60 } } as unknown as FlowRecord;
+    const wait = norm({ ts: at(1_000), action: "budget.wait", session_id: SID, payload: { endpoint_id: "azure", wait_seconds: 60 } });
     expect(deriveLiveState([wait], 11_000)).toEqual({
       state: "rest", restSecondsLeft: 50, restEndMs: 61_000, restReason: "budget · azure", restReasonWord: "budget",
     });
-    const resumed = { ts: at(20_000), action: "budget.resume", session_id: SID, payload: { endpoint_id: "azure" } } as unknown as FlowRecord;
+    const resumed = norm({ ts: at(20_000), action: "budget.resume", session_id: SID, payload: { endpoint_id: "azure" } });
     expect(deriveLiveState([wait, resumed], 21_000).state).toBe("prompt");
     expect(aggregateLiveState([[wait]], 11_000)?.state).toBe("rest");
     // (5th review C1) Stopped: the wait is over, and the execution is closed
     // (the call was never sent), never left reading PROMPT or live.
-    const stopped = { ts: at(20_000), action: "budget.stop", session_id: SID, payload: { endpoint_id: "azure" } } as unknown as FlowRecord;
+    const stopped = norm({ ts: at(20_000), action: "budget.stop", session_id: SID, payload: { endpoint_id: "azure" } });
     expect(deriveLiveState([wait, stopped], 21_000).state).toBe("prompt");
     expect(liveExecutions([[wait, stopped]], 21_000)).toEqual([]);
     // An agentic-remote run the pacer held, then stopped: it has other
     // evidence (its start), and the stop still closes it at once, before the
     // run's own terminal record lands.
-    const start = { ts: at(0), action: "dispatch start", session_id: SID, payload: {} } as unknown as FlowRecord;
+    const start = norm({ ts: at(0), action: "dispatch.start", session_id: SID, payload: {} });
     expect(liveExecutions([[start, wait, stopped]], 21_000)).toEqual([]);
     expect(aggregateLiveState([[wait, stopped]], 21_000)).toBeNull();
   });
 
-  // (5th review C1) A waiter that died mid-wait writes nothing more. Past its
-  // resume time plus the grace it is not a live execution, and not REST.
-  it("a budget wait silent past its resume time plus the grace is not live", () => {
+  // A waiter that died mid-wait writes nothing more. Past its resume time
+  // plus the grace the staleness clock runs from there (lifecycle rule 4):
+  // live until the policy's window runs out, then not.
+  it("a budget wait silent past its resume time plus the grace goes stale one window later", () => {
     const at = (ms: number) => new Date(ms).toISOString();
-    const wait = { ts: at(1_000), action: "budget.wait", session_id: SID, payload: { endpoint_id: "azure", wait_seconds: 60 } } as unknown as FlowRecord;
-    expect(liveExecutions([[wait]], 61_000 + 59_000)).toHaveLength(1);
-    expect(liveExecutions([[wait]], 61_000 + 61_000)).toEqual([]);
-    expect(aggregateLiveState([[wait]], 61_000 + 61_000)).toBeNull();
+    const wait = norm({ ts: at(1_000), action: "budget.wait", session_id: SID, payload: { endpoint_id: "azure", wait_seconds: 60 } });
+    const lapse = 61_000 + DEFAULT_POLICY.budgetWaitGraceMs;
+    expect(liveExecutions([[wait]], lapse + DEFAULT_POLICY.staleAfterMs)).toHaveLength(1);
+    expect(liveExecutions([[wait]], lapse + DEFAULT_POLICY.staleAfterMs + 1)).toEqual([]);
+    expect(aggregateLiveState([[wait]], lapse + DEFAULT_POLICY.staleAfterMs + 1)).toBeNull();
   });
 
   // (5th review C7) A day window's wait reads as a compact duration, and a
@@ -520,7 +524,7 @@ describe("deriveLiveState", () => {
   it("a long wait reads 23h 53m, then minutes, then seconds; a long endpoint id is trimmed", () => {
     const at = (ms: number) => new Date(ms).toISOString();
     const secs = 23 * 3600 + 53 * 60;
-    const wait = { ts: at(0), action: "budget.wait", session_id: SID, payload: { endpoint_id: "azure-openai-eastus2-prod", wait_seconds: secs } } as unknown as FlowRecord;
+    const wait = norm({ ts: at(0), action: "budget.wait", session_id: SID, payload: { endpoint_id: "azure-openai-eastus2-prod", wait_seconds: secs } });
     const r = deriveLiveState([wait], 0);
     // (6th review) The full id where there is room (the lamp status, the
     // hover title): two endpoints sharing a prefix stay distinct. Trimmed
@@ -606,10 +610,10 @@ describe("averageGenerationRate", () => {
   // tokens over the time it spent generating (`generation_ms` per turn), not
   // over the wall clock, which includes rests, tools and prompt reading
   // (a real run read 45 over wall clock against ~80 over generation time).
-  const turn = (sid: string, seq: number, genMs: number | undefined): FlowRecord =>
-    ({ ts: atSec(seq), action: "dispatch.turn", session_id: sid, payload: genMs == null ? { turn_seq: seq } : { turn_seq: seq, generation_ms: genMs } }) as unknown as FlowRecord;
-  const tok = (sid: string, seq: number, completion: number): FlowRecord =>
-    ({ ts: atSec(seq), action: "telemetry.tokens", session_id: sid, payload: { turn_seq: seq, completion_tokens: completion } }) as unknown as FlowRecord;
+  const turn = (sid: string, seq: number, genMs: number | undefined): NormRecord =>
+    norm({ ts: atSec(seq), action: "dispatch.turn", session_id: sid, payload: genMs == null ? { turn_seq: seq } : { turn_seq: seq, generation_ms: genMs } });
+  const tok = (sid: string, seq: number, completion: number): NormRecord =>
+    norm({ ts: atSec(seq), action: "telemetry.tokens", session_id: sid, payload: { turn_seq: seq, completion_tokens: completion } });
 
   it("sums billed tokens over summed generation time, paired per turn", () => {
     const reading = averageGenerationRate([[turn("a", 1, 5_000), tok("a", 1, 400), turn("a", 2, 5_000), tok("a", 2, 600)]]);
@@ -637,8 +641,8 @@ describe("averageGenerationRate", () => {
   // (#2886) Real recorded shape: a checkpointed turn's billed tokens cover
   // only its final continuation while `generation_ms` spans the whole
   // chain — including it drags a real ~150 tok/s down to ~34.
-  const checkpoint = (sid: string, seq: number): FlowRecord =>
-    ({ ts: atSec(seq), action: "dispatch.checkpoint", session_id: sid, payload: { turn_seq: seq, checkpoint: 1, verdict: "conclude" } }) as unknown as FlowRecord;
+  const checkpoint = (sid: string, seq: number): NormRecord =>
+    norm({ ts: atSec(seq), action: "dispatch.checkpoint", session_id: sid, payload: { turn_seq: seq, checkpoint: 1, verdict: "conclude" } });
 
   it("excludes a checkpointed turn from the average, labeling how many of the paired turns were billed", () => {
     const reading = averageGenerationRate([
@@ -669,8 +673,8 @@ describe("averageGenerationRate", () => {
   // completion tokens over 127,348 ms of generation (~265 tok/s). Excluding
   // it (treating `continue` the same as `conclude`) is the bug that made
   // this run read 102 tok/s "avg · 5 of 6 turns" instead of ~210.
-  const continueCheckpoint = (sid: string, seq: number): FlowRecord =>
-    ({ ts: atSec(seq), action: "dispatch.checkpoint", session_id: sid, payload: { turn_seq: seq, checkpoint: 1, verdict: "continue" } }) as unknown as FlowRecord;
+  const continueCheckpoint = (sid: string, seq: number): NormRecord =>
+    norm({ ts: atSec(seq), action: "dispatch.checkpoint", session_id: sid, payload: { turn_seq: seq, checkpoint: 1, verdict: "continue" } });
 
   it("does NOT exclude a turn whose checkpoint verdict is 'continue' from the average", () => {
     const reading = averageGenerationRate([[turn("a", 2, 127_348), tok("a", 2, 33_803), continueCheckpoint("a", 2)]]);
@@ -727,10 +731,10 @@ describe("restReasonLabel", () => {
 // reasons: the aggregate's reason and its countdown come from the SAME
 // execution, never one from each.
 describe("aggregateLiveState with two resting executions", () => {
-  const restOf = (sid: string, atMs: number, payload: Record<string, unknown>): FlowRecord =>
-    ({ ts: new Date(atMs).toISOString(), action: "dispatch.rest", session_id: sid, payload }) as unknown as FlowRecord;
-  const toolOf = (sid: string): FlowRecord =>
-    ({ ts: new Date(0).toISOString(), action: "dispatch.tool", session_id: sid, payload: { tool_name: "bash" } }) as unknown as FlowRecord;
+  const restOf = (sid: string, atMs: number, payload: Record<string, unknown>): NormRecord =>
+    norm({ ts: new Date(atMs).toISOString(), action: "dispatch.rest", session_id: sid, payload });
+  const toolOf = (sid: string): NormRecord =>
+    norm({ ts: new Date(0).toISOString(), action: "dispatch.tool", session_id: sid, payload: { tool_name: "bash" } });
   const thermal = [toolOf("a"), restOf("a", 1_000, { ms: 15_000, reason: "thermal", state: "serious" })];
   const battery = [toolOf("b"), restOf("b", 1_000, { ms: 5_000, reason: "battery", state: "18%" })];
   it("keeps the winning execution's reason with its own countdown, in either order", () => {
@@ -740,8 +744,8 @@ describe("aggregateLiveState with two resting executions", () => {
 });
 
 describe("the rest reading carries the rest record's own reason", () => {
-  const restWith = (atMs: number, payload: Record<string, unknown>): FlowRecord =>
-    ({ ts: new Date(atMs).toISOString(), action: "dispatch.rest", session_id: SID, payload }) as unknown as FlowRecord;
+  const restWith = (atMs: number, payload: Record<string, unknown>): NormRecord =>
+    norm({ ts: new Date(atMs).toISOString(), action: "dispatch.rest", session_id: SID, payload });
   it("a thermal pause names its state", () => {
     const r = deriveLiveState([tool(0), restWith(1_000, { ms: 2_000, reason: "thermal", state: "serious", turn: 3 })], 1_500);
     expect(r).toEqual({ state: "rest", restSecondsLeft: 2, restEndMs: 3000, restReason: "thermal · serious", restReasonWord: "thermal" });
@@ -858,8 +862,8 @@ describe("lastHeartbeatMs", () => {
 // (pre-PR review, 2026-09-24) The findings below were each PROVEN on real
 // runs before these tests existed.
 describe("which executions count: live ones only", () => {
-  const rec = (sid: string, atMs: number, action: string, payload: Record<string, unknown> = {}, source?: string): FlowRecord =>
-    ({ ts: new Date(atMs).toISOString(), action, session_id: sid, ...(source ? { source } : {}), payload }) as unknown as FlowRecord;
+  const rec = (sid: string, atMs: number, action: string, payload: Record<string, unknown> = {}, source?: string): NormRecord =>
+    norm({ ts: new Date(atMs).toISOString(), action, session_id: sid, ...(source ? { source } : {}), payload });
   const hb = (sid: string, atMs: number, chars: number, turn = 1) =>
     rec(sid, atMs, "dispatch.turn.heartbeat", { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turn });
 
@@ -887,8 +891,8 @@ describe("which executions count: live ones only", () => {
   // and every scheduler task session (`step start`/`step complete`). None is
   // an execution; each read as PROMPT and outranked a real stall.
   it("a mission's lifecycle and task sessions are not executions and never read as PROMPT over a stall", () => {
-    const lifecycle = [rec("mission-m", 0, "mission start"), rec("mission-m", 0, "phase start")];
-    const task = [rec("task-1-m", 500, "step start"), rec("task-1-m", 900, "step timing")];
+    const lifecycle = [rec("mission-m", 0, "mission.start"), rec("mission-m", 0, "phase.start")];
+    const task = [rec("task-1-m", 500, "step.start"), rec("task-1-m", 900, "step.timing")];
     const stalled = [rec("b", 0, "dispatch.start"), hb("b", 1_000, 0), hb("b", 3_000, 800)];
     expect(aggregateLiveState([lifecycle, task, stalled], 3_000 + 60_000)?.state).toBe("stalled");
   });
@@ -896,7 +900,7 @@ describe("which executions count: live ones only", () => {
   it("is null, not PROMPT, when no live execution exists (a mission between model steps)", () => {
     const runGrain = [rec("m", 0, "dispatch.start", {}, "mission")];
     const finished = [rec("a", 0, "dispatch.start"), hb("a", 1_000, 0), rec("a", 2_000, "dispatch.complete")];
-    const lifecycle = [rec("mission-m", 0, "mission start")];
+    const lifecycle = [rec("mission-m", 0, "mission.start")];
     expect(aggregateLiveState([runGrain, finished, lifecycle], 10_000)).toBeNull();
   });
 
@@ -912,12 +916,12 @@ describe("tools vs reading prompt, from the tool COMPLETION records", () => {
   // tool calls is TOOLS until N completions; after that the model is
   // reading the results: PROMPT. Before this, the next turn's prompt
   // processing read as TOOLS.
-  const turn = (atMs: number, seq: number, calls: number): FlowRecord =>
-    ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn", session_id: SID, payload: { turn_seq: seq, tool_calls_count: calls } }) as unknown as FlowRecord;
+  const turn = (atMs: number, seq: number, calls: number): NormRecord =>
+    norm({ ts: new Date(atMs).toISOString(), action: "dispatch.turn", session_id: SID, payload: { turn_seq: seq, tool_calls_count: calls } });
   // (#2963) A 1.64.0 turn record: each call's name and path, the paths key
   // left out when no call has one (as the host writes it).
-  const turnWithCalls = (atMs: number, seq: number, calls: [string, string | null][]): FlowRecord =>
-    ({
+  const turnWithCalls = (atMs: number, seq: number, calls: [string, string | null][]): NormRecord =>
+    norm({
       ts: new Date(atMs).toISOString(),
       action: "dispatch.turn",
       session_id: SID,
@@ -927,7 +931,7 @@ describe("tools vs reading prompt, from the tool COMPLETION records", () => {
         tool_names: calls.map(([n]) => n),
         ...(calls.some(([, p]) => p !== null) ? { tool_paths: calls.map(([, p]) => p) } : {}),
       },
-    }) as unknown as FlowRecord;
+    });
 
   it("is TOOLS between the turn end and the last of its tool completions", () => {
     const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 2), tool(5_000)];
@@ -942,8 +946,8 @@ describe("tools vs reading prompt, from the tool COMPLETION records", () => {
   // RUNNING call's tool: `tool_names[k]` from the turn record. Without that
   // list, a completed call's name is never shown (it is not the one
   // running), and a previous turn's tool must never leak in.
-  const namedTool = (atMs: number, name: string): FlowRecord =>
-    ({ ts: new Date(atMs).toISOString(), action: "dispatch.tool", session_id: SID, payload: { tool_name: name } }) as unknown as FlowRecord;
+  const namedTool = (atMs: number, name: string): NormRecord =>
+    norm({ ts: new Date(atMs).toISOString(), action: "dispatch.tool", session_id: SID, payload: { tool_name: name } });
 
   it("(#2963) with no tool_names, a completed call's name is never the running call's", () => {
     const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 3), namedTool(5_000, "read"), namedTool(6_000, "edit")];
@@ -980,12 +984,12 @@ describe("tools vs reading prompt, from the tool COMPLETION records", () => {
   // turn's k-th call runs (k = calls completed so far in this turn) the
   // tool is `tool_names[k]` and the file `tool_paths[k]`. A completed call's
   // own name or file never stands in for a later call's.
-  const pathTool = (atMs: number, name: string, path: string): FlowRecord =>
-    ({ ts: new Date(atMs).toISOString(), action: "dispatch.tool", session_id: SID, payload: { tool_name: name, args: JSON.stringify({ path, content: "x" }) } }) as unknown as FlowRecord;
-  const writingBeat = (atMs: number, name: string): FlowRecord =>
-    ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: 900, turn_seq: 2, phase: "writing_tool_call", tool_name: name } }) as unknown as FlowRecord;
-  const turnPathsOnly = (atMs: number, seq: number, paths: (string | null)[]): FlowRecord =>
-    ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn", session_id: SID, payload: { turn_seq: seq, tool_calls_count: paths.length, tool_paths: paths } }) as unknown as FlowRecord;
+  const pathTool = (atMs: number, name: string, path: string): NormRecord =>
+    norm({ ts: new Date(atMs).toISOString(), action: "dispatch.tool", session_id: SID, payload: { tool_name: name, args: JSON.stringify({ path, content: "x" }) } });
+  const writingBeat = (atMs: number, name: string): NormRecord =>
+    norm({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: 900, turn_seq: 2, phase: "writing_tool_call", tool_name: name } });
+  const turnPathsOnly = (atMs: number, seq: number, paths: (string | null)[]): NormRecord =>
+    norm({ ts: new Date(atMs).toISOString(), action: "dispatch.turn", session_id: SID, payload: { turn_seq: seq, tool_calls_count: paths.length, tool_paths: paths } });
 
   it("(#2963) a turn that writes a.ts then reads b.ts: `read · b.ts` while b.ts is read", () => {
     const base = [start(0), beat(1_000, 0), beat(3_000, 800), turnWithCalls(4_000, 1, [["write", "/workspace/src/a.ts"], ["read", "/workspace/src/b.ts"]])];
@@ -998,13 +1002,13 @@ describe("tools vs reading prompt, from the tool COMPLETION records", () => {
   // call the runtime refused (ungranted, not a tool, cut off) is not in
   // them, while `tool_calls_count` still counts it. The list's length is
   // how many will complete.
-  const turnRunning = (atMs: number, seq: number, count: number, calls: [string, string | null][]): FlowRecord =>
-    ({
+  const turnRunning = (atMs: number, seq: number, count: number, calls: [string, string | null][]): NormRecord =>
+    norm({
       ts: new Date(atMs).toISOString(),
       action: "dispatch.turn",
       session_id: SID,
       payload: { turn_seq: seq, tool_calls_count: count, tool_names: calls.map(([n]) => n), tool_paths: calls.map(([, p]) => p) },
-    }) as unknown as FlowRecord;
+    });
 
   it("(#2963) after an ungranted call, the readout shows the running `read · y.rs`", () => {
     // The model asked for [write x.rs (ungranted), read y.rs]; only the read runs.
@@ -1024,7 +1028,7 @@ describe("tools vs reading prompt, from the tool COMPLETION records", () => {
   });
 
   it("(#2963 review, CONSIDER 4) a stray `path` on a tool that takes none does not put the lists out of step", () => {
-    const bash = { ts: new Date(5_000).toISOString(), action: "dispatch.tool", session_id: SID, payload: { tool_name: "bash", args: JSON.stringify({ command: "ls", path: "elsewhere" }) } } as unknown as FlowRecord;
+    const bash = norm({ ts: new Date(5_000).toISOString(), action: "dispatch.tool", session_id: SID, payload: { tool_name: "bash", args: JSON.stringify({ command: "ls", path: "elsewhere" }) } });
     const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnRunning(4_000, 1, 2, [["bash", null], ["read", "src/b.ts"]]), bash];
     expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "read", toolPath: "src/b.ts" });
   });
@@ -1033,7 +1037,7 @@ describe("tools vs reading prompt, from the tool COMPLETION records", () => {
     // The capped args lost the path; the viewer falls back to the result's
     // resolved path, which must equal the listed `./src/a.ts`.
     const args = JSON.stringify({ content: "x".repeat(600), path: "./src/a.ts" }).slice(0, 512);
-    const write = { ts: new Date(5_000).toISOString(), action: "dispatch.tool", session_id: SID, payload: { tool_name: "write", args, result: "Wrote 600 bytes to /workspace/src/a.ts" } } as unknown as FlowRecord;
+    const write = norm({ ts: new Date(5_000).toISOString(), action: "dispatch.tool", session_id: SID, payload: { tool_name: "write", args, result: "Wrote 600 bytes to /workspace/src/a.ts" } });
     const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnRunning(4_000, 1, 2, [["write", "./src/a.ts"], ["read", "./src/b.ts"]]), write];
     expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "read", toolPath: "src/b.ts" });
   });
@@ -1097,7 +1101,7 @@ describe("tools vs reading prompt, from the tool COMPLETION records", () => {
   });
 
   it("(#2963) a paths list shorter than the names: no file past its end", () => {
-    const short = { ts: new Date(4_000).toISOString(), action: "dispatch.turn", session_id: SID, payload: { turn_seq: 1, tool_calls_count: 3, tool_paths: ["src/a.ts"], tool_names: ["read", "read", "read"] } } as unknown as FlowRecord;
+    const short = norm({ ts: new Date(4_000).toISOString(), action: "dispatch.turn", session_id: SID, payload: { turn_seq: 1, tool_calls_count: 3, tool_paths: ["src/a.ts"], tool_names: ["read", "read", "read"] } });
     const recs = [start(0), beat(1_000, 0), beat(3_000, 800), short, pathTool(5_000, "read", "src/a.ts")];
     expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "read" });
   });
@@ -1152,8 +1156,8 @@ describe("a turn's first reading never pairs with the previous turn", () => {
   // the tool gap between turn 1's last sample and turn 2's first, but also
   // never a bare "—" while the run is plainly still generating.
   it("never pairs a new turn's first sample with the previous turn's last (no near-zero rate across the tool gap)", () => {
-    const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
-      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
+    const hbT = (atMs: number, chars: number, turnSeq: number): NormRecord =>
+      norm({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } });
     // Turn 1: opens at 0, then 800 chars over 2s, then another 800 over 2s
     // = 400 chars/s throughout. Turn 2's first sample is 18s later — if
     // this paired turn 1's last (1,600) against turn 2's first across that
@@ -1169,8 +1173,8 @@ describe("a turn's first reading never pairs with the previous turn", () => {
 
 // (#2881) The fleet card pager's per-execution data.
 describe("executionRole", () => {
-  const rec = (action: string, handle?: string): FlowRecord =>
-    ({ ts: atSec(0), action, session_id: SID, ...(handle ? { handle } : {}), payload: {} }) as unknown as FlowRecord;
+  const rec = (action: string, handle?: string): NormRecord =>
+    norm({ ts: atSec(0), action, session_id: SID, ...(handle ? { handle } : {}), payload: {} });
 
   it("strips the darkmux/ prefix and lowercases", () => {
     expect(executionRole([rec("dispatch.start", "darkmux/coder")])).toBe("coder");
@@ -1189,15 +1193,15 @@ describe("executionRole", () => {
   });
 
   it("prefers the LATEST dispatch.start's handle over an earlier one", () => {
-    const early = { ts: atSec(0), action: "dispatch.start", session_id: SID, handle: "darkmux/coder", payload: {} } as unknown as FlowRecord;
-    const later = { ts: atSec(10), action: "dispatch.start", session_id: SID, handle: "darkmux/reviewer", payload: {} } as unknown as FlowRecord;
+    const early = norm({ ts: atSec(0), action: "dispatch.start", session_id: SID, handle: "darkmux/coder", payload: {} });
+    const later = norm({ ts: atSec(10), action: "dispatch.start", session_id: SID, handle: "darkmux/reviewer", payload: {} });
     expect(executionRole([early, later])).toBe("reviewer");
   });
 });
 
 describe("executionTokenReading", () => {
-  const rec = (sec: number, action: string, payload: Record<string, unknown> = {}, handle?: string): FlowRecord =>
-    ({ ts: atSec(sec), action, session_id: SID, ...(handle ? { handle } : {}), payload }) as unknown as FlowRecord;
+  const rec = (sec: number, action: string, payload: Record<string, unknown> = {}, handle?: string): NormRecord =>
+    norm({ ts: atSec(sec), action, session_id: SID, ...(handle ? { handle } : {}), payload });
   const hb = (sec: number, chars: number) => rec(sec, "dispatch.turn.heartbeat", { sampled_at_ms: Date.parse(atSec(sec)), generated_chars: chars, turn_seq: 1 });
 
   it("carries the session id, role, generating state and rate", () => {
@@ -1284,15 +1288,15 @@ describe("liveStatePriority", () => {
 // through that silence and the host forwards each tick as a heartbeat with
 // `phase: "writing_tool_call"`, `tool_name`, and `generated_chars` UNCHANGED.
 describe("(#2889) writing a tool call", () => {
-  const rec = (sec: number, action: string, payload: Record<string, unknown> = {}): FlowRecord =>
-    ({ ts: atSec(sec), action, session_id: SID, payload }) as unknown as FlowRecord;
+  const rec = (sec: number, action: string, payload: Record<string, unknown> = {}): NormRecord =>
+    norm({ ts: atSec(sec), action, session_id: SID, payload });
   const hb = (sec: number, chars: number, extra: Record<string, unknown> = {}) =>
     rec(sec, "dispatch.turn.heartbeat", { sampled_at_ms: Date.parse(atSec(sec)), generated_chars: chars, turn_seq: 1, ...extra });
   const writing = (sec: number, chars: number, tool = "write") => hb(sec, chars, { phase: "writing_tool_call", tool_name: tool });
 
   /** The probe's shape, stretched: 2s of reasoning, then the name at 4s,
    *  then 36s of ticks at the same count, well past `STALL_AFTER_MS`. */
-  const probe = (): FlowRecord[] => {
+  const probe = (): NormRecord[] => {
     const out = [rec(-5, "dispatch.start"), hb(0, 0, { prompt_chars: 144_000 }), hb(1, 400), hb(2, 800), writing(4, 812)];
     for (let s = 6; s <= 40; s += 2) out.push(writing(s, 812));
     return out;
@@ -1356,8 +1360,8 @@ describe("(#2889) writing a tool call", () => {
 });
 
 describe("(#2889) the prompt size on the opening heartbeat", () => {
-  const rec = (sec: number, action: string, payload: Record<string, unknown> = {}): FlowRecord =>
-    ({ ts: atSec(sec), action, session_id: SID, payload }) as unknown as FlowRecord;
+  const rec = (sec: number, action: string, payload: Record<string, unknown> = {}): NormRecord =>
+    norm({ ts: atSec(sec), action, session_id: SID, payload });
   const hb = (sec: number, chars: number, extra: Record<string, unknown> = {}) =>
     rec(sec, "dispatch.turn.heartbeat", { sampled_at_ms: Date.parse(atSec(sec)), generated_chars: chars, turn_seq: 2, ...extra });
 
@@ -1373,7 +1377,7 @@ describe("(#2889) the prompt size on the opening heartbeat", () => {
 
   it("(#2890) executionTokenReading estimates the prompt's size with the execution's own calibration", () => {
     const tokens = rec(-8, "telemetry.tokens", { turn_seq: 1, completion_tokens: 1_000 });
-    const turn1 = [hb(-12, 0), hb(-10, 3_000)].map((r) => ({ ...r, payload: { ...(r as unknown as { payload: object }).payload, turn_seq: 1 } }) as unknown as FlowRecord);
+    const turn1 = [hb(-12, 0), hb(-10, 3_000)].map((r) => norm({ ...r, payload: { ...(r as unknown as { payload: object }).payload, turn_seq: 1 } }));
     const records = [rec(-15, "dispatch.start"), ...turn1, tokens, hb(0, 0, { prompt_chars: 144_000 })];
     // 3,000 chars over 1,000 billed tokens = 3 chars/token -> 48k, not the default 4's 36k.
     expect(executionTokenReading(records, Date.parse(atSec(3))).promptLabel).toBe("~48k");
@@ -1405,8 +1409,8 @@ describe("(#2889) the prompt size on the opening heartbeat", () => {
   // wins the tie. The size must still ride along for the whole PROMPT phase.
   const wholeSec = (ms: number) => new Date(Math.floor(ms / 1000) * 1000).toISOString().replace(".000Z", "Z");
   const base = Date.parse(atSec(0));
-  const wire = (atMs: number, action: string, payload: Record<string, unknown> = {}): FlowRecord =>
-    ({ ts: wholeSec(atMs), action, session_id: SID, payload }) as unknown as FlowRecord;
+  const wire = (atMs: number, action: string, payload: Record<string, unknown> = {}): NormRecord =>
+    norm({ ts: wholeSec(atMs), action, session_id: SID, payload });
 
   it("a dispatch.start in the same second as the opener still reads PROMPT with the opener's size", () => {
     const records = [
@@ -1488,7 +1492,7 @@ describe("(#2890) executionTokenReading carries thinking", () => {
 // the 2.5 s opener trust window, so 3 chars over 577 ms read as ~1 tok/s
 // under a lit THINK lamp until the next heartbeat.
 describe("(#2926) the stream-open chunk is not a rate", () => {
-  const cut = (records: FlowRecord[], nowMs: number) => records.filter((r) => Date.parse(r.ts) <= nowMs);
+  const cut = (records: NormRecord[], nowMs: number) => records.filter((r) => Date.parse(r.ts) <= nowMs);
 
   it("turn 7's opener (0 -> 2 chars in 970 ms) carries the last real rate instead of reading ~1 tok/s", () => {
     // Turn 7's 2-char sample (ts 10:51:32) is the latest; the next lands at :34.
@@ -1533,8 +1537,8 @@ describe("(#2926) the stream-open chunk is not a rate", () => {
   });
 
   it("a fast opener with real output is still trusted (the #2886 fast-opener rule stands)", () => {
-    const hbT = (atMs: number, chars: number): FlowRecord =>
-      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: PEPPER_SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: 1 } }) as unknown as FlowRecord;
+    const hbT = (atMs: number, chars: number): NormRecord =>
+      norm({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: PEPPER_SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: 1 } });
     // 17 chars is the smallest opener chunk that counts; 16 is still stream-open.
     expect(currentTokenRate([hbT(0, 0), hbT(1_000, 17)])).not.toBeNull();
     expect(currentTokenRate([hbT(0, 0), hbT(1_000, 16)])).toBeNull();
@@ -1546,8 +1550,8 @@ describe("(#2926) the stream-open chunk is not a rate", () => {
 // like REST; the compaction's own usage record (or the execution moving on)
 // ends it; a compaction that never ends reads STALL after its own bound.
 describe("(#2915) compacting", () => {
-  const compactStart = (atMs: number, stallAfterSeconds?: number): FlowRecord =>
-    ({
+  const compactStart = (atMs: number, stallAfterSeconds?: number): NormRecord =>
+    norm({
       ts: new Date(atMs).toISOString(),
       action: "utility.start",
       category: "telemetry",
@@ -1555,9 +1559,9 @@ describe("(#2915) compacting", () => {
       session_id: SID,
       handle: "compactor",
       payload: { job: "compaction", model: "u4b", serves: SID, ...(stallAfterSeconds != null ? { stall_after_seconds: stallAfterSeconds } : {}) },
-    }) as unknown as FlowRecord;
-  const compactUsage = (atMs: number, job: string | null = "compaction"): FlowRecord =>
-    ({
+    });
+  const compactUsage = (atMs: number, job: string | null = "compaction"): NormRecord =>
+    norm({
       ts: new Date(atMs).toISOString(),
       action: "telemetry.tokens",
       category: "telemetry",
@@ -1565,9 +1569,9 @@ describe("(#2915) compacting", () => {
       session_id: SID,
       handle: "compactor",
       payload: { call_kind: "compaction", purpose: "utility", ...(job ? { job } : {}), total_tokens: 100 },
-    }) as unknown as FlowRecord;
-  const routingStart = (atMs: number): FlowRecord =>
-    ({ ...compactStart(atMs), session_id: undefined, payload: { job: "radio_routing", model: "u4b", stall_after_seconds: 30 } }) as unknown as FlowRecord;
+    });
+  const routingStart = (atMs: number): NormRecord =>
+    norm({ ...compactStart(atMs), session_id: undefined, payload: { job: "radio_routing", model: "u4b", stall_after_seconds: 30 } });
 
   const toolAt = 1_000 + STALL_AFTER_MS + 200;
   const before = [beat(0, 10), beat(1_000, 200), turnEnd(toolAt, 1), tool(toolAt)];

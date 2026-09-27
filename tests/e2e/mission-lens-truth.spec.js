@@ -11,7 +11,7 @@ const { test, expect } = require('@playwright/test');
 const MISSION_ID = 'graph-truth';
 
 // (#1913) `judgeTok`/`verifyTok` used to pin `${TODAY}T10:00:00Z` while
-// `.gen`'s freshness (`STEP_LIVENESS_WINDOW_MS`, 20 minutes, graph.ts) was
+// `.gen`'s freshness (the lifecycle policy's staleness window, 20 minutes) was
 // judged against REAL wall-clock now — so this test was red for roughly
 // 13h40m of every UTC day (10:20 onward) and green the rest, on a schedule
 // rather than intermittently. Freezing the page's clock via
@@ -22,7 +22,7 @@ const MISSION_ID = 'graph-truth';
 // fixture is internally consistent regardless of when the suite executes.
 const FIXED_NOW_MS = Date.parse('2026-06-15T10:02:00.000Z'); // 2 minutes after the T10:00 token anchor, well inside the 20-minute window
 const TODAY = '2026-06-15';
-const STEP_LIVENESS_WINDOW_MS = 1200 * 1000; // graph.ts's own STEP_LIVENESS_WINDOW_MS
+const STALE_AFTER_MS = 1200 * 1000; // the daemon's lifecycle policy at its default (`/runs`'s `policy.stale_after_ms`)
 
 const BACKFILL_RE = /\/flow\/\d{4}-\d{2}-\d{2}(?!\/stream)(\?.*)?$/;
 const STREAM_RE = /\/flow\/\d{4}-\d{2}-\d{2}\/stream(\?.*)?$/;
@@ -50,6 +50,10 @@ function graphSnapshot() {
   };
 }
 
+// The judge's run opens on its dispatch bookend, as a real seat's does: the
+// step meter is a projection of the step's run lifecycle, and a run with no
+// opening record has not started.
+const judgeStart = { ts: new Date(STARTED_SECS * 1000).toISOString(), action: 'dispatch.start', category: 'dispatch', source: 'crew', session_id: 'step-judge-1', level: 'info', payload: {} };
 const judgeTok = { ts: `${TODAY}T10:00:00Z`, action: 'telemetry.tokens', category: 'telemetry', source: 'tokens', session_id: 'step-judge-1', level: 'info', payload: { total_tokens: 5000 } };
 const verifyTok = { ts: `${TODAY}T10:00:01Z`, action: 'telemetry.tokens', category: 'telemetry', source: 'tokens', session_id: 'step-verify-1', level: 'info', payload: { total_tokens: 18000 } };
 
@@ -71,7 +75,7 @@ test('elapsed reads a sane clock, model chip is full, and a planned step shows n
 
   await page.clock.setFixedTime(FIXED_NOW_MS);
   await page.setViewportSize({ width: 390, height: 900 });
-  await routeAll(page, [judgeTok, verifyTok]);
+  await routeAll(page, [judgeStart, judgeTok, verifyTok]);
   await page.goto(`/index-live.html#mission=${MISSION_ID}`);
 
   const taskHd = page.locator('.tltask .tlt-hd');
@@ -108,23 +112,25 @@ test('elapsed reads a sane clock, model chip is full, and a planned step shows n
   expect(pageErrors).toEqual([]);
 });
 
-// (#1913) Both directions of the STEP_LIVENESS_WINDOW_MS boundary, pinned
-// explicitly — unpinned before this fix, same as FLOW_LIVE_TTL_MS in
-// FleetLens.test.tsx. `stepMeterFor` reads `lastSignal` (the judge's own
-// token record) in preference to `startedTs` for freshness, so only the
-// token's distance from "now" needs to move to walk the boundary.
-test('a judge seat 1s under STEP_LIVENESS_WINDOW_MS still renders the generating meter', async ({ page }) => {
+// (#1913) Both directions of the staleness boundary, pinned explicitly —
+// unpinned before this fix. The step meter reads the judge's run lifecycle,
+// whose quiet clock runs from its newest record (the token), so only the
+// token's distance from "now" needs to move to walk the boundary; the run
+// opened earlier, past the window, on its dispatch bookend.
+const openedLongAgo = { ...judgeStart, ts: new Date(FIXED_NOW_MS - STALE_AFTER_MS - 5000).toISOString() };
+
+test('a judge seat 1s under STALE_AFTER_MS still renders the generating meter', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(String(e)));
 
   await page.clock.setFixedTime(FIXED_NOW_MS);
   await page.setViewportSize({ width: 390, height: 900 });
   const tok = {
-    ts: new Date(FIXED_NOW_MS - (STEP_LIVENESS_WINDOW_MS - 1000)).toISOString(),
+    ts: new Date(FIXED_NOW_MS - (STALE_AFTER_MS - 1000)).toISOString(),
     action: 'telemetry.tokens', category: 'telemetry', source: 'tokens',
     session_id: 'step-judge-1', level: 'info', payload: { total_tokens: 1000 },
   };
-  await routeAll(page, [tok]);
+  await routeAll(page, [openedLongAgo, tok]);
   await page.goto(`/index-live.html#mission=${MISSION_ID}`);
 
   const taskHd = page.locator('.tltask .tlt-hd');
@@ -136,18 +142,18 @@ test('a judge seat 1s under STEP_LIVENESS_WINDOW_MS still renders the generating
   expect(pageErrors).toEqual([]);
 });
 
-test('a judge seat 1s past STEP_LIVENESS_WINDOW_MS renders no generating meter', async ({ page }) => {
+test('a judge seat 1s past STALE_AFTER_MS renders no generating meter', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(String(e)));
 
   await page.clock.setFixedTime(FIXED_NOW_MS);
   await page.setViewportSize({ width: 390, height: 900 });
   const tok = {
-    ts: new Date(FIXED_NOW_MS - (STEP_LIVENESS_WINDOW_MS + 1000)).toISOString(),
+    ts: new Date(FIXED_NOW_MS - (STALE_AFTER_MS + 1000)).toISOString(),
     action: 'telemetry.tokens', category: 'telemetry', source: 'tokens',
     session_id: 'step-judge-1', level: 'info', payload: { total_tokens: 1000 },
   };
-  await routeAll(page, [tok]);
+  await routeAll(page, [openedLongAgo, tok]);
   await page.goto(`/index-live.html#mission=${MISSION_ID}`);
 
   const taskHd = page.locator('.tltask .tlt-hd');

@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { render } from "@testing-library/react";
 import { ActivityIcon, ACT_ICON } from "./ActivityIcon";
 import { activityOf } from "../lib/eventFilters";
-import type { FlowRecord } from "../types/handwritten";
+import { norm } from "../testing/records";
 
 /** These assert on `data-act-icon`, never on text. An inline SVG contributes
  * nothing to `innerText` — the exact reason the icons could go missing from
@@ -49,7 +49,7 @@ describe("ActivityIcon", () => {
       ["dispatch.checkpoint", "checkpoint"],
     ];
     for (const [action, expected] of cases) {
-      const act = activityOf({ ts: "", action } as unknown as FlowRecord);
+      const act = activityOf(norm({ ts: "", action }));
       expect(ACT_ICON[act] ?? "").toBe(expected);
     }
   });

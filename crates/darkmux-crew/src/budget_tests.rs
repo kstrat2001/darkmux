@@ -83,10 +83,10 @@ impl FakeEnv {
         self.disk_stops = true;
         self
     }
-    pub(crate) fn actions(&self) -> Vec<String> {
+    pub(crate) fn actions(&self) -> Vec<darkmux_flow::FlowAction> {
         self.emitted.borrow().iter().map(|r| r.action.clone()).collect()
     }
-    pub(crate) fn payload(&self, action: &str) -> serde_json::Value {
+    pub(crate) fn payload(&self, action: darkmux_flow::FlowAction) -> serde_json::Value {
         self.emitted.borrow().iter().find(|r| r.action == action).and_then(|r| r.payload.clone()).unwrap()
     }
 }
@@ -347,7 +347,7 @@ fn the_warning_names_the_policy_it_runs_under() {
     let said = env.said.borrow()[0].clone();
     assert!(said.contains("policy wait: continuing; calls wait once the budget is reached"), "{said}");
     assert!(!said.contains("policy warn"), "{said}");
-    assert_eq!(env.payload(BUDGET_WARN_ACTION)["policy"], "wait");
+    assert_eq!(env.payload(darkmux_flow::FlowAction::BudgetWarn)["policy"], "wait");
     let env = FakeEnv::new(vec![(T0 - 60, 900)]);
     admit_with(budget(BudgetPolicy::Warn, Some(1_000), None, Some(0.8)), &BudgetCaller::default(), &env).unwrap();
     assert!(env.said.borrow()[0].contains("policy warn: continuing"), "{:?}", env.said.borrow());
@@ -371,8 +371,8 @@ fn warn_surfaces_the_breach_once_and_never_holds_the_call() {
     admit_with(b.clone(), &caller, &env).unwrap();
     admit_with(b.clone(), &caller, &env).unwrap();
     assert_eq!(env.slept_ms.get(), 0, "warn never waits");
-    assert_eq!(env.actions(), vec![BUDGET_WARN_ACTION], "surfaced once");
-    let p = env.payload(BUDGET_WARN_ACTION);
+    assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWarn], "surfaced once");
+    let p = env.payload(darkmux_flow::FlowAction::BudgetWarn);
     assert_eq!((p["spent"].as_u64(), p["limit"].as_u64(), p["level"].as_str()), (Some(2_000), Some(1_000), Some("at_limit")));
     assert!(env.said.borrow()[0].contains("continuing"), "{:?}", env.said.borrow());
     let rec = env.emitted.borrow()[0].clone();
@@ -415,12 +415,12 @@ fn wait_holds_until_the_window_has_room_then_resumes() {
     // Room at T0 + 90 (+1 s, the leave-at-exactly-t+period rule).
     assert!(env.now.get() >= T0 + 90 && env.now.get() <= T0 + 91, "{}", env.now.get());
     assert_eq!(env.paused_ms.get(), env.slept_ms.get(), "every waited ms is recorded as pause");
-    assert_eq!(env.actions(), vec![BUDGET_WAIT_ACTION, BUDGET_RESUME_ACTION]);
-    let wait = env.payload(BUDGET_WAIT_ACTION);
+    assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWait, darkmux_flow::FlowAction::BudgetResume]);
+    let wait = env.payload(darkmux_flow::FlowAction::BudgetWait);
     assert_eq!(wait["wait_seconds"].as_i64(), Some(90));
     assert_eq!(wait["resume_at"].as_str(), Some(darkmux_flow::ts_utc_at(T0 + 90).as_str()));
     assert!(env.said.borrow()[0].contains("resuming in about 1m 30s"), "{:?}", env.said.borrow());
-    assert!(env.payload(BUDGET_RESUME_ACTION)["waited_ms"].as_u64().unwrap() >= 90_000);
+    assert!(env.payload(darkmux_flow::FlowAction::BudgetResume)["waited_ms"].as_u64().unwrap() >= 90_000);
 }
 
 /// A stopped run (an interrupt, or a `mission abort`) ends a wait before
@@ -432,8 +432,8 @@ fn a_stopped_run_ends_a_wait_and_nothing_is_sent() {
     let err = admit_with(b, &BudgetCaller::default(), &env).unwrap_err().to_string();
     assert!(err.contains("mission `m` is aborted") && err.contains("nothing was sent"), "{err}");
     assert!(env.slept_ms.get() <= 2_500, "stopped within one slice: {}", env.slept_ms.get());
-    assert_eq!(env.actions(), vec![BUDGET_WAIT_ACTION, BUDGET_STOP_ACTION], "an announced wait records its stop");
-    let stop = env.payload(BUDGET_STOP_ACTION);
+    assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWait, darkmux_flow::FlowAction::BudgetStop], "an announced wait records its stop");
+    let stop = env.payload(darkmux_flow::FlowAction::BudgetStop);
     assert_eq!((stop["endpoint_id"].as_str(), stop["reason"].as_str()), (Some("azure"), Some("mission `m` is aborted")));
 }
 
@@ -487,7 +487,7 @@ fn an_abort_in_the_last_slice_of_a_wait_still_sends_nothing() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("mission `m` is aborted") && err.contains("nothing was sent"), "{err}");
-    assert!(!env.actions().contains(&BUDGET_RESUME_ACTION.to_string()), "{:?}", env.actions());
+    assert!(!env.actions().contains(&darkmux_flow::FlowAction::BudgetResume), "{:?}", env.actions());
 }
 
 /// (review C-i) An endpoint removed from the registry while a call waits
@@ -497,7 +497,7 @@ fn an_endpoint_removed_while_waiting_releases_it() {
     let env = FakeEnv::new(vec![(T0 - 10, 1_000)]);
     *env.reload_to.borrow_mut() = Some(None);
     admit_with(budget(BudgetPolicy::Wait, Some(1_000), None, None), &BudgetCaller::default(), &env).unwrap();
-    assert_eq!(env.actions(), vec![BUDGET_WAIT_ACTION, BUDGET_RESUME_ACTION]);
+    assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWait, darkmux_flow::FlowAction::BudgetResume]);
 }
 
 /// (3rd review #3) The reload release point re-checks the stop: an abort
@@ -511,8 +511,8 @@ fn an_abort_and_a_removal_in_one_slice_still_send_nothing() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("mission `m` is aborted") && err.contains("nothing was sent"), "{err}");
-    assert_eq!(env.actions(), vec![BUDGET_WAIT_ACTION, BUDGET_STOP_ACTION]);
-    assert_eq!(env.payload(BUDGET_STOP_ACTION)["reason"], "mission `m` is aborted");
+    assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWait, darkmux_flow::FlowAction::BudgetStop]);
+    assert_eq!(env.payload(darkmux_flow::FlowAction::BudgetStop)["reason"], "mission `m` is aborted");
 }
 
 /// (review C-i, C4) `LiveEnv::reload` reads the command's own registry: an
@@ -569,7 +569,7 @@ fn a_budget_switched_off_while_waiting_releases_it() {
     let b = budget(BudgetPolicy::Wait, Some(1_000), None, None);
     admit_with(b, &BudgetCaller::default(), &env).unwrap();
     assert!(env.slept_ms.get() <= 30_000, "released at the first re-read: {}", env.slept_ms.get());
-    assert_eq!(env.actions(), vec![BUDGET_WAIT_ACTION, BUDGET_RESUME_ACTION]);
+    assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWait, darkmux_flow::FlowAction::BudgetResume]);
 }
 
 /// A zero budget cannot come from a registry (`limits.validate` refuses
@@ -580,7 +580,7 @@ fn a_zero_budget_built_directly_waits_until_raised() {
     let env = FakeEnv::new(vec![]);
     *env.reload_to.borrow_mut() = Some(Some(budget(BudgetPolicy::Wait, Some(5), None, None)));
     admit_with(budget(BudgetPolicy::Wait, Some(0), None, None), &BudgetCaller::default(), &env).unwrap();
-    assert!(env.payload(BUDGET_WAIT_ACTION)["resume_at"].is_null());
+    assert!(env.payload(darkmux_flow::FlowAction::BudgetWait)["resume_at"].is_null());
     let said = env.said.borrow()[0].clone();
     assert!(said.contains("until its window has room") && !said.contains("budget is 0"), "{said}");
 }
@@ -597,8 +597,8 @@ fn a_step_under_warn_never_holds_and_warns_once_on_crossing() {
         settle_step(&bucket, 4_096, 600, 1, "probe", &BudgetCaller::default(), &env);
     }
     assert_eq!(env.slept_ms.get(), 0);
-    assert_eq!(env.actions(), vec![BUDGET_WARN_ACTION], "one warning, at the crossing");
-    let p = env.payload(BUDGET_WARN_ACTION);
+    assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWarn], "one warning, at the crossing");
+    let p = env.payload(darkmux_flow::FlowAction::BudgetWarn);
     assert_eq!((p["scope"].as_str(), p["step"].as_str()), (Some("step"), Some("probe")));
 }
 
@@ -649,7 +649,7 @@ fn the_pacer_pauses_through_the_pace_file_and_releases() {
     assert!(matches!(ev, Some(PacerEvent::Resumed { .. })), "{ev:?}");
     assert_eq!(pace(dir.path())["pause"], false);
     assert!(!p.is_pausing());
-    assert_eq!(env.actions(), vec![BUDGET_WAIT_ACTION, BUDGET_RESUME_ACTION]);
+    assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWait, darkmux_flow::FlowAction::BudgetResume]);
 }
 
 /// (review C6) Releasing during a thermal duty cycle writes the duty
@@ -689,7 +689,7 @@ fn the_pacer_never_releases_a_stopped_run() {
     assert_eq!(pace(dir.path())["pause"], true, "still held");
     assert_eq!(p.on_tick(2_000, dir.path(), &free, &c, &env), None, "reported once");
     assert_eq!(pace(dir.path())["pause"], true, "never released");
-    assert_eq!(env.actions(), vec![BUDGET_WAIT_ACTION, BUDGET_STOP_ACTION]);
+    assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWait, darkmux_flow::FlowAction::BudgetStop]);
 }
 
 /// (review MF1) A stopped run whose window is full is never paused into a
@@ -717,7 +717,7 @@ fn the_pacer_under_warn_never_pauses() {
     let mut p = BudgetPacer::new(budget(BudgetPolicy::Warn, Some(1_000), None, None), None);
     assert_eq!(p.on_tick(0, dir.path(), &OtherPacing::default(), &BudgetCaller::default(), &env), None);
     assert!(!crate::pace_file::path(dir.path()).exists());
-    assert_eq!(env.actions(), vec![BUDGET_WARN_ACTION]);
+    assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWarn]);
 }
 
 /// (review C4) A waiting pacer re-reads the endpoint from the command's own
@@ -888,7 +888,7 @@ fn ledger_cost_is_incremental_after_the_first_read() {
 #[test]
 fn active_waits_lists_open_waits_from_live_processes_only() {
     let dir = tempfile::tempdir().unwrap();
-    let rec = |action: &str, sid: &str, pid: u64, resume: Option<i64>| {
+    let rec = |action: darkmux_flow::FlowAction, sid: &str, pid: u64, resume: Option<i64>| {
         serde_json::json!({
             "ts": darkmux_flow::ts_utc_at(T0 - 30), "action": action, "session_id": sid, "mission_id": "m-1",
             "payload": {"scope": "endpoint", "endpoint_id": "azure", "pid": pid,
@@ -898,12 +898,12 @@ fn active_waits_lists_open_waits_from_live_processes_only() {
             + "\n"
     };
     let mut text = String::new();
-    text += &rec(BUDGET_WAIT_ACTION, "open", 1, Some(T0 + 600));
-    text += &rec(BUDGET_WAIT_ACTION, "resumed", 1, Some(T0 + 600));
-    text += &rec(BUDGET_RESUME_ACTION, "resumed", 1, None);
-    text += &rec(BUDGET_WAIT_ACTION, "dead-process", 2, Some(T0 + 600));
-    text += &rec(BUDGET_WAIT_ACTION, "long-past", 1, Some(T0 - 100));
-    text += &rec(BUDGET_WAIT_ACTION, "indefinite", 1, None);
+    text += &rec(darkmux_flow::FlowAction::BudgetWait, "open", 1, Some(T0 + 600));
+    text += &rec(darkmux_flow::FlowAction::BudgetWait, "resumed", 1, Some(T0 + 600));
+    text += &rec(darkmux_flow::FlowAction::BudgetResume, "resumed", 1, None);
+    text += &rec(darkmux_flow::FlowAction::BudgetWait, "dead-process", 2, Some(T0 + 600));
+    text += &rec(darkmux_flow::FlowAction::BudgetWait, "long-past", 1, Some(T0 - 100));
+    text += &rec(darkmux_flow::FlowAction::BudgetWait, "indefinite", 1, None);
     append(dir.path(), T0, &text);
     let waits = active_waits(dir.path(), T0, 86_400, &|pid| pid == 1);
     let sessions: Vec<&str> = waits.iter().filter_map(|w| w.session_id.as_deref()).collect();
@@ -930,7 +930,7 @@ fn active_waits_skip_a_stopped_runs_wait() {
     let dir = tempfile::tempdir().unwrap();
     let rec = |sid: &str, mission: &str| {
         serde_json::json!({
-            "ts": darkmux_flow::ts_utc_at(T0 - 30), "action": BUDGET_WAIT_ACTION, "session_id": sid, "mission_id": mission,
+            "ts": darkmux_flow::ts_utc_at(T0 - 30), "action": darkmux_flow::FlowAction::BudgetWait, "session_id": sid, "mission_id": mission,
             "payload": {"scope": "endpoint", "endpoint_id": "azure", "pid": 1,
                 "resume_at": darkmux_flow::ts_utc_at(T0 + 600), "message": "m"}
         })
@@ -956,7 +956,7 @@ fn active_waits_skip_a_stopped_runs_wait() {
 fn active_waits_reach_back_to_the_widest_window() {
     let dir = tempfile::tempdir().unwrap();
     let wait = serde_json::json!({
-        "ts": darkmux_flow::ts_utc_at(T0 - 3 * DAY), "action": BUDGET_WAIT_ACTION, "session_id": "s",
+        "ts": darkmux_flow::ts_utc_at(T0 - 3 * DAY), "action": darkmux_flow::FlowAction::BudgetWait, "session_id": "s",
         "payload": {"scope": "endpoint", "endpoint_id": "azure", "pid": 1,
             "resume_at": darkmux_flow::ts_utc_at(T0 + 3_600), "message": "m"}
     })

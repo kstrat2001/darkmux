@@ -20,7 +20,8 @@ import {
   type RestHandState,
 } from "./restHand";
 import { deriveLiveState } from "./tokenRate";
-import type { FlowRecord } from "../types/handwritten";
+import type { NormRecord } from "./ingest";
+import { norm } from "../testing/records";
 
 const TURN = 2 * Math.PI;
 /** How far the hand sweeps in one 60 Hz frame at page rate `rate`. */
@@ -242,9 +243,9 @@ describe("restHand", () => {
 
   it("agrees with the countdown the page derives: deriveLiveState's seconds left and end time", () => {
     const d = "2026-09-27";
-    const recs: FlowRecord[] = [
-      { ts: `${d}T12:00:00Z`, action: "dispatch.start", session_id: "s1", source: "dispatch" } as unknown as FlowRecord,
-      { ts: `${d}T12:00:08Z`, action: "dispatch.rest", session_id: "s1", payload: { ms: 20000 } } as unknown as FlowRecord,
+    const recs: NormRecord[] = [
+      norm({ ts: `${d}T12:00:00Z`, action: "dispatch.start", session_id: "s1", source: "dispatch" }),
+      norm({ ts: `${d}T12:00:08Z`, action: "dispatch.rest", session_id: "s1", payload: { ms: 20000 } }),
     ];
     for (const offset of [0, 1, 999, 1000, 1001, 7250, 19_999]) {
       const now = Date.parse(`${d}T12:00:08Z`) + offset;

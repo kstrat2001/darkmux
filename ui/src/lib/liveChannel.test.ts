@@ -4,24 +4,26 @@
 // reach playback.
 import { describe, expect, test, vi } from "vitest";
 import { act, renderHook } from "@testing-library/react";
-import type { FlowRecord } from "../types/handwritten";
+
 import { EMPTY_OVERLAY, LiveStore, MAX_LIVE_PER_SESSION, LIVE_SESSION_TTL_MS, MAX_TRANSIENT_FRAMES_PER_SESSION, MAX_TRANSIENT_TRAIN, TRANSIENT_FRAME_MS, liveSampleToRecord, mergeLive, useLiveOverlay } from "./liveChannel";
 import { deriveLiveState, currentTokenRate, heartbeatSamples } from "./tokenRate";
-import { LIVE_UTILITY_END_ACTION, UTILITY_JOB, UTILITY_START_ACTION, utilityStrip } from "./utilityJobs";
+import { UTILITY_JOB, utilityStrip } from "./utilityJobs";
+import { ACTION, type NormRecord } from "./ingest";
+import { norm, normAll } from "../testing/records";
 
 const T0 = Date.UTC(2026, 8, 27, 12, 0, 0);
 const SID = "live-sess";
 const M = "mach-a";
 
 /** A durable heartbeat as the host tailer writes it (whole-second `ts`). */
-function durableBeat(atMs: number, gen: number, vis: number, turn = 1): FlowRecord {
-  return {
+function durableBeat(atMs: number, gen: number, vis: number, turn = 1): NormRecord {
+  return norm({
     ts: new Date(Math.floor(atMs / 1000) * 1000).toISOString().replace(/\.\d+Z$/, "Z"),
     action: "dispatch.turn.heartbeat",
     session_id: SID,
     machine_uid: M,
     payload: { turn_seq: turn, sampled_at_ms: atMs, generated_chars: gen, cumulative_chars: vis },
-  } as FlowRecord;
+  });
 }
 
 function wireModel(atMs: number, gen: number, vis: number, turn = 1): string {
@@ -49,7 +51,7 @@ function wireUtility(atMs: number, edge: "start" | "end", jobId: string, extra: 
   });
 }
 
-const start = (): FlowRecord => ({ ts: new Date(T0 - 60_000).toISOString(), action: "dispatch.start", session_id: SID, machine_uid: M } as FlowRecord);
+const start = (): NormRecord => norm({ ts: new Date(T0 - 60_000).toISOString(), action: "dispatch.start", session_id: SID, machine_uid: M });
 
 describe("liveSampleToRecord", () => {
   test("a model sample is a heartbeat record at ms precision, marked live", () => {
@@ -64,9 +66,9 @@ describe("liveSampleToRecord", () => {
   test("utility edges become a start and a live end", () => {
     const s = liveSampleToRecord(JSON.parse(wireUtility(T0, "start", "j1")))!;
     const e = liveSampleToRecord(JSON.parse(wireUtility(T0 + 300, "end", "j1")))!;
-    expect(s.action).toBe(UTILITY_START_ACTION);
-    expect(e.action).toBe(LIVE_UTILITY_END_ACTION);
-    const p = (r: FlowRecord) => (r as unknown as { payload: Record<string, unknown> }).payload;
+    expect(s.action).toBe(ACTION.UtilityStart);
+    expect(e.action).toBe(ACTION.UtilityEnd);
+    const p = (r: NormRecord) => (r as unknown as { payload: Record<string, unknown> }).payload;
     expect(p(s).started_at_ms).toBe(T0);
     expect(p(e).ended_at_ms).toBe(T0 + 300);
     expect(p(s).event).toBeUndefined();
@@ -93,7 +95,7 @@ describe("mergeLive: live over durable, durable when live stops", () => {
   test("a durable heartbeat inside the live span is dropped; outside it is kept", () => {
     const d = [durableBeat(T0, 50, 50), durableBeat(T0 + 2_500, 110, 110), durableBeat(T0 + 4_000, 200, 200)];
     const merged = mergeLive(d, live);
-    const beats = merged.filter((r) => r.action === "dispatch.turn.heartbeat");
+    const beats = merged.filter((r) => r.action === ACTION.DispatchTurnHeartbeat);
     expect(beats.filter((r) => !(r as { live?: boolean }).live).map((r) => Date.parse(r.ts))).toEqual([T0, T0 + 4_000]);
     expect(beats.filter((r) => (r as { live?: boolean }).live)).toHaveLength(3);
   });
@@ -109,10 +111,10 @@ describe("mergeLive: live over durable, durable when live stops", () => {
   test("a durable utility edge wins over its live copy; a live edge alone is kept", () => {
     const liveStart = liveSampleToRecord(JSON.parse(wireUtility(T0, "start", "a")))!;
     const liveEnd = liveSampleToRecord(JSON.parse(wireUtility(T0 + 300, "end", "a")))!;
-    const durableStart = { ...liveStart, live: undefined } as FlowRecord;
+    const durableStart = { ...liveStart, live: undefined } as NormRecord;
     const merged = mergeLive([durableStart], [liveStart, liveEnd]);
-    expect(merged.filter((r) => r.action === UTILITY_START_ACTION)).toHaveLength(1);
-    expect(merged.filter((r) => r.action === LIVE_UTILITY_END_ACTION)).toHaveLength(1);
+    expect(merged.filter((r) => r.action === ACTION.UtilityStart)).toHaveLength(1);
+    expect(merged.filter((r) => r.action === ACTION.UtilityEnd)).toHaveLength(1);
   });
 });
 
@@ -168,10 +170,10 @@ describe("the utility glyph shows a sub-second job live", () => {
     store.ingest(wireUtility(T0, "start", "r1"), T0);
     store.ingest(wireUtility(T0 + 300, "end", "r1"), T0 + 300);
     store.ingest(wireUtility(T0 + 500, "start", "r2"), T0 + 500);
-    const durable = [
-      { ts: new Date(T0).toISOString(), action: UTILITY_START_ACTION, machine_uid: M, payload: { job: UTILITY_JOB.radio_routing, job_id: "r1", started_at_ms: T0, stall_after_seconds: 30 } },
+    const durable = normAll([
+      { ts: new Date(T0).toISOString(), action: ACTION.UtilityStart, machine_uid: M, payload: { job: UTILITY_JOB.radio_routing, job_id: "r1", started_at_ms: T0, stall_after_seconds: 30 } },
       { ts: new Date(T0).toISOString(), action: "telemetry.tokens", machine_uid: M, payload: { purpose: "utility", job: UTILITY_JOB.radio_routing, job_id: "r1", ended_at_ms: T0 + 300 } },
-    ] as FlowRecord[];
+    ]);
     const strip = utilityStrip(durable, M, T0 + 600, specsBinding, store.snapshot().utility);
     expect(strip.job?.sinceMs).toBe(T0 + 500);
   });
@@ -256,7 +258,7 @@ describe("(#2928 review, C1) a hole in the live feed does not erase durable hear
     const after = [T0 + 20_500, T0 + 20_750].map((at, i) => liveSampleToRecord(JSON.parse(wireModel(at, 900 + i, 900 + i)))!);
     const d = [durableBeat(T0 + 250, 11, 11), durableBeat(T0 + 6_000, 300, 300), durableBeat(T0 + 12_000, 600, 600), durableBeat(T0 + 20_600, 901, 901)];
     const merged = mergeLive(d, [...before, ...after]);
-    const kept = merged.filter((r) => r.action === "dispatch.turn.heartbeat" && !(r as { live?: boolean }).live).map((r) => (r as unknown as { payload: { sampled_at_ms: number } }).payload.sampled_at_ms);
+    const kept = merged.filter((r) => r.action === ACTION.DispatchTurnHeartbeat && !(r as { live?: boolean }).live).map((r) => (r as unknown as { payload: { sampled_at_ms: number } }).payload.sampled_at_ms);
     expect(kept).toEqual([T0 + 6_000, T0 + 12_000]);
   });
 });

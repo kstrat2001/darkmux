@@ -74,7 +74,8 @@ function graphSnapshot() {
 }
 
 // A dispatch bookend on task-0's step so `stepDispatchSessions` resolves a
-// real dispatch id — a successful click navigates to `#dispatch=<id>`,
+// real dispatch id — a successful click navigates to
+// `#dispatch=<id>&dispatch.mission=<mission>` (the run of THIS mission),
 // giving the click phase (below) a concrete, checkable destination.
 const dispatchStart = {
   ts: `${TODAY}T10:00:00Z`, action: 'dispatch.start', category: 'lifecycle', source: 'runtime',
@@ -151,7 +152,7 @@ test('canvas step rows stay hit-testable across the periodic clock-driven rebuil
   // navigation is the concrete behavior an operator experiences.
   const targetRow = page.locator('.mnode .mn-step-row').filter({ hasText: 'Unit 0' });
   await targetRow.click({ timeout: 5000 });
-  await expect.poll(() => page.evaluate(() => location.hash)).toBe('#dispatch=unit-session-0');
+  await expect.poll(() => page.evaluate(() => location.hash)).toBe(`#dispatch=unit-session-0&dispatch.mission=${MISSION_ID}`);
 
   expect(pageErrors).toEqual([]);
 });

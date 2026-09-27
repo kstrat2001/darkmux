@@ -68,7 +68,7 @@ export const REACHABLE: Record<RunKind, Record<RunStatus, boolean>> = {
  * every kind, on the reading that "a ghost can be any kind". It cannot,
  * and the flat table was wrong in both directions — it invented five
  * untracked LAB cells that no code path can produce, and it denied
- * `dispatch/error`, which `terminal_status_for_action` reaches on any
+ * `dispatch/error`, which `run_lifecycle.rs`'s `ending_of` reaches on any
  * `dispatch error` record. Two server functions decide this, and each
  * synthesises exactly ONE kind:
  *

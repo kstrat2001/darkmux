@@ -7,6 +7,7 @@
  * `.mnode`/`.phasegroup` — the parity goldens and the e2e specs both key on
  * it.
  */
+import type { StepPhases } from "./graph";
 import { StepMeterEl, StepRow } from "./StepRow";
 import { WorkStatus } from "../../components/WorkStatus";
 import { groupTimeline, type TaskAggMetrics } from "./timeline";
@@ -89,6 +90,7 @@ export function MissionTimelineView({
   edges,
   metrics,
   now,
+  phases,
   note,
   expanded,
   onToggleTask,
@@ -99,6 +101,7 @@ export function MissionTimelineView({
   edges: GraphEdge[];
   metrics: MetricsMap;
   now: number;
+  phases: StepPhases;
   note?: string;
   expanded: Record<string, boolean>;
   onToggleTask: (id: string) => void;
@@ -106,7 +109,7 @@ export function MissionTimelineView({
   selectedStepId?: string | null;
   onSelectStep?: (stepId: string) => void;
 }) {
-  const groups = groupTimeline(nodes, edges, metrics, now);
+  const groups = groupTimeline(nodes, edges, metrics, now, phases);
   return (
     <div className="timeline missionlens__timeline">
       {note ? <div className="tlnote">{note}</div> : null}

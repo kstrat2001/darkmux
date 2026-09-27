@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { RecordView } from "./RecordView";
+import { norm, type RawRecord } from "../testing/records";
 
 // The rules here are the ones that replace 26 per-action templates, so they
 // carry the whole design. Each assertion pins a decision made from the
@@ -21,7 +22,7 @@ const REC = {
 
 describe("RecordView", () => {
   it("leads with the verb and its subject, not with field names", () => {
-    render(<RecordView record={REC} />);
+    render(<RecordView record={norm(REC)} />);
     expect(screen.getByText("dispatch.turn")).toBeInTheDocument();
     expect(screen.getByText("coder")).toBeInTheDocument();
   });
@@ -30,26 +31,26 @@ describe("RecordView", () => {
     // level/tier/stage/machine_uid measured at <=2 distinct values across 801
     // records — machine_uid at exactly 1. Rendering them at full weight is
     // noise wearing signal's clothes.
-    render(<RecordView record={REC} />);
+    render(<RecordView record={norm(REC)} />);
     expect(screen.queryByText("00000000-0000-4000-8000-ABCDEF000011")).toBeNull();
     expect(screen.getByText(/4 unchanging fields/)).toBeInTheDocument();
   });
 
   it("reveals them on request — hidden is not gone", () => {
-    render(<RecordView record={REC} />);
+    render(<RecordView record={norm(REC)} />);
     fireEvent.click(screen.getByText(/4 unchanging fields/));
     expect(screen.getByText("dispatch")).toBeInTheDocument();
   });
 
   it("groups numbers so a token count is readable at a glance", () => {
-    render(<RecordView record={REC} />);
+    render(<RecordView record={norm(REC)} />);
     expect(screen.getByText("33,543")).toBeInTheDocument();
   });
 
   it("truncates ids in the MIDDLE, keeping the part that distinguishes them", () => {
     // These ids share long prefixes; cutting the tail would delete exactly
     // the characters that tell two of them apart.
-    render(<RecordView record={REC} />);
+    render(<RecordView record={norm(REC)} />);
     const id = screen.getByTitle("crew-dispatch-coder-1786251936375019-0");
     expect(id.textContent).toContain("…");
     expect(id.textContent!.endsWith("0")).toBe(true);
@@ -57,13 +58,13 @@ describe("RecordView", () => {
   });
 
   it("renders an absent value as a dash, not as the word null", () => {
-    render(<RecordView record={{ ...REC, source: null }} />);
+    render(<RecordView record={norm({ ...REC, source: null } as unknown as RawRecord)} />);
     expect(screen.getByText("—")).toBeInTheDocument();
     expect(screen.queryByText("null")).toBeNull();
   });
 
   it("keeps the raw JSON one click away", () => {
-    render(<RecordView record={REC} />);
+    render(<RecordView record={norm(REC)} />);
     expect(screen.queryByText(/"machine_uid"/)).toBeNull();
     fireEvent.click(screen.getByText("raw JSON"));
     expect(screen.getByText(/"machine_uid"/)).toBeInTheDocument();
@@ -75,7 +76,7 @@ describe("RecordView", () => {
   it("never shows a full machine_uid, in the rows or the raw JSON", () => {
     const FAKE_UID = "00000000-0000-4000-8000-ABCDEF000001";
     const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
-    const { container } = render(<RecordView record={{ ...REC, machine_uid: FAKE_UID, payload: { ...REC.payload, peer: { machine_uid: FAKE_UID.toLowerCase() } } }} />);
+    const { container } = render(<RecordView record={norm({ ...REC, machine_uid: FAKE_UID, payload: { ...REC.payload, peer: { machine_uid: FAKE_UID.toLowerCase() } } })} />);
     fireEvent.click(screen.getByText(/unchanging fields/));
     fireEvent.click(screen.getByText("raw JSON"));
     const text = container.textContent ?? "";
@@ -90,7 +91,7 @@ describe("RecordView", () => {
     // The median record is 463B and the largest is 46KB — that outlier is a
     // single long string, and it is exactly when the panel matters most.
     const long = "x".repeat(5000);
-    render(<RecordView record={{ ...REC, source: long }} />);
+    render(<RecordView record={norm({ ...REC, source: long })} />);
     expect(screen.getByText(/\+4,840 more/)).toBeInTheDocument();
   });
 
@@ -102,7 +103,7 @@ describe("RecordView", () => {
   // padding line 1 out to just under the cutoff; a LINE count is not.
   it("marks a short multi-line value as multi-line, not just a long one", () => {
     const cmd = "echo ok\nrm -rf /workspace";
-    render(<RecordView record={{ ...REC, source: cmd }} />);
+    render(<RecordView record={norm({ ...REC, source: cmd })} />);
     expect(screen.getByText(/\+1 more line/)).toBeInTheDocument();
     expect(screen.queryByText(cmd)).toBeNull();
   });
@@ -111,7 +112,7 @@ describe("RecordView", () => {
     // Padding line 1 out past MAX_INLINE does not change the fact that
     // there are 2 lines — the marker still says "lines", not just "chars".
     const cmd = "echo " + "x".repeat(200) + "\nrm -rf /workspace";
-    render(<RecordView record={{ ...REC, source: cmd }} />);
+    render(<RecordView record={norm({ ...REC, source: cmd })} />);
     expect(screen.getByText(/\+1 more line/)).toBeInTheDocument();
   });
 
@@ -119,7 +120,7 @@ describe("RecordView", () => {
   // override in a raw field value renders raw, so it can reorder what the
   // panel visually displays without changing what actually ran.
   it("escapes a bidi override in a plain string value so it cannot reorder the row", () => {
-    render(<RecordView record={{ ...REC, source: "safe‮exe.txt" }} />);
+    render(<RecordView record={norm({ ...REC, source: "safe‮exe.txt" })} />);
     expect(screen.getByText(/⟨U\+202E⟩/)).toBeInTheDocument();
     expect(screen.queryByText(/‮/)).toBeNull();
   });
@@ -130,7 +131,7 @@ describe("RecordView", () => {
   // `Value()` entirely. A bidi override anywhere in the record reached
   // that view raw.
   it("escapes a bidi override in the raw JSON view too, not just the rendered rows", () => {
-    render(<RecordView record={{ ...REC, source: "safe‮exe.txt" }} />);
+    render(<RecordView record={norm({ ...REC, source: "safe‮exe.txt" })} />);
     fireEvent.click(screen.getByText("raw JSON"));
     const pre = document.querySelector(".eventlog__detailpre")!;
     expect(pre).not.toBeNull();
@@ -144,7 +145,7 @@ describe("RecordView", () => {
     // the expanded text renders inline-styled so the break survives without
     // depending on the stylesheet loading.
     const cmd = "echo ok\nrm -rf /workspace";
-    render(<RecordView record={{ ...REC, source: cmd }} />);
+    render(<RecordView record={norm({ ...REC, source: cmd })} />);
     fireEvent.click(screen.getByText(/\+1 more line/));
     const val = screen.getByText(/rm -rf \/workspace/);
     expect(val.style.whiteSpace).toBe("pre-wrap");
@@ -167,18 +168,18 @@ describe("_ms fields: epoch timestamps vs durations", () => {
   });
 
   it("a small _ms value still renders as a millisecond duration", () => {
-    render(<RecordView record={{ ...REC, payload: { sampler_cost_ms: 10 } }} />);
+    render(<RecordView record={norm({ ...REC, payload: { sampler_cost_ms: 10 } })} />);
     expect(screen.getByText("10ms")).toBeInTheDocument();
   });
 
   it("a multi-second _ms duration still renders in seconds", () => {
-    render(<RecordView record={{ ...REC, payload: { wall_ms: 1500 } }} />);
+    render(<RecordView record={norm({ ...REC, payload: { wall_ms: 1500 } })} />);
     expect(screen.getByText("1.5s")).toBeInTheDocument();
   });
 
   it("an epoch-ms value on the SAME day renders as a clock time, not '<n>.<n>s'", () => {
     const sameDayMs = FROZEN_NOW - 60_000;
-    render(<RecordView record={{ ...REC, payload: { sampled_at_ms: sameDayMs } }} />);
+    render(<RecordView record={norm({ ...REC, payload: { sampled_at_ms: sameDayMs } })} />);
     const expected = new Date(sameDayMs).toLocaleTimeString([], { hour12: false });
     expect(screen.getByText(expected)).toBeInTheDocument();
     // The bug this replaces: a 9+ digit decimal-seconds string.
@@ -187,7 +188,7 @@ describe("_ms fields: epoch timestamps vs durations", () => {
 
   it("an epoch-ms value on a DIFFERENT day is prefixed with the short date", () => {
     const twoDaysAgoMs = FROZEN_NOW - 2 * 24 * 3600_000;
-    render(<RecordView record={{ ...REC, payload: { sampled_at_ms: twoDaysAgoMs } }} />);
+    render(<RecordView record={norm({ ...REC, payload: { sampled_at_ms: twoDaysAgoMs } })} />);
     const d = new Date(twoDaysAgoMs);
     const expected = `${d.toLocaleDateString([], { month: "short", day: "numeric" })} ${d.toLocaleTimeString([], { hour12: false })}`;
     expect(screen.getByText(expected)).toBeInTheDocument();
@@ -225,7 +226,7 @@ const TELEMETRY_REC = {
 
 describe("arrays of objects render as nested groups, not '[object Object]'", () => {
   it("cpu_clusters becomes one sub-group per element, labeled by its own 'name'", () => {
-    render(<RecordView record={TELEMETRY_REC} />);
+    render(<RecordView record={norm(TELEMETRY_REC)} />);
     expect(screen.queryByText(/\[object Object\]/)).toBeNull();
     // Header text, not just present anywhere — each element's own `name`
     // field ALSO renders as an ordinary row inside its group, so "Super"
@@ -238,17 +239,17 @@ describe("arrays of objects render as nested groups, not '[object Object]'", () 
   });
 
   it("arrays of primitives keep their current (comma-joined) rendering", () => {
-    render(<RecordView record={{ ...REC, payload: { tags: ["a", "b", "c"] } }} />);
+    render(<RecordView record={norm({ ...REC, payload: { tags: ["a", "b", "c"] } })} />);
     expect(screen.getByText("a,b,c")).toBeInTheDocument();
   });
 
   it("a TOP-LEVEL array of primitives no longer vanishes (used to match neither filter)", () => {
-    render(<RecordView record={{ ...REC, tags: ["x", "y"] }} />);
+    render(<RecordView record={norm({ ...REC, tags: ["x", "y"] })} />);
     expect(screen.getByText("x,y")).toBeInTheDocument();
   });
 
   it("a TOP-LEVEL array of objects renders as nested groups too", () => {
-    render(<RecordView record={{ ...REC, findings: [{ name: "f1" }, { name: "f2" }] }} />);
+    render(<RecordView record={norm({ ...REC, findings: [{ name: "f1" }, { name: "f2" }] })} />);
     const headers = [...document.querySelectorAll(".rv__grouphd")].map((el) => el.textContent);
     expect(headers).toContain("f1");
     expect(headers).toContain("f2");

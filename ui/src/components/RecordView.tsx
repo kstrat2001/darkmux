@@ -32,6 +32,7 @@
  */
 import { useMemo, useState } from "react";
 import { escapeBidiControls } from "../lib/recordDetail";
+import { wireOf, type NormRecord } from "../lib/ingest";
 
 /** Envelope fields measured as effectively constant within a session. Not a
  *  guess — see this module's header for the distinct-value counts. */
@@ -58,8 +59,9 @@ function midTruncate(s: string, max = 28): string {
   return `${s.slice(0, keep)}…${s.slice(-keep)}`;
 }
 
-function relTime(iso: string): string | null {
-  const t = Date.parse(iso);
+/** How long ago `t` was, or null for a time that does not parse or lies in
+ *  the future. */
+function relTime(t: number): string | null {
   if (Number.isNaN(t)) return null;
   const s = Math.floor((Date.now() - t) / 1000);
   if (s < 0) return null;
@@ -202,7 +204,10 @@ function Value({ name, value }: { name: string; value: unknown }) {
   // funnels through, rather than per-branch below.
   const s = escapeBidiControls(String(value));
   if (/(^|_)ts$/.test(name)) {
-    const rel = relTime(s);
+    // A payload's own `*_ts` field (`started_ts`, `finalized_ts`), not the
+    // record's `ts`: this panel shows arbitrary payload values, so it parses
+    // them itself. The record's own time comes in parsed, as `tMs`.
+    const rel = relTime(Date.parse(s));
     return <span className="rv__time">{clockOf(s)}{rel ? <span className="rv__dim"> · {rel}</span> : null}</span>;
   }
   if (/(_id|_uid)$/.test(name)) return <span className="rv__id" title={s}>{midTruncate(s)}</span>;
@@ -259,10 +264,13 @@ function maskUids(v: unknown): unknown {
   return v;
 }
 
-export function RecordView({ record: raw }: { record: Record<string, unknown> }) {
+/** Shows a record's wire fields (`wireOf`), headed by its own time as
+ *  ingest parsed it (`tMs`). */
+export function RecordView({ record: norm }: { record: NormRecord }) {
+  const atMs = norm.tMs;
   const [showConstants, setShowConstants] = useState(false);
   const [showRaw, setShowRaw] = useState(false);
-  const record = useMemo(() => maskUids(raw) as Record<string, unknown>, [raw]);
+  const record = useMemo(() => maskUids(wireOf(norm)) as Record<string, unknown>, [norm]);
 
   const entries = Object.entries(record);
   const constants = entries.filter(([k]) => CONSTANT_FIELDS.has(k));
@@ -287,8 +295,8 @@ export function RecordView({ record: raw }: { record: Record<string, unknown> })
       </div>
       {ts ? (
         <div className="rv__when">
-          {clockOf(ts)}
-          {relTime(ts) ? <span className="rv__dim"> · {relTime(ts)}</span> : null}
+          {atMs === null ? ts : clockOf(ts)}
+          {atMs !== null && relTime(atMs) ? <span className="rv__dim"> · {relTime(atMs)}</span> : null}
         </div>
       ) : null}
 

@@ -108,6 +108,7 @@
 //! as much as to a name.
 
 use crate::host_probe::{battery, thermal, BatterySample, ThermalSample};
+use darkmux_flow::FlowAction;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -525,6 +526,7 @@ pub enum StampDuty {
 /// every conceivable one. The FILE set has no such hole: see
 /// [`PRODUCER_SOURCE_PATHS`].
 #[cfg(test)]
+// flow-action-guard:allow — a prefix the test-only source scanner matches, not an action
 const WATCHED_ACTION_PREFIXES: &[&str] = &["machine.", "thermal.", "battery.", "dispatch.rest"];
 
 /// The files [`audit`] is given — every source in the workspace that BUILDS
@@ -564,14 +566,19 @@ pub(crate) const PRODUCER_SOURCE_PATHS: &[&str] = &[
 #[cfg(test)]
 pub(crate) const NON_PRODUCER_SOURCE_PATHS: &[(&str, &str)] = &[
     (
+        "crates/darkmux-flow/src/action.rs",
+        "the action vocabulary itself: every wire string is declared there, and nothing \
+         there builds a record",
+    ),
+    (
         "crates/darkmux-crew/src/host_source.rs",
         "this file — the registry itself. Its literals ARE the table, plus the scanner's own \
          fixtures; scanning it would classify the table as its own producer",
     ),
     (
         "crates/darkmux-doctor/src/checks_hooks.rs",
-        "consumer: the hooks check probes each rule against the telemetry actions darkmux \
-         writes (`TELEMETRY_ACTIONS`), builds nothing",
+        "consumer: the hooks check names `FlowAction::MachineTelemetry` to probe each rule \
+         against the telemetry samples darkmux writes (`is_telemetry_sample`), builds nothing",
     ),
     (
         "crates/darkmux-crew/src/records_emitted.rs",
@@ -580,6 +587,10 @@ pub(crate) const NON_PRODUCER_SOURCE_PATHS: &[(&str, &str)] = &[
     (
         "crates/darkmux-serve/src/runs.rs",
         "consumer: the runs board matches on action strings, builds nothing",
+    ),
+    (
+        "crates/darkmux-serve/src/run_lifecycle.rs",
+        "consumer: folds a session's records into its run attempts, builds none",
     ),
     (
         "crates/darkmux-crew/src/dispatch_internal_tests.rs",
@@ -609,16 +620,16 @@ pub(crate) const NON_PRODUCER_SOURCE_PATHS: &[(&str, &str)] = &[
 
 /// Every flow-record action, in the sources [`audit`] scans, whose payload
 /// can carry or be caused by a host reading — and what each one owes.
-pub const HOST_READING_ACTIONS: &[(&str, StampDuty)] = &[
+pub const HOST_READING_ACTIONS: &[(FlowAction, StampDuty)] = &[
     // ── machine-scoped: these ride the fleet stream to ANOTHER machine's
     // machine lens, which is what makes an unstamped one a second machine
     // being told this one hit critical.
-    ("machine.telemetry", StampDuty::Stamped),
-    ("machine.thermal", StampDuty::Stamped),
-    ("machine.battery", StampDuty::Stamped),
-    ("machine.rollup", StampDuty::Stamped),
+    (FlowAction::MachineTelemetry, StampDuty::Stamped),
+    (FlowAction::MachineThermal, StampDuty::Stamped),
+    (FlowAction::MachineBattery, StampDuty::Stamped),
+    (FlowAction::MachineRollup, StampDuty::Stamped),
     (
-        "machine.battery_health",
+        FlowAction::MachineBatteryHealth,
         StampDuty::Exempt(
             "battery::health() reads IOKit unconditionally and never consults host_source, on \
              macOS and on every other target — there is no simulated reading to name, and \
@@ -627,23 +638,23 @@ pub const HOST_READING_ACTIONS: &[(&str, StampDuty)] = &[
         ),
     ),
     (
-        "machine.online",
+        FlowAction::MachineOnline,
         StampDuty::Exempt(
             "presence edge from darkmux-flow's reconciler: `payload: None`, so there is no \
              reading in it and nothing to stamp. Emitted from a crate with no host source at all",
         ),
     ),
     (
-        "machine.offline",
+        FlowAction::MachineOffline,
         StampDuty::Exempt("presence edge, same shape as machine.online"),
     ),
     // ── dispatch-scoped: session records, but the reading in them is this
     // machine's, and two of them are Warn.
-    ("dispatch.rest", StampDuty::Stamped),
-    ("thermal.stop_unresolved", StampDuty::Stamped),
-    ("thermal.tier5_eject", StampDuty::Stamped),
-    ("thermal.tier5_eject_failed", StampDuty::Stamped),
-    ("battery.pause_unsupported", StampDuty::Stamped),
+    (FlowAction::DispatchRest, StampDuty::Stamped),
+    (FlowAction::ThermalStopUnresolved, StampDuty::Stamped),
+    (FlowAction::ThermalTier5Eject, StampDuty::Stamped),
+    (FlowAction::ThermalTier5EjectFailed, StampDuty::Stamped),
+    (FlowAction::BatteryPauseUnsupported, StampDuty::Stamped),
 ];
 
 /// What [`audit`] found wrong, if anything.
@@ -738,8 +749,32 @@ pub(crate) fn watched_action_literals_anywhere(src: &str) -> Vec<String> {
                 found.push(segment.to_string());
             }
         }
+        for wire in flow_action_variants_named(line) {
+            if WATCHED_ACTION_PREFIXES.iter().any(|p| wire.starts_with(p)) && !found.iter().any(|f| f == wire) {
+                found.push(wire.to_string());
+            }
+        }
     }
     found
+}
+
+/// The wire string of every `FlowAction::<Name>` a line names: the typed
+/// form every producer writes now, read back to the string the registry
+/// classifies.
+#[cfg(test)]
+fn flow_action_variants_named(line: &str) -> Vec<&'static str> {
+    const PATH: &str = "FlowAction::";
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some(i) = rest.find(PATH) {
+        rest = &rest[i + PATH.len()..];
+        let name_len = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(rest.len());
+        let name = &rest[..name_len];
+        if let Some(k) = FlowAction::VARIANT_NAMES.iter().position(|n| *n == name) {
+            out.push(FlowAction::KNOWN_WIRE[k]);
+        }
+    }
+    out
 }
 
 /// Scan producing sources for watched action literals and reconcile them
@@ -766,13 +801,13 @@ pub(crate) fn audit(sources: &[&str]) -> HostReadingAudit {
     HostReadingAudit {
         unclassified: found
             .iter()
-            .filter(|f| !HOST_READING_ACTIONS.iter().any(|(a, _)| a == *f))
+            .filter(|f| !HOST_READING_ACTIONS.iter().any(|(a, _)| a.as_str() == f.as_str()))
             .cloned()
             .collect(),
         stale: HOST_READING_ACTIONS
             .iter()
-            .filter(|(a, _)| !found.iter().any(|f| f == a))
-            .map(|(a, _)| *a)
+            .filter(|(a, _)| !found.iter().any(|f| f == a.as_str()))
+            .map(|(a, _)| a.as_str())
             .collect(),
     }
 }

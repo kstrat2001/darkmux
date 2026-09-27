@@ -3037,7 +3037,7 @@ fn dispatch_finding_reaches_the_flow_record_with_the_brief_and_the_keys() {
         }
         for line in fs::read_to_string(&path).unwrap().lines() {
             let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-            if rec["action"] == "dispatch start" {
+            if rec["action"] == "dispatch.start" {
                 start = Some(rec);
             }
         }
@@ -7567,7 +7567,7 @@ fn review_real_launch_runs_the_deliver_phase_and_writes_the_emit_file() {
     assert_eq!(out.status.code(), Some(0), "{combined}");
     let close = flow_actions(&flows)
         .into_iter()
-        .find(|r| r["action"] == serde_json::json!("mission close"))
+        .find(|r| r["action"] == serde_json::json!("mission.close"))
         .expect("a mission close record");
     // (#2310 fix-loop E2) The close payload IS the delivery's verdict. The
     // deliver step's output is a `{mode, summary, emit}` object — declaring
@@ -8820,7 +8820,7 @@ fn mission_launch_prunes_disabled_steps_at_mint_and_reports_them() {
     let start = day
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .find(|r| r["action"] == "mission start")
+        .find(|r| r["action"] == "mission.start")
         .expect("a mission start record");
     assert_eq!(start["payload"]["graph"]["steps_minted"], 1, "{start}");
     assert_eq!(start["payload"]["graph"]["steps_in_config"], 4);
@@ -11662,7 +11662,7 @@ fn utc_day_and_ts_matches_known_dates() {
 fn mission_status_json_surfaces_a_peer_mission_seen_only_via_the_flow_stream() {
     let home = TempDir::new().unwrap();
     let flows = TempDir::new().unwrap();
-    write_peer_mission_day_file(flows.path(), "review-peer-1711", "peer-host", Some("mission close"));
+    write_peer_mission_day_file(flows.path(), "review-peer-1711", "peer-host", Some("mission.close"));
 
     let out = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())
@@ -11851,7 +11851,7 @@ fn mission_status_never_labels_a_same_machine_orphan_as_observed_on_the_fleet() 
     // Same shape `write_peer_mission_day_file` uses, but `machine_id`
     // matches the child's OWN `DARKMUX_MACHINE_ID` below — that is the
     // whole point of this test.
-    write_peer_mission_day_file(flows.path(), "orphan-local-1711", "this-machine", Some("mission close"));
+    write_peer_mission_day_file(flows.path(), "orphan-local-1711", "this-machine", Some("mission.close"));
 
     let out = darkmux_cmd()
         .env("DARKMUX_HOME", home.path())

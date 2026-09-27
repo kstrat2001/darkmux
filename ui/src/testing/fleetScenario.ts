@@ -1,4 +1,6 @@
-import type { FlowRecord, PresenceBeat, RosterMachineEntry } from "../types/handwritten";
+import { ACTION, type NormRecord } from "../lib/ingest";
+import { norm } from "./records";
+import type { PresenceBeat, RosterMachineEntry } from "../types/handwritten";
 
 /**
  * (#2818) FLEET SCENARIOS AS FIXTURES.
@@ -52,7 +54,7 @@ export interface ScenarioSpec {
 }
 
 export interface Scenario {
-  data: FlowRecord[];
+  data: NormRecord[];
   liveMachines: Map<string, PresenceBeat>;
   roster: RosterMachineEntry[];
   nowMs: number;
@@ -64,7 +66,7 @@ function iso(ms: number): string {
 
 export function buildScenario(spec: ScenarioSpec): Scenario {
   const nowMs = spec.nowMs ?? Date.UTC(2026, 8, 19, 12, 0, 0);
-  const data: FlowRecord[] = [];
+  const data: NormRecord[] = [];
   const liveMachines = new Map<string, PresenceBeat>();
 
   spec.machines.forEach((m, mi) => {
@@ -72,24 +74,24 @@ export function buildScenario(spec: ScenarioSpec): Scenario {
     // wins" (`nameOf`, #2030) has something real to resolve against rather
     // than depending on array order.
     (m.formerNames ?? []).forEach((old, i) => {
-      data.push({
+      data.push(norm({
         ts: iso(nowMs - (90 - i) * 86_400_000),
         machine_uid: m.uid,
         machine_id: old,
         session_id: `${m.uid}-historic-${i}`,
-        action: "dispatch.start",
-      } as FlowRecord);
+        action: ACTION.DispatchStart,
+      }));
     });
 
     const n = m.records ?? 1;
     for (let i = 0; i < n; i++) {
-      data.push({
+      data.push(norm({
         ts: iso(nowMs - (n - i) * 60_000),
         machine_uid: m.uid,
         machine_id: m.name,
         session_id: `${m.uid}-s${i}`,
-        action: "dispatch.start",
-      } as FlowRecord);
+        action: ACTION.DispatchStart,
+      }));
     }
 
     if (m.beating ?? true) {
