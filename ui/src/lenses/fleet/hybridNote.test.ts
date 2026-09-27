@@ -1,10 +1,11 @@
 import { describe, it, expect } from "vitest";
 import { hybridNote } from "./hybridNote";
 import type { TokensOffMeter } from "./savings";
-import type { FlowRecord } from "../../types/handwritten";
+import type { NormRecord } from "../../lib/ingest";
+import { norm, type RawRecord } from "../../testing/records";
 
-function rec(overrides: Partial<FlowRecord>): FlowRecord {
-  return { ts: "2026-08-08T00:00:00.000Z", ...overrides };
+function rec(overrides: RawRecord): NormRecord {
+  return norm({ ts: "2026-08-08T00:00:00.000Z", ...overrides });
 }
 
 const ZERO_TOKENS: TokensOffMeter = {
@@ -18,9 +19,9 @@ const ZERO_TOKENS: TokensOffMeter = {
 
 describe("hybridNote", () => {
   it("a real orchestrator note wins over every deterministic template — the latest one, by timestamp", () => {
-    const data: FlowRecord[] = [
-      rec({ action: "note", source: "orchestrator", handle: "shipped m6", ts: "2026-08-08T10:00:00.000Z" }),
-      rec({ action: "note", source: "orchestrator", handle: "shipped m7", ts: "2026-08-08T12:00:00.000Z" }),
+    const data: NormRecord[] = [
+      rec({ action: "operator.note", source: "orchestrator", handle: "shipped m6", ts: "2026-08-08T10:00:00.000Z" }),
+      rec({ action: "operator.note", source: "orchestrator", handle: "shipped m7", ts: "2026-08-08T12:00:00.000Z" }),
     ];
     const note = hybridNote(data, { ...ZERO_TOKENS, runs: 5 });
     expect(note.text).toContain("shipped m7");
@@ -29,16 +30,16 @@ describe("hybridNote", () => {
   });
 
   it("a session-scoped note (adjudication trail) is ignored — dashboard notes are mission-level only", () => {
-    const data: FlowRecord[] = [rec({ action: "note", source: "orchestrator", session_id: "s1", handle: "verdict: pass" })];
+    const data: NormRecord[] = [rec({ action: "operator.note", source: "orchestrator", session_id: "s1", handle: "verdict: pass" })];
     const note = hybridNote(data, { ...ZERO_TOKENS, runs: 3 });
     expect(note.text).not.toContain("verdict: pass");
     expect(note.hasHistory).toBe(false);
   });
 
   it("falls back to the latest mission.run record when there's no orchestrator note", () => {
-    const data: FlowRecord[] = [
-      rec({ action: "mission.run.start", mission_id: "m1", ts: "2026-08-08T09:00:00.000Z" }),
-      rec({ action: "mission.run.complete", mission_id: "m2", ts: "2026-08-08T11:00:00.000Z" }),
+    const data: NormRecord[] = [
+      rec({ action: "mission.run.finalize", mission_id: "m1", ts: "2026-08-08T09:00:00.000Z" }),
+      rec({ action: "mission.run.abort", mission_id: "m2", ts: "2026-08-08T11:00:00.000Z" }),
     ];
     const note = hybridNote(data, ZERO_TOKENS);
     expect(note.text).toContain("m2");

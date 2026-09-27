@@ -1,11 +1,9 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { handleNamesExecution } from "../lib/usageRecords";
-import type { FlowRecord } from "../types/handwritten";
-import { recKey } from "../lib/flow";
 import { useThrottledValue } from "../hooks/useThrottledValue";
 import { useArrivalKeys } from "../hooks/useArrivalKeys";
 import { LIVE_WINDOW_MS } from "../lib/flow";
-import { clk, compactThousands, type CompactStyle } from "../lib/format";
+import { clkAt, compactThousands, type CompactStyle } from "../lib/format";
 import { RecordView } from "./RecordView";
 import { Shimmer } from "./Placeholder";
 import {
@@ -30,6 +28,7 @@ import { recordDetail, recordObject } from "../lib/recordDetail";
 import { turnItems } from "../lib/turnGroups";
 import { restReasonLabel } from "../lib/tokenRate";
 import { openModalEl } from "../lib/dialogManager";
+import { recKey, unknownActionCount, type NormRecord } from "../lib/ingest";
 
 /** Row cap — `renderLog()`'s `all.slice(-50).reverse()` (viewer.html:2443):
  * newest 50, newest-first. */
@@ -69,7 +68,7 @@ const COUNT_STYLE: CompactStyle = { k: 1, m: 1 };
  * next one may replace it. Two updates a second is still "live"; faster is
  * unreadable on a phone and reads as flicker. */
 const FOLLOW_HOLD_MS = 500;
-function sameRecord(a: FlowRecord | null, b: FlowRecord | null): boolean {
+function sameRecord(a: NormRecord | null, b: NormRecord | null): boolean {
   if (a === b) return true;
   if (!a || !b) return false;
   return recKey(a) === recKey(b);
@@ -311,7 +310,7 @@ export function EventLogColumn({
   pushDetail = false,
   headerExtra = null,
 }: {
-  records: FlowRecord[];
+  records: NormRecord[];
   visible: boolean;
   /** (#1066 QA) Which MOUNT SITE this is — `"app"` for the App-level
    *  mainstay, something else for a lens that owns its own pane. Keys the
@@ -392,6 +391,12 @@ export function EventLogColumn({
   // (`"note"`) was a facet value that had never been seen before and the
   // one-shot reseed had already run.
   const facets = useMemo(() => computeFacets(records), [records]);
+  // Vocabulary skew, said out loud: records whose action this build does not
+  // know (a newer daemon, or an archive the daemon could not upgrade). They
+  // still render, but every derivation keyed on the vocabulary ignores them,
+  // so the numbers around them can be quietly wrong. Normally zero, so the
+  // chip only grows when something is actually off.
+  const unknownActions = useMemo(() => unknownActionCount(records), [records]);
 
   // (#2018) Seeded from `sessionStorage`, reconciled against the facets this
   // window actually offers. The lazy initializer runs ONCE, which is what
@@ -662,7 +667,7 @@ export function EventLogColumn({
     return visibleRecs.find((r) => recKey(r) === selectedKey) ?? null;
   }, [follow, followed, visibleRecs, selectedKey]);
 
-  function selectRecord(r: FlowRecord) {
+  function selectRecord(r: NormRecord) {
     setSelectedKey(recKey(r));
     setFollow(false);
     if (pushDetail) {
@@ -828,7 +833,8 @@ export function EventLogColumn({
   // not a nonzero-but-narrowed chip reading "887 hidden", was the one
   // indistinguishable from a broken viewer.
   const hiddenCause = hiddenByFilters > 0 ? hiddenCauseLabel(filters, facets) : null;
-  const hiddenSuffix = hiddenByFilters > 0 ? ` · ${hiddenByFilters} hidden` : "";
+  const hiddenSuffix =
+    (hiddenByFilters > 0 ? ` · ${hiddenByFilters} hidden` : "") + (unknownActions > 0 ? ` · ${unknownActions} unknown` : "");
 
   const q = filters.q.length > 0;
   const qcountText = q
@@ -993,7 +999,7 @@ export function EventLogColumn({
             onKeyDown={onActivateKeyDown(() => setPushedDetailOpen(false))}
           >
             <span className="eventlog__stripback-icon" aria-hidden="true">{"\u2039"}</span>
-            <span className="eventlog__rectime">{clk(Date.parse(selected.ts))}</span>{" "}
+            <span className="eventlog__rectime">{clkAt(selected.tMs)}</span>{" "}
             <ActivityIcon act={activityOf(selected)} />
             <span className="eventlog__ractivity">{activityOf(selected)}</span>
             {recordDetail(selected) ? <span className="preview-text"> · {recordDetail(selected)}</span> : null}
@@ -1228,7 +1234,7 @@ export function EventLogColumn({
                 className="eventlog__rec sel eventlog__rec--strip"
                 data-act="rec-strip"
               >
-                <span className="eventlog__rectime">{clk(Date.parse(selected.ts))}</span>{" "}
+                <span className="eventlog__rectime">{clkAt(selected.tMs)}</span>{" "}
                 <ActivityIcon act={activityOf(selected)} />
                 <span className="eventlog__ractivity">{activityOf(selected)}</span>
                 {recordDetail(selected) ? (
@@ -1303,7 +1309,7 @@ export function EventLogColumn({
                     <div className="eventlog__turnline">
                       <span className="eventlog__ractivity eventlog__turnname">Turn {t.seq}</span>
                       <span className="eventlog__turnwhy">{t.why}</span>
-                      <span className="eventlog__rectime">{clk(Date.parse(r.ts))}</span>
+                      <span className="eventlog__rectime">{clkAt(r.tMs)}</span>
                       {t.durationMs !== null ? (
                         <span
                           className={`eventlog__turndur${t.durationMs >= SLOW_TURN_MS ? " eventlog__turndur--slow" : ""}`}
@@ -1449,7 +1455,7 @@ export function EventLogColumn({
                   onClick={() => selectRecord(r)}
                   onKeyDown={onActivateKeyDown(() => selectRecord(r))}
                 >
-                  <span className="eventlog__rectime">{clk(Date.parse(r.ts))}</span>{" "}
+                  <span className="eventlog__rectime">{clkAt(r.tMs)}</span>{" "}
                   {/* (#2863) A row says what happened in one scannable line:
                       the kind (a tool's own name, or "reasoning") as a chip,
                       the object it was about, and how a tool came out. The
@@ -1560,10 +1566,10 @@ export function EventLogColumn({
  * working detail pane (the operator can inspect any field of any selected
  * event) — just not the bespoke per-action layout, named as a follow-up
  * rather than partially reproducing four separate card shapes. */
-function EventDetail({ record }: { record: FlowRecord }) {
+function EventDetail({ record }: { record: NormRecord }) {
   return (
     <div className="eventlog__detailcard">
-      <RecordView record={record as unknown as Record<string, unknown>} />
+      <RecordView record={record} />
     </div>
   );
 }

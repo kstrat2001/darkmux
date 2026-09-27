@@ -22,7 +22,7 @@
  * honored for its own "hasn't started yet" guard; see its own doc.
  */
 
-import { uidOf, sessionsOn, sessionRunning, sessionRecords, T, isDispatchStart } from "../../lib/flow";
+import { uidOf, sessionsOn, sessionRunning, sessionRecords } from "../../lib/flow";
 import {
   aggregateLiveState,
   aggregateTokenRate,
@@ -33,7 +33,7 @@ import {
   liveStateWhileConnected,
 } from "../../lib/tokenRate";
 import type { ExecutionTokenReading, LiveState } from "../../lib/tokenRate";
-import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
+import type { MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
 // (#2814) `isSelfMachine`/`displayNameOf` live in `lib/flow.ts` beside
 // `nameOf`/`machineNames`/`localMachineUid` rather than here, because the
 // machine lens and the app shell need the identical self-identity rule and a
@@ -44,6 +44,7 @@ import type { RosterName } from "../../lib/flow";
 import type { Run } from "../../types/generated/Run";
 import { utilityStrip, type UtilityStrip } from "../../lib/utilityJobs";
 import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";
+import { ACTION, recordsAsOf, type NormRecord } from "../../lib/ingest";
 
 /** `machActive()` — viewer.html:1342-1349. A machine is "in flight" iff one
  * of its started sessions is still running — routed through the shared
@@ -52,7 +53,7 @@ import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";
  * running-forever bug class can't be fixed at one site and linger at
  * another.
  *
- * (#1869) `T(r.ts) <= t` restores legacy's own `visible()` gate — legacy's
+ * (#1869) The as-of cut at `t` (`recordsAsOf`) restores legacy's own `visible()` gate — legacy's
  * `machActive` reads `visible().some(...)`, `visible = () =>
  * DATA.filter(r=>T(r.ts)<=state.t)`. This port dropped the gate because,
  * before the playback transport existed, `t` was always the day's true max
@@ -63,18 +64,17 @@ import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";
  * day still rendered it active, because `sessionRunning`'s close-edge check
  * finds no close (there's nothing to close yet) and defaults to "running". */
 export function machActive(
-  data: FlowRecord[],
+  data: NormRecord[],
   liveSet: Set<string>,
   m: string,
   t: number,
 ): boolean {
-  return data.some(
+  return recordsAsOf(data, t).some(
     (r) =>
-      T(r.ts) <= t &&
       uidOf(r) === m &&
       // (#2902 step 5) Or a hosted call's budget wait: its gate runs before
       // the bookends, so while it waits there is no start to find.
-      (isDispatchStart(r.action) || r.action === "budget.wait") &&
+      (r.action === ACTION.DispatchStart || r.action === ACTION.BudgetWait) &&
       sessionRunning(data, liveSet, r.session_id ?? "", t),
   );
 }
@@ -84,7 +84,7 @@ export function machActive(
  * comment names). `MACH_SPEC` (a static hardcoded lookup) is empty in the
  * live viewer — dropped here entirely, matching that source comment. */
 export function specOf(
-  data: FlowRecord[],
+  data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
   specs: MachineSpecs | null,
   m: string,
@@ -144,7 +144,7 @@ export function specOf(
  * no `mission_id` at all (a standalone dispatch, a lab run) always counts on
  * its own — nothing to collapse into.
  */
-export function topLevelRunSessionIds(data: FlowRecord[], sessionIds: string[]): string[] {
+export function topLevelRunSessionIds(data: NormRecord[], sessionIds: string[]): string[] {
   const missionIdOf = new Map<string, string | undefined>();
   for (const r of data) {
     if (!r.session_id || missionIdOf.has(r.session_id)) continue;
@@ -271,7 +271,7 @@ function normalizeMachineAlias(name: string): string {
 }
 
 export function rosterOnlyEntries(
-  data: FlowRecord[],
+  data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
   roster: RosterMachineEntry[],
   /** (#1855 follow-up) This machine's own `/machine/specs` read, when
@@ -576,7 +576,7 @@ export interface FleetCard {
  * (`unknown` presence renders the same as "present" for this purpose,
  * matching `absent?'offline':(act?...)`'s two-way branch). */
 export function buildFleetCard(
-  data: FlowRecord[],
+  data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
   specs: MachineSpecs | null,
   liveSet: Set<string>,
@@ -592,7 +592,7 @@ export function buildFleetCard(
   /** The playhead — `PlaybackLens`'s scrubbable `t` (#1869), pinned to the
    * day's true max in live mode (there is no scrubber on `/next`'s default
    * route). `sessionRunning`'s close-edge/TTL check and `machActive`'s
-   * `T(r.ts) <= t` gate are both defined against it. */
+   * as-of cut are both defined against it. */
   t: number,
   /** (#2067) See `specOf`'s own doc — the spec source, when it is not the
    * presence beats (a static build). */
@@ -651,17 +651,17 @@ export function buildFleetCard(
 export interface FleetCardBase extends Omit<FleetCard, "liveTokRate" | "liveTokStalled" | "liveTokState" | "liveTokRestSecondsLeft" | "liveTokCarried" | "executions" | "defaultExecutionSessionId" | "utility"> {
   /** @internal The inputs the live readings need. */
   liveInputs: {
-    data: FlowRecord[];
+    data: NormRecord[];
     runningSids: string[];
     /** Each running session's durable records, cut at the base's `t`. */
-    durableSets: FlowRecord[][];
+    durableSets: NormRecord[][];
     self: boolean;
     binding: { id: string; loaded: boolean } | null;
   };
 }
 
 export function buildFleetCardBase(
-  data: FlowRecord[],
+  data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
   specs: MachineSpecs | null,
   liveSet: Set<string>,
@@ -740,7 +740,7 @@ export function buildFleetCardBase(
   // genuinely generating reads the same "N tok/s" a live viewer saw at that
   // instant (finding #3): the tok/s scope is a fact about the recorded
   // instant, not a live-only instrument.
-  // `T(r.ts) <= t` is load-bearing here, not redundant with the LIVE
+  // The as-of cut is load-bearing here, not redundant with the LIVE
   // caller's window already being time-bounded: a REPLAY caller hands this
   // function the WHOLE day's records (`sessionRunning`'s own doc — presence
   // is empty, so the running verdict comes from records up to `t`), and
@@ -748,7 +748,7 @@ export function buildFleetCardBase(
   // would read heartbeats from AFTER the playhead too, inflating/changing
   // the rate a live viewer actually saw at `t` (measured: 122 tok/s off a
   // heartbeat 6h in the day's future vs the correct 95 tok/s as of `t`).
-  const durableSets = runningSids.map((sid) => sessionRecords(data, sid).filter((r) => T(r.ts) <= t));
+  const durableSets = runningSids.map((sid) => recordsAsOf(sessionRecords(data, sid), t));
   const spec = specOf(data, liveMachines, specs, m, specBeats);
   // (#1855) `specBeats` is the SAME map `specOf` falls back to for a remote
   // machine's hardware line, so "was there anything to read" is exactly
@@ -903,7 +903,7 @@ export function withLiveReadings(
   const m = base.uid;
   const liveTokRecordSets = runningSids.map((sid, i) => {
     const liveRecs = live?.bySession.get(sid);
-    return liveRecs ? mergeLive(durableSets[i], liveRecs.filter((r) => T(r.ts) <= t)) : durableSets[i];
+    return liveRecs ? mergeLive(durableSets[i], recordsAsOf(liveRecs, t)) : durableSets[i];
   });
   // (#2877 dogfood finding) A session can be `active` (no terminal record
   // yet — a mission genuinely stuck open, observed live: `status: "running"`

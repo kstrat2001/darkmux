@@ -2,8 +2,8 @@
  * (#2206/#2207, slop-chop pilot) "Is a non-array object" — the single
  * shared form of a rule that appears inline across `ui/src` (at least six
  * sites); this pilot converted the three in `eventFilters.ts` (two
- * `JSON.parse` result checks) and `flow.ts` (`bodyTruncated`,
- * `asRecordArray`). Known remaining lookalikes, left for a follow-up
+ * `JSON.parse` result checks) and `flow.ts` (`bodyTruncated`; `ingest.ts`
+ * now reads the record bodies with it). Known remaining lookalikes, left for a follow-up
  * sweep: `recordDetail.ts:45`, `RecordView.tsx:132,149`,
  * `MissionGraphLens.tsx:196,427`.
  *

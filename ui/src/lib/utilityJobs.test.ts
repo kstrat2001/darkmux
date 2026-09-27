@@ -1,12 +1,12 @@
 import { describe, expect, test } from "vitest";
-import type { FlowRecord } from "../types/handwritten";
+import { ACTION, type NormRecord } from "./ingest";
+import { norm, type RawRecord } from "../testing/records";
 import {
-  UTILITY_ERROR_ACTION,
   UTILITY_JOB,
   UTILITY_JOB_DEFAULT_STALL_MS,
-  UTILITY_START_ACTION,
   isKnownUtilityJob,
   machineUtilityJob,
+  openUtilityJobs,
   utilityJobVisual,
   utilityUsageByJob,
 } from "./utilityJobs";
@@ -15,20 +15,20 @@ const M = "mach-a";
 const at = (s: number) => new Date(Date.UTC(2026, 8, 27, 12, 0, s)).toISOString();
 const ms = (s: number) => Date.parse(at(s));
 
-function start(s: number, job: string, extra: Partial<FlowRecord> = {}, payload: Record<string, unknown> = {}): FlowRecord {
-  return {
+function start(s: number, job: string, extra: RawRecord = {}, payload: Record<string, unknown> = {}): NormRecord {
+  return norm({
     ts: at(s),
-    action: UTILITY_START_ACTION,
+    action: ACTION.UtilityStart,
     category: "telemetry",
     source: "utility",
     machine_uid: M,
     model: "u4b",
     payload: { job, model: "u4b", stall_after_seconds: 30, ...payload },
     ...extra,
-  } as FlowRecord;
+  });
 }
-function usage(s: number, job: string | undefined, extra: Partial<FlowRecord> = {}, payload: Record<string, unknown> = {}): FlowRecord {
-  return {
+function usage(s: number, job: string | undefined, extra: RawRecord = {}, payload: Record<string, unknown> = {}): NormRecord {
+  return norm({
     ts: at(s),
     action: "telemetry.tokens",
     category: "telemetry",
@@ -36,10 +36,10 @@ function usage(s: number, job: string | undefined, extra: Partial<FlowRecord> = 
     machine_uid: M,
     payload: { purpose: "utility", call_kind: "single_shot", ...(job ? { job } : {}), total_tokens: 10, requested_model: "u4b", ...payload },
     ...extra,
-  } as FlowRecord;
+  });
 }
-function err(s: number, job: string, extra: Partial<FlowRecord> = {}): FlowRecord {
-  return { ts: at(s), action: UTILITY_ERROR_ACTION, category: "telemetry", source: "utility", machine_uid: M, payload: { job, model: "u4b" }, ...extra } as FlowRecord;
+function err(s: number, job: string, extra: RawRecord = {}): NormRecord {
+  return norm({ ts: at(s), action: ACTION.UtilityError, category: "telemetry", source: "utility", machine_uid: M, payload: { job, model: "u4b" }, ...extra });
 }
 
 describe("the one definition of the utility jobs", () => {
@@ -102,7 +102,7 @@ describe("machineUtilityJob: the machine's live utility job", () => {
     const s = start(0, UTILITY_JOB.compaction, { session_id: "s1" }, { serves: "s1" });
     expect(machineUtilityJob([s], ms(3))?.job).toBe(UTILITY_JOB.compaction);
     expect(machineUtilityJob([s, usage(2, UTILITY_JOB.compaction, { session_id: "s1" }, { call_kind: "compaction" })], ms(3))).toBeNull();
-    const heartbeat = { ts: at(2), action: "dispatch.turn.heartbeat", session_id: "s1", machine_uid: M, payload: {} } as FlowRecord;
+    const heartbeat = norm({ ts: at(2), action: "dispatch.turn.heartbeat", session_id: "s1", machine_uid: M, payload: {} });
     expect(machineUtilityJob([s, heartbeat], ms(3))).toBeNull();
     // Another execution's record does not end it.
     const other = { ...heartbeat, session_id: "s2" };
@@ -138,7 +138,7 @@ describe("utilityUsageByJob: each job's recent usage", () => {
       usage(2, UTILITY_JOB.radio_routing, {}, { total_tokens: 5 }),
       usage(3, undefined, { session_id: "s" }, { call_kind: "compaction", total_tokens: 100 }),
       usage(4, "dream_job", {}, { total_tokens: 7 }),
-      { ...usage(5, UTILITY_JOB.radio_routing), payload: { purpose: "work", call_kind: "turn", total_tokens: 999 } } as FlowRecord,
+      norm({ ...usage(5, UTILITY_JOB.radio_routing), payload: { purpose: "work", call_kind: "turn", total_tokens: 999 } }),
     ]);
     expect(rows).toEqual([
       { job: UTILITY_JOB.compaction, known: true, calls: 1, tokens: 100 },
@@ -155,8 +155,8 @@ describe("utilityUsageByJob: each job's recent usage", () => {
 
 // (#2915 review) Pairing by job id, orphans, terminals, ms times.
 describe("(#2915 review) machineUtilityJob pairing", () => {
-  const withId = (r: FlowRecord, id: string, ms?: Record<string, number>): FlowRecord =>
-    ({ ...r, payload: { ...(r.payload as Record<string, unknown>), job_id: id, ...(ms ?? {}) } }) as FlowRecord;
+  const withId = (r: NormRecord, id: string, ms?: Record<string, number>): NormRecord =>
+    norm({ ...r, payload: { ...(r.payload as Record<string, unknown>), job_id: id, ...(ms ?? {}) } });
 
   test("MUST 1: an orphaned routing start never absorbs a later job's end: [orphan, start, end] -> quiet", () => {
     const recs = [
@@ -185,21 +185,21 @@ describe("(#2915 review) machineUtilityJob pairing", () => {
 
   test("MUST 2: a compaction whose runtime was killed is closed by its execution's dispatch error", () => {
     const s = start(0, UTILITY_JOB.compaction, { session_id: "s1" }, { serves: "s1" });
-    const errRec = { ts: at(4), action: "dispatch error", session_id: "s1", machine_uid: M, payload: {} } as FlowRecord;
+    const errRec = norm({ ts: at(4), action: "dispatch.error", session_id: "s1", machine_uid: M, payload: {} });
     expect(machineUtilityJob([s, errRec], ms(5))).toBeNull();
-    const done = { ...errRec, action: "dispatch complete" } as FlowRecord;
+    const done = norm({ ...errRec, action: "dispatch.complete" });
     expect(machineUtilityJob([s, done], ms(5))).toBeNull();
   });
 
   test("C3: a terminal in the SAME second as the start still closes it", () => {
     const s = withId(start(4, UTILITY_JOB.compaction, { session_id: "s1" }, { serves: "s1" }), "s1:compaction:1", { started_at_ms: ms(4) + 400 });
-    const errRec = { ts: at(4), action: "dispatch.error", session_id: "s1", machine_uid: M, payload: {} } as FlowRecord;
+    const errRec = norm({ ts: at(4), action: "dispatch.error", session_id: "s1", machine_uid: M, payload: {} });
     expect(machineUtilityJob([s, errRec], ms(5))).toBeNull();
   });
 
   test("a heartbeat is judged by its own sample time: one sampled before the start leaves it open, one after closes it", () => {
     const s = withId(start(4, UTILITY_JOB.compaction, { session_id: "s1" }, { serves: "s1" }), "s1:compaction:1", { started_at_ms: ms(4) + 400 });
-    const beat = (sampled: number) => ({ ts: at(4), action: "dispatch.turn.heartbeat", session_id: "s1", machine_uid: M, payload: { sampled_at_ms: sampled } }) as FlowRecord;
+    const beat = (sampled: number) => norm({ ts: at(4), action: "dispatch.turn.heartbeat", session_id: "s1", machine_uid: M, payload: { sampled_at_ms: sampled } });
     expect(machineUtilityJob([beat(ms(4) + 100), s], ms(5))?.job).toBe(UTILITY_JOB.compaction);
     expect(machineUtilityJob([s, beat(ms(4) + 700)], ms(5))).toBeNull();
   });
@@ -212,5 +212,20 @@ describe("(#2915 review) machineUtilityJob pairing", () => {
     expect(machineUtilityJob(recs, ms(8) + 300)?.job).toBe(UTILITY_JOB.radio_routing);
     expect(machineUtilityJob(recs, ms(8) + 300)?.sinceMs).toBe(ms(8) + 100);
     expect(machineUtilityJob(recs, ms(8) + 700)).toBeNull();
+  });
+});
+
+describe("a utility record with no usable time (the bad-timestamp policy)", () => {
+  const NOW = Date.parse("2026-09-27T10:00:00Z");
+  const start = (ts: string) => norm({ ts, action: ACTION.UtilityStart, session_id: "s1", payload: { job: "compaction", job_id: "j1" } });
+  const end = (ts: string) => norm({ ts, action: ACTION.UtilityError, session_id: "s1", payload: { job: "compaction", job_id: "j1" } });
+
+  test("an untimed start is kept, open as of now rather than dropped", () => {
+    const open = openUtilityJobs([start("garbage")], NOW);
+    expect(open.map((o) => [o.job, o.sinceMs])).toEqual([["compaction", NOW]]);
+  });
+
+  test("an untimed end still closes its job", () => {
+    expect(openUtilityJobs([start("2026-09-27T09:59:00Z"), end("garbage")], NOW)).toEqual([]);
   });
 });

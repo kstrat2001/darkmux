@@ -13,16 +13,16 @@ import {
   labBadgeText,
   LAB_FEED_CAP,
 } from "./labRun";
-import type { LabRunEvent } from "../../types/handwritten";
+import { norm, normAll, type RawRecord } from "../../testing/records";
 
 describe("computeLabPipeline", () => {
   it("folds step-result events into per-step-id payloads, in first-seen order", () => {
-    const events: LabRunEvent[] = [
-      { ts: "2026-01-01T00:00:00Z", action: "step result", payload: { step_id: "bundle", items_out: 5 } },
-      { ts: "2026-01-01T00:00:01Z", action: "step result", payload: { step_id: "probe", draws_total: 10, draws_done: 3 } },
-      { ts: "2026-01-01T00:00:02Z", action: "step result", payload: { step_id: "bundle", items_out: 8 } },
+    const events: RawRecord[] = [
+      { ts: "2026-01-01T00:00:00Z", action: "step.result", payload: { step_id: "bundle", items_out: 5 } },
+      { ts: "2026-01-01T00:00:01Z", action: "step.result", payload: { step_id: "probe", draws_total: 10, draws_done: 3 } },
+      { ts: "2026-01-01T00:00:02Z", action: "step.result", payload: { step_id: "bundle", items_out: 8 } },
     ];
-    const pipe = computeLabPipeline(events);
+    const pipe = computeLabPipeline(normAll(events));
     expect(pipe.order).toEqual(["bundle", "probe"]);
     // Later payload for the same step_id overwrites the earlier one, but
     // the ORDER position is set on first sight only.
@@ -30,22 +30,22 @@ describe("computeLabPipeline", () => {
   });
 
   it("tallies review-ruling events by pass, separately from the step order", () => {
-    const events: LabRunEvent[] = [
-      { ts: "t", action: "step result", payload: { step_id: "review-ruling", pass: 1, ruling: "confirmed" } },
-      { ts: "t", action: "step result", payload: { step_id: "review-ruling", pass: 1, ruling: "confirmed" } },
-      { ts: "t", action: "step result", payload: { step_id: "review-ruling", pass: 2, ruling: "needs_check" } },
+    const events: RawRecord[] = [
+      { ts: "t", action: "step.result", payload: { step_id: "review-ruling", pass: 1, ruling: "confirmed" } },
+      { ts: "t", action: "step.result", payload: { step_id: "review-ruling", pass: 1, ruling: "confirmed" } },
+      { ts: "t", action: "step.result", payload: { step_id: "review-ruling", pass: 2, ruling: "needs_check" } },
     ];
-    const pipe = computeLabPipeline(events);
+    const pipe = computeLabPipeline(normAll(events));
     expect(pipe.order).toEqual([]);
     expect(pipe.rulingTally).toEqual({ 1: { confirmed: 2 }, 2: { needs_check: 1 } });
   });
 
   it("ignores events with no payload or a non-step-result action", () => {
-    const events: LabRunEvent[] = [
-      { ts: "t", action: "step result" },
+    const events: RawRecord[] = [
+      { ts: "t", action: "step.result" },
       { ts: "t", action: "telemetry" },
     ];
-    expect(computeLabPipeline(events)).toEqual({ steps: {}, order: [], rulingTally: { 1: {}, 2: {} } });
+    expect(computeLabPipeline(normAll(events))).toEqual({ steps: {}, order: [], rulingTally: { 1: {}, 2: {} } });
   });
 });
 
@@ -68,9 +68,9 @@ describe("labStageMeta", () => {
 
 describe("labPipelineLines", () => {
   it("emits a name/meta line pair per stage in arrival order, plus a trailing synthesis stage", () => {
-    const pipe = computeLabPipeline([
-      { ts: "t", action: "step result", payload: { step_id: "bundle", items_out: 5 } },
-    ]);
+    const pipe = computeLabPipeline(normAll([
+      { ts: "t", action: "step.result", payload: { step_id: "bundle", items_out: 5 } },
+    ]));
     const lines = labPipelineLines(pipe, { crew: "c", mode: "m", confirmed: 3, needs_check: 1, archived: 0 });
     // Only `items_out` was seeded above (no `items_in`) — the em dash marks
     // the absent side, matching `labStageMeta`'s own `itemsIn ?? "—"`.
@@ -85,9 +85,9 @@ describe("labPipelineLines", () => {
   });
 
   it("shows the provisional ruling tally when no terminal envelope has landed", () => {
-    const pipe = computeLabPipeline([
-      { ts: "t", action: "step result", payload: { step_id: "review-ruling", pass: 1, ruling: "confirmed" } },
-    ]);
+    const pipe = computeLabPipeline(normAll([
+      { ts: "t", action: "step.result", payload: { step_id: "review-ruling", pass: 1, ruling: "confirmed" } },
+    ]));
     const lines = labPipelineLines(pipe, null);
     expect(lines.slice(-2)).toEqual(["synthesis", "(provisional, from rulings so far) pass1 confirmed:1 · pass2 —"]);
   });
@@ -107,36 +107,36 @@ describe("labShortId / labFeedTs", () => {
 
 describe("labFeedRowLines", () => {
   it("renders a host-telemetry row as ts/host/cpu-mem-gpu", () => {
-    const r: LabRunEvent = { ts: "t", category: "telemetry", source: "process", payload: { cpu: 12, mem: 40, gpu: 0 } };
-    expect(labFeedRowLines(r)).toEqual(["t", "host", "cpu 12% · mem 40% · gpu 0%"]);
+    const r: RawRecord = { ts: "t", category: "telemetry", source: "process", payload: { cpu: 12, mem: 40, gpu: 0 } };
+    expect(labFeedRowLines(norm(r))).toEqual(["t", "host", "cpu 12% · mem 40% · gpu 0%"]);
   });
 
   it("renders a review-ruling row naming stage/bundle/ruling/seconds", () => {
-    const r: LabRunEvent = {
+    const r: RawRecord = {
       ts: "t",
-      action: "step result",
+      action: "step.result",
       payload: { step_id: "review-ruling", stage: "judge", pass: 1, bundle_id: "short-id", ruling: "confirmed", seconds: 2.3456 },
     };
-    expect(labFeedRowLines(r)).toEqual(["t", "judge", "short-id pass1 → confirmed (2.3s)"]);
+    expect(labFeedRowLines(norm(r))).toEqual(["t", "judge", "short-id pass1 → confirmed (2.3s)"]);
   });
 
   it("truncates a long bundle_id at 18 chars with an ellipsis (labShortId)", () => {
-    const r: LabRunEvent = {
+    const r: RawRecord = {
       ts: "t",
-      action: "step result",
+      action: "step.result",
       payload: { step_id: "review-ruling", stage: "judge", pass: 1, bundle_id: "someVerb@some/path.ts", ruling: "confirmed", seconds: 2.3456 },
     };
-    expect(labFeedRowLines(r)).toEqual(["t", "judge", "someVerb@some/path… pass1 → confirmed (2.3s)"]);
+    expect(labFeedRowLines(norm(r))).toEqual(["t", "judge", "someVerb@some/path… pass1 → confirmed (2.3s)"]);
   });
 
   it("renders a plain stage-completion step-result row", () => {
-    const r: LabRunEvent = { ts: "t", action: "step result", payload: { step_id: "probe", wall_ms: 500 } };
-    expect(labFeedRowLines(r)).toEqual(["t", "probe", "500ms"]);
+    const r: RawRecord = { ts: "t", action: "step.result", payload: { step_id: "probe", wall_ms: 500 } };
+    expect(labFeedRowLines(norm(r))).toEqual(["t", "probe", "500ms"]);
   });
 
   it("falls back to a bare action line for anything else", () => {
-    const r: LabRunEvent = { ts: "t", action: "task started" };
-    expect(labFeedRowLines(r)).toEqual(["t", "", "task started"]);
+    const r: RawRecord = { ts: "t", action: "task started" };
+    expect(labFeedRowLines(norm(r))).toEqual(["t", "", "task started"]);
   });
 });
 
@@ -146,19 +146,19 @@ describe("labFeedLines", () => {
   });
 
   it("renders newest-first, flattened", () => {
-    const events: LabRunEvent[] = [
+    const events: RawRecord[] = [
       { ts: "1", action: "task started" },
       { ts: "2", action: "task ended" },
     ];
-    expect(labFeedLines(events)).toEqual(["2", "", "task ended", "1", "", "task started"]);
+    expect(labFeedLines(normAll(events))).toEqual(["2", "", "task ended", "1", "", "task started"]);
   });
 
   it("caps at LAB_FEED_CAP, keeping the newest", () => {
-    const events: LabRunEvent[] = Array.from({ length: LAB_FEED_CAP + 10 }, (_, i) => ({
+    const events: RawRecord[] = Array.from({ length: LAB_FEED_CAP + 10 }, (_, i) => ({
       ts: String(i),
       action: "task started",
     }));
-    const lines = labFeedLines(events);
+    const lines = labFeedLines(normAll(events));
     // 3 lines per event.
     expect(lines.length).toBe(LAB_FEED_CAP * 3);
     // Newest (highest ts) first.

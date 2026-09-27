@@ -53,15 +53,16 @@
  * golden moves — asserted directly in `lib/format.test.ts`.
  */
 
-import { T, dispatchErrored, dispatchKilled, statusLabel, runStateFrom, computeTMax, isDispatchStart, isDispatchTerminal } from "../../lib/flow";
-import { fmtElapsed, clk, fmtC } from "../../lib/format";
+import { dispatchErrored, dispatchKilled, statusLabel, runStateFrom, computeTMax } from "../../lib/flow";
+import { fmtElapsed, clk, clkAt, fmtC } from "../../lib/format";
 import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
 import { aggregateLiveState, aggregateTokenRate, averageGenerationRate, lastHeartbeatMs, liveStateWhileConnected } from "../../lib/tokenRate";
 import type { LiveState } from "../../lib/tokenRate";
 import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";
-import { PURPOSE, sumUsage, type UsageRecordLike } from "../../lib/usageRecords";
-import type { FlowRecord, DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
+import { PURPOSE, sumUsage } from "../../lib/usageRecords";
+import type { DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
 import { toolOutcome } from "../../lib/recordDetail";
+import { ACTION, CATEGORY, byTime, isAsOf, isDispatchTerminal, latestByTime, recordsAsOf, timesOf, type NormRecord } from "../../lib/ingest";
 
 /** The run-time figure's long hover text, shared by SYSTEM's WALL CLOCK and
  *  (#2890) the MODEL section's ACTIVE TIME, which show the same number. */
@@ -432,7 +433,7 @@ function pushKv(rows: BriefEntry[], label: string, value: string | null | undefi
  *  ONLY calls are utility jobs (a radio-routing dispatch) IS that job, so its
  *  page shows them. `null` when nothing was measured (the tile shows "—").
  *  Replaces #2759's hardcoded utility-role handle list. */
-function executionTokens(records: readonly UsageRecordLike[]): { prompt: number; completion: number } | null {
+function executionTokens(records: readonly NormRecord[]): { prompt: number; completion: number } | null {
   const own = sumUsage(records, { exclude: PURPOSE.utility });
   const s = own.usageRecords + own.legacyCompletes > 0 ? own : sumUsage(records);
   return s.reported > 0 ? { prompt: s.prompt, completion: s.completion } : null;
@@ -447,6 +448,22 @@ interface MissionModelRollup {
   ctxNow: number;
   nctx: number;
   loadLines: string[];
+}
+
+/** An execution's context-window figures from its `context` telemetry: the
+ * window (`nctx`, the earliest sample's `max`), the peak use, and the use
+ * NOW, which is the LATEST sample's (`latestByTime`: an untimed sample only
+ * when no timed one exists, the bad-timestamp policy). */
+function contextFigures(tel: readonly NormRecord[]): { samples: number; nctx: number; ctxPeak: number; ctxNow: number } {
+  const cx = tel.filter((r) => r.source === "context").sort(byTime);
+  const used = (r: NormRecord | undefined) => Number((r?.fields as Record<string, unknown> | undefined)?.used) || 0;
+  const max0 = cx.length ? Number((cx[0].fields as Record<string, unknown>)?.max) : NaN;
+  return {
+    samples: cx.length,
+    nctx: cx.length && Number.isFinite(max0) && max0 > 0 ? max0 : 0,
+    ctxPeak: cx.length ? Math.max(...cx.map(used)) : 0,
+    ctxNow: cx.length ? used(latestByTime(cx)) : 0,
+  };
 }
 
 /** (#2759) A run's OWN top-level session — the run-grain trio of
@@ -476,7 +493,7 @@ interface MissionModelRollup {
  *  here — this fix targets the reported defect (a run session with zero
  *  telemetry finding real numbers on its inner sessions), not per-seat
  *  breakdown. */
-function rollUpMissionModelWork(data: FlowRecord[], missionId: string, excludeSid: string): MissionModelRollup {
+function rollUpMissionModelWork(data: NormRecord[], missionId: string, excludeSid: string): MissionModelRollup {
   const candidateSids = new Set<string>();
   for (const r of data) {
     if (r.mission_id === missionId && r.session_id && r.session_id !== excludeSid) candidateSids.add(r.session_id);
@@ -491,25 +508,19 @@ function rollUpMissionModelWork(data: FlowRecord[], missionId: string, excludeSi
   let hasEvidence = false;
   for (const csid of candidateSids) {
     const own = data.filter((r) => r.session_id === csid);
-    const tel = own.filter((r) => r.category === "telemetry");
+    const tel = own.filter((r) => r.category === CATEGORY.Telemetry);
     const rt = tel.filter((r) => r.source === "runtime").slice(-1)[0] ?? null;
     // (#2902 step 2a) This inner execution's own tokens, utility excluded.
     const cTok = executionTokens(own);
-    const cx = tel
-      .filter((r) => r.source === "context")
-      .slice()
-      .sort((a, b) => T(a.ts) - T(b.ts));
+    const cx = contextFigures(tel);
     const loads = tel.filter(
       (r) => r.source === "lms" && (r.fields as Record<string, unknown> | undefined)?.event === "load",
     );
     const cTurns = rt ? Number((rt.fields as Record<string, unknown>).turns) : null;
     const cTokIn = cTok ? cTok.prompt : null;
     const cTokOut = cTok ? cTok.completion : null;
-    const cCx0Max = cx.length ? Number((cx[0].fields as Record<string, unknown>)?.max) : NaN;
-    const cNctx = cx.length && Number.isFinite(cCx0Max) && cCx0Max > 0 ? cCx0Max : 0;
-    const cCtxPeak = cx.length ? Math.max(...cx.map((r) => Number((r.fields as Record<string, unknown>)?.used) || 0)) : 0;
-    const cCtxNow = cx.length ? Number((cx[cx.length - 1].fields as Record<string, unknown>)?.used) || 0 : 0;
-    const csHasEvidence = loads.length > 0 || cTurns != null || cTokIn != null || cTokOut != null || cx.length > 0;
+    const { nctx: cNctx, ctxPeak: cCtxPeak, ctxNow: cCtxNow } = cx;
+    const csHasEvidence = loads.length > 0 || cTurns != null || cTokIn != null || cTokOut != null || cx.samples > 0;
     if (!csHasEvidence) continue;
     hasEvidence = true;
     if (cTurns != null) turns = (turns ?? 0) + cTurns;
@@ -583,7 +594,7 @@ function flowSchemaAtLeast(version: string | null, min: string): boolean {
  * `connected` boolean, same as omitting it there.
  */
 export function runRegions(
-  data: FlowRecord[],
+  data: NormRecord[],
   sid: string,
   nowOverride?: number,
   connected = true,
@@ -597,28 +608,12 @@ export function runRegions(
   const tMax = computeTMax(data);
   const nowMs = nowOverride != null ? Math.max(nowOverride, tMax) : tMax;
 
-  // (#1988) `T(ts)` is `NaN` for an unparsable timestamp, and EVERY
-  // comparison against `NaN` is false — including `NaN <= nowMs`. So a single
-  // malformed `ts` on the start record used to drop it from `sidStarts`
-  // entirely, leave `startTs` as `NaN`, and make `inAttempt` false for every
-  // record in the session including a perfectly good `dispatch.complete`.
-  // The run then read RUNNING forever AND lost its whole brief — prompt,
-  // runtime, image, workspace, model — because `d` was null.
-  //
-  // Two separate repairs, because the record serves two purposes: it is the
-  // PAYLOAD source (the brief) and the CLOCK source (the attempt window).
-  // A bad clock must not cost the payload.
-  const finiteTs = (r: FlowRecord): number | null => {
-    const t = T(r.ts);
-    return Number.isFinite(t) ? t : null;
-  };
-  const allSidStarts = data.filter((r) => r.session_id === sid && isDispatchStart(r.action));
-  const sidStarts = allSidStarts
-    .filter((r) => {
-      const t = finiteTs(r);
-      return t != null && t <= nowMs;
-    })
-    .sort((a, b) => T(a.ts) - T(b.ts));
+  // (#1988) A start record serves two purposes: it is the PAYLOAD source
+  // (the brief) and the CLOCK source (the attempt window). A bad clock
+  // (`tMs === null`) must not cost the payload, so the brief falls back to a
+  // start with no usable time while the clock walks outward below.
+  const allSidStarts = data.filter((r) => r.session_id === sid && r.action === ACTION.DispatchStart);
+  const sidStarts = allSidStarts.filter((r) => r.tMs !== null && r.tMs <= nowMs).sort(byTime);
   // Prefer a start with a usable clock; fall back to ANY start so the brief
   // survives a malformed timestamp rather than vanishing with it.
   const d = sidStarts.length ? sidStarts[sidStarts.length - 1] : (allSidStarts[allSidStarts.length - 1] ?? null);
@@ -626,19 +621,18 @@ export function runRegions(
   // `startTs` must be FINITE or it poisons every downstream comparison. Walk
   // outward for a usable clock: the start record, then the session's first
   // record, then its earliest parsable one, then `now`.
-  const sessionTimes = data.filter((r) => r.session_id === sid).map(finiteTs).filter((t): t is number => t != null);
+  const sessionTimes = timesOf(data.filter((r) => r.session_id === sid));
   const startTs =
-    (d ? finiteTs(d) : null) ??
-    (firstSessRec ? finiteTs(firstSessRec) : null) ??
+    d?.tMs ??
+    firstSessRec?.tMs ??
     (sessionTimes.length ? Math.min(...sessionTimes) : null) ??
     nowMs;
   // A record whose own `ts` is unparsable is INCLUDED, not silently dropped.
   // Excluding it is what hid a legitimate terminal; a malformed record should
   // be visible and wrong-looking, never invisible.
-  const inAttempt = (r: FlowRecord) => {
+  const inAttempt = (r: NormRecord) => {
     if (r.session_id !== sid) return false;
-    const t = finiteTs(r);
-    return t == null || t >= startTs;
+    return r.tMs === null || r.tMs >= startTs;
   };
 
   // (#1988) The close edge is selected WITHOUT requiring `ts >= startTs`.
@@ -651,12 +645,12 @@ export function runRegions(
   // it was the inconsistency.
   // (#2902 step 5) A hosted call's gate writes `budget.stop` when its run
   // is stopped mid-wait, BEFORE any bookend (the call is never sent): with
-  // no `dispatch start` after it, it is this run's close.
-  const startAfter = (r: FlowRecord) =>
-    data.some((o) => o.session_id === sid && isDispatchStart(o.action) && T(o.ts) >= T(r.ts));
-  const isTerminal = (r: FlowRecord) =>
-    isDispatchTerminal(r.action) || r.action === "session.end" || (r.action === "budget.stop" && !startAfter(r));
-  const sessionTerminals = data.filter((r) => r.session_id === sid && isTerminal(r)).sort((a, b) => T(a.ts) - T(b.ts));
+  // no `dispatch.start` at or after it, it is this run's close.
+  const startAfter = (r: NormRecord) =>
+    data.some((o) => o.session_id === sid && o.action === ACTION.DispatchStart && byTime(o, r) >= 0);
+  const isTerminal = (r: NormRecord) =>
+    isDispatchTerminal(r.action) || r.action === ACTION.SessionEnd || (r.action === ACTION.BudgetStop && !startAfter(r));
+  const sessionTerminals = data.filter((r) => r.session_id === sid && isTerminal(r)).sort(byTime);
   const inAttemptCloses = sessionTerminals.filter(inAttempt);
   // Prefer terminals inside the attempt window; fall back to any terminal on
   // the session, so a skewed one is honored rather than hidden. `skewedClose`
@@ -667,14 +661,14 @@ export function runRegions(
   const close = attemptCloses[0] ?? null;
   // Not a `budget.stop`: it closes the run but is no completion, and reading
   // it as one would call a stopped wait a clean finish.
-  const c = attemptCloses.find((r) => r.action !== "session.end" && r.action !== "budget.stop") ?? null;
-  // A close with an unparsable `ts` still terminates the run — it is a
-  // terminal record, and `NaN <= nowMs` being false must not resurrect it.
-  const closeTs = close ? finiteTs(close) : null;
-  const done = !!close && (closeTs == null || closeTs <= nowMs);
+  const c = attemptCloses.find((r) => r.action !== ACTION.SessionEnd && r.action !== ACTION.BudgetStop) ?? null;
+  // A close with an unparsable `ts` still terminates the run (the as-of cut
+  // keeps an untimed record).
+  const closeTs = close ? close.tMs : null;
+  const done = !!close && isAsOf(close, nowMs);
 
-  const visible = data.filter((r) => T(r.ts) <= nowMs);
-  const tel = visible.filter((r) => inAttempt(r) && r.category === "telemetry");
+  const visible = recordsAsOf(data, nowMs);
+  const tel = visible.filter((r) => inAttempt(r) && r.category === CATEGORY.Telemetry);
   const lms = tel.filter((r) => r.source === "lms");
   // (#2413 M4) Host cpu/ram/gpu samples used to ride the per-dispatch
   // `telemetry.process` record — `category: "telemetry"`, `source:
@@ -701,10 +695,9 @@ export function runRegions(
   const runMachineUid = d?.machine_uid ?? firstSessRec?.machine_uid ?? null;
   const hostSamples = visible.filter(
     (r) =>
-      r.action === "machine.telemetry" &&
+      r.action === ACTION.MachineTelemetry &&
       (runMachineUid == null || r.machine_uid === runMachineUid) &&
-      T(r.ts) >= startTs &&
-      (closeTs == null || T(r.ts) <= closeTs),
+      (r.tMs === null || (r.tMs >= startTs && (closeTs == null || r.tMs <= closeTs))),
   );
   const procs = [...tel.filter((r) => r.source === "process"), ...hostSamples];
   const rt = tel.filter((r) => r.source === "runtime").slice(-1)[0] ?? null;
@@ -715,22 +708,16 @@ export function runRegions(
   const handle = d ? d.handle : firstSessRec ? firstSessRec.handle : "unknown";
   const turnsValue = rt ? Number((rt.fields as Record<string, unknown>).turns) : null;
 
-  const cx = tel
-    .filter((r) => r.source === "context")
-    .slice()
-    .sort((a, b) => T(a.ts) - T(b.ts));
   const comps = tel.filter((r) => r.source === "compaction");
-  const cx0Max = cx.length ? Number((cx[0].fields as Record<string, unknown>)?.max) : NaN;
-  const nctx = cx.length && Number.isFinite(cx0Max) && cx0Max > 0 ? cx0Max : 0;
-  const ctxPeak = cx.length ? Math.max(...cx.map((r) => Number((r.fields as Record<string, unknown>)?.used) || 0)) : 0;
-  const ctxNow = cx.length ? Number((cx[cx.length - 1].fields as Record<string, unknown>)?.used) || 0 : 0;
+  const { samples: ctxSamples, nctx, ctxPeak, ctxNow } = contextFigures(tel);
 
   // (#1972) Proof of life: the newest record belonging to THIS attempt. Not
   // heartbeats alone — a run emitting turns and tool results is demonstrably
   // alive whether or not a heartbeat happens to have landed recently, and
   // keying only on heartbeats would make a busy run look dead.
   const attemptRecs = visible.filter(inAttempt);
-  const lastBeatMs = attemptRecs.length ? Math.max(...attemptRecs.map((r) => T(r.ts))) : null;
+  const attemptTimes = timesOf(attemptRecs);
+  const lastBeatMs = attemptTimes.length ? Math.max(...attemptTimes) : null;
 
   // (#2011) The finished run's DURATION is read from the terminal record's
   // own `wall_ms` — the runtime's measure, taken between its start and
@@ -762,8 +749,8 @@ export function runRegions(
   const runWallMs =
     typeof recordedWallMs === "number" && Number.isFinite(recordedWallMs)
       ? recordedWallMs
-      : close
-        ? T(close.ts) - startTs
+      : closeTs !== null
+        ? closeTs - startTs
         : NaN;
 
   // (U3-7/U5-2) `fmtElapsed`, not the retired `fmtDuration`: a dispatch
@@ -816,7 +803,7 @@ export function runRegions(
   // one quantity, so they read from one source — deriving it twice is how
   // they end up disagreeing by a second at a rounding boundary. The two
   // CLOCK stamps stay record-derived: they are timestamps, not a duration.
-  const briefTiming = `${clk(startTs)}${done ? ` → ${clk(T(close!.ts))} (${fmtElapsed(runWallMs)})` : " · running"}`;
+  const briefTiming = `${clk(startTs)}${done ? ` → ${clkAt(closeTs)} (${fmtElapsed(runWallMs)})` : " · running"}`;
   const RUNTIME_LABEL: Record<string, string> = {
     internal: "internal container",
     direct: "direct client (hosted · no container)",
@@ -895,7 +882,7 @@ export function runRegions(
   // mission-wide rollup on `d != null` would never fire for the one case it
   // exists to fix, so this checks for actual numbers instead.
   const ownHasTelemetryEvidence =
-    loads.length > 0 || turnsValue != null || tokIn != null || tokOut != null || cx.length > 0 || comps.length > 0;
+    loads.length > 0 || turnsValue != null || tokIn != null || tokOut != null || ctxSamples > 0 || comps.length > 0;
   const missionIdForRollup = d?.mission_id ?? firstSessRec?.mission_id ?? null;
   const rollup =
     !ownHasTelemetryEvidence && missionIdForRollup ? rollUpMissionModelWork(data, missionIdForRollup, sid) : null;
@@ -949,9 +936,9 @@ export function runRegions(
   // `budget.wait` BEFORE `dispatch start` (the gate runs before the
   // bookends): it is model work waiting to be sent, and its pane (where
   // REST reads "budget · <endpoint>") must not grow in when it is.
-  const heldByBudget = data.some((r) => r.session_id === sid && r.action === "budget.wait");
+  const heldByBudget = data.some((r) => r.session_id === sid && r.action === ACTION.BudgetWait);
   const hasModelWork =
-    d != null || heldByBudget || loads.length > 0 || turnsValue != null || tokIn != null || tokOut != null || cx.length > 0 || comps.length > 0;
+    d != null || heldByBudget || loads.length > 0 || turnsValue != null || tokIn != null || tokOut != null || ctxSamples > 0 || comps.length > 0;
   // (#2759) The MODEL pane's own gate. Own-session evidence keeps the
   // existing behavior byte-for-byte (including the `d != null` "started, no
   // telemetry yet" case); otherwise a rolled-up execution elsewhere in the
@@ -1112,7 +1099,7 @@ export function runRegions(
   };
   const restByKind = new Map<string, { label: string; count: number; totalMs: number }>();
   for (const r of attemptRecs) {
-    if (r.action !== "dispatch.rest") continue;
+    if (r.action !== ACTION.DispatchRest) continue;
     const f = (r.fields || r.payload || {}) as Record<string, unknown>;
     // A record carrying `delay_ms` with no `ms` is the governor changing
     // its PACING, not a rest (`emit_rest`/`emit_rest_with_extra`,
@@ -1157,7 +1144,7 @@ export function runRegions(
     let toolCalls = 0;
     let toolFailed = 0;
     for (const r of toolSids.size === 1 && toolSids.has(sid) ? attemptRecs : visible) {
-      if (r.action !== "dispatch.tool" || !toolSids.has(r.session_id ?? "")) continue;
+      if (r.action !== ACTION.DispatchTool || !toolSids.has(r.session_id ?? "")) continue;
       toolCalls += 1;
       if (toolOutcome((r.fields || r.payload || {}) as Record<string, unknown>) === "failed") toolFailed += 1;
     }
@@ -1328,7 +1315,7 @@ export function runRegions(
   // the run, so it says that.
   //
   // Marking the primary needs no new wire field: the `dispatch start` record
-  // carries the resolved model (`FlowRecord.model`), which is ground truth
+  // carries the resolved model (`NormRecord.model`), which is ground truth
   // for what this role actually ran on. Note it is read from `d?.model`
   // SPECIFICALLY, not from the `model` binding above — that one falls back to
   // `distinct[0]`, the first-loaded model, which is a heuristic. Marking a
@@ -1356,7 +1343,7 @@ export function runRegions(
   // and every model on a real run, including the one that ran, read "also
   // loaded". The model that ran is listed first.
   const bare = (m: unknown) => String(m ?? "").replace(/^darkmux:/, "");
-  const isRan = (r: FlowRecord) =>
+  const isRan = (r: NormRecord) =>
     primaryModel != null && bare((r.fields as Record<string, unknown>).model) === bare(primaryModel);
   const orderedLoads = [...loads].sort((a, b) => Number(isRan(b)) - Number(isRan(a)));
   const modelEntries =
@@ -1546,7 +1533,7 @@ export function runRegions(
       });
     }
   }
-  const runStartMs = d?.ts ? T(d.ts) : null;
+  const runStartMs = d ? d.tMs : null;
   // (#2887 F2) The run-level policy the dispatch actually ran under, read
   // from `dispatch.start`'s own `payload.bounds.detection_degeneracy_
   // policy.value` — the SAME resolved value the host stamps into the
@@ -1591,7 +1578,7 @@ export function runRegions(
     // this generic per-record loop that reads as three-to-six findings for
     // one operator-visible event.
     if (f.kind === "repetition") continue;
-    const atMs = r.ts ? T(r.ts) : null;
+    const atMs = r.tMs;
     finds.push({
       // (#1989) `String(f.kind)` turned a missing field into the literal
       // string `undefined`, rendered verbatim as a group heading — an
@@ -1628,7 +1615,7 @@ export function runRegions(
   // telemetry`), so it never reached `dets`/`tel` above; read it straight
   // off `visible` instead, scoped to this session's attempt window the same
   // way every other region here is.
-  const checkpoints = visible.filter((r) => inAttempt(r) && r.action === "dispatch.checkpoint");
+  const checkpoints = visible.filter((r) => inAttempt(r) && r.action === ACTION.DispatchCheckpoint);
 
   // (#2887 N3) `turn_seq` alone is not a safe key. A dispatch session id is
   // TASK-scoped (`darkmux_types::session_id::task` — see this project's own
@@ -1640,7 +1627,7 @@ export function runRegions(
   // `payload.step_id` (present only inside a mission graph step — absent
   // for a standalone `darkmux dispatch`) and `handle` (the role). Combined
   // with `turn_seq` this is the merge key below.
-  const seatKeyFor = (r: FlowRecord, f: Record<string, unknown>): string =>
+  const seatKeyFor = (r: NormRecord, f: Record<string, unknown>): string =>
     `${r.handle ?? ""}::${typeof f.step_id === "string" ? f.step_id : ""}`;
 
   type TurnFlag = {
@@ -1710,7 +1697,7 @@ export function runRegions(
     for (const r of dets) {
       const f = r.fields as Record<string, unknown>;
       if (f.kind !== "repetition") continue;
-      const atMs = r.ts ? T(r.ts) : null;
+      const atMs = r.tMs;
       const ratio = typeof f.tail_ratio === "number" ? f.tail_ratio.toFixed(3) : null;
       // Only `dispatch.gate.abort` ever populates `generated_chars` (the
       // runtime's own trajectory shape — `append_gate_observation` never
@@ -1749,7 +1736,7 @@ export function runRegions(
       const acted = f.verdict === "conclude";
       const flagged = f.would_conclude === true || acted;
       if (!flagged) continue;
-      const atMs = r.ts ? T(r.ts) : null;
+      const atMs = r.tMs;
       const ratio = typeof f.tail_ratio === "number" ? f.tail_ratio.toFixed(3) : null;
       mergeTurn(
         f.turn_seq,

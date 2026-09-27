@@ -2,15 +2,15 @@ import { useEffect, useMemo, useState } from "react";
 import { skipToken, useQueries, useQuery } from "@tanstack/react-query";
 import { fetchJson, type FetchResult } from "../lib/fetcher";
 import { DATE_ROLLOVER_CHECK_MS, RECONCILE_BACKSTOP_MS, queryKeys } from "../lib/queryKeys";
-import { asRecordArray, buildFlowWindow, computeTMax, prevDateUTC, todayUTC } from "../lib/flow";
+import { buildFlowWindow, computeTMax, prevDateUTC, todayUTC } from "../lib/flow";
 import { getSource } from "../lib/source";
-import type { FlowRecord } from "../types/handwritten";
+import { ingest, type NormRecord } from "../lib/ingest";
 
 export interface FlowWindowResult {
   /** True once BOTH day-fetches have settled (success or failure) — mirrors
    * `loadLiveWindow`'s await, not a per-query pending flag. */
   settled: boolean;
-  data: FlowRecord[];
+  data: NormRecord[];
   tMax: number;
   /** (#2965) A day's read failed, or `null` when every day answered. A
    *  failed day settles the window and contributes no records, exactly as a
@@ -148,8 +148,8 @@ export function useFlowWindow(nowMs: number): FlowWindowResult {
 
   // `queryFn: skipToken` — this hook never fetches these keys, only reads
   // whatever `useLiveTail` has (or hasn't yet) written there.
-  const yTailQuery = useQuery<FlowRecord[]>({ queryKey: queryKeys.flowTail(yesterday), queryFn: skipToken });
-  const tTailQuery = useQuery<FlowRecord[]>({ queryKey: queryKeys.flowTail(today), queryFn: skipToken });
+  const yTailQuery = useQuery<NormRecord[]>({ queryKey: queryKeys.flowTail(yesterday), queryFn: skipToken });
+  const tTailQuery = useQuery<NormRecord[]>({ queryKey: queryKeys.flowTail(today), queryFn: skipToken });
 
   // (#2911) The merge keys on the window's trailing EDGE, not on `nowMs`
   // itself. Callers pass a fresh `Date.now()` every render, and the fleet
@@ -161,8 +161,8 @@ export function useFlowWindow(nowMs: number): FlowWindowResult {
   // once: it arrives as new query data, which is a dependency here.
   const windowEdgeMs = flowWindowEdgeMs(nowMs);
   const data = useMemo(() => {
-    const yData = yQuery.data?.ok ? asRecordArray(yQuery.data.data) : [];
-    const tData = tQuery.data?.ok ? asRecordArray(tQuery.data.data) : [];
+    const yData = yQuery.data?.ok ? ingest(yQuery.data.data) : [];
+    const tData = tQuery.data?.ok ? ingest(tQuery.data.data) : [];
     const yMerged = yTailQuery.data?.length ? [...yData, ...yTailQuery.data] : yData;
     const tMerged = tTailQuery.data?.length ? [...tData, ...tTailQuery.data] : tData;
     return buildFlowWindow(yMerged, tMerged, windowEdgeMs);

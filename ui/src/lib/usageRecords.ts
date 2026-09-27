@@ -29,7 +29,7 @@
 
 import type { CallKind } from "../types/generated/CallKind";
 import type { UsagePurpose } from "../types/generated/UsagePurpose";
-import { isDispatchComplete } from "./flow";
+import { ACTION, CATEGORY, type NormRecord } from "./ingest";
 
 /** Every `UsagePurpose` variant, by name. A key missing or extra relative to
  *  the generated union is a type error. */
@@ -58,22 +58,9 @@ export interface UsagePayload {
   remote_tokens?: unknown;
 }
 
-/** A flow record as either shape the viewer holds it in: the wire's
- *  `payload`, or the render model's `fields`. */
-export interface UsageRecordLike {
-  ts?: string;
-  action?: string;
-  category?: string;
-  source?: string;
-  session_id?: string | null;
-  mission_id?: string | null;
-  handle?: string | null;
-  machine_uid?: string | null;
-  payload?: unknown;
-  fields?: unknown;
-}
-
-function payloadOf(r: UsageRecordLike): UsagePayload {
+/** A record's data, in either place it is held: the wire's `payload`, or
+ *  the render model's `fields`. */
+function payloadOf(r: NormRecord): UsagePayload {
   return ((r.payload ?? r.fields) as UsagePayload | null | undefined) ?? {};
 }
 
@@ -97,10 +84,10 @@ function isFiniteNumber(v: unknown): v is number {
   return typeof v === "number" && Number.isFinite(v);
 }
 
-/** True for a usage record (`telemetry.tokens`), in either spelling the
- *  viewer receives it (category+source, or the action). */
-export function isUsageRecord(r: UsageRecordLike): boolean {
-  return (r.category === "telemetry" && r.source === "tokens") || r.action === "telemetry.tokens";
+/** True for a usage record (`telemetry.tokens`), in either shape the viewer
+ *  receives it (category+source, or the action). */
+export function isUsageRecord(r: NormRecord): boolean {
+  return (r.category === CATEGORY.Telemetry && r.source === "tokens") || r.action === ACTION.TelemetryTokens;
 }
 
 /** A record's `purpose`. Records from before flow schema 1.59.0 carry none;
@@ -159,7 +146,7 @@ function amountOf(p: UsagePayload, opts: SumOptions): UsageAmount | null {
  *  graph folds records one at a time and calls this directly. `total` is
  *  the provider's own total, falling back to prompt + completion only when
  *  the record reported a split without one (the writer's own precedence). */
-export function usageContribution(r: UsageRecordLike, opts: SumOptions = {}): UsageAmount | null {
+export function usageContribution(r: NormRecord, opts: SumOptions = {}): UsageAmount | null {
   if (!isUsageRecord(r)) return null;
   return amountOf(payloadOf(r), opts);
 }
@@ -169,7 +156,7 @@ export function usageContribution(r: UsageRecordLike, opts: SumOptions = {}): Us
  *  same id recurs across unrelated runs (#2690/#2709). The legacy fallback
  *  and the hero's run count both key on this. A sessionless record gets a
  *  composite of its own; `\u0000` cannot occur inside either id. */
-export function runKey(r: UsageRecordLike): string {
+export function runKey(r: NormRecord): string {
   const sid = r.session_id || `ts:${r.ts}:${r.handle || ""}:${r.machine_uid || ""}`;
   return `${sid}\u0000${r.mission_id || ""}`;
 }
@@ -178,7 +165,7 @@ export function runKey(r: UsageRecordLike): string {
  *  same `(session_id, mission_id)` (a run's turns arrive together), so a
  *  pass over a window builds one key string per run instead of one per
  *  record. Same result as `runKey`, always. */
-export function runKeyMemo(): (r: UsageRecordLike) => string {
+export function runKeyMemo(): (r: NormRecord) => string {
   let lastSid: string | null | undefined;
   let lastMid: string | null | undefined;
   let lastKey = "";
@@ -214,13 +201,13 @@ export function hasAnyTokenCounts(p: UsagePayload): boolean {
  *  records (#2902 step 2b); the viewer's window is a moving 24h, so a run
  *  sits in that state for seconds, and the sum is corrected on the next
  *  poll when the complete scrolls out too. */
-function isLegacyFallbackComplete(r: UsageRecordLike, runsWithUsage: ReadonlySet<string>, key: (r: UsageRecordLike) => string): boolean {
-  return isDispatchComplete(r.action) && hasAnyTokenCounts(payloadOf(r)) && !runsWithUsage.has(key(r));
+function isLegacyFallbackComplete(r: NormRecord, runsWithUsage: ReadonlySet<string>, key: (r: NormRecord) => string): boolean {
+  return r.action === ACTION.DispatchComplete && hasAnyTokenCounts(payloadOf(r)) && !runsWithUsage.has(key(r));
 }
 
 /** The records the legacy fallback counts, for a reader that needs them
  *  itself (a per-field breakdown). `sumUsage` applies the same rule. */
-export function legacyCompleteCounts<R extends UsageRecordLike>(records: readonly R[]): R[] {
+export function legacyCompleteCounts<R extends NormRecord>(records: readonly R[]): R[] {
   const withUsage = new Set<string>();
   for (const r of records) if (isUsageRecord(r)) withUsage.add(runKey(r));
   return records.filter((r) => isLegacyFallbackComplete(r, withUsage, runKey));
@@ -258,7 +245,7 @@ export interface UsageSum {
  *  legacy fallback's completes (`isLegacyFallbackComplete`). Linear in
  *  `records`, allocation-free per record: the hero recomputes it on every
  *  playback scrub. */
-export function sumUsage(records: readonly UsageRecordLike[], opts: SumOptions = {}): UsageSum {
+export function sumUsage(records: readonly NormRecord[], opts: SumOptions = {}): UsageSum {
   const out: UsageSum = { total: 0, prompt: 0, completion: 0, cached: null, utility: 0, usageRecords: 0, reported: 0, legacyCompletes: 0 };
   const exclude = opts.exclude;
   const add = (p: UsagePayload): boolean => {
@@ -276,13 +263,13 @@ export function sumUsage(records: readonly UsageRecordLike[], opts: SumOptions =
     return true;
   };
   const withUsage = new Set<string>();
-  const completes: UsageRecordLike[] = [];
+  const completes: NormRecord[] = [];
   const key = runKeyMemo();
   for (const r of records) {
     if (isUsageRecord(r)) {
       withUsage.add(key(r));
       if (add(payloadOf(r))) out.usageRecords++;
-    } else if (isDispatchComplete(r.action)) {
+    } else if (r.action === ACTION.DispatchComplete) {
       completes.push(r);
     }
   }
@@ -295,8 +282,8 @@ export function sumUsage(records: readonly UsageRecordLike[], opts: SumOptions =
  *  compactor (`handle: "compactor"`), a sub-execution INSIDE the session, so
  *  it never names the session's own role (a header saying who ran a session
  *  must not lose its role because the run compacted). */
-export function handleNamesExecution(r: { action?: string; payload?: unknown; fields?: unknown }): boolean {
-  if (r.action !== "telemetry.tokens") return true;
+export function handleNamesExecution(r: NormRecord): boolean {
+  if (r.action !== ACTION.TelemetryTokens) return true;
   const p = (r.payload ?? r.fields) as UsagePayload | null | undefined;
   return !isCompactionUsage(p);
 }

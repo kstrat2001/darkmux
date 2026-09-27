@@ -25,10 +25,9 @@
  * verbatim.
  */
 
-import { T } from "../../lib/flow";
-import { clk } from "../../lib/format";
-import type { FlowRecord } from "../../types/handwritten";
+import { clkAt } from "../../lib/format";
 import type { TokensOffMeter } from "./savings";
+import { ACTION, byTime, type NormRecord } from "../../lib/ingest";
 
 /** `orchNotes()` — viewer.html:1553-1554. Dashboard notes are MISSION-level
  * by definition (`!r.session_id`) — session-scoped notes are adjudication
@@ -38,10 +37,10 @@ import type { TokensOffMeter } from "./savings";
  * `NotesDialog.tsx` — the notes-HISTORY modal `openNotes()` builds
  * (viewer.html:1606-1610) — reads the SAME set rather than re-deriving it;
  * `hybridNote`'s own `hasHistory` flag is `orchNotes(data).length > 0`. */
-export function orchNotes(data: FlowRecord[]): FlowRecord[] {
+export function orchNotes(data: NormRecord[]): NormRecord[] {
   return data
-    .filter((r) => r.action === "note" && r.source === "orchestrator" && !r.session_id)
-    .sort((a, b) => T(a.ts) - T(b.ts));
+    .filter((r) => r.action === ACTION.OperatorNote && r.source === "orchestrator" && !r.session_id)
+    .sort(byTime);
 }
 
 export interface HybridNote {
@@ -54,18 +53,18 @@ export interface HybridNote {
   hasHistory: boolean;
 }
 
-export function hybridNote(data: FlowRecord[], t: Pick<TokensOffMeter, "runs">): HybridNote {
+export function hybridNote(data: NormRecord[], t: Pick<TokensOffMeter, "runs">): HybridNote {
   const notes = orchNotes(data);
   const hasHistory = notes.length > 0;
 
   const last = notes[notes.length - 1];
   if (last) {
-    return { text: `${last.handle ?? ""} · ${clk(T(last.ts))}`, hasHistory };
+    return { text: `${last.handle ?? ""} · ${clkAt(last.tMs)}`, hasHistory };
   }
 
   const mr = data
-    .filter((r) => r.action?.startsWith("mission.run") && r.mission_id)
-    .sort((a, b) => T(a.ts) - T(b.ts))
+    .filter((r) => (r.action === ACTION.MissionRunFinalize || r.action === ACTION.MissionRunAbort) && r.mission_id)
+    .sort(byTime)
     .pop();
   if (mr) {
     return {

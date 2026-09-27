@@ -1,4 +1,5 @@
 import type { QueryClient, QueryKey } from "@tanstack/react-query";
+import { ingestRecord, type NormRecord } from "./ingest";
 
 /**
  * SSE spike (packet brief: prove the wiring pattern here; the LIVE proof
@@ -82,7 +83,9 @@ export function startFlowTail(
       // must not die because one record failed to parse.
       return;
     }
-    queryClient.setQueryData<unknown[]>(queryKey, (prev) => [...(prev ?? []), parsed]);
+    const rec = ingestRecord(parsed);
+    if (!rec) return;
+    queryClient.setQueryData<NormRecord[]>(queryKey, (prev) => [...(prev ?? []), rec]);
   };
 
   const open = () => {

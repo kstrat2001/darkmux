@@ -114,7 +114,7 @@ describe("LabRunDetail", () => {
 
   it("renders pipeline stages and the event feed from a real events poll", async () => {
     mockFetch({
-      events: [{ ts: "2026-01-01T00:00:00Z", action: "step result", payload: { step_id: "bundle", items_in: 3, items_out: 3 } }],
+      events: [{ ts: "2026-01-01T00:00:00Z", action: "step.result", payload: { step_id: "bundle", items_in: 3, items_out: 3 } }],
     });
     renderDetail("d1");
     // "bundle" appears TWICE once the event lands — the pipeline stage name
@@ -135,7 +135,7 @@ describe("LabRunDetail", () => {
   });
 
   it("resets accumulated events when the dir prop changes (a fresh drill-in)", async () => {
-    mockFetch({ events: [{ ts: "1", action: "step result", payload: { step_id: "bundle" } }] });
+    mockFetch({ events: [{ ts: "1", action: "step.result", payload: { step_id: "bundle" } }] });
     const { rerender } = renderDetail("d1");
     // "bundle" appears TWICE once the event lands — once as the pipeline
     // stage name, once as the feed row's tag — `getAllByText` (not the

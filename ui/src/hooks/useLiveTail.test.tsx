@@ -119,7 +119,7 @@ describe("useLiveTail", () => {
     });
 
     expect(queryClient.getQueryData(queryKeys.flowTail("2026-08-09"))).toEqual([
-      { action: "dispatch.start", ts: "2026-08-09T12:00:01Z" },
+      { action: "dispatch.start", ts: "2026-08-09T12:00:01Z", tMs: Date.parse("2026-08-09T12:00:01Z") },
     ]);
 
     unmount();
@@ -241,6 +241,8 @@ describe("useLiveTail", () => {
   it("merges reconciled records into the flowTail cache, deduped against what's already there", async () => {
     const queryClient = new QueryClient();
     const rec = { action: "dispatch.complete", ts: "2026-08-09T11:59:00Z" };
+    // The cache holds the record as ingested: its wire fields plus its parsed time.
+    const ingested = { ...rec, tMs: Date.parse(rec.ts) };
     const { impl } = makeFetchImpl((path) => (path.startsWith("/flow/2026-08-09?") ? { ok: true, data: [rec] } : { ok: true, data: [] }));
 
     const { unmount } = renderHook(
@@ -252,13 +254,13 @@ describe("useLiveTail", () => {
       await vi.advanceTimersByTimeAsync(5000 * 4);
     });
 
-    expect(queryClient.getQueryData(queryKeys.flowTail("2026-08-09"))).toEqual([rec]);
+    expect(queryClient.getQueryData(queryKeys.flowTail("2026-08-09"))).toEqual([ingested]);
 
     // A second reconcile round with the SAME record must not duplicate it.
     await act(async () => {
       await vi.advanceTimersByTimeAsync(5000 * 4);
     });
-    expect(queryClient.getQueryData(queryKeys.flowTail("2026-08-09"))).toEqual([rec]);
+    expect(queryClient.getQueryData(queryKeys.flowTail("2026-08-09"))).toEqual([ingested]);
 
     unmount();
   });

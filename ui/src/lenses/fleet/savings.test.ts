@@ -12,8 +12,8 @@ import path from "node:path";
 import { tokensOffMeter } from "./savings";
 import { hasAnyTokenCounts } from "../../lib/usageRecords";
 import { hybridNote } from "./hybridNote";
-import { isDispatchComplete, T } from "../../lib/flow";
-import type { FlowRecord } from "../../types/handwritten";
+import { CATEGORY, ACTION, recordsAsOf, timesOf, type NormRecord } from "../../lib/ingest";
+import { norm, normAll, type RawRecord } from "../../testing/records";
 
 /** (#2919) Vocabulary. `local` / `cloud` / `unknown` (and their `*Runs`
  * twins) name what `tokensOffMeter` can tell from a record's own bookends —
@@ -22,11 +22,11 @@ import type { FlowRecord } from "../../types/handwritten";
  * not say whether it is metered) and sums all three into one figure; the run
  * twins still feed `hybridNote`. Test names below use the field names for
  * what a record classifies as, never "free" or "off the meter". */
-function rec(overrides: Partial<FlowRecord>): FlowRecord {
-  return { ts: "2026-08-08T00:00:00.000Z", ...overrides };
+function rec(overrides: RawRecord): NormRecord {
+  return norm({ ts: "2026-08-08T00:00:00.000Z", ...overrides });
 }
 
-function tokenRec(sid: string, turnSeq: number | undefined, prompt: number, completion: number, ts = "2026-08-08T00:00:00.000Z"): FlowRecord {
+function tokenRec(sid: string, turnSeq: number | undefined, prompt: number, completion: number, ts = "2026-08-08T00:00:00.000Z"): NormRecord {
   return rec({
     ts,
     session_id: sid,
@@ -60,14 +60,14 @@ function seatTokenRec(
   completion: number,
   seat: { remote: boolean; index: number },
   ts = "2026-08-08T00:00:00.000Z",
-): FlowRecord {
+): NormRecord {
   const base = tokenRec(sid, turnSeq, prompt, completion, ts);
   return { ...base, payload: { ...(base.payload as object), remote: seat.remote, index: seat.index } };
 }
 
 describe("tokensOffMeter", () => {
   it("counts a locally-run session (clean complete, no endpoint) as local, with the re-read/fresh split across its turns", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: "s1", action: "dispatch.start", handle: "coder" }),
       tokenRec("s1", 1, 100, 20),
       tokenRec("s1", 2, 150, 30),
@@ -80,7 +80,7 @@ describe("tokensOffMeter", () => {
   });
 
   it("counts a session with an endpoint-bearing dispatch bookend as cloud, not local", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: "s2", action: "dispatch.start", handle: "coder", payload: { endpoint: "azure-foundry" } }),
       tokenRec("s2", 1, 200, 40),
       rec({ session_id: "s2", action: "dispatch.complete", payload: { total_tokens: 240, endpoint: "azure-foundry" } }),
@@ -92,7 +92,7 @@ describe("tokensOffMeter", () => {
   it("a session with NO dispatch bookend at all classifies as unknown — never as the endpoint-less local bucket (#1607)", () => {
     // Token telemetry with no dispatch.start/complete anywhere for the
     // session — darkmux has no evidence of where this ran.
-    const data: FlowRecord[] = [tokenRec("s3", 1, 500, 10)];
+    const data: NormRecord[] = [tokenRec("s3", 1, 500, 10)];
     const t = tokensOffMeter(data);
     expect(t.total).toBe(510);
     // The load-bearing invariant: local is what's LEFT after cloud AND
@@ -109,7 +109,7 @@ describe("tokensOffMeter", () => {
 
 
   it("the single-shot remote fallback (no telemetry family, dispatch.complete carries the totals) counts as cloud", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: "s6", action: "dispatch.start", handle: "reviewer", payload: { endpoint: "gemini" } }),
       rec({
         session_id: "s6",
@@ -122,7 +122,7 @@ describe("tokensOffMeter", () => {
   });
 
   it("(#1853) the single-shot LOCAL fallback (no telemetry family, no endpoint, dispatch.complete carries the totals) counts as local — not invisible", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: "s8", action: "dispatch.start", handle: "radio-router" }),
       rec({
         session_id: "s8",
@@ -145,7 +145,7 @@ describe("tokensOffMeter", () => {
     // counted via its telemetry family must not ALSO have its
     // dispatch.complete totals summed in — that would double-count rather
     // than fix the undercount.
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: "s9", action: "dispatch.start", handle: "coder" }),
       tokenRec("s9", 1, 100, 20),
       rec({ session_id: "s9", action: "dispatch.complete", payload: { total_tokens: 120 } }),
@@ -156,7 +156,7 @@ describe("tokensOffMeter", () => {
   });
 
   it("(#1853, inverted) a cloud single-shot session is still classified cloud, never local, once collection is endpoint-blind", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: "s10", action: "dispatch.start", handle: "reviewer", payload: { endpoint: "azure-foundry" } }),
       rec({
         session_id: "s10",
@@ -181,7 +181,7 @@ describe("tokensOffMeter", () => {
   // entirely). Both orderings below must land on the SAME correct totals,
   // and neither seat's tokens may be lost.
   it("(#2635) task-scoped session collision — hosted-then-local — both seats' tokens survive, correctly attributed", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({
         session_id: "task:t3",
         action: "dispatch.complete",
@@ -195,7 +195,7 @@ describe("tokensOffMeter", () => {
   });
 
   it("(#2635) task-scoped session collision — local-then-hosted — same totals regardless of order", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: "task:t3b", action: "dispatch.complete", payload: { total_tokens: 500 } }),
       rec({
         session_id: "task:t3b",
@@ -209,7 +209,7 @@ describe("tokensOffMeter", () => {
   });
 
   it("(#2635) task-scoped session collision — two local seats — both counted, neither dropped", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: "task:t3c", action: "dispatch.complete", payload: { total_tokens: 500 } }),
       rec({ session_id: "task:t3c", action: "dispatch.complete", payload: { total_tokens: 700 } }),
     ];
@@ -228,7 +228,7 @@ describe("tokensOffMeter", () => {
   // run-count-level three-way split `tokensOffMeter` now exposes;
   // hybridNote.test.ts pins the corrected rendered text.
   it("(#2637) five sessions — one local, two cloud, two unattributed — unknownRuns separates them from local", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: "cloud1", action: "dispatch.start", handle: "reviewer", payload: { endpoint: "gemini" } }),
       tokenRec("cloud1", 1, 200, 40),
       rec({ session_id: "cloud1", action: "dispatch.complete", payload: { total_tokens: 240, endpoint: "gemini" } }),
@@ -262,7 +262,7 @@ describe("tokensOffMeter", () => {
   // `runs` was `sess.size` — one per distinct KEY — so this session
   // undercounted to 1 no matter how many real dispatches closed under it.
   it("(#2659) a session id spanning two dispatches counts as TWO runs, not one — sess.size undercounted this", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: "spanning2", action: "dispatch.start", handle: "coder" }),
       tokenRec("spanning2", 1, 100, 10, "2026-08-08T00:00:00Z"),
       rec({ session_id: "spanning2", action: "dispatch.complete", payload: { total_tokens: 110 } }),
@@ -288,7 +288,7 @@ describe("tokensOffMeter", () => {
   // every telemetry turn or every start+complete pair as a separate run
   // would fail this the same way undercounting failed the test above.
   it("(#2659, inverted) an ordinary single-dispatch session still counts as ONE run under the bookend-count fix", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: "ordinary2", action: "dispatch.start", handle: "coder" }),
       tokenRec("ordinary2", 1, 100, 10),
       tokenRec("ordinary2", 2, 50, 5),
@@ -305,7 +305,7 @@ describe("tokensOffMeter", () => {
   // classification via the old `epBySid.has(k)` aggregate check (which
   // would have painted the local bookend cloud too).
   it("(#2659) a spanning session with mixed local+cloud bookends classifies each bookend on its OWN endpoint", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       // First dispatch: local (no endpoint).
       rec({ session_id: "mixed", action: "dispatch.start", handle: "coder" }),
       tokenRec("mixed", 1, 100, 10, "2026-08-08T00:00:00Z"),
@@ -384,7 +384,7 @@ describe("tokensOffMeter", () => {
   // are correct about their own question: one seat's completion really was
   // local, and the task really did bill a hosted endpoint.
   it("(#2690, corrected) an endpoint on the START but not on the lone COMPLETE: the RUN counts local, the TOKENS count cloud", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: "start-only-ep", action: "dispatch.start", handle: "reviewer", payload: { endpoint: "azure-foundry" } }),
       tokenRec("start-only-ep", 1, 100, 10),
       rec({ session_id: "start-only-ep", action: "dispatch.complete", payload: { total_tokens: 110 } }),
@@ -403,7 +403,7 @@ describe("tokensOffMeter", () => {
   // name the endpoint (what every producer actually emits), so the
   // completion classifies itself cloud with no session-wide lookup needed.
   it("(#2690, inverted) the genuine single hosted dispatch — endpoint on BOTH bookends — still classifies cloud", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: "genuine-hosted", action: "dispatch.start", handle: "reviewer", payload: { endpoint: "azure-foundry" } }),
       tokenRec("genuine-hosted", 1, 100, 10),
       rec({ session_id: "genuine-hosted", action: "dispatch.complete", payload: { total_tokens: 110, endpoint: "azure-foundry" } }),
@@ -447,7 +447,7 @@ describe("tokensOffMeter", () => {
   // and both of those are a recurrence artifact, not real mixed staffing.
   it("(#2690 steady state) a hosted sibling in flight does not paint a completed local sibling's DISPATCH cloud", () => {
     const sid = "task:review-probe-steady";
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       // The hosted seat: started, still running, no terminal.
       rec({ session_id: sid, action: "dispatch.start", handle: "judge-hosted", payload: { endpoint: "azure-foundry" } }),
       // The local seat: ran and closed cleanly.
@@ -476,7 +476,7 @@ describe("tokensOffMeter", () => {
   // sibling is merely IN FLIGHT.
   it("(#2690 steady state, 1.49.0 wire) a local seat's own tokens read LOCAL beside an in-flight hosted sibling", () => {
     const sid = "task:review-probe-steady-seat";
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: sid, action: "dispatch.start", handle: "judge-hosted", payload: { endpoint: "azure-foundry" } }),
       rec({ session_id: sid, action: "dispatch.start", handle: "judge-local" }),
       seatTokenRec(sid, 1, 90, 10, { remote: false, index: 0 }, "2026-08-08T00:01:00Z"),
@@ -522,7 +522,7 @@ describe("tokensOffMeter", () => {
   // hosted attempt that died still burned hosted tokens.
   it("(#2690, K1) a hosted sibling's dispatch.error does not reclassify a local sibling's DISPATCH — but its tokens read cloud", () => {
     const sid = "task:review-probe-k1";
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       // The hosted seat's start is OUTSIDE the window; only its error is in.
       rec({ session_id: sid, action: "dispatch.error", handle: "judge-hosted", payload: { endpoint: "azure-foundry", result_class: "error" } }),
       rec({ session_id: sid, action: "dispatch.start", handle: "judge-local" }),
@@ -545,7 +545,7 @@ describe("tokensOffMeter", () => {
   // it just no longer reaches this one.
   it("(#2690, K1, 1.49.0 wire) a hosted sibling's dispatch.error no longer paints a local seat's TOKENS cloud", () => {
     const sid = "task:review-probe-k1-seat";
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: sid, action: "dispatch.error", handle: "judge-hosted", payload: { endpoint: "azure-foundry", result_class: "error" } }),
       rec({ session_id: sid, action: "dispatch.start", handle: "judge-local" }),
       seatTokenRec(sid, 1, 900, 100, { remote: false, index: 0 }, "2026-08-08T00:01:00Z"),
@@ -590,7 +590,7 @@ describe("tokensOffMeter", () => {
   // dispatches beside LOCAL 2,000.
   it("(#2690, K2, pre-1.49.0 wire) the dispatches line still contradicts the token tiles for one mixed key", () => {
     const sid = "task:review-probe-k2";
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: sid, action: "dispatch.error", handle: "judge-hosted", payload: { endpoint: "azure-foundry", result_class: "error" } }),
       rec({ session_id: sid, action: "dispatch.start", handle: "judge-local-1" }),
       tokenRec(sid, 1, 900, 100, "2026-08-08T00:01:00Z"),
@@ -619,7 +619,7 @@ describe("tokensOffMeter", () => {
   // counts) still land on the right tile.
   it("(#2690, K2, 1.49.0 wire) two local seats' tokens read LOCAL, and the dispatches line matches the tiles", () => {
     const sid = "task:review-probe-k2-seat";
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: sid, action: "dispatch.error", handle: "judge-hosted", payload: { endpoint: "azure-foundry", result_class: "error" } }),
       rec({ session_id: sid, action: "dispatch.start", handle: "judge-local-1" }),
       seatTokenRec(sid, 1, 900, 100, { remote: false, index: 0 }, "2026-08-08T00:01:00Z"),
@@ -648,7 +648,7 @@ describe("tokensOffMeter", () => {
   // live Azure spend the last time this function moved.
   it("(#2690) a hosted seat's own token record reads CLOUD even under a key whose only terminal is local", () => {
     const sid = "task:review-probe-inverted";
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: sid, action: "dispatch.start", handle: "judge-local" }),
       seatTokenRec(sid, 1, 900, 100, { remote: true, index: 0 }, "2026-08-08T00:01:00Z"),
       rec({ session_id: sid, action: "dispatch.complete", payload: { total_tokens: 1000 } }),
@@ -680,7 +680,7 @@ describe("tokensOffMeter", () => {
   // is 1, exactly as before. What changed is that the hosted seat now has
   // its own run instead of none.
   it("(#2690) one local seat beside a usage-omitting hosted sibling classifies local at arity 1, exactly as it does at arity 2", () => {
-    const arity1 = (sid: string): FlowRecord[] => [
+    const arity1 = (sid: string): NormRecord[] => [
       rec({ session_id: sid, action: "dispatch.start", handle: "hosted", payload: { endpoint: "azure-foundry" } }),
       rec({ session_id: sid, action: "dispatch.complete", payload: { endpoint: "azure-foundry", total_tokens: null } }),
       rec({ session_id: sid, action: "dispatch.start", handle: "local-1" }),
@@ -717,7 +717,7 @@ describe("tokensOffMeter", () => {
   // unknownRuns=1`.
   it("(#2690) a hosted completion reporting no usage still counts its run cloud when no token-bearing bookend exists", () => {
     const sid = "task:null-usage-solo";
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: sid, action: "dispatch.start", handle: "hosted", payload: { endpoint: "azure-foundry" } }),
       rec({ session_id: sid, action: "dispatch.complete", payload: { endpoint: "azure-foundry", total_tokens: null } }),
       tokenRec(sid, 1, 90, 10, "2026-08-08T00:01:00Z"),
@@ -751,12 +751,12 @@ describe("tokensOffMeter", () => {
   // and the actual #2690 regression), and the mixed case is pinned
   // separately below as a documented divergence.
   it("(#2690) telemetry-present and telemetry-absent forms of the same LOCAL work classify identically", () => {
-    const dataPresent: FlowRecord[] = [
+    const dataPresent: NormRecord[] = [
       rec({ session_id: "task:pair-present", action: "dispatch.start", handle: "local-seat" }),
       tokenRec("task:pair-present", 1, 90, 10, "2026-08-08T00:01:00Z"),
       rec({ session_id: "task:pair-present", action: "dispatch.complete", payload: { total_tokens: 100 } }),
     ];
-    const dataAbsent: FlowRecord[] = [
+    const dataAbsent: NormRecord[] = [
       rec({ session_id: "task:pair-absent", action: "dispatch.start", handle: "local-seat" }),
       rec({
         session_id: "task:pair-absent",
@@ -783,7 +783,7 @@ describe("tokensOffMeter", () => {
   // now non-decreasing, with no carve-out.
   it("(#2690) the dispatch count is non-decreasing across EVERY prefix of the four-seat arrival sequence", () => {
     const sid = "task:review-probe-monotone";
-    const arrivals: FlowRecord[] = [
+    const arrivals: NormRecord[] = [
       rec({ session_id: sid, action: "dispatch.start", handle: "reviewer-A", payload: { endpoint: "azure-foundry" } }),
       rec({ session_id: sid, action: "dispatch.error", payload: { endpoint: "azure-foundry", result_class: "error" } }),
       rec({ session_id: sid, action: "dispatch.start", handle: "reviewer-B" }),
@@ -818,7 +818,7 @@ describe("tokensOffMeter", () => {
   // the test above it — that one stays cloud because it is genuinely ONE
   // dispatch, not a group of siblings).
   it("(post-review) a spanning group whose bookends carry no endpoint of their own classifies LOCAL, not floored by a dispatch.start", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: "start-only-multi", action: "dispatch.start", handle: "coder", payload: { endpoint: "azure-foundry" } }),
       tokenRec("start-only-multi", 1, 100, 10, "2026-08-08T00:00:00Z"),
       rec({ session_id: "start-only-multi", action: "dispatch.complete", payload: { total_tokens: 110 } }),
@@ -840,7 +840,7 @@ describe("tokensOffMeter", () => {
   // this exactly right.
   it("(MUST FIX 1) four sibling seats sharing one session id: after the second local completion, cloudRuns=0 and both are local", () => {
     const sid = "task:review-probe-1";
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: sid, action: "dispatch.start", handle: "reviewer-A", payload: { endpoint: "azure-foundry" } }),
       rec({ session_id: sid, action: "dispatch.error" }),
       rec({ session_id: sid, action: "dispatch.start", handle: "reviewer-B" }),
@@ -873,7 +873,7 @@ describe("tokensOffMeter", () => {
   // separately below.
   it("(MUST FIX 1) cloudRuns is non-decreasing across the arity-2-to-3 transition (C completing, then D)", () => {
     const sid = "task:review-probe-2";
-    const throughC: FlowRecord[] = [
+    const throughC: NormRecord[] = [
       rec({ session_id: sid, action: "dispatch.start", handle: "reviewer-A", payload: { endpoint: "azure-foundry" } }),
       rec({ session_id: sid, action: "dispatch.error" }),
       rec({ session_id: sid, action: "dispatch.start", handle: "reviewer-B" }),
@@ -884,7 +884,7 @@ describe("tokensOffMeter", () => {
       rec({ session_id: sid, action: "dispatch.complete", payload: { total_tokens: 200 } }),
     ];
 
-    const throughD: FlowRecord[] = [
+    const throughD: NormRecord[] = [
       ...throughC,
       rec({ session_id: sid, action: "dispatch.start", handle: "reviewer-D", payload: { endpoint: "azure-foundry" } }),
       rec({ session_id: sid, action: "dispatch.complete", payload: { total_tokens: 300, endpoint: "azure-foundry" } }),
@@ -909,7 +909,7 @@ describe("tokensOffMeter", () => {
   // own run instead of vanishing. `runs` is 3 because three seats ran.
   it("(MUST FIX 1) a hosted sibling reporting no usage doesn't float two local siblings to cloud", () => {
     const sid = "task:null-usage-hosted";
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: sid, action: "dispatch.start", handle: "hosted", payload: { endpoint: "azure-foundry" } }),
       rec({ session_id: sid, action: "dispatch.complete", payload: { endpoint: "azure-foundry", total_tokens: null } }),
       rec({ session_id: sid, action: "dispatch.start", handle: "local-1" }),
@@ -941,13 +941,13 @@ describe("tokensOffMeter", () => {
   // `dcTok` evidence, and neither should disagree with the other now that
   // both are purely per-bookend.
   it("(MUST FIX 1) telemetry-present and telemetry-absent forms of the same hosted dispatch classify identically", () => {
-    const dataAbsent: FlowRecord[] = [
+    const dataAbsent: NormRecord[] = [
       rec({ session_id: "direct-cloud-1", action: "dispatch.start", payload: { endpoint: "azure-foundry" } }),
       rec({ session_id: "direct-cloud-1", action: "dispatch.complete", payload: { endpoint: "azure-foundry", total_tokens: 500 } }),
     ];
     const tAbsent = tokensOffMeter(dataAbsent);
 
-    const dataPresent: FlowRecord[] = [
+    const dataPresent: NormRecord[] = [
       rec({ session_id: "direct-cloud-2", action: "dispatch.start", payload: { endpoint: "azure-foundry" } }),
       tokenRec("direct-cloud-2", 1, 450, 50, "2026-08-08T00:00:00Z"),
       rec({ session_id: "direct-cloud-2", action: "dispatch.complete", payload: { endpoint: "azure-foundry", total_tokens: 500 } }),
@@ -969,7 +969,7 @@ describe("tokensOffMeter", () => {
   // they collapsed to 1 (`sess.size`), same undercount shape as the
   // mission-run spanning case, just from a different producer.
   it("(post-review) three sibling single-shot seats sharing one task-scoped session id, each WITH telemetry, count as THREE runs", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: "task:siblings", action: "dispatch.complete", payload: { total_tokens: 100 } }),
       tokenRec("task:siblings", 1, 90, 10, "2026-08-08T00:00:00Z"),
 
@@ -1000,7 +1000,7 @@ describe("tokensOffMeter", () => {
   // completion — a shape NO producer ever emits. `DispatchMapStepKind::
   // bookend_record` (`crates/darkmux-crew/src/step_kinds/builtins.rs:1626-
   // 1660`) always seeds `{step_id, kind: "dispatch.map", runtime:
-  // "scheduler"}`, and its "dispatch complete" call site
+  // "scheduler"}`, and its "dispatch.complete" call site
   // (`builtins.rs:2053-2064`) merges `{result_class, items_in, ok_count,
   // failed_count}` on top — `stamp_remote_classification` no-ops both its
   // fields when `endpoint_label` is `None` (a local step), so NEITHER
@@ -1015,14 +1015,14 @@ describe("tokensOffMeter", () => {
   // `Object.keys` mutant at the `dcTok` collection site: this test flips
   // from `runs === 1` to `runs === 2` under either mutation.
   it("(MUST FIX 2) a token-bearing completion plus a token-LESS local map-step completion sharing one session id count as ONE run, not two", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: "task:map-mix", action: "dispatch.start", handle: "coder" }),
       tokenRec("task:map-mix", 1, 90, 10, "2026-08-08T00:00:00Z"),
       // The genuine model dispatch's own bookend — carries tokens.
       rec({ session_id: "task:map-mix", action: "dispatch.complete", payload: { total_tokens: 100 } }),
       // A LOCAL `dispatch.map` step's own summary bookend under the SAME
       // session id — the ACTUAL producer shape from `bookend_record` +
-      // its "dispatch complete" call site, carrying no `endpoint` and no
+      // its "dispatch.complete" call site, carrying no `endpoint` and no
       // token field, but very much NOT an empty object.
       rec({
         session_id: "task:map-mix",
@@ -1043,7 +1043,7 @@ describe("tokensOffMeter", () => {
   });
 
   it("a remote_tokens-only completion (the review path's own spelling) counts as cloud AND unclassified", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       rec({ session_id: "s7", action: "dispatch.start", handle: "pr-reviewer", payload: { endpoint: "gemini" } }),
       rec({ session_id: "s7", action: "dispatch.complete", payload: { endpoint: "gemini", remote_tokens: 1200 } }),
     ];
@@ -1061,44 +1061,6 @@ describe("tokensOffMeter", () => {
     const t = tokensOffMeter([]);
     expect(t).toEqual({ total: 0, input: 0, generated: 0, cached: null, utility: 0, runs: 0 });
   });
-});
-
-/** (#1852) Before this, `savings.ts` compared the DOTTED literal only, and was
- * correct purely because its records had passed through `buildFlowWindow`,
- * which normalizes. Nothing stated or tested that coupling — so a caller that
- * fed it raw records (a direct Redis consumer, a new lens, a test) got silent
- * misattribution: every crew-lineage dispatch would fall to `unknown`.
- *
- * These feed RAW, un-normalized records in the spaced spelling the crew path
- * actually writes to disk. Red-proved: reverting to the literal comparison
- * flips `local` to 0 and dumps the whole total into `unknown`. */
-describe("bookend spelling independence (#1852)", () => {
-  const raw = (action: string, payload: Record<string, unknown>) =>
-    ({
-      ts: "2026-08-16T00:00:00Z",
-      action,
-      session_id: "s1",
-      category: "machinery",
-      source: "dispatch",
-      payload,
-    }) as unknown as FlowRecord;
-
-  const tokens = () =>
-    ({
-      ts: "2026-08-16T00:00:01Z",
-      action: "telemetry.tokens",
-      session_id: "s1",
-      category: "telemetry",
-      source: "tokens",
-      payload: { total_tokens: 1000, prompt_tokens: 900, completion_tokens: 100, turn_seq: 0 },
-    }) as unknown as FlowRecord;
-
-  it("attributes a SPACED-spelling completion as local, not unknown", () => {
-    const out = tokensOffMeter([raw("dispatch complete", {}), tokens()]);
-    expect(out.total).toBe(1000);
-  });
-
-
 });
 
 describe("hasAnyTokenCounts", () => {
@@ -1161,19 +1123,19 @@ describe("tokensOffMeter — run-scoped evidence (the recurring session id)", ()
    * countable bookend. Every pre-existing test in this file gives its local
    * completions a `total_tokens`, which is exactly why none of them reached
    * this path. */
-  const localMapComplete = (mission: string, ts: string): FlowRecord =>
+  const localMapComplete = (mission: string, ts: string): NormRecord =>
     rec({
       ts,
       session_id: SID,
       mission_id: mission,
-      action: "dispatch complete",
+      action: "dispatch.complete",
       payload: { kind: "dispatch.map", result_class: "ok", items_in: 82, ok_count: 82, failed_count: 0 },
     });
 
-  const hostedMapStart = (mission: string, ts: string): FlowRecord =>
-    rec({ ts, session_id: SID, mission_id: mission, action: "dispatch start", payload: { kind: "dispatch.map", endpoint: AZURE } });
+  const hostedMapStart = (mission: string, ts: string): NormRecord =>
+    rec({ ts, session_id: SID, mission_id: mission, action: "dispatch.start", payload: { kind: "dispatch.map", endpoint: AZURE } });
 
-  const tok = (mission: string | undefined, total: number, ts: string): FlowRecord =>
+  const tok = (mission: string | undefined, total: number, ts: string): NormRecord =>
     rec({
       ts,
       session_id: SID,
@@ -1203,7 +1165,7 @@ describe("tokensOffMeter — run-scoped evidence (the recurring session id)", ()
    * their own missions' keys and cannot be reached from here.
    */
   it("(MUST FIX 1) an in-flight HOSTED run does not inherit an earlier mission's LOCAL verdict", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       // Three earlier missions, each completing this session id locally
       // with a token-less `dispatch.map` completion.
       localMapComplete("review-1786070274-89d50b", "2026-08-07T02:40:43Z"),
@@ -1268,9 +1230,9 @@ describe("tokensOffMeter — run-scoped evidence (the recurring session id)", ()
    * own completion lands.
    */
   it("(MUST FIX 1, mirror) an in-flight run does not inherit an earlier mission's verdict in either direction", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       localMapComplete("review-1786068582-93f404", "2026-08-07T02:09:46Z"),
-      rec({ ts: "2026-08-07T02:37:54Z", session_id: SID, mission_id: "review-1786070274-89d50b", action: "dispatch start", payload: { kind: "dispatch.map" } }),
+      rec({ ts: "2026-08-07T02:37:54Z", session_id: SID, mission_id: "review-1786070274-89d50b", action: "dispatch.start", payload: { kind: "dispatch.map" } }),
       tok("review-1786070274-89d50b", 3639, "2026-08-07T02:41:04Z"),
     ];
     const t = tokensOffMeter(data);
@@ -1291,11 +1253,11 @@ describe("tokensOffMeter — run-scoped evidence (the recurring session id)", ()
    * cloud-over-local holds the line when it is not.
    */
   it("(MUST FIX 1, no mission_id) a hosted START out-votes a stale local verdict even with no mission to scope by", () => {
-    const data: FlowRecord[] = [
-      rec({ ts: "2026-08-07T06:00:00Z", session_id: SID, action: "dispatch start" }),
+    const data: NormRecord[] = [
+      rec({ ts: "2026-08-07T06:00:00Z", session_id: SID, action: "dispatch.start" }),
       tok(undefined, 5000, "2026-08-07T06:01:00Z"),
-      rec({ ts: "2026-08-07T06:02:00Z", session_id: SID, action: "dispatch complete", payload: { kind: "dispatch.map", result_class: "ok" } }),
-      rec({ ts: "2026-08-08T00:53:50Z", session_id: SID, action: "dispatch start", payload: { kind: "dispatch.map", endpoint: AZURE } }),
+      rec({ ts: "2026-08-07T06:02:00Z", session_id: SID, action: "dispatch.complete", payload: { kind: "dispatch.map", result_class: "ok" } }),
+      rec({ ts: "2026-08-08T00:53:50Z", session_id: SID, action: "dispatch.start", payload: { kind: "dispatch.map", endpoint: AZURE } }),
       tok(undefined, 100000, "2026-08-08T00:54:03Z"),
     ];
     const t = tokensOffMeter(data);
@@ -1320,14 +1282,14 @@ describe("tokensOffMeter — run-scoped evidence (the recurring session id)", ()
    * one — and the local run reappearing is the entire point.
    */
   it("(#2709) two runs under one session id, one hosted and one local, count and classify separately", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       // A local run under one mission.
       localMapComplete("mission-local", "2026-08-08T00:10:00Z"),
       tok("mission-local", 1000, "2026-08-08T00:09:00Z"),
       // A hosted run under another, closing with a usage-omitting hosted
       // completion (`single_shot.rs:51`'s `total_tokens: null` shape), so
       // it too never enters `dcTok`.
-      rec({ ts: "2026-08-08T00:20:00Z", session_id: SID, mission_id: "mission-hosted", action: "dispatch complete", payload: { kind: "dispatch.map", endpoint: AZURE } }),
+      rec({ ts: "2026-08-08T00:20:00Z", session_id: SID, mission_id: "mission-hosted", action: "dispatch.complete", payload: { kind: "dispatch.map", endpoint: AZURE } }),
       tok("mission-hosted", 2000, "2026-08-08T00:19:00Z"),
     ];
     const t = tokensOffMeter(data);
@@ -1345,9 +1307,9 @@ describe("tokensOffMeter — run-scoped evidence (the recurring session id)", ()
    * local side would credit hosted work as free.
    */
   it("(#2709) ONE run key holding both a hosted and a local terminal counts one of each, not one of either", () => {
-    const data: FlowRecord[] = [
-      rec({ ts: "2026-08-08T00:10:00Z", session_id: SID, action: "dispatch complete", payload: { kind: "dispatch.map", result_class: "ok" } }),
-      rec({ ts: "2026-08-08T00:20:00Z", session_id: SID, action: "dispatch complete", payload: { kind: "dispatch.map", endpoint: AZURE } }),
+    const data: NormRecord[] = [
+      rec({ ts: "2026-08-08T00:10:00Z", session_id: SID, action: "dispatch.complete", payload: { kind: "dispatch.map", result_class: "ok" } }),
+      rec({ ts: "2026-08-08T00:20:00Z", session_id: SID, action: "dispatch.complete", payload: { kind: "dispatch.map", endpoint: AZURE } }),
       tok(undefined, 3000, "2026-08-08T00:19:00Z"),
     ];
     const t = tokensOffMeter(data);
@@ -1383,7 +1345,7 @@ describe("tokensOffMeter — the three gaps #2701 pinned, now closed (#2709)", (
    * under a DIFFERENT run key than the bookends these fixtures pair it
    * with. These gaps are about grouping, so the telemetry has to belong to
    * the run it is meant to belong to. */
-  const telem = (mission: string, prompt: number, completion: number, ts: string): FlowRecord =>
+  const telem = (mission: string, prompt: number, completion: number, ts: string): NormRecord =>
     rec({
       ts,
       session_id: SID,
@@ -1422,12 +1384,12 @@ describe("tokensOffMeter — the three gaps #2701 pinned, now closed (#2709)", (
    */
   it("GAP A CLOSED: cloudRuns is non-decreasing when a local sibling's completion lands after a usage-omitting hosted one", () => {
     const M = "mission-gap-a";
-    const arrivals: FlowRecord[] = [
-      rec({ ts: "2026-08-08T00:00:01Z", session_id: SID, mission_id: M, action: "dispatch start", handle: "hosted", payload: { endpoint: AZURE } }),
-      rec({ ts: "2026-08-08T00:00:02Z", session_id: SID, mission_id: M, action: "dispatch complete", handle: "hosted", payload: { endpoint: AZURE, result_class: "ok", total_tokens: null } }),
+    const arrivals: NormRecord[] = [
+      rec({ ts: "2026-08-08T00:00:01Z", session_id: SID, mission_id: M, action: "dispatch.start", handle: "hosted", payload: { endpoint: AZURE } }),
+      rec({ ts: "2026-08-08T00:00:02Z", session_id: SID, mission_id: M, action: "dispatch.complete", handle: "hosted", payload: { endpoint: AZURE, result_class: "ok", total_tokens: null } }),
       telem(M, 90, 10, "2026-08-08T00:00:03Z"),
-      rec({ ts: "2026-08-08T00:00:04Z", session_id: SID, mission_id: M, action: "dispatch start", handle: "local" }),
-      rec({ ts: "2026-08-08T00:00:05Z", session_id: SID, mission_id: M, action: "dispatch complete", handle: "local", payload: { total_tokens: 100 } }),
+      rec({ ts: "2026-08-08T00:00:04Z", session_id: SID, mission_id: M, action: "dispatch.start", handle: "local" }),
+      rec({ ts: "2026-08-08T00:00:05Z", session_id: SID, mission_id: M, action: "dispatch.complete", handle: "local", payload: { total_tokens: 100 } }),
     ];
     const seq = arrivals.map((_, i) => tokensOffMeter(arrivals.slice(0, i + 1)).runs);
     expect(seq).toEqual([0, 1, 1, 1, 2]);
@@ -1466,12 +1428,12 @@ describe("tokensOffMeter — the three gaps #2701 pinned, now closed (#2709)", (
    */
   it("GAP B CLOSED: three local runs and one hosted run under one session id report as FOUR runs", () => {
     const localMapComplete = (m: string, ts: string) =>
-      rec({ ts, session_id: SID, mission_id: m, action: "dispatch complete", payload: { kind: "dispatch.map", result_class: "ok" } });
-    const data: FlowRecord[] = [
+      rec({ ts, session_id: SID, mission_id: m, action: "dispatch.complete", payload: { kind: "dispatch.map", result_class: "ok" } });
+    const data: NormRecord[] = [
       localMapComplete("m1", "2026-08-07T02:40:43Z"),
       localMapComplete("m2", "2026-08-07T02:59:34Z"),
       localMapComplete("m3", "2026-08-07T06:03:32Z"),
-      rec({ ts: "2026-08-08T01:11:04Z", session_id: SID, mission_id: "m4", action: "dispatch complete", payload: { kind: "dispatch.map", endpoint: AZURE, remote_tokens: 147824 } }),
+      rec({ ts: "2026-08-08T01:11:04Z", session_id: SID, mission_id: "m4", action: "dispatch.complete", payload: { kind: "dispatch.map", endpoint: AZURE, remote_tokens: 147824 } }),
     ];
     const t = tokensOffMeter(data);
     // Ground truth: 4 runs, 1 hosted, 3 local. Reported, now:
@@ -1495,15 +1457,15 @@ describe("tokensOffMeter — the three gaps #2701 pinned, now closed (#2709)", (
    * Keyed by run, the guard only ever skips the run it is about.
    */
   it("GAP C CLOSED: a second run's tokens survive when a sibling run had telemetry", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       // Run A: has a telemetry family.
-      rec({ ts: "2026-08-08T00:00:01Z", session_id: SID, mission_id: "mA", action: "dispatch start" }),
+      rec({ ts: "2026-08-08T00:00:01Z", session_id: SID, mission_id: "mA", action: "dispatch.start" }),
       telem("mA", 500, 10, "2026-08-08T00:00:02Z"),
-      rec({ ts: "2026-08-08T00:00:03Z", session_id: SID, mission_id: "mA", action: "dispatch complete", payload: { total_tokens: 510 } }),
+      rec({ ts: "2026-08-08T00:00:03Z", session_id: SID, mission_id: "mA", action: "dispatch.complete", payload: { total_tokens: 510 } }),
       // Run B: a DIFFERENT mission, hosted, token-bearing completion, no
       // telemetry family of its own.
-      rec({ ts: "2026-08-08T00:10:00Z", session_id: SID, mission_id: "mB", action: "dispatch start", payload: { endpoint: AZURE } }),
-      rec({ ts: "2026-08-08T00:11:00Z", session_id: SID, mission_id: "mB", action: "dispatch complete", payload: { endpoint: AZURE, total_tokens: 9999 } }),
+      rec({ ts: "2026-08-08T00:10:00Z", session_id: SID, mission_id: "mB", action: "dispatch.start", payload: { endpoint: AZURE } }),
+      rec({ ts: "2026-08-08T00:11:00Z", session_id: SID, mission_id: "mB", action: "dispatch.complete", payload: { endpoint: AZURE, total_tokens: 9999 } }),
     ];
     const t = tokensOffMeter(data);
     // The 9,999 hosted tokens are present, and on the cloud tile.
@@ -1518,10 +1480,10 @@ describe("tokensOffMeter — the three gaps #2701 pinned, now closed (#2709)", (
    * `!sess.has(k)` guard: `total` doubles to 1,020.
    */
   it("(#2709, inverted) one run with BOTH a telemetry family and a token-bearing completion is not double-counted", () => {
-    const data: FlowRecord[] = [
-      rec({ ts: "2026-08-08T00:00:01Z", session_id: SID, mission_id: "mA", action: "dispatch start" }),
+    const data: NormRecord[] = [
+      rec({ ts: "2026-08-08T00:00:01Z", session_id: SID, mission_id: "mA", action: "dispatch.start" }),
       telem("mA", 500, 10, "2026-08-08T00:00:02Z"),
-      rec({ ts: "2026-08-08T00:00:03Z", session_id: SID, mission_id: "mA", action: "dispatch complete", payload: { total_tokens: 510 } }),
+      rec({ ts: "2026-08-08T00:00:03Z", session_id: SID, mission_id: "mA", action: "dispatch.complete", payload: { total_tokens: 510 } }),
     ];
     const t = tokensOffMeter(data);
     expect(t.total).toBe(510);
@@ -1548,8 +1510,8 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
    * flips to `runs=2, cloudRuns=1`. */
   it("TERM: a hosted START alone is not a run — only a hosted TERMINAL is", () => {
     const sid = "task:hosted-start-only";
-    const inFlight: FlowRecord[] = [
-      rec({ ts: "2026-08-08T00:00:01Z", session_id: sid, action: "dispatch start", handle: "hosted", payload: { endpoint: AZURE } }),
+    const inFlight: NormRecord[] = [
+      rec({ ts: "2026-08-08T00:00:01Z", session_id: sid, action: "dispatch.start", handle: "hosted", payload: { endpoint: AZURE } }),
       rec({ ts: "2026-08-08T00:00:02Z", session_id: sid, category: "telemetry", source: "tokens", payload: { turn_seq: 1, prompt_tokens: 90, completion_tokens: 10, total_tokens: 100 } }),
     ];
     const t = tokensOffMeter(inFlight);
@@ -1559,7 +1521,7 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
 
     // And when the terminal lands, the same run becomes a cloud run rather
     // than a second one.
-    const closed = [...inFlight, rec({ ts: "2026-08-08T00:00:03Z", session_id: sid, action: "dispatch complete", payload: { endpoint: AZURE, total_tokens: null } })];
+    const closed = [...inFlight, rec({ ts: "2026-08-08T00:00:03Z", session_id: sid, action: "dispatch.complete", payload: { endpoint: AZURE, total_tokens: null } })];
     const t2 = tokensOffMeter(closed);
     expect(t2.runs).toBe(1);
   });
@@ -1571,8 +1533,8 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
   it("TERM: an ordinary hosted dispatch that DID report usage counts once, not twice", () => {
     const sid = "task:hosted-with-usage";
     const t = tokensOffMeter([
-      rec({ ts: "2026-08-08T00:00:01Z", session_id: sid, action: "dispatch start", payload: { endpoint: AZURE } }),
-      rec({ ts: "2026-08-08T00:00:02Z", session_id: sid, action: "dispatch complete", payload: { endpoint: AZURE, total_tokens: 500 } }),
+      rec({ ts: "2026-08-08T00:00:01Z", session_id: sid, action: "dispatch.start", payload: { endpoint: AZURE } }),
+      rec({ ts: "2026-08-08T00:00:02Z", session_id: sid, action: "dispatch.complete", payload: { endpoint: AZURE, total_tokens: 500 } }),
     ]);
     expect(t.runs).toBe(1);
     expect(t.total).toBe(500);
@@ -1586,9 +1548,9 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
   it("TERM: a local dispatch that DID report usage counts once, not twice", () => {
     const sid = "task:local-with-usage";
     const t = tokensOffMeter([
-      rec({ ts: "2026-08-08T00:00:01Z", session_id: sid, action: "dispatch start" }),
-      rec({ ts: "2026-08-08T00:00:02Z", session_id: sid, action: "dispatch complete", payload: { total_tokens: 500 } }),
-      rec({ ts: "2026-08-08T00:00:03Z", session_id: sid, action: "dispatch complete", payload: { step_id: "map-1", kind: "dispatch.map", runtime: "scheduler", result_class: "ok", items_in: 3, ok_count: 3, failed_count: 0 } }),
+      rec({ ts: "2026-08-08T00:00:01Z", session_id: sid, action: "dispatch.start" }),
+      rec({ ts: "2026-08-08T00:00:02Z", session_id: sid, action: "dispatch.complete", payload: { total_tokens: 500 } }),
+      rec({ ts: "2026-08-08T00:00:03Z", session_id: sid, action: "dispatch.complete", payload: { step_id: "map-1", kind: "dispatch.map", runtime: "scheduler", result_class: "ok", items_in: 3, ok_count: 3, failed_count: 0 } }),
     ]);
     expect(t.runs).toBe(1);
   });
@@ -1599,7 +1561,7 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
    * unknownRuns=0`, i.e. an implicit LOCAL dispatch nothing proved. */
   it("TERM: a key with telemetry but no terminal at all is UNKNOWN, never implicitly local", () => {
     const t = tokensOffMeter([
-      rec({ ts: "2026-08-08T00:00:01Z", session_id: "task:in-flight", action: "dispatch start" }),
+      rec({ ts: "2026-08-08T00:00:01Z", session_id: "task:in-flight", action: "dispatch.start" }),
       rec({ ts: "2026-08-08T00:00:02Z", session_id: "task:in-flight", category: "telemetry", source: "tokens", payload: { turn_seq: 1, prompt_tokens: 90, completion_tokens: 10, total_tokens: 100 } }),
     ]);
     expect(t.runs).toBe(1);
@@ -1612,8 +1574,8 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
    * `localKeys` from the `runKeys` union: `runs` reads 0 here. */
   it("TERM: a run whose ONLY record is a token-less completion is still a run", () => {
     const t = tokensOffMeter([
-      rec({ ts: "2026-08-08T00:00:01Z", session_id: "task:bare-local", action: "dispatch complete", payload: { kind: "dispatch.map", result_class: "ok" } }),
-      rec({ ts: "2026-08-08T00:00:02Z", session_id: "task:bare-hosted", action: "dispatch complete", payload: { kind: "dispatch.map", endpoint: AZURE } }),
+      rec({ ts: "2026-08-08T00:00:01Z", session_id: "task:bare-local", action: "dispatch.complete", payload: { kind: "dispatch.map", result_class: "ok" } }),
+      rec({ ts: "2026-08-08T00:00:02Z", session_id: "task:bare-hosted", action: "dispatch.complete", payload: { kind: "dispatch.map", endpoint: AZURE } }),
     ]);
     expect(t.runs).toBe(2);
     // Neither reported a token count, so no tile moves.
@@ -1644,12 +1606,12 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
    */
   it("TERM (mixed): a token-BEARING hosted completion beside a token-LESS local terminal counts one of each", () => {
     const sid = "task:mixed-hosted-bearing";
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       // The hosted seat: reported usage, so it enters `dcTok`.
-      rec({ ts: "2026-08-08T00:00:01Z", session_id: sid, action: "dispatch complete", handle: "judge-hosted", payload: { endpoint: AZURE, total_tokens: 5000 } }),
+      rec({ ts: "2026-08-08T00:00:01Z", session_id: sid, action: "dispatch.complete", handle: "judge-hosted", payload: { endpoint: AZURE, total_tokens: 5000 } }),
       // A local `dispatch.map` step's own summary bookend under the same key —
       // the real producer shape, carrying no endpoint and no token field.
-      rec({ ts: "2026-08-08T00:00:02Z", session_id: sid, action: "dispatch complete", handle: "map-local", payload: { step_id: "map-1", kind: "dispatch.map", runtime: "scheduler", result_class: "ok", items_in: 3, ok_count: 3, failed_count: 0 } }),
+      rec({ ts: "2026-08-08T00:00:02Z", session_id: sid, action: "dispatch.complete", handle: "map-local", payload: { step_id: "map-1", kind: "dispatch.map", runtime: "scheduler", result_class: "ok", items_in: 3, ok_count: 3, failed_count: 0 } }),
     ];
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(2);
@@ -1691,8 +1653,8 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
   it("TERM (mixed, mirror): a token-BEARING local completion beside a token-LESS hosted terminal counts one of each", () => {
     const sid = "task:mixed-local-bearing";
     const t = tokensOffMeter([
-      rec({ ts: "2026-08-08T00:00:01Z", session_id: sid, action: "dispatch complete", handle: "coder-local", payload: { total_tokens: 5000 } }),
-      rec({ ts: "2026-08-08T00:00:02Z", session_id: sid, action: "dispatch complete", handle: "judge-hosted", payload: { endpoint: AZURE, total_tokens: null } }),
+      rec({ ts: "2026-08-08T00:00:01Z", session_id: sid, action: "dispatch.complete", handle: "coder-local", payload: { total_tokens: 5000 } }),
+      rec({ ts: "2026-08-08T00:00:02Z", session_id: sid, action: "dispatch.complete", handle: "judge-hosted", payload: { endpoint: AZURE, total_tokens: null } }),
     ]);
     expect(t.runs).toBe(2);
     // The local seat's own self-describing payload is the only token count
@@ -1713,8 +1675,8 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
  */
 describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
   const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..");
-  const day = (name: string): FlowRecord[] =>
-    JSON.parse(readFileSync(path.join(REPO_ROOT, `tests/parity/corpus/${name}.json`), "utf8")) as FlowRecord[];
+  const day = (name: string): NormRecord[] =>
+    normAll(JSON.parse(readFileSync(path.join(REPO_ROOT, `tests/parity/corpus/${name}.json`), "utf8")));
   const corpus = [...day("flow-yesterday"), ...day("flow-today")];
 
   /**
@@ -1730,12 +1692,12 @@ describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
    * positions. The other three never fall.
    */
   it("ALL TOKENS never falls across all 2,073 playheads", () => {
-    const heads = [...new Set(corpus.map((r) => T(r.ts)).filter((n) => !Number.isNaN(n)))].sort((a, b) => a - b);
+    const heads = [...new Set(timesOf(corpus))].sort((a, b) => a - b);
     expect(heads.length).toBe(2073);
     let prevTotal = 0;
     let last = tokensOffMeter([]);
     for (const h of heads) {
-      const t = tokensOffMeter(corpus.filter((r) => T(r.ts) <= h));
+      const t = tokensOffMeter(recordsAsOf(corpus, h));
       // A cloud dispatch that lands never un-lands. This is #2709 symptom
       // (b) in its real-data form.
       // No token ever LEAVES the cloud tile, and none ever leaves `total`
@@ -1812,8 +1774,8 @@ describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
     const compMissions = new Map<string, Set<string>>();
     for (const r of corpus) {
       if (!r.session_id) continue;
-      const bucket = r.category === "telemetry" && r.source === "tokens" ? telMissions
-        : isDispatchComplete(r.action ?? "") ? compMissions : null;
+      const bucket = r.category === CATEGORY.Telemetry && r.source === "tokens" ? telMissions
+        : r.action === ACTION.DispatchComplete ? compMissions : null;
       if (!bucket) continue;
       if (!bucket.has(r.session_id)) bucket.set(r.session_id, new Set());
       bucket.get(r.session_id)!.add(r.mission_id ?? "<none>");
@@ -1829,11 +1791,11 @@ describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
     // The cost, measured. One ordinary local dispatch, its telemetry and its
     // completion reporting the same 4,000 tokens.
     const SID = "task-skew";
-    const tel = (m: string | undefined, total: number, ts: string): FlowRecord =>
+    const tel = (m: string | undefined, total: number, ts: string): NormRecord =>
       rec({ ts, session_id: SID, ...(m ? { mission_id: m } : {}), category: "telemetry", source: "tokens",
             payload: { turn_seq: 1, prompt_tokens: total, completion_tokens: 0, total_tokens: total } });
-    const comp = (m: string | undefined, total: number, ts: string): FlowRecord =>
-      rec({ ts, session_id: SID, ...(m ? { mission_id: m } : {}), action: "dispatch complete", payload: { total_tokens: total } });
+    const comp = (m: string | undefined, total: number, ts: string): NormRecord =>
+      rec({ ts, session_id: SID, ...(m ? { mission_id: m } : {}), action: "dispatch.complete", payload: { total_tokens: total } });
 
     const aligned = tokensOffMeter([tel("m1", 4000, "2026-08-08T00:00:01Z"), comp("m1", 4000, "2026-08-08T00:00:02Z")]);
     expect(aligned.total).toBe(4000);
@@ -1847,8 +1809,8 @@ describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
   });
 
   it("every run key that closed with a dispatch.complete is counted", () => {
-    const key = (r: FlowRecord) => `${r.session_id}\u0000${r.mission_id || ""}`;
-    const closed = new Set(corpus.filter((r) => isDispatchComplete(r.action ?? "") && r.session_id).map(key));
+    const key = (r: NormRecord) => `${r.session_id}\u0000${r.mission_id || ""}`;
+    const closed = new Set(corpus.filter((r) => r.action === ACTION.DispatchComplete && r.session_id).map(key));
     // 50 keys closed; `runs` reported 40 before #2709. The two extra runs
     // are one key holding two token-bearing sibling bookends, plus one
     // telemetry-only key with no terminal (an `unknownRuns` member).
@@ -1866,7 +1828,7 @@ describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
     const tokenLessLocalKeys = new Set(
       corpus
         .filter((r) => {
-          if (!r.session_id || !isDispatchComplete(r.action ?? "")) return false;
+          if (!r.session_id || r.action !== ACTION.DispatchComplete) return false;
           const p = (r.payload ?? {}) as Record<string, unknown>;
           if (p.endpoint) return false;
           return !(p.total_tokens || p.prompt_tokens || p.completion_tokens || p.remote_tokens);
@@ -1894,13 +1856,13 @@ describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
  * Both mutations below left 64 of 64 green before these two tests existed.
  */
 describe("tokensOffMeter — runKey injectivity", () => {
-  const hostedComplete = (sid: string, mission: string | undefined, ts: string): FlowRecord =>
-    rec({ ts, session_id: sid, ...(mission ? { mission_id: mission } : {}), action: "dispatch complete",
+  const hostedComplete = (sid: string, mission: string | undefined, ts: string): NormRecord =>
+    rec({ ts, session_id: sid, ...(mission ? { mission_id: mission } : {}), action: "dispatch.complete",
           payload: { kind: "dispatch.map", endpoint: "azure:my.endpoint/gpt-4o", result_class: "ok" } });
-  const localComplete = (sid: string, mission: string | undefined, ts: string): FlowRecord =>
-    rec({ ts, session_id: sid, ...(mission ? { mission_id: mission } : {}), action: "dispatch complete",
+  const localComplete = (sid: string, mission: string | undefined, ts: string): NormRecord =>
+    rec({ ts, session_id: sid, ...(mission ? { mission_id: mission } : {}), action: "dispatch.complete",
           payload: { kind: "dispatch.map", result_class: "ok" } });
-  const telem = (sid: string, mission: string | undefined, total: number, ts: string): FlowRecord =>
+  const telem = (sid: string, mission: string | undefined, total: number, ts: string): NormRecord =>
     rec({ ts, session_id: sid, ...(mission ? { mission_id: mission } : {}), category: "telemetry", source: "tokens",
           payload: { turn_seq: 1, prompt_tokens: total, completion_tokens: 0, total_tokens: total } });
 
@@ -1921,7 +1883,7 @@ describe("tokensOffMeter — runKey injectivity", () => {
    */
   it("GUARD 1: two SESSIONS under one mission classify independently", () => {
     const M = "review-1786150410-209398";
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       hostedComplete("task-review-judge-task", M, "2026-08-08T01:00:00Z"),
       telem("task-review-judge-task", M, 1000, "2026-08-08T00:59:00Z"),
       localComplete("task-review-verify-task", M, "2026-08-08T01:05:00Z"),
@@ -1950,7 +1912,7 @@ describe("tokensOffMeter — runKey injectivity", () => {
    * row's endpoint then paints the local row's tokens cloud.
    */
   it("GUARD 2: two runs whose ids concatenate to the same string stay distinct", () => {
-    const data: FlowRecord[] = [
+    const data: NormRecord[] = [
       // ("task-judge", "m1")  -> "task-judge" + SEP + "m1"
       hostedComplete("task-judge", "m1", "2026-08-08T01:00:00Z"),
       telem("task-judge", "m1", 1000, "2026-08-08T00:59:00Z"),

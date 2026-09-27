@@ -10,12 +10,14 @@ import {
   resolvedMissionLabel,
   replayPlaybackKvValue,
 } from "./replayMeta";
-import { normalizeRecords } from "./flow";
+import { shapeRecords } from "./flow";
+import { ingest, type NormRecord } from "./ingest";
 import { clk, clkrange, lday } from "./format";
-import type { FlowRecord } from "../types/handwritten";
+import { norm, normAll, type RawRecord } from "../testing/records";
 
-function rec(overrides: Partial<FlowRecord>): FlowRecord {
-  return { ts: "2026-08-07T02:09:42.000Z", ...overrides };
+
+function rec(overrides: RawRecord): NormRecord {
+  return norm({ ts: "2026-08-07T02:09:42.000Z", ...overrides });
 }
 
 /**
@@ -69,7 +71,7 @@ describe("replayDataSource", () => {
 });
 
 describe("replayMetaLines", () => {
-  const day: FlowRecord[] = [
+  const day: NormRecord[] = [
     rec({ mission_id: "m-a", machine_uid: "u1", session_id: "s1", action: "dispatch.start", ts: "2026-08-07T02:09:42.000Z" }),
     rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.complete", ts: "2026-08-07T18:28:15.000Z" }),
   ];
@@ -86,34 +88,32 @@ describe("replayMetaLines", () => {
     expect(census).toBe("2 records · 1 machines");
   });
 
-  // The bug this line exposed. `useRouteRecords` handed out RAW records, so
-  // the schema header — which has no `machine_uid` — counted as a second
-  // machine. Nothing else on the page says a machine COUNT out loud, which is
-  // why a phantom machine could ride along unnoticed until the meta line had
-  // to state it.
-  it("the schema header is not a machine (it is dropped before counting)", () => {
-    const withHeader = [{ _type: "schema", ts: "" } as unknown as FlowRecord, ...day];
-    const [, census] = replayMetaLines(normalizeRecords(withHeader), "2026-08-07");
+  // The bug this line exposed. `useRouteRecords` once handed out RAW
+  // records, so the schema header — which has no `machine_uid` — counted as a
+  // second machine. Nothing else on the page says a machine COUNT out loud,
+  // which is why a phantom machine could ride along unnoticed until the meta
+  // line had to state it. The header is now dropped at the ingest boundary,
+  // so an unshaped set holding it can no longer reach a lens at all.
+  it("the schema header is not a machine (it is dropped at ingest)", () => {
+    const withHeader = ingest([{ _type: "schema", ts: "" }, ...day]);
+    const [, census] = replayMetaLines(shapeRecords(withHeader), "2026-08-07");
     expect(census).toBe("2 records · 1 machines");
-    // …and read UNSHAPED it really does miscount, which is what shipped.
-    const [, wrong] = replayMetaLines(withHeader, "2026-08-07");
-    expect(wrong).toBe("3 records · 2 machines");
   });
 });
 
-describe("normalizeRecords — the per-session runtime aggregate", () => {
+describe("shapeRecords — the per-session runtime aggregate", () => {
   // `flowToRenderModel` APPENDS one synthetic runtime telemetry record per
   // session that emitted any `dispatch.turn` (viewer.html:3223-3234). These
   // are counted in `DATA.length`, which is why the golden reads 2008 records
   // against a fixture holding 1993 real ones plus 15 such sessions.
-  const turns: FlowRecord[] = [
+  const turns: NormRecord[] = [
     rec({ session_id: "s1", action: "dispatch.turn", machine_uid: "u1", machine_id: "mac", payload: { turn_seq: 1 }, ts: "2026-08-07T01:00:00.000Z" }),
     rec({ session_id: "s1", action: "dispatch.turn", machine_uid: "u1", machine_id: "mac", payload: { turn_seq: 7 }, ts: "2026-08-07T02:00:00.000Z" }),
     rec({ session_id: "s2", action: "dispatch.turn", machine_uid: "u1", payload: { turn_seq: 3 }, ts: "2026-08-07T03:00:00.000Z" }),
   ];
 
   it("appends exactly one record per session with turns", () => {
-    const out = normalizeRecords(turns);
+    const out = shapeRecords(turns);
     expect(out).toHaveLength(turns.length + 2);
     const synthetic = out.filter((r) => r.source === "runtime");
     expect(synthetic).toHaveLength(2);
@@ -121,7 +121,7 @@ describe("normalizeRecords — the per-session runtime aggregate", () => {
 
   it("carries each session's MAX turn_seq", () => {
     const bySession = new Map(
-      normalizeRecords(turns)
+      shapeRecords(turns)
         .filter((r) => r.source === "runtime")
         .map((r) => [r.session_id, (r.fields as { turns: number }).turns]),
     );
@@ -133,12 +133,12 @@ describe("normalizeRecords — the per-session runtime aggregate", () => {
     // Without this, an implementation that emitted one record per SESSION
     // (rather than per session-with-turns) would pass every test above.
     const noTurns = [rec({ session_id: "s9", action: "dispatch.start" })];
-    expect(normalizeRecords(noTurns).filter((r) => r.source === "runtime")).toHaveLength(0);
-    expect(normalizeRecords(noTurns)).toHaveLength(1);
+    expect(shapeRecords(noTurns).filter((r) => r.source === "runtime")).toHaveLength(0);
+    expect(shapeRecords(noTurns)).toHaveLength(1);
   });
 
   it("returns the whole set in timestamp order — the aggregates are appended out of order", () => {
-    const out = normalizeRecords(turns);
+    const out = shapeRecords(turns);
     const ts = out.map((r) => Date.parse(r.ts));
     expect(ts).toEqual([...ts].sort((a, b) => a - b));
     // The event log reverses this set and follow-latest takes the topmost row,
@@ -191,19 +191,19 @@ describe("humanMissionLabel", () => {
 
 /** (#2121) A REAL title, read off `mission_title` — the demo's
  * `import_mission.py --title` writer, never a production one today (see
- * `mission_title`'s own doc on `FlowRecord`). */
+ * `mission_title`'s own doc on `NormRecord`). */
 describe("missionTitle", () => {
   it("finds the title on any correlated record, not just the first", () => {
     const data = [
-      rec({ mission_id: "demo-review-nameof-recency", action: "phase start" }),
-      rec({ mission_id: "demo-review-nameof-recency", action: "mission start", mission_title: "Review of a merged darkmux PR" }),
-      rec({ mission_id: "demo-review-nameof-recency", action: "dispatch start" }),
+      rec({ mission_id: "demo-review-nameof-recency", action: "phase.start" }),
+      rec({ mission_id: "demo-review-nameof-recency", action: "mission.start", mission_title: "Review of a merged darkmux PR" }),
+      rec({ mission_id: "demo-review-nameof-recency", action: "dispatch.start" }),
     ];
     expect(missionTitle(data, "demo-review-nameof-recency")).toBe("Review of a merged darkmux PR");
   });
 
   it("is null when no correlated record carries a title — every real dispatch today", () => {
-    const data = [rec({ mission_id: "coder-phase-1786068582-93f404", action: "mission start" })];
+    const data = [rec({ mission_id: "coder-phase-1786068582-93f404", action: "mission.start" })];
     expect(missionTitle(data, "coder-phase-1786068582-93f404")).toBeNull();
   });
 
@@ -241,11 +241,11 @@ describe("resolvedMissionLabel", () => {
  * to carry, now that the transport shows only a human mission label (or
  * nothing) in its place. */
 describe("replayPlaybackKvValue", () => {
-  const day: FlowRecord[] = [
-    { ts: "2026-08-26T01:08:17.000Z", machine_uid: "u1", mission_id: "demo-review-nameof-recency" } as FlowRecord,
-    { ts: "2026-08-26T14:13:01.000Z", machine_uid: "u1", mission_id: "demo-review-nameof-recency" } as FlowRecord,
-    { ts: "2026-08-26T09:00:00.000Z", machine_uid: "u2", mission_id: "demo-review-nameof-recency" } as FlowRecord,
-  ];
+  const day: NormRecord[] = normAll([
+    { ts: "2026-08-26T01:08:17.000Z", machine_uid: "u1", mission_id: "demo-review-nameof-recency" },
+    { ts: "2026-08-26T14:13:01.000Z", machine_uid: "u1", mission_id: "demo-review-nameof-recency" },
+    { ts: "2026-08-26T09:00:00.000Z", machine_uid: "u2", mission_id: "demo-review-nameof-recency" },
+  ]);
 
   it("names the day, the bare time span (no repeated date), the census, and the raw mission id", () => {
     const tMin = Date.parse("2026-08-26T01:08:17.000Z");
@@ -256,7 +256,7 @@ describe("replayPlaybackKvValue", () => {
   });
 
   it("omits the mission clause entirely when the day has no mission ids", () => {
-    const noMission: FlowRecord[] = [{ ts: "2026-08-26T01:08:17.000Z", machine_uid: "u1" } as FlowRecord];
+    const noMission: NormRecord[] = normAll([{ ts: "2026-08-26T01:08:17.000Z", machine_uid: "u1" }]);
     expect(replayPlaybackKvValue(noMission, "2026-08-26")).toBe(`flow 2026-08-26 · ${clkrange(Date.parse("2026-08-26T01:08:17.000Z"), Date.parse("2026-08-26T01:08:17.000Z"))} · 1 records · 1 machines`);
     expect(replayPlaybackKvValue(noMission, "2026-08-26")).not.toContain("mission");
   });
@@ -267,7 +267,7 @@ describe("replayPlaybackKvValue", () => {
   // kv value still names the RAW id, unchanged. The transport is the only
   // surface that swaps to the title.
   it("still names the raw id even when the mission carries a mission_title", () => {
-    const titled: FlowRecord[] = day.map((r) => ({ ...r, mission_title: "Review of a merged darkmux PR" }));
+    const titled: NormRecord[] = day.map((r) => ({ ...r, mission_title: "Review of a merged darkmux PR" }));
     const value = replayPlaybackKvValue(titled, "2026-08-26");
     expect(value).toContain("mission demo-review-nameof-recency");
     expect(value).not.toContain("Review of a merged darkmux PR");
@@ -276,7 +276,7 @@ describe("replayPlaybackKvValue", () => {
   // (#2121) `mission_reviewed` — additional detail-pane content, appended
   // after the raw id, never replacing it.
   it("appends the reviewed PR reference when a correlated record carries mission_reviewed", () => {
-    const reviewed: FlowRecord[] = day.map((r, i) => (i === 1 ? { ...r, mission_reviewed: "kstrat2001/darkmux#2030" } : r));
+    const reviewed: NormRecord[] = day.map((r, i) => (i === 1 ? { ...r, mission_reviewed: "kstrat2001/darkmux#2030" } : r));
     const value = replayPlaybackKvValue(reviewed, "2026-08-26");
     expect(value.endsWith("· mission demo-review-nameof-recency · reviewed kstrat2001/darkmux#2030")).toBe(true);
   });

@@ -12,6 +12,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ScopeLamps, SessionReplay, modelScopeHero } from "./SessionReplay";
 import { PlaybackClockContext } from "../../lib/pageClockRate";
 import { PEPPER_SID, pepperAt, pepperRecords } from "../../testing/pepperGrinderRun";
+import { ACTION } from "../../lib/ingest";
 
 // (#2886 pass 5, MUST — fresh-reviewer finding F5) Several fixes here stayed
 // green while broken in the actual render path — `effectiveConnected`/
@@ -353,14 +354,7 @@ describe("SessionReplay", () => {
     expect(system?.textContent).not.toContain("ACTIVE TIME");
   });
 
-  // Both producer lineages' bookend spellings. The space form is the one a
-  // mission's run-grain session really carries (darkmux-crew); a fixture that
-  // only used the dotted form passed while the live page never fetched the
-  // mission's records at all.
-  it.each([
-    ["space (darkmux-crew, what a mission emits)", " "],
-    ["dot (darkmux-lab and the runtime)", "."],
-  ])("(#2759) rolls the MODEL panes up from the run's INNER sessions when the run's OWN session carries no telemetry: %s spelling", async (_label, sep) => {
+  it("(#2759) rolls the MODEL panes up from the run's INNER sessions when the run's OWN session carries no telemetry", async () => {
     // The defect: a mission mints a run-grain session (`dispatch start` /
     // `dispatch complete` / `mission.grow` — bookends only) distinct from its
     // inner role-execution session, which carries the real turns/tokens/
@@ -378,7 +372,7 @@ describe("SessionReplay", () => {
       // only, exactly the shape #2759 measured on a real run.
       {
         ts: "2026-09-16T05:30:44Z",
-        action: `dispatch${sep}start`,
+        action: "dispatch.start",
         session_id: missionId,
         mission_id: missionId,
         machine_id: "M",
@@ -388,7 +382,7 @@ describe("SessionReplay", () => {
       { ts: "2026-09-16T05:31:00Z", action: "mission.grow", session_id: missionId, mission_id: missionId, machine_id: "M", payload: {} },
       {
         ts: "2026-09-16T05:31:41Z",
-        action: `dispatch${sep}complete`,
+        action: "dispatch.complete",
         session_id: missionId,
         mission_id: missionId,
         machine_id: "M",
@@ -398,7 +392,7 @@ describe("SessionReplay", () => {
       // dispatch, carrying the real telemetry.
       {
         ts: "2026-09-16T05:30:50Z",
-        action: `dispatch${sep}start`,
+        action: "dispatch.start",
         session_id: unitSid,
         mission_id: missionId,
         machine_id: "M",
@@ -437,7 +431,7 @@ describe("SessionReplay", () => {
         machine_id: "M",
         payload: { event: "load", model: "qwen3.6-35b-a3b-turboquant-mlx", gb: 20 },
       },
-      { ts: "2026-09-16T05:31:35Z", action: `dispatch${sep}complete`, session_id: unitSid, mission_id: missionId, machine_id: "M", payload: {} },
+      { ts: "2026-09-16T05:31:35Z", action: "dispatch.complete", session_id: unitSid, mission_id: missionId, machine_id: "M", payload: {} },
       // A SECOND inner execution (the crawl's coder) that saw the same model
       // resident: its own load record must not list the model twice.
       {
@@ -1663,10 +1657,10 @@ describe("(#2926) run page: THINK opener and TOOL GEN, from the real run", () =>
     const files = (k: number) => `/workspace/src/deep/tree/file${k}.js`;
     return pepperRecords().map((r) => {
       const p = (r as unknown as { payload: Record<string, unknown> }).payload;
-      if (withPaths && r.action === "dispatch.turn" && p.turn_seq === 1) {
+      if (withPaths && r.action === ACTION.DispatchTurn && p.turn_seq === 1) {
         return { ...r, payload: { ...p, tool_names: ["read", "read", "read", "read", "read"], tool_paths: [1, 2, 3, 4, 5].map(files) } } as unknown as typeof r;
       }
-      if (r.action !== "dispatch.tool" || p.tool_name !== "read") return r;
+      if (r.action !== ACTION.DispatchTool || p.tool_name !== "read") return r;
       n += 1;
       return { ...r, payload: { ...p, args: JSON.stringify({ path: files(n), offset: 1, limit: 200 }) } } as unknown as typeof r;
     });

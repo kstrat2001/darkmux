@@ -1,9 +1,8 @@
 import { useMemo } from "react";
-import { T } from "../lib/flow";
-import { clk, relAgoFrom } from "../lib/format";
+import { clkAt, relAgoFrom } from "../lib/format";
 import { orchNotes } from "../lenses/fleet/hybridNote";
-import type { FlowRecord } from "../types/handwritten";
 import { Dialog } from "./Dialog";
+import type { NormRecord } from "../lib/ingest";
 
 /**
  * `openNotes()` (viewer.html:1606-1610) — every orchestrator note in the
@@ -24,7 +23,7 @@ import { Dialog } from "./Dialog";
  * meet — the notes-history dialog's relative-age readout on a replay is a
  * follow-up, not fixed here).
  */
-export function NotesDialog({ data, nowMs }: { data: FlowRecord[]; nowMs: number }) {
+export function NotesDialog({ data, nowMs }: { data: NormRecord[]; nowMs: number }) {
   // (#2911) Memoized on the window: the fleet lens re-renders every second
   // while an execution is live, and the notes only change with the records.
   const notes = useMemo(() => orchNotes(data).slice().reverse(), [data]);
@@ -41,12 +40,12 @@ export function NotesDialog({ data, nowMs }: { data: FlowRecord[]; nowMs: number
   );
 }
 
-function NoteRow({ note, nowMs }: { note: FlowRecord; nowMs: number }) {
-  const t = T(note.ts);
+function NoteRow({ note, nowMs }: { note: NormRecord; nowMs: number }) {
+  const t = note.tMs;
   return (
     <div className="dialog__nrow">
       <div className="dialog__nts">
-        {clk(t)} · {relAgoFrom(nowMs, t)}
+        {clkAt(t)} · {t === null ? "" : relAgoFrom(nowMs, t)}
       </div>
       <div className="dialog__ntext">{note.handle ?? ""}</div>
     </div>

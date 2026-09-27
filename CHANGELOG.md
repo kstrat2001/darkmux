@@ -134,6 +134,16 @@ darkmux release.
   `id_ambiguous` and `phase.review.begin` / `aborted` / `dispatch` /
   `failed` / `verdict`. **Migration:** a receiver behind one of these globs
   sees more records; narrow the rule (`dispatch.tool`) if it should not.
+- **The viewer matches the dotted flow vocabulary only, and says when it
+  meets anything else.** Every record enters the viewer through one module
+  (`ui/src/lib/ingest.ts`); the spaced spellings are no longer matched
+  anywhere in it. The event log's activity filter names scheduler and mission
+  records by their dotted action (`step.start`, was `step start`), and a
+  record whose action is neither current nor retired adds `· N unknown` to
+  the event count. A record whose timestamp does not parse is kept on every
+  surface: it closes its run, shows `--:--:--` for its clock, and is left
+  out of any duration or rate arithmetic. **Migration:** re-pick any saved
+  activity filter that named a spaced action.
 
 - **The degeneracy detector's policy values name the action: `off`,
   `record`, `warn`, `conclude`** (#2947). `enforce` is now `conclude` (still

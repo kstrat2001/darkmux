@@ -17,23 +17,23 @@
  * not per-lens.
  */
 
-import { T, isDispatchStart } from "./flow";
 import { relAgoFrom } from "./format";
-import type { FlowRecord, PresenceBeat } from "../types/handwritten";
+import type { PresenceBeat } from "../types/handwritten";
+import { ACTION, timesOf, type NormRecord } from "./ingest";
 
 /** How long ago the newest dispatch STARTED, as of `nowMs` ("" when none
  *  has, or the newest lies after `nowMs`). The idle headline and the ready
  *  parts both read it, so the two can never date "last dispatch" differently.
- *  Either bookend spelling counts (#2927). */
-function lastDispatchAgo(data: FlowRecord[], nowMs: number): string {
-  const starts = data.filter((r) => isDispatchStart(r.action));
-  const last = starts.length ? Math.max(...starts.map((r) => T(r.ts))) : null;
+ */
+function lastDispatchAgo(data: NormRecord[], nowMs: number): string {
+  const starts = timesOf(data.filter((r) => r.action === ACTION.DispatchStart));
+  const last = starts.length ? Math.max(...starts) : null;
   const known = last != null && nowMs - last >= 0;
   return known ? relAgoFrom(nowMs, last as number) : "";
 }
 
 /** `idleStatus()` — viewer.html:1258-1276. */
-function idleHeadline(data: FlowRecord[], liveMachines: Map<string, PresenceBeat>, nowMs: number): string {
+function idleHeadline(data: NormRecord[], liveMachines: Map<string, PresenceBeat>, nowMs: number): string {
   const n = liveMachines.size;
   if (!n) return "○ waiting for a machine";
   const ago = lastDispatchAgo(data, nowMs);
@@ -52,7 +52,7 @@ function idleHeadline(data: FlowRecord[], liveMachines: Map<string, PresenceBeat
  *  dot's colour AND the icon while keeping the text identical, which is
  *  exactly why the goldens never noticed. */
 export interface ReadyParts { kind: "ready"; n: number; ago: string }
-export function readyParts(data: FlowRecord[], liveMachines: Map<string, PresenceBeat>, nowMs: number): ReadyParts | null {
+export function readyParts(data: NormRecord[], liveMachines: Map<string, PresenceBeat>, nowMs: number): ReadyParts | null {
   const n = liveMachines.size;
   if (!n) return null;
   // LAST DISPATCH, measured at its START.
@@ -68,7 +68,7 @@ export function readyParts(data: FlowRecord[], liveMachines: Map<string, Presenc
 }
 
 /** The two `#meta` lines (joined by `<br>` in legacy — two lines here). */
-export function computeMetaLines(data: FlowRecord[], liveMachines: Map<string, PresenceBeat>, nowMs: number): string[] {
+export function computeMetaLines(data: NormRecord[], liveMachines: Map<string, PresenceBeat>, nowMs: number): string[] {
   // (operator) One line. The record count lives in the event pane now, next
   // to the records — stating it here too cost the status bar a second line
   // for something the pane already says. See EventLogColumn's counter chip.

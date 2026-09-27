@@ -12,34 +12,23 @@
  * fixed "model only" boolean because the full modal — and the facet lists
  * it needs — didn't exist yet).
  */
-import type { FlowRecord } from "../types/handwritten";
 import { isPlainObject } from "./guards";
-import { isDispatchStart, isDispatchComplete, isDispatchError } from "./flow";
-import { UTILITY_ERROR_ACTION, UTILITY_START_ACTION } from "./utilityJobs";
+import { ACTION, CATEGORY, tagText, wireOf, type NormAction, type NormRecord } from "./ingest";
 
 /** `activityOf()` — viewer.html:1014-1042, the FULL mapping (every branch,
  * including session end / machine online-offline / note, which the port's
  * previous row-label-only subset omitted because nothing yet needed the
  * facet checkboxes those branches feed). */
-export function activityOf(r: FlowRecord): string {
-  const a = r.action || "";
-  if (a === "dispatch.reasoning") return "reasoning";
-  if (a === "dispatch.tool") return "tool call";
-  if (a === "dispatch.turn") return "turn";
-  if (a === "dispatch.turn.heartbeat") return "heartbeat";
-  // (#1221) The harness deciding mid-turn whether the model keeps thinking.
-  if (a === "dispatch.checkpoint") return "checkpoint";
-  if (isDispatchStart(a)) return "dispatch start";
-  if (isDispatchComplete(a)) return "dispatch end";
-  if (isDispatchError(a)) return "dispatch error";
-  if (a === "dispatch.feedback.injected") return "feedback";
-  if (a === "tier-decision") return "routing";
-  if (a === "dispatch.compaction" || r.source === "compaction") return "compaction";
-  const isNoteEvent = a === "flow.note" || a === "note" || r.source === "orchestrator" || r.source === "adjudication";
+export function activityOf(r: NormRecord): string {
+  const a = r.action;
+  const named = a === undefined ? undefined : ACTIVITY_NAMES.get(a);
+  if (named) return named;
+  if (a === ACTION.DispatchCompaction || r.source === "compaction") return "compaction";
+  const isNoteEvent = a === ACTION.OperatorNote || r.source === "orchestrator" || r.source === "adjudication";
   if (isNoteEvent) return "note";
-  if (a === "machine.online" || a === "machine online") return "machine online";
-  if (a === "machine.offline" || a === "machine offline") return "machine offline";
-  if (a === "session.end") return "session end";
+  if (a === ACTION.MachineOnline) return "machine online";
+  if (a === ACTION.MachineOffline) return "machine offline";
+  if (a === ACTION.SessionEnd) return "session end";
   // (#2413) `machine.telemetry` is the machine-scoped replacement for the
   // retired per-dispatch `telemetry.process` — same friendly facet label
   // as the `category: "telemetry", source: "process"` branch below, so a
@@ -47,11 +36,11 @@ export function activityOf(r: FlowRecord): string {
   // (and across the retired mechanism's continuing partial use — see
   // `FLOW_SCHEMA_VERSION` 1.42.0's changelog) instead of fragmenting into
   // a second, differently-named facet.
-  if (a === "machine.telemetry") return "host telemetry";
+  if (a === ACTION.MachineTelemetry) return "host telemetry";
   // (#2915) A utility job's start/error markers: their own facet, filed with
   // the machine (utility jobs are machine-level), not generic telemetry.
-  if (a === UTILITY_START_ACTION || a === UTILITY_ERROR_ACTION) return "utility";
-  if (r.category === "telemetry") {
+  if (a === ACTION.UtilityStart || a === ACTION.UtilityError) return "utility";
+  if (r.category === CATEGORY.Telemetry) {
     if (r.source === "detector") return "detector";
     if (r.source === "tokens") return "tokens";
     if (r.source === "process") return "host telemetry";
@@ -61,8 +50,24 @@ export function activityOf(r: FlowRecord): string {
     if (r.source === "budget") return "budget";
     return "telemetry";
   }
-  return a || "other";
+  return a === undefined ? "other" : tagText(a) || "other";
 }
+
+/** The actions whose activity label depends on the action alone, checked
+ *  before `activityOf`'s source- and category-dependent branches. */
+const ACTIVITY_NAMES: ReadonlyMap<NormAction, string> = new Map<NormAction, string>([
+  [ACTION.DispatchReasoning, "reasoning"],
+  [ACTION.DispatchTool, "tool call"],
+  [ACTION.DispatchTurn, "turn"],
+  [ACTION.DispatchTurnHeartbeat, "heartbeat"],
+  // (#1221) The harness deciding mid-turn whether the model keeps thinking.
+  [ACTION.DispatchCheckpoint, "checkpoint"],
+  [ACTION.DispatchStart, "dispatch start"],
+  [ACTION.DispatchComplete, "dispatch end"],
+  [ACTION.DispatchError, "dispatch error"],
+  [ACTION.DispatchFeedbackInjected, "feedback"],
+  [ACTION.TierDecision, "routing"],
+]);
 
 /** `ACT_ORDER` — viewer.html:1047. Preferred display order for the activity
  * facet: model-doing activities first, then dispatch lifecycle, then fleet
@@ -109,7 +114,7 @@ export const ACT_ORDER: string[] = [
 // divider between turns, and one per turn is what explains wall time against
 // active time (the thermal governor's pauses). The raw value is kept rather
 // than renamed; the section router already files it under DISPATCH.
-export const DEFAULT_ACTIVITIES = new Set(["reasoning", "checkpoint", "tool call", "turn", "dispatch error", "dispatch.rest"]);
+export const DEFAULT_ACTIVITIES = new Set<string>(["reasoning", "checkpoint", "tool call", "turn", "dispatch error", tagText(ACTION.DispatchRest)]);
 
 /** (operator, 2026-09-23) Activity values that are FIXED-CADENCE SAMPLES —
  * a sampler thread emitting a new record roughly every N seconds for as
@@ -148,37 +153,19 @@ export const DEFAULT_ACTIVITIES = new Set(["reasoning", "checkpoint", "tool call
  * condition) recorded at daemon start and when health changes. It is not
  * activity, and the machine lens already shows its current values
  * (operator, 2026-09-24: the lens's events list was nothing but these). */
-export const PERIODIC_SAMPLE_ACTIVITIES = new Set(["host telemetry", "heartbeat", "tokens", "lms", "telemetry", "machine.battery_health"]);
-
-/** (silent-miss audit, 2026-09-06) Suffixes that mark an activity value as
- * failure- or abandonment-shaped, checked in ADDITION to `DEFAULT_ACTIVITIES`
- * membership by `isDefaultOn` below. `activityOf`'s literal `return a ||
- * "other"` fallback means any scheduler action with no dedicated branch —
- * `"step error"`, `"phase abandon"` (`darkmux-crew`'s `scheduler.rs`/
- * `lifecycle.rs`) — surfaces here as a value `DEFAULT_ACTIVITIES` was never
- * curated to anticipate, and defaulted OFF: the exact "operator never sees
- * it" failure `DEFAULT_ACTIVITIES`'s own `dispatch error` entry exists to
- * prevent, just reached through a kind this allowlist didn't name instead
- * of a value it forgot. A suffix check closes that off structurally — ANY
- * future action reading as an error or an abandonment (whatever new kind
- * introduces it) defaults on without needing its own allowlist entry. A
- * non-failure activity like `"step start"` matches no suffix and stays off,
- * same as today. */
-const DEFAULT_ON_ACTIVITY_SUFFIXES = ["error", "abandon", "abandoned", "failed"];
-
-function looksLikeFailureActivity(value: string): boolean {
-  return DEFAULT_ON_ACTIVITY_SUFFIXES.some((suffix) => value.endsWith(suffix));
-}
+export const PERIODIC_SAMPLE_ACTIVITIES = new Set<string>(["host telemetry", "heartbeat", "tokens", "lms", "telemetry", tagText(ACTION.MachineBatteryHealth)]);
 
 /** Whether facet value `v` under key `k` is ON absent any operator
  * override. `cat`/`tier`/`src` default fully on; `act` defaults to
- * `DEFAULT_ACTIVITIES` PLUS anything failure/abandonment-shaped (see
- * `looksLikeFailureActivity`). This one function is the single place that
- * distinction lives — `defaultFilterState`, `absorbNewFacetValues` and
- * `applyStoredPicks` all defer to it rather than re-deriving it. */
+ * `DEFAULT_ACTIVITIES` PLUS every failure or abandonment the typed table
+ * names (`activityFacet(v).failure`), so a `step.error` or `phase.abandon`
+ * is never hidden by default (silent-miss audit, 2026-09-06). This one
+ * function is the single place that distinction lives —
+ * `defaultFilterState`, `absorbNewFacetValues` and `applyStoredPicks` all
+ * defer to it rather than re-deriving it. */
 function isDefaultOn(key: keyof Facets, value: string): boolean {
   if (key !== "act") return true;
-  return DEFAULT_ACTIVITIES.has(value) || looksLikeFailureActivity(value);
+  return DEFAULT_ACTIVITIES.has(value) || activityFacet(value).failure;
 }
 
 /** (#2512) Construction-level backstop for the `act` facet only — the one
@@ -231,13 +218,13 @@ function isDefaultOn(key: keyof Facets, value: string): boolean {
  * own failure mode: a quiet fleet's 24h window (report: "50 OF 2883 EVENTS
  * · 103 HIDDEN") is almost entirely `machine.telemetry` from two idle
  * machines sampling every ~2s — none of it `DEFAULT_ACTIVITIES`, none of it
- * failure-shaped, so tier (a) below folds to empty and the OLD tier (b)
+ * a named failure, so tier (a) below folds to empty and the OLD tier (b)
  * turned every one of those ~2,780 samples on, flooding the list with the
  * exact noise `DEFAULT_ACTIVITIES` exists to hide, just reached through the
  * empty-corpus door instead of around it.
  *
  *   (a) the curated per-value fold above (`DEFAULT_ACTIVITIES` plus
- *       failure-shaped values plus the operator's own picks) — unchanged,
+ *       the named failures plus the operator's own picks) — unchanged,
  *       and skipped entirely (this fallback never runs) the moment it
  *       produces anything.
  *   (b) if (a) is empty and the operator has no opinion on anything this
@@ -323,52 +310,130 @@ export interface Facets {
  * then everything else. */
 export type ActivitySectionTitle = "MODEL" | "DISPATCH" | "MISSION" | "MACHINE" | "OTHER";
 
-const MODEL_SECTION_VALUES = new Set(["reasoning", "tool call", "checkpoint", "turn"]);
-const DISPATCH_SECTION_VALUES = new Set([
-  "dispatch start",
-  "dispatch end",
-  "dispatch error",
-  "heartbeat",
-  "detector",
-  "runtime",
-  "tokens",
-  "lms",
-  "compaction",
-  "feedback",
-  "routing",
-  "session end", "telemetry"]);
-const MISSION_SECTION_VALUES = new Set(["note"]);
-const MACHINE_SECTION_VALUES = new Set(["machine online", "machine offline", "host telemetry", "utility"]);
+/** Where an activity value is filed, and whether it is a failure that must
+ * default on. */
+interface ActivityFacet {
+  section: ActivitySectionTitle;
+  failure: boolean;
+}
 
-/** Which section a single activity value (a mapped `ACT_ORDER` label, or a
- * raw value `activityOf`'s fallback passed through unmapped) belongs under.
- * Mapped values are matched by exact membership first; a raw/absorbed value
- * that matches none of the curated sets falls through to the PREFIX rules
- * the operator specified (`dispatch.` for DISPATCH; `mission`/`phase`/
- * `step`/`hook.` for MISSION; `machine` for MACHINE), and anything left
- * over — including the literal `"other"` — lands in OTHER. Order matters:
- * a value is checked against each section's curated set/prefix in the same
- * MODEL → DISPATCH → MISSION → MACHINE → OTHER order the sections render
- * in, so no value can match two sections. */
-/* "telemetry" (the generic label, in practice `telemetry.context` — a
- * dispatch's own context-window usage per compaction) is DISPATCH, not
- * MACHINE: it is per-dispatch bookkeeping, unlike "host telemetry"
- * (`machine.telemetry`, the machine-scoped sampler). Review finding on
- * the sectioned panel, 2026-09-06. */
+/** Every action by name, with the section its RAW label (`activityOf`'s
+ * fallback: the action's own text) files under and whether it is a
+ * failure. Keyed by `ACTION`'s names, so an action added to the vocabulary
+ * without a row here is a type error. Actions with a mapped label
+ * (`ACTIVITY_NAMES`, "note", "session end", ...) are filed by that label
+ * below instead; their row here only decides their raw text, which a
+ * record reaches when its own label branch does not apply. */
+const ACTION_FACET: { readonly [K in keyof typeof ACTION]: ActivityFacet } = {
+  AuditWriteFailed: { section: "OTHER", failure: true },
+  BatteryPauseUnsupported: { section: "OTHER", failure: false },
+  BudgetWarn: { section: "OTHER", failure: false },
+  BudgetWait: { section: "OTHER", failure: false },
+  BudgetResume: { section: "OTHER", failure: false },
+  BudgetStop: { section: "OTHER", failure: false },
+  DispatchStart: { section: "DISPATCH", failure: false },
+  DispatchComplete: { section: "DISPATCH", failure: false },
+  DispatchError: { section: "DISPATCH", failure: true },
+  DispatchTurn: { section: "DISPATCH", failure: false },
+  DispatchTurnHeartbeat: { section: "DISPATCH", failure: false },
+  DispatchTool: { section: "DISPATCH", failure: false },
+  DispatchCompaction: { section: "DISPATCH", failure: false },
+  DispatchCheckpoint: { section: "DISPATCH", failure: false },
+  DispatchReasoning: { section: "DISPATCH", failure: false },
+  DispatchFeedbackInjected: { section: "DISPATCH", failure: false },
+  DispatchRest: { section: "DISPATCH", failure: false },
+  DispatchDegeneracyWarning: { section: "DISPATCH", failure: false },
+  DispatchWorkdirGitUnavailable: { section: "DISPATCH", failure: false },
+  DispatchRoute: { section: "DISPATCH", failure: false },
+  GhVerbExecuted: { section: "OTHER", failure: false },
+  HookFired: { section: "MISSION", failure: false },
+  HookFailed: { section: "MISSION", failure: true },
+  HookDryRun: { section: "MISSION", failure: false },
+  MachineOnline: { section: "MACHINE", failure: false },
+  MachineOffline: { section: "MACHINE", failure: false },
+  MachineTelemetry: { section: "MACHINE", failure: false },
+  MachineThermal: { section: "MACHINE", failure: false },
+  MachineBattery: { section: "MACHINE", failure: false },
+  MachineBatteryHealth: { section: "MACHINE", failure: false },
+  MachineRollup: { section: "MACHINE", failure: false },
+  MissionStart: { section: "MISSION", failure: false },
+  MissionClose: { section: "MISSION", failure: false },
+  MissionAbort: { section: "MISSION", failure: false },
+  MissionPause: { section: "MISSION", failure: false },
+  MissionResume: { section: "MISSION", failure: false },
+  MissionGrow: { section: "MISSION", failure: false },
+  MissionDebriefPrompt: { section: "MISSION", failure: false },
+  MissionRunFinalize: { section: "MISSION", failure: false },
+  MissionRunAbort: { section: "MISSION", failure: false },
+  OperatorNote: { section: "OTHER", failure: false },
+  OperatorCatch: { section: "OTHER", failure: false },
+  PhaseStart: { section: "MISSION", failure: false },
+  PhaseComplete: { section: "MISSION", failure: false },
+  PhaseAbandon: { section: "MISSION", failure: true },
+  PhaseAdded: { section: "MISSION", failure: false },
+  PhaseIdAmbiguous: { section: "MISSION", failure: false },
+  PhaseReviewBegin: { section: "MISSION", failure: false },
+  PhaseReviewAborted: { section: "MISSION", failure: false },
+  PhaseReviewDispatch: { section: "MISSION", failure: false },
+  PhaseReviewFailed: { section: "MISSION", failure: true },
+  PhaseReviewVerdict: { section: "MISSION", failure: false },
+  RadioRoute: { section: "OTHER", failure: false },
+  SessionEnd: { section: "OTHER", failure: false },
+  StepStart: { section: "MISSION", failure: false },
+  StepComplete: { section: "MISSION", failure: false },
+  StepError: { section: "MISSION", failure: true },
+  StepResult: { section: "MISSION", failure: false },
+  StepTiming: { section: "MISSION", failure: false },
+  StepSeatUnresolved: { section: "MISSION", failure: false },
+  StreamError: { section: "OTHER", failure: true },
+  TelemetryTokens: { section: "OTHER", failure: false },
+  TelemetryDetector: { section: "OTHER", failure: false },
+  TelemetryContext: { section: "OTHER", failure: false },
+  TelemetryCompaction: { section: "OTHER", failure: false },
+  TelemetryRuntime: { section: "OTHER", failure: false },
+  TelemetryLms: { section: "OTHER", failure: false },
+  TierDecision: { section: "OTHER", failure: false },
+  ThermalStopUnresolved: { section: "OTHER", failure: false },
+  ThermalTier5Eject: { section: "OTHER", failure: false },
+  ThermalTier5EjectFailed: { section: "OTHER", failure: true },
+  UtilityStart: { section: "OTHER", failure: false },
+  UtilityError: { section: "OTHER", failure: true },
+  UtilityEnd: { section: "OTHER", failure: false },
+};
+
+const facet = (section: ActivitySectionTitle, failure = false): ActivityFacet => ({ section, failure });
+
+/** Every activity value this build files: the mapped labels, then each
+ * action's own text. "telemetry" (the generic label, in practice
+ * `telemetry.context` — a dispatch's own context-window usage per
+ * compaction) is DISPATCH, not MACHINE: it is per-dispatch bookkeeping,
+ * unlike "host telemetry" (`machine.telemetry`, the machine-scoped sampler).
+ * Review finding on the sectioned panel, 2026-09-06. */
+const ACTIVITY_FACETS: ReadonlyMap<string, ActivityFacet> = new Map<string, ActivityFacet>([
+  ...(Object.keys(ACTION_FACET) as (keyof typeof ACTION)[]).map((k): [string, ActivityFacet] => [tagText(ACTION[k]), ACTION_FACET[k]]),
+  ...["reasoning", "tool call", "checkpoint", "turn"].map((v): [string, ActivityFacet] => [v, facet("MODEL")]),
+  ...["dispatch start", "dispatch end", "heartbeat", "detector", "runtime", "tokens", "lms", "compaction", "feedback", "routing", "session end", "telemetry"].map(
+    (v): [string, ActivityFacet] => [v, facet("DISPATCH")],
+  ),
+  ["dispatch error", facet("DISPATCH", true)],
+  ["note", facet("MISSION")],
+  ...["machine online", "machine offline", "host telemetry", "utility"].map((v): [string, ActivityFacet] => [v, facet("MACHINE")]),
+]);
+
+/** An activity value no table names (an action this build does not know,
+ * a stale stored pick): filed under OTHER, and not a failure. A spelling
+ * guess ("ends in error") is exactly what this replaces; an unknown action
+ * is surfaced by the vocabulary-skew count instead (`unknownActionCount`). */
+const UNNAMED_ACTIVITY: ActivityFacet = facet("OTHER");
+
+function activityFacet(value: string): ActivityFacet {
+  return ACTIVITY_FACETS.get(value) ?? UNNAMED_ACTIVITY;
+}
+
+/** Which section a single activity value (a mapped `ACT_ORDER` label, or an
+ * action's own text) belongs under, from the typed tables above. */
 export function activitySectionOf(value: string): ActivitySectionTitle {
-  if (MODEL_SECTION_VALUES.has(value)) return "MODEL";
-  if (DISPATCH_SECTION_VALUES.has(value) || value.startsWith("dispatch.")) return "DISPATCH";
-  if (
-    MISSION_SECTION_VALUES.has(value) ||
-    value.startsWith("mission") ||
-    value.startsWith("phase") ||
-    value.startsWith("step") ||
-    value.startsWith("hook.")
-  ) {
-    return "MISSION";
-  }
-  if (MACHINE_SECTION_VALUES.has(value) || value.startsWith("machine")) return "MACHINE";
-  return "OTHER";
+  return activityFacet(value).section;
 }
 
 export interface ActivitySectionGroup {
@@ -437,9 +502,9 @@ export function sortUnmappedActivities(values: string[]): string[] {
   });
 }
 
-export function computeFacets(records: FlowRecord[]): Facets {
-  const cat = [...new Set(records.map((r) => r.category).filter((v): v is string => v != null))];
-  const tier = [...new Set(records.map((r) => r.tier).filter((v): v is string => v != null))];
+export function computeFacets(records: NormRecord[]): Facets {
+  const cat = [...new Set(records.flatMap((r) => (r.category == null ? [] : [tagText(r.category)])))];
+  const tier = [...new Set(records.flatMap((r) => (r.tier == null ? [] : [tagText(r.tier)])))];
   const src = [...new Set(records.map((r) => r.source).filter((v): v is string => v != null))];
   const acts = new Set(records.map(activityOf));
   const act = ACT_ORDER.filter((a) => acts.has(a)).concat(
@@ -672,14 +737,14 @@ export function absorbNewFacetValues(
  * A record whose cat/tier/src is simply ABSENT (no checkbox represents it)
  * is never excluded on that facet — only a PRESENT value that got
  * unchecked filters the record out. */
-export function matchesFilters(r: FlowRecord, filters: FilterState): boolean {
+export function matchesFilters(r: NormRecord, filters: FilterState): boolean {
   if (!filters.act.has(activityOf(r))) return false;
-  if (r.category != null && !filters.cat.has(r.category)) return false;
-  if (r.tier != null && !filters.tier.has(r.tier)) return false;
+  if (r.category != null && !filters.cat.has(tagText(r.category))) return false;
+  if (r.tier != null && !filters.tier.has(tagText(r.tier))) return false;
   if (r.source != null && !filters.src.has(r.source)) return false;
   if (filters.q) {
     const q = filters.q.trim().toLowerCase();
-    if (q && !JSON.stringify(r).toLowerCase().includes(q)) return false;
+    if (q && !JSON.stringify(wireOf(r)).toLowerCase().includes(q)) return false;
   }
   return true;
 }

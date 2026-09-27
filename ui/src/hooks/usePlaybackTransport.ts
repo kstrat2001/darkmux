@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { T, computeTMax, computeTMin, isDispatchStart, isDispatchTerminal } from "../lib/flow";
-import type { FlowRecord } from "../types/handwritten";
+import { computeTMax, computeTMin } from "../lib/flow";
+import { ACTION, isDispatchTerminal, recordsAsOf, timesOf, type NormRecord } from "../lib/ingest";
 
 /** (#2346) What the transport's `tMin`/`tMax` scope to. `day` (the
  * default) is the pre-existing behavior — the whole loaded day. A
@@ -22,8 +22,8 @@ import type { FlowRecord } from "../types/handwritten";
  * per-session/per-mission fetch has no such cap. */
 export type PlaybackFocus =
   | { kind: "day" }
-  | { kind: "dispatch"; sessionId: string; records: FlowRecord[] }
-  | { kind: "mission"; missionId: string; records: FlowRecord[] };
+  | { kind: "dispatch"; sessionId: string; records: NormRecord[] }
+  | { kind: "mission"; missionId: string; records: NormRecord[] };
 
 const DAY_FOCUS: PlaybackFocus = { kind: "day" };
 
@@ -54,9 +54,7 @@ function focusRecordsSignature(focus: PlaybackFocus): string {
 }
 
 /** The focus's own span. `dispatch` prefers the session's `dispatch.start`/
- * terminal (`dispatch.complete`/`dispatch.error`) records — the same
- * bookend matchers `lib/flow.ts` already exports for this exact
- * "which spelling did this producer use" question (#1852) — and falls
+ * terminal (`dispatch.complete`/`dispatch.error`) records, and falls
  * back to the session's earliest/latest record when a bookend is missing
  * (a session mid-flight has no terminal yet; an oddly-shaped record set
  * has no bookend at all). `mission` mirrors it with the mission lifecycle
@@ -71,7 +69,7 @@ function focusRecordsSignature(focus: PlaybackFocus): string {
  * function starts returning the narrow range instead (the preserve-or-snap
  * effect in the hook below is what makes the PLAYHEAD follow that change,
  * not just the range). */
-function focusRange(dayRecords: FlowRecord[], focus: PlaybackFocus): { tMin: number; tMax: number } {
+function focusRange(dayRecords: NormRecord[], focus: PlaybackFocus): { tMin: number; tMax: number } {
   if (focus.kind === "day") return { tMin: computeTMin(dayRecords), tMax: computeTMax(dayRecords) };
 
   const scoped =
@@ -80,13 +78,13 @@ function focusRange(dayRecords: FlowRecord[], focus: PlaybackFocus): { tMin: num
       : focus.records.filter((r) => r.mission_id === focus.missionId);
   if (!scoped.length) return { tMin: computeTMin(dayRecords), tMax: computeTMax(dayRecords) };
 
-  const startMatch = (r: FlowRecord): boolean =>
-    focus.kind === "dispatch" ? isDispatchStart(r.action) : r.action === "mission start";
-  const endMatch = (r: FlowRecord): boolean =>
-    focus.kind === "dispatch" ? isDispatchTerminal(r.action) : r.action === "mission close" || r.action === "mission abort";
+  const startMatch = (r: NormRecord): boolean =>
+    focus.kind === "dispatch" ? r.action === ACTION.DispatchStart : r.action === ACTION.MissionStart;
+  const endMatch = (r: NormRecord): boolean =>
+    focus.kind === "dispatch" ? isDispatchTerminal(r.action) : r.action === ACTION.MissionClose || r.action === ACTION.MissionAbort;
 
-  const starts = scoped.filter(startMatch).map((r) => T(r.ts)).filter((n) => !Number.isNaN(n));
-  const ends = scoped.filter(endMatch).map((r) => T(r.ts)).filter((n) => !Number.isNaN(n));
+  const starts = timesOf(scoped.filter(startMatch));
+  const ends = timesOf(scoped.filter(endMatch));
   return {
     tMin: starts.length ? Math.min(...starts) : computeTMin(scoped),
     tMax: ends.length ? Math.max(...ends) : computeTMax(scoped),
@@ -168,7 +166,7 @@ export interface PlaybackTransport {
   seekGen: number;
 }
 
-export function usePlaybackTransport(dayRecords: FlowRecord[] | null, focus: PlaybackFocus = DAY_FOCUS): PlaybackTransport {
+export function usePlaybackTransport(dayRecords: NormRecord[] | null, focus: PlaybackFocus = DAY_FOCUS): PlaybackTransport {
   const records = dayRecords && dayRecords.length ? dayRecords : null;
   const focusKey = focusKeyOf(focus);
   const focusRecordsSig = focusRecordsSignature(focus);
@@ -368,7 +366,7 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null, focus: Pla
   }, [playing, playheadT, tMin, tMax, speed, bumpSeek]);
   const cycleSpeed = useCallback(() => setSpeed((s) => SPEEDS[(SPEEDS.indexOf(s) + 1) % SPEEDS.length]), []);
 
-  const visibleCount = useMemo(() => (records ? records.filter((r) => !(T(r.ts) > playheadT)).length : 0), [records, playheadT]);
+  const visibleCount = useMemo(() => (records ? recordsAsOf(records, playheadT).length : 0), [records, playheadT]);
 
   return {
     active: records !== null,

@@ -66,16 +66,13 @@ import { useIsMobile } from "../hooks/useIsMobile";
 import type { Route } from "../lib/route";
 import type { ReactNode } from "react";
 import type { LiveTailStatus } from "../hooks/useLiveTail";
-import type {
-  FlowRecord,
-  MachineSpecs,
-  PresenceBeat,
-} from "../types/handwritten";
+import type { MachineSpecs, PresenceBeat } from "../types/handwritten";
+import type { NormRecord } from "../lib/ingest";
 
 export interface MachineDrawerProps {
   route: Route;
-  routeRecords: FlowRecord[];
-  flowWindow: FlowRecord[];
+  routeRecords: NormRecord[];
+  flowWindow: NormRecord[];
   localUid: string | null;
   /** For the header line's identity/hardware — the SAME two inputs
    * `nameOf`/`specOf` (`lib/flow.ts`, `lenses/fleet/cards.ts` — "hardware
@@ -98,7 +95,7 @@ export interface MachineDrawerProps {
    * desktop (the pill/dialog carries no events pane) — see `App.tsx`'s own
    * doc for why the inline `EventLogColumn` mount and this one are
    * mutually exclusive by viewport, never both mounted at once. */
-  eventLogRecords: FlowRecord[];
+  eventLogRecords: NormRecord[];
   eventLogScopeLabel: string;
   eventLogVisible: boolean;
   eventLogLoading: boolean;

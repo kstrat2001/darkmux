@@ -127,7 +127,7 @@ async function liveRecordCount(page) {
  * WHY that stuck state is reachable at all — reproduced DETERMINISTICALLY by
  * deleting the seed below: none of this corpus's 14 activity values is in
  * `DEFAULT_ACTIVITIES` (`ui/src/lib/eventFilters.ts`); they are all
- * lifecycle/telemetry (`dispatch start`, `step complete`, `host telemetry`,
+ * lifecycle/telemetry (`dispatch start`, `step.complete`, `host telemetry`,
  * ...). With no stored picks the curated default turns on NOTHING and the chip
  * reads exactly `0 events · 952 hidden`, forever. The only thing between this
  * suite and that state is the `beforeEach` below seeding a show-everything
@@ -147,7 +147,7 @@ async function liveRecordCount(page) {
  * NOT this suite. The `beforeEach` seed below stays: removing it does not
  * reproduce #2512 any more (confirmed by hand, five runs, all landing on a
  * real 952 baseline instead of a stuck 0), but it DOES break this suite for
- * an unrelated, correct reason — the SSE-delivered `flow.note` record this
+ * an unrelated, correct reason — the SSE-delivered `operator.note` record this
  * suite injects is a value `absorbNewFacetValues` has never seen before,
  * and #2416's own (deliberate, separately tested) policy is that a brand
  * new activity value absorbs OFF, not on. That is #2416's contract working
@@ -194,7 +194,7 @@ async function installHangingStream(page, matchesStreamPath) {
 }
 
 // (#2416) The event filter now defaults to model activity only, and the
-// `flow.note` record this suite delivers over SSE is an activity the default
+// `operator.note` record this suite delivers over SSE is an activity the default
 // hides, so the count never rose. These goldens freeze RENDER parity of the events list, not the
 // filter default, so the spec seeds the operator's "everything on" picks
 // exactly as the e2e mission-lens specs do (one global stored payload,
@@ -222,14 +222,14 @@ const SHOW_ALL_ACTIVITIES = [
   'host telemetry',
   'telemetry',
   'other',
-  'step start',
-  'phase start',
-  'mission start',
-  'step complete',
-  'phase complete',
-  'mission close',
-  'step result',
-  'step timing',
+  'step.start',
+  'phase.start',
+  'mission.start',
+  'step.complete',
+  'phase.complete',
+  'mission.close',
+  'step.result',
+  'step.timing',
 ];
 test.beforeEach(async ({ page }) => {
   await page.addInitScript((acts: string[]) => {
@@ -253,7 +253,7 @@ test.describe("next-parity: live/SSE lens (Packet 5)", () => {
     const streamPath = `/flow/${meta.captured_date}/stream`;
     const record = {
       ts: new Date(meta.frozen_clock_ms).toISOString(),
-      action: "flow.note",
+      action: "operator.note",
       source: "next-parity-live",
       handle: "packet-5-sse-proof",
     };

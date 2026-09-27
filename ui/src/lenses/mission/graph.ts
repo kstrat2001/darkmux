@@ -23,10 +23,9 @@
  * a codebase that already prefers pure, foldable state (`darkmux-crew`'s own
  * step reducers work the same way).
  */
-import type { FlowRecord } from "../../types/handwritten";
 import { compactThousands, fmtElapsed, type CompactStyle } from "../../lib/format";
-import { PURPOSE, stepTokensWithLegacyFallback, usageContribution } from "../../lib/usageRecords";
-import { isDispatchStart, isDispatchComplete, isDispatchTerminal } from "../../lib/flow";
+import { PURPOSE, isUsageRecord, stepTokensWithLegacyFallback, usageContribution } from "../../lib/usageRecords";
+import { ACTION, CATEGORY, byTimeNewestFirst, isAfter, isDispatchFamily, isDispatchTerminal, type NormAction, type NormRecord } from "../../lib/ingest";
 
 // ─── wire types (crates/darkmux-serve/src/mission_graph.rs) ────────────────
 
@@ -405,13 +404,14 @@ const EMPTY_METRICS: StepMetrics = {
 
 export type MetricsMap = Record<string, StepMetrics>;
 
-/** `tsToMs` — mission-graph.html. Parses a flow-record `ts` (ISO string) or
- * an epoch NUMBER (seconds OR ms — a value below 1e12 is a seconds epoch)
- * to epoch ms; 0 when unparseable. */
-export function tsToMs(ts: string | number | null | undefined): number {
-  if (ts == null) return 0;
-  if (typeof ts === "number") return ts < 1e12 ? ts * 1000 : ts;
-  const t = Date.parse(ts);
+/** `tsToMs` — mission-graph.html. Parses a graph step's own timestamp
+ * (`startedTs`/`completedTs`: an ISO string, or an epoch NUMBER in seconds
+ * OR ms — a value below 1e12 is a seconds epoch) to epoch ms; 0 when
+ * unparseable. A flow record's time is its `tMs`, parsed at ingest. */
+export function tsToMs(stamp: string | number | null | undefined): number {
+  if (stamp == null) return 0;
+  if (typeof stamp === "number") return stamp < 1e12 ? stamp * 1000 : stamp;
+  const t = Date.parse(stamp);
   return isNaN(t) ? 0 : t;
 }
 
@@ -429,7 +429,7 @@ export function tsToMs(ts: string | number | null | undefined): number {
  * key is the only one that can attribute it. Mirrors
  * `crates/darkmux-serve/src/mission_graph.rs`'s `step_for_record` exactly —
  * the two must stay in lock-step. */
-export function stepForRecord(rec: FlowRecord, idx: GraphIndex, missionId: string): string | null {
+export function stepForRecord(rec: NormRecord, idx: GraphIndex, missionId: string): string | null {
   if (rec.mission_id && rec.mission_id !== missionId) return null;
   const p = rec.payload || {};
   const stepId = typeof p.step_id === "string" ? p.step_id : undefined;
@@ -456,16 +456,6 @@ export function unscopeSession(sessionId: string, missionId: string): string {
   return sessionId.slice(0, sessionId.length - suffix.length);
 }
 
-/** (#2223) Does this flow-record action attest MODEL-DISPATCH work?
- * Covers both the dotted (`dispatch.start`) and legacy space-separated
- * (`dispatch start`) spellings the stream carries. Mission/phase/step
- * bookkeeping (`mission start`, `step result`, ...) and telemetry all say
- * no -- which is the point: it separates "a dispatch actually ran under
- * this session" from "this session merely appears in the record stream". */
-export function isDispatchAction(action: string): boolean {
-  return action === "dispatch" || action.startsWith("dispatch.") || action.startsWith("dispatch ");
-}
-
 /** `stepDispatchSessions` (#2223) -- the INVERSE of {@link stepForRecord}:
  * for each step, the dispatch session id observed on that step's own
  * records, which is what lets the step drill-in reach the dispatch detail
@@ -473,7 +463,7 @@ export function isDispatchAction(action: string): boolean {
  *
  * The discriminator is EVIDENCE OF DISPATCH, not the shape of the session
  * id: a session counts only through records whose action is a
- * `dispatch.*` bookend/turn ({@link isDispatchAction}). This matters
+ * `dispatch.*` bookend/turn (`isDispatchFamily`). This matters
  * because the emitter's DEFAULT session id for a `dispatch.internal` step
  * with no configured session is literally `step-<id>`
  * (`session_id::step`, see `crates/darkmux-serve/src/runs.rs`'s
@@ -502,11 +492,14 @@ export function isDispatchAction(action: string): boolean {
  *    selects the failure; recency selects the attempt that represents the
  *    step's current state. Count breaks ts ties.
  */
-export function stepDispatchSessions(records: FlowRecord[], missionId: string): Record<string, string> {
+export function stepDispatchSessions(records: NormRecord[], missionId: string): Record<string, string> {
   type Tally = { n: number; lastTs: number; ours: boolean };
   const tally: Record<string, Record<string, Tally>> = {};
   for (const rec of records) {
-    if (!isDispatchAction(rec.action || "")) continue;
+    // (#2223) Evidence that a dispatch actually ran under this session, as
+    // opposed to the session merely appearing in the record stream:
+    // mission/phase/step bookkeeping and telemetry do not count.
+    if (!isDispatchFamily(rec.action)) continue;
     const p = rec.payload || {};
     const stepId = typeof p.step_id === "string" ? p.step_id : "";
     const sid = typeof rec.session_id === "string" ? rec.session_id : "";
@@ -515,7 +508,7 @@ export function stepDispatchSessions(records: FlowRecord[], missionId: string): 
     const forStep = (tally[stepId] ||= {});
     const t = (forStep[sid] ||= { n: 0, lastTs: 0, ours: false });
     t.n += 1;
-    t.lastTs = Math.max(t.lastTs, tsToMs(rec.ts));
+    t.lastTs = Math.max(t.lastTs, rec.tMs ?? 0);
     if (rec.mission_id === missionId) t.ours = true;
   }
   const out: Record<string, string> = {};
@@ -560,33 +553,32 @@ export function stepDispatchSessions(records: FlowRecord[], missionId: string): 
 /** `applyRecordToMetrics` — mission-graph.html. Folds one record into the
  * per-step metric accumulator, returning a NEW map only when something
  * changed (so a no-op record doesn't churn state). */
-export function applyRecordToMetrics(metrics: MetricsMap, rec: FlowRecord, idx: GraphIndex, missionId: string): MetricsMap {
+export function applyRecordToMetrics(metrics: MetricsMap, rec: NormRecord, idx: GraphIndex, missionId: string): MetricsMap {
   const sid = stepForRecord(rec, idx, missionId);
   if (!sid) return metrics;
   const p = rec.payload || {};
   const cur = metrics[sid] || EMPTY_METRICS;
-  const recMs = tsToMs(rec.ts);
+  const recMs = rec.tMs ?? 0;
   const next: StepMetrics = { ...cur, lastTs: Math.max(cur.lastTs, recMs) };
 
-  const action = rec.action || "";
+  const action = rec.action;
   // (#2902 step 2a) The step's running figure is the plain sum of its usage
   // records through the one sum's per-record half, darkmux's utility jobs
   // excluded: a step's meter is its own execution's numbers, never a
   // sub-execution's (contract 8). `null` for a non-usage record.
   const usage = usageContribution(rec, { exclude: PURPOSE.utility });
-  const isUsage = (rec.category === "telemetry" && rec.source === "tokens") || action === "telemetry.tokens";
-  const isTurn = action === "dispatch.turn";
-  const isTool = action === "dispatch.tool";
-  const isComplete = isDispatchComplete(action);
-  const isStepResult = action === "step result";
-  const isStart = isDispatchStart(action) || action === "step start";
-  const isTerminal =
-    action === "step complete" ||
-    action === "step error" ||
-    isDispatchTerminal(action);
+  const isUsage = isUsageRecord(rec);
+  const isTurn = action === ACTION.DispatchTurn;
+  const isTool = action === ACTION.DispatchTool;
+  const isComplete = action === ACTION.DispatchComplete;
+  const isStepResult = action === ACTION.StepResult;
+  const isStart = action === ACTION.DispatchStart || action === ACTION.StepStart;
+  const isTerminal = action === ACTION.StepComplete || action === ACTION.StepError || isDispatchTerminal(action);
 
   if (isStart && recMs) next.startTs = next.startTs ? Math.min(next.startTs, recMs) : recMs;
-  if (isTerminal && recMs) next.endTs = Math.max(next.endTs, recMs);
+  // A terminal with no usable time still ends the step, at the latest time
+  // the step is known to have been alive (the bad-timestamp policy).
+  if (isTerminal) next.endTs = Math.max(next.endTs, recMs || next.lastTs || next.startTs);
 
   const finalTok = (typeof p.total_tokens === "number" ? p.total_tokens : 0) || (typeof p.tokens === "number" ? p.tokens : 0);
   const started = next.startTs > 0;
@@ -698,23 +690,22 @@ export function missionTotals(metrics: MetricsMap): MissionTotals {
 // ─── status transitions from flow records (mission-graph.html: STATUS_ACTIONS,
 // statusFromRecord, App's onMessage node/step status-flip branch) ──────────
 
-const STATUS_ACTIONS: Record<string, string> = {
-  "step start": "running",
-  "step complete": "complete",
-  "step error": "error",
-  "phase start": "running",
-  "phase complete": "complete",
-  "phase abandon": "abandoned",
-  "mission start": "active",
-  "mission close": "finalized",
-  "mission pause": "paused",
-  "mission resume": "active",
-  "mission abort": "aborted",
-};
+const STATUS_ACTIONS: ReadonlyMap<NormAction, string> = new Map<NormAction, string>([
+  [ACTION.StepStart, "running"],
+  [ACTION.StepComplete, "complete"],
+  [ACTION.StepError, "error"],
+  [ACTION.PhaseStart, "running"],
+  [ACTION.PhaseComplete, "complete"],
+  [ACTION.PhaseAbandon, "abandoned"],
+  [ACTION.MissionStart, "active"],
+  [ACTION.MissionClose, "finalized"],
+  [ACTION.MissionPause, "paused"],
+  [ACTION.MissionResume, "active"],
+  [ACTION.MissionAbort, "aborted"],
+]);
 
-export function statusFromRecord(rec: FlowRecord): string | undefined {
-  const action = rec.action || "";
-  return normalizeMissionStatus(STATUS_ACTIONS[action]);
+export function statusFromRecord(rec: NormRecord): string | undefined {
+  return normalizeMissionStatus(rec.action === undefined ? undefined : STATUS_ACTIONS.get(rec.action));
 }
 
 /** `applyFlowRecord` — the pure counterpart to mission-graph.html's App
@@ -726,7 +717,7 @@ export function statusFromRecord(rec: FlowRecord): string | undefined {
  * those are separate folds ({@link applyRecordToMetrics}, {@link recordInMission})
  * over the same record stream, matching the legacy page's own three
  * independent effects of one incoming record. */
-export function applyFlowRecord(graph: MissionGraph, rec: FlowRecord, idx: GraphIndex, missionId: string): MissionGraph {
+export function applyFlowRecord(graph: MissionGraph, rec: NormRecord, idx: GraphIndex, missionId: string): MissionGraph {
   const newStatus = statusFromRecord(rec);
   const handle = rec.handle;
   if (!newStatus || !handle) return graph;
@@ -800,14 +791,17 @@ export function applyFlowRecord(graph: MissionGraph, rec: FlowRecord, idx: Graph
  *
  * `<=`, not `<`: a record stamped in the exact same instant the snapshot
  * was built carries no information the snapshot doesn't already have.
+ * A record with no usable time is folded (`isAfter`): nothing proves the
+ * snapshot already holds it, and an untimed terminal must still end its
+ * step, as it ends its run everywhere else.
  * `generated_at_ms` missing (older fixtures, hand-built graphs with no
  * opinion on freshness) folds every record, unfiltered — today's
  * pre-#2518 behavior, preserved as the lenient-on-read default. */
-export function foldFlowRecords(baseGraph: MissionGraph, records: FlowRecord[], idx: GraphIndex, missionId: string): MissionGraph {
+export function foldFlowRecords(baseGraph: MissionGraph, records: NormRecord[], idx: GraphIndex, missionId: string): MissionGraph {
   const snapshotMs = baseGraph.generated_at_ms;
   let g = baseGraph;
   for (const rec of records) {
-    if (snapshotMs !== undefined && tsToMs(rec.ts) <= snapshotMs) continue;
+    if (snapshotMs !== undefined && !isAfter(rec, snapshotMs)) continue;
     g = applyFlowRecord(g, rec, idx, missionId);
   }
   return g;
@@ -846,7 +840,7 @@ export function mergeGraphs(prevGraph: MissionGraph | null, fresh: MissionGraph)
 /** `recordInMission` — mission-graph.html. Does this record belong to THIS
  * mission (the events panel filter)? `mission_id`, when present, is
  * authoritative; absent, falls back to proxy matching on handle/session. */
-export function recordInMission(rec: FlowRecord, idx: GraphIndex, missionId: string): boolean {
+export function recordInMission(rec: NormRecord, idx: GraphIndex, missionId: string): boolean {
   if (rec.mission_id) return rec.mission_id === missionId;
   if (rec.phase_id && idx.phaseIds.has(rec.phase_id)) return true;
   if (rec.handle && (idx.nodeIds.has(rec.handle) || idx.stepIds.has(rec.handle))) return true;
@@ -981,12 +975,12 @@ export interface StepHeaderField {
  * home in `GraphStep`/`StepMetrics` yet. Scanned NEWEST-FIRST so the most
  * recent record wins when more than one carries the same key (a crawl unit
  * can emit `source`/`rule` more than once while working through a batch). */
-export function buildStepHeaderFields(step: GraphStep, metrics: MetricsMap, now: number, stepRecords: FlowRecord[]): StepHeaderField[] {
+export function buildStepHeaderFields(step: GraphStep, metrics: MetricsMap, now: number, stepRecords: NormRecord[]): StepHeaderField[] {
   const fields: StepHeaderField[] = [];
   fields.push({ key: "unit", label: "unit", value: step.label || step.id });
   if (step.kind) fields.push({ key: "kind", label: "kind", value: step.kind });
 
-  const ordered = [...stepRecords].sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0));
+  const ordered = [...stepRecords].sort(byTimeNewestFirst);
   const pick = (keys: string[]): string | undefined => {
     for (const rec of ordered) {
       const p = rec.payload;
@@ -1029,7 +1023,7 @@ export function buildStepHeaderFields(step: GraphStep, metrics: MetricsMap, now:
 
   const detectorKinds = new Set<string>();
   for (const rec of stepRecords) {
-    const isDetector = rec.action === "telemetry.detector" || (rec.category === "telemetry" && rec.source === "detector");
+    const isDetector = rec.action === ACTION.TelemetryDetector || (rec.category === CATEGORY.Telemetry && rec.source === "detector");
     if (!isDetector) continue;
     const p = rec.payload;
     const kind = p ? (typeof p.kind === "string" ? p.kind : typeof p.detector === "string" ? p.detector : undefined) : undefined;

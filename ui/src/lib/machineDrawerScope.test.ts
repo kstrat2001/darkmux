@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { resolveDrawerScope, findLastKnownSample, DRAWER_ROLLING_SCOPE_LABEL } from "./machineDrawerScope";
-import type { FlowRecord } from "../types/handwritten";
+import type { NormRecord } from "./ingest";
+import { norm } from "../testing/records";
 
-const proc = (ts: string, cpu: number, machine_uid?: string): FlowRecord => ({
+const proc = (ts: string, cpu: number, machine_uid?: string): NormRecord => norm({
   ts,
   category: "telemetry",
   source: "process",
@@ -162,7 +163,7 @@ describe("lastKnown (#2107 phone feedback)", () => {
 
 // ─── (#2413) machine.telemetry — the machine-scoped replacement ──────────
 
-const machineTelemetry = (ts: string, cpu: number, machine_uid?: string): FlowRecord => ({
+const machineTelemetry = (ts: string, cpu: number, machine_uid?: string): NormRecord => norm({
   ts,
   category: "machinery",
   source: "host",

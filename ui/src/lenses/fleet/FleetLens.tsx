@@ -12,8 +12,8 @@ import { useCountUp } from "../../hooks/useCountUp";
 import { useFleetRoster, useLiveMachines, useStaticFleetBeats } from "../../hooks/useLiveMachines";
 import { getSource, runsSrc, runsReachable } from "../../lib/source";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
-import { machineUids, machPresent, liveSessionSet, machineNames, recordsAsOf, LIVE_WINDOW_MS, T } from "../../lib/flow";
-import type { FleetMachinesLiveResponse, FleetSessionsLiveResponse, FlowRecord, RunsResponse } from "../../types/handwritten";
+import { machineUids, machPresent, liveSessionSet, machineNames, LIVE_WINDOW_MS } from "../../lib/flow";
+import type { FleetMachinesLiveResponse, FleetSessionsLiveResponse, RunsResponse } from "../../types/handwritten";
 import { fmtN, fmtC } from "../../lib/format";
 import { MachineIcon } from "../../components/MachineIcon";
 import { Shimmer } from "../../components/Placeholder";
@@ -32,6 +32,7 @@ import { useLatch } from "../../hooks/useLatch";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
 import type { MachineSpecs } from "../../types/handwritten";
 import { runsForMachine } from "../runs/format";
+import { recordsAsOf, type NormRecord } from "../../lib/ingest";
 
 /** `ICON.machine` (viewer.html:935) — the generic processor/chip glyph
  * every fleet card renders, since `MACH_ICON` (the per-machine form-factor
@@ -162,7 +163,7 @@ const SavingsHero = memo(function SavingsHero({
   /** The window this hero's numbers derive from — passed through to
    *  `NotesDialog` so "history →" opens the SAME notes those numbers came
    *  from, not a second, differently-scoped fetch. */
-  data: FlowRecord[];
+  data: NormRecord[];
   nowMs: number;
   /** (#2817) False while the flow window is still loading. A zero is a
    *  MEASUREMENT — "darkmux dispatched no tokens in this window" — and
@@ -499,7 +500,7 @@ export function FleetLens({
   connected = true,
   lastContactMs = null,
 }: {
-  records?: FlowRecord[];
+  records?: NormRecord[];
   tMax?: number;
   tMin?: number;
   /** (#1869) The scrub PLAYHEAD — a genuinely separate value from `tMax`
@@ -807,12 +808,10 @@ export function FleetLens({
   // on every 1 Hz tick: with nothing ahead of now it returns the window
   // itself, the same reference each tick, so the hero's token sums and note
   // do not recompute; with a record ahead, it filters once and re-filters
-  // only when the window changes or now crosses that record. A replay keeps
-  // its plain playhead filter, which runs only when the playhead moves.
+  // only when the window changes or now crosses that record. A replay cuts
+  // the same way at the playhead.
   const scopedData = useMemo(
-    () => (playhead == null
-      ? recordsAsOf(flowWindow.data, wallNow)
-      : flowWindow.data.filter((r) => T(r.ts) <= playhead)),
+    () => recordsAsOf(flowWindow.data, playhead ?? wallNow),
     [flowWindow.data, playhead, wallNow],
   );
   const tokens = useMemo(() => tokensOffMeter(scopedData), [scopedData]);

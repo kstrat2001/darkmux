@@ -5,7 +5,8 @@ import path from "node:path";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { PhoneDrawer } from "./PhoneDrawer";
 import { EventLogColumn } from "./EventLogColumn";
-import type { FlowRecord } from "../types/handwritten";
+import type { NormRecord } from "../lib/ingest";
+import { norm } from "../testing/records";
 
 function readStylesheet(): string {
   return readFileSync(
@@ -33,18 +34,18 @@ const NOOP_MACHINE_TAB = {
 // by activity (reasoning/checkpoint/tool call/turn/dispatch error); the
 // previous `note` fixture no longer shows by default, and none of these
 // tests are about filtering, just generic row/drawer mechanics.
-function record(i: number): FlowRecord {
-  return {
+function record(i: number): NormRecord {
+  return norm({
     ts: `2026-01-01T00:0${i}:00Z`,
     category: "work",
     source: "operator",
     action: "dispatch.reasoning",
     handle: `rec-${i}`,
-  };
+  });
 }
 
 const NO_EVENTS = {
-  records: [] as FlowRecord[],
+  records: [] as NormRecord[],
   scopeLabel: "fleet",
   visible: true,
   loading: false,
@@ -506,8 +507,8 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
   });
 
   it("tapping a row PUSHES a full detail screen — the strip names the record, the back control returns to the list", () => {
-    const older: FlowRecord = { ...record(1), payload: { tool_name: "grep", args_chars: 42 } } as FlowRecord;
-    const newer: FlowRecord = { ...record(2), payload: { tool_name: "ls", args_chars: 3 } } as FlowRecord;
+    const older: NormRecord = { ...record(1), payload: { tool_name: "grep", args_chars: 42 } };
+    const newer: NormRecord = { ...record(2), payload: { tool_name: "ls", args_chars: 3 } };
     const events = { ...NO_EVENTS, records: [older, newer] };
     render(
       <PhoneDrawer

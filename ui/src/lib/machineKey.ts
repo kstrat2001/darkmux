@@ -1,5 +1,6 @@
-import type { FlowRecord, PresenceBeat } from "../types/handwritten";
-import { T, displayNameOf, machineUids, ownMachineName, type RosterName, type SelfIdentity } from "./flow";
+import type { PresenceBeat } from "../types/handwritten";
+import { displayNameOf, machineUids, ownMachineName, type RosterName, type SelfIdentity } from "./flow";
+import type { NormRecord } from "./ingest";
 
 /**
  * (#2929) The machine identity the URL hash carries, and the ONE place that
@@ -41,7 +42,7 @@ import { T, displayNameOf, machineUids, ownMachineName, type RosterName, type Se
  * hash to the key.
  */
 export interface MachineKeyContext {
-  data: FlowRecord[];
+  data: NormRecord[];
   liveMachines: Map<string, PresenceBeat>;
   specs: SelfIdentity | null;
   roster: readonly RosterName[];
@@ -103,7 +104,7 @@ interface KeyTable {
   declaredUid: Map<string, string>;
 }
 
-const tableCache = new WeakMap<FlowRecord[], { ctx: MachineKeyContext; table: KeyTable }>();
+const tableCache = new WeakMap<NormRecord[], { ctx: MachineKeyContext; table: KeyTable }>();
 
 function keyTable(ctx: MachineKeyContext): KeyTable {
   const hit = tableCache.get(ctx.data);
@@ -123,8 +124,7 @@ function buildKeyTable(ctx: MachineKeyContext): KeyTable {
   for (const r of data) {
     const uid = r.machine_uid;
     if (!uid) continue;
-    const t = T(r.ts);
-    const at = Number.isFinite(t) ? t : Infinity;
+    const at = r.tMs ?? Infinity;
     const prev = firstSeen.get(uid);
     if (prev === undefined || at < prev) firstSeen.set(uid, at);
   }

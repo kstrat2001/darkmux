@@ -1,5 +1,4 @@
-import type { FlowRecord } from "../types/handwritten";
-import { isDispatchStart, isDispatchTerminal } from "./flow";
+import { ACTION, byTime, isDispatchTerminal, type NormRecord } from "./ingest";
 
 /** (#2863) A run's event list, grouped by the turn each event belongs to.
  *
@@ -48,13 +47,13 @@ export type TurnItem =
   // header an identity nothing else in the list can collide with; a REAL
   // header (whose `rec` genuinely IS the `dispatch.turn` record) leaves
   // this undefined and keys off `rec` exactly as before.
-  | { kind: "turn"; rec: FlowRecord; turn: TurnInfo; id?: string }
-  | { kind: "rest"; rec: FlowRecord }
-  | { kind: "rec"; rec: FlowRecord };
+  | { kind: "turn"; rec: NormRecord; turn: TurnInfo; id?: string }
+  | { kind: "rest"; rec: NormRecord }
+  | { kind: "rec"; rec: NormRecord };
 
 type Fields = Record<string, unknown>;
 
-function fields(r: FlowRecord): Fields {
+function fields(r: NormRecord): Fields {
   return ((r as unknown as { fields?: Fields }).fields || (r as unknown as { payload?: Fields }).payload || {}) as Fields;
 }
 
@@ -63,9 +62,9 @@ function num(v: unknown): number | null {
 }
 
 /** Whether a list is one session's, with turns to group by. */
-export function groupsByTurn(all: FlowRecord[]): boolean {
+export function groupsByTurn(all: NormRecord[]): boolean {
   const sessions = new Set(all.map((r) => r.session_id).filter(Boolean));
-  return sessions.size === 1 && all.some((r) => r.action === "dispatch.turn");
+  return sessions.size === 1 && all.some((r) => r.action === ACTION.DispatchTurn);
 }
 
 /**
@@ -73,16 +72,16 @@ export function groupsByTurn(all: FlowRecord[]): boolean {
  * @param all every record the list was given, so a hidden record (a
  *   heartbeat, a context reading) can still inform a turn's header
  */
-export function turnItems(visible: FlowRecord[], all: FlowRecord[]): TurnItem[] {
+export function turnItems(visible: NormRecord[], all: NormRecord[]): TurnItem[] {
   if (!groupsByTurn(all)) return visible.map((rec) => ({ kind: "rec", rec }));
 
-  const byTime = [...all].sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
+  const ordered = [...all].sort(byTime);
   // Keys are per ROLE EXECUTION, not the bare seq: each `dispatch start`
   // begins a new execution whose turns count from 1 again, and a session can
   // hold more than one (#2863 review). `null` = before any turn.
   let exec = 0;
   const key = (seq: number) => `${exec}:${seq}`;
-  const turnOf = new Map<FlowRecord, string | null>();
+  const turnOf = new Map<NormRecord, string | null>();
   const firstBeat = new Map<string, number>();
   // Per-call usage by turn. A checkpointed turn takes several calls under
   // one seq, and the turn record's own `usage` is only the LAST call's, so
@@ -113,9 +112,9 @@ export function turnItems(visible: FlowRecord[], all: FlowRecord[]): TurnItem[] 
   // turn has no closing record) or "in progress" (the run has not ended
   // yet, so "did not finish" would be a claim about the future).
   const terminalForExec = new Map<number, boolean>();
-  for (const r of byTime) {
+  for (const r of ordered) {
     const f = fields(r);
-    if (isDispatchStart(r.action)) {
+    if (r.action === ACTION.DispatchStart) {
       exec++;
       current = null;
       currentSeqNum = null;
@@ -146,29 +145,29 @@ export function turnItems(visible: FlowRecord[], all: FlowRecord[]): TurnItem[] 
       seqForKey.set(own, seq);
     }
     turnOf.set(r, own ?? current);
-    if (r.action === "dispatch.turn.heartbeat" && own !== null && !firstBeat.has(own)) {
-      firstBeat.set(own, Date.parse(r.ts));
+    if (r.action === ACTION.DispatchTurnHeartbeat && own !== null && r.tMs !== null && !firstBeat.has(own)) {
+      firstBeat.set(own, r.tMs);
     }
-    if (r.action === "telemetry.tokens" && own !== null) {
+    if (r.action === ACTION.TelemetryTokens && own !== null) {
       const out = num(f.completion_tokens);
       const think = num(f.reasoning_tokens);
       if (out !== null) callOut.set(own, (callOut.get(own) ?? 0) + out);
       if (think !== null) callThink.set(own, (callThink.get(own) ?? 0) + think);
     }
-    if (r.action === "telemetry.context") {
+    if (r.action === ACTION.TelemetryContext) {
       window = num(f.max) ?? window;
       threshold = num(f.threshold) ?? threshold;
     }
   }
 
-  const info = (r: FlowRecord): TurnInfo => {
+  const info = (r: NormRecord): TurnInfo => {
     const f = fields(r);
     const seq = num(f.turn_seq) ?? 0;
     const k = turnOf.get(r) ?? "";
     const usage = (f.usage || {}) as Fields;
     const exact = num(f.generation_ms);
     const beat = firstBeat.get(k);
-    const approxMs = beat !== undefined ? Date.parse(r.ts) - beat : null;
+    const approxMs = beat !== undefined && r.tMs !== null ? r.tMs - beat : null;
     const tools = num(f.tool_calls_count) ?? 0;
     return {
       seq,
@@ -198,8 +197,8 @@ export function turnItems(visible: FlowRecord[], all: FlowRecord[]): TurnItem[] 
       groups.set(t, []);
       order.push(t);
     }
-    if (rec.action === "dispatch.turn") headers.set(t, { kind: "turn", rec, turn: info(rec) });
-    else if (rec.action === "dispatch.rest") (rests.get(t) ?? rests.set(t, []).get(t)!).push({ kind: "rest", rec });
+    if (rec.action === ACTION.DispatchTurn) headers.set(t, { kind: "turn", rec, turn: info(rec) });
+    else if (rec.action === ACTION.DispatchRest) (rests.get(t) ?? rests.set(t, []).get(t)!).push({ kind: "rest", rec });
     else groups.get(t)!.push({ kind: "rec", rec });
   }
   const out: TurnItem[] = [];

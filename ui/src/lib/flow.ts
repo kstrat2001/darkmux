@@ -19,13 +19,14 @@
  * validate-before-port step exists to catch.
  */
 
-import type { FlowRecord, PresenceBeat } from "../types/handwritten";
+import type { PresenceBeat } from "../types/handwritten";
 // (#2813) The canonical status axis, generated from the Rust enum. Importing
 // it here is the point: the label below is a total function of it, so the two
 // cannot drift apart again.
 import type { RunStatus } from "../types/generated/RunStatus";
 import type { AbandonReason } from "../types/generated/AbandonReason";
 import { isPlainObject } from "./guards";
+import { ACTION, CATEGORY, byTime, ingestJsonl, ingestRecord, isAsOf, latestByTime, recKey, recordsAsOf, recordsSince, timesOf, type NormAction, type NormRecord } from "./ingest";
 
 /** `LIVE_WINDOW_MS` — viewer.html:3374. The rolling live window `RAW` is
  * bounded to; also the "N records · last Nh" meta-line's hour figure. */
@@ -47,8 +48,6 @@ export const BUDGET_WAIT_GRACE_MS = 60 * 1000;
 /** `RECENT_CAP` — viewer.html:1052. Default cap on the recent-runs list. */
 export const RECENT_CAP = 20;
 
-export const T = (s: string): number => Date.parse(s);
-
 /** `todayUTC()` — viewer.html:3369. */
 export function todayUTC(): string {
   return new Date().toISOString().slice(0, 10);
@@ -61,92 +60,11 @@ export function prevDateUTC(d: string): string {
   return dt.toISOString().slice(0, 10);
 }
 
-/** (#1852) Exported so a consumer that does NOT receive its data through
- * `buildFlowWindow` can normalize for itself, instead of comparing a literal
- * and being silently wrong for one of the two producer lineages.
- *
- * `savings.ts` matches the dotted form only, and is correct today *purely*
- * because its records passed through `buildFlowWindow` first — a coupling
- * nothing stated or tested until now. See `isDispatchStart` below. */
-export function normalizeAction(a: string | undefined): string | undefined {
-  // flowToRenderModel() — viewer.html:3164-3170. Only the dispatch
-  // lifecycle normalization matters for this lens (the turn/compaction
-  // telemetry synthesis in the legacy function feeds OTHER lenses' log
-  // stream, not the runs-list summary fields this port reads — see the
-  // module doc's scope note in the packet report).
-  if (a === "dispatch start") return "dispatch.start";
-  if (a === "dispatch complete") return "dispatch.complete";
-  if (a === "dispatch error") return "dispatch.error";
-  return a;
-}
-
-/** (#1852) Bookend matchers that accept EITHER producer lineage's spelling.
- *
- * `darkmux-crew` and the CLI emit `"dispatch start"`; `darkmux-lab` and the
- * runtime emit `"dispatch.start"`. Which one a record carries is not a
- * property a call site can reason about locally, so comparing a literal is
- * a coin flip. These mirror `darkmux_flow::is_dispatch_*` on the Rust side. */
-export const isDispatchStart = (a: string | undefined): boolean =>
-  a === "dispatch.start" || a === "dispatch start";
-export const isDispatchComplete = (a: string | undefined): boolean =>
-  a === "dispatch.complete" || a === "dispatch complete";
-export const isDispatchError = (a: string | undefined): boolean =>
-  a === "dispatch.error" || a === "dispatch error";
-/** Either terminal — the "did this dispatch stop" question. */
-export const isDispatchTerminal = (a: string | undefined): boolean =>
-  isDispatchComplete(a) || isDispatchError(a);
-
-/** `recKey()` — viewer.html:3390/3397. Dedup key for the two-day fetch
- * overlap AND (Packet 5) the live tail's SSE-append / reconcile-backstop
- * dedup (`SEEN_KEYS`, viewer.html:3396-3398) — exported so `useLiveTail`
- * can dedup against the exact same identity `buildFlowWindow` itself uses,
- * rather than inventing a second key shape that could silently drift from
- * this one. */
-export function recKey(r: FlowRecord): string {
-  return [
-    r.ts,
-    r.machine_uid || "",
-    r.session_id || "",
-    r.action || "",
-    r.source || "",
-    r.handle || "",
-    r.level || "",
-    r.stage || "",
-    r.payload != null ? JSON.stringify(r.payload) : "",
-  ].join("\x1f");
-}
-
-/** Parses a flow file's raw JSONL TEXT the way the daemon parses the
- * on-disk file the static demo commits a copy of — viewer.html:3899-3901
- * (the `flowSrc` branch): split on newlines, trim, drop empty lines,
- * `JSON.parse` each remaining line, drop any line that fails to parse.
- * Lenient by design, matching legacy exactly: a truncated last line or a
- * stray blank line must not fail the whole page, and the leading
- * `{"_type":"schema"}` header line parses FINE here — it is dropped later,
- * by `normalizeRecords`' `_type` filter, not by this function (#1801 — see
- * that function's own doc for why the two stay separate steps). */
-export function parseFlowJsonl(text: string): FlowRecord[] {
-  return text
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter(Boolean)
-    .map((l): FlowRecord | null => {
-      try {
-        return JSON.parse(l) as FlowRecord;
-      } catch {
-        return null;
-      }
-    })
-    .filter((r): r is FlowRecord => r !== null);
-}
-
 /** GETs a static playback source (`source.ts, the flow file`) and
- * parses it via `parseFlowJsonl` above — the static-build twin of
- * `GET /flow/<date>`, read directly by both `useRouteRecords` (the event
- * log's data) and `PlaybackLens` (the stage's data), each via the SAME
- * query key so they share one fetch and can never disagree about the file's
- * contents (#1801 — same "one source of truth" discipline this module's own
- * doc already establishes for `normalizeRecords`).
+ * ingests it — the static-build twin of `GET /flow/<date>`, read directly by
+ * both `useRouteRecords` (the event log's data) and `PlaybackLens` (the
+ * stage's data), each via the SAME query key so they share one fetch and can
+ * never disagree about the file's contents (#1801).
  *
  * Returns `[]` rather than throwing on a network failure, a 404, or an
  * empty file — matching legacy's own `catch(e){ RAW=[]; }` around the same
@@ -154,12 +72,12 @@ export function parseFlowJsonl(text: string): FlowRecord[] {
  * is a valid, if empty, playback — never a crash and never a silent
  * fallback to the live route (see `route.ts`'s own doc for why the ROUTE
  * itself does not depend on this fetch succeeding). */
-export async function fetchStaticFlowRecords(src: string): Promise<FlowRecord[]> {
+export async function fetchStaticFlowRecords(src: string): Promise<NormRecord[]> {
   try {
     const res = await fetch(src);
     if (!res.ok) return [];
     const text = await res.text();
-    return parseFlowJsonl(text);
+    return ingestJsonl(text);
   } catch {
     return [];
   }
@@ -167,38 +85,24 @@ export async function fetchStaticFlowRecords(src: string): Promise<FlowRecord[]>
 
 /** `if(!injectedDate&&RAW.length)date=String(RAW[0].ts||"").slice(0,10)||date;`
  * — viewer.html:3902, the flowSrc branch's own date derivation. Takes the
- * RAW parsed array (file order, BEFORE `normalizeRecords` drops the
- * `{"_type":"schema"}` header line) — deliberately `records[0]`, not the
- * earliest `ts`, matching legacy's own un-sorted read exactly, quirk
- * included: a file whose first LINE is the schema header (no `ts` field)
- * yields `null` here the same way legacy's derivation falls through to
- * whatever `date` already defaulted to. Returns `null` on an empty array, an
- * unreachable file, or a first record with no usable `ts` so a caller
- * supplies its OWN placeholder rather than this function inventing one. */
-export function firstRecordDate(records: FlowRecord[]): string | null {
-  const ts = records[0]?.ts;
-  if (!ts) return null;
-  const date = String(ts).slice(0, 10);
-  return date || null;
+ * records in FILE order, deliberately `records[0]` rather than the earliest
+ * record, matching legacy's un-sorted read, and reads its parsed time as a
+ * UTC day. Returns `null` on an empty array or a first record with no usable
+ * time, so a caller supplies its OWN placeholder rather than this function
+ * inventing one. */
+export function firstRecordDate(records: readonly NormRecord[]): string | null {
+  const t = records[0]?.tMs;
+  return t == null ? null : utcDay(t);
 }
 
-/** A `/flow/<date>` response body is EITHER a bare array or one of two
- * wrapper shapes — `loadLiveWindow()`, viewer.html:3502:
- * `Array.isArray(body)?body:(body.records||body.flow||[])`. The recorded
- * corpus is always a bare array; this stays loose for parity with the
- * legacy tolerance rather than assuming the shape never changes. Shared by
- * `useFlowWindow` (the day-fetch) and `useLiveTail` (the reconcile
- * backstop's `?since=` fetch, which hits the SAME `/flow/<date>` handler). */
+const utcDay = (t: number): string => new Date(t).toISOString().slice(0, 10);
+
 /** The earliest record's UTC day in a slice, or null. Records from the daemon
  * are not guaranteed to arrive sorted, so this scans rather than reading the
  * first element. */
-export function earliestRecordDate(records: FlowRecord[]): string | null {
-  let min = Infinity;
-  for (const r of records) {
-    const t = T(r.ts);
-    if (!Number.isNaN(t) && t < min) min = t;
-  }
-  return Number.isFinite(min) ? new Date(min).toISOString().slice(0, 10) : null;
+export function earliestRecordDate(records: readonly NormRecord[]): string | null {
+  const ts = timesOf(records);
+  return ts.length ? utcDay(Math.min(...ts)) : null;
 }
 
 /** Header owns liveness (operator, 2026-09-03): a mission page is a RECORDING
@@ -207,80 +111,56 @@ export function earliestRecordDate(records: FlowRecord[]): string | null {
  * from presence; a mission decides it from its own lifecycle records because
  * a mission's work spans many sessions. Returns the replay day, or null while
  * the mission is still running. */
-export function missionReplayDate(records: FlowRecord[]): string | null {
-  const terminal = records.some((r) => r.action === "mission close" || r.action === "mission abort");
+export function missionReplayDate(records: readonly NormRecord[]): string | null {
+  const terminal = records.some((r) => r.action === ACTION.MissionClose || r.action === ACTION.MissionAbort);
   return terminal ? earliestRecordDate(records) : null;
-}
-
-export function asRecordArray(body: unknown): FlowRecord[] {
-  if (Array.isArray(body)) return body as FlowRecord[];
-  // (#2206) `isPlainObject` is drop-in here: the array case returned above,
-  // and `body && typeof body === "object"` differs from it only on `null`,
-  // which both reject.
-  if (isPlainObject(body)) {
-    const obj = body as { records?: FlowRecord[]; flow?: FlowRecord[] };
-    return obj.records ?? obj.flow ?? [];
-  }
-  return [];
 }
 
 /** The `/flow-mission/:id` response body's own `truncated` flag —
  * `crates/darkmux-serve/src/lib.rs`'s `collect_records_by_field`, capped at
- * `MAX_CATALOG_RECORDS` (10,000). A bare array (the shape every OTHER
- * `/flow/...` caller tolerates per `asRecordArray` above) never carries this
- * flag and reads as `false`. `MissionGraphLens.tsx`'s own `srvTruncated`
- * reads the SAME field (`bodies[0].truncated`) for the same reason: a
- * mission past the server cap must say so, or "N of 10000" silently
- * restates the cap as the mission's whole history. */
+ * `MAX_CATALOG_RECORDS` (10,000). A bare array never carries this flag and
+ * reads as `false`. `MissionGraphLens.tsx`'s own `srvTruncated` reads the
+ * SAME field (`bodies[0].truncated`) for the same reason: a mission past the
+ * server cap must say so, or "N of 10000" silently restates the cap as the
+ * mission's whole history. */
 export function bodyTruncated(body: unknown): boolean {
   if (!isPlainObject(body)) return false;
   return !!(body as { truncated?: boolean }).truncated;
 }
 
 /** The tail-cache-side counterpart to `buildFlowWindow`'s own dedup+window
- * filter — used by `useLiveTail`'s reconcile backstop (viewer.html's
- * `reconcileLiveWindow`, 3758-3782) so repeated `?since=` polls with a
- * deliberate overlap window (`RECONCILE_OVERLAP_MS`) don't grow the tail
- * cache's stored array by the overlap on every single poll. `buildFlowWindow`
- * itself ALSO dedups the final merged (day-fetch + tail) result, so this
- * isn't required for display correctness — duplicates would render
- * correctly either way — it's what keeps the underlying cache entry bounded
- * across a long-lived tab, the same thing `applyLive()`'s RAW age-out prunes
- * for (viewer.html:3522-3539). */
-export function mergeTailRecords(existing: FlowRecord[], incoming: FlowRecord[], cutMs: number): FlowRecord[] {
+ * filter — used by the live tail (SSE appends and the reconcile backstop,
+ * viewer.html's `reconcileLiveWindow`, 3758-3782) so repeated `?since=`
+ * polls with a deliberate overlap window (`RECONCILE_OVERLAP_MS`) don't grow
+ * the tail cache's stored array by the overlap on every single poll.
+ * `buildFlowWindow` itself ALSO dedups the final merged (day-fetch + tail)
+ * result, so this isn't required for display correctness — it's what keeps
+ * the underlying cache entry bounded across a long-lived tab, the same thing
+ * `applyLive()`'s RAW age-out prunes for (viewer.html:3522-3539). */
+export function mergeTailRecords(existing: readonly NormRecord[], incoming: readonly NormRecord[], cutMs: number): NormRecord[] {
   const seen = new Set(existing.map(recKey));
   const merged = existing.slice();
   for (const r of incoming) {
-    if (!r || !r.ts) continue;
-    if (T(r.ts) < cutMs) continue;
     const k = recKey(r);
     if (seen.has(k)) continue;
     seen.add(k);
     merged.push(r);
   }
-  return merged.filter((r) => T(r.ts) >= cutMs);
+  return recordsSince(merged, cutMs);
 }
 
-/** The RECORD-SHAPING half of `flowToRenderModel()` — viewer.html:3195-3204.
- * Drops non-record meta lines and normalizes the space-separated legacy
- * action spellings to their dotted forms. Deliberately does NOT window or
- * dedup: those belong to the LIVE two-day merge (`buildFlowWindow`, below),
- * not to reading a record set.
+/** The view-model half of `flowToRenderModel()` (viewer.html:3195-3234):
+ * ingested records plus one synthesized runtime row per session, sorted by
+ * time. Deliberately does NOT window or dedup: those belong to the LIVE
+ * two-day merge (`buildFlowWindow`, below), not to reading a record set.
  *
- * (#1800 P2) Split out because a historical day must be shaped the same way
- * and windowed NOT AT ALL — legacy's playback boot is literally
- * `DATA=flowToRenderModel(RAW)` with no window step (viewer.html:3922).
- * Feeding a replayed day through `buildFlowWindow` instead would have
- * dropped every record older than 24h — i.e. the entire day — and running it
- * unshaped leaves the flow file's leading `{"_type":"schema"}` header in the
- * set, where it renders as a phantom "unknown" machine card, an
- * `Invalid Date other` log row, and a third timeline lane. Both were live
- * before this split. */
-export function normalizeRecords(records: FlowRecord[]): FlowRecord[] {
-  const shaped = records
-    .filter((r): r is FlowRecord => !!r && !r._type)
-    .map((r) => ({ ...r, action: normalizeAction(r.action) }));
-  return [...shaped, ...perSessionRuntimeRecords(records)].sort((a, b) => T(a.ts) - T(b.ts));
+ * (#1800 P2) A historical day is shaped the same way and windowed NOT AT
+ * ALL — legacy's playback boot is literally `DATA=flowToRenderModel(RAW)`
+ * with no window step (viewer.html:3922). Feeding a replayed day through
+ * `buildFlowWindow` instead would drop every record older than 24h, i.e. the
+ * entire day. */
+export function shapeRecords(records: readonly NormRecord[]): NormRecord[] {
+  return [...records, ...perSessionRuntimeRecords(records)].sort(byTime);
 }
 
 /** The APPEND half of `flowToRenderModel()` — viewer.html:3223-3234. One
@@ -298,17 +178,14 @@ export function normalizeRecords(records: FlowRecord[]): FlowRecord[] {
  *
  * Legacy sorts the whole set by ts afterwards because these are appended out
  * of order, and the event log plus follow-latest both assume `DATA` is
- * temporal. `normalizeRecords` does the same, so the sort is not this
- * function's own concern.
- *
- * Reads from the RAW records deliberately — `dispatch.turn` needs no action
- * normalization (it has no space-separated legacy spelling), and taking the
- * pre-filter set keeps this independent of the shaping step's ordering. */
-function perSessionRuntimeRecords(records: FlowRecord[]): FlowRecord[] {
+ * temporal. `shapeRecords` does the same, so the sort is not this function's
+ * own concern. Each row goes through `ingestRecord` like any other record, so
+ * its `tMs` obeys the one bad-timestamp policy. */
+function perSessionRuntimeRecords(records: readonly NormRecord[]): NormRecord[] {
   const perSession = new Map<string, { turns: number; ts: string; machineId?: string; machineUid?: string }>();
   for (const r of records) {
-    if (!r || r._type || r.action !== "dispatch.turn" || !r.session_id) continue;
-    const seq = (r.payload as { turn_seq?: number } | undefined)?.turn_seq ?? 0;
+    if (r.action !== ACTION.DispatchTurn || !r.session_id) continue;
+    const seq = Number((r.payload as { turn_seq?: unknown } | undefined)?.turn_seq) || 0;
     const prev = perSession.get(r.session_id);
     const entry = prev ?? { turns: 0, ts: r.ts };
     entry.turns = Math.max(entry.turns, seq);
@@ -320,23 +197,27 @@ function perSessionRuntimeRecords(records: FlowRecord[]): FlowRecord[] {
     if (r.machine_uid) entry.machineUid = r.machine_uid;
     perSession.set(r.session_id, entry);
   }
-  return [...perSession.entries()].map(([sessionId, e]) => ({
-    ts: e.ts,
-    category: "telemetry",
-    source: "runtime",
-    machine_id: e.machineId,
-    machine_uid: e.machineUid,
-    session_id: sessionId,
-    fields: { turns: e.turns },
-  })) as FlowRecord[];
+  const out: NormRecord[] = [];
+  for (const [sessionId, e] of perSession) {
+    const row = ingestRecord({
+      ts: e.ts,
+      category: CATEGORY.Telemetry,
+      source: "runtime",
+      machine_id: e.machineId,
+      machine_uid: e.machineUid,
+      session_id: sessionId,
+      fields: { turns: e.turns },
+    });
+    if (row) out.push(row);
+  }
+  return out;
 }
 
 /** `loadLiveWindow()` + the dispatch-action slice of `flowToRenderModel()` —
  * viewer.html:3497-3512 / 3161-3187. `yesterday`/`today` MUST be passed in
  * that fetch order (see the module doc above for why). */
-export function buildFlowWindow(yesterday: FlowRecord[], today: FlowRecord[], nowMs: number): FlowRecord[] {
-  const merged = normalizeRecords([...yesterday, ...today]);
-  const windowed = merged.filter((r) => T(r.ts) >= nowMs - LIVE_WINDOW_MS);
+export function buildFlowWindow(yesterday: readonly NormRecord[], today: readonly NormRecord[], nowMs: number): NormRecord[] {
+  const windowed = recordsSince(shapeRecords([...yesterday, ...today]), nowMs - LIVE_WINDOW_MS);
   const seen = new Set<string>();
   return windowed.filter((r) => {
     const k = recKey(r);
@@ -347,8 +228,8 @@ export function buildFlowWindow(yesterday: FlowRecord[], today: FlowRecord[], no
 }
 
 /** `recompute()`'s tMax — viewer.html:1040-1041. */
-export function computeTMax(data: FlowRecord[]): number {
-  const ts = data.map((r) => T(r.ts)).filter((n) => !Number.isNaN(n));
+export function computeTMax(data: readonly NormRecord[]): number {
+  const ts = timesOf(data);
   return ts.length ? Math.max(...ts) : Date.now();
 }
 
@@ -356,13 +237,13 @@ export function computeTMax(data: FlowRecord[]): number {
  * live-only (the live timeline anchors on NOW and a fixed window); a REPLAY
  * spans `tMin..tMax`, which is what makes the axis describe the recorded day
  * rather than the last 24 hours of wall-clock. */
-export function computeTMin(data: FlowRecord[]): number {
-  const ts = data.map((r) => T(r.ts)).filter((n) => !Number.isNaN(n));
+export function computeTMin(data: readonly NormRecord[]): number {
+  const ts = timesOf(data);
   return ts.length ? Math.min(...ts) : Date.now();
 }
 
 /** `uidOf()` — viewer.html:1107. */
-export const uidOf = (r: FlowRecord): string => r.machine_uid || "unknown";
+export const uidOf = (r: NormRecord): string => r.machine_uid || "unknown";
 
 /** (#2921) The label for a machine nothing has named. Never the hardware uid:
  * a uid lands in screenshots and identifies the physical machine. */
@@ -375,7 +256,7 @@ export const isUnnamedMachineLabel = (name: string): boolean =>
 /** `nameOf()` — viewer.html:1112. The newest `machine_id` a record carried
  * for this uid, then the presence beat's `display_name`, then
  * `UNNAMED_MACHINE` — never the uid itself (#2921; legacy fell back to it). */
-export function nameOf(data: FlowRecord[], liveMachines: Map<string, PresenceBeat>, m: string): string {
+export function nameOf(data: NormRecord[], liveMachines: Map<string, PresenceBeat>, m: string): string {
   if (m === "unknown") return "unknown";
   // (#2030) The MOST RECENT name this uid carried, not the first one found.
   //
@@ -398,14 +279,13 @@ export function nameOf(data: FlowRecord[], liveMachines: Map<string, PresenceBea
   //
   // Ties and unparsable timestamps keep the earlier winner, so a window with
   // no usable `ts` behaves exactly as before rather than picking arbitrarily.
-  let best: FlowRecord | null = null;
+  let best: NormRecord | null = null;
   let bestTs = -Infinity;
   for (const x of data) {
     if (uidOf(x) !== m || !x.machine_id) continue;
-    const ts = T(x.ts as string);
-    if (best === null || (Number.isFinite(ts) && ts > bestTs)) {
+    if (best === null || (x.tMs !== null && x.tMs > bestTs)) {
       best = x;
-      bestTs = Number.isFinite(ts) ? ts : bestTs;
+      bestTs = x.tMs ?? bestTs;
     }
   }
   if (best) return best.machine_id as string;
@@ -414,7 +294,7 @@ export function nameOf(data: FlowRecord[], liveMachines: Map<string, PresenceBea
 }
 
 /** `machines()` — viewer.html:1123. */
-export function machineUids(data: FlowRecord[], liveMachines: Map<string, PresenceBeat>): string[] {
+export function machineUids(data: NormRecord[], liveMachines: Map<string, PresenceBeat>): string[] {
   return [...new Set([...data.map(uidOf), ...liveMachines.keys()])];
 }
 
@@ -435,7 +315,7 @@ export function machineUids(data: FlowRecord[], liveMachines: Map<string, Presen
  * happen to be different aliases of the same machine. Identity questions ask
  * this instead, and get a yes if ANY known alias matches. */
 export function machineNames(
-  data: FlowRecord[],
+  data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
   uid: string,
 ): Set<string> {
@@ -479,7 +359,7 @@ export function machineNames(
  * same name this daemon reports passes the name join and gets credited with
  * this host's CPU and RAM. The uid join cannot make that mistake. */
 export function isSelfMachine(
-  data: FlowRecord[],
+  data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
   specs: SelfIdentity | null,
   m: string,
@@ -525,7 +405,7 @@ export interface SelfIdentity {
  * specs reports — still wins, because #2030's lesson is that a value which
  * cannot be outvoted is the defect rather than the fix. */
 export function displayNameOf(
-  data: FlowRecord[],
+  data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
   specs: SelfIdentity | null,
   m: string,
@@ -551,7 +431,7 @@ export interface RosterName {
  *  (`nameOf`), this daemon's specs name when `m` is this daemon, the roster
  *  id declared for `m`. `null` when it has none. */
 export function ownMachineName(
-  data: FlowRecord[],
+  data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
   specs: SelfIdentity | null,
   roster: readonly RosterName[],
@@ -576,7 +456,7 @@ export function ownMachineName(
  *  own (see `ownMachineName`) take a number, and the number says nothing about the
  *  hardware. */
 function unnamedLabel(
-  data: FlowRecord[],
+  data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
   specs: SelfIdentity | null,
   roster: readonly RosterName[],
@@ -601,13 +481,13 @@ function unnamedLabel(
 }
 
 const unnamedOrderCache = new WeakMap<
-  FlowRecord[],
+  NormRecord[],
   { liveMachines: Map<string, PresenceBeat>; specs: SelfIdentity | null; roster: readonly RosterName[]; order: string[] }
 >();
 
 /** The uids with no name of their own, in first-seen order. */
 function unnamedOrder(
-  data: FlowRecord[],
+  data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
   specs: SelfIdentity | null,
   roster: readonly RosterName[],
@@ -616,8 +496,7 @@ function unnamedOrder(
   for (const r of data) {
     const uid = r.machine_uid;
     if (!uid) continue;
-    const t = T(r.ts);
-    const at = Number.isFinite(t) ? t : Infinity;
+    const at = r.tMs ?? Infinity;
     const prev = firstSeen.get(uid);
     if (prev === undefined || at < prev) firstSeen.set(uid, at);
   }
@@ -660,7 +539,7 @@ function unnamedOrder(
  * it is absent — off macOS, a failed probe, a peer or static fixture built
  * before the field existed — the name path below runs exactly as before. */
 export function localMachineUid(
-  data: FlowRecord[],
+  data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
   machineId: string | null | undefined,
   reportedUid?: string | null,
@@ -671,7 +550,7 @@ export function localMachineUid(
 }
 
 /** `sessionsOn()` — viewer.html:1124. */
-export function sessionsOn(data: FlowRecord[], m: string): string[] {
+export function sessionsOn(data: NormRecord[], m: string): string[] {
   return [...new Set(data.filter((r) => uidOf(r) === m && r.session_id).map((r) => r.session_id as string))];
 }
 
@@ -698,7 +577,7 @@ export interface MachineSessionRun {
   sessionId: string;
   missionId?: string;
 }
-export function sessionRunsOn(data: FlowRecord[], m: string): MachineSessionRun[] {
+export function sessionRunsOn(data: NormRecord[], m: string): MachineSessionRun[] {
   const seen = new Set<string>();
   const out: MachineSessionRun[] = [];
   // (#2125 follow-up) A session's bookends (`session.end`, some dispatch
@@ -744,10 +623,10 @@ export function sessionRunsOn(data: FlowRecord[], m: string): MachineSessionRun[
  * first read. Every producer builds a new array (`buildFlowWindow`, the
  * playback slices), so that already holds; a caller that appended to an
  * array in place after reading it would get the stale grouping. */
-const sessionIndexCache = new WeakMap<readonly FlowRecord[], Map<unknown, readonly FlowRecord[]>>();
+const sessionIndexCache = new WeakMap<readonly NormRecord[], Map<unknown, readonly NormRecord[]>>();
 /** Returned on every miss, shared: typed `readonly` (as are the groups) so a
  *  caller cannot `push` into it and corrupt every later lookup. */
-const NO_RECORDS: readonly FlowRecord[] = [];
+const NO_RECORDS: readonly NormRecord[] = [];
 let sessionIndexBuilds = 0;
 
 /** Test-only: how many session indexes have been built. A test that ticks a
@@ -759,14 +638,14 @@ export function __sessionIndexBuilds(): number {
   return sessionIndexBuilds;
 }
 
-export function sessionRecords(data: readonly FlowRecord[], sid: string): readonly FlowRecord[] {
+export function sessionRecords(data: readonly NormRecord[], sid: string): readonly NormRecord[] {
   let index = sessionIndexCache.get(data);
   if (!index) {
     // Keyed on `session_id` exactly as the record carries it, whatever its
     // type: the scans this replaces compared `r.session_id === sid`, and a
     // `Map` key matches the same way (SameValueZero). Its one difference,
     // `NaN` equal to itself, is answered below the way the scan answered it.
-    const groups = new Map<unknown, FlowRecord[]>();
+    const groups = new Map<unknown, NormRecord[]>();
     for (const r of data) {
       if (!r) continue;
       const group = groups.get(r.session_id);
@@ -781,111 +660,37 @@ export function sessionRecords(data: readonly FlowRecord[], sid: string): readon
   return index.get(sid) ?? NO_RECORDS;
 }
 
-/** (#2911) The window's latest timestamp, once per window ARRAY (same
- * identity contract as `sessionRecords`' index). A record whose `ts` does not
- * parse makes this `Infinity`: the filter in `recordsAsOf` excludes such a
- * record (`NaN <= now` is false), so the "nothing is ahead of now" fast path
- * must never apply to a window holding one. */
-const latestTsCache = new WeakMap<readonly FlowRecord[], number>();
-function latestTs(data: readonly FlowRecord[]): number {
-  let latest = latestTsCache.get(data);
-  if (latest === undefined) {
-    latest = -Infinity;
-    for (const r of data) {
-      const t = T(r.ts);
-      if (Number.isNaN(t)) {
-        latest = Infinity;
-        break;
-      }
-      if (t > latest) latest = t;
-    }
-    latestTsCache.set(data, latest);
-  }
-  return latest;
-}
-
-/** The last filtered result per window array, with the range of `now` it
- * stays exact for: `now >= lo` (the latest record it includes) and
- * `now < hi` (the earliest record it excludes). */
-const asOfCache = new WeakMap<readonly FlowRecord[], { out: FlowRecord[]; lo: number; hi: number }>();
-let asOfFilterRuns = 0;
-
-/** Test-only: how many times `recordsAsOf` has actually filtered a window. */
-export function __asOfFilterRuns(): number {
-  return asOfFilterRuns;
-}
-
-/** (#2911) `data.filter((r) => T(r.ts) <= now)`, without paying for it on
- * every clock tick. The live fleet hero reads the window "as of now" (a
- * record stamped after the viewer's own clock is not counted yet, matching
- * the fleet cards), and the lens re-renders every second while an execution
- * is live, so a plain filter re-ran over the whole window each second and
- * handed the hero a new array, recomputing its token sums and note too.
- *
- * - Nothing in the window is later than `now` (the normal case): returns
- *   `data` itself, the same reference on every tick. No filter runs.
- * - Something is: filters once, and returns that same result on later calls
- *   until the window array changes or `now` crosses the next excluded
- *   record's timestamp.
- *
- * Same contract as `sessionRecords`: a window array is never mutated after
- * it is first read. */
-export function recordsAsOf(data: FlowRecord[], now: number): FlowRecord[] {
-  if (latestTs(data) <= now) return data;
-  const cached = asOfCache.get(data);
-  if (cached && now >= cached.lo && now < cached.hi) return cached.out;
-  asOfFilterRuns++;
-  const out: FlowRecord[] = [];
-  let lo = -Infinity;
-  let hi = Infinity;
-  for (const r of data) {
-    const t = T(r.ts);
-    if (t <= now) {
-      out.push(r);
-      if (t > lo) lo = t;
-    } else if (t < hi) {
-      hi = t;
-    }
-  }
-  asOfCache.set(data, { out, lo, hi });
-  return out;
-}
-
 /** `dispatch()` — viewer.html:1125. `missionId` (#2125), when given, scopes
  * the match to records naming that mission — see `sessionRunsOn`'s own doc
  * for why a bare `session_id` match is unsafe for a review-shaped session.
  * `undefined` (every pre-existing caller) preserves the exact prior
  * session_id-only behavior. */
-export function dispatchRec(data: FlowRecord[], sid: string, act: "start" | "complete" | "error", missionId?: string): FlowRecord | undefined {
-  // (#2927) Either producer spelling. Every app ingest path dots the action
-  // first (`normalizeRecords`/`buildFlowWindow`), so this is defense in depth
-  // for a consumer handed raw records (unit fixtures, the mission graph's
-  // stream), per the #1852 contract.
-  const is = DISPATCH_ACT[act];
+export function dispatchRec(data: NormRecord[], sid: string, act: "start" | "complete" | "error", missionId?: string): NormRecord | undefined {
+  const action = DISPATCH_ACT[act];
   return sessionRecords(data, sid).find(
-    (r) => r.session_id === sid && is(r.action) && (missionId === undefined || !r.mission_id || r.mission_id === missionId),
+    (r) => r.session_id === sid && r.action === action && (missionId === undefined || !r.mission_id || r.mission_id === missionId),
   );
 }
 
 /** `dispatchEnd()` — viewer.html:1131. */
-export function dispatchEnd(data: FlowRecord[], sid: string, missionId?: string): FlowRecord | undefined {
+export function dispatchEnd(data: NormRecord[], sid: string, missionId?: string): NormRecord | undefined {
   return dispatchRec(data, sid, "complete", missionId) ?? dispatchRec(data, sid, "error", missionId);
 }
 
-const DISPATCH_ACT = { start: isDispatchStart, complete: isDispatchComplete, error: isDispatchError } as const;
+const DISPATCH_ACT = { start: ACTION.DispatchStart, complete: ACTION.DispatchComplete, error: ACTION.DispatchError } as const;
 
 /** `dispatchErrored()` — viewer.html:1132. */
-export const dispatchErrored = (rec: FlowRecord | undefined): boolean => !!rec && isDispatchError(rec.action);
+export const dispatchErrored = (rec: NormRecord | undefined): boolean => !!rec && rec.action === ACTION.DispatchError;
 
 /** `dispatchKilled()` — viewer.html:1133. Watchdog kill = exit 137. */
-export const dispatchKilled = (rec: FlowRecord | undefined): boolean =>
+export const dispatchKilled = (rec: NormRecord | undefined): boolean =>
   dispatchErrored(rec) && (rec?.payload as { exit_code?: number } | undefined)?.exit_code === 137;
 
 /** `sessEnd()` — viewer.html:1149. `missionId` (#2125) — see `dispatchRec`'s
  * own doc. */
-export function sessEnd(data: FlowRecord[], sid: string, missionId?: string): FlowRecord | undefined {
+export function sessEnd(data: NormRecord[], sid: string, missionId?: string): NormRecord | undefined {
   return sessionRecords(data, sid).find(
-    (r) => r.session_id === sid && r.action === "session.end" && (missionId === undefined || !r.mission_id || r.mission_id === missionId),
+    (r) => r.session_id === sid && r.action === ACTION.SessionEnd && (missionId === undefined || !r.mission_id || r.mission_id === missionId),
   );
 }
 
@@ -899,10 +704,10 @@ export function sessEnd(data: FlowRecord[], sid: string, missionId?: string): Fl
  * (#2125) `missionId`, threaded straight through — an abort closes only ITS
  * OWN mission's open steps; a bare `mission_id`-less lookup would let a
  * SIBLING mission's abort (or `session.end`) close this one's bar too. */
-export function sessionCloseEdge(data: FlowRecord[], sid: string, missionId?: string): FlowRecord | undefined {
+export function sessionCloseEdge(data: NormRecord[], sid: string, missionId?: string): NormRecord | undefined {
   const c = dispatchEnd(data, sid, missionId);
   const e = sessEnd(data, sid, missionId);
-  if (c && e) return T(c.ts) <= T(e.ts) ? c : e;
+  if (c && e) return byTime(c, e) <= 0 ? c : e;
   return c ?? e;
 }
 
@@ -913,25 +718,28 @@ export function sessionCloseEdge(data: FlowRecord[], sid: string, missionId?: st
  * `null` otherwise. A hosted call's gate writes its wait BEFORE any
  * `dispatch start` (contract 2), so this is the one piece of live work a
  * session can have with no start at all: every liveness gate asks it. */
-export function openBudgetWait(own: readonly FlowRecord[], t: number): FlowRecord | null {
-  let open: FlowRecord | null = null;
-  for (const r of own) {
-    if (r.action === "budget.wait" && T(r.ts) <= t && (!open || T(r.ts) >= T(open.ts))) open = r;
-  }
+export function openBudgetWait(own: readonly NormRecord[], t: number): NormRecord | null {
+  const seen = recordsAsOf(own, t);
+  const open = latestByTime(seen.filter((r) => r.action === ACTION.BudgetWait));
   if (!open) return null;
-  const at = T(open.ts);
-  const closed = own.some(
-    (r) =>
-      T(r.ts) >= at &&
-      T(r.ts) <= t &&
-      r !== open &&
-      (r.action === "budget.resume" || r.action === "budget.stop" || isDispatchTerminal(r.action) || r.action === "session.end"),
-  );
-  if (closed) return null;
-  const p = (open.payload ?? (open as { fields?: unknown }).fields ?? {}) as { wait_seconds?: unknown };
+  if (seen.some((r) => r !== open && r.action !== undefined && BUDGET_WAIT_CLOSERS.has(r.action) && byTime(r, open) >= 0)) return null;
+  // A wait with no usable time has no deadline to outlive (the bad-timestamp
+  // policy): it stays open until something closes it.
+  if (open.tMs === null) return open;
+  const p = (open.payload ?? open.fields ?? {}) as { wait_seconds?: unknown };
   const secs = typeof p.wait_seconds === "number" && Number.isFinite(p.wait_seconds) ? Math.max(0, p.wait_seconds) : 0;
-  return t <= at + secs * 1000 + BUDGET_WAIT_GRACE_MS ? open : null;
+  return t <= open.tMs + secs * 1000 + BUDGET_WAIT_GRACE_MS ? open : null;
 }
+
+/** What ends a budget wait: its call went ahead, its run was stopped, or its
+ *  execution or session ended. */
+const BUDGET_WAIT_CLOSERS: ReadonlySet<NormAction> = new Set<NormAction>([
+  ACTION.BudgetResume,
+  ACTION.BudgetStop,
+  ACTION.DispatchComplete,
+  ACTION.DispatchError,
+  ACTION.SessionEnd,
+]);
 
 /** `sessionRunning()` — viewer.html:1183-1187. THE single source of truth for
  * "is this session in flight?"
@@ -965,7 +773,7 @@ export function openBudgetWait(own: readonly FlowRecord[], t: number): FlowRecor
  * `liveSessionSet`'s own #2123 doc), so that collision risk, if any, lives
  * entirely in that separate, already-fixed gap, not here. */
 export function sessionRunning(
-  data: FlowRecord[],
+  data: NormRecord[],
   liveSet: Set<string>,
   sid: string,
   t: number,
@@ -973,14 +781,13 @@ export function sessionRunning(
 ): boolean {
   if (liveSet.has(sid)) return true;
   const close = sessionCloseEdge(data, sid, missionId);
-  if (close && T(close.ts) <= t) return false;
-  const own = sessionRecords(data, sid);
+  if (close && isAsOf(close, t)) return false;
   // (#2902 step 5) A call held by its budget is running, however long ago
   // its wait was announced (a day window's wait outlasts the TTL below).
-  if (openBudgetWait(own, t)) return true;
-  const started = own.some((r) => isDispatchStart(r.action) && T(r.ts) <= t);
-  if (!started) return false;
-  const activityTimes = own.filter((r) => T(r.ts) <= t).map((r) => T(r.ts));
+  if (openBudgetWait(sessionRecords(data, sid), t)) return true;
+  const own = recordsAsOf(sessionRecords(data, sid), t);
+  if (!own.some((r) => r.action === ACTION.DispatchStart)) return false;
+  const activityTimes = timesOf(own);
   const lastActivity = activityTimes.length ? Math.max(...activityTimes) : -Infinity;
   return t - lastActivity <= FLOW_LIVE_TTL_MS;
 }
@@ -1070,24 +877,25 @@ export function statusLabel(state: RunState): string {
 /** `machPresent()` — viewer.html:1321-1327. true=present, false=absent,
  * null=unknown (no evidence either way). */
 export function machPresent(
-  data: FlowRecord[],
+  data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
   tMax: number,
   m: string,
 ): boolean | null {
   if (liveMachines.has(m)) return true;
-  const edges = data
-    .filter((r) => uidOf(r) === m && (r.action === "machine.online" || r.action === "machine.offline") && T(r.ts) <= tMax)
-    .sort((a, b) => T(a.ts) - T(b.ts));
-  if (!edges.length) return null;
-  return edges[edges.length - 1].action === "machine.online";
+  const edges = recordsAsOf(data, tMax).filter(
+    (r) => uidOf(r) === m && (r.action === ACTION.MachineOnline || r.action === ACTION.MachineOffline),
+  );
+  // The latest edge by time; an untimed one only when no edge is timed.
+  const last = latestByTime(edges);
+  return last === undefined ? null : last.action === ACTION.MachineOnline;
 }
 
 /** `flowLiveSessions()` — viewer.html:1343-1358. Flow-derived liveness
  * fallback for when Redis session-presence (`/fleet/sessions/live`) is
  * empty. `nowMs` is REAL wall-clock now (frozen via Playwright's clock in
  * the parity spec), not `tMax` — see the legacy comment this ports. */
-export function flowLiveSessions(data: FlowRecord[], nowMs: number, liveMode = true): Set<string> {
+export function flowLiveSessions(data: NormRecord[], nowMs: number, liveMode = true): Set<string> {
   // `if(!document.body.classList.contains('live-mode')) return new Set();`
   // (viewer.html:3378) — the gate this port dropped, because until #1800 P2
   // nothing here ever ran outside live mode. Without it a REPLAY derives
@@ -1101,11 +909,10 @@ export function flowLiveSessions(data: FlowRecord[], nowMs: number, liveMode = t
   const waited = new Set<string>();
   for (const r of data) {
     if (!r.session_id) continue;
-    const t = T(r.ts);
     const prev = lastBySid.get(r.session_id);
-    if (prev === undefined || t > prev) lastBySid.set(r.session_id, t);
-    if (isDispatchStart(r.action)) started.add(r.session_id);
-    if (r.action === "budget.wait") waited.add(r.session_id);
+    if (r.tMs !== null && (prev === undefined || r.tMs > prev)) lastBySid.set(r.session_id, r.tMs);
+    if (r.action === ACTION.DispatchStart) started.add(r.session_id);
+    if (r.action === ACTION.BudgetWait) waited.add(r.session_id);
   }
   const out = new Set<string>();
   // (#2902 step 5) A hosted call held by its budget has no start yet (its
@@ -1154,7 +961,7 @@ export function flowLiveSessions(data: FlowRecord[], nowMs: number, liveMode = t
  * which is itself always empty in replay (`useLiveSessionIds`'s `enabled`
  * gate). */
 export function liveSessionSet(
-  data: FlowRecord[],
+  data: NormRecord[],
   liveSessionIds: Set<string>,
   nowMs: number,
   liveMode = true,
@@ -1185,7 +992,7 @@ export interface MachineRunNode {
  * viewer.html:1914-1957, sorted the same way (closeTs, falling back to
  * startTs, descending — most-recent-first). */
 export function buildMachineRuns(
-  data: FlowRecord[],
+  data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
   liveSessionIds: Set<string>,
   tMax: number,
@@ -1200,11 +1007,11 @@ export function buildMachineRuns(
     const s = dispatchRec(data, sid, "start");
     const c = dispatchEnd(data, sid);
     const e = sessEnd(data, sid);
-    const closeCands = [c ? T(c.ts) : null, e ? T(e.ts) : null].filter((x): x is number => x != null);
+    const closeCands = timesOf([c, e].filter((x): x is NormRecord => x !== undefined));
     const closeTs = closeCands.length ? Math.min(...closeCands) : null;
     const closedBy = closeTs != null && closeTs <= tMax;
-    const cleanClose = !!c && T(c.ts) === closeTs && !dispatchErrored(c);
-    const errClose = !!c && T(c.ts) === closeTs && dispatchErrored(c);
+    const cleanClose = !!c && c.tMs === closeTs && !dispatchErrored(c);
+    const errClose = !!c && c.tMs === closeTs && dispatchErrored(c);
     const liveNow = liveSet.has(sid);
     const killed = dispatchKilled(c);
     const lbl = statusLabel(
@@ -1215,7 +1022,7 @@ export function buildMachineRuns(
         clean: closedBy && cleanClose,
       }),
     );
-    const startTs = s ? T(s.ts) : null;
+    const startTs = s ? s.tMs : null;
     const donePayload = c?.payload ?? null;
 
     if (s) {
@@ -1236,7 +1043,7 @@ export function buildMachineRuns(
     const first = data.find((r) => r.session_id === sid);
     const handle = first?.handle || `session ${sid}`;
     const model = first?.model || "?";
-    const fbTs = closeTs ?? (first?.ts ? T(first.ts) : null);
+    const fbTs = closeTs ?? first?.tMs ?? null;
     return {
       lbl: "no start",
       closeTs,
@@ -1257,13 +1064,10 @@ export function buildMachineRuns(
  * close-edge (so the bar stops at its last sign of life, not at "now").
  * `missionId` (#2125) narrows to one mission's own activity — see
  * `dispatchRec`'s own doc; `undefined` preserves the exact prior behavior. */
-export function lastTs(data: FlowRecord[], sid: string, missionId?: string): number {
+export function lastTs(data: NormRecord[], sid: string, missionId?: string): number {
   let m = 0;
   for (const r of data) {
-    if (r.session_id === sid && (missionId === undefined || r.mission_id === missionId)) {
-      const t = T(r.ts);
-      if (t > m) m = t;
-    }
+    if (r.session_id === sid && (missionId === undefined || r.mission_id === missionId) && r.tMs !== null && r.tMs > m) m = r.tMs;
   }
   return m;
 }
@@ -1272,73 +1076,38 @@ function compKey(sessionId: string | undefined, ts: string | undefined): string 
   return `${sessionId || ""}\x1f${ts || ""}`;
 }
 
-/** `flowToRenderModel()` — viewer.html:3171-3242. Normalizes a raw record
- * array (the `/flow-session/<id>` or `/flow-mission/<id>` "replay this
+/** `flowToRenderModel()` — viewer.html:3171-3242. Shapes an ingested
+ * record array (the `/flow-session/<id>` or `/flow-mission/<id>` "replay this
  * thing" payload — the session drill-in's data source, `lenses/session/
  * sessionRun.ts`) into the shape `runRegions()` reads:
  *
- * - action dotting (`normalizeAction`, already used by `buildFlowWindow`
- *   above — reused here, not re-derived)
  * - `fields` ALIASED from `payload` when a record carries the latter but
  *   not the former (schema 1.6+ carries type-specific data under `fields`
- *   on the wire; older/synthesized records only have `payload`) — this is
- *   the piece `buildFlowWindow` above does NOT do (that pipeline's own doc
- *   notes its normalization is deliberately narrower, scoped to what the
- *   machine lens's runs-list needs), so a session-view consumer reading
- *   `r.fields` uniformly needs THIS pass, not that one
+ *   on the wire; older/synthesized records only have `payload`), which the
+ *   live window's `shapeRecords` does not do, so a session-view consumer
+ *   reading `r.fields` uniformly needs THIS pass
  * - a `dispatch.compaction` record retagged as compaction telemetry, UNLESS
  *   a dedicated `telemetry.compaction` sibling already covers the same
  *   `(session_id, ts)` (the #1122 double-count guard)
  * - a category default (`work` absent a `source`, else `telemetry`)
- * - a SYNTHESIZED per-session "runtime" telemetry record carrying the max
- *   `dispatch.turn` `turn_seq` — the ONLY source for the session view's
- *   TURNS metric
- *
- * Sorted by ts at the end (the synthesized runtime records are appended out
- * of order, and the whole point of this pass is a temporally-ordered
- * array). NOT the same pipeline `buildFlowWindow` runs for the fleet/
- * machine lenses' live window — see that function's own doc for why the
- * two stay separate rather than one growing to cover both call sites'
- * needs. */
-export function flowToRenderModel(records: FlowRecord[]): FlowRecord[] {
+ * - then `shapeRecords`: the synthesized per-session "runtime" row (the
+ *   ONLY source for the session view's TURNS metric) and the time sort. */
+export function flowToRenderModel(records: readonly NormRecord[]): NormRecord[] {
   const compTelemetryKeys = new Set<string>();
   for (const r of records) {
-    if (r && r.action === "telemetry.compaction") {
-      compTelemetryKeys.add(compKey(r.session_id, r.ts));
+    if (r.action === ACTION.TelemetryCompaction) compTelemetryKeys.add(compKey(r.session_id, r.ts));
+  }
+  const retagged = records.map((r) => {
+    const o: NormRecord = { ...r };
+    if (o.payload && !o.fields) o.fields = o.payload;
+    if (o.action === ACTION.DispatchCompaction && !compTelemetryKeys.has(compKey(o.session_id, o.ts))) {
+      const p = (o.payload || {}) as { before_messages?: number; after_messages?: number };
+      o.category = CATEGORY.Telemetry;
+      o.source = "compaction";
+      o.fields = { from: p.before_messages || 0, to: p.after_messages || 0 };
     }
-  }
-
-  const out: FlowRecord[] = records
-    .filter((r): r is FlowRecord => !!r && !r._type)
-    .map((r) => {
-      const o: FlowRecord = { ...r, action: normalizeAction(r.action) };
-      if (o.payload && !o.fields) o.fields = o.payload;
-      if (o.action === "dispatch.compaction" && !compTelemetryKeys.has(compKey(o.session_id, o.ts))) {
-        const p = (o.payload || {}) as { before_messages?: number; after_messages?: number };
-        o.category = "telemetry";
-        o.source = "compaction";
-        o.fields = { from: p.before_messages || 0, to: p.after_messages || 0 };
-      }
-      if (!o.category) o.category = o.source ? "telemetry" : "work";
-      return o;
-    });
-
-  const perSession = new Map<string, { turns: number; ts: string }>();
-  for (const r of records) {
-    if (r.action === "dispatch.turn" && r.session_id) {
-      const seq = Number((r.payload as { turn_seq?: number } | undefined)?.turn_seq) || 0;
-      const existing = perSession.get(r.session_id);
-      if (existing) {
-        existing.turns = Math.max(existing.turns, seq);
-        existing.ts = r.ts;
-      } else {
-        perSession.set(r.session_id, { turns: seq, ts: r.ts });
-      }
-    }
-  }
-  for (const [sid, agg] of perSession) {
-    out.push({ ts: agg.ts, category: "telemetry", source: "runtime", session_id: sid, fields: { turns: agg.turns } });
-  }
-
-  return out.sort((a, b) => T(a.ts) - T(b.ts));
+    if (!o.category) o.category = o.source ? CATEGORY.Telemetry : CATEGORY.Work;
+    return o;
+  });
+  return shapeRecords(retagged);
 }

@@ -14,14 +14,17 @@
 // matching what a replay caller always passes.
 process.env.TZ = "UTC";
 import { describe, it, expect } from "vitest";
-import { normalizeRecords, sessionRunning, FLOW_LIVE_TTL_MS } from "./flow";
+import { shapeRecords, sessionRunning, FLOW_LIVE_TTL_MS } from "./flow";
+import { normAll } from "../testing/records";
 
 describe("sessionRunning: one algorithm, TTL measured from t (#7)", () => {
   const t0 = Date.parse("2026-09-24T03:00:00Z");
-  const data = normalizeRecords([
-    { ts: new Date(t0).toISOString(), action: "dispatch.start", session_id: "orph", machine_id: "M" },
-    { ts: new Date(t0 + 10_000).toISOString(), action: "dispatch.turn.heartbeat", session_id: "orph", machine_id: "M" },
-  ] as never);
+  const data = shapeRecords(
+    normAll([
+      { ts: new Date(t0).toISOString(), action: "dispatch.start", session_id: "orph", machine_id: "M" },
+      { ts: new Date(t0 + 10_000).toISOString(), action: "dispatch.turn.heartbeat", session_id: "orph", machine_id: "M" },
+    ]),
+  );
 
   it("reads running while inside the TTL of its last heartbeat", () => {
     const probe = t0 + 10_000 + FLOW_LIVE_TTL_MS - 1_000;
@@ -43,10 +46,10 @@ describe("sessionRunning: one algorithm, TTL measured from t (#7)", () => {
   });
 
   it("a close edge before t still wins over presence being silent", () => {
-    const closed = normalizeRecords([
+    const closed = shapeRecords([
       ...data,
-      { ts: new Date(t0 + 20_000).toISOString(), action: "dispatch.complete", session_id: "orph", machine_id: "M" },
-    ] as never);
+      ...normAll([{ ts: new Date(t0 + 20_000).toISOString(), action: "dispatch.complete", session_id: "orph", machine_id: "M" }]),
+    ]);
     expect(sessionRunning(closed, new Set(), "orph", t0 + 25_000)).toBe(false);
   });
 });

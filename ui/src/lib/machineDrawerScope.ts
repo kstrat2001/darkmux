@@ -53,10 +53,10 @@
  * Kept separate from the React component so the scope decision is testable
  * without rendering anything.
  */
-import type { FlowRecord } from "../types/handwritten";
 import type { Route } from "./route";
-import { T, uidOf } from "./flow";
+import { uidOf } from "./flow";
 import type { ProcSamplePoint } from "./hostStats";
+import { ACTION, CATEGORY, byTime, recordsAsOf, recordsSince, type NormRecord } from "./ingest";
 
 export const DRAWER_ROLLING_WINDOW_MS = 10 * 60 * 1000;
 export const DRAWER_ROLLING_SCOPE_LABEL = "last 10 min";
@@ -75,16 +75,17 @@ const LAST_KNOWN_LOOKBACK_MS = 24 * 60 * 60 * 1000;
  * that used to was deleted in the same round). A reader still needs both
  * arms for a pre-1.42.0 day file, which is lenient-on-read and un-migrated
  * by design, so old records keep showing SOMETHING rather than going
- * blank. */
-function isHostSampleRecord(r: FlowRecord): boolean {
+ * blank. The retired action is outside the flow vocabulary, so its arm
+ * matches the shape it always carried (`category: "telemetry"`,
+ * `source: "process"`). */
+export function isHostSampleRecord(r: NormRecord): boolean {
   return (
-    r.action === "telemetry.process" ||
-    r.action === "machine.telemetry" ||
-    (r.category === "telemetry" && r.source === "process")
+    r.action === ACTION.MachineTelemetry ||
+    (r.category === CATEGORY.Telemetry && r.source === "process")
   );
 }
 
-function toPoint(r: FlowRecord): ProcSamplePoint {
+function toPoint(r: NormRecord): ProcSamplePoint {
   // Raw route/window records carry `payload`; a normalized render model
   // (`flowToRenderModel`) renames it to `fields` — accept either so this
   // works against whichever shape a caller hands it.
@@ -133,11 +134,11 @@ export interface DrawerScope {
  * (#1833) can use the SAME window without faking a `Route` — that lens
  * always wants "this machine, last 10 min" regardless of which app route
  * is current, since IT is what the route names. */
-export function rollingWindowSamples(records: FlowRecord[], uid: string | null, nowMs: number): ProcSamplePoint[] {
+export function rollingWindowSamples(records: NormRecord[], uid: string | null, nowMs: number): ProcSamplePoint[] {
   const cutoff = nowMs - DRAWER_ROLLING_WINDOW_MS;
-  return records
-    .filter((r) => isHostSampleRecord(r) && (uid == null || uidOf(r) === uid) && T(r.ts) >= cutoff && T(r.ts) <= nowMs)
-    .sort((a, b) => T(a.ts) - T(b.ts))
+  return recordsSince(recordsAsOf(records, nowMs), cutoff)
+    .filter((r) => isHostSampleRecord(r) && (uid == null || uidOf(r) === uid))
+    .sort(byTime)
     .map(toPoint);
 }
 
@@ -148,13 +149,14 @@ export function rollingWindowSamples(records: FlowRecord[], uid: string | null, 
  * "no reading in the last 10 min" is a very different claim from "never
  * measured at all". Bounded by `LAST_KNOWN_LOOKBACK_MS` so a genuinely
  * stale record doesn't get reported as if it just happened. */
-export function findLastKnownSample(records: FlowRecord[], uid: string | null, nowMs: number): LastKnownSample | null {
-  let best: { r: FlowRecord; ts: number } | null = null;
+export function findLastKnownSample(records: NormRecord[], uid: string | null, nowMs: number): LastKnownSample | null {
+  let best: { r: NormRecord; ts: number } | null = null;
   for (const r of records) {
     if (!isHostSampleRecord(r)) continue;
     if (uid != null && uidOf(r) !== uid) continue;
-    const ts = T(r.ts);
-    if (!Number.isFinite(ts) || ts > nowMs) continue;
+    const ts = r.tMs;
+    // The result states when it was measured, so an untimed sample cannot be it.
+    if (ts === null || ts > nowMs) continue;
     if (nowMs - ts > LAST_KNOWN_LOOKBACK_MS) continue;
     if (best == null || ts > best.ts) best = { r, ts };
   }
@@ -163,8 +165,8 @@ export function findLastKnownSample(records: FlowRecord[], uid: string | null, n
 
 export function resolveDrawerScope(
   route: Route,
-  routeRecords: FlowRecord[],
-  rollingWindow: FlowRecord[],
+  routeRecords: NormRecord[],
+  rollingWindow: NormRecord[],
   localUid: string | null,
   nowMs: number,
 ): DrawerScope {
@@ -177,7 +179,7 @@ export function resolveDrawerScope(
   // with no id/time/machine bound would just be the same unscoped window
   // wearing a "this mission" label.
   if (route.kind === "dispatch") {
-    const scoped = routeRecords.filter(isHostSampleRecord).sort((a, b) => T(a.ts) - T(b.ts));
+    const scoped = routeRecords.filter(isHostSampleRecord).sort(byTime);
     return {
       scopeLabel: "this dispatch",
       samples: scoped.map(toPoint),

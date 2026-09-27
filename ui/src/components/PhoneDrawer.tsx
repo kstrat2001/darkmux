@@ -91,12 +91,12 @@ import type { ReactNode } from "react";
 import { EventLogColumn } from "./EventLogColumn";
 import { isLiveRoute, type Route } from "../lib/route";
 import type { LiveTailStatus } from "../hooks/useLiveTail";
-import type { FlowRecord } from "../types/handwritten";
 import {
   loadDrawerHeightPct,
   saveDrawerHeightPct,
   type DrawerTabId,
 } from "../lib/drawerStorage";
+import type { NormRecord } from "../lib/ingest";
 
 
 /** vh used the first time a tab is ever opened (nothing stored yet).
@@ -198,7 +198,7 @@ export interface PhoneDrawerMachineTab {
 }
 
 export interface PhoneDrawerEventsTab {
-  records: FlowRecord[];
+  records: NormRecord[];
   scopeLabel: string;
   visible: boolean;
   loading: boolean;

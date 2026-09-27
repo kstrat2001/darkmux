@@ -4,7 +4,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { EventLogColumn, compactCountLabel, fmtTok, fmtTurnDuration } from "./EventLogColumn";
-import type { FlowRecord } from "../types/handwritten";
+import { ingest, type NormRecord } from "../lib/ingest";
+import { norm, type RawRecord } from "../testing/records";
 import { closeOpenModal } from "../lib/dialogManager";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -30,19 +31,18 @@ const REPO_ROOT = path.resolve(__dirname, "../../..");
  * uses) and a neutral `/tmp/...` path. Every other field (the prompt, the
  * diff it reviews, tool args/results, timings, turn structure) is the real
  * captured shape — only the two host-identifying values were touched. */
-function readCorpus(name: string): FlowRecord[] {
-  const raw = JSON.parse(readFileSync(path.join(REPO_ROOT, "tests/parity/corpus", name), "utf8"));
-  return raw.records as FlowRecord[];
+function readCorpus(name: string): NormRecord[] {
+  return ingest(JSON.parse(readFileSync(path.join(REPO_ROOT, "tests/parity/corpus", name), "utf8")));
 }
 
-function rec(overrides: Partial<FlowRecord>): FlowRecord {
-  return {
+function rec(overrides: RawRecord): NormRecord {
+  return norm({
     ts: "2026-08-08T12:00:00.000Z",
     category: "dispatch",
     action: "dispatch.reasoning",
     machine_id: "MacBook-Pro",
     ...overrides,
-  };
+  });
 }
 
 // `dialogManager`'s "which dialog is open" state is a module-level
@@ -109,6 +109,21 @@ describe("EventLogColumn", () => {
     const rows = document.querySelectorAll('[data-act="rec"]');
     expect(rows.length).toBe(1);
     expect(rows[0].textContent).toContain("s-alpha");
+  });
+
+  it("states vocabulary skew beside the totals: records whose action this build does not know", () => {
+    const records = [
+      rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s-alpha" }),
+      rec({ ts: "2026-08-08T12:01:00.000Z", action: "dispatch start", session_id: "s-alpha" }),
+      rec({ ts: "2026-08-08T12:02:00.000Z", action: "wibble.fired", session_id: "s-alpha" }),
+    ];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    expect(document.getElementById("qcount")?.textContent).toMatch(/ · 2 unknown$/);
+  });
+
+  it("says nothing about skew when every action is known", () => {
+    render(<EventLogColumn scopeLabel="fleet" records={[rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning" })]} visible />);
+    expect(document.getElementById("qcount")?.textContent).not.toMatch(/unknown/);
   });
 
   it("shows 'no match' in the query count when the search matches nothing", () => {
@@ -360,13 +375,13 @@ describe("EventLogColumn", () => {
   it("the modal's checkbox grid filters by category/tier/source, not just activity", () => {
     const records = [
       rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s-local", tier: "local" }),
-      rec({ ts: "2026-08-08T12:05:00.000Z", action: "dispatch.reasoning", session_id: "s-cloud", tier: "cloud" }),
+      rec({ ts: "2026-08-08T12:05:00.000Z", action: "dispatch.reasoning", session_id: "s-cloud", tier: "frontier" }),
     ];
     render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
     fireEvent.click(document.getElementById("fbtn")!);
-    // Uncheck the "cloud" tier checkbox — its own accessible label is the
+    // Uncheck the "frontier" tier checkbox — its own accessible label is the
     // literal facet value text (see FiltersDialog.tsx).
-    fireEvent.click(screen.getByLabelText("cloud"));
+    fireEvent.click(screen.getByLabelText("frontier"));
     const rows = document.querySelectorAll('[data-act="rec"]');
     expect(rows.length).toBe(1);
     expect(rows[0].textContent).toContain("s-local");
@@ -455,7 +470,7 @@ describe("EventLogColumn", () => {
   it("(#2027 dual-mount) an idle sibling pane's own reconcile never writes, so it cannot clobber a gesture made in the other", () => {
     const records = [
       rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s-local", tier: "local" }),
-      rec({ ts: "2026-08-08T12:05:00.000Z", action: "dispatch.reasoning", session_id: "s-cloud", tier: "cloud" }),
+      rec({ ts: "2026-08-08T12:05:00.000Z", action: "dispatch.reasoning", session_id: "s-cloud", tier: "frontier" }),
     ];
     const { container: paneA } = render(<EventLogColumn scopeLabel="fleet" paneId="a" records={records} visible />);
     const { rerender: rerenderB } = render(
@@ -479,7 +494,7 @@ describe("EventLogColumn", () => {
     // operator gesture of its own.
     //
     // (#2417 round 3, MF-B) The tick record carries a BRAND-NEW facet value
-    // (`tier: "edge"` — neither "local" nor "cloud" was ever offered
+    // (`tier: "operator"` — neither "local" nor "frontier" was ever offered
     // before) rather than reusing an already-seen one. `absorbNewFacetValues`
     // returns the SAME `filters` reference when nothing is new (its own
     // "no spurious re-render" guarantee — see `eventFilters.ts`'s doc), so
@@ -492,7 +507,7 @@ describe("EventLogColumn", () => {
       <EventLogColumn
         scopeLabel="mission m1"
         paneId="b"
-        records={[...records, rec({ ts: "2026-08-08T12:10:00.000Z", action: "dispatch.reasoning", session_id: "s-edge", tier: "edge" })]}
+        records={[...records, rec({ ts: "2026-08-08T12:10:00.000Z", action: "dispatch.reasoning", session_id: "s-edge", tier: "operator" })]}
         visible={false}
       />,
     );

@@ -8,7 +8,9 @@ import {
   machineLabel,
   type MachineKeyContext,
 } from "./machineKey";
-import type { FlowRecord, PresenceBeat } from "../types/handwritten";
+import type { PresenceBeat } from "../types/handwritten";
+import type { NormRecord } from "./ingest";
+import { norm } from "../testing/records";
 
 // FAKE hardware uids — UUID-shaped so the no-uid assertions below have
 // something uid-shaped to catch. All in the repo's fake form (#2957), with hex
@@ -19,10 +21,10 @@ const UID_B = "00000000-0000-4000-8000-abcdef000002";
 const UID_C = "00000000-0000-4000-8000-ABCDEF000004";
 const UID_D = "00000000-0000-4000-8000-ABCDEF000007";
 
-const rec = (uid: string, ts: string, machine_id?: string): FlowRecord =>
-  ({ ts, machine_uid: uid, ...(machine_id ? { machine_id } : {}) }) as FlowRecord;
+const rec = (uid: string, ts: string, machine_id?: string): NormRecord =>
+  norm({ ts, machine_uid: uid, ...(machine_id ? { machine_id } : {}) });
 
-function ctx(data: FlowRecord[], extra: Partial<MachineKeyContext> = {}): MachineKeyContext {
+function ctx(data: NormRecord[], extra: Partial<MachineKeyContext> = {}): MachineKeyContext {
   return { data, liveMachines: new Map<string, PresenceBeat>(), specs: null, roster: [], ...extra };
 }
 
