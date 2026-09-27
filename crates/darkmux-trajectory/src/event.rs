@@ -300,7 +300,7 @@ pub struct ModelCompleted {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reported_model: Option<String>,
     /// True when `tool_calls` carry their `runs` marks.
-    #[serde(skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub calls_planned: bool,
 }
 
