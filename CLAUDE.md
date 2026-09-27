@@ -625,21 +625,16 @@ crates/darkmux-crew/src/step_kinds/
     patterns/     — Tier 2: a genuinely new, reusable control-flow SHAPE,
                     with the domain-specific ALGORITHM plugged in as a
                     caller-supplied strategy (deliberately NO runtime
-                    name-keyed strategy registry yet; dedup.rs's module
-                    doc names the upgrade path for when a second strategy
-                    needs runtime selection). multi_pass_confirm.rs (the
-                    pass-1 → conditional confirmation passes → demote-on-
-                    disagreement shape, generalized from the PR-review
-                    judge; pass count + confirm rule are parameterized,
-                    the demotion rule is currently fixed — a known,
-                    documented narrowing of #1352's spec, widen when a
-                    consumer needs a different demotion). dedup.rs (the
-                    "scan for the first survivor a candidate collapses
-                    into, per a pluggable match/merge strategy" procedure,
-                    generalized from the PR-review dedup stage). Neither
-                    submodule depends on any mission's own types, which is
-                    what keeps a Tier 2 pattern actually reusable rather
-                    than one mission's code with extra ceremony.
+                    name-keyed strategy registry). plan_sites.rs (the
+                    "prefilter hits over a source, window each hit, pack
+                    windows into sizing-bounded units" procedure, shared
+                    by the crawl planner and the diff-scoped `plan.sites`
+                    step). Nothing here depends on any mission's own
+                    types, which is what keeps a Tier 2 pattern actually
+                    reusable rather than one mission's code with extra
+                    ceremony. (The funnel-era multi_pass_confirm.rs and
+                    dedup.rs were deleted in 4.0: their only consumer was
+                    the funnel #2310 P4d removed.)
     types.rs      — the StepKind trait itself.
     registry.rs   — StepKindRegistry.
 ```

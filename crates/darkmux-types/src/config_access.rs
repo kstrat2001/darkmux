@@ -4091,9 +4091,8 @@ mod tests {
 
     /// Accessors this guard KNOWS are currently unread outside their own
     /// unit test, each with a tracking issue — named in place rather than
-    /// silently excluded, the same discipline `step_kinds/patterns/
-    /// dedup.rs` and `coder_phase.rs` (#1352) use for a documented
-    /// narrowing. Grow this list only with a linked issue, never to
+    /// silently excluded, the same discipline `coder_phase.rs` (#1352) uses
+    /// for a documented narrowing. Grow this list only with a linked issue, never to
     /// silence a failure without one.
     // (#1665 review CONSIDER 5) `remote_concurrent_cap` (#2681) was here —
     // found BY this guard while it was being written, then resolved in the
