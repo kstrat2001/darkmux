@@ -483,7 +483,12 @@ fn peer_mission_runs(
 /// chain `run_list.rs::run_activity` uses, so a peer row and a local run
 /// row agree on what "most recently active" means.
 fn peer_activity(r: &Run) -> u64 {
-    r.updated_ts.or(r.completed_ts).or(r.started_ts).unwrap_or(0)
+    peer_last_seen(r).unwrap_or(0)
+}
+
+/// The newest timestamp a peer run carries, if any.
+fn peer_last_seen(r: &Run) -> Option<u64> {
+    r.updated_ts.or(r.completed_ts).or(r.started_ts)
 }
 
 /// (#1711) The status word for one peer-observed mission row.
@@ -556,8 +561,8 @@ fn format_age_span(secs: u64) -> String {
 /// shared flow stream but does not OWN. Thinner than a local row by
 /// necessity — no phase graph, no per-task detail, because that structure
 /// only exists on the machine that ran it (see [`peer_mission_runs`]'s doc).
-/// A no-op when `peer` is empty, which includes every standalone install —
-/// this is what keeps the local-only board byte-identical to before #1711.
+/// Empty when `peer` is empty, which includes every standalone install, so
+/// a local-only board prints no fleet section at all.
 fn peer_mission_lines(peer: &[Run], now: u64, width: Option<usize>) -> Vec<String> {
     let mut out = Vec::new();
     if peer.is_empty() {
@@ -581,8 +586,7 @@ fn peer_mission_lines(peer: &[Run], now: u64, width: Option<usize>) -> Vec<Strin
     for r in peer {
         let id = ellipsize(&r.id, id_w);
         let machine = ellipsize(r.machine.as_deref().unwrap_or("unknown machine"), machine_w);
-        let ts = r.updated_ts.or(r.completed_ts).or(r.started_ts).unwrap_or(now);
-        let age = relative_age(now, ts);
+        let age = relative_age(now, peer_last_seen(r).unwrap_or(now));
         let status = peer_status_word(r.status, r.abandoned_reason);
         out.push(format!(
             "  ◇ {id:<id_w$}  {machine:<machine_w$}  {age:>age_w$}  {status}",
@@ -1347,102 +1351,29 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
     let now = now_unix();
     let stale_days = config_access::mission_stale_active_days();
 
-    // Bucket phases by mission_id once.
-    let mut by_mission: BTreeMap<&str, Vec<&Phase>> = BTreeMap::new();
-    for s in &phases {
-        by_mission.entry(s.mission_id.as_str()).or_default().push(s);
-    }
-
-    // (#1711) Fetched BEFORE the per-mission view loop below (moved up from
-    // its original position after that loop — see the "known_mission_ids"
-    // paragraph there for why the ORIGINAL #1711 design deliberately never
-    // re-loaded Mission/Phase JSON here, and `local_run_status`'s own doc
-    // just below for why #2682 now pays that cost anyway): missions this
-    // machine can SEE via the shared flow stream but does not OWN.
-    // `fleet_records_for_runs()` degrades to an empty vec + `SourceState::Off`
-    // on a standalone install with no `DARKMUX_REDIS_URL`, so this costs
-    // nothing there. See [`peer_mission_runs`]'s doc for why THAT call reuses
-    // #1705's narrow aggregation rather than re-deriving it.
+    // (#1711) Missions this machine can SEE via the shared flow stream but
+    // does not OWN. `fleet_records_for_runs()` degrades to an empty vec +
+    // `SourceState::Off` on a standalone install with no `DARKMUX_REDIS_URL`,
+    // so this costs nothing there. See [`peer_mission_runs`]'s doc for why
+    // that call reuses #1705's narrow aggregation rather than re-deriving it.
     let known_mission_ids: std::collections::HashSet<String> =
         missions.iter().map(|m| m.id.clone()).collect();
     let flows_dir = config_access::flows_dir();
     let fleet = darkmux_serve::fleet_records_for_runs();
 
-    // (#2682, replaced by the #2682 fix-pass) This mission's OWN
-    // dispatch-session status — and, when it reads `Abandoned`, WHICH of
-    // three genuinely different situations produced it
-    // ([`DispatchSessionEvidence`]) — exactly as `darkmux run list`/the
-    // viewer's missions lens already compute it (`mission_to_run` →
-    // `mission_run_status_and_evidence`, which applies `session_is_live`
-    // against this machine's own flow records). Consumed by `detect_drift`
-    // below so this board and `run list` read the SAME value for the same
-    // mission by construction, rather than two independently-derived
-    // opinions that usually — but not always — agree.
-    //
-    // **Superseeds calling the FULL `darkmux_serve::build_runs` and
-    // filtering its output to `known_mission_ids`** (the original #2682
-    // shape). That filter turned out to be untested dead weight — the
-    // fix-pass review deleted it and 93 tests stayed green — because it
-    // isn't what scopes this map to local missions; looping over `missions`
-    // (this function's OWN already-loaded snapshot) is what does that,
-    // structurally. `darkmux_serve::local_dispatch_status` shares the exact
-    // session-pool + verdict code `mission_to_run` uses (see that
-    // function's own doc), so this is the SAME judgment, computed more
-    // narrowly and more cheaply: it never builds the other `Run` attributes
-    // (machine/role/model/timestamps) this board doesn't read, and it takes
-    // `&missions` rather than reloading Mission/Phase JSON a second time —
-    // one fewer snapshot than the original design, not one more.
+    // (#2682) Each local mission's OWN dispatch-session status — and, when it
+    // reads `Abandoned`, WHICH of three different situations produced it
+    // ([`DispatchSessionEvidence`]) — computed by the same session-pool and
+    // verdict code `darkmux run list` and the viewer's missions lens use, so
+    // `detect_drift` and `run list` read the SAME value for the same mission
+    // by construction. It takes `&missions`, the snapshot already loaded
+    // here, and builds none of the `Run` attributes this board doesn't read.
     let local_dispatch_status: std::collections::HashMap<
         String,
         (RunStatus, Option<DispatchSessionEvidence>),
     > = darkmux_serve::local_dispatch_status(&missions, &flows_dir, &fleet.records);
 
-    let mut views: Vec<MissionView> = missions
-        .iter()
-        .map(|m| {
-            let ss: Vec<&Phase> = by_mission.get(m.id.as_str()).cloned().unwrap_or_default();
-            // (#2406) The envelope's degraded set, applied ONLY over a
-            // phase that disk agrees is `Complete` — the same
-            // monotone-authority shape the graph lens uses
-            // (`mission_graph.rs::phase_display_status`): the envelope may
-            // refine a persisted `Complete` into `Degraded`, and may never
-            // overwrite any other persisted terminal. Keeps a stale or
-            // hand-edited envelope from inventing a bucket disk disagrees
-            // with, and keeps the four display buckets summing to `total`.
-            let degraded_ids = degraded_phase_ids(&m.id);
-            let is_degraded =
-                |s: &&&Phase| s.status == PhaseStatus::Complete && degraded_ids.contains(&s.id);
-            MissionView {
-                total: ss.len(),
-                complete: ss
-                    .iter()
-                    .filter(|s| s.status == PhaseStatus::Complete && !is_degraded(s))
-                    .count(),
-                degraded: ss.iter().filter(is_degraded).count(),
-                running: ss.iter().filter(|s| s.status == PhaseStatus::Running).count(),
-                planned: ss.iter().filter(|s| s.status == PhaseStatus::Planned).count(),
-                abandoned: ss.iter().filter(|s| s.status == PhaseStatus::Abandoned).count(),
-                drifts: {
-                    let (local_status, local_evidence) = local_dispatch_status
-                        .get(&m.id)
-                        .map(|(s, e)| (Some(*s), *e))
-                        .unwrap_or((None, None));
-                    detect_drift(
-                        m,
-                        &ss,
-                        &live_steps_for(m, &ss),
-                        local_status,
-                        local_evidence,
-                        now,
-                        stale_days,
-                    )
-                },
-                graph: crew::lifecycle::load_graph_report(&m.id).ok().flatten(),
-                m,
-            }
-        })
-        .collect();
-    views.sort_by(board_order);
+    let views = build_views(&missions, &phases, &local_dispatch_status, now, stale_days);
 
     let peer = peer_mission_runs(&flows_dir, &fleet.records, &known_mission_ids);
 
@@ -1491,11 +1422,9 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
         // this may spawn `tailscale serve status --json`, and doing that 82 times
         // for an 82-mission board would be absurd. It short-circuits to loopback
         // without spawning when the machine declares itself standalone, or when
-        // no links will be emitted at all.
-        //
-        // NB the old "isn't a TTY" spelling of that second case stopped being
-        // true in B1: a panel spawn is a pipe but sets CLICOLOR_FORCE, so it DOES
-        // resolve — bounded by the daemon's own panel cache.
+        // no links will be emitted at all. A panel spawn is a pipe but sets
+        // CLICOLOR_FORCE, so it DOES resolve — bounded by the daemon's own
+        // panel cache.
         let link_base = board_link_base();
         let all_link = panel_deep_link(&link_base, "mission-status-all");
         render_board(&Board {
@@ -1515,6 +1444,65 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
         println!("{line}");
     }
     Ok(0)
+}
+
+/// One [`MissionView`] per mission, sorted by [`board_order`].
+fn build_views<'a>(
+    missions: &'a [Mission],
+    phases: &'a [Phase],
+    local_dispatch_status: &std::collections::HashMap<String, (RunStatus, Option<DispatchSessionEvidence>)>,
+    now: u64,
+    stale_days: u64,
+) -> Vec<MissionView<'a>> {
+    let mut by_mission: BTreeMap<&str, Vec<&Phase>> = BTreeMap::new();
+    for s in phases {
+        by_mission.entry(s.mission_id.as_str()).or_default().push(s);
+    }
+    let mut views: Vec<MissionView> = missions
+        .iter()
+        .map(|m| {
+            let ss: Vec<&Phase> = by_mission.get(m.id.as_str()).cloned().unwrap_or_default();
+            let (local_status, local_evidence) =
+                local_dispatch_status.get(&m.id).map(|(s, e)| (Some(*s), *e)).unwrap_or((None, None));
+            let drifts = detect_drift(m, &ss, &live_steps_for(m, &ss), local_status, local_evidence, now, stale_days);
+            let graph = crew::lifecycle::load_graph_report(&m.id).ok().flatten();
+            count_phases(m, &ss, &degraded_phase_ids(&m.id), drifts, graph)
+        })
+        .collect();
+    views.sort_by(board_order);
+    views
+}
+
+/// A mission's view from its phases, bucketed.
+///
+/// (#2406) The envelope's degraded set applies ONLY over a phase disk agrees
+/// is `Complete` — the same monotone-authority shape the graph lens uses
+/// (`mission_graph.rs::phase_display_status`): the envelope may refine a
+/// persisted `Complete` into `Degraded`, and may never overwrite any other
+/// persisted terminal. That keeps a stale or hand-edited envelope from
+/// inventing a bucket disk disagrees with, and keeps the five buckets
+/// summing to `total`.
+fn count_phases<'a>(
+    m: &'a Mission,
+    ss: &[&Phase],
+    degraded_ids: &std::collections::BTreeSet<String>,
+    drifts: Vec<Drift>,
+    graph: Option<crew::mission_config::prune::PruneReport>,
+) -> MissionView<'a> {
+    let count = |status: PhaseStatus| ss.iter().filter(|s| s.status == status).count();
+    let degraded =
+        ss.iter().filter(|s| s.status == PhaseStatus::Complete && degraded_ids.contains(&s.id)).count();
+    MissionView {
+        m,
+        total: ss.len(),
+        complete: count(PhaseStatus::Complete) - degraded,
+        degraded,
+        running: count(PhaseStatus::Running),
+        planned: count(PhaseStatus::Planned),
+        abandoned: count(PhaseStatus::Abandoned),
+        drifts,
+        graph,
+    }
 }
 
 /// Everything the human board renders from, resolved by [`run`] — so the
@@ -1558,311 +1546,273 @@ fn render_empty_board(fleet_state: &SourceState, width: Option<usize>) -> Vec<St
 
 /// The human board: local sections, the peer section, and the rollup.
 fn render_board(b: &Board) -> Vec<String> {
-    let mut out = Vec::new();
-    let Board { views, peer, fleet_state, now, width, limit, unlimited, missions_only, link_base, all_link } = *b;
-    let fleet_complete = matches!(fleet_state, SourceState::Ok | SourceState::Off);
-    // (#1709) RECENT-FIRST default, filter on request — the inversion of
-    // #1562's named-first rule.
-    //
-    // #1562 was solving a real problem (minted runs outnumber named missions
-    // and drown them), but it solved it by answering the wrong question. The
-    // board's default now includes run instances, because "what's recent" is
-    // the question an operator actually brings to a status board; "which
-    // missions did I name" is a FILTER they ask for when they want it
-    // (`--missions`), the other tab of the same view.
-    //
-    // Lived failure that forced the flip: with zero open missions, the
-    // FINALIZED section — documented in `default_limit` as "recent-history
-    // context, not the question the board answers" — WAS the entire board,
-    // and its top row was frozen on the last named mission finalized 8 days
-    // earlier. Meanwhile a full day of reviews and panel commands showed up
-    // as a single grey "+61 run instances" footer. The board was accurate and
-    // useless at the same time.
-    let (visible, hidden) = board_partition(views, missions_only);
+    // (#1709) RECENT-FIRST default, filter on request. "What's recent" is the
+    // question an operator brings to a status board, so the default includes
+    // run instances; "which missions did I name" is a FILTER they ask for
+    // (`--missions`). The named-first default this replaced (#1562) left a
+    // day of reviews as one grey "+61 run instances" footer under a FINALIZED
+    // section frozen on a mission closed 8 days earlier — accurate and
+    // useless at once.
+    let (visible, hidden) = board_partition(b.views, b.missions_only);
+    let mut out = vec![style::header(&format!(
+        "mission status — {} mission{}",
+        visible.len(),
+        if visible.len() == 1 { "" } else { "s" }
+    ))];
+    let sections: Vec<Section> = section_groups(&visible)
+        .into_iter()
+        .map(|(group, rows)| Section { shown: shown_count(group, rows.len(), b.limit, b.unlimited), group, rows })
+        .collect();
+    // (#2406 CONSIDER 2) One cache for the WHOLE render, shared by the layout
+    // pass and the rows, so each distinct config is loaded at most once.
+    let mut cache: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let layout = plan_layout(sections.iter().flat_map(|s| s.rows.iter().take(s.shown).copied()), b.width, &mut cache);
 
-    out.push(style::header(&format!(
-            "mission status — {} mission{}",
-            visible.len(),
-            if visible.len() == 1 { "" } else { "s" }
-        )));
     // The link is one affordance for the whole board, not one per section:
     // it goes to the same place from every group, and Active + Paused +
     // Finalized all overflowing would otherwise stack three identical rows.
     let mut all_link_shown = false;
-
-    // Section membership first, so the layout can be planned from exactly the
-    // rows that will be printed (and stay aligned across every section).
-    let groups: Vec<(MissionStatus, Vec<&MissionView>)> =
-        [
-            MissionStatus::Active,
-            MissionStatus::Paused,
-            MissionStatus::Finalized,
-            // (#1627) Its own section, last: a torn-down mission is terminal but
-            // is NOT a success, and folding it under FINALIZED is what let 6 of
-            // 51 phase-bearing missions read as finished work that never ran.
-            MissionStatus::Aborted,
-        ]
-            .into_iter()
-            .map(|group| (group, visible.iter().filter(|v| v.m.status == group).copied().collect()))
-            .filter(|(_, g): &(_, Vec<&MissionView>)| !g.is_empty())
-            .collect();
-
-    let shown_counts: Vec<usize> = groups
-        .iter()
-        .map(|(group, g)| {
-            if unlimited {
-                g.len()
-            } else {
-                limit.unwrap_or_else(|| default_limit(*group)).min(g.len())
-            }
-        })
-        .collect();
-    // (#2406 CONSIDER 2) One cache for the WHOLE render — shared between this
-    // layout pass and the row-print loop below, which is what actually
-    // collapses the redundant per-row `mission_config::load::load` calls a
-    // review-heavy board used to pay for (up to 3 per printed row: once
-    // here, once for the row's own name, once for its description note).
-    let mut config_name_cache: BTreeMap<String, Option<String>> = BTreeMap::new();
-    let layout = plan_layout(
-        groups.iter().zip(&shown_counts).flat_map(|((_, g), n)| g.iter().take(*n).copied()),
-        width,
-        &mut config_name_cache,
-    );
-
     // Tracked across sections so the closing rollup can admit that some of the
     // missions it counts had their suggestions paginated away.
     let mut any_drift_hidden = false;
-
-    for ((group, g), &shown) in groups.iter().zip(&shown_counts) {
+    for section in &sections {
         out.push(String::new());
-        out.push(style::dim(&format!("{} ({})", status_word(*group).to_uppercase(), g.len())));
-        for v in g.iter().take(shown) {
-            // (#2406) The progress numerator is `done()` — complete PLUS
-            // degraded. A degraded phase is terminal and produced output;
-            // dropping it out of the bar would make a mixed run look less
-            // far along than it is. The mix line beside it is what names
-            // the difference.
-            let prog = format!("{}/{}", v.done(), v.total);
-            let bar = progress_bar(v.done(), v.total);
-            let name = ellipsize(&display_label_cached(v.m, &mut config_name_cache), layout.name_width);
-            // (#1569 packet A) Pad BEFORE linking, and by the VISIBLE width:
-            // `{:<width$}` counts the OSC 8 escape bytes, so formatting a
-            // linkified name would silently destroy the column alignment the
-            // whole layout planner exists to maintain. The link wraps only
-            // the name text; the padding stays outside it, so the clickable
-            // target is the name rather than a run of trailing whitespace.
-            let name_cell = format!(
-                "{}{}",
-                style::link(&mission_url(link_base, &v.m.id), &name),
-                " ".repeat(layout.name_width.saturating_sub(name.chars().count()))
-            );
-            // (#1612) Dim, and blank-padded rather than omitted, so a board
-            // where only some ids carry a handle keeps one straight column.
-            let handle_cell = if layout.show_handle {
-                let h = short_handle(&v.m.id).unwrap_or("");
-                format!(
-                    "  {}{}",
-                    style::dim(h),
-                    " ".repeat(layout.handle_width.saturating_sub(h.chars().count()))
-                )
-            } else {
-                String::new()
-            };
-            // Right-aligned by hand for the same reason the name is padded by
-            // hand: `{:>width$}` would count `style::dim`'s escape bytes and
-            // silently eat the alignment.
-            let age = relative_age(now, last_activity(v.m));
-            let age_cell = format!(
-                "{}{}",
-                " ".repeat(AGE_COLS.saturating_sub(age.chars().count())),
-                style::dim(&age)
-            );
-            let row = format!(
-                "  {} {}{}  {}  {:>5}  {}",
-                kind_glyph(v.total),
-                name_cell,
-                handle_cell,
-                age_cell,
-                prog,
-                bar,
-            );
-            if layout.show_mix {
-                out.push(format!("{row}  {}", style::dim(&phase_mix(v))));
-            } else {
-                // Narrow terminal: the mix is dropped rather than the name, the
-                // age or the progress, because it is the one column whose
-                // information the others already carry.
-                out.push(format!("{row}"));
-            }
-            // (#2299) A run whose config left steps out says so in one dim
-            // line; nothing gray is ever drawn for the pruned steps themselves.
-            if let Some(g) = v.graph.as_ref().filter(|g| g.pruned_anything()) {
-                out.push(format!("      {} {}", style::dim("·"), style::dim(&format!("graph: {}", g.summary_line()))));
-            }
-            // (#2300) Growth is the opposite direction from pruning — tasks
-            // the config never counted, minted at a phase boundary from a
-            // step's output — so it gets its own line rather than being
-            // folded into the "N of M steps minted" arithmetic above.
-            if let Some(line) = v.graph.as_ref().and_then(|g| g.grown_line()) {
-                out.push(format!("      {} {}", style::dim("·"), style::dim(&format!("graph: {line}"))));
-            }
-            // (#2406 CONSIDER 6) The description, when the row's title above
-            // came from the config's `name` instead — one dim line, one
-            // sentence, never the whole ~200-word document.
-            if let Some(note) = description_note_cached(v.m, &mut config_name_cache) {
-                out.push(format!("      {} {}", style::dim("·"), style::dim(&note)));
-            }
-            for d in &v.drifts {
-                // The ⚠ marks the warning, not each of its lines — continuation
-                // lines get blank space in the marker column so one wrapped
-                // warning still reads as one warning.
-                for (i, line) in wrap_indented(&d.detail, 8, width).iter().enumerate() {
-                    let marker = if i == 0 { style::warn("⚠") } else { " ".to_string() };
-                    out.push(format!("      {} {}", marker, style::warn(line.trim_start())));
-                }
-                for cmd in &d.suggest {
-                    // The command itself is printed verbatim and never wrapped
-                    // or truncated — it exists to be copy-pasted, and a command
-                    // broken across lines by a renderer is worse than one that
-                    // overflows. Only its trailing rationale is wrapped.
-                    let (command, note) = split_suggestion(cmd);
-                    out.push(format!("        {} {}", style::dim("→"), command));
-                    for line in wrap_indented(note, 10, width) {
-                        out.push(style::dim(&line));
-                    }
-                }
-            }
+        out.push(style::dim(&format!("{} ({})", status_word(section.group).to_uppercase(), section.rows.len())));
+        for v in section.rows.iter().take(section.shown) {
+            out.extend(mission_lines(v, &layout, b, &mut cache));
         }
-        if shown < g.len() {
-            let hidden_drift = g.iter().skip(shown).filter(|v| !v.drifts.is_empty()).count();
-            // In a panel the flag names itself once, as a link, at the end of
-            // the block — so the two overflow lines don't each repeat advice
-            // the operator cannot take.
-            let more = if all_link.is_some() {
-                format!("… {} more ({} of {} shown)", g.len() - shown, shown, g.len())
-            } else {
-                format!(
-                    "… {} more ({} of {} shown) — `--all` for every mission",
-                    g.len() - shown,
-                    shown,
-                    g.len()
-                )
-            };
-            for line in wrap_indented(&more, 2, width) {
-                out.push(style::dim(&line));
-            }
-            if hidden_drift > 0 {
-                any_drift_hidden = true;
-                // Never let a limit silently swallow an attention item.
-                let warn = format!(
-                    "⚠ {} hidden mission{} need{} attention{}",
-                    hidden_drift,
-                    if hidden_drift == 1 { "" } else { "s" },
-                    if hidden_drift == 1 { "s" } else { "" },
-                    if all_link.is_some() { "" } else { " — run with `--all`" }
-                );
-                for line in wrap_indented(&warn, 2, width) {
-                    out.push(style::warn(&line));
-                }
-            }
-            if let Some(url) = &all_link {
-                if !all_link_shown {
-                    all_link_shown = true;
-                    out.push(format!("  {}", style::link(url, "→ show every mission")));
-                }
-            }
+        if section.shown < section.rows.len() {
+            let overflow = overflow_lines(section, b, !all_link_shown);
+            all_link_shown |= overflow.showed_link;
+            any_drift_hidden |= overflow.hidden_drift;
+            out.extend(overflow.lines);
         }
     }
+    out.extend(footer_lines(b, &visible, &hidden, any_drift_hidden));
+    out
+}
 
-    // (#1562) The named-first default's own footer: names what was collapsed
-    // above (count + how many of those need attention) so a hidden actionable
-    // run can never read as silently gone — operator sovereignty (#44).
-    // `--all` leaves `hidden` empty, so this never prints on a full board.
-    let hidden_attention = hidden.iter().filter(|v| !v.drifts.is_empty()).count();
-    if let Some(line) = hidden_run_summary(hidden.len(), hidden_attention) {
-        out.push(String::new());
-        for l in wrap_indented(&line, 0, width) {
-            out.push(style::dim(&l));
-        }
-    }
-    // (#1709) The other half of the tab. A filter nobody can find is a
-    // filter that doesn't exist — and the default board now MIXES named
-    // missions with minted runs, which is exactly when someone wants the
-    // named-only list. Printed only when there is something to filter, so a
-    // board of purely named work never advertises a no-op.
-    // `all_link.is_none()` — the panel surface has no prompt to type a flag
-    // at, and this file already learned that the hard way: see
-    // `panel_deep_link`'s doc ("the ADVICE has to match the surface … a dead
-    // end in a panel"), which is why the `--all` advice above is suppressed
-    // the same way. A hint the operator cannot act on is worse than none.
-    if !missions_only && all_link.is_none() && visible.iter().any(|v| is_minted_run(v.m)) {
-        for l in wrap_indented("→ `--missions` for named missions only", 0, width) {
-            out.push(style::dim(&l));
-        }
-    }
-    // A hidden run needing attention is exactly the same "some are hidden"
-    // situation a per-section `--limit` already warns about below — folded
-    // into the same flag rather than a second, competing qualifier.
-    let any_drift_hidden = any_drift_hidden || hidden_attention > 0;
+/// One status group's rows, and how many of them fit its limit.
+struct Section<'v, 'a> {
+    group: MissionStatus,
+    rows: Vec<&'v MissionView<'a>>,
+    shown: usize,
+}
 
-    // (#1711) The fleet half of the board — printed after every local
-    // section so the operator's own machine stays visually primary, and
-    // before the final rollup so the clean-board claim just below can be
-    // qualified by what this printed (or admits it could not check). A
-    // no-op on a standalone install: `peer_mission_lines` is empty for an
-    // empty slice and `fleet_scope_note` is `None` for `Off`.
-    //
-    // (#1711 review finding) The scope note prints BEFORE the rows it
-    // qualifies, not after — same rule `run_list.rs`'s own `fleet_warning`
-    // states: "an incomplete answer has to be qualified where the reader
-    // meets it, not in a footnote under rows they have already believed."
-    if let Some(note) = fleet_scope_note(fleet_state) {
-        out.push(String::new());
-        for line in wrap_indented(&note, 0, width) {
-            out.push(style::warn(&line));
-        }
-    }
-    out.extend(peer_mission_lines(peer, now, width));
+/// The non-empty status groups in board order. Section membership comes
+/// first so the layout can be planned from exactly the rows that will print.
+fn section_groups<'v, 'a>(visible: &[&'v MissionView<'a>]) -> Vec<(MissionStatus, Vec<&'v MissionView<'a>>)> {
+    [
+        MissionStatus::Active,
+        MissionStatus::Paused,
+        MissionStatus::Finalized,
+        // (#1627) Its own section, last: a torn-down mission is terminal but
+        // is NOT a success, and folding it under FINALIZED is what let 6 of
+        // 51 phase-bearing missions read as finished work that never ran.
+        MissionStatus::Aborted,
+    ]
+    .into_iter()
+    .map(|group| (group, visible.iter().filter(|v| v.m.status == group).copied().collect::<Vec<_>>()))
+    .filter(|(_, rows)| !rows.is_empty())
+    .collect()
+}
 
-    out.push(String::new());
-    // "above" is only true for the drifted missions that were PRINTED as full
-    // rows; a section limit or the named-first default can leave others
-    // unshown (each warns its own way above), so the rollup admits it rather
-    // than pointing at commands that never appeared.
-    let visible_attention: usize = visible.iter().filter(|v| !v.drifts.is_empty()).count();
-    let (clean, summary) = attention_rollup(
-        visible_attention,
-        hidden_attention,
-        any_drift_hidden,
-        all_link.is_some(),
-        fleet_complete,
-    );
-    for line in wrap_indented(&summary, 0, width) {
-        out.push(format!("{}", if clean { style::success(&line) } else { style::warn(&line) }));
+/// Rows a section prints: all of them when unlimited, else the explicit
+/// `--limit` (uniform across sections, #44) or the section's default.
+fn shown_count(group: MissionStatus, len: usize, limit: Option<usize>, unlimited: bool) -> usize {
+    if unlimited {
+        return len;
+    }
+    limit.unwrap_or_else(|| default_limit(group)).min(len)
+}
+
+/// One mission's row plus the dim notes and drift warnings under it.
+fn mission_lines(
+    v: &MissionView,
+    layout: &Layout,
+    b: &Board,
+    cache: &mut BTreeMap<String, Option<String>>,
+) -> Vec<String> {
+    let label = display_label_cached(v.m, cache);
+    let row = mission_row(v, layout, b, &label);
+    let mut out = vec![if layout.show_mix {
+        format!("{row}  {}", style::dim(&phase_mix(v)))
+    } else {
+        // Narrow terminal: the mix is dropped rather than the name, the age
+        // or the progress, because it is the one column whose information the
+        // others already carry.
+        row
+    }];
+    let notes = graph_notes(v.graph.as_ref()).into_iter().chain(description_note_cached(v.m, cache));
+    out.extend(notes.map(|note| format!("      {} {}", style::dim("·"), style::dim(&note))));
+    for d in &v.drifts {
+        out.extend(drift_lines(d, b.width));
     }
     out
 }
 
-/// Split `views` into (visible, hidden). `include_minted == true` returns
-/// every mission visible and nothing hidden; `false` hides machine-minted
-/// run instances (`is_minted_run`).
+/// The row itself: glyph, linked name, handle, age, progress, bar.
+fn mission_row(v: &MissionView, layout: &Layout, b: &Board, label: &str) -> String {
+    // (#2406) The progress numerator is `done()` — complete PLUS degraded. A
+    // degraded phase is terminal and produced output; dropping it out of the
+    // bar would make a mixed run look less far along than it is. The mix
+    // line beside it is what names the difference.
+    let prog = format!("{}/{}", v.done(), v.total);
+    let name = ellipsize(label, layout.name_width);
+    // (#1569 packet A) Pad BEFORE linking, and by the VISIBLE width:
+    // `{:<width$}` counts the OSC 8 escape bytes, so formatting a linkified
+    // name would destroy the column alignment the layout planner maintains.
+    // The link wraps only the name text, so the clickable target is the name
+    // rather than a run of trailing whitespace.
+    let name_cell = format!(
+        "{}{}",
+        style::link(&mission_url(b.link_base, &v.m.id), &name),
+        " ".repeat(layout.name_width.saturating_sub(name.chars().count()))
+    );
+    // (#1612) Dim, and blank-padded rather than omitted, so a board where only
+    // some ids carry a handle keeps one straight column.
+    let handle_cell = if layout.show_handle {
+        let h = short_handle(&v.m.id).unwrap_or("");
+        format!("  {}{}", style::dim(h), " ".repeat(layout.handle_width.saturating_sub(h.chars().count())))
+    } else {
+        String::new()
+    };
+    // Right-aligned by hand for the same reason the name is padded by hand:
+    // `{:>width$}` would count `style::dim`'s escape bytes.
+    let age = relative_age(b.now, last_activity(v.m));
+    let age_cell = format!("{}{}", " ".repeat(AGE_COLS.saturating_sub(age.chars().count())), style::dim(&age));
+    format!(
+        "  {} {name_cell}{handle_cell}  {age_cell}  {prog:>5}  {}",
+        kind_glyph(v.total),
+        progress_bar(v.done(), v.total)
+    )
+}
+
+/// (#2299) A run whose config left steps out says so in one line; nothing is
+/// drawn for the pruned steps themselves. (#2300) Growth — tasks minted at a
+/// phase boundary from a step's output, which the config never counted — gets
+/// its own line rather than being folded into the "N of M steps minted"
+/// arithmetic.
+fn graph_notes(graph: Option<&crew::mission_config::prune::PruneReport>) -> Vec<String> {
+    let Some(g) = graph else { return Vec::new() };
+    let pruned = g.pruned_anything().then(|| format!("graph: {}", g.summary_line()));
+    let grown = g.grown_line().map(|line| format!("graph: {line}"));
+    pruned.into_iter().chain(grown).collect()
+}
+
+/// One drift: the warning, wrapped with the ⚠ on its first line only (so a
+/// wrapped warning still reads as one), then each suggested command.
 ///
-/// (#1709) The parameter is no longer "`--all`": the DEFAULT board passes
-/// `true` here and `--missions` passes `false` — see [`board_partition`],
-/// which owns that mapping. `--all` now only controls pagination.
-///
-/// Pure and borrowing, so it's unit-testable without any disk I/O.
+/// The command is printed verbatim, never wrapped or truncated — it exists to
+/// be copy-pasted, and a command broken across lines by a renderer is worse
+/// than one that overflows. Only its trailing rationale wraps.
+fn drift_lines(d: &Drift, width: Option<usize>) -> Vec<String> {
+    let mut out: Vec<String> = wrap_indented(&d.detail, 8, width)
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let marker = if i == 0 { style::warn("⚠") } else { " ".to_string() };
+            format!("      {} {}", marker, style::warn(line.trim_start()))
+        })
+        .collect();
+    for cmd in &d.suggest {
+        let (command, note) = split_suggestion(cmd);
+        out.push(format!("        {} {}", style::dim("→"), command));
+        out.extend(wrap_indented(note, 10, width).iter().map(|line| style::dim(line)));
+    }
+    out
+}
+
+/// What a section prints past its limit.
+struct Overflow {
+    lines: Vec<String>,
+    /// A mission needing attention is among the hidden rows.
+    hidden_drift: bool,
+    /// This section printed the board's one "show every mission" link.
+    showed_link: bool,
+}
+
+/// The "… N more" line, a warning when any hidden row needs attention, and —
+/// in a panel, once per board — the link to the full board. In a panel the
+/// flag names itself as that link, so neither line repeats advice the
+/// operator cannot take there.
+fn overflow_lines(section: &Section, b: &Board, link_still_unshown: bool) -> Overflow {
+    let (total, shown) = (section.rows.len(), section.shown);
+    let hidden_drift = section.rows.iter().skip(shown).filter(|v| !v.drifts.is_empty()).count();
+    let in_panel = b.all_link.is_some();
+    let more = format!(
+        "… {} more ({shown} of {total} shown){}",
+        total - shown,
+        if in_panel { "" } else { " — `--all` for every mission" }
+    );
+    let mut lines: Vec<String> = wrap_indented(&more, 2, b.width).iter().map(|l| style::dim(l)).collect();
+    if hidden_drift > 0 {
+        // Never let a limit silently swallow an attention item.
+        let warn = format!(
+            "⚠ {hidden_drift} hidden mission{} need{} attention{}",
+            if hidden_drift == 1 { "" } else { "s" },
+            if hidden_drift == 1 { "s" } else { "" },
+            if in_panel { "" } else { " — run with `--all`" }
+        );
+        lines.extend(wrap_indented(&warn, 2, b.width).iter().map(|l| style::warn(l)));
+    }
+    let link = b.all_link.filter(|_| link_still_unshown);
+    lines.extend(link.map(|url| format!("  {}", style::link(url, "→ show every mission"))));
+    Overflow { lines, hidden_drift: hidden_drift > 0, showed_link: link.is_some() }
+}
+
+/// Everything after the local sections: the `--missions` footer and hint,
+/// the fleet half, and the closing rollup.
+fn footer_lines(b: &Board, visible: &[&MissionView], hidden: &[&MissionView], any_drift_hidden: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    // (#1562) Name what the `--missions` filter collapsed (count + how many
+    // need attention) so a hidden actionable run never reads as silently gone
+    // (#44). `--all` leaves `hidden` empty, so this never prints on a full
+    // board.
+    let hidden_attention = hidden.iter().filter(|v| !v.drifts.is_empty()).count();
+    if let Some(line) = hidden_run_summary(hidden.len(), hidden_attention) {
+        out.push(String::new());
+        out.extend(wrap_indented(&line, 0, b.width).iter().map(|l| style::dim(l)));
+    }
+    // (#1709) The other half of the tab: a filter nobody can find doesn't
+    // exist. Printed only when there is something to filter, and never in a
+    // panel, which has no prompt to type a flag at (see `panel_deep_link`).
+    if !b.missions_only && b.all_link.is_none() && visible.iter().any(|v| is_minted_run(v.m)) {
+        out.extend(wrap_indented("→ `--missions` for named missions only", 0, b.width).iter().map(|l| style::dim(l)));
+    }
+    // (#1711) The fleet half — after every local section so this machine stays
+    // visually primary, and before the rollup so the clean-board claim can be
+    // qualified by it. The scope note prints BEFORE the rows it qualifies
+    // (`run_list.rs`'s `fleet_warning` rule: qualify an incomplete answer
+    // where the reader meets it). Both are empty on a standalone install.
+    if let Some(note) = fleet_scope_note(b.fleet_state) {
+        out.push(String::new());
+        out.extend(wrap_indented(&note, 0, b.width).iter().map(|l| style::warn(l)));
+    }
+    out.extend(peer_mission_lines(b.peer, b.now, b.width));
+
+    out.push(String::new());
+    // A filtered-out run needing attention is the same "some are hidden"
+    // situation a section limit warns about, so it rides the same flag.
+    let visible_attention = visible.iter().filter(|v| !v.drifts.is_empty()).count();
+    let (clean, summary) = attention_rollup(
+        visible_attention,
+        hidden_attention,
+        any_drift_hidden || hidden_attention > 0,
+        b.all_link.is_some(),
+        fleet_complete(b.fleet_state),
+    );
+    let style_line = if clean { style::success } else { style::warn };
+    out.extend(wrap_indented(&summary, 0, b.width).iter().map(|l| style_line(l)));
+    out
+}
+
 /// (#1709 gate MF-3) The flag → partition mapping, as a NAMED function the
-/// tests can actually reach.
-///
-/// The mapping itself is one `!`, which is exactly why it needs to live
-/// here: `run()` is a printing function no unit test calls, so a mapping
-/// written inline is unpinnable, and reverting it to the pre-#1709
-/// `partition_visibility(&views, all)` would leave the whole suite green
-/// while the default silently re-flipped. This file has already paid for
-/// that lesson once — see `board_order`'s doc on shipping an INVERTED
-/// comparator because it "lived inside `run()` … so no unit test could
-/// reach it".
+/// tests can reach. The mapping is one `!`, which is why it lives here: a
+/// mapping written inline in the renderer reverted to the pre-#1709
+/// `partition_visibility(&views, all)` would flip the default with nothing
+/// pinning it — the same way `board_order` once shipped an INVERTED
+/// comparator.
 fn board_partition<'a>(
     views: &'a [MissionView<'a>],
     missions_only: bool,
@@ -1871,6 +1821,11 @@ fn board_partition<'a>(
     partition_visibility(views, !missions_only)
 }
 
+/// Split `views` into (visible, hidden). `include_minted == true` returns
+/// every mission visible and nothing hidden; `false` hides machine-minted
+/// run instances (`is_minted_run`). (#1709) The DEFAULT board passes `true`
+/// and `--missions` passes `false`, via [`board_partition`]; `--all` only
+/// controls pagination. Pure and borrowing.
 fn partition_visibility<'a>(
     views: &'a [MissionView<'a>],
     include_minted: bool,
@@ -1914,8 +1869,8 @@ fn hidden_run_summary(hidden_len: usize, hidden_attention: usize) -> Option<Stri
 ///   - nothing anywhere → the clean checkmark;
 ///   - something ONLY among hidden (collapsed) runs → the rollup must still
 ///     say so, since nothing about that is visible above it;
-///   - something on-screen → the existing "run the suggested commands
-///     above" wording, with `any_drift_hidden`'s tail unchanged.
+///   - something on-screen → "run the suggested commands above", with a
+///     tail naming where the hidden ones are when `any_drift_hidden`.
 ///
 /// Returns `(is_clean, message)`; the caller picks `style::success` /
 /// `style::warn` from `is_clean`.
@@ -1926,65 +1881,57 @@ fn attention_rollup(
     all_link_present: bool,
     // (#1711) Whether the fleet-wide peer-mission read covered the whole
     // fleet (`SourceState::Ok`/`Off`) or came back degraded
-    // (`Stale`/`Unavailable`). The issue's own complaint was specifically
-    // about this line: "✓ board is clean" is currently scoped to one
-    // machine while claiming to be scoped to everything. `true` on every
-    // pre-#1711 call site preserves the exact old wording.
+    // (`Stale`/`Unavailable`): "✓ board is clean" must not claim the fleet
+    // when only this machine was read.
     fleet_complete: bool,
 ) -> (bool, String) {
-    // (#1711) Appended to every branch below so the scope caveat travels
-    // with whichever message actually prints, rather than living only in
-    // the separate `fleet_scope_note` line above it (which a narrow
-    // terminal or a script grepping just this line could miss).
+    // (#1711) Appended to every branch so the scope caveat travels with
+    // whichever message prints, rather than living only in the separate
+    // `fleet_scope_note` line above it (which a narrow terminal or a script
+    // grepping just this line could miss).
     let fleet_tail =
         if fleet_complete { "" } else { " — the fleet-wide read did not complete; peer missions may be missing" };
-    if visible_attention == 0 && hidden_attention == 0 {
-        if !fleet_complete {
-            // Never the green checkmark here: this machine's own missions
-            // are reconciled, but that is not the claim the summary line
-            // makes — it says "board", and the board includes the fleet.
-            return (
-                false,
-                format!("this machine's missions are reconciled{fleet_tail} (see note above)"),
-            );
-        }
-        return (true, "✓ board is clean — every mission's phases are reconciled".to_string());
+    match (visible_attention, hidden_attention) {
+        (0, 0) if fleet_complete => (true, "✓ board is clean — every mission's phases are reconciled".to_string()),
+        // Never the green checkmark here: this machine's own missions are
+        // reconciled, but the line says "board", and the board includes the
+        // fleet.
+        (0, 0) => (false, format!("this machine's missions are reconciled{fleet_tail} (see note above)")),
+        (0, hidden) => (false, filtered_out_attention(hidden, fleet_tail)),
+        (visible, _) => (false, visible_attention_line(visible, any_drift_hidden, all_link_present, fleet_tail)),
     }
-    if visible_attention == 0 {
-        // Nothing printed above needs action, but a filtered-out run does.
-        // (#1709) This branch is now reachable ONLY under `--missions` —
-        // that is the only way anything lands in `hidden` — so the remedy is
-        // to DROP the filter, matching `hidden_run_summary`'s advice one line
-        // above. Suggesting `--all` here would sit under a footer offering a
-        // different cure for the same set, and an operator who ADDED `--all`
-        // to their current `--missions` invocation would see nothing new.
-        let plural = if hidden_attention == 1 { "" } else { "s" };
-        let verb = if hidden_attention == 1 { "needs" } else { "need" };
-        let it = if hidden_attention == 1 { "it" } else { "them" };
-        return (
-            false,
-            format!(
-                "{hidden_attention} filtered-out run instance{plural} {verb} attention — drop \
-                 `--missions` to see {it} and {its} reconcile command{plural}{fleet_tail}",
-                its = if hidden_attention == 1 { "its" } else { "their" },
-            ),
-        );
-    }
-    let tail = if !any_drift_hidden {
-        ""
-    } else if all_link_present {
-        " (some are hidden — open the full board above)"
-    } else {
-        " (some are hidden — `--all` to see them)"
+}
+
+/// Nothing printed above needs action, but a filtered-out run does. (#1709)
+/// Reachable ONLY under `--missions` — the only way anything lands in
+/// `hidden` — so the remedy is to DROP the filter, matching
+/// `hidden_run_summary`'s advice one line above; `--all` would offer a
+/// different cure for the same set, and show nothing new.
+fn filtered_out_attention(hidden: usize, fleet_tail: &str) -> String {
+    let one = hidden == 1;
+    format!(
+        "{hidden} filtered-out run instance{s} {verb} attention — drop `--missions` to see {it} and {its} \
+         reconcile command{s}{fleet_tail}",
+        s = if one { "" } else { "s" },
+        verb = if one { "needs" } else { "need" },
+        it = if one { "it" } else { "them" },
+        its = if one { "its" } else { "their" },
+    )
+}
+
+/// Some printed mission needs action. "above" is only true for the ones
+/// printed as full rows, so when a limit or the filter hid others, the line
+/// says where to see them.
+fn visible_attention_line(visible: usize, any_drift_hidden: bool, all_link_present: bool, fleet_tail: &str) -> String {
+    let tail = match (any_drift_hidden, all_link_present) {
+        (false, _) => "",
+        (true, true) => " (some are hidden — open the full board above)",
+        (true, false) => " (some are hidden — `--all` to see them)",
     };
-    (
-        false,
-        format!(
-            "{visible_attention} mission{s} {verb} attention — run the suggested commands above to \
-             reconcile{tail}{fleet_tail}",
-            s = if visible_attention == 1 { "" } else { "s" },
-            verb = if visible_attention == 1 { "needs" } else { "need" },
-        ),
+    format!(
+        "{visible} mission{s} {verb} attention — run the suggested commands above to reconcile{tail}{fleet_tail}",
+        s = if visible == 1 { "" } else { "s" },
+        verb = if visible == 1 { "needs" } else { "need" },
     )
 }
 
@@ -2024,12 +1971,7 @@ fn board_json(views: &[MissionView], peer: &[Run], fleet_state: &SourceState) ->
         })
         .collect();
     let attention = views.iter().filter(|v| !v.drifts.is_empty()).count();
-    // (#1711) `fleet_complete` mirrors `SourceState::is_complete` (that
-    // method is `pub(crate)` inside `darkmux-serve`, not visible from this
-    // crate) — `Ok`/`Off` both mean the fleet-wide read covers everything it
-    // claims to; `Stale`/`Unavailable` mean a peer's mission could be
-    // missing from `peer_missions` below.
-    let fleet_complete = matches!(fleet_state, SourceState::Ok | SourceState::Off);
+    let fleet_complete = fleet_complete(fleet_state);
     serde_json::json!({
         "missions": arr,
         // (#1711) Peer missions — observed via the shared flow stream, not
@@ -2049,6 +1991,14 @@ fn board_json(views: &[MissionView], peer: &[Run], fleet_state: &SourceState) ->
             "fleet_complete": fleet_complete,
         },
     })
+}
+
+/// (#1711) Whether the fleet-wide read covers everything it claims to: `Ok`
+/// and `Off` do; `Stale`/`Unavailable` mean a peer's mission could be
+/// missing. Mirrors `SourceState::is_complete`, which is `pub(crate)` inside
+/// `darkmux-serve`.
+fn fleet_complete(state: &SourceState) -> bool {
+    matches!(state, SourceState::Ok | SourceState::Off)
 }
 
 fn run_json(
@@ -5231,6 +5181,29 @@ mod tests {
         vs
     }
 
+    /// (#2406) The envelope refines only a phase disk calls `Complete`; an id
+    /// it names on any other status changes nothing, and the buckets still
+    /// sum to the total.
+    #[test]
+    fn count_phases_moves_only_disk_complete_phases_into_degraded() {
+        let m = mission("m", MissionStatus::Active);
+        let ps = [
+            phase("p1", "m", PhaseStatus::Complete),
+            phase("p2", "m", PhaseStatus::Complete),
+            phase("p3", "m", PhaseStatus::Running),
+            phase("p4", "m", PhaseStatus::Planned),
+            phase("p5", "m", PhaseStatus::Abandoned),
+        ];
+        let ss: Vec<&Phase> = ps.iter().collect();
+        let degraded: std::collections::BTreeSet<String> = ["p1".to_string(), "p3".to_string()].into();
+        let v = count_phases(&m, &ss, &degraded, Vec::new(), None);
+        assert_eq!(
+            (v.total, v.complete, v.degraded, v.running, v.planned, v.abandoned),
+            (5, 1, 1, 1, 1, 1),
+            "p3 is Running on disk, so the envelope cannot call it degraded"
+        );
+    }
+
     #[test]
     fn board_prints_sections_rows_drift_and_the_rollup() {
         let ms = three_active();
@@ -5355,6 +5328,25 @@ mod tests {
             out.ends_with("\n\n1 filtered-out run instance needs attention — drop `--missions` to see it and its reconcile command"),
             "{out}"
         );
+    }
+
+    /// A filtered-out run needing attention qualifies the rollup even when
+    /// every printed row is also flagged — the rollup must not read as the
+    /// whole story.
+    #[test]
+    fn filtered_out_attention_qualifies_a_rollup_that_also_has_visible_attention() {
+        let named = mission("doom-loop-m4", MissionStatus::Active);
+        let mut minted = mission("dispatch-code-reviewer-1785589698-5d6a-0", MissionStatus::Active);
+        minted.spec = Some(minted_spec());
+        let mut vs = vec![view(&named, 1, 0), view(&minted, 1, 0)];
+        vs[0].drifts.push(drift("named drift", &[]));
+        vs[1].drifts.push(drift("minted drift", &[]));
+        let mut b = board(&vs);
+        b.missions_only = true;
+        let out = text(render_board(&b));
+        let rollup = out.rsplit("\n\n").next().unwrap();
+        assert!(rollup.starts_with("1 mission needs attention"), "{rollup}");
+        assert!(rollup.contains("(some are "), "{rollup}");
     }
 
     #[test]
