@@ -1,3 +1,4 @@
+import { NO_PRESENCE } from "../../lib/lifecycle";
 import { useLifecyclePolicy } from "../../hooks/useLifecyclePolicy";
 import { encodeMachineKey } from "../../lib/machineKey";
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
@@ -832,10 +833,10 @@ export function FleetLens({
   // most of the feed's cost. A replay keys on the playhead itself.
   const liveEdgeClock = playhead == null ? Math.floor(playheadT / 1000) : playheadT;
   // Session presence: an ADDITIVE input to each run's lifecycle
-  // (`lib/lifecycle.ts`), never a subtraction. A replay reads none (the
-  // presence hook is disabled there), so its runs are judged from records
-  // up to the playhead alone.
-  const presence = liveSessionIds;
+  // (`lib/lifecycle.ts`), never a subtraction. It is a fact about NOW: a
+  // replay reads none (the presence hook is disabled there), and a scrubbed
+  // playhead on a live day judges from records up to the playhead alone.
+  const presence = playhead == null ? liveSessionIds : NO_PRESENCE;
   const policy = useLifecyclePolicy();
   // (#2814) SELF IS NEVER UNKNOWN — and before this, self could be ABSENT.
   //

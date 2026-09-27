@@ -6,19 +6,25 @@
  * the run page's pill and clock, the mission graph's step meter, playback's
  * focus range, the live token scope), so the same run reads the same phase
  * on each of them at the same moment. Live is `asOf = now`; playback is
- * `asOf = the playhead`. Presence is an extra input that can only ADD:
- * it holds a run open against the staleness clock, never against a record
- * that closed it.
+ * `asOf = the playhead`. Presence is an extra input that can only ADD: it
+ * holds the session's CURRENT run (its latest attempt, whatever mission)
+ * open against the staleness clock, never a run a later attempt
+ * superseded, never one that has not started, and never against a record
+ * that closed it. It is a fact about now: a caller passes it only when the
+ * instant it judges is the live edge.
  *
  * The rules:
  *
- * 1. Attempts. A run's records segment into attempts (`attemptsOf`). An
- *    attempt opens on its first opening record (a `dispatch.start`, a
- *    `budget.wait`, a `mission.start`, a `step.start`, or, when nothing
- *    opened yet, any turn, heartbeat, tool call or rest). A `dispatch.start`
- *    in an attempt that already has one, or any reopening record after the
- *    attempt closed, starts the next attempt (a relaunch under the same id).
- *    The attempt current as of t is the latest one opened by t.
+ * 1. Attempts. A session's records segment into attempts, every mission's
+ *    together in time order (`segmentSession`). An attempt opens on its
+ *    first opening record (a `dispatch.start`, a `budget.wait`, a
+ *    `mission.start`, a `step.start`, or, when nothing opened yet, any
+ *    turn, heartbeat, tool call or rest). A record naming a mission joins
+ *    that mission's latest attempt; one naming none joins the attempt open
+ *    at its time. A `dispatch.start` in an attempt that already has one, or
+ *    any reopening record after the attempt closed, starts the next
+ *    attempt (a relaunch under the same id). The attempt current as of t is
+ *    the latest one opened by t.
  * 2. Close. An attempt closes on its earliest closing record: a dispatch or
  *    step terminal, `session.end`, `budget.stop`, `mission.close` or
  *    `mission.abort`. A closing record timestamped before anything opened
@@ -34,7 +40,7 @@
  *    `budgetWaitGraceMs`; past that the staleness clock runs from there.
  * 5. Stale. An open attempt whose last record is more than `staleAfterMs`
  *    before t has stopped with no ending recorded. So has an attempt a later
- *    one superseded.
+ *    one of its session superseded, whichever mission that one is.
  * 6. A mission's whole-run bookend (`runRef.ts`'s `run` grain) never beats
  *    itself; its steps do. Its activity and its waits are its mission's
  *    other runs' too, so it is in flight while any of them is.
@@ -119,6 +125,20 @@ export interface Attempt {
   /** Its earliest closing record. */
   readonly close: NormRecord | null;
   readonly skewed: boolean;
+  /** The mission its records name (the first that names one); `null` when
+   *  none does. */
+  readonly missionId: string | null;
+  /** Its place among its SESSION's attempts, every mission's together. */
+  readonly index: number;
+}
+
+/** A session's records segmented: its attempts (every mission's, time
+ *  order) and the records that belong to no attempt, by the mission they
+ *  name (`null` for none): work whose opening is outside the window, and a
+ *  close with nothing opened before it. */
+export interface SessionSegments {
+  readonly attempts: readonly Attempt[];
+  readonly strays: ReadonlyMap<string | null, readonly NormRecord[]>;
 }
 
 /** The records that open an attempt even after an earlier one closed. */
@@ -178,57 +198,85 @@ interface Building {
   records: NormRecord[];
   close: NormRecord | null;
   skewed: boolean;
+  missionId: string | null;
+  index: number;
 }
 
-/** Whether `r` opens a new attempt after `cur` (rule 1). */
-function opensAttempt(cur: Building | null, r: NormRecord): boolean {
+/** The last attempt of mission `m`. */
+function latestOf(attempts: readonly Building[], m: string): Building | null {
+  for (let i = attempts.length - 1; i >= 0; i--) if (attempts[i].missionId === m) return attempts[i];
+  return null;
+}
+
+/** The attempt a record joins (rule 1): a record naming a mission joins
+ *  that mission's latest attempt, or adopts the current attempt when that
+ *  one names no mission yet; a record naming none joins the attempt open
+ *  (or latest opened) at its time. `null`: it belongs to no attempt yet. */
+function targetFor(attempts: readonly Building[], m: string | null): Building | null {
+  const cur = attempts.at(-1) ?? null;
+  if (!m) return cur;
+  return latestOf(attempts, m) ?? (cur && cur.missionId === null ? cur : null);
+}
+
+/** Whether `r` opens a new attempt rather than joining `mine` (rule 1). */
+function opensAttempt(mine: Building | null, r: NormRecord): boolean {
   const reopener = r.action !== undefined && REOPENERS.has(r.action);
-  if (cur === null) return reopener || (r.action !== undefined && FIRST_OPENERS.has(r.action));
+  if (mine === null) return reopener || (r.action !== undefined && FIRST_OPENERS.has(r.action));
   if (!reopener) return false;
-  if (cur.close !== null) return true;
-  return r.action === ACTION.DispatchStart && cur.start !== null;
+  if (mine.close !== null) return true;
+  return r.action === ACTION.DispatchStart && mine.start !== null;
 }
 
-function add(cur: Building, r: NormRecord): void {
+function add(cur: Building, r: NormRecord, m: string | null): void {
   cur.records.push(r);
+  if (cur.missionId === null && m) cur.missionId = m;
   if (r.action === ACTION.DispatchStart && cur.start === null) cur.start = r;
   if (cur.close === null && isClosing(r)) cur.close = r;
 }
 
-/** Closing records seen before anything opened go to the first attempt left
- *  with no close of its own (rule 2's skew case). */
-function assignOrphans(attempts: Building[], orphans: NormRecord[]): void {
-  for (const orphan of orphans) {
-    const open = attempts.find((a) => a.close === null);
-    if (!open) return;
-    open.close = orphan;
-    open.skewed = true;
-  }
+function pushStray(strays: Map<string | null, NormRecord[]>, m: string | null, r: NormRecord): void {
+  const list = strays.get(m);
+  if (list) list.push(r);
+  else strays.set(m, [r]);
 }
 
-/** A run's records segmented into attempts (rule 1), time order. */
-export function attemptsOf(records: readonly NormRecord[]): Attempt[] {
-  const sorted = [...records].sort(byTime);
-  const attempts: Building[] = [];
-  const lead: NormRecord[] = [];
-  const orphans: NormRecord[] = [];
-  let cur: Building | null = null;
-  for (const r of sorted) {
-    if (opensAttempt(cur, r)) {
-      cur = { opening: r, start: null, records: [], close: null, skewed: false };
-      attempts.push(cur);
-    }
-    if (cur) {
-      add(cur, r);
-    } else {
-      lead.push(r);
-      if (isClosing(r)) orphans.push(r);
+/** A stray's attempt, once the segmentation is done: a close with nothing
+ *  opened before it closes the first attempt of its mission (any, when it
+ *  names none) left with no close of its own, marked `skewed` (rule 2); any
+ *  other record joins that mission's first attempt, from before it opened. */
+function homeFor(attempts: readonly Building[], r: NormRecord, m: string | null): Building | null {
+  const mine = attempts.filter((a) => m === null || a.missionId === m);
+  return isClosing(r) ? (mine.find((a) => a.close === null) ?? null) : (mine[0] ?? null);
+}
+
+function placeStrays(attempts: Building[], strays: Map<string | null, NormRecord[]>): Map<string | null, NormRecord[]> {
+  const left = new Map<string | null, NormRecord[]>();
+  for (const [m, recs] of strays) {
+    for (const r of recs) {
+      const home = homeFor(attempts, r, m);
+      if (!home) pushStray(left, m, r);
+      else if (isClosing(r)) Object.assign(home, { close: r, skewed: true, records: [r, ...home.records] });
+      else home.records.unshift(r);
     }
   }
-  if (attempts.length) attempts[0].records.unshift(...lead);
-  else if (orphans.length) attempts.push({ opening: orphans[0], start: null, records: lead, close: orphans[0], skewed: false });
-  assignOrphans(attempts, orphans);
-  return attempts;
+  return left;
+}
+
+/** A session's records segmented into attempts (rule 1), time order. */
+export function segmentSession(records: readonly NormRecord[]): SessionSegments {
+  const attempts: Building[] = [];
+  const strays = new Map<string | null, NormRecord[]>();
+  for (const r of [...records].sort(byTime)) {
+    const m = r.mission_id || null;
+    let target = targetFor(attempts, m);
+    if (opensAttempt(target, r)) {
+      target = { opening: r, start: null, records: [], close: null, skewed: false, missionId: m, index: attempts.length };
+      attempts.push(target);
+    }
+    if (target) add(target, r, m);
+    else pushStray(strays, m, r);
+  }
+  return { attempts, strays: placeStrays(attempts, strays) };
 }
 
 /** The attempt's close as of `asOf` (rules 2 and 3), or `null`. */
@@ -300,8 +348,7 @@ function maxOf(xs: readonly (number | null)[]): number | null {
 export function lifecycleAt(run: RunRecords, asOf: number, policy: LifecyclePolicy, presence: Presence = NO_PRESENCE): Lifecycle {
   const a = run.attempt;
   if (!a || !isAsOf(a.opening, asOf)) {
-    const phase = presence.has(run.ref.sessionId) ? "open" : "not_started";
-    return { phase, startMs: null, lastActivityMs: latestTime(recordsAsOf(run.group.records, asOf)), close: null, waitUntilMs: null };
+    return { phase: "not_started", startMs: null, lastActivityMs: latestTime(recordsAsOf(run.group.records, asOf)), close: null, waitUntilMs: null };
   }
   const recs = recordsAsOf(a.records, asOf);
   const base = { startMs: startOf(a), lastActivityMs: latestTime(recs) };
@@ -378,10 +425,10 @@ export const isMissionLifecycle = (group: RunGroup): boolean =>
   group.records.some((r) => r.action !== undefined && MISSION_LIFECYCLE.has(r.action));
 
 /** Whether a mission's lifecycle session has closed (a `mission.close` or
- *  `mission.abort`), in whatever record set it is read from. */
+ *  `mission.abort`), in whatever record set it is read from: its latest
+ *  attempt closed, or, with the mission's start outside the set, the close
+ *  itself is there. A close with nothing opened is no RUN (rule 2), but it
+ *  still says the mission ended. */
 export function missionClosed(groups: readonly RunGroup[]): boolean {
-  return groups.some((g) => {
-    const last = g.attempts[g.attempts.length - 1];
-    return isMissionLifecycle(g) && last?.close != null;
-  });
+  return groups.some((g) => isMissionLifecycle(g) && (g.attempts.length ? g.attempts[g.attempts.length - 1].close != null : g.records.some(isClosing)));
 }

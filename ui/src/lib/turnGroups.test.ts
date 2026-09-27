@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { groupsByTurn, turnItems } from "./turnGroups";
 import type { NormRecord } from "./ingest";
+import { DEFAULT_POLICY } from "./lifecycle";
 import { norm } from "../testing/records";
 
 /** One session's records in the order the host emits them (measured on
@@ -201,6 +202,31 @@ describe("turnItems (#2863)", () => {
     const items = turnItems([checkpoint2, t1, e1], all);
     const head2 = items.find((i) => i.kind === "turn" && i.turn.seq === 2);
     expect(head2 && head2.kind === "turn" && head2.turn.why).toBe("in progress");
+  });
+
+  // The header reads the run's lifecycle (`lib/lifecycle.ts`), the same
+  // phase every surface states: a run silent past the staleness window, or
+  // one a relaunch under the same id superseded, has ended.
+  it("a checkpoint on a run gone silent past the staleness window reads did not finish", () => {
+    const e1 = r(0, "dispatch.start");
+    const t1 = r(5, "dispatch.turn", { turn_seq: 1, finish_reason: "tool_calls", tool_calls_count: 1, usage: { prompt_tokens: 100 } });
+    const checkpoint2 = r(10, "dispatch.checkpoint", { turn_seq: 2, verdict: "continue" });
+    const all = [e1, t1, checkpoint2];
+    const later = (checkpoint2.tMs as number) + DEFAULT_POLICY.staleAfterMs + 1;
+    const head2 = turnItems([checkpoint2, t1, e1], all, later, DEFAULT_POLICY).find((i) => i.kind === "turn" && i.turn.seq === 2);
+    expect(head2 && head2.kind === "turn" && head2.turn.why).toBe("did not finish");
+    const inside = turnItems([checkpoint2, t1, e1], all, later - 2, DEFAULT_POLICY).find((i) => i.kind === "turn" && i.turn.seq === 2);
+    expect(inside && inside.kind === "turn" && inside.turn.why).toBe("in progress");
+  });
+
+  it("a checkpoint on an attempt a relaunch superseded reads did not finish", () => {
+    const e1 = r(0, "dispatch.start");
+    const t1 = r(5, "dispatch.turn", { turn_seq: 1, finish_reason: "tool_calls", tool_calls_count: 1, usage: { prompt_tokens: 100 } });
+    const checkpoint2 = r(10, "dispatch.checkpoint", { turn_seq: 2, verdict: "continue" });
+    const e2 = r(20, "dispatch.start");
+    const all = [e1, t1, checkpoint2, e2];
+    const head2 = turnItems([e2, checkpoint2, t1, e1], all).find((i) => i.kind === "turn" && i.turn.seq === 2);
+    expect(head2 && head2.kind === "turn" && head2.turn.why).toBe("did not finish");
   });
 
   // (#2863 review round 2, finding 8) A record naming an OLDER turn_seq

@@ -535,8 +535,9 @@ export function SessionReplay({
   const [livenessMissionId, setLivenessMissionId] = useState<string | null>(null);
   const { isLive, shouldPoll, endedByPresence } = useSessionLiveness(sessionId, livenessMissionId);
   // Presence, as the lifecycle's additive input: it holds this run open
-  // against the staleness clock, never against a record that closed it.
-  const presence = useMemo<Presence>(() => (isLive ? new Set([sessionId]) : NO_PRESENCE), [isLive, sessionId]);
+  // against the staleness clock, never against a record that closed it. It
+  // is a fact about NOW, so a parked playhead judges without it.
+  const presence = useMemo<Presence>(() => (isLive && playhead === null ? new Set([sessionId]) : NO_PRESENCE), [isLive, playhead, sessionId]);
   const policy = useLifecyclePolicy();
 
   // (#2065) A static build has no `/flow-session/<id>` to reach — the demo's

@@ -214,3 +214,29 @@ describe("SessionReplay — the run finishing while the page is open (#2011)", (
     expect(pillText()).toContain("running");
   });
 });
+
+describe("SessionReplay — presence is a fact about now, not about a scrubbed instant", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    h.liveIds = new Set<string>();
+  });
+
+  it("a playhead parked in a silent stretch reads the run stopped, whatever presence says now", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    // Silent for 30 minutes (past the 20-minute window), then beating again.
+    const early = { ...START, ts: iso(T0 - 3 * 3_600_000) };
+    const lateBeat = { ...BEAT, ts: iso(T0 - 1_000) };
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ records: [early, lateBeat], count: 2 }), { status: 200 })));
+    h.liveIds = new Set([SID]);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <SessionReplay sessionId={SID} playhead={T0 - 3 * 3_600_000 + 1_800_000} />
+      </QueryClientProvider>,
+    );
+    await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    expect(pillText().toLowerCase()).toContain("no ending recorded");
+  });
+});

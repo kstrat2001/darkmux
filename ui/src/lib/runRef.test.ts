@@ -43,12 +43,13 @@ describe("runIndex: attribution of a record naming no mission", () => {
     expect(lifecycleAt(currentRun(groups[0], Date.parse(at(90))), Date.parse(at(90)), DEFAULT_POLICY).phase).toBe("closed");
   });
 
-  it("is kept apart when its session spans several missions", () => {
+  it("joins the run open at its time when its session spans several missions, never a group of its own", () => {
     const data = normAll([...shared.map((r) => ({ ...r }) as unknown as RawRecord), rec(700, "session.end")]);
     const groups = runIndex(data).groupsOfSession("task-probe");
-    expect(groups.map((g) => g.missionId)).toEqual(["A", "B", null]);
-    const b = groups[1];
-    expect(lifecycleAt(currentRun(b, Date.parse(at(720))), Date.parse(at(720)), DEFAULT_POLICY).phase).toBe("open");
+    expect(groups.map((g) => g.missionId)).toEqual(["A", "B"]);
+    const t = Date.parse(at(720));
+    expect(lifecycleAt(currentRun(groups[1], t), t, DEFAULT_POLICY).phase).toBe("closed");
+    expect(lifecycleAt(currentRun(groups[0], t), t, DEFAULT_POLICY).close?.edge.kind).toBe("complete");
   });
 });
 

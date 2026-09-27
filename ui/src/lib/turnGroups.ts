@@ -1,5 +1,6 @@
-import { ACTION, byTime, type NormRecord } from "./ingest";
-import { groupOfRecords } from "./runRef";
+import { ACTION, byTime, latestByTime, type NormRecord } from "./ingest";
+import { recordsOfGroup, runIndex } from "./runRef";
+import { DEFAULT_POLICY, isRunning, lifecycleAt, type LifecyclePolicy } from "./lifecycle";
 
 /** (#2863) A run's event list, grouped by the turn each event belongs to.
  *
@@ -62,13 +63,19 @@ function num(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
-/** (#2863 review round 2, finding 2) Whether the attempt `rec` belongs to
- *  has closed (`lib/lifecycle.ts`), deciding whether an unfinished turn's
- *  header says "did not finish" (the run ended; this turn has no closing
- *  record) or "in progress" (the run has not ended yet, so "did not finish"
- *  would be a claim about the future). */
-function attemptClosed(all: readonly NormRecord[], rec: NormRecord): boolean {
-  return groupOfRecords(all).attempts.some((a) => a.close !== null && a.records.includes(rec));
+/** (#2863 review round 2, finding 2) Whether the run attempt `rec` belongs
+ *  to has ended as of `asOf` by the one lifecycle (`lib/lifecycle.ts`):
+ *  closed, gone stale, or superseded by a relaunch. It decides whether an
+ *  unfinished turn's header says "did not finish" (the run ended; this turn
+ *  has no closing record) or "in progress" (the run has not ended yet, so
+ *  "did not finish" would be a claim about the future). Read per RUN: a
+ *  session two missions share is two runs. */
+function attemptEnded(all: readonly NormRecord[], rec: NormRecord, asOf: number, policy: LifecyclePolicy): boolean {
+  const group = runIndex(all).groupOf(rec);
+  const attempt = group ? group.attempts.findIndex((a) => a.records.includes(rec)) : -1;
+  if (!group || attempt < 0) return false;
+  const run = recordsOfGroup(group, { sessionId: group.sessionId, missionId: group.missionId, attempt });
+  return !isRunning(lifecycleAt(run, asOf, policy));
 }
 
 /** Whether a list is one session's, with turns to group by. */
@@ -82,7 +89,13 @@ export function groupsByTurn(all: NormRecord[]): boolean {
  * @param all every record the list was given, so a hidden record (a
  *   heartbeat, a context reading) can still inform a turn's header
  */
-export function turnItems(visible: NormRecord[], all: NormRecord[]): TurnItem[] {
+export function turnItems(
+  visible: NormRecord[],
+  all: NormRecord[],
+  /** The instant the list is read at; by default the newest record's. */
+  asOf: number = latestByTime(all)?.tMs ?? -Infinity,
+  policy: LifecyclePolicy = DEFAULT_POLICY,
+): TurnItem[] {
   if (!groupsByTurn(all)) return visible.map((rec) => ({ kind: "rec", rec }));
 
   const ordered = [...all].sort(byTime);
@@ -222,7 +235,7 @@ export function turnItems(visible: NormRecord[], all: NormRecord[]): TurnItem[] 
         // about the PAST — the run ended and this turn has no closing
         // record. A checkpoint with no terminal record YET does not mean
         // the turn never will finish; it means the run is still going.
-        const finished = attemptClosed(all, anchor);
+        const finished = attemptEnded(all, anchor, asOf, policy);
         h = {
           kind: "turn",
           rec: anchor,
