@@ -356,9 +356,14 @@ fn describe_key_at(path: &Path, key: &str) -> Result<String> {
             // (#2947 review C7) A stored value that is not one of the values
             // is said to be so here, not just echoed.
             let stored = match stored_value.as_ref() {
-                Some(Value::String(raw)) if s.canonical(raw).is_none() => {
-                    format!("{stored} - not a valid value; runs that read it refuse to start")
-                }
+                Some(Value::String(raw)) if s.canonical(raw).is_none() => match s.renamed(raw) {
+                    // (#2947 review C-f) Name the replacement, as doctor does.
+                    Some(new) => format!(
+                        "{stored} - not a valid value: `{}` was renamed to `{new}` in 4.0",
+                        raw.trim().to_ascii_lowercase()
+                    ),
+                    None => format!("{stored} - not a valid value; runs that read it refuse to start"),
+                },
                 Some(v) if !v.is_string() => format!("{stored} - not a valid value (not a string)"),
                 _ => stored,
             };
@@ -1306,6 +1311,10 @@ mod tests {
         std::fs::write(f.path(), r#"{"fleet":{"mode":"hub"}}"#).unwrap();
         let out = describe_key_at(f.path(), "fleet.mode").unwrap();
         assert!(!out.contains("not a valid value"), "{out}");
+        // (#2947 review C-f) A stored retired spelling names its replacement.
+        std::fs::write(f.path(), r#"{"runtime":{"detection":{"degeneracy":{"policy":"enforce"}}}}"#).unwrap();
+        let out = describe_key_at(f.path(), "runtime.detection.degeneracy.policy").unwrap();
+        assert!(out.contains("`enforce` was renamed to `conclude` in 4.0"), "{out}");
     }
 
     #[test]

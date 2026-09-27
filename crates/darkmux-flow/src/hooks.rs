@@ -198,13 +198,16 @@ pub fn hook_match(m: &HookMatch, record: &FlowRecord) -> bool {
             return false;
         }
     }
+    // (#2947 review C-d) Trimmed, the same way the registry validates
+    // them: `" warn "` passes validation, so it must also MATCH, or a
+    // padded value is accepted and then silently matches nothing.
     if let Some(v) = m.category.as_deref() {
-        if !category_wire(record.category).eq_ignore_ascii_case(v) {
+        if !category_wire(record.category).eq_ignore_ascii_case(v.trim()) {
             return false;
         }
     }
     if let Some(v) = m.level.as_deref() {
-        if !level_wire(record.level).eq_ignore_ascii_case(v) {
+        if !level_wire(record.level).eq_ignore_ascii_case(v.trim()) {
             return false;
         }
     }
@@ -4745,6 +4748,19 @@ mod tests {
         }
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
         assert!(HookSink::new(&[rule(Some("WARN"), Some("Audit"))], tmp.path().to_path_buf(), report).is_ok());
+    }
+
+    /// (#2947 review C-d) A padded `match.level` / `match.category` is
+    /// VALID (the registry trims), so it must also match: validation and
+    /// matching read the value the same way.
+    #[test]
+    fn a_padded_level_or_category_validates_and_matches() {
+        let m = HookMatch { level: Some(" Info ".into()), category: Some(" work ".into()), ..Default::default() };
+        let rule = HookRule { r#match: Some(m.clone()), ..Default::default() };
+        assert!(darkmux_types::config_enum::bad_hook_rule_values(&[rule]).is_empty(), "padded is valid");
+        assert!(hook_match(&m, &record("dispatch start")), "and a valid value must match");
+        let other = HookMatch { level: Some(" warn ".into()), ..Default::default() };
+        assert!(!hook_match(&other, &record("dispatch start")), "a different level still does not");
     }
 
     /// (#2947 review C2) The hook-rule config vocabulary (declared in

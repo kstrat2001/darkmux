@@ -244,7 +244,8 @@ impl Refusal {
             ),
             Refusal::BadConfig { detail } => format!(
                 "{receiver} cannot run work until its own config is fixed (on {receiver}: \
-                 `darkmux doctor`). {detail}"
+                 `darkmux doctor`, then restart `darkmux serve`, which reads config once at \
+                 start). {detail}"
             ),
         }
     }

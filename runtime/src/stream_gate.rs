@@ -204,7 +204,7 @@ pub enum GateAction {
     /// Judged and allowed to continue. `would_abort` is TRUE when the
     /// judgement WAS degenerate but the detector's policy does not permit it
     /// to act (#2846) — the finding is real and must still be recorded, only
-    /// the abort is suppressed. Under `enforce` this is always false, because
+    /// the abort is suppressed. Under `conclude` this is always false, because
     /// a degenerate judgement returns [`GateAction::Degenerate`] instead.
     Observed { slice_chars: usize, ratio: Option<f32>, would_abort: bool },
     /// A boundary was reached and the slice is degenerate. Stop reading.
@@ -450,7 +450,7 @@ impl StreamGate {
         let chars = self.slice.chars().count();
         // (#2846) `off` measures nothing, which is what its doc says. An
         // earlier revision ran the judge regardless and only suppressed the
-        // abort, so `off` was `observe` that threw the finding away.
+        // abort, so `off` was `record` that threw the finding away.
         if !self.may_judge {
             return GateAction::Observed { slice_chars: chars, ratio: None, would_abort: false };
         }
@@ -458,7 +458,7 @@ impl StreamGate {
         // (#2846) Judge identically, act conditionally. A gate that may not
         // act reports the SAME finding through the non-acting arm, so the
         // slice lifecycle, the cadence and the observation count are
-        // bit-for-bit what `enforce` would have produced. Returning early
+        // bit-for-bit what `conclude` would have produced. Returning early
         // instead, or suppressing the record, would each introduce the second
         // variable this policy exists to avoid.
         if degenerate && !self.may_abort {

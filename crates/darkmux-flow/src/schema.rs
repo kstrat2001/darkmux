@@ -317,7 +317,8 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.63.0";
 //           (null on an observation, only ever populated by an abort — also
 //           the field a consumer uses to tell the two record shapes apart
 //           without a dedicated discriminator key), `policy`
-//           (`"enforce"`/`"observe"`/`"off"`) and `acted` (true on every
+//           (`"enforce"`/`"observe"`/`"off"`; renamed in 1.63.0 to
+//           `"conclude"`/`"record"`/`"off"`, plus `"warn"`) and `acted` (true on every
 //           `dispatch.gate.abort`, AND on the degenerate observation whose
 //           verdict ended the call — under `enforce` that observation is
 //           written for the same moment as the abort that follows it, and

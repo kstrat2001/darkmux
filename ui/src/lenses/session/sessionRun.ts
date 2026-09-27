@@ -289,7 +289,7 @@ export interface SessionRunView {
    * at all, so the SIGNALS card must not claim "repetition: clean" (which
    * asserts the detector looked and found nothing); it renders the
    * checklist cell as "off" instead. `false` covers both "ran, found
-   * nothing" (cut/warn/record with no findings; enforce/observe in runs
+   * nothing" (conclude/warn/record with no findings; enforce/observe in runs
    * recorded before 4.0) and "unknown" (no
    * `dispatch.start`, or an older record predating this field) — an
    * unknown run-level policy must NOT render as off, since that would be
@@ -1739,7 +1739,7 @@ export function runRegions(
   }
 
   for (const acc of byTurn.values()) {
-    // (#2887 F2) Prefer the RUN-LEVEL policy for the recorded/warned/cut
+    // (#2887 F2) Prefer the RUN-LEVEL policy for the recorded/warned/concluded
     // wording — it is the one resolved value every record in this run
     // shares, where an individual record's own `policy` field may be
     // absent (an older runtime image) or, in principle, stale.

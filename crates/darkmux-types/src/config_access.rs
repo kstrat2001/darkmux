@@ -1603,7 +1603,7 @@ pub fn thermal_enabled_with_source() -> (bool, Source) {
 }
 
 /// (#2846) Resolved policy for the repeated-output detector.
-/// `env(DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY) > config > enforce`.
+/// `env(DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY) > config > conclude`.
 ///
 /// (#2947) An unrecognized value is an error naming it, where it was set
 /// and the valid values. It used to resolve to `enforce` (the armed

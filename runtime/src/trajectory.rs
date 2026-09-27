@@ -173,8 +173,8 @@ pub struct CheckpointVerdict<'a> {
     /// gate was armed cannot be compared against one that does.
     pub policy: &'a str,
     /// (#2846) What the detector FOUND, independent of whether it was
-    /// allowed to act. Under `enforce` this equals `verdict == "conclude"`.
-    /// Under `observe` it is the counterfactual the policy exists to
+    /// allowed to act. Under `conclude` this equals `verdict == "conclude"`.
+    /// Under `record` (and `warn`) it is the counterfactual the policy exists to
     /// provide. Under `off` nothing was measured, so it is `None`.
     pub would_conclude: Option<bool>,
 }
