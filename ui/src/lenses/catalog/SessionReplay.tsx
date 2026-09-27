@@ -77,14 +77,17 @@ const SCOPE_LAMPS: Array<{ state: LiveStateReading["state"]; label: string }> = 
   { state: "prompt", label: "prompt" },
   { state: "tools", label: "tools" },
   { state: "rest", label: "rest" },
-  { state: "stalled", label: "stall" },
+  // (#2911) "stalled", the word the fleet card's line and this row's own
+  // status text (`liveStateLabel`) already use; the lamp was the one place
+  // that said "stall".
+  { state: "stalled", label: "stalled" },
 ];
 export function ScopeLamps({
   reading,
   noSignal = false,
   finished = false,
 }: {
-  reading: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; writing?: true; writingSeconds?: number; thinking?: boolean };
+  reading: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; toolName?: string; writing?: true; writingSeconds?: number; thinking?: boolean };
   /** (#2886 pass 3) `state: null` is ALSO what a disconnection-downgraded
    *  stall reads as (`liveStateWhileConnected`) — visually identical
    *  (every lamp off) but a different fact, so the aria text says which. */
@@ -109,6 +112,7 @@ export function ScopeLamps({
         : liveStateLabel({
             state: reading.state,
             restSecondsLeft: reading.restSecondsLeft,
+            toolName: reading.toolName,
             writing: reading.writing,
             writingSeconds: reading.writingSeconds,
           } as LiveStateReading);
@@ -153,7 +157,7 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
   centerLabel: string | null;
   centerUnit: string | null;
   centerCarried: boolean;
-  lamps: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; writing?: true; writingSeconds?: number; thinking?: boolean };
+  lamps: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; toolName?: string; writing?: true; writingSeconds?: number; thinking?: boolean };
   note: string | null;
 } | null {
   const live = view.liveTokScope;
@@ -179,15 +183,30 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
         writing,
         writingSeconds: live.writingSeconds,
         thinking: live.thinking === true,
+        // (#2911) A live scope means the run is in flight: `state: null`
+        // (a mission between model steps) reads "no model working" in the
+        // tube, the same phrase the lamps' status gives it.
+        inFlight: true,
       }),
       lamps: {
         state: live.state,
         restSecondsLeft: live.restSecondsLeft,
+        toolName: state === "tools" ? live.toolName : undefined,
         writing: live.writing,
         writingSeconds: live.writingSeconds,
         thinking: generating && live.thinking === true,
       },
-      note: state === "nosignal" ? "no signal" : null,
+      // (#2926) While the model generates a tool call, the readout line
+      // under the lamps says which tool and for how long ("tool gen · write
+      // · 18s"): LM Studio streams nothing for the arguments, so there is no
+      // rate, and the lit lamp and the tube center carry no live data. The
+      // seconds tick with the page's clock (the playhead in playback).
+      note:
+        state === "nosignal"
+          ? "no signal"
+          : writing
+            ? liveStateLabel({ state: "tools", toolName: live.toolName, writing: true, writingSeconds: live.writingSeconds })
+            : null,
     };
   }
   const fin = view.finishedTokRate;
@@ -786,16 +805,23 @@ export function SessionReplay({
                       // most recent heartbeats.
                       centerCarried={scopeHero.centerCarried}
                     />
-                    <ScopeLamps
-                      reading={scopeHero.lamps}
-                      noSignal={scopeHero.state === "nosignal"}
-                      finished={scopeHero.state === "finished"}
-                    />
-                    {/* A quiet line under the lamps: "no signal" when the page
-                        lost its connection (distinct from a genuinely idle
-                        run, which has nothing wrong to name), or the finished
-                        average's qualifier when it is partial or a fallback. */}
-                    {scopeHero.note && <div className="modelbox__note">{scopeHero.note}</div>}
+                    {/* The lamps and, under them, a quiet readout line: "no
+                        signal" when the page lost its connection (distinct
+                        from a genuinely idle run, which has nothing wrong to
+                        name), the finished average's qualifier when it is
+                        partial or a fallback, or (#2926) the tool being
+                        generated and its elapsed seconds. The readout takes
+                        NO height of its own: it sits in the hero's bottom
+                        padding (`.modelbox__status` in `styles.css`), so the
+                        MODEL section is the same size in every state. */}
+                    <div className="modelbox__status">
+                      <ScopeLamps
+                        reading={scopeHero.lamps}
+                        noSignal={scopeHero.state === "nosignal"}
+                        finished={scopeHero.state === "finished"}
+                      />
+                      {scopeHero.note && <div className="modelbox__note">{scopeHero.note}</div>}
+                    </div>
                   </div>
                 )}
                 {view.metricScope.model.length > 0 && (

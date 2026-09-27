@@ -558,10 +558,51 @@
             .to_string();
         assert!(msg.contains("GHCR"), "{msg}");
         assert!(msg.contains("ghcr.io/kstrat2001/darkmux-runtime:"), "{msg}");
+        // (#2923) The build fix stamps the version label, or dispatch would
+        // skip the image it just told the operator to build.
         assert!(
-            msg.contains("docker build -t darkmux-runtime:latest runtime/"),
+            msg.contains(&format!(
+                "docker build --build-arg DARKMUX_VERSION={} -t darkmux-runtime:latest runtime/",
+                env!("CARGO_PKG_VERSION")
+            )),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn a_default_image_plan_dispatch_would_refuse_reads_refused_not_missing() {
+        // (#2923 review C8) Doctor's `docker runtime` row and dispatch must
+        // agree: a present pinned image with a contradicting label is refused
+        // by dispatch, so doctor must not say "will pull".
+        use crate::runtime_image::{pinned_runtime_image, plan_default_image, ImageInspection, ImageInspector};
+        struct Contradicting;
+        impl ImageInspector for Contradicting {
+            fn inspect(&self, image: &str) -> ImageInspection {
+                if image == pinned_runtime_image("9.9.9") {
+                    ImageInspection::Present { id: "sha256:x".into(), version_label: Some("1.0.0".into()) }
+                } else {
+                    ImageInspection::Absent
+                }
+            }
+        }
+        struct Empty;
+        impl ImageInspector for Empty {
+            fn inspect(&self, _: &str) -> ImageInspection {
+                ImageInspection::Absent
+            }
+        }
+        match status_for_plan(plan_default_image(&Contradicting, "9.9.9", None)) {
+            DockerRuntimeStatus::ImageRefused(msg) => assert!(msg.contains("1.0.0"), "{msg}"),
+            other => panic!("expected ImageRefused, got {other:?}"),
+        }
+        assert_eq!(
+            status_for_plan(plan_default_image(&Empty, "9.9.9", None)),
+            DockerRuntimeStatus::ImageMissing
+        );
+        assert!(preflight_result_for(DockerRuntimeStatus::ImageRefused("refusing: x".into()))
+            .unwrap_err()
+            .to_string()
+            .contains("refusing: x"));
     }
 
     #[test]
@@ -583,6 +624,11 @@
         assert!(is_darkmux_runtime_image(
             "ghcr.io/kstrat2001/darkmux-runtime:1.2.3"
         ));
+        // (#2923) Any tag of the local repo is darkmux's own image — an
+        // operator's `darkmux-runtime:4.0-rc` runs directly (and is version
+        // checked), never gets a second runtime injected into it.
+        assert!(is_darkmux_runtime_image("darkmux-runtime:4.0-rc"));
+        assert!(!is_darkmux_runtime_image("darkmux-runtime-bun:local"));
         assert!(!is_darkmux_runtime_image("rust:slim"));
         assert!(!is_darkmux_runtime_image("ubuntu:24.04"));
         // A lookalike repo prefix without the `:tag` separator must not match.

@@ -53,7 +53,7 @@
 <section>
   <div class="wrap">
     <h2>Prerequisites for lab</h2>
-    <p><code>darkmux lab run</code> uses the same internal Docker-bounded runtime as <code>darkmux dispatch</code>. Workloads dispatch through a per-invocation <code>darkmux-runtime</code> container; build the image once with <code>docker build -t darkmux-runtime:latest runtime/</code> from the darkmux repo root.</p>
+    <p><code>darkmux lab run</code> uses the same internal Docker-bounded runtime as <code>darkmux dispatch</code>. Workloads dispatch through a per-invocation <code>darkmux-runtime</code> container. darkmux pulls the image built for your version on first use; to build one yourself instead, run <code>docker build --build-arg DARKMUX_VERSION=&lt;version&gt; -t darkmux-runtime:latest runtime/</code> from the darkmux repo root at that version. An image built for another version, or without the build-arg, is not used.</p>
     <p>If you don't have Docker, the <code>profile</code> / <code>machine</code> / <code>doctor</code> verbs still work. You just can't run lab dispatches.</p>
   </div>
 </section>

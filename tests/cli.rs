@@ -212,7 +212,80 @@ fn darkmux_std_cmd() -> std::process::Command {
     neutralize_state_vars(&mut cmd);
     pin_child_tmpdir(&mut cmd, &home);
     cmd.env("HOME", home).env("DARKMUX_HOME", darkmux_home);
+    // (#2923) Every spawn resolves `docker` to a shim that refuses loudly,
+    // so no CLI test can pull, build, tag or run a real image on a
+    // developer machine or in CI. A test that needs Docker behavior puts
+    // its own fake `docker` earlier on PATH (`fake_docker_for_runtime_image`).
+    let real_path = std::env::var("PATH").unwrap_or_default();
+    cmd.env("PATH", format!("{}:{real_path}", docker_shim_dir().display()));
     cmd
+}
+
+/// Exit code of the refusing `docker` shim; distinctive so a failure that
+/// came from it is recognizable.
+const DOCKER_SHIM_EXIT: i32 = 97;
+
+/// A directory holding only a `docker` that refuses every call, written
+/// once per test run under cargo's per-target temp dir (never the shared
+/// temp root, #2707).
+fn docker_shim_dir() -> std::path::PathBuf {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("cli-docker-shim");
+        fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("docker");
+        let tmp = dir.join(format!("docker.{}", std::process::id()));
+        fs::write(
+            &tmp,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"tests/cli.rs docker shim: refused \\`docker $*\\`; CLI tests never reach \
+                 the host's Docker (#2923). Put a fake docker on PATH for this test.\" >&2\n\
+                 exit {DOCKER_SHIM_EXIT}\n"
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Atomic publish: nextest runs each test in its own process, and a
+        // half-written shim would be an exec failure, not a refusal.
+        fs::rename(&tmp, &shim).unwrap();
+        dir
+    })
+    .clone()
+}
+
+/// (#2923) The guard itself: through the spawn helper's own PATH, an
+/// accidental `docker pull` (or any other docker call) fails loudly instead
+/// of reaching the host's Docker. Before this, `mission launch review`
+/// tests ran the real image resolver, and one pulled a GHCR image onto a
+/// developer machine.
+#[test]
+fn cli_spawns_cannot_reach_the_hosts_docker() {
+    use std::ffi::OsStr;
+    let cmd = darkmux_std_cmd();
+    let path = cmd
+        .get_envs()
+        .find(|(k, _)| *k == OsStr::new("PATH"))
+        .and_then(|(_, v)| v)
+        .expect("the spawn helper must pin PATH")
+        .to_owned();
+    for args in [["pull", "ghcr.io/kstrat2001/darkmux-runtime:0.0.0"], ["version", "--format"]] {
+        let out = std::process::Command::new("docker")
+            .args(args)
+            .env("PATH", &path)
+            .output()
+            .expect("`docker` must resolve to the shim");
+        assert_eq!(out.status.code(), Some(DOCKER_SHIM_EXIT), "docker {args:?} reached a real docker");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("docker shim: refused"),
+            "the refusal must say what happened: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 /// (#2707) The child's temp root is pinned under this spawn's own tree.
@@ -3354,30 +3427,19 @@ fn dispatch_host_side_unset_compactor_disclosure_fires_on_the_local_path() {
     )
     .unwrap();
 
-    let fake_bin = tmp.path().join("fake-bin");
-    fs::create_dir_all(&fake_bin).unwrap();
-    let fake_lms = fake_bin.join("lms");
+    // The stable fakes (#2923): `lms ps` reports the model resident; `docker
+    // image inspect` answers with a runtime image built for this darkmux,
+    // since `--skip-preflight` skips only the daemon probe.
     fs::write(
-        &fake_lms,
-        "#!/bin/sh\n\
-         if [ \"$1\" = \"ps\" ]; then\n\
-         echo '[{\"identifier\":\"darkmux:model-a\",\"modelKey\":\"model-a\",\"status\":\"loaded\",\"sizeBytes\":1000000000,\"contextLength\":32000}]'\n\
-         exit 0\n\
-         fi\n\
-         exit 0\n",
+        tmp.path().join("lms-ps.json"),
+        r#"[{"identifier":"darkmux:model-a","modelKey":"model-a","status":"loaded","sizeBytes":1000000000,"contextLength":32000}]"#,
     )
     .unwrap();
-    let fake_docker = fake_bin.join("docker");
-    fs::write(&fake_docker, "#!/bin/sh\nexit 0\n").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        for p in [&fake_lms, &fake_docker] {
-            let mut perms = fs::metadata(p).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(p, perms).unwrap();
-        }
-    }
+    let (fake_bin, _log) = fake_docker_for_runtime_image(
+        tmp.path(),
+        &[("darkmux-runtime:latest", env!("CARGO_PKG_VERSION"))],
+    );
+    let fake_lms = fake_bin.join("lms");
 
     let ack_dir = TempDir::new().unwrap();
     let real_path = std::env::var("PATH").unwrap_or_default();
@@ -3386,7 +3448,11 @@ fn dispatch_host_side_unset_compactor_disclosure_fires_on_the_local_path() {
         .env("DARKMUX_ACK_DIR", ack_dir.path())
         .env("DARKMUX_PROFILES", &profiles_path)
         .env("DARKMUX_LMS_BIN", &fake_lms)
-        .env("PATH", format!("{}:{real_path}", fake_bin.display()))
+        .env("FAKE_DOCKER_STATE_DIR", tmp.path())
+        .env(
+            "PATH",
+            format!("{}:{}:{real_path}", fake_bin.display(), docker_shim_dir().display()),
+        )
         .args(["dispatch", "coder", "--skip-preflight", "smoke"])
         .assert()
         .stderr(
@@ -3394,6 +3460,261 @@ fn dispatch_host_side_unset_compactor_disclosure_fires_on_the_local_path() {
                 .and(predicate::str::contains("compaction is OFF"))
                 .and(predicate::str::contains("32000")),
         );
+}
+
+// ─── #2923: a runtime image built for another darkmux is refused before it runs ──
+
+/// Stable fake `docker` and `lms`, shared by every test in this binary and
+/// parameterized by `$FAKE_DOCKER_STATE_DIR` (a per-test directory):
+/// - `docker` appends its argv to `<state>/docker.log`; answers `version`;
+///   answers `image inspect <ref>` from `<state>/docker-labels` (lines of
+///   `<ref>=<label>`, empty label = present but unlabeled; an unlisted ref is
+///   absent) in the `{{.Id}}|<label>` shape dispatch asks for; fails `pull`;
+///   exits 0 for everything else.
+/// - `lms` prints `<state>/lms-ps.json` for `ps` (or `[]`).
+///
+/// (#2923) Written ONCE per build at a stable path, never per test. macOS
+/// runs an XProtect assessment on the first exec of every newly written
+/// executable and those assessments serialize: measured, 48 concurrent
+/// first-execs took up to 10.4s and 200 up to 21.2s, against 0.02s for
+/// re-execs of an assessed file. A per-test fake under load therefore read
+/// as a `docker image inspect` that did not answer within
+/// `runtime_image::INSPECT_TIMEOUT` (15s), failing the test for a reason
+/// that had nothing to do with it.
+fn stable_cli_fakes() -> std::path::PathBuf {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("cli-fake-bin");
+    fs::create_dir_all(&dir).unwrap();
+    let docker = "#!/bin/sh\n\
+        state=\"${FAKE_DOCKER_STATE_DIR:?the fake docker needs FAKE_DOCKER_STATE_DIR}\"\n\
+        echo \"$*\" >> \"$state/docker.log\"\n\
+        if [ \"$1\" = version ]; then echo 27.0.0; exit 0; fi\n\
+        if [ \"$1\" = image ] && [ \"$2\" = inspect ]; then\n\
+        for last; do :; done\n\
+        if [ -f \"$state/docker-labels\" ]; then\n\
+        while IFS= read -r entry; do\n\
+        case \"$entry\" in \"$last=\"*) echo \"sha256:id-of-$last|${entry#\"$last=\"}\"; exit 0 ;; esac\n\
+        done < \"$state/docker-labels\"\n\
+        fi\n\
+        echo \"Error response from daemon: No such image: $last\" >&2; exit 1\n\
+        fi\n\
+        if [ \"$1\" = pull ]; then echo 'pull denied' >&2; exit 1; fi\n\
+        exit 0\n";
+    let lms = "#!/bin/sh\n\
+        if [ \"$1\" = ps ] && [ -f \"$FAKE_DOCKER_STATE_DIR/lms-ps.json\" ]; then cat \"$FAKE_DOCKER_STATE_DIR/lms-ps.json\"; exit 0; fi\n\
+        echo '[]'\nexit 0\n";
+    for (name, body) in [("docker", docker), ("lms", lms)] {
+        let path = dir.join(name);
+        if fs::read_to_string(&path).ok().as_deref() == Some(body) {
+            continue;
+        }
+        // Same-directory temp + atomic rename: parallel test processes never
+        // exec a half-written file, and an unchanged fake is never re-created
+        // (a re-created file is a new file to XProtect).
+        let tmp = dir.join(format!("{name}.tmp.{}", std::process::id()));
+        fs::write(&tmp, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::rename(&tmp, &path).unwrap();
+    }
+    dir
+}
+
+/// Pins the #2923 fix: asking for the fakes again must not re-create them.
+#[test]
+fn the_cli_fakes_are_written_once_not_per_test() {
+    let first = stable_cli_fakes();
+    let modified = |d: &std::path::Path| fs::metadata(d.join("docker")).unwrap().modified().unwrap();
+    let before = modified(&first);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let second = stable_cli_fakes();
+    assert_eq!(first, second);
+    assert_eq!(before, modified(&second), "an unchanged fake must not be rewritten");
+}
+
+/// Set up the stable fakes for one test: `labels` maps an image ref to the
+/// version label its fake reports (`""` = present but unlabeled). Returns
+/// (fake-bin dir, docker log path). Use with [`dispatch_with_fake_docker`],
+/// which points the fakes at `tmp`.
+fn fake_docker_for_runtime_image(
+    tmp: &std::path::Path,
+    labels: &[(&str, &str)],
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let lines: String = labels.iter().map(|(image, label)| format!("{image}={label}\n")).collect();
+    fs::write(tmp.join("docker-labels"), lines).unwrap();
+    (stable_cli_fakes(), tmp.join("docker.log"))
+}
+
+fn dispatch_with_fake_docker(
+    tmp: &std::path::Path,
+    fake_bin: &std::path::Path,
+    extra: &[&str],
+) -> assert_cmd::assert::Assert {
+    let profiles_path = tmp.join("profiles.json");
+    fs::write(
+        &profiles_path,
+        r#"{"profiles":{"fast":{"models":[{"id":"model-a","n_ctx":32000,"role":"primary"}]}},"default_profile":"fast"}"#,
+    )
+    .unwrap();
+    let ack_dir = tmp.join("ack");
+    fs::create_dir_all(&ack_dir).unwrap();
+    let real_path = std::env::var("PATH").unwrap_or_default();
+    let mut args = vec!["dispatch", "coder"];
+    args.extend_from_slice(extra);
+    args.push("smoke");
+    darkmux_cmd()
+        .env("DARKMUX_ACK_DIR", &ack_dir)
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_LMS_BIN", fake_bin.join("lms"))
+        .env("FAKE_DOCKER_STATE_DIR", tmp)
+        .env(
+            "PATH",
+            format!("{}:{}:{real_path}", fake_bin.display(), docker_shim_dir().display()),
+        )
+        .args(&args)
+        .assert()
+}
+
+/// Nothing beyond inspecting images may have happened: no container, no
+/// extraction. (A pull may be attempted on the default path; it fails here.)
+fn assert_no_container_ran(log: &std::path::Path) {
+    let calls = fs::read_to_string(log).unwrap_or_default();
+    for line in calls.lines() {
+        assert!(
+            !(line.starts_with("run ") || line.starts_with("create ")),
+            "a container was started before the refusal: {line}\nall calls:\n{calls}"
+        );
+    }
+}
+
+#[test]
+fn dispatch_refuses_an_explicit_unlabeled_darkmux_runtime_tag_before_running() {
+    // The operator's side-by-side case: `--image darkmux-runtime:4.0-rc`,
+    // built with no DARKMUX_VERSION build-arg. It must be checked (not treated
+    // as a BYO image and injected), and refused naming the image and the fix.
+    let tmp = TempDir::new().unwrap();
+    let (fake_bin, log) =
+        fake_docker_for_runtime_image(tmp.path(), &[("darkmux-runtime:4.0-rc", "")]);
+    let version = env!("CARGO_PKG_VERSION");
+    dispatch_with_fake_docker(tmp.path(), &fake_bin, &["--image", "darkmux-runtime:4.0-rc"])
+        .failure()
+        .stderr(
+            predicate::str::contains("refusing to dispatch")
+                .and(predicate::str::contains("`darkmux-runtime:4.0-rc`"))
+                .and(predicate::str::contains("no version label"))
+                .and(predicate::str::contains(format!(
+                    "docker build --build-arg DARKMUX_VERSION={version} -t darkmux-runtime:4.0-rc runtime/"
+                ))),
+        );
+    assert_no_container_ran(&log);
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.contains("pull"),
+        "an explicit tag is never replaced by a pull:\n{calls}"
+    );
+}
+
+#[test]
+fn dispatch_refuses_an_explicit_mismatched_darkmux_runtime_tag_naming_both_versions() {
+    let tmp = TempDir::new().unwrap();
+    let (fake_bin, log) =
+        fake_docker_for_runtime_image(tmp.path(), &[("darkmux-runtime:4.0-rc", "0.0.1")]);
+    let version = env!("CARGO_PKG_VERSION");
+    dispatch_with_fake_docker(tmp.path(), &fake_bin, &["--image", "darkmux-runtime:4.0-rc"])
+        .failure()
+        .stderr(
+            predicate::str::contains("built for darkmux 0.0.1")
+                .and(predicate::str::contains(format!("this darkmux is {version}"))),
+        );
+    assert_no_container_ran(&log);
+}
+
+#[test]
+fn dispatch_skips_a_stale_unlabeled_latest_and_refuses_when_the_pin_cannot_be_pulled() {
+    // The Studio's shape (#2923): an unlabeled local `darkmux-runtime:latest`
+    // and no pinned image. The local image must not run; with the pull
+    // failing, the refusal names the skipped image, this version, and the fix.
+    let tmp = TempDir::new().unwrap();
+    let (fake_bin, log) =
+        fake_docker_for_runtime_image(tmp.path(), &[("darkmux-runtime:latest", "")]);
+    let version = env!("CARGO_PKG_VERSION");
+    let pinned = format!("ghcr.io/kstrat2001/darkmux-runtime:{version}");
+    dispatch_with_fake_docker(tmp.path(), &fake_bin, &[])
+        .failure()
+        .stderr(
+            predicate::str::contains("`darkmux-runtime:latest` carries no version label")
+                .and(predicate::str::contains(format!("this darkmux is {version}")))
+                .and(predicate::str::contains(format!("DARKMUX_VERSION={version}")))
+                .and(predicate::str::contains("failed to pull")),
+        );
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(calls.contains(&format!("pull {pinned}")), "the pin was tried:\n{calls}");
+    assert_no_container_ran(&log);
+}
+
+#[test]
+fn dispatch_skip_preflight_still_refuses_a_stale_unlabeled_latest() {
+    // (#2923 review C1) `--skip-preflight` (and the `skip_preflight` mission
+    // step key) skips the daemon probe only. It used to return
+    // `darkmux-runtime:latest` unchecked, so the Studio's stale image ran.
+    let tmp = TempDir::new().unwrap();
+    let (fake_bin, log) =
+        fake_docker_for_runtime_image(tmp.path(), &[("darkmux-runtime:latest", "")]);
+    dispatch_with_fake_docker(tmp.path(), &fake_bin, &["--skip-preflight"])
+        .failure()
+        .stderr(predicate::str::contains("`darkmux-runtime:latest` carries no version label"));
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.lines().any(|l| l.starts_with("version")),
+        "the daemon probe is what --skip-preflight skips:\n{calls}"
+    );
+    assert_no_container_ran(&log);
+}
+
+#[test]
+fn dispatch_says_pulling_the_pinned_image_not_that_none_is_local_after_a_skip() {
+    // (#2923 review C8) Right after "local `darkmux-runtime:latest` … not
+    // using it", the pull line must not claim there is no local image.
+    let tmp = TempDir::new().unwrap();
+    let (fake_bin, _log) =
+        fake_docker_for_runtime_image(tmp.path(), &[("darkmux-runtime:latest", "0.0.1")]);
+    dispatch_with_fake_docker(tmp.path(), &fake_bin, &[])
+        .failure()
+        .stderr(
+            predicate::str::contains("pulling the version-pinned runtime image")
+                .and(predicate::str::contains("no local runtime image").not()),
+        );
+}
+
+#[test]
+fn dispatch_byo_image_takes_its_injected_runtime_from_the_matching_image_not_a_stale_latest() {
+    // (#703 + #2923) `--image rust:slim` injects darkmux's runtime binary,
+    // extracted from a darkmux image. That source must be the image built
+    // for this darkmux, not a stale local `:latest`, or the injected runtime
+    // is stale and the #1730 cache stamps it as current.
+    let tmp = TempDir::new().unwrap();
+    let version = env!("CARGO_PKG_VERSION");
+    let pinned = format!("ghcr.io/kstrat2001/darkmux-runtime:{version}");
+    let (fake_bin, log) = fake_docker_for_runtime_image(
+        tmp.path(),
+        &[("darkmux-runtime:latest", ""), (pinned.as_str(), version)],
+    );
+    // The fake `docker create` prints no container id, so extraction stops
+    // right there; what matters is which image it was asked to extract from.
+    let _ = dispatch_with_fake_docker(tmp.path(), &fake_bin, &["--image", "rust:slim"]);
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    // By the id the gate checked (#2923 review C6), never by a tag.
+    assert!(
+        calls.contains(&format!("create -- sha256:id-of-{pinned}")),
+        "the injected runtime comes from the pinned image:\n{calls}"
+    );
+    assert!(
+        !calls.contains("create -- darkmux-runtime:latest")
+            && !calls.contains("create -- sha256:id-of-darkmux-runtime:latest"),
+        "never from the stale local tag:\n{calls}"
+    );
 }
 
 // ─── #2124: SIGTERM mid-probe leaves a terminal record + no orphaned curl ──

@@ -46,8 +46,10 @@ The shape converged through an empirical-evaluation arc against the canonical Ar
 From this directory:
 
 ```
-# build the image
-docker build -t darkmux-runtime .
+# build the image, stamped with the darkmux version it is for; dispatch
+# skips (or, when named with --image, refuses) an image whose
+# org.opencontainers.image.version label does not match the host (#2923)
+docker build --build-arg DARKMUX_VERSION=<version> -t darkmux-runtime .
 
 # default CMD runs the container environment check
 docker run --rm darkmux-runtime

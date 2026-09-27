@@ -5939,16 +5939,50 @@ body {
   --d: 240px;
   --rim: 9px;
 }
+/* The lamps row and the readout line under it. The row is the only thing in
+   flow; the readout is positioned out of flow under it, into the hero's 24px
+   bottom padding, so it takes no height: a readout that came and went (the
+   tool being generated, "no signal", a finished average's qualifier) grew
+   the MODEL section 35-42px and shrank it again (measured, #2926). Full
+   hero width, one line, ellipsized if a tool name is ever that long. */
+.session-run .modelbox__status {
+  position: relative;
+  align-self: stretch;
+}
 /* In DOM order here (scope, lamps, note), not the old tile's `order: 4`. */
 .session-run .modelbox__hero .scope-lamps {
   order: 0;
   margin-top: 0;
 }
-/* The "no signal" words, or a finished average's qualifier, under the lamps. */
+/* A zero-width strut in the lamp label's own font: with every lamp off (a
+   finished run, no model working between steps) no label is shown and the
+   row was only the dots' 7px tall, 7px shorter than with a lamp lit. The
+   strut holds the row at a label line's height in every state. The -8px
+   cancels the row's own 8px gap, so the dots do not move. */
+.session-run .modelbox__hero .scope-lamps::before {
+  content: "\200b";
+  font: calc(10px * var(--fs-scale)) var(--font-mono);
+  width: 0;
+  margin-right: -8px;
+}
+/* The "no signal" words, a finished average's qualifier, or (#2926) the tool
+   being generated and its elapsed seconds ("tool gen · write · 18s"), under
+   the lamps. Tabular figures so the ticking seconds do not shift the line. */
 .session-run .modelbox__note {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  margin-top: 4px;
+  text-align: center;
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   font-size: calc(11px * var(--fs-scale));
   letter-spacing: 0.1em;
   color: var(--dim);
+  font-variant-numeric: tabular-nums;
 }
 .session-run .metrics.modelbox__figs {
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -8751,6 +8785,13 @@ body {
 .token-scope-center:not(.token-scope-center--icon):not(:has(.token-scope-n)) .token-scope-u {
   top: 50%;
   transform: translateY(-50%);
+  /* (#2911) "no model working" (a run in flight between model steps) is
+     too wide for the card's ring on one line: this unit may wrap, kept to
+     the ring's inner width (the ring sits at 40% of the screen's radius). */
+  left: 19%;
+  right: 19%;
+  white-space: normal;
+  line-height: 1.3;
 }
 /* (#2890) The card's tube shows the same center as the run page's, unit
    included; the larger tube and ring leave the unit clear of the trace. */

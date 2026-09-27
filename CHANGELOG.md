@@ -121,6 +121,32 @@ darkmux release.
   default) had a `role_profiles` binding, so the run's `profile=` stamp named a profile
   the operator had not bound. It now follows the same precedence
   `darkmux dispatch <role>` does; an explicit `--profile` still wins.
+- **A stale local runtime image no longer shadows the one built for this
+  darkmux** (#2923). A local `darkmux-runtime:latest` was used whenever it
+  existed, so a weeks-old unlabeled build ran under a newer host and the
+  dispatch died with `unknown flag: --session-id`. Dispatch now reads the
+  image's `org.opencontainers.image.version` label (metadata only, nothing
+  runs) and uses a local `:latest` only when it matches; otherwise it runs
+  the version-pinned `ghcr.io/kstrat2001/darkmux-runtime:<version>`, pulling
+  it if absent, and says which local image it skipped. If no matching image
+  can be had, it refuses before starting a container, naming both versions
+  and the rebuild command. An image with no label counts as a mismatch (a
+  GHCR version tag can explain a mismatch, never vouch for a match). The
+  check runs under `--skip-preflight` and the `skip_preflight` mission step
+  key too, which now skip only the Docker daemon probe. The container runs
+  by the checked image id, not the tag. A development build that falls back
+  to the release image for its version number says so, with the command
+  that builds a matching one. `darkmux doctor`'s `docker runtime` row
+  reports an image dispatch would refuse as refused, not "will pull".
+  **Behavior change for
+  source builds:** a local runtime image must now be built with
+  `docker build --build-arg DARKMUX_VERSION=<version> -t darkmux-runtime:latest runtime/`
+  to be used. `--image darkmux-runtime:<any tag>` (e.g. `:4.0-rc`) is now
+  treated as darkmux's own image: version checked, run directly, never
+  injected. A BYO `--image` (#703) now extracts its injected runtime from
+  the matching image too. `darkmux doctor`'s `runtime image freshness`
+  warns on an unlabeled `:latest` (it used to pass) and lists other
+  unlabeled local tags.
 
 - **radio says the model is busy instead of queueing behind it** (#2917).
   One LM Studio instance serves one request at a time, and darkmux caps

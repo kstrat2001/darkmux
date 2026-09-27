@@ -5,11 +5,12 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
+import { useNowMs } from "../../lib/clock";
 import { useCountUp } from "../../hooks/useCountUp";
 import { useFleetRoster, useLiveMachines, useStaticFleetBeats } from "../../hooks/useLiveMachines";
 import { getSource, runsSrc, runsReachable } from "../../lib/source";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
-import { machineUids, machPresent, liveSessionSet, machineNames, LIVE_WINDOW_MS, T } from "../../lib/flow";
+import { machineUids, machPresent, liveSessionSet, machineNames, recordsAsOf, LIVE_WINDOW_MS, T } from "../../lib/flow";
 import type { FlowRecord, RunsResponse } from "../../types/handwritten";
 import { fmtN, fmtC } from "../../lib/format";
 import { MachineIcon } from "../../components/MachineIcon";
@@ -650,10 +651,8 @@ export function FleetLens({
   // (#1869) The token hero + hybrid note are "as of the playhead" — legacy's
   // own `visible()` gate (`DATA.filter(r=>T(r.ts)<=state.t)`), restored at
   // this call site rather than inside `tokensOffMeter`/`hybridNote`
-  // themselves (see `savings.ts`'s module doc for the full reasoning). A
-  // no-op in live mode: `playheadT` there is `flowWindow.tMax`, which is
-  // `computeTMax(flowWindow.data)` by construction, so every record already
-  // satisfies `ts <= playheadT`. In replay, `playheadT` is the scrubbable
+  // themselves (see `savings.ts`'s module doc for the full reasoning). In
+  // replay, `playheadT` is the scrubbable
   // position `PlaybackLens` passes as its `playhead` prop, so this is what
   // makes scrubbing before a session's completion drop that session's
   // tokens out of "local" and into "unattributed" — the token half of the
@@ -669,9 +668,21 @@ export function FleetLens({
   // `PlaybackLens`'s `onPlayheadChange` reporting the same `playheadT` this
   // line reads up to `App`, which threads it into `EventLogColumn`. See
   // `App.tsx`'s own `eventLogRecords` doc for that half.
+  //
+  // (#2911) Live, the gate is "as of now" (`wallNow`): a record stamped after
+  // the viewer's own clock (a peer whose clock runs ahead) is not counted
+  // until the clock reaches it, the same rule the fleet cards apply
+  // (`cards.ts`). `recordsAsOf` keeps that from costing a whole-window filter
+  // on every 1 Hz tick: with nothing ahead of now it returns the window
+  // itself, the same reference each tick, so the hero's token sums and note
+  // do not recompute; with a record ahead, it filters once and re-filters
+  // only when the window changes or now crosses that record. A replay keeps
+  // its plain playhead filter, which runs only when the playhead moves.
   const scopedData = useMemo(
-    () => flowWindow.data.filter((r) => T(r.ts) <= playheadT),
-    [flowWindow.data, playheadT],
+    () => (playhead == null
+      ? recordsAsOf(flowWindow.data, wallNow)
+      : flowWindow.data.filter((r) => T(r.ts) <= playhead)),
+    [flowWindow.data, playhead, wallNow],
   );
   const tokens = useMemo(() => tokensOffMeter(scopedData), [scopedData]);
   const note = useMemo(() => hybridNote(scopedData, tokens), [scopedData, tokens]);
@@ -778,6 +789,20 @@ export function FleetLens({
     ],
     [uids, rosterOnly, flowWindow.data, playheadT, liveMachines, specs, liveSet, liveMode, specBeats, runs, roster, connected, lastContactMs],
   );
+  // (#2911) The card ticks while an execution is live. Nothing above
+  // re-rendered this lens between records: SSE contact is a ref, presence
+  // re-renders only on a changed payload, and a resting runtime emits no
+  // heartbeats, so a REST countdown froze for the 5 s host-sampler cadence
+  // (or 20 s with the sampler off) and then jumped, and the rest -> prompt
+  // flip and stall detection waited the same way. Subscribing to the shared
+  // 1 s clock re-renders this component every second; `wallNow` above is a
+  // fresh `Date.now()` on each of those renders, which is what every card
+  // derivation reads. The same gate as `SessionReplay`'s `ticking`: live
+  // edge only (a replay's clock is the transport's), and only while a card
+  // has a live execution, so an idle fleet page runs no timer at all
+  // (`useNowMs` subscribes to nothing when inactive).
+  const ticking = livePolling && playhead == null && cards.some((c) => c.liveTokRate !== null);
+  useNowMs(ticking);
 
   const timeline = useMemo(
     () =>
@@ -990,9 +1015,14 @@ export function FleetLens({
                       // page's tile already shows for the identical case
                       // (`SessionReplay.tsx`'s `centerLabel`). `Math.round(...
                       // ?? 0)` used to print a confident "0 tok/s" here.
+                      // (#2911) Thinking keeps its word while unmeasured:
+                      // "— think tok/s", as the run page's lamp already
+                      // says "think" for the same opening seconds.
                       selectedExec.tokensPerSec != null
                       ? `${fmtN(Math.round(selectedExec.tokensPerSec))} ${selectedExec.thinking ? "think tok/s" : "tok/s"}`
-                      : "—"
+                      : selectedExec.thinking
+                        ? "— think tok/s"
+                        : "—"
                     : // (#2886 pass 3) `state: null` here (rather than the
                       // "no live execution" case, ruled out since
                       // `card.liveTokRate !== null` implies something IS
@@ -1011,6 +1041,9 @@ export function FleetLens({
                         : liveStateLabel({
                             state: selectedExec.state,
                             restSecondsLeft: selectedExec.restSecondsLeft,
+                            // (#2926) "tool gen · write · 18s": the tool
+                            // being written, on this line, never in the tube.
+                            toolName: selectedExec.toolName,
                             writing: selectedExec.writing,
                             writingSeconds: selectedExec.writingSeconds,
                           })}
@@ -1156,7 +1189,7 @@ export function FleetLens({
                     state={scopeStateOf({ state: selectedExec.state, noSignal: selectedExec.state === null })}
                     toolName={selectedExec.toolName}
                     // (#2889) The writing cue; the status line under the
-                    // tube carries the live "tool gen · N s".
+                    // tube carries the live "tool gen · <tool> · Ns" (#2926).
                     toolWriting={selectedExec.writing === true}
                     // (#2890) Thinking tints the ring and shimmers the rate;
                     // the words and number stay as they are.
@@ -1183,7 +1216,12 @@ export function FleetLens({
               )}
               {!(card.liveTokRate !== null && selectedExec) && !card.absent && (
                 <div className="mach-scope" data-testid="fleet-token-scope">
-                  <TokenScope tokensPerSec={0} state="idle" size="card" {...scopeCenter({ state: "idle", tokensPerSec: 0 })} />
+                  {/* (#2911) A card whose stat reads "dispatch in flight"
+                      (a mission between model steps, a lab run with no
+                      execution) says "no model working" in the tube, not
+                      "idle": the two words contradicted each other on one
+                      card. The run page uses the same phrase. */}
+                  <TokenScope tokensPerSec={0} state="idle" size="card" {...scopeCenter({ state: "idle", tokensPerSec: 0, inFlight: card.active })} />
                 </div>
               )}
             </div>

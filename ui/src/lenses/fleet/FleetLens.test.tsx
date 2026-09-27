@@ -2,13 +2,16 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, act } from "@testing-library/react";
 import { QueryClientProvider, QueryClient } from "@tanstack/react-query";
 import { FleetLens } from "./FleetLens";
 import type { FlowRecord } from "../../types/handwritten";
-import { todayUTC, prevDateUTC, FLOW_LIVE_TTL_MS } from "../../lib/flow";
+import { pepperAt, pepperRecords } from "../../testing/pepperGrinderRun";
+import { todayUTC, prevDateUTC, FLOW_LIVE_TTL_MS, __sessionIndexBuilds, __asOfFilterRuns } from "../../lib/flow";
+import { tokensOffMeter } from "./savings";
 import { closeOpenModal } from "../../lib/dialogManager";
 import { queryKeys } from "../../lib/queryKeys";
+import { __clockDebug } from "../../lib/clock";
 
 // (#2886 pass 5, MUST — fresh-reviewer finding F5) Several fixes in this
 // file stayed green while broken in the actual render path: the DOM-text
@@ -24,6 +27,14 @@ import { queryKeys } from "../../lib/queryKeys";
 vi.mock("../../components/TokenScope", () => ({
   TokenScope: (props: Record<string, unknown>) => <div data-testid="token-scope-probe" data-props={JSON.stringify(props)} />,
 }));
+
+// (#2911) A pass-through spy: every behavior is the real `tokensOffMeter`;
+// the tick tests read its call count to pin that a tick does not make the
+// hero recompute its token sums.
+vi.mock("./savings", async (importOriginal) => {
+  const real = await importOriginal<typeof import("./savings")>();
+  return { ...real, tokensOffMeter: vi.fn(real.tokensOffMeter) };
+});
 
 function latestTokenScopeProps(): Record<string, unknown> {
   const nodes = document.querySelectorAll('[data-testid="token-scope-probe"]');
@@ -1891,5 +1902,313 @@ describe("FleetLens card scope: the tool icon (#2890)", () => {
     );
     await waitFor(() => expect(document.querySelector('[data-testid="fleet-token-scope"]')).not.toBeNull());
     expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolName: "search", size: "card" });
+  });
+});
+
+describe("(#2911) the fleet card ticks while an execution is live", () => {
+  const now = Date.parse(FROZEN_NOW);
+  const ago = (ms: number) => new Date(now - ms).toISOString();
+
+  it("the REST countdown counts down with NO new records, and the clock stops when the lens unmounts", async () => {
+    // `Date` is frozen by the file's beforeEach; this test also fakes the
+    // interval so a tick of the shared clock is an asserted event.
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    vi.setSystemTime(new Date(FROZEN_NOW));
+    mockFleetFetch({
+      flowToday: [
+        { ts: ago(20_000), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s-rest", action: "dispatch.start", handle: "darkmux/coder" },
+        { ts: ago(10_000), machine_uid: "u1", session_id: "s-rest", action: "dispatch.rest", payload: { ms: 30_000 } },
+      ],
+    });
+    const r = renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach-scope__rate")?.textContent).toBe("rest 20s"));
+    expect(__clockDebug().running).toBe(true);
+    act(() => {
+      vi.advanceTimersByTime(3_000);
+    });
+    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("rest 17s");
+    expect(latestTokenScopeProps()).toMatchObject({ state: "rest", centerLabel: "17s", centerUnit: "resting" });
+    r.unmount();
+    expect(__clockDebug().running).toBe(false);
+  });
+
+  it("a tick recomputes the card, not the flow window", async () => {
+    // The tick exists to move the card's clock-bound state (a REST
+    // countdown, a stall, the live TTL). The window merge and the
+    // per-session index built over it depend only on records, and a tick
+    // brings none: rebuilding them every second was a ~100 ms hitch per
+    // second on a busy day. Measured here as "no new session index is built
+    // across ticks", which pins the window half: the merged array stayed the
+    // same object. It does NOT pin that the card's lookups use the index (a
+    // lookup reverted to a whole-window scan builds nothing either); that
+    // half is pinned where each lookup lives, in `flow.test.ts`
+    // (`sessionRunning`) and `cards.test.ts` (the heartbeat reads).
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    vi.setSystemTime(new Date(FROZEN_NOW));
+    mockFleetFetch({
+      flowToday: [
+        { ts: ago(20_000), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s-rest", action: "dispatch.start", handle: "darkmux/coder" },
+        { ts: ago(10_000), machine_uid: "u1", session_id: "s-rest", action: "dispatch.rest", payload: { ms: 30_000 } },
+      ],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach-scope__rate")?.textContent).toBe("rest 20s"));
+    const builds = __sessionIndexBuilds();
+    for (let i = 0; i < 3; i++) {
+      act(() => {
+        vi.advanceTimersByTime(1_000);
+      });
+    }
+    // The card DID recompute: the countdown moved three seconds.
+    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("rest 17s");
+    expect(__sessionIndexBuilds()).toBe(builds);
+  });
+
+  it("the flow-derived live TTL expires on the tick, with no new record", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    vi.setSystemTime(new Date(FROZEN_NOW));
+    mockFleetFetch({
+      flowToday: [
+        { ts: ago(FLOW_LIVE_TTL_MS - 500), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s-old", action: "dispatch.start", handle: "darkmux/coder" },
+        { ts: ago(FLOW_LIVE_TTL_MS - 1_500), machine_uid: "u1", session_id: "s-old", action: "dispatch.rest", payload: { ms: 600_000 } },
+      ],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")?.textContent).toContain("dispatch in flight"));
+    act(() => {
+      vi.advanceTimersByTime(2_000);
+    });
+    expect(document.querySelector(".mach")!.textContent).not.toContain("dispatch in flight");
+    expect(document.querySelector(".mach")!.textContent).toContain("idle");
+  });
+
+  it("an online machine with nothing running drives no clock at all", async () => {
+    mockFleetFetch({
+      machines: [{ machine_uid: "u1", display_name: "MacBook-Pro", schema_version: "1.43.0", beat_ts_ms: Date.now() }],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    expect(latestTokenScopeProps()).toMatchObject({ state: "idle" });
+    expect(__clockDebug()).toEqual({ listeners: 0, running: false });
+  });
+
+  it("a replay never ticks, whatever is running at the playhead", async () => {
+    const D0 = Date.parse("2026-08-26T10:00:00.000Z");
+    const at = (sec: number) => new Date(D0 + sec * 1000).toISOString();
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens
+          records={[
+            { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s2", action: "dispatch.start", handle: "reviewer" },
+            { ts: at(3), machine_uid: "u1", session_id: "s2", action: "dispatch.rest", payload: { ms: 15_000 } },
+          ] as FlowRecord[]}
+          tMax={D0 + 5000}
+          tMin={D0}
+          playhead={D0 + 5000}
+          historical
+        />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".mach-scope__rate")?.textContent).toBe("rest 13s"));
+    expect(__clockDebug().running).toBe(false);
+  });
+});
+
+describe("(#2911) fleet card wording", () => {
+  const D0 = Date.parse("2026-08-26T10:00:00.000Z");
+  const at = (sec: number) => new Date(D0 + sec * 1000).toISOString();
+  function renderAt(records: FlowRecord[], playheadSec: number) {
+    return render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={records} tMax={D0 + playheadSec * 1000} tMin={D0} playhead={D0 + playheadSec * 1000} historical />
+      </QueryClientProvider>,
+    );
+  }
+
+  it("thinking with no rate yet reads '— think tok/s', not a bare '—'", async () => {
+    // One heartbeat with reasoning chars and no visible chars: thinking,
+    // and (one sample) no trusted pair to rate.
+    renderAt(
+      [
+        { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+        { ts: at(2), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 2000, generated_chars: 300, cumulative_chars: 0 } },
+      ] as FlowRecord[],
+      4,
+    );
+    await waitFor(() => expect(document.querySelector(".mach-scope__rate")).not.toBeNull());
+    const line = document.querySelector(".mach-scope__rate")!;
+    expect(line.textContent).toBe("— think tok/s");
+    expect(line.getAttribute("data-thinking")).toBe("true");
+    expect(latestTokenScopeProps()).toMatchObject({ state: "generating", thinking: true, tokensPerSec: null, centerLabel: "—" });
+  });
+
+  it("a mission between model steps: 'dispatch in flight' above a tube that says 'no model working', not 'idle'", async () => {
+    // A running lab run and no execution: active, nothing generating.
+    mockFleetFetch({
+      machines: [{ machine_uid: "u1", display_name: "MacBook-Pro", schema_version: "1.43.0", beat_ts_ms: Date.now() }],
+      runs: [{ id: "lab-1", kind: "lab", status: "running", machine: "MacBook-Pro", tracked: true }],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    expect(document.querySelector(".mach")!.textContent).toContain("dispatch in flight");
+    expect(latestTokenScopeProps()).toMatchObject({ state: "idle", centerUnit: "no model working" });
+  });
+
+  it("a machine with nothing running still says 'idle' in the tube", async () => {
+    mockFleetFetch({
+      machines: [{ machine_uid: "u1", display_name: "MacBook-Pro", schema_version: "1.43.0", beat_ts_ms: Date.now() }],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    expect(document.querySelector(".mach")!.textContent).toContain("idle");
+    expect(latestTokenScopeProps()).toMatchObject({ state: "idle", centerUnit: "idle" });
+  });
+});
+
+// (#2911) Live, the hero counts records as of the viewer's clock, as it did
+// before #2911 and as the fleet cards do: a record stamped ahead of now (a
+// peer whose clock runs fast) is left out until the clock reaches it. A
+// replay gates on the playhead instead. The gate must not cost a
+// whole-window filter per 1 Hz tick; `recordsAsOf` (flow.ts) is what keeps
+// it off that path, and the last two tests pin that from the lens.
+describe("(#2911) a record stamped ahead of the viewer's clock", () => {
+  const records = () => {
+    const today = todayUTC();
+    return [
+      { ts: `${today}T09:00:00.000Z`, action: "note", source: "orchestrator", handle: "the earlier note" },
+      { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+      // FROZEN_NOW is 10:02; both of these are two minutes in its future.
+      { ts: `${today}T10:04:00.000Z`, machine_uid: "u1", session_id: "s1", action: "dispatch.complete", payload: { total_tokens: 600 } },
+      { ts: `${today}T10:04:00.000Z`, action: "note", source: "orchestrator", handle: "the future-stamped note" },
+    ];
+  };
+
+  it("is excluded from the live hero while ahead of now, and counted once now passes it", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    vi.setSystemTime(new Date(FROZEN_NOW));
+    expect(Date.now()).toBeLessThan(Date.parse(`${todayUTC()}T10:04:00.000Z`));
+    mockFleetFetch({ flowToday: records() });
+    renderFleetLens();
+    await waitFor(() => expect(screen.getByText(/the earlier note/)).toBeInTheDocument());
+    expect(document.querySelector(".savings .savnum")?.textContent).toBe("0");
+    expect(screen.queryByText(/the future-stamped note/)).not.toBeInTheDocument();
+    // The dispatch is running (its completion is still ahead), so the lens
+    // ticks; 2m05s of ticks carry the clock past 10:04.
+    act(() => {
+      vi.advanceTimersByTime(125_000);
+    });
+    await waitFor(() => expect(document.querySelector(".savings .savnum")?.textContent).toBe("600"));
+    expect(screen.getByText(/the future-stamped note/)).toBeInTheDocument();
+  });
+
+  it("is excluded under a playhead before it", async () => {
+    const today = todayUTC();
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens
+          records={records()}
+          tMax={Date.parse(`${today}T10:04:00.000Z`)}
+          tMin={Date.parse(`${today}T09:00:00.000Z`)}
+          playhead={Date.parse(`${today}T10:02:00.000Z`)}
+          historical
+        />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(screen.getByText(/the earlier note/)).toBeInTheDocument());
+    expect(document.querySelector(".savings .savnum")?.textContent).toBe("0");
+    expect(screen.queryByText(/the future-stamped note/)).not.toBeInTheDocument();
+  });
+
+  it("with nothing ahead of now, a tick hands the hero the window itself: no filter, no token recompute", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    vi.setSystemTime(new Date(FROZEN_NOW));
+    const today = todayUTC();
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s-rest", action: "dispatch.start", handle: "darkmux/coder" },
+        { ts: `${today}T10:01:50.000Z`, machine_uid: "u1", session_id: "s-rest", action: "dispatch.rest", payload: { ms: 30_000 } },
+      ],
+    });
+    const filters = __asOfFilterRuns();
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach-scope__rate")?.textContent).toBe("rest 20s"));
+    const calls = vi.mocked(tokensOffMeter).mock.calls.length;
+    for (let i = 0; i < 3; i++) {
+      act(() => {
+        vi.advanceTimersByTime(1_000);
+      });
+    }
+    // The lens DID re-render on each tick: the countdown moved.
+    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("rest 17s");
+    // Nothing is ahead of now, so the hero was never handed a filtered copy.
+    expect(__asOfFilterRuns()).toBe(filters);
+    expect(vi.mocked(tokensOffMeter).mock.calls.length).toBe(calls);
+  });
+
+  it("with a record ahead of now, a tick that crosses nothing does not re-filter", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    vi.setSystemTime(new Date(FROZEN_NOW));
+    mockFleetFetch({ flowToday: records() });
+    renderFleetLens();
+    await waitFor(() => expect(screen.getByText(/the earlier note/)).toBeInTheDocument());
+    const filters = __asOfFilterRuns();
+    const calls = vi.mocked(tokensOffMeter).mock.calls.length;
+    for (let i = 0; i < 3; i++) {
+      act(() => {
+        vi.advanceTimersByTime(1_000);
+      });
+    }
+    // Still ahead: three ticks re-rendered the lens and filtered nothing.
+    expect(__clockDebug().running).toBe(true);
+    expect(__asOfFilterRuns()).toBe(filters);
+    expect(vi.mocked(tokensOffMeter).mock.calls.length).toBe(calls);
+    expect(document.querySelector(".savings .savnum")?.textContent).toBe("0");
+  });
+});
+
+// (#2926) The fleet card over the same real run, in playback: the rate line
+// under the tube is where its live text lives.
+describe("(#2926) fleet card: THINK opener and TOOL GEN, from the real run", () => {
+  function renderAt(records: FlowRecord[], playhead: number) {
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={records} tMax={playhead} tMin={pepperAt("10:51:00")} playhead={playhead} historical />
+      </QueryClientProvider>,
+    );
+  }
+  const rateLine = () =>
+    waitFor(() => {
+      const el = document.querySelector(".mach-scope__rate");
+      expect(el, "the rate line should be mounted").toBeTruthy();
+      return el as HTMLElement;
+    });
+  const extra = { machine_uid: "u1" };
+  // The real crew dispatch opens with `dispatch start` (spaced), and the
+  // card's `machActive` (`cards.ts`) only recognizes `dispatch.start`, so the
+  // real records alone leave the card idle in playback (a separate defect,
+  // reported with #2926, not fixed here). Dotted here so the card is active.
+  const dotted = (rs: FlowRecord[]) => rs.map((r) => (r.action === "dispatch start" ? { ...r, action: "dispatch.start" } : r));
+
+  it("turn 7's stream-open chunk: the previous turn's rate, dimmed, never ~1 think tok/s", async () => {
+    renderAt(dotted(pepperRecords({ extra })), pepperAt("10:51:33"));
+    const rate = await rateLine();
+    expect(rate.getAttribute("data-thinking")).toBe("true");
+    expect(rate.getAttribute("data-carried")).toBe("true");
+    expect(Number(rate.textContent?.split(" ")[0])).toBeGreaterThan(50);
+    expect(latestTokenScopeProps()).toMatchObject({ state: "generating", thinking: true, centerCarried: true });
+  });
+
+  it("the same opener on a session's first turn: '— think tok/s', no figure", async () => {
+    renderAt(dotted(pepperRecords({ minTurn: 7, extra })), pepperAt("10:51:33"));
+    const rate = await rateLine();
+    expect(rate.textContent).toBe("— think tok/s");
+    expect(latestTokenScopeProps()).toMatchObject({ state: "generating", centerLabel: "—" });
+  });
+
+  it("turn 10 writing a `write` call: 'tool gen · write · 18s' on the rate line, the tube keeps just 'tool gen'", async () => {
+    renderAt(dotted(pepperRecords({ extra })), pepperAt("10:52:48.500"));
+    const rate = await rateLine();
+    expect(rate.textContent).toBe("tool gen · write · 18s");
+    expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolName: "write", toolWriting: true, centerLabel: null, centerUnit: "tool gen" });
   });
 });
