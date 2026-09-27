@@ -625,6 +625,13 @@ fn parse_value(ty: Ty, raw: &str) -> Result<Value> {
                     .map(|(t, m)| format!("  {t}  {m}"))
                     .collect::<Vec<_>>()
                     .join("\n");
+                // (#2947) A retired spelling names its replacement first.
+                if let Some(new) = setting.renamed(raw) {
+                    bail!(
+                        "`{raw}` was renamed to `{new}` in 4.0: `darkmux config set {} {new}` — valid values:\n{list}",
+                        setting.key
+                    )
+                }
                 bail!("`{raw}` is not a valid {} — valid values:\n{list}", setting.kind)
             }
         },
@@ -1260,6 +1267,32 @@ mod tests {
                 assert!(preflight(scope).is_ok(), "{}: {scope:?} still refusing after cleanup", s.key);
             }
         }
+    }
+
+    /// (#2947 rename) `config set` refuses every retired spelling of every
+    /// registered scalar setting and suggests the new word; doctor says the
+    /// same (the summary carries the rename).
+    #[serial_test::serial]
+    #[test]
+    fn config_set_and_doctor_name_the_replacement_for_a_retired_spelling() {
+        let mut exercised = 0;
+        for s in config_enum::ENUM_SETTINGS.iter().filter(|s| !s.is_per_item()) {
+            for (old, new) in s.retired {
+                let f = tmp();
+                let err = set_at(f.path(), s.key, old).unwrap_err().to_string();
+                assert!(err.contains(&format!("renamed to `{new}`")), "{err}");
+                assert!(err.contains(&format!("darkmux config set {} {new}", s.key)), "{err}");
+                let _g = darkmux_types::config_access::set_config_for_test(config_enum::config_with_value(s, old));
+                let row = darkmux_doctor::check_enum_settings()
+                    .into_iter()
+                    .find(|c| c.status == darkmux_doctor::Status::Fail)
+                    .expect("doctor fails a retired spelling");
+                assert!(row.message.contains(&format!("was renamed to `{new}` in 4.0")), "{row:?}");
+                assert!(row.hint.unwrap_or_default().contains(&format!("config set {} {new}", s.key)));
+                exercised += 1;
+            }
+        }
+        assert!(exercised >= 2);
     }
 
     /// (#2947 review C7) `config set <key>` with no value names a stored
