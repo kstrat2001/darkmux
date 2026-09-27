@@ -1123,7 +1123,7 @@ export function FleetLens({
               {/* (#2915) The utility strip: a fixed box at the end of the
                   name row, always present, so a job starting or ending never
                   changes the card's layout. See `UtilityGlyph`. */}
-              <UtilityGlyph strip={card.utility} />
+              <UtilityGlyph strip={card.utility} noSignal={awaitingData} />
             </div>
             {/* (#1855) The dim fallback says WHICH kind of unknown this is —
                 a machine that beat and carried no hardware, vs one nothing

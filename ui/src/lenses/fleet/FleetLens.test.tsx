@@ -1830,6 +1830,9 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
     expect(card.className).not.toContain("active");
     expect(cardScope(card)).toMatchObject({ state: "nosignal", size: "card" });
     expect(cardScope(card).centerUnit ?? null).toBeNull();
+    // The utility strip's words, too (its tooltip and accessible name).
+    expect(card.querySelector(".mach-util")!.getAttribute("aria-label")).toMatch(/no signal$/);
+    expect(card.querySelector(".mach-util")!.getAttribute("aria-label")).not.toMatch(/idle/);
 
     runs.open();
     await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("dispatch in flight"));
@@ -1854,6 +1857,7 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
     const card = document.querySelector(".mach")!;
     expect(card.textContent).toContain("0 running");
     expect(cardScope(card)).toMatchObject({ state: "idle", centerUnit: "idle" });
+    expect(card.querySelector(".mach-util")!.getAttribute("aria-label")).toMatch(/idle$/);
   });
 
   // Each source on its own: this machine's card (drawn from /machine/specs,
