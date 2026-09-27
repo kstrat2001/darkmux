@@ -40,6 +40,11 @@ describe("runIndex: a session id two missions share", () => {
     expect(sessionRun(shared, "task-probe", Date.parse(at(620)), "C")?.ref.missionId).toBe("B");
   });
 
+  it("a route naming no mission reads the run that opened last, mission-less or not", () => {
+    const data = normAll([rec(0, "dispatch.start"), rec(60, "dispatch.complete"), rec(600, "dispatch.start", { mission_id: "B" }), rec(610, "dispatch.turn.heartbeat", { mission_id: "B" })]);
+    expect(sessionRun(data, "task-probe", Date.parse(at(620)))?.ref.missionId).toBe("B");
+  });
+
   it("a route naming a mission the session's records do not carry reads the session as a link naming none", () => {
     // An older archive, or a session of mission-less bookends: the link's
     // mission names nothing here, and an empty page is worse than the run.

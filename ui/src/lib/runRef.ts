@@ -268,6 +268,7 @@ function openingRank(run: RunRecords, asOf: number): number {
  *  none: the run, never an empty page. */
 function routeGroups(data: readonly NormRecord[], sessionId: string, missionId: string | null): readonly RunGroup[] {
   const groups = runIndex(data).groupsOfSession(sessionId);
+  if (missionId === null) return groups;
   const named = groups.filter((g) => g.missionId === missionId);
   return named.length > 0 ? named : groups;
 }
