@@ -944,6 +944,16 @@ describe("tools vs reading prompt, from the tool COMPLETION records", () => {
     expect(deriveLiveState(later, 6_500)).toEqual({ state: "tools", toolName: "read" });
   });
 
+  it("(#2963) a turn out of step does not stop the next turn's list", () => {
+    const recs = [
+      start(0), beat(1_000, 0), beat(3_000, 800),
+      turnWithPaths(4_000, 1, ["src/a.ts"]), pathTool(5_000, "read", "src/other.ts"),
+      beat(6_000, 0), beat(8_000, 900),
+      turnWithPaths(9_000, 2, ["src/next.ts", "src/last.ts"]), pathTool(10_000, "read", "src/next.ts"),
+    ];
+    expect(deriveLiveState(recs, 11_000)).toEqual({ state: "tools", toolName: "read", toolPath: "src/last.ts" });
+  });
+
   it("(#2963) a list shorter than the turn's calls: no file past its end", () => {
     const short = { ts: new Date(4_000).toISOString(), action: "dispatch.turn", session_id: SID, payload: { turn_seq: 1, tool_calls_count: 3, tool_paths: ["src/a.ts"] } } as unknown as FlowRecord;
     const recs = [start(0), beat(1_000, 0), beat(3_000, 800), short, pathTool(5_000, "read", "src/a.ts")];
