@@ -603,20 +603,13 @@ pub fn run_ephemeral(
     let facts = Facts::default();
     let est = FixedEstimator::default();
 
-    // (#1684 QA finding — MUST-FIX 4) A per-INVOCATION correlation id,
-    // backfilled onto every emitted flow record exactly the way
-    // `mission_launch.rs`'s `run_step_graph` call sites backfill their own
-    // minted `mission_id` (`record.mission_id.get_or_insert_with(...)`,
-    // never overwriting a record that already carries one — see
-    // `step_lifecycle_record`'s own doc in `darkmux-crew`'s scheduler for
-    // why the bare records carry NO mission_id and rely on the caller to
-    // backfill it). Without this, every ephemeral run of the SAME config
-    // shares one CONFIG-scoped `session_id` (`session_id::task` hashes
-    // only `step.task_id`) and no `mission_id` at all — two concurrent
-    // invocations collide in the viewer with nothing to tell them apart.
-    // This id is a FLOW-RECORD correlation label only — no mission
-    // instance is minted for it (rule D still holds: nothing under
-    // `<mission_id>/` is ever written).
+    // (#1684 QA finding — MUST-FIX 4) A per-INVOCATION run, the one every
+    // record of this ephemeral run carries (the scheduler mints its sessions
+    // in it). Without it, two concurrent invocations of the SAME config
+    // would collide in the viewer with nothing to tell them apart. It is a
+    // FLOW-RECORD correlation run only — no mission instance is minted for
+    // it (rule D still holds: nothing under `<mission_id>/` is ever
+    // written).
     let correlation = RunId::mission(mint_ephemeral_correlation_id(&config.id))?;
 
     // (#1877 QA must-fix 1) A whole-run dispatch bookend, PRESCRIBED here
@@ -1658,9 +1651,8 @@ mod tests {
     /// bucket on the reporting machine). Sibling of
     /// `mission_launch.rs`'s `two_launches_of_the_same_config_produce_
     /// distinct_step_lifecycle_session_ids` — same fix, same assertions,
-    /// proving the SAME `scope_to_run` composition applies at this
-    /// SEPARATE `run_step_graph` choke point (`run_ephemeral`'s own
-    /// `emit`-wrap), not just the generic `mission launch` path.
+    /// proving the run reaches this SEPARATE `run_step_graph` entry point
+    /// (`run_ephemeral`'s own), not just the generic `mission launch` path.
     #[test]
     #[serial_test::serial]
     fn two_ephemeral_runs_of_the_same_document_produce_distinct_step_lifecycle_session_ids() {

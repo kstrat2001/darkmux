@@ -153,6 +153,24 @@ darkmux release.
 
 ### Changed (breaking, 4.0)
 
+- **A session id is a typed identity that names its run.** Every flow
+  record's `session_id` is now `<run>[.lab|.solo].<kind>[.<field>...]`
+  (FLOW 2.0.0; see its schema entry): a task session reads
+  `review-1790000000-ab12cd.task.probe`, not `task-probe`, so two launches
+  of one config never share a session, a presence key or a budget record,
+  and `mission_id` always agrees with the session. `mission-<m>` and the
+  bare `<m>` of the whole-run bookend are one session, `<m>.run`. A fleet
+  receiver runs a submitted job under a relay of the sender's session in a
+  standalone run (WORK_JOB 6), never one of its own missions, so the
+  `-from-` rule on machine names is gone. `darkmux dispatch --session-id
+  <name>` now names the dispatch within its crew-of-one run
+  (`<run>.adhoc.<role>.<name>`). Archives are never rewritten: an old id
+  still reads for step attribution and corrections. **Migration:** a script
+  that matched session prefixes (`task-`, `step-`, `mission-run-`,
+  `crew-dispatch-`) should key on `mission_id`, or on the printed session
+  id as a whole; a `flow note --session-id` names the session a dispatch
+  printed.
+
 - **A lab run with no verify spec reports verify "not checked", not a pass**
   (#2982). A `prompt` workload that declares no verify used to record
   `verify=pass (no verify spec)`; its outcome is now no verify at all, so

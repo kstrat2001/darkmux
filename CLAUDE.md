@@ -309,11 +309,13 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
      (what the work is done to), review's **seats** (which staffed model does it), and
      **draws** (one invocation, `MemberRecord.draws`). They all bottom out in one model call,
      which is what `dispatch` already means.
-   - **session** — INTERNAL ONLY: a join key tying a family of flow records together
-     (`darkmux-types/src/session_id.rs`). Never an operator-facing word, because it is also
-     minted for mission lifecycle transitions that are not executions at all
-     (`session_id::mission()`). The `session_id` FIELD keeps its name on disk — renaming it
-     strands every archive, and consumers already treat it opaquely.
+   - **session** — INTERNAL ONLY: a join key tying a family of flow records together,
+     typed as `SessionId { kind, run }` (`darkmux-types/src/session_id.rs`): no session
+     exists without its run, `wire()` is its only string form, and pre-4.0 strings read
+     only through `SessionId::parse_legacy`. Never an operator-facing word, because it is
+     also minted for mission lifecycle transitions that are not executions at all (the
+     run's own session, `SessionKind::Run`). The `session_id` FIELD keeps its name on
+     disk — renaming it strands every archive.
 
    Two consequences that new code inherits:
 

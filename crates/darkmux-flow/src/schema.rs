@@ -44,6 +44,23 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           darkmux reads the dotted spellings; darkmux's own readers
 //           upgrade old archives.
 //
+//           Also (4.0): the session grammar. `session_id` is the wire
+//           string of a typed `darkmux_types::session_id::SessionId`, one
+//           session within one run, `.`-separated and begun by its run:
+//           `<run>[.lab|.solo].<kind>[.<field>...]`, kind one of `run`,
+//           `phase.<p>`, `task.<t>`, `step.<s>`, `adhoc.<role>.<nonce>`,
+//           `relay.<peer>.<sender>`, every component escaped (`[A-Za-z0-9-]`
+//           kept, any other byte `_XX`). Replaces the free-form ids
+//           (`mission-<m>`, bare `<m>`, `mission-run-<m>-<p>`,
+//           `task-<t>[-<m>]`, `step-<s>[-<m>]`, `crew-dispatch-...`,
+//           `crawl-...`, `radio-...`, `phase-review-...`, the lab forms and
+//           the fleet `<sender>-from-<peer>`). `session_id` and
+//           `mission_id` are stamped from the one session
+//           (`FlowRecord::for_session`): `mission_id` is the run when it is
+//           a mission, absent for a lab, standalone or relay run. A reader
+//           of an archive reads an old id through
+//           `SessionId::parse_legacy` only.
+//
 //           Also removed (4.0, one token truth): `dispatch.complete`'s
 //           `cumulative_prompt_tokens` / `cumulative_completion_tokens`.
 //           Their only source was the runtime's `metrics.json`, which 4.0

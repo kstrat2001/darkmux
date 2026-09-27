@@ -1141,6 +1141,17 @@ pub(crate) fn capped_prompt(s: &str) -> String {
     s.chars().take(MAX_PROMPT_PAYLOAD_CHARS).collect()
 }
 
+/// `payload` with the graph step a step session names, as `step_id`: the
+/// typed field a reader attributes the record to its step by, never the
+/// session's spelling. A payload that already names its step keeps it; a
+/// non-object payload, or a session that is not a step's, is unchanged.
+fn with_session_step(session: &SessionId, mut payload: serde_json::Value) -> serde_json::Value {
+    if let (Some(step), Some(obj)) = (session.step_id(), payload.as_object_mut()) {
+        obj.entry("step_id").or_insert_with(|| serde_json::Value::from(step));
+    }
+    payload
+}
+
 /// Build a dispatch-stage flow record with an explicit `payload` for
 /// event-specific fields (#204).
 #[allow(clippy::too_many_arguments)]
@@ -1160,7 +1171,7 @@ pub fn build_dispatch_record_with_payload(
         // `dispatch`); do NOT rename in a spelling-cleanup sweep.
         source: Some("crew_dispatch".to_string()),
         model: model.map(String::from),
-        payload,
+        payload: payload.map(|p| with_session_step(session, p)),
         ..darkmux_flow::FlowRecord::for_session(
             session,
             level,
@@ -1193,7 +1204,7 @@ pub fn build_telemetry_record(
         phase_id: phase_id.map(String::from),
         source: Some(source.to_string()),
         model: model.map(String::from),
-        payload: Some(payload),
+        payload: Some(with_session_step(session, payload)),
         ..darkmux_flow::FlowRecord::for_session(
             session,
             level,
@@ -1773,6 +1784,45 @@ mod tests {
             Some(tmp.path().join("identity.md")),
             "must scope under DARKMUX_HOME, not the real user home"
         );
+    }
+
+    /// A record under a step session names its step as `payload.step_id`,
+    /// so a reader never parses the session to find it; any other session
+    /// adds nothing, and a payload that already names a step keeps it.
+    #[test]
+    fn a_step_sessions_records_name_their_step() {
+        let step = SessionId::step(crate::test_run(), "s1");
+        let rec = build_dispatch_record_with_payload(
+            darkmux_flow::Level::Info,
+            darkmux_flow::FlowAction::DispatchStart,
+            "coder",
+            &step,
+            None,
+            None,
+            Some(serde_json::json!({ "runtime": "internal" })),
+        );
+        assert_eq!(rec.payload.unwrap()["step_id"], "s1");
+        let usage = build_telemetry_record(
+            darkmux_flow::Level::Info,
+            darkmux_flow::FlowAction::TelemetryTokens,
+            "tokens",
+            "coder",
+            &step,
+            None,
+            None,
+            serde_json::json!({ "step_id": "named" }),
+        );
+        assert_eq!(usage.payload.unwrap()["step_id"], "named", "an explicit step is kept");
+        let task = build_dispatch_record_with_payload(
+            darkmux_flow::Level::Info,
+            darkmux_flow::FlowAction::DispatchStart,
+            "coder",
+            &SessionId::task(crate::test_run(), "t1"),
+            None,
+            None,
+            Some(serde_json::json!({})),
+        );
+        assert!(task.payload.unwrap().get("step_id").is_none(), "a task session names no step");
     }
 
     // ─── #88: a fresh nonce per ad-hoc dispatch ────────────────────────────

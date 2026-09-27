@@ -5926,9 +5926,8 @@ mod tests {
     }
 
     /// (#1918) Two missions launched from the SAME config must NOT share a
-    /// step-lifecycle `session_id`. Before this fix,
-    /// `session_id::task(&step.task_id)` was a literal string straight out
-    /// of the mission config document — byte-identical across every launch
+    /// step-lifecycle `session_id`. Before #1918 a task session was a
+    /// literal string straight out of the mission config document — byte-identical across every launch
     /// of the same config (`crates/darkmux-crew/src/scheduler.rs`'s
     /// `step_lifecycle_record` doc names this exact collision) — so
     /// `darkmux-serve`'s flow index, keyed by `session_id` ALONE, folded
@@ -5942,11 +5941,8 @@ mod tests {
     /// the bucket even though each record still carried its own correct
     /// `mission_id`.
     ///
-    /// The fix composes the launcher's own per-run `mission_id` into the
-    /// scheduler's config-derived `session_id::task`/`session_id::step`
-    /// forms, at the SAME `emit`-wrap choke point that already backfills
-    /// `mission_id` (#1641) — see
-    /// `darkmux_types::session_id::scope_to_run`. This test proves BOTH
+    /// Every session is now minted in its run (`SessionId`), and the
+    /// scheduler is handed the launch's run. This test proves BOTH
     /// directions: two runs of the same config now mint DIFFERENT session
     /// ids for the same task (the actual fix), and one run's OWN
     /// step-lifecycle records still share exactly ONE session id so a
@@ -6047,10 +6043,8 @@ mod tests {
              for the same task — this is the #1918 collision surface"
         );
 
-        // Each session id must carry its OWN mission's identity as the
-        // disambiguator (tying the fix to `mission_id`, not an unrelated
-        // opaque value) — matches `darkmux_types::session_id::scope_to_run`'s
-        // contract.
+        // Each session id must carry its OWN mission's identity: a session
+        // names its run.
         for sid in &first_sessions {
             assert!(sid.contains(&first_id), "session id `{sid}` must carry mission `{first_id}`'s own identity");
         }

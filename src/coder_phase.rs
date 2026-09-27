@@ -2045,11 +2045,9 @@ pub(crate) fn lab_context_window(role: Option<&str>, profile: Option<&str>, prof
 /// (#849 half 1) The adjudication corrections recorded across this mission's
 /// dispatches, for injection into the next coder brief. Scans the flow trail
 /// for `action=note` + `source=adjudication` whose `session_id` is one of the
-/// mission's EXACT dispatch session ids (`mission_session_ids`, built from the
-/// mission's phases as `mission-run-<mission>-<phase>`). Exact-set match, NOT
-/// a `mission-run-<mission>-` prefix — a prefix bleeds a sibling mission whose
-/// id is a hyphen-extension (`auth` would swallow `auth-v2`'s notes, since
-/// `mission-run-auth-v2-s1` starts with `mission-run-auth-`). Mission-scoped,
+/// mission's phases' coder runs (`crew::corrections::PhaseSessions`). An exact
+/// phase match, NOT a prefix — a prefix bleeds a sibling mission whose id is a
+/// hyphen-extension (`auth` would swallow `auth-v2`'s notes). Mission-scoped,
 /// not phase-scoped, by design — a correction like "don't rename that field"
 /// applies mission-wide. Best-effort: any IO/parse problem reads as "no
 /// corrections" (the loop just doesn't get the carry-forward, never errors).
@@ -2270,8 +2268,8 @@ fn allocate_injected_context(
 /// Reads the flow stream DIRECTLY — always fresh, no dependency on the SQLite
 /// index's derive-on-rebuild freshness (the index serves the query/recall +
 /// status surface; this hot per-dispatch path mirrors the corrections
-/// collector). Scoped to the mission's EXACT dispatch session ids (exact-set,
-/// not a `mission-run-<id>-` prefix — same sibling-bleed guard as #849), deduped,
+/// collector). Scoped to the mission's phases' coder runs (an exact phase
+/// match, not a prefix — same sibling-bleed guard as #849), deduped,
 /// over the most-recent `CAUTION_LOOKBACK_DAYS` day-files. Fully ranked but NOT
 /// count-capped (#1011 — the proportional budget governs how many land).
 /// (#1002) Ranked **file-in-play first** (a caution about a file this
@@ -2569,9 +2567,9 @@ struct DebriefReport {
 /// each ended. READ-ONLY.
 ///
 /// The flow stream IS the mission's durable history (the #557 single-stream
-/// doctrine); this reads it scoped to the mission's EXACT dispatch session ids
-/// (same `mission-run-<id>-<phase>` construction as the run path, so a sibling
-/// mission whose id is a hyphen-extension never bleeds in). It does NOT assume a
+/// doctrine); this reads it scoped to the mission's phases' coder runs (the
+/// same `PhaseSessions` scope as the run path, so a sibling mission whose id
+/// is a hyphen-extension never bleeds in). It does NOT assume a
 /// coding mission — no git diffs are reconstructed here: for a coding mission
 /// the `darkmux-mission-debrief` skill pulls the actual patch with `git show`,
 /// and a non-coding mission simply has no coding activity.
