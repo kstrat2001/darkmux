@@ -143,6 +143,47 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
   }
 }
 
+// (#2958) Before its first data a fleet card says "no signal" (its stat word
+// and a static tube), in the same boxes: the same size as the same card once
+// loaded idle, and on a phone as running too. Live only: a replay has its
+// records in hand and never waits. The loading page is the "finished" state's
+// day with `/runs` never answered.
+for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
+  test(`fleet card: the same size before its first data as loaded (${vpName})`, async ({ browser }) => {
+    const byId = Object.fromEntries(STATES.map((s) => [s.id, s]));
+    const rows = [];
+    for (const [id, state, holdRuns] of [
+      ["loading", byId.finished, true],
+      ["idle", byId.finished, false],
+      ...(vpName === "phone" ? [["generating", byId.generating, false]] : []),
+    ]) {
+      const ctx = await browser.newContext({ viewport, timezoneId: "UTC", locale: "en-US" });
+      const page = await ctx.newPage();
+      await page.clock.setFixedTime(state.nowMs);
+      await installLayoutRoutes(page, { holdRuns });
+      await page.goto("/index.html#lens=fleet");
+      const card = page.locator(CARD.card).first();
+      await expect(card).toBeVisible();
+      const want = id === "loading" ? "no signal" : id === "idle" ? "idle" : "dispatch in flight";
+      await expect(card.locator(".stat"), `${id}: the card's stat word`).toHaveText(want);
+      if (id === "loading") {
+        await expect(card.locator(".runs"), "loading: no count yet").toHaveText("—");
+        await expect(card.locator(".token-scope-bezel"), "loading: the no-signal tube").toHaveAttribute("data-state", "nosignal");
+      }
+      await page.waitForTimeout(400);
+      const m = await measure(page, { card: CARD.card, cardScope: CARD.cardScope, util: CARD.util, stat: ".mach .stat", runs: ".mach .runs" });
+      // The stat and count lines hold their words, so only their HEIGHT is
+      // the box: "no signal" and "idle" are different widths of one line.
+      rows.push({ state: id, ...m, stat: m.stat.map((b) => b.h), runs: m.runs.map((b) => b.h) });
+      await ctx.close();
+    }
+    for (const key of ["card", "cardScope", "util", "stat", "runs"]) {
+      const groups = sizeGroups(rows, key);
+      expect(groups, `${key} changed size between loading and loaded (${vpName}):\n  ${groups.join("\n  ")}`).toHaveLength(1);
+    }
+  });
+}
+
 // On a desktop the card is 23px taller while a dispatch runs than idle: the
 // rate line under the status appears only with a running execution. That is
 // on origin/main as of 93709c0c9 (measured: 282px idle, 305px running), not
