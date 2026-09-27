@@ -9441,7 +9441,7 @@ impl TailerState {
             | E::StaleContextTokens(_)
             | E::PreSendBound(_)
             | E::ReasoningBoundNotApplied(_)
-            | E::LegacyPromptSubmitted(_)
+            | E::Legacy(_)
             | E::Unknown => {}
         }
     }
@@ -10425,7 +10425,7 @@ fn detector_finding(event: &darkmux_trajectory::TrajectoryEvent) -> Option<Detec
         | E::Checkpoint(_)
         | E::ReasoningBoundNotApplied(_)
         | E::FeedbackInjected(_)
-        | E::LegacyPromptSubmitted(_)
+        | E::Legacy(_)
         | E::Unknown => None,
     }
 }

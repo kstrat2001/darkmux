@@ -87,10 +87,12 @@ pub enum TrajectoryEvent {
     EscalationTriggered(EscalationTriggered),
     #[serde(rename = "dispatch.feedback.injected")]
     FeedbackInjected(FeedbackInjected),
-    /// A turn of the retired openclaw runtime. Read from run directories
-    /// recorded before #1405, never written. See [`crate::legacy`].
-    #[serde(rename = "prompt.submitted")]
-    LegacyPromptSubmitted(crate::legacy::PromptSubmitted),
+    /// A line of the retired openclaw runtime, read from run directories
+    /// recorded before #1405 and never written. [`parse_line`] routes every
+    /// such line here (see [`crate::legacy`]), so it never lands on a
+    /// current variant it happens to share a `type` with.
+    #[serde(skip)]
+    Legacy(crate::legacy::LegacyEvent),
     /// An event type this build does not know. Never written.
     #[serde(other)]
     Unknown,
@@ -98,11 +100,17 @@ pub enum TrajectoryEvent {
 
 /// Parse one trajectory line. `None` for a blank line, a line that is not
 /// JSON (a run killed mid-write ends in a partial line), or a known event
-/// whose fields have the wrong JSON type.
+/// whose fields have the wrong JSON type. A line of the retired openclaw
+/// format is read by [`crate::legacy`], never as a current event.
 pub fn parse_line(line: &str) -> Option<TrajectoryEvent> {
     let line = line.trim();
     if line.is_empty() {
         return None;
+    }
+    if crate::legacy::may_be_legacy(line) {
+        if let Some(e) = crate::legacy::parse(line) {
+            return Some(TrajectoryEvent::Legacy(e));
+        }
     }
     serde_json::from_str(line).ok()
 }
@@ -790,7 +798,7 @@ impl TrajectoryEvent {
             | E::CompactionSkipped(_)
             | E::CompactionUnproductive(_)
             | E::PreSendBound(_)
-            | E::LegacyPromptSubmitted(_)
+            | E::Legacy(_)
             | E::Unknown => None,
         }
     }
@@ -833,7 +841,7 @@ impl TrajectoryEvent {
             E::MalformedToolNames(e) => Some(e.ts),
             E::EscalationTriggered(e) => Some(e.ts),
             E::FeedbackInjected(e) => Some(e.ts),
-            E::LegacyPromptSubmitted(_) | E::Unknown => None,
+            E::Legacy(_) | E::Unknown => None,
         }
     }
 }

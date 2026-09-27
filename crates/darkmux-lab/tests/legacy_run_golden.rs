@@ -14,8 +14,9 @@
 //!   another run's copy (9 turns, 175,557 prompt tokens). The trajectory
 //!   says 27 turns; the stale file must not be read.
 //! - `openclaw`: a run of the retired openclaw runtime (#1405), whose turns
-//!   are `prompt.submitted` events and whose compactions are distinct
-//!   summaries inside the thread.
+//!   are `prompt.submitted` events, whose compactions are distinct
+//!   summaries inside the thread, and whose tokens are its completions'
+//!   `data.usage` (input/output/total, under an ISO-string clock).
 
 use darkmux_lab::lab::inspect::run_trajectory;
 use darkmux_lab::lab::stats::compute_from_dir;
@@ -55,7 +56,7 @@ fn a_run_with_a_stale_metrics_json_reports_its_trajectory_totals() {
 }
 
 #[test]
-fn an_openclaw_run_reports_its_prompts_and_distinct_summaries() {
+fn an_openclaw_run_reports_its_prompts_summaries_and_tokens() {
     let dir = fixture("openclaw");
     assert_eq!(totals(&dir), expected(&dir));
 }

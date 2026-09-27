@@ -1,8 +1,8 @@
 {
   "turns": 4,
   "compactions": 2,
-  "prompt_tokens": 0,
-  "completion_tokens": 0,
-  "total_tokens": 0,
+  "prompt_tokens": 920812,
+  "completion_tokens": 21642,
+  "total_tokens": 942454,
   "rest_ms": 0
 }

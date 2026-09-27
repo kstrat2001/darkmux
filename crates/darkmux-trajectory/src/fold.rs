@@ -241,7 +241,9 @@ impl TrajectoryFold {
             E::ToolCallPromoted(p) => {
                 bump(&mut self.detectors.promoted_calls, u32::try_from(p.promoted_call_count).unwrap_or(u32::MAX))
             }
-            E::LegacyPromptSubmitted(p) => self.legacy.apply(p),
+            E::Legacy(crate::legacy::LegacyEvent::PromptSubmitted(p)) => self.legacy.apply(p),
+            E::Legacy(crate::legacy::LegacyEvent::ModelCompleted(counts)) => self.tokens.add(counts),
+            E::Legacy(crate::legacy::LegacyEvent::Other) => {}
             E::ToolCallWriting(_)
             | E::PromotionSuppressed(_)
             | E::CompactionStart(_)
@@ -291,11 +293,15 @@ impl TrajectoryFold {
         });
     }
 
-    /// Logical turns: distinct `seq` among the `model.completed` events (a
-    /// checkpoint continuation resumes its turn under the same `seq`), plus
-    /// an openclaw run's turns.
+    /// Logical turns, from ONE source per format: an openclaw run's prompts
+    /// ([`crate::legacy`]), else the distinct `seq` among the
+    /// `model.completed` events (a checkpoint continuation resumes its turn
+    /// under the same `seq`).
     pub fn turns(&self) -> u32 {
-        u32::try_from(self.turn_seqs.len()).unwrap_or(u32::MAX).saturating_add(self.legacy.turns)
+        match self.legacy.turns {
+            0 => u32::try_from(self.turn_seqs.len()).unwrap_or(u32::MAX),
+            prompts => prompts,
+        }
     }
 
     /// The `seq` of the last turn a model call was recorded under.

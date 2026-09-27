@@ -3,10 +3,68 @@
 //! The one place that shape is known. An openclaw run wrote one
 //! `prompt.submitted` per turn, carrying the whole message thread, and
 //! recorded a compaction only as a `compactionSummary` message inside that
-//! thread (repeated on every later turn). Nothing current writes this; a
-//! handful of old lab run directories still hold it.
+//! thread (repeated on every later turn). Its own `model.completed` lines
+//! carry the call's usage as `data.usage` (`input`/`output`/`total`) under
+//! an ISO-string clock. Every line names `"traceSchema":
+//! "openclaw-trajectory"`. Nothing current writes this; a handful of old lab
+//! run directories still hold it.
 
 use serde::{Deserialize, Serialize};
+
+const TRACE_SCHEMA: &str = "openclaw-trajectory";
+const PROMPT_SUBMITTED: &str = "prompt.submitted";
+
+/// One line of the retired format, as the fold reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LegacyEvent {
+    /// One openclaw turn.
+    PromptSubmitted(PromptSubmitted),
+    /// One openclaw model call's usage.
+    ModelCompleted(crate::UsageCounts),
+    /// Anything else the format wrote (session, trace and context lines).
+    Other,
+}
+
+/// Cheap pre-check before [`parse`]: false for every line a current runtime
+/// writes (a current line carrying one of these strings in its text is
+/// re-checked by [`parse`], which returns `None` for it).
+pub fn may_be_legacy(line: &str) -> bool {
+    line.contains(TRACE_SCHEMA) || line.contains(PROMPT_SUBMITTED)
+}
+
+/// A line of the retired format, or `None` when the line is not one: it
+/// neither names the openclaw `traceSchema` nor is a `prompt.submitted`
+/// (a type only openclaw wrote). Lenient per field: a turn counts even if
+/// its thread cannot be read, and a count that is not a whole number reads
+/// as unreported.
+pub fn parse(line: &str) -> Option<LegacyEvent> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let ty = v.get("type").and_then(serde_json::Value::as_str);
+    let openclaw = v.get("traceSchema").and_then(serde_json::Value::as_str) == Some(TRACE_SCHEMA);
+    if !openclaw && ty != Some(PROMPT_SUBMITTED) {
+        return None;
+    }
+    Some(match ty {
+        Some(PROMPT_SUBMITTED) => LegacyEvent::PromptSubmitted(PromptSubmitted {
+            data: PromptData {
+                messages: v
+                    .pointer("/data/messages")
+                    .and_then(|m| serde_json::from_value(m.clone()).ok())
+                    .unwrap_or_default(),
+            },
+        }),
+        Some("model.completed") => {
+            let count = |k: &str| v.pointer(&format!("/data/usage/{k}")).and_then(serde_json::Value::as_u64);
+            LegacyEvent::ModelCompleted(crate::UsageCounts {
+                prompt: count("input"),
+                completion: count("output"),
+                total: count("total"),
+                ..Default::default()
+            })
+        }
+        _ => LegacyEvent::Other,
+    })
+}
 
 /// `prompt.submitted`: one openclaw turn.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
