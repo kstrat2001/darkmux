@@ -13118,19 +13118,9 @@ pub(crate) fn is_reloadable_target(
         && resident_identifier == darkmux_gestalt::namespaced_identifier(want, want_identifier)
 }
 
-/// (#1615) The LOADABLE model key for a value that may carry the darkmux
-/// namespace. A bare key passes through untouched; `darkmux:foo` becomes `foo`.
-///
-/// The namespace is a LOAD-TIME DECORATION, never part of the key: `lms ps`
-/// reports a darkmux load as `identifier=darkmux:foo, modelKey=foo`, so
-/// LMStudio has no key carrying the prefix and every comparison-or-load
-/// against a prefixed string is guaranteed to miss.
-///
-/// Pure and borrowing, so the strip is unit-testable without a live `lms` and
-/// costs no allocation on the hot path.
-pub(crate) fn bare_model_key(value: &str) -> &str {
-    darkmux_gestalt::bare_model_key(value)
-}
+// The loadable model key is `darkmux_gestalt::bare_model_key` (#1615): the
+// namespace is a load-time decoration, never part of the key. One definition.
+use darkmux_gestalt::bare_model_key;
 
 /// (#2318) Serializes the residency preflight's check-then-load window inside
 /// this process.

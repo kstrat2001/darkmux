@@ -586,6 +586,26 @@ darkmux release.
 
 ### Fixed
 
+- **Model output can no longer reach host files through symlinks** (#2869).
+  Every host read or copy of a container-writable path (the out-dir,
+  `.darkmux-runtime/`, the resume checkpoint, the live trajectory tailer,
+  `mods.gate`'s scratch copy) now walks with no-follow at every component and
+  accepts regular files only, with a size cap. A refused file is named once in
+  a warning. `mods.gate` recreates a relative link only when it provably stays
+  inside the checkout; other links are skipped and named. The live tailer reads
+  in bounded chunks, so a huge sparse trajectory can't exhaust memory.
+- **`darkmux flow status` no longer reports every `file` hook rule as URL
+  REFUSED**, and doctor no longer contradicts itself on a rule that names both
+  `http` and `file` (or neither). Doctor, `flow status` and the hook engine share
+  one destination decision.
+- **Doctor warns when a hook rule's deliveries keep giving up**, naming the last
+  error in an indented, sanitized hint. Its remedy names the resolved
+  `config.json` (honoring `DARKMUX_HOME`), and delivery-side flags point at
+  `darkmux flow status` rather than the config.
+- **The residency planner no longer evicts when nothing needs the room** (an
+  unpriced or zero-sized load, or no surviving load). Latent today: no config
+  sets a model-RAM budget yet (#2987).
+
 - **The compaction window is the selected model's own** (#2902 step 3).
   With several models in a profile, a dispatch compacted at the profile's
   DEFAULT model's `n_ctx` even when capability selection picked another

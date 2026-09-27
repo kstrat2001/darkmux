@@ -149,7 +149,7 @@ pub fn is_local_utility_model(model: &ProfileModel, utility_model: Option<&str>)
 /// `config.model` carries the namespaced wire id). The ONE comparison every
 /// utility-model check uses.
 pub fn names_utility_model(candidate: &str, utility_model: &str) -> bool {
-    let bare = crate::dispatch_internal::bare_model_key;
+    let bare = darkmux_gestalt::bare_model_key;
     bare(candidate) == bare(utility_model)
 }
 

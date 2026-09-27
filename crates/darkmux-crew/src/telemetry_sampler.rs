@@ -116,7 +116,7 @@ pub fn lms_diff(prev: &[LoadedModel], cur: &[LoadedModel]) -> Vec<serde_json::Va
 /// one utility model now, so there is one tag; records from before carry
 /// `"compactor"`, and the viewer reads both as the utility seat.
 ///
-/// **Every operand is [`crate::dispatch_internal::bare_model_key`]-normalized
+/// **Every operand is [`darkmux_gestalt::bare_model_key`]-normalized
 /// before comparison, on BOTH sides.** An earlier revision of this function
 /// compared with a plain `==` and a doc claiming all four ids already arrive
 /// bare. That was false on all three seats, and the bug it produced was
@@ -147,7 +147,7 @@ pub fn lms_diff(prev: &[LoadedModel], cur: &[LoadedModel]) -> Vec<serde_json::Va
 /// rule."* The only signal honored is which id THIS dispatch actually
 /// declared for which seat.
 pub fn role_for_load(model_id: &str, primary: &str, utility: Option<&str>) -> &'static str {
-    let bare = crate::dispatch_internal::bare_model_key;
+    let bare = darkmux_gestalt::bare_model_key;
     let key = bare(model_id);
     if key == bare(primary) {
         "primary"
