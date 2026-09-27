@@ -259,6 +259,21 @@ function drawRestStroke(ctx: CanvasRenderingContext2D, cx: number, cy: number, r
   }
 }
 
+/** (#2962) Whether two static-readout targets would paint the same frame. */
+type StaticTarget = { state: ScopeState; rate: number; rgb: Rgb; writing: boolean; thinking: boolean; restEnd: number | null };
+function sameTarget(a: StaticTarget, b: StaticTarget): boolean {
+  return (
+    a.state === b.state &&
+    a.rate === b.rate &&
+    a.rgb[0] === b.rgb[0] &&
+    a.rgb[1] === b.rgb[1] &&
+    a.rgb[2] === b.rgb[2] &&
+    a.writing === b.writing &&
+    a.thinking === b.thinking &&
+    a.restEnd === b.restEnd
+  );
+}
+
 /** One frame of the scope, from the current morph parameters `p`. Ported
  *  from the prototype's `draw()`: an afterglow fill (a low-alpha fill rather
  *  than a hard clear, so the previous frame bleeds through), then, each
@@ -540,7 +555,7 @@ export function TokenScope({
   const thinking = state === "generating" && thinkingProp;
   // (#2961) REST's seconds hand: the rest's end on the page clock, or null.
   const restEnd = state === "rest" && restEndMs !== undefined && Number.isFinite(restEndMs) ? restEndMs : null;
-  const targetRef = useRef<{ state: ScopeState; rate: number; rgb: Rgb; writing: boolean; thinking: boolean; restEnd: number | null }>({ state, rate, rgb: PHOSPHOR_FALLBACK, writing, thinking, restEnd });
+  const targetRef = useRef<StaticTarget>({ state, rate, rgb: PHOSPHOR_FALLBACK, writing, thinking, restEnd });
   targetRef.current = { state, rate, rgb, writing, thinking, restEnd };
   // (#2961) The page clock and the page's seek generation, read by the
   // loop every frame (`lib/restHand.ts`: the clock carries the moment it was
@@ -566,15 +581,30 @@ export function TokenScope({
     const ctx = canvas.getContext("2d");
     if (!ctx) return undefined;
 
-    function drawStatic() {
+    // (#2962) The target the static readout last painted, so a prop effect
+    // that brings nothing new (the mount, where the branch below has already
+    // drawn) paints nothing: one settled frame per change, never two.
+    let drawn: StaticTarget | null = null;
+    function drawStatic(force: boolean) {
       const w = canvas!.clientWidth;
       const h = canvas!.clientHeight;
       const t = targetRef.current;
+      if (!force && drawn !== null && sameTarget(drawn, t)) return;
       const p = settleMorph(morphRef.current, t.state, t.rate, t.rgb, t.writing, t.thinking);
       // (#2961) Reduced motion: the dot still at 12, no stroke, glow or fade;
       // the number is the caller's own countdown.
       const hand = t.restEnd !== null ? REST_STILL_FRAME : null;
-      if (w && h) drawFrame(ctx!, w, h, p, clocksRef.current, morphRef.current.clock, 0, hand);
+      if (!(w && h)) return;
+      // (#2962) Clear the whole bitmap first. `drawFrame`'s background is
+      // translucent (the animated path's afterglow), so over an old frame it
+      // would leave about three quarters of the previous state showing under
+      // this one. A still frame shows only the current state.
+      ctx!.save();
+      ctx!.setTransform(1, 0, 0, 1, 0, 0);
+      ctx!.clearRect(0, 0, canvas!.width, canvas!.height);
+      ctx!.restore();
+      drawFrame(ctx!, w, h, p, clocksRef.current, morphRef.current.clock, 0, hand);
+      drawn = t;
     }
 
     // `redraw`: a resize repaints the static readout (a resized canvas is
@@ -586,7 +616,7 @@ export function TokenScope({
       canvas!.width = Math.max(1, Math.round(rect.width * dpr));
       canvas!.height = Math.max(1, Math.round(rect.height * dpr));
       ctx!.setTransform(dpr, 0, 0, dpr, 0, 0);
-      if (redraw && reduce) drawStatic();
+      if (redraw && reduce) drawStatic(true);
     }
     size2(false);
 
@@ -596,8 +626,8 @@ export function TokenScope({
     if (reduce) {
       // Static readout: one settled frame, redrawn only when the state or
       // rate changes (the effect below), never a loop.
-      staticRedrawRef.current = drawStatic;
-      drawStatic();
+      staticRedrawRef.current = () => drawStatic(false);
+      drawStatic(true);
       return () => {
         staticRedrawRef.current = null;
         ro?.disconnect();
