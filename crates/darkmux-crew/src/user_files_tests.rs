@@ -235,3 +235,18 @@ fn a_partial_rule_override_is_not_missing_keys() {
     write(&state, "rules", &json!({"id": "existing-solution", "window": 40}));
     assert_eq!(problems(UserFileKind::Rule), vec![]);
 }
+
+/// (review C3) Every role key a released darkmux had and this one does not,
+/// from `git log`, is named as retired.
+#[test]
+#[serial_test::serial]
+fn every_historical_role_key_is_named_as_retired() {
+    let state = IsolatedState::new();
+    let mut role = embedded(crate::loader::BUILTIN_ROLES, "code-reviewer");
+    role["capabilities"] = json!(["code-reviewing"]);
+    role["tier"] = json!("large");
+    write(&state, "roles", &role);
+    let msg = problems(UserFileKind::Role).iter().map(ToString::to_string).collect::<String>();
+    assert!(msg.contains("unknown key `capabilities`: renamed to `skills`"), "{msg}");
+    assert!(msg.contains("unknown key `tier`: removed in #605"), "{msg}");
+}

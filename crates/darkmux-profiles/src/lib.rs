@@ -208,3 +208,28 @@ mod wrong_type_tests {
         assert!(msg.contains("unknown key `profiles.bad.models[0].n_ctxx`") && !msg.contains("must be"), "{msg}");
     }
 }
+
+#[cfg(test)]
+mod historical_key_tests {
+    use darkmux_types::user_files::{Issue, Problem};
+
+    /// Every registry key a released darkmux had and this one does not, from
+    /// `git log`, is named as retired.
+    #[test]
+    fn every_historical_registry_key_is_named_as_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let doc = serde_json::json!({
+            "crews": {}, "hooks": {"pre_swap": {"command": "x"}},
+            "profiles": {"p": {"models": [{"id": "m", "n_ctx": 1, "role": "primary"}],
+                "runtime": {"configPath": "x", "config_path": "x", "contextTokens": 5}}},
+        });
+        std::fs::write(&path, doc.to_string()).unwrap();
+        let p = crate::profiles::user_file_problem(&path).unwrap();
+        let Problem::Keys(keys) = &p.problem else { panic!("{p:?}") };
+        assert_eq!(keys.len(), 6, "{keys:#?}");
+        let unnamed: Vec<String> = keys.iter().filter(|k| !matches!(k.issue, Issue::Retired(_))).map(ToString::to_string).collect();
+        assert!(unnamed.is_empty(), "{unnamed:#?}");
+        assert!(p.to_string().contains("`profiles.p.runtime.contextTokens`: renamed to `context_tokens`"), "{p}");
+    }
+}

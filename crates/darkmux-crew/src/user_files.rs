@@ -16,7 +16,7 @@ use crate::types::{Crew, Role, Skill};
 /// another crate owns has nothing here.
 pub fn problems(kind: UserFileKind) -> Vec<FileProblem> {
     match kind {
-        UserFileKind::Role => check_dir::<Role>(kind, &crate::loader::roles_dir(), &no_retired),
+        UserFileKind::Role => check_dir::<Role>(kind, &crate::loader::roles_dir(), &role_retired),
         UserFileKind::Skill => check_dir::<Skill>(kind, &crate::loader::skills_dir(), &no_retired),
         UserFileKind::Crew => check_dir::<Crew>(kind, &crate::loader::crews_dir(), &no_retired),
         UserFileKind::MissionConfig => crate::mission_config::load::on_disk_dirs()
@@ -33,6 +33,17 @@ pub fn problems(kind: UserFileKind) -> Vec<FileProblem> {
         | UserFileKind::LabFixture
         | UserFileKind::WorkspaceSpec => Vec::new(),
     }
+}
+
+/// A role manifest's retired keys: every key a past `Role` had and this one
+/// does not, from `git log` (`every_historical_role_key_is_named_as_retired`).
+fn role_retired(path: &str) -> Option<String> {
+    let line = match path {
+        "capabilities" => "renamed to `skills` (#449): the skill ids this role draws on",
+        "tier" => "removed in #605: nothing reads it (a model is chosen by capability, not tier). Delete it",
+        _ => return None,
+    };
+    Some(line.to_string())
 }
 
 /// A user rule file is an OVERRIDE merged over the embedded rule of the same

@@ -823,10 +823,7 @@ fn config_retired(path: &str) -> Option<String> {
         .find(|r| r.old_key == path)
         .map(|r| format!("renamed to `{}` in 4.0 (#2902); {}", r.new_key, r.advice))
         .or_else(|| {
-            crate::config::REMOVED_SETTINGS
-                .iter()
-                .find(|r| r.key == path)
-                .map(|r| format!("removed in {}; {}", r.removed_in, r.advice))
+            crate::config::RETIRED_SETTINGS.iter().find(|r| r.key == path).map(|r| r.line.to_string())
         })
 }
 

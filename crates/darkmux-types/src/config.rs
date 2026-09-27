@@ -358,8 +358,8 @@ use std::path::Path;
 //           same gate as every other user file). The valid keys are derived
 //           from this type's JSON schema, never listed. A retired key is
 //           named with what replaced it: `remote.max_tokens_per_execution`
-//           (renamed, `RENAMED_SETTINGS`), `dirs.notebook` and
-//           `radio.router_profile` (removed, `REMOVED_SETTINGS`). A leftover
+//           (renamed, `RENAMED_SETTINGS`) and every other key a past
+//           `DarkmuxConfig` had (`RETIRED_SETTINGS`, built from `git log`). A leftover
 //           of any of the three used to be warned about and ignored; now it
 //           refuses. A value of the wrong type (`"port": "x"`) is refused the
 //           same way, naming the expected type and what it got: one such
@@ -396,30 +396,63 @@ pub const RENAMED_SETTINGS: &[RenamedSetting] = &[
     },
 ];
 
-/// A `config.json` key darkmux removed, with no replacement. The unknown-key
-/// gate (`user_files`) names it with this line instead of guessing a
-/// near-miss.
+/// A `config.json` key an older darkmux read (and `init` may have written)
+/// that this one does not. The unknown-key gate (`user_files`) names it with
+/// `line` instead of guessing a near-miss. Built from `git log` of this file
+/// (every field a past `DarkmuxConfig` carried that this one does not);
+/// `every_historical_config_key_is_named_as_retired` pins the set. Settings
+/// renamed in 4.0 that also had an env var are [`RENAMED_SETTINGS`].
 #[derive(Debug, Clone, Copy)]
-pub struct RemovedSetting {
+pub struct RetiredSetting {
+    /// The dotted key; a block (`review`) covers every key inside it.
     pub key: &'static str,
-    /// The release that removed it.
-    pub removed_in: &'static str,
-    /// What to do about a leftover.
-    pub advice: &'static str,
+    /// What replaced it, or that nothing did, and what to do.
+    pub line: &'static str,
 }
 
-/// Every `config.json` key removed without a replacement.
-pub const REMOVED_SETTINGS: &[RemovedSetting] = &[
-    RemovedSetting {
+/// Every retired `config.json` key that is not a [`RENAMED_SETTINGS`] entry.
+pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
+    RetiredSetting {
         key: "dirs.notebook",
-        removed_in: "4.0",
-        advice: "delete it (#2913): the notebook verbs retired; the bundled `darkmux-lab-notebook` skill writes \
-                 an entry wherever your own instructions say",
+        line: "removed in 4.0 (#2913): the notebook verbs retired; the bundled `darkmux-lab-notebook` skill writes \
+               an entry wherever your own instructions say. Delete it",
     },
-    RemovedSetting {
+    RetiredSetting {
         key: "radio.router_profile",
-        removed_in: "CONFIG 1.28",
-        advice: "delete it: radio routing runs on the machine's utility model, `internal.utility` in profiles.json",
+        line: "removed in CONFIG 1.28: radio routing runs on the machine's utility model, `internal.utility` in \
+               profiles.json. Delete it",
+    },
+    RetiredSetting {
+        key: "dirs.openclaw_config",
+        line: "removed with the openclaw runtime (#1405): nothing reads it. Delete it",
+    },
+    RetiredSetting {
+        key: "dirs.runtime_agents",
+        line: "removed with the openclaw runtime (#1405): nothing reads it. Delete it",
+    },
+    RetiredSetting {
+        key: "gh",
+        line: "renamed to `cmd` (#2003): move `gh.enabled` / `gh.allowed` to `cmd.enabled` / `cmd.allowed`",
+    },
+    RetiredSetting {
+        key: "orchestrator",
+        line: "removed in #1766 (`init` wrote it from #663): flow records no longer carry an orchestrator. \
+               Delete it",
+    },
+    RetiredSetting {
+        key: "remote.stage_budget_policy",
+        line: "renamed to `remote.step_budget_policy` in 4.0 (#2902), which takes `off` or `warn` (`wait` is an \
+               endpoint budget's policy only)",
+    },
+    RetiredSetting {
+        key: "review",
+        line: "removed with the review funnel (#2310): `review` runs as a mission config now, and its judge knobs \
+               went with the funnel. Delete the block",
+    },
+    RetiredSetting {
+        key: "runtime.telemetry_record_every_samples",
+        line: "removed in #2413: one machine-scoped host sampler replaced the per-dispatch curve; its cadence is \
+               `runtime.host_sampler_interval_ms`. Delete it",
     },
 ];
 
@@ -2312,7 +2345,7 @@ mod tests {
     /// (#2914) `radio.router_profile` is REMOVED (CONFIG 1.28): routing runs
     /// on the machine's utility model. `with_defaults()` no longer writes it,
     /// and an older config still carrying it loads leniently into
-    /// `radio.extras`; the unknown-key gate refuses it (`REMOVED_SETTINGS`).
+    /// `radio.extras`; the unknown-key gate refuses it (`RETIRED_SETTINGS`).
     #[test]
     fn radio_router_profile_is_removed_and_a_leftover_lands_in_extras() {
         let cfg = DarkmuxConfig::with_defaults();

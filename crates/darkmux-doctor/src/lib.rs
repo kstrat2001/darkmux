@@ -1450,7 +1450,7 @@ fn check_removed_radio_router_staffing() -> Check {
 /// Pure decision for [`check_removed_radio_router_staffing`].
 /// A leftover `radio.router_profile` key is not this check's: it is an
 /// unknown key, which the user-file keys row fails with its removal line
-/// (`config::REMOVED_SETTINGS`).
+/// (`config::RETIRED_SETTINGS`).
 fn removed_radio_router_staffing_status(role_binding: Option<&str>, env_set: bool) -> Check {
     let name = "radio router staffing (removed)".to_string();
     let mut leftovers: Vec<String> = Vec::new();

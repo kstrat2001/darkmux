@@ -12,17 +12,23 @@ use crate::lab::registry::{default_registry_path, LabRegistry};
 use crate::workloads::types::WorkloadManifest;
 
 /// A workload document's retired keys, named instead of guessed at.
+/// Every key a past workload schema had and this one does not, from
+/// `git log` (`every_historical_workload_and_fixture_key_is_named_as_retired`).
 fn workload_retired(path: &str) -> Option<String> {
-    (path == "workload.expected.test_count_baseline").then(|| {
-        "removed in #2833: nothing read it; a coding workload's baseline test count is its fixture's \
-         `.fixture.json` `baseline.test_count`. Delete it"
-            .to_string()
-    })
+    let line = match path {
+        "workload.expected.test_count_baseline" => {
+            "removed in #2833: nothing read it; a coding workload's baseline test count is its fixture's \
+             `.fixture.json` `baseline.test_count`. Delete it"
+        }
+        "workload.agent" => "renamed to `role` (#328): name a darkmux role manifest",
+        _ => return None,
+    };
+    Some(line.to_string())
 }
 
 /// A fixture manifest's retired keys, named instead of guessed at.
 fn fixture_retired(path: &str) -> Option<String> {
-    (path == "hash_exclude").then(|| {
+    matches!(path, "hash_exclude" | "hash_include").then(|| {
         "removed in #610: nothing read it (the hash excludes are built in). Delete it; a built-in fixture \
          registered from an older darkmux checkout still carries it"
             .to_string()

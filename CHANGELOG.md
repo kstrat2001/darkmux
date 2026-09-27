@@ -23,14 +23,19 @@ darkmux release.
   nothing. Now every entry point that reads the file refuses to start,
   naming the file, the key's path and the closest valid key, and `darkmux
   doctor` fails it. Files still load, so doctor always runs. A retired key
-  is named with what replaced it: `remote.max_tokens_per_execution`,
-  `dirs.notebook` and `radio.router_profile` in `config.json` (these used to
-  be warned about and ignored); `crews`, `hooks`, a model's `role`, a
-  profile's `runtime.config_path` and the openclaw compaction keys (`mode`,
-  `model`, `customInstructions`, `maxHistoryShare`, `recentTurnsPreserve`)
-  in `profiles.json`; `gh_verb` and a task's `expand` in a mission config;
-  `expected.test_count_baseline` in a workload; `hash_exclude` in a fixture
-  manifest. `_comment` is accepted anywhere as a note. A value of the wrong
+  is named with what replaced it; the tables come from `git log`, so every
+  key an older darkmux read or `init` wrote is covered: in `config.json`,
+  `remote.max_tokens_per_execution`, `remote.stage_budget_policy`, `gh`,
+  `orchestrator`, `review`, `dirs.notebook`, `dirs.openclaw_config`,
+  `dirs.runtime_agents`, `radio.router_profile` and
+  `runtime.telemetry_record_every_samples` (the first three used to be warned
+  about and ignored, the rest silently ignored); in `profiles.json`, `crews`,
+  `hooks`, a model's `role`, a profile's `runtime.config_path` /
+  `configPath` / `contextTokens` and the openclaw compaction keys (`mode`,
+  `model`, `customInstructions`, `maxHistoryShare`, `recentTurnsPreserve`);
+  a role's `capabilities` and `tier`; a mission config's `gh_verb` and a
+  task's `expand`; a workload's `agent` and `expected.test_count_baseline`;
+  a fixture manifest's `hash_exclude` and `hash_include`. `_comment` is accepted anywhere as a note. A value of the wrong
   type (`"port": "x"`) is refused the same way, naming the expected type and
   what it got: one used to make `config.json` silently fall back to every
   default (Redis and audit off), and made a user role, skill or rule

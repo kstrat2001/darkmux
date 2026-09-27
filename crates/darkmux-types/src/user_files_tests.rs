@@ -436,3 +436,31 @@ fn a_file_path_cannot_forge_an_output_line() {
     let fp = check_text::<Probe>(UserFileKind::Role, p, "{\"rediss\": 1}", &no_retired).unwrap();
     assert!(!fp.to_string().contains('\n'), "{:?}", fp.to_string());
 }
+
+// ── (review C3) every key an older darkmux wrote is named as retired ──
+
+/// Every `config.json` key a released darkmux ever had and this one does
+/// not, from `git log` of `config.rs`: each is named with what replaced it,
+/// never a near-miss guess (`orchestrator` used to read "did you mean
+/// `remote`?").
+#[test]
+fn every_historical_config_key_is_named_as_retired() {
+    let doc = json!({
+        "orchestrator": "claude",
+        "gh": {"enabled": true, "allowed": []},
+        "review": {"judge_concurrency": 2, "judge_fail_on_any_skip": true},
+        "dirs": {"notebook": "/n", "openclaw_config": "/o", "runtime_agents": "/r"},
+        "radio": {"router_profile": "p"},
+        "remote": {"max_tokens_per_execution": 1, "stage_budget_policy": "warn"},
+        "runtime": {"telemetry_record_every_samples": 5},
+    });
+    let keys = config_keys(doc);
+    let not_retired: Vec<String> =
+        keys.iter().filter(|k| !matches!(k.issue, Issue::Retired(_))).map(ToString::to_string).collect();
+    assert!(not_retired.is_empty(), "{not_retired:#?}");
+    assert_eq!(keys.len(), 10, "{keys:#?}");
+    let msg: String = keys.iter().map(|k| format!("{k}\n")).collect();
+    for says in ["`gh`: renamed to `cmd`", "`orchestrator`: removed", "`remote.stage_budget_policy`: renamed to `remote.step_budget_policy`", "host_sampler_interval_ms"] {
+        assert!(msg.contains(says), "{says}: {msg}");
+    }
+}

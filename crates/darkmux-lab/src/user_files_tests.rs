@@ -302,3 +302,20 @@ fn whatever_the_gate_passes_the_typed_load_accepts() {
     failures.truncate(20);
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// (review C3) Every workload and fixture key a released darkmux had and
+/// this one does not, from `git log`, is named as retired.
+#[test]
+#[serial_test::serial]
+fn every_historical_workload_and_fixture_key_is_named_as_retired() {
+    let state = IsolatedState::new();
+    let mut wl = quick_q();
+    wl["workload"]["agent"] = json!("code-reviewer");
+    write_workload(&state, &wl);
+    let mut fx = tiny_fixture();
+    fx["hash_include"] = json!(["src"]);
+    register_fixture(&state, &fx);
+    let refusal = preflight_with(Scope::LabRun, None).unwrap_err().to_string();
+    assert!(refusal.contains("unknown key `workload.agent`: renamed to `role`"), "{refusal}");
+    assert!(refusal.contains("unknown key `hash_include`: removed in #610"), "{refusal}");
+}

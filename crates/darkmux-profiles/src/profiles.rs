@@ -79,7 +79,8 @@ pub fn user_file_problem(path: &Path) -> Option<darkmux_types::user_files::FileP
 }
 
 /// `profiles.json`'s retired keys (path with array indices dropped), named
-/// instead of guessed at.
+/// instead of guessed at: every key a past registry schema had and this one
+/// does not, from `git log` (`every_historical_registry_key_is_named_as_retired`).
 fn registry_retired(path: &str) -> Option<String> {
     let line = match path {
         "crews" => "removed in 2.0 (#1426): review staffing is derived from the active profile's roster; delete it",
@@ -88,7 +89,10 @@ fn registry_retired(path: &str) -> Option<String> {
             "removed in #590: a model no longer declares a role; bind roles to profiles with \
              `darkmux config set role_profiles.<role> <profile>`. Delete it"
         }
-        "profiles.*.runtime.config_path" => "removed with the openclaw runtime (#1405); delete it",
+        "profiles.*.runtime.config_path" | "profiles.*.runtime.configPath" => {
+            "removed with the openclaw runtime (#1405); delete it"
+        }
+        "profiles.*.runtime.contextTokens" => "renamed to `context_tokens` (#709)",
         "profiles.*.runtime.compaction.mode"
         | "profiles.*.runtime.compaction.model"
         | "profiles.*.runtime.compaction.customInstructions"
