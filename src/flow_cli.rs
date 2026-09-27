@@ -272,7 +272,8 @@ struct DrainCountingSink {
 }
 
 impl flow::FlowSink for DrainCountingSink {
-    fn write(&self, record: &FlowRecord) -> Result<()> {
+    fn persist(&self, record: crate::flow::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
         if let Some(idx) = self.rule_filter {
             let matches_idx = record
                 .payload

@@ -240,8 +240,16 @@ impl Serialize for FlowAction {
 
 impl<'de> Deserialize<'de> for FlowAction {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Strict: a current spelling, or an old spelling of a current
+        // action. An unknown or retired action is REFUSED here, so no code
+        // outside this crate can mint one through serde; the lenient
+        // archive read is `crate::reader`'s, and it is crate-private.
         let s = String::deserialize(d)?;
-        Ok(crate::legacy::read_action(&s))
+        match crate::legacy::read_action(&s) {
+            FlowAction::Other(_) => Err(serde::de::Error::custom(format!("unknown flow action `{s}`"))),
+            FlowAction::Retired(_) => Err(serde::de::Error::custom(format!("retired flow action `{s}`"))),
+            known => Ok(known),
+        }
     }
 }
 
@@ -377,10 +385,19 @@ mod tests {
 
     #[test]
     fn an_unknown_string_reads_as_other_and_writes_back_verbatim() {
-        let a: FlowAction = serde_json::from_str("\"future.thing\"").unwrap();
+        let a = crate::legacy::read_action("future.thing");
         assert!(matches!(a, FlowAction::Other(_)));
         assert_eq!(a.scope(), None);
         assert_eq!(serde_json::to_string(&a).unwrap(), "\"future.thing\"");
+    }
+
+    /// The public deserializer is strict: an unknown or retired action is
+    /// refused, a current or old spelling of a current action reads.
+    #[test]
+    fn serde_refuses_unknown_and_retired_actions() {
+        assert!(serde_json::from_str::<FlowAction>("\"future.thing\"").is_err());
+        assert!(serde_json::from_str::<FlowAction>("\"telemetry.process\"").is_err());
+        assert_eq!(serde_json::from_str::<FlowAction>("\"dispatch start\"").unwrap(), FlowAction::DispatchStart);
     }
 
     #[test]

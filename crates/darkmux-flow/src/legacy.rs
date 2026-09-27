@@ -75,9 +75,17 @@ retired_actions! {
     MissionRunBlocked => "mission.run.blocked";
     MissionRunShip => "mission.run.ship";
     MissionRunShipMerged => "mission.run.ship.merged";
+    /// Added in 9ce9c1864 (#799), removed with `mission ship` in a39a133e0
+    /// (#1463).
+    MissionRunShipHeld => "mission.run.ship.held";
+    /// Added in 073d9adce (#782b), removed in 90c67d2e5 (#1348).
+    MissionRunQaUnavailable => "mission.run.qa-unavailable";
     /// The retired `mission propose` compiler (#204, #2912).
     MissionCompileStart => "mission.compile.start";
     MissionCompileComplete => "mission.compile.complete";
+    /// Added in ab7d75611 (#204), removed with `mission propose` in
+    /// 3531f17ff (#2912).
+    MissionCompileError => "mission.compile.error";
     /// Terminal-mission reopen (#1284), retired in #1503.
     MissionReopen => "mission reopen";
     /// The literal crawl launcher's records, retired with it (#2301).
@@ -89,40 +97,52 @@ retired_actions! {
 }
 
 
-/// The current action for a retired spelling, or `None` when `old` is not
-/// one. Never consulted on write: producers build [`FlowAction`] directly.
+/// Every old spelling of a current action, and the action it now is. The
+/// pre-rename `sprint *` spellings are the Sprint→Phase rename's. A
+/// `verdict: <v>` record is the one prefix-shaped spelling; see
+/// [`upgrade_action`].
+pub const OLD_SPELLINGS: &[(&str, FlowAction)] = &[
+    ("dispatch start", FlowAction::DispatchStart),
+    ("dispatch complete", FlowAction::DispatchComplete),
+    ("dispatch error", FlowAction::DispatchError),
+    ("dispatch route", FlowAction::DispatchRoute),
+    ("step start", FlowAction::StepStart),
+    ("step complete", FlowAction::StepComplete),
+    ("step error", FlowAction::StepError),
+    ("step result", FlowAction::StepResult),
+    ("step timing", FlowAction::StepTiming),
+    ("step seat unresolved", FlowAction::StepSeatUnresolved),
+    ("phase start", FlowAction::PhaseStart),
+    ("sprint start", FlowAction::PhaseStart),
+    ("phase complete", FlowAction::PhaseComplete),
+    ("sprint complete", FlowAction::PhaseComplete),
+    ("phase abandon", FlowAction::PhaseAbandon),
+    ("sprint abandon", FlowAction::PhaseAbandon),
+    ("phase added", FlowAction::PhaseAdded),
+    ("sprint added", FlowAction::PhaseAdded),
+    ("ambiguous-phase-id", FlowAction::PhaseIdAmbiguous),
+    ("phase review begin", FlowAction::PhaseReviewBegin),
+    ("sprint review begin", FlowAction::PhaseReviewBegin),
+    ("phase review aborted", FlowAction::PhaseReviewAborted),
+    ("dispatch code-reviewer", FlowAction::PhaseReviewDispatch),
+    ("dispatch failed", FlowAction::PhaseReviewFailed),
+    ("mission start", FlowAction::MissionStart),
+    ("mission close", FlowAction::MissionClose),
+    ("mission abort", FlowAction::MissionAbort),
+    ("mission pause", FlowAction::MissionPause),
+    ("mission resume", FlowAction::MissionResume),
+    ("tier-decision", FlowAction::TierDecision),
+    ("note", FlowAction::OperatorNote),
+    ("catch", FlowAction::OperatorCatch),
+];
+
+/// The current action for an old spelling, or `None` when `old` is not one.
+/// Never consulted on write: producers build [`FlowAction`] directly.
 pub fn upgrade_action(old: &str) -> Option<FlowAction> {
-    Some(match old {
-        "dispatch start" => FlowAction::DispatchStart,
-        "dispatch complete" => FlowAction::DispatchComplete,
-        "dispatch error" => FlowAction::DispatchError,
-        "dispatch route" => FlowAction::DispatchRoute,
-        "step start" => FlowAction::StepStart,
-        "step complete" => FlowAction::StepComplete,
-        "step error" => FlowAction::StepError,
-        "step result" => FlowAction::StepResult,
-        "step timing" => FlowAction::StepTiming,
-        "step seat unresolved" => FlowAction::StepSeatUnresolved,
-        "phase start" | "sprint start" => FlowAction::PhaseStart,
-        "phase complete" | "sprint complete" => FlowAction::PhaseComplete,
-        "phase abandon" | "sprint abandon" => FlowAction::PhaseAbandon,
-        "phase added" | "sprint added" => FlowAction::PhaseAdded,
-        "ambiguous-phase-id" => FlowAction::PhaseIdAmbiguous,
-        "phase review begin" | "sprint review begin" => FlowAction::PhaseReviewBegin,
-        "phase review aborted" => FlowAction::PhaseReviewAborted,
-        "dispatch code-reviewer" => FlowAction::PhaseReviewDispatch,
-        "dispatch failed" => FlowAction::PhaseReviewFailed,
-        "mission start" => FlowAction::MissionStart,
-        "mission close" => FlowAction::MissionClose,
-        "mission abort" => FlowAction::MissionAbort,
-        "mission pause" => FlowAction::MissionPause,
-        "mission resume" => FlowAction::MissionResume,
-        "tier-decision" => FlowAction::TierDecision,
-        "note" => FlowAction::OperatorNote,
-        "catch" => FlowAction::OperatorCatch,
-        verdict if verdict.starts_with("verdict: ") => FlowAction::PhaseReviewVerdict,
-        _ => return None,
-    })
+    if old.starts_with("verdict: ") {
+        return Some(FlowAction::PhaseReviewVerdict);
+    }
+    OLD_SPELLINGS.iter().find(|(spelling, _)| *spelling == old).map(|(_, action)| action.clone())
 }
 
 /// A retired spelling that carried a value INSIDE the action string

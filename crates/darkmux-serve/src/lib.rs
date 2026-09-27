@@ -4570,6 +4570,13 @@ fn read_flow_records_from_redis(
         .arg(MAX_FLOW_FILE_RECORDS)
         .query(&mut conn)
         .with_context(|| format!("XREVRANGE on {stream}"))?;
+    records_from_xrevrange(raw, date)
+}
+
+/// The records an `XREVRANGE` reply holds, read through the flow reader
+/// (so a pre-4.0 spelling comes back current), filtered to `date` when one
+/// is given, in chronological order.
+fn records_from_xrevrange(raw: redis::Value, date: Option<&str>) -> Result<Vec<serde_json::Value>> {
     let entries = match raw {
         redis::Value::Array(v) => v,
         other => {

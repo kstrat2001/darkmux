@@ -18,7 +18,7 @@
 
 #![cfg(unix)]
 
-use darkmux_flow::FlowSink as _;
+use darkmux_flow::FlowSinkWrite as _;
 use std::os::unix::fs::PermissionsExt;
 
 // ===== DARKMUX-SPAWN-HELPERS: BEGIN (#2710) ==========================
@@ -358,7 +358,7 @@ fn flock_try_lock_exclusive_creates_files_owner_only_mode() {
 /// those land.
 struct NullSink;
 impl darkmux_flow::FlowSink for NullSink {
-    fn write(&self, _record: &darkmux_flow::FlowRecord) -> anyhow::Result<()> {
+    fn persist(&self, _record: darkmux_flow::CheckedRecord<'_>) -> anyhow::Result<()> {
         Ok(())
     }
     fn info(&self) -> darkmux_flow::SinkInfo {

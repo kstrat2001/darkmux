@@ -74,7 +74,7 @@
 //! afterward, envelope or none.
 //!
 //! Concretely: `crate::scheduler::apply_step_terminal` now streams a
-//! `darkmux_flow::FlowAction::StepTiming` ("step timing") flow record for
+//! `step.timing` flow record for
 //! each `StepRecord` at the moment it is pushed onto
 //! `SchedulerReport::step_records`. See that field's own doc and
 //! `step_timing_record`'s doc in `scheduler.rs`. Every mission that runs

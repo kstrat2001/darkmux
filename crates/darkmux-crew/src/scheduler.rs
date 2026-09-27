@@ -4249,13 +4249,13 @@ mod tests {
     /// the in-memory summary a caller might or might not read.
     ///
     /// **Proved failing first**: before `apply_step_terminal` called
-    /// `emit(step_timing_record(...))`, `emitted` here carried only "step
-    /// start"/"step complete"; filtering for `darkmux_flow::FlowAction::StepTiming` found
+    /// `emit(step_timing_record(...))`, `emitted` here carried only
+    /// `step.start`/`step.complete`; filtering for `step.timing` found
     /// nothing, and this test failed on the `expect` below. Observed
     /// directly while writing this test.
     ///
     /// Also pins the vocabulary decision itself: the flow record's action
-    /// is `darkmux_flow::FlowAction::StepTiming` (darkmux_flow::FlowAction::StepTiming), never `"step result"`. See
+    /// is `step.timing`, never `step.result`. See
     /// `step_timing_record`'s own doc for why reusing that action would be
     /// genuinely ambiguous. Its payload is `StepRecord`'s own
     /// `serde_json::to_value`, so the wire shape a flow-stream consumer
@@ -4313,7 +4313,7 @@ mod tests {
     }
 
     /// (#1877, final wiring step) The vocabulary decision itself, pinned
-    /// directly: `darkmux_flow::FlowAction::StepTiming` must never collapse onto EITHER of
+    /// directly: `step.timing` must never collapse onto EITHER of
     /// the two vocabularies it has to coexist with: the lifecycle
     /// transitions (`STEP_LIFECYCLE_ACTIONS`) or the business-result
     /// companion (`"step result"`). A future edit that renamed the

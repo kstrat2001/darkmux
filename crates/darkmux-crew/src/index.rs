@@ -1485,7 +1485,7 @@ mod tests {
         // A non-telemetry record, even with source=detector, is not a caution
         // (the category gate). Deserialized from the minimal required fields.
         let work: darkmux_flow::FlowRecord = serde_json::from_str(
-            r#"{"ts":"2026-06-22T00:00:00Z","level":"info","category":"work","tier":"local","stage":"dispatch","action":"x","handle":"coder","source":"detector"}"#,
+            r#"{"ts":"2026-06-22T00:00:00Z","level":"info","category":"work","tier":"local","stage":"dispatch","action":"dispatch.turn","handle":"coder","source":"detector"}"#,
         )
         .unwrap();
         assert!(!is_detector_caution(&work), "non-telemetry category is not a caution");

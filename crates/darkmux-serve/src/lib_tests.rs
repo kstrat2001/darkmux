@@ -156,11 +156,8 @@
             if line.is_empty() {
                 continue;
             }
-            serde_json::from_str::<darkmux_flow::FlowRecord>(line).unwrap_or_else(|e| {
-                panic!(
-                    "xss-flow.jsonl line {} is not a valid FlowRecord: {e}\n  {line}",
-                    i + 1
-                )
+            darkmux_flow::reader::parse_record(line).unwrap_or_else(|| {
+                panic!("xss-flow.jsonl line {} is not a valid FlowRecord\n  {line}", i + 1)
             });
             n += 1;
         }
@@ -185,8 +182,8 @@
             if line.is_empty() {
                 continue;
             }
-            let r: darkmux_flow::FlowRecord = serde_json::from_str(line).unwrap_or_else(|e| {
-                panic!("demo-flow.jsonl line {} is not a valid FlowRecord: {e}\n  {line}", i + 1)
+            let r = darkmux_flow::reader::parse_record(line).unwrap_or_else(|| {
+                panic!("demo-flow.jsonl line {} is not a valid FlowRecord\n  {line}", i + 1)
             });
             recs.push(r);
         }
@@ -2394,6 +2391,27 @@
         let v: serde_json::Value = serde_json::from_str(&got).unwrap();
         assert_eq!(v["action"], "step.result");
         assert_eq!(v["handle"], "h");
+    }
+
+    /// `/flow/:date`'s Redis backfill (`read_flow_records_from_redis`) reads
+    /// each `XREVRANGE` entry through the flow reader.
+    #[test]
+    fn redis_backfill_serves_a_spaced_record_dotted() {
+        let entry = |id: &str, json: &str| {
+            redis::Value::Array(vec![
+                redis::Value::BulkString(id.as_bytes().to_vec()),
+                redis::Value::Array(vec![
+                    redis::Value::BulkString(b"record".to_vec()),
+                    redis::Value::BulkString(json.as_bytes().to_vec()),
+                ]),
+            ])
+        };
+        let raw = redis::Value::Array(vec![
+            entry("2-0", r#"{"ts":"2026-05-14T09:00:05Z","action":"dispatch complete"}"#),
+            entry("1-0", r#"{"ts":"2026-05-14T09:00:00Z","action":"dispatch.start"}"#),
+        ]);
+        let records = super::records_from_xrevrange(raw, Some("2026-05-14")).unwrap();
+        assert_eq!(actions_of(&serde_json::Value::Array(records)), vec!["dispatch.start", "dispatch.complete"]);
     }
 
     /// The Redis half of the same stream (`xread_block_once`) forwards each

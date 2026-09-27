@@ -122,6 +122,77 @@ pub fn action_glob_matches(pattern: &str, action: &str) -> bool {
         && pat_segs.iter().zip(act_segs.iter()).all(|(p, a)| segment_glob(p, a))
 }
 
+/// Say once, at load, which rules name an action pattern that matches no
+/// action darkmux writes (a spelling 4.0 retired, or a typo). They load and
+/// deliver nothing; `darkmux doctor` names them too.
+fn warn_unmatchable_rules(rules: &[HookRule]) {
+    for (index, pattern) in unmatchable_rule_patterns(rules) {
+        let hint = dotted_twin(pattern).map(|t| format!("; did you mean `{t}`?")).unwrap_or_default();
+        eprintln!(
+            "flow::HookSink: rule #{index}'s action `{pattern}` matches no action darkmux writes \
+             (actions are spelled `<scope>.<event>`){hint}"
+        );
+    }
+}
+
+/// `(rule index, pattern)` for every rule whose action pattern cannot match.
+fn unmatchable_rule_patterns(rules: &[HookRule]) -> Vec<(usize, &str)> {
+    rules
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| Some((i, r.r#match.as_ref()?.action.as_deref()?)))
+        .filter(|(_, p)| !action_pattern_can_match(p))
+        .collect()
+}
+
+/// The action glob a rule means under 4.0. A rule written before 4.0 names
+/// the old spellings (`dispatch complete`, `step *`); those would match
+/// nothing now, silently. So:
+///
+/// * an exact old spelling reads as its current action;
+/// * a spaced glob reads as its dotted twin (`step *` -> `step.*`) ONLY when
+///   the twin matches exactly the actions the old glob matched, upgraded. A
+///   twin that would match MORE (`dispatch *` -> `dispatch.*` would add every
+///   `dispatch.turn` and `dispatch.tool` record) is not taken: the rule stays
+///   as written, matches nothing, and `darkmux doctor` and [`HookSink::new`]
+///   say so.
+///
+/// Anything else is returned as written.
+pub fn effective_action_pattern(pattern: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(current) = crate::legacy::upgrade_action(pattern) {
+        return std::borrow::Cow::Owned(current.as_str().to_string());
+    }
+    match dotted_twin(pattern) {
+        Some(twin) if !widens(pattern, &twin) => std::borrow::Cow::Owned(twin),
+        _ => std::borrow::Cow::Borrowed(pattern),
+    }
+}
+
+/// The dotted spelling of a spaced glob, when it has one.
+pub fn dotted_twin(pattern: &str) -> Option<String> {
+    (pattern.contains(' ') && pattern.contains('*')).then(|| pattern.replace(' ', "."))
+}
+
+/// True when `twin` matches a current action that `pattern` (an old spaced
+/// glob) never matched in its old spelling, or matches none at all.
+fn widens(pattern: &str, twin: &str) -> bool {
+    let old: std::collections::BTreeSet<&str> = crate::legacy::OLD_SPELLINGS
+        .iter()
+        .filter(|(spelling, _)| action_glob_matches(pattern, spelling))
+        .map(|(_, action)| action.as_str())
+        .collect();
+    let new: std::collections::BTreeSet<&str> =
+        crate::FlowAction::KNOWN_WIRE.iter().copied().filter(|w| action_glob_matches(twin, w)).collect();
+    old.is_empty() || old != new
+}
+
+/// True when `pattern`, read as [`effective_action_pattern`] reads it,
+/// matches at least one action darkmux writes.
+pub fn action_pattern_can_match(pattern: &str) -> bool {
+    let effective = effective_action_pattern(pattern);
+    crate::FlowAction::KNOWN_WIRE.iter().any(|w| action_glob_matches(&effective, w))
+}
+
 fn segment_glob(pattern: &str, value: &str) -> bool {
     if pattern == "*" {
         return true;
@@ -174,7 +245,7 @@ pub fn hook_match(m: &HookMatch, record: &FlowRecord) -> bool {
         return false;
     }
     if let Some(pat) = m.action.as_deref() {
-        if !action_glob_matches(pat, record.action.as_str()) {
+        if !action_glob_matches(&effective_action_pattern(pat), record.action.as_str()) {
             return false;
         }
     }
@@ -3861,6 +3932,7 @@ impl HookSink {
         // destination), which still refuses the WHOLE sink, unchanged
         // pre-#2183 behavior (see `resolve_rules_refuses_on_first_non_
         // loopback`).
+        warn_unmatchable_rules(rules);
         let mut resolved = Vec::with_capacity(rules.len());
         for (index, r) in rules.iter().enumerate() {
             match resolve_one_rule(index, r, &outbox_dir) {
@@ -3979,7 +4051,8 @@ impl HookSink {
 }
 
 impl FlowSink for HookSink {
-    fn write(&self, record: &FlowRecord) -> Result<()> {
+    fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
         // Loop guard — never even considered against any rule. See
         // `is_hook_own_action`'s doc (#2093 merge-gate finding 11).
         if is_hook_own_action(&record.action) {
@@ -4328,6 +4401,7 @@ pub mod test_receiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FlowSinkWrite;
     use darkmux_types::config::HookMatch;
     use test_receiver::HookReceiver;
 
@@ -4342,7 +4416,7 @@ mod tests {
     /// `CapturingSink` instead (see `delivers_matching_record_and_emits_hook_fired`).
     struct NullSink;
     impl FlowSink for NullSink {
-        fn write(&self, _record: &FlowRecord) -> Result<()> {
+        fn persist(&self, _record: crate::CheckedRecord<'_>) -> Result<()> {
             Ok(())
         }
         fn info(&self) -> SinkInfo {
@@ -4357,7 +4431,7 @@ mod tests {
     /// own doc above.
     struct NoopSink;
     impl FlowSink for NoopSink {
-        fn write(&self, _record: &FlowRecord) -> Result<()> {
+        fn persist(&self, _record: crate::CheckedRecord<'_>) -> Result<()> {
             Ok(())
         }
         fn info(&self) -> SinkInfo {
@@ -4388,6 +4462,40 @@ mod tests {
             work_id: None,
             attempt: None,
         }
+    }
+
+    /// (4.0) A rule written against an old spelling keeps matching: an
+    /// exact old spelling reads as its current action, and a spaced glob as
+    /// its dotted twin when that twin matches exactly what the old glob did.
+    #[test]
+    fn an_old_spelling_rule_reads_as_its_current_action() {
+        assert_eq!(effective_action_pattern("dispatch complete"), "dispatch.complete");
+        assert_eq!(effective_action_pattern("sprint start"), "phase.start");
+        assert_eq!(effective_action_pattern("step *"), "step.*");
+        assert_eq!(effective_action_pattern("dispatch.tool"), "dispatch.tool", "a current pattern is untouched");
+        let m = HookMatch { action: Some("dispatch complete".to_string()), ..Default::default() };
+        assert!(hook_match(&m, &record(crate::FlowAction::DispatchComplete)));
+        assert!(!hook_match(&m, &record(crate::FlowAction::DispatchError)));
+        let m = HookMatch { action: Some("step *".to_string()), ..Default::default() };
+        assert!(hook_match(&m, &record(crate::FlowAction::StepResult)));
+    }
+
+    /// The inverse: a spaced glob whose dotted twin would match MORE than it
+    /// used to is not widened, so it matches nothing and is reported.
+    #[test]
+    fn a_widening_glob_is_left_as_written_and_reported() {
+        for pattern in ["dispatch *", "mission *", "phase *"] {
+            assert_eq!(effective_action_pattern(pattern), pattern, "{pattern} must not widen");
+        }
+        let m = HookMatch { action: Some("dispatch *".to_string()), ..Default::default() };
+        assert!(!hook_match(&m, &record(crate::FlowAction::DispatchTurn)), "not silently widened");
+        let rule = |action: &str| HookRule {
+            r#match: Some(HookMatch { action: Some(action.to_string()), ..Default::default() }),
+            ..Default::default()
+        };
+        let rules = vec![rule("dispatch *"), rule("step *"), rule("dispatchh.*"), rule("dispatch complete"), rule("*")];
+        let bad: Vec<(usize, &str)> = unmatchable_rule_patterns(&rules);
+        assert_eq!(bad, vec![(0, "dispatch *"), (2, "dispatchh.*")]);
     }
 
     /// (4.0) An outbox line a pre-4.0 binary enqueued is delivered with its
@@ -4584,7 +4692,7 @@ mod tests {
     #[test]
     fn hook_scope_and_unknown_actions_never_match() {
         let unknown = ["HOOK.FIRED", "Hook.Failed", "hook", "hooks.status", "future.thing"]
-            .map(|a| serde_json::from_value::<crate::FlowAction>(serde_json::json!(a)).unwrap());
+            .map(crate::legacy::read_action);
         let own = [crate::FlowAction::HookFired, crate::FlowAction::HookFailed, crate::FlowAction::HookDryRun];
         for action in unknown.into_iter().chain(own) {
             let label = action.to_string();
@@ -4932,7 +5040,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -5302,7 +5411,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -5384,7 +5494,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -5431,7 +5542,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -5459,7 +5571,8 @@ mod tests {
     #[derive(Default)]
     struct CapturingSink(Mutex<Vec<FlowRecord>>);
     impl FlowSink for CapturingSink {
-        fn write(&self, record: &FlowRecord) -> Result<()> {
+        fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
             self.0.lock().unwrap().push(record.clone());
             Ok(())
         }
@@ -7079,7 +7192,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -7143,7 +7257,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -7268,7 +7383,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -7388,7 +7504,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -7500,7 +7617,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -8177,7 +8295,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -8322,7 +8441,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -8481,7 +8601,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -8631,7 +8752,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -8781,7 +8903,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }

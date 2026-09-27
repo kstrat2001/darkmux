@@ -64,10 +64,17 @@ pub fn upgrade(record: &mut Value) -> ActionRead {
 }
 
 /// Put a value a retired action string carried into `payload.<key>`, unless
-/// the payload already has one.
+/// the payload already has one. A payload that is not an object (never
+/// written that way, but an archive is not ours to assume) is kept, nested
+/// under `payload.legacy_payload`, rather than overwritten.
 fn move_into_payload(record: &mut Value, key: &str, detail: &str) {
-    if !record.get("payload").is_some_and(Value::is_object) {
-        record["payload"] = Value::Object(Default::default());
+    match record.get("payload") {
+        None | Some(Value::Null) => record["payload"] = Value::Object(Default::default()),
+        Some(Value::Object(_)) => {}
+        Some(other) => {
+            let kept = other.clone();
+            record["payload"] = serde_json::json!({ "legacy_payload": kept });
+        }
     }
     if record["payload"].get(key).is_none() {
         record["payload"][key] = Value::String(detail.to_string());
@@ -106,7 +113,15 @@ pub fn upgrade_line(line: &str) -> Option<std::borrow::Cow<'_, str>> {
 /// [`parse_value`] upgrades it. `None` for a line that is not a flow record
 /// (a schema header, a torn write).
 pub fn parse_record(line: &str) -> Option<FlowRecord> {
-    serde_json::from_value(parse_value(line)?).ok()
+    let mut v = parse_value(line)?;
+    // `FlowAction`'s public deserializer refuses an unknown or retired
+    // action; this is the one lenient path, so the action is read here and
+    // put back after the rest of the record deserializes.
+    let action = action_of(&v)?;
+    v["action"] = Value::String(FlowAction::OperatorNote.as_str().to_string());
+    let mut record: FlowRecord = serde_json::from_value(v).ok()?;
+    record.action = action;
+    Some(record)
 }
 
 /// The typed action of a JSON record, upgraded; `None` when the record has
@@ -124,7 +139,14 @@ impl UnknownActions {
     /// Count `record`'s action if this binary does not know it, current or
     /// retired.
     pub fn observe(&mut self, record: &Value) {
-        if let Some(FlowAction::Other(unknown)) = action_of(record) {
+        if let Some(wire) = record.get("action").and_then(Value::as_str) {
+            self.observe_wire(wire);
+        }
+    }
+
+    /// Count one action string if this binary does not know it.
+    pub fn observe_wire(&mut self, wire: &str) {
+        if let FlowAction::Other(unknown) = crate::legacy::read_action(wire) {
             *self.0.entry(unknown.as_str().to_string()).or_insert(0) += 1;
         }
     }
@@ -172,14 +194,39 @@ pub fn day_file_records(path: &Path) -> Vec<Value> {
 }
 
 /// Tally the unknown actions in the `days` newest day files under `dir`.
+/// Reads only each line's `action` field ([`action_field`]), not the whole
+/// record, so a week of busy day files costs a scan, not a parse.
 pub fn unknown_actions_in(dir: &Path, days: usize) -> UnknownActions {
     let mut tally = UnknownActions::default();
     for path in recent_day_files(dir, days) {
-        for record in day_file_records(&path) {
-            tally.observe(&record);
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        for wire in text.lines().filter_map(action_field) {
+            tally.observe_wire(&wire);
         }
     }
     tally
+}
+
+/// A line's top-level `action` string without parsing the record. darkmux
+/// writes `action` before `payload`, so the first `"action"` key is the
+/// record's own. A line whose action carries an escape, or whose key is
+/// followed by anything but a string, is parsed in full instead.
+pub fn action_field(line: &str) -> Option<std::borrow::Cow<'_, str>> {
+    const KEY: &str = "\"action\"";
+    let rest = &line[line.find(KEY)? + KEY.len()..];
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    let quick = rest.strip_prefix('"').and_then(|body| {
+        let end = body.find('"')?;
+        let wire = &body[..end];
+        (!wire.contains('\\')).then_some(wire)
+    });
+    match quick {
+        Some(wire) => Some(std::borrow::Cow::Borrowed(wire)),
+        None => {
+            let v: Value = serde_json::from_str(line).ok()?;
+            v.get("action")?.as_str().map(|s| std::borrow::Cow::Owned(s.to_string()))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -252,6 +299,21 @@ mod tests {
     }
 
     #[test]
+    fn action_field_reads_the_top_level_action_without_a_full_parse() {
+        let cases = [
+            (r#"{"ts":"t","action":"dispatch.start","payload":{"action":"x"}}"#, Some("dispatch.start")),
+            (r#"{"ts":"t", "action" : "future.thing"}"#, Some("future.thing")),
+            (r#"{"payload":{"delivered_action":"x"},"action":"hook.fired"}"#, Some("hook.fired")),
+            (r#"{"action":"we\"ird"}"#, Some("we\"ird")),
+            (r#"{"_type":"schema"}"#, None),
+            (r#"{"action":7}"#, None),
+        ];
+        for (line, want) in cases {
+            assert_eq!(action_field(line).as_deref(), want, "{line}");
+        }
+    }
+
+    #[test]
     fn unknown_actions_are_tallied_across_the_newest_day_files_only() {
         let tmp = tempfile::TempDir::new().unwrap();
         let write = |day: &str, actions: &[&str]| {
@@ -296,6 +358,18 @@ mod tests {
             assert!(!FlowAction::KNOWN_WIRE.contains(wire), "{wire} is current");
             assert!(crate::legacy::upgrade_action(wire).is_none(), "{wire} upgrades");
         }
+    }
+
+    /// A non-object payload on a `verdict: <v>` record is kept, not
+    /// overwritten; an existing `payload.verdict` is never replaced.
+    #[test]
+    fn moving_a_verdict_never_clobbers_the_payload() {
+        let mut v = json!({"action": "verdict: clean", "payload": "a string"});
+        upgrade(&mut v);
+        assert_eq!(v["payload"], json!({"legacy_payload": "a string", "verdict": "clean"}));
+        let mut v = json!({"action": "verdict: clean", "payload": {"verdict": "kept", "n": 1}});
+        upgrade(&mut v);
+        assert_eq!(v["payload"], json!({"verdict": "kept", "n": 1}));
     }
 
     #[test]

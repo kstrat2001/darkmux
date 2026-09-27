@@ -2214,21 +2214,25 @@ fn check_hooks() -> Vec<Check> {
     build_hooks_check(enabled, provenance, &rules, &outbox_dir)
 }
 
-/// The action a hook rule names when it names one no record can carry: a
-/// glob that matches none of the actions this darkmux writes. `None` for a
-/// rule whose glob matches at least one, and for the bare `*`.
-///
-/// When the configured string is a spelling 4.0 retired (`dispatch start`),
-/// the second element is the current one, so the warning can say what to
-/// write instead.
-fn unmatchable_action(configured: &str) -> Option<Option<darkmux_flow::FlowAction>> {
-    let matches_some = darkmux_flow::FlowAction::KNOWN_WIRE
-        .iter()
-        .any(|wire| darkmux_flow::hooks::action_glob_matches(configured, wire));
-    if matches_some {
-        return None;
+/// What a hook rule's `action` pattern needs said about it under 4.0: nothing
+/// (it is current), that it is an old spelling the hook layer reads as a
+/// current one (`darkmux_flow::hooks::effective_action_pattern`), or that it
+/// matches no action at all.
+fn action_pattern_flag(configured: &str) -> Option<String> {
+    use darkmux_flow::hooks::{action_pattern_can_match, dotted_twin, effective_action_pattern};
+    if !action_pattern_can_match(configured) {
+        let hint = dotted_twin(configured)
+            .map(|t| format!("; `{t}` matches the dotted actions, and more than the old spelling did"))
+            .unwrap_or_default();
+        return Some(format!(
+            "CANNOT MATCH — action=\"{configured}\" matches no action darkmux writes \
+             (actions are spelled `<scope>.<event>`){hint}"
+        ));
     }
-    Some(darkmux_flow::legacy::upgrade_action(configured))
+    let effective = effective_action_pattern(configured);
+    (effective != configured).then(|| {
+        format!("OLD SPELLING — action=\"{configured}\" is read as \"{effective}\"; write \"{effective}\" instead")
+    })
 }
 
 /// The literal `action=<value>` predicate from a `describe_match`
@@ -2507,18 +2511,12 @@ fn build_hooks_check(
                 rule_status = Status::Warn;
             }
         }
-        // (#4.0) A rule whose `action` glob matches no action darkmux writes
-        // can never deliver anything, however quiet it looks. The usual
-        // cause is a spelling 4.0 retired (`dispatch start` is now
-        // `dispatch.start`), so when the configured string is one, say what
-        // to write instead.
+        // (4.0) A rule whose `action` pattern matches no action darkmux
+        // writes can never deliver, however quiet it looks; one written in an
+        // old spelling still delivers, and says what to write instead.
         if let Some(configured) = action_from_match_desc(&s.match_desc) {
-            if let Some(current) = unmatchable_action(configured) {
-                let instead = current.map(|a| format!("; write \"{a}\" instead")).unwrap_or_default();
-                flags.push(format!(
-                    "CANNOT MATCH — action=\"{configured}\" matches no action darkmux writes \
-                     (actions are spelled `<scope>.<event>`){instead}"
-                ));
+            if let Some(flag) = action_pattern_flag(configured) {
+                flags.push(flag);
                 if rule_status == Status::Pass {
                     rule_status = Status::Warn;
                 }
@@ -8831,17 +8829,22 @@ mod tests {
         assert!(check.message.contains("future.thing (2), other.x (1)"), "{}", check.message);
     }
 
-    /// (#4.0) A rule written against a retired spelling can never deliver:
-    /// the warning names it and says what to write instead.
+    /// (4.0) A rule written against an old spelling still delivers (the
+    /// hook layer reads it as its current action) and warns with what to
+    /// write instead; a spaced glob whose dotted twin would widen it cannot
+    /// match, and says so.
     #[test]
     fn hooks_check_warns_on_a_rule_written_against_a_retired_spelling() {
         let tmp = tempfile::TempDir::new().unwrap();
         let checks = build_hooks_check(true, "config.json", &one_rule_matching("dispatch complete"), tmp.path());
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.status, Status::Warn, "{}", rule.message);
-        assert!(rule.message.contains("CANNOT MATCH"), "{}", rule.message);
-        assert!(rule.message.contains("\"dispatch complete\""), "names the configured spelling: {}", rule.message);
+        assert!(rule.message.contains("OLD SPELLING"), "{}", rule.message);
         assert!(rule.message.contains("write \"dispatch.complete\" instead"), "names the current one: {}", rule.message);
+        let checks = build_hooks_check(true, "config.json", &one_rule_matching("dispatch *"), tmp.path());
+        let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
+        assert!(rule.message.contains("CANNOT MATCH"), "{}", rule.message);
+        assert!(rule.message.contains("`dispatch.*` matches"), "{}", rule.message);
     }
 
     /// A glob that matches no action at all (a typo, an invented scope)

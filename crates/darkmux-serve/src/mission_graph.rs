@@ -1628,36 +1628,28 @@ mod tests {
         assert_eq!(out["example-judge-step"].turns, None);
     }
 
-    /// (#1877, final wiring step, schema leniency) `darkmux-crew::
-    /// scheduler::darkmux_flow::FlowAction::StepTiming` ("step timing") is a NEW action this
-    /// fold predates. An older/unaware consumer must ignore an action it
-    /// doesn't recognize entirely, never crash, and never fold it into a
-    /// wrongly-zeroed entry (a step with NO entry reads as "nothing folded
-    /// yet"; a step with `tokens: None` from a record this fold chose not
-    /// to read would be indistinguishable from that, but an entry with
-    /// SOME zeroed field would read as "measured as zero," a real lie).
-    /// `fold_step_finals` only folds `"dispatch complete"`/`"step
-    /// result"`, so a correlating "step timing" record, even one with a
-    /// real `wall_ms`, must produce no entry at all.
+    /// (#1877) `fold_step_finals` folds only `dispatch.complete` and
+    /// `step.result`. A `step.timing` record for the same step, even one
+    /// with a real `wall_ms`, must produce no entry at all: an entry with a
+    /// zeroed field would read as "measured as zero", which is false.
     #[test]
     fn fold_finals_ignores_the_step_timing_action_entirely() {
         let step_ids = ids(&["s1"]);
         let rec = serde_json::json!({
-            "action": "step timing",
+            "action": "step.timing",
             "mission_id": "m-this",
             "payload": { "step_id": "s1", "kind": "procedural.shell", "wall_ms": 42 }
         });
         let out = fold_step_finals(vec![rec], &step_ids, "m-this");
         assert!(
             out.is_empty(),
-            "an unrecognized action must be ignored entirely, not folded into a (wrongly \
-             zeroed) entry: {out:?}"
+            "a step.timing record must not be folded into a (wrongly zeroed) entry: {out:?}"
         );
     }
 
     /// Same leniency, but proving the two vocabularies coexist for the
-    /// SAME step without the new "step timing" record disturbing what the
-    /// pre-existing "step result" record already folds. The vocabulary
+    /// SAME step without the `step.timing` record disturbing what the
+    /// `step.result` record already folds. The vocabulary
     /// decision #1877's own issue asked to be made explicit rather than
     /// merged silently.
     #[test]

@@ -88,12 +88,57 @@ pub trait FlowSink: Send + Sync {
     /// that DO want to react to write failures — e.g., a fleet
     /// coordinator might want to fall back to a local-file sink on
     /// network failure).
-    fn write(&self, record: &FlowRecord) -> Result<()>;
+    ///
+    /// Implemented as `persist`, never called directly: callers write
+    /// through [`FlowSinkWrite::write`], the one place a record is checked,
+    /// and a [`CheckedRecord`] can be made nowhere else.
+    fn persist(&self, record: CheckedRecord<'_>) -> Result<()>;
 
     /// Introspection for diagnostics. Required so `darkmux flow status`
     /// and the doctor's `flow-sink-health` check can describe the active
     /// sink graph without per-sink-type knowledge.
     fn info(&self) -> SinkInfo;
+}
+
+/// A record that passed the write check: its action is one darkmux writes
+/// today, never [`FlowAction::Other`] (unknown) or [`FlowAction::Retired`].
+/// Its field is private, so the only way to hand one to a sink is
+/// [`FlowSinkWrite::write`], the one chokepoint every sink's write goes
+/// through.
+#[derive(Clone, Copy)]
+pub struct CheckedRecord<'a>(&'a FlowRecord);
+
+impl<'a> CheckedRecord<'a> {
+    fn check(record: &'a FlowRecord) -> Result<Self> {
+        match &record.action {
+            FlowAction::Other(unknown) => {
+                anyhow::bail!("refusing to write a flow record whose action `{}` is not one darkmux knows", unknown.as_str())
+            }
+            FlowAction::Retired(retired) => {
+                anyhow::bail!("refusing to write a flow record with the retired action `{}`", retired.as_str())
+            }
+            _ => Ok(Self(record)),
+        }
+    }
+
+    /// The record.
+    pub fn get(self) -> &'a FlowRecord {
+        self.0
+    }
+}
+
+/// How every record reaches a sink. Blanket-implemented for every
+/// [`FlowSink`] (and `dyn FlowSink`), so no sink can supply its own: an
+/// unknown or retired action is refused here, before any sink sees it.
+pub trait FlowSinkWrite {
+    /// Check `record`, then persist it.
+    fn write(&self, record: &FlowRecord) -> Result<()>;
+}
+
+impl<S: FlowSink + ?Sized> FlowSinkWrite for S {
+    fn write(&self, record: &FlowRecord) -> Result<()> {
+        self.persist(CheckedRecord::check(record)?)
+    }
 }
 
 /// File-based flow sink: appends to per-day JSONL files under
@@ -190,7 +235,8 @@ impl FlowSink for LocalFileSink {
     // serialization on Linux/macOS keep concurrent writers to a shared day-file
     // from tearing each other's lines — the best-effort, lock-free counterpart
     // to AuditFileSink's tear-proof `flock`.
-    fn write(&self, record: &FlowRecord) -> Result<()> {
+    fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
         let dir = local_sink_dir();
         let day = day_utc_now();
         let path = dir.join(format!("{day}.jsonl"));
@@ -323,7 +369,8 @@ impl Default for AuditFileSink {
 
 #[cfg(unix)]
 impl FlowSink for AuditFileSink {
-    fn write(&self, record: &FlowRecord) -> Result<()> {
+    fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
         let day = day_utc_now();
         let path = self.dir.join(format!("{day}.jsonl"));
         audit_record_at(record, &path)
@@ -1339,7 +1386,8 @@ impl RedisSink {
 }
 
 impl FlowSink for RedisSink {
-    fn write(&self, record: &FlowRecord) -> Result<()> {
+    fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
         // (#388) Once disabled, skip silently — no connection attempt
         // (so no 500ms timeout) and no log. Returning Ok keeps this
         // best-effort coordination sink from masking the durable
@@ -1502,7 +1550,8 @@ impl TeeSink {
 }
 
 impl FlowSink for TeeSink {
-    fn write(&self, record: &FlowRecord) -> Result<()> {
+    fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
         // Best-effort: record per-sink failures but always attempt every
         // sink. Return the first error (so callers can react if they
         // want); log the rest to stderr so the operator sees them.
@@ -1722,24 +1771,7 @@ pub(crate) fn default_sink_info() -> SinkInfo {
 /// production code path uses `record()` which dispatches through the
 /// process-wide default sink.
 pub fn record_via(sink: &dyn FlowSink, record: &FlowRecord) -> Result<()> {
-    refuse_unknown_action(record)?;
     sink.write(record)
-}
-
-/// An action this build does not know, or one darkmux retired, is readable
-/// (lenient on read) and never writable: writing one would pass it off as
-/// current vocabulary. Only a record READ from an archive can carry one, so
-/// this refuses the re-write.
-fn refuse_unknown_action(record: &FlowRecord) -> Result<()> {
-    match &record.action {
-        FlowAction::Other(unknown) => {
-            anyhow::bail!("refusing to write a flow record whose action `{}` is not one darkmux knows", unknown.as_str())
-        }
-        FlowAction::Retired(retired) => {
-            anyhow::bail!("refusing to write a flow record with the retired action `{}`", retired.as_str())
-        }
-        _ => Ok(()),
-    }
 }
 
 /// Append `record` to today's per-day JSONL file. Creates the file with a
@@ -1769,7 +1801,6 @@ pub fn record(record: FlowRecord) -> Result<()> {
 /// default sink + live env. The provenance auto-populate is identical to
 /// the pre-split `record()`.
 pub(crate) fn record_to(sink: &dyn FlowSink, record: FlowRecord) -> Result<()> {
-    refuse_unknown_action(&record)?;
     let mut rec = record;
     if rec.machine_id.is_none() {
         rec.machine_id = resolve_machine_id();
@@ -1992,7 +2023,7 @@ mod tests {
     fn an_unknown_action_is_refused_on_write_and_a_known_one_is_not() {
         struct Counting(std::sync::atomic::AtomicUsize);
         impl FlowSink for Counting {
-            fn write(&self, _record: &FlowRecord) -> Result<()> {
+            fn persist(&self, _record: crate::CheckedRecord<'_>) -> Result<()> {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
@@ -2002,11 +2033,11 @@ mod tests {
         }
         let sink = Counting(Default::default());
         let mut unknown = minimal_record();
-        unknown.action = serde_json::from_str("\"future.thing\"").unwrap();
+        unknown.action = crate::legacy::read_action("future.thing");
         assert!(record_via(&sink, &unknown).is_err());
         assert!(record_to(&sink, unknown).is_err());
         let mut retired = minimal_record();
-        retired.action = serde_json::from_str("\"telemetry.process\"").unwrap();
+        retired.action = crate::legacy::read_action("telemetry.process");
         assert!(matches!(retired.action, FlowAction::Retired(_)));
         assert!(record_via(&sink, &retired).is_err());
         assert!(record_to(&sink, retired).is_err());
@@ -2637,7 +2668,8 @@ mod tests {
         }
     }
     impl FlowSink for InMemorySink {
-        fn write(&self, record: &FlowRecord) -> Result<()> {
+        fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
             self.captured.lock().unwrap().push(record.clone());
             Ok(())
         }
@@ -2658,7 +2690,8 @@ mod tests {
             captured: std::sync::Mutex<Vec<FlowRecord>>,
         }
         impl FlowSink for KindedRecorder {
-            fn write(&self, r: &FlowRecord) -> Result<()> {
+            fn persist(&self, r: crate::CheckedRecord<'_>) -> Result<()> {
+        let r = r.get();
                 self.captured.lock().unwrap().push(r.clone());
                 Ok(())
             }
@@ -2668,7 +2701,7 @@ mod tests {
         }
         struct FailingAudit;
         impl FlowSink for FailingAudit {
-            fn write(&self, _r: &FlowRecord) -> Result<()> {
+            fn persist(&self, _r: crate::CheckedRecord<'_>) -> Result<()> {
                 Err(anyhow::anyhow!("audit dir unwritable (test)"))
             }
             fn info(&self) -> SinkInfo {
@@ -2832,7 +2865,7 @@ mod tests {
     /// shouldn't prevent the others from receiving the record.
     struct FailingSink;
     impl FlowSink for FailingSink {
-        fn write(&self, _record: &FlowRecord) -> Result<()> {
+        fn persist(&self, _record: crate::CheckedRecord<'_>) -> Result<()> {
             anyhow::bail!("simulated sink failure for test")
         }
         fn info(&self) -> SinkInfo {
