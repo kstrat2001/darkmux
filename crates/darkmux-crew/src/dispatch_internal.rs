@@ -7147,15 +7147,31 @@ fn enrich_envelope_with_summary(
 /// later reads from it. A refusal is warned on stderr and then treated as
 /// absent, which every caller already degrades on; absence stays silent.
 pub(crate) fn read_out_dir_text(out_dir: &Path, rel: &str) -> Option<String> {
+    read_out_dir_text_with(out_dir, rel, &stderr_warning_sink)
+}
+
+/// (#2869) Whether this is the first refusal of `path` in this process.
+/// The end-of-dispatch reads open the same `metrics.json` up to four times;
+/// the operator hears about a refused file once. Out-dirs are unique per
+/// dispatch, so keying on the full path is "once per file per dispatch".
+/// The set grows only by refused files, which a normal run has none of.
+fn first_refusal_of(path: &Path) -> bool {
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+        .lock()
+        .map(|mut seen| seen.insert(path.to_path_buf()))
+        .unwrap_or(true)
+}
+
+/// [`read_out_dir_text`] with the warning sink injected (tests capture it).
+pub(crate) fn read_out_dir_text_with(out_dir: &Path, rel: &str, sink: &dyn Fn(&str)) -> Option<String> {
     use crate::contained_file::{read_contained_to_string, DEFAULT_MAX_BYTES};
     match read_contained_to_string(out_dir, Path::new(rel), DEFAULT_MAX_BYTES) {
         Ok(body) => Some(body),
         Err(e) => {
-            if e.is_refused() {
-                stderr_warning_sink(&format!(
-                    "darkmux: {} not read — {e}",
-                    out_dir.join(rel).display()
-                ));
+            let path = out_dir.join(rel);
+            if e.is_refused() && first_refusal_of(&path) {
+                sink(&format!("darkmux: {} not read — {e}", path.display()));
             }
             None
         }
@@ -9475,14 +9491,38 @@ fn merge_record_context(payload: &mut serde_json::Value, record_context: &Option
     }
 }
 
+/// (#2869) Most bytes one tailer poll reads. A long trajectory streams
+/// across polls; a sparse or runaway one cannot make the host allocate its
+/// whole claimed size.
+const TAILER_MAX_POLL_BYTES: u64 = 8 * 1024 * 1024;
+
+/// (#2869) Longest trajectory line the tailer will carry across polls.
+/// Real events are bounded far below this; a line past it is dropped.
+const TAILER_MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
+
 /// any partial-line tail bytes carried across polls, and the last
 /// heartbeat instant for rate limiting.
+///
+/// (#2869) The trajectory file is model-writable, so its size is not a
+/// number the host may trust: one poll reads at most
+/// [`TAILER_MAX_POLL_BYTES`], and an unterminated line longer than
+/// [`TAILER_MAX_PENDING_BYTES`] is dropped (one warning) rather than
+/// buffered without bound.
 struct TailerState {
     trajectory_path: PathBuf,
     /// (#2869) Set once the tailer has warned that the trajectory file was
     /// refused (a symlink, a non-regular file, a swapped directory), so a
     /// 250ms poll loop warns once, not four times a second.
     trajectory_refusal_warned: bool,
+    /// (#2869) Most bytes one poll reads (`TAILER_MAX_POLL_BYTES`).
+    max_poll_bytes: u64,
+    /// (#2869) Largest unterminated line the tailer carries across polls
+    /// (`TAILER_MAX_PENDING_BYTES`).
+    max_pending_bytes: usize,
+    /// (#2869) Skipping the remainder of an oversize line until its newline.
+    discarding_line: bool,
+    /// (#2869) The oversize-line warning has been given (once per tailer).
+    pending_overflow_warned: bool,
     offset: u64,
     /// Trailing partial line carried from one poll to the next when the
     /// file ends mid-line (a write was in progress at our read).
@@ -9698,6 +9738,10 @@ impl TailerState {
             open_compaction: None,
             trajectory_path,
             trajectory_refusal_warned: false,
+            max_poll_bytes: TAILER_MAX_POLL_BYTES,
+            max_pending_bytes: TAILER_MAX_PENDING_BYTES,
+            discarding_line: false,
+            pending_overflow_warned: false,
             offset: 0,
             pending: Vec::new(),
             last_counted_turn_seq: None,
@@ -9926,6 +9970,10 @@ impl TailerState {
             open_compaction: None,
             trajectory_path,
             trajectory_refusal_warned: false,
+            max_poll_bytes: TAILER_MAX_POLL_BYTES,
+            max_pending_bytes: TAILER_MAX_PENDING_BYTES,
+            discarding_line: false,
+            pending_overflow_warned: false,
             offset: 0,
             pending: Vec::new(),
             last_counted_turn_seq: None,
@@ -9997,18 +10045,54 @@ impl TailerState {
         if file.seek(SeekFrom::Start(self.offset)).is_err() {
             return;
         }
-        let mut buf = Vec::with_capacity((size - self.offset) as usize);
-        if file.read_to_end(&mut buf).is_err() {
+        // (#2869) Bounded: never size a buffer from `fstat` (the model can
+        // make the file claim any size, e.g. a sparse petabyte, and a
+        // `with_capacity` of that aborts the host process). Read at most
+        // `max_poll_bytes` and advance by what was ACTUALLY read; the rest
+        // streams on later polls.
+        let budget = (size - self.offset).min(self.max_poll_bytes);
+        let mut buf = Vec::new();
+        if (&mut file).take(budget).read_to_end(&mut buf).is_err() {
             return;
         }
-        self.offset = size;
+        self.offset += buf.len() as u64;
+
+        // (#2869) A line being discarded (it outgrew the cap) is skipped up
+        // to and including its newline.
+        let mut bytes: &[u8] = &buf;
+        if self.discarding_line {
+            match bytes.iter().position(|&b| b == b'\n') {
+                Some(i) => {
+                    self.discarding_line = false;
+                    bytes = &bytes[i + 1..];
+                }
+                None => return,
+            }
+        }
 
         // Append raw bytes; decode happens per-line (after the
         // trailing newline arrives) so multi-byte UTF-8 chars that
         // straddle a poll boundary don't corrupt to U+FFFD (#329).
-        self.pending.extend_from_slice(&buf);
+        self.pending.extend_from_slice(bytes);
         for line in drain_complete_lines_from_bytes(&mut self.pending) {
             self.handle_event(&line);
+        }
+        // (#2869) What remains is one unterminated line. Past the cap it is
+        // dropped, not buffered without bound, and so is the rest of it.
+        if self.pending.len() > self.max_pending_bytes {
+            let dropped = self.pending.len();
+            self.pending = Vec::new();
+            self.discarding_line = true;
+            if !self.pending_overflow_warned {
+                self.pending_overflow_warned = true;
+                (self.warning_sink)(&format!(
+                    "darkmux: live trajectory {} has a line that exceeds the {}-byte cap \
+                     ({dropped} bytes so far with no newline); dropping it and any \
+                     further oversize lines",
+                    self.trajectory_path.display(),
+                    self.max_pending_bytes
+                ));
+            }
         }
     }
 

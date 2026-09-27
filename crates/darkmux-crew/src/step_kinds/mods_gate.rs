@@ -510,7 +510,22 @@ fn resolve_single_source_dir(tree_root: &Path) -> Result<PathBuf, String> {
     let entries = std::fs::read_dir(tree_root).map_err(|e| format!("reading {}: {e}", tree_root.display()))?;
     let mut dirs: Vec<PathBuf> = Vec::new();
     for entry in entries.flatten() {
-        if entry.path().is_dir() {
+        // (#2869) The entry's OWN type, not its target's: `Path::is_dir`
+        // follows a link, so `tree_root/src -> <host dir>` (plantable by a
+        // dispatch with a read-write workdir) used to resolve as the source
+        // checkout and get copied. A symlinked candidate is refused
+        // outright rather than skipped, so the refusal is loud.
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() {
+            if entry.path().is_dir() {
+                return Err(format!(
+                    "{} is a symlink to a directory; refusing to use a symlinked source checkout",
+                    entry.path().display()
+                ));
+            }
+            continue;
+        }
+        if ft.is_dir() {
             dirs.push(entry.path());
         }
     }
@@ -524,8 +539,8 @@ fn resolve_single_source_dir(tree_root: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// A plain recursive file copy (directories + regular files; symlinks are
-/// skipped rather than followed, to bound the walk) — deliberately NOT
+/// A plain recursive file copy (directories, regular files, and in-tree
+/// relative symlinks; nothing is ever followed) — deliberately NOT
 /// `git worktree add` (the reviewer's own alternative): a plain copy works
 /// whether or not the mirror is a real git checkout, and leaves the
 /// mirror's own `.git` (if any) untouched rather than sharing object
@@ -543,38 +558,37 @@ fn resolve_single_source_dir(tree_root: &Path) -> Result<PathBuf, String> {
 ///
 /// (#2869) The source checkout is the mission's workdir, which a dispatch
 /// may have mounted read-write, so every entry here could have been placed
-/// by a model. The type decision is therefore made on the OPEN descriptor,
-/// not the directory entry: each non-directory is opened no-follow and
-/// non-blocking (`contained_file::open_regular_nofollow`) and copied only
-/// if `fstat` says it is a regular file. A symlink, FIFO, socket or device
-/// is skipped, including one swapped in after `read_dir` listed a regular
-/// file. The copy keeps the source's permission bits (a test script's
-/// executable bit is load-bearing for `test_command`).
-fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
-    use crate::contained_file::{open_regular_nofollow, ContainedFileError};
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let dst_path = dst.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_dir_recursive(&entry.path(), &dst_path)?;
-            continue;
-        }
-        // Symlinks and other non-regular entries: skipped, not followed — a
-        // scratch copy used once for one gate run has no need of them, and
-        // following one could walk outside `src`.
-        let mut from = match open_regular_nofollow(&entry.path()) {
-            Ok(f) => f,
-            Err(ContainedFileError::Refused(_)) | Err(ContainedFileError::NotFound) => continue,
-            Err(ContainedFileError::Io(e)) => return Err(e),
-        };
-        let perms = from.metadata()?.permissions();
-        let mut to = std::fs::File::create(&dst_path)?;
-        std::io::copy(&mut from, &mut to)?;
-        to.set_permissions(perms)?;
+/// by a model. The copy is `contained_file::copy_tree_nofollow`: it walks
+/// by directory fd (no directory is ever re-opened by path), never follows
+/// a symlink, and copies only what `fstat` on the open fd calls a regular
+/// file, keeping permission bits (a test script's executable bit is
+/// load-bearing for `test_command`). Relative symlinks that stay inside the
+/// checkout are recreated, since real repos commit them and `test_command`
+/// should see them; absolute or escaping links, FIFOs, sockets and devices
+/// are skipped and named in one warning. On macOS the file bytes are a
+/// copy-on-write clone, which answers the cost note above.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<crate::contained_file::TreeCopyReport> {
+    let report = crate::contained_file::copy_tree_nofollow(src, dst)?;
+    if !report.skipped.is_empty() {
+        let listed: Vec<String> = report
+            .skipped
+            .iter()
+            .take(10)
+            .map(|(p, why)| format!("{} ({why})", p.display()))
+            .collect();
+        eprintln!(
+            "{}",
+            darkmux_types::style::warn(&format!(
+                "mods.gate: {} entr{} of {} not copied into the scratch checkout: {}{}",
+                report.skipped.len(),
+                if report.skipped.len() == 1 { "y" } else { "ies" },
+                src.display(),
+                listed.join("; "),
+                if report.skipped.len() > 10 { "; …" } else { "" }
+            ))
+        );
     }
-    Ok(())
+    Ok(report)
 }
 
 /// A content fingerprint of a directory tree — every regular file's
@@ -1371,5 +1385,128 @@ mod tests {
         let mode = std::fs::metadata(dst.join("run.sh")).unwrap().permissions().mode();
         assert_eq!(mode & 0o111, 0o111, "the executable bit was lost: {mode:o}");
         assert!(!dst.join("pipe").exists());
+    }
+
+    // ── (#2869 fix pass) directory-level symlinks and mid-walk swaps ──
+
+    /// A tree root whose single "source checkout" is a symlink to a host
+    /// directory. Resolved through the link, the gate would copy the host
+    /// directory into its scratch checkout and run `test_command` over it.
+    #[test]
+    fn resolve_single_source_dir_refuses_a_symlinked_source_dir() {
+        let tmp = TempDir::new().unwrap();
+        let tree_root = tmp.path().join("tree");
+        std::fs::create_dir_all(&tree_root).unwrap();
+        let host = tmp.path().join("host-dir");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("secret.txt"), "HOST").unwrap();
+        std::os::unix::fs::symlink(&host, tree_root.join("src")).unwrap();
+
+        let err = resolve_single_source_dir(&tree_root)
+            .expect_err("a symlinked source checkout must be refused, not resolved through");
+        assert!(err.contains("symlink"), "{err}");
+    }
+
+    #[test]
+    fn copy_dir_recursive_does_not_descend_a_symlinked_subdirectory() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let host = tmp.path().join("host-dir");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("secret.txt"), "HOST").unwrap();
+        std::os::unix::fs::symlink(&host, src.join("sub")).unwrap();
+        let dst = tmp.path().join("dst");
+
+        copy_dir_recursive(&src, &dst).unwrap();
+
+        assert!(!dst.join("sub/secret.txt").exists(), "the host directory was copied");
+        assert!(std::fs::symlink_metadata(dst.join("sub")).is_err(), "an absolute link is skipped");
+    }
+
+    /// `sub` is listed as a real directory, then swapped for a link to a
+    /// host directory before the walk descends into it.
+    #[test]
+    fn copy_dir_recursive_refuses_a_subdirectory_swapped_after_listing() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/f.txt"), "REAL").unwrap();
+        let host = tmp.path().join("host-dir");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("f.txt"), "HOST").unwrap();
+        let dst = tmp.path().join("dst");
+        let (src_c, host_c) = (src.clone(), host.clone());
+        crate::contained_file::set_after_list_hook(Some(Box::new(move |dir: &Path| {
+            if dir == src_c.as_path() {
+                std::fs::rename(src_c.join("sub"), src_c.join("sub.moved")).unwrap();
+                std::os::unix::fs::symlink(&host_c, src_c.join("sub")).unwrap();
+            }
+        })));
+        let r = copy_dir_recursive(&src, &dst);
+        crate::contained_file::set_after_list_hook(None);
+        r.unwrap();
+
+        let got = std::fs::read_to_string(dst.join("sub/f.txt")).unwrap_or_default();
+        assert_ne!(got, "HOST", "the walk followed a directory swapped in after listing");
+    }
+
+    /// `sub` is opened and listed, then (while its files are being copied)
+    /// renamed away and replaced with a link to a host directory holding a
+    /// file of the same name. A walk that re-opens `src/sub/f.txt` by path
+    /// reads the host file; one that holds `sub`'s fd reads the original.
+    #[test]
+    fn copy_dir_recursive_holds_the_parent_fd_when_it_is_swapped_mid_walk() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/f.txt"), "REAL").unwrap();
+        let host = tmp.path().join("host-dir");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("f.txt"), "HOST").unwrap();
+        let dst = tmp.path().join("dst");
+        let (src_c, host_c) = (src.clone(), host.clone());
+        crate::contained_file::set_after_list_hook(Some(Box::new(move |dir: &Path| {
+            if dir.ends_with("sub") {
+                std::fs::rename(src_c.join("sub"), src_c.join("sub.moved")).unwrap();
+                std::os::unix::fs::symlink(&host_c, src_c.join("sub")).unwrap();
+            }
+        })));
+        let r = copy_dir_recursive(&src, &dst);
+        crate::contained_file::set_after_list_hook(None);
+        r.unwrap();
+
+        let got = std::fs::read_to_string(dst.join("sub/f.txt")).unwrap_or_default();
+        assert_ne!(got, "HOST", "a parent was re-opened by path after it was swapped");
+        assert_eq!(got, "REAL");
+    }
+
+    /// Committed relative links that stay inside the checkout (`node_modules
+    /// /.bin/x -> ../x/bin.js`, a docs link) are recreated so `test_command`
+    /// sees them; absolute and escaping links are skipped.
+    #[test]
+    fn copy_dir_recursive_recreates_relative_in_tree_links_and_skips_escaping_ones() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("lib")).unwrap();
+        std::fs::create_dir_all(src.join("bin")).unwrap();
+        std::fs::write(src.join("lib/tool.sh"), "tool").unwrap();
+        std::os::unix::fs::symlink("../lib/tool.sh", src.join("bin/tool")).unwrap();
+        std::os::unix::fs::symlink("lib", src.join("lib-alias")).unwrap();
+        std::os::unix::fs::symlink("/etc/hosts", src.join("abs")).unwrap();
+        std::os::unix::fs::symlink("../../outside", src.join("bin/escape")).unwrap();
+        let dst = tmp.path().join("dst");
+
+        copy_dir_recursive(&src, &dst).unwrap();
+
+        assert_eq!(
+            std::fs::read_link(dst.join("bin/tool")).unwrap(),
+            Path::new("../lib/tool.sh"),
+            "an in-tree relative link must be recreated verbatim"
+        );
+        assert_eq!(std::fs::read_to_string(dst.join("bin/tool")).unwrap(), "tool");
+        assert_eq!(std::fs::read_link(dst.join("lib-alias")).unwrap(), Path::new("lib"));
+        assert!(std::fs::symlink_metadata(dst.join("abs")).is_err(), "absolute link recreated");
+        assert!(std::fs::symlink_metadata(dst.join("bin/escape")).is_err(), "escaping link recreated");
     }
 }
