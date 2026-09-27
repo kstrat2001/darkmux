@@ -890,6 +890,8 @@ mod tests {
         assert_eq!(reply.status, "refused");
         let reason = reply.reason.unwrap_or_default();
         assert!(reason.contains("`seroius`") && reason.contains("darkmux doctor"), "{reason}");
+        // (#2947 review C-e) The daemon reads config once at start.
+        assert!(reason.contains("restart `darkmux serve`"), "{reason}");
         assert!(h.busy.lock().unwrap().is_none(), "the busy slot was taken");
         assert!(h.ran.lock().unwrap().is_empty(), "the job ran");
     }
