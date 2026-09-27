@@ -4,9 +4,10 @@
 use serde::{Deserialize, Serialize};
 
 /// The usage block of a `model.completed` or `compaction.call` event, as the
-/// runtime wrote it from the endpoint's reply.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+/// runtime wrote it from the endpoint's reply. Read leniently per field: a
+/// count that is not a whole number reads as unreported and never costs the
+/// event its other counts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Usage {
     /// `None` when the block did not carry the count (the runtime always
     /// writes both; a null is read as unreported, never as zero).
@@ -20,6 +21,20 @@ pub struct Usage {
     pub reasoning_tokens: Option<u64>,
     /// Same contract as `reasoning_tokens`.
     pub cached_tokens: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for Usage {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        let count = |k: &str| v.get(k).and_then(serde_json::Value::as_u64);
+        Ok(Self {
+            prompt_tokens: count("prompt_tokens"),
+            completion_tokens: count("completion_tokens"),
+            total_tokens: count("total_tokens"),
+            reasoning_tokens: count("reasoning_tokens"),
+            cached_tokens: count("cached_tokens"),
+        })
+    }
 }
 
 impl Usage {

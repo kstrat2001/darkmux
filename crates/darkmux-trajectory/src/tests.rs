@@ -298,3 +298,28 @@ fn a_resumed_runs_whole_task_turns_come_from_its_seqs() {
     let fresh = CheckpointCounts::default();
     assert_eq!(fresh.cumulative_turns(&clean), 5);
 }
+
+/// One TEXT field of the wrong JSON type must not drop a whole known event:
+/// an older runtime's non-string `args` would otherwise lose the tool from
+/// every count. Such a field reads as absent (its default). A number or
+/// flag is what a count is built from, and `seq` identifies the turn, so a
+/// bad one of those still rejects the event (the partner case above:
+/// `runtime.rest` with `"ms":"a lot"`).
+#[test]
+fn a_mistyped_text_field_reads_as_absent_and_keeps_the_event() {
+    let f = fold(&[
+        r#"{"type":"tool.completed","seq":1,"tool_name":"bash","ok":false,"args":{"cmd":"ls"},"failure_reason":404}"#,
+        r#"{"type":"model.completed","seq":1,"finish_reason":5,"usage":{"prompt_tokens":"12","completion_tokens":3}}"#,
+        r#"{"type":"runtime.rest","seq":1,"ms":400,"state":7}"#,
+    ]);
+    assert_eq!((f.tool_calls(), f.tool_calls_failed()), (1, 1), "the tool still counts, and so does its failure");
+    assert_eq!(f.tools[0].args, "", "the unreadable args read as absent");
+    assert_eq!(f.turns(), 1);
+    assert_eq!((f.tokens.prompt, f.tokens.completion), (0, 3), "a count that is not a number reads as unreported, per field");
+    assert_eq!(f.rest_ms(), 400);
+    assert!(parse_line(r#"{"type":"model.completed","seq":"1"}"#).is_none(), "seq identifies the turn: a bad one rejects");
+    assert!(
+        parse_line(r#"{"type":"tool.completed","seq":1,"ok":"no","args":{}}"#).is_none(),
+        "`ok` feeds the failure count: a bad one rejects, text rescue or not"
+    );
+}

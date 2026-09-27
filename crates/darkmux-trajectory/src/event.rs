@@ -100,8 +100,12 @@ pub enum TrajectoryEvent {
 
 /// Parse one trajectory line. `None` for a blank line, a line that is not
 /// JSON (a run killed mid-write ends in a partial line), or a known event
-/// whose fields have the wrong JSON type. A line of the retired openclaw
-/// format is read by [`crate::legacy`], never as a current event.
+/// whose `type`, `seq` or a number or flag field has the wrong JSON type:
+/// every count is built from those, so a wrong one is skipped, not
+/// guessed. A TEXT or opaque field of the wrong type (an older runtime's
+/// non-string `args`, say) reads as absent instead of dropping the event
+/// and every count it feeds. A line of the retired openclaw format is read
+/// by [`crate::legacy`], never as a current event.
 pub fn parse_line(line: &str) -> Option<TrajectoryEvent> {
     let line = line.trim();
     if line.is_empty() {
@@ -112,7 +116,38 @@ pub fn parse_line(line: &str) -> Option<TrajectoryEvent> {
             return Some(TrajectoryEvent::Legacy(e));
         }
     }
-    serde_json::from_str(line).ok()
+    serde_json::from_str(line).ok().or_else(|| parse_tolerant(line))
+}
+
+/// The fields that identify an event: never dropped to rescue it.
+const IDENTIFYING_FIELDS: [&str; 2] = ["type", "seq"];
+
+/// The strict parse failed. Each field is judged on its own, beside the
+/// identifying fields (every event struct is flat and defaults whatever is
+/// absent): one that reads is kept; one that does not is dropped only when
+/// the event would accept text there, i.e. it is a text field. A mistyped
+/// number or flag leaves the event unreadable. Runs only on a line that
+/// already failed, so the ordinary path pays nothing for it.
+fn parse_tolerant(line: &str) -> Option<TrajectoryEvent> {
+    let serde_json::Value::Object(obj) = serde_json::from_str::<serde_json::Value>(line).ok()? else {
+        return None;
+    };
+    let identity: serde_json::Map<String, serde_json::Value> =
+        obj.iter().filter(|(k, _)| IDENTIFYING_FIELDS.contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
+    let reads = |k: &str, v: serde_json::Value| {
+        let mut probe = identity.clone();
+        probe.insert(k.to_string(), v);
+        serde_json::from_value::<TrajectoryEvent>(serde_json::Value::Object(probe)).is_ok()
+    };
+    let mut kept = identity.clone();
+    for (k, v) in obj.iter().filter(|(k, _)| !IDENTIFYING_FIELDS.contains(&k.as_str())) {
+        if reads(k, v.clone()) {
+            kept.insert(k.clone(), v.clone());
+        } else if !reads(k, serde_json::Value::String(String::new())) {
+            return None;
+        }
+    }
+    serde_json::from_value(serde_json::Value::Object(kept)).ok()
 }
 
 /// `dispatch.start`: the first event.
