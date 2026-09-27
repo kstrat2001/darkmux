@@ -350,23 +350,62 @@ export function toolOutcome(f: Record<string, unknown>): RecordObject["outcome"]
   return undefined;
 }
 
+/** A `dispatch.tool` record's `args` as an object, or `null` when they are
+ *  not a JSON object (absent, or cut short by the per-call cap). */
+function parseToolArgs(f: Record<string, unknown>): Record<string, unknown> | null {
+  if (typeof f.args !== "string") return null;
+  try {
+    let parsed: unknown = JSON.parse(f.args);
+    // Some tools' arguments arrive double-encoded, a JSON string of JSON
+    // (measured on `edit`): one parse yields a string, so parse again.
+    if (typeof parsed === "string") parsed = JSON.parse(parsed);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** (#2963) The file a completed tool call named, from its `dispatch.tool`
+ *  record's own fields: the call's `path` argument (parsed, or read out of
+ *  arguments the per-call cap cut short), else, for `write`, the path its
+ *  result names. The container prefix and a leading `./` are dropped and
+ *  bidi and zero-width characters are escaped (`cleanToolPath`): the event
+ *  log row's reading (`recordObject`), plus the `./`, so the
+ *  run page's readout and the log never name different files. `null` when
+ *  the call named none. */
+export function toolCallPath(f: Record<string, unknown>): string | null {
+  const args = parseToolArgs(f);
+  let path: string | null = null;
+  if (args) {
+    if (typeof args.path === "string") path = args.path;
+  } else if (typeof f.args === "string") {
+    const raw = fieldFromRaw(f.args, ["path"]);
+    if (raw) path = raw.value;
+  }
+  if (!path && f.tool_name === "write" && typeof f.result === "string") path = pathFromResult(f.result);
+  return path ? cleanToolPath(path) : null;
+}
+
+/** (#2963) A tool call's path as the viewer shows it: the container prefix
+ *  and any leading `./` dropped, bidi and zero-width characters escaped
+ *  (`escapeBidiControls`); `null` when nothing is left. Shared
+ *  by `toolCallPath` and the turn record's `tool_paths` list, so the two
+ *  compare equal for the same file. */
+export function cleanToolPath(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  // (#2963 review, CONSIDER 4) A leading `./` names the same file as none:
+  // a listed `./src/a.ts` and a write result's `/workspace/src/a.ts` must
+  // compare equal.
+  const clean = raw.replace(CONTAINER_ROOT, "").replace(/^(?:\.\/)+/, "");
+  return clean ? escapeBidiControls(clean) : null;
+}
+
 export function recordObject(r: FlowRecord): RecordObject {
   const f = (r.fields || r.payload) as Record<string, unknown> | undefined;
   const a = r.action || "";
 
   if (a === "dispatch.tool" && f) {
-    let args: Record<string, unknown> | null = null;
-    if (typeof f.args === "string") {
-      try {
-        let parsed: unknown = JSON.parse(f.args);
-        // Some tools' arguments arrive double-encoded, a JSON string of JSON
-        // (measured on `edit`): one parse yields a string, so parse again.
-        if (typeof parsed === "string") parsed = JSON.parse(parsed);
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) args = parsed as Record<string, unknown>;
-      } catch {
-        args = null;
-      }
-    }
+    const args = parseToolArgs(f);
     let text = "";
     let mono = false;
     if (args && typeof args.command === "string") {

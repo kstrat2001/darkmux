@@ -11633,6 +11633,144 @@
         }
     }
 
+    /// (#2963) `dispatch.turn` forwards the runtime's per-call `path`s as
+    /// `tool_paths`, aligned by index with the turn's calls, `null` for a
+    /// call without one; the key is absent when no call has a path. A path
+    /// over the field bound is `null`, never clipped (a clipped path names a
+    /// different file).
+    #[test]
+    fn turn_tool_paths_aligns_with_the_calls_and_is_absent_when_none_has_one() {
+        let ev = serde_json::json!({ "calls_planned": true, "tool_calls": [
+            { "id": "a", "name": "read", "arguments_chars": 40, "path": "/workspace/src/a.rs" },
+            { "id": "b", "name": "bash", "arguments_chars": 12 },
+            { "id": "c", "name": "write", "arguments_chars": 90, "path": "src/b.rs" },
+            { "id": "d", "name": "read", "arguments_chars": 90, "path": 7 },
+            { "id": "e", "name": "read", "arguments_chars": 90, "path": "x".repeat(MAX_TRAJ_FIELD_BYTES + 1) },
+        ]});
+        assert_eq!(
+            turn_tool_paths(&ev),
+            Some(serde_json::json!(["/workspace/src/a.rs", null, "src/b.rs", null, null]))
+        );
+        let none = serde_json::json!({ "calls_planned": true, "tool_calls": [{ "id": "b", "name": "bash", "arguments_chars": 12 }] });
+        assert_eq!(turn_tool_paths(&none), None);
+        assert_eq!(turn_tool_paths(&serde_json::json!({ "calls_planned": true, "tool_calls": [] })), None);
+        assert_eq!(turn_tool_paths(&serde_json::json!({ "calls_planned": true, "tool_calls": null })), None);
+        assert_eq!(turn_tool_paths(&serde_json::json!({})), None);
+    }
+
+    /// (#2963) `dispatch.turn` forwards each call's tool name as
+    /// `tool_names`, aligned by index with `tool_paths`; unlike the paths
+    /// the key is present whenever the turn made any calls. A name that is
+    /// not a string is `null`; an over-bound name is `null`, never clipped.
+    #[test]
+    fn turn_tool_names_aligns_with_the_calls_and_is_present_whenever_there_are_calls() {
+        let ev = serde_json::json!({ "calls_planned": true, "tool_calls": [
+            { "id": "a", "name": "write", "arguments_chars": 40, "path": "src/a.rs" },
+            { "id": "b", "name": "read", "arguments_chars": 12, "path": "src/b.rs" },
+            { "id": "c", "name": 7, "arguments_chars": 1 },
+            { "id": "d", "name": "x".repeat(MAX_TRAJ_FIELD_BYTES + 1), "arguments_chars": 1 },
+        ]});
+        // (#2963 review, CONSIDER 2) A name that is not a known runtime tool
+        // never rides the flow stream, so `7` and the over-long name are
+        // `null`; so would a model-invented one be.
+        assert_eq!(turn_tool_names(&ev), Some(serde_json::json!(["write", "read", null, null])));
+        let invented = serde_json::json!({ "calls_planned": true, "tool_calls": [{ "id": "a", "name": "rm_rf_everything", "arguments_chars": 2 }] });
+        assert_eq!(turn_tool_names(&invented), Some(serde_json::json!([null])));
+        let bash = serde_json::json!({ "calls_planned": true, "tool_calls": [{ "id": "b", "name": "bash", "arguments_chars": 12 }] });
+        assert_eq!(turn_tool_names(&bash), Some(serde_json::json!(["bash"])));
+        assert_eq!(turn_tool_names(&serde_json::json!({ "calls_planned": true, "tool_calls": [] })), None);
+        assert_eq!(turn_tool_names(&serde_json::json!({ "calls_planned": true, "tool_calls": null })), None);
+        assert_eq!(turn_tool_names(&serde_json::json!({})), None);
+    }
+
+    /// (#2963 review) Fail closed on runtime version skew: a record that does
+    /// not say its calls were planned (a runtime older than the `runs`
+    /// marks) gets no lists, rather than reading as "every call runs". The
+    /// key names are pinned as literals here and in the runtime's own test.
+    #[test]
+    fn turn_lists_need_the_runtime_to_say_its_calls_were_planned() {
+        assert_eq!(CALLS_PLANNED_KEY, "calls_planned");
+        assert_eq!(RUNS_KEY, "runs");
+        let unplanned = serde_json::json!({ "tool_calls": [
+            { "id": "a", "name": "read", "arguments_chars": 12, "path": "src/y.rs" },
+        ]});
+        assert_eq!(turn_tool_names(&unplanned), None);
+        assert_eq!(turn_tool_paths(&unplanned), None);
+        let mut planned = unplanned.clone();
+        planned["calls_planned"] = serde_json::json!(true);
+        assert_eq!(turn_tool_names(&planned), Some(serde_json::json!(["read"])));
+        assert_eq!(turn_tool_paths(&planned), Some(serde_json::json!(["src/y.rs"])));
+    }
+
+    /// (#2963 review, MUST FIX 1) Only the calls that RUN are in the lists.
+    /// The runtime marks a call it will not dispatch (ungranted, not a tool,
+    /// cut off mid-arguments) `runs: false` on its `model.completed` entry;
+    /// the lists skip it, so index k is the k-th call that runs, in order.
+    /// `tool_names` is present (possibly empty) whenever the turn made any
+    /// calls, so its length is the number that will complete.
+    #[test]
+    fn turn_lists_hold_only_the_calls_that_run() {
+        let ev = serde_json::json!({ "calls_planned": true, "tool_calls": [
+            { "id": "a", "name": "write", "arguments_chars": 40, "path": "src/x.rs", "runs": false },
+            { "id": "b", "name": "read", "arguments_chars": 12, "path": "src/y.rs" },
+            { "id": "c", "name": "frobnicate", "arguments_chars": 2, "runs": false },
+            { "id": "d", "name": "edit", "arguments_chars": 30, "path": "src/z.rs", "runs": true },
+        ]});
+        assert_eq!(turn_tool_names(&ev), Some(serde_json::json!(["read", "edit"])));
+        assert_eq!(turn_tool_paths(&ev), Some(serde_json::json!(["src/y.rs", "src/z.rs"])));
+        let none_run = serde_json::json!({ "calls_planned": true, "tool_calls": [
+            { "id": "a", "name": "write", "arguments_chars": 40, "path": "src/x.rs", "runs": false },
+        ]});
+        assert_eq!(turn_tool_names(&none_run), Some(serde_json::json!([])), "no call runs: an empty list, not a missing one");
+        assert_eq!(turn_tool_paths(&none_run), None);
+    }
+
+    /// (#2963) End to end through the tailer: the turn record carries the
+    /// list, and a turn whose calls name no path carries no key.
+    #[test]
+    #[serial]
+    fn handle_event_turn_record_carries_tool_paths() {
+        let tmp = TempDir::new().unwrap();
+        // SAFETY: serialized via `#[serial]`; no concurrent env reader.
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            "sess-paths".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        state.handle_event(
+            r#"{"type":"model.completed","seq":1,"finish_reason":"tool_calls","calls_planned":true,"tool_calls":[{"id":"a","name":"read","arguments_chars":40,"path":"src/a.rs"},{"id":"b","name":"bash","arguments_chars":9}]}"#,
+        );
+        state.handle_event(
+            r#"{"type":"model.completed","seq":2,"finish_reason":"tool_calls","calls_planned":true,"tool_calls":[{"id":"c","name":"bash","arguments_chars":9}]}"#,
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+        let records = drain_flow_records_for_session(tmp.path(), "sess-paths");
+        let turns: Vec<_> = records.iter().filter(|v| v["action"] == "dispatch.turn").collect();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0]["payload"]["tool_paths"], serde_json::json!(["src/a.rs", null]));
+        assert_eq!(turns[0]["payload"]["tool_names"], serde_json::json!(["read", "bash"]));
+        assert_eq!(turns[0]["payload"]["tool_calls_count"], 2);
+        assert!(turns[1]["payload"].get("tool_paths").is_none(), "no key when no call names a path: {:?}", turns[1]);
+        // The names ride whenever the turn made calls, paths or not.
+        assert_eq!(turns[1]["payload"]["tool_names"], serde_json::json!(["bash"]));
+    }
+
     /// (#1483) A dispatch that is NOT a graph step (`step_id` unset — the
     /// one-off `darkmux dispatch` path) emits the SAME records WITHOUT a
     /// `step_id` payload key, so the field is purely additive and those records

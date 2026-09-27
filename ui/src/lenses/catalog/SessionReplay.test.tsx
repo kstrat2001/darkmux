@@ -1390,14 +1390,31 @@ describe("SessionReplay MODEL section (#2890)", () => {
     expect(system).not.toContain("THERMAL REST");
   });
 
-  it("a live run in TOOLS hands the scope the tool for its icon, and no number", async () => {
-    // One of the turn's two calls has completed: still TOOLS, named by it.
+  it("a live run in TOOLS hands the scope the RUNNING call's tool for its icon, and no number (#2963)", async () => {
+    // The turn's first call (read) has completed; its second (edit) runs.
+    // The turn record names both (`tool_names`, FLOW 1.64.0).
+    const t0 = Date.parse(at(5)) + 500;
+    vi.useFakeTimers();
+    vi.setSystemTime(t0);
+    try {
+      const recs = finishedRun()
+        .filter((r) => Date.parse(r.ts) <= t0)
+        .map((r) => (r.action === "dispatch.turn" ? ({ ...r, payload: { ...(r as unknown as { payload: object }).payload, tool_names: ["read", "edit"] } } as unknown as typeof r) : r));
+      await renderRun(recs);
+      expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolName: "edit", centerLabel: null });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("with no tool_names, the completed call's tool is never the icon while the next runs (#2963)", async () => {
     const t0 = Date.parse(at(5)) + 500;
     vi.useFakeTimers();
     vi.setSystemTime(t0);
     try {
       await renderRun(finishedRun().filter((r) => Date.parse(r.ts) <= t0));
-      expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolName: "read", centerLabel: null });
+      expect(latestTokenScopeProps()).toMatchObject({ state: "tools", centerLabel: null });
+      expect(latestTokenScopeProps().toolName).toBeUndefined();
     } finally {
       vi.useRealTimers();
     }
@@ -1486,6 +1503,21 @@ describe("modelScopeHero (#2890)", () => {
     expect(lamps.container.querySelector(".scope-lamps")?.getAttribute("aria-label")).toBe("run state: rest 12s · thermal · serious");
     const none = base as unknown as NonNullable<Parameters<typeof modelScopeHero>[0]["liveTokScope"]>;
     expect(modelScopeHero({ liveTokScope: none, finishedTokRate: null })?.note).toBeNull();
+  });
+
+  // (#2963) The file a read/write/edit call named goes in the readout slot.
+  it("(#2963) tools with a file: the readout line names the action and the file", () => {
+    const base = { tokensPerSec: 0, state: "tools", stalled: false, carried: false, noSignal: false };
+    const live = (x: object) => ({ ...base, ...x }) as unknown as NonNullable<Parameters<typeof modelScopeHero>[0]["liveTokScope"]>;
+    const h = modelScopeHero({ liveTokScope: live({ toolName: "write", toolPath: "src/lib/tokenRate.ts" }), finishedTokRate: null });
+    expect(h).toMatchObject({ state: "tools", toolName: "write", note: "write · src/lib/tokenRate.ts", noteTool: { action: "write", path: "src/lib/tokenRate.ts" } });
+    // Another tool, or no file: no line, as before.
+    expect(modelScopeHero({ liveTokScope: live({ toolName: "bash", toolPath: "src/a.ts" }), finishedTokRate: null })?.note).toBeNull();
+    // The running call's file unknown: the action word alone, never an
+    // earlier call's file.
+    expect(modelScopeHero({ liveTokScope: live({ toolName: "write" }), finishedTokRate: null })).toMatchObject({ note: "write", noteTool: { action: "write" } });
+    // TOOL GEN keeps its own words.
+    expect(modelScopeHero({ liveTokScope: live({ toolName: "write", toolPath: "src/a.ts", writing: true, writingSeconds: 4 }), finishedTokRate: null })?.note).toBe("tool gen · write · 4s");
   });
 
   it("finished: the scope is driven by the average, so its wave matches the number", () => {
@@ -1621,10 +1653,52 @@ describe("(#2926) run page: THINK opener and TOOL GEN, from the real run", () =>
     expect(document.querySelector(".modelbox__note")?.textContent).toBe("tool gen · write · 25s");
   });
 
-  it("no readout line while darkmux runs the tool (no generation to report)", async () => {
-    // Turn 1 asked for five reads; four have completed by 10:51:08.5.
-    await renderAt(pepperRecords(), pepperAt("10:51:08.500"));
+  // (#2963) A completed read/write/edit call's file, in the same slot: the
+  // action, then the file, trimmed from the LEFT (CSS) so the name stays.
+  // Turn 1 asked for five reads; four have completed by 10:51:08.5, so the
+  // fifth is running. Each read gets the path argument a real record
+  // carries; `withPaths` also puts the turn's list on its turn record.
+  const readsWithFiles = (withPaths: boolean) => {
+    let n = 0;
+    const files = (k: number) => `/workspace/src/deep/tree/file${k}.js`;
+    return pepperRecords().map((r) => {
+      const p = (r as unknown as { payload: Record<string, unknown> }).payload;
+      if (withPaths && r.action === "dispatch.turn" && p.turn_seq === 1) {
+        return { ...r, payload: { ...p, tool_names: ["read", "read", "read", "read", "read"], tool_paths: [1, 2, 3, 4, 5].map(files) } } as unknown as typeof r;
+      }
+      if (r.action !== "dispatch.tool" || p.tool_name !== "read") return r;
+      n += 1;
+      return { ...r, payload: { ...p, args: JSON.stringify({ path: files(n), offset: 1, limit: 200 }) } } as unknown as typeof r;
+    });
+  };
+
+  // (#2963) The RUNNING call's file, from the turn's own list, in the same
+  // slot: the action, then the file, trimmed from the LEFT (CSS).
+  it("(#2963) while darkmux runs the turn's fifth read: its own file on the readout line", async () => {
+    await renderAt(readsWithFiles(true), pepperAt("10:51:08.500"));
     expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolName: "read", toolWriting: false });
+    const note = document.querySelector(".modelbox__note");
+    expect(note?.textContent).toBe("read · src/deep/tree/file5.js");
+    // The file sits in its own left-trimming box; the whole line is the hover.
+    expect(note?.querySelector(".modelbox__note-path")?.textContent).toBe("src/deep/tree/file5.js");
+    expect(note?.getAttribute("title")).toBe("read · src/deep/tree/file5.js");
+    // The lamp keeps its one word; the file is the readout's alone.
+    expect(lit()?.querySelector(".scope-lamp__label")?.textContent).toBe("tools");
+  });
+
+  it("(#2963) a record set with no lists (an older host): the neutral TOOLS state, never the fourth read's word or file", async () => {
+    await renderAt(readsWithFiles(false), pepperAt("10:51:08.500"));
+    expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolWriting: false });
+    expect(latestTokenScopeProps().toolName).toBeUndefined();
+    expect(document.querySelector(".modelbox__note")).toBeNull();
+  });
+
+  it("while darkmux runs the turn's tools with no lists: no readout line, the neutral icon (#2963)", async () => {
+    // Turn 1 asked for five reads; four have completed by 10:51:08.5. The
+    // records carry no `tool_names`, so nothing says the fifth is a read.
+    await renderAt(pepperRecords(), pepperAt("10:51:08.500"));
+    expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolWriting: false });
+    expect(latestTokenScopeProps().toolName).toBeUndefined();
     expect(document.querySelector(".modelbox__note")).toBeNull();
   });
 });

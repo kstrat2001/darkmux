@@ -52,6 +52,37 @@ pub const WRITING_TOOL_CALL_PHASE: &str = "writing_tool_call";
 /// exceeds it, and a truncated head is enough to recall what was attempted.
 const MAX_TOOL_ARGS_CHARS: usize = 512;
 
+/// (#2963) Bound on a `tool_calls[]` entry's `path`, in bytes: the host's
+/// `MAX_TRAJ_FIELD_BYTES` for a short flow field. A longer path is left out
+/// rather than clipped, since a clipped path names a different file.
+const MAX_TOOL_PATH_BYTES: usize = 4 * 1024;
+
+/// (#2963) The `model.completed` keys the host reads to build
+/// `dispatch.turn`'s `tool_names` / `tool_paths`, spelled once here and
+/// pinned as literals by a test on each side: `runs` (`false` on a call
+/// that will not run) and `calls_planned` (`true` on a record whose calls
+/// carry those marks; the host lists a turn's calls only when it is there).
+pub const RUNS_KEY: &str = "runs";
+pub const CALLS_PLANNED_KEY: &str = "calls_planned";
+
+/// (#2963) The `path` argument of one tool call, for a tool that takes one
+/// (`Tool::takes_path`). `None` for any other tool or an unknown name, when
+/// the arguments are not a JSON object, when `path` is missing, empty, or
+/// not a string, and when it is longer than `MAX_TOOL_PATH_BYTES`. Reads
+/// that one key; no other argument leaves this function.
+fn tool_call_path(name: &str, arguments: &str) -> Option<String> {
+    let tool = crate::tools::Tool::from_name(name)?;
+    if !tool.takes_path() {
+        return None;
+    }
+    let args: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let path = args.as_object()?.get("path")?.as_str()?;
+    if path.is_empty() || path.len() > MAX_TOOL_PATH_BYTES {
+        return None;
+    }
+    Some(path.to_string())
+}
+
 /// Truncate to at most `max` chars on a char boundary, appending an ellipsis
 /// marker when truncation happened. Never splits a multi-byte char.
 fn cap_chars(s: &str, max: usize) -> String {
@@ -245,18 +276,32 @@ impl Trajectory {
         finish_reason: &str,
         usage: Option<&Usage>,
         tool_calls: Option<&[ToolCall]>,
+        // (#2963) Aligned with `tool_calls`: whether each call will run
+        // (`loop_runner::plan_tool_calls`). A call that will not is marked
+        // `runs: false`; one that will carries no key. `None`: unknown, no
+        // marks (a caller with no plan).
+        runs: Option<&[bool]>,
         reported_model: Option<&str>,
     ) {
         let usage_json = usage_event_json(usage);
         let tool_calls_json = tool_calls.map(|calls| {
             calls
                 .iter()
-                .map(|c| {
-                    serde_json::json!({
+                .enumerate()
+                .map(|(i, c)| {
+                    let mut entry = serde_json::json!({
                         "id": c.id,
                         "name": c.function.name,
                         "arguments_chars": c.function.arguments.len(),
-                    })
+                    });
+                    // (#2963) The path argument only, never the content.
+                    if let Some(path) = tool_call_path(&c.function.name, &c.function.arguments) {
+                        entry["path"] = serde_json::json!(path);
+                    }
+                    if runs.and_then(|r| r.get(i)) == Some(&false) {
+                        entry[RUNS_KEY] = serde_json::json!(false);
+                    }
+                    entry
                 })
                 .collect::<Vec<_>>()
         });
@@ -273,6 +318,10 @@ impl Trajectory {
         // ABSENT when the server named none; never copied from the request.
         if let Some(m) = reported_model {
             event["reported_model"] = serde_json::json!(m);
+        }
+        // (#2963) The calls carry their `runs` marks: the host lists them.
+        if runs.is_some() {
+            event[CALLS_PLANNED_KEY] = serde_json::json!(true);
         }
         self.write_event(&event);
     }
@@ -1564,7 +1613,7 @@ mod tests {
         let ws = tempfile::Builder::new().prefix("traj-test-2").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
         t.append_dispatch_start("test-model", 100, 50, &["read", "search"]);
-        t.append_model_completed(1, "stop", None, None, None);
+        t.append_model_completed(1, "stop", None, None, None, None);
         drop(t);
 
         let traj_file = ws
@@ -1581,6 +1630,86 @@ mod tests {
             assert!(parsed["type"].is_string());
             assert!(parsed["ts"].is_number());
         }
+    }
+
+    /// (#2963) Each `tool_calls[]` entry of `model.completed` carries the
+    /// call's `path` argument, and only that: for a tool that takes a path,
+    /// when the arguments parse and name one within the bound. The host
+    /// forwards the list as `dispatch.turn`'s `tool_paths`, so the viewer can
+    /// name the file of the call running NOW. Never any other argument (the
+    /// write's content must not appear anywhere in the event).
+    #[test]
+    fn model_completed_tool_calls_carry_the_path_argument_only() {
+        use crate::lmstudio::FunctionCall;
+        let call = |id: &str, name: &str, args: &str| ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: FunctionCall { name: name.into(), arguments: args.into() },
+            extra_content: None,
+        };
+        let long = format!("src/{}.rs", "d/".repeat(MAX_TOOL_PATH_BYTES));
+        let calls = vec![
+            call("c1", "read", r#"{"path":"/workspace/src/a.rs","offset":1,"limit":20}"#),
+            call("c2", "bash", r#"{"command":"cat /workspace/src/a.rs","path":"src/a.rs"}"#),
+            call("c3", "write", r#"{"path":"src/b.rs","content":"SECRET-CONTENT"}"#),
+            call("c4", "edit", r#"{"path":"src/c.rs","edits":[{"old_string":"x""#),
+            call("c5", "search", r#"{"pattern":"p","path":"src"}"#),
+            call("c6", "write", r#"{"path":"","content":"x"}"#),
+            call("c7", "edit", r#"{"path":7,"edits":[]}"#),
+            call("c8", "read", &serde_json::json!({ "path": long, "offset": 1, "limit": 1 }).to_string()),
+            call("c9", "not_a_tool", r#"{"path":"src/z.rs"}"#),
+        ];
+        let ws = tempfile::Builder::new().prefix("traj-paths").tempdir().unwrap();
+        let mut t = Trajectory::open(ws.path());
+        t.append_model_completed(1, "tool_calls", None, Some(&calls), None, None);
+        drop(t);
+
+        let body = fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
+        assert!(!body.contains("SECRET-CONTENT"), "no argument but the path is recorded: {body}");
+        let ev: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        // (#2963) The host forwards each entry's `name` as `tool_names`.
+        let names: Vec<&str> = ev["tool_calls"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["read", "bash", "write", "edit", "search", "write", "edit", "read", "not_a_tool"]);
+        let paths: Vec<Option<&str>> = ev["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.get("path").map(|p| p.as_str().expect("a path is a string")))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![Some("/workspace/src/a.rs"), None, Some("src/b.rs"), None, Some("src"), None, None, None, None],
+            "read/write/edit/search name their path; bash, unparsable args, an empty or \
+             non-string path, an over-bound path, and an unknown tool name none"
+        );
+    }
+
+    /// (#2963 review) A record whose calls were planned says so at the turn
+    /// level, and the host lists a turn's calls only when it does: a runtime
+    /// older than the `runs` marks would otherwise read as "every call runs",
+    /// the bug the marks exist to fix. The two key names are pinned as
+    /// literals here and on the host side, so a rename on one side fails.
+    #[test]
+    fn model_completed_says_its_calls_were_planned() {
+        assert_eq!(CALLS_PLANNED_KEY, "calls_planned");
+        assert_eq!(RUNS_KEY, "runs");
+        use crate::lmstudio::FunctionCall;
+        let calls = vec![ToolCall {
+            id: "c1".into(),
+            kind: "function".into(),
+            function: FunctionCall { name: "read".into(), arguments: r#"{"path":"a"}"#.into() },
+            extra_content: None,
+        }];
+        let ws = tempfile::Builder::new().prefix("traj-planned").tempdir().unwrap();
+        let mut t = Trajectory::open(ws.path());
+        t.append_model_completed(1, "tool_calls", None, Some(&calls), Some(&[false]), None);
+        t.append_model_completed(2, "tool_calls", None, Some(&calls), None, None);
+        drop(t);
+        let body = fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
+        let lines: Vec<serde_json::Value> = body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines[0]["calls_planned"], true, "planned: {}", lines[0]);
+        assert_eq!(lines[0]["tool_calls"][0]["runs"], false);
+        assert!(lines[1].get("calls_planned").is_none(), "no plan, no marker: {}", lines[1]);
     }
 
     /// (#1444 review) Pins `append_model_completed`'s reasoning/cached
@@ -1604,12 +1733,12 @@ mod tests {
             }),
             prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: Some(20) }),
         };
-        t.append_model_completed(1, "stop", Some(&usage), None, None);
+        t.append_model_completed(1, "stop", Some(&usage), None, None, None);
 
         // A second turn whose provider reported NO details object at all —
         // both keys must be JSON `null`, never a fabricated `0`.
         let bare = Usage { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12, ..Default::default() };
-        t.append_model_completed(2, "stop", Some(&bare), None, None);
+        t.append_model_completed(2, "stop", Some(&bare), None, None, None);
         drop(t);
 
         let body =
@@ -1951,8 +2080,8 @@ mod tests {
     fn model_completed_carries_the_reported_model_only_when_known() {
         let ws = tempfile::Builder::new().prefix("traj-reported").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
-        t.append_model_completed(1, "stop", None, None, Some("served-a"));
-        t.append_model_completed(2, "stop", None, None, None);
+        t.append_model_completed(1, "stop", None, None, None, Some("served-a"));
+        t.append_model_completed(2, "stop", None, None, None, None);
         drop(t);
         let body =
             fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();

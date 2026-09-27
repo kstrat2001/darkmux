@@ -3,10 +3,11 @@ import type { ToolIconKind } from "../lib/scopeMorph";
 
 /**
  * (#2890) The glowing line icon the scope's TOOLS center shows for the tool
- * being run: read = eye, edit = pencil, write = page with a plus, bash =
+ * being run: read = eye, edit = pencil, write = a plain file, bash =
  * terminal prompt, search = magnifier, anything else = gear; and, while the
  * model is still generating the call, a wrench (`toolgen`). Shapes are the
- * operator-approved prototype's (`scope-states-prototype.html`) verbatim.
+ * operator-approved prototype's (`scope-states-prototype.html`) verbatim, write's
+ * from the Scope State Lab (#2963).
  * Same stroke-only glyph convention as `ActivityIcon.tsx`.
  *
  * No tool NAME is ever printed; the icon is the whole message. Tests assert
@@ -32,11 +33,14 @@ const GLYPH: Record<ScopeIconKind, ReactNode> = {
       <path d="M13.5 6.5l4 4" />
     </>
   ),
+  // (#2963, operator 2026-09-27) A plain file: the page outline and its
+  // folded corner, no mark. `write` replaces the whole file, so the old "+"
+  // read as "adds lines only"; the readout line under the lamps carries the
+  // detail ("write · src/lib/tokenRate.ts").
   write: (
     <>
       <path d="M6 3h8l4 4v14H6z" />
       <path d="M14 3v4h4" />
-      <path d="M12 11v6M9 14h6" />
     </>
   ),
   bash: (

@@ -6096,6 +6096,32 @@ body {
   color: var(--dim);
   font-variant-numeric: tabular-nums;
 }
+/* (#2963) darkmux running a read/write/edit: the action, then the file
+   ("write · src/lib/tokenRate.ts"). The file's box trims from the LEFT: the
+   box runs right-to-left, so its overflow and ellipsis fall at the start of
+   the path, and the <bdi> keeps the path itself left-to-right. A long path
+   loses its leading folders and keeps its file name. Same line box as every
+   other readout (the spans inherit its font and line-height), so the line is
+   one line tall whatever the path. */
+.session-run .modelbox__note--tool {
+  display: flex;
+  justify-content: center;
+}
+.session-run .modelbox__note-act {
+  flex: none;
+  white-space: pre;
+}
+.session-run .modelbox__note-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+}
+.session-run .modelbox__note-path > bdi {
+  direction: ltr;
+  unicode-bidi: isolate;
+}
 .session-run .metrics.modelbox__figs {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   grid-auto-rows: 1fr;

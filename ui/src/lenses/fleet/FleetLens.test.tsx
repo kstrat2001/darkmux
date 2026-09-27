@@ -2225,12 +2225,13 @@ describe("savings hero: nothing leaks while loading (#2830)", () => {
 describe("FleetLens card scope: the tool icon (#2890)", () => {
   const D0 = Date.UTC(2026, 8, 24, 1, 0, 0);
   const at = (sec: number) => new Date(D0 + sec * 1000).toISOString();
-  it("hands the card's scope the running execution's tool while it is in TOOLS", async () => {
+  it("hands the card's scope the running call's tool while it is in TOOLS (#2963)", async () => {
+    // search has completed; the turn's second call, read, runs.
     const records: FlowRecord[] = [
       { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "darkmux/coder" },
       { ts: at(1), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 1_000, generated_chars: 0 } },
       { ts: at(3), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 3_000, generated_chars: 800 } },
-      { ts: at(4), machine_uid: "u1", session_id: "s1", action: "dispatch.turn", payload: { turn_seq: 1, tool_calls_count: 2 } },
+      { ts: at(4), machine_uid: "u1", session_id: "s1", action: "dispatch.turn", payload: { turn_seq: 1, tool_calls_count: 2, tool_names: ["search", "read"] } },
       { ts: at(5), machine_uid: "u1", session_id: "s1", action: "dispatch.tool", payload: { tool_name: "search" } },
     ] as FlowRecord[];
     render(
@@ -2239,7 +2240,7 @@ describe("FleetLens card scope: the tool icon (#2890)", () => {
       </QueryClientProvider>,
     );
     await waitFor(() => expect(document.querySelector('[data-testid="fleet-token-scope"]')).not.toBeNull());
-    expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolName: "search", size: "card" });
+    expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolName: "read", size: "card" });
   });
 });
 

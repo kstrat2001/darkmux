@@ -22,6 +22,7 @@ import {
   liveStateLabel,
   liveStateWhileConnected,
   lastHeartbeatMs,
+  toolReadout,
 } from "./tokenRate";
 
 const SID = "darkmux-coder-1790125784225";
@@ -450,8 +451,9 @@ describe("deriveLiveState", () => {
   it("is tools while a dispatch.tool is the latest thing and no heartbeat has followed it", () => {
     const toolAt = 1_000 + STALL_AFTER_MS + 200;
     const recs = [beat(0, 10), beat(1_000, 200), turnEnd(toolAt, 1), tool(toolAt)];
-    // (#2890) The completed tool's name rides along for the TOOLS icon.
-    expect(deriveLiveState(recs, toolAt + 2_000)).toEqual({ state: "tools", toolName: "bash" });
+    // (#2963) The completed call is not the one running (if any is), and
+    // with no `tool_names` nothing says what is: the neutral TOOLS state.
+    expect(deriveLiveState(recs, toolAt + 2_000)).toEqual({ state: "tools" });
   });
 
   // (Found via screenshot verification against the real corpus — a
@@ -473,7 +475,7 @@ describe("deriveLiveState", () => {
       beat(beatAtMs, 5_623),
       { ts: toolTs, action: "dispatch.tool", session_id: SID, payload: { tool_name: "edit" } } as unknown as FlowRecord,
     ];
-    expect(deriveLiveState(recs, beatAtMs + STALL_AFTER_MS + 1_000)).toEqual({ state: "tools", toolName: "edit" });
+    expect(deriveLiveState(recs, beatAtMs + STALL_AFTER_MS + 1_000)).toEqual({ state: "tools" });
   });
 
   it("is rest with a countdown while inside a reported rest's ms window, then falls to prompt once it elapses", () => {
@@ -488,7 +490,7 @@ describe("deriveLiveState", () => {
 
   it("ignores the announce-only rest record (no ms) — a pacing nudge, not a rest", () => {
     const recs = [tool(0), restAnnounceOnly(1_000)];
-    expect(deriveLiveState(recs, 2_000)).toEqual({ state: "tools", toolName: "bash" });
+    expect(deriveLiveState(recs, 2_000)).toEqual({ state: "tools" });
   });
 
   it("is stalled once a heartbeat has gone stale with nothing after it to explain the gap", () => {
@@ -498,14 +500,14 @@ describe("deriveLiveState", () => {
 
   it("prefers a marker newer than the last stale heartbeat over calling it stalled", () => {
     const recs = [beat(0, 10), beat(1_000, 200), tool(1_000 + STALL_AFTER_MS + 500)];
-    expect(deriveLiveState(recs, 1_000 + STALL_AFTER_MS + 600)).toEqual({ state: "tools", toolName: "bash" });
+    expect(deriveLiveState(recs, 1_000 + STALL_AFTER_MS + 600)).toEqual({ state: "tools" });
   });
 
   it("ignores records after the given clock — never reads the future", () => {
     // The rest record technically exists in the array, but its ts is after
     // `nowMs`; the state must read as if it had not happened yet.
     const recs = [tool(0), rest(5_000, 15_000)];
-    expect(deriveLiveState(recs, 1_000)).toEqual({ state: "tools", toolName: "bash" });
+    expect(deriveLiveState(recs, 1_000)).toEqual({ state: "tools" });
   });
 
   it("mutation self-check: without the rest branch this would read prompt/tools instead", () => {
@@ -854,6 +856,20 @@ describe("tools vs reading prompt, from the tool COMPLETION records", () => {
   // processing read as TOOLS.
   const turn = (atMs: number, seq: number, calls: number): FlowRecord =>
     ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn", session_id: SID, payload: { turn_seq: seq, tool_calls_count: calls } }) as unknown as FlowRecord;
+  // (#2963) A 1.64.0 turn record: each call's name and path, the paths key
+  // left out when no call has one (as the host writes it).
+  const turnWithCalls = (atMs: number, seq: number, calls: [string, string | null][]): FlowRecord =>
+    ({
+      ts: new Date(atMs).toISOString(),
+      action: "dispatch.turn",
+      session_id: SID,
+      payload: {
+        turn_seq: seq,
+        tool_calls_count: calls.length,
+        tool_names: calls.map(([n]) => n),
+        ...(calls.some(([, p]) => p !== null) ? { tool_paths: calls.map(([, p]) => p) } : {}),
+      },
+    }) as unknown as FlowRecord;
 
   it("is TOOLS between the turn end and the last of its tool completions", () => {
     const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 2), tool(5_000)];
@@ -864,15 +880,16 @@ describe("tools vs reading prompt, from the tool COMPLETION records", () => {
     const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 2), tool(5_000), tool(6_000)];
     expect(deriveLiveState(recs, 7_000).state).toBe("prompt");
   });
-  // (#2890) The TOOLS center shows an icon for the tool. The runtime emits
-  // `dispatch.tool` on COMPLETION, so the name the viewer has is the latest
-  // completed call of THIS turn; a previous turn's tool must never leak in.
+  // (#2890) The TOOLS center shows an icon for the tool. (#2963) It is the
+  // RUNNING call's tool: `tool_names[k]` from the turn record. Without that
+  // list, a completed call's name is never shown (it is not the one
+  // running), and a previous turn's tool must never leak in.
   const namedTool = (atMs: number, name: string): FlowRecord =>
     ({ ts: new Date(atMs).toISOString(), action: "dispatch.tool", session_id: SID, payload: { tool_name: name } }) as unknown as FlowRecord;
 
-  it("names the latest completed tool of this turn while TOOLS", () => {
+  it("(#2963) with no tool_names, a completed call's name is never the running call's", () => {
     const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 3), namedTool(5_000, "read"), namedTool(6_000, "edit")];
-    expect(deriveLiveState(recs, 7_000)).toEqual({ state: "tools", toolName: "edit" });
+    expect(deriveLiveState(recs, 7_000)).toEqual({ state: "tools" });
   });
 
   it("names no tool before this turn's first completion", () => {
@@ -895,14 +912,177 @@ describe("tools vs reading prompt, from the tool COMPLETION records", () => {
   });
 
   it("ignores a tool completion from after the clock (playback cut)", () => {
-    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 3), namedTool(5_000, "read"), namedTool(9_000, "edit")];
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnWithCalls(4_000, 1, [["read", null], ["edit", null], ["edit", null]]), namedTool(5_000, "read"), namedTool(9_000, "edit")];
+    expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "edit" });
+  });
+
+  // (#2963) The run page's readout and the TOOLS icon name the call RUNNING
+  // NOW. `dispatch.turn` carries `tool_names` and `tool_paths` (FLOW
+  // 1.64.0), one entry per call of the turn in the model's order; while the
+  // turn's k-th call runs (k = calls completed so far in this turn) the
+  // tool is `tool_names[k]` and the file `tool_paths[k]`. A completed call's
+  // own name or file never stands in for a later call's.
+  const pathTool = (atMs: number, name: string, path: string): FlowRecord =>
+    ({ ts: new Date(atMs).toISOString(), action: "dispatch.tool", session_id: SID, payload: { tool_name: name, args: JSON.stringify({ path, content: "x" }) } }) as unknown as FlowRecord;
+  const writingBeat = (atMs: number, name: string): FlowRecord =>
+    ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: 900, turn_seq: 2, phase: "writing_tool_call", tool_name: name } }) as unknown as FlowRecord;
+  const turnPathsOnly = (atMs: number, seq: number, paths: (string | null)[]): FlowRecord =>
+    ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn", session_id: SID, payload: { turn_seq: seq, tool_calls_count: paths.length, tool_paths: paths } }) as unknown as FlowRecord;
+
+  it("(#2963) a turn that writes a.ts then reads b.ts: `read · b.ts` while b.ts is read", () => {
+    const base = [start(0), beat(1_000, 0), beat(3_000, 800), turnWithCalls(4_000, 1, [["write", "/workspace/src/a.ts"], ["read", "/workspace/src/b.ts"]])];
+    expect(deriveLiveState(base, 4_500)).toEqual({ state: "tools", toolName: "write", toolPath: "src/a.ts" });
+    const after = [...base, pathTool(5_000, "write", "/workspace/src/a.ts")];
+    expect(deriveLiveState(after, 5_500)).toEqual({ state: "tools", toolName: "read", toolPath: "src/b.ts" });
+  });
+
+  // (#2963 review, MUST FIX 1) The lists hold only the calls that RUN: a
+  // call the runtime refused (ungranted, not a tool, cut off) is not in
+  // them, while `tool_calls_count` still counts it. The list's length is
+  // how many will complete.
+  const turnRunning = (atMs: number, seq: number, count: number, calls: [string, string | null][]): FlowRecord =>
+    ({
+      ts: new Date(atMs).toISOString(),
+      action: "dispatch.turn",
+      session_id: SID,
+      payload: { turn_seq: seq, tool_calls_count: count, tool_names: calls.map(([n]) => n), tool_paths: calls.map(([, p]) => p) },
+    }) as unknown as FlowRecord;
+
+  it("(#2963) after an ungranted call, the readout shows the running `read · y.rs`", () => {
+    // The model asked for [write x.rs (ungranted), read y.rs]; only the read runs.
+    const base = [start(0), beat(1_000, 0), beat(3_000, 800), turnRunning(4_000, 1, 2, [["read", "/workspace/src/y.rs"]])];
+    expect(deriveLiveState(base, 4_500)).toEqual({ state: "tools", toolName: "read", toolPath: "src/y.rs" });
+  });
+
+  it("(#2963) once every call that runs has completed, it is PROMPT, whatever the raw count says", () => {
+    // [read a, write b (ungranted)]: the read completes and nothing else will.
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnRunning(4_000, 1, 2, [["read", "src/a.ts"]]), pathTool(5_000, "read", "src/a.ts")];
+    expect(deriveLiveState(recs, 6_000).state).toBe("prompt");
+  });
+
+  it("(#2963) a turn none of whose calls run is PROMPT at once", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnRunning(4_000, 1, 1, [])];
+    expect(deriveLiveState(recs, 4_500).state).toBe("prompt");
+  });
+
+  it("(#2963 review, CONSIDER 4) a stray `path` on a tool that takes none does not put the lists out of step", () => {
+    const bash = { ts: new Date(5_000).toISOString(), action: "dispatch.tool", session_id: SID, payload: { tool_name: "bash", args: JSON.stringify({ command: "ls", path: "elsewhere" }) } } as unknown as FlowRecord;
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnRunning(4_000, 1, 2, [["bash", null], ["read", "src/b.ts"]]), bash];
+    expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "read", toolPath: "src/b.ts" });
+  });
+
+  it("(#2963 review, CONSIDER 4) a write whose path was cut off matches the listed path through its result, `./` or not", () => {
+    // The capped args lost the path; the viewer falls back to the result's
+    // resolved path, which must equal the listed `./src/a.ts`.
+    const args = JSON.stringify({ content: "x".repeat(600), path: "./src/a.ts" }).slice(0, 512);
+    const write = { ts: new Date(5_000).toISOString(), action: "dispatch.tool", session_id: SID, payload: { tool_name: "write", args, result: "Wrote 600 bytes to /workspace/src/a.ts" } } as unknown as FlowRecord;
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnRunning(4_000, 1, 2, [["write", "./src/a.ts"], ["read", "./src/b.ts"]]), write];
+    expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "read", toolPath: "src/b.ts" });
+  });
+
+  it("(#2963 review, CONSIDER 5) with no lists, the written tool's name goes once its call completes", () => {
+    // An older record: no count and no lists. The heartbeat named the call
+    // being written; once a completion arrives, that call is done, and the
+    // record set says nothing about what (if anything) runs next.
+    const recs = [start(0), beat(1_000, 0), writingBeat(2_000, "write"), turnEnd(3_000, 1), namedTool(4_000, "write")];
+    expect(deriveLiveState(recs, 4_500)).toEqual({ state: "tools" });
+  });
+
+  it("(#2963) never shows a previous call's word or file while a later call runs (no lists)", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 2), pathTool(5_000, "read", "/workspace/src/a.ts")];
+    expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools" });
+  });
+
+  it("(#2963) names with no paths (calls that take none) still name the running call", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnWithCalls(4_000, 1, [["bash", null], ["read", null]]), namedTool(5_000, "bash")];
     expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "read" });
   });
 
+  it("(#2963) paths with no names (a partial record): the file, with no word", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnPathsOnly(4_000, 1, ["src/a.ts", "src/b.ts"]), pathTool(5_000, "read", "src/a.ts")];
+    expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolPath: "src/b.ts" });
+  });
+
+  it("(#2963) the running call's tool and file advance with each completion", () => {
+    const base = [start(0), beat(1_000, 0), beat(3_000, 800), turnWithCalls(4_000, 1, [["read", "/workspace/src/a.ts"], ["edit", "/workspace/src/b.ts"], ["write", "src/c.ts"]])];
+    const one = [...base, pathTool(5_000, "read", "/workspace/src/a.ts")];
+    expect(deriveLiveState(one, 5_500)).toEqual({ state: "tools", toolName: "edit", toolPath: "src/b.ts" });
+    const two = [...one, pathTool(6_000, "edit", "/workspace/src/b.ts")];
+    expect(deriveLiveState(two, 6_500)).toEqual({ state: "tools", toolName: "write", toolPath: "src/c.ts" });
+  });
+
+  it("(#2963) a call with no path in the list has no file, and keeps its word", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnWithCalls(4_000, 1, [["read", "src/a.ts"], ["write", null]]), pathTool(5_000, "read", "src/a.ts")];
+    expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "write" });
+  });
+
+  it("(#2963) a completion whose FILE disagrees with the list stops both lists for the rest of the turn", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnWithCalls(4_000, 1, [["read", "src/a.ts"], ["read", "src/b.ts"], ["read", "src/c.ts"]]), pathTool(5_000, "read", "src/b.ts")];
+    expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools" });
+    const later = [...recs, pathTool(6_000, "read", "src/b.ts")];
+    expect(deriveLiveState(later, 6_500)).toEqual({ state: "tools" });
+  });
+
+  it("(#2963) a completion whose NAME disagrees with the list stops both lists for the rest of the turn", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnWithCalls(4_000, 1, [["write", null], ["read", "src/b.ts"]]), namedTool(5_000, "bash")];
+    expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools" });
+  });
+
+  it("(#2963) a turn out of step does not stop the next turn's lists", () => {
+    const recs = [
+      start(0), beat(1_000, 0), beat(3_000, 800),
+      turnWithCalls(4_000, 1, [["read", "src/a.ts"]]), pathTool(5_000, "read", "src/other.ts"),
+      beat(6_000, 0), beat(8_000, 900),
+      turnWithCalls(9_000, 2, [["read", "src/next.ts"], ["edit", "src/last.ts"]]), pathTool(10_000, "read", "src/next.ts"),
+    ];
+    expect(deriveLiveState(recs, 11_000)).toEqual({ state: "tools", toolName: "edit", toolPath: "src/last.ts" });
+  });
+
+  it("(#2963) a paths list shorter than the names: no file past its end", () => {
+    const short = { ts: new Date(4_000).toISOString(), action: "dispatch.turn", session_id: SID, payload: { turn_seq: 1, tool_calls_count: 3, tool_paths: ["src/a.ts"], tool_names: ["read", "read", "read"] } } as unknown as FlowRecord;
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), short, pathTool(5_000, "read", "src/a.ts")];
+    expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "read" });
+  });
+
+  it("(#2963) never carries the previous turn's lists into this one", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnWithCalls(4_000, 1, [["read", "src/a.ts"]]), pathTool(5_000, "read", "src/a.ts"), beat(6_000, 0), beat(8_000, 900), turn(9_000, 2, 2)];
+    expect(deriveLiveState(recs, 10_000)).toEqual({ state: "tools" });
+  });
+
+  it("(#2963) no lists, one call: the writing heartbeat's name is that call's", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 1), pathTool(5_000, "read", "src/a.ts"), beat(6_000, 0), writingBeat(8_000, "write"), turn(9_000, 2, 1)];
+    expect(deriveLiveState(recs, 10_000)).toEqual({ state: "tools", toolName: "write" });
+  });
+
+  it("(#2963) no lists, several calls: the writing heartbeat names the LAST call written, not the first to run", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), writingBeat(3_500, "read"), turn(4_000, 1, 2)];
+    expect(deriveLiveState(recs, 4_500)).toEqual({ state: "tools" });
+  });
+
+  it("(#2963) the list wins over the writing heartbeat, even for a turn of one call", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), writingBeat(3_500, "read"), turnWithCalls(4_000, 1, [["write", "src/new.ts"]])];
+    expect(deriveLiveState(recs, 4_500)).toEqual({ state: "tools", toolName: "write", toolPath: "src/new.ts" });
+  });
+
+  it("(#2963) the list wins over the writing heartbeat", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), writingBeat(3_500, "read"), turnWithCalls(4_000, 1, [["write", "src/new.ts"], ["read", "src/r.ts"]])];
+    expect(deriveLiveState(recs, 4_500)).toEqual({ state: "tools", toolName: "write", toolPath: "src/new.ts" });
+  });
+
+  it("(#2963) escapes control characters in a listed path", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnWithCalls(4_000, 1, [["write", "src/a\u202Eb.ts"]])];
+    expect(deriveLiveState(recs, 5_000)).toEqual({ state: "tools", toolName: "write", toolPath: "src/a⟨U+202E⟩b.ts" });
+  });
+
+  it("(#2963) a completion after the playback cut does not advance the index", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnWithCalls(4_000, 1, [["read", "src/a.ts"], ["edit", "src/b.ts"]]), pathTool(9_000, "read", "src/a.ts")];
+    expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "read", toolPath: "src/a.ts" });
+  });
+
   it("carries the name through executionTokenReading and aggregateLiveState", () => {
-    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 3), namedTool(5_000, "search")];
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnWithCalls(4_000, 1, [["read", null], ["search", "src"], ["bash", null]]), namedTool(5_000, "read")];
     expect(executionTokenReading(recs, 6_000).toolName).toBe("search");
-    expect(aggregateLiveState([recs], 6_000)).toEqual({ state: "tools", toolName: "search" });
+    expect(aggregateLiveState([recs], 6_000)).toEqual({ state: "tools", toolName: "search", toolPath: "src" });
   });
 });
 
@@ -1403,5 +1583,28 @@ describe("(#2915) compacting", () => {
     const r = executionTokenReading([...before, compactStart(at, 600)], at + 4_000);
     expect(r).toMatchObject({ state: "prompt", compacting: true, compactingSeconds: 4 });
     expect(r.promptLabel).toBeUndefined();
+  });
+});
+
+// (#2963) The run page's readout line for a tool that takes a file: the
+// action and the file ("write · src/lib/tokenRate.ts"), for read, write and
+// edit only. Anything else, or no file, has no line.
+describe("toolReadout (#2963)", () => {
+  it("names the action and the running call's file for read, write and edit", () => {
+    expect(toolReadout({ state: "tools", toolName: "write", toolPath: "src/lib/tokenRate.ts" })).toEqual({ action: "write", path: "src/lib/tokenRate.ts" });
+    expect(toolReadout({ state: "tools", toolName: "read", toolPath: "README.md" })).toEqual({ action: "read", path: "README.md" });
+    expect(toolReadout({ state: "tools", toolName: "edit", toolPath: "a/b.rs" })).toEqual({ action: "edit", path: "a/b.rs" });
+  });
+
+  it("the action word alone when the running call's file is unknown", () => {
+    expect(toolReadout({ state: "tools", toolName: "write" })).toEqual({ action: "write" });
+  });
+
+  it("has no line for another tool, no tool name, or while the call is generated", () => {
+    expect(toolReadout({ state: "tools", toolName: "search", toolPath: "src" })).toBeNull();
+    expect(toolReadout({ state: "tools", toolName: "bash", toolPath: "src/a.ts" })).toBeNull();
+    expect(toolReadout({ state: "tools", toolPath: "src/a.ts" })).toBeNull();
+    expect(toolReadout({ state: "tools", toolName: "write", toolPath: "src/a.ts", writing: true, writingSeconds: 3 })).toBeNull();
+    expect(toolReadout({ state: "prompt", toolName: "write", toolPath: "src/a.ts" })).toBeNull();
   });
 });
