@@ -154,10 +154,9 @@ impl WorkloadProvider for PromptProvider {
             turns: 1,
             compactions: 0,
             // (#2094) A single-turn provider never rests (nothing to rest
-            // BETWEEN); not read from metrics.json here.
+            // BETWEEN).
             rest_ms: 0,
             tokens_before: vec![],
-            summary_chars: vec![],
             mode: None,
             // (#2494) This provider already had the outcome in hand and was
             // only formatting it into a note string; the note stays (it is

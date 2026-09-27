@@ -641,7 +641,7 @@
         // printing an envelope — the bench genuinely has no way to know how
         // many, which is the whole point of the next assertion.
         let meta = vec![
-            EnvelopeMeta { model: Some("m-x".into()), total_tokens: Some(300), infra_exit: false },
+            EnvelopeMeta { model: Some("m-x".into()), total_tokens: Some(300), infra_exit: false, runtime_error: false },
             envelope_meta_with_exit("", 1),
         ];
         let artifact = ArtifactKey { model: "m-x".into(), ..Default::default() };
@@ -714,7 +714,7 @@
             EnvelopeMeta {
                 model: Some("m-x".into()),
                 total_tokens: Some(500),
-                infra_exit: false,
+                infra_exit: false, runtime_error: false,
             },
             EnvelopeMeta::default(),
         ];
@@ -775,9 +775,9 @@
         ];
         let _ = (&pass, &degen);
         let meta = vec![
-            EnvelopeMeta { model: Some("m-x".into()), total_tokens: Some(500), infra_exit: false }, // ran + passed
-            EnvelopeMeta { model: Some("m-x".into()), total_tokens: Some(0), infra_exit: false },   // 429: zero served
-            EnvelopeMeta { model: Some("m-x".into()), total_tokens: Some(200), infra_exit: false }, // ran, unparseable
+            EnvelopeMeta { model: Some("m-x".into()), total_tokens: Some(500), infra_exit: false, runtime_error: false }, // ran + passed
+            EnvelopeMeta { model: Some("m-x".into()), total_tokens: Some(0), infra_exit: false, runtime_error: false },   // 429: zero served
+            EnvelopeMeta { model: Some("m-x".into()), total_tokens: Some(200), infra_exit: false, runtime_error: false }, // ran, unparseable
         ];
         let artifact = ArtifactKey { model: "m-x".into(), ..Default::default() };
         let rows = build_score_rows(&scored, &meta, &artifact);
@@ -827,9 +827,9 @@
             (&c3, CaseScore { degenerate: true, ..Default::default() }), // ran, unparseable
         ];
         let meta = vec![
-            EnvelopeMeta { model: None, total_tokens: Some(500), infra_exit: false },
-            EnvelopeMeta { model: None, total_tokens: Some(0), infra_exit: false },
-            EnvelopeMeta { model: None, total_tokens: Some(120), infra_exit: false },
+            EnvelopeMeta { model: None, total_tokens: Some(500), infra_exit: false, runtime_error: false },
+            EnvelopeMeta { model: None, total_tokens: Some(0), infra_exit: false, runtime_error: false },
+            EnvelopeMeta { model: None, total_tokens: Some(120), infra_exit: false, runtime_error: false },
         ];
         let (capability, infra) = infra_partition(&scored, &meta);
         assert_eq!(infra, 1, "exactly the zero-token case");

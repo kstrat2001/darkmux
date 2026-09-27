@@ -1374,8 +1374,8 @@ pub(crate) fn unix_ms() -> u64 {
 /// `Usage::reasoning_tokens`), so nothing derives one from the other.
 fn usage_of(u: &Usage) -> dt::Usage {
     dt::Usage {
-        prompt_tokens: u64::from(u.prompt_tokens),
-        completion_tokens: u64::from(u.completion_tokens),
+        prompt_tokens: Some(u64::from(u.prompt_tokens)),
+        completion_tokens: Some(u64::from(u.completion_tokens)),
         total_tokens: Some(u64::from(u.total_tokens)),
         reasoning_tokens: u.reasoning_tokens().map(u64::from),
         cached_tokens: u.cached_tokens().map(u64::from),

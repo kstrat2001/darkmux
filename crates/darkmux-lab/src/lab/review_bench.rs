@@ -510,7 +510,7 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
             meta.push(EnvelopeMeta {
                 model: debate.prosecutor.model.clone(),
                 total_tokens: total,
-                infra_exit: false,
+                infra_exit: false, runtime_error: false,
             });
             debates.push(debate);
             review

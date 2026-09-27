@@ -35,7 +35,7 @@ use crate::workloads::types::{
 use darkmux_types::Profile;
 use anyhow::{anyhow, ensure, Context, Result};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -473,80 +473,25 @@ struct TrajStats {
     completion_tokens: u64,
 }
 
+/// A trial's stats, from the fold of its trajectory: the one reading
+/// `lab run stats` and the live tailer use, so a bench's turn and token
+/// counts are the same numbers every other surface quotes.
 fn analyze_trajectory(text: &str) -> TrajStats {
-    let mut s = TrajStats::default();
-    // (#1947) A reasoning checkpoint (#1221) closes one chat-completion
-    // call early and re-opens a new one to let the model check in, but the
-    // logical turn never ended — `loop_runner.rs` dispatches the
-    // continuation with the SAME `seq` as the turn it resumes
-    // (`next_seq = turns`, unincremented) and stamps only a genuinely NEW
-    // turn with `next_seq = turns + 1`. Counting `model.completed` EVENTS
-    // therefore counts "how many times this turn got interrupted to check
-    // in" as if every interruption were its own turn — one long
-    // checkpointed turn inflated `turns` 5-13x. Counting DISTINCT `seq`
-    // values among those events recovers the runtime's own notion of a
-    // turn. A `model.completed` missing `seq` (malformed/pre-seq legacy
-    // line) still counts on its own rather than being silently dropped.
-    let mut turn_seqs: HashSet<u64> = HashSet::new();
-    let mut turns_without_seq: u32 = 0;
-    for line in text.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-            "tool.completed" => {
-                s.calls += 1;
-                // Missing `ok` predates #469 and means success.
-                //
-                // (#2008) `ok` no longer counts a command that RAN and
-                // reported a non-zero exit — that is now `outcome:
-                // "reported"` and `ok: true`. Checked against this bench's
-                // own recovery axis before the change landed: both
-                // `planted_failure` tasks plant a MISSING FILE, so their
-                // failure arrives through `Tool::execute`'s `Err` path
-                // (`"tool 'read' returned error: ..."`) and still classifies
-                // as failed. The axis is unaffected.
-                //
-                // What DOES move: a `failed_calls` series that spans the
-                // 1.22.0 flow-schema boundary mixes two definitions of
-                // failure. Compare per-side, never summed across it.
-                if !v.get("ok").and_then(|o| o.as_bool()).unwrap_or(true) {
-                    s.failed_calls += 1;
-                }
-                if let Some(name) = v.get("tool_name").and_then(|n| n.as_str()) {
-                    *s.calls_by_tool.entry(name.to_string()).or_insert(0) += 1;
-                }
-            }
-            "tool_call.promoted" => {
-                s.promoted += v
-                    .get("promoted_call_count")
-                    .and_then(|c| c.as_u64())
-                    .unwrap_or(1) as u32;
-            }
-            "dispatch.cycle.suspected" => s.cycles += 1,
-            "model.completed" => {
-                match v.get("seq").and_then(|s| s.as_u64()) {
-                    Some(seq) => {
-                        turn_seqs.insert(seq);
-                    }
-                    None => turns_without_seq += 1,
-                }
-                if let Some(u) = v.get("usage") {
-                    s.prompt_tokens += u
-                        .get("prompt_tokens")
-                        .and_then(|t| t.as_u64())
-                        .unwrap_or(0);
-                    s.completion_tokens += u
-                        .get("completion_tokens")
-                        .and_then(|t| t.as_u64())
-                        .unwrap_or(0);
-                }
-            }
-            _ => {}
-        }
+    let f = darkmux_trajectory::TrajectoryFold::from_lines(text);
+    let mut calls_by_tool: BTreeMap<String, u32> = BTreeMap::new();
+    for t in &f.tools {
+        *calls_by_tool.entry(t.name.clone()).or_insert(0) += 1;
     }
-    s.turns = turn_seqs.len() as u32 + turns_without_seq;
-    s
+    TrajStats {
+        calls: f.tool_calls(),
+        failed_calls: f.tool_calls_failed(),
+        calls_by_tool,
+        promoted: f.detectors.promoted_calls,
+        cycles: f.detectors.cycle,
+        turns: f.turns(),
+        prompt_tokens: f.tokens.prompt,
+        completion_tokens: f.tokens.completion,
+    }
 }
 
 // ─── scoring ─────────────────────────────────────────────────────────────
@@ -1225,17 +1170,14 @@ impl WorkloadProvider for ToolBenchProvider {
                 // the next dispatch of this workload (#364 lesson).
                 let mut traj_text = String::new();
                 if let Some(out) = out_dir.as_deref() {
-                    let rt = out.join(".darkmux-runtime");
-                    for name in ["trajectory.jsonl", "metrics.json"] {
-                        let src = rt.join(name);
-                        if src.exists() {
-                            if let Err(e) = fs::copy(&src, trial_dir.join(name)) {
-                                eprintln!("darkmux: warn — copying runtime {name}: {e}");
-                            }
+                    let src = darkmux_trajectory::trajectory_path(out);
+                    let dst = trial_dir.join(darkmux_trajectory::TRAJECTORY_FILE);
+                    if src.exists() {
+                        if let Err(e) = fs::copy(&src, &dst) {
+                            eprintln!("darkmux: warn — copying the runtime trajectory: {e}");
                         }
                     }
-                    traj_text = fs::read_to_string(trial_dir.join("trajectory.jsonl"))
-                        .unwrap_or_default();
+                    traj_text = fs::read_to_string(&dst).unwrap_or_default();
                 }
 
                 // (#2685) The envelope AND the exit code together — the
@@ -1314,7 +1256,9 @@ impl WorkloadProvider for ToolBenchProvider {
         fs::write(
             run_dir.join("manifest.json"),
             serde_json::to_string_pretty(&serde_json::json!({
-                "schema_version": 2,
+                // v3 (4.0): a trial directory carries no `metrics.json`;
+                // its counts are in its `trajectory.jsonl`.
+                "schema_version": 3,
                 "run_id": run_id,
                 "workload": wl.id,
                 "provider": self.id(),
@@ -1409,10 +1353,9 @@ impl WorkloadProvider for ToolBenchProvider {
             walltime_ms: meta.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0) as u128,
             turns: 0,
             compactions: 0,
-            // (#2094) tool_bench scores don't currently read metrics.json.
+            // (#2094) tool_bench scores do not read rests.
             rest_ms: 0,
             tokens_before: vec![],
-            summary_chars: vec![],
             mode: None,
             verify: None,
             notes,
@@ -1886,21 +1829,6 @@ not json — tolerated
 {"type":"model.completed","seq":3}"#;
         let s = analyze_trajectory(jsonl);
         assert_eq!(s.turns, 3);
-    }
-
-    /// A `model.completed` missing `seq` (a malformed line, or a pre-seq
-    /// legacy trajectory) counts on its own rather than being silently
-    /// dropped — three seq-less events plus one real turn is 4, not 1.
-    /// Red-proves against `None => {}` in `analyze_trajectory`'s match,
-    /// which reports 1 and left the whole suite green before this test.
-    #[test]
-    fn analyze_trajectory_keeps_model_completed_events_missing_seq() {
-        let jsonl = r#"{"type":"model.completed"}
-{"type":"model.completed"}
-{"type":"model.completed"}
-{"type":"model.completed","seq":1}"#;
-        let s = analyze_trajectory(jsonl);
-        assert_eq!(s.turns, 4);
     }
 
     #[test]

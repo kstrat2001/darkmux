@@ -370,6 +370,10 @@ pub(crate) struct EnvelopeMeta {
     /// was measured, not 'zero was measured'" discipline
     /// `runtime/src/main.rs` documents beside its own hardcoded-zero arms.
     pub infra_exit: bool,
+    /// The envelope's own `result` was `error`: the runtime's loop returned
+    /// an error (an endpoint that refused or dropped the call). Classified
+    /// as infra the same as a zero-token dispatch; see [`is_infra_failure`].
+    pub runtime_error: bool,
 }
 
 /// (#2719) WHICH line of a dispatch's stdout is the envelope — the last one
@@ -513,6 +517,7 @@ pub(crate) fn envelope_meta(stdout: &str) -> EnvelopeMeta {
         model: m.get("model").and_then(|s| s.as_str()).map(str::to_string),
         total_tokens: total,
         infra_exit: false,
+        runtime_error: v.get("result").and_then(|r| r.as_str()) == Some("error"),
     }
 }
 
@@ -563,7 +568,7 @@ pub(crate) fn envelope_meta_with_exit(stdout: &str, exit_code: i32) -> EnvelopeM
     // proxy "no model and no token count", which also swept up a complete,
     // parseable, merely metrics-less envelope. See that helper's doc.
     if exit_code != 0 && parse_envelope(stdout).is_none() {
-        return EnvelopeMeta { model: None, total_tokens: None, infra_exit: true };
+        return EnvelopeMeta { model: None, total_tokens: None, infra_exit: true, runtime_error: false };
     }
     m
 }
@@ -580,12 +585,17 @@ pub(crate) fn envelope_meta_with_exit(stdout: &str, exit_code: i32) -> EnvelopeM
 /// tokens (metrics absent/unparsed) is deliberately NOT treated as infra —
 /// we reclassify only on POSITIVE evidence of zero tokens served.
 ///
-/// The `Some(0)` discriminator matches the REAL quota-failure shape (verified
-/// against the runtime, 2026-07-17): the container runtime's `--json` envelope
-/// ALWAYS emits numeric `prompt_tokens`/`completion_tokens` — the success path
-/// carries the loop's totals, and the error path calls
-/// `build_json_envelope("error", ..., 0, 0, ...)` (`runtime/src/main.rs`) with
-/// literal zeros — so a quota-dead dispatch parses as `Some(0)`, never `None`.
+/// The `Some(0)` discriminator matches the REAL quota-failure shape: the
+/// container dispatch's envelope ALWAYS carries numeric token counts (the
+/// host's fold of the trajectory), so a dispatch whose first call was refused
+/// parses as `Some(0)`, never `None`.
+///
+/// (4.0) Before 4.0 the runtime's error envelope carried literal zeros
+/// whatever the loop had spent, so EVERY loop error read as zero tokens here.
+/// The counts are now real, so a loop that errored after spending tokens
+/// would have flipped from infra to a capability verdict; the envelope's own
+/// `result: "error"` (`EnvelopeMeta::runtime_error`) keeps that
+/// classification, now on the signal that actually says so.
 /// `None` only arises when stdout carried NO parseable envelope at all (a
 /// crash before envelope emission), which used to leave `total_tokens` at
 /// `None` with no other signal to key off. [`envelope_meta_with_exit`] now
@@ -650,7 +660,7 @@ pub(crate) fn is_infra_failure(produced_no_usable_output: bool, m: Option<&Envel
     }
     // The recovered-envelope-with-literal-zeros shape (#1210): gated on the
     // caller's own "this trial produced no usable output" signal.
-    produced_no_usable_output && matches!(m.total_tokens, Some(0))
+    produced_no_usable_output && (matches!(m.total_tokens, Some(0)) || m.runtime_error)
 }
 
 #[cfg(test)]
@@ -1026,10 +1036,10 @@ mod tests {
         // passes "the reply carried no ANSWER:/BLOCKED: verdict".
         let degen = true;
         let ran_fine = false;
-        let zero = EnvelopeMeta { model: None, total_tokens: Some(0), infra_exit: false };
-        let served = EnvelopeMeta { model: None, total_tokens: Some(250), infra_exit: false };
+        let zero = EnvelopeMeta { model: None, total_tokens: Some(0), infra_exit: false, runtime_error: false };
+        let served = EnvelopeMeta { model: None, total_tokens: Some(250), infra_exit: false, runtime_error: false };
         let unknown = EnvelopeMeta::default(); // total_tokens: None, infra_exit: false
-        let exit_promoted = EnvelopeMeta { model: None, total_tokens: None, infra_exit: true };
+        let exit_promoted = EnvelopeMeta { model: None, total_tokens: None, infra_exit: true, runtime_error: false };
 
         assert!(is_infra_failure(degen, Some(&zero)), "degenerate + zero tokens = infra");
         assert!(!is_infra_failure(degen, Some(&served)), "model ran = capability degenerate");

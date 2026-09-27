@@ -311,7 +311,7 @@ fn cmd_lab_run_inspect(run: &str, summary: bool) -> Result<i32> {
     print_inspection(&report);
     if summary {
         let run_dir = lab::inspect::resolve_run_path(run);
-        print_compaction_summaries(&lab::inspect::read_compaction_summaries(&run_dir)?);
+        print_compaction_summaries(&lab::inspect::read_compaction_summaries(&run_dir));
     }
     Ok(0)
 }
@@ -360,7 +360,7 @@ fn verify_line(verify: Option<&workloads::types::VerifyReport>) -> String {
     }
 }
 
-fn print_compaction_summaries(summaries: &[lab::inspect::CompactionSummary]) {
+fn print_compaction_summaries(summaries: &[darkmux_trajectory::legacy::LegacyCompaction]) {
     println!();
     if summaries.is_empty() {
         println!("compaction summaries: (none — no trajectory.jsonl recorded)");
@@ -373,11 +373,11 @@ fn print_compaction_summaries(summaries: &[lab::inspect::CompactionSummary]) {
             "─── summary {} of {} (turn {}, tokensBefore={}, {} chars) ───",
             i + 1,
             summaries.len(),
-            s.turn_index,
+            s.turn,
             s.tokens_before,
-            s.summary_chars
+            s.summary_chars()
         );
-        println!("{}", s.summary_text);
+        println!("{}", s.summary);
     }
 }
 

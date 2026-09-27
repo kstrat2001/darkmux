@@ -79,7 +79,7 @@ fn a_written_event_reads_back_equal() {
         seq: 3,
         ts: 9,
         finish_reason: "tool_calls".into(),
-        usage: Some(Usage { prompt_tokens: 10, completion_tokens: 2, total_tokens: Some(12), reasoning_tokens: None, cached_tokens: Some(4) }),
+        usage: Some(Usage { prompt_tokens: Some(10), completion_tokens: Some(2), total_tokens: Some(12), reasoning_tokens: None, cached_tokens: Some(4) }),
         tool_calls: Some(vec![ToolCallEntry { id: "a".into(), name: "read".into(), arguments_chars: 5, path: Some("f".into()), runs: Some(false) }]),
         reported_model: None,
         calls_planned: true,
@@ -111,6 +111,10 @@ fn a_continuation_is_the_same_turn_and_its_usage_still_counts() {
     assert_eq!((f.tokens.prompt, f.tokens.completion, f.tokens.total), (220, 15, 240));
     assert_eq!(f.frames, vec![Some(10), Some(5), None], "an unbilled call is None, not 0");
     assert_eq!(f.turn_detail[&1].completion_tokens, 15, "a turn's frames accumulate");
+    let null_count = fold(&[r#"{"type":"model.completed","seq":1,"usage":{"completion_tokens":null,"total_tokens":7}}"#]);
+    assert_eq!(null_count.model_calls, 1, "a null count inside the block still parses");
+    assert_eq!(null_count.frames, vec![None], "and reads as unreported, never 0");
+    assert_eq!(null_count.tokens.total, 7);
 }
 
 #[test]
@@ -234,6 +238,8 @@ fn an_openclaw_run_counts_its_prompts_and_distinct_summaries() {
     assert_eq!(f.turns(), 3);
     assert_eq!(f.compactions(), 2);
     assert_eq!(f.legacy.compactions.iter().map(|c| c.tokens_before).collect::<Vec<_>>(), vec![900, 1200]);
+    assert_eq!(f.legacy.compactions.iter().map(|c| c.turn).collect::<Vec<_>>(), vec![1, 3], "the turn that first carried each");
+    assert_eq!(f.legacy.compactions[0].summary, "first summary");
     assert_eq!(f.model_calls, 0, "openclaw's own model.completed is not a call of this format");
 }
 

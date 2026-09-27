@@ -10186,18 +10186,18 @@
         assert_eq!(turn_tokens_payload(&mc(null.clone()), "coder", "m", "ep", None)["token_source"], "absent", "null usage → an absent record, no counts");
     }
 
-    /// (#795) Defensive: a `usage` object missing a count degrades that
-    /// count to 0 (the runtime always writes both fields; this guards
-    /// hand-rolled or cross-runtime trajectories).
+    /// (#795) A `usage` object missing a count omits that count from the
+    /// record (unreported, never a fabricated 0); the total is still the
+    /// one rule over what was reported.
     #[test]
-    fn turn_tokens_payload_defaults_missing_counts_to_zero() {
+    fn turn_tokens_payload_omits_an_unreported_count() {
         let event = serde_json::json!({
             "type": "model.completed",
             "seq": 1,
             "usage": { "completion_tokens": 500 },
         });
         let payload = turn_tokens_payload(&mc(event.clone()), "coder", "m", "ep", None);
-        assert_eq!(payload["prompt_tokens"], 0);
+        assert!(payload.get("prompt_tokens").is_none(), "{payload}");
         assert_eq!(payload["completion_tokens"], 500);
         assert_eq!(payload["total_tokens"], 500);
     }

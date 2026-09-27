@@ -9,8 +9,8 @@
 //! falsely report success?**
 //!
 //! This module is the analysis half. It reads a completed run's artifacts
-//! (`trajectory.jsonl` detector events + `tool.completed` count, `metrics.json`
-//! turns/compactions, `manifest.json` sandbox hashes) plus the dispatch +
+//! (its trajectory, through the one fold: detector firings, tool calls,
+//! turns, compactions; `manifest.json` sandbox hashes) plus the dispatch +
 //! verify outcome, and produces a single [`Verdict`] over a small, explicit
 //! axis. The classification rule lives in [`classify`] — pure, so it is the
 //! unit-tested heart of the bench.
@@ -28,24 +28,11 @@
 //!   - `Failed` — the dispatch errored, the model did nothing and could not be
 //!     confirmed to have passed, or it engaged but verify contradicts it.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use darkmux_trajectory::DetectorCounts;
 use serde::Serialize;
 use std::fs;
 use std::path::Path;
-
-/// Trajectory event `"type"` strings the aggregator counts. Kept here as the
-/// single source of truth so a runtime-side rename surfaces as a test break
-/// (the runtime emits these in `runtime/src/trajectory.rs`).
-mod ev {
-    pub const CYCLE: &str = "dispatch.cycle.suspected";
-    pub const REASONING_LOOP: &str = "dispatch.reasoning_loop.suspected";
-    pub const INTRA_TURN_STALL: &str = "dispatch.intra_turn_stall.recovered";
-    pub const REPEATED_FAILURE: &str = "dispatch.tool.repeated_failure";
-    pub const PER_TURN_CAP: &str = "dispatch.per_turn_cap.salvaged";
-    // flow-action-guard:allow — a runtime trajectory event type, not a flow action
-    pub const FEEDBACK_INJECTED: &str = "dispatch.feedback.injected";
-    pub const TOOL_COMPLETED: &str = "tool.completed";
-}
 
 /// Per-run-overridable compaction knobs (the loop-variation axis the trait
 /// threads into the provider). Each `Some` overrides the value
@@ -98,49 +85,31 @@ impl LoopCompactionOverride {
 /// "the harness noticed the model struggling" signals; `feedback_injected`
 /// is reported for context but is NOT counted toward the struggle signal
 /// (feedback is injected on normal nudges too, not only on pathology).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct DetectorCounts {
-    pub cycle: u32,
-    pub reasoning_loop: u32,
-    pub intra_turn_stall: u32,
-    pub repeated_failure: u32,
-    pub per_turn_cap: u32,
-    pub feedback_injected: u32,
+/// The detector firings that signal a STRUGGLE: every loop detector,
+/// never the feedback injection that merely delivered one.
+pub fn struggle_signal(d: &DetectorCounts) -> u32 {
+    d.cycle
+        .saturating_add(d.reasoning_loop)
+        .saturating_add(d.intra_turn_stall)
+        .saturating_add(d.repeated_failure)
+        .saturating_add(d.per_turn_cap)
 }
 
-impl DetectorCounts {
-    /// The sum of the pathology detectors (everything except routine
-    /// feedback injection). `> 0` is what tips a successful run into
-    /// `Struggled`. Saturating so a pathological / runaway trajectory can
-    /// never debug-panic the bench on overflow.
-    pub fn struggle_signal(&self) -> u32 {
-        self.cycle
-            .saturating_add(self.reasoning_loop)
-            .saturating_add(self.intra_turn_stall)
-            .saturating_add(self.repeated_failure)
-            .saturating_add(self.per_turn_cap)
-    }
-
-    /// Human-readable list of which detectors fired (`["cycle×2", …]`),
-    /// empty when none did. Used in the report's notes.
-    pub fn fired_summary(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut push = |name: &str, n: u32| {
-            if n > 0 {
-                out.push(format!("{name}×{n}"));
-            }
-        };
-        push("cycle", self.cycle);
-        push("reasoning-loop", self.reasoning_loop);
-        push("intra-turn-stall", self.intra_turn_stall);
-        push("repeated-failure", self.repeated_failure);
-        push("per-turn-cap", self.per_turn_cap);
-        out
-    }
+/// The struggle detectors that fired, as `name×count`.
+pub fn fired_summary(d: &DetectorCounts) -> Vec<String> {
+    [
+        ("cycle", d.cycle),
+        ("reasoning-loop", d.reasoning_loop),
+        ("intra-turn-stall", d.intra_turn_stall),
+        ("repeated-failure", d.repeated_failure),
+        ("per-turn-cap", d.per_turn_cap),
+    ]
+    .into_iter()
+    .filter(|(_, n)| *n > 0)
+    .map(|(name, n)| format!("{name}×{n}"))
+    .collect()
 }
 
-/// The loop-behavior classification. See the module doc for the mapping to
-/// the failure modes this bench exists to surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Verdict {
@@ -188,7 +157,7 @@ impl std::fmt::Display for Verdict {
 ///     made no tool calls at all — and since every edit goes through a tool,
 ///     zero tool calls means the sandbox is necessarily unchanged. This is
 ///     the primary "did the model engage?" signal.
-///   - `struggle`: [`DetectorCounts::struggle_signal`].
+///   - `struggle`: [`struggle_signal`].
 ///
 /// Order matters — earlier branches dominate:
 ///   1. `!dispatch_ok` → `Failed` (nothing else is trustworthy).
@@ -265,15 +234,16 @@ pub fn analyze_run(
     duration_ms: u128,
     loop_config: Vec<String>,
 ) -> Result<LoopReport> {
-    let (detectors, tool_calls) = parse_trajectory(&run_dir.join("trajectory.jsonl"))?;
-    let (turns, compactions) = read_metrics(&run_dir.join("metrics.json"));
+    let fold = crate::lab::inspect::run_trajectory(run_dir);
+    let (detectors, tool_calls) = (fold.detectors, fold.tool_calls());
+    let (turns, compactions) = (fold.turns(), fold.compactions());
     let sandbox_changed = read_sandbox_changed(&run_dir.join("manifest.json"));
 
     let verdict = classify(
         dispatch_ok,
         verify_passed,
         tool_calls,
-        detectors.struggle_signal(),
+        struggle_signal(&detectors),
     );
 
     let notes = build_notes(
@@ -333,7 +303,7 @@ fn build_notes(
         Verdict::Struggled => {
             notes.push(format!(
                 "task achieved, but the harness caught pathological loop signals: {}",
-                detectors.fired_summary().join(", ")
+                fired_summary(detectors).join(", ")
             ));
         }
         Verdict::Productive => {
@@ -357,73 +327,6 @@ fn build_notes(
     }
     let _ = verify; // referenced only via the verdict branches above
     notes
-}
-
-/// Parse a trajectory JSONL file in a SINGLE pass, returning the detector
-/// counts plus the `tool.completed` tally (the "did the model engage?"
-/// signal). A missing file yields all-zero counts (the dispatch may have
-/// hard-errored before writing one) — a valid, reportable state, not an
-/// error. Reading + parsing once matters: an agentic run's trajectory can be
-/// large.
-fn parse_trajectory(trajectory: &Path) -> Result<(DetectorCounts, u32)> {
-    let mut counts = DetectorCounts::default();
-    let mut tool_calls: u32 = 0;
-    if !trajectory.exists() {
-        return Ok((counts, tool_calls));
-    }
-    let raw = fs::read_to_string(trajectory)
-        .with_context(|| format!("reading {}", trajectory.display()))?;
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        // A malformed line is skipped (best-effort observability parsing),
-        // not fatal — one truncated tail line shouldn't sink the report.
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        // saturating_add: a runaway trajectory can never debug-panic the bench.
-        match v.get("type").and_then(|t| t.as_str()) {
-            Some(ev::CYCLE) => counts.cycle = counts.cycle.saturating_add(1),
-            Some(ev::REASONING_LOOP) => {
-                counts.reasoning_loop = counts.reasoning_loop.saturating_add(1)
-            }
-            Some(ev::INTRA_TURN_STALL) => {
-                counts.intra_turn_stall = counts.intra_turn_stall.saturating_add(1)
-            }
-            Some(ev::REPEATED_FAILURE) => {
-                counts.repeated_failure = counts.repeated_failure.saturating_add(1)
-            }
-            Some(ev::PER_TURN_CAP) => {
-                counts.per_turn_cap = counts.per_turn_cap.saturating_add(1)
-            }
-            Some(ev::FEEDBACK_INJECTED) => {
-                counts.feedback_injected = counts.feedback_injected.saturating_add(1)
-            }
-            Some(ev::TOOL_COMPLETED) => tool_calls = tool_calls.saturating_add(1),
-            _ => {}
-        }
-    }
-    Ok((counts, tool_calls))
-}
-
-/// Read turns + compactions from the runtime's `metrics.json`. Both default
-/// to 0 when the file is absent or unparseable (a run that predates the
-/// internal runtime, or one that died before finalizing metrics).
-fn read_metrics(metrics: &Path) -> (u32, u32) {
-    let Ok(raw) = fs::read_to_string(metrics) else {
-        return (0, 0);
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return (0, 0);
-    };
-    let turns = v.get("turns").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-    let compactions = v
-        .get("compactions")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0) as u32;
-    (turns, compactions)
 }
 
 /// Compare `final_hash` (top-level) against `fixture.baseline_hash` (added by
@@ -476,7 +379,7 @@ pub fn print_report(report: &LoopReport) {
     println!("  tool calls:   {}", report.tool_calls);
     println!("  turns:        {}", report.turns);
     println!("  compactions:  {}", report.compactions);
-    let fired = report.detectors.fired_summary();
+    let fired = fired_summary(&report.detectors);
     println!(
         "  detectors:    {}",
         if fired.is_empty() {
@@ -570,8 +473,9 @@ mod tests {
             repeated_failure: 2,
             per_turn_cap: 0,
             feedback_injected: 5, // routine nudges — must NOT count as struggle
+            ..Default::default()
         };
-        assert_eq!(d.struggle_signal(), 3);
+        assert_eq!(struggle_signal(&d), 3);
     }
 
     #[test]
@@ -583,8 +487,9 @@ mod tests {
             repeated_failure: 0,
             per_turn_cap: 0,
             feedback_injected: 0,
+            ..Default::default()
         };
-        assert_eq!(d.fired_summary(), vec!["cycle×2", "intra-turn-stall×1"]);
+        assert_eq!(fired_summary(&d), vec!["cycle×2", "intra-turn-stall×1"]);
     }
 
     // ─── LoopCompactionOverride ─────────────────────────────────────
@@ -652,8 +557,6 @@ mod tests {
             r#"{"final_hash":"blake3:same","fixture":{"baseline_hash":"blake3:same"}}"#,
         )
         .unwrap();
-        fs::write(run.join("metrics.json"), r#"{"turns":1,"compactions":0}"#).unwrap();
-
         let report =
             analyze_run(run, "phi4-run", true, Some(true), 37_000, vec!["profile=loop-phi4".into()])
                 .unwrap();
@@ -673,11 +576,16 @@ mod tests {
         write_trajectory(
             run,
             &[
+                r#"{"type":"model.completed","seq":1}"#,
                 r#"{"type":"tool.completed","ok":true}"#,
                 r#"{"type":"dispatch.cycle.suspected"}"#,
                 r#"{"type":"dispatch.feedback.injected"}"#,
+                r#"{"type":"compaction","generation":1}"#,
+                r#"{"type":"model.completed","seq":2}"#,
                 r#"{"type":"dispatch.reasoning_loop.suspected"}"#,
                 r#"{"type":"tool.completed","ok":true}"#,
+                r#"{"type":"compaction","generation":2}"#,
+                r#"{"type":"model.completed","seq":3}"#,
             ],
         );
         fs::write(
@@ -685,7 +593,8 @@ mod tests {
             r#"{"final_hash":"blake3:after","fixture":{"baseline_hash":"blake3:before"}}"#,
         )
         .unwrap();
-        fs::write(run.join("metrics.json"), r#"{"turns":18,"compactions":2}"#).unwrap();
+        // A stale metrics.json with other numbers: never read.
+        fs::write(run.join("metrics.json"), r#"{"turns":18,"compactions":9}"#).unwrap();
 
         let report = analyze_run(run, "struggle-run", true, Some(true), 240_000, vec![]).unwrap();
         assert_eq!(report.verdict, Verdict::Struggled);
@@ -693,9 +602,9 @@ mod tests {
         assert_eq!(report.detectors.cycle, 1);
         assert_eq!(report.detectors.reasoning_loop, 1);
         assert_eq!(report.detectors.feedback_injected, 1);
-        assert_eq!(report.detectors.struggle_signal(), 2);
+        assert_eq!(struggle_signal(&report.detectors), 2);
         assert_eq!(report.sandbox_changed, Some(true));
-        assert_eq!(report.turns, 18);
+        assert_eq!(report.turns, 3, "from the trajectory, not the stale metrics.json");
         assert_eq!(report.compactions, 2);
     }
 
@@ -716,12 +625,10 @@ mod tests {
             r#"{"final_hash":"blake3:after","fixture":{"baseline_hash":"blake3:before"}}"#,
         )
         .unwrap();
-        fs::write(run.join("metrics.json"), r#"{"turns":6,"compactions":0}"#).unwrap();
-
         let report = analyze_run(run, "clean-run", true, Some(true), 60_000, vec![]).unwrap();
         assert_eq!(report.verdict, Verdict::Productive);
         assert_eq!(report.tool_calls, 3);
-        assert!(report.detectors.fired_summary().is_empty());
+        assert!(fired_summary(&report.detectors).is_empty());
     }
 
     #[test]

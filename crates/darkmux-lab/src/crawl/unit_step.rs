@@ -487,19 +487,9 @@ type UnitDispatchOutcome = (String, u64, u64, u64, Option<String>, Option<Value>
 /// the runtime reported `max_turns` (#2193 — a BOUND, not a failure),
 /// `"timeout"` when stderr carries the watchdog marker, else `"error"`.
 ///
-/// (#2263 review, third consumer) `prompt_tokens`/`completion_tokens` read
-/// from `/metrics/this_run/...` — THIS unit's own dispatch, never
-/// `/metrics/prompt_tokens`/`/metrics/completion_tokens` (the WHOLE-TASK
-/// cumulative counters, seeded from a resume checkpoint). This pairs the
-/// token figure with `model` above into one outcome, and the caller rolls
-/// both into `tokens_per_hour` — exactly the "a figure next to a model
-/// name" shape #2263 exists to fix. Safe today because a crawl unit never
-/// resumes (`this_run` == the cumulative fields on a never-resumed
-/// dispatch, so this changes nothing yet), but the crawl's own per-unit
-/// resume is a named coming caller of the resume path (see
-/// `RunCheckpoint`'s doc) — reading `this_run` now means that future
-/// caller doesn't inherit the misattribution the rest of #2263 already
-/// fixed.
+/// The token figures are the envelope's `metrics` block, which the host
+/// writes from this dispatch's own trajectory (never a resume seed), so
+/// they pair with `model` without misattribution.
 pub fn interpret_dispatch_result(unit_id: &str, res: &DispatchResult) -> UnitDispatchOutcome {
     let envelope: Option<Value> =
         if res.stdout.trim().starts_with('{') { serde_json::from_str(&res.stdout).ok() } else { None };
@@ -531,30 +521,16 @@ pub fn interpret_dispatch_result(unit_id: &str, res: &DispatchResult) -> UnitDis
             }
         }
     };
+    // The envelope's `metrics` block is the host's fold of this unit's
+    // trajectory: its own counts, never a prior resume's.
     let num = |e: &Option<Value>, p: &str| e.as_ref().and_then(|e| e.pointer(p)).and_then(Value::as_u64).unwrap_or(0);
-    // (#2263 review) `this_run` first, falling back to the whole-task
-    // cumulative field only when `this_run` is absent entirely — a
-    // pre-#2263 runtime image's envelope has no `metrics.this_run` object
-    // at all (schema leniency: an older/newer binary pairing must degrade,
-    // never zero out a real number). A crawl unit never resumes, so for
-    // every runtime that DOES write `this_run`, it is byte-identical to
-    // the cumulative field anyway — this only changes behavior once the
-    // crawl's own per-unit resume (named as a coming caller in
-    // `RunCheckpoint`'s doc) exists.
-    let this_run_or_cumulative = |e: &Option<Value>, this_run_ptr: &str, cumulative_ptr: &str| {
-        e.as_ref()
-            .and_then(|e| e.pointer(this_run_ptr))
-            .and_then(Value::as_u64)
-            .or_else(|| e.as_ref().and_then(|e| e.pointer(cumulative_ptr)).and_then(Value::as_u64))
-            .unwrap_or(0)
-    };
     let model =
         envelope.as_ref().and_then(|e| e.pointer("/metrics/model")).and_then(Value::as_str).map(String::from);
     (
         result_label,
         num(&envelope, "/metrics/wall_ms"),
-        this_run_or_cumulative(&envelope, "/metrics/this_run/prompt_tokens", "/metrics/prompt_tokens"),
-        this_run_or_cumulative(&envelope, "/metrics/this_run/completion_tokens", "/metrics/completion_tokens"),
+        num(&envelope, "/metrics/prompt_tokens"),
+        num(&envelope, "/metrics/completion_tokens"),
         model,
         envelope.as_ref().and_then(|e| e.get("detections")).cloned(),
         num(&envelope, "/metrics/rest_ms"),
@@ -594,26 +570,15 @@ pub fn unit_hit_no_progress_bound(out_dir: &Path, n: usize) -> bool {
     if n == 0 {
         return false;
     }
-    let Ok(body) = std::fs::read_to_string(out_dir.join(".darkmux-runtime").join("trajectory.jsonl")) else {
-        return false;
-    };
-
+    let fold = unit_trajectory(out_dir);
     let mut by_turn: BTreeMap<u64, bool> = BTreeMap::new();
     let mut read_paths_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-
-    for line in body.lines() {
-        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
-        if v.get("type").and_then(Value::as_str) != Some("tool.completed") {
-            continue;
-        }
-        let Some(seq) = v.get("seq").and_then(Value::as_u64) else { continue };
-        let tool_name = v.get("tool_name").and_then(Value::as_str).unwrap_or("");
-        let entry = by_turn.entry(seq).or_insert(false);
-        match tool_name {
+    for t in &fold.tools {
+        let entry = by_turn.entry(t.seq).or_insert(false);
+        match t.name.as_str() {
             "create_finding" => *entry = true,
             "read" => {
-                let args = v.get("args").and_then(Value::as_str).unwrap_or("");
-                if let Some(path) = serde_json::from_str::<Value>(args)
+                if let Some(path) = serde_json::from_str::<Value>(&t.args)
                     .ok()
                     .and_then(|a| a.get("path").and_then(Value::as_str).map(str::to_string))
                 {
@@ -625,11 +590,16 @@ pub fn unit_hit_no_progress_bound(out_dir: &Path, n: usize) -> bool {
             _ => {}
         }
     }
-
     if by_turn.len() < n {
         return false;
     }
     by_turn.values().rev().take(n).all(|progressed| !progressed)
+}
+
+/// This unit's trajectory, through the one fold. A missing or unreadable
+/// file folds empty.
+fn unit_trajectory(out_dir: &Path) -> darkmux_trajectory::TrajectoryFold {
+    darkmux_trajectory::TrajectoryFold::from_path(&darkmux_trajectory::trajectory_path(out_dir))
 }
 
 /// (#1959) Count `create_finding` tool calls THIS unit's dispatch made
@@ -638,17 +608,7 @@ pub fn unit_hit_no_progress_bound(out_dir: &Path, n: usize) -> bool {
 /// skipped — this is a best-effort operator-facing count, never a
 /// correctness-bearing value.
 pub fn count_rejected_create_findings(out_dir: &Path) -> usize {
-    let Ok(body) = std::fs::read_to_string(out_dir.join(".darkmux-runtime").join("trajectory.jsonl")) else {
-        return 0;
-    };
-    body.lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter(|v| {
-            v.get("type").and_then(Value::as_str) == Some("tool.completed")
-                && v.get("tool_name").and_then(Value::as_str) == Some("create_finding")
-                && v.get("ok").and_then(Value::as_bool) == Some(false)
-        })
-        .count()
+    unit_trajectory(out_dir).tools.iter().filter(|t| t.name == "create_finding" && !t.ok).count()
 }
 
 // ── crawler seat (#2188) ─────────────────────────────────────────────────

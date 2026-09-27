@@ -8,8 +8,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Usage {
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
+    /// `None` when the block did not carry the count (the runtime always
+    /// writes both; a null is read as unreported, never as zero).
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
     /// The provider's own total. It can exceed prompt + completion: some
     /// providers bill a token class outside `completion_tokens`.
     pub total_tokens: Option<u64>,
@@ -21,12 +23,11 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// The counts this block reported. The runtime always writes prompt and
-    /// completion inside a usage block, so both are reported.
+    /// The counts this block reported.
     pub fn counts(&self) -> UsageCounts {
         UsageCounts {
-            prompt: Some(self.prompt_tokens),
-            completion: Some(self.completion_tokens),
+            prompt: self.prompt_tokens,
+            completion: self.completion_tokens,
             total: self.total_tokens,
             reasoning: self.reasoning_tokens,
             cached: self.cached_tokens,

@@ -38,10 +38,22 @@ const COMPACTION_SUMMARY_ROLE: &str = "compactionSummary";
 const SUMMARY_KEY_CHARS: usize = 80;
 
 /// One compaction an openclaw thread recorded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyCompaction {
+    /// The 1-based turn whose thread first carried the summary.
+    pub turn: u32,
+    /// The prompt-token count the compaction was triggered at.
     pub tokens_before: u64,
-    pub summary_chars: u64,
+    /// The summary the compactor wrote.
+    pub summary: String,
+}
+
+impl LegacyCompaction {
+    /// The summary's length in chars (never bytes: multi-byte text would
+    /// over-report, #906).
+    pub fn summary_chars(&self) -> u64 {
+        self.summary.chars().count() as u64
+    }
 }
 
 /// What an openclaw trajectory says: its turns and its distinct
@@ -64,8 +76,9 @@ impl LegacyFold {
             let key: String = summary.chars().take(SUMMARY_KEY_CHARS).collect();
             if self.seen_summaries.insert(key) {
                 self.compactions.push(LegacyCompaction {
+                    turn: self.turns,
                     tokens_before: m.tokens_before.unwrap_or(0),
-                    summary_chars: summary.len() as u64,
+                    summary: summary.to_string(),
                 });
             }
         }
