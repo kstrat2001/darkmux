@@ -656,6 +656,9 @@ fn read_fleet_mode(c: &DarkmuxConfig) -> Option<&str> {
 fn read_fleet_identity_provider(c: &DarkmuxConfig) -> Option<&str> {
     c.fleet.as_ref()?.identity.as_ref()?.provider.as_deref()
 }
+fn read_fleet_busy_policy(c: &DarkmuxConfig) -> Option<&str> {
+    c.fleet.as_ref()?.busy_policy.as_deref()
+}
 /// `(hooks.rules[i].match.<field>, raw)` for every rule that sets `field`.
 fn hook_match_values(c: &DarkmuxConfig, field: &str, get: fn(&crate::config::HookMatch) -> Option<&str>) -> Vec<(String, String)> {
     let rules = c.hooks.as_ref().and_then(|h| h.rules.as_ref());
@@ -738,6 +741,15 @@ pub static ENUM_SETTINGS: &[EnumSetting] = &[
         "tailscale",
         &[Scope::FleetSubmission],
         read_fleet_identity_provider,
+    ),
+    // (#2916 stage 2) Read by the fleet listener, which runs the fleet
+    // submission preflight when it builds its identity provider.
+    EnumSetting::of::<crate::config::BusyPolicy>(
+        "fleet.busy_policy",
+        Some("DARKMUX_FLEET_BUSY_POLICY"),
+        "refuse",
+        &[Scope::FleetSubmission],
+        read_fleet_busy_policy,
     ),
     // (#2947 review C2) A typo here used to match nothing, silently.
     EnumSetting::each::<crate::config::HookLevel>("hooks.rules[].match.level", &[], read_hook_match_levels)

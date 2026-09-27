@@ -207,79 +207,12 @@ pub(crate) fn roster_doctor_checks() -> Vec<crate::doctor::Check> {
     roster_checks(&roster, &known)
 }
 
-/// What this doctor run learned without reading flow history.
-struct LiveIdentity {
-    /// Presence beats as `(uid, display_name)`.
-    beats: Vec<(String, String)>,
-    /// This machine's hardware uid, when readable.
-    local_uid: Option<String>,
-    /// This machine's resolved machine_id.
-    local_name: Option<String>,
-    /// True when `local_name` came from the `DARKMUX_MACHINE_ID` env tier.
-    local_name_from_env: bool,
-    presence: crate::doctor::PresenceState,
-}
-
-/// (#2924 C-5) How many of the most recent flow FILES the roster identity
-/// check reads (one file per day in practice, but it counts files: a day
-/// with no records has none). Bounds doctor's cost as history is retained without
-/// limit (the laptop holds ~130 days, ~300 MB). 120 covers the live rename
-/// this check was written for; a rename older than the window is reported as
-/// a note ("matches no machine_id this machine can see"), never a warning.
-const ROSTER_HISTORY_FILES: usize = 120;
-
-/// True when some roster entry cannot be settled from live knowledge alone:
-/// it declares no uid and is not a current name, or declares a uid nobody
-/// live answers to. History can only change the verdict for those.
-fn roster_needs_history(roster: &fleet::FleetRoster, live: &crate::doctor::FleetIdentityKnowledge) -> bool {
-    roster.machines.values().any(|m| match &m.machine_uid {
-        Some(uid) => !live.current_name_by_uid.contains_key(uid),
-        None => !live.is_current_name(&m.id),
-    })
-}
-
-/// A flow record's top-level `(machine_id, machine_uid)`, or `None` when it
-/// carries no machine_id.
-///
-/// Measured cost is why this is not a plain `serde_json` parse: a full
-/// history on the laptop is ~300 MB, and parsing every line added ~4 s to a
-/// debug `darkmux doctor`. darkmux writes both fields as flat strings among
-/// the record's leading scalar fields, so the fast path reads them by key,
-/// accepting a match only when no `{` precedes it (i.e. it is not inside a
-/// nested object). Any other shape falls back to a real parse.
-fn record_identity(line: &str) -> Option<(String, Option<String>)> {
-    fn flat_field<'a>(line: &'a str, key: &str) -> Option<Option<&'a str>> {
-        let pat = format!("\"{key}\":\"");
-        let Some(at) = line.find(&pat) else {
-            return if line.contains(&format!("\"{key}\"")) { None } else { Some(None) };
-        };
-        if line.get(1..at).is_some_and(|pre| pre.contains('{')) {
-            return None;
-        }
-        let rest = &line[at + pat.len()..];
-        let end = rest.find('"')?;
-        let v = &rest[..end];
-        if v.contains('\\') {
-            return None;
-        }
-        Some(Some(v))
-    }
-    let fast = flat_field(line, "machine_id").zip(flat_field(line, "machine_uid"));
-    let (id, uid) = match fast {
-        Some((id, uid)) => (id.map(str::to_string), uid.map(str::to_string)),
-        None => {
-            #[derive(serde::Deserialize)]
-            struct Ids {
-                machine_id: Option<String>,
-                machine_uid: Option<String>,
-            }
-            let ids: Ids = serde_json::from_str(line).ok()?;
-            (ids.machine_id, ids.machine_uid)
-        }
-    };
-    let id = id.filter(|n| !n.is_empty())?;
-    Some((id, uid.filter(|u| !u.is_empty())))
-}
+// (#2916 stage 2) `LiveIdentity`, `record_identity`, `gather_identity_knowledge`,
+// `roster_needs_history` and `ROSTER_HISTORY_FILES` moved to
+// `darkmux_fleet::identity_knowledge`, re-exported at the crate root.
+use fleet::{gather_identity_knowledge, roster_needs_history, LiveIdentity};
+#[cfg(test)]
+use fleet::{record_identity, ROSTER_HISTORY_FILES};
 
 /// The pure half of [`roster_doctor_checks`]: roster + knowledge in, rows out.
 fn roster_checks(
@@ -301,75 +234,6 @@ fn roster_checks(
         crate::doctor::check_roster_addresses(&views, known),
         crate::doctor::check_roster_identity(&views, known),
     ]
-}
-
-/// Build [`crate::doctor::FleetIdentityKnowledge`] from the last
-/// [`ROSTER_HISTORY_FILES`] flow day-files, presence beats, and this
-/// machine's own resolution. Later sources override earlier ones for a uid's
-/// CURRENT name. Every uid a name was ever seen under is kept (a set, never
-/// last-writer-wins), because one machine collects throwaway session names
-/// and two machines can once have shared a hostname-derived id.
-///
-/// Flow files are read in name (date) order so the last name a uid wrote is
-/// its current one by history.
-fn gather_identity_knowledge(
-    flows_dir: Option<&std::path::Path>,
-    live: &LiveIdentity,
-) -> crate::doctor::FleetIdentityKnowledge {
-    use std::io::BufRead;
-    let mut known = crate::doctor::FleetIdentityKnowledge::default();
-    let mut files: Vec<std::path::PathBuf> = flows_dir
-        .and_then(|d| std::fs::read_dir(d).ok())
-        .map(|rd| {
-            rd.flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-                .collect()
-        })
-        .unwrap_or_default();
-    files.sort();
-    let skip = files.len().saturating_sub(ROSTER_HISTORY_FILES);
-    if skip > 0 {
-        known.history_truncated_to = Some(ROSTER_HISTORY_FILES);
-    }
-    for path in files.into_iter().skip(skip) {
-        let Ok(file) = std::fs::File::open(&path) else { continue };
-        for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
-            let Some((name, uid)) = record_identity(&line) else { continue };
-            match uid {
-                Some(uid) => {
-                    known.uids_by_name.entry(name.clone()).or_default().insert(uid.clone());
-                    known.current_name_by_uid.insert(uid, name);
-                }
-                None => {
-                    known.uidless_names.insert(name);
-                }
-            }
-        }
-    }
-    // (#2924 C-b) A `DARKMUX_MACHINE_ID` override is a per-shell name, not
-    // this machine's name for the fleet, so it is not overlaid onto the local
-    // uid; that uid keeps whatever presence or history says.
-    let local_overlay = if live.local_name_from_env {
-        None
-    } else {
-        live.local_uid.as_deref().zip(live.local_name.as_deref())
-    };
-    let overlays = live
-        .beats
-        .iter()
-        .map(|(u, n)| (u.as_str(), n.as_str()))
-        .chain(local_overlay);
-    for (uid, name) in overlays {
-        known.uids_by_name.entry(name.to_string()).or_default().insert(uid.to_string());
-        known.current_name_by_uid.insert(uid.to_string(), name.to_string());
-        known.live_uids.insert(uid.to_string());
-    }
-    known.local_name = live.local_name.clone();
-    known.local_name_from_env = live.local_name_from_env;
-    known.local_uid = live.local_uid.clone();
-    known.presence = live.presence;
-    known
 }
 
 pub(crate) fn cmd_machine_remove(id: &str) -> Result<i32> {
@@ -1258,6 +1122,16 @@ pub(crate) fn fleet_submission_doctor_checks() -> Vec<crate::doctor::Check> {
         } else {
             None
         },
+        busy: crate::doctor::BusyFacts {
+            running: daemon_health().as_ref().and_then(running_busy_settings),
+            configured: darkmux_types::config_access::fleet_busy_policy().ok().map(|policy| {
+                crate::doctor::BusySettings {
+                    policy,
+                    hosted_cap: darkmux_types::config_access::remote_concurrent_cap(),
+                }
+            }),
+        },
+        local_machine: darkmux_flow::resolve_machine_id(),
     };
     crate::doctor::fleet_submission_checks(&facts)
 }
@@ -1265,8 +1139,13 @@ pub(crate) fn fleet_submission_doctor_checks() -> Vec<crate::doctor::Check> {
 /// (#2916 review C8) What the local daemon says about its fleet listener
 /// (`/health`'s `fleet_listener`), when it answers within 500 ms.
 fn daemon_listener_state() -> Option<String> {
+    daemon_health()?.get("fleet_listener").and_then(|s| s.as_str()).map(str::to_string)
+}
+
+/// The local daemon's `/health`, when it answers within 500 ms.
+fn daemon_health() -> Option<serde_json::Value> {
     let port = darkmux_types::config_access::serve_port();
-    let v: serde_json::Value = ureq::AgentBuilder::new()
+    ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_millis(500))
         .build()
         .get(&format!("http://127.0.0.1:{port}/health"))
@@ -1274,8 +1153,18 @@ fn daemon_listener_state() -> Option<String> {
         .ok()?
         .into_string()
         .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())?;
-    v.get("fleet_listener").and_then(|s| s.as_str()).map(str::to_string)
+        .and_then(|t| serde_json::from_str(&t).ok())
+}
+
+/// (#2916 stage 2 review C5) The busy settings the running listener
+/// reports in `/health`'s `fleet_busy` (parsed here, at the boundary).
+fn running_busy_settings(health: &serde_json::Value) -> Option<crate::doctor::BusySettings> {
+    use darkmux_types::config_enum::ConfigEnum;
+    let busy = health.get("fleet_busy")?;
+    Some(crate::doctor::BusySettings {
+        policy: darkmux_types::config::BusyPolicy::parse(busy.get("policy")?.as_str()?)?,
+        hosted_cap: u32::try_from(busy.get("hosted_cap")?.as_u64()?).ok()?,
+    })
 }
 
 /// The retired work-queue streams (`darkmux:work`, `darkmux:work:<tier>`)
@@ -1735,6 +1624,25 @@ pub(crate) mod tests {
         let mut offline = healthy.clone();
         fleet::add_machine(&mut offline, "mini-1", "mini.tailnet.example", None, Some("UID-C")).unwrap();
         assert!(roster_needs_history(&offline, &live), "a uid nobody live answers to needs history");
+    }
+
+    /// (#2916 stage 2 review C5) `/health`'s `fleet_busy` is read into typed
+    /// settings; anything malformed is "no report", never a guess.
+    #[test]
+    fn the_running_busy_settings_are_read_from_health() {
+        let got = running_busy_settings(&serde_json::json!({"fleet_busy": {"policy": "queue", "hosted_cap": 3}}));
+        assert_eq!(
+            got,
+            Some(crate::doctor::BusySettings { policy: darkmux_types::config::BusyPolicy::Queue, hosted_cap: 3 })
+        );
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"fleet_busy": null}),
+            serde_json::json!({"fleet_busy": {"policy": "sometimes", "hosted_cap": 1}}),
+            serde_json::json!({"fleet_busy": {"policy": "queue", "hosted_cap": -1}}),
+        ] {
+            assert_eq!(running_busy_settings(&bad), None, "{bad}");
+        }
     }
 
     /// A config whose `fleet.identity.provider` is an unregistered value.

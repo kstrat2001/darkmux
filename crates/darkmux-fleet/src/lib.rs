@@ -3,19 +3,23 @@
 //! Split by concern into submodules (#508); this file is the crate facade.
 
 mod identity;
+mod identity_knowledge;
 mod job;
 mod peer;
 mod roster;
 mod routing;
 mod runner;
+mod seats;
 mod submission;
 
 pub use identity::*;
+pub use identity_knowledge::*;
 pub use job::*;
 pub use peer::*;
 pub use roster::*;
 pub use routing::*;
 pub use runner::*;
+pub use seats::*;
 pub use submission::*;
 
 #[cfg(test)]

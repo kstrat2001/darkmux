@@ -528,14 +528,15 @@ Two rules worth carrying without looking anything up:
   (or `calls: 0`) is REFUSED ("0 is not a budget; set policy off to turn it
   off"), because read either way it would be an eternal wait.
 - **Two concurrency caps, and they are not interchangeable (#2394).**
-  `DARKMUX_REMOTE_CONCURRENT_CAP` → `remote.concurrent_cap` bounds HOSTED
-  endpoint dispatches; `DARKMUX_DISPATCH_FREE_CONCURRENCY` →
+  `DARKMUX_REMOTE_CONCURRENT_CAP` → `remote.concurrent_cap` (default `1`,
+  `0` = unbounded) bounds HOSTED endpoint dispatches, and on a fleet
+  receiver the hosted jobs other machines send; `DARKMUX_DISPATCH_FREE_CONCURRENCY` →
   `runtime.dispatch_free_concurrency` (default `8`) bounds steps that speak to
   no model at all (`procedural.shell`, `mods.gate`, `records.gather`,
   `deliver.github_review`). They were one cap only because a dispatch-free step
-  had no way to say what it consumed; a mission launch sets the remote cap to
-  1, so six independent shell waits ran strictly one at a time. See "Seat
-  classes" in `DESIGN.md`.
+  had no way to say what it consumed; a mission launch reads the remote cap
+  from config (default `1`, since #2681), so at the default six independent
+  shell waits ran strictly one at a time. See "Seat classes" in `DESIGN.md`.
 
 
 ## Where things live
@@ -781,7 +782,7 @@ When writing a new feature that mutates LMStudio state on the operator's behalf:
 
 - `darkmux machine status` — list `lms ps` results grouped by ownership (darkmux-managed vs user state). Read-only.
 - `darkmux machine eject [--dry-run]` — unload everything in the `darkmux:` namespace; never touches user state. Use to release darkmux's RAM footprint without disturbing other tools.
-- `darkmux dispatch <role-id> <text>` — dispatch a single turn to the named role. Looks up the role manifest + `.md` system prompt, then runs the role through the **internal runtime** (per-dispatch `darkmux-runtime` Docker container, mounted workspace tempdir, in-house Rust agent loop with streamed flow records). Pass `--image <tag>` (#703) to dispatch into a specific environment. By default darkmux runs the slim (python + node) runtime image built for its own version: a local `darkmux-runtime:latest` only when its `org.opencontainers.image.version` label matches the binary, otherwise the version-pinned `ghcr.io/kstrat2001/darkmux-runtime:<version>`, pulled on first use, and never an unlabeled or mismatched image (#2923). Naming a `darkmux-runtime:<tag>` (or GHCR) image runs that image after the same check, refused on mismatch. Naming any OTHER Linux image (e.g. `rust:slim`, the operator's own CI image) makes darkmux **inject** its static runtime binary into that image (bind-mount + entrypoint override) so the coder runs in that environment and can `cargo check`/`test` in-sandbox — the inner verify loop. darkmux ships NO per-language images (it brings the agent; you bring the environment). The image needs `bash` + coreutils (debian/ubuntu-family work as-is; bare-alpine needs them added). **For Rust in-sandbox lint** (`cargo clippy`), name an image that includes the clippy component — `rust:latest` ships it; bare `rust:slim` may not, and a missing clippy slips lint to the frontier gate. The coder role makes one bounded `rustup component add clippy` attempt when cargo is present but clippy isn't (the single exception to its no-toolchain-setup rule), but the reliable fix is the operator's image choice — BYO-environment, so bring clippy if you want in-sandbox lint. Local dispatch only today (ignored on cross-machine `--machine`).
+- `darkmux dispatch <role-id> <text>` — dispatch a single turn to the named role. Looks up the role manifest + `.md` system prompt, then runs the role through the **internal runtime** (per-dispatch `darkmux-runtime` Docker container, mounted workspace tempdir, in-house Rust agent loop with streamed flow records). Pass `--image <tag>` (#703) to dispatch into a specific environment. By default darkmux runs the slim (python + node) runtime image built for its own version: a local `darkmux-runtime:latest` only when its `org.opencontainers.image.version` label matches the binary, otherwise the version-pinned `ghcr.io/kstrat2001/darkmux-runtime:<version>`, pulled on first use, and never an unlabeled or mismatched image (#2923). Naming a `darkmux-runtime:<tag>` (or GHCR) image runs that image after the same check, refused on mismatch. Naming any OTHER Linux image (e.g. `rust:slim`, the operator's own CI image) makes darkmux **inject** its static runtime binary into that image (bind-mount + entrypoint override) so the coder runs in that environment and can `cargo check`/`test` in-sandbox — the inner verify loop. darkmux ships NO per-language images (it brings the agent; you bring the environment). The image needs `bash` + coreutils (debian/ubuntu-family work as-is; bare-alpine needs them added). **For Rust in-sandbox lint** (`cargo clippy`), name an image that includes the clippy component — `rust:latest` ships it; bare `rust:slim` may not, and a missing clippy slips lint to the frontier gate. The coder role makes one bounded `rustup component add clippy` attempt when cargo is present but clippy isn't (the single exception to its no-toolchain-setup rule), but the reliable fix is the operator's image choice — BYO-environment, so bring clippy if you want in-sandbox lint. On a `--profile <p>@<machine>` dispatch the tag is sent along, and the other machine runs it only if its allow-list entry for this machine lists it.
 
 (A previous entry here, the `crew sync` verb — reconciling an openclaw agent registry with the crew role manifests — was removed along with the openclaw shell-out path in #1405; the internal runtime reads role manifests directly, so there is no registry left to sync.)
 

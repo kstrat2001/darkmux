@@ -87,7 +87,10 @@ pub struct WorkJob {
 /// `attempt` / `published_by_orchestrator` fields were removed. The receiver
 /// reads the envelope's `schema` BEFORE parsing the job, so a sender on
 /// another version gets a reply naming the version, not a field error.
-pub const WORK_JOB_SCHEMA_VERSION: &str = "5";
+/// "6" (#2916 stage 2): the reply body became newline-delimited (a queued
+/// job's `queued` lines before its answer), and `profile` never carries a
+/// `profile@machine` address (the sender splits it off).
+pub const WORK_JOB_SCHEMA_VERSION: &str = "6";
 
 /// Max byte size of a `WorkJob.message`. 256 KiB matches the
 /// reasoning-text cap in `dispatch_internal.rs` (#231 / S6). (#246 PR-C.2)
@@ -130,6 +133,14 @@ impl WorkJob {
                 return Err(anyhow!(
                     "WorkJob.profile must be 1..={MAX_WORK_IDENTIFIER_LEN} printable ASCII characters \
                      with no spaces: {p:?}"
+                ));
+            }
+            // (#2916 stage 2) The sender splits `profile@machine`; the
+            // machine rides in `target_machine`, never in `profile`.
+            if p.contains('@') {
+                return Err(anyhow!(
+                    "WorkJob.profile is the receiver's own profile name and never contains `@` (the \
+                     sender splits a `profile@machine` address): {p:?}"
                 ));
             }
         }
@@ -203,8 +214,8 @@ pub fn validate_identifier(label: &str, value: &str) -> Result<()> {
 }
 
 /// (#2916) A machine name (`machine_id`): `[A-Za-z0-9_-]`, 1..=64. Machine
-/// names are ASCII case-INSENSITIVE everywhere (`--machine MacBook-Pro`
-/// and `--machine macbook-pro` are the same machine; compare with
+/// names are ASCII case-INSENSITIVE everywhere (`host@MacBook-Pro`
+/// and `host@macbook-pro` name the same machine; compare with
 /// [`same_machine`]); the displayed name keeps its case. Capitals are
 /// allowed because a hostname-derived `machine_id` has them.
 pub fn validate_machine_name(label: &str, value: &str) -> Result<()> {
@@ -347,6 +358,28 @@ mod tests {
         for bad in ["", "has space", "tab\t", "x".repeat(65).as_str()] {
             job.profile = Some(bad.to_string());
             assert!(job.validate().unwrap_err().to_string().contains("profile"), "{bad:?}");
+        }
+    }
+
+    /// (#2916 stage 2) An address never crosses the wire: the sender splits
+    /// `profile@machine`, so a `profile` with `@` is refused.
+    #[test]
+    fn validate_refuses_an_address_in_profile() {
+        let mut job = make_valid_job();
+        job.profile = Some("host@studio".into());
+        let err = job.validate().unwrap_err().to_string();
+        assert!(err.contains("never contains `@`"), "{err}");
+    }
+
+    /// (#2916 stage 2) The address parser and the wire accept the same
+    /// machine names (the wire adds only the `-from-` rule).
+    #[test]
+    fn the_address_parser_and_the_wire_agree_on_machine_names() {
+        let long = "m".repeat(65);
+        for name in ["studio", "MacBook-Pro", "a_b", "x", "studio.lan", "has space", "", "m/1", long.as_str()] {
+            let parser_ok = darkmux_types::profile_address::machine_name_problem(name).is_none();
+            let wire_ok = validate_machine_name("m", name).is_ok();
+            assert_eq!(parser_ok, wire_ok, "{name:?}: parser {parser_ok}, wire {wire_ok}");
         }
     }
 

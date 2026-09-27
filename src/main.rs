@@ -146,7 +146,6 @@ fn run(cmd: Cmd) -> Result<i32> {
             phase_id,
             skip_preflight,
             json,
-            machine,
             no_wait,
             image,
             max_completion_tokens,
@@ -165,7 +164,6 @@ fn run(cmd: Cmd) -> Result<i32> {
             phase_id,
             skip_preflight,
             json,
-            machine,
             no_wait,
             image,
             max_completion_tokens,
@@ -1098,9 +1096,9 @@ fn cmd_mission_dispatch(
         jobs.push((phase.id.clone(), session_id, job));
     }
 
-    // 5. Submit, one phase at a time: the receiver runs one submitted job at
-    //    a time (a second is answered "busy"), so there is no fan-out to a
-    //    single machine. A refusal comes back at once with its reason.
+    // 5. Submit, one phase at a time. The receiver answers each at once: it
+    //    runs it, queues it behind a busy seat (its `fleet.busy_policy`), or
+    //    refuses it with the reason.
     eprintln!(
         "darkmux mission dispatch: mission={mission_id} role={role_id} phases={} machine={machine}",
         jobs.len()
@@ -1109,17 +1107,16 @@ fn cmd_mission_dispatch(
     let mut failures: usize = 0;
     for (phase_id, session_id, job) in jobs {
         match fleet::submit_work(job, wait) {
-            Ok(reply) if reply.status == "accepted" => {
-                println!("  phase={phase_id} session_id={session_id} submitted to {machine} (not waiting)");
-            }
-            Ok(reply) => {
-                completed += 1;
-                let code = reply.exit_code.unwrap_or(1);
-                if code != 0 {
-                    failures += 1;
+            Ok(reply) => match phase_outcome(&reply, &phase_id, &session_id, machine) {
+                PhaseOutcome::NotWaiting(line) => println!("{line}"),
+                PhaseOutcome::Finished { ok, line } => {
+                    completed += 1;
+                    if !ok {
+                        failures += 1;
+                    }
+                    eprintln!("{line}");
                 }
-                eprintln!("  {} phase={phase_id} exit_code={code} session={session_id}", if code == 0 { "✓" } else { "✗" });
-            }
+            },
             Err(e) => {
                 failures += 1;
                 eprintln!(
@@ -1133,6 +1130,40 @@ fn cmd_mission_dispatch(
         println!("\nmission dispatch: completed={completed} failures={failures} (on {machine})");
     }
     Ok(if failures > 0 { 1 } else { 0 })
+}
+
+/// What `mission dispatch` reports for one submitted phase.
+#[derive(Debug, PartialEq, Eq)]
+enum PhaseOutcome {
+    /// Handed over and not waited on (accepted, or queued behind a busy
+    /// seat): not a failure.
+    NotWaiting(String),
+    /// The phase ran; `ok` is a zero exit code.
+    Finished { ok: bool, line: String },
+}
+
+/// (#2916 stage 2 review M3) One phase's reply as `mission dispatch` reports
+/// it. A `queued` reply is the receiver taking the phase, not a failure: its
+/// own reason is printed.
+fn phase_outcome(reply: &fleet::SubmissionReply, phase_id: &str, session_id: &str, machine: &str) -> PhaseOutcome {
+    use fleet::ReplyStatus;
+    match reply.status {
+        ReplyStatus::Accepted => PhaseOutcome::NotWaiting(format!(
+            "  phase={phase_id} session_id={session_id} submitted to {machine} (not waiting)"
+        )),
+        ReplyStatus::Queued => PhaseOutcome::NotWaiting(format!(
+            "  phase={phase_id} session_id={session_id} queued on {machine} (not waiting): {}",
+            fleet::sanitize_remote_text(reply.reason.as_deref().unwrap_or("its seat is busy"))
+        )),
+        ReplyStatus::Completed | ReplyStatus::Error | ReplyStatus::Refused => {
+            let code = reply.exit_code.unwrap_or(1);
+            let mark = if code == 0 { "✓" } else { "✗" };
+            PhaseOutcome::Finished {
+                ok: code == 0,
+                line: format!("  {mark} phase={phase_id} exit_code={code} session={session_id}"),
+            }
+        }
+    }
 }
 
 /// (#1426) Owned fields of the top-level `dispatch` verb — a plain carrier so
@@ -1152,7 +1183,6 @@ struct DispatchInvocation {
     phase_id: Option<String>,
     skip_preflight: bool,
     json: bool,
-    machine: Option<String>,
     no_wait: bool,
     image: Option<String>,
     max_completion_tokens: Option<u32>,
@@ -1185,12 +1215,20 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         phase_id,
         skip_preflight,
         json,
-        machine,
         no_wait,
         image,
         max_completion_tokens,
         resume_from,
     } = inv;
+    // (#2916 stage 2) The machine comes from the profile address: parsed
+    // here, before the message is read, so a malformed address is refused
+    // first. `dispatch_routed_via` splits it for the dispatch itself.
+    let machine = profile
+        .as_deref()
+        .map(darkmux_types::profile_address::ProfileAddress::parse)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("darkmux dispatch: {e}"))?
+        .and_then(|a| a.machine);
     // (#1426) Resolve the message in precedence order: positional MESSAGE >
     // `--message-from-file` > stdin. clap makes the positional and the file
     // flag mutually exclusive, so at most one of the first two is present.
@@ -1287,8 +1325,8 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
                 anyhow::bail!(
                     "--finding / --mod cannot be routed to another machine yet: a submitted \
                      job carries no record refs, and {target}'s own finding / \
-                     mod stores are its own. Run it on this machine (drop --machine), or \
-                     paste the record's content into the message."
+                     mod stores are its own. Run it on this machine (a profile without \
+                     `@{target}`), or paste the record's content into the message."
                 );
             }
         }
@@ -1319,7 +1357,9 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         json,
         workdir,
         phase_id,
-        machine,
+        // (#2916 stage 2) Set from the `profile@machine` address by
+        // `dispatch_routed_via`, never from a flag.
+        machine: None,
         wait: !no_wait,
         // A bare `dispatch` carries no profile-derived compaction config here;
         // the internal dispatch fills the runtime-required context window from
@@ -1393,7 +1433,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
     // `crew::dispatch::dispatch` primitive — see
     // `darkmux_crew::dispatch_as_crew_of_one`'s module doc for the full
     // rationale (closes the #1487 residency-lease bypass a raw `dispatch`
-    // fell through). `--machine` routing (and every other caller of
+    // fell through). `profile@machine` routing (and every other caller of
     // `fleet::dispatch_routed`) is untouched.
     let result = match fleet::dispatch_routed_via(opts, crew::dispatch_as_crew_of_one::dispatch_as_crew_of_one) {
         Ok(r) => r,
@@ -2133,6 +2173,30 @@ fn model_ctx_label(m: &types::ProfileModel, registry: &darkmux_types::ProfileReg
 
 #[cfg(test)]
 mod tests {
+    /// (#2916 stage 2 review M3) `mission dispatch --no-wait` reports a
+    /// queued phase as handed over, with the receiver's reason, never as a
+    /// failure; a finished phase is judged by its exit code.
+    #[test]
+    fn a_queued_phase_is_not_a_failure() {
+        use fleet::{ReplyStatus, SubmissionReply};
+        let queued = SubmissionReply {
+            reason: Some("studio is busy (x is running on big); the job is queued".into()),
+            ..SubmissionReply::of(ReplyStatus::Queued)
+        };
+        match super::phase_outcome(&queued, "p1", "s1", "studio") {
+            super::PhaseOutcome::NotWaiting(line) => {
+                assert!(line.contains("queued on studio") && line.contains("x is running on big"), "{line}")
+            }
+            other => panic!("a queued phase was reported as {other:?}"),
+        }
+        let accepted = SubmissionReply::of(ReplyStatus::Accepted);
+        assert!(matches!(super::phase_outcome(&accepted, "p", "s", "m"), super::PhaseOutcome::NotWaiting(_)));
+        let done = SubmissionReply { exit_code: Some(0), ..SubmissionReply::of(ReplyStatus::Completed) };
+        assert!(matches!(super::phase_outcome(&done, "p", "s", "m"), super::PhaseOutcome::Finished { ok: true, .. }));
+        let failed = SubmissionReply { exit_code: Some(2), ..SubmissionReply::of(ReplyStatus::Completed) };
+        assert!(matches!(super::phase_outcome(&failed, "p", "s", "m"), super::PhaseOutcome::Finished { ok: false, .. }));
+    }
+
     /// (#2947 review C1) `mission dispatch` refuses bad enum config before
     /// it looks up the mission or flips a phase: the dispatch-scope values
     /// always, and the fleet-submission ones with `--machine`.

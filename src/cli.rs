@@ -133,7 +133,19 @@ pub(crate) enum Cmd {
         /// a note). Lets a machine-agnostic caller (e.g. the self-review CI
         /// workflow) NAME the profile it wants while each machine owns which
         /// lab-validated model that profile maps to.
-        #[arg(long)]
+        ///
+        /// (#2916) `<profile>@<machine>` runs the dispatch on the machine
+        /// that owns the profile: it is submitted straight to that machine's
+        /// fleet listener (the roster host on `fleet.listener.port`) with the
+        /// fleet token (the serve token). That machine resolves `<profile>`
+        /// against its own registry (an undefined name is refused, never
+        /// replaced by its default) and runs it only if its allow-list trusts
+        /// this machine (`darkmux machine trust <this-machine> --profiles ...`
+        /// there) for that profile; otherwise it answers at once with the
+        /// reason. `<machine>` is its `machine_id`, looked up in this
+        /// machine's roster (`darkmux machine add`); naming this machine runs
+        /// the profile here.
+        #[arg(long, value_name = "PROFILE[@MACHINE]")]
         profile: Option<String>,
         /// Override the dispatch session id. Default: a fresh
         /// `crew-dispatch-<role>-<unix-micros>-<process-counter>` is
@@ -161,7 +173,7 @@ pub(crate) enum Cmd {
         /// the RADIO answering seat): a genuine wall-clock cap on that one
         /// blocking HTTP call.
         ///
-        /// Local dispatch only: ignored on a cross-machine --machine
+        /// Local dispatch only: ignored on a `--profile <p>@<machine>`
         /// dispatch, which does not carry the value to the other machine.
         ///
         /// Omit to use each path's own default (600 either way; from
@@ -230,24 +242,11 @@ pub(crate) enum Cmd {
         /// Schema: `{ result, final_assistant, metrics, trajectory_path }`.
         #[arg(long)]
         json: bool,
-        /// Run the dispatch on another fleet machine (#2916). The id is
-        /// that machine's `machine_id`, looked up in this machine's roster
-        /// (`darkmux machine add`); the dispatch is submitted straight to
-        /// its fleet listener (the roster host on `fleet.listener.port`)
-        /// with the fleet token (the serve token). The other machine runs
-        /// it only if its allow-list trusts this machine
-        /// (`darkmux machine trust <this-machine> --profiles ...` there) and
-        /// the resolved profile is in that scope; otherwise it answers at
-        /// once with the reason. `--profile` names a profile on THAT
-        /// machine; omitted, it resolves the role's binding there. The id
-        /// matching this machine runs locally.
-        #[arg(long, value_name = "ID")]
-        machine: Option<String>,
-        /// With --machine: return as soon as the other machine accepts the
-        /// job instead of waiting for its result. The CLI prints the
-        /// `session_id`; follow it with `darkmux flow tail --session <id>`
-        /// or in the viewer. Ignored for local dispatches (always
-        /// synchronous).
+        /// With `--profile <p>@<machine>`: return as soon as the other
+        /// machine accepts (or queues) the job instead of waiting for its
+        /// result. The CLI prints the `session_id`; follow it with `darkmux
+        /// flow tail --session <id>` or in the viewer. Ignored for local
+        /// dispatches (always synchronous).
         #[arg(long)]
         no_wait: bool,
         /// (#703) Dispatch into a specific Docker image. Default: the
@@ -262,8 +261,9 @@ pub(crate) enum Cmd {
         /// that environment and can `cargo check`/`test` in-sandbox — the
         /// inner verify loop. No per-language darkmux images. The image needs
         /// `bash` + coreutils (debian/ubuntu-family have them; bare-alpine
-        /// needs them added). Local dispatch only: ignored on
-        /// cross-machine `--machine` dispatch.
+        /// needs them added). On a `--profile <p>@<machine>` dispatch the
+        /// tag is sent along, and the other machine runs it only if its
+        /// allow-list entry for this machine lists it.
         #[arg(long, value_name = "TAG")]
         image: Option<String>,
         /// (#1199) Cap the completion tokens of a single-shot hosted dispatch

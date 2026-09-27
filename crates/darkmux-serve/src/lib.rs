@@ -631,6 +631,46 @@ async fn auth_mw(req: Request, next: Next) -> Response {
     }
 }
 
+/// Headers a reverse proxy in front of this daemon adds, so a request that
+/// reaches loopback THROUGH one is told apart from this machine's own.
+/// `tailscale serve` (the way a hub's daemon reaches the tailnet) proxies
+/// every request to loopback and always sets `X-Forwarded-For` (the tailnet
+/// peer's address) and `X-Forwarded-Host`; for a user-owned node it also
+/// sets `Tailscale-User-Login`, `Tailscale-User-Name` and
+/// `Tailscale-Headers-Info` (its `ipn/ipnlocal/serve.go`, and the serve
+/// docs' identity headers). `Forwarded`, `Via` and the rest are what other
+/// common proxies and CDNs add.
+const PROXY_HEADERS: &[&str] = &[
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-forwarded-server",
+    "x-real-ip",
+    "forwarded",
+    "via",
+    "cf-connecting-ip",
+    "true-client-ip",
+    "tailscale-user-login",
+    "tailscale-user-name",
+    "tailscale-headers-info",
+    "tailscale-funnel-request",
+    "tailscale-app-capabilities",
+];
+
+/// (#2916 stage 2 review C5) Whether a request comes from THIS machine: a
+/// loopback peer address, and no header a reverse proxy adds. Behind
+/// `tailscale serve` every tailnet peer arrives on loopback, so the address
+/// alone would hand a peer what only this machine may read. A local process
+/// that adds such a header only makes itself look remote, which fails
+/// toward showing less. No address (no `ConnectInfo`) is not local.
+///
+/// The limit: a proxy that forwards to loopback and adds NONE of these
+/// headers looks exactly like a local request, and cannot be told apart.
+pub(crate) fn is_local_request(peer: Option<SocketAddr>, headers: &axum::http::HeaderMap) -> bool {
+    peer.is_some_and(|p| p.ip().is_loopback()) && !PROXY_HEADERS.iter().any(|h| headers.contains_key(*h))
+}
+
 /// (#881) Refuse a non-loopback bind unless a token is configured. Pure +
 /// testable: parse `bind` to an `IpAddr`; a loopback address (127.0.0.0/8, ::1)
 /// is always allowed; any other parsed address (a LAN/Tailnet IP, or `0.0.0.0`)
@@ -1519,9 +1559,12 @@ fn current_exe_mtime() -> Option<u64> {
 async fn health(
     State(state): State<AppState>,
     peer: Option<ConnectInfo<SocketAddr>>,
+    headers: axum::http::HeaderMap,
 ) -> axum::Json<serde_json::Value> {
     // (#2916 re-review C9) A peer sees only the listener's coarse state.
-    let loopback_caller = peer.is_some_and(|c| c.0.ip().is_loopback());
+    // (#2916 stage 2 review C5) "This machine" is a loopback request that
+    // did not come through a reverse proxy (`is_local_request`).
+    let loopback_caller = is_local_request(peer.map(|c| c.0), &headers);
     axum::Json(serde_json::json!({
         "darkmux_version": env!("CARGO_PKG_VERSION"),
         "build": darkmux_types::build_version(),
@@ -1531,6 +1574,9 @@ async fn health(
         // is off), so `darkmux doctor` reads the DAEMON's view rather than
         // re-deriving it from a shell whose PATH may differ.
         "fleet_listener": fleet_listener::listener_state(loopback_caller),
+        // (#2916 stage 2 review C5) The busy policy and hosted-job bound the
+        // running listener uses, for this machine only.
+        "fleet_busy": fleet_listener::listener_busy(loopback_caller),
         // (#2916 re-review C3) The open-file soft limit this daemon runs
         // with (raised at start), for this machine only.
         "open_file_limit": if loopback_caller { current_open_file_limit() } else { None },

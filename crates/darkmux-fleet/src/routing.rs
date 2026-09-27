@@ -1,10 +1,14 @@
-//! Fleet dispatch routing — local vs `--machine`, and direct work submission
-//! to the target machine (#2916).
+//! Fleet dispatch routing — local vs a `profile@machine` address, and direct
+//! work submission to the owning machine (#2916).
 //!
-//! `--machine <id>` sends the dispatch STRAIGHT to that machine's
-//! work-submission listener (`submission.rs`), which checks the fleet token
-//! and the connecting node before it runs anything, and answers at once with
-//! a refusal or (with `--wait`, the default) the finished dispatch's result.
+//! A profile address (`--profile host@studio`, #2916 stage 2) sends the
+//! dispatch STRAIGHT to that machine's work-submission listener
+//! (`submission.rs`), which resolves `host` against its own registry, checks
+//! the fleet token and the connecting node before it runs anything, and
+//! answers at once with a refusal or (with `--wait`, the default) the
+//! finished dispatch's result. An address naming this machine runs here. The
+//! `--machine` flag that used to name the target is gone (4.0): the profile
+//! names its machine.
 //! Until 4.0 the dispatch was published to the Redis work queue
 //! (`darkmux:work`) and waited on through the flow stream; the queue is
 //! retired because it could not say who wrote an entry, and any runner
@@ -75,19 +79,60 @@ pub fn dispatch_routed(opts: DispatchOpts) -> Result<DispatchResult> {
     dispatch_routed_via(opts, dispatch::dispatch)
 }
 
-/// Route a dispatch local-vs-remote, then run it. When `--machine` names
-/// another machine, the dispatch is SUBMITTED to that machine's fleet
-/// listener (`submission::submit_work`): its roster host on the fleet's
-/// submission port, with the fleet token. The receiver answers at once with a
+/// (#2916 stage 2) Split a `profile@machine` address in `opts.profile_name`
+/// into the owning machine's own profile name and `opts.machine`. A plain
+/// profile name is left alone. The machine is resolved at dispatch time
+/// against the roster, by its canonical `machine_id` (case-insensitive).
+/// Every caller of [`dispatch_routed_via`] gets the same reading of an
+/// address (contract 1).
+pub fn apply_profile_address(opts: &mut DispatchOpts) -> Result<()> {
+    let Some(raw) = opts.profile_name.as_deref() else { return Ok(()) };
+    if !darkmux_types::profile_address::ProfileAddress::is_address(raw) {
+        return Ok(());
+    }
+    let address = darkmux_types::profile_address::ProfileAddress::parse(raw)
+        .map_err(|e| anyhow!("darkmux dispatch: {e}"))?;
+    let Some(machine) = address.machine.clone() else {
+        return Err(anyhow!("darkmux dispatch: profile address `{raw}` names no machine"));
+    };
+    // The wire's own machine-name rule (it adds `-from-` to the parser's).
+    crate::job::validate_machine_name(&format!("the machine in `{raw}`"), &machine)?;
+    if let Some(existing) = opts.machine.as_deref() {
+        if !crate::job::same_machine(existing, &machine) {
+            return Err(anyhow!(
+                "darkmux dispatch: profile address `{raw}` names {machine}, but this dispatch was \
+                 already addressed to {existing}; a dispatch runs on one machine"
+            ));
+        }
+    }
+    opts.profile_name = Some(address.profile);
+    opts.machine = Some(machine);
+    Ok(())
+}
+
+/// The address a routed dispatch was written as, for messages.
+fn address_label(opts: &DispatchOpts, target: &str) -> String {
+    match opts.profile_name.as_deref() {
+        Some(p) => format!("{p}@{target}"),
+        None => format!("@{target}"),
+    }
+}
+
+/// Route a dispatch local-vs-remote, then run it. When a `profile@machine`
+/// address names another machine ([`apply_profile_address`]), the dispatch
+/// is SUBMITTED to that machine's fleet listener
+/// (`submission::submit_work`): its roster host on the fleet's submission
+/// port, with the fleet token. The receiver answers at once with a
 /// refusal ("studio does not accept work from macbook-pro"), or runs it and
 /// (with `--wait`) replies with the result. Otherwise the dispatch falls
 /// through to `local_dispatch`, a caller-injected LOCAL execution primitive
 /// (#1509): the CLI verb passes `dispatch_as_crew_of_one`, radio passes its
 /// single-shot primitive, `phase_cli` the raw one via [`dispatch_routed`].
 pub fn dispatch_routed_via(
-    opts: DispatchOpts,
+    mut opts: DispatchOpts,
     local_dispatch: impl FnOnce(DispatchOpts) -> Result<DispatchResult>,
 ) -> Result<DispatchResult> {
+    apply_profile_address(&mut opts)?;
     if let Some(target) = opts.machine.clone() {
         let local = darkmux_flow::resolve_machine_id();
         match dispatch::routing_decision(Some(target.as_str()), local.as_deref()) {
@@ -95,9 +140,12 @@ pub fn dispatch_routed_via(
                 matches_was_explicit: true,
             } => {
                 eprintln!(
-                    "darkmux dispatch: --machine={target} matches local machine_id; \
-                     routing locally."
+                    "darkmux dispatch: `{}` names this machine; running it here.",
+                    address_label(&opts, &target)
                 );
+                // The address is spent: the local path resolves the bare
+                // profile name against this machine's own registry.
+                opts.machine = None;
             }
             RoutingDecision::Remote {
                 target,
@@ -114,12 +162,13 @@ pub fn dispatch_routed_via(
                 if opts.resume_from.is_some() {
                     return Err(anyhow!(
                         "darkmux dispatch: --resume-from is not supported with \
-                         --machine={target} (role `{}`): a submitted dispatch runs on the \
+                         `{}` (role `{}`): a submitted dispatch runs on the \
                          OTHER machine, which has no access to this machine's checkpoint — it \
                          would start fresh and report success regardless. darkmux never silently \
                          starts a dispatch fresh under a name that looked like a resume: resume \
-                         on THIS machine (drop --machine) or start this role fresh there on \
-                         purpose (drop --resume-from).",
+                         on THIS machine (name a profile here, without `@{target}`) or start \
+                         this role fresh there on purpose (drop --resume-from).",
+                        address_label(&opts, &target),
                         opts.role_id
                     ));
                 }
@@ -130,9 +179,10 @@ pub fn dispatch_routed_via(
                     "{}",
                     darkmux_types::style::warn(&format!(
                         "darkmux dispatch: WARNING — this machine's machine_id is unresolvable. \
-                         --machine={target} is submitted to {target} regardless. \
+                         `{}` is submitted to {target} regardless. \
                          Set DARKMUX_MACHINE_ID (or `darkmux config set machine_id`) so the \
-                         local-vs-remote decision is deterministic."
+                         local-vs-remote decision is deterministic.",
+                        address_label(&opts, &target)
                     ))
                 );
                 // #290 — the pinned route record, so the audit trail and
@@ -152,12 +202,13 @@ pub fn dispatch_routed_via(
                 if opts.resume_from.is_some() {
                     return Err(anyhow!(
                         "darkmux dispatch: --resume-from is not supported with \
-                         --machine={target} (role `{}`): a submitted dispatch runs on the \
+                         `{}` (role `{}`): a submitted dispatch runs on the \
                          OTHER machine, which has no access to this machine's checkpoint — it \
                          would start fresh and report success regardless. darkmux never silently \
                          starts a dispatch fresh under a name that looked like a resume: resume \
-                         on THIS machine (drop --machine) or start this role fresh there on \
-                         purpose (drop --resume-from).",
+                         on THIS machine (name a profile here, without `@{target}`) or start \
+                         this role fresh there on purpose (drop --resume-from).",
+                        address_label(&opts, &target),
                         opts.role_id
                     ));
                 }
@@ -176,7 +227,7 @@ pub fn dispatch_routed_via(
         }
     }
 
-    // Local fall-through — no `--machine` means run on this machine.
+    // Local fall-through — no address naming another machine means run here.
     local_dispatch(opts)
 }
 
@@ -216,35 +267,37 @@ fn dispatch_via_submission(opts: DispatchOpts, target: &str) -> Result<DispatchR
     Ok(reply_to_dispatch_result(reply, &session_id, target))
 }
 
-/// Translate an accepted or completed [`crate::SubmissionReply`] into the
-/// `DispatchResult` the CLI prints.
+/// Translate a reply `submit_work` returned (completed, accepted or queued)
+/// into the `DispatchResult` the CLI prints.
 pub(crate) fn reply_to_dispatch_result(
     reply: crate::SubmissionReply,
     session_id: &str,
     target: &str,
 ) -> DispatchResult {
+    use crate::ReplyStatus;
     let session_id = reply.session_id.clone().unwrap_or_else(|| session_id.to_string());
-    if reply.status == "accepted" {
-        return DispatchResult {
-            exit_code: 0,
-            stdout: format!(
-                "submitted to {target}; not waiting (session_id={session_id}). Follow it with \
-                 `darkmux flow tail --session {session_id}` or in the viewer.\n"
-            ),
-            stderr: String::new(),
-            session_id,
-            // The run's bookkeeping lands on the receiving machine.
-            out_dir: None,
-        };
-    }
-    // (#2916 review C1) Remote output never reaches the terminal raw.
-    DispatchResult {
-        exit_code: reply.exit_code.unwrap_or(1),
-        stdout: crate::sanitize_remote_text(&reply.stdout.unwrap_or_default()),
-        stderr: crate::sanitize_remote_text(&reply.stderr.unwrap_or_default()),
-        session_id,
-        out_dir: None,
-    }
+    let follow = format!("Follow it with `darkmux flow tail --session {session_id}` or in the viewer.");
+    let stdout = match reply.status {
+        // (#2916 stage 2) Queued without `--wait`: the receiver's own words,
+        // verbatim (control characters removed), and how to follow it.
+        ReplyStatus::Queued => format!(
+            "queued on {target}; not waiting (session_id={session_id}): {}. {follow}\n",
+            crate::sanitize_remote_text(reply.reason.as_deref().unwrap_or("its seat is busy"))
+        ),
+        ReplyStatus::Accepted => format!("submitted to {target}; not waiting (session_id={session_id}). {follow}\n"),
+        // (#2916 review C1) Remote output never reaches the terminal raw.
+        ReplyStatus::Completed | ReplyStatus::Error | ReplyStatus::Refused => {
+            return DispatchResult {
+                exit_code: reply.exit_code.unwrap_or(1),
+                stdout: crate::sanitize_remote_text(&reply.stdout.unwrap_or_default()),
+                stderr: crate::sanitize_remote_text(&reply.stderr.unwrap_or_default()),
+                session_id,
+                out_dir: None,
+            }
+        }
+    };
+    // The run's bookkeeping lands on the receiving machine.
+    DispatchResult { exit_code: 0, stdout, stderr: String::new(), session_id, out_dir: None }
 }
 
 #[cfg(test)]
@@ -289,16 +342,15 @@ mod tests {
     #[test]
     fn a_completed_reply_carries_the_remote_exit_code_and_output() {
         let reply = crate::SubmissionReply {
-            status: "completed".into(),
             session_id: Some("s-remote".into()),
             exit_code: Some(42),
             stdout: Some("out\x1b[2J".into()),
             stderr: Some("err".into()),
-            ..Default::default()
+            ..crate::SubmissionReply::of(crate::ReplyStatus::Completed)
         };
         let r = reply_to_dispatch_result(reply, "s-local", "studio");
         assert_eq!((r.exit_code, r.stdout.as_str(), r.stderr.as_str(), r.session_id.as_str()), (42, "out[2J", "err", "s-remote"), "the ESC byte is stripped");
-        let accepted = crate::SubmissionReply { status: "accepted".into(), ..Default::default() };
+        let accepted = crate::SubmissionReply::of(crate::ReplyStatus::Accepted);
         let r = reply_to_dispatch_result(accepted, "s-local", "studio");
         assert_eq!(r.exit_code, 0);
         assert!(r.stdout.contains("submitted to studio; not waiting (session_id=s-local)"), "{}", r.stdout);
@@ -307,7 +359,7 @@ mod tests {
     // (#1509) `dispatch_routed_via`'s local-dispatch injection seam. No
     // `opts.machine` means the local fall-through runs — never touches
     // the network, so this is a fast, hermetic unit test even though
-    // `dispatch_routed_via` is the same function a live `--machine` dispatch
+    // `dispatch_routed_via` is the same function a live `profile@machine` dispatch
     // uses.
 
     fn local_opts(role_id: &str) -> DispatchOpts {
@@ -375,12 +427,12 @@ mod tests {
         assert!(err.to_string().contains("injected failure"), "{err}");
     }
 
-    // ─── #2584: `--resume-from` routed to another machine via `--machine`
+    // ─── #2584: `--resume-from` routed to another machine via `profile@machine`
     //     must refuse BEFORE anything is sent ──────────────────────────
     //
     // `dispatch_via_submission` sends a `WorkJob` that carries no
     // `resume_from` field at all, and the receiver runs it with
-    // `resume_from: None`. A dispatch with `--machine <peer> --resume-from
+    // `resume_from: None`. A dispatch with `--profile <p>@<peer> --resume-from
     // <dir>` would start FRESH on the other machine and exit 0 — the
     // promise-break #2561/#2580 closed on the other two routes.
     //
@@ -407,7 +459,7 @@ mod tests {
         (port, rx)
     }
 
-    /// Env for a `--machine=peer-b` dispatch whose submission would dial
+    /// Env for a `host@peer-b` dispatch whose submission would dial
     /// the counting peer: a roster naming `peer-b` at 127.0.0.1, the fleet
     /// port pointed at the peer, a fleet token, a private flows dir.
     /// Restores everything on drop.
@@ -473,16 +525,16 @@ mod tests {
         let env = PeerEnv::new(port);
 
         let mut opts = local_opts("pr-reviewer");
-        opts.machine = Some("peer-b".to_string());
+        opts.profile_name = Some("host@peer-b".to_string());
         opts.resume_from = Some(std::path::PathBuf::from("/tmp/darkmux-2584-checkpoint"));
 
         let err = dispatch_routed_via(opts, |_opts| {
-            panic!("local_dispatch must never be invoked for a --machine=peer-b dispatch");
+            panic!("local_dispatch must never be invoked for a host@peer-b dispatch");
         })
-        .expect_err("--resume-from with --machine=<peer> must refuse, not submit");
+        .expect_err("--resume-from with a remote profile address must refuse, not submit");
         let msg = format!("{err:#}");
 
-        assert!(msg.contains("--machine=peer-b"), "must name the pinned target machine: {msg}");
+        assert!(msg.contains("`host@peer-b`"), "must name the address it was sent to: {msg}");
         assert!(
             msg.contains(
                 "darkmux never silently \
@@ -554,6 +606,166 @@ mod tests {
         assert!(r.session_id.starts_with("pr-reviewer") || !r.session_id.contains("pwned"), "{:?}", r.session_id);
     }
 
+    /// A peer that reads one whole request, sends its body on the channel,
+    /// and answers `reply` (a newline-delimited body) with HTTP 200.
+    fn spawn_scripted_peer(reply: &'static str) -> (u16, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut got = Vec::new();
+                let mut b = [0u8; 65536];
+                s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let body = loop {
+                    let n = s.read(&mut b).unwrap_or(0);
+                    if n == 0 {
+                        break String::new();
+                    }
+                    got.extend_from_slice(&b[..n]);
+                    let text = String::from_utf8_lossy(&got).to_string();
+                    if let Some(h) = text.find("\r\n\r\n") {
+                        let len = text[..h]
+                            .lines()
+                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                            .unwrap_or(0);
+                        if got.len() >= h + 4 + len {
+                            break text[h + 4..].to_string();
+                        }
+                    }
+                };
+                let _ = tx.send(body);
+                let _ = s.write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len())
+                        .as_bytes(),
+                );
+            }
+        });
+        (port, rx)
+    }
+
+    fn peer_b_is_verified() {
+        crate::submission::test_sender_provider::set(Box::new(crate::identity::StaticIdentityProvider {
+            local: crate::identity::test_node("nLOCAL", "local-a", "100.64.0.1"),
+            peers: vec![crate::identity::test_node("nPEERB", "peer-b", "127.0.0.1")],
+            down: None,
+        }));
+    }
+
+    /// (#2916 stage 2) `host@peer-b` is submitted to peer-b, and what
+    /// crosses is the OWNER's profile name, never the address.
+    #[test]
+    #[serial]
+    fn an_address_is_submitted_to_its_machine_with_the_bare_profile() {
+        let (port, rx) = spawn_scripted_peer("{\"status\":\"completed\",\"exit_code\":0,\"stdout\":\"done\"}\n");
+        let _env = PeerEnv::new(port);
+        peer_b_is_verified();
+        let mut opts = local_opts("radio-host");
+        opts.profile_name = Some("host@Peer-B".to_string());
+        let r = dispatch_routed_via(opts, |_| panic!("an address naming another machine never runs here")).unwrap();
+        assert_eq!((r.exit_code, r.stdout.as_str()), (0, "done"));
+        let sent: serde_json::Value = serde_json::from_str(&rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+        assert_eq!(sent["job"]["profile"], "host", "the owner's own profile name crosses: {sent}");
+        assert_eq!(sent["job"]["target_machine"], "Peer-B");
+        assert_eq!(sent["schema"], crate::WORK_JOB_SCHEMA_VERSION);
+    }
+
+    /// (#2916 stage 2) An address naming THIS machine runs here, on the
+    /// bare profile name, and nothing is sent.
+    #[test]
+    #[serial]
+    fn an_address_naming_this_machine_runs_here_on_the_bare_profile() {
+        let (port, rx) = spawn_connection_counting_peer();
+        let _env = PeerEnv::new(port);
+        let mut opts = local_opts("coder");
+        opts.profile_name = Some("host@LOCAL-A".to_string());
+        let mut seen = None;
+        dispatch_routed_via(opts, |o| {
+            seen = Some((o.profile_name.clone(), o.machine.clone()));
+            Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: "s".into(), out_dir: None })
+        })
+        .unwrap();
+        assert_eq!(seen, Some((Some("host".to_string()), None)));
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "nothing may be sent for a local address");
+    }
+
+    /// (#2916 stage 2) A malformed address, or one that conflicts with a
+    /// machine the caller already named, is refused before anything runs
+    /// or is sent.
+    #[test]
+    #[serial]
+    fn a_bad_address_is_refused_before_anything_is_sent() {
+        let (port, rx) = spawn_connection_counting_peer();
+        let env = PeerEnv::new(port);
+        for (profile, needle) in [("host@peer.b", "contains '.'"), ("@peer-b", "names no profile"), ("host@x-from-y", "may not contain `-from-`")] {
+            let mut opts = local_opts("coder");
+            opts.profile_name = Some(profile.to_string());
+            let err = dispatch_routed_via(opts, |_| panic!("never local")).unwrap_err();
+            assert!(format!("{err:#}").contains(needle), "{profile}: {err:#}");
+        }
+        let mut opts = local_opts("coder");
+        opts.profile_name = Some("host@peer-b".to_string());
+        opts.machine = Some("peer-c".to_string());
+        let err = dispatch_routed_via(opts, |_| panic!("never local")).unwrap_err();
+        assert!(format!("{err:#}").contains("already addressed to peer-c"), "{err:#}");
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "nothing may be sent");
+        // Refused before the route record, too: nothing was dispatched.
+        let files: Vec<_> = std::fs::read_dir(env.flows_dir.path())
+            .map(|rd| rd.filter_map(|e| e.ok()).collect())
+            .unwrap_or_default();
+        assert!(files.is_empty(), "no flow record may be written for a refused address: {files:?}");
+    }
+
+    /// (#2916 stage 2 review C1) A connection that never opens sent
+    /// nothing, and the sender says so instead of "may still be running".
+    #[test]
+    #[serial]
+    fn a_refused_connection_says_nothing_was_sent() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let _env = PeerEnv::new(port);
+        peer_b_is_verified();
+        let mut opts = local_opts("radio-host");
+        opts.profile_name = Some("host@peer-b".to_string());
+        let msg = format!("{:#}", dispatch_routed_via(opts, |_| panic!("never local")).unwrap_err());
+        assert!(msg.contains("nothing was sent") && !msg.contains("may still be running"), "{msg}");
+    }
+
+    /// (#2916 stage 2) Queued without `--wait`: the answer is the
+    /// receiver's own words, and the dispatch is not an error.
+    #[test]
+    #[serial]
+    fn a_queued_answer_without_wait_is_reported_verbatim() {
+        let (port, _rx) = spawn_scripted_peer(
+            "{\"status\":\"queued\",\"session_id\":\"s-from-local-a\",\"reason\":\"peer-b is busy (x is running on big); the job is queued and runs when its seat frees\"}\n",
+        );
+        let _env = PeerEnv::new(port);
+        peer_b_is_verified();
+        let mut opts = local_opts("radio-host");
+        opts.profile_name = Some("host@peer-b".to_string());
+        opts.wait = false;
+        let r = dispatch_routed_via(opts, |_| panic!("never local")).unwrap();
+        assert_eq!(r.exit_code, 0);
+        assert!(r.stdout.contains("queued on peer-b") && r.stdout.contains("x is running on big"), "{}", r.stdout);
+        assert_eq!(r.session_id, "s-from-local-a");
+    }
+
+    /// (#2916 stage 2) Waited on: the queued lines come first, then the
+    /// result, which is what the dispatch returns.
+    #[test]
+    #[serial]
+    fn a_waited_queued_job_returns_its_final_result() {
+        let (port, _rx) = spawn_scripted_peer(
+            "{\"status\":\"queued\",\"reason\":\"busy\"}\n{\"status\":\"completed\",\"exit_code\":3,\"stdout\":\"late\"}\n",
+        );
+        let _env = PeerEnv::new(port);
+        peer_b_is_verified();
+        let mut opts = local_opts("radio-host");
+        opts.profile_name = Some("host@peer-b".to_string());
+        let r = dispatch_routed_via(opts, |_| panic!("never local")).unwrap();
+        assert_eq!((r.exit_code, r.stdout.as_str()), (3, "late"));
+    }
+
     /// Positive control for the test above: the same setup WITHOUT a resume
     /// does dial the peer (and fails loudly, since the peer answers
     /// nothing), so "never dialed" above means refused, not misconfigured.
@@ -573,7 +785,11 @@ mod tests {
         opts.machine = Some("peer-b".to_string());
         let err = dispatch_routed_via(opts, |_opts| panic!("never local")).unwrap_err();
         rx.recv_timeout(Duration::from_secs(5)).expect("the submission must have dialed the peer");
-        assert!(format!("{err:#}").contains("no answer from http://127.0.0.1:"), "{err:#}");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no answer from http://127.0.0.1:"), "{msg}");
+        // (#2916 stage 2 review C1) The request reached the peer, so the
+        // sender cannot know whether it runs: it says so, with the session.
+        assert!(msg.contains("may still be running on peer-b") && msg.contains("-from-local-a"), "{msg}");
     }
 
     // ─── #2584 conformance: every call site of `dispatch_via_submission` must be
@@ -1389,7 +1605,7 @@ mod tests {
         out
     }
 
-    /// The phrase every `--machine`+`--resume-from` guard must contain —
+    /// The phrase every remote-address + `--resume-from` guard must contain —
     /// the same promise `validate_resume_checkpoint` (container path) and
     /// the #2561/#2580 remote-single-shot guards state, restated true for
     /// the queued-peer route.

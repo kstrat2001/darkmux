@@ -318,9 +318,9 @@ pub fn run_bounded<T: Send + 'static>(
     est: &(dyn FootprintEstimator + Sync),
     remote_cap: usize,
     // (#2394) The concurrency ceiling for `SeatClaim::NoModel` jobs — the
-    // caller-resolved `config_access::dispatch_free_concurrency()`. Clamped
-    // to >= 1 here, same as `remote_cap` (a 0 cap would mean "run nothing,
-    // forever").
+    // caller-resolved `config_access::dispatch_free_concurrency()` (which
+    // is itself never below 1). For both caps `0` means unbounded
+    // (`config_access::jobs_at_once`), the darkmux bound convention.
     dispatch_free_cap: usize,
     host_factory: &(dyn Fn() -> Box<dyn ModelHost> + Sync),
 ) -> Result<Vec<(usize, JobOutcome<T>)>> {
@@ -378,12 +378,12 @@ pub fn run_bounded<T: Send + 'static>(
             spawn_scoped_named(scope, || run_local_waves(schedule, local_by_seat, &results, est, host_factory))
         });
         let remote_track = (!remote_jobs.is_empty())
-            .then(|| spawn_scoped_named(scope, || run_capped_batches(remote_jobs, remote_cap.max(1), &results)));
+            .then(|| spawn_scoped_named(scope, || run_capped_batches(remote_jobs, remote_cap, &results)));
         // (#2394) The third sibling. Same batching mechanism as the remote
         // track, a DIFFERENT cap — and running on its own thread means a
         // long dispatch-free wait never occupies a hosted-endpoint slot.
         let dispatch_free_track = (!dispatch_free_jobs.is_empty()).then(|| {
-            spawn_scoped_named(scope, || run_capped_batches(dispatch_free_jobs, dispatch_free_cap.max(1), &results))
+            spawn_scoped_named(scope, || run_capped_batches(dispatch_free_jobs, dispatch_free_cap, &results))
         });
 
         // (#1452) Join each track EXPLICITLY. A track thread panics when one
@@ -1048,16 +1048,16 @@ pub(crate) fn ensure_wave_loaded(
 ///
 /// `cap` is the caller-resolved ceiling for THAT track —
 /// `config_access::remote_concurrent_cap()` for the hosted-endpoint track,
-/// `config_access::dispatch_free_concurrency()` for the dispatch-free one —
-/// already clamped to >= 1 by [`run_bounded`] (a 0 cap would otherwise mean
-/// "run nothing, forever"). The two tracks share this code and share
-/// nothing else: separate vecs, separate caps, separate threads.
+/// `config_access::dispatch_free_concurrency()` for the dispatch-free one.
+/// `0` means unbounded (`config_access::jobs_at_once`): one batch holding
+/// every job. The two tracks share this code and share nothing else:
+/// separate vecs, separate caps, separate threads.
 fn run_capped_batches<T: Send + 'static>(
     mut remote_jobs: Vec<(usize, DispatchJob<T>)>,
     cap: usize,
     results: &ResultsSink<T>,
 ) {
-    for batch in remote_jobs.chunks_mut(cap.max(1)) {
+    for batch in remote_jobs.chunks_mut(darkmux_types::config_access::jobs_at_once(cap)) {
         std::thread::scope(|batch_scope| {
             for (index, job) in batch {
                 let index = *index;
@@ -3237,7 +3237,7 @@ mod tests {
 
     /// (#2394) The two cap-bounded tracks are INDEPENDENT: a
     /// `SeatClaim::NoModel` job is bounded by `dispatch_free_cap`, and
-    /// `remote_cap` — even at 1, the mission-launch value — does not touch
+    /// `remote_cap` — even at 1, its default — does not touch
     /// it. Timed, because the whole bug was a timing one: four jobs each
     /// sleeping 200ms under `remote_cap: 1` must finish in ~200ms, not
     /// ~800ms.
@@ -3268,7 +3268,7 @@ mod tests {
             })
             .collect();
         let t0 = std::time::Instant::now();
-        // remote_cap = 1 (a mission launch's value); dispatch_free_cap = 4.
+        // remote_cap = 1 (its default); dispatch_free_cap = 4.
         let results = run_bounded(jobs, &facts, &est, 1, 4, &mock_host_factory).expect("planning never fails under Auto");
         let elapsed = t0.elapsed();
         assert_eq!(results.len(), 4);
@@ -3320,6 +3320,31 @@ mod tests {
     /// behavior — it rides the remote track, cap and all — rather than
     /// silently gaining the dispatch-free track's much wider ceiling. The
     /// class is new; the scheduling of this case is not.
+    /// (#2916 stage 2 review C2) `remote.concurrent_cap = 0` is UNBOUNDED on
+    /// the hosted track, as it is on the fleet listener's hosted seats: the
+    /// jobs overlap. It used to be clamped to 1, so one setting meant two
+    /// things.
+    #[test]
+    fn a_zero_remote_cap_is_unbounded_not_one() {
+        let est = FixedEstimator::default();
+        let facts = Facts::default();
+        let jobs = (0..3)
+            .map(|i| QueuedJob {
+                index: i,
+                seat: SeatClaim::LocalModelUnresolved { reason: "no active profile".to_string() },
+                job: Box::new(move || {
+                    std::thread::sleep(Duration::from_millis(150));
+                    Ok((i, vec![]))
+                }),
+            })
+            .collect();
+        let t0 = std::time::Instant::now();
+        let results = run_bounded(jobs, &facts, &est, 0, 8, &mock_host_factory).expect("planning never fails under Auto");
+        assert_eq!(results.len(), 3);
+        let elapsed = t0.elapsed();
+        assert!(elapsed < Duration::from_millis(400), "three 150ms jobs at cap 0 must overlap, got {elapsed:?}");
+    }
+
     #[test]
     fn an_unresolved_local_seat_still_rides_the_remote_cap() {
         let est = FixedEstimator::default();

@@ -32,6 +32,10 @@ axum = "0.7"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs", "io-util", "process", "time", "sync"] }
 tokio-stream = "0.1"
 futures = "0.3"
+# (#2916 stage 2) A fingerprint of the fleet token a queued job was
+# admitted with (never the token itself). Already in the tree via
+# darkmux-flow's audit sink.
+blake3 = "1.5"
 tower-http = { version = "0.5", features = ["cors", "timeout"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -56,6 +60,14 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "http1", "service"] }
 # (#2916 review M1) Raise RLIMIT_NOFILE's soft limit at daemon start.
 libc = "0.2"
+
+[features]
+# (#2916 stage 2) Test-only: lets the fleet listener bind the loopback
+# address a fake identity tool reports, so `tests/fleet_profile_address_two_daemons.rs`
+# can run two daemons on one machine. Enabled only by that test target's
+# `required-features` (through the root crate's feature of the same name);
+# never by a release build. See `fleet_listener::LOOPBACK_FOR_E2E`.
+e2e-fleet-loopback = []
 
 [dev-dependencies]
 serial_test = "3.1"
