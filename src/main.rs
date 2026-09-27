@@ -2189,7 +2189,7 @@ fn profile_matches(profile: &types::Profile, loaded: &[types::LoadedModel]) -> b
     // registered profile". Any local load means the state isn't this
     // profile's.
     let local: Vec<&types::ProfileModel> =
-        profile.models.iter().filter(|m| !m.is_remote()).collect();
+        profile.models.iter().filter(|m| m.is_managed()).collect();
     if local.len() != loaded.len() {
         return false;
     }
@@ -2241,20 +2241,84 @@ fn cmd_profiles(config: Option<&str>, json: bool) -> Result<i32> {
             };
             // (#1282) `n_ctx` is optional (endpoint-bearing models have no
             // local context to declare) — show what the entry actually says.
-            let ctx = match m.n_ctx {
-                Some(n) => format!("ctx {n}"),
-                None if m.is_remote() => "endpoint".to_string(),
-                None => "ctx unset".to_string(),
-            };
+            let ctx = model_ctx_label(m, &loaded.registry);
             println!("  - {} {} @ {}", darkmux_types::style::dim(&format!("{:<10}", marker)), m.id, ctx);
+        }
+    }
+    // (#2902 step 4) The endpoints profiles name by id: what darkmux does
+    // there and where requests go (host only, never the path or a credential).
+    if !loaded.registry.endpoints.is_empty() {
+        println!("\n{}", darkmux_types::style::accent("endpoints"));
+        for (id, ep) in &loaded.registry.endpoints {
+            let what = match ep.kind() {
+                Ok(darkmux_types::EndpointKind::Managed(_)) => "managed (lmstudio)".to_string(),
+                Ok(darkmux_types::EndpointKind::Unmanaged) => {
+                    format!("unmanaged @ {}", ep.host().unwrap_or_else(|| "?".to_string()))
+                }
+                Err(e) => format!("unusable: {e}"),
+            };
+            println!("  - {id}: {what}");
         }
     }
     Ok(0)
 }
 
+/// `profile list`'s `@ …` for one model: its window, or (#2902) its
+/// endpoint by id, saying WHY an id cannot be used: its entry (or the whole
+/// `endpoints` value) is quarantined, it is defined but unusable, or it is
+/// not defined at all.
+fn model_ctx_label(m: &types::ProfileModel, registry: &darkmux_types::ProfileRegistry) -> String {
+    use darkmux_types::QuarantinedEntryKind;
+    if let Some(n) = m.n_ctx {
+        return format!("ctx {n}");
+    }
+    if m.is_managed() {
+        return "ctx unset".to_string();
+    }
+    let Some(id) = m.endpoint.as_ref().and_then(|e| e.named_id()) else {
+        return "endpoint".to_string();
+    };
+    if m.endpoint_kind().is_ok() {
+        return format!("endpoint `{id}`");
+    }
+    let quarantined = registry
+        .quarantined
+        .iter()
+        .any(|q| q.kind == QuarantinedEntryKind::Endpoint && (q.name == id || q.name == "endpoints"));
+    if quarantined {
+        format!("endpoint `{id}` (quarantined: its `endpoints` entry failed to parse; see `darkmux doctor`)")
+    } else if registry.endpoints.contains_key(id) {
+        format!("endpoint `{id}` (unusable; see `darkmux doctor`)")
+    } else {
+        format!("endpoint `{id}` (not defined in `endpoints`)")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (#2902 re-review C2) `profile list` tells a quarantined endpoint
+    /// entry from an undefined id and from a defined-but-unusable one.
+    #[test]
+    fn profile_list_says_why_an_endpoint_id_cannot_be_used() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        std::fs::write(
+            &p,
+            r#"{"profiles":{"p":{"models":[
+                    {"id":"a","endpoint":"bad"},{"id":"b","endpoint":"ghost"},
+                    {"id":"c","endpoint":"newer"},{"id":"d","endpoint":"ok"}]}},
+                "endpoints":{"bad":{"url":5},"newer":{"managed":"machine"},"ok":{"url":"https://h.example/v1"}}}"#,
+        )
+        .unwrap();
+        let reg = profiles::load_registry(p.to_str()).unwrap().registry;
+        let label = |i: usize| model_ctx_label(&reg.profiles["p"].models[i], &reg);
+        assert!(label(0).contains("quarantined"), "{}", label(0));
+        assert!(label(1).contains("not defined"), "{}", label(1));
+        assert!(label(2).contains("unusable"), "{}", label(2));
+        assert_eq!(label(3), "endpoint `ok`");
+    }
 
     // ─── profile_matches (#1282) ─────────────────────────────────────
 

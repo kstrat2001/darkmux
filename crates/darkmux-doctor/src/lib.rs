@@ -192,6 +192,7 @@ pub fn run() -> DoctorReport {
         check_quarantined_mirrors(),
         checks_power::check_power_posture(),
         check_remote_endpoint_credentials(),
+        check_endpoints(),
         check_env_masks_config(),
         check_binary_split_brain(),
         check_audit_integrity(),
@@ -1408,7 +1409,7 @@ fn utility_in_profiles_status(registry: &darkmux_types::ProfileRegistry) -> Chec
             profile
                 .models
                 .iter()
-                .find(|m| !m.is_remote() && bare(&m.id) == utility_key)
+                .find(|m| m.is_managed() && bare(&m.id) == utility_key)
                 .map(|m| (profile_name.clone(), m.n_ctx))
         })
         .collect();
@@ -1688,14 +1689,16 @@ fn unreachable_residents_status(
         String::new()
     } else {
         format!(
-            " Note: {} profile entr{} in this registry {} currently quarantined (failed to parse — see the profile-registry check): {}. If one of the residents above was loaded from a quarantined profile, it may simply be waiting on that profile to be fixed, not genuinely orphaned.",
+            " Note: {} registry entr{} {} currently quarantined (failed to parse — see the profile-registry check): {}. If one of the residents above was loaded from a quarantined profile, or a profile naming a quarantined endpoint, it may simply be waiting on that entry to be fixed, not genuinely orphaned.",
             registry.quarantined.len(),
             if registry.quarantined.len() == 1 { "y" } else { "ies" },
             if registry.quarantined.len() == 1 { "is" } else { "are" },
+            // (#2902 re-review C2) Profiles and endpoints both quarantine;
+            // each is named with its kind.
             registry
                 .quarantined
                 .iter()
-                .map(|q| q.name.as_str())
+                .map(|q| format!("{} \"{}\"", q.kind, q.name))
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -4243,54 +4246,50 @@ fn check_remote_endpoint_credentials() -> Check {
     let mut problems: Vec<String> = Vec::new();
     let mut checked = 0usize;
 
+    // (#2902 step 4) A named endpoint is checked once, under its id; an
+    // inline one per model that declares it.
+    let mut seen_named: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (profile_name, profile) in &registry.registry.profiles {
         for model in &profile.models {
             let Some(ep) = model.endpoint.as_ref() else {
                 continue;
             };
+            let subject = match ep.named_id() {
+                Some(id) => {
+                    if !seen_named.insert(id.to_string()) {
+                        continue;
+                    }
+                    format!("endpoint `{id}`")
+                }
+                None => format!("profile `{profile_name}` model `{}`", model.id),
+            };
             let Some(auth) = ep.auth.as_ref() else {
                 continue;
             };
-            if auth.auth_type.is_none() {
-                continue;
-            }
-            checked += 1;
-            // (#1312) A declared env var (`key_env`) that is PRESENT in this
-            // process's environment satisfies the credential — the headless
-            // runner sets it from its secret store and the dispatch never reads
-            // the Keychain. Present env var ⇒ satisfied, regardless of keychain.
-            let env_present = auth
-                .key_env
-                .as_deref()
-                .filter(|v| !v.is_empty())
-                .and_then(|v| std::env::var(v).ok())
-                .is_some_and(|v| !v.is_empty());
-            if env_present {
-                continue;
-            }
-            match auth.keychain.as_deref() {
-                None | Some("") => {
-                    let via = auth
-                        .key_env
-                        .as_deref()
-                        .filter(|v| !v.is_empty())
+            // (#2902 step 3) The order is `EndpointAuth::credential_source`,
+            // the same one the dispatch reads the secret by: a declared env
+            // var PRESENT here satisfies it (the headless runner sets it from
+            // its secret store and the Keychain is never read, #1312).
+            match auth.credential_source() {
+                darkmux_types::CredentialSource::NoHeader => continue,
+                darkmux_types::CredentialSource::Env(_) => checked += 1,
+                darkmux_types::CredentialSource::Missing { key_env } => {
+                    checked += 1;
+                    let via = key_env
                         .map(|v| format!(" (declared env var `{v}` is not set in this environment)"))
                         .unwrap_or_default();
                     problems.push(format!(
-                        "profile `{profile_name}` model `{}`: endpoint.auth.type is set \
+                        "{subject}: endpoint.auth.type is set \
                          but no credential source resolved — set endpoint.auth.keychain or \
-                         export endpoint.auth.key_env{via}",
-                        model.id
+                         export endpoint.auth.key_env{via}"
                     ));
                 }
-                Some(keychain) if !keychain_item_present(keychain) => {
-                    problems.push(format!(
-                        "profile `{profile_name}` model `{}`: Keychain item `{keychain}` \
-                         not found on this machine",
-                        model.id
-                    ));
+                darkmux_types::CredentialSource::Keychain(keychain) => {
+                    checked += 1;
+                    if !keychain_item_present(keychain) {
+                        problems.push(format!("{subject}: Keychain item `{keychain}` not found on this machine"));
+                    }
                 }
-                Some(_) => {}
             }
         }
     }
@@ -4344,6 +4343,81 @@ fn keychain_item_present(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// (#2902 step 4) `endpoints`: what the registry's `endpoints` map declares,
+/// one line per endpoint (what darkmux does there, the request dialect,
+/// where the credential lives by NAME, and its usage limits), and the move
+/// to name each inline endpoint by id. Limits are parsed and shown here but
+/// NOT ENFORCED until #2902 step 5; the line says so.
+fn check_endpoints() -> Check {
+    match profiles::load_registry(None) {
+        Ok(l) => endpoints_status(&l.registry),
+        Err(e) => Check {
+            name: "endpoints".into(),
+            status: Status::Warn,
+            message: format!("can't list endpoints (profile registry load failed: {e})"),
+            hint: None,
+        },
+    }
+}
+
+/// Pure decision for [`check_endpoints`].
+fn endpoints_status(registry: &darkmux_types::ProfileRegistry) -> Check {
+    let name = "endpoints".to_string();
+    let mut lines: Vec<String> = Vec::new();
+    for (id, ep) in &registry.endpoints {
+        let kind = match ep.kind() {
+            Ok(darkmux_types::EndpointKind::Managed(darkmux_types::ManagedBackend::Lmstudio)) => {
+                "managed (lmstudio)".to_string()
+            }
+            Ok(darkmux_types::EndpointKind::Unmanaged) => {
+                format!("unmanaged, {}", ep.host().unwrap_or_else(|| "no host".to_string()))
+            }
+            Err(e) => format!("unusable: {e}"),
+        };
+        let dialect = ep.resolved_dialect().map(|d| d.as_str()).unwrap_or("?");
+        let credential = match ep.auth.as_ref().map(|a| a.credential_source()) {
+            None | Some(darkmux_types::CredentialSource::NoHeader) => "no auth header".to_string(),
+            Some(darkmux_types::CredentialSource::Env(v)) => format!("credential from env `{v}`"),
+            Some(darkmux_types::CredentialSource::Keychain(k)) => format!("credential from Keychain `{k}`"),
+            Some(darkmux_types::CredentialSource::Missing { .. }) => "credential unresolved".to_string(),
+        };
+        let limits = Some(ep.limits_summary())
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("; limits {s} (not enforced yet, #2902 step 5)"))
+            .unwrap_or_default();
+        lines.push(format!("`{id}`: {kind}, {dialect}, {credential}{limits}"));
+    }
+    let advice: Vec<String> = registry
+        .validate()
+        .into_iter()
+        .filter(|i| i.severity == darkmux_types::IssueSeverity::Advice)
+        .map(|i| i.message)
+        .collect();
+    let listed = if lines.is_empty() {
+        "no `endpoints` declared".to_string()
+    } else {
+        format!("{} endpoint(s): {}", lines.len(), lines.join("; "))
+    };
+    // (#2902 review C6) Advice, not a warning: an inline endpoint works, so
+    // the check passes and names the move instead of flagging every
+    // working pre-4.0 config.
+    if advice.is_empty() {
+        Check { name, status: Status::Pass, message: listed, hint: None }
+    } else {
+        Check {
+            name,
+            status: Status::Pass,
+            message: format!("{listed}; advice: {}", advice.join("; ")),
+            hint: Some(
+                "Inline `endpoint` objects still work. Declaring each endpoint once under the \
+                 top-level `endpoints` map and naming it by id (`\"endpoint\": \"<id>\"`) keeps \
+                 its url, auth and limits in one place for every profile that uses it. (#2902)"
+                    .into(),
+            ),
+        }
+    }
+}
+
 /// (#1177) Live endpoint probes — NOT part of [`run`]'s offline check set.
 /// Opt-in via `darkmux doctor --probe` because each probe is a real API
 /// call: a paid endpoint bills a few tokens per probe. The offline
@@ -4379,7 +4453,9 @@ pub fn probe_remote_endpoints() -> Vec<Check> {
             let Some(ep) = model.endpoint.as_ref() else {
                 continue;
             };
-            if !ep.is_remote() {
+            // (#2902) Only an unmanaged endpoint is probed; an unresolvable
+            // one is the `profile registry` check's finding.
+            if !matches!(ep.kind(), Ok(darkmux_types::EndpointKind::Unmanaged)) {
                 continue;
             }
             // Dedup on EVERYTHING that changes what a probe would verify:
@@ -5948,25 +6024,26 @@ fn check_profile_registry() -> Check {
             // (#1282) The loud surface for what the lenient loader tolerated:
             //   1. entries quarantined at parse (structurally broken — each
             //      with serde's exact field-level error), and
-            //   2. LOCAL models missing `n_ctx` (legal at parse; a resolution
-            //      error the moment anything tries to load them).
+            //   2. (#2902 step 4) every error `ProfileRegistry::validate`
+            //      finds — the ONE place the registry's rules live: managed
+            //      models missing `n_ctx`, endpoints that cannot work as
+            //      written, and ids no `endpoints` entry defines. (Its advice,
+            //      inline endpoints to move to an id, is the `endpoints`
+            //      check's.)
             let mut findings: Vec<String> = loaded
                 .registry
                 .quarantined
                 .iter()
                 .map(|q| format!("quarantined {} \"{}\": {}", q.kind, q.name, q.error))
                 .collect();
-            for (pname, profile) in &loaded.registry.profiles {
-                for m in &profile.models {
-                    if !m.is_remote() && m.n_ctx.is_none() {
-                        findings.push(format!(
-                            "profile \"{pname}\" model \"{}\" is local (no endpoint) but \
-                             declares no n_ctx — swap/dispatch on it will fail at resolution",
-                            m.id
-                        ));
-                    }
-                }
-            }
+            findings.extend(
+                loaded
+                    .registry
+                    .validate()
+                    .into_iter()
+                    .filter(|i| i.severity == darkmux_types::IssueSeverity::Error)
+                    .map(|i| i.message),
+            );
 
             if findings.is_empty() {
                 Check {
@@ -12808,6 +12885,44 @@ mod tests {
         out
     }
 
+    fn materialized(json: &str) -> darkmux_types::ProfileRegistry {
+        let mut r: darkmux_types::ProfileRegistry = serde_json::from_str(json).unwrap();
+        r.materialize_endpoints();
+        r
+    }
+
+    /// (#2902 step 4) `endpoints` lists what each declared endpoint is, by
+    /// name only (never a secret), with its limits marked unenforced.
+    #[test]
+    fn endpoints_check_lists_each_endpoint_and_says_limits_are_not_enforced() {
+        let r = materialized(
+            r#"{"profiles":{"p":{"models":[{"id":"gpt-4o","endpoint":"azure"}]}},
+                "endpoints":{
+                    "azure":{"url":"https://tok@r.example/openai/deployments/d","api_version":"v1",
+                        "auth":{"type":"api-key","keychain":"darkmux-azure"},
+                        "limits":{"tokens_per_dispatch":500000,"window":{"period":"1d","tokens":2000000}}},
+                    "lms":{"managed":"lmstudio"}}}"#,
+        );
+        let c = endpoints_status(&r);
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        assert!(c.message.contains("`azure`: unmanaged, r.example"), "host only, userinfo stripped: {}", c.message);
+        assert!(!c.message.contains("tok@") && !c.message.contains("deployments"), "{}", c.message);
+        assert!(c.message.contains("credential from Keychain `darkmux-azure`"), "{}", c.message);
+        assert!(c.message.contains("500000 tokens/dispatch · 2000000 tokens per 1d (not enforced yet"), "{}", c.message);
+        assert!(c.message.contains("`lms`: managed (lmstudio), chat-completions-max-tokens"), "{}", c.message);
+    }
+
+    /// (#2902 step 4) An inline endpoint still works; doctor names the move.
+    #[test]
+    fn endpoints_check_names_the_move_from_inline_to_an_id() {
+        let r = materialized(r#"{"profiles":{"p":{"models":[{"id":"grok-4","endpoint":{"url":"https://api.x.ai/v1"}}]}}}"#);
+        let c = endpoints_status(&r);
+        assert_eq!(c.status, Status::Pass, "advice, not a warning, for a working inline endpoint");
+        assert!(c.message.contains("advice: "), "{}", c.message);
+        assert!(c.message.contains("move the object to `endpoints.\"api.x.ai\"`"), "{}", c.message);
+        assert!(c.hint.as_deref().is_some_and(|h| h.contains("still work")));
+    }
+
     #[test]
     #[serial_test::serial]
     fn run_returns_static_plus_eureka_checks() {
@@ -12894,12 +13009,15 @@ mod tests {
         // (#2914) 64, not 62: `check_utility_model_in_profiles` and
         // `check_removed_radio_router_staffing` joined the static array.
         //
+        // (#2902 step 4) 65, not 64: `check_endpoints` joined the static
+        // array.
+        //
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        // 64 on main, plus three 4.0 retirement checks: (#2913)
-        // `check_removed_notebook_settings`, and (#2912/#2913 review)
+        // 65 with #2902's endpoints check, plus three 4.0 retirement checks:
+        // (#2913) `check_removed_notebook_settings`, and (#2912/#2913 review)
         // `check_retired_role_leftovers` and `check_role_skill_references`.
-        let expected = 67 + darkmux_eureka::all_rules().len();
+        let expected = 68 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -14239,6 +14357,24 @@ mod tests {
             hint.contains("broken-profile") && hint.contains("quarantined"),
             "hint names the quarantined profile so the operator doesn't assume a genuine orphan: {hint}"
         );
+    }
+
+    /// (#2902 re-review C2) An endpoint quarantine is named as one, never
+    /// counted as a "profile entry".
+    #[test]
+    fn unreachable_residents_hint_names_each_quarantine_by_kind() {
+        let mut registry = registry_with(&[("balanced", &[("qwen/qwen3.8-27b", None)])]);
+        for (kind, name) in [
+            (darkmux_types::QuarantinedEntryKind::Profile, "broken-profile"),
+            (darkmux_types::QuarantinedEntryKind::Endpoint, "broken-endpoint"),
+        ] {
+            registry.quarantined.push(darkmux_types::QuarantinedEntry { kind, name: name.into(), error: "x".into() });
+        }
+        let c = super::unreachable_residents_status(&[lm("darkmux:orphan", "orphan")], &registry);
+        let hint = c.hint.expect("a warn carries a remedy");
+        assert!(hint.contains("2 registry entries are currently quarantined"), "{hint}");
+        assert!(hint.contains("profile \"broken-profile\"") && hint.contains("endpoint \"broken-endpoint\""), "{hint}");
+        assert!(!hint.contains("profile entr"), "{hint}");
     }
 
     // ─── role_profiles coherence (#1475 packet 1, #1547) ─────────────────

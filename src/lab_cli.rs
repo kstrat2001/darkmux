@@ -619,9 +619,13 @@ fn cmd_lab_loop(args: LabLoopArgs) -> Result<i32> {
     // ── (#1004) engagement-context A/B ───────────────────────────────
     if args.ab {
         let ws = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        // (#2902 re-review C4) Budget the brief for the model that reads it:
+        // the workload's dispatch role picks it.
+        let role = darkmux_lab::lab::run::workload_dispatch_role(&args.workload);
         let ctx = crate::coder_phase::injected_context_for_lab(
             args.inject_from_mission.as_deref(),
             &ws,
+            role.as_deref(),
             args.profile.as_deref(),
             args.profiles.as_deref(),
         );

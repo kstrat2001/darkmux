@@ -975,6 +975,13 @@ fn chain_depths_strict(extras: &BTreeMap<String, serde_json::Value>) -> Result<V
 
 // ─── provider impl ───────────────────────────────────────────────────────
 
+/// The role every tool-bench task dispatches as: the manifest's, else the
+/// bench's own `tool-bench` role. One definition, read by `run` and by
+/// `dispatch_role` (which `lab run` picks the profile for).
+fn bench_role(loaded: &LoadedWorkload) -> String {
+    loaded.manifest.workload.role.clone().unwrap_or_else(|| "tool-bench".to_string())
+}
+
 impl WorkloadProvider for ToolBenchProvider {
     fn id(&self) -> &'static str {
         "tool-bench"
@@ -982,6 +989,9 @@ impl WorkloadProvider for ToolBenchProvider {
     fn description(&self) -> &'static str {
         "Tool-call bench: nonce-provenance-scored tasks per axis (selection, arguments, \
          chaining, recovery, termination) dispatched through the internal runtime."
+    }
+    fn dispatch_role(&self, loaded: &LoadedWorkload) -> Option<String> {
+        Some(bench_role(loaded))
     }
 
     fn setup(&self, _loaded: &LoadedWorkload, run_dir: &Path, sandbox_dir: &Path) -> Result<()> {
@@ -1135,7 +1145,7 @@ impl WorkloadProvider for ToolBenchProvider {
             .unwrap_or_else(|| (now_ms as u64) ^ ((std::process::id() as u64) << 32));
 
         let tasks = generate_tasks(seed, &chain_depths);
-        let role = wl.role.clone().unwrap_or_else(|| "tool-bench".to_string());
+        let role = bench_role(loaded);
 
         // Forensics: the full fixture (prompts, files, expected answers) so a
         // surprising score is auditable straight from the run dir.
@@ -1269,10 +1279,13 @@ impl WorkloadProvider for ToolBenchProvider {
             model: envelope_model.unwrap_or_else(|| "(unknown)".to_string()),
             quant: None,
             backend: None,
-            n_ctx: profile
-                .default_model_id()
-                .and_then(|id| profile.models.iter().find(|m| m.id == id))
-                .and_then(|m| m.n_ctx.map(u64::from)),
+            // (#2902 review M2) The window of the model the dispatches RAN on
+            // (the one resolver's selection, with the lab's utility opt-in),
+            // not the profile's default model's.
+            n_ctx: darkmux_crew::dispatch_internal::dispatch_window(&role, Some(profile_name), config_path, true)
+                .ok()
+                .flatten()
+                .map(u64::from),
         };
         let rows = build_rows(&trial_refs, trials_per_task, &artifact);
         let machine_id = darkmux_types::config_access::machine_id()
@@ -2549,6 +2562,63 @@ not json — tolerated
 
     fn run_and_capture_timeout_overrides(extras: serde_json::Value) -> Result<Vec<Option<u32>>> {
         run_and_capture_timeout_overrides_with_run_dir(extras).map(|(seen, _run_dir)| seen)
+    }
+
+    /// (#2902 review M2) The scores' `ArtifactKey.n_ctx` is the window of
+    /// the model the dispatches RAN on (the resolver's selection), not the
+    /// profile's default model's. `coder` (skills `coding`) selects the
+    /// code-weighted `codestar` (128000) over the declared default (32000).
+    #[test]
+    fn scores_record_the_selected_models_window() {
+        let dir = TempDir::new().unwrap();
+        let pf = dir.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"mixed":{"default_model":"generalist","models":[
+                    {"id":"generalist","n_ctx":32000,"capabilities":{"reasoning":1.0}},
+                    {"id":"codestar","n_ctx":128000,"capabilities":{"code":1.0}}]}},
+                "default_profile":"mixed"}"#,
+        )
+        .unwrap();
+        let loaded = loaded_workload(serde_json::json!({ "chainDepths": [2], "role": "coder" }));
+        let run_dir = TempDir::new().unwrap();
+        let sandbox_dir = TempDir::new().unwrap();
+        let provider = ToolBenchProvider::with_dispatch(Arc::new(|_opts: DispatchOpts| mock_ok_result()));
+        let profile = darkmux_profiles::profiles::load_registry(pf.to_str()).unwrap().registry.profiles["mixed"].clone();
+        provider
+            .run(&loaded, run_dir.path(), sandbox_dir.path(), &profile, "mixed", pf.to_str(), None, &mut |_sid: &str| {})
+            .expect("run completes");
+        let doc = scores::read_scores(&run_dir.path().join("scores.json")).expect("the run wrote scores.json");
+        assert!(!doc.rows.is_empty());
+        assert!(doc.rows.iter().all(|r| r.artifact.n_ctx == Some(128_000)), "{:?}", doc.rows[0].artifact);
+    }
+
+    /// (#2902 re-review C3) `lab run` chooses the profile for the role the
+    /// provider reports, and that is the role every task dispatches as.
+    #[test]
+    fn the_reported_role_is_the_dispatched_role() {
+        for (extras, want) in [(serde_json::json!({ "chainDepths": [2] }), "tool-bench"), (serde_json::json!({ "chainDepths": [2], "role": "coder" }), "coder")] {
+            let mut loaded = loaded_workload(extras);
+            if want == "tool-bench" {
+                // The helper's manifest names `tool-bench`; clear it so the
+                // provider's OWN default is what is reported and dispatched.
+                loaded.manifest.workload.role = None;
+            }
+            let reported = ToolBenchProvider::with_dispatch(Arc::new(|_opts: DispatchOpts| mock_ok_result())).dispatch_role(&loaded);
+            assert_eq!(reported.as_deref(), Some(want));
+            let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let captured = seen.clone();
+            let provider = ToolBenchProvider::with_dispatch(Arc::new(move |opts: DispatchOpts| {
+                captured.lock().unwrap().push(opts.role_id.clone());
+                mock_ok_result()
+            }));
+            let (run_dir, sandbox_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+            provider
+                .run(&loaded, run_dir.path(), sandbox_dir.path(), &Profile::default(), "default", None, None, &mut |_sid: &str| {})
+                .expect("run completes");
+            let roles = seen.lock().unwrap().clone();
+            assert!(!roles.is_empty() && roles.iter().all(|r| Some(r.as_str()) == reported.as_deref()), "{roles:?}");
+        }
     }
 
     /// (#2685) Pins the WIRING, not just the predicate: `run()` must hand

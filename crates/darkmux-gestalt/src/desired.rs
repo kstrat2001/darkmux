@@ -43,15 +43,17 @@ impl DesiredEntry {
     /// registry schema itself is lenient — `ProfileModel.n_ctx` is
     /// `Option<u32>` (endpoint-bearing models declare none) — so the Option
     /// flows straight through; [`ingest`] quarantines a LOCAL entry that
-    /// lacks one. `remote` delegates to `ProfileModel::is_remote()` (the
-    /// same declared-url test the dispatch path routes on) so gestalt and
-    /// dispatch can never disagree about what counts as remote.
+    /// lacks one. `remote` is `!ProfileModel::is_managed()` (#2902: the one
+    /// endpoint classification the dispatch path routes on), so gestalt and
+    /// dispatch can never disagree about which models darkmux loads. An
+    /// endpoint named by an undefined id is not managed, so it is never
+    /// loaded on a guess.
     pub fn from_profile_model(pm: &darkmux_types::ProfileModel, seat: &str) -> Self {
         DesiredEntry {
             model_key: pm.id.clone(),
             n_ctx: pm.n_ctx,
             identifier: pm.identifier.clone(),
-            remote: pm.is_remote(),
+            remote: !pm.is_managed(),
             seat: seat.to_string(),
         }
     }

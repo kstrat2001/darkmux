@@ -166,9 +166,54 @@ fn parse_registry_lenient(raw: &str) -> Result<ProfileRegistry> {
             map.remove(&q.name);
         }
     }
+    // (#2902 review M1) The `endpoints` map, one entry at a time, the same
+    // way: a structurally broken entry is quarantined alone, so one typo
+    // never stops every dispatch. Like a quarantined profile, it is then
+    // absent from the loaded registry (`profile list --json` does not show
+    // it; nothing writes profiles.json back today). A model naming it reads as unresolved
+    // (refused at use; `validate` names the quarantine). Unknown VALUES in
+    // `managed`/`dialect`/`limits` never reach here: those fields read
+    // leniently and are refused at use.
+    // (#2902 re-review MF1) An `endpoints` value that is not an object at all
+    // is quarantined as a whole, never a failed load: before 4.0 the key was
+    // unknown and landed in `extras`, so a file carrying `"endpoints": null`
+    // (or `[]`, a string, a number) loaded, and still must.
+    if let Some(obj) = root.as_object_mut() {
+        if obj.get("endpoints").is_some_and(|v| !v.is_object()) {
+            let raw = obj.remove("endpoints").unwrap_or_default();
+            quarantined.push(QuarantinedEntry {
+                kind: QuarantinedEntryKind::Endpoint,
+                name: "endpoints".to_string(),
+                error: format!(
+                    "`endpoints` must be an object mapping each endpoint id to its definition \
+                     (got {raw}); no endpoint from it is defined"
+                ),
+            });
+        }
+    }
+    if let Some(map) = root.get_mut("endpoints").and_then(|v| v.as_object_mut()) {
+        let bad: Vec<QuarantinedEntry> = map
+            .iter()
+            .filter_map(|(name, entry)| {
+                serde_json::from_value::<darkmux_types::ModelEndpoint>(entry.clone()).err().map(|e| QuarantinedEntry {
+                    kind: QuarantinedEntryKind::Endpoint,
+                    name: name.clone(),
+                    error: e.to_string(),
+                })
+            })
+            .collect();
+        for q in &bad {
+            map.remove(&q.name);
+        }
+        quarantined.extend(bad);
+    }
 
     let mut registry: ProfileRegistry = serde_json::from_value(root)?;
     registry.quarantined = quarantined;
+    // (#2902 step 4) `"endpoint": "<id>"` references carry their definition
+    // from here on; an undefined id stays unresolved (refused at use, named
+    // by doctor), never a silent fall to the managed default.
+    registry.materialize_endpoints();
     Ok(registry)
 }
 
@@ -657,7 +702,7 @@ mod tests {
         assert!(loaded.registry.quarantined.is_empty());
         let prof = get_profile(&loaded.registry, "azure-x").unwrap();
         assert_eq!(prof.models[0].n_ctx, None);
-        assert!(prof.models[0].is_remote());
+        assert!(!prof.models[0].is_managed());
 
         // Round-trip through real file I/O: the absent field stays absent.
         let round = tmp.path().join("profiles-round.json");
@@ -666,6 +711,101 @@ mod tests {
         let prof2 = get_profile(&reloaded.registry, "azure-x").unwrap();
         assert_eq!(prof2.models[0].n_ctx, None);
         assert!(!fs::read_to_string(&round).unwrap().contains("n_ctx"));
+    }
+
+    /// (#2902 step 4) The loader materializes `"endpoint": "<id>"` from the
+    /// `endpoints` map, so every consumer downstream of `load_registry` sees
+    /// the definition's fields; an id the map does not define stays
+    /// unresolved and loads (lenient, contract 7), refused at use.
+    #[test]
+    fn loader_materializes_named_endpoints_and_keeps_a_dangling_id_unresolved() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        write(
+            &p,
+            r#"{"profiles":{
+                    "named":{"models":[{"id":"gpt-4o","endpoint":"azure"}]},
+                    "dangling":{"models":[{"id":"gpt-4o","endpoint":"nope"}]}},
+                "endpoints":{"azure":{"url":"https://example.azure.com/openai"}}}"#,
+        );
+        let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
+        assert!(loaded.registry.quarantined.is_empty());
+        let named = &get_profile(&loaded.registry, "named").unwrap().models[0];
+        assert_eq!(
+            named.endpoint.as_ref().unwrap().url.as_deref(),
+            Some("https://example.azure.com/openai")
+        );
+        assert_eq!(named.endpoint_kind().unwrap(), darkmux_types::EndpointKind::Unmanaged);
+        let dangling = &get_profile(&loaded.registry, "dangling").unwrap().models[0];
+        assert!(dangling.endpoint_kind().unwrap_err().to_string().contains("nope"));
+    }
+
+    /// (#2902 review M1) One bad `endpoints` entry never stops the registry
+    /// loading (contract 7): it is quarantined alone, like a profile entry;
+    /// a model naming it reads as unresolved (refused at use) and
+    /// `validate` names the quarantine. An entry with an unknown value in a
+    /// new field loads (read leniently) and is refused at use instead.
+    #[test]
+    fn a_bad_endpoints_entry_is_quarantined_alone() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        write(
+            &p,
+            r#"{"profiles":{
+                    "local":{"models":[{"id":"m","n_ctx":1000}]},
+                    "on-bad":{"models":[{"id":"gpt","endpoint":"bad"}]},
+                    "on-good":{"models":[{"id":"gpt","endpoint":"good"}]}},
+                "endpoints":{
+                    "bad":{"url":5},
+                    "good":{"url":"https://h.example/v1"},
+                    "newer":{"managed":"machine"},
+                    "typo":{"url":"https://h.example/v1","dialect":"responses","limits":{"tokens_per_dispatch":"500k"}}},
+                "default_profile":"local"}"#,
+        );
+        let loaded = load_registry(Some(p.to_str().unwrap())).expect("one bad endpoint never fails the file");
+        let q: Vec<(String, String)> =
+            loaded.registry.quarantined.iter().map(|q| (q.kind.to_string(), q.name.clone())).collect();
+        assert_eq!(q, vec![("endpoint".to_string(), "bad".to_string())]);
+        assert!(loaded.registry.endpoints.contains_key("newer") && loaded.registry.endpoints.contains_key("typo"));
+        let on_bad = &get_profile(&loaded.registry, "on-bad").unwrap().models[0];
+        assert!(on_bad.endpoint_kind().unwrap_err().to_string().contains("bad"));
+        let on_good = &get_profile(&loaded.registry, "on-good").unwrap().models[0];
+        assert!(on_good.endpoint_kind().is_ok());
+        let issues: Vec<String> = loaded.registry.validate().into_iter().map(|i| i.message).collect();
+        assert!(
+            issues.iter().any(|m| m.contains("\"bad\"") && m.contains("quarantined")),
+            "the reference names the quarantine: {issues:?}"
+        );
+    }
+
+    /// (#2902 re-review MF1) An `endpoints` value that is not an object at
+    /// all never stops the registry loading either: it is quarantined as a
+    /// whole (name `endpoints`), with the reason, and every other entry
+    /// works. Before 4.0 the unknown key landed in `extras` and loaded.
+    #[test]
+    fn a_non_object_endpoints_value_is_quarantined_not_fatal() {
+        for bad in ["null", "[]", "\"todo\"", "5", "true"] {
+            let tmp = TempDir::new().unwrap();
+            let p = tmp.path().join("profiles.json");
+            write(
+                &p,
+                &format!(r#"{{"profiles":{{"local":{{"models":[{{"id":"m","n_ctx":1000}}]}}}},"endpoints":{bad},"default_profile":"local"}}"#),
+            );
+            let loaded = load_registry(Some(p.to_str().unwrap()))
+                .unwrap_or_else(|e| panic!("`endpoints: {bad}` must not fail the file: {e:#}"));
+            assert!(loaded.registry.endpoints.is_empty(), "{bad}");
+            assert!(get_profile(&loaded.registry, "local").is_ok(), "{bad}");
+            let q = loaded.registry.quarantined.iter().find(|q| q.name == "endpoints").expect("quarantined");
+            assert_eq!(q.kind, QuarantinedEntryKind::Endpoint, "{bad}");
+            assert!(q.error.contains("object"), "{bad}: {}", q.error);
+        }
+        // A model naming an endpoint then says why it is undefined.
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        write(&p, r#"{"profiles":{"h":{"models":[{"id":"gpt","endpoint":"x"}]}},"endpoints":[]}"#);
+        let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
+        let issues: Vec<String> = loaded.registry.validate().into_iter().map(|i| i.message).collect();
+        assert!(issues.iter().any(|m| m.contains("\"x\"") && m.contains("quarantined")), "{issues:?}");
     }
 
     /// A LOCAL model without `n_ctx` is also legal AT PARSE (lenient-on-read

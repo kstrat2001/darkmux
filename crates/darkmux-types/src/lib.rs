@@ -10,6 +10,7 @@ pub mod child_registry;
 pub mod config;
 pub mod config_access;
 pub mod dispatch_liveness;
+pub mod endpoint;
 #[cfg(any(test, feature = "test-support"))]
 pub mod env_audit;
 #[cfg(unix)]
@@ -30,6 +31,11 @@ pub mod workdir;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+pub use endpoint::{
+    CredentialSource, Dialect, Lenient, EndpointAuth, EndpointAuthType, EndpointError, EndpointKind, EndpointSource,
+    ManagedBackend, ModelEndpoint, UsageLimits, UsageWindow,
+};
 
 /// (#1129) The running build's identifier — single source of truth for the
 /// viewer header, `darkmux doctor`, and anywhere the live build needs naming.
@@ -127,16 +133,15 @@ pub struct ProfileModel {
     /// knob look safe to populate blindly.)
     #[serde(default)]
     pub capabilities: CapabilityProfile,
-    /// The OpenAI-compatible endpoint this model is served from. Absent ⇒
-    /// LMStudio local (`config_access::lmstudio_url()`). A remote model
-    /// (Azure OpenAI, OpenAI, a LiteLLM proxy) names its URL + auth here.
-    /// When set, `n_ctx` is a *declared* window (darkmux can't load-set a
-    /// remote model's context — it asserts the ceiling for overflow
-    /// avoidance + compaction-threshold placement) rather than a load
-    /// parameter. This is the "interface to the model" the run's dispatch
-    /// section surfaces; LMStudio is simply the default value here, not a
-    /// hardwired identity.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The endpoint this model is served from. Absent ⇒ the managed LM
+    /// Studio default. (#2902 step 4) Written as an id naming an entry of the
+    /// registry's `endpoints` map (`"endpoint": "azure-east"`), or, the
+    /// pre-4.0 spelling, as an inline object (still read; `darkmux doctor`
+    /// names the move to an id). The loader materializes an id into the
+    /// definition's fields; see [`endpoint`]. On an unmanaged endpoint `n_ctx`
+    /// is a *declared* window (darkmux cannot load-set it) rather than a
+    /// load parameter.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "endpoint::endpoint_field")]
     pub endpoint: Option<ModelEndpoint>,
     /// Forward-compat overflow — unknown keys land here and
     /// re-serialize flat (a newer config read by an older binary).
@@ -145,20 +150,37 @@ pub struct ProfileModel {
 }
 
 impl ProfileModel {
-    /// Whether this model is served from a declared REMOTE endpoint (an
-    /// `endpoint` block with a `url`). Absent endpoint ⇒ LMStudio local.
-    pub fn is_remote(&self) -> bool {
-        self.endpoint.as_ref().is_some_and(|e| e.is_remote())
+    /// (#2902 step 3) What darkmux does at this model's endpoint. No endpoint
+    /// ⇒ the managed LM Studio default. THE classification every consumer
+    /// reads (dispatch routing, residency, doctor, `profile list`); an
+    /// endpoint named by an id no `endpoints` entry defines is an error.
+    pub fn endpoint_kind(&self) -> Result<EndpointKind, EndpointError> {
+        match &self.endpoint {
+            None => Ok(EndpointKind::Managed(ManagedBackend::Lmstudio)),
+            Some(ep) => ep.kind(),
+        }
     }
 
-    /// (#1282) The declared context window a LOCAL load requires.
+    /// Whether darkmux manages this model's residency (it loads it). `false`
+    /// for an unmanaged endpoint AND for an unresolvable one: a model darkmux
+    /// cannot place is never loaded on a guess.
+    pub fn is_managed(&self) -> bool {
+        self.endpoint_kind().is_ok_and(EndpointKind::is_managed)
+    }
+
+    /// (#2902 step 4) THE n_ctx rule: a managed model must declare the window
+    /// it is loaded at. The one predicate `require_n_ctx`, the registry's
+    /// validation and every placement path share.
+    pub fn missing_managed_n_ctx(&self) -> bool {
+        self.is_managed() && self.n_ctx.is_none()
+    }
+
+    /// (#1282) The declared context window a managed load requires.
     ///
-    /// `n_ctx` is optional at the schema layer (endpoint-bearing models have
-    /// no local context to declare), so every path that LOADS the model
-    /// locally — dispatch preload, swap, the review cycler — resolves the
-    /// window through this helper and gets ONE uniform, named error when a
-    /// local model omits it. Endpoint paths must not call this (they don't
-    /// read `n_ctx` at all).
+    /// `n_ctx` is optional at the schema layer (an unmanaged endpoint has no
+    /// load to size), so every path that LOADS the model resolves the window
+    /// through this helper and gets ONE uniform, named error when it is
+    /// missing. Unmanaged paths must not call this.
     pub fn require_n_ctx(&self) -> anyhow::Result<u32> {
         self.n_ctx.ok_or_else(|| {
             anyhow::anyhow!(
@@ -170,130 +192,6 @@ impl ProfileModel {
             )
         })
     }
-}
-
-/// The OpenAI-compatible endpoint a model is served from. Absent on a
-/// [`ProfileModel`] ⇒ the LMStudio local default. Every hosted provider
-/// darkmux targets (Azure OpenAI, OpenAI, OpenRouter, a LiteLLM proxy)
-/// speaks OpenAI chat-completions, so one endpoint type covers all of them —
-/// LMStudio included, as the zero-config local default.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct ModelEndpoint {
-    /// Base URL of the OpenAI-compatible server. Absent ⇒ the LMStudio
-    /// local default (`config_access::lmstudio_url()`, honoring
-    /// `DARKMUX_LMSTUDIO_URL` > `config.lmstudio_url` > `http://localhost:1234`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    /// API-version query parameter (Azure OpenAI requires one, e.g.
-    /// `"2025-01-01-preview"`). Absent for LMStudio / OpenAI.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_version: Option<String>,
-    /// Auth mechanics. Absent ⇒ no auth header (LMStudio local needs none).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth: Option<EndpointAuth>,
-    /// Reasoning effort requested from the endpoint (`"low"`/`"medium"`/
-    /// `"high"` — passed through verbatim as the OpenAI-form
-    /// `reasoning_effort`). Absent ⇒ the parameter is omitted and the
-    /// endpoint's own default applies. This is ARTIFACT configuration, not a
-    /// tuning nicety: gpt-5.1-class models default reasoning OFF, so a
-    /// judgment bench that omits it measures the model's reflexive mode
-    /// (first observed 2026-07-05: 64-completion-token rubber-stamp reviews).
-    /// Reasoning tokens bill INSIDE `max_completion_tokens`, so setting this
-    /// also raises the single-shot completion-cap default (4096 → 16384) —
-    /// an explicit cap still wins.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<String>,
-    /// Forward-compat overflow.
-    #[serde(flatten)]
-    pub extras: serde_json::Map<String, serde_json::Value>,
-}
-
-impl ModelEndpoint {
-    /// Effective base URL: the declared [`url`](Self::url), else the LMStudio
-    /// local default (env `DARKMUX_LMSTUDIO_URL` > `config.lmstudio_url` >
-    /// `http://localhost:1234`).
-    pub fn base_url(&self) -> String {
-        self.url
-            .clone()
-            .unwrap_or_else(crate::config_access::lmstudio_url)
-    }
-
-    /// Whether this is a declared *remote* server (a URL is set) vs the
-    /// implicit LMStudio local default. Drives the run's `endpoint` dimension
-    /// and the set-vs-declared `n_ctx` semantics.
-    pub fn is_remote(&self) -> bool {
-        self.url.is_some()
-    }
-
-    /// Coherence check intended for the #1177 `darkmux doctor` credential slice /
-    /// profile load — NOT yet wired into either, so today it's exercised only by
-    /// unit tests. Presence-only on auth: does NOT verify the key is correct
-    /// (that's the opt-in live probe, #1177). Returns a human-readable reason.
-    pub fn validate(&self) -> Result<(), String> {
-        if let Some(u) = &self.url {
-            if !(u.starts_with("http://") || u.starts_with("https://")) {
-                return Err(format!(
-                    "endpoint.url must start with http:// or https:// (got {u:?})"
-                ));
-            }
-        }
-        if let Some(auth) = &self.auth {
-            // (#1312) A credential SOURCE must be declared — either the macOS
-            // Keychain item (`keychain`) or the env-var name (`key_env`). One is
-            // enough; only the "neither" case is a config error.
-            if auth.auth_type.is_some()
-                && auth.keychain.as_deref().unwrap_or("").is_empty()
-                && auth.key_env.as_deref().unwrap_or("").is_empty()
-            {
-                return Err("endpoint.auth.type is set but no credential source is declared — set \
-                     endpoint.auth.keychain (a macOS Keychain item name) or endpoint.auth.key_env \
-                     (the NAME of an env var holding the key)"
-                    .to_string());
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Auth for a remote endpoint. The secret is **never** stored here — only the
-/// macOS Keychain item *name*; the secret is read at runtime via
-/// `security find-generic-password` (the same carve-out as the Redis password
-/// and serve token). The machine holding the referenced item is the keymaster
-/// for the endpoint — see doctor's credential-presence check.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct EndpointAuth {
-    /// Header mechanics: `api-key` (Azure OpenAI) or `bearer` (OpenAI).
-    /// Absent ⇒ no auth header emitted.
-    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
-    pub auth_type: Option<EndpointAuthType>,
-    /// macOS Keychain item name holding the secret (machine-local by
-    /// darkmux's per-machine provisioning convention). Read at runtime;
-    /// never logged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keychain: Option<String>,
-    /// (#1312) NAME of an environment variable holding this endpoint's API key
-    /// — the operator declares WHICH variable (any provider: `OPENAI_API_KEY`,
-    /// `AZURE_OPENAI_KEY`, anything). When set AND present in the env, it is
-    /// used VERBATIM and the Keychain is NEVER read — the headless-runner escape
-    /// hatch (a CI job exports the var from its secret store; no login keychain
-    /// to lock/hang). Resolution: `env(key_env) present > Keychain(keychain)`.
-    /// Only the variable NAME lives here; the value never does, and is never
-    /// logged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key_env: Option<String>,
-    /// Forward-compat overflow.
-    #[serde(flatten)]
-    pub extras: serde_json::Map<String, serde_json::Value>,
-}
-
-/// The header mechanics for a remote endpoint's auth.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum EndpointAuthType {
-    /// Azure OpenAI — `api-key: <secret>`.
-    ApiKey,
-    /// OpenAI / OpenRouter / most proxies — `Authorization: Bearer <secret>`.
-    Bearer,
 }
 
 /// Runtime block of a profile. (A `config_path` field — the removed
@@ -657,6 +555,14 @@ impl Profile {
 // (#1269). Alongside it, the utility model stopped being a legal work
 // model: no profile's `models[]` should list it (`darkmux doctor` flags
 // one that does), and every task/step selection path excludes it.
+// Also in 2.0 (#2902 step 4, same unreleased major): the top-level
+// `endpoints` map, and `ProfileModel.endpoint` also accepting a STRING naming
+// one of its entries. The map alone would be additive, but the string form
+// retypes a value: a binary from before it reads `"endpoint": "<id>"` as a
+// type error and quarantines that profile (#1282). Folded into 2.0 rather
+// than a 2.1 because no binary has shipped 2.0 yet, so there is no released
+// 2.x reader it could break. Inline endpoint objects still read unchanged,
+// and gained three optional fields (`managed`, `dialect`, `limits`).
 pub const PROFILES_SCHEMA_VERSION: &str = "2.0";
 
 /// Scopes a review probe seat's draws to a subset of fact families, and
@@ -700,12 +606,16 @@ pub struct QuarantinedEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuarantinedEntryKind {
     Profile,
+    /// (#2902 review M1) An `endpoints` entry: a model naming it reads as an
+    /// unresolved reference, refused at use.
+    Endpoint,
 }
 
 impl std::fmt::Display for QuarantinedEntryKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             QuarantinedEntryKind::Profile => write!(f, "profile"),
+            QuarantinedEntryKind::Endpoint => write!(f, "endpoint"),
         }
     }
 }
@@ -728,6 +638,14 @@ pub struct ProfileRegistry {
     /// standing infrastructure. (#590)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub internal: Option<RegistryInternal>,
+    /// (#2902 step 4) The endpoints profile models name by id
+    /// (`"endpoint": "<id>"`): where requests go, what darkmux does there
+    /// (`managed`), the request dialect, where the credential lives, and the
+    /// standard usage limits (parsed and shown by `darkmux doctor`, not
+    /// enforced until #2902 step 5). The loader materializes each reference
+    /// into the definition's fields (`materialize_endpoints`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub endpoints: BTreeMap<String, ModelEndpoint>,
     // (#1426 ship-2) The `crews` map retired from the profiles schema — a crew
     // is now a DERIVED VIEW of a mission's resourcing, not a declared entity
     // (round-4 decision). A profiles.json still carrying a `crews` key parses
@@ -818,6 +736,149 @@ impl ProfileRegistry {
     /// found", a silent #1054 fallback to a different profile, or a probe of
     /// whatever LMStudio happens to have loaded. (Since #1426 ship-2 only
     /// profiles quarantine — the `crews` map retired from the schema.)
+    /// (#2902 step 4) Match every `"endpoint": "<id>"` reference to its
+    /// `endpoints` definition: the model's endpoint then carries the
+    /// definition's fields and `EndpointSource::Named(id)`. An id the map
+    /// does not define stays `Unresolved`, which every consumer refuses
+    /// loudly (and `validate` reports). Idempotent. Run by the registry
+    /// loader; a registry parsed some other way reads id references as
+    /// unresolved, never as the managed default.
+    pub fn materialize_endpoints(&mut self) {
+        let endpoints = std::mem::take(&mut self.endpoints);
+        for profile in self.profiles.values_mut() {
+            for model in &mut profile.models {
+                let Some(ep) = model.endpoint.as_mut() else { continue };
+                let Some(id) = ep.named_id().map(str::to_string) else { continue };
+                *ep = named_endpoint(&endpoints, &id);
+            }
+        }
+        self.endpoints = endpoints;
+    }
+
+    /// (#2902) THE id lookup: `endpoints.<id>` as a named endpoint carrying
+    /// the definition's fields, or an unresolved reference when the map does
+    /// not define it (or its entry was quarantined). Shared by
+    /// [`Self::materialize_endpoints`] and a mission step's `config.endpoint`
+    /// id (`darkmux_crew::target::step_unmanaged_endpoint`).
+    pub fn endpoint_named(&self, id: &str) -> ModelEndpoint {
+        named_endpoint(&self.endpoints, id)
+    }
+
+    /// (#2902 step 4) THE registry validation: every rule about endpoints and
+    /// windows, in one pass, with no I/O (credential PRESENCE is doctor's live
+    /// check). `darkmux doctor` prints these; resolution refuses the same
+    /// problems at use. Assumes [`Self::materialize_endpoints`] has run.
+    pub fn validate(&self) -> Vec<RegistryIssue> {
+        let mut out = Vec::new();
+        let suggestions = self.inline_endpoint_ids();
+        for (id, def) in &self.endpoints {
+            if let Err(reason) = def.validate() {
+                out.push(RegistryIssue::error(format!("endpoint \"{id}\": {reason}")));
+            }
+        }
+        for (pname, profile) in &self.profiles {
+            for m in &profile.models {
+                if let Some(ep) = &m.endpoint {
+                    match &ep.source {
+                        EndpointSource::Unresolved(id) => {
+                            // The entry itself, else (re-review MF1) the whole
+                            // `endpoints` value, when that was not an object.
+                            let why = match self
+                                .quarantined
+                                .iter()
+                                .filter(|q| q.kind == QuarantinedEntryKind::Endpoint)
+                                .find(|q| &q.name == id)
+                                .or_else(|| {
+                                    self.quarantined
+                                        .iter()
+                                        .find(|q| q.kind == QuarantinedEntryKind::Endpoint && q.name == "endpoints")
+                                })
+                            {
+                                Some(q) => format!("whose `endpoints` entry is quarantined ({})", q.error),
+                                None => "which `endpoints` does not define".to_string(),
+                            };
+                            out.push(RegistryIssue::error(format!(
+                                "profile \"{pname}\" model \"{}\" names endpoint \"{id}\", {why}",
+                                m.id
+                            )))
+                        }
+                        EndpointSource::Inline => {
+                            if let Err(reason) = ep.validate() {
+                                out.push(RegistryIssue::error(format!(
+                                    "profile \"{pname}\" model \"{}\": {reason}",
+                                    m.id
+                                )));
+                            }
+                            let suggested = suggestions.get(&endpoint_key(ep)).cloned().unwrap_or_default();
+                            out.push(RegistryIssue::advice(format!(
+                                "profile \"{pname}\" model \"{}\" declares its endpoint inline; move the \
+                                 object to `endpoints.\"{suggested}\"` and write `\"endpoint\": \"{suggested}\"` \
+                                 on the model (inline endpoints still read)",
+                                m.id
+                            )));
+                        }
+                        EndpointSource::Named(_) => {}
+                    }
+                }
+                if m.missing_managed_n_ctx() {
+                    out.push(RegistryIssue::error(format!(
+                        "profile \"{pname}\" model \"{}\" is local (no endpoint) but declares no n_ctx — \
+                         swap/dispatch on it will fail at resolution",
+                        m.id
+                    )));
+                }
+            }
+        }
+        out
+    }
+
+    /// (#2902 review C6) A suggested `endpoints` id for each DISTINCT inline
+    /// endpoint definition (keyed by [`endpoint_key`]): its host (or
+    /// `lmstudio` for a managed one); when several distinct definitions
+    /// share a host, the host plus the URL's last path segment (an Azure
+    /// deployment name); then a numeric suffix until the id is unique, never
+    /// reusing an id `endpoints` already defines. The same definition used by
+    /// several models gets one id.
+    fn inline_endpoint_ids(&self) -> BTreeMap<String, String> {
+        let mut defs: Vec<(String, String, String)> = Vec::new(); // (key, host base, last segment)
+        for profile in self.profiles.values() {
+            for m in &profile.models {
+                let Some(ep) = m.endpoint.as_ref().filter(|e| e.source == EndpointSource::Inline) else { continue };
+                let key = endpoint_key(ep);
+                if defs.iter().any(|(k, _, _)| *k == key) {
+                    continue;
+                }
+                let base = ep.host().unwrap_or_else(|| "lmstudio".to_string());
+                // The last segment of the URL's PATH (never the host).
+                let last = ep
+                    .url
+                    .as_deref()
+                    .and_then(|u| u.split_once("://"))
+                    .and_then(|(_, rest)| rest.trim_end_matches('/').split_once('/'))
+                    .and_then(|(_, path)| path.rsplit('/').next())
+                    .filter(|seg| !seg.is_empty() && !seg.eq_ignore_ascii_case("v1"))
+                    .unwrap_or_default()
+                    .to_string();
+                defs.push((key, base, last));
+            }
+        }
+        let mut taken: std::collections::BTreeSet<String> = self.endpoints.keys().cloned().collect();
+        let mut out = BTreeMap::new();
+        for (key, base, last) in &defs {
+            let shared = defs.iter().filter(|(_, b, _)| b == base).count() > 1;
+            let mut id = if shared && !last.is_empty() { format!("{base}-{last}") } else { base.clone() };
+            let stem = id.clone();
+            let mut n = 2;
+            while taken.contains(&id) {
+                id = format!("{stem}-{n}");
+                n += 1;
+            }
+            taken.insert(id.clone());
+            out.insert(key.clone(), id);
+        }
+        out
+    }
+
     pub fn quarantine_error_for(&self, name: &str) -> Option<String> {
         self.quarantined
             .iter()
@@ -829,6 +890,45 @@ impl ProfileRegistry {
                     name, q.error
                 )
             })
+    }
+}
+
+/// A definition's identity for de-duplicating inline endpoints: its
+/// serialized form (the runtime-only `source` is not serialized).
+fn endpoint_key(ep: &ModelEndpoint) -> String {
+    serde_json::to_string(ep).unwrap_or_default()
+}
+
+fn named_endpoint(endpoints: &BTreeMap<String, ModelEndpoint>, id: &str) -> ModelEndpoint {
+    match endpoints.get(id) {
+        Some(def) => ModelEndpoint { source: EndpointSource::Named(id.to_string()), ..def.clone() },
+        None => ModelEndpoint::reference(id),
+    }
+}
+
+/// (#2902 step 4) One finding from [`ProfileRegistry::validate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryIssue {
+    pub severity: IssueSeverity,
+    /// The whole operator-facing sentence, naming the entry and the fix.
+    pub message: String,
+}
+
+/// How much a [`RegistryIssue`] matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueSeverity {
+    /// The entry fails when used.
+    Error,
+    /// The entry works; a better spelling is named.
+    Advice,
+}
+
+impl RegistryIssue {
+    fn error(message: String) -> Self {
+        RegistryIssue { severity: IssueSeverity::Error, message }
+    }
+    fn advice(message: String) -> Self {
+        RegistryIssue { severity: IssueSeverity::Advice, message }
     }
 }
 
@@ -1034,7 +1134,7 @@ mod tests {
         }"#;
         let m: ProfileModel = serde_json::from_str(json).unwrap();
         assert_eq!(m.n_ctx, None);
-        assert!(m.is_remote());
+        assert!(!m.is_managed());
         let out = serde_json::to_string(&m).unwrap();
         assert!(!out.contains("n_ctx"), "absent n_ctx must stay absent: {out}");
         let back: ProfileModel = serde_json::from_str(&out).unwrap();
@@ -1044,7 +1144,7 @@ mod tests {
     #[test]
     fn require_n_ctx_errors_on_local_model_without_one() {
         let m: ProfileModel = serde_json::from_str(r#"{"id":"qwen"}"#).unwrap();
-        assert!(!m.is_remote());
+        assert!(m.is_managed());
         let err = m.require_n_ctx().unwrap_err().to_string();
         assert!(err.contains("qwen"), "error names the model: {err}");
         assert!(err.contains("n_ctx"), "error names the field: {err}");
@@ -1085,10 +1185,10 @@ mod tests {
         }"#;
         let m: ProfileModel = serde_json::from_str(json).unwrap();
         let ep = m.endpoint.as_ref().expect("endpoint parsed");
-        assert!(ep.is_remote());
+        assert_eq!(ep.kind().unwrap(), EndpointKind::Unmanaged);
         assert_eq!(
-            ep.base_url(),
-            "https://example-aoai.cognitiveservices.azure.com/openai/deployments/gpt-4o"
+            ep.url.as_deref(),
+            Some("https://example-aoai.cognitiveservices.azure.com/openai/deployments/gpt-4o")
         );
         assert_eq!(ep.api_version.as_deref(), Some("2025-01-01-preview"));
         let auth = ep.auth.as_ref().expect("auth parsed");
@@ -1111,15 +1211,13 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn endpoint_default_is_local_not_remote() {
-        // No url ⇒ not remote; base_url resolves to the LMStudio default (a URL).
+    fn endpoint_default_is_managed() {
+        // No url ⇒ managed LM Studio; its chat URL is the configured LM
+        // Studio address (a URL).
         let ep = ModelEndpoint::default();
-        assert!(!ep.is_remote());
-        assert!(
-            ep.base_url().contains("://"),
-            "base_url should be a URL, got {:?}",
-            ep.base_url()
-        );
+        assert_eq!(ep.kind().unwrap(), EndpointKind::Managed(ManagedBackend::Lmstudio));
+        let url = ep.chat_url().unwrap();
+        assert!(url.contains("://"), "chat_url should be a URL, got {url:?}");
         assert!(ep.validate().is_ok());
     }
 

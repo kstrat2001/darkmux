@@ -155,7 +155,7 @@
             ..Default::default()
         };
         assert_eq!(
-            remote_chat_url(&az),
+            az.chat_url().unwrap(),
             "https://x.cognitiveservices.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2025-01-01-preview"
         );
         // OpenAI-style base, no api_version, trailing slash trimmed (not doubled).
@@ -164,7 +164,7 @@
             ..Default::default()
         };
         assert_eq!(
-            remote_chat_url(&oai),
+            oai.chat_url().unwrap(),
             "https://api.openai.com/v1/chat/completions"
         );
     }
@@ -178,7 +178,7 @@
             ..Default::default()
         };
         assert_eq!(
-            remote_endpoint_label(&az, "gpt-4o"),
+            crate::target::endpoint_route_label(&az, "gpt-4o"),
             "azure:example-aoai.cognitiveservices.azure.com/gpt-4o"
         );
         // Non-azure host ⇒ openai kind; label carries host + model, never the path or auth.
@@ -187,7 +187,7 @@
             ..Default::default()
         };
         assert_eq!(
-            remote_endpoint_label(&oai, "gpt-4.1"),
+            crate::target::endpoint_route_label(&oai, "gpt-4.1"),
             "openai:api.openai.com/gpt-4.1"
         );
     }
@@ -203,10 +203,7 @@
             n_ctx: Some(40960),
             ..Default::default()
         };
-        assert!(!local_no_ep
-            .endpoint
-            .as_ref()
-            .is_some_and(|e| e.is_remote()));
+        assert!(local_no_ep.is_managed());
         let remote = darkmux_types::ProfileModel {
             id: "gpt-4o".into(),
             n_ctx: Some(200000),
@@ -216,7 +213,7 @@
             }),
             ..Default::default()
         };
-        assert!(remote.endpoint.as_ref().is_some_and(|e| e.is_remote()));
+        assert!(!remote.is_managed());
     }
 
     // ─── #1199: container-path routing + single-shot cap ───────────────
@@ -240,9 +237,9 @@
 
     #[test]
     fn single_shot_body_cap_defaults_and_overrides() {
-        let default_body = single_shot_body("m", "sys", "msg", None, None);
+        let default_body = single_shot_body(darkmux_types::Dialect::ChatCompletions, "m", "sys", "msg", None, None);
         assert_eq!(default_body["max_completion_tokens"], 4096);
-        let capped = single_shot_body("m", "sys", "msg", Some(16000), None);
+        let capped = single_shot_body(darkmux_types::Dialect::ChatCompletions, "m", "sys", "msg", Some(16000), None);
         assert_eq!(capped["max_completion_tokens"], 16000);
         assert_eq!(capped["model"], "m");
         assert_eq!(capped["messages"][1]["content"], "msg");
@@ -256,18 +253,18 @@
     /// content). An explicit cap still wins over the effort-raised default.
     #[test]
     fn single_shot_body_reasoning_effort_contract() {
-        let plain = single_shot_body("m", "sys", "msg", None, None);
+        let plain = single_shot_body(darkmux_types::Dialect::ChatCompletions, "m", "sys", "msg", None, None);
         assert!(
             plain.get("reasoning_effort").is_none(),
             "unset effort must OMIT the parameter, not send a default"
         );
-        let effort = single_shot_body("m", "sys", "msg", None, Some("high"));
+        let effort = single_shot_body(darkmux_types::Dialect::ChatCompletions, "m", "sys", "msg", None, Some("high"));
         assert_eq!(effort["reasoning_effort"], "high");
         assert_eq!(
             effort["max_completion_tokens"], 16384,
             "effort without an explicit cap must raise the default (reasoning bills inside the cap)"
         );
-        let both = single_shot_body("m", "sys", "msg", Some(8000), Some("low"));
+        let both = single_shot_body(darkmux_types::Dialect::ChatCompletions, "m", "sys", "msg", Some(8000), Some("low"));
         assert_eq!(both["reasoning_effort"], "low");
         assert_eq!(both["max_completion_tokens"], 8000, "an explicit cap wins");
     }
@@ -1932,6 +1929,64 @@
         pf
     }
 
+    /// A `coder` role requesting the capabilities of `skills` (embedded
+    /// skills, so `coding` asks for `code` first).
+    fn windows_role(skills: &[&str]) -> crate::types::Role {
+        serde_json::from_value(serde_json::json!({
+            "id": "coder",
+            "description": "d",
+            "skills": skills,
+            "tool_palette": {"allow": [], "deny": []},
+            "escalation_contract": "bail-with-explanation",
+        }))
+        .unwrap()
+    }
+
+    /// (#2902 step 3) The defect the one resolver closes: with several
+    /// models in a profile, the compaction window came from the profile's
+    /// DEFAULT model even when `select_model` picked another. Here the
+    /// default is `generalist` (32000) and a `coding` role selects
+    /// `codestar` (128000); the window must be `codestar`'s own.
+    #[test]
+    #[serial]
+    fn the_window_is_the_selected_models_own_not_the_profile_defaults() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let pf = state.join("profiles-2902-window.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"mixed":{"default_model":"generalist","models":[
+                    {"id":"generalist","n_ctx":32000,"capabilities":{"reasoning":1.0}},
+                    {"id":"codestar","n_ctx":128000,"capabilities":{"code":1.0}}
+                ]}},
+                "default_profile":"mixed"}"#,
+        )
+        .unwrap();
+        let role = windows_role(&["coding"]);
+        let picked = resolve_target(&role, None, pf.to_str(), false).unwrap().unwrap();
+        assert_eq!(picked.model.id, "codestar", "precondition: selection picks the non-default model");
+        let window = resolve_dispatch_windows_with(&role, None, None, pf.to_str(), false).unwrap();
+        assert_eq!(window, Some(128_000), "the selected model's window, not the default model's 32000");
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "coder".to_string();
+        opts.config_path = Some(pf.to_str().unwrap().to_string());
+        let resolved = resolve_dispatch_compaction(&role, &opts).unwrap();
+        assert_eq!(resolved.compaction.context_window, Some(128_000), "dispatch() compacts at the same window");
+
+        // (#2902 review M2) The lab providers hand `dispatch()` compaction
+        // args built from the PROFILE (`CompactionDispatchArgs::from_profile`,
+        // for the operator's threshold/strategy settings). That prefill must
+        // not smuggle the default model's window back in.
+        let reg = darkmux_profiles::profiles::load_registry(pf.to_str()).unwrap().registry;
+        opts.compaction = crate::dispatch::CompactionDispatchArgs::from_profile(&reg.profiles["mixed"]);
+        let prefilled = resolve_dispatch_compaction(&role, &opts).unwrap();
+        assert_eq!(prefilled.compaction.context_window, Some(128_000), "a profile-prefilled args still compacts at the selected model's window");
+        // An EXPLICIT window (the loop lab's override) still wins.
+        opts.compaction.context_window = Some(50_000);
+        assert_eq!(resolve_dispatch_compaction(&role, &opts).unwrap().compaction.context_window, Some(50_000));
+        // The lab's artifact key reads the same window the dispatch used.
+        assert_eq!(dispatch_window("coder", Some("mixed"), pf.to_str(), true).unwrap(), Some(128_000));
+    }
+
     #[test]
     #[serial]
     fn dispatch_windows_follow_the_role_profiles_mapping() {
@@ -1943,7 +1998,7 @@
             resolve_role_aware_profile_with("coder", None, Some("big".to_string()), &reg).unwrap().unwrap();
         assert_eq!(model_profile, "big", "precondition: the model comes from the mapped profile");
         // The window side must agree: `big`'s 128000, not `fast`'s 32000.
-        let window = resolve_dispatch_windows_with("coder", None, Some("big".to_string()), pf.to_str()).unwrap();
+        let window = resolve_dispatch_windows_with(&windows_role(&[]), None, Some("big".to_string()), pf.to_str(), false).unwrap();
         assert_eq!(window, Some(128_000), "a role mapped to `big` must compact at `big`'s window, not default_profile's");
     }
 
@@ -1952,7 +2007,7 @@
     fn dispatch_windows_explicit_profile_wins_over_the_role_mapping() {
         let state = darkmux_types::test_isolation::IsolatedState::new();
         let pf = role_windows_registry(&state);
-        let window = resolve_dispatch_windows_with("coder", Some("fast"), Some("big".to_string()), pf.to_str()).unwrap();
+        let window = resolve_dispatch_windows_with(&windows_role(&[]), Some("fast"), Some("big".to_string()), pf.to_str(), false).unwrap();
         assert_eq!(window, Some(32_000), "an explicit --profile still wins over role_profiles");
     }
 
@@ -1961,7 +2016,7 @@
     fn dispatch_windows_unmapped_role_uses_default_profile() {
         let state = darkmux_types::test_isolation::IsolatedState::new();
         let pf = role_windows_registry(&state);
-        let window = resolve_dispatch_windows_with("coder", None, None, pf.to_str()).unwrap();
+        let window = resolve_dispatch_windows_with(&windows_role(&[]), None, None, pf.to_str(), false).unwrap();
         assert_eq!(window, Some(32_000), "no mapping, no override: default_profile's window");
     }
 
@@ -2103,7 +2158,7 @@
         // the registry lacks errs rather than sizing from default_profile.
         let state = darkmux_types::test_isolation::IsolatedState::new();
         let pf = role_windows_registry(&state);
-        let err = resolve_dispatch_windows_with("coder", None, Some("ghost".to_string()), pf.to_str()).unwrap_err();
+        let err = resolve_dispatch_windows_with(&windows_role(&[]), None, Some("ghost".to_string()), pf.to_str(), false).unwrap_err();
         assert!(format!("{err:#}").contains("ghost"), "got: {err:#}");
     }
 
@@ -2871,7 +2926,7 @@
         ))
         .unwrap();
 
-        let result = dispatch_remote(&opts, &role, "system prompt", &pm);
+        let result = dispatch_remote(&opts, &role, "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap());
 
         unsafe {
             match prev_home {
@@ -2980,7 +3035,7 @@
             ))
             .unwrap();
             let result =
-                dispatch_remote(&opts, &role, "system prompt", &pm).expect("dispatch_remote must succeed");
+                dispatch_remote(&opts, &role, "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap()).expect("dispatch_remote must succeed");
             assert_eq!(
                 result.session_id,
                 darkmux_types::session_id::scope_to_run(&raw_session_id, mission_id),
@@ -4364,6 +4419,7 @@
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
+            dialect: None,
             base_url_override: None,
             workspace_read_only: false,
             resume_checkpoint: false,
@@ -4601,6 +4657,7 @@
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
+            dialect: None,
             base_url_override: base_url,
             workspace_read_only: false,
             resume_checkpoint: false,
@@ -4816,6 +4873,7 @@
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
+            dialect: None,
             base_url_override: None,
             workspace_read_only: false,
             resume_checkpoint: false,
@@ -4939,6 +4997,7 @@
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
+            dialect: None,
             base_url_override: None,
             workspace_read_only: false,
             resume_checkpoint: false,
@@ -4996,6 +5055,7 @@
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
+            dialect: None,
             base_url_override: None,
             workspace_read_only: false,
             resume_checkpoint: false,
@@ -5891,6 +5951,89 @@
         );
     }
 
+    /// (#2902) `--dialect` reaches argv only when the endpoint declares one
+    /// that differs from its kind's default; an existing config (no
+    /// `dialect`) has byte-identical argv. The runtime accepts exactly the
+    /// spellings `Dialect::as_str` produces (runtime/src/lmstudio.rs
+    /// `Dialect::parse`, pinned by its own test).
+    #[test]
+    fn build_docker_run_argv_emits_dialect_only_when_declared() {
+        let base = build_docker_run_argv(&base_argv_config());
+        assert!(!base.iter().any(|a| a == "--dialect"), "{base:?}");
+        let mut config = base_argv_config();
+        config.dialect = Some(darkmux_types::Dialect::ChatCompletionsMaxTokens);
+        let argv = build_docker_run_argv(&config);
+        assert!(
+            argv.windows(2).any(|w| w[0] == "--dialect" && w[1] == "chat-completions-max-tokens"),
+            "{argv:?}"
+        );
+    }
+
+    /// (#2902) The container's `--dialect` is derived from the resolved
+    /// target only when the endpoint DECLARES a dialect other than its
+    /// kind's default: an agentic-remote dispatch on any existing config
+    /// (no `dialect`) gets no flag.
+    #[test]
+    fn container_dialect_flag_is_set_only_for_a_declared_non_default_dialect() {
+        let target = |ep: serde_json::Value| {
+            let pm: darkmux_types::ProfileModel =
+                serde_json::from_value(serde_json::json!({ "id": "m", "endpoint": ep })).unwrap();
+            crate::target::target_for("p".into(), Default::default(), pm).unwrap()
+        };
+        assert_eq!(super::container_dialect_flag(&target(serde_json::json!({ "url": "https://h/v1" }))), None);
+        assert_eq!(
+            super::container_dialect_flag(&target(serde_json::json!({ "url": "https://h/v1", "dialect": "chat-completions" }))),
+            None,
+            "declaring the default changes nothing"
+        );
+        assert_eq!(
+            super::container_dialect_flag(&target(
+                serde_json::json!({ "url": "https://h/v1", "dialect": "chat-completions-max-tokens" })
+            )),
+            Some(darkmux_types::Dialect::ChatCompletionsMaxTokens)
+        );
+    }
+
+    /// (#2902 review C3) What reaches an agentic HOSTED container's argv
+    /// config: the target's chat URL and its declared dialect; nothing for a
+    /// managed dispatch.
+    #[test]
+    fn agentic_brain_flags_carry_the_hosted_targets_url_and_dialect() {
+        let pm: darkmux_types::ProfileModel = serde_json::from_value(serde_json::json!({
+            "id": "m", "endpoint": { "url": "https://h.example/v1", "dialect": "chat-completions-max-tokens" }
+        }))
+        .unwrap();
+        let t = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
+        let (url, dialect) = super::agentic_brain_flags(Some(&t));
+        assert_eq!(url.as_deref(), Some("https://h.example/v1/chat/completions"));
+        assert_eq!(dialect, Some(darkmux_types::Dialect::ChatCompletionsMaxTokens));
+        assert_eq!(super::agentic_brain_flags(None), (None, None));
+        let mut config = base_argv_config();
+        (config.remote_chat_url, config.dialect) = super::agentic_brain_flags(Some(&t));
+        let argv = build_docker_run_argv(&config);
+        assert!(argv.windows(2).any(|w| w[0] == "--dialect" && w[1] == "chat-completions-max-tokens"), "{argv:?}");
+    }
+
+    /// (#2902 review C3) `mission launch` sizes the coder brief through the
+    /// role branch: with a role, the SELECTED model's window; with none,
+    /// the profile default's.
+    #[test]
+    #[serial]
+    fn the_context_window_with_a_role_is_the_selected_models() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let pf = state.join("profiles-2902-brief.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"mixed":{"default_model":"generalist","models":[
+                    {"id":"generalist","n_ctx":32000,"capabilities":{"reasoning":1.0}},
+                    {"id":"codestar","n_ctx":128000,"capabilities":{"code":1.0}}]}},
+                "default_profile":"mixed"}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_context_window_internal(Some("coder"), None, pf.to_str()).unwrap(), Some(128_000));
+        assert_eq!(resolve_context_window_internal(None, None, pf.to_str()).unwrap(), Some(32_000));
+    }
+
     #[test]
     fn build_docker_run_argv_emits_chat_url_without_stdin_flags_when_no_auth() {
         let mut config = base_argv_config();
@@ -6118,6 +6261,7 @@
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
+            dialect: None,
             base_url_override: None,
             workspace_read_only: false,
             resume_checkpoint: false,
@@ -6455,8 +6599,7 @@
             runtime: None,
             use_when: None,
         };
-        let args = crate::dispatch::CompactionDispatchArgs::from_profile(&profile);
-        assert_eq!(args.context_window, None, "no declared n_ctx ⇒ no window");
+        assert_eq!(crate::dispatch::profile_default_window(&profile), None, "no declared n_ctx ⇒ no window");
     }
 
     /// (#377) Per-role override wins over profile fallback. Operator
@@ -6592,7 +6735,8 @@
         };
         let args = crate::dispatch::CompactionDispatchArgs::from_profile(&profile);
         assert_eq!(args.threshold_tokens, Some(40_000));
-        assert_eq!(args.context_window, Some(100_000), "primary n_ctx");
+        assert_eq!(args.context_window, None, "(#2902) the window is the selected model's, filled at dispatch");
+        assert_eq!(crate::dispatch::profile_default_window(&profile), Some(100_000), "primary n_ctx");
     }
 
     #[test]
@@ -6646,7 +6790,8 @@
             "clean break: openclaw extras `model` must NOT auto-populate compactor_model \
              (would pass `lmstudio/<id>` prefix to LMStudio's direct API → HTTP 400)"
         );
-        assert_eq!(args.context_window, Some(101_000));
+        assert_eq!(args.context_window, None);
+        assert_eq!(crate::dispatch::profile_default_window(&profile), Some(101_000));
     }
 
     /// (#368 clean break invariant) When ONLY `extras["maxHistoryShare"]`
@@ -6819,8 +6964,9 @@
         assert!(args.threshold_tokens.is_none());
         assert!(args.compactor_model.is_none());
         assert!(args.threshold_ratio.is_none());
-        // Primary n_ctx still captured even without compaction block.
-        assert_eq!(args.context_window, Some(50_000));
+        // Primary n_ctx is the profile's default window, not the args'.
+        assert_eq!(args.context_window, None);
+        assert_eq!(crate::dispatch::profile_default_window(&profile), Some(50_000));
     }
 
     // ─── #363, #457: inactivity timeout (formerly wall-clock deadline) ─
@@ -12277,6 +12423,7 @@
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
+            dialect: None,
             base_url_override: None,
             workspace_read_only: false,
             resume_checkpoint: false,
@@ -12391,7 +12538,7 @@
         };
 
         assert_eq!(
-            super::dispatch_wire_model_id(bare_key, &profile_of(None)),
+            super::managed_wire_model(&profile_of(None).models[0]),
             super::compactor_wire_model_id(bare_key),
             "with no opt-out, the main dispatch model and the compactor must dispatch \
              against the identical namespaced identifier for the same bare model key \
@@ -12399,7 +12546,7 @@
         );
 
         assert_eq!(
-            super::dispatch_wire_model_id(bare_key, &profile_of(Some("my-own-alias"))),
+            super::managed_wire_model(&profile_of(Some("my-own-alias")).models[0]),
             "my-own-alias",
             "the main path honors an explicit profile `identifier` (#2240)"
         );
@@ -12801,7 +12948,7 @@ fn dispatch_wire_model_id_namespaces_a_plain_profile_model() {
         use_when: None,
     };
     assert_eq!(
-        super::dispatch_wire_model_id("qwen3-4b-instruct-2507", &profile),
+        super::managed_wire_model(&profile.models[0]),
         "darkmux:qwen3-4b-instruct-2507"
     );
 }
@@ -12829,28 +12976,14 @@ fn dispatch_wire_model_id_passes_through_an_explicit_identifier() {
         use_when: None,
     };
     assert_eq!(
-        super::dispatch_wire_model_id("qwen3-4b-instruct-2507", &profile),
+        super::managed_wire_model(&profile.models[0]),
         "my-custom-alias"
     );
 }
 
-/// Safety net for the branch `select_model`'s contract makes unreachable
-/// today: an `id` with no matching `profile.models` entry must fall back to
-/// the bare id (pre-#2240 behavior for this case) rather than panic or
-/// silently mint a wrong namespace.
-#[test]
-fn dispatch_wire_model_id_falls_back_to_bare_id_when_unmatched_in_profile() {
-    use darkmux_types::Profile;
-    let profile = Profile {
-        extras: Default::default(),
-        description: None,
-        default_model: None,
-        models: vec![],
-        runtime: None,
-        use_when: None,
-    };
-    assert_eq!(super::dispatch_wire_model_id("ghost-model", &profile), "ghost-model");
-}
+// (#2902 step 3) The "id not found in the profile" fallback test retired with
+// the lookup: `managed_wire_model` takes the selected model itself, carried
+// by the resolver's `Target`, so there is no unmatched id to fall back from.
 
 // ── (#2240 review) The CALL SITE, not just the pure helper ─────────────────
 //
@@ -12925,10 +13058,10 @@ fn resolvers_set_the_utility_model_aside_unless_the_lab_opts_in() {
         .unwrap();
     assert_eq!(lab, "util-4b", "the lab benchmarks a candidate utility model through a profile that lists it");
     // The remote-target resolver takes the same set-aside.
-    let pm = super::resolve_selected_profile_model(&wire_id_test_role(), None, pf.to_str(), false).unwrap().unwrap();
-    assert_eq!(pm.id, "worker-35b");
-    let pm = super::resolve_selected_profile_model(&wire_id_test_role(), None, pf.to_str(), true).unwrap().unwrap();
-    assert_eq!(pm.id, "util-4b");
+    let t = super::resolve_target(&wire_id_test_role(), None, pf.to_str(), false).unwrap().unwrap();
+    assert_eq!(t.model.id, "worker-35b");
+    let t = super::resolve_target(&wire_id_test_role(), None, pf.to_str(), true).unwrap().unwrap();
+    assert_eq!(t.model.id, "util-4b");
 }
 
 /// (#2917) The busy check reads the instance a dispatch WOULD send to.
@@ -16707,6 +16840,74 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
     }
 
     /// `dispatch_remote` (hosted `darkmux dispatch`), `"single_shot"`.
+    /// (#2902) An unmanaged endpoint that declares
+    /// `chat-completions-max-tokens` is sent `max_tokens`, on both hosted
+    /// single-shot paths: `dispatch_remote` (the target's dialect) and a
+    /// crew seat's `single_shot_chat_hosted` (the endpoint's dialect).
+    #[test]
+    #[serial]
+    fn a_declared_max_tokens_dialect_reaches_the_wire_on_both_hosted_paths() {
+        let (base_url, rx) = one_shot_http_mock(
+            r#"{"model":"m","choices":[{"message":{"content":"ok"}}],"usage":{"total_tokens":3}}"#,
+        );
+        let ep: darkmux_types::ModelEndpoint =
+            serde_json::from_value(serde_json::json!({ "url": base_url, "dialect": "chat-completions-max-tokens" })).unwrap();
+        crate::single_shot::single_shot_chat_hosted(&crate::single_shot::HostedSingleShotRequest {
+            endpoint: &ep,
+            model: "vllm-model",
+            system: "s",
+            user: "u",
+            max_tokens: 77,
+            timeout_seconds: 15,
+        })
+        .expect("mock answers");
+        let request = rx.recv().unwrap();
+        assert!(request.contains("\"max_tokens\":77"), "{request}");
+        assert!(!request.contains("max_completion_tokens"), "{request}");
+
+        let (base_url, rx) = one_shot_http_mock(
+            r#"{"model":"m","choices":[{"message":{"content":"ok"}}],"usage":{"total_tokens":3}}"#,
+        );
+        let home = TempDir::new().unwrap();
+        let flows_dir = TempDir::new().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+        }
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "pr-reviewer".to_string();
+        opts.session_id = Some(format!("dialect-2902-{}", std::process::id()));
+        opts.phase_id = None;
+        opts.json = false;
+        opts.max_completion_tokens = Some(55);
+        let pm: darkmux_types::ProfileModel = serde_json::from_value(serde_json::json!({
+            "id": "vllm-model", "endpoint": { "url": base_url, "dialect": "chat-completions-max-tokens" }
+        }))
+        .unwrap();
+        let result = dispatch_remote(
+            &opts,
+            &quarantine_test_role(),
+            "system prompt",
+            &crate::target::target_for("p".into(), Default::default(), pm).unwrap(),
+        );
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+        result.expect("dispatch_remote must succeed against the mock server");
+        let request = rx.recv().unwrap();
+        assert!(request.contains("\"max_tokens\":55"), "{request}");
+        assert!(!request.contains("max_completion_tokens"), "{request}");
+    }
+
     #[test]
     #[serial]
     fn usage_conformance_dispatch_remote() {
@@ -16731,7 +16932,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
             r#"{{"id":"gpt-remote","n_ctx":100000,"endpoint":{{"url":"{base_url}"}}}}"#
         ))
         .unwrap();
-        let result = dispatch_remote(&opts, &quarantine_test_role(), "system prompt", &pm);
+        let result = dispatch_remote(&opts, &quarantine_test_role(), "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap());
         unsafe {
             match prev_home {
                 Some(v) => std::env::set_var("DARKMUX_HOME", v),
@@ -16748,7 +16949,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let p = &rec["payload"];
         assert_eq!(p["requested_model"], "gpt-remote");
         assert_eq!(p["reported_model"], "served-by-mock");
-        assert_eq!(p["endpoint"], remote_endpoint_label(pm.endpoint.as_ref().unwrap(), "gpt-remote"));
+        assert_eq!(p["endpoint"], crate::target::endpoint_route_label(pm.endpoint.as_ref().unwrap(), "gpt-remote"));
         assert_eq!(p["total_tokens"], 9, "provider total wins over 4+2");
         // The complete record keeps its own counts: the telemetry record is
         // additive, it does not move them.

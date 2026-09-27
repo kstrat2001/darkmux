@@ -409,15 +409,51 @@ fn resolve_role(
         error: Some(error),
     };
 
-    let Some(model_id) = resolved.profile.default_model_id() else {
-        return bound_but_unusable(format!("profile \"{}\" declares no models", resolved.profile_name));
+    // (#2902 step 3) The model the dispatch will RUN: the one resolver's
+    // selection within this profile (capability scoring, the utility model
+    // set aside), not simply the profile's default. A role this binary does
+    // not know, or a profile selection cannot resolve, keeps the default
+    // model's line and its named reasons below.
+    //
+    // (#2902 review C1) A resolution ERROR (the selected model names an
+    // endpoint the registry cannot resolve) is the seat's error, shown; it
+    // is never swallowed into the default-model fallback, which would render
+    // it as a healthy hosted seat.
+    let role_def = crate::crew::loader::load_roles().ok().and_then(|roles| roles.into_iter().find(|r| r.id == role_id));
+    let selected: Option<darkmux_types::ProfileModel> = match role_def {
+        None => None,
+        Some(role) => match crate::crew::target::select_in_profile(
+            &ctx.registry,
+            &role,
+            resolved.profile_name.clone(),
+            resolved.profile,
+            false,
+        ) {
+            Ok(r) => r.target().map(|t| t.model),
+            Err(e) => return bound_but_unusable(format!("{e:#}")),
+        },
     };
-    let Some(pm) = resolved.profile.models.iter().find(|m| m.id == model_id) else {
-        return bound_but_unusable(format!(
-            "profile \"{}\" names default model \"{model_id}\", absent from its own models[]",
-            resolved.profile_name
-        ));
+    let pm = match &selected {
+        Some(m) => m,
+        None => {
+            let Some(model_id) = resolved.profile.default_model_id() else {
+                return bound_but_unusable(format!("profile \"{}\" declares no models", resolved.profile_name));
+            };
+            let Some(pm) = resolved.profile.models.iter().find(|m| m.id == model_id) else {
+                return bound_but_unusable(format!(
+                    "profile \"{}\" names default model \"{model_id}\", absent from its own models[]",
+                    resolved.profile_name
+                ));
+            };
+            pm
+        }
     };
+
+    // (#2902 review C1) The default-model fallback (a role this binary does
+    // not know) applies the same endpoint rule the resolver does.
+    if let Err(e) = pm.endpoint_kind() {
+        return bound_but_unusable(e.to_string());
+    }
 
     // (merge-gate MUST-FIX 1) The SAME gate every real dispatch path
     // applies before trusting a local `ProfileModel` — see
@@ -426,7 +462,7 @@ fn resolve_role(
     // non-remote model before staffing it. Without this, a local model
     // missing `n_ctx` rendered here as a healthy `not loaded` while
     // `mission launch` would refuse the whole run.
-    if !pm.is_remote() {
+    if pm.is_managed() {
         if let Err(e) = pm.require_n_ctx() {
             return bound_but_unusable(format!("{e:#}"));
         }
@@ -439,7 +475,7 @@ fn resolve_role(
         provenance: Some(provenance),
         model: Some(ModelJson {
             id: pm.id.clone(),
-            remote: pm.is_remote(),
+            remote: !pm.is_managed(),
             n_ctx: pm.n_ctx,
         }),
         residency,
@@ -462,7 +498,7 @@ fn model_residency(
     pm: &darkmux_types::ProfileModel,
     loaded_models: Result<&[LoadedModel], &str>,
 ) -> (String, Option<String>) {
-    if pm.is_remote() {
+    if !pm.is_managed() {
         return ("remote".to_string(), None);
     }
     match loaded_models {
@@ -1166,6 +1202,67 @@ mod tests {
         assert_eq!(fine.profile.as_deref(), Some("fast"));
     }
 
+    // ── #2902: the model `show` names is the one the dispatch runs ──────
+
+    /// (#2902 review C1) A seat whose selected model names an endpoint the
+    /// registry cannot resolve is shown as unusable with the reason, never
+    /// as a healthy hosted seat.
+    #[test]
+    fn show_surfaces_a_seat_on_an_unresolvable_endpoint() {
+        let mut registry: ProfileRegistry = serde_json::from_str(
+            r#"{"profiles":{"p":{"models":[{"id":"gpt","endpoint":"nope"}]}},"default_profile":"p"}"#,
+        )
+        .unwrap();
+        registry.materialize_endpoints();
+        let pctx = ctx(registry);
+        let r = resolve_role("coder", Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]));
+        assert!(r.model.is_none(), "{:?}", r.model);
+        assert!(r.error.as_deref().is_some_and(|e| e.contains("nope")), "{:?}", r.error);
+        let unknown_role = resolve_role("role-a", Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]));
+        assert!(unknown_role.error.as_deref().is_some_and(|e| e.contains("nope")), "{:?}", unknown_role.error);
+    }
+
+    /// (#2902 review C1) When the SELECTED model's endpoint cannot be
+    /// resolved but the profile's default model is fine, the seat still
+    /// shows the error: the default is not what the dispatch would run.
+    #[test]
+    fn show_does_not_fall_back_to_the_default_when_the_selection_errs() {
+        let mut registry: ProfileRegistry = serde_json::from_str(
+            r#"{"profiles":{"mixed":{"default_model":"generalist","models":[
+                    {"id":"generalist","n_ctx":32000,"capabilities":{"reasoning":1.0}},
+                    {"id":"codestar","capabilities":{"code":1.0},"endpoint":"nope"}]}},
+                "default_profile":"mixed"}"#,
+        )
+        .unwrap();
+        registry.materialize_endpoints();
+        let pctx = ctx(registry);
+        let r = resolve_role("coder", Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]));
+        assert!(r.model.is_none(), "{:?}", r.model);
+        assert!(r.error.as_deref().is_some_and(|e| e.contains("nope")), "{:?}", r.error);
+    }
+
+    /// (#2902 step 3) `show` names the model the dispatch will RUN: the one
+    /// resolver's selection within the bound profile, not simply its
+    /// default. `coder` (skills `coding`, `test-designing`) selects the
+    /// code-weighted model over the declared default.
+    #[test]
+    fn show_names_the_selected_model_not_simply_the_profile_default() {
+        let model = |id: &str, cap: &str| {
+            serde_json::from_value::<ProfileModel>(serde_json::json!({
+                "id": id, "n_ctx": 32000, "capabilities": { cap: 1.0 }
+            }))
+            .unwrap()
+        };
+        let mut profiles = reg(vec![("mixed", vec![model("generalist", "reasoning"), model("codestar", "code")])], Some("mixed"));
+        profiles.profiles.get_mut("mixed").unwrap().default_model = Some("generalist".to_string());
+        let pctx = ctx(profiles);
+        let r = resolve_role("coder", Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]));
+        assert_eq!(r.model.as_ref().map(|m| m.id.as_str()), Some("codestar"), "{:?}", r.error);
+        // A role this binary does not know keeps the profile default.
+        let unknown = resolve_role("role-a", Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]));
+        assert_eq!(unknown.model.as_ref().map(|m| m.id.as_str()), Some("generalist"));
+    }
+
     // ── n_ctx gate (merge-gate MUST-FIX 1) ─────────────────────────────
     // Every real dispatch path (resourcing.rs::resolve_task_role,
     // dispatch_internal.rs, darkmux-lab's review.rs) refuses a local model
@@ -1206,6 +1303,26 @@ mod tests {
         let role = show.phases[0].tasks[0].role.as_ref().unwrap();
         assert!(role.error.is_none(), "a remote model must never be gated on n_ctx: {:?}", role.error);
         assert_eq!(role.residency, "remote");
+    }
+
+    #[test]
+    fn resolved_model_reports_remote_only_for_an_unmanaged_model() {
+        // (#2902 step 3) `remote` is derived from `is_managed()`; a managed
+        // (local) model must read `remote: false`, an endpoint one `true`.
+        let registry = StepKindRegistry::new();
+        for (model, want_remote) in [
+            (local_model("m-local", 8000), false),
+            (remote_model("gpt-4-remote"), true),
+        ] {
+            let profiles = reg(vec![("fast", vec![model])], Some("fast"));
+            let cfg = doc(vec![phase("p1", vec![task("t1", Some("role-a"), vec![step("s1", "k")])])]);
+            let loaded = loaded_doc(cfg);
+            let pctx = ctx(profiles);
+            let show = build_show("m", &loaded, &registry, Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]), &[]);
+            let role = show.phases[0].tasks[0].role.as_ref().unwrap();
+            let m = role.model.as_ref().expect("a resolved role carries its model");
+            assert_eq!(m.remote, want_remote, "model {} remote flag", m.id);
+        }
     }
 
     // ── residency ─────────────────────────────────────────────────────

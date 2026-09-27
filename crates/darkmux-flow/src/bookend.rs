@@ -184,14 +184,14 @@ pub type DynBookendGuard<'a> = BookendGuard<'a, dyn BookendSink + 'a>;
 /// `azure:myorg.cognitiveservices.azure.com/gpt-4o`). `host` is the
 /// endpoint's hostname only (never the scheme, path, or auth) — the SAME
 /// string `MemberRecord.endpoint` and `dispatch_internal`'s own
-/// `remote_endpoint_label` already carry. Matches
-/// `dispatch_internal::remote_endpoint_label`'s exact shape byte-for-byte
+/// `endpoint_route_label` already carry. Matches
+/// `darkmux_crew::target::endpoint_route_label`'s exact shape byte-for-byte
 /// (that function now delegates its formatting here) because the viewer's
 /// session-detail route renderer parses this string by splitting on the
 /// first `:` — a format drift here would silently break that view.
 ///
 /// `kind` is `"azure"` when `host` contains `"azure"`, else `"openai"` —
-/// the same heuristic `remote_endpoint_label` used against the full URL;
+/// the same heuristic `endpoint_route_label` used against the full URL;
 /// checking the host substring instead of the full URL is equivalent for
 /// every endpoint host darkmux has seen in practice (an Azure deployment's
 /// hostname always contains `azure`, e.g. `*.cognitiveservices.azure.com`
@@ -203,7 +203,7 @@ pub fn remote_route_label(host: &str, model_id: &str) -> String {
     // and future — safe by construction instead of by remembering.
     //
     // It was previously by remembering, and two of three callers forgot:
-    // `dispatch_internal::remote_endpoint_label` (the dispatch path) and
+    // `darkmux_crew::target::endpoint_route_label` (the dispatch path) and
     // the now-deleted dedicated review launcher both handed over a raw
     // authority. Only `review.rs`'s `seat_endpoint_host` stripped it, and
     // its comment spells out why: nothing stops an operator pasting

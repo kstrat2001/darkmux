@@ -98,6 +98,30 @@ darkmux release.
 
 ### Added
 
+- **Endpoints are declared once and named by id** (#2902 step 4).
+  `profiles.json` gains a top-level `endpoints` map; each entry has a
+  `url`, `managed` (`"lmstudio"`, or absent for an endpoint darkmux only
+  sends requests to), `dialect` (`chat-completions`, the default for an
+  unmanaged endpoint, or `chat-completions-max-tokens` for a server that
+  only accepts `max_tokens`), `auth` (a Keychain item or env-var NAME, never
+  the secret) and `limits` (`tokens_per_dispatch`, `concurrent_calls`, and a
+  `window` with a `period` and `tokens`/`calls`). A profile model names one
+  with `"endpoint": "<id>"`. **Limits are parsed, validated and shown by
+  `darkmux doctor` but not enforced yet** (#2902 step 5); the `remote.*`
+  knobs still apply. Inline `endpoint` objects keep working, and doctor's
+  new `endpoints` check names the move to an id (as advice; it passes). An
+  id that `endpoints` does not define is refused when used, never sent to
+  LM Studio on a guess. The registry stays lenient: a value this darkmux
+  does not know in `managed`, `dialect` or `limits` loads and is refused
+  when used (and named by doctor); any other broken `endpoints` entry, or
+  an `endpoints` value that is not an object, is quarantined (and then
+  absent from the loaded registry, like a quarantined profile). A `"managed": "lmstudio"`
+  endpoint that also declares a `url`, an `api_version` or another dialect
+  is refused when used: its address is `lmstudio_url`.
+  `profiles.example.json` (what `darkmux init` writes) uses the id form.
+  PROFILES schema stays 2.0: the string form joins that unreleased major
+  (a binary from before it quarantines a profile that uses it).
+
 - **`/machine-status` is a built-in advertised command** (#2918). "Which
   models are loaded on this machine right now?" was refused: the catalog
   radio's router (and the editor panel) route over had no machine command
@@ -109,6 +133,28 @@ darkmux release.
 
 ### Fixed
 
+- **The compaction window is the selected model's own** (#2902 step 3).
+  With several models in a profile, a dispatch compacted at the profile's
+  DEFAULT model's `n_ctx` even when capability selection picked another
+  model. One resolver now returns the selected model with its own endpoint
+  and window, and every path (dispatch, the container path, seat placement,
+  radio's boundary and busy checks, `mission config show`, the crawl's
+  provenance stamp, the lab's `coding-task` and `tool-bench` runs, whose
+  profile-built compaction settings no longer carry the default model's
+  window, and `tool-bench`'s scores `n_ctx`) goes through it. Single-model profiles, and every
+  profile shape `profiles.example.json` and the guide ship, resolve to the
+  same URL, model id, credential source and window as before (pinned by a
+  table-driven test). Two edge shapes change: a step `config.endpoint`
+  object with no `url` (`{}`) now runs on the managed LM Studio instead of
+  posting to `lmstudio_url` without its `/v1` path, and a seat whose
+  requested profile is quarantined is reported as unplaced instead of
+  being placed on the default profile's model.
+- **`darkmux lab run` with no `--profile` runs on the role's bound
+  profile** (#2902). It used `default_profile` even when the role the
+  workload dispatches as (the manifest's `role`, else the provider's own
+  default) had a `role_profiles` binding, so the run's `profile=` stamp named a profile
+  the operator had not bound. It now follows the same precedence
+  `darkmux dispatch <role>` does; an explicit `--profile` still wins.
 - **A stale local runtime image no longer shadows the one built for this
   darkmux** (#2923). A local `darkmux-runtime:latest` was used whenever it
   existed, so a weeks-old unlabeled build ran under a newer host and the

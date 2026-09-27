@@ -3342,3 +3342,33 @@ fn two_rules_first_units_never_share_a_dispatch_session_id() {
     assert_eq!(seen[0].as_deref(), Some(format!("crawl-{MISSION}-unnamed-predicate-u-0001").as_str()));
     assert_eq!(seen[1].as_deref(), Some(format!("crawl-{MISSION}-swallowed-error-u-0001").as_str()));
 }
+
+/// (#2902 review C3) The crawl's provenance stamp names the model the unit's
+/// dispatch RUNS: the one resolver's selection, not simply the profile's
+/// default model. `coder` selects the code-weighted `codestar`.
+#[test]
+#[serial_test::serial] // points DARKMUX_PROFILES at a scratch registry
+fn the_crawler_seat_stamp_names_the_selected_model() {
+    let tmp = TempDir::new().unwrap();
+    let pf = tmp.path().join("profiles.json");
+    fs::write(
+        &pf,
+        r#"{"profiles":{"mixed":{"default_model":"generalist","models":[
+                {"id":"generalist","n_ctx":32000,"capabilities":{"reasoning":1.0}},
+                {"id":"codestar","n_ctx":128000,"capabilities":{"code":1.0}}]}},
+            "default_profile":"mixed"}"#,
+    )
+    .unwrap();
+    let prev = std::env::var("DARKMUX_PROFILES").ok();
+    unsafe { std::env::set_var("DARKMUX_PROFILES", &pf) };
+    let seat = resolve_crawler_seat("coder");
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("DARKMUX_PROFILES", v),
+            None => std::env::remove_var("DARKMUX_PROFILES"),
+        }
+    }
+    assert_eq!(seat.model.as_deref(), Some("codestar"));
+    assert_eq!(seat.locality, "local");
+    assert_eq!(seat.profile_name.as_deref(), Some("mixed"));
+}

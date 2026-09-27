@@ -20,7 +20,7 @@
 //! share, so the frozen seat texts reach a remote endpoint byte-identical
 //! to what a local seat receives).
 
-use crate::dispatch_internal::{remote_auth_header, remote_chat_completion, remote_chat_url};
+use crate::dispatch_internal::{remote_auth_header, remote_chat_completion};
 use anyhow::Result;
 
 /// One local single-shot chat request. `base_url` defaults to
@@ -140,13 +140,63 @@ pub fn local_chat_body(
     temperature: f32,
     max_tokens: u32,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "model": model,
-        "messages": chat_messages(system, user),
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "stream": false,
+    chat_body(&ChatBody {
+        dialect: darkmux_types::Dialect::ChatCompletionsMaxTokens,
+        model,
+        messages: chat_messages(system, user),
+        max_tokens,
+        temperature: Some(temperature),
+        reasoning_effort: None,
     })
+}
+
+/// (#2902 step 3) Everything a chat-completions request body is made of.
+/// The messages are assembled by the caller ([`chat_messages`] for the
+/// single-shot seats, a fixed system+user pair for `dispatch_remote`, a
+/// user-only probe for `doctor --probe`); the dialect decides the rest.
+pub struct ChatBody<'a> {
+    pub dialect: darkmux_types::Dialect,
+    pub model: &'a str,
+    pub messages: serde_json::Value,
+    pub max_tokens: u32,
+    /// Sent in the `chat-completions-max-tokens` dialect when given; never in
+    /// `chat-completions` (hosted reasoning models reject it).
+    pub temperature: Option<f32>,
+    /// Sent in the `chat-completions` dialect when given; never in
+    /// `chat-completions-max-tokens`.
+    pub reasoning_effort: Option<&'a str>,
+}
+
+/// (#2902 step 3) THE host-side request-body builder: one per dialect, every
+/// host-side caller routes through it (the runtime crate, which cannot
+/// depend on this one, builds the container's turns from its own typed
+/// request and renames the cap field by the `--dialect` it is handed).
+///
+/// - `chat-completions`: `model`, `messages`, `max_completion_tokens`, and
+///   `reasoning_effort` when set. No `temperature`, no `stream`.
+/// - `chat-completions-max-tokens`: `model`, `messages`, `max_tokens`,
+///   `temperature` when set, and `"stream": false` (single-shot, not
+///   streamed).
+pub fn chat_body(b: &ChatBody) -> serde_json::Value {
+    use darkmux_types::Dialect;
+    let mut body = serde_json::json!({ "model": b.model, "messages": b.messages });
+    let obj = body.as_object_mut().expect("json! object literal");
+    match b.dialect {
+        Dialect::ChatCompletions => {
+            obj.insert("max_completion_tokens".into(), b.max_tokens.into());
+            if let Some(effort) = b.reasoning_effort {
+                obj.insert("reasoning_effort".into(), effort.into());
+            }
+        }
+        Dialect::ChatCompletionsMaxTokens => {
+            if let Some(t) = b.temperature {
+                obj.insert("temperature".into(), serde_json::json!(t));
+            }
+            obj.insert("max_tokens".into(), b.max_tokens.into());
+            obj.insert("stream".into(), false.into());
+        }
+    }
+    body
 }
 
 /// (#1260, contract 6 — frozen model-facing text) The message-array
@@ -157,7 +207,7 @@ pub fn local_chat_body(
 /// [`hosted_chat_body`] cannot drift: a remote seat's model sees exactly
 /// the messages a local seat's model sees — only the surrounding transport
 /// dialect differs.
-fn chat_messages(system: &str, user: &str) -> serde_json::Value {
+pub(crate) fn chat_messages(system: &str, user: &str) -> serde_json::Value {
     if system.trim().is_empty() {
         serde_json::json!([{ "role": "user", "content": user }])
     } else {
@@ -191,41 +241,41 @@ pub fn hosted_chat_body(
     max_tokens: u32,
     reasoning_effort: Option<&str>,
 ) -> serde_json::Value {
-    let mut body = serde_json::json!({
-        "model": model,
-        "messages": chat_messages(system, user),
-        "max_completion_tokens": max_tokens,
-    });
-    if let Some(effort) = reasoning_effort {
-        body["reasoning_effort"] = serde_json::Value::String(effort.to_string());
+    hosted_chat_body_in(darkmux_types::Dialect::ChatCompletions, model, system, user, max_tokens, reasoning_effort)
+}
+
+/// [`hosted_chat_body`] in an endpoint's declared dialect (#2902): an
+/// unmanaged server that takes `max_tokens` declares
+/// `"dialect": "chat-completions-max-tokens"`.
+fn hosted_chat_body_in(
+    dialect: darkmux_types::Dialect,
+    model: &str,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+    reasoning_effort: Option<&str>,
+) -> serde_json::Value {
+    chat_body(&ChatBody {
+        dialect,
+        model,
+        messages: chat_messages(system, user),
+        max_tokens,
+        temperature: None,
+        reasoning_effort,
+    })
+}
+
+/// The chat-completions URL for the managed LM Studio endpoint: the
+/// configured `lmstudio_url` through `ModelEndpoint::chat_url` (the one
+/// builder, #2902), or an explicit `base_url` override (the mock-model
+/// harness) through the same `lmstudio_chat_url` rule.
+pub(crate) fn local_chat_url(base_url: Option<&str>) -> String {
+    match base_url {
+        Some(base) => darkmux_types::endpoint::lmstudio_chat_url(base),
+        None => darkmux_types::ModelEndpoint::default()
+            .chat_url()
+            .expect("the default endpoint is managed and always has a chat URL"),
     }
-    body
-}
-
-/// The chat-completions URL for a local LMStudio base:
-/// `{base}/v1/chat/completions`. `base` already has any trailing slash
-/// trimmed by `config_access::lmstudio_url()`; an explicit `base_url`
-/// override is trimmed the same way so `/v1/...` can't double up. A base
-/// that already ends in `/v1` (operators carrying the pre-#661 full-URL
-/// habit) is tolerated too — the suffix is trimmed before this appends
-/// its own.
-fn local_chat_url(base_url: Option<&str>) -> String {
-    let base = base_url
-        .map(str::to_string)
-        .unwrap_or_else(darkmux_types::config_access::lmstudio_url);
-    format!("{}/chat/completions", lmstudio_v1_base(&base))
-}
-
-/// Normalize an operator's LMStudio base URL to its OpenAI-compat `/v1`
-/// root: a trailing `/` and a trailing `/v1` are both tolerated, so
-/// `http://h:1234`, `http://h:1234/`, and `http://h:1234/v1` all yield
-/// `http://h:1234/v1`. Shared by `local_chat_url` (host-side single-shot)
-/// and the agentic container's `--base-url` (#2904,
-/// `dispatch_internal::container_lmstudio_base_url`), so both paths read a
-/// configured URL the same way.
-pub(crate) fn lmstudio_v1_base(base: &str) -> String {
-    let base = base.trim_end_matches('/').trim_end_matches("/v1");
-    format!("{base}/v1")
 }
 
 /// Container-free single-shot chat call against a local LMStudio endpoint.
@@ -269,7 +319,7 @@ pub struct HostedSingleShotRequest<'a> {
 /// (#1260) Container-free single-shot chat call against a REMOTE
 /// OpenAI-compatible endpoint — the hosted twin of [`single_shot_chat`],
 /// through the EXACT URL/auth/POST chain `dispatch_remote` and
-/// `doctor --probe` use (`remote_chat_url` + `remote_auth_header` +
+/// `doctor --probe` use (`ModelEndpoint::chat_url` + `remote_auth_header` +
 /// `remote_chat_completion`): Azure `?api-version=`, Keychain-read auth
 /// header (0600 curl config, never on argv, never logged), and the shared
 /// 429/503 backoff ladder (bounded — 3 retries at 30s/60s/120s), so one
@@ -278,9 +328,10 @@ pub struct HostedSingleShotRequest<'a> {
 /// (contract 6 — see [`hosted_chat_body`]); only the transport dialect
 /// differs.
 pub fn single_shot_chat_hosted(req: &HostedSingleShotRequest) -> Result<SingleShotReply> {
-    let url = remote_chat_url(req.endpoint);
+    let url = req.endpoint.chat_url()?;
     let auth = remote_auth_header(req.endpoint)?;
-    let body = hosted_chat_body(
+    let body = hosted_chat_body_in(
+        req.endpoint.resolved_dialect()?,
         req.model,
         req.system,
         req.user,
@@ -295,11 +346,7 @@ pub fn single_shot_chat_hosted(req: &HostedSingleShotRequest) -> Result<SingleSh
     // from the host without a live watch. HARD RULE: HOST only (never the full
     // URL — it carries `?api-version=`), never the auth header, never content.
     if darkmux_types::config_access::debug_logging() {
-        let host = url
-            .split("://")
-            .nth(1)
-            .and_then(|s| s.split('/').next())
-            .unwrap_or("remote");
+        let host = req.endpoint.host().unwrap_or_else(|| "remote".to_string());
         eprintln!(
             "[darkmux-debug] hosted-call host={host} model={} max_tokens={} returned_tokens={:?} wall_ms={}",
             req.model,

@@ -420,6 +420,30 @@ impl Usage {
     }
 }
 
+/// (#2902) The request shape an endpoint accepts, handed in by the host as
+/// `--dialect` when the endpoint declares one that differs from the kind's
+/// default. Mirrors `darkmux_types::Dialect` (this crate cannot depend on
+/// darkmux-types; the spellings are the contract): here it decides only the
+/// completion-cap field name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    /// `max_completion_tokens`.
+    ChatCompletions,
+    /// `max_tokens`.
+    ChatCompletionsMaxTokens,
+}
+
+impl Dialect {
+    /// The host's spelling (`Dialect::as_str` in darkmux-types).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "chat-completions" => Some(Dialect::ChatCompletions),
+            "chat-completions-max-tokens" => Some(Dialect::ChatCompletionsMaxTokens),
+            _ => None,
+        }
+    }
+}
+
 /// Blocking HTTP client for LMStudio's chat-completions endpoint.
 ///
 /// Deliberately does NOT derive `Debug` — `auth_header` carries a live
@@ -440,6 +464,9 @@ pub struct LmStudioClient {
     /// startup (never a file or argv/env) — see `runtime/src/main.rs`'s
     /// `--auth-header-stdin`.
     auth_header: Option<(String, String)>,
+    /// (#2902) The endpoint's declared dialect; `None` keeps the pre-#2902
+    /// rule (rename the cap field iff `chat_url_override` is set).
+    dialect: Option<Dialect>,
 }
 
 impl LmStudioClient {
@@ -474,6 +501,7 @@ impl LmStudioClient {
             agent,
             chat_url_override: None,
             auth_header: None,
+            dialect: None,
         }
     }
 
@@ -486,6 +514,23 @@ impl LmStudioClient {
     pub fn with_chat_url(mut self, url: impl Into<String>) -> Self {
         self.chat_url_override = Some(url.into());
         self
+    }
+
+    /// (#2902) Declare the endpoint's dialect (see [`Dialect`]).
+    pub fn with_dialect(mut self, dialect: Dialect) -> Self {
+        self.dialect = Some(dialect);
+        self
+    }
+
+    /// Whether requests carry `max_completion_tokens` instead of
+    /// `max_tokens`: the declared dialect when there is one, else whether
+    /// this is a `--chat-url` brain (#1187).
+    pub(crate) fn renames_cap(&self) -> bool {
+        match self.dialect {
+            Some(Dialect::ChatCompletions) => true,
+            Some(Dialect::ChatCompletionsMaxTokens) => false,
+            None => self.is_remote_brain(),
+        }
     }
 
     /// (#1187) Attach an auth header to every request this client makes.
@@ -516,7 +561,7 @@ impl LmStudioClient {
     /// is set.
     fn request_body(&self, req: &ChatRequest) -> Result<serde_json::Value> {
         let mut body = serde_json::to_value(req)?;
-        if self.is_remote_brain() {
+        if self.renames_cap() {
             if let Some(obj) = body.as_object_mut() {
                 if let Some(mt) = obj.remove("max_tokens") {
                     obj.insert("max_completion_tokens".to_string(), mt);
@@ -569,7 +614,7 @@ impl LmStudioClient {
     /// The one streaming POST both entry points share.
     fn send_streaming(&self, req: &ChatRequest) -> Result<ureq::Response> {
         let url = self.effective_chat_url();
-        let body = build_streaming_request_body(req, self.is_remote_brain())?;
+        let body = build_streaming_request_body(req, self.renames_cap())?;
         let request = self.apply_auth_header(
             self.agent
                 .post(&url)
@@ -1552,6 +1597,30 @@ mod tests {
         let body = client.request_body(&sample_request()).expect("body builds");
         assert_eq!(body.get("max_completion_tokens"), Some(&serde_json::json!(10_000)));
         assert!(body.get("max_tokens").is_none());
+    }
+
+    /// (#2902) A declared dialect decides the cap field, not the presence of
+    /// `--chat-url`: an unmanaged server that takes `max_tokens` keeps it,
+    /// and the absent flag keeps the pre-#2902 rule (rename iff chat-url).
+    #[test]
+    fn a_declared_dialect_decides_the_cap_field_over_the_chat_url_rule() {
+        let keeps = LmStudioClient::with_base_url("http://unused:1234/v1")
+            .with_chat_url("https://vllm.example/v1/chat/completions")
+            .with_dialect(Dialect::ChatCompletionsMaxTokens);
+        let body = keeps.request_body(&sample_request()).expect("body builds");
+        assert_eq!(body.get("max_tokens"), Some(&serde_json::json!(10_000)));
+        assert!(body.get("max_completion_tokens").is_none());
+        let streamed = build_streaming_request_body(&sample_request(), keeps.renames_cap()).expect("body builds");
+        assert!(streamed.get("max_completion_tokens").is_none());
+
+        let renames = LmStudioClient::with_base_url("http://h:1234/v1").with_dialect(Dialect::ChatCompletions);
+        let body = renames.request_body(&sample_request()).expect("body builds");
+        assert_eq!(body.get("max_completion_tokens"), Some(&serde_json::json!(10_000)));
+        assert!(body.get("max_tokens").is_none());
+
+        assert_eq!(Dialect::parse("chat-completions"), Some(Dialect::ChatCompletions));
+        assert_eq!(Dialect::parse("chat-completions-max-tokens"), Some(Dialect::ChatCompletionsMaxTokens));
+        assert_eq!(Dialect::parse("openai"), None);
     }
 
     #[test]

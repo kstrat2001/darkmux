@@ -78,7 +78,7 @@ fn require_config_str<'a>(step: &'a Step, kind_id: &str, key: &str) -> Result<&'
 /// both kinds' `run`/`run_map` compute it, so all four sites agree by
 /// construction instead of by four independent copies of the same two-line
 /// expression staying in sync by hand — the drift #2537 tracks. Collapsing
-/// this with `dispatch_wire_model_id` / `compactor_wire_model_id` in
+/// this with `managed_wire_model` / `compactor_wire_model_id` in
 /// `dispatch_internal.rs` (which resolve against a `Profile`, not a `Step`)
 /// is left to #2537; the shapes differ enough (a `Step.config` string vs. a
 /// `Profile.models[]` lookup) that forcing one signature over both would
@@ -185,8 +185,8 @@ fn resolve_local_placement_inner(
     seat: &str,
 ) -> std::result::Result<darkmux_gestalt::Placement, PlacementMiss> {
     // (#2329 review) The dispatch resolves an unnamed profile through the
-    // machine-local `role_profiles` map FIRST (`dispatch_internal::
-    // resolve_role_aware_profile`, #1547) and `default_profile` only as the
+    // machine-local `role_profiles` map FIRST (`target::
+    // resolve_role_aware_profile_with`, #1547) and `default_profile` only as the
     // fallback. This placement used to read `default_profile` alone, so a
     // bound role (`role_profiles.coder = coder-qwen38` on a registry whose
     // default is `balanced`) had its wave load and lease model A while every
@@ -194,11 +194,7 @@ fn resolve_local_placement_inner(
     // turboquant and each coder then loaded qwen3.8 itself. Same map, same
     // precedence, read live like the dispatch does (test builds see an empty
     // map by construction, #811 — the pure core below takes it as a value).
-    let mapped = if profile_name.is_none() {
-        darkmux_types::config_access::role_profile(role_id)
-    } else {
-        None
-    };
+    let mapped = crate::target::role_profile_binding(Some(role_id), profile_name);
     resolve_local_placement_inner_with(role_id, profile_name, mapped, config_path, seat)
 }
 
@@ -211,59 +207,38 @@ fn resolve_local_placement_inner_with(
     config_path: Option<&str>,
     seat: &str,
 ) -> std::result::Result<darkmux_gestalt::Placement, PlacementMiss> {
-    use crate::select::select_model;
     use PlacementMiss::ResolutionFailed;
 
     let loaded = darkmux_profiles::profiles::load_registry(config_path)
         .map_err(|e| ResolutionFailed(format!("profile registry: {e}")))?;
-    let profile = match (profile_name, mapped) {
-        // An explicit name wins (falling back to `default_profile` when this
-        // machine does not define it — the machine-agnostic-caller case
-        // `resolve_active` exists for).
-        (Some(_), _) | (None, None) => {
-            loaded
-                .registry
-                .resolve_active(profile_name)
-                .ok_or_else(|| ResolutionFailed("no active profile".to_string()))?
-                .1
-        }
-        // The `role_profiles` binding — loud when it names a profile the
-        // registry does not define, never a silent fallback (contract 7),
-        // exactly as the dispatch resolves it.
-        (None, Some(mapped)) => {
-            let binding = darkmux_profiles::profiles::RoleBinding::Mapped(mapped);
-            darkmux_profiles::profiles::resolve_role_profile_with(role_id, &binding, &loaded.registry)
-                .map_err(|e| ResolutionFailed(format!("{e:#}")))?
-                .profile
-        }
-    };
-
     let roles = crate::loader::load_roles().map_err(|e| ResolutionFailed(format!("loading roles: {e}")))?;
     let role = roles
         .iter()
         .find(|r| r.id == role_id)
         .ok_or_else(|| ResolutionFailed(format!("role `{role_id}` not found")))?;
-
-    let skill_index: std::collections::HashMap<String, crate::types::Skill> =
-        crate::loader::load_skills()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|s| (s.id.clone(), s))
-            .collect();
-    // (#2914) A step never runs on the machine's utility model.
-    let model_id = select_model(role, profile, |id| skill_index.get(id), loaded.registry.utility_model_id())
-        .map_err(|e| ResolutionFailed(format!("select_model: {e}")))?;
-    let pm = profile
-        .models
-        .iter()
-        .find(|m| m.id == model_id)
-        .ok_or_else(|| ResolutionFailed(format!("selected model `{model_id}` not found in profile")))?;
-    if pm.is_remote() {
-        return Err(PlacementMiss::Remote);
+    // (#2902 step 3) The ONE resolver the dispatch itself routes on: the
+    // same profile precedence (#2329: `role_profiles` before
+    // `default_profile`, a dangling binding loud), the same `select_model`
+    // with the utility set-aside (#2914: a step never runs on the machine's
+    // utility model), and the same endpoint classification.
+    let target = match crate::target::resolve_in(&loaded.registry, role, profile_name, mapped, false)
+        .map_err(|e| ResolutionFailed(format!("{e:#}")))?
+    {
+        crate::target::Resolution::Target(t) => t,
+        crate::target::Resolution::NoProfile => return Err(ResolutionFailed("no active profile".to_string())),
+        crate::target::Resolution::NoModel { error, .. } => {
+            return Err(ResolutionFailed(format!("select_model: {error}")))
+        }
+    };
+    // (#2902 review C4) Exhaustive on the kind, so a new kind is a compile
+    // error at the placement decision.
+    match target.kind {
+        darkmux_types::EndpointKind::Managed(_) => {}
+        darkmux_types::EndpointKind::Unmanaged => return Err(PlacementMiss::Remote),
     }
-    let min_ctx = pm
-        .n_ctx
-        .ok_or_else(|| ResolutionFailed(format!("model `{}` has no declared n_ctx", pm.id)))?;
+    let pm = &target.model;
+    // (#2902 step 4) The one n_ctx rule (`ProfileModel::require_n_ctx`).
+    let min_ctx = pm.require_n_ctx().map_err(|e| ResolutionFailed(format!("{e:#}")))?;
     let identifier = darkmux_gestalt::namespaced_identifier(&pm.id, pm.identifier.as_deref());
     Ok(darkmux_gestalt::Placement {
         model_key: pm.id.clone(),
@@ -271,6 +246,14 @@ fn resolve_local_placement_inner_with(
         min_ctx,
         seat: seat.to_string(),
     })
+}
+
+/// (#2902 step 3) A model step's `config.endpoint` through the one resolver
+/// (`target::step_unmanaged_endpoint`): `Some` only for an UNMANAGED
+/// endpoint, the hosted arm. An `endpoints` id resolves against the registry
+/// the step names (`config.config_path`), else the default one.
+fn step_endpoint(step: &Step) -> Result<Option<darkmux_types::ModelEndpoint>> {
+    crate::target::step_unmanaged_endpoint(&step.config, config_str(step, "config_path"))
 }
 
 /// (#1230 Packet 4 DRY pass) One `failed_tool_invocations` entry from the
@@ -915,7 +898,11 @@ impl StepKind for DispatchSingleShotStepKind {
         _input: &BTreeMap<String, String>,
         _ctx: &StepRunCtx,
     ) -> SeatClaim {
-        if step.config.get("endpoint").is_some() {
+        // (#2902 step 3) An UNMANAGED `config.endpoint` is the hosted track;
+        // a managed one (or none) is placed locally. One that cannot be
+        // resolved keeps the hosted claim it always had: `run` refuses it
+        // with the reason.
+        if !matches!(step_endpoint(step), Ok(None)) {
             return SeatClaim::RemoteEndpoint;
         }
         let Some(model) = config_str(step, "model") else {
@@ -1000,7 +987,8 @@ impl DispatchSingleShotStepKind {
         // `<key>` — the #2240/#2536 split, here. Computed once so the
         // records and the actual call can never disagree about what was
         // dispatched.
-        let is_hosted = step.config.get("endpoint").is_some();
+        let endpoint = step_endpoint(step).with_context(|| format!("step `{}`: config.endpoint", step.id))?;
+        let is_hosted = endpoint.is_some();
         let wire_model: std::borrow::Cow<'_, str> = if is_hosted {
             std::borrow::Cow::Borrowed(model)
         } else {
@@ -1028,11 +1016,8 @@ impl DispatchSingleShotStepKind {
         // which at least had the pair. Opened BEFORE any model work and
         // closed on every exit path, `?` and panic included, via
         // `StepBookend`'s Drop.
-        let endpoint_label: Option<String> = step
-            .config
-            .get("endpoint")
-            .and_then(|v| serde_json::from_value::<darkmux_types::ModelEndpoint>(v.clone()).ok())
-            .map(|ep| crate::dispatch_internal::remote_endpoint_label(&ep, wire_model.as_ref()));
+        let endpoint_label: Option<String> =
+            endpoint.as_ref().map(|ep| crate::target::endpoint_route_label(ep, wire_model.as_ref()));
         let mut bookend = StepBookend::new(
             ctx,
             Self::bookend_record(
@@ -1081,9 +1066,7 @@ impl DispatchSingleShotStepKind {
 
         let mut flow_records = Vec::new();
 
-        let reply = if let Some(endpoint_val) = step.config.get("endpoint") {
-            let endpoint: darkmux_types::ModelEndpoint = serde_json::from_value(endpoint_val.clone())
-                .with_context(|| format!("step `{}`: config.endpoint", step.id))?;
+        let reply = if let Some(endpoint) = &endpoint {
 
             // (#1412) Admit gate FIRST — a budget of 0 refuses before any
             // HTTP call is even constructed, mirroring `dispatch_remote`'s
@@ -1097,7 +1080,7 @@ impl DispatchSingleShotStepKind {
 
             let clamped_max_tokens = clamp_hosted_max_tokens(max_tokens, budget);
             let req = HostedSingleShotRequest {
-                endpoint: &endpoint,
+                endpoint,
                 model: wire_model.as_ref(),
                 system,
                 user: &user,
@@ -1851,7 +1834,8 @@ impl DispatchMapStepKind {
         // #2240/#2536 split, here. Computed once so the records and the
         // actual per-item calls can never disagree about what was
         // dispatched.
-        let is_hosted = step.config.get("endpoint").is_some();
+        let endpoint = step_endpoint(step).with_context(|| format!("step `{}`: config.endpoint", step.id))?;
+        let is_hosted = endpoint.is_some();
         let wire_model: std::borrow::Cow<'_, str> = if is_hosted {
             std::borrow::Cow::Borrowed(model)
         } else {
@@ -1878,13 +1862,6 @@ impl DispatchMapStepKind {
         // Off by default for every existing caller; the review pipeline's
         // probe stage is the first to set it (darkmux#1605 cause 2).
         let retry_on_error = self.config_retry_budget(step, "retry_on_error")?;
-        let endpoint: Option<darkmux_types::ModelEndpoint> = match step.config.get("endpoint") {
-            Some(v) => Some(
-                serde_json::from_value(v.clone())
-                    .with_context(|| format!("step `{}`: config.endpoint", step.id))?,
-            ),
-            None => None,
-        };
 
         // (#1607) Contract #2's liveness bookends. Opened BEFORE any model
         // work and closed on every exit path, including the ones a `?` takes:
@@ -1894,7 +1871,7 @@ impl DispatchMapStepKind {
         // token records name a model and a cost but never a place.
         let endpoint_label: Option<String> = endpoint
             .as_ref()
-            .map(|ep| crate::dispatch_internal::remote_endpoint_label(ep, wire_model.as_ref()));
+            .map(|ep| crate::target::endpoint_route_label(ep, wire_model.as_ref()));
         // (#2902 step 1a) The endpoint fact on each item's usage record: the
         // bookends' own label for a hosted step, else the LMStudio base the
         // local items call (`base_url: None` below, so the configured one).
@@ -2911,7 +2888,8 @@ impl StepKind for DispatchMapStepKind {
         input: &BTreeMap<String, String>,
         _ctx: &StepRunCtx,
     ) -> SeatClaim {
-        if step.config.get("endpoint").is_some() {
+        // (#2902 step 3) Same rule as `dispatch.single_shot`'s seat.
+        if !matches!(step_endpoint(step), Ok(None)) {
             return SeatClaim::RemoteEndpoint;
         }
         match resolve_map_collection(step, task, input) {
@@ -7295,6 +7273,45 @@ mod tests {
         assert!(err.contains("utility model") && err.contains("internal.utility"), "names the fix: {err}");
     }
 
+    /// (#2902 step 3) A seat whose selected model is on an UNMANAGED
+    /// endpoint is the silent `Remote` miss (no local residency to plan),
+    /// named by id or inline; an undefined id is a loud resolution failure.
+    #[serial_test::serial]
+    #[test]
+    fn placement_classifies_through_the_one_resolver() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let reg = dir.path().join("profiles.json");
+        std::fs::write(
+            &reg,
+            serde_json::json!({
+                "default_profile": "local",
+                "endpoints": { "hosted": { "url": "https://h.example/v1" } },
+                "profiles": {
+                    "local": {"models": [{"id": "m-local", "n_ctx": 4096}]},
+                    "named": {"models": [{"id": "gpt", "endpoint": "hosted"}]},
+                    "inline": {"models": [{"id": "gpt", "endpoint": {"url": "https://i.example/v1"}}]},
+                    "dangling": {"models": [{"id": "gpt", "endpoint": "nope"}]}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cfg = reg.to_str().unwrap();
+        let pick = |name: &str| {
+            resolve_local_placement_inner_with("coder", Some(name), None, Some(cfg), "step:s")
+                .map(|p| p.model_key)
+                .map_err(|e| match e {
+                    PlacementMiss::Remote => "remote".to_string(),
+                    PlacementMiss::ResolutionFailed(r) => r,
+                })
+        };
+        assert_eq!(pick("local"), Ok("m-local".into()));
+        assert_eq!(pick("named"), Err("remote".into()));
+        assert_eq!(pick("inline"), Err("remote".into()));
+        let err = pick("dangling").unwrap_err();
+        assert!(err.contains("nope") && err != "remote", "{err}");
+    }
+
     // ─── (#2902 step 1a) usage conformance: one record per model call ──
 
     /// The mock chat server every usage-conformance test below answers from.
@@ -7380,7 +7397,7 @@ mod tests {
             serde_json::from_value(json!({ "url": format!("{}/v1", server.base_url()) })).unwrap();
         assert_eq!(
             p["endpoint"],
-            crate::dispatch_internal::remote_endpoint_label(&ep, "gpt-5.1"),
+            crate::target::endpoint_route_label(&ep, "gpt-5.1"),
             "the same label the bookends carry"
         );
     }
@@ -7547,7 +7564,7 @@ mod tests {
         assert_eq!(p["requested_model"], "gpt-5.1");
         assert_eq!(p["reported_model"], "served-by-mock");
         let ep: darkmux_types::ModelEndpoint = serde_json::from_value(ep_json).unwrap();
-        assert_eq!(p["endpoint"], crate::dispatch_internal::remote_endpoint_label(&ep, "gpt-5.1"));
+        assert_eq!(p["endpoint"], crate::target::endpoint_route_label(&ep, "gpt-5.1"));
         assert_eq!(p["remote"], true);
     }
 

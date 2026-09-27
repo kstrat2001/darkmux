@@ -319,6 +319,13 @@ pub(crate) trait WorkloadProvider: Send + Sync {
     fn id(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn setup(&self, loaded: &LoadedWorkload, run_dir: &Path, sandbox_dir: &Path) -> Result<()>;
+    /// (#2902 re-review C3) The role this workload's dispatches run as, so
+    /// `lab run` picks the profile (`role_profiles.<role>`) for the SAME role
+    /// the provider dispatches, and the A/B brief sizes for its model.
+    /// `None` for a provider that dispatches no single role.
+    fn dispatch_role(&self, _loaded: &LoadedWorkload) -> Option<String> {
+        None
+    }
     /// Run the workload through darkmux's in-house container-bounded
     /// runtime, the only dispatch path (#1405). The former `runtime`
     /// parameter (a single-variant enum) retired in #1426 ship-3 along with

@@ -188,10 +188,10 @@ pub struct StepRecord {
 /// namespace marks darkmux-owned LOCAL residency, and a remote seat has
 /// none).
 pub fn seat_identifier(pm: &ProfileModel) -> String {
-    if pm.is_remote() {
-        pm.id.clone()
-    } else {
+    if pm.is_managed() {
         swap::namespaced_identifier(pm)
+    } else {
+        pm.id.clone()
     }
 }
 
@@ -200,24 +200,19 @@ pub fn seat_identifier(pm: &ProfileModel) -> String {
 /// deployment URL embeds the deployment name; the host is the boundary
 /// operators reason about). `None` for local seats.
 pub fn seat_endpoint_host(pm: &ProfileModel) -> Option<String> {
-    let ep = pm.endpoint.as_ref().filter(|e| e.is_remote())?;
-    let url = ep.base_url();
-    let authority = url.split("://").nth(1).and_then(|s| s.split('/').next()).unwrap_or("remote");
-    // (#1530) Strip URL userinfo before the `@`. This function's contract is
-    // HOST ONLY, NEVER CREDENTIALS — and its output is stamped into step
-    // config, `MemberRecord.endpoint`, and a run's envelope, which CI
-    // uploads as a public artifact. The sanctioned way to carry a key is
-    // `EndpointAuth` (a Keychain item name or an env-var name, never a
-    // value), but nothing stops an operator pasting `https://tok@proxy/v1`
-    // into a profile's `url` — some LiteLLM/proxy setups document exactly
-    // that form. Without this, that token would ride to a public surface.
-    Some(authority.rsplit('@').next().unwrap_or(authority).to_string())
+    // (#2902) `ModelEndpoint::host` is the one host extraction: authority
+    // only, `None` for a managed endpoint, and (#1530) userinfo stripped —
+    // this output is stamped into step config, `MemberRecord.endpoint` and a
+    // run's envelope, which CI uploads as a public artifact, and nothing
+    // stops an operator pasting `https://tok@proxy/v1` into a `url`.
+    let ep = seat_endpoint(pm)?;
+    Some(ep.host().unwrap_or_else(|| "remote".to_string()))
 }
 
 /// (#1260) The endpoint a seat's chat calls should route through — `Some`
 /// only when the staffing's resolved model declares a remote endpoint.
 pub fn seat_endpoint(pm: &ProfileModel) -> Option<&ModelEndpoint> {
-    pm.endpoint.as_ref().filter(|e| e.is_remote())
+    pm.endpoint.as_ref().filter(|e| e.kind().is_ok_and(|k| !k.is_managed()))
 }
 
 /// One seat staffing's resolved config, snapshotted as ACTUALLY used — see
@@ -335,7 +330,7 @@ pub fn staffing_snapshot(
             // snapshot records role → profile → model, not just profile+model.
             role_id: s.role_id.clone(),
             model: seat_identifier(&s.pm),
-            remote: s.pm.is_remote(),
+            remote: !s.pm.is_managed(),
             endpoint: seat_endpoint_host(&s.pm),
             k: s.k,
             passes: s.passes,
@@ -361,6 +356,26 @@ pub fn staffing_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (#2902 review C3) Only an UNMANAGED endpoint is a hosted seat: an
+    /// inline endpoint with no `url` is the managed LM Studio default and
+    /// must not show a host or an endpoint.
+    #[test]
+    fn seat_endpoint_shows_only_unmanaged_endpoints() {
+        let pm = |ep: serde_json::Value| -> ProfileModel {
+            serde_json::from_value(serde_json::json!({ "id": "m", "n_ctx": 1, "endpoint": ep })).unwrap()
+        };
+        for managed in [serde_json::json!({}), serde_json::json!({ "reasoning_effort": "high" }), serde_json::json!({ "managed": "lmstudio" })] {
+            let m = pm(managed.clone());
+            assert!(seat_endpoint(&m).is_none(), "{managed}");
+            assert!(seat_endpoint_host(&m).is_none(), "{managed}");
+            assert_eq!(seat_identifier(&m), "darkmux:m", "{managed}");
+        }
+        let hosted = pm(serde_json::json!({ "url": "https://tok@h.example/v1" }));
+        assert!(seat_endpoint(&hosted).is_some());
+        assert_eq!(seat_endpoint_host(&hosted).as_deref(), Some("h.example"));
+        assert_eq!(seat_identifier(&hosted), "m");
+    }
     use darkmux_types::ProfileModel;
 
     /// Golden JSON for [`MemberRecord`] — pins both the emitted fields AND

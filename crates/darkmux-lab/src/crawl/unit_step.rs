@@ -680,17 +680,24 @@ pub fn resolve_crawler_seat(role: &str) -> CrawlerSeat {
     let Ok(loaded) = darkmux_profiles::profiles::load_registry(None) else {
         return unresolved();
     };
-    let Ok(resolved) = darkmux_profiles::profiles::resolve_role_profile(role, &loaded.registry) else {
+    let Some(role_def) = darkmux_crew::loader::load_roles().ok().and_then(|rs| rs.into_iter().find(|r| r.id == role))
+    else {
         return unresolved();
     };
-    let Some(model_id) = resolved.profile.default_model_id() else {
-        return CrawlerSeat { model: None, locality: "unknown", profile_name: Some(resolved.profile_name) };
-    };
-    let is_remote = resolved.profile.models.iter().find(|m| m.id == model_id).is_some_and(|m| m.is_remote());
-    CrawlerSeat {
-        model: Some(model_id.to_string()),
-        locality: if is_remote { "endpoint" } else { "local" },
-        profile_name: Some(resolved.profile_name),
+    // (#2902 step 3) The one resolver the unit's dispatch itself routes on,
+    // so the stamp names the model that RUNS (the selected one, not simply
+    // the profile default) and its endpoint kind.
+    let mapped = darkmux_types::config_access::role_profile(role);
+    match darkmux_crew::target::resolve_in(&loaded.registry, &role_def, None, mapped, false) {
+        Ok(darkmux_crew::target::Resolution::Target(t)) => CrawlerSeat {
+            model: Some(t.model.id.clone()),
+            locality: if t.is_managed() { "local" } else { "endpoint" },
+            profile_name: Some(t.profile_name.clone()),
+        },
+        Ok(darkmux_crew::target::Resolution::NoModel { profile_name, .. }) => {
+            CrawlerSeat { model: None, locality: "unknown", profile_name: Some(profile_name) }
+        }
+        Ok(darkmux_crew::target::Resolution::NoProfile) | Err(_) => unresolved(),
     }
 }
 

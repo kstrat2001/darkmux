@@ -141,7 +141,7 @@ const ENTRY_POINTS: &[Site] = &[
     Site {
         file: "src/dispatch_internal.rs",
         func: "dispatch_remote",
-        anchor: "dispatch_remote requires a remote endpoint",
+        anchor: "runtime=direct (hosted)",
     },
 ];
 
@@ -341,7 +341,7 @@ fn the_extractor_discriminates_between_neighboring_functions() {
     let src = read_src("src/dispatch_internal.rs");
     let remote = fn_body(&src, "dispatch_remote");
     assert!(
-        remote.contains("dispatch_remote requires a remote endpoint"),
+        remote.contains("runtime=direct (hosted)"),
         "sanity: the extracted body is `dispatch_remote`'s own"
     );
     assert!(

@@ -175,6 +175,9 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // unconditional `/chat/completions` suffix can't express). When set,
     // this overrides `base_url` for request routing.
     let mut chat_url: Option<String> = None;
+    // (#2902) The endpoint's declared request dialect, when it differs from
+    // what `--chat-url` presence implies.
+    let mut dialect: Option<lmstudio::Dialect> = None;
     // (#1187) When true, read the remote endpoint's auth header as JSON
     // (`{"header": "...", "value": "..."}`) from stdin ONCE at startup — the
     // host pipes it in immediately after spawning this container (with `-i`)
@@ -379,6 +382,20 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     return ExitCode::from(2);
                 }
             }
+            "--dialect" => match args.get(i + 1).map(|v| (v, lmstudio::Dialect::parse(v))) {
+                Some((_, Some(d))) => {
+                    dialect = Some(d);
+                    i += 2;
+                }
+                Some((v, None)) => {
+                    eprintln!("--dialect must be `chat-completions` or `chat-completions-max-tokens` (got {v:?})");
+                    return ExitCode::from(2);
+                }
+                None => {
+                    eprintln!("--dialect requires a value");
+                    return ExitCode::from(2);
+                }
+            },
             "--auth-header-stdin" => {
                 auth_header_stdin = true;
                 i += 1;
@@ -835,6 +852,9 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     };
     if let Some(url) = chat_url {
         client = client.with_chat_url(url);
+    }
+    if let Some(d) = dialect {
+        client = client.with_dialect(d);
     }
     // (#1187) Read the auth header from stdin ONCE at startup — never a CLI
     // arg (ps-visible), never an env var (visible to every process, no

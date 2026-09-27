@@ -1885,6 +1885,12 @@ pub struct DockerRunConfig {
     /// `write_remote_auth_header_stdin`) — never via a file or env var. This
     /// flag carries no secret material itself.
     pub remote_needs_auth: bool,
+    /// (#2902) The endpoint's declared request dialect, passed as
+    /// `--dialect` ONLY when it differs from what the runtime assumes for the
+    /// kind (`chat-completions` for a `--chat-url` brain, the LM Studio shape
+    /// otherwise), so an existing config's argv is unchanged. It decides the
+    /// completion-cap field the runtime sends.
+    pub dialect: Option<darkmux_types::Dialect>,
     /// The container's `--base-url` (the LMStudio-compatible
     /// chat-completions host it dials for a LOCAL-brain dispatch — see
     /// `runtime/src/lmstudio.rs::DEFAULT_BASE_URL`). `dispatch()` always
@@ -2140,6 +2146,10 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
             args.push("--auth-header-stdin".to_string());
         }
     }
+    if let Some(dialect) = config.dialect {
+        args.push("--dialect".to_string());
+        args.push(dialect.as_str().to_string());
+    }
 
     // Compaction flags (#368) — delegated to `apply_compaction_flags`, the
     // single source of truth. Each must stay byte-for-byte identical to the
@@ -2168,7 +2178,7 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
 /// An explicit override (the mock-model harness) wins, verbatim. Otherwise
 /// it is the SAME resolved `lmstudio_url` the host-side single-shot path
 /// reads (`config_access::lmstudio_url`, env > config.json > default),
-/// normalized to `/v1` by the shared `single_shot::lmstudio_v1_base`, then
+/// normalized to `/v1` by the shared `darkmux_types::endpoint::lmstudio_v1_base`, then
 /// rewritten for the container's view of the network by
 /// [`loopback_to_docker_host`]. This is a networking translation only; it
 /// says nothing about where the endpoint is.
@@ -2193,8 +2203,29 @@ pub(crate) fn container_lmstudio_base_url(override_url: Option<&str>) -> Option<
         );
         return None;
     }
-    let base = crate::single_shot::lmstudio_v1_base(&configured);
+    let base = darkmux_types::endpoint::lmstudio_v1_base(&configured);
     Some(loopback_to_docker_host(&base))
+}
+
+/// (#2902) The `--dialect` the container gets for a target: only a declared
+/// dialect that differs from what the runtime already assumes for the kind
+/// (`chat-completions` for a `--chat-url` brain), so every existing config's
+/// argv is byte-identical.
+pub(crate) fn container_dialect_flag(t: &crate::target::Target) -> Option<darkmux_types::Dialect> {
+    (t.dialect != t.kind.default_dialect()).then_some(t.dialect)
+}
+
+/// (#2902 review C3) What an agentic-hosted target puts on the container's
+/// argv: its chat URL (`--chat-url`) and, when declared and non-default, its
+/// dialect (`--dialect`). `(None, None)` for a managed dispatch, whose
+/// container dials `--base-url`.
+pub(crate) fn agentic_brain_flags(
+    agentic: Option<&crate::target::Target>,
+) -> (Option<String>, Option<darkmux_types::Dialect>) {
+    match agentic {
+        Some(t) => (Some(t.chat_url.clone()), container_dialect_flag(t)),
+        None => (None, None),
+    }
 }
 
 /// Rewrite a host that means "this machine" in `url` to
@@ -2462,135 +2493,35 @@ fn write_remote_auth_header_stdin(
 // Keychain credential is the keymaster.
 // ─────────────────────────────────────────────────────────────────────────
 
-/// (#1547) Resolve which profile a dispatch for `role_id` should use,
-/// honoring the machine-local `role_profiles` map BEFORE falling to
-/// `default_profile` — the shared "step 1" both `resolve_selected_profile_model`
-/// (the remote branch-decision path, below) and `resolve_dispatch_model_internal`
-/// (the container path) chain through, so the two consumers can never disagree
-/// about which profile a role resolved to.
-///
-/// Before this, `role_profiles` had exactly ONE production reader — the
-/// (now-deleted) dedicated review launcher — so `darkmux config set
-/// role_profiles.<role> <profile>` succeeded, `darkmux doctor` reported the
-/// binding as fine, and `darkmux dispatch <role>` / `lab run` / the coder-phase
-/// seat silently ignored it and ran on `default_profile` anyway. Wiring the map
-/// in here (rather than duplicating the lookup at each call site) is also what
-/// keeps the remote-vs-local branch decision honest: a role bound to a REMOTE
-/// profile now takes the light single-shot hosted path instead of resolving
-/// "local" up front (via the old default-profile-only view) and only
-/// discovering the mismatch once the container path re-resolves.
-///
-/// Precedence — matches the (now-deleted) dedicated review launcher's
-/// former precedence for the same map (#1475, launcher removed #2310 P4d):
-/// 1. `profile_override` — an explicit `--profile <p>` on THIS call always
-///    wins. Unchanged #1054 soft-fallback semantics: a name undefined on this
-///    machine warns (at the call site) and falls to `default_profile`, since a
-///    machine-agnostic caller may name a profile only some machines define.
-/// 2. The `role_profiles.<role_id>` map. A role BOUND to a profile that
-///    doesn't exist in the registry is a LOUD error (config-leniency contract
-///    7 — semantic validation at resolution, never a silent fallback),
-///    exactly the posture `resolve_role_profile_with` already gives the
-///    review launcher for this same map.
-/// 3. `default_profile`, via the existing `resolve_active(None)` handling
-///    (soft: `None` when nothing resolves, letting the caller fall back to
-///    `probe_loaded_model()`).
-///
-/// Impure wrapper: reads the `role_profiles` map live via `config_access`
-/// (test builds see an always-empty config by construction, #811 — see
-/// `resolve_role_aware_profile_with`, the pure core below, for a version
-/// unit tests can actually drive through the mapped-binding arm).
-fn resolve_role_aware_profile<'a>(
-    role_id: &str,
-    profile_override: Option<&str>,
-    registry: &'a darkmux_types::ProfileRegistry,
-) -> Result<Option<(String, &'a darkmux_types::Profile)>> {
-    let mapped = role_profile_binding(Some(role_id), profile_override);
-    resolve_role_aware_profile_with(role_id, profile_override, mapped, registry)
-}
+// (#1547/#2902) The profile precedence (`--profile` > `role_profiles.<role>`
+// > `default_profile`) lives in `crate::target::resolve_role_aware_profile_with`,
+// the one resolver every path below routes through.
+use crate::target::{resolve_role_aware_profile_with, role_profile_binding};
 
-/// (#1547) Pure core of [`resolve_role_aware_profile`] — the `role_profiles`
-/// map binding is supplied explicitly (`mapped`) rather than read live from
-/// `config_access`, so every precedence arm is unit-testable without the
-/// process-wide config tier (which is hard-empty under `test`/`test-support`
-/// builds per #811 — see `darkmux_types::config_access`'s module doc). Same
-/// layering as `darkmux_profiles::profiles::resolve_role_profile` (impure) /
-/// `resolve_role_profile_with` (pure core) — this mirrors that split one
-/// level up, at the profile_override-vs-map precedence decision.
-fn resolve_role_aware_profile_with<'a>(
-    role_id: &str,
-    profile_override: Option<&str>,
-    mapped: Option<String>,
-    registry: &'a darkmux_types::ProfileRegistry,
-) -> Result<Option<(String, &'a darkmux_types::Profile)>> {
-    if profile_override.is_none() {
-        if let Some(mapped) = mapped {
-            let binding = darkmux_profiles::profiles::RoleBinding::Mapped(mapped);
-            let resolved = darkmux_profiles::profiles::resolve_role_profile_with(
-                role_id, &binding, registry,
-            )?;
-            return Ok(Some((resolved.profile_name, resolved.profile)));
-        }
-    }
-    Ok(registry
-        .resolve_active(profile_override)
-        .map(|(name, profile)| (name.to_string(), profile)))
-}
-
-/// Resolve the selected model's `ProfileModel` (with its endpoint) WITHOUT
-/// loading anything in LMStudio — so `dispatch` can branch to the hosted path
-/// before the container/load machinery. `Ok(None)` ⇒ no profile model resolves
-/// (the local path's `probe_loaded_model` fallback + container path).
-/// `Err` ⇒ the requested (or default) profile is QUARANTINED (#1282) — a hard
-/// stop: falling through here would re-resolve against a DIFFERENT profile
-/// (possibly routing a dispatch to the wrong remote endpoint) before the
-/// container path ever gets to raise the same error.
-fn resolve_selected_profile_model(
+/// Resolve the dispatch's [`crate::target::Target`] (the selected model with
+/// its own endpoint) WITHOUT loading anything in LMStudio — so `dispatch` can
+/// branch to the hosted path before the container/load machinery. `Ok(None)`
+/// ⇒ no profile model resolves (the local path's `probe_loaded_model`
+/// fallback + container path). `Err` ⇒ the requested (or default) profile is
+/// QUARANTINED (#1282), a `role_profiles` binding names an undefined profile,
+/// or the selected model names an undefined endpoint (#2902) — a hard stop:
+/// falling through here would re-resolve against a DIFFERENT profile
+/// (possibly routing a dispatch to the wrong endpoint) before the container
+/// path ever gets to raise the same error.
+fn resolve_target(
     role: &crate::types::Role,
     profile_override: Option<&str>,
     config_path: Option<&str>,
     allow_utility_model: bool,
-) -> Result<Option<darkmux_types::ProfileModel>> {
-    use crate::select::select_model;
-    use darkmux_profiles::profiles::load_registry;
+) -> Result<Option<crate::target::Target>> {
     // A registry-LOAD failure stays `Ok(None)`: the container path's
     // `resolve_dispatch_model_internal` raises the loud #1269 hard stop for
     // it, with the file named.
-    let Ok(loaded) = load_registry(config_path) else {
+    let Ok(loaded) = darkmux_profiles::profiles::load_registry(config_path) else {
         return Ok(None);
     };
-    // (#1282) A quarantined REQUESTED profile must hard-fail with the
-    // entry's own parse error, not fall into the #1054 default fallback.
-    if let Some(req) = profile_override {
-        if let Some(msg) = loaded.registry.quarantine_error_for(req) {
-            bail!(msg);
-        }
-    }
-    // (#1547) Role-aware: honors `role_profiles.<role.id>` before falling to
-    // `default_profile` when no explicit `--profile` was given.
-    let Some((_name, profile)) = resolve_role_aware_profile(&role.id, profile_override, &loaded.registry)? else {
-        // (#1282) Same for a quarantined `default_profile` — without this,
-        // the dispatch falls through to the container path's
-        // `probe_loaded_model()` and runs against whatever LMStudio has
-        // loaded instead of surfacing the broken entry.
-        if let Some(default_name) = loaded.registry.default_profile.as_deref() {
-            if let Some(msg) = loaded.registry.quarantine_error_for(default_name) {
-                bail!(msg);
-            }
-        }
-        return Ok(None);
-    };
-    let skill_index: std::collections::HashMap<String, crate::types::Skill> =
-        crate::loader::load_skills()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|s| (s.id.clone(), s))
-            .collect();
-    // (#2914) Same set-aside as `resolve_dispatch_model_with_hosts`.
-    let set_aside = if allow_utility_model { None } else { loaded.registry.utility_model_id() };
-    let Ok(id) = select_model(role, profile, |id| skill_index.get(id), set_aside) else {
-        return Ok(None);
-    };
-    Ok(profile.models.iter().find(|m| m.id == id).cloned())
+    let mapped = role_profile_binding(Some(&role.id), profile_override);
+    Ok(crate::target::resolve_in(&loaded.registry, role, profile_override, mapped, allow_utility_model)?.target())
 }
 
 /// (#1187) True when a role's tool palette grants at least one tool — the
@@ -2618,7 +2549,14 @@ fn container_path_required(role: &crate::types::Role, force_container: bool) -> 
 /// gets consumed by invisible reasoning and returns empty content. Effort
 /// without an explicit cap therefore defaults to 16384; an explicit cap
 /// always wins (the operator may know their task is short).
+///
+/// (#2902) In the endpoint's dialect: the messages are
+/// always a system + user pair here (never the empty-system omission the
+/// seat bodies apply), and the body itself comes from the one builder,
+/// `single_shot::chat_body`. (#1177's "a per-endpoint knob is a follow-up"
+/// for a server that only accepts `max_tokens` is `endpoint.dialect`.)
 fn single_shot_body(
+    dialect: darkmux_types::Dialect,
     model_id: &str,
     system_prompt: &str,
     message: &str,
@@ -2626,21 +2564,17 @@ fn single_shot_body(
     reasoning_effort: Option<&str>,
 ) -> serde_json::Value {
     let default_cap = if reasoning_effort.is_some() { 16384 } else { 4096 };
-    let mut body = serde_json::json!({
-        "model": model_id,
-        "messages": [
+    crate::single_shot::chat_body(&crate::single_shot::ChatBody {
+        dialect,
+        model: model_id,
+        messages: serde_json::json!([
             { "role": "system", "content": system_prompt },
             { "role": "user", "content": message },
-        ],
-        // (#1177) `max_completion_tokens` is the Azure/OpenAI form (the primary
-        // targets); an OpenAI-compat server that only accepts `max_tokens` would
-        // reject it — a per-endpoint knob is a follow-up if that comes up.
-        "max_completion_tokens": cap.unwrap_or(default_cap),
-    });
-    if let Some(effort) = reasoning_effort {
-        body["reasoning_effort"] = serde_json::Value::String(effort.to_string());
-    }
-    body
+        ]),
+        max_tokens: cap.unwrap_or(default_cap),
+        temperature: None,
+        reasoning_effort,
+    })
 }
 
 /// (#1260) Gate a bare remote `dispatch` against the per-EXECUTION
@@ -2686,20 +2620,26 @@ pub(crate) fn admit_remote_execution(budget: u64) -> Result<()> {
 /// role load is cheap embedded-string work).
 fn try_resolve_remote_target(
     opts: &DispatchOpts,
-) -> Result<Option<(crate::types::Role, String, darkmux_types::ProfileModel)>> {
+) -> Result<Option<(crate::types::Role, String, crate::target::Target)>> {
     let roles = load_roles().context("loading crew roles for internal dispatch")?;
     let role = match roles.iter().find(|r| r.id == opts.role_id) {
         Some(r) => r.clone(),
         None => return Ok(None), // let the main path raise the canonical "role not found"
     };
-    let pm = match resolve_selected_profile_model(
+    let pm = match resolve_target(
         &role,
         opts.profile_name.as_deref(),
         opts.config_path.as_deref(),
         opts.allow_utility_model,
     )? {
-        Some(pm) if pm.endpoint.as_ref().is_some_and(|e| e.is_remote()) => pm,
-        _ => return Ok(None), // local ⇒ container path
+        // (#2902 review C4) An exhaustive match on the kind, so a new kind
+        // (#2916's fleet machine) is a compile error here, not a silent
+        // fall onto one arm.
+        Some(t) => match t.kind {
+            darkmux_types::EndpointKind::Unmanaged => t,
+            darkmux_types::EndpointKind::Managed(_) => return Ok(None), // managed ⇒ container path
+        },
+        None => return Ok(None),
     };
     // (#1698 Packet B2) `system_prompt_override` is honored HERE too, not
     // just in `dispatch_local_single_shot` — a caller-supplied override
@@ -2757,7 +2697,7 @@ fn identity_augmentation_allowed(remote_brained: bool) -> bool {
 /// (the radio answering seat's grounding bundle) has to know the boundary
 /// while it is still choosing what to put IN that message.
 ///
-/// Deliberately reuses `resolve_selected_profile_model` — the SAME
+/// Deliberately reuses `resolve_target` — the SAME
 /// resolution `try_resolve_remote_target` routes on — so the predicate
 /// cannot drift from where the dispatch actually goes. A cheap alternative
 /// (reading `radio.answerer_profile` and looking it up directly) would
@@ -2780,8 +2720,12 @@ pub fn dispatch_resolves_remote(
         return true;
     };
     // (#2914) A work question: the utility model is set aside here too.
-    match resolve_selected_profile_model(role, profile_name, config_path, false) {
-        Ok(Some(pm)) => pm.endpoint.as_ref().is_some_and(|e| e.is_remote()),
+    match resolve_target(role, profile_name, config_path, false) {
+        // (#2902 review C4) Exhaustive on the kind; see `try_resolve_remote_target`.
+        Ok(Some(t)) => match t.kind {
+            darkmux_types::EndpointKind::Unmanaged => true,
+            darkmux_types::EndpointKind::Managed(_) => false,
+        },
         // No profile model resolves ⇒ the container path's local fallback.
         Ok(None) => false,
         // A quarantined profile (#1282) — the dispatch itself is about to
@@ -2826,10 +2770,10 @@ impl LocalTarget {
 /// send to, or `None` when it would not target one at all: a remote
 /// endpoint, no resolvable profile model (the container path's own
 /// fallback), or a quarantined profile — in each case there is no local
-/// instance to check. Resolves through `resolve_selected_profile_model`,
+/// instance to check. Resolves through `resolve_target`,
 /// the SAME resolution the dispatch itself routes on (as
 /// [`dispatch_resolves_remote`] does), and mints the identifier the way
-/// [`dispatch_wire_model_id`] does, so the instance checked is the
+/// the wire does (`Target::wire_model`), so the instance checked is the
 /// instance sent to.
 pub fn dispatch_local_target(
     role_id: &str,
@@ -2839,15 +2783,13 @@ pub fn dispatch_local_target(
     let roles = load_roles().ok()?;
     let role = roles.iter().find(|r| r.id == role_id)?;
     // (#2914) A work question: the utility model is set aside here too.
-    let pm = resolve_selected_profile_model(role, profile_name, config_path, false).ok().flatten()?;
-    if pm.endpoint.as_ref().is_some_and(|e| e.is_remote()) {
-        return None;
+    let t = resolve_target(role, profile_name, config_path, false).ok().flatten()?;
+    // (#2902 review C4) Exhaustive on the kind.
+    match t.kind {
+        darkmux_types::EndpointKind::Managed(_) => {}
+        darkmux_types::EndpointKind::Unmanaged => return None,
     }
-    let model_key = bare_model_key(&pm.id);
-    Some(LocalTarget {
-        identifier: darkmux_gestalt::namespaced_identifier(model_key, pm.identifier.as_deref()),
-        model_key: model_key.to_string(),
-    })
+    Some(LocalTarget { identifier: t.wire_model(), model_key: bare_model_key(&t.model.id).to_string() })
 }
 
 /// (#2917) The machine utility model's instance, addressed exactly as
@@ -2863,37 +2805,9 @@ pub fn utility_local_target(config_path: Option<&str>) -> Option<LocalTarget> {
     })
 }
 
-/// The chat-completions URL: `{base}/chat/completions` (+ `?api-version=` for
-/// Azure). The operator's `endpoint.url` is the base up to `/chat/completions`
-/// (an Azure deployment URL, or e.g. `https://api.openai.com/v1`).
-/// `pub(crate)` (#1260) — `single_shot.rs`'s hosted single-shot path reuses
-/// the exact URL/auth/POST chain rather than re-deriving the Azure dialect.
-pub(crate) fn remote_chat_url(ep: &darkmux_types::ModelEndpoint) -> String {
-    let base = ep.base_url();
-    let base = base.trim_end_matches('/');
-    match ep.api_version.as_deref() {
-        Some(v) => format!("{base}/chat/completions?api-version={v}"),
-        None => format!("{base}/chat/completions"),
-    }
-}
-
-/// A short human label for the endpoint, for the flow record payload
-/// (e.g. `azure:example-aoai.cognitiveservices.azure.com/gpt-4o`). Host + the
-/// model — never the full URL, never any auth. `dispatch_internal` owns
-/// extracting the host from `ModelEndpoint` (`darkmux-flow` — a dependency
-/// LEAF w.r.t. this crate — shouldn't know about that type); the actual
-/// string formatting delegates to `darkmux_flow::remote_route_label`
-/// (#1230 Packet 0) so this shape has one source of truth shared with the
-/// review→dispatch bookend bridge in `src/pr_review.rs`.
-pub(crate) fn remote_endpoint_label(ep: &darkmux_types::ModelEndpoint, model_id: &str) -> String {
-    let url = ep.base_url();
-    let host = url
-        .split("://")
-        .nth(1)
-        .and_then(|s| s.split('/').next())
-        .unwrap_or("remote");
-    darkmux_flow::remote_route_label(host, model_id)
-}
+// (#2902 step 3) The chat-completions URL is `ModelEndpoint::chat_url` and
+// the route label is `crate::target::endpoint_route_label`: one builder and
+// one host extraction for every path (`step_kinds::endpoint_conformance`).
 
 /// Read the endpoint's auth secret from the Keychain and build the header
 /// `(name, value)`. Read via `security find-generic-password`; NEVER logged or
@@ -2913,13 +2827,11 @@ pub(crate) fn remote_auth_header(ep: &darkmux_types::ModelEndpoint) -> Result<Op
     // (`auth.keychain`). The env tier is the headless-runner escape hatch — when
     // its var is present, `security` is NEVER spawned. NEVER logs the value.
     let secret = resolve_endpoint_secret(auth)?;
-    let header = match kind {
-        darkmux_types::EndpointAuthType::ApiKey => ("api-key".to_string(), secret),
-        darkmux_types::EndpointAuthType::Bearer => {
-            ("Authorization".to_string(), format!("Bearer {secret}"))
-        }
+    let value = match kind {
+        darkmux_types::EndpointAuthType::ApiKey => secret,
+        darkmux_types::EndpointAuthType::Bearer => format!("Bearer {secret}"),
     };
-    Ok(Some(header))
+    Ok(Some((kind.header_name().to_string(), value)))
 }
 
 /// (#1312 — the ROOT fix for the locked-keychain class) Resolve an
@@ -2937,31 +2849,42 @@ pub(crate) fn remote_auth_header(ep: &darkmux_types::ModelEndpoint) -> Result<Op
 /// process. NEVER logs the value; the `credential-read` liveness marker records
 /// only the resolution TIER (`env:<var>` / `keychain:<item>`) + elapsed.
 fn resolve_endpoint_secret(auth: &darkmux_types::EndpointAuth) -> Result<String> {
-    // Tier 1: operator-declared env var — verbatim, no cache, no keychain. THE
-    // root fix for a runner whose env already carries the key (no `security`
-    // spawn ⇒ no hang). A declared-but-absent var falls through to the Keychain.
-    if let Some(var) = auth.key_env.as_deref().filter(|s| !s.is_empty()) {
-        if let Ok(v) = std::env::var(var) {
-            if !v.is_empty() {
-                darkmux_types::dispatch_liveness::liveness_detail(
-                    &format!("credential-read:{var}"),
-                    "endpoint-auth",
-                    &format!("resolved tier=env:{var}"),
-                );
-                return Ok(v);
+    // (#2902 step 3) The ORDER is `EndpointAuth::credential_source`, written
+    // once in darkmux-types and shared with doctor's presence check.
+    let keychain = match auth.credential_source() {
+        // Tier 1: operator-declared env var — verbatim, no cache, no keychain.
+        // THE root fix for a runner whose env already carries the key (no
+        // `security` spawn ⇒ no hang).
+        darkmux_types::CredentialSource::Env(var) => {
+            if let Ok(v) = std::env::var(var) {
+                if !v.is_empty() {
+                    darkmux_types::dispatch_liveness::liveness_detail(
+                        &format!("credential-read:{var}"),
+                        "endpoint-auth",
+                        &format!("resolved tier=env:{var}"),
+                    );
+                    return Ok(v);
+                }
+            }
+            // The var vanished between the check and the read: fall to the
+            // Keychain item when one is declared, exactly as an absent var does.
+            match auth.keychain.as_deref().filter(|s| !s.is_empty()) {
+                Some(item) => item,
+                None => bail!("endpoint auth: env var `{var}` was unset before it could be read"),
             }
         }
-    }
-
-    // Tiers 2–3 need a Keychain item. If neither a present env var nor a keychain
-    // item is configured, there's no credential source — bail with both names.
-    let Some(keychain) = auth.keychain.as_deref().filter(|s| !s.is_empty()) else {
-        bail!(
+        darkmux_types::CredentialSource::Keychain(item) => item,
+        // If neither a present env var nor a keychain item is configured,
+        // there's no credential source — bail with both names.
+        darkmux_types::CredentialSource::Missing { key_env } => bail!(
             "endpoint auth type is set but no credential resolved: the declared env var{} is not \
              present in the environment, and no `endpoint.auth.keychain` (macOS Keychain item \
              name) is configured. Set one. Run `darkmux doctor` to see the gap.",
-            auth.key_env.as_deref().map(|v| format!(" `{v}`")).unwrap_or_default()
-        );
+            key_env.map(|v| format!(" `{v}`")).unwrap_or_default()
+        ),
+        darkmux_types::CredentialSource::NoHeader => {
+            bail!("endpoint auth: no `auth.type`, so there is no credential to read")
+        }
     };
 
     // Tier 2: per-dispatch (process-lifetime) in-memory cache. Without it a
@@ -3040,7 +2963,7 @@ pub struct ProbeReport {
 
 /// (#1177 `doctor --probe`) Live credential/routing probe: ONE minimal chat
 /// completion through the EXACT same URL/auth/POST path a real hosted
-/// dispatch uses (`remote_chat_url` + `remote_auth_header` +
+/// dispatch uses (`ModelEndpoint::chat_url` + `remote_auth_header` +
 /// `remote_chat_completion`). Verifies the whole chain — DNS, TLS,
 /// credential validity, deployment routing, api-version — not just Keychain
 /// presence (which `darkmux doctor` checks offline for free). Costs a few
@@ -3051,20 +2974,23 @@ pub fn probe_remote_endpoint(
     model_id: &str,
     timeout_seconds: u32,
 ) -> Result<ProbeReport> {
-    let label = remote_endpoint_label(ep, model_id);
-    let url = remote_chat_url(ep);
+    let label = crate::target::endpoint_route_label(ep, model_id);
+    let url = ep.chat_url()?;
     let auth = remote_auth_header(ep)?;
-    let req_body = serde_json::json!({
-        "model": model_id,
-        "messages": [
+    // The endpoint's own dialect, through the one body builder. Small cap —
+    // the probe verifies the ROUND-TRIP, not the content: a reasoning model
+    // may spend the whole budget thinking and return empty content, and the
+    // response shape still proves credential + routing.
+    let req_body = crate::single_shot::chat_body(&crate::single_shot::ChatBody {
+        dialect: ep.resolved_dialect()?,
+        model: model_id,
+        messages: serde_json::json!([
             { "role": "user",
               "content": "Connectivity probe from `darkmux doctor --probe`. Reply with the single word: ok" },
-        ],
-        // Mirrors dispatch_remote's parameter form (#1177). Small cap — the
-        // probe verifies the ROUND-TRIP, not the content: a reasoning model
-        // may spend the whole budget thinking and return empty content, and
-        // the response shape still proves credential + routing.
-        "max_completion_tokens": 64,
+        ]),
+        max_tokens: 64,
+        temperature: None,
+        reasoning_effort: None,
     });
     let t0 = SystemTime::now();
     let resp = remote_chat_completion(&url, auth.as_ref(), &req_body, timeout_seconds)?;
@@ -3483,17 +3409,16 @@ pub(crate) fn remote_usage_tokens(usage: &serde_json::Value) -> RemoteUsage {
     }
 }
 
-/// The hosted single-shot dispatch (#1177). Precondition: `pm.endpoint` is remote.
+/// The hosted single-shot dispatch (#1177). Precondition: `target` is an
+/// unmanaged endpoint (`try_resolve_remote_target`).
 fn dispatch_remote(
     opts: &DispatchOpts,
     _role: &crate::types::Role,
     system_prompt: &str,
-    pm: &darkmux_types::ProfileModel,
+    target: &crate::target::Target,
 ) -> Result<DispatchResult> {
-    let ep = pm
-        .endpoint
-        .as_ref()
-        .expect("dispatch_remote requires a remote endpoint");
+    let ep = &target.endpoint;
+    let pm = &target.model;
     // (#1260) Meter this bare dispatch as one execution BEFORE any record
     // is emitted — a zero allowance refuses the call cleanly, without leaving
     // an orphaned in-flight session in the viewer.
@@ -3502,7 +3427,7 @@ fn dispatch_remote(
         .session_id
         .clone()
         .unwrap_or_else(|| crate::dispatch::fresh_session_id(&opts.role_id));
-    let label = remote_endpoint_label(ep, &pm.id);
+    let label = crate::target::endpoint_route_label(ep, &pm.id);
     eprintln!(
         "darkmux dispatch: runtime=direct (hosted) — endpoint: {label} — model={}",
         pm.id
@@ -3511,7 +3436,7 @@ fn dispatch_remote(
     // (#1177) Resolve the URL + auth BEFORE emitting `dispatch start` — an auth
     // failure (missing Keychain item) then bails WITHOUT leaving an orphaned
     // in-flight session in the viewer.
-    let url = remote_chat_url(ep);
+    let url = target.chat_url.clone();
     let auth = remote_auth_header(ep)?;
     let phase = opts.phase_id.as_deref();
     // (#1645) Resolved once, same as the container path (#714) — every
@@ -3619,13 +3544,12 @@ fn dispatch_remote(
     );
 
     let req_body = single_shot_body(
+        target.dialect,
         &pm.id,
         system_prompt,
         &opts.message,
         opts.max_completion_tokens,
-        pm.endpoint
-            .as_ref()
-            .and_then(|e| e.reasoning_effort.as_deref()),
+        ep.reasoning_effort.as_deref(),
     );
 
     let t0 = SystemTime::now();
@@ -4981,7 +4905,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //     instead of local LMStudio (#1187 — agentic-remote). `agentic_pm`
     //     carries the resolved remote model forward past this point.
     let remote_target = try_resolve_remote_target(&opts)?;
-    let mut agentic_pm: Option<darkmux_types::ProfileModel> = None;
+    let mut agentic_pm: Option<crate::target::Target> = None;
     if let Some((role, system_prompt, pm)) = remote_target {
         // (#1199) `force_container` routes even a tool-less role through the
         // container/agentic path so benches get one consistent substrate
@@ -5310,8 +5234,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // the routing decision could be made before any container work) —
     // skip the local-probe/pin resolution entirely; there's no LMStudio
     // instance to probe when the brain is remote.
-    let model = if let Some(pm) = &agentic_pm {
-        pm.id.clone()
+    let model = if let Some(t) = &agentic_pm {
+        t.model.id.clone()
     } else {
         resolve_dispatch_model_internal(
             role,
@@ -5338,9 +5262,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // dispatch that correctly ran on Azure would still show up in the
     // viewer as a local dispatch, an operator-sovereignty violation (the
     // operator has no way to tell where the model actually ran).
-    let remote_endpoint_raw_label = agentic_pm
-        .as_ref()
-        .and_then(|pm| pm.endpoint.as_ref().map(|ep| remote_endpoint_label(ep, &pm.id)));
+    let remote_endpoint_raw_label = agentic_pm.as_ref().and_then(crate::target::Target::route_label);
     eprintln!(
         "darkmux dispatch: model={model}{}",
         remote_endpoint_raw_label
@@ -5582,10 +5504,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // once at startup, before the agent loop (and any chance of a tool call)
     // exists, and which leaves no artifact on any filesystem afterward.
     let mut remote_auth: Option<(String, String)> = None;
-    if let Some(pm) = &agentic_pm {
-        if let Some(ep) = pm.endpoint.as_ref() {
-            remote_auth = remote_auth_header(ep)?;
-        }
+    if let Some(t) = &agentic_pm {
+        remote_auth = remote_auth_header(&t.endpoint)?;
     }
     let remote_needs_auth = remote_auth.is_some();
 
@@ -5763,7 +5683,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 // (delegating to `ensure_utility_resident`, unchanged) AND
                 // WRITES `compaction.compactor_model` — the SAME darkmux-
                 // namespaced identifier the residency load just created (or
-                // reused) it under, mirroring `dispatch_wire_model_id`'s
+                // reused) it under, mirroring `managed_wire_model`'s
                 // treatment of the main dispatch model (#2240). Pre-#2536, this
                 // field kept whatever spelling `internal.utility` used (#1615
                 // tolerates a bare key OR an already-namespaced identifier), so
@@ -5873,6 +5793,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     let (inactivity_timeout_seconds, inactivity_timeout_seconds_source) =
         effective_inactivity_timeout_seconds(opts.timeout_override_seconds);
 
+    // (#2902) The container's hosted-brain flags, from the resolved target.
+    let agentic_brain = agentic_brain_flags(agentic_pm.as_ref());
     let argv_config = DockerRunConfig {
         container_name: container_name.clone(),
         workspace: workspace.clone(),
@@ -5939,10 +5861,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // checkpoint into `host_out` when `opts.resume_from` is `Some` —
         // this just tells the container to reload it.
         resume_checkpoint: opts.resume_from.is_some(),
-        remote_chat_url: agentic_pm
-            .as_ref()
-            .and_then(|pm| pm.endpoint.as_ref())
-            .map(remote_chat_url),
+        remote_chat_url: agentic_brain.0,
+        // (#2902) Only a declared dialect that differs from what the runtime
+        // already assumes for this kind reaches argv, so every existing
+        // config's argv is byte-identical.
+        dialect: agentic_brain.1,
         remote_needs_auth,
         base_url_override: container_lmstudio_base_url(opts.model_base_url_override.as_deref()),
         workspace_read_only: opts.workspace_read_only,
@@ -11590,12 +11513,9 @@ fn preflight_result_for(status: DockerRuntimeStatus) -> Result<()> {
 /// already lean on for load/unload. This function now returns that same
 /// identifier for dispatch, not just for residency bookkeeping.
 ///
-/// `id` is unchanged (not namespaced) when `profile.models` carries no
-/// entry matching it — `select_model`'s contract guarantees a match today,
-/// but a wire value must never come from an unwrap/panic on that
-/// guarantee; falling back to the bare id here reproduces the PRE-#2240
-/// behavior for that unreached case rather than inventing a new failure
-/// mode.
+/// (#2902 step 3) Takes the selected model itself (`Target::wire_model`
+/// calls it), so the pre-#2902 "id not found in the profile" fallback is
+/// gone with the lookup it guarded.
 ///
 /// **This trades a silent wrong answer for a loud failure, and the loud
 /// failure is NEW.** A bare model key always resolves — worst case by
@@ -11611,19 +11531,13 @@ fn preflight_result_for(status: DockerRuntimeStatus) -> Result<()> {
 /// error), but it is a real behavior change, and
 /// [`residency_lost_detail`] exists so the operator reads it as "darkmux's
 /// instance went away" and not as a raw LMStudio 400.
-fn dispatch_wire_model_id(id: &str, profile: &darkmux_types::Profile) -> String {
-    match profile.models.iter().find(|m| m.id == id) {
-        Some(pm) => {
-            let model_key = bare_model_key(&pm.id);
-            darkmux_gestalt::namespaced_identifier(model_key, pm.identifier.as_deref())
-        }
-        None => id.to_string(),
-    }
+pub(crate) fn managed_wire_model(pm: &darkmux_types::ProfileModel) -> String {
+    darkmux_gestalt::namespaced_identifier(bare_model_key(&pm.id), pm.identifier.as_deref())
 }
 
 /// (#2240) Re-word a dispatch failure that means *darkmux's own instance is
 /// no longer resident* — the new hard-failure mode
-/// [`dispatch_wire_model_id`] introduces.
+/// [`managed_wire_model`] introduces.
 ///
 /// Pre-#2240 the wire carried a bare model KEY, which LMStudio would always
 /// resolve, JIT-loading a copy at its own default context if it had to. The
@@ -11689,9 +11603,9 @@ fn resolve_dispatch_model_internal(
 /// The RETURN VALUE of this function IS the dispatch's wire `model` id — it
 /// reaches LMStudio's chat-completions body and the container's `--model`
 /// flag with no further transformation, so the return value is a contract
-/// in its own right. Pinning only the pure [`dispatch_wire_model_id`]
+/// in its own right. Pinning only the pure [`managed_wire_model`]
 /// helper left the CALL SITE untested: deleting the
-/// `wire_id = dispatch_wire_model_id(..)` assignment, and hoisting it OUT
+/// `wire_id = target.wire_model()` assignment, and hoisting it OUT
 /// of the `!skip_lmstudio_residency` guard (which would put
 /// `darkmux:<mock-id>` on the wire for every mock-server dispatch), each
 /// left the whole crate green. The two injected effects are precisely the
@@ -11708,7 +11622,6 @@ fn resolve_dispatch_model_with_hosts(
     ensure_resident: &dyn Fn(&darkmux_types::ProfileModel) -> Result<()>,
     list_loaded: &dyn Fn() -> Result<Vec<String>>,
 ) -> Result<String> {
-    use crate::select::select_model;
     use darkmux_profiles::profiles::load_registry;
 
     let loaded = load_registry(config_path).map_err(|e| {
@@ -11727,15 +11640,12 @@ fn resolve_dispatch_model_with_hosts(
         )
     })?;
 
-    // (#1282) A REQUESTED profile that was quarantined at load is a hard
-    // stop with the entry's own parse error — letting it reach the #1054
-    // "not defined" fallback below would silently dispatch the default
-    // profile's model instead of the one the operator named.
-    if let Some(req) = profile_override {
-        if let Some(msg) = loaded.registry.quarantine_error_for(req) {
-            bail!(msg);
-        }
-    }
+    // (#2902 step 3) ONE resolution: quarantine (#1282), the role-aware
+    // profile precedence (#1054/#1547), `select_model` with the utility
+    // set-aside (#2914), and the selected model's endpoint.
+    let mapped = role_profile_binding(Some(&role.id), profile_override);
+    let resolution =
+        crate::target::resolve_in(&loaded.registry, role, profile_override, mapped, allow_utility_model)?;
 
     // (#1054) Resolve the active profile: the CLI `--profile` override is
     // tried first, then the registry's `default_profile`. A `--profile` that
@@ -11747,35 +11657,12 @@ fn resolve_dispatch_model_with_hosts(
     // honors the `role_profiles.<role.id>` map before falling to
     // `default_profile` — the same precedence the review launcher already
     // applies to this map, now honored on the container dispatch path too.
-    let (active_name, profile) = match resolve_role_aware_profile(&role.id, profile_override, &loaded.registry)? {
-        Some(pair) => {
-            // Surface the fallback so the operator isn't surprised which model
-            // ran: an explicit `--profile X` that resolved to a different name
-            // means X wasn't defined here.
-            if let Some(req) = profile_override {
-                if req != pair.0.as_str() {
-                    eprintln!(
-                        "darkmux dispatch: requested profile `{req}` is not defined \
-                         on this machine; using default_profile `{}` instead. Define \
-                         `{req}` in ~/.darkmux/profiles.json to select a profile-specific \
-                         model. (#1054)",
-                        pair.0
-                    );
-                }
-            }
-            pair
-        }
-        None => {
-            // (#1282) A quarantined `default_profile` is a hard stop with
-            // the entry's own parse error — falling through to
-            // `probe_loaded_model()` would dispatch against whatever
-            // LMStudio happens to have loaded, exactly the contamination
-            // the #1269 registry-load hard stop above exists to prevent.
-            if let Some(default_name) = loaded.registry.default_profile.as_deref() {
-                if let Some(msg) = loaded.registry.quarantine_error_for(default_name) {
-                    bail!(msg);
-                }
-            }
+    let active_name = match &resolution {
+        crate::target::Resolution::Target(t) => t.profile_name.clone(),
+        crate::target::Resolution::NoModel { profile_name, .. } => profile_name.clone(),
+        crate::target::Resolution::NoProfile => {
+            // (#1282) A quarantined `default_profile` already hard-stopped in
+            // `resolve_in`, so this is genuinely "nothing configured".
             eprintln!(
                 "darkmux dispatch: no usable profile (no --profile match and no \
                  default_profile set/defined); falling back to probe_loaded_model() — \
@@ -11784,22 +11671,23 @@ fn resolve_dispatch_model_with_hosts(
             return probe_loaded_model();
         }
     };
+    // Surface the fallback so the operator isn't surprised which model ran:
+    // an explicit `--profile X` that resolved to a different name means X
+    // wasn't defined here.
+    if let Some(req) = profile_override {
+        if req != active_name.as_str() {
+            eprintln!(
+                "darkmux dispatch: requested profile `{req}` is not defined \
+                 on this machine; using default_profile `{active_name}` instead. Define \
+                 `{req}` in ~/.darkmux/profiles.json to select a profile-specific \
+                 model. (#1054)"
+            );
+        }
+    }
 
-    // (#590 phase 2) Build a skill lookup so select_model can compose the
-    // role's requested capability vector (role → skills → CapabilityProfile).
-    // Skills unavailable ⇒ empty lookup ⇒ select_model takes its
-    // default-model fallback (safe + behavior-preserving; #601).
-    let skill_index: std::collections::HashMap<String, crate::types::Skill> =
-        crate::loader::load_skills()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|s| (s.id.clone(), s))
-            .collect();
-    // (#2914) The machine's utility model is never a task's model; only the
-    // lab's benchmark opt-in leaves it selectable.
-    let set_aside = if allow_utility_model { None } else { loaded.registry.utility_model_id() };
-    match select_model(role, profile, |id| skill_index.get(id), set_aside) {
-        Ok(id) => {
+    match resolution {
+        crate::target::Resolution::Target(target) => {
+            let id = target.model.id.clone();
             // (#2038) Before anything else: a placeholder id would reach
             // LM Studio and come back as "model not found", which reads as
             // an LM Studio problem. It is an unfilled blank from
@@ -11834,10 +11722,8 @@ fn resolve_dispatch_model_with_hosts(
             // one that now answers for it.
             let mut wire_id = id.clone();
             if !skip_lmstudio_residency {
-                if let Some(pm) = profile.models.iter().find(|m| m.id == id) {
-                    ensure_resident(pm)?;
-                }
-                wire_id = dispatch_wire_model_id(&id, profile);
+                ensure_resident(&target.model)?;
+                wire_id = target.wire_model();
             }
             // (#450 review note / #408) Cross-check against actual
             // LMStudio loaded models. Residents loaded for one profile (a
@@ -11905,7 +11791,9 @@ fn resolve_dispatch_model_with_hosts(
             }
             Ok(wire_id)
         }
-        Err(e) => {
+        // `NoProfile` returned above; kept exhaustive rather than panicking.
+        crate::target::Resolution::NoProfile => probe_loaded_model(),
+        crate::target::Resolution::NoModel { error: e, .. } => {
             eprintln!(
                 "darkmux dispatch: select_model error ({e}); falling back \
                  to probe_loaded_model() — deprecated. Add a default \
@@ -11983,10 +11871,11 @@ fn resolve_dispatch_compaction(
         _ => None,
     };
     let primary_window = resolve_dispatch_windows_with(
-        &role.id,
+        role,
         opts.profile_name.as_deref(),
         role_profile_binding(Some(&role.id), opts.profile_name.as_deref()),
         opts.config_path.as_deref(),
+        opts.allow_utility_model,
     )?;
     ensure_context_window(&mut compaction, primary_window);
     Ok(DispatchCompaction { compaction, compactor_n_ctx, utility_model })
@@ -12003,7 +11892,7 @@ fn resolve_dispatch_compaction(
 /// the dispatch names.
 ///
 /// (#2905) `role_id` makes the resolution role-aware, with the SAME
-/// precedence model selection uses (`resolve_role_aware_profile`): an
+/// precedence model selection uses (`target::resolve_role_aware_profile_with`): an
 /// explicit `--profile` wins, then `role_profiles.<role>`, then
 /// `default_profile`. Pre-#2905 this read only `--profile` / default, so a
 /// role mapped to profile X ran X's model but compacted at the default
@@ -12014,26 +11903,43 @@ fn resolve_dispatch_compaction(
 // compaction window. They share the resolver; a profile that declares no
 // `context_window` falls back independently on each side (the budget to its own
 // default), so they agree whenever the profile actually declares a window.
+/// (#2902 review M2) The compaction window a dispatch of `role_id` on
+/// `profile_override` RUNS with: the selected model's own `n_ctx`, through
+/// the same resolver and the same utility set-aside the dispatch uses.
+/// `allow_utility_model` is the lab's benchmark opt-in, as on
+/// `DispatchOpts`. A role this binary does not know falls back to the
+/// profile-level answer, as [`resolve_context_window_internal`] does.
+pub fn dispatch_window(
+    role_id: &str,
+    profile_override: Option<&str>,
+    config_path: Option<&str>,
+    allow_utility_model: bool,
+) -> Result<Option<u32>> {
+    match load_roles().ok().and_then(|roles| roles.into_iter().find(|r| r.id == role_id)) {
+        Some(role) => {
+            let mapped = role_profile_binding(Some(role_id), profile_override);
+            resolve_dispatch_windows_with(&role, profile_override, mapped, config_path, allow_utility_model)
+        }
+        None => {
+            let profile = resolve_active_profile_internal(Some(role_id), profile_override, config_path)?;
+            Ok(profile.as_ref().and_then(profile_context_window))
+        }
+    }
+}
+
 pub fn resolve_context_window_internal(
     role_id: Option<&str>,
     profile_override: Option<&str>,
     config_path: Option<&str>,
 ) -> Result<Option<u32>> {
+    // (#2902 step 3) With a role in hand, the window is the SELECTED model's
+    // own (`resolve_dispatch_windows_with`), the same one the dispatch runs.
+    // A role id this binary does not know keeps the profile-level answer.
+    if let Some(role_id) = role_id {
+        return dispatch_window(role_id, profile_override, config_path, false);
+    }
     let profile = resolve_active_profile_internal(role_id, profile_override, config_path)?;
     Ok(profile.as_ref().and_then(profile_context_window))
-}
-
-/// (#2905) The `role_profiles.<role>` binding a resolution should honor:
-/// read live from `config_access`, and only when no explicit `--profile`
-/// override was given (the override always wins, so the map is not even
-/// consulted). One place for this read, shared by `resolve_role_aware_profile`
-/// (model selection) and `resolve_active_profile_internal` (window + compactor
-/// `n_ctx`), so the two cannot consult the map under different conditions.
-fn role_profile_binding(role_id: Option<&str>, profile_override: Option<&str>) -> Option<String> {
-    match (role_id, profile_override) {
-        (Some(role_id), None) => darkmux_types::config_access::role_profile(role_id),
-        _ => None,
-    }
 }
 
 /// (#1616) The registry-resolution half of `resolve_context_window_internal`,
@@ -12098,9 +12004,10 @@ fn resolve_active_profile_with(
 }
 
 /// (#632) The compaction-trigger window of a resolved profile: its default
-/// model's declared `n_ctx`, via `CompactionDispatchArgs::from_profile`.
+/// model's declared `n_ctx` (`dispatch::profile_default_window`). Only for a
+/// caller with no role, or a profile with no selectable model.
 fn profile_context_window(profile: &darkmux_types::Profile) -> Option<u32> {
-    crate::dispatch::CompactionDispatchArgs::from_profile(profile).context_window
+    crate::dispatch::profile_default_window(profile)
 }
 
 // (#2914) `profile_model_n_ctx` — the #1616 lookup of the compactor's `n_ctx`
@@ -12109,19 +12016,33 @@ fn profile_context_window(profile: &darkmux_types::Profile) -> Option<u32> {
 // profile entry for the utility model is a leftover `darkmux doctor` flags,
 // never a source.
 
-/// (#2905) The dispatch's compaction-trigger window from ONE role-aware
-/// profile resolution: the primary's declared `n_ctx`. Read off the same
-/// profile model selection resolved, so it cannot come from `default_profile`
-/// while the model came from a `role_profiles` mapping. Takes the binding
-/// explicitly (`mapped`) so a test can drive the mapped arm.
+/// (#2905, #2902 step 3) The dispatch's compaction-trigger window from the
+/// ONE resolver: the SELECTED model's own declared `n_ctx`
+/// (`Target::n_ctx`). Before #2902 this was the profile's DEFAULT model's
+/// window even when `select_model` picked another model from the same
+/// profile, so a multi-model profile compacted the selected model at the
+/// wrong window. It also cannot come from `default_profile` while the model
+/// came from a `role_profiles` mapping (#2905). Takes the binding explicitly
+/// (`mapped`) so a test can drive the mapped arm.
+///
+/// When a profile resolves but no model is selectable (the dispatch then
+/// falls back to `probe_loaded_model`), the profile's default model's window
+/// is kept, as before. A registry that does not load is `Ok(None)`.
 fn resolve_dispatch_windows_with(
-    role_id: &str,
+    role: &crate::types::Role,
     profile_override: Option<&str>,
     mapped: Option<String>,
     config_path: Option<&str>,
+    allow_utility_model: bool,
 ) -> Result<Option<u32>> {
-    let profile = resolve_active_profile_with(Some(role_id), profile_override, mapped, config_path)?;
-    Ok(profile.as_ref().and_then(profile_context_window))
+    let Ok(loaded) = darkmux_profiles::profiles::load_registry(config_path) else {
+        return Ok(None);
+    };
+    Ok(match crate::target::resolve_in(&loaded.registry, role, profile_override, mapped, allow_utility_model)? {
+        crate::target::Resolution::Target(t) => t.n_ctx(),
+        crate::target::Resolution::NoModel { profile, .. } => profile_context_window(&profile),
+        crate::target::Resolution::NoProfile => None,
+    })
 }
 
 /// (#1616) Pick the window the compactor loads at: its OWN declared `n_ctx`
@@ -12256,7 +12177,7 @@ fn ensure_utility_resident(
 /// normalize-once shape `ensure_model_resident` and `resolve_compactor_n_ctx_
 /// internal` already apply to this same value.
 ///
-/// Unlike `dispatch_wire_model_id` (the main dispatch model's sibling), there
+/// Unlike `managed_wire_model` (the main dispatch model's sibling), there
 /// is no `profile.models[]` entry consulted for an explicit `identifier`
 /// opt-out: `utility_residency_pm` synthesizes the compactor's `ProfileModel`
 /// fresh with `identifier: None`, so the LOAD itself never honors one either

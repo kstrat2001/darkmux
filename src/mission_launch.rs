@@ -889,7 +889,11 @@ pub fn launch(
     // post-mint strand window like the interpret error above and gets the
     // same reconcile (the minted mission closes to a terminal status, never
     // left Active with no envelope; #2914 review M1).
-    if let Err(e) = refuse_utility_staffed_tasks(&tasks, &all_steps, &loaded_registry_for_staffing(&collected)?, &|role| {
+    let (staffing_registry, staffing_warning) = loaded_registry_for_staffing(&collected);
+    if let Some(w) = staffing_warning {
+        eprintln!("{}", style::warn(&w));
+    }
+    if let Err(e) = refuse_utility_staffed_tasks(&tasks, &all_steps, &staffing_registry, &|role| {
         darkmux_types::config_access::role_profile(role)
     }) {
         reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &tasks, &mut all_steps, &e);
@@ -4588,13 +4592,20 @@ pub(crate) fn ensure_mission_and_phases_with_provenance(
 /// (#2914) The registry the staffing gate reads: the launch's own
 /// `profiles` input when supplied, else the machine's. A registry that
 /// cannot be loaded is the dispatch path's loud #1269 hard stop; the gate
-/// does not duplicate that error, it just has nothing to check.
+/// does not duplicate that error, but (#2902 review M1) it SAYS it checked
+/// nothing: the second value is the warning the caller prints.
 fn loaded_registry_for_staffing(
     collected: &BTreeMap<String, serde_json::Value>,
-) -> Result<darkmux_types::ProfileRegistry> {
+) -> (darkmux_types::ProfileRegistry, Option<String>) {
     match darkmux_profiles::profiles::load_registry(collected.get("profiles").and_then(|v| v.as_str())) {
-        Ok(loaded) => Ok(loaded.registry),
-        Err(_) => Ok(darkmux_types::ProfileRegistry::default()),
+        Ok(loaded) => (loaded.registry, None),
+        Err(e) => (
+            darkmux_types::ProfileRegistry::default(),
+            Some(format!(
+                "mission launch: the utility-model staffing check did not run: the profile \
+                 registry did not load ({e:#}). Each dispatch will stop on the same error."
+            )),
+        ),
     }
 }
 
@@ -4667,7 +4678,15 @@ fn refuse_utility_staffed_tasks(
             let Some(step) = steps.get(step_id) else { continue };
             // (C2) A hosted step's `config.model` is the provider's own
             // deployment name, never the local utility instance.
-            if step.config.get("endpoint").is_some() {
+            // (#2902) Through the one resolver: an unmanaged endpoint (or one
+            // that cannot be resolved, which `run` refuses) skips the check.
+            if !matches!(
+                crew::target::step_unmanaged_endpoint(
+                    &step.config,
+                    step.config.get("config_path").and_then(|v| v.as_str())
+                ),
+                Ok(None)
+            ) {
                 continue;
             }
             let named = ["model_key", "model"]
@@ -4870,6 +4889,25 @@ mod tests {
         let mut unbound = utility_gate_registry();
         unbound.internal = None;
         refuse_utility_staffed_tasks(&own, &steps, &unbound, &no_binding).unwrap();
+    }
+
+    /// (#2902 review M1) A registry the staffing gate cannot load is
+    /// REPORTED (the gate checked nothing), never a silent pass.
+    #[test]
+    fn an_unloadable_registry_is_reported_by_the_staffing_gate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bad = tmp.path().join("profiles.json");
+        std::fs::write(&bad, "{ not json").unwrap();
+        let mut collected = BTreeMap::new();
+        collected.insert("profiles".to_string(), serde_json::json!(bad.to_str().unwrap()));
+        let (registry, warning) = loaded_registry_for_staffing(&collected);
+        assert!(registry.profiles.is_empty());
+        let warning = warning.expect("an unloadable registry must be reported");
+        assert!(warning.contains("did not run") && warning.contains("profiles.json"), "{warning}");
+        let good = tmp.path().join("good.json");
+        std::fs::write(&good, r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":1}]}}}"#).unwrap();
+        collected.insert("profiles".to_string(), serde_json::json!(good.to_str().unwrap()));
+        assert!(loaded_registry_for_staffing(&collected).1.is_none());
     }
 
     // ─── #1511: the consent gate's role must be the kind's own ──────────
