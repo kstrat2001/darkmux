@@ -822,17 +822,24 @@ mod tests {
     /// Write an executable shell stub standing in for `lms` (the
     /// `write_stub_lms` pattern from `darkmux-lab`'s review tests), with a
     /// caller-supplied body dispatching on `$1`.
+    ///
+    /// (#2976) The stub is exec'd once as a no-op BEFORE its real body is
+    /// written. On macOS the first exec of a freshly written executable can
+    /// take tens of seconds on a loaded host (measured: 2.4s to 32s for a
+    /// two-line script; the second exec takes milliseconds), which timed out
+    /// the 10s deadlines below with nothing wrong. The warm-up survives the
+    /// in-place rewrite (same inode, measured), so the call under test pays
+    /// no first-exec cost and its deadline measures the adapter, not the OS.
     #[cfg(unix)]
     fn write_stub(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
-        use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("lms-stub.sh");
-        let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(f, "#!/bin/sh").unwrap();
-        writeln!(f, "{body}").unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let warm = Command::new(&path).status().expect("warming the stub");
+        assert!(warm.success(), "the no-op warm-up stub must exit 0");
+        // `fs::write` truncates in place, keeping the warmed inode.
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         path
     }
 
@@ -1259,7 +1266,10 @@ esac"#,
         std::fs::remove_dir(&victim_path).unwrap();
 
         let cmd = Command::new(&stub);
-        let result = run_bounded(cmd, "test-cwd", Deadline(Duration::from_secs(5)), StdoutMode::Capture);
+        // (#2976) A hang guard, not the claim: the stub exits at once, but
+        // exec'ing a freshly written stub can take seconds on a loaded host,
+        // and a 5s deadline timed it out there with nothing wrong.
+        let result = run_bounded(cmd, "test-cwd", Deadline(Duration::from_secs(60)), StdoutMode::Capture);
 
         // Restore before asserting: a failed assertion must not leave the
         // whole test binary running from a directory that no longer exists.
