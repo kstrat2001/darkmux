@@ -2000,6 +2000,72 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
     expect(document.querySelector(".mach")!.className).not.toContain("nosignal");
   });
 
+  // (#2958 second review, point 1) A roster entry is told apart from THIS
+  // machine by `/machine/specs` (`rosterOnlyEntries`' F1 uid check). Until
+  // specs answers, this machine's own roster entry is indistinguishable from
+  // a silent peer, so its card must not say "offline" or "0 running": once
+  // specs answers, that card is replaced by the machine's own idle one.
+  it("this machine's own roster entry says 'no signal', not 'offline', while /machine/specs is unanswered", async () => {
+    const specs = gate();
+    mockFleetFetch({
+      roster: [{ id: "laptop", address: "100.64.1.1:8765", added_unix_ms: 1000, machine_uid: "u-self" }],
+      specs: SPECS,
+      runs: [],
+      hold: { "/machine/specs": specs.promise },
+    });
+    const queryClient = newClient();
+    renderFleetLens({}, queryClient);
+    await waitFor(() => expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull());
+    await waitFor(() => {
+      for (const key of [queryKeys.fleetMachinesLive(), queryKeys.fleetSessionsLive(), queryKeys.fleetRoster(), queryKeys.runs()]) {
+        expect(queryClient.getQueryState(key)?.status, JSON.stringify(key)).not.toBe("pending");
+      }
+    });
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    expect(queryClient.getQueryState(queryKeys.machineSpecs())?.status, "/machine/specs is still unanswered").toBe("pending");
+    const card = document.querySelector(".mach")!;
+    expect(stat(card)).toBe("no signal");
+    expect(card.textContent).not.toContain("offline");
+    expect(card.textContent).not.toContain("0 running");
+    expect(card.querySelector(".runs")!.textContent).toBe("—");
+    expect(card.className).not.toContain("absent");
+    expect(cardScope(card)).toMatchObject({ state: "nosignal" });
+
+    specs.open();
+    await waitFor(() => expect(document.querySelector(".mach")!.textContent).toContain("MacBook-Pro"));
+    await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("idle"));
+    expect(document.querySelectorAll(".mach")).toHaveLength(1);
+  });
+
+  // (#2958 second review, point 4) Offline wins over a reading: a machine
+  // whose last records left an execution generating, and which then went
+  // offline, draws the powered-off screen, not a live tube.
+  it("an offline machine with a generating execution left open draws the powered-off tube, not a live one", async () => {
+    const today = todayUTC();
+    const t = (hms: string) => `${today}T${hms}.000Z`;
+    const ms = (hms: string) => Date.parse(t(hms));
+    mockFleetFetch({
+      flowToday: [
+        { ts: t("10:01:50"), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+        { ts: t("10:01:56"), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { turn_seq: 1, sampled_at_ms: ms("10:01:56"), generated_chars: 0 } },
+        { ts: t("10:01:58"), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { turn_seq: 1, sampled_at_ms: ms("10:01:58"), generated_chars: 800 } },
+        { ts: t("10:01:59"), machine_uid: "u1", machine_id: "MacBook-Pro", action: "machine.offline", source: "presence-reconciler" },
+      ],
+      runs: [],
+    });
+    const queryClient = newClient();
+    renderFleetLens({}, queryClient);
+    await waitForFleetQueriesSettled(queryClient);
+    await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("offline"));
+    const card = document.querySelector(".mach")!;
+    expect(card.className).toContain("absent");
+    const scope = card.querySelectorAll('[data-testid="fleet-token-scope"]');
+    expect(scope).toHaveLength(1);
+    expect(scope[0].querySelector('.token-scope-bezel[data-state="off"]')).not.toBeNull();
+    expect(card.querySelector('[data-testid="token-scope-probe"]')).toBeNull();
+    expect(card.querySelector(".mach-scope__rate")).toBeNull();
+  });
+
   it("a replay has its records in hand and never shows 'no signal'", async () => {
     const records = [
       { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m5", action: "machine.online", source: "presence-reconciler" },

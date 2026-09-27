@@ -764,9 +764,12 @@ export function FleetLens({
   const presenceAnswered = useLatch(!livePolling || presenceState.status !== "pending");
   const sessionsAnswered = useLatch(!livePolling || sessionsState.status !== "pending");
   const runsAnswered = useLatch(!(liveMode && runsReachable()) || runsQuery.status !== "pending");
+  // `/machine/specs` is live-only (see `specsQuery`); a replay has no self
+  // identity to wait for.
+  const specsAnswered = useLatch(!livePolling || specsQuery.status !== "pending");
   const answered = useMemo<CardSourcesAnswered>(
-    () => ({ flow: flowAnswered, presence: presenceAnswered, sessions: sessionsAnswered, runs: runsAnswered }),
-    [flowAnswered, presenceAnswered, sessionsAnswered, runsAnswered],
+    () => ({ flow: flowAnswered, presence: presenceAnswered, sessions: sessionsAnswered, runs: runsAnswered, specs: specsAnswered }),
+    [flowAnswered, presenceAnswered, sessionsAnswered, runsAnswered, specsAnswered],
   );
 
 
@@ -935,6 +938,7 @@ export function FleetLens({
           undefined,
         ),
         name: entry.id,
+        rosterOnly: true,
       })),
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
@@ -1040,7 +1044,9 @@ export function FleetLens({
           const selectedExec = selectedIdx >= 0 ? execs[selectedIdx] : null;
           const showsReading = card.liveTokRate !== null && selectedExec != null;
           // (#2958) What this card may say before every source has
-          // answered: positive readings at once, negative claims later.
+          // answered: positive readings at once, negative claims later. The
+          // live readouts (tube, rate line, pager) draw on `face.tube`, so an
+          // offline card shows its powered-off screen and nothing live.
           const face = cardFace(card, showsReading, answered);
           // `card.liveTokRate !== null` (the scope's mount gate below) only
           // ever holds when at least one execution is running, so
@@ -1177,7 +1183,7 @@ export function FleetLens({
                   execution now (`selectedExec` — the sole one when there's
                   only one running), not a machine-wide aggregate: the tube,
                   its color and this word all belong to one run. */}
-              {showsReading && selectedExec && (
+              {face.tube === "reading" && selectedExec && (
                 <div
                   className="mach-scope__rate"
                   data-tone={selectedExec.state ?? "none"}
@@ -1261,7 +1267,7 @@ export function FleetLens({
                   (`.runs--live`, #1903) — same nested-interactive-control
                   shape, same reason: a click here must not ALSO fire the
                   card body's `machineDrillHash` handler underneath it. */}
-              {pagerActive && selectedExec && (
+              {pagerActive && face.tube === "reading" && selectedExec && (
                 <div className="mach-scope__pager" data-testid="fleet-pager">
                   <div
                     className="mach-scope__pager-btn"
@@ -1377,7 +1383,7 @@ export function FleetLens({
                   </div>
                 );
               })()}
-              {showsReading && selectedExec && (
+              {face.tube === "reading" && selectedExec && (
                 <div
                   className="mach-scope"
                   data-testid="fleet-token-scope"

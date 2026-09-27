@@ -1252,8 +1252,8 @@ describe("(#2928) buildFleetCard with the live overlay", () => {
 // (#2958) Positive readings at once; negative claims once every source that
 // could contradict them has answered.
 describe("cardFace (#2958)", () => {
-  const none = { flow: false, presence: false, sessions: false, runs: false };
-  const all = { flow: true, presence: true, sessions: true, runs: true };
+  const none = { flow: false, presence: false, sessions: false, runs: false, specs: false };
+  const all = { flow: true, presence: true, sessions: true, runs: true, specs: true };
   const quiet = { absent: false, active: false, runsCount: 0 };
 
   it("nothing answered: an idle card says no signal, with no-signal static and no count", () => {
@@ -1265,8 +1265,12 @@ describe("cardFace (#2958)", () => {
   });
 
   it("idle waits on EVERY source, one at a time", () => {
-    for (const k of Object.keys(all) as Array<keyof typeof all>) {
+    for (const k of ["flow", "presence", "sessions", "runs"] as const) {
       expect(cardFace(quiet, false, { ...all, [k]: false }).stat, k).toBe("no signal");
+    }
+    // A roster-only card waits on /machine/specs as well.
+    for (const k of Object.keys(all) as Array<keyof typeof all>) {
+      expect(cardFace({ ...quiet, rosterOnly: true }, false, { ...all, [k]: false }).stat, k).toBe("no signal");
     }
   });
 
@@ -1284,8 +1288,23 @@ describe("cardFace (#2958)", () => {
     const gone = { absent: true, active: false, runsCount: 0 };
     expect(cardFace(gone, false, { ...all, presence: false })).toMatchObject({ stat: "no signal", absent: false, tube: "nosignal" });
     expect(cardFace(gone, false, { ...all, flow: false })).toMatchObject({ stat: "no signal", absent: false });
-    expect(cardFace(gone, false, { flow: true, presence: true, sessions: false, runs: false })).toMatchObject({ stat: "offline", absent: true, tube: "off", noSignal: false, countShown: false });
+    expect(cardFace(gone, false, { flow: true, presence: true, sessions: false, runs: false, specs: false })).toMatchObject({ stat: "offline", absent: true, tube: "off", noSignal: false, countShown: false });
     expect(cardFace(gone, false, all)).toMatchObject({ stat: "offline", absent: true, tube: "off", countShown: true });
+  });
+
+  it("offline wins over a reading: an offline card's tube is powered off", () => {
+    const gone = { absent: true, active: true, runsCount: 1 };
+    expect(cardFace(gone, true, all)).toMatchObject({ stat: "offline", absent: true, active: false, tube: "off" });
+    // Before presence has answered, the reading stays: it is a positive one.
+    expect(cardFace(gone, true, { ...all, presence: false })).toMatchObject({ stat: "dispatch in flight", tube: "reading" });
+  });
+
+  it("a roster-only card's offline and idle wait on /machine/specs too; other cards do not", () => {
+    const rostered = { absent: true, active: false, runsCount: 0, rosterOnly: true };
+    expect(cardFace(rostered, false, { ...all, specs: false })).toMatchObject({ stat: "no signal", absent: false, tube: "nosignal", countShown: false });
+    expect(cardFace(rostered, false, all)).toMatchObject({ stat: "offline", absent: true, tube: "off", countShown: true });
+    expect(cardFace({ absent: true, active: false, runsCount: 0 }, false, { ...all, specs: false })).toMatchObject({ stat: "offline", tube: "off", countShown: true });
+    expect(cardFace(quiet, false, { ...all, specs: false })).toMatchObject({ stat: "idle", tube: "idle" });
   });
 
   it("a quiet utility strip waits only on the flow window", () => {

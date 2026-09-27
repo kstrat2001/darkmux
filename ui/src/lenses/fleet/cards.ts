@@ -452,6 +452,11 @@ export interface FleetCard {
    * `rosterAliasFor`. `undefined` when there is no roster entry, or when the
    * alias already agrees with the machine's own id and would be noise. */
   rosterAlias?: string;
+  /** (#2958) Drawn from a roster entry nothing else accounts for (see
+   * `rosterOnlyEntries`). Until `/machine/specs` answers, such an entry may
+   * be THIS machine's own, so its negative claims wait for specs too (see
+   * `cardFace`). */
+  rosterOnly?: boolean;
   uid: string;
   name: string;
   /** "" means the `specdim` fallback — `specUnknown` below says which one. */
@@ -801,6 +806,10 @@ export interface CardSourcesAnswered {
   sessions: boolean;
   /** `/runs`: a lab run in flight, which never rides the flow stream (#1923). */
   runs: boolean;
+  /** `/machine/specs`: this machine's own identity. A roster-only card may
+   *  be this machine's own entry until specs says otherwise
+   *  (`rosterOnlyEntries`' F1 uid check), so its negative claims wait on it. */
+  specs: boolean;
 }
 
 /** (#2958) What a card may say, given what has answered so far. */
@@ -836,7 +845,10 @@ export interface CardFace {
  *    utility job. A count read before `/runs` answers is a lower bound: the
  *    lab count can only raise it (`Math.max`, #1923).
  *  - "offline": waits on presence and the flow window (a beat, or a
- *    `machine.online` edge, contradicts it).
+ *    `machine.online` edge, contradicts it). It wins over a reading: an
+ *    offline card's tube is powered off.
+ *  - A roster-only card's negative claims also wait on `/machine/specs`,
+ *    which is what tells this machine's own roster entry from a silent peer.
  *  - "idle", "no model working", "0 running": wait on every source.
  *  - A quiet utility strip's "idle": waits on the flow window, the only
  *    source of utility jobs.
@@ -844,16 +856,21 @@ export interface CardFace {
  *  execution's line says when the page loses the daemon (#2886), in the
  *  same boxes. */
 export function cardFace(
-  card: { absent: boolean; active: boolean; runsCount: number },
+  card: { absent: boolean; active: boolean; runsCount: number; rosterOnly?: boolean },
   hasReading: boolean,
   answered: CardSourcesAnswered,
 ): CardFace {
-  const all = answered.flow && answered.presence && answered.sessions && answered.runs;
-  const offlineKnown = answered.flow && answered.presence;
+  // A roster-only card is a silent peer only once `/machine/specs` has said
+  // it is not this machine's own entry.
+  const identityKnown = !card.rosterOnly || answered.specs;
+  const all = answered.flow && answered.presence && answered.sessions && answered.runs && identityKnown;
+  const offlineKnown = answered.flow && answered.presence && identityKnown;
   const absent = card.absent && offlineKnown;
   const active = card.active && !absent;
   const stat = absent ? "offline" : card.active ? "dispatch in flight" : all && !card.absent ? "idle" : NO_SIGNAL_STAT;
-  const tube = hasReading ? "reading" : absent ? "off" : all && !card.absent ? "idle" : "nosignal";
+  // Offline wins: a machine said to be gone draws the powered-off screen,
+  // even over a reading its last records left behind.
+  const tube = absent ? "off" : hasReading ? "reading" : all && !card.absent ? "idle" : "nosignal";
   return {
     stat,
     absent,
