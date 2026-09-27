@@ -649,14 +649,16 @@ pub fn format_status_human(status: &FlowStatus) -> String {
             if r.is_empty_match {
                 flags.push("EMPTY MATCH");
             }
-            if !r.is_loopback && !r.is_tailnet {
+            if r.destination_problem.is_some() {
+                flags.push("DESTINATION REFUSED");
+            } else if r.is_refused {
                 flags.push("URL REFUSED");
             }
             if r.stalled {
                 flags.push("STALLED");
             }
             let flag_str = if flags.is_empty() { String::new() } else { format!(" [{}]", flags.join("; ")) };
-            let _ = writeln!(out, "  #{}: {} -> {}{flag_str}", r.index, r.match_desc, r.url);
+            let _ = writeln!(out, "  #{}: {} -> {}{flag_str}", r.index, r.match_desc, crate::hooks::display_url(&r.url));
             let _ = writeln!(out, "      undelivered: {}", r.undelivered);
             match &r.last_delivery_ts {
                 Some(ts) => {
@@ -865,6 +867,15 @@ pub struct HookRuleStatus {
     /// (#2135 option 2) True for a genuine Tailscale target
     /// (`100.64.0.0/10` or `*.ts.net`) — NOT loopback.
     pub is_tailnet: bool,
+    /// Refused at load — `hooks::HookRuleSummary::is_refused`, the same
+    /// decision `darkmux doctor` reports. A valid `file` rule is not refused.
+    /// Additive; `#[serde(default)]` for documents from an older binary.
+    #[serde(default)]
+    pub is_refused: bool,
+    /// Why, when the refusal is the rule's destination fields (both or
+    /// neither of `http`/`file`) rather than its URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_problem: Option<crate::hooks::DestinationProblem>,
     /// (#2135 option 2) True when this rule signs its deliveries
     /// (`signing_secret_keychain_item` configured).
     pub signed: bool,
@@ -937,6 +948,8 @@ pub fn build_hooks_status(
                 url: s.url,
                 is_loopback: s.is_loopback,
                 is_tailnet: s.is_tailnet,
+                is_refused: s.is_refused,
+                destination_problem: s.destination_problem,
                 signed: s.signed,
                 is_empty_match: s.is_empty_match,
                 undelivered: s.undelivered,
@@ -1164,6 +1177,63 @@ mod hooks_status_tests {
         assert!(rendered.contains("crawl.*"), "{rendered}");
         assert!(rendered.contains("http://127.0.0.1:8790/events"), "{rendered}");
         assert!(rendered.contains("undelivered: 0"), "{rendered}");
+    }
+
+    /// Render `flow status` for these rules alone.
+    fn render_hook_rules(rules: &[HookRule]) -> String {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let hooks = build_hooks_status(true, tmp.path(), rules);
+        format_status_human(&FlowStatus {
+            schema_version: "1.0".to_string(),
+            sinks: SinkSummary {
+                info: SinkInfo { kind: "LocalFile".into(), config: Default::default(), children: vec![], raw_url: None },
+                active_kinds: vec!["LocalFile".to_string()],
+                composition: "LocalFile".to_string(),
+            },
+            redis: None,
+            disk: DiskStatus { flows_dir: "x".into(), exists: true, day_files: 0, total_bytes: 0, observed_disk_schemas: vec![] },
+            schema: SchemaSkew { writer_version: "1.0".into(), observed_versions: vec![], skew_detected: false, skew_reason: None },
+            overall_state: HealthState::Ok,
+            warn_reasons: vec![],
+            fail_reasons: vec![],
+            hooks,
+        })
+    }
+
+    fn hook_rule(http: Option<&str>, file: Option<&str>) -> HookRule {
+        HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: http.map(str::to_string),
+            signing_secret_keychain_item: None,
+            file: file.map(str::to_string),
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }
+    }
+
+    /// A `file` rule has no URL to refuse: `flow status` and `doctor` share
+    /// one refusal decision (`HookRuleSummary::is_refused` /
+    /// `destination_problem`), and a valid file rule is not refused by it.
+    #[test]
+    fn flow_status_does_not_refuse_a_file_rule() {
+        let rendered = render_hook_rules(&[hook_rule(None, Some("/tmp/darkmux-hook-sink"))]);
+        assert!(rendered.contains("file:///tmp/darkmux-hook-sink"), "{rendered}");
+        assert!(!rendered.contains("REFUSED"), "{rendered}");
+    }
+
+    #[test]
+    fn flow_status_names_a_destination_problem_and_a_refused_url_apart() {
+        let both = render_hook_rules(&[hook_rule(Some("http://127.0.0.1:8790/e"), Some("/tmp/x"))]);
+        assert!(both.contains("[DESTINATION REFUSED]"), "{both}");
+        assert!(!both.contains("URL REFUSED"), "{both}");
+        let neither = render_hook_rules(&[hook_rule(None, None)]);
+        assert!(neither.contains("-> (no destination) [DESTINATION REFUSED]"), "{neither}");
+        let bad_url = render_hook_rules(&[hook_rule(Some("http://10.0.0.5/e"), None)]);
+        assert!(bad_url.contains("[URL REFUSED]"), "{bad_url}");
+        let fine = render_hook_rules(&[hook_rule(Some("http://127.0.0.1:8790/e"), None)]);
+        assert!(!fine.contains("REFUSED"), "{fine}");
     }
 
     /// (#2273 fix-round finding 3) `flow status` is the natural verb for

@@ -372,7 +372,7 @@ http.createServer((req, res) => {
 
     <h4><code>darkmux doctor</code></h4>
     <p>A rule with a <code>transform</code> shows the adapter name, whether it parses, and its content hash. A missing or unparseable adapter disables that rule only; a bad <code>http</code> URL still refuses the whole sink.</p>
-    <pre><code>#0: payload.tool_name="create_finding" -> http://100.64.1.2:8080/rest/api/3/issue [tailnet, unsigned], transform: jira-issue.jq (sha256:a1b2c3d4e5f6a7b8) (undelivered: 0)</code></pre>
+    <pre><code>#0: action=dispatch.tool, payload.ok=true, payload.tool_name="create_finding" -> http://100.64.1.2:8080/rest/api/3/issue [tailnet, unsigned], transform: jira-issue.jq (blake3:a1b2c3d4e5f6a7b8) (undelivered: 0) [TAILNET TARGET, UNSIGNED — attribution is unsigned; fine inside the tailnet, required beyond it]</code></pre>
 
     <h4>Limits</h4>
     <ul>
