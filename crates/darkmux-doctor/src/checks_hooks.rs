@@ -357,7 +357,7 @@ fn build_hooks_check(
         // the row that's actually broken is the one operator sees red,
         // without the whole `hooks` check reading as catastrophic.
         let transform_suffix = match (&s.transform_name, &s.transform_status) {
-            (Some(name), Some(Ok(hash))) => format!(", transform: {name} (sha256:{hash})"),
+            (Some(name), Some(Ok(hash))) => format!(", transform: {name} (blake3:{hash})"),
             (Some(name), Some(Err(reason))) => {
                 flags.push(format!("TRANSFORM `{name}` FAILED TO LOAD — {reason}"));
                 rule_status = Status::Fail;
@@ -1454,7 +1454,7 @@ mod tests {
         let checks = checks_for(&[rule], state.path());
         let row = named(&checks, "hooks.rule.0");
         assert_eq!(row.status, Status::Pass, "{}", row.message);
-        assert!(row.message.contains(&format!(", transform: ok.jq (sha256:{hash})")), "{}", row.message);
+        assert!(row.message.contains(&format!(", transform: ok.jq (blake3:{hash})")), "the hash is BLAKE3: {}", row.message);
     }
 
     #[test]
