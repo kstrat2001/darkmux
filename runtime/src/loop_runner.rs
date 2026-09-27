@@ -5632,12 +5632,6 @@ fn assistant_message_has_well_formed_tool_calls(msg: &Message) -> bool {
 /// existed. Applied ONLY on the salvage path: everywhere else a malformed
 /// tool call is the model's own output and belongs in the transcript, where
 /// the failure-rate detector can see it. Here it is an artifact of OUR cut.
-/// (#479, #2963) Whether a tool call's arguments parse: the one predicate
-/// the salvage's `retain_well_formed_tool_calls` and `plan_tool_calls` share.
-fn tool_call_is_well_formed(tc: &ToolCall) -> bool {
-    serde_json::from_str::<serde_json::Value>(&tc.function.arguments).is_ok()
-}
-
 fn retain_well_formed_tool_calls(msg: &mut Message) {
     if let Some(tcs) = msg.tool_calls.as_mut() {
         tcs.retain(tool_call_is_well_formed);
@@ -5767,6 +5761,12 @@ impl InvalidToolCallReason {
 
 /// Classify why `name` fell outside `allowed_tool_names` — see
 /// [`InvalidToolCallReason`]'s doc for what distinguishes the two cases.
+/// (#479, #2963) Whether a tool call's arguments parse: the one predicate
+/// the salvage's `retain_well_formed_tool_calls` and `plan_tool_calls` share.
+fn tool_call_is_well_formed(tc: &ToolCall) -> bool {
+    serde_json::from_str::<serde_json::Value>(&tc.function.arguments).is_ok()
+}
+
 fn classify_invalid_tool_call(name: &str) -> InvalidToolCallReason {
     if crate::tools::Tool::from_name(name).is_some() {
         InvalidToolCallReason::RealToolNotGranted
@@ -5778,7 +5778,11 @@ fn classify_invalid_tool_call(name: &str) -> InvalidToolCallReason {
 /// Partition a turn's structured tool calls into THREE buckets — (1)
 /// dispatchable, (2) a real darkmux tool this dispatch wasn't granted, (3)
 /// not a real tool at all — BEFORE any of them reach `tools::dispatch`
-/// (#2169). See [`InvalidToolCallReason`]'s doc for why buckets (2) and (3)
+/// (#2169). (#2963) It follows the turn's plan (`plan_tool_calls`, made
+/// before `model.completed` was written) rather than re-deciding by name,
+/// so the calls that run are exactly the ones that record left unmarked; a
+/// `Discarded` call (cut off mid-arguments by the #479 salvage) falls in no
+/// bucket. See [`InvalidToolCallReason`]'s doc for why buckets (2) and (3)
 /// are kept separate rather than one "invalid" bucket.
 ///
 /// Structured `tool_calls` come back from LM Studio's API already
@@ -5871,6 +5875,21 @@ fn plan_tool_calls(
         .collect()
 }
 
+/// Handle ONE reason-bucket of a turn's non-dispatchable tool calls
+/// (#2169): never dispatch them, coalesce into ONE feedback message worded
+/// SPECIFICALLY for `reason` (see [`InvalidToolCallReason`]'s doc — the two
+/// reasons need different wording, not just a different counter), emit ONE
+/// `dispatch.tool.malformed_names` trajectory event carrying `reason` +
+/// this bucket's own count + a sample name, and satisfy the OpenAI
+/// tool-message-per-`tool_call_id` protocol with
+/// `MALFORMED_TOOL_CALL_RESULT_BODY`'s short constant body (same body for
+/// both reasons — the reason-specific explanation lives in the ONE
+/// feedback message, not repeated per call). No-op when `calls` is empty.
+///
+/// Called once per bucket at the call site — a turn carrying BOTH an
+/// ungranted-real-tool call and a not-a-tool call gets TWO events, TWO
+/// feedback messages, correctly separated telemetry, rather than one
+/// muddled bucket.
 #[allow(clippy::too_many_arguments)]
 fn handle_invalid_tool_calls(
     calls: &[ToolCall],
@@ -9541,7 +9560,12 @@ mod tests {
     /// (#2963) The #479 salvage keeps the well-formed calls of a turn the
     /// cap cut, and drops the one cut mid-arguments (#2836). The record
     /// marks the dropped call `runs: false` and the kept one not at all, and
-    /// only the kept call completes.
+    /// only the kept call completes: the record agrees with the loop.
+    ///
+    /// No viewer reads these marks today: a salvaged turn's record ends
+    /// `length`, and the host writes no `dispatch.turn` for a `length`
+    /// record, so the turn gets no `tool_names` / `tool_paths` at all (a
+    /// separate gap, filed on its own).
     #[test]
     #[serial_test::serial]
     fn model_completed_marks_a_call_the_cut_left_malformed() {

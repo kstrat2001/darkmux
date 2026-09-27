@@ -11711,13 +11711,29 @@ fn cap_json_result(value: Option<&serde_json::Value>, max: usize) -> serde_json:
 /// since a clipped path names a different file. `None` (the key is left
 /// out) when no call has a path. The viewer names `tool_paths[k]` while the
 /// turn's k-th call runs.
+/// (#2963) The runtime's `model.completed` keys this reads, spelled once
+/// here and pinned as literals by a test on each side (the runtime's are
+/// `trajectory::RUNS_KEY` / `CALLS_PLANNED_KEY`): `runs` is `false` on a
+/// call that will not run; `calls_planned` is `true` on a record whose calls
+/// carry those marks.
+const RUNS_KEY: &str = "runs";
+const CALLS_PLANNED_KEY: &str = "calls_planned";
+
 /// (#2963) The turn's tool calls that RUN, in order: the runtime marks a
 /// call it will not dispatch (ungranted, not a tool, cut off mid-arguments;
 /// its `plan_tool_calls`) `runs: false` on the `model.completed` entry.
-/// `None` when the event carries no `tool_calls` array.
+/// `None` when the record does not say `calls_planned: true` (a runtime
+/// older than the marks) or carries no `tool_calls` array: neither list is
+/// then written.
 fn running_tool_calls(event: &serde_json::Value) -> Option<Vec<&serde_json::Value>> {
+    // (#2963 review) Fail closed on version skew: a runtime older than the
+    // marks writes no `calls_planned`, and its calls must not read as "every
+    // call runs". No marker, no lists.
+    if event.get(CALLS_PLANNED_KEY).and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
     let calls = event.get("tool_calls")?.as_array()?;
-    Some(calls.iter().filter(|c| c.get("runs").and_then(|r| r.as_bool()) != Some(false)).collect())
+    Some(calls.iter().filter(|c| c.get(RUNS_KEY).and_then(|r| r.as_bool()) != Some(false)).collect())
 }
 
 /// (#2963 review, CONSIDER 2) A name the runtime knows as a tool: one some
@@ -11735,11 +11751,12 @@ fn is_known_runtime_tool(name: &str) -> bool {
 /// none. The viewer names `tool_names[k]` (the word and the icon) while the
 /// turn's k-th running call runs.
 fn turn_tool_names(event: &serde_json::Value) -> Option<serde_json::Value> {
+    let running = running_tool_calls(event)?;
     if event.get("tool_calls")?.as_array()?.is_empty() {
         return None;
     }
     Some(serde_json::Value::Array(
-        running_tool_calls(event)?
+        running
             .into_iter()
             .map(|c| match c.get("name").and_then(|n| n.as_str()) {
                 Some(n) if is_known_runtime_tool(n) => serde_json::json!(n),

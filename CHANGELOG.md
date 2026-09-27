@@ -216,9 +216,11 @@ darkmux release.
   runtime refuses, ungranted, not a tool, or cut off mid-arguments, is not
   in them). `tool_paths` holds only the path argument, never file content.
   **One expected change:** records written before 1.64.0 carry no lists, so
-  in older archives (and in the demo until it is regenerated) the later
-  calls of a multi-call turn show the neutral TOOLS state (the gear, no
-  line) instead of the name of the call that had just finished.
+  in older archives (and in the demo until it is regenerated) every call of
+  a multi-call turn shows the neutral TOOLS state (the gear, no line)
+  instead of the name of the call that had just finished. A runtime older
+  than this release writes no plan for its calls, so its turns carry no
+  lists either and read the same way.
 - **`darkmux machine trust <name>` / `machine untrust <name>`** (#2916).
   Trust adds `fleet.accept_work.<name>` to THIS machine's config.json (and
   touches nothing else): the peer's node is looked up through the identity
