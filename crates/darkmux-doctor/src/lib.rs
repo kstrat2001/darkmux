@@ -2144,13 +2144,13 @@ fn check_gh_allowlist() -> Check {
 }
 
 /// (silent-miss audit, 2026-09-06) Every DISTINCT `action` value present in
-/// today's flow day file — read once here so [`build_hooks_check`] can flag
+/// today's flow day file — read once here so the hooks check can flag
 /// a rule that has NEVER matched anything because its `match.action` names
 /// the OTHER bookend spelling from what today's records actually carry
 /// (`darkmux_flow::is_dispatch_start`/`is_dispatch_complete`/
 /// `is_dispatch_error` tolerate both spellings; a hook rule's own
-/// `HookMatch::action` glob does not — see `build_hooks_check`'s own
-/// comment on the check this feeds). Not a general flow reader: reads
+/// `HookMatch::action` glob does not — see `checks_hooks::never_matched_flag`,
+/// the check this feeds). Not a general flow reader: reads
 /// exactly one file (today's), and returns an empty set on any
 /// read/parse failure or a line that isn't a JSON object with a string
 /// `action` — the same descriptive-not-refusing posture the rest of
