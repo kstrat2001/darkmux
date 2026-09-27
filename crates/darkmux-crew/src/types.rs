@@ -26,7 +26,7 @@ pub use darkmux_types::{Capability, CapabilityProfile};
 /// capability vector (the capability routing). Renamed from
 /// `Capability` to free the word for the industry-conventional
 /// model-capability meaning (E14).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Skill {
     pub id: String,
     pub description: String,
@@ -43,14 +43,14 @@ pub struct Skill {
 }
 
 /// A keyword paired with a relevance weight (0.0–1.0).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct KeywordWeight {
     pub keyword: String,
     pub weight: f32,
 }
 
 /// Role positioning within a crew.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Position {
     Lead,
@@ -58,7 +58,7 @@ pub enum Position {
 }
 
 /// Escalation contract — what a role does when it can't solve an issue.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum EscalationContract {
     BailWithExplanation,
@@ -67,7 +67,7 @@ pub enum EscalationContract {
 }
 
 /// A single role definition: skills, tool palette, escalation behavior.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Role {
     pub id: String,
     pub description: String,
@@ -220,7 +220,7 @@ impl Role {
 }
 
 /// Which tool operations a role is allowed or denied.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ToolPalette {
     #[serde(default)]
     pub allow: Vec<String>,
@@ -229,14 +229,14 @@ pub struct ToolPalette {
 }
 
 /// A single crew member: which role they play and their position.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CrewMember {
     pub role_id: String,
     pub position: Position,
 }
 
 /// A crew — a named collection of role assignments.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Crew {
     pub id: String,
     pub description: String,

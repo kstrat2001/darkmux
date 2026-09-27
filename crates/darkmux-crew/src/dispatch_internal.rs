@@ -3717,7 +3717,7 @@ fn dispatch_remote(
 /// than adding speculative shape for a consumer that doesn't exist yet.
 pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> {
     // (#2947) Bad enum config refuses before anything, same as `dispatch`.
-    darkmux_profiles::preflight_with(darkmux_types::config_enum::Scope::Dispatch, opts.config_path.as_deref())?;
+    crate::user_files::preflight_with(darkmux_types::config_enum::Scope::Dispatch, opts.config_path.as_deref())?;
     darkmux_flow::daemon_probe::nudge_if_daemon_unreachable("dispatch");
     crate::dispatch::require_licensed_adjacent_ack(&opts.role_id)
         .context("licensed-adjacent role dispatch requires acknowledgment")?;
@@ -4895,7 +4895,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // is the one place that covers them all. Deliberately NOT gated on
     // `opts.skip_preflight`: that flag skips the Docker/daemon probe, and a
     // bad config value is not a probe result that could be stale.
-    darkmux_profiles::preflight_with(darkmux_types::config_enum::Scope::Dispatch, opts.config_path.as_deref())?;
+    crate::user_files::preflight_with(darkmux_types::config_enum::Scope::Dispatch, opts.config_path.as_deref())?;
     // 0. Pre-flight: nudge the operator if the daemon isn't up. The
     //    dispatch will still write flow records to disk, but they
     //    won't be observable in the viewer until the daemon comes up.

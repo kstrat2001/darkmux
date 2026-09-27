@@ -81,7 +81,7 @@ darkmux's canonical config surface is **`~/.darkmux/config.json`**, written by `
 
 ```json
 {
-  "schema_version": "1.33",
+  "schema_version": "2.0",
   "machine_id": "studio",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
@@ -97,7 +97,7 @@ When proposing a config change to an operator, write the visible field; don't re
 - **Redis password → macOS Keychain** (item `darkmux-redis`, the same item the Homebrew wrapper populates). `config.redis` holds only non-secret bits (`enabled`/`host`/`port`/`db`/`stream`/`maxlen`); the password is read at runtime via `security find-generic-password` and never logged; every URL is wrapped in `RawRedisUrl` (redacted `Display` + `Debug`; raw bytes only via `expose_for_probe`). Non-macOS uses the full-URL env override. `redis_url()` resolves `env(DARKMUX_REDIS_URL) verbatim > config.redis.enabled + Keychain > off`.
 - **`DARKMUX_HOME`**: the bootstrap pointer that *locates* the config root (`<root>/config.json`); it can't live inside the config it finds, so it stays an env var.
 
-**Schema is minor-bump + lenient on read** (all-`Option` + `#[serde(flatten)] extras` overflow): an older binary tolerates a newer config, and a partial/hand-edited/malformed config never bricks the CLI; loud validation belongs to `darkmux doctor`, not the hot load path. `CONFIG_SCHEMA_VERSION` lives in `darkmux-types/src/config.rs`.
+**Loading never bricks, consuming refuses** (CONFIG 2.0): all-`Option` + `#[serde(flatten)] extras` overflow means a partial, hand-edited or malformed config never bricks the CLI and `darkmux doctor` always runs, but a key the schema does not know is refused at every entry point's preflight and failed by doctor, naming the closest valid key. So an older binary refuses a newer config's new key. `CONFIG_SCHEMA_VERSION` lives in `darkmux-types/src/config.rs`.
 
 **Don't confuse `config.json` with the profiles registry.** `~/.darkmux/profiles.json` (the model profiles) is a SEPARATE file, overridden by `--profiles-file` / `DARKMUX_PROFILES`, **renamed in #661 from the misleading `--config` / `DARKMUX_CONFIG`** (those names are retired, not reused, because a real `config.json` now exists).
 

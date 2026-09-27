@@ -212,7 +212,7 @@ pub fn run() -> DoctorReport {
         check_flat_mission_files(),
         check_mission_envelope_readability(),
     ]);
-    let checks = [checks, check_enum_settings(), check_hooks(), eureka_checks()].concat();
+    let checks = [checks, check_enum_settings(), check_user_file_keys(), check_hooks(), eureka_checks()].concat();
     DoctorReport { checks }
 }
 
@@ -1442,26 +1442,18 @@ fn utility_in_profiles_status(registry: &darkmux_types::ProfileRegistry) -> Chec
 /// The key is read off `radio.extras`, where the typed struct no longer has
 /// a field for it.
 fn check_removed_radio_router_staffing() -> Check {
-    let cfg = darkmux_types::config::DarkmuxConfig::load_resolved();
-    let router_profile_present = cfg.radio.as_ref().is_some_and(|r| r.extras.contains_key("router_profile"));
     let role_binding = darkmux_types::config_access::role_profile("radio-router");
     let env_set = std::env::var("DARKMUX_RADIO_ROUTER_PROFILE").ok().is_some_and(|s| !s.trim().is_empty());
-    removed_radio_router_staffing_status(router_profile_present, role_binding.as_deref(), env_set)
+    removed_radio_router_staffing_status(role_binding.as_deref(), env_set)
 }
 
 /// Pure decision for [`check_removed_radio_router_staffing`].
-fn removed_radio_router_staffing_status(
-    router_profile_present: bool,
-    role_binding: Option<&str>,
-    env_set: bool,
-) -> Check {
+/// A leftover `radio.router_profile` key is not this check's: it is an
+/// unknown key, which the user-file keys row fails with its removal line
+/// (`config::REMOVED_SETTINGS`).
+fn removed_radio_router_staffing_status(role_binding: Option<&str>, env_set: bool) -> Check {
     let name = "radio router staffing (removed)".to_string();
     let mut leftovers: Vec<String> = Vec::new();
-    if router_profile_present {
-        // Hardcoded "1.28", not `CONFIG_SCHEMA_VERSION`: the key was removed
-        // in that one version, which never changes as the schema marches on.
-        leftovers.push("config.json has `radio.router_profile` — removed in CONFIG 1.28; delete it".into());
-    }
     if let Some(profile) = role_binding {
         // (C6) No CLI removes a `role_profiles` binding (`config set`
         // refuses a blank value like any other, and there is no `config
@@ -1921,6 +1913,75 @@ fn check_machine_id_resolution() -> Check {
     }
 }
 
+/// Name of the user-file keys rows (one Fail row per bad file, suffixed
+/// with its path; one Pass row when every file is clean).
+const USER_FILE_KEYS_CHECK_NAME: &str = "user file keys";
+
+/// (4.0) One Fail row per user file (`darkmux_types::user_files`) that
+/// carries a key its schema does not know or is not JSON, with the same
+/// message the preflight refuses with, and one Pass row when there is none.
+/// Loading ignores an unknown key, so this and the preflight are where it
+/// surfaces. The crawl's workspace spec has no fixed location; its launch
+/// refuses it where it is loaded.
+pub fn check_user_file_keys() -> Vec<Check> {
+    use darkmux_types::user_files::UserFileKind;
+    let problems: Vec<darkmux_types::user_files::FileProblem> =
+        UserFileKind::ALL.into_iter().flat_map(user_file_problems).collect();
+    user_file_key_rows(&problems)
+}
+
+/// Every problem in the files of `kind`, from the crate that owns its type.
+fn user_file_problems(kind: darkmux_types::user_files::UserFileKind) -> Vec<darkmux_types::user_files::FileProblem> {
+    use darkmux_types::user_files::UserFileKind;
+    match kind {
+        UserFileKind::Config => darkmux_types::user_files::config_json_problems(),
+        UserFileKind::Profiles => darkmux_profiles::profiles::load_registry_quiet(None)
+            .ok()
+            .and_then(|loaded| darkmux_profiles::profiles::user_file_problem(&loaded.path))
+            .into_iter()
+            .collect(),
+        UserFileKind::Role
+        | UserFileKind::Skill
+        | UserFileKind::Crew
+        | UserFileKind::MissionConfig
+        | UserFileKind::Rule => darkmux_crew::user_files::problems(kind),
+        UserFileKind::Workload | UserFileKind::LabFixture => darkmux_lab::user_files::problems(kind),
+        UserFileKind::WorkspaceSpec => Vec::new(),
+    }
+}
+
+/// Pure row builder for [`check_user_file_keys`].
+fn user_file_key_rows(problems: &[darkmux_types::user_files::FileProblem]) -> Vec<Check> {
+    if problems.is_empty() {
+        return vec![Check {
+            name: USER_FILE_KEYS_CHECK_NAME.into(),
+            status: Status::Pass,
+            message: "every user file's keys are known".into(),
+            hint: None,
+        }];
+    }
+    problems
+        .iter()
+        .map(|p| {
+            let refused_by: Vec<&str> = p.kind.scopes().iter().map(|s| s.label()).collect();
+            let consequence = match refused_by.is_empty() {
+                true => "Nothing that starts work reads this file, so nothing refuses to start over it".to_string(),
+                false => format!("Refused at preflight by: {}", refused_by.join(", ")),
+            };
+            Check {
+                // The file name keeps the row's name column narrow; the
+                // message carries the full path.
+                name: format!(
+                    "{USER_FILE_KEYS_CHECK_NAME}: {}",
+                    p.path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+                ),
+                status: Status::Fail,
+                message: format!("{p}. {consequence}"),
+                hint: Some("rename each key to the valid one named, or delete it; loading ignores it".into()),
+            }
+        })
+        .collect()
+}
 
 /// (#2947) THE doctor check for enum-typed settings: one row per entry of
 /// `darkmux_types::config_enum::ENUM_SETTINGS`, with no per-setting code.
@@ -2127,22 +2188,17 @@ fn resolved_config_path() -> std::path::PathBuf {
 /// (#2902 step 5) Settings RENAMED in 4.0 with no alias
 /// (`darkmux_types::config::RENAMED_SETTINGS`: the per-step cap's
 /// `remote.max_tokens_per_execution` -> `remote.max_tokens_per_step`). A
-/// leftover old key in `config.json` lands in `remote.extras` and is read by
-/// nothing; a leftover old env var is read by nothing. Either is named with
-/// the rename and what to do. Warn, not Fail: nothing refuses to run.
+/// leftover old env var is read by nothing: named with the rename and what to
+/// do. Warn, not Fail: nothing refuses to run. A leftover old `config.json`
+/// key is an unknown key, which the user-file keys row fails.
 fn check_renamed_budget_settings() -> Check {
-    let cfg = darkmux_types::config::DarkmuxConfig::load_resolved();
-    renamed_settings_status(&cfg, &|k| std::env::var(k).ok(), &resolved_config_path())
+    renamed_settings_status(&|k| std::env::var(k).ok())
 }
 
 /// Pure decision for [`check_renamed_budget_settings`].
-fn renamed_settings_status(
-    cfg: &darkmux_types::config::DarkmuxConfig,
-    env: &dyn Fn(&str) -> Option<String>,
-    config_path: &std::path::Path,
-) -> Check {
+fn renamed_settings_status(env: &dyn Fn(&str) -> Option<String>) -> Check {
     let name = "renamed settings (4.0)";
-    let leftovers = darkmux_types::config::renamed_leftovers(cfg, env);
+    let leftovers = darkmux_types::config::renamed_leftovers(env);
     if leftovers.is_empty() {
         return Check { name: name.into(), status: Status::Pass, message: "none present".into(), hint: None };
     }
@@ -2150,63 +2206,38 @@ fn renamed_settings_status(
         name: name.into(),
         status: Status::Warn,
         message: leftovers.iter().map(|l| l.line.clone()).collect::<Vec<_>>().join("; "),
-        hint: Some(format!(
-            "Nothing reads the old names. config.json is {}; an old env var is removed from your shell rc.",
-            config_path.display()
-        )),
+        hint: Some("Nothing reads the old names; remove the old env var from your shell rc.".into()),
     }
 }
 
-/// (#2913, 4.0) `dirs.notebook` and `DARKMUX_NOTEBOOK_DIR` are removed —
-/// `lab notebook draft`/`list` retired outright in 4.0 (no deprecation
-/// release, no compatibility read), replaced by the bundled
+/// (#2913, 4.0) `DARKMUX_NOTEBOOK_DIR` is removed: `lab notebook
+/// draft`/`list` retired outright in 4.0, replaced by the bundled
 /// `darkmux-lab-notebook` skill, which writes the entry wherever the
-/// operator's own instructions say. Because the `DirsConfig` field is gone,
-/// a `config.json` still carrying `dirs.notebook` is read leniently (serde
-/// ignores the unknown key) and has no effect; the env var is read by
-/// nothing at all. Both are silent by construction, so this is the ONE
-/// place an operator learns the setting is dead and what to change.
+/// operator's own instructions say. The env var is read by nothing, so this
+/// is the one place an operator learns it is dead. (A leftover
+/// `dirs.notebook` key in `config.json` is an unknown key, which the
+/// user-file keys row fails with its removal line.)
 ///
-/// `Pass` when neither tier is set (including a fresh `with_defaults()`
-/// config); `Warn` naming exactly the tier(s) that are set, with the exact
-/// removal step for each. An empty env value reads as unset, matching every
-/// other env-tier accessor.
+/// `Pass` when it is unset; `Warn` with the removal step when it is set. An
+/// empty value reads as unset, matching every other env-tier accessor.
 fn check_removed_notebook_settings() -> Check {
-    let name = "dirs.notebook / DARKMUX_NOTEBOOK_DIR (removed)";
-    let cfg = darkmux_types::config::DarkmuxConfig::load_resolved();
-    // The typed field is gone, so a leftover key lands in `DirsConfig`'s
-    // flattened `extras` overflow — the same place the other removed-key
-    // checks above look.
-    let config_set = cfg.dirs.as_ref().is_some_and(|d| d.extras.contains_key("notebook"));
+    let name = "DARKMUX_NOTEBOOK_DIR (removed)";
     let env_set = std::env::var("DARKMUX_NOTEBOOK_DIR")
         .ok()
         .is_some_and(|s| !s.trim().is_empty());
-    if !config_set && !env_set {
+    if !env_set {
         return Check { name: name.into(), status: Status::Pass, message: "not present".into(), hint: None };
-    }
-    let mut found: Vec<&str> = Vec::new();
-    let mut steps: Vec<String> = Vec::new();
-    if config_set {
-        found.push("config.json sets `dirs.notebook`");
-        steps.push(format!(
-            "delete `dirs.notebook` from the `dirs` block in {}",
-            resolved_config_path().display()
-        ));
-    }
-    if env_set {
-        found.push("`DARKMUX_NOTEBOOK_DIR` is exported");
-        steps.push("unset DARKMUX_NOTEBOOK_DIR (remove the export from your shell rc)".into());
     }
     Check {
         name: name.into(),
         status: Status::Warn,
-        message: format!("{} — removed in 4.0 (#2913); nothing reads it", found.join("; ")),
-        hint: Some(format!(
-            "{}. The notebook verbs retired in 4.0; the bundled `darkmux-lab-notebook` skill \
-             (installed by `darkmux init`) drafts an entry from `darkmux lab run stats <run-id> --json` \
-             and writes it wherever your own instructions say",
-            steps.join("; ")
-        )),
+        message: "`DARKMUX_NOTEBOOK_DIR` is exported — removed in 4.0 (#2913); nothing reads it".into(),
+        hint: Some(
+            "unset DARKMUX_NOTEBOOK_DIR (remove the export from your shell rc). The notebook verbs retired \
+             in 4.0; the bundled `darkmux-lab-notebook` skill (installed by `darkmux init`) drafts an entry \
+             from `darkmux lab run stats <run-id> --json` and writes it wherever your own instructions say"
+                .into(),
+        ),
     }
 }
 
@@ -9105,18 +9136,13 @@ mod tests {
         }
     }
 
-    // ─── (#2913, 4.0) check_removed_notebook_settings — removed dirs.notebook + env ─
+    // ─── (#2913, 4.0) check_removed_notebook_settings — the removed env var ─
 
-    /// Runs `check_removed_notebook_settings` against one config.json body
-    /// and one `DARKMUX_NOTEBOOK_DIR` value, with both tiers pinned and
-    /// restored around the call.
-    fn notebook_settings_check(config_body: &str, env_value: Option<&str>) -> Check {
-        let home = tempfile::TempDir::new().unwrap();
-        std::fs::write(home.path().join("config.json"), config_body).unwrap();
-        let prev_home = std::env::var("DARKMUX_HOME").ok();
+    /// Runs `check_removed_notebook_settings` with `DARKMUX_NOTEBOOK_DIR`
+    /// pinned to `env_value`, restored after the call.
+    fn notebook_settings_check(env_value: Option<&str>) -> Check {
         let prev_nb = std::env::var("DARKMUX_NOTEBOOK_DIR").ok();
         unsafe {
-            std::env::set_var("DARKMUX_HOME", home.path());
             match env_value {
                 Some(v) => std::env::set_var("DARKMUX_NOTEBOOK_DIR", v),
                 None => std::env::remove_var("DARKMUX_NOTEBOOK_DIR"),
@@ -9124,10 +9150,6 @@ mod tests {
         }
         let check = check_removed_notebook_settings();
         unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
             match prev_nb {
                 Some(v) => std::env::set_var("DARKMUX_NOTEBOOK_DIR", v),
                 None => std::env::remove_var("DARKMUX_NOTEBOOK_DIR"),
@@ -9138,84 +9160,20 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn check_removed_notebook_settings_passes_when_neither_tier_is_set() {
-        let check = notebook_settings_check(r#"{"schema_version":"1.22","dirs":{"lab":"~/runs"}}"#, None);
+    fn check_removed_notebook_settings_passes_when_unset() {
+        let check = notebook_settings_check(None);
         assert_eq!(check.status, Status::Pass, "{}", check.message);
     }
 
     #[serial_test::serial]
     #[test]
-    fn check_removed_notebook_settings_passes_against_with_defaults() {
-        use darkmux_types::config::DarkmuxConfig;
-        let contents = serde_json::to_string_pretty(&DarkmuxConfig::with_defaults()).unwrap();
-        let check = notebook_settings_check(&contents, None);
-        assert_eq!(check.status, Status::Pass, "with_defaults() must never trip this: {}", check.message);
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn check_removed_notebook_settings_warns_on_leftover_config_key() {
-        let check = notebook_settings_check(
-            r#"{"schema_version":"1.22","dirs":{"notebook":"~/nb","lab":"~/runs"}}"#,
-            None,
-        );
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
-        assert!(check.message.contains("dirs.notebook"), "names the key: {}", check.message);
-        assert!(!check.message.contains("DARKMUX_NOTEBOOK_DIR"), "env is not set: {}", check.message);
-        let hint = check.hint.expect("a removal step");
-        assert!(hint.contains("delete `dirs.notebook`"), "the exact change: {hint}");
-        assert!(hint.contains("darkmux-lab-notebook"), "names the replacement: {hint}");
-    }
-
-    #[serial_test::serial]
-    #[test]
     fn check_removed_notebook_settings_warns_on_leftover_env_var() {
-        let check = notebook_settings_check(r#"{"schema_version":"1.22"}"#, Some("/tmp/nb"));
+        let check = notebook_settings_check(Some("/tmp/nb"));
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("DARKMUX_NOTEBOOK_DIR"), "names the var: {}", check.message);
-        assert!(!check.message.contains("dirs.notebook"), "config key is absent: {}", check.message);
         let hint = check.hint.expect("a removal step");
         assert!(hint.contains("unset DARKMUX_NOTEBOOK_DIR"), "the exact change: {hint}");
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn check_removed_notebook_settings_names_both_when_both_are_set() {
-        let check = notebook_settings_check(r#"{"dirs":{"notebook":"~/nb"}}"#, Some("/tmp/nb"));
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
-        assert!(check.message.contains("dirs.notebook") && check.message.contains("DARKMUX_NOTEBOOK_DIR"));
-        let hint = check.hint.expect("a removal step");
-        assert!(hint.contains("delete `dirs.notebook`") && hint.contains("unset DARKMUX_NOTEBOOK_DIR"));
-    }
-
-    /// (#2913 review C4) The removal step names the config file darkmux
-    /// actually read, not a hardcoded `~/.darkmux/config.json`: under
-    /// `DARKMUX_HOME=/x` the leftover key lives in `/x/config.json`.
-    #[serial_test::serial]
-    #[test]
-    fn check_removed_notebook_settings_hint_names_the_resolved_config_path() {
-        let home = tempfile::TempDir::new().unwrap();
-        let cfg = home.path().join("config.json");
-        std::fs::write(&cfg, r#"{"dirs":{"notebook":"~/nb"}}"#).unwrap();
-        let prev_home = std::env::var("DARKMUX_HOME").ok();
-        let prev_nb = std::env::var("DARKMUX_NOTEBOOK_DIR").ok();
-        unsafe {
-            std::env::set_var("DARKMUX_HOME", home.path());
-            std::env::remove_var("DARKMUX_NOTEBOOK_DIR");
-        }
-        let check = check_removed_notebook_settings();
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-            if let Some(v) = prev_nb {
-                std::env::set_var("DARKMUX_NOTEBOOK_DIR", v);
-            }
-        }
-        let hint = check.hint.expect("a removal step");
-        assert!(hint.contains(&cfg.display().to_string()), "names the resolved file: {hint}");
-        assert!(!hint.contains("~/.darkmux/config.json"), "no hardcoded default path: {hint}");
+        assert!(hint.contains("darkmux-lab-notebook"), "names the replacement: {hint}");
     }
 
     /// An empty env value is "unset", the same reading every other env-tier
@@ -9224,7 +9182,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn check_removed_notebook_settings_treats_empty_env_as_unset() {
-        let check = notebook_settings_check(r#"{"schema_version":"1.22"}"#, Some("  "));
+        let check = notebook_settings_check(Some("  "));
         assert_eq!(check.status, Status::Pass, "{}", check.message);
     }
 
@@ -11609,30 +11567,22 @@ mod tests {
         r
     }
 
-    /// (#2902 step 5) A leftover old budget key, in config.json or the env,
-    /// is named with its exact rename; the new keys pass.
+    /// (#2902 step 5) A leftover old budget env var is named with its exact
+    /// rename; nothing set passes. (A leftover old `config.json` key is an
+    /// unknown key, failed by the user-file keys row.)
     #[test]
     fn renamed_budget_settings_are_named_with_the_exact_rename() {
-        let path = std::path::Path::new("/h/config.json");
-        let old: darkmux_types::config::DarkmuxConfig =
-            serde_json::from_str(r#"{"remote":{"max_tokens_per_execution":500000}}"#).unwrap();
-        let c = renamed_settings_status(&old, &|_| None, path);
+        let env = |k: &str| (k == "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION").then(|| "5".to_string());
+        let c = renamed_settings_status(&env);
         assert_eq!(c.status, Status::Warn, "{}", c.message);
-        assert!(c.message.contains("config.json key `remote.max_tokens_per_execution` (500000) is ignored"), "{}", c.message);
+        assert!(c.message.contains("env var DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION (5) is ignored"), "{}", c.message);
         assert!(
             c.message.contains("delete it unless you chose that number (500000 was darkmux's old default)"),
             "{}",
             c.message
         );
         assert!(c.message.contains("set remote.max_tokens_per_step only if you want one"), "{}", c.message);
-        let env = |k: &str| (k == "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION").then(|| "5".to_string());
-        let c = renamed_settings_status(&darkmux_types::config::DarkmuxConfig::default(), &env, path);
-        assert!(c.message.contains("env var DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION (5) is ignored"), "{}", c.message);
-        let new: darkmux_types::config::DarkmuxConfig =
-            serde_json::from_str(r#"{"remote":{"max_tokens_per_step":5,"step_budget_policy":"warn"}}"#).unwrap();
-        assert_eq!(renamed_settings_status(&new, &|_| None, path).status, Status::Pass);
-        let defaults = darkmux_types::config::DarkmuxConfig::with_defaults();
-        assert_eq!(renamed_settings_status(&defaults, &|_| None, path).status, Status::Pass);
+        assert_eq!(renamed_settings_status(&|_| None).status, Status::Pass);
     }
 
     fn no_spend(_: &darkmux_crew::budget::EndpointBudget) -> darkmux_crew::budget::WindowEntries {
@@ -11841,8 +11791,11 @@ mod tests {
         // `check_renamed_budget_settings` (#2902 step 5).
         //
         // (4.0 flow vocabulary) 65: `check_unknown_flow_actions` joined.
+        //
+        // (4.0 unknown-key gate) 66: `check_user_file_keys` contributes one
+        // Pass row when every user file is clean, as it is here.
         let expected =
-            65 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            66 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -12779,32 +12732,29 @@ mod tests {
     /// and names the path, the way every other removed key's check does.
     #[test]
     fn removed_radio_router_binding_says_to_edit_config_json_by_hand() {
-        let c = super::removed_radio_router_staffing_status(false, Some("radio"), false);
+        let c = super::removed_radio_router_staffing_status(Some("radio"), false);
         assert!(c.message.contains("~/.darkmux/config.json"), "names the file: {}", c.message);
         assert!(c.message.contains("by hand"), "{}", c.message);
     }
 
-    /// (#2914) The removed routing-seat staffing: `radio.router_profile`,
-    /// `role_profiles.radio-router`, and the `DARKMUX_RADIO_ROUTER_PROFILE`
-    /// env var each get named, with the fix; nothing set is a Pass.
+    /// (#2914) The removed routing-seat staffing: `role_profiles.radio-router`
+    /// and the `DARKMUX_RADIO_ROUTER_PROFILE` env var each get named, with
+    /// the fix; nothing set is a Pass. (A leftover `radio.router_profile` key
+    /// is an unknown key, failed by the user-file keys row.)
     #[test]
     fn removed_radio_router_staffing_names_each_leftover() {
-        let c = super::removed_radio_router_staffing_status(false, None, false);
+        let c = super::removed_radio_router_staffing_status(None, false);
         assert_eq!(c.status, Status::Pass, "{}", c.message);
 
-        let c = super::removed_radio_router_staffing_status(true, None, false);
-        assert_eq!(c.status, Status::Warn);
-        assert!(c.message.contains("radio.router_profile") && c.message.contains("1.28"), "{}", c.message);
-
-        let c = super::removed_radio_router_staffing_status(false, Some("radio"), false);
+        let c = super::removed_radio_router_staffing_status(Some("radio"), false);
         assert_eq!(c.status, Status::Warn);
         assert!(c.message.contains("role_profiles.radio-router") && c.message.contains("radio"), "{}", c.message);
 
-        let c = super::removed_radio_router_staffing_status(false, None, true);
+        let c = super::removed_radio_router_staffing_status(None, true);
         assert_eq!(c.status, Status::Warn);
         assert!(c.message.contains("DARKMUX_RADIO_ROUTER_PROFILE"), "{}", c.message);
 
-        let c = super::removed_radio_router_staffing_status(true, Some("radio"), true);
+        let c = super::removed_radio_router_staffing_status(Some("radio"), true);
         let hint = c.hint.clone().unwrap_or_default();
         assert!(hint.contains("internal.utility"), "the fix, once: {hint}");
         assert!(c.message.matches("radio").count() >= 2, "every leftover named: {}", c.message);
@@ -16152,5 +16102,70 @@ mod machine_id_provenance_tests {
             "{:?}",
             check.hint
         );
+    }
+}
+
+#[cfg(test)]
+mod user_file_key_tests {
+    use super::*;
+    use darkmux_types::test_isolation::IsolatedState;
+
+    fn rows_named(checks: &[Check]) -> Vec<&Check> {
+        checks.iter().filter(|c| c.name.starts_with(USER_FILE_KEYS_CHECK_NAME)).collect()
+    }
+
+    #[test]
+    fn a_clean_set_is_one_pass_row() {
+        let rows = user_file_key_rows(&[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, Status::Pass);
+    }
+
+    /// A `config.json` with an unknown key and one that is not JSON each get
+    /// a Fail row naming the file and what is wrong, with the entry points
+    /// that refuse it.
+    #[test]
+    fn a_bad_config_json_is_a_fail_row_naming_the_key_and_the_closest() {
+        let dir = tempfile::tempdir().unwrap();
+        let typo = dir.path().join("typo.json");
+        std::fs::write(&typo, r#"{"redis": {"hots": "127.0.0.1"}}"#).unwrap();
+        let broken = dir.path().join("broken.json");
+        std::fs::write(&broken, r#"{"redis": "#).unwrap();
+        let problems: Vec<_> = [&typo, &broken]
+            .iter()
+            .filter_map(|p| darkmux_types::user_files::config_json_problem_at(p))
+            .collect();
+        let rows = user_file_key_rows(&problems);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.iter().all(|r| r.status == Status::Fail));
+        assert_eq!(rows[0].name, "user file keys: typo.json");
+        assert!(rows[0].message.contains(&typo.display().to_string()), "the message names the full path");
+        assert!(rows[0].message.contains("unknown key `redis.hots`: did you mean `redis.host`?"), "{}", rows[0].message);
+        assert!(
+            rows[0].message.contains("Refused at preflight by: dispatch, mission launch, lab run, fleet work submission"),
+            "{}",
+            rows[0].message
+        );
+        assert!(rows[1].message.contains("not valid JSON"), "{}", rows[1].message);
+    }
+
+    /// Doctor runs to completion against a user file with a syntax error and
+    /// one with an unknown key, and reports each as its own Fail row.
+    #[serial_test::serial]
+    #[test]
+    fn doctor_runs_to_completion_against_broken_user_files() {
+        let state = IsolatedState::new();
+        std::fs::create_dir_all(state.join("roles")).unwrap();
+        std::fs::write(state.join("roles/broken.json"), "{\"id\": ").unwrap();
+        std::fs::create_dir_all(state.join("crews")).unwrap();
+        std::fs::write(state.join("crews/c.json"), r#"{"id": "c", "description": "d", "membrs": []}"#).unwrap();
+        let report = run();
+        let rows = rows_named(&report.checks);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.iter().all(|r| r.status == Status::Fail));
+        let text: String = rows.iter().map(|r| r.message.as_str()).collect();
+        assert!(text.contains("broken.json: not valid JSON"), "{text}");
+        assert!(text.contains("unknown key `membrs`: did you mean `members`?"), "{text}");
+        assert!(text.contains("Nothing that starts work reads this file"), "a crew manifest refuses nothing: {text}");
     }
 }

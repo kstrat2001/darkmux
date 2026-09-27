@@ -131,7 +131,7 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
     // (#2947) Bad enum config refuses before a run directory is claimed.
     // Every lab verb that runs a workload (`lab run`, `lab loop`, and the
     // benches built on this function) comes through here.
-    darkmux_profiles::preflight_with(darkmux_types::config_enum::Scope::LabRun, opts.config_path.as_deref())?;
+    crate::user_files::preflight_with(darkmux_types::config_enum::Scope::LabRun, opts.config_path.as_deref())?;
     let paths = paths::resolve(ResolveScope::Auto);
     paths::ensure(&paths)?;
 
@@ -1162,6 +1162,10 @@ mod tests {
                     verify: None,
                     expected: None,
                     image: None,
+                    trials: None,
+                    task_timeout_seconds: None,
+                    chain_depths: None,
+                    seed: None,
                     extras: BTreeMap::new(),
                 },
             },
@@ -1199,6 +1203,10 @@ mod tests {
                     verify: None,
                     expected: None,
                     image: None,
+                    trials: None,
+                    task_timeout_seconds: None,
+                    chain_depths: None,
+                    seed: None,
                     extras: BTreeMap::new(),
                 },
             },
@@ -1271,6 +1279,10 @@ mod tests {
                     verify: None,
                     expected: None,
                     image: None,
+                    trials: None,
+                    task_timeout_seconds: None,
+                    chain_depths: None,
+                    seed: None,
                     extras: BTreeMap::new(),
                 },
             },
@@ -1331,6 +1343,10 @@ mod tests {
                     verify: None,
                     expected: None,
                     image: None,
+                    trials: None,
+                    task_timeout_seconds: None,
+                    chain_depths: None,
+                    seed: None,
                     extras: BTreeMap::new(),
                 },
             },
@@ -1377,6 +1393,10 @@ mod tests {
                     verify: None,
                     expected: None,
                     image: None,
+                    trials: None,
+                    task_timeout_seconds: None,
+                    chain_depths: None,
+                    seed: None,
                     extras: BTreeMap::new(),
                 },
             },
@@ -1453,6 +1473,10 @@ mod tests {
                     verify: None,
                     expected: None,
                     image: None,
+                    trials: None,
+                    task_timeout_seconds: None,
+                    chain_depths: None,
+                    seed: None,
                     extras: BTreeMap::new(),
                 },
             },
@@ -1545,6 +1569,10 @@ mod tests {
                     verify: None,
                     expected: None,
                     image: None,
+                    trials: None,
+                    task_timeout_seconds: None,
+                    chain_depths: None,
+                    seed: None,
                     extras: BTreeMap::new(),
                 },
             },
@@ -1602,6 +1630,10 @@ mod tests {
                     verify: None,
                     expected: None,
                     image: None,
+                    trials: None,
+                    task_timeout_seconds: None,
+                    chain_depths: None,
+                    seed: None,
                     extras: BTreeMap::new(),
                 },
             },
@@ -1805,7 +1837,7 @@ mod tests {
         let cfg = tmp.path().join("profiles.json");
         fs::write(
             &cfg,
-            r#"{"profiles":{"fast":{"models":[{"id":"model-a","n_ctx":32000,"role":"primary"}]}}}"#,
+            r#"{"profiles":{"fast":{"models":[{"id":"model-a","n_ctx":32000}]}}}"#,
         )
         .unwrap();
         // (#2590) The workload user tier is forced HOME now, not cwd — a
@@ -1903,7 +1935,7 @@ mod tests {
         let cfg = tmp.path().join("profiles.json");
         fs::write(
             &cfg,
-            r#"{"default_profile":"fast","profiles":{"fast":{"models":[{"id":"model-a","n_ctx":32000,"role":"primary"}]}}}"#,
+            r#"{"default_profile":"fast","profiles":{"fast":{"models":[{"id":"model-a","n_ctx":32000}]}}}"#,
         )
         .unwrap();
 
@@ -2027,7 +2059,7 @@ mod tests {
         let cfg = tmp.path().join("profiles.json");
         fs::write(
             &cfg,
-            r#"{"default_profile":"fast","profiles":{"fast":{"models":[{"id":"model-a","n_ctx":32000,"role":"primary"}]}}}"#,
+            r#"{"default_profile":"fast","profiles":{"fast":{"models":[{"id":"model-a","n_ctx":32000}]}}}"#,
         )
         .unwrap();
 
@@ -2143,6 +2175,10 @@ mod tests {
                     verify: None,
                     expected: None,
                     image: None,
+                    trials: None,
+                    task_timeout_seconds: None,
+                    chain_depths: None,
+                    seed: None,
                     extras: BTreeMap::new(),
                 },
             },

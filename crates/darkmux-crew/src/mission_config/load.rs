@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 /// those need a resolvable on-disk `base_dir`), mission configs carry no
 /// filesystem-only fields at all — every built-in embeds cleanly, no
 /// restriction.
-const EMBEDDED_MISSION_CONFIGS: &[(&str, &str)] = &[
+pub(crate) const EMBEDDED_MISSION_CONFIGS: &[(&str, &str)] = &[
     (
         "coder-phase",
         include_str!(concat!(
@@ -189,6 +189,15 @@ fn builtin_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// Every directory a mission config is read from on disk: the user tier,
+/// then the on-disk built-in template dirs (the embedded tier is compiled
+/// in, not a file).
+pub(crate) fn on_disk_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![crate::loader::mission_configs_dir()];
+    dirs.extend(builtin_dirs());
+    dirs
+}
+
 fn find_in_dir(dir: &Path, id: &str) -> Option<PathBuf> {
     if !dir.exists() {
         return None;
@@ -260,9 +269,7 @@ pub fn load(id: &str) -> Result<LoadedMissionConfig> {
 /// resolution `list_ids` can't duplicate without re-implementing it.
 pub fn list_ids() -> Vec<String> {
     let mut set: BTreeSet<String> = BTreeSet::new();
-    let mut all_dirs: Vec<PathBuf> = vec![crate::loader::mission_configs_dir()];
-    all_dirs.extend(builtin_dirs());
-    for dir in all_dirs {
+    for dir in on_disk_dirs() {
         if !dir.exists() {
             continue;
         }

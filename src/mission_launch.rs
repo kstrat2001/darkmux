@@ -374,7 +374,7 @@ pub fn launch(
     // same loud failures a real launch would, and a launch whose dispatches
     // would each refuse is not worth planning. Not waived by `--force`,
     // which overrides a thermal/battery READING, not a config value.
-    darkmux_profiles::preflight(darkmux_types::config_enum::Scope::MissionLaunch)?;
+    darkmux_crew::user_files::preflight(darkmux_types::config_enum::Scope::MissionLaunch)?;
 
     // (#2301) `crawl` used to be routed by literal id to a bespoke
     // launcher, BEFORE the config load below, because its Task/Step graph
@@ -2574,14 +2574,14 @@ fn declared_inert_input_warning(config_id: &str, name: &str, has_default: bool) 
 /// declared input the typo was aimed at with its document DEFAULT, since
 /// the typo never touches it. A misspelled `--param rulez=<csv>` against a
 /// config that declares `rules` therefore runs with the config's full
-/// default rule set, silently — the did-you-mean suffix (via
-/// `config_cmd::nearest`, reused rather than re-implemented here) is what
-/// lets the operator catch this before the run, not after.
+/// default rule set, silently — the did-you-mean suffix (the one
+/// suggester, `darkmux_types::user_files::closest`) is what lets the
+/// operator catch this before the run, not after.
 fn undeclared_param_warning(config_id: &str, key: &str, config: &MissionConfig) -> String {
     let declared_names = config.inputs.iter().map(|i| i.name.as_str());
-    let near = crate::config_cmd::nearest(key, declared_names);
-    let did_you_mean =
-        if near.is_empty() { String::new() } else { format!(" — did you mean: {}?", near.join(", ")) };
+    let did_you_mean = darkmux_types::user_files::closest(key, declared_names)
+        .map(|near| format!(" — did you mean `{near}`?"))
+        .unwrap_or_default();
     format!(
         "mission launch: input `{key}` is not declared by config \"{config_id}\"'s \
          inputs{did_you_mean} — it is still carried into the resolved inputs and \
@@ -2718,15 +2718,10 @@ pub(crate) fn ensure_mission_and_phases_with_provenance_and_start_payload(
         started_ts: None,
         finalized_ts: None,
         paused_ts: None,
-        // (must-fix 2) Hydrate from the config's extras overflow — where
-        // a config's `source_input` preserves the operator's verbatim words (#815)
-        // and ticket id (#816). Absent keys stay None, same as before.
-        source_input: config
-            .extras
-            .get("source_input")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        ticket: config.extras.get("ticket").and_then(|v| v.as_str()).map(String::from),
+        // (must-fix 2) The config's `source_input` (the operator's verbatim
+        // words, #815) and `ticket` (#816) ride onto the mission record.
+        source_input: config.source_input.clone(),
+        ticket: config.ticket.clone(),
         spec,
         // (#1810) Stamped once at mint time so `/runs` has a durable
         // machine to read even after this mission ages out of the
@@ -4580,10 +4575,10 @@ fn print_run_summary(mission_id: &str, steps: &BTreeMap<String, crew::types::Ste
 /// with no meaningful spec (a bare test fixture, e.g.).
 ///
 /// Hydrates `Mission.source_input`/`Mission.ticket` from the config's
-/// `extras` (#1284 review round 1, must-fix 2) — that's where `mission
-/// `source_input`/`ticket` keys preserve the operator's verbatim words (#815) and ticket id
-/// (#816), and dropping them silently broke `coder_brief`'s source-input
-/// injection plus the conventions' `{ticket}` templates.
+/// `source_input`/`ticket` fields (#1284 review round 1, must-fix 2): the
+/// operator's verbatim words (#815) and ticket id (#816). Dropping them
+/// silently broke `coder_brief`'s source-input injection plus the
+/// conventions' `{ticket}` templates.
 ///
 /// Returns the doc phase id → real (composed) phase id map every subsequent
 /// step needs.
@@ -6462,11 +6457,13 @@ mod tests {
             panel: None,
             cmd: None,
             outcome_from: None,
+            source_input: None,
+            ticket: None,
             extras: BTreeMap::new(),
         };
 
         let warn = undeclared_param_warning("review", "rulez", &cfg);
-        assert!(warn.contains("did you mean: rules"), "{warn}");
+        assert!(warn.contains("did you mean `rules`?"), "{warn}");
         assert!(warn.contains("`rulez`"), "{warn}");
         assert!(
             warn.contains("resolved inputs") && warn.contains("Mission.spec"),
@@ -6482,29 +6479,22 @@ mod tests {
         );
     }
 
-    /// A key with no close declared-input match falls back cleanly (no
-    /// dangling "did you mean:" with nothing after it).
+    /// A config that declares no inputs has nothing to suggest, so the
+    /// warning carries no dangling "did you mean" with nothing after it.
     #[test]
-    fn undeclared_param_warning_with_no_close_match_has_no_did_you_mean_suffix() {
-        let input = |name: &str| mission_config::MissionInput {
-            name: name.to_string(),
-            description: None,
-            required: Some(false),
-            default: None,
-            ignored: None,
-            ignored_reason: None,
-            extras: BTreeMap::new(),
-        };
+    fn undeclared_param_warning_with_no_declared_inputs_has_no_did_you_mean_suffix() {
         let cfg = MissionConfig {
             id: "review".to_string(),
             name: "Review".to_string(),
             description: None,
             schema_version: None,
-            inputs: vec![input("workdir")],
+            inputs: Vec::new(),
             phases: Vec::new(),
             panel: None,
             cmd: None,
             outcome_from: None,
+            source_input: None,
+            ticket: None,
             extras: BTreeMap::new(),
         };
 
@@ -7122,7 +7112,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn launch_hydrates_source_input_and_ticket_from_config_extras() {
+    fn launch_hydrates_source_input_and_ticket_from_the_config() {
         let guard = LaunchTestGuard::new();
         guard.write_config(
             "hydration-test",
@@ -7146,12 +7136,12 @@ mod tests {
         assert_eq!(
             mission.source_input.as_deref(),
             Some("the operator's original unabridged words"),
-            "source_input must ride config extras onto the mission record (#815)"
+            "source_input must ride the config onto the mission record (#815)"
         );
         assert_eq!(
             mission.ticket.as_deref(),
             Some("SAMPLE-4242"),
-            "ticket must ride config extras onto the mission record (#816)"
+            "ticket must ride the config onto the mission record (#816)"
         );
     }
 
@@ -7324,6 +7314,8 @@ mod tests {
             outcome_from: None,
             panel: None,
             cmd: None,
+            source_input: None,
+            ticket: None,
             extras: BTreeMap::new(),
         };
 
@@ -7377,6 +7369,8 @@ mod tests {
             panel: None,
             cmd: None,
             outcome_from: None,
+            source_input: None,
+            ticket: None,
             extras: BTreeMap::new(),
         };
         let missing = missing_required_inputs(&cfg, &BTreeMap::new());

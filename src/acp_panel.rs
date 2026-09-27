@@ -1125,6 +1125,8 @@ mod tests {
             panel,
             cmd: None,
             outcome_from: None,
+            source_input: None,
+            ticket: None,
             extras: Map::new(),
         }
     }

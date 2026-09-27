@@ -157,7 +157,7 @@ pub struct ProfileSuggestion {
     pub description: String,
     /// Notes worth surfacing to the user about why this shape was picked
     /// (e.g., "context cut to 64K because RAM headroom on this model is
-    /// tight at native 262K"). Renders as `_notes` field in the profile JSON.
+    /// tight at native 262K"). Renders as the profile entry's `_comment`.
     pub notes: Vec<String>,
 }
 
@@ -455,58 +455,30 @@ fn format_description(
     )
 }
 
-/// JSON-serializable form of a profile suggestion + the metadata needed to
-/// emit a complete profile entry. Used by `darkmux profile draft`.
-pub fn suggestion_to_profile_json(
-    name: &str,
-    model_id: &str,
-    suggestion: &ProfileSuggestion,
-    config_path: Option<&str>,
-) -> serde_json::Value {
-    let mut models = vec![serde_json::json!({
-        "id": model_id,
-        "n_ctx": suggestion.primary_n_ctx,
-        "role": "primary",
-    })];
+/// JSON-serializable form of a profile suggestion: one `profiles` entry,
+/// written in the registry's current schema so it passes the unknown-key
+/// gate when pasted in (`darkmux_types::user_files`). Used by `darkmux
+/// profile draft`.
+///
+/// A paired compactor is not a profile model: the compactor is the
+/// registry's `internal.utility` binding (#590, #2914), so the entry names
+/// it in its `_comment` instead, next to the suggestion's notes.
+pub fn suggestion_to_profile_json(name: &str, model_id: &str, suggestion: &ProfileSuggestion) -> serde_json::Value {
+    let mut comment = suggestion.notes.clone();
+    let mut runtime = serde_json::json!({ "context_tokens": suggestion.context_tokens });
     if let Some(c) = suggestion.compactor.as_ref() {
-        models.push(serde_json::json!({
-            "id": c.model_id,
-            "n_ctx": c.n_ctx,
-            "role": "compactor",
-        }));
+        comment.push(format!(
+            "compaction runs on the machine's utility model: set \"internal\": {{\"utility\": \
+             {{\"id\": \"{}\", \"n_ctx\": {}}}}} at the top level of profiles.json",
+            c.model_id, c.n_ctx
+        ));
+        runtime["compaction"] = serde_json::json!({ "custom_instructions": DEFAULT_COMPACTION_INSTRUCTIONS });
     }
-
-    let mut runtime = serde_json::Map::new();
-    if let Some(p) = config_path {
-        runtime.insert("configPath".into(), serde_json::Value::String(p.into()));
-    }
-    runtime.insert(
-        "contextTokens".into(),
-        serde_json::Value::Number(suggestion.context_tokens.into()),
-    );
-    if let Some(c) = suggestion.compactor.as_ref() {
-        let mut compaction = serde_json::Map::new();
-        // (#385) Only darkmux-typed fields are written into heuristic-generated
-        // profiles.
-        compaction.insert(
-            "model".into(),
-            serde_json::Value::String(format!("lmstudio/{}", c.model_id)),
-        );
-        compaction.insert(
-            "custom_instructions".into(),
-            serde_json::Value::String(DEFAULT_COMPACTION_INSTRUCTIONS.into()),
-        );
-        runtime.insert(
-            "compaction".into(),
-            serde_json::Value::Object(compaction),
-        );
-    }
-
     serde_json::json!({
         name: {
-            "_notes": suggestion.notes,
+            "_comment": comment,
             "description": suggestion.description,
-            "models": models,
+            "models": [{ "id": model_id, "n_ctx": suggestion.primary_n_ctx }],
             "runtime": runtime,
         }
     })
@@ -793,27 +765,40 @@ mod tests {
         // depend on whether the local rig's tier pairs a compactor.
         let m = meta("qwen3.6-35b-a3b", Some("35B"), Some("qwen3_5_moe"), 262_144, 0);
         let s = suggest_profile_for(&m, TaskClass::Long, &apple_silicon_128gb());
-        let json = suggestion_to_profile_json("test", "qwen3.6-35b-a3b", &s, None);
+        let json = suggestion_to_profile_json("test", "qwen3.6-35b-a3b", &s);
         let obj = json.as_object().unwrap().get("test").unwrap();
-        let runtime = obj.get("runtime").unwrap();
-        let compaction = runtime.get("compaction").unwrap();
-
-        // (#385) Verify darkmux-typed fields are present.
-        assert!(compaction.get("model").unwrap().as_str().unwrap().starts_with("lmstudio/"));
+        let compaction = obj.get("runtime").unwrap().get("compaction").unwrap();
         assert!(compaction.get("custom_instructions").is_some());
+        // The compactor is the registry's utility model, never a profile model.
+        assert_eq!(obj["models"].as_array().unwrap().len(), 1, "{obj}");
+        assert!(compaction.get("model").is_none(), "{obj}");
+        let comment = obj["_comment"].to_string();
+        assert!(comment.contains("internal") && comment.contains("utility"), "names where the compactor goes: {comment}");
+    }
 
-        // (#385) Verify dead-letter openclaw-shape fields are absent.
-        assert!(compaction.get("mode").is_none(), "mode should be absent (openclaw-shape)");
-        assert!(compaction.get("maxHistoryShare").is_none(), "maxHistoryShare should be absent (openclaw-shape)");
-        assert!(compaction.get("recentTurnsPreserve").is_none(), "recentTurnsPreserve should be absent (openclaw-shape)");
-        assert!(compaction.get("customInstructions").is_none(), "customInstructions should be absent (openclaw-shape)");
+    /// What `darkmux profile draft` prints is pasted into profiles.json, so
+    /// it must pass the unknown-key gate, paired compactor or not.
+    #[test]
+    fn a_drafted_profile_has_no_unknown_keys() {
+        for (m, task) in [
+            (meta("qwen3.6-35b-a3b", Some("35B"), Some("qwen3_5_moe"), 262_144, 0), TaskClass::Long),
+            (meta("phi", Some("4B"), Some("phi"), 32_000, 0), TaskClass::Fast),
+        ] {
+            let s = suggest_profile_for(&m, task, &apple_silicon_128gb());
+            let doc = serde_json::json!({ "profiles": suggestion_to_profile_json("p", &m.model_key, &s) });
+            let keys = darkmux_types::user_files::unknown_keys::<darkmux_types::ProfileRegistry>(
+                &doc,
+                &darkmux_types::user_files::no_retired,
+            );
+            assert_eq!(keys, vec![], "{doc}");
+        }
     }
 
     #[test]
     fn suggestion_to_profile_json_omits_compaction_when_no_compactor() {
         let m = meta("phi", Some("4B"), Some("phi"), 32_000, 0);
         let s = suggest_profile(&m, TaskClass::Fast);
-        let json = suggestion_to_profile_json("phi-fast", "phi", &s, None);
+        let json = suggestion_to_profile_json("phi-fast", "phi", &s);
         let obj = json.as_object().unwrap().get("phi-fast").unwrap();
         let runtime = obj.get("runtime").unwrap();
         assert!(runtime.get("compaction").is_none());

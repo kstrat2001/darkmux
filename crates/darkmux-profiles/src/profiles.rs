@@ -57,6 +57,38 @@ fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     out
 }
 
+/// The registry file at `path` checked for keys its schema does not know
+/// (`darkmux_types::user_files`). `None` when it is clean or absent.
+pub fn user_file_problem(path: &Path) -> Option<darkmux_types::user_files::FileProblem> {
+    use darkmux_types::user_files::{check_path, UserFileKind};
+    check_path::<ProfileRegistry>(UserFileKind::Profiles, path, &registry_retired)
+}
+
+/// `profiles.json`'s retired keys (path with array indices dropped), named
+/// instead of guessed at.
+fn registry_retired(path: &str) -> Option<String> {
+    let line = match path {
+        "crews" => "removed in 2.0 (#1426): review staffing is derived from the active profile's roster; delete it",
+        "hooks" => "removed with the `swap` verb (#1426): nothing runs pre/post-swap commands; delete it",
+        "profiles.*.models.role" => {
+            "removed in #590: a model no longer declares a role; bind roles to profiles with \
+             `darkmux config set role_profiles.<role> <profile>`. Delete it"
+        }
+        "profiles.*.runtime.config_path" => "removed with the openclaw runtime (#1405); delete it",
+        "profiles.*.runtime.compaction.mode"
+        | "profiles.*.runtime.compaction.model"
+        | "profiles.*.runtime.compaction.customInstructions"
+        | "profiles.*.runtime.compaction.maxHistoryShare"
+        | "profiles.*.runtime.compaction.recentTurnsPreserve" => {
+            "an openclaw compaction setting, removed with that runtime (#1405): darkmux's compaction reads \
+             `strategy`, `threshold_tokens` / `threshold_ratio`, `tier1`, `tier2`, `reserve` and \
+             `custom_instructions`. Delete it"
+        }
+        _ => return None,
+    };
+    Some(line.to_string())
+}
+
 pub fn load_registry(explicit: Option<&str>) -> Result<LoadedRegistry> {
     load_registry_with(explicit, true)
 }
@@ -157,7 +189,8 @@ fn load_from(path: PathBuf, source: &str, announce: bool) -> Result<LoadedRegist
 ///
 /// (#1426 ship-2) The `crews` map retired from the schema, so it is no longer
 /// quarantined per-entry — a `crews` key overflows into `ProfileRegistry.extras`
-/// (lenient-on-read) and is preserved verbatim as harmless residue.
+/// and the load survives it; the unknown-key gate refuses it
+/// (`registry_retired`).
 fn parse_registry_lenient(raw: &str) -> Result<ProfileRegistry> {
     let mut root: serde_json::Value = serde_json::from_str(raw)?;
 

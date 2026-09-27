@@ -1,0 +1,207 @@
+//! The unknown-key gate over the crew-owned user files: for each kind, an
+//! unknown top-level key, an unknown nested key and a near-miss typo are
+//! refused by every preflight that consumes the kind, naming the closest
+//! valid key; the shipped documents pass; loading still works.
+
+use super::*;
+use darkmux_types::test_isolation::IsolatedState;
+use darkmux_types::user_files::{no_retired, open_objects, unknown_keys, Problem};
+use serde_json::{json, Value};
+
+fn embedded(table: &[(&str, &str)], id: &str) -> Value {
+    let (_, text) = table.iter().find(|(i, _)| *i == id).unwrap_or_else(|| panic!("no builtin {id}"));
+    serde_json::from_str(text).unwrap()
+}
+
+fn with_key(mut doc: Value, pointer: &str, key: &str) -> Value {
+    doc.pointer_mut(pointer).unwrap().as_object_mut().unwrap().insert(key.into(), json!(1));
+    doc
+}
+
+/// One file kind: where its user files live under the isolated root, a
+/// clean document, and three probes of `(document, key path, closest)`.
+struct KindCase {
+    kind: UserFileKind,
+    subdir: &'static str,
+    clean: Value,
+    probes: Vec<(Value, &'static str, &'static str)>,
+}
+
+fn cases() -> Vec<KindCase> {
+    let role = embedded(crate::loader::BUILTIN_ROLES, "code-reviewer");
+    let skill = embedded(crate::loader::BUILTIN_SKILLS, "coding");
+    let crew = json!({"id": "c", "description": "d", "members": [{"role_id": "coder", "position": "lead"}]});
+    let mission = embedded(crate::mission_config::load::EMBEDDED_MISSION_CONFIGS, "machine-status");
+    let rule = embedded(crate::rules::EMBEDDED_RULES, "existing-solution");
+    vec![
+        KindCase {
+            kind: UserFileKind::Role,
+            subdir: "roles",
+            probes: vec![
+                (with_key(role.clone(), "", "zzz_bogus"), "zzz_bogus", ""),
+                (with_key(role.clone(), "/tool_palette", "alow"), "tool_palette.alow", "tool_palette.allow"),
+                (with_key(role.clone(), "", "skils"), "skils", "skills"),
+            ],
+            clean: role,
+        },
+        KindCase {
+            kind: UserFileKind::Skill,
+            subdir: "skills",
+            probes: vec![
+                (with_key(skill.clone(), "", "zzz_bogus"), "zzz_bogus", ""),
+                (with_key(skill.clone(), "/keywords/0", "wieght"), "keywords[0].wieght", "keywords[0].weight"),
+                (with_key(skill.clone(), "", "descripton"), "descripton", "description"),
+            ],
+            clean: skill,
+        },
+        KindCase {
+            kind: UserFileKind::Crew,
+            subdir: "crews",
+            probes: vec![
+                (with_key(crew.clone(), "", "zzz_bogus"), "zzz_bogus", ""),
+                (with_key(crew.clone(), "/members/0", "rol_id"), "members[0].rol_id", "members[0].role_id"),
+                (with_key(crew.clone(), "", "member"), "member", "members"),
+            ],
+            clean: crew,
+        },
+        KindCase {
+            kind: UserFileKind::MissionConfig,
+            subdir: "mission-configs",
+            probes: vec![
+                (with_key(mission.clone(), "", "zzz_bogus"), "zzz_bogus", ""),
+                (with_key(mission.clone(), "/phases/0/tasks/0", "stpes"), "phases[0].tasks[0].stpes", "phases[0].tasks[0].steps"),
+                (with_key(mission.clone(), "", "phase"), "phase", "phases"),
+            ],
+            clean: mission,
+        },
+        KindCase {
+            kind: UserFileKind::Rule,
+            subdir: "rules",
+            probes: vec![
+                (with_key(rule.clone(), "", "zzz_bogus"), "zzz_bogus", ""),
+                (with_key(rule.clone(), "/search", "notee"), "search.notee", "search.note"),
+                (with_key(rule.clone(), "", "titel"), "titel", "title"),
+            ],
+            clean: rule,
+        },
+    ]
+}
+
+fn write(state: &IsolatedState, subdir: &str, doc: &Value) -> std::path::PathBuf {
+    let dir = state.join(subdir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("probe.json");
+    std::fs::write(&path, serde_json::to_string_pretty(doc).unwrap()).unwrap();
+    path
+}
+
+#[test]
+#[serial_test::serial]
+fn each_kind_refuses_an_unknown_key_at_every_consuming_preflight_naming_the_closest() {
+    for case in cases() {
+        for (doc, key, closest) in &case.probes {
+            let state = IsolatedState::new();
+            let path = write(&state, case.subdir, doc);
+            let found = problems(case.kind);
+            assert_eq!(found.len(), 1, "{:?} {key}: {found:?}", case.kind);
+            let msg = found[0].to_string();
+            assert!(msg.contains(&path.display().to_string()), "names the file: {msg}");
+            assert!(msg.contains(&format!("unknown key `{key}`")), "names the key: {msg}");
+            if closest.is_empty() {
+                assert!(msg.contains(": did you mean `"), "names a suggestion even for an unrelated key: {msg}");
+            } else {
+                assert!(msg.contains(&format!("did you mean `{closest}`?")), "names the closest: {msg}");
+            }
+            for scope in Scope::ALL {
+                let refused = preflight(scope).err().map(|r| r.to_string());
+                if case.kind.scopes().contains(&scope) {
+                    let r = refused.unwrap_or_else(|| panic!("{:?} must be refused at {scope:?}", case.kind));
+                    assert!(r.contains(&format!("unknown key `{key}`")), "{r}");
+                } else {
+                    assert_eq!(refused, None, "{:?} is not consumed at {scope:?}", case.kind);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn clean_documents_pass_and_nothing_is_refused() {
+    let state = IsolatedState::new();
+    for case in cases() {
+        write(&state, case.subdir, &case.clean);
+        assert_eq!(problems(case.kind), vec![], "{:?}", case.kind);
+    }
+    for scope in Scope::ALL {
+        assert_eq!(preflight(scope), Ok(()), "{scope:?}");
+    }
+}
+
+/// Loading never crashes on an unknown key: the loaders still read the file.
+#[test]
+#[serial_test::serial]
+fn a_file_with_an_unknown_key_still_loads() {
+    let state = IsolatedState::new();
+    let mut role = embedded(crate::loader::BUILTIN_ROLES, "code-reviewer");
+    role["id"] = json!("probe");
+    write(&state, "roles", &with_key(role, "", "skils"));
+    let roles = crate::loader::load_roles().unwrap();
+    assert!(roles.iter().any(|r| r.id == "probe"), "the role still loads");
+    let mission = with_key(embedded(crate::mission_config::load::EMBEDDED_MISSION_CONFIGS, "machine-status"), "", "phase");
+    std::fs::create_dir_all(state.join("mission-configs")).unwrap();
+    std::fs::write(state.join("mission-configs/probe-mc.json"), mission.to_string()).unwrap();
+    assert!(crate::mission_config::load::load("probe-mc").is_ok());
+}
+
+#[test]
+#[serial_test::serial]
+fn a_syntax_error_is_reported_not_skipped() {
+    let state = IsolatedState::new();
+    std::fs::create_dir_all(state.join("roles")).unwrap();
+    std::fs::write(state.join("roles/broken.json"), "{\"id\": ").unwrap();
+    let found = problems(UserFileKind::Role);
+    assert!(matches!(found.as_slice(), [p] if matches!(p.problem, Problem::NotJson(_))), "{found:?}");
+    assert!(preflight(Scope::Dispatch).is_err());
+}
+
+/// What darkmux ships must never be refused: every embedded role, skill,
+/// mission config and rule, as an operator's copy of it would be read.
+#[test]
+fn every_shipped_document_has_no_unknown_keys() {
+    fn check<T: schemars::JsonSchema>(table: &[(&str, &str)]) {
+        for (id, text) in table {
+            let doc: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(unknown_keys::<T>(&doc, &no_retired), vec![], "builtin {id}");
+        }
+    }
+    check::<Role>(crate::loader::BUILTIN_ROLES);
+    check::<Skill>(crate::loader::BUILTIN_SKILLS);
+    check::<MissionConfig>(crate::mission_config::load::EMBEDDED_MISSION_CONFIGS);
+    check::<Rule>(crate::rules::EMBEDDED_RULES);
+}
+
+#[test]
+fn no_crew_file_object_accepts_keys_it_does_not_name() {
+    assert_eq!(open_objects::<Role>(), Vec::<String>::new());
+    assert_eq!(open_objects::<Skill>(), Vec::<String>::new());
+    assert_eq!(open_objects::<Crew>(), Vec::<String>::new());
+    assert_eq!(open_objects::<MissionConfig>(), Vec::<String>::new());
+    assert_eq!(open_objects::<Rule>(), Vec::<String>::new());
+    assert_eq!(open_objects::<crate::workspace_spec::WorkspaceSpec>(), Vec::<String>::new());
+}
+
+/// A mission config's retired keys name what replaced them rather than a
+/// near-miss guess.
+#[test]
+#[serial_test::serial]
+fn a_retired_mission_config_key_names_its_replacement() {
+    let state = IsolatedState::new();
+    let mut mission = embedded(crate::mission_config::load::EMBEDDED_MISSION_CONFIGS, "machine-status");
+    mission["gh_verb"] = json!("pr-merge");
+    mission["phases"][0]["tasks"][0]["expand"] = json!({"over": "items"});
+    write(&state, "mission-configs", &mission);
+    let msg = problems(UserFileKind::MissionConfig).iter().map(ToString::to_string).collect::<String>();
+    assert!(msg.contains("unknown key `gh_verb`: RENAMED to `cmd` in schema 3.0"), "{msg}");
+    assert!(msg.contains("unknown key `phases[0].tasks[0].expand`: REMOVED in schema 2.0"), "{msg}");
+}

@@ -14,6 +14,35 @@ darkmux release.
 
 ## [Unreleased]
 
+### Changed (breaking, 4.0)
+
+- **An unknown key in a user file is refused (CONFIG 2.0).** `config.json`,
+  `profiles.json`, role, skill and crew manifests, mission configs, rule
+  files, workload documents, lab fixture manifests and a crawl's workspace
+  spec used to ignore a key they did not know, so a typo silently did
+  nothing. Now every entry point that reads the file refuses to start,
+  naming the file, the key's path and the closest valid key, and `darkmux
+  doctor` fails it. Files still load, so doctor always runs. A retired key
+  is named with what replaced it: `remote.max_tokens_per_execution`,
+  `dirs.notebook` and `radio.router_profile` in `config.json` (these used to
+  be warned about and ignored); `crews`, `hooks`, a model's `role`, a
+  profile's `runtime.config_path` and the openclaw compaction keys (`mode`,
+  `model`, `customInstructions`, `maxHistoryShare`, `recentTurnsPreserve`)
+  in `profiles.json`; `gh_verb` and a task's `expand` in a mission config;
+  `expected.test_count_baseline` in a workload; `hash_exclude` in a fixture
+  manifest. `_comment` is accepted anywhere as a note. **Migration:** run
+  `darkmux doctor` and delete or rename each key its `user file keys` rows
+  name. A fixture registered from an older darkmux checkout keeps its old
+  `.fixture.json`; delete `hash_exclude` from it, or re-run
+  `scripts/lab-init.sh --force` from a current checkout.
+- **A mission config's `source_input` and `ticket` are declared fields.**
+  They were read out of the unknown-key overflow; a non-string value is now a
+  parse error. **Migration:** none for a string value.
+- **`tool-bench` workload knobs are declared fields** (`trials`,
+  `taskTimeoutSeconds`, `chainDepths`, `seed`); a bad value's message reads
+  ``workload `trials` must be …`` rather than `workload extras.trials must be …`.
+  **Migration:** none.
+
 ### Removed (breaking, 4.0)
 
 - **The fleet page's orchestrator note** (#2983): the "Orchestrator note:"

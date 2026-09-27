@@ -569,6 +569,27 @@ pub struct PreflightRefusal {
     /// used as written (an endpoint's unreadable `limits`, a window period
     /// that does not parse). Empty for a config.json-only preflight.
     pub invalid: Vec<InvalidSetting>,
+    /// User files the scope consumes that carry a key their schema does not
+    /// know, or are not JSON (`crate::user_files`).
+    pub files: Vec<crate::user_files::FileProblem>,
+}
+
+impl PreflightRefusal {
+    /// A refusal with nothing in it yet, for a caller that adds its own
+    /// passes.
+    pub fn none(scope: Scope) -> Self {
+        PreflightRefusal { scope, bad: Vec::new(), invalid: Vec::new(), files: Vec::new() }
+    }
+
+    /// Nothing refused.
+    pub fn is_empty(&self) -> bool {
+        self.bad.is_empty() && self.invalid.is_empty() && self.files.is_empty()
+    }
+
+    /// `Ok` when nothing is refused.
+    pub fn into_result(self) -> Result<(), PreflightRefusal> {
+        if self.is_empty() { Ok(()) } else { Err(self) }
+    }
 }
 
 /// (#2902 step 5) A setting that cannot be used as written, where it is and
@@ -598,6 +619,7 @@ impl std::fmt::Display for PreflightRefusal {
             .map(|b| format!("  {}\n    {}\n    fix: {}", b.summary(), b.valid_line(), b.fix()))
             .collect();
         lines.extend(self.invalid.iter().map(|v| format!("  {}: {}\n    valid: {}", v.set_in, v.problem, v.valid)));
+        lines.extend(self.files.iter().map(|p| format!("  {p}")));
         write!(f, "{}", lines.join("\n"))
     }
 }
@@ -608,17 +630,17 @@ impl std::error::Error for PreflightRefusal {}
 /// `scope` consumes is resolved, and any bad value refuses. Call it before
 /// minting anything. Not skippable by `--skip-preflight`: that flag skips a
 /// Docker probe, and bad config is not a probe result that can be stale.
+///
+/// Every scope consumes `config.json`, so every scope also refuses one that
+/// carries a key its schema does not know (`crate::user_files`).
 pub fn preflight(scope: Scope) -> Result<(), PreflightRefusal> {
     let bad: Vec<BadEnumValue> = ENUM_SETTINGS
         .iter()
         .filter(|s| s.scopes.contains(&scope))
         .flat_map(crate::config_access::enum_bad_values)
         .collect();
-    if bad.is_empty() {
-        Ok(())
-    } else {
-        Err(PreflightRefusal { scope, bad, invalid: Vec::new() })
-    }
+    let files = crate::user_files::config_json_problems();
+    PreflightRefusal { scope, bad, invalid: Vec::new(), files }.into_result()
 }
 
 /// Look up a registered setting by its dotted key.
@@ -1079,6 +1101,10 @@ mod tests {
             ("Source", "provenance of a resolved value, not a setting"),
             ("Read", "how the registry reads a value, not a setting"),
             ("SetIn", "where a bad value was set, not a setting"),
+            ("UserFileKind", "which kind of user file the unknown-key gate checked, not a setting"),
+            ("KeyHint", "what an unknown-key refusal suggests, not a setting"),
+            ("Problem", "what the unknown-key gate found wrong with a file, not a setting"),
+            ("Others", "how a schema treats keys it does not name, internal to the gate"),
         ];
         const PROFILE_ENUMS: &[&str] = &["ManagedBackend", "Dialect", "BudgetPolicy"];
         const LITERAL_ARMS_ALLOWED: &[(&str, &str)] = &[(

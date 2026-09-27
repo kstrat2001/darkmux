@@ -90,7 +90,7 @@ pub(crate) fn dispatch_as_crew_of_one_with(
     // minted and before `run_step_graph` reconciles residency.
     // (#2902 step 5 review C-d) Against the registry THIS dispatch uses
     // (`--profiles-file`), so a bad budget there refuses before minting.
-    darkmux_profiles::preflight_with(darkmux_types::config_enum::Scope::Dispatch, opts.config_path.as_deref())?;
+    crate::user_files::preflight_with(darkmux_types::config_enum::Scope::Dispatch, opts.config_path.as_deref())?;
     // (#1509 — found live, tests/cli.rs's ack-gate integration tests) The
     // licensed-adjacent operator-consent gate MUST run before any model
     // residency action, never after. Inside `dispatch_internal::dispatch`

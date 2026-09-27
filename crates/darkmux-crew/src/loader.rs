@@ -19,7 +19,7 @@ use std::path::PathBuf;
 /// definition ([`crate::usage::call_purpose`], #2914) name the same role.
 pub const RADIO_ROUTER_ROLE_ID: &str = "radio-router";
 
-const BUILTIN_ROLES: &[(&str, &str)] = &[
+pub(crate) const BUILTIN_ROLES: &[(&str, &str)] = &[
     ("coder", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/coder.json"))),
     ("code-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/code-reviewer.json"))),
     ("crawler", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/crawler.json"))),
@@ -90,7 +90,7 @@ const BUILTIN_ROLES: &[(&str, &str)] = &[
 ];
 
 /// Skills compiled into the binary at build time. Filename = `<id>.json`.
-const BUILTIN_SKILLS: &[(&str, &str)] = &[
+pub(crate) const BUILTIN_SKILLS: &[(&str, &str)] = &[
     ("coding", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/skills/coding.json"))),
     ("documenting", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/skills/documenting.json"))),
     ("test-designing", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/skills/test-designing.json"))),

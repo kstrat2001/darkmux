@@ -69,7 +69,7 @@ pub const DEFAULT_EXCLUDE: &[&str] = &[
 /// A source is exactly one of a git clone URL or a local clone path, at a
 /// ref (defaulting to `main`). Identical shape to
 /// `crawl::manifest::SourceSpec` — moved here as the one definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SourceSpec {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -79,6 +79,7 @@ pub struct SourceSpec {
     #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
     pub git_ref: Option<String>,
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
 
@@ -151,12 +152,13 @@ pub(crate) fn origin_is_relative_local(origin: &str) -> bool {
 
 /// A dependency edge the workspace declares: `consumer` imports `package`
 /// from `library`, both named sources in the same spec.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct EdgeSpec {
     pub consumer: String,
     pub library: String,
     pub package: String,
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
 
@@ -168,7 +170,7 @@ pub struct EdgeSpec {
 /// any other mission is free to ignore the field entirely. This is the
 /// one deliberate crawl-shaped field on an otherwise fully generic type,
 /// and is documented here as exactly that, not hidden in `extras`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkspaceSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<String>,
@@ -219,6 +221,7 @@ pub struct WorkspaceSpec {
     /// Forward-compat overflow — unknown top-level keys land here and
     /// re-serialize flat (a newer spec read by an older binary).
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
 
@@ -230,6 +233,16 @@ impl WorkspaceSpec {
     pub fn load(path: &Path) -> Result<(Self, Vec<String>)> {
         let text = fs::read_to_string(path)
             .with_context(|| format!("reading workspace spec {}", path.display()))?;
+        // A key the spec's schema does not know is refused here, where the
+        // launch consumes the spec (`darkmux_types::user_files`).
+        if let Some(problem) = darkmux_types::user_files::check_text::<WorkspaceSpec>(
+            darkmux_types::user_files::UserFileKind::WorkspaceSpec,
+            path,
+            &text,
+            &darkmux_types::user_files::no_retired,
+        ) {
+            bail!("{problem}");
+        }
         let mut spec: WorkspaceSpec = serde_json::from_str(&text)
             .with_context(|| format!("parsing workspace spec {}", path.display()))?;
         if spec.name.as_deref().map(str::trim).unwrap_or("").is_empty() {
@@ -738,14 +751,30 @@ mod tests {
         assert_eq!(root, tmp.path().join("workspaces").join("example"));
     }
 
+    /// A key the spec's schema does not know is refused where the launch
+    /// loads the spec, naming the file, the key and the closest valid key:
+    /// an unknown top-level key, an unknown nested key, and a near-miss.
     #[test]
-    fn extras_round_trip_forward_compat() {
-        let mut json = minimal_spec_json();
-        json["future_field"] = serde_json::json!("kept");
-        let dir = TempDir::new().unwrap();
-        let path = write(&dir, "workspace.json", &json.to_string());
-        let (s, _) = WorkspaceSpec::load(&path).unwrap();
-        assert_eq!(s.extras.get("future_field"), Some(&serde_json::json!("kept")));
+    fn an_unknown_key_is_refused_naming_the_closest() {
+        let probes: [(&str, &str, &str); 3] = [
+            ("/", "future_field", ""),
+            ("/sources/0", "reff", "sources[0].ref"),
+            ("/", "sourcs", "sources"),
+        ];
+        for (pointer, key, closest) in probes {
+            let mut json = minimal_spec_json();
+            let at = if pointer == "/" { &mut json } else { json.pointer_mut(pointer).unwrap() };
+            at.as_object_mut().unwrap().insert(key.into(), serde_json::json!(1));
+            let dir = TempDir::new().unwrap();
+            let path = write(&dir, "workspace.json", &json.to_string());
+            let err = WorkspaceSpec::load(&path).unwrap_err().to_string();
+            assert!(err.contains(&path.display().to_string()), "names the file: {err}");
+            let full = if pointer == "/" { key.to_string() } else { format!("sources[0].{key}") };
+            assert!(err.contains(&format!("unknown key `{full}`: did you mean `")), "{err}");
+            if !closest.is_empty() {
+                assert!(err.contains(&format!("did you mean `{closest}`?")), "{err}");
+            }
+        }
     }
 
     #[test]

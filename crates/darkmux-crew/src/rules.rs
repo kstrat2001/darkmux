@@ -55,7 +55,7 @@ use std::path::Path;
 /// Rules compiled into the binary. `(id, json)` pairs, verbatim file
 /// contents — see `crate::loader::BUILTIN_ROLES` for the precedent this
 /// mirrors.
-const EMBEDDED_RULES: &[(&str, &str)] = &[
+pub(crate) const EMBEDDED_RULES: &[(&str, &str)] = &[
     (
         "swallowed-error",
         include_str!(concat!(
@@ -117,7 +117,7 @@ const EMBEDDED_RULES: &[(&str, &str)] = &[
     ),
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RuleKind {
     Site,
@@ -125,10 +125,11 @@ pub enum RuleKind {
     Edge,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct EdgeRuleConfig {
     pub ecosystem: String,
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
 
@@ -141,7 +142,7 @@ pub struct EdgeRuleConfig {
 /// both or omits the field, since `Rule::scope_or_default` treats an
 /// absent/empty `scope` as "everywhere" — the default every rule shipped
 /// before this field existed already had.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RuleScope {
     Tree,
@@ -158,7 +159,7 @@ pub enum RuleScope {
 /// candidates attached, honest about being unconfirmed. A small seat has
 /// no intuition for which form applies — the rule file carries the
 /// decision as data so the model never has to guess it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfirmForm {
     #[default]
@@ -176,7 +177,7 @@ pub enum ConfirmForm {
 /// that the unit executes a mechanical recipe, not that it reasons about
 /// what to search for. Lenient on read — every field optional, unknown
 /// keys ride in `extras` — same posture as [`Rule`] itself.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SearchRecipe {
     /// Literal substrings the unit's `search` tool runs, one call per
     /// pattern, verbatim — not compiled or interpreted here.
@@ -192,13 +193,14 @@ pub struct SearchRecipe {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
 
 /// One rule, matching the shape of the three built-in rule files
 /// (`templates/builtin/rules/*.json`) — see those for worked examples of
 /// every field. Lenient on read: only `id`/`kind` are required.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Rule {
     pub id: String,
     pub kind: RuleKind,
@@ -256,6 +258,7 @@ pub struct Rule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compare: Option<String>,
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
 
@@ -545,12 +548,14 @@ pub fn resolve(ids: &[String], user_dir: Option<&Path>) -> Result<(Vec<Rule>, Ve
     Ok((out, warnings))
 }
 
-/// `resolve` against the real `<darkmux root>/rules` user tier.
+/// The `<darkmux root>/rules` user tier.
+pub fn user_rules_dir() -> std::path::PathBuf {
+    darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto).root.join("rules")
+}
+
+/// `resolve` against the real [`user_rules_dir`].
 pub fn resolve_default(ids: &[String]) -> Result<(Vec<Rule>, Vec<String>)> {
-    let user_dir = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto)
-        .root
-        .join("rules");
-    resolve(ids, Some(&user_dir))
+    resolve(ids, Some(&user_rules_dir()))
 }
 
 #[cfg(test)]

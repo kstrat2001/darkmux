@@ -37,7 +37,7 @@ use std::path::Path;
 /// (resolver + doctor), so most fields/methods read as dead-code
 /// until then.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct FixtureManifest {
     /// Logical name of the fixture. Used as the registry key. Operator
     /// can override at register-time via `--name <name>`.
