@@ -1007,6 +1007,11 @@ describe("tools vs reading prompt, from the tool COMPLETION records", () => {
     expect(deriveLiveState(recs, 4_500)).toEqual({ state: "tools" });
   });
 
+  it("(#2963) the list wins over the writing heartbeat, even for a turn of one call", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), writingBeat(3_500, "read"), turnWithCalls(4_000, 1, [["write", "src/new.ts"]])];
+    expect(deriveLiveState(recs, 4_500)).toEqual({ state: "tools", toolName: "write", toolPath: "src/new.ts" });
+  });
+
   it("(#2963) the list wins over the writing heartbeat", () => {
     const recs = [start(0), beat(1_000, 0), beat(3_000, 800), writingBeat(3_500, "read"), turnWithCalls(4_000, 1, [["write", "src/new.ts"], ["read", "src/r.ts"]])];
     expect(deriveLiveState(recs, 4_500)).toEqual({ state: "tools", toolName: "write", toolPath: "src/new.ts" });
