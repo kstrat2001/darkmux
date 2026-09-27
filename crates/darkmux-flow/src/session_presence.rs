@@ -641,6 +641,22 @@ mod tests {
         );
     }
 
+    /// (6th review MF) The emitter beats under the RUN's session: a hosted
+    /// step spawns it with its bare `task-<id>` and its mission, and the key
+    /// is the scoped id its flow records carry; `stop()` removes that key.
+    #[test]
+    fn a_step_emitter_beats_and_stops_under_its_runs_session() {
+        let fake = fake_redis::FakeRedis::spawn();
+        let client = redis::Client::open(fake.url().as_str()).expect("open fake client");
+        let scoped = session_key("task-probe-m-b");
+        let emitter = spawn_with_client(client, "task-probe".into(), None, None, Some("m-b".into()))
+            .expect("spawn emitter");
+        wait_until(|| fake.contains(&scoped), "the beat under the run's scoped session");
+        assert!(!fake.contains(&session_key("task-probe")), "never the bare, shared key");
+        emitter.stop();
+        assert!(!fake.contains(&scoped), "stop() removes the scoped key");
+    }
+
     /// (#2344) THE regression this issue is about, at the emitter level: an
     /// early `?`-return between spawn and the explicit `stop()` simply lets
     /// the emitter go out of scope. Before the fix, `Drop` only halted the
