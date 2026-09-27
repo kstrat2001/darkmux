@@ -938,8 +938,13 @@ export function runRegions(
   // A dispatch that has started but reported nothing yet is model work with
   // no telemetry, and must keep its pane — otherwise a live run would render
   // no model metrics until its first turn landed, and then grow a pane.
+  // (#2902 step 5) A hosted call held by its endpoint's budget writes its
+  // `budget.wait` BEFORE `dispatch start` (the gate runs before the
+  // bookends): it is model work waiting to be sent, and its pane (where
+  // REST reads "budget · <endpoint>") must not grow in when it is.
+  const heldByBudget = data.some((r) => r.session_id === sid && r.action === "budget.wait");
   const hasModelWork =
-    d != null || loads.length > 0 || turnsValue != null || tokIn != null || tokOut != null || cx.length > 0 || comps.length > 0;
+    d != null || heldByBudget || loads.length > 0 || turnsValue != null || tokIn != null || tokOut != null || cx.length > 0 || comps.length > 0;
   // (#2759) The MODEL pane's own gate. Own-session evidence keeps the
   // existing behavior byte-for-byte (including the `d != null` "started, no
   // telemetry yet" case); otherwise a rolled-up execution elsewhere in the

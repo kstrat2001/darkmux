@@ -23,6 +23,7 @@ import {
   liveStateWhileConnected,
   lastHeartbeatMs,
   toolReadout,
+  liveExecutions,
 } from "./tokenRate";
 
 const SID = "darkmux-coder-1790125784225";
@@ -489,9 +490,36 @@ describe("deriveLiveState", () => {
     });
     const resumed = { ts: at(20_000), action: "budget.resume", session_id: SID, payload: { endpoint_id: "azure" } } as unknown as FlowRecord;
     expect(deriveLiveState([wait, resumed], 21_000).state).toBe("prompt");
-    const zero = { ts: at(1_000), action: "budget.wait", session_id: SID, payload: { endpoint_id: "azure", wait_seconds: null } } as unknown as FlowRecord;
-    expect(deriveLiveState([zero], 2_000).state).not.toBe("rest");
     expect(aggregateLiveState([[wait]], 11_000)?.state).toBe("rest");
+    // (5th review C1) Stopped: the wait is over, and the execution is closed
+    // (the call was never sent), never left reading PROMPT or live.
+    const stopped = { ts: at(20_000), action: "budget.stop", session_id: SID, payload: { endpoint_id: "azure" } } as unknown as FlowRecord;
+    expect(liveExecutions([[wait, stopped]], 21_000)).toEqual([]);
+    expect(aggregateLiveState([[wait, stopped]], 21_000)).toBeNull();
+  });
+
+  // (5th review C1) A waiter that died mid-wait writes nothing more. Past its
+  // resume time plus the grace it is not a live execution, and not REST.
+  it("a budget wait silent past its resume time plus the grace is not live", () => {
+    const at = (ms: number) => new Date(ms).toISOString();
+    const wait = { ts: at(1_000), action: "budget.wait", session_id: SID, payload: { endpoint_id: "azure", wait_seconds: 60 } } as unknown as FlowRecord;
+    expect(liveExecutions([[wait]], 61_000 + 59_000)).toHaveLength(1);
+    expect(liveExecutions([[wait]], 61_000 + 61_000)).toEqual([]);
+    expect(aggregateLiveState([[wait]], 61_000 + 61_000)).toBeNull();
+  });
+
+  // (5th review C7) A day window's wait reads as a compact duration, and a
+  // long endpoint id is trimmed so the line fits its slot.
+  it("a long wait reads 23h 53m, then minutes, then seconds; a long endpoint id is trimmed", () => {
+    const at = (ms: number) => new Date(ms).toISOString();
+    const secs = 23 * 3600 + 53 * 60;
+    const wait = { ts: at(0), action: "budget.wait", session_id: SID, payload: { endpoint_id: "azure-openai-eastus2-prod", wait_seconds: secs } } as unknown as FlowRecord;
+    const r = deriveLiveState([wait], 0);
+    expect(r.restReason).toBe("budget · azure-opena…");
+    expect(liveStateLabel(r)).toBe("rest 23h 53m · budget · azure-opena…");
+    expect(liveStateLabel(deriveLiveState([wait], (secs - 12 * 60) * 1000))).toMatch(/^rest 12m · /);
+    expect(liveStateLabel(deriveLiveState([wait], (secs - 45) * 1000))).toMatch(/^rest 45s · /);
+    expect(restReasonLabel("thermal", "serious")).toBe("thermal · serious");
   });
 
   it("is rest with a countdown while inside a reported rest's ms window, then falls to prompt once it elapses", () => {

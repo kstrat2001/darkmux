@@ -1148,6 +1148,16 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.metricScope.system.map((i) => view.metrics[i].label)).toEqual(["WALL CLOCK"]);
   });
 
+  it("(#2902 step 5) a hosted call held by its budget, before any start, is model work", () => {
+    // Its gate writes `budget.wait` before `dispatch start` (contract 2):
+    // the MODEL pane (where REST reads "budget · <endpoint>") must be there
+    // while it waits, not grow in when the call is finally sent.
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "budget.wait", handle: "coder", payload: { endpoint_id: "azure", wait_seconds: 600 } } as unknown as FlowRecord,
+    ];
+    expect(runRegions(flowToRenderModel(data), "s1").hasModelWork).toBe(true);
+  });
+
   it("(#1973) a dispatch that has STARTED but reported nothing keeps its model pane", () => {
     // The discriminator is EVIDENCE of model work, not the absence of
     // numbers. A live dispatch whose first turn has not landed would

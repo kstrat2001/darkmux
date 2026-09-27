@@ -449,9 +449,6 @@ describe("budget records (#2902 step 5)", () => {
     expect(recordDetail(rec("budget.wait", { scope: "endpoint", endpoint_id: "azure", wait_seconds: 3840 }))).toBe(
       "azure: waiting 1h 4m",
     );
-    expect(recordDetail(rec("budget.wait", { scope: "endpoint", endpoint_id: "zero", wait_seconds: null }))).toBe(
-      "zero: waiting until the budget is raised",
-    );
   });
 
   it("a warning names the spend and the budget; a resume names the wait", () => {

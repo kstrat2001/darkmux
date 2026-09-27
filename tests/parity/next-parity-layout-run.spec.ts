@@ -44,7 +44,7 @@ async function openState(browser, viewport, state, { mode, surface }) {
   const ctx = await browser.newContext({ viewport, timezoneId: "UTC", locale: "en-US" });
   const page = await ctx.newPage();
   await page.clock.setFixedTime(mode === "live" ? state.nowMs : PLAYBACK_NOW);
-  await installLayoutRoutes(page, { blockStream: state.blockStream === true });
+  await installLayoutRoutes(page, { blockStream: state.blockStream === true, presence: state.presence });
   const hash = surface === "run" ? `#dispatch=${state.runSid ?? state.sid}` : mode === "live" ? "#lens=fleet" : `#${state.date}`;
   await page.goto(`/index.html${hash}`);
   return { ctx, page };
@@ -132,6 +132,9 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
         // (#2963) The readout line itself is one line tall in every state
         // that shows one, a tool's file included.
         if ((await page.locator(NOTE).count()) > 0) noteRows.push({ state: state.id, ...(await measure(page, { note: NOTE })) });
+        // (#2902 step 5) A long rest counts down in the tube as a compact
+        // duration ("23h 53m"), never raw seconds.
+        if (state.tubeText) await expect(page.locator(`${RUN.tube} .token-scope-center`), `${state.id}: the tube's countdown`).toHaveText(new RegExp(`^${state.tubeText}`));
         // Settle: the count-ups and the scope's morph run on timers, and a
         // size taken mid-frame would be a flake, not a finding.
         await page.waitForTimeout(400);
@@ -178,6 +181,7 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
         } else {
           await expect(page.locator(CARD.rateLine)).toHaveCount(0);
         }
+        if (state.tubeText) await expect(page.locator(`${CARD.cardScope} .token-scope-center`).first(), `${state.id}: the card tube's countdown`).toHaveText(new RegExp(`^${state.tubeText}`));
         // (#2915) The utility strip shows the state's job, or is quiet.
         await expect(page.locator(CARD.util).first(), `${state.id}: the utility strip`).toHaveAttribute("data-visual", state.utilVisual ?? "quiet");
         await expect(page.locator(CARD.util).first(), `${state.id}: the strip's stall`).toHaveAttribute("data-stalled", state.utilStalled ? "true" : "false");

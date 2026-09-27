@@ -280,3 +280,15 @@ export function reclaimableNote(availableBytes: number | null | undefined, freeB
   if (reclaimable <= 0) return "";
   return ` (${memBytes(reclaimable)} reclaimable)`;
 }
+
+/** (#2902 step 5) A span of seconds in words a line can hold: "23h 53m",
+ *  then "12m", then "45s" under a minute. A day-long budget wait counts
+ *  down in this form, in the tube and on the line, never as raw seconds. */
+export function compactDuration(secs: number): string {
+  const s = Math.max(0, Math.round(secs));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m`;
+  return `${s}s`;
+}

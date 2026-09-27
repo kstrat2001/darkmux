@@ -511,6 +511,16 @@ describe("(#2961) REST's seconds hand", () => {
   });
 
   // (#2961, design B) The dot draws the circle; the breathing ring is gone.
+  it("(#2902 step 5) a day-long rest counts down in the tube as a compact duration, never raw seconds", () => {
+    const h = harness(false);
+    const left = (23 * 3600 + 53 * 60) * 1000 + 500;
+    const { container } = render(
+      <TokenScope tokensPerSec={0} size="tile" state="rest" centerLabel="23h 53m" centerUnit="resting" restEndMs={END} clock={{ kind: "playback", tMs: END - left, wallMs: 0, rate: 1 }} />,
+    );
+    for (const t of [100, 200, 300]) h.step(t);
+    expect(num(container)?.textContent).toBe("23h 53m");
+  });
+
   it("during a countdown there is no breathing ring: only the drawn circle, from 12 to the dot, dimmer by age", () => {
     const h = harness(false);
     // 5.5 s left at wall 0.

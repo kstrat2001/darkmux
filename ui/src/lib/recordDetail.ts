@@ -1,3 +1,4 @@
+import { compactDuration } from "./format";
 import type { FlowRecord } from "../types/handwritten";
 import { isDispatchStart } from "./flow";
 
@@ -113,9 +114,7 @@ function recordDetailRaw(r: FlowRecord): string {
   if (a.startsWith("budget.") && f) {
     const subject = String(f.endpoint_id ?? f.step ?? "budget");
     if (a === "budget.wait") {
-      return typeof f.wait_seconds === "number"
-        ? `${subject}: waiting ${spanWords(f.wait_seconds)}`
-        : `${subject}: waiting until the budget is raised`;
+      return typeof f.wait_seconds === "number" ? `${subject}: waiting ${spanWords(f.wait_seconds)}` : `${subject}: waiting`;
     }
     if (a === "budget.stop") {
       return typeof f.reason === "string" ? `${subject}: wait stopped (${f.reason})` : `${subject}: wait stopped`;
@@ -133,14 +132,7 @@ function recordDetailRaw(r: FlowRecord): string {
 
 /** `45s`, `14m`, `1h 4m`: a span in words, never clock-shaped (a wait of
  * `14:03` would read as a time of day). */
-function spanWords(secs: number): string {
-  const s = Math.max(0, Math.round(secs));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  if (h > 0) return `${h}h ${m}m`;
-  if (m > 0) return `${m}m`;
-  return `${s}s`;
-}
+const spanWords = compactDuration;
 
 /** (#2863) What one event row shows: a kind chip, the object the event was
  * about, and (for a tool) how it came out. Everything else about the record
