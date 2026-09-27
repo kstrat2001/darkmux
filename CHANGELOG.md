@@ -116,6 +116,42 @@ darkmux release.
 
 ### Changed (breaking, 4.0)
 
+- **A lab run with no verify spec reports verify "not checked", not a pass**
+  (#2982). A `prompt` workload that declares no verify used to record
+  `verify=pass (no verify spec)`; its outcome is now no verify at all, so
+  `lab run` prints no verify note, `lab run inspect`'s note reads `verify:
+  not checked — no verify spec`, and `lab loop` reads such a run with no
+  tool calls as `failed` rather than `inert-false-pass` (both exit 1). **Migration:** a script that
+  grepped for `verify=pass` on a no-verify workload should key on the exit
+  code instead.
+- **`lab characterize` and `lab tune` exit 1 on a failed verify** (#2982),
+  through the same gate as `lab run`; they used to exit 0 whenever every
+  dispatch completed. They, and `lab loop`, also exit 130 when a signal
+  ends the run, as `lab run` already did. **Migration:** a script that
+  treated exit 0 from these verbs as "the dispatch ran" should expect 1
+  when the workload's verify fails.
+- **A provider error fails one lab run, not the batch** (#2986). When run
+  k of N errored, `lab run`, `lab characterize` and `lab tune` stopped and
+  discarded runs 1..k-1. Now the errored run is recorded (its lifecycle
+  reads `error`, and stderr names it), returned as a failed outcome, and
+  the batch goes on; only a signal stops it. The exit code is still 1.
+  `lab tune`'s stats cover the runs that completed, it names each errored
+  run, and its header reads `× N run(s), K completed`. `lab run`'s summary
+  line reads `N run(s): K completed, E errored` (it was `N run(s)
+  complete:`). `lab run inspect` on an errored run shows the error its
+  lifecycle recorded, which now keeps the whole cause chain. **Migration:**
+  a script that read "exit 1 with an error message" as "nothing after this
+  ran" should read the per-run lines, and one that matched `run(s)
+  complete:` should match the new summary.
+- **A prompt run's manifest records its verify, so `lab run list` shows a
+  failed one as `FAIL`** (#2494). It used to show a plain tick. A manifest
+  written before this reads as not checked (`—`), never as a pass.
+- **Two lab runs in the same second no longer share a run dir, so a run id
+  can carry a claim suffix** (#2981). The second run used to overwrite the
+  first's artifacts. A run whose `<workload>-<profile>-<epoch>-<n>`
+  directory already exists now claims
+  `<n>.2`, `<n>.3`, … instead of writing into it. **Migration:** a tool that
+  parses the last segment of a run id as an integer must accept `<n>.<k>`.
 - **The per-step cap on hosted tokens is renamed, has no default, and
   never stops a step: a step that used to stop at 500,000 hosted tokens now
   runs to completion unless you set a cap** (#2902 step 5).

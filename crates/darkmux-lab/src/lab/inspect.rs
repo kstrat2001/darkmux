@@ -84,10 +84,37 @@ pub fn resolve_run_path(run_path: &str) -> PathBuf {
     resolve_run_dir(run_path)
 }
 
+/// (#2986) A run with a lifecycle record but no manifest ended before its
+/// provider finished (it errored, or was interrupted or killed): report what
+/// the lifecycle recorded, its status and its error, instead of failing.
+fn report_from_lifecycle(rec: &crate::lab::lifecycle::LifecycleRecord) -> InspectionReport {
+    let status = serde_json::to_value(rec.status)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    let mut notes = vec![
+        "the run ended before its provider finished, so it has no manifest".to_string(),
+        format!("status: {status}"),
+    ];
+    if let Some(e) = &rec.error {
+        notes.push(format!("error: {e}"));
+    }
+    InspectionReport {
+        run_id: rec.run_id.clone(),
+        workload_id: rec.workload.clone(),
+        walltime_ms: rec.ended_at_ms.map_or(0, |end| end.saturating_sub(rec.started_at_ms)) as u128,
+        notes,
+        ..Default::default()
+    }
+}
+
 pub fn lab_inspect(run_path: &str) -> Result<InspectionReport> {
     let run_dir = resolve_run_dir(run_path);
     let manifest_path = run_dir.join("manifest.json");
     if !manifest_path.exists() {
+        if let Some(rec) = crate::lab::lifecycle::read(&run_dir) {
+            return Ok(report_from_lifecycle(&rec));
+        }
         bail!(
             "no run manifest at {} — was this dispatched via `darkmux lab run`?",
             manifest_path.display()

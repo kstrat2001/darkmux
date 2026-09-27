@@ -5,7 +5,7 @@
 //! Run: dispatch via the active runtime, capture trajectory + reply.
 //! Inspect: parse trajectory, identify compactions, classify mode.
 
-use crate::providers::prompt::{extract_reply_text, run_verify};
+use crate::providers::prompt::{extract_reply_text, run_verify, verify_note};
 use darkmux_types::Profile;
 use crate::workloads::types::{
     InspectionReport, LoadedWorkload, RunMode, RunResult, WorkloadProvider,
@@ -647,16 +647,13 @@ impl WorkloadProvider for CodingTaskProvider {
                 }
             ));
         }
-        let verify = run_verify(
+        let keyword_verify = run_verify(
             loaded,
             &extract_reply_text(
                 &fs::read_to_string(run_dir.join("qa-reply.json")).unwrap_or_default(),
             ),
         );
-        notes.push(format!(
-            "verify: {}",
-            if verify.passed { "ok" } else { "fail" }
-        ));
+        notes.push(verify_note(keyword_verify.as_ref()));
 
         let run_id = meta
             .get("run_id")
@@ -1531,11 +1528,6 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-#[allow(dead_code)]
-fn _unused_bail() -> Result<()> {
-    bail!("unused")
 }
 
 // Note: a small `pathdiff` mod used to live here for computing

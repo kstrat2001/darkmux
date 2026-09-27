@@ -54,6 +54,27 @@ fn explicit_error_records_the_reason() {
     );
 }
 
+/// (review of #2986) The lifecycle record is the only durable trace of why
+/// an errored run failed, so it keeps the whole cause chain, not just the
+/// outermost context, on one line, bounded in size. Same for an interrupt.
+#[test]
+fn an_error_record_keeps_the_cause_chain_on_one_bounded_line() {
+    let tmp = TempDir::new().unwrap();
+    let e = anyhow::anyhow!("connection refused\n  at 127.0.0.1:1").context("internal-runtime dispatch via lab harness");
+    RunLifecycle::start(tmp.path(), "r", "w", "p").unwrap().finish_error(&e);
+    assert_eq!(
+        read(tmp.path()).unwrap().error.as_deref(),
+        Some("internal-runtime dispatch via lab harness: connection refused at 127.0.0.1:1")
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let huge = anyhow::anyhow!("é".repeat(10_000));
+    RunLifecycle::start(tmp.path(), "r", "w", "p").unwrap().finish_interrupted(&huge);
+    let rec = read(tmp.path()).unwrap().error.unwrap();
+    assert!(rec.len() <= ERROR_RECORD_MAX_BYTES, "{}", rec.len());
+    assert!(rec.ends_with('…') && rec.starts_with("éé"), "{rec}");
+}
+
 /// (#2462) The explicit signal-interrupted path — distinct from BOTH
 /// `finish_error` (would misclassify a signal-caused failure as "the
 /// endpoint broke") and the bare `Drop` path (which knows a run didn't

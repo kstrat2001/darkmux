@@ -1,3 +1,16 @@
+/// `writeln!` into a `String` report buffer, for the lab's text renderers.
+/// Writing to a `String` cannot fail. Defined before the modules so every
+/// one of them can use it.
+macro_rules! p {
+    ($o:expr) => {
+        $o.push('\n')
+    };
+    ($o:expr, $($t:tt)*) => {{
+        use std::fmt::Write as _;
+        let _ = writeln!($o, $($t)*);
+    }};
+}
+
 pub mod artifact_dirs;
 // (#1222 Phase B packet 3) Built-in review bundler — diff -> per-changed-
 // function code bundles + mechanical facts + manifest.

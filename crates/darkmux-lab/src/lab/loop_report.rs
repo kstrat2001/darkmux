@@ -314,6 +314,12 @@ fn build_notes(
         Verdict::Failed if !dispatch_ok => {
             notes.push("dispatch did not exit cleanly — runtime error or non-zero exit".into());
         }
+        Verdict::Failed if tool_calls == 0 && verify.is_none() => {
+            notes.push(
+                "model made 0 tool calls (inert), and the workload declares no verify to confirm success"
+                    .into(),
+            );
+        }
         Verdict::Failed if tool_calls == 0 => {
             notes.push(
                 "model made 0 tool calls (inert) and verify did not confirm success".into(),
@@ -497,6 +503,18 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
+
+    /// (review of #2986) An inert run whose workload declares no verify is
+    /// failed for being inert, and the note says no verify was declared,
+    /// not that verify "did not confirm" something it never checked.
+    #[test]
+    fn an_inert_run_names_whether_verify_was_declared() {
+        let d = DetectorCounts::default();
+        let none = build_notes(Verdict::Failed, true, None, None, 0, &d);
+        assert_eq!(none[0], "model made 0 tool calls (inert), and the workload declares no verify to confirm success");
+        let fail = build_notes(Verdict::Failed, true, Some(false), None, 0, &d);
+        assert_eq!(fail[0], "model made 0 tool calls (inert) and verify did not confirm success");
+    }
 
     // ─── classify: the four verdicts ────────────────────────────────
 
