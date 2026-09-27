@@ -628,3 +628,30 @@ fn a_failed_lms_ps_is_an_unverified_profile_warning() {
     assert!(w[0].starts_with("could not verify profile-load match — `lms ps` failed ("), "{w:?}");
     assert!(w[0].ends_with("this run's `profile=fast` tag is unverified. (#365)"), "{w:?}");
 }
+
+/// (review of #2986) `lab run inspect` on a run whose provider errored, which
+/// has a lifecycle record but no manifest, shows the recorded error instead
+/// of failing: the characterize and tune reports point there.
+#[test]
+#[serial_test::serial]
+fn inspect_shows_an_errored_runs_recorded_error() {
+    let lab = Lab::scripted(&["wx"]);
+    script(Script { run_err: true, ..Default::default() });
+    let o = lab.run("wx", 1).unwrap().remove(0);
+    let report = crate::lab::inspect::lab_inspect(&o.run_id).unwrap();
+    assert_eq!(report.run_id, o.run_id);
+    assert_eq!(report.workload_id, "wx");
+    assert!(report.verify.is_none());
+    assert_eq!(
+        report.notes,
+        [
+            "the run ended before its provider finished, so it has no manifest".to_string(),
+            "status: error".to_string(),
+            "error: scripted run failure".to_string(),
+        ]
+    );
+    // A dir with neither record is still refused.
+    let bare = darkmux_types::config_access::lab_dir().join("wx-bare");
+    fs::create_dir_all(&bare).unwrap();
+    assert!(crate::lab::inspect::lab_inspect("wx-bare").is_err());
+}

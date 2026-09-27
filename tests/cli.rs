@@ -12772,6 +12772,33 @@ fn lab_run_inspect_list_and_compare_render_recorded_runs() {
     assert!(!stdout.is_empty());
 }
 
+/// (#2986) A run whose provider errored is still inspectable: `lab run
+/// inspect` shows the error its lifecycle recorded, which is where the
+/// characterize and tune reports point.
+#[test]
+fn lab_run_inspect_shows_an_errored_runs_error() {
+    let lab = LabStub::new(&RespondingStubServer::start());
+    fs::write(
+        lab.home.path().join("workloads").join("labchar-noprov.json"),
+        r#"{"workload":{"id":"labchar-noprov","provider":"no-such-provider","prompt":"x"}}"#,
+    )
+    .unwrap();
+    let out = lab
+        .cmd()
+        .args(["lab", "run", "labchar-noprov", "--profile", "stub", "--profiles-file", lab.profiles()])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = out_text(&out);
+    assert_eq!(out.status.code(), Some(1), "{stdout} / {stderr}");
+    let id = lab.run_ids().pop().unwrap();
+    assert!(stderr.contains(&format!("[lab] run {id} failed: unknown workload provider")), "{stderr}");
+    let out = lab.cmd().args(["lab", "run", "inspect", &id]).output().unwrap();
+    let (stdout, stderr) = out_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(stdout.contains("verify:      not checked\n"), "{stdout}");
+    assert!(stdout.contains("  - status: error\n  - error: unknown workload provider: \"no-such-provider\""), "{stdout}");
+}
+
 /// `lab characterize` and `lab tune` print their reports and exit on the
 /// dispatch outcome.
 #[test]
