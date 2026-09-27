@@ -11,7 +11,7 @@ export function UtilitySection({ view }: { view: UtilitySectionView }) {
       </div>
       <div className="mm-utility__facts">{view.factsLine}</div>
       <div className="mm-utility__live">
-        <UtilityGlyph strip={view.strip} />
+        <UtilityGlyph strip={view.strip} noSignal={view.noSignal} />
         <span>{view.liveLine}</span>
       </div>
       <div className="mm-utility__jobs" role="table" aria-label="utility jobs, last 24h">

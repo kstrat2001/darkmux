@@ -452,6 +452,11 @@ export interface FleetCard {
    * `rosterAliasFor`. `undefined` when there is no roster entry, or when the
    * alias already agrees with the machine's own id and would be noise. */
   rosterAlias?: string;
+  /** (#2958) Drawn from a roster entry nothing else accounts for (see
+   * `rosterOnlyEntries`). Until `/machine/specs` answers, such an entry may
+   * be THIS machine's own, so its negative claims wait for specs too (see
+   * `cardFace`). */
+  rosterOnly?: boolean;
   uid: string;
   name: string;
   /** "" means the `specdim` fallback — `specUnknown` below says which one. */
@@ -772,6 +777,108 @@ export function buildFleetCardBase(
     runsLabel: "running",
     runningSessionIds,
     liveInputs: { data, runningSids, durableSets, self, binding: self ? (specs?.utility_model ?? null) : null },
+  };
+}
+
+/** (#2958) The word a card shows in place of its status until the first
+ *  data it is derived from has arrived: the same "no signal" a running
+ *  execution's line says when the page loses the daemon (#2886), so a card
+ *  that knows nothing yet reuses the existing word for "no information"
+ *  rather than a new indicator. */
+export const NO_SIGNAL_STAT = "no signal";
+
+/** (#2958) Which of a fleet card's sources have answered at least once on
+ *  this mount (success or failure; a source this mount never reads counts
+ *  as answered). A failed read counts: it has its own notice
+ *  (`RunsUnreadableNotice`, `FleetCoverageNotice`), and waiting on it would
+ *  hold "no signal" forever. `/fleet/roster` and `/machine/specs` are not
+ *  sources here: they decide which cards exist and what hardware they name,
+ *  never what a machine is doing. The caller latches each one, so only the
+ *  FIRST answer counts: a later pending read (a refetch, or the flow
+ *  window's new day key at UTC midnight) never re-enters "no signal". */
+export interface CardSourcesAnswered {
+  /** The flow window: sessions, activity, `machine.online/offline` edges,
+   *  utility jobs. */
+  flow: boolean;
+  /** `/fleet/machines/live`: who is beating. */
+  presence: boolean;
+  /** `/fleet/sessions/live`: which sessions are running. */
+  sessions: boolean;
+  /** `/runs`: a lab run in flight, which never rides the flow stream (#1923). */
+  runs: boolean;
+  /** `/machine/specs`: this machine's own identity. A roster-only card may
+   *  be this machine's own entry until specs says otherwise
+   *  (`rosterOnlyEntries`' F1 uid check), so its negative claims wait on it. */
+  specs: boolean;
+}
+
+/** (#2958) What a card may say, given what has answered so far. */
+export interface CardFace {
+  /** The status word: "offline", "dispatch in flight", "idle", or "no signal". */
+  stat: string;
+  /** Drawn as offline (dimmed card, powered-off tube). */
+  absent: boolean;
+  /** Drawn as active. */
+  active: boolean;
+  /** The status word is "no signal" (the dot takes the no-reading gray). */
+  noSignal: boolean;
+  /** The tube: a live execution's reading, the idle tube, the powered-off
+   *  screen of an offline machine, or no-signal static. */
+  tube: "reading" | "idle" | "off" | "nosignal";
+  /** The running count is shown; otherwise "—" holds its line. */
+  countShown: boolean;
+  /** The utility strip may call a quiet strip "idle"; otherwise its words
+   *  say "no signal". A running utility job always shows. */
+  utilityQuietKnown: boolean;
+}
+
+/** (#2958) A POSITIVE reading shows as soon as the source that produced it
+ *  has it; a NEGATIVE claim waits until every source that could contradict
+ *  it has answered. The operator watched every card say "idle" for the
+ *  3.3 s `/runs` took to answer while a run was live: "idle" was the value a
+ *  card falls back to when no record says otherwise, a claim nobody had
+ *  read yet.
+ *
+ *  - Positive, shown at once: a live execution (its tube, rate line and
+ *    pager), "dispatch in flight" (`active` is only ever set by a record or
+ *    a `/runs` row that says so), a running count of one or more, a running
+ *    utility job. A count read before `/runs` answers is a lower bound: the
+ *    lab count can only raise it (`Math.max`, #1923).
+ *  - "offline": waits on presence and the flow window (a beat, or a
+ *    `machine.online` edge, contradicts it). It wins over a reading: an
+ *    offline card's tube is powered off.
+ *  - A roster-only card's negative claims also wait on `/machine/specs`,
+ *    which is what tells this machine's own roster entry from a silent peer.
+ *  - "idle", "no model working", "0 running": wait on every source.
+ *  - A quiet utility strip's "idle": waits on the flow window, the only
+ *    source of utility jobs.
+ *  Until then the card says "no signal", the same word a running
+ *  execution's line says when the page loses the daemon (#2886), in the
+ *  same boxes. */
+export function cardFace(
+  card: { absent: boolean; active: boolean; runsCount: number; rosterOnly?: boolean },
+  hasReading: boolean,
+  answered: CardSourcesAnswered,
+): CardFace {
+  // A roster-only card is a silent peer only once `/machine/specs` has said
+  // it is not this machine's own entry.
+  const identityKnown = !card.rosterOnly || answered.specs;
+  const all = answered.flow && answered.presence && answered.sessions && answered.runs && identityKnown;
+  const offlineKnown = answered.flow && answered.presence && identityKnown;
+  const absent = card.absent && offlineKnown;
+  const active = card.active && !absent;
+  const stat = absent ? "offline" : card.active ? "dispatch in flight" : all && !card.absent ? "idle" : NO_SIGNAL_STAT;
+  // Offline wins: a machine said to be gone draws the powered-off screen,
+  // even over a reading its last records left behind.
+  const tube = absent ? "off" : hasReading ? "reading" : all && !card.absent ? "idle" : "nosignal";
+  return {
+    stat,
+    absent,
+    active,
+    noSignal: stat === NO_SIGNAL_STAT,
+    tube,
+    countShown: card.runsCount > 0 || all,
+    utilityQuietKnown: answered.flow,
   };
 }
 

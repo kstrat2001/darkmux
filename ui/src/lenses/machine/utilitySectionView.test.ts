@@ -21,6 +21,37 @@ describe("(#2915) the machine page's Utility section", () => {
     expect(v.liveLine).toBe("idle");
   });
 
+  test("(#2958) before the page's records have arrived the live line says no signal, not idle", () => {
+    const v = utilitySectionView({ data: [], uid: U, nowMs: ms(60), specs: specs({}), isLocal: true, residentRow: row, settled: false });
+    expect(v.liveLine).toBe("no signal");
+    expect(v.noSignal).toBe(true);
+    // A running job is not shown either: nothing has been read yet.
+    expect(utilitySectionView({ data: [start(0, "radio_routing")], uid: U, nowMs: ms(3), specs: specs({}), isLocal: true, residentRow: null, settled: false }).liveLine).toBe("no signal");
+    // Counts are "—" and an unknown model is not "not seen" yet; a model
+    // named by /machine/specs is a reading and shows.
+    expect(v.jobs.every((j) => j.calls === "—" && j.tokens === "—")).toBe(true);
+    expect(v.modelLine).toBe("darkmux:util-4b");
+    expect(utilitySectionView({ data: [], uid: U, nowMs: ms(60), specs: null, isLocal: false, residentRow: null, settled: false }).modelLine).toBe("—");
+    // Settled, the same empty window genuinely reads idle.
+    expect(utilitySectionView({ data: [], uid: U, nowMs: ms(60), specs: specs({}), isLocal: true, residentRow: row, settled: true }).liveLine).toBe("idle");
+  });
+
+  test("(#2958) before /machine/specs answers, the model and residency are pending, not 'not seen' or 'another machine'", () => {
+    // This machine, specs not yet read: the binding is unknown, so "no
+    // utility model seen/registered" would be a default, not a reading.
+    const local = utilitySectionView({ data: [], uid: U, nowMs: ms(60), specs: null, isLocal: true, residentRow: null, settled: true, identityKnown: false });
+    expect(local.modelLine).toBe("—");
+    expect(local.factsLine).toBe("window — · —");
+    // Not yet known to be another machine either.
+    const drill = utilitySectionView({ data: [], uid: U, nowMs: ms(60), specs: null, isLocal: false, residentRow: null, settled: true, identityKnown: false });
+    expect(drill.modelLine).toBe("—");
+    expect(drill.factsLine).toBe("window — · —");
+    // A model named by the records is a reading and shows at once.
+    expect(utilitySectionView({ data: [usage(1, "radio_routing", 40)], uid: U, nowMs: ms(60), specs: null, isLocal: false, residentRow: null, identityKnown: false }).modelLine).toBe("darkmux:util-4b");
+    // Once known, the same inputs say what they say.
+    expect(utilitySectionView({ data: [], uid: U, nowMs: ms(60), specs: null, isLocal: true, residentRow: null, settled: true, identityKnown: true }).factsLine).toBe("window — · no utility model registered");
+  });
+
   test("not loaded, and an undeclared window, are said plainly", () => {
     const v = utilitySectionView({ data: [], uid: U, nowMs: ms(60), specs: specs({ loaded: false, n_ctx: null }), isLocal: true, residentRow: null });
     expect(v.factsLine).toBe("window — · not loaded");

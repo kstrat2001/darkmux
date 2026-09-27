@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, waitFor, cleanup } from "@testing-library/react";
+import { render, screen, waitFor, cleanup, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -86,47 +86,70 @@ function mockMachineFetch(opts: {
   staticMachine?: unknown;
   /** (#2921 follow-up) `GET /fleet/roster` entries. */
   roster?: unknown[];
+  /** (#2958) The flow window never answers (`true`), or answers once the
+   *  promise resolves. */
+  holdFlow?: boolean | Promise<void>;
+  /** (#2958) Paths whose answer waits on the given promise. */
+  hold?: Record<string, Promise<void>>;
 } = {}) {
   const today = todayUTC();
   const yesterday = prevDateUTC(today);
   const resourcesCalled = { value: false };
   vi.stubGlobal(
     "fetch",
-    vi.fn((url: string) => {
-      const path = String(url);
-      if (path === "/machine/specs") {
-        return Promise.resolve(new Response(JSON.stringify(opts.specs ?? {}), { status: opts.specs === null ? 404 : 200 }));
-      }
-      if (path === "/machine/resources") {
-        resourcesCalled.value = true;
-        return Promise.resolve(new Response(JSON.stringify(opts.resources ?? RESOURCES), { status: 200 }));
-      }
-      if (path === `/flow/${today}`) return Promise.resolve(new Response(JSON.stringify(opts.flowToday ?? []), { status: 200 }));
-      if (path === `/flow/${yesterday}`) return Promise.resolve(new Response(JSON.stringify(opts.flowYesterday ?? []), { status: 200 }));
-      if (path === "/fleet/machines/live") {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({ machines: opts.liveMachines ?? [], meta: { sources: { fleet: { state: "off" } }, complete: true } }),
-            { status: 200 },
-          ),
-        );
-      }
-      if (path === "./demo-machine.json") {
-        return Promise.resolve(
-          new Response(JSON.stringify(opts.staticMachine ?? {}), { status: opts.staticMachine === undefined ? 404 : 200 }),
-        );
-      }
-      if (path === "./demo-flow.jsonl") return Promise.resolve(new Response("", { status: 200 }));
-      if (path === "/fleet/sessions/live") {
-        return Promise.resolve(new Response(JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
-      }
-      if (path === "/fleet/roster" && opts.roster) {
-        return Promise.resolve(new Response(JSON.stringify({ machines: opts.roster, error: null }), { status: 200 }));
-      }
-      return Promise.resolve(new Response("not recorded\n", { status: 404 }));
+    vi.fn((url: string): Promise<Response> => {
+      const held = opts.hold?.[String(url)];
+      if (held) return held.then(() => answer(url));
+      return answer(url);
     }),
   );
   return resourcesCalled;
+  function answer(url: string): Promise<Response> {
+    const path = String(url);
+    if (path === "/machine/specs") {
+      return Promise.resolve(new Response(JSON.stringify(opts.specs ?? {}), { status: opts.specs === null ? 404 : 200 }));
+    }
+    if (path === "/machine/resources") {
+      resourcesCalled.value = true;
+      return Promise.resolve(new Response(JSON.stringify(opts.resources ?? RESOURCES), { status: 200 }));
+    }
+    if (opts.holdFlow && (path === `/flow/${today}` || path === `/flow/${yesterday}`)) {
+      if (opts.holdFlow === true) return new Promise<Response>(() => {});
+      return opts.holdFlow.then(() => new Response(JSON.stringify(path === `/flow/${today}` ? (opts.flowToday ?? []) : (opts.flowYesterday ?? [])), { status: 200 }));
+    }
+    if (path === `/flow/${today}`) return Promise.resolve(new Response(JSON.stringify(opts.flowToday ?? []), { status: 200 }));
+    if (path === `/flow/${yesterday}`) return Promise.resolve(new Response(JSON.stringify(opts.flowYesterday ?? []), { status: 200 }));
+    if (path === "/fleet/machines/live") {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({ machines: opts.liveMachines ?? [], meta: { sources: { fleet: { state: "off" } }, complete: true } }),
+          { status: 200 },
+        ),
+      );
+    }
+    if (path === "./demo-machine.json") {
+      return Promise.resolve(
+        new Response(JSON.stringify(opts.staticMachine ?? {}), { status: opts.staticMachine === undefined ? 404 : 200 }),
+      );
+    }
+    if (path === "./demo-flow.jsonl") return Promise.resolve(new Response("", { status: 200 }));
+    if (path === "/fleet/sessions/live") {
+      return Promise.resolve(new Response(JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
+    }
+    if (path === "/fleet/roster" && opts.roster) {
+      return Promise.resolve(new Response(JSON.stringify({ machines: opts.roster, error: null }), { status: 200 }));
+    }
+    return Promise.resolve(new Response("not recorded\n", { status: 404 }));
+  }
+}
+
+/** (#2958) A promise and the function that resolves it. */
+function gate(): { promise: Promise<void>; open: () => void } {
+  let open = () => {};
+  const promise = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  return { promise, open };
 }
 
 describe("MachineLens", () => {
@@ -487,6 +510,109 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
       "other0 calls0 tokens",
     ]);
     expect([...container.querySelectorAll(".mm-row-chip")].some((c) => c.textContent === "utility")).toBe(false);
+  });
+
+  it("(#2958) the Utility section says no signal and '—' counts while the flow window is unanswered, then its reading", async () => {
+    let open = () => {};
+    const flow = new Promise<void>((r) => {
+      open = r;
+    });
+    mockMachineFetch({ ...withUtility, holdFlow: flow });
+    const { container } = renderMachine(null);
+    const section = await waitFor(() => {
+      const el = container.querySelector('[data-testid="machine-utility"]');
+      expect(el).toBeTruthy();
+      return el as HTMLElement;
+    });
+    expect(section.querySelector(".mm-utility__live")?.textContent).toBe("no signal");
+    expect(section.querySelector(".mach-util")?.getAttribute("aria-label")).toMatch(/no signal$/);
+    // The model comes from /machine/specs, a reading: it shows at once.
+    expect(section.querySelector(".mm-utility__id")?.textContent).toBe("darkmux:qwen3-4b");
+    expect([...section.querySelectorAll(".mm-utility__job")].map((r) => r.textContent)).toEqual(["compacting——", "radio routing——", "other——"]);
+
+    open();
+    await waitFor(() => expect(section.querySelector(".mm-utility__live")?.textContent).toBe("idle"));
+    expect([...section.querySelectorAll(".mm-utility__job")].map((r) => r.textContent)).toEqual([
+      "compacting0 calls0 tokens",
+      "radio routing0 calls0 tokens",
+      "other0 calls0 tokens",
+    ]);
+  });
+
+  it("(#2958) a remote machine page says no signal, not idle, while the flow window is unanswered", async () => {
+    let open = () => {};
+    const flow = new Promise<void>((r) => {
+      open = r;
+    });
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" },
+      liveMachines: [{ machine_uid: "remote-uid", display_name: "studio", schema_version: "1", beat_ts_ms: 1, specs: "M1 Max · 32 GB" }],
+      holdFlow: flow,
+    });
+    const { container } = renderMachine("remote-uid");
+    await waitFor(() => expect(container.querySelector(".machine-drawer__idle-line")).not.toBeNull());
+    expect(container.querySelector(".machine-drawer__idle-line")!.textContent).toBe("no signal");
+    const section = container.querySelector('[data-testid="machine-utility"]')!;
+    expect(section.querySelector(".mm-utility__id")?.textContent).toBe("—");
+    expect(section.querySelector(".mm-utility__live")?.textContent).toBe("no signal");
+
+    open();
+    await waitFor(() => expect(container.querySelector(".machine-drawer__idle-line")!.textContent).toBe("idle · no samples in the last 10 min"));
+    expect(section.querySelector(".mm-utility__id")?.textContent).toBe("no utility model seen");
+  });
+
+  // (#2958 second review, point 2) Only the FIRST answer counts, as on the
+  // fleet page: at UTC midnight the flow window rolls to a new day's key,
+  // which starts out pending, and the page must not go back to "no signal".
+  it("(#2958) does not return to 'no signal' when the flow window rolls to a new day at UTC midnight", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    try {
+      vi.setSystemTime(new Date("2026-06-15T23:59:58.000Z"));
+      const nextDay = gate();
+      mockMachineFetch({ ...withUtility, hold: { "/flow/2026-06-16": nextDay.promise } });
+      const { container } = renderMachine(null);
+      const live = () => container.querySelector('[data-testid="machine-utility"] .mm-utility__live')?.textContent;
+      await waitFor(() => expect(live()).toBe("idle"));
+      vi.setSystemTime(new Date("2026-06-16T00:00:03.000Z"));
+      await act(async () => {
+        vi.advanceTimersByTime(5_000);
+      });
+      // The rollover really happened: the new day's window was asked for.
+      await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([u]) => String(u) === "/flow/2026-06-16")).toBe(true));
+      expect(live()).toBe("idle");
+      expect([...container.querySelectorAll(".mm-utility__job")].map((r) => r.textContent)).not.toContain("compacting——");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // (#2958 second review, point 3) A fleet-card drill into THIS machine is
+  // told apart from a remote one by `/machine/specs`. Until it answers, the
+  // page must not say "another machine" or give a remote machine's idle line.
+  it("(#2958) a drill into this machine makes no remote claims while /machine/specs is unanswered", async () => {
+    const specs = gate();
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", machine_uid: "self-uid", cpu_brand: "M5 Max", ram_total_bytes: 137438953472 },
+      flowToday: [{ ts: `${todayUTC()}T00:00:00Z`, machine_uid: "self-uid", machine_id: "MacBook-Pro" }],
+      hold: { "/machine/specs": specs.promise },
+    });
+    const { container } = renderMachine("self-uid");
+    const section = await waitFor(() => {
+      const el = container.querySelector('[data-testid="machine-utility"]');
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    await waitFor(() => expect(section.querySelector(".mm-utility__live")?.textContent).toBe("idle"));
+    expect(container.textContent).not.toContain("another machine");
+    expect(container.textContent).not.toContain("not reported from here");
+    expect(container.querySelector(".machine-lens__health")?.getAttribute("data-state")).toBe("loading");
+    expect(container.textContent).not.toContain("no samples in the last 10 min");
+    expect(section.querySelector(".mm-utility__facts")?.textContent).toBe("window — · —");
+    expect(container.querySelector(".machine-drawer__idle-line")?.textContent).toBe("no signal");
+
+    specs.open();
+    await waitFor(() => expect(screen.getByText(/limit source/i)).toBeInTheDocument());
+    expect(container.textContent).not.toContain("another machine");
   });
 
   it("the inverted case: a machine with no utility tier configured says so", async () => {

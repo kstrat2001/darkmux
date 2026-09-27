@@ -143,6 +143,59 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
   }
 }
 
+// (#2958) Before its first data a fleet card says "no signal" (its stat word
+// and a static tube), in the same boxes: the same size as the same card once
+// loaded idle, and on a phone as running too. Live only: a replay has its
+// records in hand and never waits. The loading page is the "finished" state's
+// day with `/runs` (online) or presence (offline) never answered.
+//
+// (#2958 review M1) An OFFLINE card keeps the tube's box, its screen powered
+// off, so it too is one size loading and loaded: the "offline" variant adds a
+// rostered machine that is never seen, beside the fixture's own.
+for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
+  for (const variant of ["online", "offline"]) {
+    test(`fleet card: the same size before its first data as loaded (${vpName}, ${variant})`, async ({ browser }) => {
+      const byId = Object.fromEntries(STATES.map((s) => [s.id, s]));
+      const offline = variant === "offline";
+      const rows = [];
+      for (const [id, state, hold] of [
+        ["loading", byId.finished, true],
+        ["loaded", byId.finished, false],
+        ...(vpName === "phone" ? [["generating", byId.generating, false]] : []),
+      ]) {
+        const ctx = await browser.newContext({ viewport, timezoneId: "UTC", locale: "en-US" });
+        const page = await ctx.newPage();
+        await page.clock.setFixedTime(state.nowMs);
+        await installLayoutRoutes(page, offline ? { roster: true, holdPresence: hold } : { holdRuns: hold });
+        await page.goto("/index.html#lens=fleet");
+        const cards = page.locator(CARD.card);
+        await expect(cards).toHaveCount(offline ? 2 : 1);
+        const want = id === "loading" ? ["no signal"] : id === "loaded" ? ["idle"] : ["dispatch in flight"];
+        if (offline) want.push(id === "loading" ? "no signal" : "offline");
+        await expect(page.locator(".mach .stat"), `${id}: the cards' stat words`).toHaveText(want);
+        if (id === "loading") {
+          await expect(page.locator(".mach .runs").first(), "loading: no count yet").toHaveText("—");
+          for (let i = 0; i < want.length; i++) {
+            await expect(cards.nth(i).locator(".token-scope-bezel"), "loading: the no-signal tube").toHaveAttribute("data-state", "nosignal");
+          }
+        } else if (offline) {
+          await expect(cards.nth(1).locator(".token-scope-bezel"), "offline: the powered-off tube").toHaveAttribute("data-state", "off");
+        }
+        await page.waitForTimeout(400);
+        const m = await measure(page, { card: CARD.card, cardScope: CARD.cardScope, util: CARD.util, stat: ".mach .stat", runs: ".mach .runs" });
+        // The stat and count lines hold their words, so only their HEIGHT is
+        // the box: "no signal" and "idle" are different widths of one line.
+        rows.push({ state: id, ...m, stat: m.stat.map((b) => b.h), runs: m.runs.map((b) => b.h) });
+        await ctx.close();
+      }
+      for (const key of ["card", "cardScope", "util", "stat", "runs"]) {
+        const groups = sizeGroups(rows, key);
+        expect(groups, `${key} changed size between loading and loaded (${vpName}, ${variant}):\n  ${groups.join("\n  ")}`).toHaveLength(1);
+      }
+    });
+  }
+}
+
 // On a desktop the card is 23px taller while a dispatch runs than idle: the
 // rate line under the status appears only with a running execution. That is
 // on origin/main as of 93709c0c9 (measured: 282px idle, 305px running), not

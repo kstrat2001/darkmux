@@ -148,6 +148,10 @@ function mockFleetFetch(opts: {
    * present-but-corrupt roster file. Omitted (the default) keeps `null`,
    * so every pre-CONSIDER-4 test in this file is unaffected. */
   rosterError?: string;
+  /** (#2958) Paths whose answer waits on the given promise: a daemon that
+   *  is slow to answer one endpoint (the operator measured `/runs` at 3.3 s).
+   *  Resolve the promise to let the answer through. */
+  hold?: Record<string, Promise<void>>;
 } = {}) {
   const today = todayUTC();
   const yesterday = prevDateUTC(today);
@@ -155,40 +159,54 @@ function mockFleetFetch(opts: {
     "fetch",
     vi.fn((url: string) => {
       const path = String(url);
-      if (path === `/flow/${today}`) return Promise.resolve(new Response(JSON.stringify(opts.flowToday ?? []), { status: 200 }));
-      if (path === `/flow/${yesterday}`) return Promise.resolve(new Response(JSON.stringify(opts.flowYesterday ?? []), { status: 200 }));
-      if (path === "/fleet/machines/live") {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              machines: opts.machines ?? [],
-              meta: { sources: { fleet: { state: "off" } }, complete: true },
-            }),
-            { status: 200 },
-          ),
-        );
-      }
-      if (path === "/fleet/sessions/live") {
-        return Promise.resolve(
-          new Response(JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }),
-        );
-      }
-      if (path === "/machine/specs") {
-        if (opts.specs === undefined) return Promise.resolve(new Response("{}", { status: 404 }));
-        return Promise.resolve(new Response(JSON.stringify(opts.specs), { status: 200 }));
-      }
-      if (path === "/runs") {
-        if (opts.runs === undefined) return Promise.resolve(new Response("not recorded\n", { status: 404 }));
-        return Promise.resolve(new Response(JSON.stringify({ runs: opts.runs, generated_at_ms: 1 }), { status: 200 }));
-      }
-      if (path === "/fleet/roster") {
-        return Promise.resolve(
-          new Response(JSON.stringify({ machines: opts.roster ?? [], error: opts.rosterError ?? null }), { status: 200 }),
-        );
-      }
-      return Promise.resolve(new Response("not recorded\n", { status: 404 }));
+      const held = opts.hold?.[path];
+      if (held) return held.then(() => answer(path));
+      return answer(path);
     }),
   );
+  function answer(path: string): Promise<Response> {
+    if (path === `/flow/${today}`) return Promise.resolve(new Response(JSON.stringify(opts.flowToday ?? []), { status: 200 }));
+    if (path === `/flow/${yesterday}`) return Promise.resolve(new Response(JSON.stringify(opts.flowYesterday ?? []), { status: 200 }));
+    if (path === "/fleet/machines/live") {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            machines: opts.machines ?? [],
+            meta: { sources: { fleet: { state: "off" } }, complete: true },
+          }),
+          { status: 200 },
+        ),
+      );
+    }
+    if (path === "/fleet/sessions/live") {
+      return Promise.resolve(
+        new Response(JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }),
+      );
+    }
+    if (path === "/machine/specs") {
+      if (opts.specs === undefined) return Promise.resolve(new Response("{}", { status: 404 }));
+      return Promise.resolve(new Response(JSON.stringify(opts.specs), { status: 200 }));
+    }
+    if (path === "/runs") {
+      if (opts.runs === undefined) return Promise.resolve(new Response("not recorded\n", { status: 404 }));
+      return Promise.resolve(new Response(JSON.stringify({ runs: opts.runs, generated_at_ms: 1 }), { status: 200 }));
+    }
+    if (path === "/fleet/roster") {
+      return Promise.resolve(
+        new Response(JSON.stringify({ machines: opts.roster ?? [], error: opts.rosterError ?? null }), { status: 200 }),
+      );
+    }
+    return Promise.resolve(new Response("not recorded\n", { status: 404 }));
+  }
+}
+
+/** (#2958) A promise and the function that resolves it. */
+function gate(): { promise: Promise<void>; open: () => void } {
+  let open = () => {};
+  const promise = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  return { promise, open };
 }
 
 describe("FleetLens", () => {
@@ -1416,17 +1434,19 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
   it("a machine on the roster with zero flow history and no live beat renders an offline card, not nothing", async () => {
     mockFleetFetch({ roster: [{ id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 }] });
     renderFleetLens();
-    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    // (#2958) "offline" waits on presence and the flow window.
+    await waitFor(() => expect(document.querySelector(".mach")?.textContent).toContain("offline"));
     expect(screen.getByText("studio")).toBeInTheDocument();
     const card = document.querySelector(".mach")!;
-    expect(card.textContent).toContain("offline");
     // Reuses the SAME "offline"/`.absent` indicator a machine that WAS seen
     // and has since gone quiet already renders with — no parallel "silent"
     // vocabulary invented for this case (the project's "no snowflakes,
     // shared indicators" rule).
     expect(card.className).toContain("absent");
-    // (#2890) A machine that is off shows no tube at all.
-    expect(card.querySelector('[data-testid="fleet-token-scope"]')).toBeNull();
+    // (#2958 review M1) A machine that is off keeps the tube's box, its
+    // screen powered off (no TokenScope, no canvas), so the card is one size.
+    expect(card.querySelector('[data-testid="fleet-token-scope"] .token-scope-bezel[data-state="off"]')).not.toBeNull();
+    expect(card.querySelector('[data-testid="token-scope-probe"]')).toBeNull();
   });
 
   it("(#2890) the machine name and hardware line carry their full text as a tooltip", async () => {
@@ -1780,6 +1800,282 @@ describe("FleetLens — hero grid-switch breakpoint accounts for the eventlog pa
 // The distinction these two tests protect is what makes the fix correct
 // rather than merely quiet. A SETTLED zero is real and must still read "0";
 // a fresh fleet that has genuinely run nothing deserves to be told so.
+// (#2958) The operator, watching the fleet page load on a phone: the cards
+// said "idle" for the seconds `/runs` and `/fleet/roster` took to answer,
+// while a run was live. A POSITIVE reading shows as soon as its own source
+// has it; a NEGATIVE claim ("idle", "no model working", "0 running",
+// "offline") waits for every source that could contradict it and says
+// "no signal" (stat word, tube, and a dash for the count) until then.
+describe("FleetLens — a card says no signal until its first data arrives (#2958)", () => {
+  const BEAT = [{ machine_uid: "u1", display_name: "MacBook-Pro", schema_version: "1.43.0", beat_ts_ms: Date.parse(FROZEN_NOW) }];
+  const cardScope = (card: Element) => JSON.parse(card.querySelector('[data-testid="token-scope-probe"]')!.getAttribute("data-props")!);
+  const stat = (card: Element) => card.querySelector(".stat")!.textContent;
+  const utilLabel = (card: Element) => card.querySelector(".mach-util")!.getAttribute("aria-label")!;
+  const SPECS = { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 };
+  const newClient = () => new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+  it("a live lab run: 'no signal' while /runs is unanswered, then 'dispatch in flight'", async () => {
+    const runs = gate();
+    mockFleetFetch({
+      machines: BEAT,
+      runs: [{ id: "lab-1", kind: "lab", status: "running", machine: "MacBook-Pro", tracked: true }],
+      hold: { "/runs": runs.promise },
+    });
+    const queryClient = newClient();
+    renderFleetLens({}, queryClient);
+    // Presence and the flow window have answered (so the card exists and
+    // its utility strip knows it is quiet); `/runs` has not.
+    await waitForFleetQueriesSettled(queryClient);
+    await waitFor(() => expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull());
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    const card = document.querySelector(".mach")!;
+    expect(stat(card)).toBe("no signal");
+    expect(card.textContent).not.toContain("idle");
+    expect(card.textContent).not.toContain("running");
+    expect(card.querySelector(".runs")!.textContent).toBe("—");
+    expect(card.className).toContain("nosignal");
+    expect(card.className).not.toContain("absent");
+    expect(card.className).not.toContain("active");
+    expect(document.querySelectorAll('[data-testid="fleet-token-scope"]')).toHaveLength(1);
+    expect(cardScope(card)).toMatchObject({ state: "nosignal", size: "card" });
+    expect(cardScope(card).centerUnit ?? null).toBeNull();
+    // The flow window HAS answered, and it is the only source of utility
+    // jobs, so a quiet strip may say so.
+    expect(utilLabel(card)).toMatch(/idle$/);
+
+    runs.open();
+    await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("dispatch in flight"));
+    const loaded = document.querySelector(".mach")!;
+    expect(loaded.textContent).toContain("1 running");
+    expect(loaded.className).not.toContain("nosignal");
+    expect(cardScope(loaded)).toMatchObject({ state: "idle", centerUnit: "no model working" });
+  });
+
+  it("a genuinely idle machine: 'no signal' while loading, then 'idle' once its data says so", async () => {
+    const runs = gate();
+    mockFleetFetch({ machines: BEAT, runs: [], hold: { "/runs": runs.promise } });
+    const queryClient = newClient();
+    renderFleetLens({}, queryClient);
+    await waitForFleetQueriesSettled(queryClient);
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    expect(stat(document.querySelector(".mach")!)).toBe("no signal");
+    expect(cardScope(document.querySelector(".mach")!)).toMatchObject({ state: "nosignal" });
+
+    runs.open();
+    await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("idle"));
+    const card = document.querySelector(".mach")!;
+    expect(card.textContent).toContain("0 running");
+    expect(cardScope(card)).toMatchObject({ state: "idle", centerUnit: "idle" });
+    expect(utilLabel(card)).toMatch(/idle$/);
+  });
+
+  // Each source on its own: this machine's card (drawn from /machine/specs,
+  // which is fast) must wait on every source its "idle" is derived from,
+  // so holding any ONE of them holds "no signal".
+  // The flow paths are named inside the test: `todayUTC()` reads the frozen
+  // clock, which `beforeEach` sets after this list is built.
+  const flowPaths = () => [`/flow/${todayUTC()}`, `/flow/${prevDateUTC(todayUTC())}`];
+  for (const [what, held] of [
+    ["the flow window", flowPaths],
+    ["live machines", () => ["/fleet/machines/live"]],
+    ["live sessions", () => ["/fleet/sessions/live"]],
+    ["/runs", () => ["/runs"]],
+  ] as const) {
+    it(`this machine's own card says 'no signal' while ${what} alone is unanswered, then 'idle'`, async () => {
+      const paths: string[] = held();
+      const slow = gate();
+      mockFleetFetch({ specs: SPECS, runs: [], hold: Object.fromEntries(paths.map((p) => [p, slow.promise])) });
+      const queryClient = newClient();
+      renderFleetLens({}, queryClient);
+      await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+      // Every other source has answered before the card is read: the held
+      // one is the only thing standing between the card and its reading.
+      const others = { "/fleet/machines/live": queryKeys.fleetMachinesLive(), "/fleet/sessions/live": queryKeys.fleetSessionsLive(), "/runs": queryKeys.runs() };
+      await waitFor(() => {
+        for (const [path, key] of Object.entries(others)) {
+          if (!paths.includes(path)) expect(queryClient.getQueryState(key)?.status, path).toBe("success");
+        }
+        if (what !== "the flow window") expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull();
+      });
+      const card = document.querySelector(".mach")!;
+      expect(card.textContent).toContain("MacBook-Pro");
+      expect(stat(card)).toBe("no signal");
+      expect(card.querySelector(".runs")!.textContent).toBe("—");
+      expect(cardScope(card)).toMatchObject({ state: "nosignal" });
+      // Only the flow window can contradict a quiet utility strip.
+      expect(utilLabel(card)).toMatch(what === "the flow window" ? /no signal$/ : /idle$/);
+
+      slow.open();
+      await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("idle"));
+    });
+  }
+
+  // (#2958 review C1/C2) A POSITIVE reading is not held back by a source
+  // that cannot contradict it: two executions generating in the flow
+  // window, and a utility job running, all show while `/runs` is still
+  // unanswered.
+  it("a live reading shows at once, with /runs still unanswered: tube, rate line, pager, count and utility job", async () => {
+    const today = todayUTC();
+    const t = (hms: string) => `${today}T${hms}.000Z`;
+    const ms = (hms: string) => Date.parse(t(hms));
+    const gen = (sid: string, handle: string) => [
+      { ts: t("10:01:50"), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: sid, action: "dispatch.start", handle },
+      { ts: t("10:01:56"), machine_uid: "u1", session_id: sid, action: "dispatch.turn.heartbeat", payload: { turn_seq: 1, sampled_at_ms: ms("10:01:56"), generated_chars: 0 } },
+      { ts: t("10:01:58"), machine_uid: "u1", session_id: sid, action: "dispatch.turn.heartbeat", payload: { turn_seq: 1, sampled_at_ms: ms("10:01:58"), generated_chars: 800 } },
+    ];
+    const runs = gate();
+    mockFleetFetch({
+      machines: BEAT,
+      flowToday: [
+        ...gen("s1", "coder"),
+        ...gen("s2", "reviewer"),
+        { ts: t("10:01:59"), machine_uid: "u1", machine_id: "MacBook-Pro", action: "utility.start", source: "utility", handle: "radio-router", payload: { job: "radio_routing", model: "darkmux:util-4b", stall_after_seconds: 30 } },
+      ],
+      runs: [],
+      hold: { "/runs": runs.promise },
+    });
+    const queryClient = newClient();
+    renderFleetLens({}, queryClient);
+    await waitForFleetQueriesSettled(queryClient);
+    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
+    expect(queryClient.getQueryState(queryKeys.runs())?.status, "/runs is still unanswered").toBe("pending");
+    const card = document.querySelector(".mach")!;
+    expect(stat(card)).toBe("dispatch in flight");
+    expect(card.className).toContain("active");
+    expect(card.className).not.toContain("nosignal");
+    expect(card.querySelectorAll('[data-testid="fleet-token-scope"]')).toHaveLength(1);
+    expect(cardScope(card)).toMatchObject({ state: "generating" });
+    expect(card.querySelector(".mach-scope__rate")!.textContent).toMatch(/tok\/s$/);
+    expect(card.querySelector(".mach-scope__pager-n")!.textContent).toBe("1/2");
+    expect(card.querySelector(".runs")!.textContent).toMatch(/^2 running · /);
+    expect(card.querySelector(".mach-util")!.getAttribute("data-visual")).toBe("radio");
+    expect(utilLabel(card)).toMatch(/radio routing$/);
+  });
+
+  // (#2958 review M1) An offline card is one size in every state: while
+  // presence is unanswered it says "no signal" in the tube's box, and once
+  // presence says it is gone it keeps that box with the screen powered off.
+  it("a rostered-but-silent machine: 'no signal' while presence is unanswered, then 'offline' with a powered-off tube", async () => {
+    const presence = gate();
+    mockFleetFetch({ roster: [{ id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 }], runs: [], hold: { "/fleet/machines/live": presence.promise } });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    await waitFor(() => expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull());
+    const card = document.querySelector(".mach")!;
+    expect(stat(card)).toBe("no signal");
+    expect(card.className).not.toContain("absent");
+    expect(cardScope(card)).toMatchObject({ state: "nosignal" });
+
+    presence.open();
+    await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("offline"));
+    const off = document.querySelector(".mach")!;
+    expect(off.className).toContain("absent");
+    expect(off.className).not.toContain("nosignal");
+    const scope = off.querySelectorAll('[data-testid="fleet-token-scope"]');
+    expect(scope).toHaveLength(1);
+    expect(scope[0].querySelector('.token-scope-bezel[data-state="off"] .token-scope-screen')).not.toBeNull();
+    // Powered off: no trace, no static, no center, no canvas.
+    expect(scope[0].querySelector('[data-testid="token-scope-probe"]')).toBeNull();
+    expect(scope[0].querySelector("canvas")).toBeNull();
+  });
+
+  // (#2958 review C4) Only the FIRST answer counts. At UTC midnight the
+  // flow window rolls to a new day's key, which starts out pending; the
+  // cards must not blink back to "no signal" while it loads.
+  it("does not return to 'no signal' when the flow window rolls to a new day at UTC midnight", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    vi.setSystemTime(new Date("2026-06-15T23:59:58.000Z"));
+    const nextDay = gate();
+    mockFleetFetch({ machines: BEAT, runs: [], hold: { "/flow/2026-06-16": nextDay.promise } });
+    renderFleetLens();
+    await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("idle"));
+    const fetchMock = vi.mocked(fetch);
+    vi.setSystemTime(new Date("2026-06-16T00:00:03.000Z"));
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+    });
+    // The rollover really happened: the new day's window was asked for.
+    await waitFor(() => expect(fetchMock.mock.calls.some(([u]) => String(u) === "/flow/2026-06-16")).toBe(true));
+    expect(stat(document.querySelector(".mach")!)).toBe("idle");
+    expect(document.querySelector(".mach")!.className).not.toContain("nosignal");
+  });
+
+  // (#2958 second review, point 1) A roster entry is told apart from THIS
+  // machine by `/machine/specs` (`rosterOnlyEntries`' F1 uid check). Until
+  // specs answers, this machine's own roster entry is indistinguishable from
+  // a silent peer, so its card must not say "offline" or "0 running": once
+  // specs answers, that card is replaced by the machine's own idle one.
+  it("this machine's own roster entry says 'no signal', not 'offline', while /machine/specs is unanswered", async () => {
+    const specs = gate();
+    mockFleetFetch({
+      roster: [{ id: "laptop", address: "100.64.1.1:8765", added_unix_ms: 1000, machine_uid: "u-self" }],
+      specs: SPECS,
+      runs: [],
+      hold: { "/machine/specs": specs.promise },
+    });
+    const queryClient = newClient();
+    renderFleetLens({}, queryClient);
+    await waitFor(() => expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull());
+    await waitFor(() => {
+      for (const key of [queryKeys.fleetMachinesLive(), queryKeys.fleetSessionsLive(), queryKeys.fleetRoster(), queryKeys.runs()]) {
+        expect(queryClient.getQueryState(key)?.status, JSON.stringify(key)).not.toBe("pending");
+      }
+    });
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    expect(queryClient.getQueryState(queryKeys.machineSpecs())?.status, "/machine/specs is still unanswered").toBe("pending");
+    const card = document.querySelector(".mach")!;
+    expect(stat(card)).toBe("no signal");
+    expect(card.textContent).not.toContain("offline");
+    expect(card.textContent).not.toContain("0 running");
+    expect(card.querySelector(".runs")!.textContent).toBe("—");
+    expect(card.className).not.toContain("absent");
+    expect(cardScope(card)).toMatchObject({ state: "nosignal" });
+
+    specs.open();
+    await waitFor(() => expect(document.querySelector(".mach")!.textContent).toContain("MacBook-Pro"));
+    await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("idle"));
+    expect(document.querySelectorAll(".mach")).toHaveLength(1);
+  });
+
+  // (#2958 second review, point 4) Offline wins over a reading: a machine
+  // whose last records left an execution generating, and which then went
+  // offline, draws the powered-off screen, not a live tube.
+  it("an offline machine with a generating execution left open draws the powered-off tube, not a live one", async () => {
+    const today = todayUTC();
+    const t = (hms: string) => `${today}T${hms}.000Z`;
+    const ms = (hms: string) => Date.parse(t(hms));
+    mockFleetFetch({
+      flowToday: [
+        { ts: t("10:01:50"), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+        { ts: t("10:01:56"), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { turn_seq: 1, sampled_at_ms: ms("10:01:56"), generated_chars: 0 } },
+        { ts: t("10:01:58"), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { turn_seq: 1, sampled_at_ms: ms("10:01:58"), generated_chars: 800 } },
+        { ts: t("10:01:59"), machine_uid: "u1", machine_id: "MacBook-Pro", action: "machine.offline", source: "presence-reconciler" },
+      ],
+      runs: [],
+    });
+    const queryClient = newClient();
+    renderFleetLens({}, queryClient);
+    await waitForFleetQueriesSettled(queryClient);
+    await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("offline"));
+    const card = document.querySelector(".mach")!;
+    expect(card.className).toContain("absent");
+    const scope = card.querySelectorAll('[data-testid="fleet-token-scope"]');
+    expect(scope).toHaveLength(1);
+    expect(scope[0].querySelector('.token-scope-bezel[data-state="off"]')).not.toBeNull();
+    expect(card.querySelector('[data-testid="token-scope-probe"]')).toBeNull();
+    expect(card.querySelector(".mach-scope__rate")).toBeNull();
+  });
+
+  it("a replay has its records in hand and never shows 'no signal'", async () => {
+    const records = [
+      { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m5", action: "machine.online", source: "presence-reconciler" },
+    ] as unknown as FlowRecord[];
+    renderFleetLens({ records, tMin: Date.parse("2026-08-26T09:00:00.000Z"), tMax: Date.parse("2026-08-26T10:00:00.000Z"), historical: true });
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    expect(stat(document.querySelector(".mach")!)).toBe("idle");
+  });
+});
+
 describe("FleetLens — the token hero distinguishes waiting from zero (#2817)", () => {
   it("silhouettes the figures while the flow window is still loading", async () => {
     // A fetch that never resolves: the window stays pending, which is the

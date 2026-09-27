@@ -27,6 +27,9 @@ export interface UtilitySectionView {
   factsLine: string;
   /** "idle", "radio routing · 3s", "compacting · 12s", "compacting · stalled". */
   liveLine: string;
+  /** (#2958) The page's flow window has not answered yet: the live line
+   *  says "no signal" rather than "idle", and every count reads "—". */
+  noSignal: boolean;
   jobs: Array<{ word: string; calls: string; tokens: string; known: boolean }>;
 }
 
@@ -39,19 +42,31 @@ export function utilitySectionView(args: {
   isLocal: boolean;
   /** The residency row for the utility model, when resident (local only). */
   residentRow: MachineResourcesModel | null;
+  /** (#2958) Whether the records this reads have arrived. Omitted: true. */
+  settled?: boolean;
+  /** (#2958) Whether the page knows which machine it shows and, for this
+   *  machine, what `/machine/specs` says (the utility binding comes from
+   *  it). Until then the model and residency read "—": "no utility model
+   *  seen", "no utility model registered" and "another machine" are all
+   *  claims specs could contradict. Omitted: true. */
+  identityKnown?: boolean;
 }): UtilitySectionView {
+  const noSignal = args.settled === false;
+  const identityKnown = args.identityKnown !== false;
   const binding = args.isLocal ? (args.specs?.utility_model ?? null) : null;
   const strip = utilityStrip(args.data, args.uid, args.nowMs, binding);
   const win = binding?.n_ctx != null ? `window ${binding.n_ctx.toLocaleString("en-US")}` : "window —";
-  const residency = !args.isLocal
-    ? "residency unknown (another machine)"
-    : strip.resident === true
-      ? `resident${args.residentRow?.current_bytes != null ? ` · ${memBytes(args.residentRow.current_bytes)}` : ""}`
-      : strip.resident === false
-        ? "not loaded"
-        : "no utility model registered";
+  const residency = !identityKnown
+    ? "—"
+    : !args.isLocal
+      ? "residency unknown (another machine)"
+      : strip.resident === true
+        ? `resident${args.residentRow?.current_bytes != null ? ` · ${memBytes(args.residentRow.current_bytes)}` : ""}`
+        : strip.resident === false
+          ? "not loaded"
+          : "no utility model registered";
   const job = strip.job;
-  const liveLine = job ? (job.stalled ? `${job.word} · stalled` : `${job.word} · ${Math.max(0, Math.floor((args.nowMs - job.sinceMs) / 1000))}s`) : "idle";
+  const liveLine = noSignal ? "no signal" : job ? (job.stalled ? `${job.word} · stalled` : `${job.word} · ${Math.max(0, Math.floor((args.nowMs - job.sinceMs) / 1000))}s`) : "idle";
   const mine = args.data.filter((r) => uidOf(r) === args.uid && T(r.ts) <= args.nowMs);
   // (#2915 review, C7) A FIXED set of rows, so the section is one size
   // whatever ran: one per known job, then ONE "other" row folding every job
@@ -59,18 +74,23 @@ export function utilitySectionView(args: {
   // routing record from before 1.61.0), present even at zero.
   const usage = utilityUsageByJob(mine);
   const other = usage.filter((u) => !u.known).reduce((acc, u) => ({ calls: acc.calls + u.calls, tokens: acc.tokens + u.tokens }), { calls: 0, tokens: 0 });
+  // (#2958) "0 calls" before the records arrive is a default, not a count:
+  // "—" holds the cell until then.
   const row = (word: string, calls: number, tokens: number, known: boolean) => ({
     word,
-    calls: `${calls.toLocaleString("en-US")} ${calls === 1 ? "call" : "calls"}`,
-    tokens: `${fmtC(tokens)} tokens`,
+    calls: noSignal ? "—" : `${calls.toLocaleString("en-US")} ${calls === 1 ? "call" : "calls"}`,
+    tokens: noSignal ? "—" : `${fmtC(tokens)} tokens`,
     known,
   });
   const jobs = [...usage.filter((u) => u.known).map((u) => row(utilityJobWord(u.job), u.calls, u.tokens, true)), row("other", other.calls, other.tokens, false)];
   return {
     strip,
-    modelLine: strip.model ?? "no utility model seen",
+    // (#2958) "no utility model seen" is a claim about the records; a model
+    // named by `/machine/specs` is a reading and shows at once.
+    modelLine: strip.model ?? (noSignal || !identityKnown ? "—" : "no utility model seen"),
     factsLine: `${win} · ${residency}`,
     liveLine,
+    noSignal,
     jobs,
   };
 }

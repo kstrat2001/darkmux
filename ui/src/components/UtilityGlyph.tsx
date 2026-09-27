@@ -24,7 +24,17 @@ import type { UtilityStrip } from "../lib/utilityJobs";
  * Fast transitions are shown as they happen: the glyph is a function of the
  * reading at this instant, with no hold or smoothing.
  */
-export function UtilityGlyph({ strip }: { strip: UtilityStrip }) {
+export function UtilityGlyph({
+  strip,
+  noSignal = false,
+}: {
+  strip: UtilityStrip;
+  /** (#2958) The source that would name a running job has not answered
+   *  yet: a QUIET strip's words say "no signal", not "idle", which would be
+   *  a default rather than a reading. A job already read still shows. The
+   *  box is unchanged. */
+  noSignal?: boolean;
+}) {
   const job = strip.job;
   const visual = job ? job.visual : "quiet";
   const residency =
@@ -35,7 +45,7 @@ export function UtilityGlyph({ strip }: { strip: UtilityStrip }) {
         : strip.resident === false
           ? "not loaded"
           : "residency unknown";
-  const doing = job ? (job.stalled ? `${job.word}, stalled` : job.word) : "idle";
+  const doing = job ? (job.stalled ? `${job.word}, stalled` : job.word) : noSignal ? "no signal" : "idle";
   const label = strip.model != null ? `utility model ${strip.model} · ${residency} · ${doing}` : `${residency} · ${doing}`;
   const dot = strip.resident === true ? "filled" : strip.resident === false ? "hollow" : "unknown";
   return (

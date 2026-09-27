@@ -6,6 +6,7 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, MACHINE_MEM_POLL_MS } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
+import { useLatch } from "../../hooks/useLatch";
 import { useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
 import { localMachineUid, displayNameOf } from "../../lib/flow";
 import { relAgoFrom } from "../../lib/format";
@@ -197,6 +198,9 @@ export function MachineLens({
   const staticSettled = !daemonBacked && (machineSrc === null || !staticMachineQuery.isPending);
 
   const flowWindow = useFlowWindow(nowMs);
+  // (#2958) The window's FIRST answer: a new day's pending key at UTC
+  // midnight does not send the page back to "no signal".
+  const flowAnswered = useLatch(flowWindow.settled);
   const liveMachines = useLiveMachines(daemonBacked);
 
   const specsQuery = useQuery({
@@ -206,6 +210,9 @@ export function MachineLens({
   });
 
   const specs = staticMachine ? staticMachine.specs : specsQuery.data?.ok ? specsQuery.data.data : null;
+  // (#2958) `/machine/specs` has answered once (a failed read counts: it is
+  // an answer). A static build's specs ride its machine fixture.
+  const specsAnswered = useLatch(daemonBacked ? specsQuery.status !== "pending" : staticSettled);
 
   // (#2814) The reported hardware uid first — `isLocalSpecs` below compares
   // this against a drilled-in `routeUid`, and on a quiet window the name path
@@ -272,6 +279,12 @@ export function MachineLens({
   // `isLocalSpecs` is what self-corrects that case once specs resolve).
   const machineIsLocal = routeUid == null;
   const isLocalMach = machineIsLocal || isLocalSpecs;
+  // (#2958) Whether "this machine" versus "another machine" is known yet. A
+  // drill is told apart from this machine by `/machine/specs` and the flow
+  // window's aliases (`localMachineUid`); until both answer, `isLocalMach`
+  // is false by default, not by reading, so the page makes no remote claim
+  // ("another machine", a remote idle line) and shows its pending form.
+  const identityKnown = specsAnswered && (machineIsLocal || flowAnswered);
 
   // (#2108, operator design rule — "the lens must be a strict SUPERSET of
   // the sheet") The SAME shared hook `MachineDrawer.tsx`'s desktop dialog
@@ -450,19 +463,23 @@ export function MachineLens({
       <div
         className="machine-lens__health"
         data-state={
-          !isLocalMach
-            ? "remote"
-            : resources
-              ? "loaded"
-              : resourcesErrored
-                ? "error"
-                : staticSettled
-                  ? "no-daemon"
-                  : "loading"
+          !identityKnown
+            ? "loading"
+            : !isLocalMach
+              ? "remote"
+              : resources
+                ? "loaded"
+                : resourcesErrored
+                  ? "error"
+                  : staticSettled
+                    ? "no-daemon"
+                    : "loading"
         }
       >
         <MachineHealthRegion
-          isLocalMach={isLocalMach}
+          // (#2958) Until the page knows whose machine it is, the region
+          // shows its loading form, not the not-reported-from-here note.
+          isLocalMach={isLocalMach || !identityKnown}
           machineName={label}
           resources={resources}
           resourcesErrored={resourcesErrored}
@@ -482,6 +499,8 @@ export function MachineLens({
             nowMs,
             specs,
             isLocal: isLocalMach,
+            settled: flowAnswered,
+            identityKnown,
             residentRow: residencyRows.find((r) => r.status !== "ghost" && isUtilityTierRow(r.model.identifier, r.model.model_key, utilityModelId(specs, isLocalSpecs)))?.model ?? null,
           })}
         />
@@ -504,7 +523,11 @@ export function MachineLens({
           liveBlock
         ) : liveSamples.length === 0 ? (
           <div className="machine-drawer__idle">
-            <div className="machine-drawer__idle-line">idle · no samples in the last 10 min</div>
+            {/* (#2958) Before the flow window answers, "idle" is a default:
+                the page has no samples because it has read nothing yet.
+                Before the page knows whose machine it is, this may not be
+                the remote branch at all. */}
+            <div className="machine-drawer__idle-line">{flowAnswered && identityKnown ? "idle · no samples in the last 10 min" : "no signal"}</div>
             {liveLastKnown && (
               <div className="machine-drawer__lastknown">
                 {`last sample ${relAgoFrom(nowMs, liveLastKnown.ts)} — CPU ${fmtPct(liveLastKnown.point.cpu ?? null)} · GPU ${fmtPct(liveLastKnown.point.gpu ?? null)} · MEM ${fmtPct(liveLastKnown.point.mem ?? null)}`}

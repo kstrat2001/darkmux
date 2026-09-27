@@ -13,7 +13,7 @@ import { useFleetRoster, useLiveMachines, useStaticFleetBeats } from "../../hook
 import { getSource, runsSrc, runsReachable } from "../../lib/source";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
 import { machineUids, machPresent, liveSessionSet, machineNames, recordsAsOf, LIVE_WINDOW_MS, T } from "../../lib/flow";
-import type { FlowRecord, RunsResponse } from "../../types/handwritten";
+import type { FleetMachinesLiveResponse, FleetSessionsLiveResponse, FlowRecord, RunsResponse } from "../../types/handwritten";
 import { fmtN, fmtC } from "../../lib/format";
 import { MachineIcon } from "../../components/MachineIcon";
 import { Shimmer } from "../../components/Placeholder";
@@ -27,7 +27,8 @@ import { tokensOffMeter } from "./savings";
 import { hybridNote } from "./hybridNote";
 import { NotesDialog } from "../../components/NotesDialog";
 import { openModalEl } from "../../lib/dialogManager";
-import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, rosterOnlyEntries, rosterAliasFor, specUnknownLabel } from "./cards";
+import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, rosterOnlyEntries, rosterAliasFor, specUnknownLabel, cardFace, type CardSourcesAnswered } from "./cards";
+import { useLatch } from "../../hooks/useLatch";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
 import type { MachineSpecs } from "../../types/handwritten";
 import { runsForMachine } from "../runs/format";
@@ -740,6 +741,37 @@ export function FleetLens({
   const runsUnreadable = liveMode && (runsQuery.isError || runsQuery.data?.ok === false);
   const runsErrorMessage = runsQuery.data && !runsQuery.data.ok ? runsQuery.data.message : null;
 
+  // (#2958) Which of the cards' sources have answered once (see
+  // `cardFace`'s doc for what each one gates, and why). The two
+  // presence hooks above return data, not status, so these are observers of
+  // their shared cache slots for the settle state only: disabled, the hooks
+  // above own the fetch (the same pattern as `useMachineKeyContext`).
+  // `/runs` counts only in live mode: a replay never reads it.
+  const presenceState = useQuery({
+    enabled: false,
+    queryKey: queryKeys.fleetMachinesLive(),
+    queryFn: () => fetchJson<FleetMachinesLiveResponse>("/fleet/machines/live"),
+  });
+  const sessionsState = useQuery({
+    enabled: false,
+    queryKey: queryKeys.fleetSessionsLive(),
+    queryFn: () => fetchJson<FleetSessionsLiveResponse>("/fleet/sessions/live"),
+  });
+  // Each latched: the FIRST answer counts (`useLatch`), so the flow
+  // window's new day key at UTC midnight does not blink every card back to
+  // "no signal".
+  const flowAnswered = useLatch(flowWindow.settled);
+  const presenceAnswered = useLatch(!livePolling || presenceState.status !== "pending");
+  const sessionsAnswered = useLatch(!livePolling || sessionsState.status !== "pending");
+  const runsAnswered = useLatch(!(liveMode && runsReachable()) || runsQuery.status !== "pending");
+  // `/machine/specs` is live-only (see `specsQuery`); a replay has no self
+  // identity to wait for.
+  const specsAnswered = useLatch(!livePolling || specsQuery.status !== "pending");
+  const answered = useMemo<CardSourcesAnswered>(
+    () => ({ flow: flowAnswered, presence: presenceAnswered, sessions: sessionsAnswered, runs: runsAnswered, specs: specsAnswered }),
+    [flowAnswered, presenceAnswered, sessionsAnswered, runsAnswered, specsAnswered],
+  );
+
 
   // (#1869) The token hero + hybrid note are "as of the playhead" — legacy's
   // own `visible()` gate (`DATA.filter(r=>T(r.ts)<=state.t)`), restored at
@@ -906,6 +938,7 @@ export function FleetLens({
           undefined,
         ),
         name: entry.id,
+        rosterOnly: true,
       })),
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
@@ -1009,6 +1042,12 @@ export function FleetLens({
           const selectedSid = pinnedSid != null && execs.some((e) => e.sessionId === pinnedSid) ? pinnedSid : effectiveDefaultSid;
           const selectedIdx = selectedSid != null ? execs.findIndex((e) => e.sessionId === selectedSid) : -1;
           const selectedExec = selectedIdx >= 0 ? execs[selectedIdx] : null;
+          const showsReading = card.liveTokRate !== null && selectedExec != null;
+          // (#2958) What this card may say before every source has
+          // answered: positive readings at once, negative claims later. The
+          // live readouts (tube, rate line, pager) draw on `face.tube`, so an
+          // offline card shows its powered-off screen and nothing live.
+          const face = cardFace(card, showsReading, answered);
           // `card.liveTokRate !== null` (the scope's mount gate below) only
           // ever holds when at least one execution is running, so
           // `selectedExec` is non-null everywhere it's read below — this is
@@ -1047,7 +1086,10 @@ export function FleetLens({
           // for one machine made the same gesture mean two different things.
           <div
             key={card.uid}
-            className={`mach${card.active && !card.absent ? " active" : ""}${card.absent ? " absent" : ""}`}
+            // (#2958) `face`, not the card's raw flags: "offline" waits on
+            // the sources that could contradict it. `nosignal` gives the dot
+            // the absent dot's no-reading gray, without dimming the card.
+            className={`mach${face.active ? " active" : ""}${face.absent ? " absent" : ""}${face.noSignal ? " nosignal" : ""}`}
             data-act="machine"
             data-arg={encodeMachineKey(machineKeyCtx, card.uid)}
             role="button"
@@ -1093,7 +1135,7 @@ export function FleetLens({
               {/* (#2915) The utility strip: a fixed box at the end of the
                   name row, always present, so a job starting or ending never
                   changes the card's layout. See `UtilityGlyph`. */}
-              <UtilityGlyph strip={card.utility} />
+              <UtilityGlyph strip={card.utility} noSignal={!face.utilityQuietKnown} />
             </div>
             {/* (#1855) The dim fallback says WHICH kind of unknown this is —
                 a machine that beat and carried no hardware, vs one nothing
@@ -1115,10 +1157,15 @@ export function FleetLens({
             {/* (#2890) Every ONLINE card carries the tube: running work
                 drives it; a machine with nothing running shows it idle
                 (breathing, like rest). A machine that is off shows none. */}
-            <div className={(card.liveTokRate !== null && selectedExec) || !card.absent ? "mach-body mach-body--scope" : "mach-body"}>
+            {/* (#2958) Every card carries the tube's box, offline included
+                (a powered-off screen), so no card changes size when its
+                data arrives or its machine comes and goes. */}
+            <div className="mach-body mach-body--scope">
               <div className="stat">
                 <span className="dot" />
-                {card.stat}
+                {/* (#2958) "idle" before its sources answer is a default,
+                    not a reading: see `cardFace`. */}
+                {face.stat}
               </div>
               {/* (#2877) Live token-rate scope. Rendered ONLY when the card
                   computed a reading (`liveTokRate !== null` — live mode,
@@ -1136,7 +1183,7 @@ export function FleetLens({
                   execution now (`selectedExec` — the sole one when there's
                   only one running), not a machine-wide aggregate: the tube,
                   its color and this word all belong to one run. */}
-              {card.liveTokRate !== null && selectedExec && (
+              {face.tube === "reading" && selectedExec && (
                 <div
                   className="mach-scope__rate"
                   data-tone={selectedExec.state ?? "none"}
@@ -1220,7 +1267,7 @@ export function FleetLens({
                   (`.runs--live`, #1903) — same nested-interactive-control
                   shape, same reason: a click here must not ALSO fire the
                   card body's `machineDrillHash` handler underneath it. */}
-              {pagerActive && selectedExec && (
+              {pagerActive && face.tube === "reading" && selectedExec && (
                 <div className="mach-scope__pager" data-testid="fleet-pager">
                   <div
                     className="mach-scope__pager-btn"
@@ -1300,6 +1347,10 @@ export function FleetLens({
                   collapse), which is the common case — that keeps the
                   original "N running · X tok/s" wording unchanged. */}
               {(() => {
+                // (#2958) "0 running" before every source has answered is a
+                // default, not a count: the app's "not yet measured" mark,
+                // in the same one-line slot. One or more is a reading.
+                if (!face.countShown) return <div className="runs">—</div>;
                 const runsHash = machineRunsHash(encodeMachineKey(machineKeyCtx, card.uid), card.runningSessionIds);
                 const rateText = `${fmtN(Math.round(card.liveTokRate ?? 0))} tok/s`;
                 const countText = pagerActive
@@ -1332,7 +1383,7 @@ export function FleetLens({
                   </div>
                 );
               })()}
-              {card.liveTokRate !== null && selectedExec && (
+              {face.tube === "reading" && selectedExec && (
                 <div
                   className="mach-scope"
                   data-testid="fleet-token-scope"
@@ -1389,7 +1440,26 @@ export function FleetLens({
                   />
                 </div>
               )}
-              {!(card.liveTokRate !== null && selectedExec) && !card.absent && (
+              {face.tube === "nosignal" && (
+                <div className="mach-scope" data-testid="fleet-token-scope">
+                  {/* (#2958) Nothing read yet: the same static a running
+                      execution's tube shows once the page loses the daemon,
+                      in the idle tube's slot and size. */}
+                  <TokenScope tokensPerSec={0} state="nosignal" size="card" {...scopeCenter({ state: "nosignal", tokensPerSec: 0 })} />
+                </div>
+              )}
+              {face.tube === "off" && (
+                <div className="mach-scope" data-testid="fleet-token-scope">
+                  {/* (#2958) An offline machine keeps the tube's box, its
+                      screen powered off: the scope's own dark screen with no
+                      trace drawn, no static, no center. Plain markup, not a
+                      `TokenScope`, so an offline card runs no canvas at all. */}
+                  <div className="token-scope-bezel token-scope-bezel--card" data-state="off" aria-hidden="true">
+                    <div className="token-scope-screen" />
+                  </div>
+                </div>
+              )}
+              {face.tube === "idle" && (
                 <div className="mach-scope" data-testid="fleet-token-scope">
                   {/* (#2911) A card whose stat reads "dispatch in flight"
                       (a mission between model steps, a lab run with no
