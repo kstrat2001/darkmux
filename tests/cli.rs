@@ -12174,3 +12174,21 @@ fn config_list_and_bare_config_set_list_every_enum_value_with_its_meaning() {
         }
     }
 }
+
+/// (#2947 review C4) `darkmux radio` refuses bad enum config up front, under
+/// its own label, rather than degrading into an answering-seat fallback.
+#[test]
+fn radio_refuses_bad_enum_config_before_routing() {
+    let empty_path = TempDir::new().unwrap();
+    let out = darkmux_cmd()
+        .env("PATH", empty_path.path())
+        .env("DARKMUX_THERMAL_PAUSE_AT", "seroius")
+        .args(["radio", "what is running"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("radio: dispatch: refusing to start: bad config"), "{stderr}");
+    assert!(!stdout.contains("falling back") && !stderr.contains("falling back"), "{stdout}{stderr}");
+}

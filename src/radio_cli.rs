@@ -30,6 +30,11 @@ use std::io::IsTerminal;
 
 /// Top-level entry called from `main.rs`'s dispatch table for `Cmd::Radio`.
 pub fn run(text: &str, dry_run: bool) -> Result<i32> {
+    // (#2947 review C4) Bad enum config refuses up front, before the
+    // utility routing call, instead of the routing dispatch failing and the
+    // exchange degrading into "answering seat failed ... falling back".
+    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::Dispatch)
+        .map_err(|e| anyhow::anyhow!("radio: {e}"))?;
     // (#2463) `darkmux radio` dispatches the routing seat
     // (`radio::dispatch_router_call`, below) and, on a `Refuse` decision,
     // the answering seat too (`radio_answer::answer_live` ->
