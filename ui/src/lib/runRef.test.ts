@@ -45,6 +45,9 @@ describe("runIndex: a session id two missions share", () => {
     // mission names nothing here, and an empty page is worse than the run.
     const bare = normAll([rec(0, "dispatch.start"), rec(60, "dispatch.complete")]);
     expect(sessionRouteRecords(bare, "task-probe", "gone")).toEqual(bare);
+    // Several missions on the session and the named one absent: all of them,
+    // not the first mission's run.
+    expect(sessionRouteRecords(shared, "task-probe", "C")).toEqual(shared);
     expect(sessionRun(bare, "task-probe", Date.parse(at(100)), "gone")?.ref.sessionId).toBe("task-probe");
   });
 });
