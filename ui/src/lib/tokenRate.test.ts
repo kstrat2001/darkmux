@@ -920,6 +920,13 @@ describe("tools vs reading prompt, from the tool COMPLETION records", () => {
     expect(deriveLiveState(recs, 10_000)).toEqual({ state: "tools" });
   });
 
+  it("(#2963) a name from the next call's writing heartbeat never takes the previous call's file", () => {
+    const writingBeat = (atMs: number): FlowRecord =>
+      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: 900, turn_seq: 2, phase: "writing_tool_call", tool_name: "write" } }) as unknown as FlowRecord;
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 1), pathTool(5_000, "read", "src/a.ts"), beat(6_000, 0), writingBeat(8_000), turn(9_000, 2, 1)];
+    expect(deriveLiveState(recs, 10_000)).toEqual({ state: "tools", toolName: "write" });
+  });
+
   it("(#2963) a file only in the past of a playback cut is not read", () => {
     const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 3), namedTool(5_000, "read"), pathTool(9_000, "write", "src/b.ts")];
     expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "read" });
