@@ -298,6 +298,11 @@ impl TrajectoryFold {
         u32::try_from(self.turn_seqs.len()).unwrap_or(u32::MAX).saturating_add(self.legacy.turns)
     }
 
+    /// The `seq` of the last turn a model call was recorded under.
+    pub fn last_turn_seq(&self) -> Option<u64> {
+        self.turn_seqs.last().copied()
+    }
+
     /// Installed compactions, plus an openclaw run's distinct ones.
     pub fn compactions(&self) -> u32 {
         let legacy = u32::try_from(self.legacy.compactions.len()).unwrap_or(u32::MAX);

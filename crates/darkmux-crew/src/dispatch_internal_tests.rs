@@ -13759,10 +13759,11 @@ fn the_envelope_metrics_are_the_fold_of_the_trajectory() {
     let mut s = super::TrajectorySummary::default();
     for line in [
         serde_json::json!({"type":"dispatch.start","ts":1000,"model":"m"}),
-        serde_json::json!({"type":"model.completed","seq":1,"finish_reason":"length","usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":120}}),
-        serde_json::json!({"type":"model.completed","seq":1,"finish_reason":"tool_calls","usage":{"prompt_tokens":150,"completion_tokens":5}}),
-        serde_json::json!({"type":"runtime.rest","seq":1,"ms":400}),
-        serde_json::json!({"type":"model.completed","seq":2,"finish_reason":"stop","usage":null}),
+        // Resumed from a checkpoint at turn 3, so this run's calls are turns 4 and 5.
+        serde_json::json!({"type":"model.completed","seq":4,"finish_reason":"length","usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":120}}),
+        serde_json::json!({"type":"model.completed","seq":4,"finish_reason":"tool_calls","usage":{"prompt_tokens":150,"completion_tokens":5}}),
+        serde_json::json!({"type":"runtime.rest","seq":4,"ms":400}),
+        serde_json::json!({"type":"model.completed","seq":5,"finish_reason":"stop","usage":null}),
         serde_json::json!({"type":"compaction","generation":1}),
         serde_json::json!({"type":"dispatch.complete","ts":9000,"result":"stop","wall_ms":7777,"turn_delay_effective_ms":400}),
     ] {
@@ -13788,6 +13789,40 @@ fn the_envelope_metrics_are_the_fold_of_the_trajectory() {
     assert_eq!(m["wall_ms"], 7777, "the runtime's own clock");
     assert_eq!(m["turn_delay_effective_ms"], 400);
     assert_eq!((m["cumulative_turns"].clone(), m["cumulative_compactions"].clone()), (serde_json::json!(5), serde_json::json!(2)));
+}
+
+/// (#2263) A resume from a hand-back checkpoint CONTINUES the checkpoint's
+/// turn: its first call is `seq` = the checkpoint's turn count. The whole
+/// task has made 3 turns, not 4, on the envelope and the flow record alike.
+#[test]
+fn a_hand_back_resume_continues_the_checkpoints_turn() {
+    let mut s = super::TrajectorySummary::default();
+    for line in [
+        serde_json::json!({"type":"dispatch.start","ts":1000,"model":"m"}),
+        serde_json::json!({"type":"model.completed","seq":3,"finish_reason":"stop","usage":{"prompt_tokens":10,"completion_tokens":2}}),
+        serde_json::json!({"type":"dispatch.complete","ts":2000,"result":"stop","wall_ms":1000}),
+    ] {
+        s.fold.apply(&ev(line));
+    }
+    let seed = darkmux_trajectory::CheckpointCounts { turns: 3, compactions: 0 };
+    let out = super::enrich_envelope_with_summary(
+        r#"{"result":"stop"}"#.to_string(),
+        "darkmux:m",
+        &s,
+        seed,
+        &super::HostStats::default(),
+        &no_extras(),
+        no_findings_dir(),
+        serde_json::json!({}),
+        None,
+    );
+    let m = serde_json::from_str::<serde_json::Value>(&out).unwrap()["metrics"].clone();
+    assert_eq!(m["turns"], 1, "this run made one call");
+    assert_eq!(m["cumulative_turns"], 3, "{m}");
+    let payload = super::build_dispatch_complete_payload(
+        1000, "", "", 0, &s, seed, None, &super::HostStats::default(), &no_extras(), &None, None, None,
+    );
+    assert_eq!(payload["cumulative_turns"], 3, "{payload}");
 }
 
 #[test]
@@ -16205,8 +16240,9 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     fn build_dispatch_complete_payload_carries_reasoning_and_cached_tokens_when_present() {
         let stats = super::reduce_host_stats(&[]);
         let mut summary = super::TrajectorySummary::default();
+        // Resumed from a checkpoint at turn 7, so this run's one call is turn 8.
         summary.fold.apply(&ev(serde_json::json!({
-            "type": "model.completed", "seq": 1, "finish_reason": "stop",
+            "type": "model.completed", "seq": 8, "finish_reason": "stop",
             "usage": { "prompt_tokens": 100, "completion_tokens": 600, "reasoning_tokens": 500, "cached_tokens": 20 },
         })));
         let payload = super::build_dispatch_complete_payload(

@@ -49,8 +49,10 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           Their only source was the runtime's `metrics.json`, which 4.0
 //           no longer writes; the task's token total is the sum of its
 //           `telemetry.tokens` usage records. `cumulative_turns` /
-//           `cumulative_compactions` stay, computed as the resume
-//           checkpoint's counters plus this invocation's trajectory fold.
+//           `cumulative_compactions` stay, computed from the resume
+//           checkpoint and this invocation's trajectory by
+//           `darkmux_trajectory::CheckpointCounts` (a hand-back resume
+//           continues the checkpoint's turn rather than adding one).
 //   1.65.0 (#2902 step 5, budgets): additive, four actions and one usage
 //           field.
 //

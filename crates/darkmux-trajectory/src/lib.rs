@@ -56,6 +56,24 @@ impl CheckpointCounts {
     pub fn of(checkpoint_json: &str) -> Self {
         serde_json::from_str(checkpoint_json).unwrap_or_default()
     }
+
+    /// THE whole task's turn count after a run resumed from this checkpoint
+    /// recorded `fold`. The runtime numbers every call's `seq` with the
+    /// task's own turn counter, seeded from the checkpoint, so the count is
+    /// the later of the checkpoint's and the last seq the run recorded. A
+    /// hand-back resume continues turn N (`seq: N`) and a clean one starts
+    /// N+1, so adding the run's own turn count to the seed would count the
+    /// continued turn twice.
+    pub fn cumulative_turns(&self, fold: &TrajectoryFold) -> u32 {
+        let last = fold.last_turn_seq().map_or(0, |s| u32::try_from(s).unwrap_or(u32::MAX));
+        self.turns.max(last)
+    }
+
+    /// The whole task's compactions: each is its own event, never
+    /// continued across a resume, so the checkpoint's plus the run's.
+    pub fn cumulative_compactions(&self, fold: &TrajectoryFold) -> u32 {
+        self.compactions.saturating_add(fold.compactions())
+    }
 }
 
 /// `<out_dir>/.darkmux-runtime/trajectory.jsonl`.

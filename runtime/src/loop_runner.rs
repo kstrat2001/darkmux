@@ -7587,11 +7587,70 @@ mod tests {
         assert_eq!(this_run.tokens.prompt, 140);
         assert_eq!(this_run.tokens.completion, 5);
         assert_eq!(this_run.compactions(), 0, "cfg is never_compact");
-        // The WHOLE dispatch's turn count is the checkpoint it resumed from
-        // plus what this run recorded (the loop writes no checkpoint after
-        // its terminal turn, so the one it resumed from is the seed, not
-        // the answer): 2 seeded + 1 = turn 3, the turn the loop stopped on.
-        assert_eq!(seed_turns + this_run.turns(), 3);
+        // The WHOLE dispatch's turn count, by the host's one rule (the loop
+        // writes no checkpoint after its terminal turn, so the one it resumed
+        // from is the seed, not the answer): turn 3, the turn it stopped on.
+        let seed = darkmux_trajectory::CheckpointCounts { turns: seed_turns, compactions: 0 };
+        assert_eq!(seed.cumulative_turns(&this_run), 3);
+    }
+
+    /// (#2263) A resume from a #1221 hand-back checkpoint CONTINUES the
+    /// checkpoint's turn rather than starting the next: its call is recorded
+    /// under `seq` = the checkpoint's turn count, and the whole dispatch has
+    /// made that many turns, not one more.
+    #[test]
+    #[serial_test::serial]
+    fn a_hand_back_resume_continues_the_checkpoints_turn() {
+        use crate::lmstudio::{LmStudioClient, Message};
+        use crate::trajectory::Trajectory;
+
+        std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        std::env::remove_var("DARKMUX_TURN_DELAY_MS");
+
+        let server = crate::test_support::GuardedMockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 140, 5));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("resume-hand-back").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let cfg = compaction::CompactionConfig::never_compact();
+        let resume_checkpoint = checkpoint::RunCheckpoint {
+            schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+            role_id: "test-role".to_string(),
+            messages: vec![Message::system("test"), Message::user("think it through")],
+            turns: 3,
+            total_prompt_tokens: 300,
+            total_completion_tokens: 60,
+            compactions: 0,
+            rest_ms: 0,
+            rests: 0,
+            pending_hand_back: Some(checkpoint::PendingHandBack {
+                thought: "working through the first half".to_string(),
+                answer: String::new(),
+                think_closed: false,
+                is_reasoning: true,
+                carries_own_opener: false,
+            }),
+            pending_tool_calls: None,
+            pending_tool_calls_seq_base: 0,
+            written_at_unix_ms: checkpoint::unix_ms(),
+        };
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", vec![], &[], &mut traj, false, &cfg,
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None,
+            tmp.path(), "test-role", Some(resume_checkpoint), &RealSleeper,
+        )
+        .expect("a hand-back resume returns Ok");
+        drop(traj);
+
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+        let this_run = crate::trajectory::recorded(tmp.path());
+        assert_eq!(this_run.turn_detail.keys().copied().collect::<Vec<_>>(), vec![3], "the continued turn keeps its seq");
+        let seed = darkmux_trajectory::CheckpointCounts { turns: 3, compactions: 0 };
+        assert_eq!(seed.cumulative_turns(&this_run), 3, "three turns, not four");
     }
 
     /// (#2263) The inverted case: a dispatch that was NEVER resumed records

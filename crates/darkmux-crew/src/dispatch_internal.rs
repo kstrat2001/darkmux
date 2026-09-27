@@ -6419,8 +6419,9 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         .join()
         .unwrap_or_else(|_| TrajectorySummary::default());
 
-    // (#2263) A resumed execution's whole-task counts: the checkpoint it
-    // resumed from, plus what this run recorded. The trajectory itself only
+    // (#2263) A resumed execution's whole-task counts come from the
+    // checkpoint it resumed from and what this run recorded
+    // (`CheckpointCounts::cumulative_turns`). The trajectory itself only
     // ever holds this run's events (`host_out` is a fresh tempdir).
     let resume_seed = resume_checkpoint_contents
         .as_deref()
@@ -7029,8 +7030,8 @@ fn envelope_metrics(
         "rest_ms": fold.rest_ms(),
         "rests": fold.rest_count(),
         "turn_delay_effective_ms": fold.complete.as_ref().and_then(|c| c.turn_delay_effective_ms),
-        "cumulative_turns": resume_seed.turns.saturating_add(fold.turns()),
-        "cumulative_compactions": resume_seed.compactions.saturating_add(fold.compactions()),
+        "cumulative_turns": resume_seed.cumulative_turns(fold),
+        "cumulative_compactions": resume_seed.cumulative_compactions(fold),
     })
 }
 
@@ -7617,11 +7618,11 @@ fn build_dispatch_complete_payload(
         // provider-scoped; consumers must not derive one from the other.
         "reasoning_tokens": fold.tokens.reasoning,
         "cached_tokens": fold.tokens.cached,
-        // (#2263) The WHOLE task's counts across every resume: the checkpoint
-        // this execution resumed from, plus what it recorded. Equal to
+        // (#2263) The WHOLE task's counts across every resume, by the one
+        // rule (`CheckpointCounts::cumulative_turns`). Equal to
         // `total_turns`/`total_compactions` for a run that was never resumed.
-        "cumulative_turns": resume_seed.turns.saturating_add(fold.turns()),
-        "cumulative_compactions": resume_seed.compactions.saturating_add(fold.compactions()),
+        "cumulative_turns": resume_seed.cumulative_turns(fold),
+        "cumulative_compactions": resume_seed.cumulative_compactions(fold),
     });
     // (#1187 follow-up) Same field, same reason as `dispatch_start_payload` —
     // parity with `dispatch_remote`'s completion record, and needed by any
