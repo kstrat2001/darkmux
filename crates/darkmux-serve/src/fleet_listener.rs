@@ -35,8 +35,8 @@ use axum::{
 };
 use darkmux_crew::dispatch::DispatchResult;
 use darkmux_fleet::{
-    Admitted, IdentityProvider, ProfileResolution, Refusal, SeatBook, SeatGuard, SubmissionReply, TokenCheck,
-    WorkJob, WorkSubmission,
+    Admitted, IdentityProvider, ProfileResolution, Refusal, ReplyStatus, ScopedJob, SeatBook, SeatGuard,
+    SubmissionReply, TokenCheck, Waited, WorkJob, WorkSubmission,
 };
 use darkmux_types::config::{AcceptWorkEntry, BusyPolicy};
 use std::collections::BTreeMap;
@@ -75,6 +75,8 @@ pub(crate) struct FleetListenerState {
     pub queue_slots: Arc<KeySlots<String>>,
     /// How often a waiting sender hears that its job is still queued.
     pub queue_heartbeat: std::time::Duration,
+    /// How long a queued job may wait for its seat ([`queue_deadline`]).
+    pub queue_limits: QueueLimits,
     /// Per-peer throttle on refusal log lines.
     pub refusal_log: Arc<RefusalLog>,
     /// (#2916 round 3 C5) Requests in flight per admitted NODE, so a node
@@ -117,6 +119,7 @@ impl FleetListenerState {
             busy_policy,
             queue_slots: Arc::new(KeySlots::new(NODE_CAP)),
             queue_heartbeat: QUEUE_HEARTBEAT,
+            queue_limits: QueueLimits::PRODUCTION,
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
             config_preflight: Arc::new(dispatch_config_preflight),
@@ -342,9 +345,9 @@ enum Start {
     /// The seat was free: the job holds it now.
     Now(SeatGuard),
     /// The seat is busy and this machine queues (`fleet.busy_policy =
-    /// queue`): the job waits for it, holding one of its sender's queue
-    /// slots until it gets the seat.
-    Queued { what: String, queue_slot: KeySlot<String> },
+    /// queue`): the job waits for it until `deadline`, holding one of its
+    /// sender's queue slots while it waits.
+    Queued { what: String, queue_slot: KeySlot<String>, deadline: std::time::Instant },
 }
 
 /// One line of a reply body. Every body is newline-delimited JSON: one line
@@ -366,36 +369,197 @@ fn finished_reply(
         Some(Ok(r)) => (
             StatusCode::OK,
             SubmissionReply {
-                status: "completed".into(),
                 exit_code: Some(r.exit_code),
                 stdout: Some(r.stdout),
                 stderr: Some(r.stderr),
-                ..base.clone()
+                ..with_status(base, ReplyStatus::Completed)
             },
         ),
         Some(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            SubmissionReply { status: "error".into(), reason: Some(format!("{e:#}")), ..base.clone() },
+            SubmissionReply { reason: Some(format!("{e:#}")), ..with_status(base, ReplyStatus::Error) },
         ),
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
             SubmissionReply {
-                status: "error".into(),
                 reason: Some("the job's worker ended without a result".into()),
-                ..base.clone()
+                ..with_status(base, ReplyStatus::Error)
             },
         ),
     }
 }
 
+/// `base` (machine, session, profile) with `status`.
+fn with_status(base: &SubmissionReply, status: ReplyStatus) -> SubmissionReply {
+    SubmissionReply { status, ..base.clone() }
+}
+
 /// The `queued` line a waiting sender reads.
 fn queued_reply(base: &SubmissionReply, receiver: &str, what: &str) -> SubmissionReply {
     SubmissionReply {
-        status: "queued".into(),
-        reason: Some(format!(
-            "{receiver} is busy ({what}); the job is queued and runs when its seat frees"
-        )),
-        ..base.clone()
+        reason: Some(format!("{receiver} is busy ({what}); the job is queued and runs when its seat frees")),
+        ..with_status(base, ReplyStatus::Queued)
+    }
+}
+
+/// (#2916 stage 2 review C1) How long a job may wait for its seat, or
+/// `None` when it cannot wait at all. A job the sender waits on must finish
+/// inside its connection's lifetime, so its queue time is that lifetime
+/// less the job's own timeout and [`QUEUE_SLACK`]; a job queued without
+/// `--wait` may wait [`QueueLimits::no_wait_max_age`].
+fn queue_deadline(limits: &QueueLimits, wait: bool, job_timeout_seconds: u32) -> Option<std::time::Instant> {
+    let window = if wait {
+        limits
+            .connection_lifetime
+            .saturating_sub(std::time::Duration::from_secs(u64::from(job_timeout_seconds)))
+            .saturating_sub(QUEUE_SLACK)
+    } else {
+        limits.no_wait_max_age
+    };
+    (!window.is_zero()).then(|| std::time::Instant::now() + window)
+}
+
+/// Decide how a scoped job starts: its seat now, a place in the queue, or a
+/// busy refusal.
+fn start_or_refuse(
+    state: &FleetListenerState,
+    admitted: &Admitted,
+    scoped: &ScopedJob,
+    session_id: &str,
+    sub: &WorkSubmission,
+) -> Result<Start, Refusal> {
+    let occupied = match state.seats.try_claim(&scoped.seat, session_id) {
+        Ok(guard) => return Ok(Start::Now(guard)),
+        Err(occupied) => occupied,
+    };
+    match state.busy_policy {
+        BusyPolicy::Refuse => Err(Refusal::Busy { what: occupied.what }),
+        BusyPolicy::Queue => {
+            let Some(deadline) = queue_deadline(&state.queue_limits, sub.wait, sub.job.timeout_seconds) else {
+                return Err(Refusal::Busy {
+                    what: format!(
+                        "{}; a job with a {}s timeout has no time left to wait inside one connection",
+                        occupied.what, sub.job.timeout_seconds
+                    ),
+                });
+            };
+            match state.queue_slots.try_take(admitted.peer_name.clone()) {
+                Some(queue_slot) => Ok(Start::Queued { what: occupied.what, queue_slot, deadline }),
+                None => Err(Refusal::QueueFull { peer: admitted.peer_name.clone(), what: occupied.what }),
+            }
+        }
+    }
+}
+
+/// Everything a submitted job's worker thread needs.
+struct Worker {
+    state: FleetListenerState,
+    admitted: Admitted,
+    peer: std::net::IpAddr,
+    job: WorkJob,
+    scoped: ScopedJob,
+    base: SubmissionReply,
+    /// A waited-on queued job's reply stream. Closed = the sender hung up.
+    progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// The result, for a job that is not streamed.
+    result_tx: tokio::sync::oneshot::Sender<anyhow::Result<DispatchResult>>,
+}
+
+impl Worker {
+    fn sender_gone(&self) -> bool {
+        self.progress.as_ref().is_some_and(|p| p.is_closed())
+    }
+
+    /// A refusal decided after the job was answered `queued`: to a waiting
+    /// sender as the last line of its reply, and to the log either way.
+    fn refuse_late(&self, r: &Refusal) {
+        let receiver = &self.state.receiver;
+        self.state.refusal_log.log(
+            Some(self.peer),
+            &format!("darkmux serve: fleet listener: refused queued {} — {}", self.job.session_id, r.reason(receiver)),
+        );
+        if let Some(p) = &self.progress {
+            let reply = SubmissionReply { session_id: self.base.session_id.clone(), ..r.reply(receiver) };
+            let _ = p.send(reply_line(&reply));
+        }
+    }
+
+    /// (#2916 stage 2 review M1) A queued job is checked again when its seat
+    /// frees, against the state of THIS moment: the config preflight, the
+    /// allow-list entry for the sending node (`untrust` may have run), and
+    /// the scope with the profile resolved afresh. It still runs on the seat
+    /// it waited for, or not at all.
+    fn recheck(&self) -> Result<String, Refusal> {
+        let state = &self.state;
+        (state.config_preflight)().map_err(|detail| Refusal::BadConfig { detail })?;
+        let allow = (state.allow_list)().map_err(|e| {
+            Refusal::BadRequest(format!("this machine's allow-list cannot be read ({e}); refusing everything"))
+        })?;
+        let admitted = darkmux_fleet::match_entry(&self.admitted.node_id, &self.admitted.node_name, &allow)?;
+        let resolution = (state.resolve_profile)(&self.job.role_id, self.job.profile.as_deref());
+        let now = darkmux_fleet::check_scope(&state.receiver, &admitted, &self.job, resolution)?;
+        if now.seat != self.scoped.seat {
+            return Err(Refusal::SeatChanged { profile: now.profile });
+        }
+        Ok(now.profile)
+    }
+
+    /// Wait for the seat, then check again; the seat and the profile to run
+    /// on, or `None` when the job ends here (its end already reported).
+    fn wait_for_seat(&self, queue_slot: KeySlot<String>, deadline: std::time::Instant) -> Option<(SeatGuard, String)> {
+        let state = &self.state;
+        let receiver = &state.receiver;
+        let sid = &self.job.session_id;
+        let waited = state.seats.claim_waiting(&self.scoped.seat, sid, state.queue_heartbeat, deadline, &|| self.sender_gone(), |o| {
+            if let Some(p) = &self.progress {
+                let _ = p.send(reply_line(&queued_reply(&self.base, receiver, &o.what)));
+            }
+        });
+        // Waiting is over, however it ended: the sender's queue slot frees.
+        drop(queue_slot);
+        match waited {
+            Waited::Cancelled => {
+                eprintln!("darkmux serve: fleet listener: dropped queued {sid}: its sender stopped waiting");
+                None
+            }
+            Waited::TimedOut(o) => {
+                self.refuse_late(&Refusal::Busy { what: format!("{}; the job waited as long as it may", o.what) });
+                None
+            }
+            Waited::Seat(guard) => match self.recheck() {
+                Ok(profile) => Some((guard, profile)),
+                Err(r) => {
+                    drop(guard);
+                    self.refuse_late(&r);
+                    None
+                }
+            },
+        }
+    }
+
+    /// The worker thread's body.
+    fn run(self, start: Start) {
+        let (seat, profile) = match start {
+            Start::Now(guard) => (guard, self.scoped.profile.clone()),
+            Start::Queued { queue_slot, deadline, .. } => match self.wait_for_seat(queue_slot, deadline) {
+                Some(got) => got,
+                None => return,
+            },
+        };
+        // A sender that hung up between its seat freeing and now: nothing ran.
+        if self.sender_gone() {
+            return;
+        }
+        let result = (self.state.execute)(self.job.clone(), profile, self.admitted.peer_name.clone());
+        drop(seat);
+        match &self.progress {
+            Some(p) => {
+                let _ = p.send(reply_line(&finished_reply(&self.base, Some(result)).1));
+            }
+            None => {
+                let _ = self.result_tx.send(result);
+            }
+        }
     }
 }
 
@@ -414,112 +578,77 @@ async fn submit_handler(
         return refuse(&state, Some(peer_addr.ip()), &Refusal::BadConfig { detail });
     }
     let receiver = state.receiver.clone();
-    let sub = match WorkSubmission::parse(&body) {
+    let mut sub = match WorkSubmission::parse(&body) {
         Ok(s) => s,
         Err(r) => return refuse(&state, Some(peer_addr.ip()), &r),
     };
-    let mut job = sub.job;
     let resolve = state.resolve_profile.clone();
-    let (role, requested) = (job.role_id.clone(), job.profile.clone());
+    let (role, requested) = (sub.job.role_id.clone(), sub.job.profile.clone());
     let resolution = match tokio::task::spawn_blocking(move || resolve(&role, requested.as_deref())).await {
         Ok(r) => r,
         Err(e) => ProfileResolution::Unresolved(format!("profile resolution did not finish: {e}")),
     };
-    let scoped = match darkmux_fleet::check_scope(&receiver, &admitted, &job, resolution) {
+    let scoped = match darkmux_fleet::check_scope(&receiver, &admitted, &sub.job, resolution) {
         Ok(s) => s,
         Err(r) => return refuse(&state, Some(peer_addr.ip()), &r),
     };
-    let profile = scoped.profile.clone();
 
     // (#2916 review C2) The receiver's own id for this run, never the
     // sender's verbatim.
-    job.session_id = darkmux_fleet::receiver_session_id(&job.session_id, &admitted.peer_name);
+    sub.job.session_id = darkmux_fleet::receiver_session_id(&sub.job.session_id, &admitted.peer_name);
     // (#2916 re-review C4) A submitted job is never attributed to one of
     // THIS machine's own missions: no allow-list scope grants that, so any
     // `phase_id` the sender set is dropped here.
-    job.phase_id = None;
-    let session_id = job.session_id.clone();
+    sub.job.phase_id = None;
+    let session_id = sub.job.session_id.clone();
 
     // (#2916 stage 2) Busy is per seat: one job per local model, hosted jobs
     // up to `remote.concurrent_cap`. Past that, `fleet.busy_policy`.
-    let start = match state.seats.try_claim(&scoped.seat, &session_id) {
-        Ok(guard) => Start::Now(guard),
-        Err(occupied) => match state.busy_policy {
-            BusyPolicy::Refuse => {
-                return refuse(&state, Some(peer_addr.ip()), &Refusal::Busy { what: occupied.what })
-            }
-            BusyPolicy::Queue => match state.queue_slots.try_take(admitted.peer_name.clone()) {
-                Some(queue_slot) => Start::Queued { what: occupied.what, queue_slot },
-                None => {
-                    return refuse(
-                        &state,
-                        Some(peer_addr.ip()),
-                        &Refusal::QueueFull { peer: admitted.peer_name.clone(), what: occupied.what },
-                    )
-                }
-            },
-        },
+    let start = match start_or_refuse(&state, &admitted, &scoped, &session_id, &sub) {
+        Ok(s) => s,
+        Err(r) => return refuse(&state, Some(peer_addr.ip()), &r),
     };
     let queued_what = match &start {
         Start::Queued { what, .. } => Some(what.clone()),
         Start::Now(_) => None,
     };
     eprintln!(
-        "darkmux serve: fleet listener: {} {session_id} from {} (role {}, profile {profile})",
+        "darkmux serve: fleet listener: {} {session_id} from {} (role {}, profile {})",
         if queued_what.is_some() { "queued" } else { "accepted" },
         admitted.peer_name,
-        job.role_id
+        sub.job.role_id,
+        scoped.profile
     );
 
     let base = SubmissionReply {
         machine: Some(receiver.clone()),
         session_id: Some(session_id.clone()),
-        profile: Some(profile.clone()),
-        ..Default::default()
+        profile: Some(scoped.profile.clone()),
+        ..SubmissionReply::of(ReplyStatus::Accepted)
     };
     // A waited-on queued job streams its `queued` lines as they happen.
-    let (progress_tx, progress_rx) = if queued_what.is_some() && sub.wait {
+    let (progress, progress_rx) = if queued_what.is_some() && sub.wait {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         (Some(tx), Some(rx))
     } else {
         (None, None)
     };
-
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let execute = state.execute.clone();
-    let seats = state.seats.clone();
-    let seat = scoped.seat.clone();
-    let heartbeat = state.queue_heartbeat;
-    let run_profile = profile.clone();
-    let origin = admitted.peer_name.clone();
-    let thread_base = base.clone();
-    let thread_receiver = receiver.clone();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let worker = Worker {
+        state: state.clone(),
+        admitted,
+        peer: peer_addr.ip(),
+        job: sub.job,
+        scoped,
+        base: base.clone(),
+        progress,
+        result_tx,
+    };
     // A dedicated OS thread, not the async runtime: a dispatch blocks for
     // minutes, and a queued job blocks until its seat frees. The seat guard
     // lives in the thread, so the seat frees when the work ends, even if
     // the sender stopped waiting.
-    let spawned = std::thread::Builder::new().name("darkmux-fleet-job".into()).spawn(move || {
-        let _seat = match start {
-            Start::Now(guard) => guard,
-            Start::Queued { queue_slot, .. } => {
-                let sid = thread_base.session_id.clone().unwrap_or_default();
-                let guard = seats.claim_waiting(&seat, &sid, heartbeat, |o| {
-                    if let Some(p) = &progress_tx {
-                        let _ = p.send(reply_line(&queued_reply(&thread_base, &thread_receiver, &o.what)));
-                    }
-                });
-                // Waiting is over: the sender's queue slot frees.
-                drop(queue_slot);
-                guard
-            }
-        };
-        let result = execute(job, run_profile, origin);
-        if let Some(p) = &progress_tx {
-            let _ = p.send(reply_line(&finished_reply(&thread_base, Some(result)).1));
-        } else {
-            let _ = tx.send(result);
-        }
-    });
+    let spawned = std::thread::Builder::new().name("darkmux-fleet-job".into()).spawn(move || worker.run(start));
     if let Err(e) = spawned {
         return refuse(&state, Some(peer_addr.ip()), &Refusal::BadRequest(format!("could not start the job: {e}")));
     }
@@ -533,10 +662,9 @@ async fn submit_handler(
         return (StatusCode::ACCEPTED, Json(queued_reply(&base, &receiver, &what))).into_response();
     }
     if !sub.wait {
-        let reply = SubmissionReply { status: "accepted".into(), ..base };
-        return (StatusCode::ACCEPTED, Json(reply)).into_response();
+        return (StatusCode::ACCEPTED, Json(base)).into_response();
     }
-    let (code, reply) = finished_reply(&base, rx.await.ok());
+    let (code, reply) = finished_reply(&base, result_rx.await.ok());
     (code, Json(reply)).into_response()
 }
 
@@ -568,11 +696,33 @@ pub(crate) fn listen_addr(local: &darkmux_fleet::NodeIdentity, port: u16) -> Res
 /// enables the feature, so production still refuses loopback.
 pub(crate) const LOOPBACK_FOR_E2E: bool = cfg!(feature = "e2e-fleet-loopback");
 
+// (#2916 stage 2 review C7) The loopback seam must never reach an optimized
+// build: a release binary (brew, `cargo build --release`) with it would let
+// a real listener answer on loopback, where every caller looks like this
+// machine. The two-daemon test builds a debug binary.
+#[cfg(all(feature = "e2e-fleet-loopback", not(debug_assertions)))]
+compile_error!("the `e2e-fleet-loopback` feature is for the debug-build two-daemon test only; never build it with optimizations");
+
 /// What the listener is doing, for `/health` and so for `darkmux doctor`
 /// (#2916 review C8): a daemon started by launchd can fail where a shell
 /// succeeds, and the reason used to live only in the daemon's log. Coarse
 /// phrases only: no provider output, no ids.
 static LISTENER_STATE: std::sync::Mutex<Option<(&'static str, String)>> = std::sync::Mutex::new(None);
+
+/// (#2916 stage 2 review C5) The busy policy and hosted-job bound the
+/// running listener was started with (it reads config once), so `darkmux
+/// doctor` can report what is in force rather than what the file says now.
+static LISTENER_BUSY: std::sync::Mutex<Option<(BusyPolicy, u32)>> = std::sync::Mutex::new(None);
+
+/// [`LISTENER_BUSY`] for `/health`, for this machine only; `None` when the
+/// listener has not started.
+pub(crate) fn listener_busy(loopback_caller: bool) -> Option<serde_json::Value> {
+    if !loopback_caller {
+        return None;
+    }
+    let (policy, cap) = (*LISTENER_BUSY.lock().ok()?)?;
+    Some(serde_json::json!({ "policy": policy.as_str(), "hosted_cap": cap }))
+}
 
 /// `coarse` is one of `starting` / `waiting` / `listening` / `not started`;
 /// `detail` may name the address and the reason.
@@ -627,6 +777,30 @@ pub(crate) const NODE_CAP: usize = 4;
 /// is still queued: well inside the shortest read deadline a sender uses
 /// (60 s), so the connection never looks dead while the job waits.
 pub(crate) const QUEUE_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// (#2916 stage 2 review C1) Time a waited-on queued job leaves between its
+/// own timeout and the end of its connection: its answer must still reach a
+/// sender that is listening.
+pub(crate) const QUEUE_SLACK: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// (#2916 stage 2 review C1) How long queued jobs may wait for a seat.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct QueueLimits {
+    /// How long one connection may live ([`ConnLimits::conn_deadline`]): a
+    /// waited-on job waits and runs inside it.
+    pub connection_lifetime: std::time::Duration,
+    /// How long a job queued without `--wait` may wait before it is
+    /// dropped as stale: 30 minutes. Nobody is listening for it, and work
+    /// sent half an hour ago is rarely still wanted.
+    pub no_wait_max_age: std::time::Duration,
+}
+
+impl QueueLimits {
+    pub(crate) const PRODUCTION: QueueLimits = QueueLimits {
+        connection_lifetime: ConnLimits::PRODUCTION.conn_deadline,
+        no_wait_max_age: std::time::Duration::from_secs(30 * 60),
+    };
+}
 
 /// In-flight counts per key (a peer address, or an admitted node); a slot
 /// is released when its guard drops (the connection's task, or the
@@ -783,6 +957,9 @@ async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<(), Str
     set_state("listening", format!("listening on {addr}"));
     println!("  fleet listener: {addr} (work submission; identity: {})", provider.provider_name());
     let state = FleetListenerState::production(receiver, provider, Some(local_id), busy_policy);
+    if let Ok(mut g) = LISTENER_BUSY.lock() {
+        *g = Some((busy_policy, darkmux_types::config_access::remote_concurrent_cap()));
+    }
     // (#2916 round 3 C6) Suppressed refusal counts are reported every minute,
     // not only when the next refusal arrives.
     let log = state.refusal_log.clone();
@@ -839,7 +1016,18 @@ mod tests {
         url: String,
         ran: Arc<Mutex<Vec<(String, String)>>>,
         seats: Arc<SeatBook>,
+        /// The allow-list the listener reads per request; a test may revoke.
+        allow: Arc<Mutex<AllowList>>,
+        queue_slots: Arc<KeySlots<String>>,
+        /// When set, the default profile resolves to another local model.
+        model_moved: Arc<std::sync::atomic::AtomicBool>,
     }
+
+    /// Wide queue limits: nothing in a test waits long enough to hit them.
+    const WIDE: QueueLimits = QueueLimits {
+        connection_lifetime: Duration::from_secs(3600),
+        no_wait_max_age: Duration::from_secs(3600),
+    };
 
     fn start(peer: Option<darkmux_fleet::NodeIdentity>, down: bool, job_ms: u64) -> Harness {
         start_with_preflight(peer, down, job_ms, Arc::new(|| Ok(())))
@@ -851,7 +1039,7 @@ mod tests {
         job_ms: u64,
         config_preflight: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
     ) -> Harness {
-        start_full(peer, down, job_ms, config_preflight, BusyPolicy::Refuse, 1)
+        start_full(peer, down, job_ms, config_preflight, BusyPolicy::Refuse, 1, WIDE)
     }
 
     /// The test resolver: `utility` is utility-only, `cloud` is a hosted
@@ -874,7 +1062,13 @@ mod tests {
         config_preflight: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
         busy_policy: BusyPolicy,
         remote_cap: u32,
+        queue_limits: QueueLimits,
     ) -> Harness {
+        let allow_now = Arc::new(Mutex::new(allow()));
+        let allow_read = allow_now.clone();
+        let queue_slots = Arc::new(KeySlots::new(NODE_CAP));
+        let model_moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let moved = model_moved.clone();
         let local = test_node("nSTUDIO", "studio", "100.64.0.2");
         let provider = StaticIdentityProvider {
             local,
@@ -890,8 +1084,16 @@ mod tests {
             provider: Arc::new(provider),
             local_node_id: Some("nSTUDIO".into()),
             token: Arc::new(|| Some(TOKEN.to_string())),
-            allow_list: Arc::new(|| Ok(allow())),
-            resolve_profile: Arc::new(|_role, requested| test_resolution(requested)),
+            allow_list: Arc::new(move || Ok(allow_read.lock().unwrap().clone())),
+            resolve_profile: Arc::new(move |_role, requested| {
+                if requested.is_none() && moved.load(std::sync::atomic::Ordering::SeqCst) {
+                    return ProfileResolution::Work {
+                        profile: "host".into(),
+                        seat: darkmux_fleet::WorkSeat::Local { model: "moved".into() },
+                    };
+                }
+                test_resolution(requested)
+            }),
             execute: Arc::new(move |job: WorkJob, profile: String, _origin: String| {
                 std::thread::sleep(Duration::from_millis(job_ms));
                 assert!(job.phase_id.is_none(), "a submitted job's phase_id must be dropped (#2916 re-review C4)");
@@ -906,8 +1108,9 @@ mod tests {
             }),
             seats: seats.clone(),
             busy_policy,
-            queue_slots: Arc::new(KeySlots::new(NODE_CAP)),
+            queue_slots: queue_slots.clone(),
             queue_heartbeat: Duration::from_millis(100),
+            queue_limits,
             refusal_log: refusal_log.clone(),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
             config_preflight,
@@ -923,7 +1126,7 @@ mod tests {
                 serve_bounded(l, router(state), ConnLimits::PRODUCTION, rx).await;
             });
         });
-        Harness { refusal_log, url: format!("http://127.0.0.1:{port}{}", darkmux_fleet::SUBMISSION_PATH), ran, seats }
+        Harness { refusal_log, url: format!("http://127.0.0.1:{port}{}", darkmux_fleet::SUBMISSION_PATH), ran, seats, allow: allow_now, queue_slots, model_moved }
     }
 
     fn laptop() -> darkmux_fleet::NodeIdentity {
@@ -954,7 +1157,7 @@ mod tests {
         let h = start(Some(laptop()), false, 0);
         let (code, reply) = post(&h, TOKEN, job("s-ok", None), true);
         assert_eq!(code, 200, "{reply:?}");
-        assert_eq!(reply.status, "completed");
+        assert_eq!(reply.status, ReplyStatus::Completed);
         assert_eq!(reply.exit_code, Some(0));
         assert_eq!(reply.stdout.as_deref(), Some("ran radio-host on host"));
         assert_eq!(reply.profile.as_deref(), Some("host"));
@@ -979,7 +1182,7 @@ mod tests {
         for (token, j, want_code, want_reason) in cases {
             let (code, reply) = post(&h, token, j, true);
             assert_eq!(code, want_code, "{reply:?}");
-            assert_eq!(reply.status, "refused");
+            assert_eq!(reply.status, ReplyStatus::Refused);
             assert!(reply.reason.as_deref().unwrap_or("").contains(want_reason), "{reply:?}");
         }
         assert!(h.ran.lock().unwrap().is_empty(), "a refused request must never run");
@@ -1044,7 +1247,7 @@ mod tests {
         );
         let (code, reply) = post(&h, TOKEN, job("s-bad", None), false);
         assert_eq!(code, 503, "{reply:?}");
-        assert_eq!(reply.status, "refused");
+        assert_eq!(reply.status, ReplyStatus::Refused);
         let reason = reply.reason.unwrap_or_default();
         assert!(reason.contains("`seroius`") && reason.contains("darkmux doctor"), "{reason}");
         // (#2947 review C-e) The daemon reads config once at start.
@@ -1082,7 +1285,7 @@ mod tests {
         let h = start(Some(laptop()), false, 600);
         let (code, reply) = post(&h, TOKEN, job("s-long", None), false);
         assert_eq!(code, 202, "{reply:?}");
-        assert_eq!(reply.status, "accepted");
+        assert_eq!(reply.status, ReplyStatus::Accepted);
         let started = std::time::Instant::now();
         let (code, reply) = post(&h, TOKEN, job("s-second", None), true);
         assert_eq!(code, 503);
@@ -1110,14 +1313,14 @@ mod tests {
         assert_eq!(code, 202);
         let (code, reply) = post(&h, TOKEN, job("s-small", Some("small")), true);
         assert_eq!(code, 200, "a different local model is a different seat: {reply:?}");
-        assert_eq!(reply.status, "completed");
+        assert_eq!(reply.status, ReplyStatus::Completed);
     }
 
     /// (#2916 stage 2) Hosted jobs run beside each other up to this
     /// machine's `remote.concurrent_cap`, and busy past it.
     #[test]
     fn hosted_jobs_run_together_up_to_the_receivers_cap() {
-        let h = start_full(Some(laptop()), false, 600, Arc::new(|| Ok(())), BusyPolicy::Refuse, 2);
+        let h = start_full(Some(laptop()), false, 600, Arc::new(|| Ok(())), BusyPolicy::Refuse, 2, WIDE);
         allow_profiles(&h, &["host", "small", "cloud"]);
         assert_eq!(post(&h, TOKEN, job("c1", Some("cloud")), false).0, 202);
         assert_eq!(post(&h, TOKEN, job("c2", Some("cloud")), false).0, 202, "the second hosted job fits a cap of 2");
@@ -1133,7 +1336,7 @@ mod tests {
     /// then runs when the seat frees and gets its result.
     #[test]
     fn a_queued_job_is_told_it_waits_then_runs() {
-        let h = start_full(Some(laptop()), false, 500, Arc::new(|| Ok(())), BusyPolicy::Queue, 1);
+        let h = start_full(Some(laptop()), false, 500, Arc::new(|| Ok(())), BusyPolicy::Queue, 1, WIDE);
         assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
         let mut progress = Vec::new();
         let (code, reply) = darkmux_fleet::post_submission_with_progress(
@@ -1145,7 +1348,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(code, 200, "{reply:?}");
-        assert_eq!(reply.status, "completed", "{reply:?}");
+        assert_eq!(reply.status, ReplyStatus::Completed, "{reply:?}");
         assert_eq!(reply.stdout.as_deref(), Some("ran radio-host on host"));
         assert!(!progress.is_empty(), "the sender was never told it waits");
         let first = progress[0].reason.clone().unwrap();
@@ -1158,12 +1361,12 @@ mod tests {
     /// at once, and the job still runs.
     #[test]
     fn a_queued_job_without_wait_is_answered_queued_and_still_runs() {
-        let h = start_full(Some(laptop()), false, 300, Arc::new(|| Ok(())), BusyPolicy::Queue, 1);
+        let h = start_full(Some(laptop()), false, 300, Arc::new(|| Ok(())), BusyPolicy::Queue, 1, WIDE);
         assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
         let started = std::time::Instant::now();
         let (code, reply) = post(&h, TOKEN, job("s-second", None), false);
         assert_eq!(code, 202, "{reply:?}");
-        assert_eq!(reply.status, "queued");
+        assert_eq!(reply.status, ReplyStatus::Queued);
         assert!(started.elapsed() < Duration::from_millis(250), "answered at once");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while h.ran.lock().unwrap().len() < 2 {
@@ -1172,14 +1375,204 @@ mod tests {
         }
     }
 
+    /// (#2916 stage 2 review C5) `/health` reports the listener's busy
+    /// settings to this machine only.
+    #[test]
+    fn the_busy_settings_are_reported_to_this_machine_only() {
+        *LISTENER_BUSY.lock().unwrap() = Some((BusyPolicy::Queue, 2));
+        let local = listener_busy(true).unwrap();
+        assert_eq!((local["policy"].as_str(), local["hosted_cap"].as_u64()), (Some("queue"), Some(2)));
+        assert!(listener_busy(false).is_none(), "a peer sees nothing");
+    }
+
+    /// Wait until `ran` holds `n` jobs (or fail after 10 s).
+    fn wait_ran(h: &Harness, n: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while h.ran.lock().unwrap().len() < n {
+            assert!(std::time::Instant::now() < deadline, "only {:?} ran", h.ran.lock().unwrap());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Wait until nothing holds a seat and nothing is queued for the laptop.
+    fn wait_idle(h: &Harness) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let slots_free = (0..NODE_CAP).map(|_| h.queue_slots.try_take("macbook-pro".into())).collect::<Vec<_>>();
+            if h.seats.running().is_empty() && slots_free.iter().all(Option::is_some) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "the listener never went idle: {:?}", h.seats.running());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Post `j` with `wait` from a background thread; the reply and every
+    /// `queued` line it heard come back on the handle.
+    fn post_in_background(h: &Harness, j: WorkJob) -> std::thread::JoinHandle<(u16, SubmissionReply, Vec<SubmissionReply>)> {
+        let url = h.url.clone();
+        std::thread::spawn(move || {
+            let mut heard = Vec::new();
+            let (code, r) = darkmux_fleet::post_submission_with_progress(
+                &url,
+                TOKEN,
+                &WorkSubmission::new(j, true),
+                Duration::from_secs(20),
+                &mut |p| heard.push(p.clone()),
+            )
+            .unwrap();
+            (code, r, heard)
+        })
+    }
+
+    /// (#2916 stage 2 review M1) A job queued while its sender was trusted is
+    /// checked again when its seat frees: after `untrust`, it is refused, and
+    /// it never runs.
+    #[test]
+    fn a_queued_job_is_refused_when_its_sender_was_untrusted_while_it_waited() {
+        let h = start_full(Some(laptop()), false, 600, Arc::new(|| Ok(())), BusyPolicy::Queue, 1, WIDE);
+        assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
+        let waiting = post_in_background(&h, job("s-queued", None));
+        std::thread::sleep(Duration::from_millis(200));
+        h.allow.lock().unwrap().clear();
+        let (_, reply, heard) = waiting.join().unwrap();
+        assert!(!heard.is_empty(), "it was queued first");
+        assert_eq!(reply.status, ReplyStatus::Refused, "{reply:?}");
+        assert!(reply.reason.unwrap().contains("does not accept work from macbook-pro"));
+        wait_idle(&h);
+        assert_eq!(h.ran.lock().unwrap().len(), 1, "only the first job ran");
+    }
+
+    /// (#2916 stage 2 review M1) The same for a job queued without `--wait`:
+    /// nobody is listening, and it still never runs.
+    #[test]
+    fn a_no_wait_queued_job_never_runs_after_untrust() {
+        let h = start_full(Some(laptop()), false, 400, Arc::new(|| Ok(())), BusyPolicy::Queue, 1, WIDE);
+        assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
+        assert_eq!(post(&h, TOKEN, job("s-queued", None), false).1.status, ReplyStatus::Queued);
+        h.allow.lock().unwrap().clear();
+        wait_ran(&h, 1);
+        wait_idle(&h);
+        assert_eq!(h.ran.lock().unwrap().len(), 1, "the queued job ran after untrust");
+    }
+
+    /// (#2916 stage 2 review M1) The config preflight runs again when a
+    /// queued job's seat frees: a receiver whose config went bad while the
+    /// job waited refuses it.
+    #[test]
+    fn a_queued_job_is_refused_when_the_receivers_config_went_bad_while_it_waited() {
+        let bad = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let b = bad.clone();
+        let preflight: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = Arc::new(move || {
+            if b.load(std::sync::atomic::Ordering::SeqCst) {
+                Err("dispatch: refusing to start: bad config `seroius`".into())
+            } else {
+                Ok(())
+            }
+        });
+        let h = start_full(Some(laptop()), false, 600, preflight, BusyPolicy::Queue, 1, WIDE);
+        assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
+        let waiting = post_in_background(&h, job("s-queued", None));
+        std::thread::sleep(Duration::from_millis(200));
+        bad.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (_, reply, _) = waiting.join().unwrap();
+        assert_eq!(reply.status, ReplyStatus::Refused, "{reply:?}");
+        assert!(reply.reason.unwrap().contains("`seroius`"));
+        assert_eq!(h.ran.lock().unwrap().len(), 1, "only the first job ran");
+    }
+
+    /// (#2916 stage 2 review M1) The profile is resolved again too: if it now
+    /// runs on another model than the seat the job waited for, the job is
+    /// refused rather than run on a seat it does not hold.
+    #[test]
+    fn a_queued_job_is_refused_when_its_profile_moved_to_another_model() {
+        let h = start_full(Some(laptop()), false, 600, Arc::new(|| Ok(())), BusyPolicy::Queue, 1, WIDE);
+        assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
+        let waiting = post_in_background(&h, job("s-queued", None));
+        std::thread::sleep(Duration::from_millis(200));
+        h.model_moved.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (_, reply, _) = waiting.join().unwrap();
+        assert_eq!(reply.status, ReplyStatus::Refused, "{reply:?}");
+        assert!(reply.reason.unwrap().contains("different model"));
+        assert_eq!(h.ran.lock().unwrap().len(), 1, "only the first job ran");
+    }
+
+    /// (#2916 stage 2 review M2) A sender that waits on a queued job and then
+    /// hangs up gives its place back: its queue slot frees, and its job never
+    /// runs.
+    #[test]
+    fn a_waiting_sender_that_hangs_up_frees_its_slot_and_its_job_never_runs() {
+        use std::io::{Read, Write};
+        let h = start_full(Some(laptop()), false, 1_500, Arc::new(|| Ok(())), BusyPolicy::Queue, 1, WIDE);
+        assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
+        let body = serde_json::to_vec(&WorkSubmission::new(job("s-gone", None), true)).unwrap();
+        let addr = h.url.trim_start_matches("http://").split('/').next().unwrap().to_string();
+        let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+        write!(
+            sock,
+            "POST {} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            darkmux_fleet::SUBMISSION_PATH,
+            body.len()
+        )
+        .unwrap();
+        sock.write_all(&body).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut got = Vec::new();
+        let mut b = [0u8; 4096];
+        while !String::from_utf8_lossy(&got).contains("\"queued\"") {
+            let n = sock.read(&mut b).unwrap();
+            assert!(n > 0, "the listener closed before saying queued");
+            got.extend_from_slice(&b[..n]);
+        }
+        drop(sock);
+        wait_ran(&h, 1);
+        wait_idle(&h);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(h.ran.lock().unwrap().len(), 1, "the abandoned job ran");
+    }
+
+    /// (#2916 stage 2 review C1) A waited-on job whose timeout leaves no time
+    /// to wait inside one connection is answered busy at once, not queued.
+    #[test]
+    fn a_waited_job_with_no_room_in_its_connection_is_busy_not_queued() {
+        let tight = QueueLimits { connection_lifetime: Duration::from_secs(120), no_wait_max_age: Duration::from_secs(60) };
+        let h = start_full(Some(laptop()), false, 600, Arc::new(|| Ok(())), BusyPolicy::Queue, 1, tight);
+        assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
+        // A 60 s job in a 120 s connection, less 60 s of slack: no time left.
+        let (code, reply) = post(&h, TOKEN, job("s-second", None), true);
+        assert_eq!((code, reply.status), (503, ReplyStatus::Refused), "{reply:?}");
+        assert!(reply.reason.unwrap().contains("no time left to wait"));
+    }
+
+    /// (#2916 stage 2 review C1) A queued job that waits past its limit is
+    /// dropped: busy to a waiting sender, silently for a job sent without
+    /// `--wait`. Neither runs.
+    #[test]
+    fn a_queued_job_past_its_limit_is_dropped_and_never_runs() {
+        let short = QueueLimits {
+            connection_lifetime: Duration::from_secs(60) + QUEUE_SLACK + Duration::from_millis(300),
+            no_wait_max_age: Duration::from_millis(300),
+        };
+        let h = start_full(Some(laptop()), false, 1_500, Arc::new(|| Ok(())), BusyPolicy::Queue, 1, short);
+        assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
+        assert_eq!(post(&h, TOKEN, job("s-nowait", None), false).1.status, ReplyStatus::Queued);
+        let (_, reply, heard) = post_in_background(&h, job("s-wait", None)).join().unwrap();
+        assert!(!heard.is_empty());
+        assert_eq!(reply.status, ReplyStatus::Refused, "{reply:?}");
+        assert!(reply.reason.unwrap().contains("waited as long as it may"));
+        wait_ran(&h, 1);
+        wait_idle(&h);
+        assert_eq!(h.ran.lock().unwrap().len(), 1, "a timed-out queued job ran");
+    }
+
     /// (#2916 stage 2) A peer may queue at most `NODE_CAP` jobs.
     #[test]
     fn a_peer_cannot_queue_without_bound() {
-        let h = start_full(Some(laptop()), false, 2_000, Arc::new(|| Ok(())), BusyPolicy::Queue, 1);
+        let h = start_full(Some(laptop()), false, 2_000, Arc::new(|| Ok(())), BusyPolicy::Queue, 1, WIDE);
         assert_eq!(post(&h, TOKEN, job("s-run", None), false).0, 202);
         for i in 0..NODE_CAP {
             let (code, r) = post(&h, TOKEN, job(&format!("s-q{i}"), None), false);
-            assert_eq!((code, r.status.as_str()), (202, "queued"), "{r:?}");
+            assert_eq!((code, r.status), (202, ReplyStatus::Queued), "{r:?}");
         }
         let (code, r) = post(&h, TOKEN, job("s-over", None), false);
         assert_eq!(code, 503, "{r:?}");
@@ -1212,6 +1605,7 @@ mod tests {
             busy_policy: BusyPolicy::Refuse,
             queue_slots: Arc::new(KeySlots::new(NODE_CAP)),
             queue_heartbeat: QUEUE_HEARTBEAT,
+            queue_limits: QueueLimits::PRODUCTION,
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
             config_preflight: Arc::new(|| Ok(())),
@@ -1251,6 +1645,7 @@ mod tests {
             busy_policy: BusyPolicy::Refuse,
             queue_slots: Arc::new(KeySlots::new(NODE_CAP)),
             queue_heartbeat: QUEUE_HEARTBEAT,
+            queue_limits: QueueLimits::PRODUCTION,
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
             config_preflight: Arc::new(|| Ok(())),
@@ -1447,6 +1842,7 @@ mod tests {
             busy_policy: BusyPolicy::Refuse,
             queue_slots: Arc::new(KeySlots::new(NODE_CAP)),
             queue_heartbeat: QUEUE_HEARTBEAT,
+            queue_limits: QueueLimits::PRODUCTION,
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
             config_preflight: Arc::new(|| Ok(())),
@@ -1503,6 +1899,7 @@ mod tests {
             busy_policy: BusyPolicy::Refuse,
             queue_slots: Arc::new(KeySlots::new(NODE_CAP)),
             queue_heartbeat: QUEUE_HEARTBEAT,
+            queue_limits: QueueLimits::PRODUCTION,
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(1)),
             config_preflight: Arc::new(|| Ok(())),

@@ -489,12 +489,12 @@ pub struct DispatchOpts {
     /// closed by #2580): both `dispatch()`'s remote fork and the
     /// `dispatch_local_single_shot` primitive refuse `resume_from` before
     /// the HTTP call, rather than silently starting fresh. A `darkmux
-    /// dispatch --machine <peer>` invocation is routed to the fleet queue
-    /// even earlier than that — before `dispatch()` (and so this gate) is
-    /// ever called — and carries the analogous refusal in
-    /// `darkmux-fleet`'s `dispatch_routed_via` (#2584): the queue's
-    /// `WorkJob` has no checkpoint field, so a queued dispatch has no way
-    /// to honor one on the peer either. A FOURTH route bypassed this gate
+    /// dispatch --profile <p>@<peer>` invocation is submitted to that
+    /// machine's fleet listener even earlier than that — before
+    /// `dispatch()` (and so this gate) is ever called — and carries the
+    /// analogous refusal in `darkmux-fleet`'s `dispatch_routed_via` (#2584):
+    /// a `WorkJob` has no checkpoint field, so a submitted dispatch has no
+    /// way to honor one on the peer either. A FOURTH route bypassed this gate
     /// the same way, and worse, at MULTIPLE entry points: every caller of
     /// `dispatch.internal` — `darkmux dispatch`'s own crew-of-one path
     /// (`dispatch_as_crew_of_one`), a `mission launch <config>` staffing a

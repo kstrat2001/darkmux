@@ -1531,6 +1531,9 @@ async fn health(
         // is off), so `darkmux doctor` reads the DAEMON's view rather than
         // re-deriving it from a shell whose PATH may differ.
         "fleet_listener": fleet_listener::listener_state(loopback_caller),
+        // (#2916 stage 2 review C5) The busy policy and hosted-job bound the
+        // running listener uses, for this machine only.
+        "fleet_busy": fleet_listener::listener_busy(loopback_caller),
         // (#2916 re-review C3) The open-file soft limit this daemon runs
         // with (raised at start), for this machine only.
         "open_file_limit": if loopback_caller { current_open_file_limit() } else { None },

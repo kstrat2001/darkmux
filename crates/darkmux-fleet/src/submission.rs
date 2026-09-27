@@ -79,18 +79,33 @@ impl WorkSubmission {
     }
 }
 
-/// The reply, for every outcome. `status` is `completed`, `accepted`,
-/// `queued` (#2916 stage 2: the seat is busy and the receiver's
-/// `fleet.busy_policy` is `queue`), `error` (the dispatch itself failed) or
-/// `refused`.
+/// What a reply says happened. Parsed once, at the wire (serde); every
+/// consumer matches on it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReplyStatus {
+    /// The job ran; the reply carries its exit code and output.
+    Completed,
+    /// The job was accepted and is running; the sender is not waiting.
+    Accepted,
+    /// (#2916 stage 2) The seat is busy and the receiver's
+    /// `fleet.busy_policy` is `queue`: the job waits for its seat.
+    Queued,
+    /// The job was accepted but the dispatch itself failed.
+    Error,
+    /// The job was not run; `reason` says why.
+    Refused,
+}
+
+/// The reply, for every outcome.
 ///
 /// A reply body is newline-delimited JSON, one reply per line. It is one
 /// line for every answer except a job the sender waits on that was queued:
 /// that body carries a `queued` line when it is queued (again at every
 /// heartbeat while it waits), then the final line.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SubmissionReply {
-    pub status: String,
+    pub status: ReplyStatus,
     /// The machine that answered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
@@ -105,9 +120,25 @@ pub struct SubmissionReply {
     pub stdout: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr: Option<String>,
-    /// Why, for `refused` and `error`.
+    /// Why, for `refused` and `error` (and what a `queued` job waits for).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+impl SubmissionReply {
+    /// A reply with `status` and nothing else set.
+    pub fn of(status: ReplyStatus) -> Self {
+        Self {
+            status,
+            machine: None,
+            session_id: None,
+            profile: None,
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            reason: None,
+        }
+    }
 }
 
 /// How the presented token compared.
@@ -152,6 +183,10 @@ pub enum Refusal {
     /// (#2916 stage 2) The seat is busy, this machine queues, and the peer
     /// already has as many jobs queued here as it may.
     QueueFull { peer: String, what: String },
+    /// (#2916 stage 2 review M1) While the job was queued, the profile it
+    /// resolved to changed to one on a different seat than the one it
+    /// waited for.
+    SeatChanged { profile: String },
     /// (#2916 round 3 C5) One node already has its cap of requests in flight.
     TooManyAtOnce { peer: String },
     /// (#2947) This machine's own config has an unregistered value in an
@@ -172,6 +207,7 @@ impl Refusal {
             Refusal::NoWorkProfile { .. } => 422,
             Refusal::Busy { .. }
             | Refusal::QueueFull { .. }
+            | Refusal::SeatChanged { .. }
             | Refusal::TooManyAtOnce { .. }
             | Refusal::NoTokenConfigured
             | Refusal::IdentityUnavailable { .. }
@@ -256,6 +292,10 @@ impl Refusal {
                 "busy: {receiver} is running other work on that seat ({what}). Retry when it \
                  finishes ({receiver}'s `fleet.busy_policy` is `refuse`)"
             ),
+            Refusal::SeatChanged { profile } => format!(
+                "{receiver}'s profile {profile} now runs on a different model than the one this job \
+                 waited for, so the queued job was not run; send it again"
+            ),
             Refusal::QueueFull { peer, what } => format!(
                 "busy: {receiver} is running other work on that seat ({what}), and {peer} already \
                  has as many jobs queued on {receiver} as it may. Retry when one finishes"
@@ -270,10 +310,9 @@ impl Refusal {
 
     pub fn reply(&self, receiver: &str) -> SubmissionReply {
         SubmissionReply {
-            status: "refused".into(),
             machine: Some(receiver.to_string()),
             reason: Some(self.reason(receiver)),
-            ..Default::default()
+            ..SubmissionReply::of(ReplyStatus::Refused)
         }
     }
 }
@@ -283,6 +322,12 @@ impl Refusal {
 pub struct Admitted {
     /// The allow-list key (the peer's machine name).
     pub peer_name: String,
+    /// (#2916 stage 2) The node the network named, so a queued job can be
+    /// matched against the allow-list again when its seat frees
+    /// ([`match_entry`]). Never printed.
+    pub node_id: String,
+    /// The node's name on the network, for the refusal text.
+    pub node_name: String,
     pub profiles: Vec<String>,
     pub roles: Vec<String>,
     pub images: Vec<String>,
@@ -324,14 +369,28 @@ pub fn admit(
     if local_node_id.is_some_and(|me| !me.is_empty() && me == node.node_id) {
         return Err(Refusal::FromSelf);
     }
+    match_entry(&node.node_id, &node.name, allow)
+}
+
+/// The allow-list entry for the node `node_id` (named `node_name` on the
+/// network): exactly one entry must carry that node id. The one match rule
+/// [`admit`] uses, and what a queued job is checked against again when its
+/// seat frees, since `untrust` may have run while it waited.
+pub fn match_entry(
+    node_id: &str,
+    node_name: &str,
+    allow: &BTreeMap<String, AcceptWorkEntry>,
+) -> std::result::Result<Admitted, Refusal> {
     let matches: Vec<(&String, &AcceptWorkEntry)> = allow
         .iter()
-        .filter(|(_, e)| e.node_id.as_deref().is_some_and(|id| !id.is_empty() && id == node.node_id))
+        .filter(|(_, e)| e.node_id.as_deref().is_some_and(|id| !id.is_empty() && id == node_id))
         .collect();
     match matches.as_slice() {
-        [] => Err(Refusal::NotAllowed { node_name: node.name }),
+        [] => Err(Refusal::NotAllowed { node_name: node_name.to_string() }),
         [(name, entry)] => Ok(Admitted {
             peer_name: (*name).clone(),
+            node_id: node_id.to_string(),
+            node_name: node_name.to_string(),
             profiles: entry.profiles.clone().unwrap_or_default(),
             roles: entry.roles.clone().unwrap_or_default(),
             images: entry.images.clone().unwrap_or_default(),
@@ -514,6 +573,22 @@ pub fn submission_url(roster_address: &str, port: u16) -> Result<String> {
 /// stderr ride in it).
 const MAX_REPLY_BYTES: u64 = 16 * 1024 * 1024;
 
+/// (#2916 stage 2 review C1) The connection failed after the request may
+/// have reached the receiver: the job may be running there, and the sender
+/// cannot tell. [`submit_work`] adds the session id to follow it by.
+#[derive(Debug)]
+pub struct AnswerLost {
+    pub detail: String,
+}
+
+impl std::fmt::Display for AnswerLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for AnswerLost {}
+
 fn read_reply(
     where_: &str,
     resp: std::result::Result<ureq::Response, ureq::Error>,
@@ -522,11 +597,21 @@ fn read_reply(
     let (code, resp) = match resp {
         Ok(r) => (r.status(), r),
         Err(ureq::Error::Status(code, r)) => (code, r),
-        Err(ureq::Error::Transport(t)) => {
-            return Err(anyhow!("no answer from {where_}: {t}"));
-        }
+        Err(ureq::Error::Transport(t)) => return Err(transport_failure(where_, &t)),
     };
     read_reply_lines(where_, code, std::io::Read::take(resp.into_reader(), MAX_REPLY_BYTES), on_progress)
+}
+
+/// A transport failure: nothing was sent when the connection never opened;
+/// otherwise the answer was lost and the job may be running ([`AnswerLost`]).
+fn transport_failure(where_: &str, t: &ureq::Transport) -> anyhow::Error {
+    use ureq::ErrorKind;
+    match t.kind() {
+        ErrorKind::Dns | ErrorKind::ConnectionFailed | ErrorKind::InvalidUrl | ErrorKind::UnknownScheme => {
+            anyhow!("no answer from {where_}: {t}; nothing was sent")
+        }
+        _ => AnswerLost { detail: format!("no answer from {where_}: {t}") }.into(),
+    }
 }
 
 /// (#2916 stage 2) Read a newline-delimited reply body: every line before
@@ -548,18 +633,18 @@ pub(crate) fn read_reply_lines(
     };
     let mut last: Option<SubmissionReply> = None;
     for line in std::io::BufReader::new(body).lines() {
-        let line = line.context("reading the submission reply")?;
+        let line = line.map_err(|e| AnswerLost { detail: format!("the answer from {where_} broke off: {e}") })?;
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
         let reply: SubmissionReply = serde_json::from_str(line).map_err(|_| not_a_listener(line))?;
         // Only a `queued` line may be followed by another.
-        if last.take().is_some_and(|prev| prev.status != "queued") {
+        if last.take().is_some_and(|prev| prev.status != ReplyStatus::Queued) {
             return Err(not_a_listener(line));
         }
         // Reported as it arrives: that is the point of sending it.
-        if reply.status == "queued" {
+        if reply.status == ReplyStatus::Queued {
             on_progress(&reply);
         }
         last = Some(reply);
@@ -830,6 +915,7 @@ pub fn submit_work(job: WorkJob, wait: bool) -> Result<SubmissionReply> {
     } else {
         Duration::from_secs(60)
     };
+    let session_id = job.session_id.clone();
     let submission = WorkSubmission::new(job, wait);
     // (#2916 stage 2) A waited-on job the receiver queued says so as it
     // happens, verbatim (control characters removed). Without `--wait` the
@@ -841,7 +927,20 @@ pub fn submit_work(job: WorkJob, wait: bool) -> Result<SubmissionReply> {
             }
         }
     };
-    let (code, mut reply) = send_submission(&peer, &submission, read_timeout, &mut on_progress)?;
+    let (code, mut reply) =
+        send_submission(&peer, &submission, read_timeout, &mut on_progress).map_err(|e| match e.downcast::<AnswerLost>() {
+            Ok(lost) => {
+                // The receiver names the run after the allow-list entry it
+                // trusts this machine under, normally this machine_id.
+                let me = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "<this machine>".into());
+                let theirs = receiver_session_id(&session_id, &me);
+                anyhow!(
+                    "{lost}. The job may still be running on {target} (session {theirs}); follow it \
+                     there with `darkmux flow tail --session {theirs}` or in its viewer"
+                )
+            }
+            Err(other) => other,
+        })?;
     // (#2916 re-review C6) The echoed session id is printed and stored:
     // only a well-formed one is kept.
     if let Some(sid) = &reply.session_id {
@@ -849,13 +948,13 @@ pub fn submit_work(job: WorkJob, wait: bool) -> Result<SubmissionReply> {
             reply.session_id = None;
         }
     }
-    match reply.status.as_str() {
-        "completed" | "accepted" | "queued" => Ok(reply),
-        "error" => Err(anyhow!(
+    match reply.status {
+        ReplyStatus::Completed | ReplyStatus::Accepted | ReplyStatus::Queued => Ok(reply),
+        ReplyStatus::Error => Err(anyhow!(
             "{target} accepted the job but the dispatch failed: {}",
             sanitize_remote_text(reply.reason.as_deref().unwrap_or("no reason given"))
         )),
-        _ => Err(anyhow!(
+        ReplyStatus::Refused => Err(anyhow!(
             "{}",
             reply
                 .reason
@@ -1023,6 +1122,8 @@ mod tests {
         assert_eq!(r, Err(Refusal::FromSelf));
 
         let admitted = Admitted {
+            node_id: "nLAPTOP".into(),
+            node_name: "macbook-pro".into(),
             peer_name: "laptop".into(),
             profiles: vec!["host".into()],
             roles: vec!["radio-host".into()],
@@ -1049,6 +1150,8 @@ mod tests {
     #[test]
     fn scope_refuses_a_misaddressed_job_and_a_workdir_without_workspace() {
         let admitted = Admitted {
+            node_id: "nLAPTOP".into(),
+            node_name: "macbook-pro".into(),
             peer_name: "macbook-pro".into(),
             profiles: vec!["host".into()],
             roles: vec!["radio-host".into()],
@@ -1087,7 +1190,7 @@ mod tests {
         assert_eq!(Refusal::Busy { what: "s".into() }.http_status(), 503);
         assert_eq!(Refusal::QueueFull { peer: "p".into(), what: "s".into() }.http_status(), 503);
         let reply = Refusal::Token.reply("studio");
-        assert_eq!(reply.status, "refused");
+        assert_eq!(reply.status, ReplyStatus::Refused);
         assert!(!serde_json::to_string(&reply).unwrap().contains("nLAPTOP"));
     }
 
@@ -1270,11 +1373,11 @@ mod tests {
         let body = "{\"status\":\"queued\",\"reason\":\"busy (a)\"}\n{\"status\":\"queued\",\"reason\":\"busy (b)\"}\n{\"status\":\"completed\",\"exit_code\":0}\n";
         let mut seen = Vec::new();
         let (code, r) = read_reply_lines("x", 200, body.as_bytes(), &mut |p| seen.push(p.reason.clone().unwrap())).unwrap();
-        assert_eq!((code, r.status.as_str(), r.exit_code), (200, "completed", Some(0)));
+        assert_eq!((code, r.status, r.exit_code), (200, ReplyStatus::Completed, Some(0)));
         assert_eq!(seen, vec!["busy (a)".to_string(), "busy (b)".to_string()]);
         // One line: the answer, as before.
         let (_, r) = read_reply_lines("x", 202, "{\"status\":\"accepted\"}".as_bytes(), &mut |_| panic!("no progress")).unwrap();
-        assert_eq!(r.status, "accepted");
+        assert_eq!(r.status, ReplyStatus::Accepted);
         // A final answer followed by more is not a listener's reply.
         let bad = "{\"status\":\"completed\"}\n{\"status\":\"completed\"}\n";
         assert!(read_reply_lines("x", 200, bad.as_bytes(), &mut |_| {}).is_err());

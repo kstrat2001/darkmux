@@ -28,9 +28,10 @@
 
 #![cfg(unix)]
 
-#[path = "e2e/fixture_reaper.rs"]
-#[allow(dead_code)]
-mod fixture_reaper;
+#[path = "e2e/mod.rs"]
+mod e2e;
+
+use e2e::fixture_reaper;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -42,6 +43,11 @@ use std::time::{Duration, Instant};
 
 const TOKEN: &str = "e2e-fleet-token-2916";
 const MOCK_REPLY: &str = "the beta seat answered";
+
+/// The flow action of a usage record (`darkmux_crew::usage::USAGE_ACTION`).
+/// Spelled here because this test drives the binary, not the library; the
+/// assertion that the receiver HAS one keeps a rename from passing silently.
+const USAGE_ACTION: &str = "telemetry.tokens";
 
 /// The binary under test: a plain `cargo build` of `darkmux` WITH the
 /// `e2e-fleet-loopback` feature, in its own target directory.
@@ -370,13 +376,19 @@ fn an_addressed_dispatch_runs_on_the_owning_machine_and_each_side_records_its_ha
     );
 
     // alpha recorded where it sent the work, and no tokens: the machine that
-    // ran the model counts them (#2916 decision 6).
+    // ran the model counts them (#2916 decision 6). The mock reports usage,
+    // so beta has a usage record for its session and alpha has none.
     let alpha = f.alpha.flow_lines();
     let route = alpha.iter().find(|v| v["action"] == "dispatch route").unwrap_or_else(|| panic!("{:?}", actions(&alpha)));
     assert_eq!(route["payload"]["profile_address"], "cloud@beta", "{route}");
     assert_eq!(route["payload"]["target_machine"], "beta", "{route}");
     assert!(
-        !alpha.iter().any(|v| v["action"].as_str().is_some_and(|a| a.contains("usage"))),
+        beta.iter().any(|v| v["action"] == USAGE_ACTION && v["session_id"] == sid),
+        "the receiver counted the tokens of the model it ran: {:?}",
+        actions(&beta)
+    );
+    assert!(
+        !alpha.iter().any(|v| v["action"] == USAGE_ACTION),
         "the sender recorded token usage for work another machine ran: {:?}",
         actions(&alpha)
     );
@@ -394,6 +406,7 @@ fn the_receiver_refuses_at_once_and_the_sender_shows_why() {
     assert!(text(&out).contains("profile nope is not defined on beta"), "{}", text(&out));
     assert!(started.elapsed() < Duration::from_secs(20), "a refusal is answered at once");
     assert_eq!(f.mock.served.load(Ordering::SeqCst), 0, "nothing ran on beta");
+    assert_eq!(beta_dispatch_starts(&f), 0, "beta started a dispatch for a refused job");
 
     // Busy on the hosted seat (beta's remote.concurrent_cap is 1).
     f.mock.delay_ms.store(4_000, Ordering::SeqCst);
@@ -403,6 +416,18 @@ fn the_receiver_refuses_at_once_and_the_sender_shows_why() {
     assert!(!second.status.success(), "{}", text(&second));
     let why = text(&second);
     assert!(why.contains("busy: beta") && why.contains("remote.concurrent_cap"), "{why}");
+    // Only the first job ever started on beta: the busy one never did.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(beta_dispatch_starts(&f), 1, "beta started a dispatch for the refused busy job");
+}
+
+/// `dispatch start` records beta wrote for jobs alpha sent.
+fn beta_dispatch_starts(f: &Fleet) -> usize {
+    f.beta
+        .flow_lines()
+        .iter()
+        .filter(|v| v["action"] == "dispatch start" && v["session_id"].as_str().is_some_and(|s| s.ends_with("-from-alpha")))
+        .count()
 }
 
 /// With `fleet.busy_policy = queue` the second job waits for the seat, the

@@ -22,7 +22,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// What a submitted job invokes, as the receiver resolved it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +42,17 @@ impl WorkSeat {
             WorkSeat::Hosted { .. } => "hosted".to_string(),
         }
     }
+}
+
+/// How a wait for a seat ended.
+pub enum Waited {
+    /// The job holds its seat now.
+    Seat(SeatGuard),
+    /// The sender stopped waiting; the job left the queue and never ran.
+    Cancelled,
+    /// The job waited as long as it may; it left the queue and never ran.
+    /// Carries what held the seat.
+    TimedOut(Occupied),
 }
 
 /// Why a seat is not free: a sentence naming what is running.
@@ -100,7 +111,7 @@ impl SeatBook {
     /// `remote_concurrent_cap` is the receiver's `remote.concurrent_cap`;
     /// `0` means unbounded.
     pub fn new(remote_concurrent_cap: u32) -> Self {
-        let hosted_cap = if remote_concurrent_cap == 0 { usize::MAX } else { remote_concurrent_cap as usize };
+        let hosted_cap = darkmux_types::config_access::jobs_at_once(remote_concurrent_cap as usize);
         Self { hosted_cap, book: Mutex::new(Book::default()), freed: Condvar::new() }
     }
 
@@ -143,24 +154,34 @@ impl SeatBook {
         Ok(self.take(&mut b, seat, session))
     }
 
-    /// Wait for `seat`, first come first served, then take it. While
-    /// waiting, `on_wait` is called with what holds the seat right away and
+    /// Wait for `seat`, first come first served, then take it.
+    ///
+    /// While it waits, `on_wait` hears what holds the seat right away and
     /// again every `heartbeat`, so a waiting sender hears from this machine
-    /// before its read deadline.
+    /// before its read deadline. It stops waiting, leaving the queue and
+    /// taking nothing, when `cancelled()` turns true (the sender hung up) or
+    /// `deadline` passes (the job would outlive its connection or its
+    /// maximum queue age).
     pub fn claim_waiting(
         self: &Arc<Self>,
         seat: &WorkSeat,
         session: &str,
         heartbeat: Duration,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
         mut on_wait: impl FnMut(&Occupied),
-    ) -> SeatGuard {
+    ) -> Waited {
         let key = seat.key();
         let mut b = self.book.lock().unwrap_or_else(|p| p.into_inner());
         let ticket = b.next_ticket;
         b.next_ticket += 1;
         b.waiting.push_back((key.clone(), ticket));
-        let mut announced = false;
+        let mut announce = true;
         loop {
+            if cancelled() {
+                self.leave(&mut b, ticket);
+                return Waited::Cancelled;
+            }
             let first_for_key = b.waiting.iter().find(|(k, _)| *k == key).map(|(_, t)| *t) == Some(ticket);
             let held = self.occupied(&b, seat);
             if first_for_key && held.is_none() {
@@ -169,30 +190,34 @@ impl SeatBook {
                 drop(b);
                 // Wake the next waiter for another key that may now move.
                 self.freed.notify_all();
-                return guard;
+                return Waited::Seat(guard);
             }
             let what = held.unwrap_or_else(|| Occupied { what: "earlier jobs are waiting for the same seat".into() });
-            if !announced {
-                announced = true;
+            let now = Instant::now();
+            if now >= deadline {
+                self.leave(&mut b, ticket);
+                return Waited::TimedOut(what);
+            }
+            if announce {
+                announce = false;
                 drop(b);
                 on_wait(&what);
                 b = self.book.lock().unwrap_or_else(|p| p.into_inner());
                 continue;
             }
-            let (next, timeout) = self.freed.wait_timeout(b, heartbeat).unwrap_or_else(|p| p.into_inner());
+            let (next, timeout) =
+                self.freed.wait_timeout(b, heartbeat.min(deadline - now)).unwrap_or_else(|p| p.into_inner());
             b = next;
-            if timeout.timed_out() {
-                let first_for_key = b.waiting.iter().find(|(k, _)| *k == key).map(|(_, t)| *t) == Some(ticket);
-                if !(first_for_key && self.occupied(&b, seat).is_none()) {
-                    let what = self
-                        .occupied(&b, seat)
-                        .unwrap_or_else(|| Occupied { what: "earlier jobs are waiting for the same seat".into() });
-                    drop(b);
-                    on_wait(&what);
-                    b = self.book.lock().unwrap_or_else(|p| p.into_inner());
-                }
-            }
+            // A heartbeat: say again what it waits for, if it still waits.
+            announce = timeout.timed_out();
         }
+    }
+
+    /// Take `ticket` out of the queue and wake the others: the one behind
+    /// it may now be first.
+    fn leave(&self, b: &mut Book, ticket: u64) {
+        b.waiting.retain(|(_, t)| *t != ticket);
+        self.freed.notify_all();
     }
 
     /// Sessions running now (for tests and logs).
@@ -211,6 +236,22 @@ mod tests {
     }
     fn hosted() -> WorkSeat {
         WorkSeat::Hosted { model: "gpt-x".into() }
+    }
+
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
+    fn never() -> bool {
+        false
+    }
+
+    fn seat_of(w: Waited) -> SeatGuard {
+        match w {
+            Waited::Seat(g) => g,
+            Waited::Cancelled => panic!("cancelled"),
+            Waited::TimedOut(o) => panic!("timed out behind {o:?}"),
+        }
     }
 
     #[test]
@@ -250,9 +291,9 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let g = b2.claim_waiting(&local("m"), "s2", Duration::from_millis(40), |o| {
+            let g = seat_of(b2.claim_waiting(&local("m"), "s2", Duration::from_millis(40), far(), &never, |o| {
                 let _ = tx.send(o.what.clone());
-            });
+            }));
             drop(g);
             let _ = done_tx.send(());
         });
@@ -287,7 +328,7 @@ mod tests {
         let b2 = book.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let g = b2.claim_waiting(&local("m"), "s-second", Duration::from_millis(20), |_| {});
+            let g = seat_of(b2.claim_waiting(&local("m"), "s-second", Duration::from_millis(20), far(), &never, |_| {}));
             let _ = done_tx.send(());
             std::thread::sleep(Duration::from_millis(50));
             drop(g);
@@ -308,9 +349,9 @@ mod tests {
             let (b, o) = (book.clone(), order.clone());
             let (tx, rx) = std::sync::mpsc::channel::<()>();
             handles.push(std::thread::spawn(move || {
-                let g = b.claim_waiting(&local("m"), &format!("s{i}"), Duration::from_secs(5), |_| {
+                let g = seat_of(b.claim_waiting(&local("m"), &format!("s{i}"), Duration::from_secs(5), far(), &never, |_| {
                     let _ = tx.send(());
-                });
+                }));
                 o.lock().unwrap().push(i);
                 std::thread::sleep(Duration::from_millis(10));
                 drop(g);
@@ -328,5 +369,48 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(*order.lock().unwrap(), vec![1, 2, 3]);
+    }
+
+    /// (#2916 stage 2 review M2) A waiter whose sender hung up leaves the
+    /// queue without the seat, and the next waiter is not held behind it.
+    #[test]
+    fn a_cancelled_waiter_leaves_the_queue_and_never_takes_the_seat() {
+        let book = Arc::new(SeatBook::new(1));
+        let first = book.try_claim(&local("m"), "s1").unwrap();
+        let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (b2, g2) = (book.clone(), gone.clone());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let cancelled = || g2.load(std::sync::atomic::Ordering::SeqCst);
+            let w = b2.claim_waiting(&local("m"), "s2", Duration::from_millis(20), far(), &cancelled, |_| {});
+            let _ = done_tx.send(matches!(w, Waited::Cancelled));
+        });
+        std::thread::sleep(Duration::from_millis(60));
+        gone.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "the wait ended as cancelled");
+        assert!(book.book.lock().unwrap().waiting.is_empty(), "its ticket is gone");
+        drop(first);
+        assert!(book.try_claim(&local("m"), "s3").is_ok(), "nobody is left waiting for the seat");
+    }
+
+    /// (#2916 stage 2 review C1) A waiter past its deadline leaves the queue
+    /// and says what held the seat.
+    #[test]
+    fn a_waiter_past_its_deadline_times_out_naming_what_held_the_seat() {
+        let book = Arc::new(SeatBook::new(1));
+        let _first = book.try_claim(&local("m"), "s1").unwrap();
+        let b2 = book.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let w = b2.claim_waiting(&local("m"), "s2", Duration::from_secs(5), Instant::now() + Duration::from_millis(80), &never, |_| {});
+            let _ = tx.send(match w {
+                Waited::TimedOut(o) => Some(o.what),
+                Waited::Seat(_) | Waited::Cancelled => None,
+            });
+        });
+        // Well under the 5 s heartbeat: the deadline, not the heartbeat, ends it.
+        let what = rx.recv_timeout(Duration::from_secs(2)).expect("the wait outlived its deadline");
+        assert!(what.as_deref().is_some_and(|w| w.contains("s1")), "{what:?}");
+        assert!(book.book.lock().unwrap().waiting.is_empty(), "its ticket is gone");
     }
 }

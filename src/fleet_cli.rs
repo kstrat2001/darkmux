@@ -1122,8 +1122,15 @@ pub(crate) fn fleet_submission_doctor_checks() -> Vec<crate::doctor::Check> {
         } else {
             None
         },
-        busy_policy: darkmux_types::config_access::fleet_busy_policy().ok().map(|p| p.as_str().to_string()),
-        hosted_cap: darkmux_types::config_access::remote_concurrent_cap(),
+        busy: crate::doctor::BusyFacts {
+            running: daemon_health().as_ref().and_then(running_busy_settings),
+            configured: darkmux_types::config_access::fleet_busy_policy().ok().map(|policy| {
+                crate::doctor::BusySettings {
+                    policy,
+                    hosted_cap: darkmux_types::config_access::remote_concurrent_cap(),
+                }
+            }),
+        },
         local_machine: darkmux_flow::resolve_machine_id(),
     };
     crate::doctor::fleet_submission_checks(&facts)
@@ -1132,8 +1139,13 @@ pub(crate) fn fleet_submission_doctor_checks() -> Vec<crate::doctor::Check> {
 /// (#2916 review C8) What the local daemon says about its fleet listener
 /// (`/health`'s `fleet_listener`), when it answers within 500 ms.
 fn daemon_listener_state() -> Option<String> {
+    daemon_health()?.get("fleet_listener").and_then(|s| s.as_str()).map(str::to_string)
+}
+
+/// The local daemon's `/health`, when it answers within 500 ms.
+fn daemon_health() -> Option<serde_json::Value> {
     let port = darkmux_types::config_access::serve_port();
-    let v: serde_json::Value = ureq::AgentBuilder::new()
+    ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_millis(500))
         .build()
         .get(&format!("http://127.0.0.1:{port}/health"))
@@ -1141,8 +1153,18 @@ fn daemon_listener_state() -> Option<String> {
         .ok()?
         .into_string()
         .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())?;
-    v.get("fleet_listener").and_then(|s| s.as_str()).map(str::to_string)
+        .and_then(|t| serde_json::from_str(&t).ok())
+}
+
+/// (#2916 stage 2 review C5) The busy settings the running listener
+/// reports in `/health`'s `fleet_busy` (parsed here, at the boundary).
+fn running_busy_settings(health: &serde_json::Value) -> Option<crate::doctor::BusySettings> {
+    use darkmux_types::config_enum::ConfigEnum;
+    let busy = health.get("fleet_busy")?;
+    Some(crate::doctor::BusySettings {
+        policy: darkmux_types::config::BusyPolicy::parse(busy.get("policy")?.as_str()?)?,
+        hosted_cap: u32::try_from(busy.get("hosted_cap")?.as_u64()?).ok()?,
+    })
 }
 
 /// The retired work-queue streams (`darkmux:work`, `darkmux:work:<tier>`)
@@ -1602,6 +1624,25 @@ pub(crate) mod tests {
         let mut offline = healthy.clone();
         fleet::add_machine(&mut offline, "mini-1", "mini.tailnet.example", None, Some("UID-C")).unwrap();
         assert!(roster_needs_history(&offline, &live), "a uid nobody live answers to needs history");
+    }
+
+    /// (#2916 stage 2 review C5) `/health`'s `fleet_busy` is read into typed
+    /// settings; anything malformed is "no report", never a guess.
+    #[test]
+    fn the_running_busy_settings_are_read_from_health() {
+        let got = running_busy_settings(&serde_json::json!({"fleet_busy": {"policy": "queue", "hosted_cap": 3}}));
+        assert_eq!(
+            got,
+            Some(crate::doctor::BusySettings { policy: darkmux_types::config::BusyPolicy::Queue, hosted_cap: 3 })
+        );
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"fleet_busy": null}),
+            serde_json::json!({"fleet_busy": {"policy": "sometimes", "hosted_cap": 1}}),
+            serde_json::json!({"fleet_busy": {"policy": "queue", "hosted_cap": -1}}),
+        ] {
+            assert_eq!(running_busy_settings(&bad), None, "{bad}");
+        }
     }
 
     /// A config whose `fleet.identity.provider` is an unregistered value.

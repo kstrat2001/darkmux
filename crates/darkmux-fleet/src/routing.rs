@@ -267,50 +267,37 @@ fn dispatch_via_submission(opts: DispatchOpts, target: &str) -> Result<DispatchR
     Ok(reply_to_dispatch_result(reply, &session_id, target))
 }
 
-/// Translate an accepted or completed [`crate::SubmissionReply`] into the
-/// `DispatchResult` the CLI prints.
+/// Translate a reply `submit_work` returned (completed, accepted or queued)
+/// into the `DispatchResult` the CLI prints.
 pub(crate) fn reply_to_dispatch_result(
     reply: crate::SubmissionReply,
     session_id: &str,
     target: &str,
 ) -> DispatchResult {
+    use crate::ReplyStatus;
     let session_id = reply.session_id.clone().unwrap_or_else(|| session_id.to_string());
-    // (#2916 stage 2) Queued without `--wait`: the receiver's own words,
-    // verbatim (control characters removed), and how to follow it.
-    if reply.status == "queued" {
-        let why = crate::sanitize_remote_text(reply.reason.as_deref().unwrap_or("its seat is busy"));
-        return DispatchResult {
-            exit_code: 0,
-            stdout: format!(
-                "queued on {target}; not waiting (session_id={session_id}): {why}. Follow it with \
-                 `darkmux flow tail --session {session_id}` or in the viewer.\n"
-            ),
-            stderr: String::new(),
-            session_id,
-            out_dir: None,
-        };
-    }
-    if reply.status == "accepted" {
-        return DispatchResult {
-            exit_code: 0,
-            stdout: format!(
-                "submitted to {target}; not waiting (session_id={session_id}). Follow it with \
-                 `darkmux flow tail --session {session_id}` or in the viewer.\n"
-            ),
-            stderr: String::new(),
-            session_id,
-            // The run's bookkeeping lands on the receiving machine.
-            out_dir: None,
-        };
-    }
-    // (#2916 review C1) Remote output never reaches the terminal raw.
-    DispatchResult {
-        exit_code: reply.exit_code.unwrap_or(1),
-        stdout: crate::sanitize_remote_text(&reply.stdout.unwrap_or_default()),
-        stderr: crate::sanitize_remote_text(&reply.stderr.unwrap_or_default()),
-        session_id,
-        out_dir: None,
-    }
+    let follow = format!("Follow it with `darkmux flow tail --session {session_id}` or in the viewer.");
+    let stdout = match reply.status {
+        // (#2916 stage 2) Queued without `--wait`: the receiver's own words,
+        // verbatim (control characters removed), and how to follow it.
+        ReplyStatus::Queued => format!(
+            "queued on {target}; not waiting (session_id={session_id}): {}. {follow}\n",
+            crate::sanitize_remote_text(reply.reason.as_deref().unwrap_or("its seat is busy"))
+        ),
+        ReplyStatus::Accepted => format!("submitted to {target}; not waiting (session_id={session_id}). {follow}\n"),
+        // (#2916 review C1) Remote output never reaches the terminal raw.
+        ReplyStatus::Completed | ReplyStatus::Error | ReplyStatus::Refused => {
+            return DispatchResult {
+                exit_code: reply.exit_code.unwrap_or(1),
+                stdout: crate::sanitize_remote_text(&reply.stdout.unwrap_or_default()),
+                stderr: crate::sanitize_remote_text(&reply.stderr.unwrap_or_default()),
+                session_id,
+                out_dir: None,
+            }
+        }
+    };
+    // The run's bookkeeping lands on the receiving machine.
+    DispatchResult { exit_code: 0, stdout, stderr: String::new(), session_id, out_dir: None }
 }
 
 #[cfg(test)]
@@ -355,16 +342,15 @@ mod tests {
     #[test]
     fn a_completed_reply_carries_the_remote_exit_code_and_output() {
         let reply = crate::SubmissionReply {
-            status: "completed".into(),
             session_id: Some("s-remote".into()),
             exit_code: Some(42),
             stdout: Some("out\x1b[2J".into()),
             stderr: Some("err".into()),
-            ..Default::default()
+            ..crate::SubmissionReply::of(crate::ReplyStatus::Completed)
         };
         let r = reply_to_dispatch_result(reply, "s-local", "studio");
         assert_eq!((r.exit_code, r.stdout.as_str(), r.stderr.as_str(), r.session_id.as_str()), (42, "out[2J", "err", "s-remote"), "the ESC byte is stripped");
-        let accepted = crate::SubmissionReply { status: "accepted".into(), ..Default::default() };
+        let accepted = crate::SubmissionReply::of(crate::ReplyStatus::Accepted);
         let r = reply_to_dispatch_result(accepted, "s-local", "studio");
         assert_eq!(r.exit_code, 0);
         assert!(r.stdout.contains("submitted to studio; not waiting (session_id=s-local)"), "{}", r.stdout);
@@ -731,6 +717,20 @@ mod tests {
         assert!(files.is_empty(), "no flow record may be written for a refused address: {files:?}");
     }
 
+    /// (#2916 stage 2 review C1) A connection that never opens sent
+    /// nothing, and the sender says so instead of "may still be running".
+    #[test]
+    #[serial]
+    fn a_refused_connection_says_nothing_was_sent() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let _env = PeerEnv::new(port);
+        peer_b_is_verified();
+        let mut opts = local_opts("radio-host");
+        opts.profile_name = Some("host@peer-b".to_string());
+        let msg = format!("{:#}", dispatch_routed_via(opts, |_| panic!("never local")).unwrap_err());
+        assert!(msg.contains("nothing was sent") && !msg.contains("may still be running"), "{msg}");
+    }
+
     /// (#2916 stage 2) Queued without `--wait`: the answer is the
     /// receiver's own words, and the dispatch is not an error.
     #[test]
@@ -785,7 +785,11 @@ mod tests {
         opts.machine = Some("peer-b".to_string());
         let err = dispatch_routed_via(opts, |_opts| panic!("never local")).unwrap_err();
         rx.recv_timeout(Duration::from_secs(5)).expect("the submission must have dialed the peer");
-        assert!(format!("{err:#}").contains("no answer from http://127.0.0.1:"), "{err:#}");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no answer from http://127.0.0.1:"), "{msg}");
+        // (#2916 stage 2 review C1) The request reached the peer, so the
+        // sender cannot know whether it runs: it says so, with the session.
+        assert!(msg.contains("may still be running on peer-b") && msg.contains("-from-local-a"), "{msg}");
     }
 
     // ─── #2584 conformance: every call site of `dispatch_via_submission` must be

@@ -42,6 +42,24 @@ pub struct TrustView {
     pub workspace: bool,
 }
 
+/// (#2916 stage 2) A listener's busy settings: its `fleet.busy_policy`
+/// and its `remote.concurrent_cap` (hosted jobs at once, `0` = unbounded).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BusySettings {
+    pub policy: darkmux_types::config::BusyPolicy,
+    pub hosted_cap: u32,
+}
+
+/// (#2916 stage 2 review C5) The busy settings the running daemon reports
+/// (what is in force; it reads config once, at start) and the ones
+/// `config.json` holds now (`None` when a value is bad: the generic
+/// enum-settings row reports that).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BusyFacts {
+    pub running: Option<BusySettings>,
+    pub configured: Option<BusySettings>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FleetSubmissionFacts {
     pub listener_enabled: bool,
@@ -63,12 +81,8 @@ pub struct FleetSubmissionFacts {
     /// What the running daemon reports about its listener (`/health`'s
     /// `fleet_listener`), when the daemon answered.
     pub daemon_listener_state: Option<String>,
-    /// (#2916 stage 2) `fleet.busy_policy`'s token, or `None` when the
-    /// value is bad (the generic enum-settings row reports that).
-    pub busy_policy: Option<String>,
-    /// (#2916 stage 2) This machine's `remote.concurrent_cap`: hosted jobs
-    /// it runs at once (`0` = unbounded).
-    pub hosted_cap: u32,
+    /// (#2916 stage 2) How the listener answers a busy seat.
+    pub busy: BusyFacts,
     /// (#2916 stage 2) This machine's resolved `machine_id`: the name a
     /// `profile@machine` address uses for it.
     pub local_machine: Option<String>,
@@ -229,19 +243,44 @@ fn listener_row(f: &FleetSubmissionFacts) -> Check {
     }
 }
 
-/// (#2916 stage 2) What a busy seat gets, for the listener row.
+/// (#2916 stage 2) What a busy seat gets, for the listener row: the
+/// running daemon's settings, or the file's when the daemon did not say.
 fn busy_note(f: &FleetSubmissionFacts) -> String {
-    let Some(policy) = f.busy_policy.as_deref() else { return String::new() };
-    let hosted = if f.hosted_cap == 0 {
-        "hosted jobs unbounded".to_string()
-    } else {
-        format!("hosted jobs up to {} (remote.concurrent_cap)", f.hosted_cap)
+    let BusyFacts { running, configured } = f.busy;
+    let Some(shown) = running.or(configured) else { return String::new() };
+    let mut note = format!("; {}", describe_busy(shown));
+    match (running, configured) {
+        (None, Some(_)) => {
+            note.push_str(" (from config.json; the running daemon did not report its own)");
+        }
+        (Some(r), Some(c)) if r != c => {
+            note.push_str(&format!("; config.json now says {}: restart `darkmux serve` to apply it", describe_busy(c)));
+        }
+        // The daemon and the file agree, or the file's value is bad (the
+        // enum-settings row reports that), or neither said anything.
+        (Some(_), Some(_)) | (Some(_), None) | (None, None) => {}
+    }
+    note
+}
+
+fn describe_busy(b: BusySettings) -> String {
+    use darkmux_types::config::BusyPolicy;
+    let hosted = match b.hosted_cap {
+        0 => "hosted jobs unbounded".to_string(),
+        n => format!("hosted jobs up to {n} (remote.concurrent_cap)"),
     };
-    let past = match policy {
-        "queue" => "queues the rest",
-        _ => "refuses the rest at once",
+    let past = match b.policy {
+        BusyPolicy::Queue => "queues the rest",
+        BusyPolicy::Refuse => "refuses the rest at once",
     };
-    format!("; one job per local model, {hosted}; fleet.busy_policy `{policy}` {past}")
+    // (#2916 stage 2 review C3) The listener counts only the jobs other
+    // machines submit; a local model this machine is using for its own
+    // dispatch is not "busy" to it.
+    format!(
+        "one fleet job per local model (this machine's own dispatches are not counted), {hosted}; \
+         fleet.busy_policy `{}` {past}",
+        b.policy.as_str()
+    )
 }
 
 fn trust_row(f: &FleetSubmissionFacts) -> Check {
@@ -338,6 +377,14 @@ mod tests {
         }
     }
 
+    fn refuse(hosted_cap: u32) -> BusySettings {
+        BusySettings { policy: darkmux_types::config::BusyPolicy::Refuse, hosted_cap }
+    }
+
+    fn queue(hosted_cap: u32) -> BusySettings {
+        BusySettings { policy: darkmux_types::config::BusyPolicy::Queue, hosted_cap }
+    }
+
     fn facts() -> FleetSubmissionFacts {
         FleetSubmissionFacts {
             listener_enabled: true,
@@ -349,8 +396,7 @@ mod tests {
             retired_streams: vec![],
             queue_consumers: vec![],
             daemon_listener_state: None,
-            busy_policy: Some("refuse".into()),
-            hosted_cap: 1,
+            busy: BusyFacts { running: Some(refuse(1)), configured: Some(refuse(1)) },
             local_machine: Some("studio".into()),
         }
     }
@@ -370,8 +416,9 @@ mod tests {
         assert!(t.message.contains("node `laptop`, online"), "{}", t.message);
         assert_eq!(
             row(&rows, "fleet listener").message,
-            "listening on 100.64.0.2:8766; one job per local model, hosted jobs up to 1 \
-             (remote.concurrent_cap); fleet.busy_policy `refuse` refuses the rest at once"
+            "listening on 100.64.0.2:8766; one fleet job per local model (this machine's own \
+             dispatches are not counted), hosted jobs up to 1 (remote.concurrent_cap); \
+             fleet.busy_policy `refuse` refuses the rest at once"
         );
         assert!(row(&rows, "fleet identity").message.contains("this machine is `studio`"));
     }
@@ -380,15 +427,31 @@ mod tests {
     /// name a `profile@machine` address uses for this machine.
     #[test]
     fn the_rows_name_the_busy_policy_and_the_address_name() {
-        let f = FleetSubmissionFacts { busy_policy: Some("queue".into()), hosted_cap: 0, ..facts() };
+        let f = FleetSubmissionFacts { busy: BusyFacts { running: Some(queue(0)), configured: Some(queue(0)) }, ..facts() };
         let rows = fleet_submission_checks(&f);
         let l = &row(&rows, "fleet listener").message;
         assert!(l.contains("hosted jobs unbounded") && l.contains("`queue` queues the rest"), "{l}");
+        assert!(!l.contains("config.json"), "the daemon and the file agree: {l}");
         let i = &row(&rows, "fleet identity").message;
         assert!(i.contains("`<profile>@studio`") && i.contains("restart `darkmux serve`"), "{i}");
         // A bad policy value is the enum-settings row's to report, not this one's.
-        let f = FleetSubmissionFacts { busy_policy: None, ..facts() };
+        let f = FleetSubmissionFacts { busy: BusyFacts::default(), ..facts() };
         assert_eq!(row(&fleet_submission_checks(&f), "fleet listener").message, "listening on 100.64.0.2:8766");
+    }
+
+    /// (#2916 stage 2 review C5) The row shows what the running daemon
+    /// uses; a file that says otherwise is named, with the restart that
+    /// applies it; with no daemon answer, the file's values are marked as
+    /// such.
+    #[test]
+    fn the_busy_row_shows_the_running_values_and_what_a_restart_would_change() {
+        let f = FleetSubmissionFacts { busy: BusyFacts { running: Some(refuse(1)), configured: Some(queue(3)) }, ..facts() };
+        let l = row(&fleet_submission_checks(&f), "fleet listener").message.clone();
+        assert!(l.contains("`refuse` refuses the rest at once"), "shows the running policy: {l}");
+        assert!(l.contains("config.json now says") && l.contains("up to 3") && l.contains("restart `darkmux serve`"), "{l}");
+        let f = FleetSubmissionFacts { busy: BusyFacts { running: None, configured: Some(queue(2)) }, ..facts() };
+        let l = row(&fleet_submission_checks(&f), "fleet listener").message.clone();
+        assert!(l.contains("`queue`") && l.contains("from config.json; the running daemon did not report"), "{l}");
     }
 
     /// (#2947) A bad provider value gets no `fleet identity` row: the

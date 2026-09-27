@@ -1139,9 +1139,25 @@ pub fn renamed_setting_leftovers() -> Vec<crate::config::RenamedLeftover> {
 /// concurrency increase on the main dispatch path deserves its own
 /// dogfood pass, per this repo's release-gate doctrine, not a side effect
 /// of wiring the knob.
+///
+/// `0` means UNBOUNDED (the darkmux bound convention), never "run nothing"
+/// and never "1": every consumer turns it into a job count through
+/// [`jobs_at_once`].
 pub fn remote_concurrent_cap() -> u32 {
     let cfg = config().remote.as_ref().and_then(|r| r.concurrent_cap);
     pick_parsed("DARKMUX_REMOTE_CONCURRENT_CAP", cfg, Some(1)).unwrap()
+}
+
+/// (#2916 stage 2) A concurrency cap as the number of jobs allowed at once:
+/// `0` is unbounded (`usize::MAX`), anything else is itself. The one place
+/// the zero-means-unbounded rule for a cap lives; the scheduler's hosted
+/// track and the fleet listener's hosted seats both go through it.
+pub fn jobs_at_once(cap: usize) -> usize {
+    if cap == 0 {
+        usize::MAX
+    } else {
+        cap
+    }
 }
 // ── Radio interpreter (#1698 Packet B2) ──
 // (#2914) `radio_router_profile` / `DARKMUX_RADIO_ROUTER_PROFILE` are gone:
