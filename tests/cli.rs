@@ -3947,14 +3947,16 @@ fn hanging_endpoint_profiles_json(port: u16) -> String {
 
 /// Assert that no `curl` spawned by the darkmux child `pid` outlives it.
 /// Polls the process table for that child's own `darkmux-remote-<pid>-`
-/// config-file marker (see `remote_chat_attempt`) for up to 2s: the OS
+/// config-file marker (see `remote_chat_attempt`) for up to 30s: the OS
 /// tears the table down asynchronously after SIGKILL, and instrumented
-/// (coverage) builds are slower than a fixed settle delay allows for.
+/// (coverage) builds and loaded hosts are slower than a fixed settle delay
+/// allows for. A clean table returns on the first poll, so the bound costs
+/// nothing unless a curl really survives (#2976).
 /// Scoped to `pid` so a sibling test's live curl is never mistaken for a
 /// survivor of this one.
 fn assert_no_surviving_remote_curl(pid: u32, label: &str) {
     let marker = format!("darkmux-remote-{pid}-");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let survivors = loop {
         let Ok(out) = std::process::Command::new("pgrep").args(["-f", &marker]).output() else {
             return; // no `pgrep` on this image — the socket-close proof already covers it
@@ -4238,7 +4240,11 @@ fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
         None,
         None,
         None,
-        60,
+        // (#2976) The job's own timeout (curl's `-m`) must far outlast
+        // FLEET_TEST_HANG_BOUND: a curl that gives up on its own also closes
+        // its connection, and the close-wait below could no longer tell a
+        // reaped child from a timed-out one.
+        600,
         None,
     );
     let url = format!("http://{fleet_addr}{}", darkmux_fleet::SUBMISSION_PATH);
@@ -4255,8 +4261,8 @@ fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
     // A REAL observable readiness signal, not a fixed sleep: the job's
     // dispatch `curl` has actually reached the hanging stub.
     assert!(
-        stub.wait_for_a_connection(std::time::Duration::from_secs(20)),
-        "the submitted job never reached a dispatch call to the stub server within 20s"
+        stub.wait_for_a_connection(FLEET_TEST_HANG_BOUND),
+        "the submitted job never reached a dispatch call to the stub server within {FLEET_TEST_HANG_BOUND:?}"
     );
 
     let kill_status = std::process::Command::new("kill")
@@ -4265,7 +4271,7 @@ fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
         .expect("running kill -TERM");
     assert!(kill_status.success(), "kill -TERM itself must succeed");
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + FLEET_TEST_HANG_BOUND;
     loop {
         if let Some(status) = serve_child.try_wait().expect("polling darkmux serve after SIGTERM") {
             eprintln!("darkmux serve exited with {status:?}");
@@ -4273,13 +4279,13 @@ fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "darkmux serve did not exit within 15s of SIGTERM (#2476 review round 2 regression)"
+            "darkmux serve did not exit within {FLEET_TEST_HANG_BOUND:?} of SIGTERM (#2476 review round 2 regression)"
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
     assert!(
-        stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(5)),
+        stub.wait_for_a_connection_to_close(FLEET_TEST_HANG_BOUND),
         "no curl connection to the stub server was ever torn down — the submitted job's dispatch \
          child survived the daemon's own exit (#2476 review round 2 regression)"
     );
@@ -4367,6 +4373,12 @@ struct FleetDaemon {
     fleet_addr: std::net::SocketAddr,
 }
 
+/// (#2976) The bound on every wait in the fleet-daemon tests below. Each is
+/// a polled condition that returns the moment it holds, so the bound only
+/// decides how long a REAL hang takes to fail; it is not the claim. The old
+/// 3s to 20s bounds failed on a loaded host with nothing wrong.
+const FLEET_TEST_HANG_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn spawn_fleet_daemon(profiles_json: &str, nofile: Option<u64>) -> Option<FleetDaemon> {
     // A UDP `connect` sends nothing; it only picks the outbound address.
     let lan_ip = std::net::UdpSocket::bind("0.0.0.0:0")
@@ -4399,6 +4411,12 @@ fn spawn_fleet_daemon(profiles_json: &str, nofile: Option<u64>) -> Option<FleetD
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
     }
+    // (#2976) Exec the fake tool once before the daemon can. On macOS the
+    // first exec of a freshly written executable can take tens of seconds on
+    // a loaded host (measured 2.4s to 32s; the second takes milliseconds),
+    // which would land inside the daemon's bounded identity lookup. An
+    // unknown subcommand is a side-effect-free `exit 2`.
+    let _ = std::process::Command::new(&tool).arg("warm-up").status();
     let path = format!(
         "{}:{}:{}",
         fake_bin.display(),
@@ -4439,9 +4457,11 @@ fn spawn_fleet_daemon(profiles_json: &str, nofile: Option<u64>) -> Option<FleetD
         }
     }
     let child = DirectChildGuard(cmd.spawn().expect("spawning darkmux serve"));
-    wait_for_serve_health(serve_port, std::time::Duration::from_secs(15));
+    // (#2976) Readiness waits are hang guards, sized for a loaded host: a
+    // freshly built binary's first exec alone can take seconds on a busy Mac.
+    wait_for_serve_health(serve_port, FLEET_TEST_HANG_BOUND);
     let fleet_addr = std::net::SocketAddr::new(lan_ip, fleet_port);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + FLEET_TEST_HANG_BOUND;
     while std::net::TcpStream::connect_timeout(&fleet_addr, std::time::Duration::from_millis(200)).is_err() {
         assert!(std::time::Instant::now() < deadline, "the fleet listener never came up on {fleet_addr}");
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -4511,7 +4531,7 @@ fn a_flooded_fleet_listener_leaves_the_viewer_answering() {
     };
     let mut held = Vec::new();
     for _ in 0..300 {
-        match std::net::TcpStream::connect_timeout(&daemon.fleet_addr, std::time::Duration::from_millis(500)) {
+        match std::net::TcpStream::connect_timeout(&daemon.fleet_addr, std::time::Duration::from_secs(5)) {
             Ok(mut s) => {
                 let _ = s.write_all(b"POST /fleet/work HTTP/1.1\r\nHost: x\r\n");
                 held.push(s);
@@ -4519,17 +4539,25 @@ fn a_flooded_fleet_listener_leaves_the_viewer_answering() {
             Err(_) => break,
         }
     }
-    // The viewer still answers while the flood is held open.
+    // The viewer still answers while the flood is held open. (#2976) "While"
+    // is checked as an ordering, not a 3s timeout that failed on a loaded
+    // host: the viewer answers, and only THEN is the first flood connection
+    // confirmed still open. A viewer that only answered once the header
+    // deadline had released the flood fails the second check.
     let health = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(3))
+        .timeout(FLEET_TEST_HANG_BOUND)
         .build()
         .get(&format!("http://127.0.0.1:{}/health", daemon.serve_port))
         .call();
     assert!(health.is_ok(), "the viewer's /health stopped answering under a listener flood: {health:?}");
+    held[0].set_nonblocking(true).unwrap();
+    let still_held = matches!(held[0].read(&mut [0u8; 1]), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock);
+    held[0].set_nonblocking(false).unwrap();
+    assert!(still_held, "the viewer answered only after the flood had already been released");
     // The first half-sent connection (holding a slot) is closed by the
     // header deadline (10s in production), not held forever.
     let first = &mut held[0];
-    first.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+    first.set_read_timeout(Some(FLEET_TEST_HANG_BOUND)).unwrap();
     let mut b = [0u8; 64];
     let closed = match first.read(&mut b) {
         Ok(0) => true,

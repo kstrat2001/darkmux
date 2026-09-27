@@ -4575,12 +4575,30 @@ fn watchdog_finalize_kill(
     outcome.warning(container_name)
 }
 
+/// Why `run_watchdog` stopped waiting, and therefore what it did next. The
+/// thread returns it, so the cause of an exit is an asserted value rather
+/// than something inferred from how long the thread took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchdogWake {
+    /// `watchdog_done` was set: the main thread proved the wait is over.
+    /// No kill ran.
+    Done,
+    /// `watchdog_abandoned` was set: the scope holding the guard exited
+    /// without proving anything. The persistent kill ran; `timeout_fired`
+    /// was left alone.
+    Abandoned,
+    /// The inactivity deadline passed first. `timeout_fired` was set and
+    /// the persistent kill ran.
+    DeadlineExpired,
+}
+
 /// (#2641 follow-up review, MUST FIX 2) The inactivity watchdog's poll loop,
 /// extracted to a standalone function so `spawn_guarded_watchdog` can prove
 /// it's wired to a real thread (same reason `run_tailer` is standalone
 /// rather than inline in `spawn_guarded_tailer`'s closure).
 ///
-/// Two flags gate this loop, and they are NOT interchangeable:
+/// Two flags gate the wait (`wait_for_watchdog_wake`), and they are NOT
+/// interchangeable:
 ///
 /// - `watchdog_done` — set only by `dispatch()`'s own explicit
 ///   `.store(true, …)` calls on a normal-return path, once the main thread
@@ -4611,46 +4629,26 @@ fn run_watchdog(
     watchdog_abandoned: Arc<AtomicBool>,
     timeout_fired: Arc<AtomicBool>,
     kill_disposition: Arc<AtomicU8>,
-) {
-    // Poll every 500ms. Each iteration reads the CURRENT deadline (which
-    // the tailer may have just reset on a compaction event). When the main
-    // thread signals `watchdog_done`, exit promptly without firing the
-    // kill. When the main thread is instead GONE (panicked) —
-    // `watchdog_abandoned` — stop waiting on the deadline and go straight
-    // to the kill; see this function's own doc for why these are two
-    // separate flags with opposite failure directions.
-    loop {
-        if watchdog_done.load(Ordering::SeqCst) {
-            return;
-        }
-        if watchdog_abandoned.load(Ordering::SeqCst) {
-            break;
-        }
-        let now = Instant::now();
-        let deadline = *lock_deadline(&inactivity_deadline);
-        if now >= deadline {
-            break;
-        }
-        thread::sleep(Duration::from_millis(500));
-    }
-    // Race window: a natural exit can land in the final 500ms sleep above.
-    // Re-check before firing to avoid stamping a spurious timeout on a
+) -> WatchdogWake {
+    let wake = wait_for_watchdog_wake(&inactivity_deadline, &watchdog_done, &watchdog_abandoned);
+    // Race window: a natural exit can land in the final 500ms sleep of the
+    // wait. Re-check before firing to avoid stamping a spurious timeout on a
     // clean exit (QA finding 2026-05-25).
     if watchdog_done.load(Ordering::SeqCst) {
-        return;
+        return WatchdogWake::Done;
     }
-    // Only a genuine deadline expiry earns the "no proof-of-work signal"
-    // framing that `inactivity_timeout_stderr` builds from `timeout_fired`.
-    // An abandonment is a different cause (the main thread panicked, not
-    // that the dispatch stalled) — no in-process reader ever inspects
-    // `timeout_fired` on this path (the panicking function never resumes
-    // to read it), but this function's own behavior stays honest about
-    // WHY it is killing regardless of who, if anyone, later looks.
-    if !watchdog_abandoned.load(Ordering::SeqCst) {
-        // Deadline genuinely hit before the dispatch completed. Mark
-        // timeout BEFORE the kill so the post-wait detection sees the flag,
-        // then SIGKILL the container.
-        timeout_fired.store(true, Ordering::SeqCst);
+    match wake {
+        WatchdogWake::Done => return WatchdogWake::Done,
+        // Only a genuine deadline expiry earns the "no proof-of-work
+        // signal" framing that `inactivity_timeout_stderr` builds from
+        // `timeout_fired`. Mark it BEFORE the kill so the post-wait
+        // detection sees the flag.
+        WatchdogWake::DeadlineExpired => timeout_fired.store(true, Ordering::SeqCst),
+        // A different cause (the main thread panicked, not that the
+        // dispatch stalled). No in-process reader ever inspects
+        // `timeout_fired` on this path, but this function stays honest
+        // about WHY it is killing regardless of who, if anyone, later looks.
+        WatchdogWake::Abandoned => {}
     }
     // (#2232) PERSISTENT, not fire-and-forget. This thread stays alive
     // until the container is confirmed stopped or the attempts are
@@ -4667,7 +4665,7 @@ fn run_watchdog(
     // `watchdog_handle.join()` bounded WHENEVER THE DOCKER CLI RETURNS:
     // ~3.75s of backoff plus however long the subprocesses take, and only
     // on a dispatch that already timed out or was abandoned (a healthy one
-    // returns from the poll loop above without ever reaching this line).
+    // returns from the wait above without ever reaching this line).
     //
     // It is NOT a hard ceiling, and the ~3.75s figure covers only the
     // sleeps. Every attempt is a blocking `Command::output()` and the
@@ -4691,6 +4689,38 @@ fn run_watchdog(
     {
         eprintln!("{warning}");
     }
+    wake
+}
+
+/// `run_watchdog`'s wait: poll every 500ms until the main thread is done,
+/// the guard reports the scope abandoned, or the inactivity deadline passes.
+/// Each iteration reads the CURRENT deadline, which the tailer may have
+/// just reset on a compaction event.
+///
+/// The deadline is read BEFORE the abandonment flag, so an iteration that
+/// sees an expired deadline also sees any abandonment that happened before
+/// the deadline was last written, and abandonment wins the tie. That makes
+/// the returned cause exact rather than a race, which is what lets
+/// `spawn_guarded_watchdog_wiring_survives_a_real_thread_spawn` assert the
+/// cause instead of timing the thread.
+fn wait_for_watchdog_wake(
+    inactivity_deadline: &Mutex<Instant>,
+    watchdog_done: &AtomicBool,
+    watchdog_abandoned: &AtomicBool,
+) -> WatchdogWake {
+    loop {
+        if watchdog_done.load(Ordering::SeqCst) {
+            return WatchdogWake::Done;
+        }
+        let expired = Instant::now() >= *lock_deadline(inactivity_deadline);
+        if watchdog_abandoned.load(Ordering::SeqCst) {
+            return WatchdogWake::Abandoned;
+        }
+        if expired {
+            return WatchdogWake::DeadlineExpired;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
 }
 
 /// (#2641 follow-up review, MUST FIX 1) Construct the watchdog's panic-safe
@@ -4705,9 +4735,9 @@ fn run_watchdog(
 /// `spawn_guarded_watchdog_wiring_survives_a_real_thread_spawn` in the test
 /// module for the red-prove: it calls this function with an inactivity
 /// deadline far in the future, panics immediately after, and asserts the
-/// real spawned thread runs the persistent kill PROMPTLY (bounded wait, not
-/// the full deadline) — the specific regression MUST FIX 2 found and this
-/// shape closes.
+/// real spawned thread woke because of the abandonment (not the deadline)
+/// and ran the persistent kill — the specific regression MUST FIX 2 found
+/// and this shape closes.
 #[allow(clippy::too_many_arguments)]
 fn spawn_guarded_watchdog(
     watchdog_abandoned: &Arc<AtomicBool>,
@@ -4716,7 +4746,7 @@ fn spawn_guarded_watchdog(
     watchdog_done: Arc<AtomicBool>,
     timeout_fired: Arc<AtomicBool>,
     kill_disposition: Arc<AtomicU8>,
-) -> (StopFlagGuard, thread::JoinHandle<()>) {
+) -> (StopFlagGuard, thread::JoinHandle<WatchdogWake>) {
     // Armed the moment this function is called — see `StopFlagGuard`'s own
     // doc. The caller holds the returned guard to the natural end of its
     // own scope (never dropped early), so it backstops every panic between
