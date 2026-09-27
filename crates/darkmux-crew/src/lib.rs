@@ -46,6 +46,9 @@ mod test_guard_conformance;
 pub mod bounded_command;
 pub mod brief_refs;
 pub mod concurrent_dispatch;
+/// (#2869) No-follow, regular-file-only reads out of a directory a
+/// container can write (the out-dir, the workspace).
+pub mod contained_file;
 /// Unified-diff parsing (#2310 P4b) — moved down from `darkmux-lab`'s
 /// `bundle::diff` so both the lab bundler and this crate's own
 /// `deliver_github_review` step kind share ONE parser instead of two. See

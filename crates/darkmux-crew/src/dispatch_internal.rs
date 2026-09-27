@@ -641,7 +641,24 @@ pub(crate) fn validate_resume_checkpoint_content(
     expected_role_id: &str,
 ) -> Result<String> {
     let src = resume_from.join(CHECKPOINT_FILENAME);
-    if !src.is_file() {
+    // (#2869) `resume_from` is a prior dispatch's out-dir, which that
+    // dispatch's model could write. Read the checkpoint with no-follow and
+    // regular-file-only, so a planted `checkpoint.json -> <host file>` is
+    // refused here rather than read and staged into the new container.
+    let read = crate::contained_file::read_contained_to_string(
+        resume_from,
+        Path::new(CHECKPOINT_FILENAME),
+        crate::contained_file::DEFAULT_MAX_BYTES,
+    );
+    if let Err(e @ crate::contained_file::ContainedFileError::Refused(_)) = &read {
+        bail!(
+            "darkmux dispatch: RESUME CHECKPOINT REFUSED — {} was {e}; darkmux reads a \
+             checkpoint only as a regular file inside --resume-from {}",
+            src.display(),
+            resume_from.display()
+        );
+    }
+    if matches!(read, Err(crate::contained_file::ContainedFileError::NotFound)) {
         bail!(
             "darkmux dispatch: RESUME CHECKPOINT NOT FOUND — expected {} to \
              exist (no checkpoint.json under --resume-from {}); this \
@@ -653,7 +670,7 @@ pub(crate) fn validate_resume_checkpoint_content(
             resume_from.display()
         );
     }
-    let contents = fs::read_to_string(&src)
+    let contents = read
         .with_context(|| format!("reading resume checkpoint at {}", src.display()))?;
     let value: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
         anyhow!(
@@ -835,7 +852,14 @@ pub(crate) fn validate_resume_checkpoint(
     // (Security audit, #2114 resume follow-up) Workspace mount-mode + path
     // gate — see this fn's own doc for the escalation this closes.
     let origin_path = resume_from.join(RESUME_ORIGIN_FILENAME);
-    let origin_contents = fs::read_to_string(&origin_path).map_err(|e| {
+    // (#2869) Same no-follow read as the checkpoint: this file sits in the
+    // same model-writable out-dir.
+    let origin_contents = crate::contained_file::read_contained_to_string(
+        resume_from,
+        Path::new(RESUME_ORIGIN_FILENAME),
+        crate::contained_file::DEFAULT_MAX_BYTES,
+    )
+    .map_err(|e| {
         anyhow!(
             "darkmux dispatch: RESUME ORIGIN UNKNOWN — could not read {} ({e}); this host has \
              no record of the workspace mount mode/path the checkpoint at {} was written \
@@ -1012,9 +1036,7 @@ pub(crate) fn resume_hint_from_origin(
     role_id: &str,
     phase_id: Option<&str>,
 ) -> String {
-    let origin_path = host_out.join(RESUME_ORIGIN_FILENAME);
-    let origin = fs::read_to_string(&origin_path)
-        .ok()
+    let origin = read_out_dir_text(host_out, RESUME_ORIGIN_FILENAME)
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
     let Some(origin) = origin else {
         return format!(
@@ -7118,6 +7140,28 @@ fn enrich_envelope_with_summary(
     serde_json::to_string(&v).unwrap_or(stdout)
 }
 
+/// (#2869) Read `<out_dir>/<rel>` as text with the no-follow,
+/// regular-file-only reader. The out-dir is mounted read-write into the
+/// container, so the model's tools can plant a symlink (or a FIFO, or swap
+/// `.darkmux-runtime` for a link to a host directory) at any file the host
+/// later reads from it. A refusal is warned on stderr and then treated as
+/// absent, which every caller already degrades on; absence stays silent.
+pub(crate) fn read_out_dir_text(out_dir: &Path, rel: &str) -> Option<String> {
+    use crate::contained_file::{read_contained_to_string, DEFAULT_MAX_BYTES};
+    match read_contained_to_string(out_dir, Path::new(rel), DEFAULT_MAX_BYTES) {
+        Ok(body) => Some(body),
+        Err(e) => {
+            if e.is_refused() {
+                stderr_warning_sink(&format!(
+                    "darkmux: {} not read — {e}",
+                    out_dir.join(rel).display()
+                ));
+            }
+            None
+        }
+    }
+}
+
 /// (#1959) Count what the crawler recorded, and say where it is.
 ///
 /// Deliberately a COUNT plus a PATH rather than the findings themselves: the
@@ -7127,7 +7171,7 @@ fn enrich_envelope_with_summary(
 /// path in an envelope is a path the caller cannot open.
 fn read_findings_summary(out_dir: &std::path::Path) -> Option<serde_json::Value> {
     let path = out_dir.join(".darkmux-runtime").join("findings.jsonl");
-    let body = std::fs::read_to_string(&path).ok()?;
+    let body = read_out_dir_text(out_dir, ".darkmux-runtime/findings.jsonl")?;
     // Count RECORDS, not lines: a trailing newline is not a finding, and a
     // count that says 4 when the file holds 3 is worse than no count.
     let count = body.lines().filter(|l| !l.trim().is_empty()).count();
@@ -7356,8 +7400,7 @@ impl TokenTotals {
 /// totals — this is an observability enrichment, never a dispatch
 /// failure. Same out-dir the trajectory tailer reads from.
 pub fn read_token_totals(out_dir: &Path) -> TokenTotals {
-    let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
-    let Ok(raw) = fs::read_to_string(&metrics_path) else {
+    let Some(raw) = read_out_dir_text(out_dir, ".darkmux-runtime/metrics.json") else {
         return TokenTotals::default();
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
@@ -7430,8 +7473,7 @@ pub struct CumulativeCounts {
 /// file degrades to zero — this is observability enrichment, never a
 /// dispatch-failing path.
 pub fn read_cumulative_counts(out_dir: &Path) -> CumulativeCounts {
-    let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
-    let Ok(raw) = fs::read_to_string(&metrics_path) else {
+    let Some(raw) = read_out_dir_text(out_dir, ".darkmux-runtime/metrics.json") else {
         return CumulativeCounts::default();
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
@@ -7488,9 +7530,7 @@ pub struct RestTotals {
 /// degrade to `RestTotals::default()` when neither is available —
 /// observability enrichment, never a dispatch failure.
 pub fn read_rest_totals(out_dir: &Path) -> RestTotals {
-    let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
-    let from_metrics = fs::read_to_string(&metrics_path)
-        .ok()
+    let from_metrics = read_out_dir_text(out_dir, ".darkmux-runtime/metrics.json")
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         .filter(|v| v.get("rest_ms").is_some());
     if let Some(v) = from_metrics {
@@ -7508,8 +7548,7 @@ pub fn read_rest_totals(out_dir: &Path) -> RestTotals {
 /// or unreadable lines are skipped rather than aborting the whole sum —
 /// the same lenient-on-read posture the live tailer uses on this file.
 fn sum_rest_totals_from_trajectory(out_dir: &Path) -> RestTotals {
-    let traj_path = out_dir.join(".darkmux-runtime").join("trajectory.jsonl");
-    let Ok(raw) = fs::read_to_string(&traj_path) else {
+    let Some(raw) = read_out_dir_text(out_dir, ".darkmux-runtime/trajectory.jsonl") else {
         return RestTotals::default();
     };
     let mut totals = RestTotals::default();
@@ -7573,9 +7612,7 @@ pub(crate) fn reconcile_rest_totals(from_metrics: RestTotals, from_tailer: RestT
 /// field's zero when there were also zero rests to derive an average
 /// from (a single-turn dispatch's honest `0`); otherwise fall through.
 pub fn read_turn_delay_effective_ms(out_dir: &Path, rest: RestTotals) -> Option<u64> {
-    let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
-    let from_metrics = fs::read_to_string(&metrics_path)
-        .ok()
+    let from_metrics = read_out_dir_text(out_dir, ".darkmux-runtime/metrics.json")
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         .and_then(|v| v.get("turn_delay_effective_ms").and_then(|n| n.as_u64()));
     if let Some(v) = from_metrics {
@@ -9442,6 +9479,10 @@ fn merge_record_context(payload: &mut serde_json::Value, record_context: &Option
 /// heartbeat instant for rate limiting.
 struct TailerState {
     trajectory_path: PathBuf,
+    /// (#2869) Set once the tailer has warned that the trajectory file was
+    /// refused (a symlink, a non-regular file, a swapped directory), so a
+    /// 250ms poll loop warns once, not four times a second.
+    trajectory_refusal_warned: bool,
     offset: u64,
     /// Trailing partial line carried from one poll to the next when the
     /// file ends mid-line (a write was in progress at our read).
@@ -9656,6 +9697,7 @@ impl TailerState {
             compaction_attempts: 0,
             open_compaction: None,
             trajectory_path,
+            trajectory_refusal_warned: false,
             offset: 0,
             pending: Vec::new(),
             last_counted_turn_seq: None,
@@ -9883,6 +9925,7 @@ impl TailerState {
             compaction_attempts: 0,
             open_compaction: None,
             trajectory_path,
+            trajectory_refusal_warned: false,
             offset: 0,
             pending: Vec::new(),
             last_counted_turn_seq: None,
@@ -9913,12 +9956,28 @@ impl TailerState {
     /// One poll round: open the trajectory file, read new bytes since
     /// the previous offset, drain complete lines, dispatch each event.
     /// Silent on errors — file may not exist yet (container hasn't
-    /// written) and any IO hiccup is best-effort.
+    /// written) and any IO hiccup is best-effort. The one exception is a
+    /// REFUSED open (#2869): the out-dir is model-writable, so the file is
+    /// opened with no-follow at `.darkmux-runtime/trajectory.jsonl` and
+    /// must be a regular file; a symlink or FIFO planted there is never
+    /// read, and the tailer says so once through its warning sink.
     fn poll_and_emit(&mut self) {
+        use crate::contained_file::{open_path_tail, ContainedFileError};
         use std::io::{Read, Seek, SeekFrom};
 
-        let mut file = match std::fs::File::open(&self.trajectory_path) {
+        let mut file = match open_path_tail(&self.trajectory_path, 2) {
             Ok(f) => f,
+            Err(ContainedFileError::Refused(why)) => {
+                if !self.trajectory_refusal_warned {
+                    self.trajectory_refusal_warned = true;
+                    (self.warning_sink)(&format!(
+                        "darkmux: live trajectory {} not read — {why}; this dispatch's \
+                         live records and turn counts will be missing",
+                        self.trajectory_path.display()
+                    ));
+                }
+                return;
+            }
             Err(_) => return,
         };
         let size = match file.metadata() {

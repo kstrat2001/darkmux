@@ -309,6 +309,7 @@ impl WorkloadProvider for CodingTaskProvider {
         // analysis was reading the latest dispatch's data for every
         // historical run.
         let mut trajectory_path: Option<PathBuf> = None;
+        let refused_artifacts: Vec<RefusedArtifact>;
         {
             // Read from the dispatch's out-dir. `out_dir` is ALWAYS `Some`
             // for a local internal-runtime dispatch (the host allocates +
@@ -319,10 +320,7 @@ impl WorkloadProvider for CodingTaskProvider {
             // so the #457 watchdog would hard-kill productive dispatches.
             // The host-code change and the darkmux-runtime image rebuild
             // must land atomically.
-            let runtime_dir = dispatch_out_dir
-                .as_deref()
-                .unwrap_or(sandbox_dir)
-                .join(".darkmux-runtime");
+            let out_dir = dispatch_out_dir.as_deref().unwrap_or(sandbox_dir);
             // `src.exists()` gate is intentional: a #363-timeout
             // dispatch may have written partial trajectory but no
             // metrics.json. Copying what's there preserves forensic
@@ -335,23 +333,15 @@ impl WorkloadProvider for CodingTaskProvider {
             // losing a trajectory costs forensics, losing this costs the
             // result. Absent for every role that never calls `create_finding`,
             // which the `exists()` gate below already handles.
-            for (name, dst_name) in [
-                ("trajectory.jsonl", "trajectory.jsonl"),
-                ("metrics.json", "metrics.json"),
-                ("findings.jsonl", "findings.jsonl"),
-            ] {
-                let src = runtime_dir.join(name);
-                if src.exists() {
-                    let dst = run_dir.join(dst_name);
-                    if let Err(e) = fs::copy(&src, &dst) {
-                        eprintln!(
-                            "darkmux: warn — failed copying runtime {name} into run dir: {e}"
-                        );
-                    } else if name == "trajectory.jsonl" {
-                        trajectory_path = Some(dst);
-                    }
-                }
+            let preserved = preserve_runtime_artifacts(
+                out_dir,
+                run_dir,
+                &["trajectory.jsonl", "metrics.json", "findings.jsonl"],
+            );
+            if preserved.copied.iter().any(|n| n == "trajectory.jsonl") {
+                trajectory_path = Some(run_dir.join("trajectory.jsonl"));
             }
+            refused_artifacts = preserved.refused;
         }
 
         let verify_outcome = run_verify_command(loaded, run_dir, sandbox_dir)?;
@@ -470,6 +460,8 @@ impl WorkloadProvider for CodingTaskProvider {
             "sandbox": sandbox_dir.canonicalize().unwrap_or_else(|_| sandbox_dir.to_path_buf()).display().to_string(),
             "final_hash": final_hash,
         });
+        let mut manifest_json = manifest_json;
+        record_refused_artifacts(&mut manifest_json, &refused_artifacts);
         fs::write(
             run_dir.join("manifest.json"),
             serde_json::to_string_pretty(&manifest_json)?,
@@ -522,12 +514,14 @@ impl WorkloadProvider for CodingTaskProvider {
         //      the per-run copy yet. Old-run-only once the runtime writes
         //      out-of-band (#611): new runs no longer leave metrics in the
         //      sandbox, so tier 1 is always authoritative for them.
-        let runtime_metrics = read_metrics_json(&run_dir.join("metrics.json")).or_else(|| {
+        let runtime_metrics = read_metrics_json(run_dir, Path::new("metrics.json")).or_else(|| {
             meta.get("sandbox")
                 .and_then(|v| v.as_str())
                 .and_then(|sandbox| {
+                    // (#2869) The sandbox is model-writable: read with no-follow.
                     read_metrics_json(
-                        &Path::new(sandbox).join(".darkmux-runtime").join("metrics.json"),
+                        Path::new(sandbox),
+                        &Path::new(".darkmux-runtime").join("metrics.json"),
                     )
                 })
         });
@@ -1387,8 +1381,26 @@ fn sum_rest_ms_from_events(events: &[serde_json::Value]) -> u64 {
         .fold(0u64, u64::saturating_add)
 }
 
-fn read_metrics_json(path: &Path) -> Option<InternalRuntimeMetrics> {
-    let raw = fs::read_to_string(path).ok()?;
+/// Read `root/rel` as runtime metrics. (#2869) A no-follow, regular-file
+/// read: `root` may be a model-writable sandbox. A refusal is warned and
+/// treated as absent, so `inspect` falls back to the trajectory counts.
+fn read_metrics_json(root: &Path, rel: &Path) -> Option<InternalRuntimeMetrics> {
+    use darkmux_crew::contained_file::{read_contained_to_string, DEFAULT_MAX_BYTES};
+    let raw = match read_contained_to_string(root, rel, DEFAULT_MAX_BYTES) {
+        Ok(raw) => raw,
+        Err(e) => {
+            if e.is_refused() {
+                eprintln!(
+                    "{}",
+                    darkmux_types::style::warn(&format!(
+                        "darkmux: {} not read — {e}",
+                        root.join(rel).display()
+                    ))
+                );
+            }
+            return None;
+        }
+    };
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     Some(InternalRuntimeMetrics {
         turns: v.get("turns").and_then(|x| x.as_u64()).map(|n| n as u32),
@@ -1409,6 +1421,85 @@ fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect()
+}
+
+/// (#2869) One runtime bookkeeping file the host declined to copy out of
+/// the dispatch's out-dir, and why. Recorded in the run's `manifest.json`
+/// (`refused_artifacts`) as well as warned on stderr, so a refusal is never
+/// a silent gap in the run artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RefusedArtifact {
+    pub file: String,
+    pub reason: String,
+}
+
+/// (#2869) Write `refused` into a run manifest as `refused_artifacts`.
+/// Additive and present only when something was refused, so a clean run's
+/// manifest is unchanged; the run still finalizes, and this is where the
+/// gap is written down.
+pub(crate) fn record_refused_artifacts(manifest: &mut serde_json::Value, refused: &[RefusedArtifact]) {
+    if refused.is_empty() {
+        return;
+    }
+    if let Some(obj) = manifest.as_object_mut() {
+        obj.insert(
+            "refused_artifacts".to_string(),
+            serde_json::Value::Array(
+                refused
+                    .iter()
+                    .map(|r| serde_json::json!({ "file": r.file, "reason": r.reason }))
+                    .collect(),
+            ),
+        );
+    }
+}
+
+/// What [`preserve_runtime_artifacts`] did: the names it copied, and the
+/// names it refused.
+#[derive(Debug, Default)]
+pub(crate) struct PreservedArtifacts {
+    pub copied: Vec<String>,
+    pub refused: Vec<RefusedArtifact>,
+}
+
+/// (#364/#2869) Copy the runtime's bookkeeping files (`names`, each a bare
+/// file name) from `<out_dir>/.darkmux-runtime/` into
+/// `run_dir` under the same name. A missing file is not an error: a
+/// #363-timeout dispatch may have written a partial trajectory and no
+/// metrics.json, and copying what is there preserves the forensic data.
+pub(crate) fn preserve_runtime_artifacts(
+    out_dir: &Path,
+    run_dir: &Path,
+    names: &[&str],
+) -> PreservedArtifacts {
+    use darkmux_crew::contained_file::{copy_contained, ContainedFileError, DEFAULT_MAX_BYTES};
+    let mut out = PreservedArtifacts::default();
+    for name in names {
+        // (#2869) `out_dir` is writable by the model's tools, so `fs::copy`
+        // (which follows symlinks) would let a planted link make the HOST
+        // read any file its user can. `copy_contained` walks
+        // `.darkmux-runtime/<name>` with O_NOFOLLOW at every component and
+        // copies only a regular file, bounded in size.
+        let rel = Path::new(".darkmux-runtime").join(name);
+        match copy_contained(out_dir, &rel, &run_dir.join(name), DEFAULT_MAX_BYTES) {
+            Ok(_) => out.copied.push((*name).to_string()),
+            Err(ContainedFileError::NotFound) => {}
+            Err(ContainedFileError::Refused(reason)) => {
+                eprintln!(
+                    "{}",
+                    darkmux_types::style::warn(&format!(
+                        "darkmux: runtime {name} NOT copied into the run dir — {reason}; \
+                         recorded as refused_artifacts in the run manifest"
+                    ))
+                );
+                out.refused.push(RefusedArtifact { file: (*name).to_string(), reason });
+            }
+            Err(ContainedFileError::Io(e)) => {
+                eprintln!("darkmux: warn — failed copying runtime {name} into run dir: {e}");
+            }
+        }
+    }
+    out
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
@@ -1785,6 +1876,107 @@ mod tests {
             !dst.join("leak.txt").exists(),
             "symlink must be skipped, not copied/followed into the sandbox"
         );
+    }
+
+    // ── (#2869) copy-out of the model-writable out-dir ──────────────────
+
+    /// An out-dir with `.darkmux-runtime/` created, plus a host-side secret
+    /// OUTSIDE it that the model must never be able to pull in.
+    fn out_dir_with_secret() -> (TempDir, PathBuf, PathBuf, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("out");
+        fs::create_dir_all(out.join(".darkmux-runtime")).unwrap();
+        let run = tmp.path().join("run");
+        fs::create_dir_all(&run).unwrap();
+        let secret = tmp.path().join("host-secret.txt");
+        fs::write(&secret, "HOST-SECRET-2869").unwrap();
+        (tmp, out, run, secret)
+    }
+
+    #[test]
+    fn preserve_runtime_artifacts_refuses_a_file_symlink_to_a_host_secret() {
+        let (_tmp, out, run, secret) = out_dir_with_secret();
+        std::os::unix::fs::symlink(&secret, out.join(".darkmux-runtime/metrics.json")).unwrap();
+
+        let got = preserve_runtime_artifacts(&out, &run, &["metrics.json"]);
+
+        let copied = fs::read_to_string(run.join("metrics.json")).unwrap_or_default();
+        assert!(
+            !copied.contains("HOST-SECRET-2869"),
+            "the host secret was copied through the model's symlink"
+        );
+        assert!(!run.join("metrics.json").exists(), "nothing may land for a refused file");
+        assert!(got.copied.is_empty(), "copied: {:?}", got.copied);
+        assert_eq!(got.refused.len(), 1, "the refusal must be recorded: {:?}", got.refused);
+        assert_eq!(got.refused[0].file, "metrics.json");
+        assert!(got.refused[0].reason.contains("symlink"), "reason: {}", got.refused[0].reason);
+    }
+
+    #[test]
+    fn preserve_runtime_artifacts_refuses_a_directory_symlink_swap() {
+        // The model replaces `.darkmux-runtime` itself with a symlink to a
+        // host directory that holds a file of the expected name. O_NOFOLLOW
+        // on the final component alone would not catch this.
+        let (tmp, out, run, _secret) = out_dir_with_secret();
+        let host_dir = tmp.path().join("host-dir");
+        fs::create_dir_all(&host_dir).unwrap();
+        fs::write(host_dir.join("trajectory.jsonl"), "HOST-DIR-SECRET-2869\n").unwrap();
+        fs::remove_dir_all(out.join(".darkmux-runtime")).unwrap();
+        std::os::unix::fs::symlink(&host_dir, out.join(".darkmux-runtime")).unwrap();
+
+        let got = preserve_runtime_artifacts(&out, &run, &["trajectory.jsonl"]);
+
+        assert!(
+            !run.join("trajectory.jsonl").exists(),
+            "a file under a swapped-in directory symlink was copied"
+        );
+        assert!(got.copied.is_empty(), "copied: {:?}", got.copied);
+        assert_eq!(got.refused.len(), 1, "refused: {:?}", got.refused);
+        assert!(got.refused[0].reason.contains("symlink"), "reason: {}", got.refused[0].reason);
+    }
+
+    #[test]
+    fn preserve_runtime_artifacts_refuses_a_fifo_without_hanging() {
+        let (_tmp, out, run, _secret) = out_dir_with_secret();
+        let fifo = out.join(".darkmux-runtime/metrics.json");
+        let st = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(st.success(), "mkfifo");
+
+        let got = preserve_runtime_artifacts(&out, &run, &["metrics.json"]);
+
+        assert!(got.copied.is_empty(), "copied: {:?}", got.copied);
+        assert_eq!(got.refused.len(), 1, "refused: {:?}", got.refused);
+        assert!(
+            got.refused[0].reason.contains("not a regular file"),
+            "reason: {}",
+            got.refused[0].reason
+        );
+    }
+
+    #[test]
+    fn preserve_runtime_artifacts_copies_regular_files_and_skips_absent_ones() {
+        let (_tmp, out, run, _secret) = out_dir_with_secret();
+        fs::write(out.join(".darkmux-runtime/trajectory.jsonl"), "{\"t\":1}\n").unwrap();
+
+        let got = preserve_runtime_artifacts(&out, &run, &["trajectory.jsonl", "metrics.json"]);
+
+        assert_eq!(got.copied, vec!["trajectory.jsonl".to_string()]);
+        assert!(got.refused.is_empty(), "an absent file is not a refusal: {:?}", got.refused);
+        assert_eq!(fs::read_to_string(run.join("trajectory.jsonl")).unwrap(), "{\"t\":1}\n");
+        assert!(!run.join("metrics.json").exists());
+    }
+
+    #[test]
+    fn record_refused_artifacts_writes_the_refusal_into_the_manifest() {
+        let mut m = serde_json::json!({ "schema_version": 5 });
+        record_refused_artifacts(&mut m, &[]);
+        assert!(m.get("refused_artifacts").is_none(), "a clean run's manifest is unchanged");
+        record_refused_artifacts(
+            &mut m,
+            &[RefusedArtifact { file: "metrics.json".into(), reason: "`metrics.json` is a symlink (not followed)".into() }],
+        );
+        assert_eq!(m["refused_artifacts"][0]["file"], "metrics.json");
+        assert!(m["refused_artifacts"][0]["reason"].as_str().unwrap().contains("symlink"));
     }
 
     #[test]

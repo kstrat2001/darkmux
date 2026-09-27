@@ -2191,8 +2191,17 @@ fn intent_files(description: &str) -> std::collections::HashSet<String> {
 /// algorithm + raw-bytes framing as the runtime captured with, so an unchanged
 /// file matches. Best-effort: a missing/unreadable file → `None` (treated as
 /// "unknown freshness", never stale — we don't bury what we can't verify).
+///
+/// (#2869) The workspace is model-writable, so the read is no-follow and
+/// regular-file-only (`contained_file`): a symlink or FIFO a model left at
+/// `file` reads as "unknown freshness", never hashes a host file or hangs.
 fn current_file_blake3(workspace_root: &Path, file: &str) -> Option<String> {
-    let bytes = std::fs::read(workspace_root.join(file)).ok()?;
+    let bytes = darkmux_crew::contained_file::read_contained(
+        workspace_root,
+        Path::new(file),
+        darkmux_crew::contained_file::DEFAULT_MAX_BYTES,
+    )
+    .ok()?;
     Some(blake3::hash(&bytes).to_hex().to_string())
 }
 

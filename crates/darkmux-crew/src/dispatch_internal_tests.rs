@@ -18035,3 +18035,115 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(complete["payload"]["total_tokens"], 9);
         assert_eq!(rec["mission_id"], complete["mission_id"], "same run key as the terminal");
     }
+
+    // ── (#2869) host reads of the model-writable out-dir ──────────────
+
+    /// `.darkmux-runtime/<name>` in a fresh out-dir, as a symlink to a host
+    /// file outside it holding `body`.
+    fn out_dir_with_symlinked(name: &str, body: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let rt = tmp.path().join("out/.darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        let host = tmp.path().join(format!("host-{name}"));
+        fs::write(&host, body).unwrap();
+        std::os::unix::fs::symlink(&host, rt.join(name)).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn read_token_totals_refuses_a_symlinked_metrics_file() {
+        let tmp = out_dir_with_symlinked(
+            "metrics.json",
+            r#"{"total_prompt_tokens": 1200, "total_completion_tokens": 345}"#,
+        );
+        let t = read_token_totals(&tmp.path().join("out"));
+        assert_eq!(t.prompt, 0, "the symlinked host file was read");
+        assert_eq!(t.completion, 0);
+    }
+
+    #[test]
+    fn read_findings_summary_refuses_a_symlinked_findings_file() {
+        let tmp = out_dir_with_symlinked("findings.jsonl", "{\"a\":1}\n{\"b\":2}\n");
+        assert!(
+            read_findings_summary(&tmp.path().join("out")).is_none(),
+            "the symlinked host file was counted"
+        );
+    }
+
+    #[test]
+    fn read_rest_totals_refuses_a_symlinked_trajectory_fallback() {
+        let tmp = out_dir_with_symlinked(
+            "trajectory.jsonl",
+            "{\"type\":\"runtime.rest\",\"ms\":500}\n",
+        );
+        let r = read_rest_totals(&tmp.path().join("out"));
+        assert_eq!(r.rest_ms, 0, "the symlinked host trajectory was summed");
+    }
+
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record()
+    fn tailer_refuses_a_symlinked_trajectory_and_warns_once() {
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let tmp = out_dir_with_symlinked(
+            "trajectory.jsonl",
+            "{\"type\":\"compaction\",\"seq\":1,\"generation\":1,\"before_messages\":40,\"after_messages\":7,\"summary_chars\":1500}\n",
+        );
+        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let lines_c = lines.clone();
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("out/.darkmux-runtime/trajectory.jsonl"),
+            "sess-2869".into(),
+            "coder".into(),
+            "darkmux:m".into(),
+        );
+        state.warning_sink = Arc::new(move |l: &str| lines_c.lock().unwrap().push(l.to_string()));
+        state.poll_and_emit();
+        state.poll_and_emit();
+        assert_eq!(state.summary.compactions, 0, "the tailer followed the model's symlink");
+        let lines = lines.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "one warning, not one per poll: {lines:?}");
+        assert!(lines[0].contains("symlink"), "{lines:?}");
+    }
+
+    #[test]
+    fn resume_checkpoint_refuses_a_symlinked_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let resume_from = tmp.path().join("prior-out");
+        fs::create_dir_all(&resume_from).unwrap();
+        let host = tmp.path().join("host-checkpoint.json");
+        fs::write(&host, r#"{"schema_version":3,"messages":[],"role_id":"coder"}"#).unwrap();
+        std::os::unix::fs::symlink(&host, resume_from.join(CHECKPOINT_FILENAME)).unwrap();
+        let err = validate_resume_checkpoint_content(&resume_from, "coder")
+            .expect_err("a symlinked checkpoint must be refused, not followed");
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+    }
+
+    #[test]
+    fn resume_checkpoint_refuses_a_symlinked_origin_file() {
+        // The checkpoint itself is a genuine regular file; the host-held
+        // provenance file beside it has been swapped for a symlink to a
+        // forged origin outside the out-dir. Followed, it would pass.
+        let tmp = TempDir::new().unwrap();
+        let resume_from = tmp.path().join("prior-out");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&resume_from).unwrap();
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(
+            resume_from.join(CHECKPOINT_FILENAME),
+            r#"{"schema_version":3,"messages":[],"role_id":"coder"}"#,
+        )
+        .unwrap();
+        let forged = tmp.path().join("forged-origin.json");
+        let ws_canon = ws.canonicalize().unwrap();
+        fs::write(
+            &forged,
+            serde_json::json!({ "workspace": ws_canon.display().to_string(), "workspace_read_only": false })
+                .to_string(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&forged, resume_from.join(RESUME_ORIGIN_FILENAME)).unwrap();
+        let err = validate_resume_checkpoint(&resume_from, "coder", &ws_canon, false)
+            .expect_err("a symlinked origin file must be refused, not followed");
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+    }
+

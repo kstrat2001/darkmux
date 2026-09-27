@@ -540,7 +540,18 @@ fn resolve_single_source_dir(tree_root: &Path) -> Result<PathBuf, String> {
 /// inside the mirror). A source whose checkout DID hold a build tree would
 /// make this the gate's dominant cost, and the fix then is a
 /// copy-on-write clone (`clonefile`/`FICLONE`), not more threads.
+///
+/// (#2869) The source checkout is the mission's workdir, which a dispatch
+/// may have mounted read-write, so every entry here could have been placed
+/// by a model. The type decision is therefore made on the OPEN descriptor,
+/// not the directory entry: each non-directory is opened no-follow and
+/// non-blocking (`contained_file::open_regular_nofollow`) and copied only
+/// if `fstat` says it is a regular file. A symlink, FIFO, socket or device
+/// is skipped, including one swapped in after `read_dir` listed a regular
+/// file. The copy keeps the source's permission bits (a test script's
+/// executable bit is load-bearing for `test_command`).
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use crate::contained_file::{open_regular_nofollow, ContainedFileError};
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -548,12 +559,20 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         let dst_path = dst.join(entry.file_name());
         if file_type.is_dir() {
             copy_dir_recursive(&entry.path(), &dst_path)?;
-        } else if file_type.is_file() {
-            std::fs::copy(entry.path(), &dst_path)?;
+            continue;
         }
-        // Symlinks: skipped, not followed — a scratch copy used once for
-        // one gate run has no need of them, and following one could walk
-        // outside `src`.
+        // Symlinks and other non-regular entries: skipped, not followed — a
+        // scratch copy used once for one gate run has no need of them, and
+        // following one could walk outside `src`.
+        let mut from = match open_regular_nofollow(&entry.path()) {
+            Ok(f) => f,
+            Err(ContainedFileError::Refused(_)) | Err(ContainedFileError::NotFound) => continue,
+            Err(ContainedFileError::Io(e)) => return Err(e),
+        };
+        let perms = from.metadata()?.permissions();
+        let mut to = std::fs::File::create(&dst_path)?;
+        std::io::copy(&mut from, &mut to)?;
+        to.set_permissions(perms)?;
     }
     Ok(())
 }
@@ -1310,5 +1329,47 @@ mod tests {
         let registry = StepKindRegistry::new();
         register_mods_gate_kind(&registry).unwrap();
         assert!(registry.ids().iter().any(|id| id == MODS_GATE_KIND));
+    }
+
+    // ── (#2869) the scratch copy of a model-writable source checkout ──
+
+    #[test]
+    fn copy_dir_recursive_does_not_follow_a_symlink_to_a_host_file() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        let secret = tmp.path().join("host-secret.txt");
+        std::fs::write(&secret, "HOST-SECRET-2869").unwrap();
+        std::os::unix::fs::symlink(&secret, src.join("sub/leak.txt")).unwrap();
+        std::fs::write(src.join("sub/real.txt"), "real").unwrap();
+        let dst = tmp.path().join("dst");
+
+        copy_dir_recursive(&src, &dst).unwrap();
+
+        assert_eq!(std::fs::read_to_string(dst.join("sub/real.txt")).unwrap(), "real");
+        assert!(
+            std::fs::symlink_metadata(dst.join("sub/leak.txt")).is_err(),
+            "the symlinked host file was copied into the scratch checkout"
+        );
+    }
+
+    #[test]
+    fn copy_dir_recursive_keeps_the_executable_bit_and_skips_a_fifo() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("run.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(src.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fifo = std::ffi::CString::new(src.join("pipe").to_str().unwrap()).unwrap();
+        // SAFETY: valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let dst = tmp.path().join("dst");
+
+        copy_dir_recursive(&src, &dst).unwrap();
+
+        let mode = std::fs::metadata(dst.join("run.sh")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "the executable bit was lost: {mode:o}");
+        assert!(!dst.join("pipe").exists());
     }
 }
