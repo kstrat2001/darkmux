@@ -482,6 +482,7 @@ export function MachineLens({
             nowMs,
             specs,
             isLocal: isLocalMach,
+            settled: flowWindow.settled,
             residentRow: residencyRows.find((r) => r.status !== "ghost" && isUtilityTierRow(r.model.identifier, r.model.model_key, utilityModelId(specs, isLocalSpecs)))?.model ?? null,
           })}
         />

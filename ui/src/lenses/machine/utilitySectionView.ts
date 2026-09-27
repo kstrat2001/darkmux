@@ -27,6 +27,9 @@ export interface UtilitySectionView {
   factsLine: string;
   /** "idle", "radio routing · 3s", "compacting · 12s", "compacting · stalled". */
   liveLine: string;
+  /** (#2958) The page's flow window has not answered yet: the live line
+   *  says "no signal" and the strip draws quiet, rather than "idle". */
+  noSignal: boolean;
   jobs: Array<{ word: string; calls: string; tokens: string; known: boolean }>;
 }
 
@@ -39,7 +42,10 @@ export function utilitySectionView(args: {
   isLocal: boolean;
   /** The residency row for the utility model, when resident (local only). */
   residentRow: MachineResourcesModel | null;
+  /** (#2958) Whether the records this reads have arrived. Omitted: true. */
+  settled?: boolean;
 }): UtilitySectionView {
+  const noSignal = args.settled === false;
   const binding = args.isLocal ? (args.specs?.utility_model ?? null) : null;
   const strip = utilityStrip(args.data, args.uid, args.nowMs, binding);
   const win = binding?.n_ctx != null ? `window ${binding.n_ctx.toLocaleString("en-US")}` : "window —";
@@ -51,7 +57,7 @@ export function utilitySectionView(args: {
         ? "not loaded"
         : "no utility model registered";
   const job = strip.job;
-  const liveLine = job ? (job.stalled ? `${job.word} · stalled` : `${job.word} · ${Math.max(0, Math.floor((args.nowMs - job.sinceMs) / 1000))}s`) : "idle";
+  const liveLine = noSignal ? "no signal" : job ? (job.stalled ? `${job.word} · stalled` : `${job.word} · ${Math.max(0, Math.floor((args.nowMs - job.sinceMs) / 1000))}s`) : "idle";
   const mine = args.data.filter((r) => uidOf(r) === args.uid && T(r.ts) <= args.nowMs);
   // (#2915 review, C7) A FIXED set of rows, so the section is one size
   // whatever ran: one per known job, then ONE "other" row folding every job
@@ -71,6 +77,7 @@ export function utilitySectionView(args: {
     modelLine: strip.model ?? "no utility model seen",
     factsLine: `${win} · ${residency}`,
     liveLine,
+    noSignal,
     jobs,
   };
 }
