@@ -1,23 +1,53 @@
-import { useMemo } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useEffect, useSyncExternalStore } from "react";
 import { fetchJson } from "../lib/fetcher";
-import { policyOf, type LifecyclePolicy } from "../lib/lifecycle";
-import { queryKeys } from "../lib/queryKeys";
-import { runsReachable, runsSrc } from "../lib/source";
-import type { RunsResponse } from "../types/handwritten";
+import { DEFAULT_POLICY, policyOf, type LifecyclePolicy } from "../lib/lifecycle";
+import { getSource } from "../lib/source";
+import type { RunsPolicy } from "../types/generated/RunsPolicy";
 
-/** The lifecycle policy the daemon judges runs by (`/runs`'s `policy`), so
- *  every surface judges a run by the same numbers the runs board does. It
- *  rides the `/runs` query every other reader shares (the fleet lens and
- *  the runs board poll it; a page with neither reads it once). Until it
- *  answers, and from a daemon that does not publish one, the defaults. */
+/** The lifecycle policy the daemon judges runs by, read once per page from
+ * `/health`'s `lifecycle_policy` (cheap: it builds nothing), so every surface
+ * judges a run by the same numbers the runs board does. Until it answers,
+ * the defaults; a static build has no daemon and keeps them. A daemon that
+ * publishes none (one from before it did, or a failed read) is said once on
+ * the console, never silently. */
+let current: LifecyclePolicy = DEFAULT_POLICY;
+let requested = false;
+const listeners = new Set<() => void>();
+
+function isPolicy(p: unknown): p is RunsPolicy {
+  const o = p as { stale_after_ms?: unknown; budget_wait_grace_ms?: unknown } | null;
+  return typeof o?.stale_after_ms === "number" && typeof o.budget_wait_grace_ms === "number";
+}
+
+async function load(): Promise<void> {
+  const res = await fetchJson<{ lifecycle_policy?: unknown }>("/health");
+  const p = res.ok ? res.data.lifecycle_policy : undefined;
+  if (!isPolicy(p)) {
+    console.warn("darkmux viewer: the daemon published no lifecycle policy on /health; runs are judged by the default (a run silent for 20 minutes has stopped).");
+    return;
+  }
+  current = policyOf(p);
+  for (const l of listeners) l();
+}
+
+function subscribe(cb: () => void): () => void {
+  listeners.add(cb);
+  return () => listeners.delete(cb);
+}
+
+const snapshot = () => current;
+
 export function useLifecyclePolicy(): LifecyclePolicy {
-  const q = useQuery({
-    queryKey: queryKeys.runs(),
-    queryFn: () => fetchJson<RunsResponse>(runsSrc()),
-    enabled: runsReachable(),
-  });
-  const p = q.data?.ok ? q.data.data.policy : undefined;
-  // One object per policy VALUE: callers key memos on it.
-  return useMemo(() => policyOf(p), [p?.stale_after_ms, p?.budget_wait_grace_ms]); // eslint-disable-line react-hooks/exhaustive-deps -- keyed on the values, not the response object
+  useEffect(() => {
+    if (requested || getSource().kind !== "daemon") return;
+    requested = true;
+    void load();
+  }, []);
+  return useSyncExternalStore(subscribe, snapshot, snapshot);
+}
+
+/** Test-only: forget the policy read, so a test starts from the defaults. */
+export function __resetLifecyclePolicy(): void {
+  current = DEFAULT_POLICY;
+  requested = false;
 }
