@@ -31,6 +31,10 @@ const NOTE = ".session-run .modelbox__hero .modelbox__note";
 // (#2915) `util`: the utility strip at the end of the name row. It is always
 // there, so it too must keep one size whatever the machine's utility job.
 const CARD = { card: ".mach", cardScope: ".mach-scope", rateLine: ".mach-scope__rate", util: ".mach-util" };
+// (#2955) The status line: "idle", "dispatch in flight", or, while a model
+// runs, the live reading itself (`.stat.mach-scope__rate`). One line in
+// every state, so measured across all of them.
+const STAT = ".mach .stat";
 
 // (#2950 review, CONSIDER 2) A REST reason must FIT its one-line slot, not
 // just be in it: `toHaveText` (inner text included) reads the whole string
@@ -182,7 +186,23 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
         await expect(page.locator(CARD.util).first(), `${state.id}: the utility strip`).toHaveAttribute("data-visual", state.utilVisual ?? "quiet");
         await expect(page.locator(CARD.util).first(), `${state.id}: the strip's stall`).toHaveAttribute("data-stalled", state.utilStalled ? "true" : "false");
         await page.waitForTimeout(400);
-        rows.push({ state: state.id, running: !!state.rateText, ...(await measure(page, CARD)) });
+        // (#2955) The reading is the status line, not a line under it.
+        if (state.rateText) await expect(page.locator(CARD.rateLine).first(), `${state.id}: the reading is the status line`).toHaveClass(/(^|\s)stat(\s|$)/);
+        // (#2955 self-review) On the status line, the reading keeps its
+        // state's tone and the thinking shimmer: a rule that moved it onto
+        // `.stat` once outranked both and painted every state phosphor green.
+        if (state.id === "rest-thermal" || state.id === "think") {
+          const { got, want } = await page.locator(CARD.rateLine).first().evaluate((e, id) => {
+            const probe = document.createElement("span");
+            probe.style.color = id === "think" ? "transparent" : "var(--lamp-rest)";
+            e.parentElement.appendChild(probe);
+            const want = getComputedStyle(probe).color;
+            probe.remove();
+            return { got: getComputedStyle(e).color, want };
+          }, state.id);
+          expect(got, `${state.id}: the status line's color is its state's`).toBe(want);
+        }
+        rows.push({ state: state.id, running: !!state.rateText, ...(await measure(page, { ...CARD, stat: STAT })) });
         await ctx.close();
       }
       expect(rows.map((r) => r.state)).toEqual(
@@ -193,14 +213,16 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
         const groups = sizeGroups(running, key);
         expect(groups, `${key} changed size between running states (${vpName}, ${mode}):\n  ${groups.join("\n  ")}`).toHaveLength(1);
       }
-      // On a phone the card is also the same size idle and running.
       // (#2915) The strip is one size in EVERY state, idle included.
       expect(sizeGroups(rows, "util"), `the utility strip changed size (${vpName}, ${mode})`).toHaveLength(1);
-      if (vpName === "phone") {
-        for (const key of ["card", "cardScope"]) {
-          const groups = sizeGroups(rows, key);
-          expect(groups, `${key} changed size between states (${vpName}, ${mode}):\n  ${groups.join("\n  ")}`).toHaveLength(1);
-        }
+      // (#2955, operator 2026-09-27) The card is also the same size idle and
+      // running, on a desktop as on a phone: the reading rides the status
+      // line, so no state adds a line. Idle states here: a finished run and
+      // a mission between model steps ("dispatch in flight", no reading).
+      expect(rows.filter((r) => !r.running).map((r) => r.state)).toEqual(expect.arrayContaining(["finished", "between-steps"]));
+      for (const key of ["card", "cardScope", "stat"]) {
+        const groups = sizeGroups(rows, key);
+        expect(groups, `${key} changed size between states (${vpName}, ${mode}):\n  ${groups.join("\n  ")}`).toHaveLength(1);
       }
     });
   }
@@ -224,7 +246,9 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
       for (const [id, state, hold] of [
         ["loading", byId.finished, true],
         ["loaded", byId.finished, false],
-        ...(vpName === "phone" ? [["generating", byId.generating, false]] : []),
+        // (#2955) Running too, on both widths now: the desktop card no
+        // longer grows a line while a model runs.
+        ["generating", byId.generating, false],
       ]) {
         const ctx = await browser.newContext({ viewport, timezoneId: "UTC", locale: "en-US" });
         const page = await ctx.newPage();
@@ -233,7 +257,8 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
         await page.goto("/index.html#lens=fleet");
         const cards = page.locator(CARD.card);
         await expect(cards).toHaveCount(offline ? 2 : 1);
-        const want = id === "loading" ? ["no signal"] : id === "loaded" ? ["idle"] : ["dispatch in flight"];
+        // (#2955) A generating card's status line is its reading.
+        const want = id === "loading" ? ["no signal"] : id === "loaded" ? ["idle"] : [byId.generating.rateText];
         if (offline) want.push(id === "loading" ? "no signal" : "offline");
         await expect(page.locator(".mach .stat"), `${id}: the cards' stat words`).toHaveText(want);
         if (id === "loading") {
@@ -258,14 +283,6 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
     });
   }
 }
-
-// On a desktop the card is 23px taller while a dispatch runs than idle: the
-// rate line under the status appears only with a running execution. That is
-// on origin/main as of 93709c0c9 (measured: 282px idle, 305px running), not
-// introduced by the branch that added this suite, and fixing it is the
-// operator's design call (reserve the line on an idle card, or fold the rate
-// into an existing line), so it is recorded here, not decided here.
-test.fixme("fleet card: the same size idle and running on a desktop (owner: the operator's call on where the rate line lives)", async () => {});
 
 // (#2950, found while adding the thermal REST states) With the thermal
 // governor armed, a FINISHED run's MODEL section is shorter than the same run

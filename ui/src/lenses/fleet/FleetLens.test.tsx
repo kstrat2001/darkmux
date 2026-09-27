@@ -1940,7 +1940,9 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
     await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
     expect(queryClient.getQueryState(queryKeys.runs())?.status, "/runs is still unanswered").toBe("pending");
     const card = document.querySelector(".mach")!;
-    expect(stat(card)).toBe("dispatch in flight");
+    // (#2955) The live reading is the status line: shown at once, in
+    // "dispatch in flight"'s place.
+    expect(stat(card)).toMatch(/tok\/s$/);
     expect(card.className).toContain("active");
     expect(card.className).not.toContain("nosignal");
     expect(card.querySelectorAll('[data-testid="fleet-token-scope"]')).toHaveLength(1);
@@ -2315,12 +2317,15 @@ describe("(#2911) the fleet card ticks while an execution is live", () => {
       ],
     });
     renderFleetLens();
-    await waitFor(() => expect(document.querySelector(".mach")?.textContent).toContain("dispatch in flight"));
+    // (#2955) A running card's status line may hold its reading ("rest
+    // 10m") rather than "dispatch in flight", so "running" is the card's
+    // `active` class here, and "idle" is the status line's own word.
+    await waitFor(() => expect(document.querySelector(".mach")?.className).toContain("active"));
     act(() => {
       vi.advanceTimersByTime(2_000);
     });
-    expect(document.querySelector(".mach")!.textContent).not.toContain("dispatch in flight");
-    expect(document.querySelector(".mach")!.textContent).toContain("idle");
+    expect(document.querySelector(".mach")!.className).not.toContain("active");
+    expect(document.querySelector(".mach .stat")!.textContent).toBe("idle");
   });
 
   it("an online machine with nothing running drives no clock at all", async () => {
@@ -2393,6 +2398,42 @@ describe("(#2911) fleet card wording", () => {
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
     expect(document.querySelector(".mach")!.textContent).toContain("dispatch in flight");
     expect(latestTokenScopeProps()).toMatchObject({ state: "idle", centerUnit: "no model working" });
+  });
+
+  // (#2955, operator 2026-09-27) The card is one height in every state, so a
+  // live reading takes the status line's place instead of a line of its own:
+  // the reading IS the status line, dot included, and the text rows beside
+  // the tube are the same two ("stat", "runs") running or not.
+  const textRows = (card: Element) =>
+    [...card.querySelector(".mach-body--scope")!.children].filter((c) => !c.classList.contains("mach-scope")).map((c) => c.className.split(" ")[0]);
+
+  it("(#2955) a live reading rides the status line: no extra row", async () => {
+    renderAt(
+      [
+        { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+        { ts: at(0), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 0 } },
+        { ts: at(2), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 2000, generated_chars: 800 } },
+      ] as FlowRecord[],
+      3,
+    );
+    await waitFor(() => expect(document.querySelector(".mach-scope__rate")).not.toBeNull());
+    const card = document.querySelector(".mach")!;
+    const stat = card.querySelector(".stat")!;
+    expect(card.querySelector(".mach-scope__rate"), "the reading is the status line itself").toBe(stat);
+    expect(stat.querySelector(".dot"), "the status dot stays on the line").not.toBeNull();
+    expect(stat.textContent).toBe("100 tok/s");
+    expect(textRows(card)).toEqual(["stat", "runs"]);
+  });
+
+  it("(#2955) a card with nothing running has the same two text rows", async () => {
+    mockFleetFetch({
+      machines: [{ machine_uid: "u1", display_name: "MacBook-Pro", schema_version: "1.43.0", beat_ts_ms: Date.now() }],
+      runs: [{ id: "lab-1", kind: "lab", status: "running", machine: "MacBook-Pro", tracked: true }],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    expect(document.querySelector(".mach .stat")!.textContent).toBe("dispatch in flight");
+    expect(textRows(document.querySelector(".mach")!)).toEqual(["stat", "runs"]);
   });
 
   it("a machine with nothing running still says 'idle' in the tube", async () => {

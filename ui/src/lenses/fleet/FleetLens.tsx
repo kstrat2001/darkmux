@@ -1161,12 +1161,6 @@ export function FleetLens({
                 (a powered-off screen), so no card changes size when its
                 data arrives or its machine comes and goes. */}
             <div className="mach-body mach-body--scope">
-              <div className="stat">
-                <span className="dot" />
-                {/* (#2958) "idle" before its sources answer is a default,
-                    not a reading: see `cardFace`. */}
-                {face.stat}
-              </div>
               {/* (#2877) Live token-rate scope. Rendered ONLY when the card
                   computed a reading (`liveTokRate !== null` — live mode,
                   active, and at least one running session has produced two
@@ -1183,9 +1177,16 @@ export function FleetLens({
                   execution now (`selectedExec` — the sole one when there's
                   only one running), not a machine-wide aggregate: the tube,
                   its color and this word all belong to one run. */}
-              {face.tube === "reading" && selectedExec && (
+              {/* (#2955, operator 2026-09-27: the card is one height in
+                  every state) The reading takes the STATUS line's place, dot
+                  included, instead of a line of its own under it: with a
+                  reading, "dispatch in flight" says less than "42 tok/s" or
+                  "processing ~36k" does, and a second line grew the desktop
+                  card 23px whenever a model ran. Same slot either way, so
+                  the text beside the tube is always two rows. */}
+              {face.tube === "reading" && selectedExec ? (
                 <div
-                  className="mach-scope__rate"
+                  className="stat mach-scope__rate"
                   data-tone={selectedExec.state ?? "none"}
                   data-carried={selectedExec.carried ? "true" : "false"}
                   data-thinking={selectedExec.state === "generating" && selectedExec.thinking === true ? "true" : undefined}
@@ -1199,6 +1200,7 @@ export function FleetLens({
                         : undefined
                   }
                 >
+                  <span className="dot" />
                   {selectedExec.state === "generating"
                     ? // (#2886 pass 5, MUST — fresh-reviewer finding F3) A GEN
                       // lamp with no reading yet (fewer than two same-turn
@@ -1258,6 +1260,13 @@ export function FleetLens({
                             compacting: selectedExec.compacting,
                             compactingSeconds: selectedExec.compactingSeconds,
                           })}
+                </div>
+              ) : (
+                <div className="stat">
+                  <span className="dot" />
+                  {/* (#2958) "idle" before its sources answer is a default,
+                      not a reading: see `cardFace`. */}
+                  {face.stat}
                 </div>
               )}
               {/* (#2881) The pager: shown only with 2+ running executions —
