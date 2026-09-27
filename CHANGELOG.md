@@ -96,7 +96,12 @@ darkmux release.
   view carries its mission (`#dispatch=<sid>&dispatch.mission=<id>`), so a
   session id several missions share opens the run that was clicked, and
   the event log beside it lists that run alone; a link naming only the
-  session still opens the run that started last. `/runs` gains
+  session still opens the run that started last. On `/runs` and in
+  radio's busy check, a mission whose task session another mission shares
+  (#1918) is judged by its own attempts on that session: it reads Running
+  while it runs, where it used to read Abandoned after 20 minutes. Its
+  role, model, machine and endpoint are still not read from a shared
+  session. `/runs` gains
   `policy: {stale_after_ms, budget_wait_grace_ms}`, the numbers it judged
   by, and `/health` gains the same object as `lifecycle_policy`, which is
   where the viewer reads it (both additive). **Migration:** none.
