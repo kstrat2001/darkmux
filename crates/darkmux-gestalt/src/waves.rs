@@ -86,7 +86,7 @@ use crate::estimator::FootprintEstimator;
 use crate::facts::Facts;
 use crate::plan::{Reason, Warning};
 use crate::planner::{
-    commit_surviving_stales, resident_base, single_pool_headroom,
+    commit_surviving_stales, resident_base, resident_bytes, single_pool_headroom,
     warn_unknown_owned_resident_bytes, ReconcileStale,
 };
 use crate::residency::{decide_residency, ResidencyDecision};
@@ -318,11 +318,7 @@ pub fn plan_waves(
                         stales.push(ReconcileStale::locate(facts, stale_identifier, i));
                     }
                     ResidencyDecision::ForeignDuplicate { foreign_identifier } => {
-                        let bytes = facts
-                            .residents
-                            .iter()
-                            .find(|r| r.identifier == *foreign_identifier)
-                            .and_then(|r| r.est_bytes);
+                        let bytes = resident_bytes(facts, foreign_identifier);
                         foreign_dups.insert(i, (foreign_identifier.clone(), bytes));
                     }
                     _ => {}
