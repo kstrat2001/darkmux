@@ -7107,6 +7107,30 @@ mod tests {
         );
     }
 
+    /// (review C5 follow-up) A workspace path that comes only from the
+    /// input's document DEFAULT is checked too: the spec check runs after
+    /// defaults land, still before minting and before `--dry-run`.
+    #[test]
+    #[serial_test::serial]
+    fn a_bad_workspace_spec_from_an_input_default_is_refused_before_minting() {
+        let guard = LaunchTestGuard::new();
+        let spec_dir = tempfile::tempdir().unwrap();
+        let spec = spec_dir.path().join("spec.json");
+        std::fs::write(&spec, r#"{"name": "w", "sources": [{"id": "a", "path": "/x"}], "sourcs": []}"#).unwrap();
+        let doc = serde_json::json!({
+            "id": "ws-default", "name": "WS default",
+            "inputs": [{"name": "workspace", "default": spec.to_str().unwrap()}],
+            "phases": [{"id": "p1", "tasks": [{"id": "t1", "steps": [
+                {"id": "s1", "kind": "procedural.noop", "config": {"workspace": "{{workspace}}"}}
+            ]}]}],
+        });
+        guard.write_config("ws-default", &doc.to_string());
+        let err = launch("ws-default", None, &["dry_run=true".to_string()], None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("refusing to start") && msg.contains("unknown key `sourcs`"), "{msg}");
+        assert!(all_mission_ids().is_empty(), "nothing was minted");
+    }
+
     // ── source_input/ticket hydration (#1284 review round 1, must-fix 2) ─
 
     #[test]
