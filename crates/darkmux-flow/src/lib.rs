@@ -6,6 +6,7 @@
 //! `~/.darkmux/flows/` (overridable via `DARKMUX_FLOWS_DIR`). The first write
 //! atomically prepends a schema header so partial-file recovery is possible.
 
+mod action;
 pub mod daemon_probe;
 pub(crate) mod hmac_sha256;
 pub mod hook_transform;
@@ -20,6 +21,7 @@ mod integrity;
 mod schema;
 mod status;
 
+pub use action::{FlowAction, FlowScope, UnknownAction};
 pub use bookend::*;
 pub use integrity::*;
 pub use schema::*;

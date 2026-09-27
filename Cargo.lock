@@ -812,6 +812,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "tempfile",
+ "ts-rs",
  "unicode-general-category",
  "unicode-width",
  "ureq",

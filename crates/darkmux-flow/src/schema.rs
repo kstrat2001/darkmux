@@ -2023,6 +2023,8 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.65.0";
 //           exactly as it did before this fix — only the name changed.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
 pub enum Level {
     Error,
@@ -2058,6 +2060,8 @@ pub enum Level {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
 pub enum Category {
     Work,
@@ -2076,6 +2080,8 @@ pub enum Category {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
     Operator,
@@ -2088,6 +2094,8 @@ pub enum Tier {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "kebab-case")]
 pub enum Stage {
     Scope,
