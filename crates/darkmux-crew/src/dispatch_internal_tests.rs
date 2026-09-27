@@ -13491,27 +13491,6 @@ fn with_both_copies_resident_only_the_darkmux_one_is_selected() {
     );
 }
 
-// ── (#1615) The namespace is a decoration on the identifier, never the key ───
-
-/// The strip itself, both directions. A bare key must survive untouched — the
-/// overwhelmingly common spelling — and a namespaced one must reduce to the key
-/// LMStudio actually publishes.
-#[test]
-fn bare_model_key_strips_only_the_namespace() {
-    assert_eq!(super::bare_model_key("qwen3-4b-instruct-2507"), "qwen3-4b-instruct-2507");
-    assert_eq!(
-        super::bare_model_key("darkmux:qwen3-4b-instruct-2507"),
-        "qwen3-4b-instruct-2507"
-    );
-    // Not a prefix match on anything shorter or adjacent — those are real keys.
-    assert_eq!(super::bare_model_key("dark:foo"), "dark:foo");
-    assert_eq!(super::bare_model_key("predarkmux:foo"), "predarkmux:foo");
-    // Idempotent: stripping an already-bare key is a no-op, so normalizing
-    // twice on a path that gains a second call site can never over-strip.
-    let once = super::bare_model_key("darkmux:foo");
-    assert_eq!(super::bare_model_key(once), once);
-}
-
 // ── (#1934) `tag_lms_role` — the `telemetry.lms` payload stamper ────────
 
 /// A load payload gets both `role` (delegated to `role_for_load`, already

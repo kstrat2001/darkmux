@@ -605,7 +605,6 @@ darkmux release.
 - **The residency planner no longer evicts when nothing needs the room** (an
   unpriced or zero-sized load, or no surviving load). Latent today: no config
   sets a model-RAM budget yet (#2987).
-
 - **The compaction window is the selected model's own** (#2902 step 3).
   With several models in a profile, a dispatch compacted at the profile's
   DEFAULT model's `n_ctx` even when capability selection picked another
