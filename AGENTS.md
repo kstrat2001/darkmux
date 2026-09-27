@@ -81,7 +81,7 @@ darkmux's canonical config surface is **`~/.darkmux/config.json`**, written by `
 
 ```json
 {
-  "schema_version": "1.31",
+  "schema_version": "1.33",
   "machine_id": "studio",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
