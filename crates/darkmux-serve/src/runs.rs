@@ -186,7 +186,7 @@ pub enum AbandonReason {
 pub enum DispatchSessionEvidence {
     /// darkmux POSITIVELY recorded this mission's dispatch session ending —
     /// the presence reconciler's crash/kill/timeout close-edge (a
-    /// `session.end` record, see [`terminal_status_for_action`]). This is
+    /// `session.end` record, see `run_lifecycle.rs`'s `ending_of`). This is
     /// an observation, not an absence: something darkmux was watching
     /// stopped, and darkmux saw it stop.
     RecordedEnd,
@@ -1335,7 +1335,7 @@ fn mission_to_run(
     // `mission_run_status` lets one mission read Running off ANOTHER
     // mission's activity clock: the agg is permanently non-terminal (its
     // records are `step start`/`step complete`, which
-    // `terminal_status_for_action` maps to `None`), so it both disables the
+    // `run_lifecycle.rs`'s `ending_of` maps to `None`), so it both disables the
     // all-terminal branch and keeps `session_is_live` true. `is_ambiguous`
     // is the detector that already exists for exactly this corruption.
     // Membership (`sessions`) deliberately keeps them — claiming the
@@ -1571,7 +1571,7 @@ fn mission_run_status_and_evidence(
                 if mission.status != MissionStatus::Paused && most_recent_terminal_is_abandoned {
                     // A `session.end` terminal really did land — darkmux
                     // OBSERVED this session stop (see
-                    // `terminal_status_for_action`), never a guess from
+                    // `run_lifecycle.rs`'s `ending_of`), never a guess from
                     // silence.
                     return (RunStatus::Abandoned, Some(DispatchSessionEvidence::RecordedEnd));
                 }
@@ -2315,7 +2315,7 @@ struct SessionAgg {
     start_ts: Option<String>,
     /// The terminal outcome this session reached, from whichever of
     /// `dispatch complete` / `dispatch error` / `session.end` landed first
-    /// (see [`terminal_status_for_action`]) — `None` while still running.
+    /// (see `run_lifecycle.rs`'s `ending_of`) — `None` while still running.
     terminal_status: Option<RunStatus>,
     terminal_ts: Option<String>,
     /// (#1642, #1633) The newest `ts` seen on ANY record for this session —
@@ -2602,8 +2602,8 @@ fn ghost_runs(
         // (#1907) There is no per-dispatch abort action — `mission abort`
         // is mission-scoped, and a standalone session's only terminals are
         // `dispatch complete`/`dispatch error`/the presence reconciler's
-        // `session.end` crash-close-edge (see `terminal_status_for_action`'s
-        // own doc) — so an Abandoned ghost always means "no ending
+        // `session.end` crash-close-edge (see `run_lifecycle.rs`'s
+        // `ending_of`) — so an Abandoned ghost always means "no ending
         // recorded", whether it came from `session.end` or the staleness
         // gate above.
         let abandoned_reason = (status == RunStatus::Abandoned).then_some(if agg.stopped_by_operator {
@@ -4834,12 +4834,11 @@ mod tests {
     /// 60s TTL can still let one through — the "benign edge" noted on
     /// `remove_presence_key`'s own doc) — so the schema decision not to
     /// bump `FLOW_SCHEMA_VERSION` over #2344 rests on this: even when both
-    /// records exist for the same session, `terminal_status_for_action`'s
-    /// "keep the FIRST terminal seen" (file/write order, not a timestamp
-    /// sort) already resolves to the dispatch's own terminal, because
-    /// `session.end` can only ever be written AFTER the reconciler notices
-    /// the presence key gone — strictly later than the terminal that caused
-    /// its removal.
+    /// records exist for the same session, the attempt's outcome is its
+    /// dispatch terminal whenever it has one (`run_lifecycle.rs`, rule 3),
+    /// whichever closing record came first — and `session.end` is only ever
+    /// written AFTER the reconciler notices the presence key gone, strictly
+    /// later than the terminal that caused its removal.
     #[test]
     fn build_flow_session_index_dispatch_error_wins_over_a_later_redundant_session_end() {
         let tmp = TempDir::new().unwrap();
@@ -7772,7 +7771,7 @@ mod tests {
     /// exists only when this daemon can see the run directory.
     fn untracked_cell_is_reachable(kind: RunKind, status: RunStatus) -> bool {
         match (kind, status) {
-            // `ghost_runs`: `terminal_status_for_action` yields Complete
+            // `ghost_runs`: `run_lifecycle.rs`'s `ending_of` yields Complete
             // (`dispatch complete`), Error (`dispatch error`) and
             // Abandoned (`session.end`); the staleness gate yields Running
             // or Abandoned.

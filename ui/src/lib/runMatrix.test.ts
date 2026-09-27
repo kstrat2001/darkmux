@@ -74,7 +74,7 @@ describe("the matrix is derived, not listed", () => {
 
   it("reaches an untracked dispatch in error", () => {
     // The other direction of the same correction: `dispatch error` is a
-    // terminal record `terminal_status_for_action` maps to `error`, so a
+    // terminal record `run_lifecycle.rs`'s `ending_of` maps to `error`, so a
     // ghost genuinely reaches it. The flat table said it could not.
     expect(CELLS.some((c) => c.kind === "dispatch" && !c.tracked && c.status === "error")).toBe(
       true,
