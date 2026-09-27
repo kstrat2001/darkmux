@@ -3,6 +3,51 @@
     use std::io::Write;
     use tempfile::TempDir;
 
+    /// A trajectory event from a JSON fixture, through the one parser the
+    /// tailer and the lab use. Panics on a fixture that does not parse, so a
+    /// typo in a test cannot pass as "the event was ignored".
+    fn ev(v: serde_json::Value) -> darkmux_trajectory::TrajectoryEvent {
+        darkmux_trajectory::parse_line(&v.to_string()).unwrap_or_else(|| panic!("not a trajectory event: {v}"))
+    }
+
+    /// [`ev`] with its `type` set, for fixtures written without one.
+    fn ev_as(event_type: &str, mut v: serde_json::Value) -> darkmux_trajectory::TrajectoryEvent {
+        v["type"] = serde_json::json!(event_type);
+        ev(v)
+    }
+
+    /// A `model.completed` fixture.
+    fn mc(v: serde_json::Value) -> darkmux_trajectory::ModelCompleted {
+        match ev_as("model.completed", v) {
+            darkmux_trajectory::TrajectoryEvent::ModelCompleted(m) => m,
+            other => panic!("not model.completed: {other:?}"),
+        }
+    }
+
+    /// The heartbeat payload of a `model.partial` or `model.tool_call.writing`
+    /// fixture.
+    fn hb(v: serde_json::Value) -> serde_json::Value {
+        match ev(v) {
+            darkmux_trajectory::TrajectoryEvent::Partial(p) => heartbeat_payload(&Chunk::of_partial(&p)),
+            darkmux_trajectory::TrajectoryEvent::ToolCallWriting(w) => heartbeat_payload(&Chunk::of_writing(&w)),
+            other => panic!("not a chunk or a tick: {other:?}"),
+        }
+    }
+
+    /// The `area` a detector fixture's telemetry payload carries.
+    fn area_of(event_type: &str, v: serde_json::Value) -> Option<serde_json::Value> {
+        detector_telemetry_payload(&ev_as(event_type, v))?.get("area").cloned()
+    }
+
+    /// The degeneracy warning a checkpoint or stream-gate fixture calls for.
+    fn dw(event_type: &str, v: serde_json::Value) -> Option<DegeneracyWarning> {
+        match ev_as(event_type, v) {
+            darkmux_trajectory::TrajectoryEvent::Checkpoint(c) => checkpoint_degeneracy_warning(&c),
+            darkmux_trajectory::TrajectoryEvent::GateObservation(g) => gate_degeneracy_warning(&g),
+            _ => None,
+        }
+    }
+
     // ─── #2413 M2 (review round 2): telemetry_emission_due honors the knob ─
 
     #[test]
@@ -836,492 +881,6 @@
     }
 
     // ─── #368: compaction-flag passthrough to runtime CLI ────────────
-
-    // ─── out-of-band bookkeeping: volume mounts ──────────────────────
-
-    #[test]
-    fn read_token_totals_parses_metrics_json() {
-        // metrics.json lives under <out_dir>/.darkmux-runtime/ — the same
-        // out-dir the trajectory tailer reads. read_token_totals pulls the
-        // runtime's recorded prompt/completion totals; total() is derived.
-        // (#1444) This fixture predates the reasoning/cached fields
-        // (no such keys at all) — `reasoning`/`cached` must read as
-        // `None`, never a fabricated `0`.
-        let out = TempDir::new().unwrap();
-        let rt = out.path().join(".darkmux-runtime");
-        fs::create_dir_all(&rt).unwrap();
-        fs::write(
-            rt.join("metrics.json"),
-            r#"{"total_prompt_tokens": 1200, "total_completion_tokens": 345, "turns": 4}"#,
-        )
-        .unwrap();
-        let t = read_token_totals(out.path());
-        assert_eq!(t.prompt, 1200);
-        assert_eq!(t.completion, 345);
-        assert_eq!(t.total(), 1545);
-        assert_eq!(t.reasoning, None, "a pre-#1444 metrics.json has no such key at all");
-        assert_eq!(t.cached, None);
-    }
-
-    /// (#1444) A metrics.json written by a build that DOES track reasoning/
-    /// cached totals (a hosted reasoning-family dispatch) — both fields
-    /// must round-trip as real numbers. `reasoning <= completion` holds for
-    /// THIS fixture's provider family and is asserted as such; it is not a
-    /// universal invariant (#1444 review).
-    #[test]
-    fn read_token_totals_parses_reasoning_and_cached_tokens_when_present() {
-        let out = TempDir::new().unwrap();
-        let rt = out.path().join(".darkmux-runtime");
-        fs::create_dir_all(&rt).unwrap();
-        fs::write(
-            rt.join("metrics.json"),
-            r#"{"total_prompt_tokens": 1200, "total_completion_tokens": 345,
-                "total_reasoning_tokens": 300, "total_cached_tokens": 64, "turns": 4}"#,
-        )
-        .unwrap();
-        let t = read_token_totals(out.path());
-        assert_eq!(t.reasoning, Some(300));
-        assert_eq!(t.cached, Some(64));
-        assert!(t.reasoning.unwrap() <= t.completion);
-    }
-
-    #[test]
-    fn read_token_totals_degrades_to_zero_on_missing_or_malformed() {
-        // Observability enrichment, never a dispatch-failing path: a missing
-        // file (container died before writing) or malformed JSON yields zero
-        // totals rather than erroring.
-        // (#1444) `reasoning`/`cached` degrade to `None` on the SAME paths
-        // — "unmeasured" is the honest reading, not a fabricated zero.
-        let missing = TempDir::new().unwrap();
-        let t = read_token_totals(missing.path());
-        assert_eq!(t.total(), 0, "missing metrics.json → zero totals");
-        assert_eq!(t.reasoning, None);
-        assert_eq!(t.cached, None);
-
-        let bad = TempDir::new().unwrap();
-        let rt = bad.path().join(".darkmux-runtime");
-        fs::create_dir_all(&rt).unwrap();
-        fs::write(rt.join("metrics.json"), "{not valid json").unwrap();
-        let t = read_token_totals(bad.path());
-        assert_eq!(t.total(), 0, "malformed metrics.json → zero totals");
-        assert_eq!(t.reasoning, None);
-        assert_eq!(t.cached, None);
-    }
-
-    #[test]
-    fn token_totals_total_saturates() {
-        // Guard the derived sum against overflow on absurd inputs (the
-        // runtime caps real totals far below this, but the helper must not
-        // panic in a release build with overflow checks off — saturate).
-        let t = TokenTotals { prompt: u32::MAX, completion: 10, reasoning: None, cached: None };
-        assert_eq!(t.total(), u32::MAX);
-    }
-
-    // ─── (#2094) read_rest_totals — mirrors read_token_totals exactly ────
-
-    #[test]
-    fn read_rest_totals_parses_metrics_json() {
-        let out = TempDir::new().unwrap();
-        let rt = out.path().join(".darkmux-runtime");
-        fs::create_dir_all(&rt).unwrap();
-        fs::write(rt.join("metrics.json"), r#"{"rest_ms": 1000, "rests": 2}"#).unwrap();
-        let r = read_rest_totals(out.path());
-        assert_eq!(r.rest_ms, 1000);
-        assert_eq!(r.rests, 2);
-    }
-
-    #[test]
-    fn read_rest_totals_degrades_to_zero_on_missing_or_malformed() {
-        // (#2094 finding 5) Both cases now also fall back to
-        // trajectory.jsonl — but neither temp dir has one, so the
-        // fallback itself degrades to zero too, same end result as before
-        // the fallback existed.
-        let missing = TempDir::new().unwrap();
-        let r = read_rest_totals(missing.path());
-        assert_eq!((r.rest_ms, r.rests), (0, 0), "missing metrics.json + no trajectory → zero");
-
-        let bad = TempDir::new().unwrap();
-        let rt = bad.path().join(".darkmux-runtime");
-        fs::create_dir_all(&rt).unwrap();
-        fs::write(rt.join("metrics.json"), "{not valid json").unwrap();
-        let r = read_rest_totals(bad.path());
-        assert_eq!((r.rest_ms, r.rests), (0, 0), "malformed metrics.json + no trajectory → zero");
-    }
-
-    #[test]
-    fn read_rest_totals_absent_fields_falls_back_to_trajectory_or_zero() {
-        // A metrics.json from BEFORE #2094 (or a build without the feature)
-        // has no rest_ms/rests keys at all. With no trajectory.jsonl either,
-        // this must still degrade to zero, not error.
-        let out = TempDir::new().unwrap();
-        let rt = out.path().join(".darkmux-runtime");
-        fs::create_dir_all(&rt).unwrap();
-        fs::write(rt.join("metrics.json"), r#"{"total_prompt_tokens": 100}"#).unwrap();
-        let r = read_rest_totals(out.path());
-        assert_eq!((r.rest_ms, r.rests), (0, 0));
-    }
-
-    // ─── #2094 finding 5: rest_ms on the error path ──────────────────────
-
-    #[test]
-    fn read_rest_totals_falls_back_to_trajectory_when_metrics_json_is_absent() {
-        // No metrics.json at all — e.g. the runtime was SIGKILLed before
-        // its exit-time write ran. The runtime.rest events are durably
-        // streamed to trajectory.jsonl as they happen, so summing them
-        // recovers the totals metrics.json never got the chance to write.
-        let out = TempDir::new().unwrap();
-        let rt = out.path().join(".darkmux-runtime");
-        fs::create_dir_all(&rt).unwrap();
-        fs::write(
-            rt.join("trajectory.jsonl"),
-            "{\"type\":\"runtime.rest\",\"seq\":1,\"ts\":1,\"ms\":500}\n\
-             {\"type\":\"model.completed\",\"seq\":1}\n\
-             {\"type\":\"runtime.rest\",\"seq\":2,\"ts\":2,\"ms\":300}\n",
-        )
-        .unwrap();
-        let r = read_rest_totals(out.path());
-        assert_eq!(r.rest_ms, 800, "sum of both runtime.rest ms fields");
-        assert_eq!(r.rests, 2, "count of runtime.rest events, ignoring other event types");
-    }
-
-    #[test]
-    fn read_rest_totals_falls_back_to_trajectory_when_metrics_lacks_rest_ms() {
-        // metrics.json IS present and valid JSON, but (pre-#2094 shape, or
-        // a runtime build without the feature) carries no rest_ms key —
-        // must still reach for the trajectory fallback rather than
-        // treating a present-but-incomplete file as authoritative zero.
-        let out = TempDir::new().unwrap();
-        let rt = out.path().join(".darkmux-runtime");
-        fs::create_dir_all(&rt).unwrap();
-        fs::write(rt.join("metrics.json"), r#"{"total_prompt_tokens": 100}"#).unwrap();
-        fs::write(
-            rt.join("trajectory.jsonl"),
-            "{\"type\":\"runtime.rest\",\"seq\":1,\"ts\":1,\"ms\":250}\n",
-        )
-        .unwrap();
-        let r = read_rest_totals(out.path());
-        assert_eq!(r.rest_ms, 250);
-        assert_eq!(r.rests, 1);
-    }
-
-    #[test]
-    fn read_rest_totals_prefers_metrics_json_over_trajectory_when_both_present() {
-        // metrics.json carrying rest_ms is authoritative — the trajectory
-        // fallback only kicks in when metrics.json can't answer at all.
-        let out = TempDir::new().unwrap();
-        let rt = out.path().join(".darkmux-runtime");
-        fs::create_dir_all(&rt).unwrap();
-        fs::write(rt.join("metrics.json"), r#"{"rest_ms": 1000, "rests": 2}"#).unwrap();
-        fs::write(
-            rt.join("trajectory.jsonl"),
-            "{\"type\":\"runtime.rest\",\"seq\":1,\"ts\":1,\"ms\":9999}\n",
-        )
-        .unwrap();
-        let r = read_rest_totals(out.path());
-        assert_eq!(r.rest_ms, 1000, "metrics.json wins, not the trajectory sum");
-        assert_eq!(r.rests, 2);
-    }
-
-    #[test]
-    fn read_rest_totals_skips_malformed_trajectory_lines() {
-        let out = TempDir::new().unwrap();
-        let rt = out.path().join(".darkmux-runtime");
-        fs::create_dir_all(&rt).unwrap();
-        fs::write(
-            rt.join("trajectory.jsonl"),
-            "not even json\n\
-             {\"type\":\"runtime.rest\",\"seq\":1,\"ts\":1,\"ms\":500}\n",
-        )
-        .unwrap();
-        let r = read_rest_totals(out.path());
-        assert_eq!(r.rest_ms, 500, "the malformed line is skipped, not fatal to the sum");
-        assert_eq!(r.rests, 1);
-    }
-
-    // ─── #2094 second round, finding 1: rest_ms max(metrics, tailer) ─────
-
-    #[test]
-    fn reconcile_rest_totals_prefers_the_larger_of_metrics_and_tailer() {
-        let from_metrics = RestTotals { rest_ms: 0, rests: 0 };
-        let from_tailer = RestTotals { rest_ms: 1000, rests: 2 };
-        let merged = reconcile_rest_totals(from_metrics, from_tailer);
-        assert_eq!(merged.rest_ms, 1000);
-        assert_eq!(merged.rests, 2);
-    }
-
-    #[test]
-    fn reconcile_rest_totals_keeps_metrics_when_it_reports_more_than_the_tailer() {
-        // The live tailer's view can be the SMALLER one too (its last poll
-        // landed a beat before the runtime's clean-exit flush) — metrics.json
-        // is the fuller picture in that direction, so this isn't a blind
-        // "trajectory always wins," it's a genuine per-field max.
-        let from_metrics = RestTotals { rest_ms: 1000, rests: 2 };
-        let from_tailer = RestTotals { rest_ms: 400, rests: 1 };
-        let merged = reconcile_rest_totals(from_metrics, from_tailer);
-        assert_eq!(merged.rest_ms, 1000);
-        assert_eq!(merged.rests, 2);
-    }
-
-    #[test]
-    fn dispatch_error_terminal_recovers_rest_totals_from_the_live_tailer_when_metrics_json_is_zeroed(
-    ) {
-        // (#2094 second round, finding 1) Reproduces the exact failure this
-        // finding names: the runtime crashed (SIGKILL, hard error) after
-        // writing a zeroed metrics.json, but AFTER two real rests had
-        // already streamed to trajectory.jsonl and been seen live by the
-        // tailer. `read_rest_totals` alone gates its own trajectory
-        // fallback on metrics.json KEY PRESENCE, not value — so it trusts
-        // the zeroed-but-present `rest_ms`/`rests` and never reaches
-        // `sum_rest_totals_from_trajectory` itself. The payload must still
-        // surface the real totals by reconciling against what the live
-        // tailer (`TrajectorySummary`) actually observed as the events
-        // streamed, independent of the post-hoc metrics.json read.
-        let out = TempDir::new().unwrap();
-        let rt = out.path().join(".darkmux-runtime");
-        fs::create_dir_all(&rt).unwrap();
-        fs::write(rt.join("metrics.json"), r#"{"rest_ms": 0, "rests": 0}"#).unwrap();
-        fs::write(
-            rt.join("trajectory.jsonl"),
-            "{\"type\":\"runtime.rest\",\"seq\":1,\"ts\":1,\"ms\":400}\n\
-             {\"type\":\"runtime.rest\",\"seq\":2,\"ts\":2,\"ms\":600}\n",
-        )
-        .unwrap();
-
-        // Confirms the gap this finding names: read_rest_totals alone
-        // trusts the zeroed-but-present metrics.json and never falls
-        // through to the trajectory sum.
-        let from_metrics = read_rest_totals(out.path());
-        assert_eq!((from_metrics.rest_ms, from_metrics.rests), (0, 0));
-
-        // What the live tailer accumulated processing the same two events
-        // as they streamed — TrajectorySummary's own running total, kept
-        // independently of the post-hoc metrics.json read.
-        let from_tailer = RestTotals { rest_ms: 1000, rests: 2 };
-
-        let merged = reconcile_rest_totals(from_metrics, from_tailer);
-        assert_eq!(merged.rest_ms, 1000, "payload must carry the tailer-observed total");
-        assert_eq!(merged.rests, 2);
-    }
-
-    // ─── #2263 review MUST FIX: cumulative_turns/compactions and
-    // cumulative_prompt_tokens/completion_tokens must not fabricate a zero
-    // that sits below the per-run figures on the SAME dispatch.complete /
-    // dispatch.error record ────────────────────────────────────────────
-
-    #[test]
-    fn reconcile_cumulative_counts_prefers_the_larger_of_metrics_and_tailer() {
-        let from_metrics = CumulativeCounts { turns: 0, compactions: 0 };
-        let from_tailer = CumulativeCounts { turns: 7, compactions: 3 };
-        let merged = reconcile_cumulative_counts(from_metrics, from_tailer);
-        assert_eq!(merged.turns, 7);
-        assert_eq!(merged.compactions, 3);
-    }
-
-    #[test]
-    fn reconcile_cumulative_counts_keeps_metrics_when_it_reports_more_than_the_tailer() {
-        // A clean-exit metrics.json legitimately carries MORE than the
-        // tailer's this-invocation-only count whenever the checkpoint
-        // seeded a prior invocation's turns/compactions into it — a real
-        // resume, not a defect. Max, not "prefer the tailer."
-        let from_metrics = CumulativeCounts { turns: 12, compactions: 5 };
-        let from_tailer = CumulativeCounts { turns: 3, compactions: 1 };
-        let merged = reconcile_cumulative_counts(from_metrics, from_tailer);
-        assert_eq!(merged.turns, 12);
-        assert_eq!(merged.compactions, 5);
-    }
-
-    #[test]
-    fn reconcile_token_totals_prefers_the_larger_of_metrics_and_tailer() {
-        let from_metrics = TokenTotals { prompt: 0, completion: 0, reasoning: None, cached: None };
-        let from_tailer = TokenTotals { prompt: 9100, completion: 9600, reasoning: Some(500), cached: Some(50) };
-        let merged = reconcile_token_totals(from_metrics, from_tailer);
-        assert_eq!(merged.prompt, 9100);
-        assert_eq!(merged.completion, 9600);
-        // `reasoning`/`cached` are NOT reconciled — they aren't surfaced as
-        // cumulative fields, so there is nothing for the tailer side to
-        // contribute; the metrics-side value (here, unset) passes through.
-        assert_eq!(merged.reasoning, None);
-        assert_eq!(merged.cached, None);
-    }
-
-    #[test]
-    fn reconcile_token_totals_keeps_metrics_when_it_reports_more_than_the_tailer() {
-        let from_metrics = TokenTotals { prompt: 5000, completion: 2000, reasoning: Some(80), cached: Some(10) };
-        let from_tailer = TokenTotals { prompt: 100, completion: 50, reasoning: None, cached: None };
-        let merged = reconcile_token_totals(from_metrics, from_tailer);
-        assert_eq!(merged.prompt, 5000);
-        assert_eq!(merged.completion, 2000);
-        assert_eq!(merged.reasoning, Some(80), "metrics-side reasoning/cached pass through unconditionally");
-        assert_eq!(merged.cached, Some(10));
-    }
-
-    /// Reachable path 1 (MUST FIX #1): the loop's ERROR ARM
-    /// (`runtime::main`'s `else` branch with no surviving `LoopOutcome`)
-    /// writes `metrics.json` with `turns`/`compactions`/
-    /// `total_prompt_tokens`/`total_completion_tokens` HARDCODED to `0` —
-    /// not a race, certain, every time the loop returns an error — even
-    /// though real turns/tokens already streamed to `trajectory.jsonl` and
-    /// were seen live by the tailer before the failure. Without
-    /// reconciliation, `read_cumulative_counts`/`read_token_totals` trust
-    /// that zeroed-but-present file as authoritative and the
-    /// `dispatch.error` record reports `cumulative_turns: 0` /
-    /// `cumulative_prompt_tokens: 0` beside `total_turns`/`prompt_tokens`
-    /// in the thousands.
-    #[test]
-    fn dispatch_error_terminal_recovers_cumulative_counts_from_the_live_tailer_when_metrics_json_is_zeroed(
-    ) {
-        let out = TempDir::new().unwrap();
-        let rt = out.path().join(".darkmux-runtime");
-        fs::create_dir_all(&rt).unwrap();
-        fs::write(
-            rt.join("metrics.json"),
-            r#"{"turns": 0, "compactions": 0, "total_prompt_tokens": 0, "total_completion_tokens": 0}"#,
-        )
-        .unwrap();
-
-        // Confirms the gap this finding names: the raw metrics.json read
-        // alone reports the fabricated zero, not the real work already done.
-        let cumulative_from_metrics = read_cumulative_counts(out.path());
-        assert_eq!((cumulative_from_metrics.turns, cumulative_from_metrics.compactions), (0, 0));
-        let tokens_from_metrics = read_token_totals(out.path());
-        assert_eq!((tokens_from_metrics.prompt, tokens_from_metrics.completion), (0, 0));
-
-        // What the live tailer accumulated processing this dispatch's real
-        // turns/tokens as they streamed, before the crash — independent of
-        // the post-hoc metrics.json read.
-        let from_tailer_counts = CumulativeCounts { turns: 5000, compactions: 12 };
-        let from_tailer_tokens =
-            TokenTotals { prompt: 91_000, completion: 34_500, reasoning: None, cached: None };
-
-        let merged_counts = reconcile_cumulative_counts(cumulative_from_metrics, from_tailer_counts);
-        assert_eq!(merged_counts.turns, 5000, "payload must carry the tailer-observed turns, not 0");
-        assert_eq!(merged_counts.compactions, 12);
-
-        let merged_tokens = reconcile_token_totals(tokens_from_metrics, from_tailer_tokens);
-        assert_eq!(merged_tokens.prompt, 91_000, "payload must carry the tailer-observed tokens, not 0");
-        assert_eq!(merged_tokens.completion, 34_500);
-    }
-
-    /// Reachable path 2 (MUST FIX #1): metrics.json is written at exit, so
-    /// a watchdog hard-kill (or any SIGKILL before the clean-exit write
-    /// runs) leaves NO metrics.json at all — same fabricated-zero landing
-    /// as the error arm above, via a completely different cause.
-    #[test]
-    fn dispatch_error_terminal_recovers_cumulative_counts_from_the_live_tailer_when_metrics_json_is_absent(
-    ) {
-        let out = TempDir::new().unwrap();
-        // No .darkmux-runtime dir at all — the container never got far
-        // enough to create it, let alone write metrics.json.
-
-        let cumulative_from_metrics = read_cumulative_counts(out.path());
-        assert_eq!((cumulative_from_metrics.turns, cumulative_from_metrics.compactions), (0, 0));
-        let tokens_from_metrics = read_token_totals(out.path());
-        assert_eq!((tokens_from_metrics.prompt, tokens_from_metrics.completion), (0, 0));
-
-        let from_tailer_counts = CumulativeCounts { turns: 3000, compactions: 8 };
-        let from_tailer_tokens =
-            TokenTotals { prompt: 61_000, completion: 22_000, reasoning: None, cached: None };
-
-        let merged_counts = reconcile_cumulative_counts(cumulative_from_metrics, from_tailer_counts);
-        assert_eq!(merged_counts.turns, 3000, "payload must carry the tailer-observed turns, not 0");
-        assert_eq!(merged_counts.compactions, 8);
-
-        let merged_tokens = reconcile_token_totals(tokens_from_metrics, from_tailer_tokens);
-        assert_eq!(merged_tokens.prompt, 61_000, "payload must carry the tailer-observed tokens, not 0");
-        assert_eq!(merged_tokens.completion, 22_000);
-    }
-
-    // ─── #2094 finding 8: turn_delay_effective_ms ─────────────────────────
-
-    #[test]
-    fn read_turn_delay_effective_ms_prefers_the_metrics_json_field() {
-        let out = TempDir::new().unwrap();
-        let rt = out.path().join(".darkmux-runtime");
-        fs::create_dir_all(&rt).unwrap();
-        fs::write(
-            rt.join("metrics.json"),
-            r#"{"rest_ms": 1000, "rests": 2, "turn_delay_effective_ms": 500}"#,
-        )
-        .unwrap();
-        let rest = read_rest_totals(out.path());
-        let effective = read_turn_delay_effective_ms(out.path(), rest);
-        assert_eq!(effective, Some(500), "the exact resolved constant, not the 1000/2 average");
-    }
-
-    #[test]
-    fn read_turn_delay_effective_ms_falls_back_to_rest_average_when_metrics_json_absent() {
-        let out = TempDir::new().unwrap();
-        let rt = out.path().join(".darkmux-runtime");
-        fs::create_dir_all(&rt).unwrap();
-        // No metrics.json at all — trajectory carries two rests of 500ms
-        // and 300ms, summing 800ms over 2 rests.
-        fs::write(
-            rt.join("trajectory.jsonl"),
-            "{\"type\":\"runtime.rest\",\"seq\":1,\"ts\":1,\"ms\":500}\n\
-             {\"type\":\"runtime.rest\",\"seq\":2,\"ts\":2,\"ms\":300}\n",
-        )
-        .unwrap();
-        let rest = read_rest_totals(out.path());
-        assert_eq!((rest.rest_ms, rest.rests), (800, 2));
-        let effective = read_turn_delay_effective_ms(out.path(), rest);
-        assert_eq!(effective, Some(400), "800ms / 2 rests = 400ms average, the derived fallback");
-    }
-
-    #[test]
-    fn read_turn_delay_effective_ms_falls_back_when_metrics_json_lacks_the_field() {
-        let out = TempDir::new().unwrap();
-        let rt = out.path().join(".darkmux-runtime");
-        fs::create_dir_all(&rt).unwrap();
-        // metrics.json present (pre-finding-8 shape) but has no
-        // turn_delay_effective_ms key — must still reach for the average.
-        fs::write(rt.join("metrics.json"), r#"{"rest_ms": 600, "rests": 3}"#).unwrap();
-        let rest = RestTotals { rest_ms: 600, rests: 3 };
-        let effective = read_turn_delay_effective_ms(out.path(), rest);
-        assert_eq!(effective, Some(200));
-    }
-
-    #[test]
-    fn read_turn_delay_effective_ms_is_none_when_nothing_is_knowable() {
-        let out = TempDir::new().unwrap();
-        // No metrics.json, no trajectory.jsonl, zero rests — genuinely
-        // unknowable, not a misleading 0.
-        let rest = RestTotals::default();
-        let effective = read_turn_delay_effective_ms(out.path(), rest);
-        assert_eq!(effective, None);
-    }
-
-    #[test]
-    fn read_turn_delay_effective_ms_zero_field_does_not_short_circuit_the_derived_average_when_rests_positive(
-    ) {
-        // (#2094 second round, finding 1) Same shape of bug as rest_ms: a
-        // metrics.json written with `turn_delay_effective_ms: 0` (the
-        // exit-time write raced a crash and only got a zeroed struct out)
-        // must not be trusted as "the resolved cadence was genuinely
-        // zero" when `rest` says this dispatch actually rested. Fall
-        // through to the derived average instead.
-        let out = TempDir::new().unwrap();
-        let rt = out.path().join(".darkmux-runtime");
-        fs::create_dir_all(&rt).unwrap();
-        fs::write(rt.join("metrics.json"), r#"{"turn_delay_effective_ms": 0}"#).unwrap();
-        let rest = RestTotals { rest_ms: 1000, rests: 2 };
-        let effective = read_turn_delay_effective_ms(out.path(), rest);
-        assert_eq!(effective, Some(500), "falls through to 1000/2 = 500, not the zeroed field");
-    }
-
-    #[test]
-    fn read_turn_delay_effective_ms_zero_field_is_honored_when_there_were_genuinely_no_rests() {
-        // A single-turn dispatch that never rested legitimately has
-        // turn_delay_effective_ms=0 with rests=0 — that zero IS the truth,
-        // not a raced write, and must still be returned as Some(0) rather
-        // than falling to None.
-        let out = TempDir::new().unwrap();
-        let rt = out.path().join(".darkmux-runtime");
-        fs::create_dir_all(&rt).unwrap();
-        fs::write(rt.join("metrics.json"), r#"{"turn_delay_effective_ms": 0}"#).unwrap();
-        let rest = RestTotals::default();
-        let effective = read_turn_delay_effective_ms(out.path(), rest);
-        assert_eq!(effective, Some(0));
-    }
 
     // ─── #2094 finding 4: never rest an agentic-REMOTE dispatch ──────────
 
@@ -8227,7 +7786,7 @@
         state.handle_event(r#"{"type":"runtime.rest","seq":4,"ts":4,"ms":2000,"reason":"paused"}"#);
 
         assert_eq!(
-            state.summary.paced_rest_ms, 4000,
+            state.summary.fold.paced_rest_ms(), 4000,
             "only events 3 and 4 (reason != turn_delay) count as paced"
         );
 
@@ -8394,10 +7953,6 @@
         state.handle_event(
             r#"{"type":"tool.completed","seq":1,"tool_seq":1,"tool_name":"read","args":"{\"path\":\"/workspace/acme/src/x.ts\"}","result":"line\n","ok":true,"emitted":null,"emit_seq":null}"#,
         );
-        // A runtime that PREDATES the field (a stale local image) sends no key.
-        state.handle_event(
-            r#"{"type":"tool.completed","seq":1,"tool_seq":2,"tool_name":"create_finding","args":"{\"file\":\"x\"}","result":"Recorded. 1 finding(s) so far, 39 remaining in this run's budget.","ok":true}"#,
-        );
 
         unsafe {
             match prev {
@@ -8424,13 +7979,7 @@
             .filter_map(|l| serde_json::from_str(l).ok())
             .filter(|v: &serde_json::Value| v["session_id"] == "sess-emit" && v["action"] == "dispatch.tool")
             .collect();
-        assert_eq!(records.len(), 3, "one dispatch.tool record per tool.completed event");
-
-        let stale = records[2]["payload"].as_object().unwrap();
-        assert!(
-            !stale.contains_key("emitted") && !stale.contains_key("emit_seq"),
-            "a runtime that sent no key yields a record with NO key — a stale image must never read as \"emitted nothing\": {stale:?}"
-        );
+        assert_eq!(records.len(), 2, "one dispatch.tool record per tool.completed event");
 
         let reported = &records[0]["payload"];
         assert_eq!(reported["emitted"], emitted, "the emission is forwarded whole, untouched");
@@ -9412,7 +8961,7 @@
             "window_size": 10,
         });
         let payload =
-            detector_telemetry_payload("dispatch.cycle.suspected", &event).expect("maps cycle");
+            detector_telemetry_payload(&ev_as("dispatch.cycle.suspected", event.clone())).expect("maps cycle");
         assert_eq!(payload["kind"], "cycle");
         assert_eq!(payload["severity"], "warn");
         let detail = payload["detail"].as_str().expect("detail is a string");
@@ -9439,7 +8988,7 @@
             "degenerate": false,
         });
         assert!(
-            detector_telemetry_payload("dispatch.gate.observation", &event).is_none(),
+            detector_telemetry_payload(&ev_as("dispatch.gate.observation", event.clone())).is_none(),
             "a clean observation must not become a flow record"
         );
     }
@@ -9459,7 +9008,7 @@
             "interval_tokens": 1000,
             "degenerate": true,
         });
-        let payload = detector_telemetry_payload("dispatch.gate.observation", &event)
+        let payload = detector_telemetry_payload(&ev_as("dispatch.gate.observation", event.clone()))
             .expect("a degenerate observation must map to a record");
         assert_eq!(payload["kind"], "repetition");
         assert_eq!(payload["severity"], "warn");
@@ -9484,7 +9033,7 @@
             "interval_tokens": 1000,
             "tool_call_in_flight": false,
         });
-        let payload = detector_telemetry_payload("dispatch.gate.abort", &event)
+        let payload = detector_telemetry_payload(&ev_as("dispatch.gate.abort", event.clone()))
             .expect("an abort must always map to a record");
         assert_eq!(payload["kind"], "repetition");
         assert_eq!(payload["severity"], "warn");
@@ -9504,7 +9053,7 @@
             "recoveries_used": 1,
             "recoveries_budget": 3,
         });
-        let payload = detector_telemetry_payload("dispatch.intra_turn_stall.recovered", &event)
+        let payload = detector_telemetry_payload(&ev_as("dispatch.intra_turn_stall.recovered", event.clone()))
             .expect("maps intra-turn-stall");
         assert_eq!(payload["kind"], "intra-turn-stall");
         assert_eq!(payload["severity"], "info");
@@ -9533,7 +9082,7 @@
             "salvaged_tool_calls": 2,
             "bound": {"kind": "reasoning_checkpoint_interval", "value": 1000, "source": "built-in"},
         });
-        let payload = detector_telemetry_payload("dispatch.per_turn_cap.salvaged", &event)
+        let payload = detector_telemetry_payload(&ev_as("dispatch.per_turn_cap.salvaged", event.clone()))
             .expect("maps per-turn-cap");
         assert_eq!(
             payload["bound"],
@@ -9644,7 +9193,7 @@
             "arguments_chars": 1,
             "cut": "server_length",
         });
-        let payload = detector_telemetry_payload("dispatch.tool_call.discarded", &event)
+        let payload = detector_telemetry_payload(&ev_as("dispatch.tool_call.discarded", event.clone()))
             .expect("maps discarded_tool_call");
         assert_eq!(payload["kind"], "discarded_tool_call");
         assert_eq!(
@@ -9688,7 +9237,7 @@
             "arguments_chars": 42,
             "cut": "runtime_abort:degenerate",
         });
-        let payload = detector_telemetry_payload("dispatch.tool_call.discarded", &event)
+        let payload = detector_telemetry_payload(&ev_as("dispatch.tool_call.discarded", event.clone()))
             .expect("maps discarded_tool_call");
         let detail = payload["detail"].as_str().expect("detail is a string");
         assert!(detail.contains("42 characters of"), "got {detail:?}");
@@ -9714,7 +9263,7 @@
             "model": "mistralai/devstral-small-2-2512",
             "sample_name_prefix": "} catch (error) { --- [TOOL_CALLS]",
         });
-        let payload = detector_telemetry_payload("dispatch.tool.malformed_names", &event)
+        let payload = detector_telemetry_payload(&ev_as("dispatch.tool.malformed_names", event.clone()))
             .expect("maps malformed_tool_names");
         assert_eq!(payload["kind"], "malformed_tool_names");
         assert_eq!(payload["severity"], "warn");
@@ -9752,7 +9301,7 @@
             "sample_name_prefix": "bash",
             "reason": "real_tool_not_granted",
         });
-        let payload = detector_telemetry_payload("dispatch.tool.malformed_names", &event)
+        let payload = detector_telemetry_payload(&ev_as("dispatch.tool.malformed_names", event.clone()))
             .expect("maps malformed_tool_names");
         assert_eq!(payload["kind"], "malformed_tool_names", "same detector kind, different reason");
         assert_eq!(payload["reason"], "real_tool_not_granted");
@@ -9796,13 +9345,13 @@
         std::fs::write(&path, lines).unwrap();
         state.poll_and_emit();
 
-        assert_eq!(state.summary.tool_calls, 2, "total_tools counts only DISPATCHED calls");
+        assert_eq!(state.summary.fold.tool_calls(), 2, "total_tools counts only DISPATCHED calls");
         assert_eq!(
-            state.summary.tool_calls_failed, 1,
+            state.summary.fold.tool_calls_failed(), 1,
             "exactly the one dispatched-and-failed call, never the 5 malformed ones"
         );
         assert_eq!(
-            state.summary.tool_calls_invalid_name, 5,
+            state.summary.fold.tool_calls_invalid_name, 5,
             "the coalesced event's count lands here, not in tool_calls/tool_calls_failed"
         );
         // Also lands in the envelope's `detections` array via the shared
@@ -9842,11 +9391,11 @@
         state.poll_and_emit();
 
         assert_eq!(
-            state.summary.tool_calls_invalid_name, 4,
+            state.summary.fold.tool_calls_invalid_name, 4,
             "the not_a_tool event's 3 plus the reason-less (legacy) event's 1 = 4"
         );
         assert_eq!(
-            state.summary.tool_calls_ungranted, 2,
+            state.summary.fold.tool_calls_ungranted, 2,
             "the real_tool_not_granted event's 2, kept in its OWN bucket"
         );
         let kinds_and_reasons: Vec<(&str, &str)> = state
@@ -9879,7 +9428,7 @@
             "salvaged_tool_calls": 1,
             "bound": {"kind": "max_tokens_per_call", "value": 4000, "source": "config"},
         });
-        let payload = detector_telemetry_payload("dispatch.per_turn_cap.salvaged", &event)
+        let payload = detector_telemetry_payload(&ev_as("dispatch.per_turn_cap.salvaged", event.clone()))
             .expect("maps per-turn-cap");
         let detail = payload["detail"].as_str().unwrap();
         assert!(
@@ -9899,7 +9448,7 @@
             "recoveries_budget": 2,
             "bound": {"kind": "max_tokens_per_call", "value": 10000, "source": "env"},
         });
-        let payload = detector_telemetry_payload("dispatch.intra_turn_stall.recovered", &event)
+        let payload = detector_telemetry_payload(&ev_as("dispatch.intra_turn_stall.recovered", event.clone()))
             .expect("maps intra-turn-stall");
         assert_eq!(
             payload["bound"],
@@ -9925,7 +9474,7 @@
             "cap": 1000,
             "salvaged_tool_calls": 2,
         });
-        let payload = detector_telemetry_payload("dispatch.per_turn_cap.salvaged", &event)
+        let payload = detector_telemetry_payload(&ev_as("dispatch.per_turn_cap.salvaged", event.clone()))
             .expect("maps per-turn-cap even without a bound field");
         assert!(payload.get("bound").is_none(), "no bound field on the event -> none on the payload");
         let detail = payload["detail"].as_str().unwrap();
@@ -9983,7 +9532,7 @@
             "recoveries_budget": 2,
             "bound": {"kind": "generation_checkpoint_interval", "value": 4000, "source": "built-in"},
         });
-        let payload = detector_telemetry_payload("dispatch.intra_turn_stall.recovered", &event)
+        let payload = detector_telemetry_payload(&ev_as("dispatch.intra_turn_stall.recovered", event.clone()))
             .expect("maps intra-turn-stall");
         let detail = payload["detail"].as_str().unwrap();
         assert!(
@@ -10018,7 +9567,7 @@
             "recoveries_budget": 2,
             "bound": {"kind": "generation_checkpoint_interval", "value": 4000, "source": "built-in"},
         });
-        let payload = detector_telemetry_payload("dispatch.empty_tool_calls.recovered", &event)
+        let payload = detector_telemetry_payload(&ev_as("dispatch.empty_tool_calls.recovered", event.clone()))
             .expect("maps empty_tool_calls");
         assert_eq!(payload["kind"], serde_json::json!("empty_tool_calls"));
         let detail = payload["detail"].as_str().unwrap();
@@ -10048,7 +9597,7 @@
             "model": "devstral-small-2-2512",
             "prompt_tokens": 19133,
         });
-        let payload = detector_telemetry_payload("dispatch.escalation.triggered", &event)
+        let payload = detector_telemetry_payload(&ev_as("dispatch.escalation.triggered", event.clone()))
             .expect("maps escalation");
         assert_eq!(payload["kind"], serde_json::json!("escalation"));
         assert_eq!(payload["model"], serde_json::json!("devstral-small-2-2512"));
@@ -10433,7 +9982,7 @@
             "finish_reason": "tool_calls",
             "usage": { "prompt_tokens": 24000, "completion_tokens": 850 },
         });
-        let payload = turn_tokens_payload(&event, "coder", "m", "ep", None);
+        let payload = turn_tokens_payload(&mc(event.clone()), "coder", "m", "ep", None);
         assert_eq!(payload["turn_seq"], 12);
         assert_eq!(payload["prompt_tokens"], 24000);
         assert_eq!(payload["completion_tokens"], 850);
@@ -10462,7 +10011,7 @@
                 "reasoning_tokens": 1024, "cached_tokens": 64,
             },
         });
-        let payload = turn_tokens_payload(&event, "coder", "m", "ep", None);
+        let payload = turn_tokens_payload(&mc(event.clone()), "coder", "m", "ep", None);
         assert_eq!(payload["reasoning_tokens"], 1024);
         assert_eq!(payload["cached_tokens"], 64);
         assert!(payload["reasoning_tokens"].as_u64().unwrap() <= payload["completion_tokens"].as_u64().unwrap());
@@ -10487,7 +10036,7 @@
             "seq": 4,
             "usage": { "prompt_tokens": 9970, "completion_tokens": 128, "total_tokens": 11598 },
         });
-        let payload = turn_tokens_payload(&event, "coder", "m", "ep", None);
+        let payload = turn_tokens_payload(&mc(event.clone()), "coder", "m", "ep", None);
         assert_eq!(
             payload["total_tokens"], 11598,
             "the provider's own total must win; prompt + completion (10098) understates by 1500"
@@ -10507,7 +10056,7 @@
             "seq": 5,
             "usage": { "prompt_tokens": 300, "completion_tokens": 45 },
         });
-        let payload = turn_tokens_payload(&event, "coder", "m", "ep", None);
+        let payload = turn_tokens_payload(&mc(event.clone()), "coder", "m", "ep", None);
         assert_eq!(payload["total_tokens"], 345, "no reported total → derive from the split");
     }
 
@@ -10564,82 +10113,6 @@
         assert!(bare.mission_id.is_none(), "a None mission_id must never be fabricated into Some");
     }
 
-    // ─── remote_usage_tokens (#1444 review) ───────────────────────────
-
-    /// (#1444 review) `dispatch_remote` performs real HTTP, so nothing in
-    /// the suite ever executed the inline `usage` extraction that used to
-    /// live in its body: nulling `reasoning_tok` there left all 1503 crew
-    /// tests green while the field stopped being recorded on the ONE path
-    /// that actually reports it. Extracted to `remote_usage_tokens` and
-    /// pinned here.
-    #[test]
-    fn remote_usage_tokens_reads_reasoning_and_cached_from_the_details_objects() {
-        let usage = serde_json::json!({
-            "prompt_tokens": 75,
-            "completion_tokens": 1186,
-            "total_tokens": 1261,
-            "completion_tokens_details": { "reasoning_tokens": 1024 },
-            "prompt_tokens_details": { "cached_tokens": 64 },
-        });
-        let u = remote_usage_tokens(&usage);
-        assert_eq!(u.prompt, 75);
-        assert_eq!(u.completion, 1186);
-        assert_eq!(u.total, 1261);
-        assert_eq!(u.reasoning, Some(1024));
-        assert_eq!(u.cached, Some(64));
-    }
-
-    /// (#1444) Absence at BOTH depths — no details object at all, and a
-    /// details object present but not naming the field — must read as
-    /// `None`, never a fabricated `0`.
-    #[test]
-    fn remote_usage_tokens_absent_details_stay_none_never_zero() {
-        let no_objects = serde_json::json!({
-            "prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42,
-        });
-        let u = remote_usage_tokens(&no_objects);
-        assert_eq!(u.reasoning, None);
-        assert_eq!(u.cached, None);
-
-        let empty_objects = serde_json::json!({
-            "prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42,
-            "completion_tokens_details": {}, "prompt_tokens_details": {},
-        });
-        let u = remote_usage_tokens(&empty_objects);
-        assert_eq!(u.reasoning, None, "an empty details object names no zero");
-        assert_eq!(u.cached, None);
-
-        // A reported zero stays distinguishable from "didn't say".
-        let explicit_zero = serde_json::json!({
-            "prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42,
-            "completion_tokens_details": { "reasoning_tokens": 0 },
-        });
-        assert_eq!(remote_usage_tokens(&explicit_zero).reasoning, Some(0));
-    }
-
-    /// (#1444 review) The endpoint's own `total_tokens` wins over the sum.
-    /// Numbers lifted verbatim from a recorded `gemini-2.5-flash` block in
-    /// `~/.darkmux/flows/2026-07-05.jsonl`: the endpoint billed 11,598 while
-    /// prompt + completion is 10,098.
-    #[test]
-    fn remote_usage_tokens_prefers_the_endpoints_own_total() {
-        let usage = serde_json::json!({
-            "prompt_tokens": 9970, "completion_tokens": 128, "total_tokens": 11598,
-        });
-        let u = remote_usage_tokens(&usage);
-        assert_eq!(u.total, 11598, "recomputing the sum would understate by 1500");
-
-        // …and the sum is still the fallback when the endpoint sent none.
-        let no_total = serde_json::json!({ "prompt_tokens": 300, "completion_tokens": 45 });
-        assert_eq!(remote_usage_tokens(&no_total).total, 345);
-
-        // A `usage` that is JSON null (the endpoint omitted it) degrades to
-        // honest zeros rather than panicking.
-        let u = remote_usage_tokens(&serde_json::Value::Null);
-        assert_eq!((u.prompt, u.completion, u.total), (0, 0, 0));
-        assert_eq!(u.reasoning, None);
-    }
-
     // ─── "direct"-runtime token key parity (#1444 review) ─────────────
 
     /// (#1444 review) Both `runtime: "direct"` producers — `dispatch_remote`
@@ -10648,21 +10121,15 @@
     /// way it did when #1444's first pass added `reasoning_tokens`/
     /// `cached_tokens` to one and not the other.
     ///
-    /// The keys must be present even when every value is unreported: a
-    /// consumer that distinguishes "reported null" from "key absent" — which
-    /// is the entire point of the tri-state — must get the same answer from
-    /// both arms.
-    /// The key names are spelled out as LITERALS here on purpose. An earlier
-    /// draft of this test iterated `DIRECT_TOKEN_KEYS` itself, which made it
-    /// self-referential and vacuous: rewriting the constant's last two
-    /// entries to duplicate `prompt_tokens`/`completion_tokens` — deleting
-    /// the whole #1444 contribution from both direct producers — left this
-    /// test GREEN. Caught by mutation; the literals are what give it teeth.
+    /// The keys must be present even when every value is unreported. The
+    /// key names are spelled out as LITERALS on purpose: an earlier draft
+    /// iterated `DIRECT_TOKEN_KEYS` itself and stayed green when mutation
+    /// rewrote the constant.
     #[test]
     fn insert_direct_token_keys_always_writes_all_five_keys() {
         let mut payload = serde_json::json!({ "runtime": "direct" });
         let obj = payload.as_object_mut().unwrap();
-        insert_direct_token_keys(obj, None, None, None, None, None);
+        insert_direct_token_keys(obj, &darkmux_trajectory::UsageCounts::default());
         for key in [
             "prompt_tokens",
             "completion_tokens",
@@ -10670,69 +10137,39 @@
             "reasoning_tokens",
             "cached_tokens",
         ] {
-            assert!(
-                obj.contains_key(key),
-                "{key} must be PRESENT-and-null when unreported, never absent — \
-                 the two direct producers have to answer identically"
-            );
+            assert!(obj.contains_key(key), "{key} must be PRESENT-and-null when unreported, never absent");
             assert!(obj[key].is_null(), "{key} must be null, never a fabricated 0");
         }
-        // …and the constant the writer iterates must name exactly those five,
-        // so the parity contract and the emission cannot disagree.
-        assert_eq!(
-            DIRECT_TOKEN_KEYS,
-            [
-                "prompt_tokens",
-                "completion_tokens",
-                "total_tokens",
-                "reasoning_tokens",
-                "cached_tokens"
-            ]
-        );
         assert_eq!(obj.len(), 6, "the five token keys plus the pre-existing `runtime`");
     }
 
-    /// (#1444 review) The remote arm's convention: counts degrade to `0`
-    /// (pre-existing behavior) while the details stay tri-state. The local
-    /// arm's convention: every `SingleShotReply` `Option` forwarded
-    /// untouched. Both go through the same writer, so the key set matches
-    /// even though the values legitimately differ.
+    /// A direct completion record quotes the call's counts exactly as its
+    /// usage record does: the provider's own total when it sent one, the
+    /// split's sum when it sent only that. There is no second reading of
+    /// the reply to disagree with.
     #[test]
-    fn direct_token_key_set_matches_across_both_producers() {
-        let remote_usage = serde_json::json!({
-            "prompt_tokens": 9970, "completion_tokens": 128, "total_tokens": 11598,
-        });
-        let u = remote_usage_tokens(&remote_usage);
-        let mut remote = serde_json::json!({});
-        insert_direct_token_keys(
-            remote.as_object_mut().unwrap(),
-            Some(u.prompt),
-            Some(u.completion),
-            Some(u.total),
-            u.reasoning,
-            u.cached,
-        );
-
-        // The local arm, with an LMStudio reply that reports a split and no
-        // details object at all.
-        let mut local = serde_json::json!({});
-        insert_direct_token_keys(
-            local.as_object_mut().unwrap(),
-            Some(30),
-            Some(12),
-            Some(42),
-            None,
-            None,
-        );
-
-        let remote_keys: Vec<&String> = remote.as_object().unwrap().keys().collect();
-        let local_keys: Vec<&String> = local.as_object().unwrap().keys().collect();
-        assert_eq!(remote_keys, local_keys, "both direct producers must emit the same key set");
-        // The provider's own total survives on the remote side.
-        assert_eq!(remote["total_tokens"], 11598);
-        // …and absence reads identically on both.
-        assert!(remote["reasoning_tokens"].is_null());
-        assert!(local["reasoning_tokens"].is_null());
+    fn a_direct_completion_quotes_the_same_counts_as_its_usage_record() {
+        let facts = crate::usage::CallFacts {
+            call_kind: crate::usage::CallKind::SingleShot,
+            role_id: Some("coder"),
+            requested_model: "m",
+            reported_model: None,
+            endpoint: "ep",
+            endpoint_id: None,
+        };
+        for counts in [
+            darkmux_trajectory::UsageCounts { prompt: Some(9970), completion: Some(128), total: Some(11598), ..Default::default() },
+            darkmux_trajectory::UsageCounts { prompt: Some(300), completion: Some(45), ..Default::default() },
+            darkmux_trajectory::UsageCounts { reasoning: Some(0), cached: Some(64), ..Default::default() },
+        ] {
+            let mut complete = serde_json::json!({});
+            insert_direct_token_keys(complete.as_object_mut().unwrap(), &counts);
+            let record = crate::usage::usage_payload(&facts, &counts);
+            for key in ["prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens", "cached_tokens"] {
+                let recorded = record.get(key).cloned().unwrap_or(serde_json::Value::Null);
+                assert_eq!(complete[key], recorded, "{key} for {counts:?}");
+            }
+        }
     }
 
     /// (#795, #2902 step 1a) No `usage` (or JSON-null usage — upstream
@@ -10742,11 +10179,11 @@
     #[test]
     fn turn_tokens_payload_marks_absent_or_null_usage_absent() {
         let absent = serde_json::json!({ "type": "model.completed", "seq": 3 });
-        assert_eq!(turn_tokens_payload(&absent, "coder", "m", "ep", None)["token_source"], "absent", "absent usage → an absent record, no counts");
+        assert_eq!(turn_tokens_payload(&mc(absent.clone()), "coder", "m", "ep", None)["token_source"], "absent", "absent usage → an absent record, no counts");
         let null = serde_json::json!({
             "type": "model.completed", "seq": 3, "usage": serde_json::Value::Null,
         });
-        assert_eq!(turn_tokens_payload(&null, "coder", "m", "ep", None)["token_source"], "absent", "null usage → an absent record, no counts");
+        assert_eq!(turn_tokens_payload(&mc(null.clone()), "coder", "m", "ep", None)["token_source"], "absent", "null usage → an absent record, no counts");
     }
 
     /// (#795) Defensive: a `usage` object missing a count degrades that
@@ -10759,7 +10196,7 @@
             "seq": 1,
             "usage": { "completion_tokens": 500 },
         });
-        let payload = turn_tokens_payload(&event, "coder", "m", "ep", None);
+        let payload = turn_tokens_payload(&mc(event.clone()), "coder", "m", "ep", None);
         assert_eq!(payload["prompt_tokens"], 0);
         assert_eq!(payload["completion_tokens"], 500);
         assert_eq!(payload["total_tokens"], 500);
@@ -10779,29 +10216,10 @@
             "generated_chars": 340,
             "ts": 1_758_700_000_123u64,
         });
-        let payload = heartbeat_payload(&event);
+        let payload = hb(event.clone());
         assert_eq!(payload["cumulative_chars"], 120);
         assert_eq!(payload["generated_chars"], 340);
         assert_eq!(payload["sampled_at_ms"], 1_758_700_000_123u64);
-    }
-
-    /// (#2877) An OLDER runtime's `model.partial` — no `ts`, no
-    /// `generated_chars` — must still produce a valid heartbeat payload:
-    /// the two new keys degrade to JSON `null` rather than panicking or
-    /// dropping the record. This is the backward-compat guard the flow
-    /// schema minor bump promises readers.
-    #[test]
-    fn heartbeat_payload_degrades_gracefully_on_older_runtime_shape() {
-        let event = serde_json::json!({
-            "type": "model.partial",
-            "seq": 1,
-            "partial_index": 0,
-            "cumulative_chars": 10,
-        });
-        let payload = heartbeat_payload(&event);
-        assert_eq!(payload["cumulative_chars"], 10);
-        assert!(payload["generated_chars"].is_null());
-        assert!(payload["sampled_at_ms"].is_null());
     }
 
     /// (#2889) A partial that names the tool call being written forwards the
@@ -10815,7 +10233,7 @@
             "cumulative_chars": 0, "generated_chars": 812, "ts": 5_000u64,
             "phase": "writing_tool_call", "tool_name": "edit",
         });
-        let payload = heartbeat_payload(&writing);
+        let payload = hb(writing.clone());
         assert_eq!(payload["phase"], "writing_tool_call");
         assert_eq!(payload["tool_name"], "edit");
         assert_eq!(payload["generated_chars"], 812);
@@ -10824,7 +10242,7 @@
             "type": "model.partial", "seq": 2, "partial_index": 3,
             "cumulative_chars": 10, "generated_chars": 40, "ts": 4_000u64,
         });
-        let payload = heartbeat_payload(&plain);
+        let payload = hb(plain.clone());
         assert!(payload.get("phase").is_none(), "no phase key without a named call: {payload}");
         assert!(payload.get("tool_name").is_none(), "no tool_name key without a named call: {payload}");
     }
@@ -11550,7 +10968,7 @@
         }
 
         assert_eq!(
-            state.summary.turns, 2,
+            state.summary.fold.turns(), 2,
             "four checkpoint continuations of one thought plus one real turn is \
              TWO turns, not five — counting API calls inflates every \
              operator-visible turn count for reasoning-heavy dispatches"
@@ -11693,17 +11111,13 @@
         assert_eq!(turns, 2, "dispatch.turn unaffected by the telemetry emission");
     }
 
-    /// (#2263 review, minor) The tailer's per-turn token accumulation casts
-    /// each `usage` field's `u64` down to `u32` before feeding
-    /// `saturating_add` — the surrounding code's OWN stated convention is
-    /// "clamp, never wrap." A bare `as u32` cast wraps instead: a usage
-    /// value 5 over `u32::MAX` would read back as `4`, not `u32::MAX`.
-    /// Unreachable with a real token count, but this pins the cast itself
-    /// (`u32::try_from(..).unwrap_or(u32::MAX)`) independent of whether any
-    /// real provider can trigger it.
+    /// (#2263 review, minor) A usage count beyond `u32::MAX` survives whole:
+    /// counts are `u64` from the trajectory through the fold, so nothing
+    /// narrows (and so nothing can wrap) a value on the way. A narrowing cast
+    /// once read a count 5 over `u32::MAX` back as `4`.
     #[test]
     #[serial] // (#1882) reaches emit() -> darkmux_flow::record()
-    fn handle_event_model_completed_saturates_rather_than_wraps_a_u64_usage_field_beyond_u32_max() {
+    fn handle_event_model_completed_keeps_a_usage_count_beyond_u32_max_whole() {
         // (#2718) Every darkmux write destination, pinned for this test.
         // Measured before this line existed: a full `-p darkmux-crew --lib`
         // run with all twelve state variables exported to a fresh root still
@@ -11719,17 +11133,16 @@
             "coder".into(),
             "darkmux:qwen3.6".into(),
         );
-        // u32::MAX == 4_294_967_295; these are each 5 over it. A wrapping
-        // `as u32` cast reads each back as `4`; a saturating conversion
-        // clamps each to `u32::MAX`.
+        // u32::MAX == 4_294_967_295; these are each 5 over it.
         state.handle_event(
             r#"{"type":"model.completed","seq":1,"finish_reason":"stop","usage":{"prompt_tokens":4294967300,"completion_tokens":4294967300,"reasoning_tokens":4294967300,"cached_tokens":4294967300}}"#,
         );
-        assert_eq!(state.summary.prompt_tokens, u32::MAX, "must clamp, not wrap to 4");
-        assert_eq!(state.summary.completion_tokens, u32::MAX, "must clamp, not wrap to 4");
-        assert_eq!(state.summary.reasoning_tokens, Some(u32::MAX), "must clamp, not wrap to 4");
-        assert_eq!(state.summary.cached_tokens, Some(u32::MAX), "must clamp, not wrap to 4");
-        assert_eq!(state.summary.total_tokens, u32::MAX, "must clamp, not wrap");
+        let over = 4_294_967_300u64;
+        assert_eq!(state.summary.fold.tokens.prompt, over, "never narrowed to 4");
+        assert_eq!(state.summary.fold.tokens.completion, over);
+        assert_eq!(state.summary.fold.tokens.reasoning, Some(over));
+        assert_eq!(state.summary.fold.tokens.cached, Some(over));
+        assert_eq!(state.summary.fold.tokens.total, 2 * over, "no provider total: prompt + completion");
     }
 
     /// (#1483) A multi-turn / multi-tool agent loop stamps EVERY live per-event
@@ -11833,62 +11246,57 @@
             { "id": "a", "name": "read", "arguments_chars": 40, "path": "/workspace/src/a.rs" },
             { "id": "b", "name": "bash", "arguments_chars": 12 },
             { "id": "c", "name": "write", "arguments_chars": 90, "path": "src/b.rs" },
-            { "id": "d", "name": "read", "arguments_chars": 90, "path": 7 },
             { "id": "e", "name": "read", "arguments_chars": 90, "path": "x".repeat(MAX_TRAJ_FIELD_BYTES + 1) },
         ]});
         assert_eq!(
-            turn_tool_paths(&ev),
-            Some(serde_json::json!(["/workspace/src/a.rs", null, "src/b.rs", null, null]))
+            turn_tool_paths(&mc(ev.clone())),
+            Some(serde_json::json!(["/workspace/src/a.rs", null, "src/b.rs", null]))
         );
         let none = serde_json::json!({ "calls_planned": true, "tool_calls": [{ "id": "b", "name": "bash", "arguments_chars": 12 }] });
-        assert_eq!(turn_tool_paths(&none), None);
-        assert_eq!(turn_tool_paths(&serde_json::json!({ "calls_planned": true, "tool_calls": [] })), None);
-        assert_eq!(turn_tool_paths(&serde_json::json!({ "calls_planned": true, "tool_calls": null })), None);
-        assert_eq!(turn_tool_paths(&serde_json::json!({})), None);
+        assert_eq!(turn_tool_paths(&mc(none.clone())), None);
+        assert_eq!(turn_tool_paths(&mc(serde_json::json!({ "calls_planned": true, "tool_calls": [] }))), None);
+        assert_eq!(turn_tool_paths(&mc(serde_json::json!({ "calls_planned": true, "tool_calls": null }))), None);
+        assert_eq!(turn_tool_paths(&mc(serde_json::json!({}))), None);
     }
 
     /// (#2963) `dispatch.turn` forwards each call's tool name as
     /// `tool_names`, aligned by index with `tool_paths`; unlike the paths
-    /// the key is present whenever the turn made any calls. A name that is
-    /// not a string is `null`; an over-bound name is `null`, never clipped.
+    /// the key is present whenever the turn made any calls. An over-bound
+    /// name is `null`, never clipped.
     #[test]
     fn turn_tool_names_aligns_with_the_calls_and_is_present_whenever_there_are_calls() {
         let ev = serde_json::json!({ "calls_planned": true, "tool_calls": [
             { "id": "a", "name": "write", "arguments_chars": 40, "path": "src/a.rs" },
             { "id": "b", "name": "read", "arguments_chars": 12, "path": "src/b.rs" },
-            { "id": "c", "name": 7, "arguments_chars": 1 },
             { "id": "d", "name": "x".repeat(MAX_TRAJ_FIELD_BYTES + 1), "arguments_chars": 1 },
         ]});
         // (#2963 review, CONSIDER 2) A name that is not a known runtime tool
-        // never rides the flow stream, so `7` and the over-long name are
-        // `null`; so would a model-invented one be.
-        assert_eq!(turn_tool_names(&ev), Some(serde_json::json!(["write", "read", null, null])));
+        // never rides the flow stream, so the over-long name is `null`; so
+        // would a model-invented one be.
+        assert_eq!(turn_tool_names(&mc(ev.clone())), Some(serde_json::json!(["write", "read", null])));
         let invented = serde_json::json!({ "calls_planned": true, "tool_calls": [{ "id": "a", "name": "rm_rf_everything", "arguments_chars": 2 }] });
-        assert_eq!(turn_tool_names(&invented), Some(serde_json::json!([null])));
+        assert_eq!(turn_tool_names(&mc(invented.clone())), Some(serde_json::json!([null])));
         let bash = serde_json::json!({ "calls_planned": true, "tool_calls": [{ "id": "b", "name": "bash", "arguments_chars": 12 }] });
-        assert_eq!(turn_tool_names(&bash), Some(serde_json::json!(["bash"])));
-        assert_eq!(turn_tool_names(&serde_json::json!({ "calls_planned": true, "tool_calls": [] })), None);
-        assert_eq!(turn_tool_names(&serde_json::json!({ "calls_planned": true, "tool_calls": null })), None);
-        assert_eq!(turn_tool_names(&serde_json::json!({})), None);
+        assert_eq!(turn_tool_names(&mc(bash.clone())), Some(serde_json::json!(["bash"])));
+        assert_eq!(turn_tool_names(&mc(serde_json::json!({ "calls_planned": true, "tool_calls": [] }))), None);
+        assert_eq!(turn_tool_names(&mc(serde_json::json!({ "calls_planned": true, "tool_calls": null }))), None);
+        assert_eq!(turn_tool_names(&mc(serde_json::json!({}))), None);
     }
 
     /// (#2963 review) Fail closed on runtime version skew: a record that does
     /// not say its calls were planned (a runtime older than the `runs`
-    /// marks) gets no lists, rather than reading as "every call runs". The
-    /// key names are pinned as literals here and in the runtime's own test.
+    /// marks) gets no lists, rather than reading as "every call runs".
     #[test]
     fn turn_lists_need_the_runtime_to_say_its_calls_were_planned() {
-        assert_eq!(CALLS_PLANNED_KEY, "calls_planned");
-        assert_eq!(RUNS_KEY, "runs");
         let unplanned = serde_json::json!({ "tool_calls": [
             { "id": "a", "name": "read", "arguments_chars": 12, "path": "src/y.rs" },
         ]});
-        assert_eq!(turn_tool_names(&unplanned), None);
-        assert_eq!(turn_tool_paths(&unplanned), None);
+        assert_eq!(turn_tool_names(&mc(unplanned.clone())), None);
+        assert_eq!(turn_tool_paths(&mc(unplanned.clone())), None);
         let mut planned = unplanned.clone();
         planned["calls_planned"] = serde_json::json!(true);
-        assert_eq!(turn_tool_names(&planned), Some(serde_json::json!(["read"])));
-        assert_eq!(turn_tool_paths(&planned), Some(serde_json::json!(["src/y.rs"])));
+        assert_eq!(turn_tool_names(&mc(planned.clone())), Some(serde_json::json!(["read"])));
+        assert_eq!(turn_tool_paths(&mc(planned.clone())), Some(serde_json::json!(["src/y.rs"])));
     }
 
     /// (#2963 review, MUST FIX 1) Only the calls that RUN are in the lists.
@@ -11905,13 +11313,13 @@
             { "id": "c", "name": "frobnicate", "arguments_chars": 2, "runs": false },
             { "id": "d", "name": "edit", "arguments_chars": 30, "path": "src/z.rs", "runs": true },
         ]});
-        assert_eq!(turn_tool_names(&ev), Some(serde_json::json!(["read", "edit"])));
-        assert_eq!(turn_tool_paths(&ev), Some(serde_json::json!(["src/y.rs", "src/z.rs"])));
+        assert_eq!(turn_tool_names(&mc(ev.clone())), Some(serde_json::json!(["read", "edit"])));
+        assert_eq!(turn_tool_paths(&mc(ev.clone())), Some(serde_json::json!(["src/y.rs", "src/z.rs"])));
         let none_run = serde_json::json!({ "calls_planned": true, "tool_calls": [
             { "id": "a", "name": "write", "arguments_chars": 40, "path": "src/x.rs", "runs": false },
         ]});
-        assert_eq!(turn_tool_names(&none_run), Some(serde_json::json!([])), "no call runs: an empty list, not a missing one");
-        assert_eq!(turn_tool_paths(&none_run), None);
+        assert_eq!(turn_tool_names(&mc(none_run.clone())), Some(serde_json::json!([])), "no call runs: an empty list, not a missing one");
+        assert_eq!(turn_tool_paths(&mc(none_run.clone())), None);
     }
 
     /// (#2963) End to end through the tailer: the turn record carries the
@@ -12344,54 +11752,33 @@
         assert_eq!(result, vec!["bash".to_string()]);
     }
 
-    // ─── cap_reasoning_text (S6) ──────────────────────────────────────
+    // ─── reasoning text bound (S6) ────────────────────────────────────
 
     #[test]
-    fn cap_reasoning_text_passes_through_short_string() {
-        let v = serde_json::Value::String("short".into());
-        let out = cap_reasoning_text(Some(&v));
-        assert_eq!(out, v);
+    fn reasoning_text_under_the_bound_passes_through() {
+        assert_eq!(cap_str("short", MAX_REASONING_TEXT_BYTES), "short");
     }
 
     #[test]
-    fn cap_reasoning_text_passes_through_null() {
-        assert_eq!(cap_reasoning_text(None), serde_json::Value::Null);
-    }
-
-    #[test]
-    fn cap_reasoning_text_passes_through_non_string() {
-        let v = serde_json::Value::Number(42.into());
-        let out = cap_reasoning_text(Some(&v));
-        assert_eq!(out, v);
-    }
-
-    #[test]
-    fn cap_reasoning_text_truncates_oversize_and_marks() {
+    fn reasoning_text_over_the_bound_is_cut_and_marked() {
         let oversize = "x".repeat(MAX_REASONING_TEXT_BYTES + 100);
-        let v = serde_json::Value::String(oversize.clone());
-        let out = cap_reasoning_text(Some(&v));
-        let s = out.as_str().expect("output is string");
-        assert!(s.len() < oversize.len(), "must be shorter than input");
-        assert!(s.contains("[truncated"), "must carry truncation marker");
-        assert!(s.contains(&oversize.len().to_string()), "marker must include original byte count");
+        let out = cap_str(&oversize, MAX_REASONING_TEXT_BYTES);
+        assert!(out.len() < oversize.len(), "must be shorter than input");
+        assert!(out.contains("[truncated"), "must carry truncation marker");
+        assert!(out.contains(&oversize.len().to_string()), "marker must include original byte count");
     }
 
     #[test]
-    fn cap_reasoning_text_truncates_at_utf8_boundary() {
-        // Build a string where the byte just past the cap is mid-codepoint
-        // (4-byte emoji starting at a position near the cap). Result must
-        // still be valid UTF-8.
-        let pad_bytes = MAX_REASONING_TEXT_BYTES - 1;
-        let mut s = "a".repeat(pad_bytes);
-        s.push('🦀'); // 4 bytes, starts at pad_bytes
+    fn reasoning_text_is_cut_on_a_utf8_boundary() {
+        // The byte just past the cap is mid-codepoint (a 4-byte emoji starts
+        // one byte before it); the cut must back off to the boundary.
+        let mut s = "a".repeat(MAX_REASONING_TEXT_BYTES - 1);
+        s.push('🦀');
         s.push_str(&"b".repeat(50));
-        let v = serde_json::Value::String(s);
-        let out = cap_reasoning_text(Some(&v));
-        let truncated = out.as_str().expect("output is string");
-        // The marker is appended; the actual truncated content is valid UTF-8
-        // because String::from_utf8_lossy isn't used — we sliced on a boundary.
-        assert!(truncated.is_char_boundary(0));
-        assert!(truncated.contains("[truncated"));
+        let out = cap_str(&s, MAX_REASONING_TEXT_BYTES);
+        assert!(out.starts_with(&"a".repeat(MAX_REASONING_TEXT_BYTES - 1)));
+        assert!(!out.contains('🦀'), "a split codepoint is dropped whole");
+        assert!(out.contains("[truncated"));
     }
 
     // ─── #237: bounding container-written trajectory fields at ingest ──
@@ -12434,8 +11821,6 @@
     fn a_result_under_the_cap_is_returned_untouched() {
         let small = "exit: 0\n--- stdout ---\nok\n";
         assert_eq!(cap_result_middle(small, 4096), small);
-        let v = serde_json::Value::String(small.to_string());
-        assert_eq!(cap_json_result(Some(&v), 4096), v);
     }
 
     #[test]
@@ -12454,22 +11839,15 @@
     }
 
     #[test]
-    fn cap_json_str_bounds_short_fields() {
+    fn cap_str_bounds_short_fields() {
         // A container could write a pathologically large tool_name / finish_reason.
         let huge = "z".repeat(MAX_TRAJ_FIELD_BYTES + 5000);
-        let v = serde_json::Value::String(huge.clone());
-        let out = cap_json_str(Some(&v), MAX_TRAJ_FIELD_BYTES);
-        let s = out.as_str().expect("string out");
+        let s = cap_str(&huge, MAX_TRAJ_FIELD_BYTES);
         assert!(s.len() <= MAX_TRAJ_FIELD_BYTES + 100, "bounded near the cap (+marker)");
         assert!(s.contains("[truncated"), "carries the marker");
         assert!(s.contains(&huge.len().to_string()), "marker names the original size");
         // Short values are untouched.
-        let small = serde_json::json!("read");
-        assert_eq!(cap_json_str(Some(&small), MAX_TRAJ_FIELD_BYTES), small);
-        // Non-string + None pass through / null.
-        let n = serde_json::json!(42);
-        assert_eq!(cap_json_str(Some(&n), MAX_TRAJ_FIELD_BYTES), n);
-        assert_eq!(cap_json_str(None, MAX_TRAJ_FIELD_BYTES), serde_json::Value::Null);
+        assert_eq!(cap_str("read", MAX_TRAJ_FIELD_BYTES), "read");
     }
 
     #[test]
@@ -12483,7 +11861,7 @@
             "count": 3,
             "window_size": 10,
         });
-        let payload = detector_telemetry_payload("dispatch.cycle.suspected", &event)
+        let payload = detector_telemetry_payload(&ev_as("dispatch.cycle.suspected", event.clone()))
             .expect("cycle event yields a payload");
         let detail = payload["detail"].as_str().expect("detail string");
         assert!(detail.len() <= MAX_TRAJ_FIELD_BYTES + 100, "detail bounded near the cap");
@@ -12508,7 +11886,7 @@
             "window_size": 10,
         });
         let payload =
-            detector_telemetry_payload("dispatch.cycle.suspected", &event).expect("maps cycle");
+            detector_telemetry_payload(&ev_as("dispatch.cycle.suspected", event.clone())).expect("maps cycle");
         assert_eq!(
             payload["area"]["files"],
             serde_json::json!(["src/lib.rs"]),
@@ -12529,7 +11907,7 @@
             "window_size": 10,
         });
         let payload =
-            detector_telemetry_payload("dispatch.cycle.suspected", &event).expect("maps cycle");
+            detector_telemetry_payload(&ev_as("dispatch.cycle.suspected", event.clone())).expect("maps cycle");
         assert!(payload.get("area").is_none(), "bash cycle has no file area");
     }
 
@@ -12547,7 +11925,7 @@
             "window_size": 10,
         });
         let payload =
-            detector_telemetry_payload("dispatch.cycle.suspected", &event).expect("maps cycle");
+            detector_telemetry_payload(&ev_as("dispatch.cycle.suspected", event.clone())).expect("maps cycle");
         assert!(
             payload.get("area").is_none(),
             "search's path is a directory, not a file — must not be stamped as area.files"
@@ -12565,7 +11943,7 @@
             "count": 3,
             "window_size": 10,
         });
-        let payload = detector_telemetry_payload("dispatch.cycle.suspected", &event)
+        let payload = detector_telemetry_payload(&ev_as("dispatch.cycle.suspected", event.clone()))
             .expect("maps cycle even with bad args");
         assert!(payload.get("area").is_none());
         assert_eq!(payload["kind"], "cycle");
@@ -12583,7 +11961,7 @@
             "window_size": 10,
         });
         let payload =
-            detector_telemetry_payload("dispatch.cycle.suspected", &event).expect("maps cycle");
+            detector_telemetry_payload(&ev_as("dispatch.cycle.suspected", event.clone())).expect("maps cycle");
         assert!(payload.get("area").is_none());
     }
 
@@ -12596,7 +11974,7 @@
             "count": 4,
             "window_size": 6,
         });
-        let payload = detector_telemetry_payload("dispatch.reasoning_loop.suspected", &event)
+        let payload = detector_telemetry_payload(&ev_as("dispatch.reasoning_loop.suspected", event.clone()))
             .expect("maps reasoning-loop");
         assert!(payload.get("area").is_none());
     }
@@ -12614,7 +11992,7 @@
             "window_size": 10,
         });
         let payload =
-            detector_telemetry_payload("dispatch.cycle.suspected", &event).expect("maps cycle");
+            detector_telemetry_payload(&ev_as("dispatch.cycle.suspected", event.clone())).expect("maps cycle");
         let file = payload["area"]["files"][0].as_str().expect("file string");
         assert!(file.len() <= MAX_TRAJ_FIELD_BYTES + 100, "path bounded near the cap");
         assert!(file.contains("[truncated"), "carries the marker");
@@ -12632,7 +12010,7 @@
             "count": 3,
             "window_size": 10,
         });
-        let area = detector_area("dispatch.cycle.suspected", &event).expect("has area");
+        let area = area_of("dispatch.cycle.suspected", event.clone()).expect("has area");
         assert_eq!(area["files"][0], "src/a.rs");
         assert_eq!(area["code_hash"], "deadbeef");
     }
@@ -12648,7 +12026,7 @@
             "count": 3,
             "window_size": 10,
         });
-        let area = detector_area("dispatch.cycle.suspected", &event).expect("has area");
+        let area = area_of("dispatch.cycle.suspected", event.clone()).expect("has area");
         assert_eq!(area["files"][0], "src/a.rs");
         assert!(area.get("code_hash").is_none(), "no code_hash key when uncaptured");
     }
@@ -12665,7 +12043,7 @@
             "code_hash": "cafe",
             "failure_count": 3,
         });
-        let area = detector_area("dispatch.tool.repeated_failure", &edit_fail).expect("file area");
+        let area = area_of("dispatch.tool.repeated_failure", edit_fail.clone()).expect("file area");
         assert_eq!(area["files"][0], "src/b.rs");
         assert_eq!(area["code_hash"], "cafe");
 
@@ -12676,7 +12054,7 @@
             "failure_count": 3,
         });
         assert!(
-            detector_area("dispatch.tool.repeated_failure", &bash_fail).is_none(),
+            area_of("dispatch.tool.repeated_failure", bash_fail.clone()).is_none(),
             "a bash failure is engagement-level, not file-scoped"
         );
     }
@@ -12758,7 +12136,7 @@
             write!(f, "{{\"type\":\"model.compl").unwrap();
         }
         state.poll_and_emit();
-        assert_eq!(state.summary.turns, 0, "no complete line yet");
+        assert_eq!(state.summary.fold.turns(), 0, "no complete line yet");
         assert!(!state.pending.is_empty(), "partial line carried");
 
         // Second write: appends the rest of the line with newline
@@ -12767,7 +12145,7 @@
             writeln!(f, "eted\",\"seq\":1,\"finish_reason\":\"stop\"}}").unwrap();
         }
         state.poll_and_emit();
-        assert_eq!(state.summary.turns, 1, "complete line dispatched after second poll");
+        assert_eq!(state.summary.fold.turns(), 1, "complete line dispatched after second poll");
         assert!(state.pending.is_empty(), "pending drained after newline");
     }
 
@@ -12859,7 +12237,7 @@
             f.write_all(b"\xF0\x9F").unwrap();
         }
         state.poll_and_emit();
-        assert_eq!(state.summary.turns, 1, "first line dispatched");
+        assert_eq!(state.summary.fold.turns(), 1, "first line dispatched");
 
         // Second write: completes the 🦀 + closes the JSON.
         {
@@ -12917,7 +12295,7 @@
             {\"type\":\"tool.completed\",\"tool_seq\":1,\"tool_name\":\"bash\"}\n";
         std::fs::write(&path, lines).unwrap();
         state.poll_and_emit();
-        assert_eq!(state.summary.tool_calls, 1, "later valid event still processed");
+        assert_eq!(state.summary.fold.tool_calls(), 1, "later valid event still processed");
     }
 
     // ─── Heartbeat rate limiting ──────────────────────────────────────
@@ -14127,26 +13505,25 @@ fn summary_with(detections: Vec<serde_json::Value>) -> super::TrajectorySummary 
 /// `observe` does not, and a non-finding never does.
 #[test]
 fn only_a_warn_policy_finding_produces_a_degeneracy_warning() {
-    use super::degeneracy_warning;
     let cp = |policy: &str, would: bool| {
         serde_json::json!({"type":"dispatch.checkpoint","seq":4,"tail_ratio":0.12,"policy":policy,"would_conclude":would})
     };
     let gate = |policy: &str, degenerate: bool| {
         serde_json::json!({"type":"dispatch.gate.observation","seq":5,"tail_ratio":0.2,"policy":policy,"degenerate":degenerate})
     };
-    let w = degeneracy_warning("dispatch.checkpoint", &cp("warn", true)).expect("a warn finding warns");
+    let w = dw("dispatch.checkpoint", cp("warn", true)).expect("a warn finding warns");
     assert!(w.line.contains("turn 4") && w.line.contains("not concluded") && w.line.contains("policy = warn"), "{}", w.line);
     assert_eq!(w.payload["source"], "checkpoint");
     assert_eq!(w.payload["acted"], false);
-    let g = degeneracy_warning("dispatch.gate.observation", &gate("warn", true)).expect("a warn gate finding warns");
+    let g = dw("dispatch.gate.observation", gate("warn", true)).expect("a warn gate finding warns");
     assert_eq!(g.payload["source"], "stream_gate");
     for policy in ["record", "conclude", "observe", "enforce", "off"] {
-        assert!(degeneracy_warning("dispatch.checkpoint", &cp(policy, true)).is_none(), "{policy}");
-        assert!(degeneracy_warning("dispatch.gate.observation", &gate(policy, true)).is_none(), "{policy}");
+        assert!(dw("dispatch.checkpoint", cp(policy, true)).is_none(), "{policy}");
+        assert!(dw("dispatch.gate.observation", gate(policy, true)).is_none(), "{policy}");
     }
-    assert!(degeneracy_warning("dispatch.checkpoint", &cp("warn", false)).is_none(), "no finding, no warning");
-    assert!(degeneracy_warning("dispatch.gate.observation", &gate("warn", false)).is_none());
-    assert!(degeneracy_warning("dispatch.turn", &cp("warn", true)).is_none());
+    assert!(dw("dispatch.checkpoint", cp("warn", false)).is_none(), "no finding, no warning");
+    assert!(dw("dispatch.gate.observation", gate("warn", false)).is_none());
+    assert!(dw("dispatch.turn", cp("warn", true)).is_none());
 }
 
 /// (#2947) The `warn` policy's envelope surface: the count reaches the
@@ -14157,7 +13534,9 @@ fn degeneracy_warnings_reach_the_envelope() {
     summary.degeneracy_warnings = 2;
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
+        "m",
         &summary,
+        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
@@ -14168,7 +13547,9 @@ fn degeneracy_warnings_reach_the_envelope() {
     assert_eq!(v["degeneracy_warnings"], 2, "{out}");
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
+        "m",
         &summary_with(vec![]),
+        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
@@ -14188,11 +13569,13 @@ fn a_detection_reaches_the_envelope() {
     });
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
+        "m",
         &summary_with(vec![det.clone()]),
+        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
-    serde_json::json!({}),
+        serde_json::json!({}),
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -14207,11 +13590,13 @@ fn a_clean_run_reports_an_empty_array_not_an_absent_field() {
     // act on it.
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
+        "m",
         &summary_with(vec![]),
+        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
-    serde_json::json!({}),
+        serde_json::json!({}),
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -14234,7 +13619,9 @@ fn bounds_argument_survives_into_the_envelope() {
     });
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
+        "m",
         &summary_with(vec![]),
+        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
@@ -14249,15 +13636,15 @@ fn bounds_argument_survives_into_the_envelope() {
 }
 
 fn summary_over_ratios(ratios: &[f64], concluded: u32) -> super::TrajectorySummary {
-    let mut s = super::TrajectorySummary {
-        checkpoints_concluded: concluded,
-        ..Default::default()
-    };
-    for r in ratios {
-        // Drive the REAL accumulator. Rebuilding this fold by hand is what let
-        // an earlier version of these tests pass against a mutation that
-        // replaced the running minimum with the last value.
-        s.record_checkpoint(Some(*r), false);
+    let mut s = super::TrajectorySummary::default();
+    for (i, r) in ratios.iter().enumerate() {
+        // Drive the REAL fold. Rebuilding it by hand is what let an earlier
+        // version of these tests pass against a mutation that replaced the
+        // running minimum with the last value.
+        let verdict = if (i as u32) < concluded { "conclude" } else { "continue" };
+        s.fold.apply(&ev(serde_json::json!({
+            "type": "dispatch.checkpoint", "seq": i, "tail_ratio": r, "verdict": verdict,
+        })));
     }
     s
 }
@@ -14265,11 +13652,13 @@ fn summary_over_ratios(ratios: &[f64], concluded: u32) -> super::TrajectorySumma
 fn checkpoint_block(s: &super::TrajectorySummary) -> serde_json::Value {
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
+        "m",
         s,
+        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
-    serde_json::json!({}),
+        serde_json::json!({}),
         None,
     );
     serde_json::from_str::<serde_json::Value>(&out).unwrap()["checkpoints"].clone()
@@ -14348,41 +13737,57 @@ fn a_dispatch_that_never_checkpointed_omits_the_block() {
     // on every envelope.
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
+        "m",
         &super::TrajectorySummary::default(),
+        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
-    serde_json::json!({}),
+        serde_json::json!({}),
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(v.get("checkpoints").is_none(), "no boundary hit, no block: {out}");
 }
 
+/// The envelope's `metrics` block is the fold of the trajectory, the same
+/// computation the `dispatch complete` record reads, and it replaces any
+/// block the stdout already carried: there is no second tally beside it.
+/// A resumed run's `cumulative_*` add the checkpoint it resumed from.
 #[test]
-fn enrichment_does_not_duplicate_the_runtime_metrics_block() {
-    // `metrics` is the RUNTIME counting its own work; the summary is the HOST
-    // tailer's observation. Where they disagree (#1947) that is signal, so
-    // enrichment must not overwrite or shadow it.
-    let s = super::TrajectorySummary {
-        turns: 9,
-        checkpoints: 2,
-        ..Default::default()
-    };
+fn the_envelope_metrics_are_the_fold_of_the_trajectory() {
+    let mut s = super::TrajectorySummary::default();
+    for line in [
+        serde_json::json!({"type":"dispatch.start","ts":1000,"model":"m"}),
+        serde_json::json!({"type":"model.completed","seq":1,"finish_reason":"length","usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":120}}),
+        serde_json::json!({"type":"model.completed","seq":1,"finish_reason":"tool_calls","usage":{"prompt_tokens":150,"completion_tokens":5}}),
+        serde_json::json!({"type":"runtime.rest","seq":1,"ms":400}),
+        serde_json::json!({"type":"model.completed","seq":2,"finish_reason":"stop","usage":null}),
+        serde_json::json!({"type":"compaction","generation":1}),
+        serde_json::json!({"type":"dispatch.complete","ts":9000,"result":"stop","wall_ms":7777,"turn_delay_effective_ms":400}),
+    ] {
+        s.fold.apply(&ev(line));
+    }
     let out = super::enrich_envelope_with_summary(
-        r#"{"result":"stop","metrics":{"turns":1}}"#.to_string(),
+        r#"{"result":"stop","metrics":{"turns":99,"prompt_tokens":0}}"#.to_string(),
+        "darkmux:m",
         &s,
+        darkmux_trajectory::CheckpointCounts { turns: 3, compactions: 1 },
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
-    serde_json::json!({}),
+        serde_json::json!({}),
         None,
     );
-    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(
-        v["metrics"]["turns"], 1,
-        "the runtime's own count must be left exactly as reported: {out}"
-    );
+    let m = serde_json::from_str::<serde_json::Value>(&out).unwrap()["metrics"].clone();
+    assert_eq!(m["model"], "darkmux:m");
+    assert_eq!(m["turns"], 2, "two logical turns, three calls; the stdout's 99 is gone: {m}");
+    assert_eq!((m["prompt_tokens"].clone(), m["completion_tokens"].clone()), (serde_json::json!(250), serde_json::json!(15)));
+    assert_eq!(m["total_tokens"], 275, "the provider's 120, then 150 + 5 for the call without a total");
+    assert_eq!((m["rest_ms"].clone(), m["rests"].clone()), (serde_json::json!(400), serde_json::json!(1)));
+    assert_eq!(m["wall_ms"], 7777, "the runtime's own clock");
+    assert_eq!(m["turn_delay_effective_ms"], 400);
+    assert_eq!((m["cumulative_turns"].clone(), m["cumulative_compactions"].clone()), (serde_json::json!(5), serde_json::json!(2)));
 }
 
 #[test]
@@ -14391,14 +13796,16 @@ fn non_envelope_stdout_is_untouched_by_enrichment() {
     for raw in ["plain model output", "", "{ not json"] {
         assert_eq!(
             super::enrich_envelope_with_summary(
-                raw.to_string(),
-                &s,
-                &super::HostStats::default(),
-                &no_extras(),
-                no_findings_dir(),
-                serde_json::json!({}),
-                None,
-            ),
+        raw.to_string(),
+        "m",
+        &s,
+        darkmux_trajectory::CheckpointCounts::default(),
+        &super::HostStats::default(),
+        &no_extras(),
+        no_findings_dir(),
+        serde_json::json!({}),
+        None,
+    ),
             raw,
             "the non-json path must pass through verbatim: {raw:?}"
         );
@@ -14506,11 +13913,13 @@ fn host_stats_reach_the_envelope_nested_by_metric_with_top_level_aliases() {
     let stats = super::reduce_host_stats(&worked_samples());
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
+        "m",
         &super::TrajectorySummary::default(),
+        darkmux_trajectory::CheckpointCounts::default(),
         &stats,
         &no_extras(),
         no_findings_dir(),
-    serde_json::json!({}),
+        serde_json::json!({}),
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -14560,11 +13969,13 @@ fn power_thermal_and_energy_reach_the_envelope_without_disturbing_the_2107_shape
     let stats = super::reduce_host_stats(&worked_samples());
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
+        "m",
         &super::TrajectorySummary::default(),
+        darkmux_trajectory::CheckpointCounts::default(),
         &stats,
         &extras,
         no_findings_dir(),
-    serde_json::json!({}),
+        serde_json::json!({}),
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -14583,11 +13994,13 @@ fn power_thermal_and_energy_reach_the_envelope_without_disturbing_the_2107_shape
     // stats produce with no extras at all.
     let without = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
+        "m",
         &super::TrajectorySummary::default(),
+        darkmux_trajectory::CheckpointCounts::default(),
         &stats,
         &no_extras(),
         no_findings_dir(),
-    serde_json::json!({}),
+        serde_json::json!({}),
         None,
     );
     let w: serde_json::Value = serde_json::from_str(&without).unwrap();
@@ -14603,11 +14016,13 @@ fn a_host_without_power_or_thermal_sources_omits_those_blocks() {
     // read are ABSENT rather than zeroed.
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
+        "m",
         &super::TrajectorySummary::default(),
+        darkmux_trajectory::CheckpointCounts::default(),
         &super::reduce_host_stats(&worked_samples()),
         &no_extras(),
         no_findings_dir(),
-    serde_json::json!({}),
+        serde_json::json!({}),
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -14626,11 +14041,13 @@ fn an_unsampled_run_omits_the_host_block_rather_than_reporting_zero() {
     // claim it observed an idle machine. Absent means "not measured".
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
+        "m",
         &super::TrajectorySummary::default(),
+        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
-    serde_json::json!({}),
+        serde_json::json!({}),
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -14680,11 +14097,13 @@ fn the_envelope_reports_how_many_findings_the_crawl_recorded() {
     ]);
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
+        "m",
         &super::TrajectorySummary::default(),
+        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         td.path(),
-    serde_json::json!({}),
+        serde_json::json!({}),
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -14702,11 +14121,13 @@ fn a_trailing_newline_is_not_a_finding() {
     let td = out_dir_with_findings(&[r#"{"file":"lib.rs","line":147}"#]);
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
+        "m",
         &super::TrajectorySummary::default(),
+        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         td.path(),
-    serde_json::json!({}),
+        serde_json::json!({}),
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -14722,11 +14143,13 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     // narrated its findings into prose instead. `count: 0` cannot say that.
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
+        "m",
         &super::TrajectorySummary::default(),
+        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
-    serde_json::json!({}),
+        serde_json::json!({}),
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -16294,7 +15717,8 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             frames: 4,
             span_ms: 90_000,
         };
-        let p = super::runtime_rest_payload(&event, 30_000, 45_000, 3, "thermal", &scripted);
+        let darkmux_trajectory::TrajectoryEvent::Rest(rest) = ev(event) else { panic!("a rest") };
+        let p = super::runtime_rest_payload(&rest, 45_000, 3, &scripted);
         // The forwarding this function already owed, asserted here so the
         // stamp cannot be added by quietly replacing the payload.
         assert_eq!(p["ms"], 30_000);
@@ -16311,7 +15735,8 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         // Real readings: absent, and `state` still omitted (not nulled)
         // when the runtime's event carries none.
         let plain = serde_json::json!({ "type": "runtime.rest", "seq": 1, "ms": 500 });
-        let p = super::runtime_rest_payload(&plain, 500, 500, 1, "turn_delay", &Provenance::Real);
+        let darkmux_trajectory::TrajectoryEvent::Rest(plain) = ev(plain) else { panic!("a rest") };
+        let p = super::runtime_rest_payload(&plain, 500, 1, &Provenance::Real);
         assert_eq!(p["reason"], "turn_delay");
         assert!(p.get("state").is_none(), "no pace-file state on a plain turn delay: {p}");
         assert!(
@@ -16586,14 +16011,16 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         );
         let stats = super::reduce_host_stats(&worked_samples());
         let out = super::enrich_envelope_with_summary(
-            r#"{"result":"stop"}"#.to_string(),
-            &super::TrajectorySummary::default(),
-            &stats,
-            &extras,
-            no_findings_dir(),
-            serde_json::json!({}),
-            None,
-        );
+        r#"{"result":"stop"}"#.to_string(),
+        "m",
+        &super::TrajectorySummary::default(),
+        darkmux_trajectory::CheckpointCounts::default(),
+        &stats,
+        &extras,
+        no_findings_dir(),
+        serde_json::json!({}),
+        None,
+    );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["host_window"]["thermal_worst_state"], "serious");
         assert_eq!(v["host_window"]["min_cpu_speed_limit_pct"], 62);
@@ -16624,17 +16051,19 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     fn the_thermal_ladder_numbers_reach_the_envelope_distinctly() {
         let stats = super::reduce_host_stats(&worked_samples());
         let out = super::enrich_envelope_with_summary(
-            r#"{"result":"stop"}"#.to_string(),
-            &super::TrajectorySummary::default(),
-            &stats,
-            &no_extras(),
-            no_findings_dir(),
-            serde_json::json!({}),
-            Some(crate::thermal_governor::ThermalLadderSummary {
+        r#"{"result":"stop"}"#.to_string(),
+        "m",
+        &super::TrajectorySummary::default(),
+        darkmux_trajectory::CheckpointCounts::default(),
+        &stats,
+        &no_extras(),
+        no_findings_dir(),
+        serde_json::json!({}),
+        Some(crate::thermal_governor::ThermalLadderSummary {
                 serious_episodes: 3,
                 current_duty_delay_ms: 120_000,
             }),
-        );
+    );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
             v["host_window"]["thermal_serious_episodes"], 3,
@@ -16654,14 +16083,11 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let stats = super::reduce_host_stats(&worked_samples());
         let payload = super::build_dispatch_complete_payload(
             1000,
-            super::RestTotals { rest_ms: 200, rests: 1 },
-            Some(50),
             "stdout-body",
             "",
             0,
             &super::TrajectorySummary::default(),
-            super::TokenTotals { prompt: 10, completion: 20, reasoning: None, cached: None },
-            super::CumulativeCounts::default(),
+            darkmux_trajectory::CheckpointCounts::default(),
             None,
             &stats,
             &no_extras(),
@@ -16684,14 +16110,16 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     fn a_lost_thermal_ladder_reads_as_null_not_zero() {
         let stats = super::reduce_host_stats(&worked_samples());
         let out = super::enrich_envelope_with_summary(
-            r#"{"result":"stop"}"#.to_string(),
-            &super::TrajectorySummary::default(),
-            &stats,
-            &no_extras(),
-            no_findings_dir(),
-            serde_json::json!({}),
-            None,
-        );
+        r#"{"result":"stop"}"#.to_string(),
+        "m",
+        &super::TrajectorySummary::default(),
+        darkmux_trajectory::CheckpointCounts::default(),
+        &stats,
+        &no_extras(),
+        no_findings_dir(),
+        serde_json::json!({}),
+        None,
+    );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["host_window"]["thermal_serious_episodes"].is_null(), "{v}");
         assert!(v["host_window"]["thermal_duty_delay_ms"].is_null(), "{v}");
@@ -16700,14 +16128,16 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     #[test]
     fn an_unsampled_run_omits_host_window_too() {
         let out = super::enrich_envelope_with_summary(
-            r#"{"result":"stop"}"#.to_string(),
-            &super::TrajectorySummary::default(),
-            &super::HostStats::default(),
-            &no_extras(),
-            no_findings_dir(),
-            serde_json::json!({}),
-            None,
-        );
+        r#"{"result":"stop"}"#.to_string(),
+        "m",
+        &super::TrajectorySummary::default(),
+        darkmux_trajectory::CheckpointCounts::default(),
+        &super::HostStats::default(),
+        &no_extras(),
+        no_findings_dir(),
+        serde_json::json!({}),
+        None,
+    );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v.get("host_window").is_none(), "unsampled must omit host_window, never zero it");
     }
@@ -16736,14 +16166,11 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let stats = super::reduce_host_stats(&worked_samples());
         let payload = super::build_dispatch_complete_payload(
             1000,
-            super::RestTotals { rest_ms: 200, rests: 1 },
-            Some(50),
             "stdout-body",
             "",
             0,
             &super::TrajectorySummary::default(),
-            super::TokenTotals { prompt: 10, completion: 20, reasoning: None, cached: None },
-            super::CumulativeCounts::default(),
+            darkmux_trajectory::CheckpointCounts::default(),
             None,
             &stats,
             &extras,
@@ -16759,54 +16186,36 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         assert_eq!(payload["host_window"]["samples"], 5);
         assert_eq!(payload["wall_ms"], 1000);
         assert_eq!(payload["result_class"], "ok");
-        // (#1444) Neither `TokenTotals.reasoning` nor `.cached` was set on
-        // this run (metrics.json never carried the field — a local
-        // dispatch) — the payload must render `null`, never a fabricated
-        // `0` that would read as "measured, zero reasoning burn".
+        // (#1444) No call reported reasoning or cached tokens (a local
+        // dispatch): `null`, never a fabricated `0` that would read as
+        // "measured, zero reasoning burn".
         assert!(payload["reasoning_tokens"].is_null());
         assert!(payload["cached_tokens"].is_null());
     }
 
-    /// (#1444) When the tailer's live token accumulation DOES carry a
-    /// reasoning/cached figure (a hosted reasoning-family dispatch
-    /// reported one on some turn), the payload surfaces it as a real
-    /// number — never silently dropped.
-    ///
-    /// (#2263) `prompt_tokens`/`completion_tokens`/`reasoning_tokens`/
-    /// `cached_tokens` on the payload now come from `TrajectorySummary`
-    /// (the tailer's live per-turn sum — this-invocation-only by
-    /// construction), NOT from `TokenTotals`/`tokens` (metrics.json's
-    /// whole-dispatch cumulative counters, seeded from the checkpoint on
-    /// a resume). This test constructs the summary directly instead of
-    /// routing the figures through `tokens`, which now only feeds the
-    /// separate `cumulative_prompt_tokens`/`cumulative_completion_tokens`
-    /// fields — asserted below too, so a regression that swaps the two
-    /// sources back is caught.
+    /// (#1444) When a call DOES report a reasoning/cached figure (a hosted
+    /// reasoning-family dispatch), the payload surfaces it as a real number,
+    /// never silently dropped. (#2263) The token fields are THIS execution's
+    /// own (the fold of its trajectory); a resumed run's whole-task view is
+    /// the turn and compaction count only, the checkpoint it resumed from
+    /// plus what it recorded. The whole-task token totals are gone: tokens
+    /// are the sum of usage records, which a reader sums over the runs it
+    /// wants.
     #[test]
     fn build_dispatch_complete_payload_carries_reasoning_and_cached_tokens_when_present() {
         let stats = super::reduce_host_stats(&[]);
-        let summary = super::TrajectorySummary {
-            prompt_tokens: 100,
-            completion_tokens: 600,
-            reasoning_tokens: Some(500),
-            cached_tokens: Some(20),
-            ..Default::default()
-        };
+        let mut summary = super::TrajectorySummary::default();
+        summary.fold.apply(&ev(serde_json::json!({
+            "type": "model.completed", "seq": 1, "finish_reason": "stop",
+            "usage": { "prompt_tokens": 100, "completion_tokens": 600, "reasoning_tokens": 500, "cached_tokens": 20 },
+        })));
         let payload = super::build_dispatch_complete_payload(
             1000,
-            super::RestTotals { rest_ms: 0, rests: 0 },
-            None,
             "stdout-body",
             "",
             0,
             &summary,
-            // (#2263) Deliberately DIFFERENT numbers from `summary` above —
-            // this is the WHOLE-DISPATCH cumulative view (as if a resume had
-            // already run once before), proving the payload's
-            // `prompt_tokens`/`completion_tokens` read from `summary`, not
-            // from this cumulative source.
-            super::TokenTotals { prompt: 9100, completion: 9600, reasoning: Some(9500), cached: Some(920) },
-            super::CumulativeCounts { turns: 7, compactions: 3 },
+            darkmux_trajectory::CheckpointCounts { turns: 7, compactions: 3 },
             None,
             &stats,
             &no_extras(),
@@ -16818,15 +16227,12 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         assert_eq!(payload["completion_tokens"], 600);
         assert_eq!(payload["reasoning_tokens"], 500);
         assert_eq!(payload["cached_tokens"], 20);
-        // Subset, never additional: reasoning_tokens <= completion_tokens.
-        assert!(payload["reasoning_tokens"].as_u64().unwrap() <= payload["completion_tokens"].as_u64().unwrap());
-        // (#2263) The cumulative (whole-task) view lives in its OWN fields,
-        // sourced from `tokens`/`cumulative` — never conflated with the
-        // this-run numbers above.
-        assert_eq!(payload["cumulative_prompt_tokens"], 9100);
-        assert_eq!(payload["cumulative_completion_tokens"], 9600);
-        assert_eq!(payload["cumulative_turns"], 7);
+        assert_eq!(payload["total_turns"], 1);
+        assert_eq!(payload["cumulative_turns"], 8, "7 resumed from + 1 recorded");
         assert_eq!(payload["cumulative_compactions"], 3);
+        for retired in ["cumulative_prompt_tokens", "cumulative_completion_tokens"] {
+            assert!(payload.get(retired).is_none(), "{retired} was a second token number: {payload}");
+        }
     }
 
     /// (#2903) Feed `model.completed` events through the REAL tailer, then
@@ -16847,14 +16253,11 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let stats = super::reduce_host_stats(&[]);
         super::build_dispatch_complete_payload(
             1000,
-            super::RestTotals { rest_ms: 0, rests: 0 },
-            None,
             "",
             "",
             0,
             &state.summary,
-            super::TokenTotals { prompt: 0, completion: 0, reasoning: None, cached: None },
-            super::CumulativeCounts { turns: 0, compactions: 0 },
+            darkmux_trajectory::CheckpointCounts::default(),
             None,
             &stats,
             &no_extras(),
@@ -16885,8 +16288,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let per_turn_sum: u64 = events
             .iter()
             .map(|e| {
-                let ev: serde_json::Value = serde_json::from_str(e).unwrap();
-                super::turn_tokens_payload(&ev, "coder", "m", "ep", None)["total_tokens"].as_u64().unwrap()
+                super::turn_tokens_payload(&mc(serde_json::from_str(e).unwrap()), "coder", "m", "ep", None)["total_tokens"].as_u64().unwrap()
             })
             .sum();
         assert_eq!(per_turn_sum, 11598 + 150);
@@ -16934,14 +16336,11 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let stats = super::reduce_host_stats(&worked_samples());
         let payload = super::build_dispatch_complete_payload(
             500,
-            super::RestTotals::default(),
-            None,
             "",
             "boom: container crashed",
             137,
             &super::TrajectorySummary::default(),
-            super::TokenTotals::default(),
-            super::CumulativeCounts::default(),
+            darkmux_trajectory::CheckpointCounts::default(),
             Some("azure/gpt-x"),
             &stats,
             &extras,
@@ -16965,14 +16364,11 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     fn build_dispatch_complete_payload_omits_host_window_when_unsampled() {
         let payload = super::build_dispatch_complete_payload(
             10,
-            super::RestTotals::default(),
-            None,
             "",
             "",
             0,
             &super::TrajectorySummary::default(),
-            super::TokenTotals::default(),
-            super::CumulativeCounts::default(),
+            darkmux_trajectory::CheckpointCounts::default(),
             None,
             &super::HostStats::default(),
             &no_extras(),
@@ -17783,9 +17179,9 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
             !records.iter().any(|r| r["action"] == "dispatch.turn"),
             "no turn record for a compactor call"
         );
-        assert_eq!(summary.turns, 0, "a compactor call is not a turn");
+        assert_eq!(summary.fold.turns(), 0, "a compactor call is not a turn");
         assert_eq!(
-            (summary.prompt_tokens, summary.completion_tokens, summary.total_tokens),
+            (summary.fold.tokens.prompt, summary.fold.tokens.completion, summary.fold.tokens.total),
             (0, 0, 0),
             "never blended into the specialist's own totals"
         );
@@ -17835,8 +17231,8 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(p["started_at_ms"], 1_790_000_000_100u64, "{p}");
         assert_eq!(records[usage_at]["payload"]["ended_at_ms"], 1_790_000_004_600u64);
         assert_eq!(records[usage_at]["payload"]["duration_ms"], 4_500);
-        assert_eq!(summary.turns, 0);
-        assert_eq!(summary.compactions, 0, "a start is not an installed compaction");
+        assert_eq!(summary.fold.turns(), 0);
+        assert_eq!(summary.fold.compactions(), 0, "a start is not an installed compaction");
     }
 
     /// (#2915 review, MUST 1) Each compaction attempt in an execution gets

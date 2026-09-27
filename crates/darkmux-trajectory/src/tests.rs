@@ -191,6 +191,8 @@ fn checkpoints_and_the_stream_gate_keep_finding_apart_from_action() {
     let judged: Vec<bool> = f.checkpoints.iter().map(|c| c.judged_degenerate).collect();
     assert_eq!(judged, vec![true, true], "a pre-`would_conclude` conclusion still counts as a finding");
     assert_eq!(f.checkpoint_policy.as_deref(), Some("warn"));
+    assert_eq!(f.checkpoints_concluded(), 1);
+    assert_eq!(f.checkpoint_tail_ratios(), (Some(0.2), Some(0.2)), "a checkpoint with no ratio is no evidence, not a 1.0");
     assert_eq!((f.gate.observations, f.gate.abort_events, f.gate.aborted_turns.len()), (2, 2, 1));
     assert_eq!(f.gate.min_tail_ratio, Some(0.4));
 }
@@ -233,4 +235,19 @@ fn an_openclaw_run_counts_its_prompts_and_distinct_summaries() {
     assert_eq!(f.compactions(), 2);
     assert_eq!(f.legacy.compactions.iter().map(|c| c.tokens_before).collect::<Vec<_>>(), vec![900, 1200]);
     assert_eq!(f.model_calls, 0, "openclaw's own model.completed is not a call of this format");
+}
+
+/// (#1959) A run that decayed and recovered must not read healthier than a
+/// clean one: the minimum is the running minimum, never the last value.
+#[test]
+fn checkpoint_ratios_report_the_worst_and_the_mean() {
+    let f = fold(&[
+        r#"{"type":"dispatch.checkpoint","seq":1,"tail_ratio":0.9}"#,
+        r#"{"type":"dispatch.checkpoint","seq":2,"tail_ratio":0.2}"#,
+        r#"{"type":"dispatch.checkpoint","seq":3,"tail_ratio":0.99}"#,
+    ]);
+    let (min, mean) = f.checkpoint_tail_ratios();
+    assert_eq!(min, Some(0.2));
+    assert!((mean.unwrap() - (0.9 + 0.2 + 0.99) / 3.0).abs() < 1e-12);
+    assert_eq!(fold(&[]).checkpoint_tail_ratios(), (None, None));
 }

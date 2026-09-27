@@ -5836,12 +5836,8 @@ mod tests {
                 ));
                 Ok(crate::single_shot::SingleShotReply {
                     content: format!("mocked reply for {}", call.user),
-                    total_tokens: Some(7),
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                    reasoning_tokens: None,
-                    cached_tokens: None,
                     model: Some("served-by-mock".to_string()),
+                    counts: darkmux_trajectory::UsageCounts { total: Some(7), ..Default::default() },
                 })
             });
 

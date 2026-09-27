@@ -738,10 +738,11 @@ pub struct DispatchSingleShotStepKind;
 /// green. Same pure-payload/emitter division `map_item_token_payload` and
 /// `turn_tokens_payload` already use.
 ///
-/// `null` for a field the endpoint never reported, never a fabricated `0`.
-/// Nothing here derives one token field from another: whether reasoning
-/// sits inside `completion_tokens` is provider-scoped (see the runtime
-/// crate's `lmstudio::CompletionTokensDetails::reasoning_tokens`).
+/// The token fields are the call's usage counts, the ones its usage record
+/// carries: `null` for a field the endpoint never reported, never a
+/// fabricated `0`, and `total_tokens` by the one total rule. Whether
+/// reasoning sits inside `completion_tokens` is provider-scoped (see the
+/// runtime crate's `lmstudio::CompletionTokensDetails::reasoning_tokens`).
 fn hosted_single_shot_step_payload(
     step_id: &str,
     budget: Option<u64>,
@@ -749,6 +750,7 @@ fn hosted_single_shot_step_payload(
     max_tokens_sent: u32,
     reply: &crate::single_shot::SingleShotReply,
 ) -> serde_json::Value {
+    let counts = &reply.counts;
     serde_json::json!({
         "step_id": step_id,
         "kind": "dispatch.single_shot",
@@ -758,12 +760,12 @@ fn hosted_single_shot_step_payload(
         "remote_max_tokens_per_execution": budget,
         "max_tokens_requested": max_tokens_requested,
         "max_tokens_sent": max_tokens_sent,
-        "prompt_tokens": reply.prompt_tokens,
-        "completion_tokens": reply.completion_tokens,
-        "total_tokens": reply.total_tokens,
+        "prompt_tokens": counts.prompt,
+        "completion_tokens": counts.completion,
+        "total_tokens": counts.total_tokens(),
         // (#1444, payload-additive — FLOW_SCHEMA_VERSION 1.44.0)
-        "reasoning_tokens": reply.reasoning_tokens,
-        "cached_tokens": reply.cached_tokens,
+        "reasoning_tokens": counts.reasoning,
+        "cached_tokens": counts.cached,
     })
 }
 
@@ -1065,7 +1067,7 @@ impl DispatchSingleShotStepKind {
             crate::budget::settle_step_live(
                 &step_bucket,
                 max_tokens,
-                reply.total_tokens.unwrap_or(u64::from(max_tokens)),
+                conservative_hosted_spend(reply.counts.total_tokens(), max_tokens),
                 1,
                 &step.id,
                 &budget_caller,
@@ -1171,7 +1173,7 @@ impl DispatchSingleShotStepKind {
             serde_json::json!({
                 "result_class": "ok",
                 "stdout_chars": reply.content.len(),
-                "total_tokens": reply.total_tokens,
+                "total_tokens": reply.counts.total_tokens(),
             }),
         ));
 
@@ -1193,9 +1195,10 @@ impl DispatchSingleShotStepKind {
 // `dispatch.single_shot`'s hosted arm) is unchanged and documented on `run`
 // below.
 
-/// (#1442 gate C4) What one hosted map item SPENDS from the bucket: the
-/// reply's reported `usage.total_tokens` when present, else — conservatively
-/// — the clamped `max_tokens` the call was granted. An endpoint that omits
+/// (#1442 gate C4) What one hosted call SPENDS from the bucket: its usage
+/// total ([`darkmux_trajectory::UsageCounts::total_tokens`], the amount its
+/// usage record carries) when the reply reported one, else — conservatively
+/// — the `max_tokens` the call was granted. An endpoint that omits
 /// usage entirely must not mint an infinite allowance (spending 0 per call
 /// would let an omitting endpoint dispatch the whole collection off the
 /// meter); over-counting a capped grant is the safe direction.
@@ -1230,7 +1233,7 @@ fn conservative_hosted_spend(total_tokens: Option<u64>, granted_max_tokens: u32)
 ///   just as it adds its own tokens). An item skipped before any call fired (a
 ///   first-attempt remote-budget exhaustion) measures the honest near-zero of
 ///   the skip — a real measured `0`-ish duration, not a fabricated value.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MapItemResult {
     pub index: usize,
     pub ok: bool,
@@ -1277,8 +1280,8 @@ pub struct MapItemResult {
     /// Still `Option`, with the same honesty rule as every sibling: a
     /// provider that never named the field leaves it `None`, and
     /// the usage writer omits the key rather than inventing a
-    /// zero. Tracked with flags INDEPENDENT of `any_split` — see
-    /// [`accumulate_details`].
+    /// zero. Each field is summed independently ([`MapItemResult::tokens_of`]):
+    /// a provider can name one details object without the other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2191,27 +2194,26 @@ fn map_hosted_dispatch(
     crate::single_shot::single_shot_chat_hosted(req)
 }
 
-/// (#1442) `total_tokens` for a per-item result: the accumulated sum across
-/// every attempt, but only when at least one attempt actually reported usage.
-/// A run where no attempt sent `usage` stays honest `None` — never a
-/// fabricated `0` a run-level token sum would silently swallow (the same
-/// discipline `conservative_hosted_spend`/the aggregate record already keep).
-fn item_total_tokens(any_usage: bool, sum: u64) -> Option<u64> {
-    any_usage.then_some(sum)
-}
-
-/// (#1530 dogfood) The `prompt_tokens`/`completion_tokens` sibling of
-/// [`item_total_tokens`], with the SAME honesty rule: accumulate across every
-/// attempt, but report `None` unless at least one attempt actually carried a
-/// split. A provider that returns only `usage.total_tokens` therefore leaves
-/// both fields absent rather than reporting a fabricated `0` — which the
-/// dashboard would read as "this dispatch generated nothing", a worse lie
-/// than "unknown".
-///
-/// Tracked separately from `any_usage` on purpose: a reply can carry a total
-/// without a split, so the two flags are genuinely independent.
-fn item_split_tokens(any_split: bool, sum: u64) -> Option<u64> {
-    any_split.then_some(sum)
+impl MapItemResult {
+    /// An item's token fields: the sum of its calls' counts, the SAME counts
+    /// each call's usage record carries (one record per attempt), so the
+    /// item and its records cannot disagree. A field no call reported stays
+    /// `None`, never a fabricated 0; `total_tokens` sums each call's
+    /// [`darkmux_trajectory::UsageCounts::total_tokens`]. The other fields
+    /// are left default for the caller's struct-update.
+    fn tokens_of(calls: &[MapCall]) -> Self {
+        let sum = |f: fn(&darkmux_trajectory::UsageCounts) -> Option<u64>| {
+            calls.iter().filter_map(|c| f(&c.counts)).reduce(u64::saturating_add)
+        };
+        Self {
+            total_tokens: sum(darkmux_trajectory::UsageCounts::total_tokens),
+            prompt_tokens: sum(|c| c.prompt),
+            completion_tokens: sum(|c| c.completion),
+            reasoning_tokens: sum(|c| c.reasoning),
+            cached_tokens: sum(|c| c.cached),
+            ..Self::default()
+        }
+    }
 }
 
 /// (#2902 step 1a) What one `dispatch.map` model call reported, captured the
@@ -2222,14 +2224,14 @@ fn item_split_tokens(any_split: bool, sum: u64) -> Option<u64> {
 /// a budget skip) made no completed call and pushes nothing.
 #[derive(Debug, Clone)]
 pub(crate) struct MapCall {
-    pub counts: crate::usage::UsageCounts,
+    pub counts: darkmux_trajectory::UsageCounts,
     /// The response's own `model` field, local and hosted alike.
     pub reported_model: Option<String>,
 }
 
 impl MapCall {
     fn from_reply(reply: &crate::single_shot::SingleShotReply) -> Self {
-        Self { counts: reply.usage_counts(), reported_model: reply.model.clone() }
+        Self { counts: reply.counts.clone(), reported_model: reply.model.clone() }
     }
 }
 
@@ -2349,7 +2351,7 @@ fn map_item_token_payload(
     endpoint: &str,
 ) -> Option<serde_json::Value> {
     let call = MapCall {
-        counts: crate::usage::UsageCounts {
+        counts: darkmux_trajectory::UsageCounts {
             prompt: res.prompt_tokens,
             completion: res.completion_tokens,
             total: res.total_tokens,
@@ -2359,66 +2361,6 @@ fn map_item_token_payload(
         reported_model: res.served_model.clone(),
     };
     Some(map_call_token_payload(&call, res.index, remote, requested_model, endpoint, None))
-}
-
-/// (#1530 dogfood) Fold one reply's usage split into the running per-item
-/// accumulators. Shared by the local and hosted arms so both report
-/// identically — the token-accounting parity [`map_local_item`] and
-/// [`map_hosted_item`] already keep for the total.
-///
-/// ASSUMPTION worth naming: a provider is expected to report usage
-/// CONSISTENTLY across the attempts of one item. If attempt 1 returns a
-/// total with no split and attempt 2 returns both, the item's accumulated
-/// `total` covers both attempts while its split covers only the second, so
-/// the dashboard's `total == prompt + completion` identity drifts for that
-/// item. Nothing renders wrong (the unclassified bucket only ever adds), and
-/// no provider we dispatch to behaves this way — recorded so a future reader
-/// who hits it knows it was considered rather than missed.
-fn accumulate_split(
-    reply_prompt: Option<u64>,
-    reply_completion: Option<u64>,
-    psum: &mut u64,
-    csum: &mut u64,
-    any_split: &mut bool,
-) {
-    if reply_prompt.is_none() && reply_completion.is_none() {
-        return;
-    }
-    *psum += reply_prompt.unwrap_or(0);
-    *csum += reply_completion.unwrap_or(0);
-    *any_split = true;
-}
-
-/// (#1444 review) The `reasoning_tokens`/`cached_tokens` sibling of
-/// [`accumulate_split`], with the same honesty rule and one difference that
-/// matters: the two fields carry INDEPENDENT "was it ever reported" flags
-/// rather than sharing one.
-///
-/// `accumulate_split` can share `any_split` because a provider that reports
-/// a usage split reports both halves of it. These two are genuinely
-/// independent — `completion_tokens_details` and `prompt_tokens_details` are
-/// separate objects, and a provider can name one without the other (the
-/// runtime's own accumulator test pins exactly that turn shape: reasoning
-/// reported, `prompt_tokens_details` absent). Folding them under a shared
-/// flag would fabricate a `0` for whichever one the provider never named —
-/// the absent-vs-zero collapse #1444 exists to prevent, reintroduced inside
-/// the fix for it.
-fn accumulate_details(
-    reply_reasoning: Option<u64>,
-    reply_cached: Option<u64>,
-    rsum: &mut u64,
-    cachesum: &mut u64,
-    any_reasoning: &mut bool,
-    any_cached: &mut bool,
-) {
-    if let Some(r) = reply_reasoning {
-        *rsum += r;
-        *any_reasoning = true;
-    }
-    if let Some(c) = reply_cached {
-        *cachesum += c;
-        *any_cached = true;
-    }
 }
 
 /// (#1605) The bounded transient-error retry's backoff — short on purpose
@@ -2451,15 +2393,8 @@ fn map_local_item(
     calls: &mut Vec<MapCall>,
 ) -> MapItemResult {
     use crate::single_shot::{single_shot_chat, SingleShotRequest};
-    let mut sum = 0u64;
-    let mut any_usage = false;
-    // (#1530 dogfood) Parallel to `sum`/`any_usage`, for the usage SPLIT.
-    let (mut psum, mut csum, mut any_split) = (0u64, 0u64, false);
-    // (#1444 review) Same shape again for the usage DETAILS, with one flag
-    // per field — see [`accumulate_details`] for why they can't share one.
-    let (mut rsum, mut cachesum, mut any_reasoning, mut any_cached) = (0u64, 0u64, false, false);
-    // (#1442) Cumulative dispatch wall-clock across every attempt — the same
-    // per-attempt accumulation `sum` (tokens) uses. A LOCAL item's
+    // (#1442) Cumulative dispatch wall-clock across every attempt, as the
+    // tokens are (`MapItemResult::tokens_of` over `calls`). A LOCAL item's
     // `served_model` is ALWAYS `None` by construction (see [`MapItemResult`]'s
     // doc): the response body's echoed `model` is not ground truth for a local
     // dispatch, so this arm never reads it.
@@ -2497,39 +2432,16 @@ fn map_local_item(
         match dispatch {
             Ok(reply) => {
                 calls.push(MapCall::from_reply(&reply));
-                if let Some(t) = reply.total_tokens {
-                    sum += t;
-                    any_usage = true;
-                }
-                accumulate_split(
-                    reply.prompt_tokens,
-                    reply.completion_tokens,
-                    &mut psum,
-                    &mut csum,
-                    &mut any_split,
-                );
-                accumulate_details(
-                    reply.reasoning_tokens,
-                    reply.cached_tokens,
-                    &mut rsum,
-                    &mut cachesum,
-                    &mut any_reasoning,
-                    &mut any_cached,
-                );
                 if !reply.content.trim().is_empty() {
                     return MapItemResult {
                         index,
                         ok: true,
                         content: reply.content,
                         error: None,
-                        total_tokens: item_total_tokens(any_usage, sum),
-                        prompt_tokens: item_split_tokens(any_split, psum),
-                        completion_tokens: item_split_tokens(any_split, csum),
-                        reasoning_tokens: item_split_tokens(any_reasoning, rsum),
-                        cached_tokens: item_split_tokens(any_cached, cachesum),
                         served_model: None,
                         wall_ms,
                         retried: error_retries_used,
+                        ..MapItemResult::tokens_of(calls)
                     };
                 }
                 // Empty content — retry (until the budget is spent).
@@ -2559,14 +2471,10 @@ fn map_local_item(
                         ok: false,
                         content: String::new(),
                         error: Some(format!("{e:#}")),
-                        total_tokens: item_total_tokens(any_usage, sum),
-                        prompt_tokens: item_split_tokens(any_split, psum),
-                        completion_tokens: item_split_tokens(any_split, csum),
-                        reasoning_tokens: item_split_tokens(any_reasoning, rsum),
-                        cached_tokens: item_split_tokens(any_cached, cachesum),
                         served_model: None,
                         wall_ms,
                         retried: error_retries_used,
+                        ..MapItemResult::tokens_of(calls)
                     };
                 }
                 error_budget -= 1;
@@ -2583,14 +2491,10 @@ fn map_local_item(
         ok: true,
         content: String::new(),
         error: None,
-        total_tokens: item_total_tokens(any_usage, sum),
-        prompt_tokens: item_split_tokens(any_split, psum),
-        completion_tokens: item_split_tokens(any_split, csum),
-        reasoning_tokens: item_split_tokens(any_reasoning, rsum),
-        cached_tokens: item_split_tokens(any_cached, cachesum),
         served_model: None,
         wall_ms,
         retried: error_retries_used,
+        ..MapItemResult::tokens_of(calls)
     }
 }
 
@@ -2620,15 +2524,8 @@ fn map_hosted_item(
     caller: &crate::budget::BudgetCaller<'_>,
 ) -> MapItemResult {
     use crate::single_shot::HostedSingleShotRequest;
-    let mut sum = 0u64;
-    let mut any_usage = false;
-    // (#1530 dogfood) Parallel to `sum`/`any_usage`, for the usage SPLIT.
-    let (mut psum, mut csum, mut any_split) = (0u64, 0u64, false);
-    // (#1444 review) Same shape again for the usage DETAILS, with one flag
-    // per field — see [`accumulate_details`] for why they can't share one.
-    let (mut rsum, mut cachesum, mut any_reasoning, mut any_cached) = (0u64, 0u64, false, false);
-    // (#1442) Cumulative dispatch wall-clock across every attempt (the same
-    // shape as `sum`), and the ENDPOINT-reported served model — captured from
+    // (#1442) Cumulative dispatch wall-clock across every attempt, and the
+    // ENDPOINT-reported served model — captured from
     // the reply body's `model` field (last non-`None` across attempts wins, so
     // a later usage-less reply never erases a served model an earlier attempt
     // reported).
@@ -2660,14 +2557,10 @@ fn map_hosted_item(
                 ok: false,
                 content: String::new(),
                 error: Some(format!("{e:#}")),
-                total_tokens: item_total_tokens(any_usage, sum),
-                prompt_tokens: item_split_tokens(any_split, psum),
-                completion_tokens: item_split_tokens(any_split, csum),
-                reasoning_tokens: item_split_tokens(any_reasoning, rsum),
-                cached_tokens: item_split_tokens(any_cached, cachesum),
                 served_model,
                 wall_ms,
                 retried: error_retries_used,
+                ..MapItemResult::tokens_of(calls)
             };
         }
         let clamped = max_tokens;
@@ -2701,29 +2594,10 @@ fn map_hosted_item(
                 crate::budget::settle_step_live(
                     bucket,
                     clamped,
-                    conservative_hosted_spend(reply.total_tokens, clamped),
+                    conservative_hosted_spend(reply.counts.total_tokens(), clamped),
                     1,
                     step_label,
                     caller,
-                );
-                if let Some(t) = reply.total_tokens {
-                    sum += t;
-                    any_usage = true;
-                }
-                accumulate_split(
-                    reply.prompt_tokens,
-                    reply.completion_tokens,
-                    &mut psum,
-                    &mut csum,
-                    &mut any_split,
-                );
-                accumulate_details(
-                    reply.reasoning_tokens,
-                    reply.cached_tokens,
-                    &mut rsum,
-                    &mut cachesum,
-                    &mut any_reasoning,
-                    &mut any_cached,
                 );
                 if reply.model.is_some() {
                     served_model = reply.model.clone();
@@ -2734,14 +2608,10 @@ fn map_hosted_item(
                         ok: true,
                         content: reply.content,
                         error: None,
-                        total_tokens: item_total_tokens(any_usage, sum),
-                        prompt_tokens: item_split_tokens(any_split, psum),
-                        completion_tokens: item_split_tokens(any_split, csum),
-                        reasoning_tokens: item_split_tokens(any_reasoning, rsum),
-                        cached_tokens: item_split_tokens(any_cached, cachesum),
                         served_model,
                         wall_ms,
                         retried: error_retries_used,
+                        ..MapItemResult::tokens_of(calls)
                     };
                 }
                 // Empty content: retry, when `retry_on_empty` allows.
@@ -2763,14 +2633,10 @@ fn map_hosted_item(
                         ok: false,
                         content: String::new(),
                         error: Some(format!("{e:#}")),
-                        total_tokens: item_total_tokens(any_usage, sum),
-                        prompt_tokens: item_split_tokens(any_split, psum),
-                        completion_tokens: item_split_tokens(any_split, csum),
-                        reasoning_tokens: item_split_tokens(any_reasoning, rsum),
-                        cached_tokens: item_split_tokens(any_cached, cachesum),
                         served_model,
                         wall_ms,
                         retried: error_retries_used,
+                        ..MapItemResult::tokens_of(calls)
                     };
                 }
                 error_budget -= 1;
@@ -2788,14 +2654,10 @@ fn map_hosted_item(
         ok: last_error.is_none(),
         content: String::new(),
         error: last_error,
-        total_tokens: item_total_tokens(any_usage, sum),
-        prompt_tokens: item_split_tokens(any_split, psum),
-        completion_tokens: item_split_tokens(any_split, csum),
-        reasoning_tokens: item_split_tokens(any_reasoning, rsum),
-        cached_tokens: item_split_tokens(any_cached, cachesum),
         served_model,
         wall_ms,
         retried: error_retries_used,
+        ..MapItemResult::tokens_of(calls)
     }
 }
 
@@ -4923,12 +4785,8 @@ mod tests {
             seen.lock().unwrap().push(call.max_tokens);
             Ok(crate::single_shot::SingleShotReply {
                 content: "answer".into(),
-                total_tokens: Some(700),
-                prompt_tokens: None,
-                completion_tokens: None,
-                reasoning_tokens: None,
-                cached_tokens: None,
                 model: None,
+                counts: darkmux_trajectory::UsageCounts { total: Some(700), ..Default::default() },
             })
         });
         let out = map_hosted_item(
@@ -4939,6 +4797,32 @@ mod tests {
         assert_eq!(out.content, "answer");
         assert_eq!(*sent.lock().unwrap(), vec![4_096], "fired once, with the full cap");
         assert_eq!(bucket.lock().unwrap().used(), 5_700, "settled with the real spend");
+    }
+
+    /// The step cap settles with the amount the call's usage record carries:
+    /// a reply that reported a split and no total settles prompt +
+    /// completion, as its record's `total_tokens` does, not the whole
+    /// granted cap (which is only for a reply that reported nothing). The
+    /// item's own total is the same number.
+    #[test]
+    fn a_map_call_settles_the_amount_its_usage_record_carries() {
+        let bucket = Arc::new(Mutex::new(RemoteBudget::new(None, darkmux_types::config::StepBudgetPolicy::Warn)));
+        let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
+            Ok(crate::single_shot::SingleShotReply {
+                content: "answer".into(),
+                model: None,
+                counts: darkmux_trajectory::UsageCounts { prompt: Some(30), completion: Some(12), ..Default::default() },
+            })
+        });
+        let mut calls = Vec::new();
+        let out = map_hosted_item(
+            0, &bucket, &map_ep(), "gpt-5.1", "sys", "user", 4_096, 0, 0, 0, Some(&ovr),
+            &mut calls, "s1", &crate::budget::BudgetCaller::default(),
+        );
+        let record = map_call_token_payload(&calls[0], 0, true, "gpt-5.1", "ep", None);
+        assert_eq!(record["total_tokens"], 42);
+        assert_eq!(bucket.lock().unwrap().used(), 42, "settled with the record's amount, not the 4096 cap");
+        assert_eq!(out.total_tokens, Some(42));
     }
 
     /// (#1605 QA finding, kept) An item whose first dispatch errored and
@@ -4957,12 +4841,8 @@ mod tests {
             }
             Ok(crate::single_shot::SingleShotReply {
                 content: String::new(),
-                total_tokens: Some(1),
-                prompt_tokens: None,
-                completion_tokens: None,
-                reasoning_tokens: None,
-                cached_tokens: None,
                 model: None,
+                counts: darkmux_trajectory::UsageCounts { total: Some(1), ..Default::default() },
             })
         });
         let out = map_hosted_item(
@@ -5033,8 +4913,9 @@ mod tests {
         let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
         let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
             Ok(crate::single_shot::SingleShotReply {
-                content: "ok".into(), total_tokens: Some(12), prompt_tokens: None, completion_tokens: None,
-                reasoning_tokens: None, cached_tokens: None, model: None,
+                content: "ok".into(),
+                model: None,
+                counts: darkmux_trajectory::UsageCounts { total: Some(12), ..Default::default() },
             })
         });
         let bucket = Arc::new(Mutex::new(RemoteBudget::new(Some(10), darkmux_types::config::StepBudgetPolicy::Warn)));
@@ -5058,8 +4939,9 @@ mod tests {
         let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::full_window());
         let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
             Ok(crate::single_shot::SingleShotReply {
-                content: "ok".into(), total_tokens: Some(1), prompt_tokens: None, completion_tokens: None,
-                reasoning_tokens: None, cached_tokens: None, model: None,
+                content: "ok".into(),
+                model: None,
+                counts: darkmux_trajectory::UsageCounts { total: Some(1), ..Default::default() },
             })
         });
         let bucket = Arc::new(Mutex::new(RemoteBudget::new(None, darkmux_types::config::StepBudgetPolicy::Warn)));
@@ -5291,12 +5173,8 @@ mod tests {
     fn single_shot_step_telemetry_carries_reasoning_and_cached_tokens() {
         let reply = crate::single_shot::SingleShotReply {
             content: "ok".to_string(),
-            total_tokens: Some(1261),
-            prompt_tokens: Some(75),
-            completion_tokens: Some(1186),
-            reasoning_tokens: Some(1024),
-            cached_tokens: Some(64),
             model: Some("hosted".to_string()),
+            counts: darkmux_trajectory::UsageCounts { total: Some(1261), prompt: Some(75), completion: Some(1186), reasoning: Some(1024), cached: Some(64) },
         };
         let payload = hosted_single_shot_step_payload("s1", Some(500_000), 4096, 4096, &reply);
         assert_eq!(payload["reasoning_tokens"], 1024);
@@ -5319,12 +5197,8 @@ mod tests {
     fn single_shot_step_telemetry_renders_unreported_details_as_null() {
         let reply = crate::single_shot::SingleShotReply {
             content: "ok".to_string(),
-            total_tokens: Some(42),
-            prompt_tokens: Some(30),
-            completion_tokens: Some(12),
-            reasoning_tokens: None,
-            cached_tokens: None,
             model: None,
+            counts: darkmux_trajectory::UsageCounts { total: Some(42), prompt: Some(30), completion: Some(12), ..Default::default() },
         };
         let payload = hosted_single_shot_step_payload("s1", Some(500_000), 4096, 4096, &reply);
         let obj = payload.as_object().expect("object");
@@ -5522,39 +5396,50 @@ mod tests {
         assert!(payload.get("cached_tokens").is_none());
     }
 
-    /// (#1444 review) The accumulator behind those fields. Independent flags
-    /// are the point: a provider can name `completion_tokens_details`
-    /// without `prompt_tokens_details` (the runtime's own two-turn
-    /// accumulator test pins exactly that turn shape), so a shared
-    /// `any_*` flag would fabricate a `0` for whichever one went unnamed.
+    /// (#1444 review) An item's token fields are the sum of its calls'
+    /// counts, each field on its own: a provider can name
+    /// `completion_tokens_details` without `prompt_tokens_details`, so a
+    /// shared "was it reported" flag would fabricate a `0` for whichever one
+    /// went unnamed.
     #[test]
-    fn accumulate_details_tracks_each_field_independently() {
-        let (mut r, mut c, mut any_r, mut any_c) = (0u64, 0u64, false, false);
+    fn an_items_tokens_sum_each_reported_field_independently() {
+        let call = |counts| MapCall { counts, reported_model: None };
+        let none = MapItemResult::tokens_of(&[call(darkmux_trajectory::UsageCounts::default())]);
+        assert_eq!((none.total_tokens, none.reasoning_tokens, none.cached_tokens), (None, None, None));
 
-        // No attempt reported anything → both stay absent.
-        accumulate_details(None, None, &mut r, &mut c, &mut any_r, &mut any_c);
-        assert_eq!(item_split_tokens(any_r, r), None);
-        assert_eq!(item_split_tokens(any_c, c), None);
-
-        // Attempt 1 reports both; attempt 2 reports reasoning only.
-        accumulate_details(Some(500), Some(20), &mut r, &mut c, &mut any_r, &mut any_c);
-        accumulate_details(Some(300), None, &mut r, &mut c, &mut any_r, &mut any_c);
-        assert_eq!(item_split_tokens(any_r, r), Some(800), "500 + 300 across attempts");
-        assert_eq!(
-            item_split_tokens(any_c, c),
-            Some(20),
-            "attempt 2's silence on cached must not reset or zero what attempt 1 reported"
-        );
+        // Attempt 1 reports both details; attempt 2 reasoning only.
+        let both = MapItemResult::tokens_of(&[
+            call(darkmux_trajectory::UsageCounts { reasoning: Some(500), cached: Some(20), ..Default::default() }),
+            call(darkmux_trajectory::UsageCounts { reasoning: Some(300), ..Default::default() }),
+        ]);
+        assert_eq!(both.reasoning_tokens, Some(800), "500 + 300 across attempts");
+        assert_eq!(both.cached_tokens, Some(20), "attempt 2's silence must not reset what attempt 1 reported");
 
         // The mirror case: cached reported, reasoning never.
-        let (mut r2, mut c2, mut any_r2, mut any_c2) = (0u64, 0u64, false, false);
-        accumulate_details(None, Some(64), &mut r2, &mut c2, &mut any_r2, &mut any_c2);
-        assert_eq!(
-            item_split_tokens(any_r2, r2),
-            None,
-            "a shared flag would have fabricated Some(0) here"
-        );
-        assert_eq!(item_split_tokens(any_c2, c2), Some(64));
+        let mirror = MapItemResult::tokens_of(&[call(darkmux_trajectory::UsageCounts { cached: Some(64), ..Default::default() })]);
+        assert_eq!(mirror.reasoning_tokens, None, "a shared flag would have fabricated Some(0) here");
+        assert_eq!(mirror.cached_tokens, Some(64));
+    }
+
+    /// The item's total is the sum of what its usage records carry, one per
+    /// call: a call that reported only a split counts its prompt +
+    /// completion, exactly as its record's `total_tokens` does. (The item
+    /// used to sum provider totals alone and dropped such a call.)
+    #[test]
+    fn an_items_total_is_the_sum_of_its_calls_usage_record_totals() {
+        let calls = [
+            MapCall { counts: darkmux_trajectory::UsageCounts { prompt: Some(30), completion: Some(12), ..Default::default() }, reported_model: None },
+            MapCall { counts: darkmux_trajectory::UsageCounts { total: Some(100), prompt: Some(60), completion: Some(20), ..Default::default() }, reported_model: None },
+        ];
+        let item = MapItemResult::tokens_of(&calls);
+        let records: u64 = calls
+            .iter()
+            .map(|c| map_call_token_payload(c, 0, false, "m", "ep", None))
+            .map(|p| p["total_tokens"].as_u64().unwrap_or(0))
+            .sum();
+        assert_eq!(item.total_tokens, Some(142), "42 from the split + the provider's own 100");
+        assert_eq!(item.total_tokens, Some(records), "the item and its records are one number");
+        assert_eq!((item.prompt_tokens, item.completion_tokens), (Some(90), Some(32)));
     }
 
     /// The no-fabrication rule survives the fix: a provider reporting only a
@@ -5610,25 +5495,21 @@ mod tests {
     }
 
 
-    /// The accumulator folds multi-attempt usage and keeps `None` honest.
+    /// The split sums across attempts and stays `None` when never reported.
+    /// A half-reported split counts its half, and the other half stays
+    /// unreported, as the call's usage record omits it.
     #[test]
     fn split_accumulates_across_attempts_and_stays_absent_when_never_reported() {
-        let (mut p, mut c, mut any) = (0u64, 0u64, false);
-        accumulate_split(None, None, &mut p, &mut c, &mut any);
-        assert!(!any, "a reply with no split must not arm the flag");
-        assert_eq!(item_split_tokens(any, p), None);
-
-        accumulate_split(Some(10), Some(4), &mut p, &mut c, &mut any);
-        accumulate_split(Some(7), Some(3), &mut p, &mut c, &mut any);
-        assert_eq!(item_split_tokens(any, p), Some(17));
-        assert_eq!(item_split_tokens(any, c), Some(7));
-
-        // A half-reported split still counts, with the missing half as 0 —
-        // the same "partial is better than nothing" rule `total` uses.
-        let (mut p2, mut c2, mut any2) = (0u64, 0u64, false);
-        accumulate_split(Some(5), None, &mut p2, &mut c2, &mut any2);
-        assert_eq!(item_split_tokens(any2, p2), Some(5));
-        assert_eq!(item_split_tokens(any2, c2), Some(0));
+        let call = |prompt, completion| MapCall {
+            counts: darkmux_trajectory::UsageCounts { prompt, completion, ..Default::default() },
+            reported_model: None,
+        };
+        let never = MapItemResult::tokens_of(&[call(None, None)]);
+        assert_eq!((never.prompt_tokens, never.completion_tokens), (None, None));
+        let both = MapItemResult::tokens_of(&[call(None, None), call(Some(10), Some(4)), call(Some(7), Some(3))]);
+        assert_eq!((both.prompt_tokens, both.completion_tokens), (Some(17), Some(7)));
+        let half = MapItemResult::tokens_of(&[call(Some(5), None)]);
+        assert_eq!((half.prompt_tokens, half.completion_tokens), (Some(5), None));
     }
 
     #[test]
@@ -5779,12 +5660,8 @@ mod tests {
     fn hosted_reply(total: Option<u64>) -> crate::single_shot::SingleShotReply {
         crate::single_shot::SingleShotReply {
             content: "flag".to_string(),
-            total_tokens: total,
-            prompt_tokens: None,
-            completion_tokens: None,
-            reasoning_tokens: None,
-            cached_tokens: None,
             model: Some("hosted".to_string()),
+            counts: darkmux_trajectory::UsageCounts { total, ..Default::default() },
         }
     }
 
@@ -5866,12 +5743,8 @@ mod tests {
             let (content, total) = script[i];
             Ok(crate::single_shot::SingleShotReply {
                 content: content.to_string(),
-                total_tokens: total,
-                prompt_tokens: None,
-                completion_tokens: None,
-                reasoning_tokens: None,
-                cached_tokens: None,
                 model: Some("hosted".to_string()),
+                counts: darkmux_trajectory::UsageCounts { total, ..Default::default() },
             })
         });
     }
@@ -6009,12 +5882,8 @@ mod tests {
             match &script[i] {
                 Ok((content, total)) => Ok(crate::single_shot::SingleShotReply {
                     content: content.to_string(),
-                    total_tokens: *total,
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                    reasoning_tokens: None,
-                    cached_tokens: None,
                     model: Some("hosted".to_string()),
+                    counts: darkmux_trajectory::UsageCounts { total: *total, ..Default::default() },
                 }),
                 Err(e) => Err(anyhow!("{e}")),
             }
@@ -6199,12 +6068,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
             Ok(crate::single_shot::SingleShotReply {
                 content: "flag".to_string(),
-                total_tokens: total,
-                prompt_tokens: None,
-                completion_tokens: None,
-                reasoning_tokens: None,
-                cached_tokens: None,
                 model: served.map(str::to_string),
+                counts: darkmux_trajectory::UsageCounts { total, ..Default::default() },
             })
         });
     }
@@ -6615,12 +6480,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(300));
             Ok(crate::single_shot::SingleShotReply {
                 content: "ok".to_string(),
-                total_tokens: Some(5),
-                prompt_tokens: None,
-                completion_tokens: None,
-                reasoning_tokens: None,
-                cached_tokens: None,
                 model: None,
+                counts: darkmux_trajectory::UsageCounts { total: Some(5), ..Default::default() },
             })
         });
 
@@ -7115,12 +6976,8 @@ mod tests {
                 let (content, total) = script[i];
                 Ok(crate::single_shot::SingleShotReply {
                     content: content.to_string(),
-                    total_tokens: total,
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                    reasoning_tokens: None,
-                    cached_tokens: None,
                     model: Some("served-r".to_string()),
+                    counts: darkmux_trajectory::UsageCounts { total, ..Default::default() },
                 })
             });
         }
@@ -7559,12 +7416,8 @@ mod tests {
     fn scripted_reply(content: &str, total: Option<u64>) -> crate::single_shot::SingleShotReply {
         crate::single_shot::SingleShotReply {
             content: content.to_string(),
-            total_tokens: total,
-            prompt_tokens: total.map(|t| t - 2),
-            completion_tokens: total.map(|_| 2),
-            reasoning_tokens: None,
-            cached_tokens: None,
             model: Some("served-by-script".to_string()),
+            counts: darkmux_trajectory::UsageCounts { total, prompt: total.map(|t| t - 2), completion: total.map(|_| 2), ..Default::default() },
         }
     }
 

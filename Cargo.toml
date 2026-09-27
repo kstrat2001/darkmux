@@ -64,6 +64,7 @@ darkmux-serve = { path = "crates/darkmux-serve" }
 # other crate here pulls it in transitively via darkmux-profiles), just not
 # previously wired as a DIRECT dependency of the binary itself.
 darkmux-gestalt = { path = "crates/darkmux-gestalt" }
+darkmux-trajectory = { path = "crates/darkmux-trajectory" }
 anyhow = "1.0"
 axum = "0.7"
 clap = { version = "4.5", features = ["derive"] }

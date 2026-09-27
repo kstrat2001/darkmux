@@ -3300,37 +3300,6 @@ fn build_remote_record(
     )
 }
 
-/// (#1444 review) The token figures [`dispatch_remote`] reads out of a
-/// hosted endpoint's `usage` object, extracted as a pure function so the
-/// mapping is unit-testable.
-///
-/// It used to be an inline run of five `let` bindings in the middle of
-/// `dispatch_remote`, which performs real HTTP and is therefore never
-/// executed by the suite — so replacing `reasoning` with `None` there left
-/// all 1503 crew tests green while the field silently stopped being
-/// recorded on the one path that actually reports it.
-pub(crate) struct RemoteUsage {
-    pub prompt: u64,
-    pub completion: u64,
-    /// The endpoint's OWN `total_tokens`, falling back to
-    /// `prompt + completion` only when the endpoint reported none.
-    ///
-    /// The precedence is load-bearing, not defensive: 284 usage blocks in
-    /// this operator's recorded corpus (`gemini-3.1-pro-preview`,
-    /// `gemini-2.5-flash`, `grok-4.3`) report a total GREATER than the sum,
-    /// so recomputing it would understate those dispatches by the whole
-    /// third addend — up to ~4.9k tokens on a single recorded call.
-    pub total: u64,
-    /// Tri-state: `None` when the endpoint's response carries no
-    /// `completion_tokens_details`/`prompt_tokens_details` object, or the
-    /// object is present but doesn't name the field — never a fabricated
-    /// `0`. NOT necessarily a subset of `completion`: that relation is
-    /// provider-scoped (see the runtime crate's
-    /// `lmstudio::CompletionTokensDetails::reasoning_tokens`).
-    pub reasoning: Option<u64>,
-    pub cached: Option<u64>,
-}
-
 /// (#1444 review) The five token keys EVERY `runtime: "direct"` dispatch
 /// completion record carries, written into the payload from ONE place so
 /// the two producers — [`dispatch_remote`] and `dispatch_local_single_shot`
@@ -3345,22 +3314,22 @@ pub(crate) struct RemoteUsage {
 /// question depending on which arm answered. The absent-vs-zero problem,
 /// reintroduced one level up.
 ///
-/// Each producer keeps its own honest convention for the first three:
-/// `dispatch_remote` reads a hosted `usage` object and degrades a missing
-/// count to `0` (its pre-existing behavior), while the local arm forwards
-/// `SingleShotReply`'s `Option`s untouched so an unreported count stays
-/// `null`. This helper legislates the KEY SET, never the values.
+/// The values are the call's own counts, the ones its usage record
+/// carries: an unreported count is `null`, never a fabricated 0, and
+/// `total_tokens` is [`darkmux_trajectory::UsageCounts::total_tokens`], the
+/// one total rule.
 pub(crate) fn insert_direct_token_keys(
     obj: &mut serde_json::Map<String, serde_json::Value>,
-    prompt: Option<u64>,
-    completion: Option<u64>,
-    total: Option<u64>,
-    reasoning: Option<u64>,
-    cached: Option<u64>,
+    counts: &darkmux_trajectory::UsageCounts,
 ) {
-    for (key, value) in
-        DIRECT_TOKEN_KEYS.iter().zip([prompt, completion, total, reasoning, cached])
-    {
+    // A reply with no usage block reports nothing, details included: the
+    // same `reported()` gate its usage record applies.
+    let values = if counts.reported() {
+        [counts.prompt, counts.completion, counts.total_tokens(), counts.reasoning, counts.cached]
+    } else {
+        [None; 5]
+    };
+    for (key, value) in DIRECT_TOKEN_KEYS.iter().zip(values) {
         obj.insert((*key).to_string(), serde_json::json!(value));
     }
 }
@@ -3376,24 +3345,6 @@ pub(crate) const DIRECT_TOKEN_KEYS: [&str; 5] = [
     "reasoning_tokens",
     "cached_tokens",
 ];
-
-pub(crate) fn remote_usage_tokens(usage: &serde_json::Value) -> RemoteUsage {
-    let prompt = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-    let completion = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-    let total = usage
-        .get("total_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or_else(|| prompt.saturating_add(completion));
-    RemoteUsage {
-        prompt,
-        completion,
-        total,
-        reasoning: usage
-            .pointer("/completion_tokens_details/reasoning_tokens")
-            .and_then(|v| v.as_u64()),
-        cached: usage.pointer("/prompt_tokens_details/cached_tokens").and_then(|v| v.as_u64()),
-    }
-}
 
 /// The hosted single-shot dispatch (#1177). Precondition: `target` is an
 /// unmanaged endpoint (`try_resolve_remote_target`).
@@ -3580,33 +3531,22 @@ fn dispatch_remote(
         }
     };
 
-    let content = resp
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|s| s.as_str())
-        .unwrap_or("")
-        .to_string();
-    let usage = resp.get("usage").cloned().unwrap_or(serde_json::Value::Null);
-    let RemoteUsage {
-        prompt: ptok,
-        completion: ctok,
-        total: ttok,
-        reasoning: reasoning_tok,
-        cached: cached_tok,
-    } = remote_usage_tokens(&usage);
+    // One reading of the reply, through the shared seam: its text and its
+    // counts. The usage record, the budget settle, the completion record and
+    // the envelope all take their numbers from `counts`.
+    let reply = crate::single_shot::extract_reply(&resp);
+    let counts = reply.counts.clone();
 
-    // (#2902 step 1a) The one usage record for this one model call, from
-    // the shared reply seam — before the terminal, so a reader of the
-    // stream sees the call's cost no later than its completion.
+    // (#2902 step 1a) The one usage record for this one model call — before
+    // the terminal, so a reader of the stream sees the call's cost no later
+    // than its completion.
     emit_single_shot_usage(
         &opts.role_id,
         &session_id,
         &pm.id,
         mission_id.as_deref(),
         phase,
-        crate::single_shot::extract_reply(&resp).usage_payload(
+        reply.usage_payload(
             crate::usage::CallKind::SingleShot,
             Some(&opts.role_id),
             &pm.id,
@@ -3614,7 +3554,14 @@ fn dispatch_remote(
             ep.named_id(),
         ),
     );
-    crate::budget::settle_step_live(&step_bucket, 0, ttok, 1, "dispatch", &budget_caller);
+    crate::budget::settle_step_live(
+        &step_bucket,
+        0,
+        counts.total_tokens().unwrap_or(0),
+        1,
+        "dispatch",
+        &budget_caller,
+    );
 
 
     let mut complete_payload = serde_json::json!({
@@ -3626,22 +3573,11 @@ fn dispatch_remote(
         "total_tools": 0,
         "total_compactions": 0,
         "wall_ms": wall_ms,
-        "stdout_chars": content.len(),
+        "stdout_chars": reply.content.len(),
     });
-    // (#1444, payload-additive — FLOW_SCHEMA_VERSION 1.44.0; key set owned
-    // by `insert_direct_token_keys` so this producer and the local-single-
-    // shot one cannot drift apart again.) This arm degrades a count the
-    // endpoint never sent to `0`, its pre-existing behavior — but
-    // `reasoning`/`cached` stay tri-state, because a `0` there would be the
-    // fabrication this whole change exists to prevent.
-    insert_direct_token_keys(
-        complete_payload.as_object_mut().expect("json! built an object"),
-        Some(ptok),
-        Some(ctok),
-        Some(ttok),
-        reasoning_tok,
-        cached_tok,
-    );
+    // (#1444) Key set owned by `insert_direct_token_keys`, so this producer
+    // and the local single-shot one cannot drift apart.
+    insert_direct_token_keys(complete_payload.as_object_mut().expect("json! built an object"), &counts);
 
     // (#2344) See the error arm above — the call is done, so the session is
     // no longer running; stop the beat before the terminal record.
@@ -3662,20 +3598,19 @@ fn dispatch_remote(
     );
 
     let stdout = if opts.json {
+        let mut metrics = serde_json::json!({
+            "model": pm.id, "endpoint": label, "runtime": "direct",
+            "wall_ms": wall_ms, "turns": 1,
+        });
+        insert_direct_token_keys(metrics.as_object_mut().expect("json! built an object"), &counts);
         serde_json::to_string(&serde_json::json!({
             "result": "stop",
-            "final_assistant": content,
-            "metrics": {
-                "model": pm.id, "endpoint": label, "runtime": "direct",
-                "wall_ms": wall_ms, "turns": 1,
-                "prompt_tokens": ptok, "completion_tokens": ctok, "total_tokens": ttok,
-                // (#1444) Provider-reported; see the tri-state note above.
-                "reasoning_tokens": reasoning_tok, "cached_tokens": cached_tok,
-            },
+            "final_assistant": reply.content,
+            "metrics": metrics,
         }))
-        .unwrap_or_else(|_| content.clone())
+        .unwrap_or_else(|_| reply.content.clone())
     } else {
-        content
+        reply.content
     };
 
     Ok(DispatchResult {
@@ -4014,25 +3949,10 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
         "wall_ms": wall_ms,
         "stdout_chars": reply.content.len(),
     });
-    // (#1444 review) This producer was MISSED by #1444's first pass: its
-    // sibling `dispatch_remote` emitted the two new keys and this one did
-    // not, so a consumer reading `runtime: "direct"` got an explicit `null`
-    // from one arm and a MISSING KEY from the other — the absent-vs-zero
-    // ambiguity this change exists to remove, reintroduced one level up.
-    // Shape-only today (this arm dispatches to LMStudio, which never sends
-    // a details object), but the two producers must agree on their key set
-    // regardless of what the values happen to be — which is now enforced by
-    // both routing through `insert_direct_token_keys`. Unlike the remote
-    // arm, this one forwards `SingleShotReply`'s `Option`s untouched, so an
-    // unreported count stays `null` rather than degrading to `0`.
-    insert_direct_token_keys(
-        complete_payload.as_object_mut().expect("json! built an object"),
-        reply.prompt_tokens,
-        reply.completion_tokens,
-        reply.total_tokens,
-        reply.reasoning_tokens,
-        reply.cached_tokens,
-    );
+    // (#1444) Key set and values owned by `insert_direct_token_keys`, the
+    // same as `dispatch_remote`'s: the call's own counts, the ones its usage
+    // record carries.
+    insert_direct_token_keys(complete_payload.as_object_mut().expect("json! built an object"), &reply.counts);
 
     // (#2344) See the error arm above — stop the beat before the terminal.
     if let Some(em) = session_emitter.take() {
@@ -6497,12 +6417,22 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         .join()
         .unwrap_or_else(|_| TrajectorySummary::default());
 
+    // (#2263) A resumed execution's whole-task counts: the checkpoint it
+    // resumed from, plus what this run recorded. The trajectory itself only
+    // ever holds this run's events (`host_out` is a fresh tempdir).
+    let resume_seed = resume_checkpoint_contents
+        .as_deref()
+        .map(darkmux_trajectory::CheckpointCounts::of)
+        .unwrap_or_default();
+
     // (#1955) The envelope is the orchestrator's only surface, so the
     // reduction lands here — after the tailer has finished and its
     // observations are final.
     let stdout = enrich_envelope_with_summary(
         stdout,
+        &model,
         &trajectory_summary,
+        resume_seed,
         &host_stats,
         &host_extras,
         &host_out,
@@ -6513,58 +6443,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         )?,
         thermal_ladder_summary,
     );
-
-    // (#782) Read the runtime's token totals from metrics.json now the
-    // container has exited. Best-effort — zero totals on any read failure
-    // (this is observability enrichment, never a dispatch-failing path).
-    //
-    // (#2263 review) Reconciled against the live tailer's own per-invocation
-    // accumulation the same way `rest` is reconciled below — see
-    // `reconcile_token_totals`'s doc for why a metrics.json read alone can
-    // land a fabricated zero here (the loop's error arm hardcodes these
-    // fields; a hard-kill leaves no file at all) beside this dispatch's
-    // real, live-observed token counts.
-    let tokens = reconcile_token_totals(
-        read_token_totals(&host_out),
-        TokenTotals {
-            prompt: trajectory_summary.prompt_tokens,
-            completion: trajectory_summary.completion_tokens,
-            reasoning: None,
-            cached: None,
-        },
-    );
-    // (#2263) Same best-effort read, same source file — the WHOLE
-    // dispatch's cumulative turns/compactions across every resume, for
-    // the `cumulative_turns`/`cumulative_compactions` payload fields.
-    //
-    // (#2263 review) Reconciled the same way, against the same tailer, for
-    // the same reason — see `reconcile_cumulative_counts`'s doc.
-    let cumulative = reconcile_cumulative_counts(
-        read_cumulative_counts(&host_out),
-        CumulativeCounts { turns: trajectory_summary.turns, compactions: trajectory_summary.compactions },
-    );
-    // (#2094) Same best-effort read, same source file — the sum of every
-    // inter-turn rest this dispatch took + how many. `wall_ms` above
-    // INCLUDES this time (wall stays wall); a caller wanting model-only
-    // time subtracts `rest_ms` from `wall_ms` itself.
-    let rest_from_metrics = read_rest_totals(&host_out);
-    // (#2094 second round, finding 1) Reconcile against the live tailer's
-    // OWN running total (`trajectory_summary`, already accumulated above
-    // from every `runtime.rest` event AS IT STREAMED — the same mechanism
-    // `total_turns` below already trusts) rather than trusting
-    // `read_rest_totals`'s file read alone. See `reconcile_rest_totals`'s
-    // doc for why: a metrics.json that raced a crash and landed a zeroed
-    // struct on disk must not undercut a real, live-observed rest total.
-    let rest = reconcile_rest_totals(
-        rest_from_metrics,
-        RestTotals { rest_ms: trajectory_summary.rest_ms, rests: trajectory_summary.rests },
-    );
-    // (#2094 finding 8) Best-effort read of the post-clamp cadence this
-    // dispatch actually applied — see read_turn_delay_effective_ms's own
-    // doc for the metrics.json-then-derived-average fallback chain. Fed
-    // the RECONCILED `rest` above so the derived-average fallback uses
-    // the best available rest data too.
-    let turn_delay_effective_ms = read_turn_delay_effective_ms(&host_out, rest);
 
     // 8. Emit dispatch.complete flow record with summary metadata.
     // (#2111 review finding) Built by a standalone, pure function —
@@ -6577,14 +6455,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // coverage — a deleted flow-record insert left the suite green.
     let dispatch_complete_payload = build_dispatch_complete_payload(
         wall_ms,
-        rest,
-        turn_delay_effective_ms,
         &stdout,
         &stderr,
         exit_code,
         &trajectory_summary,
-        tokens,
-        cumulative,
+        resume_seed,
         remote_endpoint_raw_label.as_deref(),
         &host_stats,
         &host_extras,
@@ -6631,7 +6506,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         Some(&model),
         mission_id.as_deref(),
         phase_id.as_deref(),
-        serde_json::json!({ "turns": trajectory_summary.turns }),
+        serde_json::json!({ "turns": trajectory_summary.fold.turns() }),
     ));
 
     // (#795) NO at-complete `telemetry.tokens` aggregate here. The tailer
@@ -6919,31 +6794,36 @@ fn stderr_warning_sink(line: &str) {
     eprintln!("{}", darkmux_types::style::warn(line));
 }
 
-/// (#2947) Pure: the warning a runtime trajectory event calls for, or
-/// `None`. Only under the `warn` policy (read off the event, which the
-/// RUNTIME stamps with the policy it actually ran under, never the host's
-/// current env), and only for a finding: a checkpoint whose judge
-/// `would_conclude`, or a stream-gate observation judged `degenerate`.
-/// `record` and `conclude` produce none here: `record` is silent by design,
-/// and `conclude` already surfaces the conclusion itself.
-pub(crate) fn degeneracy_warning(event_type: &str, event: &serde_json::Value) -> Option<DegeneracyWarning> {
-    if event.get("policy").and_then(|v| v.as_str()) != Some("warn") {
+/// (#2947) The warning a checkpoint calls for: its judge `would_conclude`
+/// under the `warn` policy. See [`degeneracy_warning`].
+pub(crate) fn checkpoint_degeneracy_warning(c: &darkmux_trajectory::Checkpoint) -> Option<DegeneracyWarning> {
+    degeneracy_warning(c.policy.as_deref(), c.would_conclude == Some(true), "checkpoint", c.seq, c.tail_ratio)
+}
+
+/// (#2947) The warning a stream-gate observation calls for: judged
+/// `degenerate` under the `warn` policy. See [`degeneracy_warning`].
+pub(crate) fn gate_degeneracy_warning(g: &darkmux_trajectory::GateObservation) -> Option<DegeneracyWarning> {
+    degeneracy_warning(g.policy.as_deref(), g.degenerate, "stream_gate", g.seq, g.tail_ratio)
+}
+
+/// (#2947) Pure: the warning a finding calls for, or `None`. Only under the
+/// `warn` policy (the one the RUNTIME stamped on the event, never the host's
+/// current env), and only for a finding. `record` and `conclude` produce
+/// none here: `record` is silent by design, and `conclude` already surfaces
+/// the conclusion itself.
+fn degeneracy_warning(
+    policy: Option<&str>,
+    found: bool,
+    source: &'static str,
+    turn: u64,
+    ratio: Option<f64>,
+) -> Option<DegeneracyWarning> {
+    if recorded_policy(policy) != Some(darkmux_types::config::DetectionPolicy::Warn) || !found {
         return None;
     }
-    let (found, source) = match event_type {
-        // flow-action-guard:allow — a runtime trajectory event type, not a flow action
-        "dispatch.checkpoint" => (event.get("would_conclude").and_then(|v| v.as_bool()) == Some(true), "checkpoint"),
-        "dispatch.gate.observation" => (event.get("degenerate").and_then(|v| v.as_bool()) == Some(true), "stream_gate"),
-        _ => return None,
-    };
-    if !found {
-        return None;
-    }
-    let turn = event.get("seq").cloned().unwrap_or(serde_json::Value::Null);
-    let ratio = event.get("tail_ratio").and_then(|v| v.as_f64());
     let ratio_text = ratio.map(|r| format!(" (tail_ratio={r:.3})")).unwrap_or_default();
     Some(DegeneracyWarning {
-        turn_seq: event.get("seq").and_then(|v| v.as_u64()),
+        turn_seq: Some(turn),
         line: format!(
             "darkmux dispatch: warning: turn {turn}: the output is repeating{ratio_text}; not concluded \
              (runtime.detection.degeneracy.policy = warn). Set it to `conclude` to close a repeating thought."
@@ -6972,13 +6852,16 @@ pub(crate) fn degeneracy_warning(event_type: &str, event: &serde_json::Value) ->
 /// **would this change what the caller does next?** A field that would not
 /// belongs in the trajectory, which `trajectory_path` still points at.
 ///
-/// Deliberately does NOT duplicate `metrics`. Those are the RUNTIME's counts
-/// of its own work; these are the HOST tailer's observations. Where the two
-/// could disagree (see #1947) that disagreement is signal, and collapsing them
-/// into one number would hide it.
+/// The `metrics` block is written here too, from the same fold of the
+/// trajectory the `dispatch complete` record reads ([`envelope_metrics`]):
+/// the runtime prints no counts of its own, so there is no second tally to
+/// disagree with.
+#[allow(clippy::too_many_arguments)]
 fn enrich_envelope_with_summary(
     stdout: String,
+    model: &str,
     summary: &TrajectorySummary,
+    resume_seed: darkmux_trajectory::CheckpointCounts,
     stats: &HostStats,
     extras: &HostExtras,
     out_dir: &std::path::Path,
@@ -7000,6 +6883,7 @@ fn enrich_envelope_with_summary(
     let Some(obj) = v.as_object_mut() else {
         return stdout;
     };
+    obj.insert("metrics".into(), envelope_metrics(&summary.fold, model, resume_seed));
     // Always present, even when empty. An absent field is ambiguous between
     // "nothing fired" and "this build does not report it"; `[]` is not.
     obj.insert(
@@ -7105,18 +6989,47 @@ fn enrich_envelope_with_summary(
     if summary.degeneracy_warnings > 0 {
         obj.insert("degeneracy_warnings".into(), serde_json::json!(summary.degeneracy_warnings));
     }
-    if summary.checkpoints > 0 {
+    if !summary.fold.checkpoints.is_empty() {
+        let (min_tail_ratio, mean_tail_ratio) = summary.fold.checkpoint_tail_ratios();
         obj.insert(
             "checkpoints".into(),
             serde_json::json!({
-                "total": summary.checkpoints,
-                "concluded": summary.checkpoints_concluded,
-                "min_tail_ratio": summary.min_tail_ratio,
-                "mean_tail_ratio": summary.mean_tail_ratio(),
+                "total": summary.fold.checkpoints.len(),
+                "concluded": summary.fold.checkpoints_concluded(),
+                "min_tail_ratio": min_tail_ratio,
+                "mean_tail_ratio": mean_tail_ratio,
             }),
         );
     }
     serde_json::to_string(&v).unwrap_or(stdout)
+}
+
+/// The envelope's `metrics` block: this execution's counts, from the fold
+/// of its trajectory, under the names envelope readers (`--json` callers,
+/// the lab benches, the crawl) read. `wall_ms` is the runtime's own clock
+/// (the span its events cover, for a killed run). `cumulative_*` add the
+/// checkpoint a resumed run started from.
+fn envelope_metrics(
+    fold: &darkmux_trajectory::TrajectoryFold,
+    model: &str,
+    resume_seed: darkmux_trajectory::CheckpointCounts,
+) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "wall_ms": fold.wall_ms(),
+        "turns": fold.turns(),
+        "compactions": fold.compactions(),
+        "prompt_tokens": fold.tokens.prompt,
+        "completion_tokens": fold.tokens.completion,
+        "total_tokens": fold.tokens.total,
+        "reasoning_tokens": fold.tokens.reasoning,
+        "cached_tokens": fold.tokens.cached,
+        "rest_ms": fold.rest_ms(),
+        "rests": fold.rest_count(),
+        "turn_delay_effective_ms": fold.complete.as_ref().and_then(|c| c.turn_delay_effective_ms),
+        "cumulative_turns": resume_seed.turns.saturating_add(fold.turns()),
+        "cumulative_compactions": resume_seed.compactions.saturating_add(fold.compactions()),
+    })
 }
 
 /// (#1959) Count what the crawler recorded, and say where it is.
@@ -7156,439 +7069,25 @@ use crate::telemetry_sampler::{reduce_host_stats, HostSampleAt, HostStats, Metri
 #[cfg(test)]
 use crate::telemetry_sampler::reduce_metric;
 
-/// Summary of what the trajectory tailer surfaced. Used to enrich the
-/// dispatch.complete payload with end-of-dispatch counts.
+/// What the trajectory tailer observed over one execution: the fold of
+/// every event (`darkmux_trajectory::TrajectoryFold`, the one reading of the
+/// trajectory, so the live counts, the `dispatch complete` payload and the
+/// envelope are one computation), plus what only the host sees.
 #[derive(Default, Debug, Clone)]
 struct TrajectorySummary {
-    turns: u32,
-    tool_calls: u32,
-    /// (#2169) Of `tool_calls` above, the subset that DISPATCHED and came
-    /// back `ok: false` — a real tool that ran (or tried to) and reported
-    /// failure. Kept separate from `tool_calls_invalid_name` below so
-    /// "84 ok / 0 failed / 48 malformed" reads as three distinct numbers:
-    /// a call counted here reached `tools::dispatch`; one counted below
-    /// never did.
-    tool_calls_failed: u32,
-    /// (#2169) Structured tool calls whose `name` matched NO real darkmux
-    /// tool (`reason: "not_a_tool"` on the runtime's event — Devstral 2 +
-    /// LM Studio's Mistral parser slicing model content at `[TOOL_CALLS]`
-    /// into the name field is the observed cause). These never reach
-    /// `tools::dispatch` — they never increment `tool_calls` or
-    /// `tool_calls_failed` above — so this is the ONLY place they're
-    /// counted. Summed from each turn's coalesced
-    /// `dispatch.tool.malformed_names` event's `count` field, not counted
-    /// one-by-one (the runtime never emits one event per invalid call).
-    tool_calls_invalid_name: u32,
-    /// (#2169 merge-gate MUST FIX 1) Structured tool calls that named a
-    /// REAL darkmux tool (`reason: "real_tool_not_granted"` on the
-    /// runtime's event) this dispatch's role simply wasn't granted — a
-    /// DIFFERENT cause from `tool_calls_invalid_name` above, which is why
-    /// it's a separate counter rather than folded into it: mixing a
-    /// permission refusal into the "model produced garbage tool-call
-    /// names" metric this issue exists to surface would corrupt exactly
-    /// the signal #2169's detector was built to produce. Also never
-    /// reaches `tools::dispatch` (a merge-gate probe confirmed this was a
-    /// REAL, independent, pre-existing hole pre-#2169 — see the runtime
-    /// crate's `ungranted_real_tool_call_is_never_dispatched_and_names_the_correct_reason`
-    /// regression test).
-    tool_calls_ungranted: u32,
-    compactions: u32,
+    fold: darkmux_trajectory::TrajectoryFold,
     heartbeats: u32,
-    /// (#2094 finding 2) Live running sum/count of the `runtime.rest`
-    /// events this dispatch has taken so far — mirrors the runtime's own
-    /// `rest_ms`/`rests` accumulators (`runtime/src/loop_runner.rs`), kept
-    /// host-side too so each `dispatch.rest` flow record can carry the
-    /// cumulative totals alongside its own `ms`, the same "live running
-    /// total" shape `turns_so_far`/`tool_calls_so_far` already give the
-    /// mission-graph viewer's seat-card meter.
-    rest_ms: u64,
-    rests: u32,
-    /// (2026-08-30 fleet-observability finding) Of `rest_ms` above, the
-    /// portion attributable to a PACED rest (`reason != "turn_delay"` on
-    /// the runtime's own `runtime.rest` event — a manual operator pause or
-    /// the thermal governor, never routine turn-to-turn cool-down). Live-
-    /// tailer-only, like `checkpoints`/`detections` below — `metrics.json`
-    /// carries no such breakdown from the runtime side, so this is NOT
-    /// reconciled against it the way `rest_ms`/`rests` themselves are (see
-    /// `reconcile_rest_totals`); a crash-during-write race loses at most
-    /// this one derived field, never the totals it's derived from.
-    paced_rest_ms: u64,
-    /// (#2263) Live running sum of THIS DISPATCH's own `model.completed`
-    /// usage — accumulated turn-by-turn from the exact same events
-    /// `turns` above counts, so it is this-invocation-only BY
-    /// CONSTRUCTION: `host_out` is always a fresh per-dispatch tempdir
-    /// (including for a resumed dispatch, see `write_staged_resume_
-    /// checkpoint`'s own doc), so `trajectory.jsonl` — and therefore this
-    /// sum — never sees a PRIOR invocation's calls. This is deliberately
-    /// NOT sourced from `metrics.json`'s `total_prompt_tokens`/
-    /// `total_completion_tokens` (`TokenTotals`/`read_token_totals`
-    /// below): those are the runtime's WHOLE-DISPATCH cumulative
-    /// counters, seeded from the checkpoint on a resume so the loop's own
-    /// budgets see the right total — exactly the number that must NOT be
-    /// attributed to whichever model this dispatch happens to be running.
-    prompt_tokens: u32,
-    completion_tokens: u32,
-    /// (#2903) Live running sum of each turn's `total_tokens` AS
-    /// `turn_tokens_payload` resolved it: the provider's own total wins, the
-    /// turn's prompt+completion is the fallback. Accumulated from the same
-    /// per-turn payload the `telemetry.tokens` records carry, so the
-    /// complete record's total always equals the sum of the per-turn
-    /// totals. NOT `prompt_tokens + completion_tokens`: a provider that
-    /// bills a third token class outside `completion_tokens` reports a
-    /// total greater than that sum, and recomputing it drops the difference.
-    total_tokens: u32,
-    /// (#2263) Same tri-state contract as the runtime's own
-    /// `LoopOutcome::total_reasoning_tokens`/`total_cached_tokens`:
-    /// `None` until at least one turn this dispatch reports the field.
-    reasoning_tokens: Option<u32>,
-    cached_tokens: Option<u32>,
-    // (#1955) The two things the orchestrator could not see.
-    //
-    // Both were already COMPUTED here — the tailer forwards checkpoints and
-    // every detector firing into the flow stream — and neither reached the
-    // caller, whose only surface is the envelope. So a dispatch that tripped
-    // a cycle detector returned an envelope indistinguishable from a clean
-    // one, and the operator's orchestrator had to find the trajectory file
-    // and aggregate it by hand to learn otherwise.
-    checkpoints: u32,
-    checkpoints_concluded: u32,
     /// (#2947) Findings the degeneracy detector surfaced as warnings under
     /// the `warn` policy (it measured, found repetition, and did not conclude).
     degeneracy_warnings: u32,
-    /// (#1959) The WORST and the MEAN novelty ratio across the run's
-    /// checkpoints, replacing the LAST one.
-    ///
-    /// `last` was not merely uninformative, it INVERTED the ranking. Measured
-    /// on two real crawls: a run that decayed through fourteen checkpoints to
-    /// 0.193, tripped the gate, and then recovered reported `last = 0.997`,
-    /// while a clean four-checkpoint run reported `0.976`. The degenerate run
-    /// looked HEALTHIER than the healthy one on the field an operator reads
-    /// first.
-    ///
-    /// The two together separate three cases that either alone collapses:
-    /// low min + high mean is one excursion the gate caught and recovered from
-    /// (0.193 / 0.698); low min + low mean is a chronically degenerate run;
-    /// high both is clean (0.976 / 0.985). `min` answers "did this ever
-    /// degenerate", `mean` answers "how much of the run was compromised", and
-    /// the trust decision needs both.
-    ///
-    /// A pure fold over checkpoints the tailer already receives — no extra
-    /// probe, no cost charged to the measured run.
-    min_tail_ratio: Option<f64>,
-    tail_ratio_sum: f64,
-    tail_ratio_count: u32,
-    /// `{kind, severity, detail}` per firing, from the same pure
-    /// `detector_telemetry_payload` the flow stream uses — one producer, so
-    /// the two surfaces cannot drift.
+    /// (#1955) `{kind, severity, detail}` per detector firing, from the same
+    /// pure `detector_telemetry_payload` the flow stream uses — one producer,
+    /// so the orchestrator's envelope and the viewer cannot drift. Firings
+    /// were already forwarded to the flow stream and never reached the
+    /// caller, whose only surface is the envelope.
     detections: Vec<serde_json::Value>,
     /// (#2928) The live channel's own cost; see [`LiveSummary`].
     live: LiveSummary,
-}
-
-impl TrajectorySummary {
-    /// Fold one checkpoint into the reduction.
-    ///
-    /// Lives here rather than inline in the tailer so a test can drive the
-    /// REAL accumulation. The first version of this change kept the logic in
-    /// `handle_event` and the tests rebuilt it by hand — which made them pass
-    /// against a mutation that replaced the running minimum with the last
-    /// value, the exact regression they were written to catch.
-    fn record_checkpoint(&mut self, tail_ratio: Option<f64>, concluded: bool) {
-        self.checkpoints = self.checkpoints.saturating_add(1);
-        if concluded {
-            self.checkpoints_concluded = self.checkpoints_concluded.saturating_add(1);
-        }
-        if let Some(r) = tail_ratio {
-            self.min_tail_ratio = Some(self.min_tail_ratio.map_or(r, |m: f64| m.min(r)));
-            self.tail_ratio_sum += r;
-            self.tail_ratio_count = self.tail_ratio_count.saturating_add(1);
-        }
-    }
-
-    /// Mean novelty ratio across the run's checkpoints, or `None` when none
-    /// were recorded. Kept as an accessor rather than a stored field so the
-    /// sum and the count cannot drift out of step with each other.
-    fn mean_tail_ratio(&self) -> Option<f64> {
-        (self.tail_ratio_count > 0)
-            .then(|| self.tail_ratio_sum / f64::from(self.tail_ratio_count))
-    }
-}
-
-/// Token totals the runtime records in `metrics.json` at dispatch exit.
-/// Read host-side once the container has exited, then surfaced into the
-/// `dispatch.complete` payload so the per-dispatch drill-down shows
-/// totals without re-parsing the runtime's stdout envelope (#782). The
-/// live "tokens off-meter" aggregation no longer reads from here — it
-/// sums the PER-TURN `telemetry.tokens` records the tailer emits (#795).
-/// `total` is derived (prompt + completion) at the read site so
-/// consumers don't have to.
-///
-/// `pub` so a second host-side consumer (`mission run`, #782b) reads the
-/// same canonical totals from a `DispatchResult.out_dir` rather than
-/// duplicating the metrics.json field names.
-#[derive(Default, Debug, Clone, Copy)]
-pub struct TokenTotals {
-    pub prompt: u32,
-    pub completion: u32,
-    /// (#1444) `None` when the runtime never wrote the field (metrics.json
-    /// predates #1444) OR no turn this dispatch ever reported it (local
-    /// LMStudio, or a hosted non-reasoning model). Never a fabricated zero.
-    ///
-    /// (#1444 review) Whether this is a SUBSET of `completion` above is
-    /// PROVIDER-SCOPED, not universal — see the runtime crate's
-    /// `lmstudio::CompletionTokensDetails::reasoning_tokens` doc for the
-    /// recorded counter-evidence. Do not derive either field from the other.
-    pub reasoning: Option<u32>,
-    /// (#1444) Same tri-state contract as `reasoning` above.
-    pub cached: Option<u32>,
-}
-
-impl TokenTotals {
-    pub fn total(&self) -> u32 {
-        self.prompt.saturating_add(self.completion)
-    }
-}
-
-/// Read `total_prompt_tokens` / `total_completion_tokens` from the
-/// runtime's `metrics.json` under `<out_dir>/.darkmux-runtime/`. The
-/// runtime writes this file at exit on BOTH the success and error paths
-/// (`runtime/src/main.rs`), so it's present once the container has been
-/// `wait`ed. Best-effort: a missing/malformed file degrades to zero
-/// totals — this is an observability enrichment, never a dispatch
-/// failure. Same out-dir the trajectory tailer reads from.
-pub fn read_token_totals(out_dir: &Path) -> TokenTotals {
-    let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
-    let Ok(raw) = fs::read_to_string(&metrics_path) else {
-        return TokenTotals::default();
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return TokenTotals::default();
-    };
-    TokenTotals {
-        prompt: v.get("total_prompt_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
-        completion: v.get("total_completion_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
-        // (#1444) `.and_then(as_u64)` already returns `None` for both an
-        // absent key and a `null` value — matching the runtime's own
-        // "absent means unknown, never a fabricated zero" contract with no
-        // extra branching needed here.
-        reasoning: v.get("total_reasoning_tokens").and_then(|n| n.as_u64()).map(|n| n as u32),
-        cached: v.get("total_cached_tokens").and_then(|n| n.as_u64()).map(|n| n as u32),
-    }
-}
-
-/// (#2263 review) Merge the post-hoc `metrics.json` read
-/// ([`read_token_totals`]) with the live tailer's own per-invocation
-/// accumulation (`TrajectorySummary::prompt_tokens`/`completion_tokens`),
-/// taking the per-field MAX of the two — same pattern, same reason, as
-/// [`reconcile_rest_totals`] below.
-///
-/// Without this, `cumulative_prompt_tokens`/`cumulative_completion_tokens`
-/// inherit a FABRICATED zero on two reachable paths: the loop's error arm
-/// (`runtime::main`) hardcodes every whole-dispatch counter in
-/// `metrics.json` to `0` — not a race, certain, every time the loop
-/// returns an `Err` — and a watchdog hard-kill leaves no `metrics.json` at
-/// all. Both land `TokenTotals::default()` from `read_token_totals`, an
-/// authoritative-looking `0` sitting beside this dispatch's own per-run
-/// token counts in the thousands on the exact `dispatch.error` record an
-/// operator reads to diagnose the failure — and this field's whole purpose
-/// is to be the trustworthy whole-task total.
-///
-/// The tailer's count is real work that happened whether or not
-/// `metrics.json` survived to say so. On a RESUMED dispatch that then
-/// errors, the tailer only saw THIS invocation's tokens, so the merged
-/// result can still undercount a true whole-task cumulative that included
-/// a prior invocation's seed — the same known limitation
-/// `reconcile_rest_totals` already carries, and strictly better than
-/// reporting zero next to a live model name. `reasoning`/`cached` are not
-/// reconciled: they aren't surfaced as cumulative fields today (see
-/// `build_dispatch_complete_payload`), so there is nothing here for the
-/// tailer's side to contribute.
-pub(crate) fn reconcile_token_totals(from_metrics: TokenTotals, from_tailer: TokenTotals) -> TokenTotals {
-    TokenTotals {
-        prompt: from_metrics.prompt.max(from_tailer.prompt),
-        completion: from_metrics.completion.max(from_tailer.completion),
-        reasoning: from_metrics.reasoning,
-        cached: from_metrics.cached,
-    }
-}
-
-/// (#2263) `turns` / `compactions` as `metrics.json` reports them — the
-/// WHOLE dispatch's cumulative count across every resume (the runtime
-/// seeds both from the checkpoint on a resume; see `RunCheckpoint`'s own
-/// doc). Surfaced on `dispatch.complete` as `cumulative_turns`/
-/// `cumulative_compactions`, alongside `total_turns`/`total_compactions`
-/// (this invocation's own count, from the live tailer) — never as a
-/// replacement for them. Same read pattern, same best-effort
-/// degrade-to-default posture as [`read_token_totals`].
-#[derive(Default, Debug, Clone, Copy)]
-pub struct CumulativeCounts {
-    pub turns: u32,
-    pub compactions: u32,
-}
-
-/// Read `turns` / `compactions` from the runtime's `metrics.json`, the
-/// same file [`read_token_totals`] reads. Best-effort: a missing/malformed
-/// file degrades to zero — this is observability enrichment, never a
-/// dispatch-failing path.
-pub fn read_cumulative_counts(out_dir: &Path) -> CumulativeCounts {
-    let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
-    let Ok(raw) = fs::read_to_string(&metrics_path) else {
-        return CumulativeCounts::default();
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return CumulativeCounts::default();
-    };
-    CumulativeCounts {
-        turns: v.get("turns").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
-        compactions: v.get("compactions").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
-    }
-}
-
-/// (#2263 review) Merge the post-hoc `metrics.json` read
-/// ([`read_cumulative_counts`]) with the live tailer's own per-invocation
-/// count (`TrajectorySummary::turns`/`compactions`), taking the per-field
-/// MAX of the two. See [`reconcile_token_totals`]'s doc, immediately above
-/// — same fabricated-zero failure (the loop's error arm hardcodes `turns`/
-/// `compactions` to `0`; a hard-kill leaves no file at all), same fix
-/// shape as the established [`reconcile_rest_totals`] precedent, same
-/// resumed-then-errored undercount limitation.
-pub(crate) fn reconcile_cumulative_counts(
-    from_metrics: CumulativeCounts,
-    from_tailer: CumulativeCounts,
-) -> CumulativeCounts {
-    CumulativeCounts {
-        turns: from_metrics.turns.max(from_tailer.turns),
-        compactions: from_metrics.compactions.max(from_tailer.compactions),
-    }
-}
-
-/// (#2094) Sum + count of the inter-turn rests the runtime took during
-/// this dispatch. Read primarily from `metrics.json`, same as
-/// [`TokenTotals`] — but see [`read_rest_totals`]'s own doc for the
-/// `trajectory.jsonl` fallback (finding 5) that source alone doesn't
-/// have. Best-effort degrade-to-zero when neither source is available
-/// (observability enrichment, never a dispatch failure).
-#[derive(Default, Debug, Clone, Copy)]
-pub struct RestTotals {
-    pub rest_ms: u64,
-    pub rests: u32,
-}
-
-/// Read `rest_ms` / `rests` from the runtime's `metrics.json` under
-/// `<out_dir>/.darkmux-runtime/`, the same way [`read_token_totals`] does.
-///
-/// (#2094 finding 5) Unlike token totals, rest totals have a second
-/// source: when `metrics.json` is absent, unparseable, or simply carries
-/// no `rest_ms` key at all (predates #2094; or the runtime never reached
-/// its own exit-time write — SIGKILL, Ctrl-C, a hard crash before the
-/// clean-exit path runs), fall back to SUMMING the `runtime.rest` events
-/// straight out of `trajectory.jsonl`. Those events are durably streamed
-/// to disk as each rest happens (`Trajectory::append_rest`), so this
-/// fallback covers exactly the case `metrics.json` structurally cannot: a
-/// dispatch that never got to write its own totals file. Both sources
-/// degrade to `RestTotals::default()` when neither is available —
-/// observability enrichment, never a dispatch failure.
-pub fn read_rest_totals(out_dir: &Path) -> RestTotals {
-    let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
-    let from_metrics = fs::read_to_string(&metrics_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .filter(|v| v.get("rest_ms").is_some());
-    if let Some(v) = from_metrics {
-        return RestTotals {
-            rest_ms: v.get("rest_ms").and_then(|n| n.as_u64()).unwrap_or(0),
-            rests: v.get("rests").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
-        };
-    }
-    sum_rest_totals_from_trajectory(out_dir)
-}
-
-/// (#2094 finding 5) The fallback source `read_rest_totals` reaches for
-/// when `metrics.json` can't answer: sum every `runtime.rest` event's
-/// `ms` out of `<out_dir>/.darkmux-runtime/trajectory.jsonl`. Malformed
-/// or unreadable lines are skipped rather than aborting the whole sum —
-/// the same lenient-on-read posture the live tailer uses on this file.
-fn sum_rest_totals_from_trajectory(out_dir: &Path) -> RestTotals {
-    let traj_path = out_dir.join(".darkmux-runtime").join("trajectory.jsonl");
-    let Ok(raw) = fs::read_to_string(&traj_path) else {
-        return RestTotals::default();
-    };
-    let mut totals = RestTotals::default();
-    for line in raw.lines() {
-        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if event.get("type").and_then(|t| t.as_str()) != Some("runtime.rest") {
-            continue;
-        }
-        let ms = event.get("ms").and_then(|n| n.as_u64()).unwrap_or(0);
-        totals.rest_ms = totals.rest_ms.saturating_add(ms);
-        totals.rests = totals.rests.saturating_add(1);
-    }
-    totals
-}
-
-/// (#2094 second round, finding 1) Merge the post-hoc `metrics.json` read
-/// ([`read_rest_totals`]) with the live tailer's own running accumulation
-/// (`TrajectorySummary::rest_ms`/`rests`, kept independently as each
-/// `runtime.rest` event streams in — see the doc at that field), taking
-/// the per-field MAX of the two.
-///
-/// `read_rest_totals` gates its own trajectory fallback on metrics.json
-/// KEY PRESENCE, not value — a `metrics.json` written with `rest_ms: 0`
-/// (an exit-time write that raced a SIGKILL or a hard crash, landing a
-/// zeroed struct on disk moments before the process died) reads as an
-/// authoritative zero and never reaches `sum_rest_totals_from_trajectory`
-/// at all, even though the tailer watched real rests happen live. The
-/// live tailer's total is the second, independent witness this case
-/// needs: max rather than "prefer one or the other" because either source
-/// can legitimately be the fuller one (metrics.json's clean-exit write
-/// can also capture a beat the tailer's last poll missed).
-pub(crate) fn reconcile_rest_totals(from_metrics: RestTotals, from_tailer: RestTotals) -> RestTotals {
-    RestTotals {
-        rest_ms: from_metrics.rest_ms.max(from_tailer.rest_ms),
-        rests: from_metrics.rests.max(from_tailer.rests),
-    }
-}
-
-/// (#2094 finding 8) The POST-CLAMP `turn_delay_ms` cadence this dispatch
-/// actually applied — `resolve_turn_delay_ms`'s output
-/// (`runtime/src/loop_runner.rs`), written by the runtime into
-/// `metrics.json` as `turn_delay_effective_ms` because only the runtime
-/// knows the clamped value. Preferred source: the metrics.json field
-/// itself, when present. Fallback (metrics.json absent, or present but
-/// missing this field — predates finding 8, or the runtime never reached
-/// its clean-exit write): `rest.rest_ms / rest.rests` when `rest.rests >
-/// 0` — a derived AVERAGE cadence, not the exact resolved constant, but
-/// the cheapest available approximation from data that already exists
-/// (`RestTotals`, itself already trajectory-fallback-covered by
-/// [`read_rest_totals`]). `None` when nothing is knowable at all (no
-/// metrics.json field AND zero rests — could mean turn_delay_ms was never
-/// configured, or the dispatch never reached a second turn).
-///
-/// (#2094 second round, finding 1) A metrics.json field of exactly `0`
-/// must NOT short-circuit the derived-average fallback when `rest.rests
-/// > 0` — same failure shape as `reconcile_rest_totals` guards against: a
-/// clean-exit write that raced a crash can land a zeroed struct on disk
-/// even though the dispatch genuinely rested. Only trust the metrics
-/// field's zero when there were also zero rests to derive an average
-/// from (a single-turn dispatch's honest `0`); otherwise fall through.
-pub fn read_turn_delay_effective_ms(out_dir: &Path, rest: RestTotals) -> Option<u64> {
-    let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
-    let from_metrics = fs::read_to_string(&metrics_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|v| v.get("turn_delay_effective_ms").and_then(|n| n.as_u64()));
-    if let Some(v) = from_metrics {
-        if v != 0 || rest.rests == 0 {
-            return Some(v);
-        }
-    }
-    if rest.rests > 0 {
-        Some(rest.rest_ms / u64::from(rest.rests))
-    } else {
-        None
-    }
 }
 
 /// (#2094 finding 4) Whether the operator's configured `turn_delay_ms`
@@ -8050,14 +7549,11 @@ fn host_window_json(
 #[allow(clippy::too_many_arguments)]
 fn build_dispatch_complete_payload(
     wall_ms: u64,
-    rest: RestTotals,
-    turn_delay_effective_ms: Option<u64>,
     stdout: &str,
     stderr: &str,
     exit_code: i32,
     summary: &TrajectorySummary,
-    tokens: TokenTotals,
-    cumulative: CumulativeCounts,
+    resume_seed: darkmux_trajectory::CheckpointCounts,
     remote_endpoint_raw_label: Option<&str>,
     host_stats: &HostStats,
     host_extras: &HostExtras,
@@ -8066,34 +7562,28 @@ fn build_dispatch_complete_payload(
     // (#2774) See `host_window_json`'s own doc.
     thermal_ladder: Option<crate::thermal_governor::ThermalLadderSummary>,
 ) -> serde_json::Value {
+    // Every count below is the fold of this execution's trajectory: the one
+    // reading of the one log, the same one the live records and the envelope
+    // quote. Its tokens are the sum of the very counts this execution's usage
+    // records carry, one per call.
+    let fold = &summary.fold;
     let mut payload = serde_json::json!({
         "runtime": "internal",
         "wall_ms": wall_ms,
-        // (#2094) Surfaced NEXT TO wall_ms per the issue's own framing — a
-        // rested run's wall clock must never be misread as a slow model.
-        "rest_ms": rest.rest_ms,
-        "rests": rest.rests,
-        // (2026-08-30 fleet-observability finding) Of `rest_ms` above, the
-        // portion attributable to a PACED rest (a manual operator pause or
-        // the thermal governor) — separating "cool-down by policy" from
-        // "paused by operator/governor" so a reader doesn't have to
-        // subtract `turn_delay_effective_ms * rests` themselves to notice a
-        // dispatch spent real time paused, not just resting between turns.
-        // Live-tailer-only (see `TrajectorySummary::paced_rest_ms`'s own
-        // doc) — NOT reconciled against metrics.json the way `rest_ms`/
-        // `rests` are, so a crash-during-write race can undercount this
-        // ONE derived field without touching the totals it's derived from.
-        "paced_rest_ms": summary.paced_rest_ms,
-        // (#2094 finding 8) null when unknowable (no metrics.json field
-        // AND zero rests) rather than a misleading 0.
-        "turn_delay_effective_ms": turn_delay_effective_ms,
+        // (#2094) Surfaced NEXT TO wall_ms: a rested run's wall clock must
+        // never be misread as a slow model.
+        "rest_ms": fold.rest_ms(),
+        "rests": fold.rest_count(),
+        // Of `rest_ms`, the PACED rests (a manual pause or the thermal
+        // governor), so a reader need not subtract the routine cool-down.
+        "paced_rest_ms": fold.paced_rest_ms(),
+        // (#2094 finding 8) The post-clamp cadence the runtime applied; null
+        // when it did not say (an errored loop, or a killed container).
+        "turn_delay_effective_ms": fold.complete.as_ref().and_then(|c| c.turn_delay_effective_ms),
         "stdout_chars": stdout.chars().count(),
         "stderr_chars": stderr.chars().count(),
-        // (#1042) On the error path, carry a bounded stderr TAIL so a failed
-        // dispatch is diagnosable from the flow stream alone (the internal
-        // path previously emitted only the char count — you couldn't see WHY
-        // it failed without shelling into the runner). null on success so
-        // clean records aren't bloated. Payload-additive — no FLOW_SCHEMA bump.
+        // (#1042) On the error path, a bounded stderr TAIL so a failed
+        // dispatch is diagnosable from the flow stream alone; null on success.
         "stderr_excerpt": if exit_code == 0 {
             None
         } else {
@@ -8101,89 +7591,35 @@ fn build_dispatch_complete_payload(
         },
         "exit_code": exit_code,
         "result_class": if exit_code == 0 { "ok" } else { "error" },
-        "total_turns": summary.turns,
-        "total_tools": summary.tool_calls,
-        // (#2169, payload-additive — no FLOW_SCHEMA bump, same precedent as
-        // `stderr_excerpt` above) Separates what `total_tools` always
-        // conflated: a dispatched call that came back `ok: false`
-        // (`tool_calls_failed`) from a structured call that never
-        // dispatched at all — split further (merge-gate MUST FIX 1) into
-        // WHY it never dispatched: `tool_calls_invalid_name` (no real tool
-        // is named this — the Devstral/`[TOOL_CALLS]`-marker pattern) vs
-        // `tool_calls_ungranted` (a REAL darkmux tool this role simply
-        // wasn't granted — a permission refusal, not a garbage name, and
-        // mixing the two would corrupt the Devstral-pattern signal this
-        // issue exists to surface). Reading "84 ok / 0 failed / 48
-        // malformed / 2 ungranted" off a run now takes
-        // `total_tools - tool_calls_failed` for ok, `tool_calls_failed`
-        // for failed, `tool_calls_invalid_name` for the not-a-tool
-        // pattern, and `tool_calls_ungranted` for the permission-refusal
-        // pattern — instead of the pre-#2169 shape where all four were
-        // one undifferentiated number.
-        "tool_calls_failed": summary.tool_calls_failed,
-        "tool_calls_invalid_name": summary.tool_calls_invalid_name,
-        "tool_calls_ungranted": summary.tool_calls_ungranted,
-        "total_compactions": summary.compactions,
+        "total_turns": fold.turns(),
+        "total_tools": fold.tool_calls(),
+        // (#2169) What `total_tools` alone conflated: a dispatched call that
+        // came back `ok: false`, versus structured calls that never ran,
+        // split by why (a name that is no tool, or a real tool the role was
+        // not granted).
+        "tool_calls_failed": fold.tool_calls_failed(),
+        "tool_calls_invalid_name": fold.tool_calls_invalid_name,
+        "tool_calls_ungranted": fold.tool_calls_ungranted,
+        "total_compactions": fold.compactions(),
         // (#2928, FLOW_SCHEMA_VERSION 1.62.0) The live channel's own cost for
-        // this execution: its cadence, samples sent and dropped, the time
-        // spent forwarding them and the runtime's silence ticks. The live
-        // samples themselves are never records.
+        // this execution. The live samples themselves are never records.
         "live": summary.live.to_json(),
-        // (#2263, FLOW_SCHEMA_VERSION 1.46.0) THIS DISPATCH's own token
-        // usage, summed live from the tailer's per-turn `model.completed`
-        // events — the SAME source `total_turns`/`total_compactions`
-        // above already trust, and this-invocation-only by construction
-        // (`host_out` is always a fresh per-dispatch tempdir; see
-        // `TrajectorySummary::prompt_tokens`'s own doc). Previously
-        // sourced from `metrics.json`'s `total_prompt_tokens`/
-        // `total_completion_tokens` (`tokens.prompt`/`tokens.completion`
-        // below) — the runtime's WHOLE-DISPATCH cumulative counters,
-        // seeded from the checkpoint on a resume — so a resumed
-        // dispatch's `prompt_tokens` here used to report the PRIOR
-        // invocation's tokens too, misattributed to whichever model this
-        // dispatch happens to run. See `cumulative_prompt_tokens` below
-        // for the whole-task total.
-        "prompt_tokens": summary.prompt_tokens,
-        "completion_tokens": summary.completion_tokens,
-        // (#2903) The provider's own total wins; the sum is the fallback,
-        // never the override. Resolved per turn by `turn_tokens_payload` and
-        // summed by the tailer, so this equals the per-turn records' total.
-        "total_tokens": summary.total_tokens,
-        // (#1444, payload-additive — FLOW_SCHEMA_VERSION 1.44.0) `null`
-        // when the field was never reported for this dispatch (every
-        // local LMStudio dispatch today) — never a fabricated `0`. Whether
-        // it sits inside `completion_tokens` above is provider-scoped
-        // (#1444 review); consumers must not derive one from the other.
-        // (#2263) Same tailer source as `prompt_tokens`/`completion_tokens`
-        // above, for the same reason — these were already this-run-only
-        // (never seeded across a resume, per #1444's own scope cut), so
-        // switching sources changes nothing on the resumed OR fresh path;
-        // it only buys the same crash-survival property `total_turns`
-        // already has (a live-streamed sum survives a SIGKILL that races
-        // metrics.json's own exit-time write).
-        "reasoning_tokens": summary.reasoning_tokens,
-        "cached_tokens": summary.cached_tokens,
-        // (#2263, additive, FLOW_SCHEMA_VERSION 1.46.0) The WHOLE TASK's
-        // cumulative counters across every resume — what `metrics.json`
-        // itself reports (seeded from the checkpoint, then accumulated),
-        // RECONCILED against the live tailer's own per-invocation count
-        // (`reconcile_token_totals`/`reconcile_cumulative_counts` — see
-        // their docs) so a metrics.json hardcoded to zero on the loop's
-        // error arm, or entirely absent after a hard-kill, cannot land a
-        // fabricated `0` here. Never read these next to `model` above as
-        // if they were this dispatch's own cost; that is exactly the
-        // corruption #2263 fixes. Present for "what has this whole task
-        // cost so far, across every model that has ever touched it" — AT
-        // LEAST the `total_turns`/`total_compactions`/`prompt_tokens`/
-        // `completion_tokens` fields above on every path (the
-        // reconciliation floor), and exactly equal whenever this dispatch
-        // was never resumed and metrics.json survived to report its own
-        // seed-free totals (nothing to have seeded, nothing for the floor
-        // to correct).
-        "cumulative_turns": cumulative.turns,
-        "cumulative_compactions": cumulative.compactions,
-        "cumulative_prompt_tokens": tokens.prompt,
-        "cumulative_completion_tokens": tokens.completion,
+        // (#2263) THIS execution's own tokens, never a prior resume's.
+        "prompt_tokens": fold.tokens.prompt,
+        "completion_tokens": fold.tokens.completion,
+        // (#2903) Each call's own total (the provider's, else its split),
+        // summed: never recomputed as prompt + completion over the run.
+        "total_tokens": fold.tokens.total,
+        // (#1444) `null` when no call reported the field, never a fabricated
+        // 0. Whether reasoning sits inside `completion_tokens` is
+        // provider-scoped; consumers must not derive one from the other.
+        "reasoning_tokens": fold.tokens.reasoning,
+        "cached_tokens": fold.tokens.cached,
+        // (#2263) The WHOLE task's counts across every resume: the checkpoint
+        // this execution resumed from, plus what it recorded. Equal to
+        // `total_turns`/`total_compactions` for a run that was never resumed.
+        "cumulative_turns": resume_seed.turns.saturating_add(fold.turns()),
+        "cumulative_compactions": resume_seed.compactions.saturating_add(fold.compactions()),
     });
     // (#1187 follow-up) Same field, same reason as `dispatch_start_payload` —
     // parity with `dispatch_remote`'s completion record, and needed by any
@@ -9454,24 +8890,9 @@ struct TailerState {
     /// We accumulate bytes here and decode per-line, after the
     /// trailing newline arrives.
     pending: Vec<u8>,
-    /// (#1221) `seq` of the last `model.completed` counted as a TURN.
-    ///
-    /// A checkpointed thinking turn produces many `model.completed` events —
-    /// one per API call — all carrying the SAME `seq`, because the runtime
-    /// deliberately does not spend a turn on a continuation. The host used to
-    /// re-derive its own count by incrementing on every event, so one long
-    /// thought read as a dozen turns on the seat-card meter, in
-    /// `dispatch.complete`'s `total_turns`, and in everything downstream. The
-    /// runtime's own envelope had the right number the whole time; only this
-    /// re-derivation was wrong.
-    last_counted_turn_seq: Option<u64>,
-    /// (#2863) The stream in progress: its `seq` and its start timestamp.
-    open_stream: Option<(Option<u64>, u64)>,
-    /// (#2863) Generation time so far per logical turn, summed over its
-    /// streams (a checkpoint continuation resumes the same `seq`). Emitted
-    /// on the turn's record as `generation_ms` and cleared, so a turn's time
-    /// never leaks into the next.
-    generation_ms_by_seq: std::collections::HashMap<u64, u64>,
+    /// (#2863) Turns whose generation time a `dispatch.turn` record already
+    /// carried.
+    generation_reported: std::collections::HashSet<u64>,
     session_id: String,
     role_id: String,
     model: String,
@@ -9614,30 +9035,24 @@ impl LiveSummary {
 /// pacing flow record"): a scripted `thermal` rest here is indistinguishable
 /// on the wire from a real one.
 fn runtime_rest_payload(
-    event: &serde_json::Value,
-    ms: u64,
+    r: &darkmux_trajectory::Rest,
     rest_ms: u64,
     rests: u32,
-    reason: &str,
     provenance: &crate::host_source::Provenance,
 ) -> serde_json::Value {
     let mut payload = serde_json::json!({
-        "ms": ms,
-        "turn": event.get("seq"),
+        "ms": r.ms,
+        "turn": r.seq,
         "rest_ms": rest_ms,
         "rests": rests,
-        "reason": reason,
+        "reason": String::from(r.reason.clone()),
     });
     // (2026-08-30 fleet-observability finding) The pace file's own `state`
-    // (an OS thermal-state name when the governor wrote the pause) —
-    // forwarded only when the runtime's event actually carries one (a plain
-    // turn-delay rest never does; an older runtime image predating this
-    // doesn't either), rather than stamping a `null` a reader has to learn
-    // means "not applicable."
-    if let Some(state) = event.get("state") {
-        if !state.is_null() {
-            payload["state"] = state.clone();
-        }
+    // (an OS thermal-state name when the governor wrote the pause), only
+    // when the rest carries one (a plain turn-delay rest never does), rather
+    // than a `null` a reader has to learn means "not applicable."
+    if let Some(state) = &r.state {
+        payload["state"] = serde_json::json!(state);
     }
     crate::host_source::stamp_with(provenance, &mut payload);
     payload
@@ -9659,9 +9074,7 @@ impl TailerState {
             trajectory_path,
             offset: 0,
             pending: Vec::new(),
-            last_counted_turn_seq: None,
-            open_stream: None,
-            generation_ms_by_seq: std::collections::HashMap::new(),
+            generation_reported: std::collections::HashSet::new(),
             session_id,
             role_id,
             model,
@@ -9730,13 +9143,12 @@ impl TailerState {
     /// send whatever it releases. Never a flow record. `build` makes the
     /// payload, so a dispatch with no channel pays nothing, and building it
     /// is counted in `sampler_us` with everything else the channel does here.
-    fn live_model(&mut self, event: &serde_json::Value, build: fn(&serde_json::Value) -> serde_json::Value) {
+    fn live_model(&mut self, ts: u64, build: impl FnOnce() -> serde_json::Value) {
         if self.live.is_none() {
             return;
         }
         let t0 = Instant::now();
-        let ts = event.get("ts").and_then(|v| v.as_u64()).unwrap_or_else(crate::usage::unix_ms_now);
-        let released = self.live.as_mut().map(|l| l.gate.offer(ts, build(event))).unwrap_or_default();
+        let released = self.live.as_mut().map(|l| l.gate.offer(ts, build())).unwrap_or_default();
         for p in released {
             let sample = self.model_sample(p);
             if let Some(live) = self.live.as_mut() {
@@ -9886,9 +9298,7 @@ impl TailerState {
             trajectory_path,
             offset: 0,
             pending: Vec::new(),
-            last_counted_turn_seq: None,
-            open_stream: None,
-            generation_ms_by_seq: std::collections::HashMap::new(),
+            generation_reported: std::collections::HashSet::new(),
             session_id,
             role_id,
             model,
@@ -9954,769 +9364,399 @@ impl TailerState {
         }
     }
 
+    /// One trajectory line: parsed once into the shared event type, folded
+    /// into this execution's counts (`darkmux_trajectory::TrajectoryFold`, the
+    /// one reading every surface quotes), then turned into whatever flow
+    /// records and deadline resets it calls for. A line that does not parse
+    /// (a partial write) is dropped here and by every other reader alike.
     fn handle_event(&mut self, line: &str) {
-        let event: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => return,
-        };
-        let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        match event_type {
-            "model.completed" => {
-                // Count TURNS, not API calls. Same `seq` = the same logical
-                // turn resuming after a checkpoint.
-                let seq = event.get("seq").and_then(|v| v.as_u64());
-                let is_new_turn = seq.is_none() || seq != self.last_counted_turn_seq;
-                if is_new_turn {
-                    self.summary.turns += 1;
-                    self.last_counted_turn_seq = seq;
-                }
-                let payload = serde_json::json!({
-                    "turn_seq": event.get("seq"),
-                    "finish_reason": cap_json_str(event.get("finish_reason"), MAX_TRAJ_FIELD_BYTES),
-                    "tool_calls_count": event.get("tool_calls").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
-                    "usage": event.get("usage"),
-                    // (#1483) The AUTHORITATIVE running turn count for this
-                    // dispatch (monotonic, 1-based). The mission-graph viewer's
-                    // live seat-card meter uses this as the running tick so a
-                    // page opened MID-dispatch reads the true count immediately
-                    // rather than under-counting from the tail-from-now stream.
-                    "turns_so_far": self.summary.turns,
-                });
-                // (#1221) ONE record per LOGICAL turn, emitted when that turn
-                // ENDS. A `length` finish mid-checkpointing is a continuation,
-                // not a turn boundary — the loop uses exactly this test to
-                // decide whether to run its terminal fold.
-                //
-                // This emit used to be unconditional while only the COUNTER was
-                // deduped, so a single long reasoning turn wrote one
-                // `dispatch.turn` record per API call. Observed: 66 turn
-                // records for a run whose `turns` was 1, each correctly stamped
-                // `turn_seq: 1`, rendered by the viewer as 66 separate turns
-                // interleaved with the checkpoints. The summary said 1 and the
-                // stream said 66, and the stream is what the operator reads.
-                //
-                // Continuations are not silent — they emit `dispatch.checkpoint`,
-                // which is the accurate vocabulary for what they are, plus the
-                // per-call `telemetry.tokens` record below (unchanged: billed
-                // usage is genuinely per CALL and the viewer sums it).
-                let finish_is_terminal = event
-                    .get("finish_reason")
-                    .and_then(|v| v.as_str())
-                    .map(|f| f != "length")
-                    .unwrap_or(true);
-                if finish_is_terminal {
-                    // (#2863) The turn's model time (request sent to stream end), from the
-                    // trajectory's millisecond stream bookends. Absent (not
-                    // zero) when no stream was recorded.
-                    let mut payload = payload;
-                    if let Some(ms) = seq.and_then(|s| self.generation_ms_by_seq.remove(&s)) {
-                        payload["generation_ms"] = serde_json::json!(ms);
-                    }
-                    // (#2963, FLOW 1.64.0) Each call's file, so the viewer
-                    // names the file of the call running now.
-                    if let Some(paths) = turn_tool_paths(&event) {
-                        payload["tool_paths"] = paths;
-                    }
-                    // (#2963, FLOW 1.64.0) Each call's tool name, same order,
-                    // so the word and the icon name the call running now.
-                    if let Some(names) = turn_tool_names(&event) {
-                        payload["tool_names"] = names;
-                    }
-                    self.emit(darkmux_flow::FlowAction::DispatchTurn, darkmux_flow::Level::Info, payload);
-                }
-                // (#795) Per-turn token telemetry — the live "tokens
-                // off-meter" odometer climbs DURING the dispatch, not just
-                // at complete. Each turn's billed usage is its own
-                // `telemetry.tokens` record; the viewer SUMS records, and
-                // per-turn billed prompt tokens genuinely sum to THIS
-                // DISPATCH's own totals (each turn re-sends context — same
-                // accumulator the runtime uses).
-                //
-                // (#2263) That "sums to the runtime's own totals" claim
-                // used to say "metrics.json totals" unconditionally — true
-                // for a fresh dispatch, but metrics.json's
-                // `total_prompt_tokens`/`total_completion_tokens` are
-                // SEEDED from the checkpoint on a resume (the runtime's
-                // own whole-dispatch cumulative counters), so they no
-                // longer equal the sum of THIS process's own per-turn
-                // events. `self.summary.prompt_tokens`/`completion_tokens`
-                // below accumulate straight from these events instead —
-                // this-invocation-only by construction (`host_out` is
-                // always a fresh tempdir) — and are what
-                // `build_dispatch_complete_payload` now reports as
-                // `prompt_tokens`/`completion_tokens`, replacing the old
-                // metrics.json-sourced (cumulative, seeded) totals.
-                //
-                // The former at-complete aggregate record is gone so
-                // nothing double-counts. A turn whose event carries no
-                // `usage` accumulates nothing here (nor in metrics.json)
-                // but still gets its record, per #2902 below.
-                // (#2902 step 1a) ONE record per call, usage or not: a turn
-                // whose event carried no usage still emits, marked
-                // `token_source: "absent"` with no counts, so it adds zero
-                // to every sum below and to every reader's.
-                {
-                    let tokens_payload = turn_tokens_payload(
-                        &event,
-                        &self.role_id,
-                        &self.model,
-                        self.endpoint.as_deref().unwrap_or_default(),
-                        self.endpoint_id.as_deref(),
-                    );
-                    // (#2263 review, minor) `u32::try_from(..).unwrap_or(u32::MAX)`,
-                    // not `as u32` — an `as` cast WRAPS on a u64 that exceeds
-                    // u32::MAX, silently truncating instead of clamping.
-                    // Unreachable with a real token count, but the
-                    // `.saturating_add` right next to each of these already
-                    // signals "clamp, never wrap" as this code's own
-                    // convention; the cast feeding it should match.
-                    self.summary.prompt_tokens = self.summary.prompt_tokens.saturating_add(
-                        tokens_payload
-                            .get("prompt_tokens")
-                            .and_then(|n| n.as_u64())
-                            .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
-                            .unwrap_or(0),
-                    );
-                    self.summary.completion_tokens =
-                        self.summary.completion_tokens.saturating_add(
-                            tokens_payload
-                                .get("completion_tokens")
-                                .and_then(|n| n.as_u64())
-                                .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
-                                .unwrap_or(0),
-                        );
-                    // (#2903) The per-turn total, precedence already applied
-                    // by `turn_tokens_payload` — never recomputed here.
-                    self.summary.total_tokens = self.summary.total_tokens.saturating_add(
-                        tokens_payload
-                            .get("total_tokens")
-                            .and_then(|n| n.as_u64())
-                            .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
-                            .unwrap_or(0),
-                    );
-                    if let Some(rt) =
-                        tokens_payload.get("reasoning_tokens").and_then(|n| n.as_u64())
-                    {
-                        self.summary.reasoning_tokens = Some(
-                            self.summary
-                                .reasoning_tokens
-                                .unwrap_or(0)
-                                .saturating_add(u32::try_from(rt).unwrap_or(u32::MAX)),
-                        );
-                    }
-                    if let Some(ct) = tokens_payload.get("cached_tokens").and_then(|n| n.as_u64())
-                    {
-                        self.summary.cached_tokens = Some(
-                            self.summary
-                                .cached_tokens
-                                .unwrap_or(0)
-                                .saturating_add(u32::try_from(ct).unwrap_or(u32::MAX)),
-                        );
-                    }
-                    self.emit_telemetry("tokens", darkmux_flow::FlowAction::TelemetryTokens, tokens_payload);
-                }
-            }
-            "tool.completed" => {
-                self.summary.tool_calls += 1;
-                // (#464) Tool completion is the second proof-of-work signal
-                // (alongside compaction). Reset the inactivity deadline:
-                // the model is actively producing or inspecting state,
-                // which means the dispatch is alive in a way the deadline
-                // should respect. Pathological tool patterns (cycle on
-                // same args, cascade of failures, edit-drift on same file,
-                // reasoning loops) are caught by their dedicated detectors
-                // — per-mole-hole guards make this generous reset safe.
-                //
-                // Operator-stated principle (Beat 54): "at least one guard
-                // per mole hole." Read alone isn't proof-of-work in
-                // isolation, but read patterns that look like spinning
-                // are caught by the cycle detector. Edit drift is caught
-                // by the cadence-drift detector (post-#465 redesign).
-                // The deadline trusts activity; the detectors catch
-                // struggle.
-                //
-                // (#469) ONLY a successful tool call resets the deadline.
-                // A model fast-failing with varying tool calls (different
-                // args each time, so the cycle detector misses; failures
-                // interleaved with reads, so the failure-rate detector's
-                // consecutive-count never trips) would otherwise keep the
-                // deadline alive indefinitely. The `ok` field closes that
-                // loophole. Backward-compat: events predating the field
-                // (no `ok`) are treated as success so old trajectories
-                // behave as before.
-                let tool_ok = event
-                    .get("ok")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                // (#2169) A dispatched-and-failed call is a DIFFERENT
-                // bucket from an invalid-name call that never dispatched
-                // at all (`tool_calls_invalid_name`, incremented in the
-                // detector-event arm above). Both used to be
-                // indistinguishable inside the single `total_tools`
-                // count.
-                if !tool_ok {
-                    self.summary.tool_calls_failed = self.summary.tool_calls_failed.saturating_add(1);
-                }
-                if tool_ok {
-                    if let Some(deadline) = &self.inactivity_deadline {
-                        let new_deadline =
-                            Instant::now() + Duration::from_secs(self.inactivity_secs);
-                        *lock_deadline(deadline) = new_deadline;
-                    }
-                }
-                // (#2265 review) Bound ONCE, then share. The flow record and
-                // the finding record must hold the SAME bytes for an emission
-                // — otherwise an over-cap emission is whole or clipped
-                // depending on which producer wrote it, since `finding sync`
-                // replays the (clipped) flow record while the tailer would
-                // have stored the raw one.
-                let bounded_emission = bound_emitted(event.get("emitted"));
-                let mut payload = serde_json::json!({
-                    "tool_seq": event.get("tool_seq"),
-                    // (#1483) The AUTHORITATIVE running tool-call count for this
-                    // dispatch (monotonic, 1-based) — the viewer's live seat-card
-                    // meter ticks tool-calls off this, same mid-dispatch-open
-                    // robustness as `turns_so_far` on `dispatch.turn`.
-                    "tool_calls_so_far": self.summary.tool_calls,
-                    "tool_name": cap_json_str(event.get("tool_name"), MAX_TRAJ_FIELD_BYTES),
-                    // The actual arguments (search pattern / path / command) so the
-                    // viewer can show WHAT the model did, not just that it acted.
-                    // Already capped in the runtime (MAX_TOOL_ARGS_CHARS); re-bound
-                    // here defensively against MAX_TRAJ_FIELD_BYTES for the flow record.
-                    "args": cap_json_str(event.get("args"), MAX_TRAJ_FIELD_BYTES),
-                    "args_chars": event.get("args_chars"),
-                    // (#2272) An accepted `create_finding`'s emission, whole
-                    // (bounded loudly), plus its 1-based ordinal within this
-                    // dispatch. A runtime that knows the field sends it on
-                    // EVERY tool.completed — `null` for a non-emitting call —
-                    // so it is forwarded exactly as sent; a runtime that
-                    // predates the field (a stale local `darkmux-runtime:
-                    // latest`) sends no key, and the record then has no key,
-                    // so "nothing emitted" and "the image cannot emit" stay
-                    // distinguishable downstream. The crawl's product rides
-                    // THIS, never the `args` preview above.
-                    "emitted": bounded_emission.clone(),
-                    "emit_seq": event.get("emit_seq"),
-                    "result_chars": event.get("result_chars"),
-                    // (#2007) The result itself, so a failed tool call can be
-                    // diagnosed from the record instead of only counted. Bound
-                    // is `MAX_TOOL_RESULT_BYTES`, not the 4 KiB used for the
-                    // short fields above — see that constant for why the two
-                    // differ and why `result_chars` above stays the true
-                    // length regardless of what this carries.
-                    "result": cap_json_result(event.get("result"), MAX_TOOL_RESULT_BYTES),
-                    "ok": tool_ok,
-                    // (#2008) The three-way outcome the runtime classified,
-                    // forwarded verbatim. `ok` answers "did the tool work"
-                    // (true for a red test); these say WHICH of the three
-                    // things happened, so the viewer can render "exit 1"
-                    // rather than a bare cross, and so an auditor can tell a
-                    // reported result from a broken instrument.
-                    "outcome": event.get("outcome"),
-                    "exit_code": event.get("exit_code"),
-                    "failure_reason": cap_json_str(
-                        event.get("failure_reason"), MAX_TRAJ_FIELD_BYTES),
-                });
-                if event.get("emitted").is_none() {
-                    // (#2272) The runtime sent no `emitted` key at all: it
-                    // predates the field. Drop both keys rather than forward
-                    // `null`, so a stale image is visible as an ABSENT field
-                    // and never reads as "this call emitted nothing".
-                    if let Some(map) = payload.as_object_mut() {
-                        map.remove("emitted");
-                        map.remove("emit_seq");
-                    }
-                }
-                self.emit(darkmux_flow::FlowAction::DispatchTool, darkmux_flow::Level::Info, payload);
-                // (#2265) The tailer is the LIVE producer of the finding
-                // record. `finding sync` replays the same stream for anything
-                // this missed (an older binary, a killed process); both go
-                // through the same write-once materializer, so the two
-                // producers cannot disagree about what a finding is.
-                self.materialize_finding(&event, tool_ok, &bounded_emission);
-                // (#2265) The mod channel's live producer, the same shape for
-                // the same reasons. The two are separate calls rather than one
-                // dispatcher because they build different records from
-                // different stores, and neither may fail the dispatch.
-                self.materialize_mod(&event, tool_ok, &bounded_emission);
-            }
-            "compaction.start" => {
-                // (#2915) The runtime is about to call its compactor: one
-                // lean `utility.start` (job `compaction`), attributed to the
-                // compactor like the call's usage record (contract 8), inside
-                // the execution it serves. The viewer reads "compacting" from
-                // here until that usage record lands. Touches nothing in
-                // `self.summary`, and does not reset the inactivity deadline
-                // (a start is not proof of progress; the install is).
-                let model = event_model_id(&event, "requested_model").or_else(|| self.compactor_model.clone());
-                let model = model.unwrap_or_default();
-                // (#2915 review, MUST 1 / C4) One job id per compaction
-                // ATTEMPT in this execution (a refused attempt can repeat its
-                // generation), echoed on every call's usage record below;
-                // the runtime event's own ms `ts` is the start time.
-                self.compaction_attempts += 1;
-                let job_id = format!("{}:compaction:{}", self.session_id, self.compaction_attempts);
-                let started_at_ms = event.get("ts").and_then(|v| v.as_u64()).unwrap_or_else(crate::usage::unix_ms_now);
-                self.open_compaction = Some((job_id.clone(), started_at_ms));
-                let mut payload = crate::usage::utility_start_payload(
-                    crate::usage::UtilityJobKind::Compaction,
-                    &job_id,
-                    &model,
-                    Some(&self.session_id),
-                    self.inactivity_secs,
-                    started_at_ms,
-                );
-                payload["generation"] = event.get("generation").cloned().unwrap_or(serde_json::Value::Null);
-                // (#2928) The same start on the live channel, at once: a
-                // compaction shorter than the durable stream's delivery
-                // window is otherwise never seen open.
-                let mut live = payload.clone();
-                live["event"] = serde_json::json!("start");
-                live["serves"] = serde_json::json!(self.session_id);
-                self.live_utility(live, Some(&model));
-                self.emit_telemetry_as(
-                    COMPACTOR_ROLE,
-                    Some(&model).filter(|m| !m.is_empty()).map(String::as_str),
-                    crate::usage::UTILITY_SOURCE,
-                    darkmux_flow::FlowAction::UtilityStart,
-                    payload,
-                );
-            }
-            "compaction.call" => {
-                // (#2902 step 1b) One runtime COMPACTOR call, installed or
-                // refused: exactly one usage record, attributed to the
-                // compactor (record `handle` + `model`), never to the
-                // specialist this dispatch is for (CLAUDE.md contract 8,
-                // #1974). Deliberately touches nothing in `self.summary`:
-                // the `dispatch complete` totals are the specialist's own,
-                // and a compactor call is neither a turn nor a compaction
-                // (the `compaction` event below counts installs).
-                let payload = compaction_call_tokens_payload(
-                    &event,
-                    self.compactor_model.as_deref(),
-                    self.compactor_endpoint.as_deref().unwrap_or_default(),
-                    &self.role_id,
-                    &self.model,
-                );
-                // (#2915 review) The attempt this call served: its job id
-                // and ms times (an older runtime writes no start: no id).
-                let mut payload = payload;
-                if let Some((job_id, started_at_ms)) = self.open_compaction.clone() {
-                    let ended_at_ms = event.get("ts").and_then(|v| v.as_u64()).unwrap_or_else(crate::usage::unix_ms_now);
-                    crate::usage::stamp_utility_end(&mut payload, &job_id, started_at_ms, ended_at_ms);
-                    // (#2928) The job's end on the live channel, at once.
-                    let live = serde_json::json!({
-                        "event": "end",
-                        "job": crate::usage::UtilityJobKind::Compaction,
-                        "job_id": job_id,
-                        "ended_at_ms": ended_at_ms,
-                        "duration_ms": ended_at_ms.saturating_sub(started_at_ms),
-                    });
-                    let m = payload["requested_model"].as_str().map(str::to_string);
-                    self.live_utility(live, m.as_deref());
-                }
-                let model = payload["requested_model"].as_str().map(str::to_string);
-                self.emit_telemetry_as(
-                    COMPACTOR_ROLE,
-                    model.as_deref(),
-                    crate::usage::USAGE_SOURCE,
-                    darkmux_flow::FlowAction::TelemetryTokens,
-                    payload,
-                );
-            }
-            "compaction" => {
-                self.summary.compactions += 1;
-                // (#457) Reset the inactivity deadline shared with the
-                // watchdog thread. A successful compaction is observable
-                // proof the dispatch is alive (compactor model ran,
-                // primary accepted new state, turns continued). Without
-                // this reset, productive dispatches that legitimately
-                // need many minutes between compactions get killed by
-                // the absolute-deadline shape we replaced.
-                if let Some(deadline) = &self.inactivity_deadline {
-                    let new_deadline =
-                        Instant::now() + Duration::from_secs(self.inactivity_secs);
-                    *lock_deadline(deadline) = new_deadline;
-                }
-                // (#2794) Name the model that actually did this work.
-                //
-                // `emit` stamps the record's `model` with `self.model` — the
-                // SPECIALIST this dispatch is for. Compaction is not the
-                // specialist's work: it is a SUB-EXECUTION performed by the
-                // utility agent bound to `internal.utility`, typically a 4B
-                // model where the specialist is 35B. Confirmed live on a
-                // dogfood run, where 44 compaction records all carried
-                // `handle: "coder"` and the 35B's id while a 4B did the work,
-                // and the compactor's identity appeared in NONE of the three
-                // artifacts — not the flow record, not `compaction-N.json`'s
-                // metadata, not the trajectory event.
-                //
-                // CLAUDE.md's work-unit contract is explicit that a utility
-                // invocation inside a role execution is "attributed to their
-                // OWN role and model, never blended into the primary's
-                // metrics", and names this emitter as the violator.
-                //
-                // The record-level `model` stays the specialist: it is the
-                // parent execution's identity, four consumers key on it, and
-                // the stream is append-only. The payload carries the
-                // sub-execution's model alongside, so cost attribution has
-                // the number it was missing rather than a wrong one.
-                let payload = serde_json::json!({
-                    "generation": event.get("generation"),
-                    "before_messages": event.get("before_messages"),
-                    "after_messages": event.get("after_messages"),
-                    "summary_chars": event.get("summary_chars"),
-                    "compactor_model": self.compactor_model,
-                    "parent_model": self.model,
-                });
-                self.emit(darkmux_flow::FlowAction::DispatchCompaction, darkmux_flow::Level::Info, payload);
-                // (#557 slice 3) Compaction token telemetry — the drop in
-                // the context-occupancy sawtooth. The runtime now carries
-                // `tokens_before` (EXACT prompt-token count that triggered
-                // compaction) + `tokens_after` (chars/4 estimate of the
-                // compacted buffer) on the compaction event; forward them
-                // as a `source=compaction` telemetry record the viewer
-                // reads as `{from, to}`.
-                self.emit_telemetry("compaction", darkmux_flow::FlowAction::TelemetryCompaction, serde_json::json!({
-                    "from": event.get("tokens_before"),
-                    "to": event.get("tokens_after"),
-                    // (#2794) Same correction as the record above: the tokens
-                    // in this telemetry were spent by the COMPACTOR, and a
-                    // consumer summing per-model cost needs to know that.
-                    "compactor_model": self.compactor_model,
-                }));
-            }
-            // flow-action-guard:allow — a runtime trajectory event type, not a flow action
-            "dispatch.checkpoint" => {
-                // (#1221) A checkpoint is the harness deciding, mid-turn,
-                // whether the model keeps thinking. Without its own record the
-                // viewer shows only the `dispatch.turn` each underlying API
-                // call produces, so one long thought reads as a dozen turns
-                // with nothing saying why — which is exactly what an operator
-                // watching a live dispatch reported. `verdict` is the decision
-                // (`continue` / `conclude`) and `tail_ratio` is the measured
-                // repetition of the accumulated reasoning it was made on, so
-                // the surface shows the judgment AND its evidence.
-                let payload = serde_json::json!({
-                    "turn_seq": event.get("seq"),
-                    "checkpoint": event.get("checkpoint"),
-                    "slice_tokens": event.get("slice_tokens"),
-                    "tail_ratio": event.get("tail_ratio"),
-                    "verdict": event.get("verdict"),
-                    // (#2165) Which bound the runtime judged this checkpoint
-                    // against + its provenance — forwarded VERBATIM from the
-                    // runtime's own trajectory event (see `bounds::BoundRef`
-                    // on the runtime side). A checkpoint only ever fires on
-                    // the reasoning check-in interval, but a remote reader
-                    // over the tailnet reads the FLOW STREAM, not
-                    // trajectory.jsonl — without this, the #2165 fix never
-                    // reached the surface the miss actually happened on.
-                    "bound": event.get("bound"),
-                    // (#2887) `policy` (off/record/warn/conclude; `enforce` /
-                    // `observe` in runs recorded before 4.0) and
-                    // `would_conclude` (the judge's verdict BEFORE policy is
-                    // applied) already ride the runtime's own trajectory
-                    // event (`trajectory::append_checkpoint`) but were
-                    // dropped here — the SIGNALS card could not tell an
-                    // enforced conclusion from an observe-mode "would have
-                    // concluded", nor count either as a flag at all. Forward
-                    // both verbatim, same as `bound` above.
-                    "policy": event.get("policy"),
-                    "would_conclude": event.get("would_conclude"),
-                });
-                // (#1955) Reduce as we go: the caller wants "13 checkpoints,
-                // one concluded, final ratio 0.29", never 65 records.
-                self.summary.record_checkpoint(
-                    event.get("tail_ratio").and_then(|v| v.as_f64()),
-                    event.get("verdict").and_then(|v| v.as_str()) == Some("conclude"),
-                );
-                self.emit(darkmux_flow::FlowAction::DispatchCheckpoint, darkmux_flow::Level::Info, payload);
-                if let Some(w) = degeneracy_warning(event_type, &event) {
-                    self.surface_degeneracy_warning(w);
-                }
-            }
-            "model.reasoning" => {
-                // The runtime emits these when it parses <think>...</think>
-                // blocks from the assistant content (#204). The full
-                // reasoning text rides in payload so the flow viewer can
-                // render a collapse/expand block. Capped at
-                // MAX_REASONING_TEXT_BYTES so a single huge thinking
-                // session can't blow up downstream storage. (#231 / S6)
-                let reasoning_text = cap_reasoning_text(event.get("reasoning_text"));
-                let payload = serde_json::json!({
-                    "turn_seq": event.get("seq"),
-                    "reasoning_chars": event.get("reasoning_chars"),
-                    "reasoning_text": reasoning_text,
-                    "reasoning_format": event.get("reasoning_format").unwrap_or(&serde_json::Value::String("inline-think-tags".into())),
-                });
-                self.emit(darkmux_flow::FlowAction::DispatchReasoning, darkmux_flow::Level::Info, payload);
-            }
-            // flow-action-guard:allow — a runtime trajectory event type, not a flow action
-            "dispatch.feedback.injected" => {
-                // (#454 feedback-injection scaffold) Forward the new
-                // runtime trajectory event into the flow stream so
-                // fleet observability surfaces (flow tail, topology
-                // viewer, audit chain) can see when the runtime's
-                // meta-awareness channel delivered a system message
-                // to the model. Companion to the per-signal flow
-                // forwarders (cycle/cascade trajectory events today
-                // do NOT have flow forwarders, but feedback.injected
-                // is the model-visible delivery event that operators
-                // monitoring fleet behavior most want surfaced).
-                let payload = serde_json::json!({
-                    "turn_seq": event.get("seq"),
-                    "message_count": event.get("message_count"),
-                    "signal_kinds": event.get("signal_kinds"),
-                });
-                self.emit(darkmux_flow::FlowAction::DispatchFeedbackInjected, darkmux_flow::Level::Info, payload);
-            }
-            // (#2863) Stream bookends: accumulate each logical turn's
-            // model time for its `dispatch.turn` record.
-            "model.streaming.start" => {
-                let seq = event.get("seq").and_then(|v| v.as_u64());
-                if let Some(ts) = event.get("ts").and_then(|v| v.as_u64()) {
-                    self.open_stream = Some((seq, ts));
-                }
-                // (#2889) The opening heartbeat: `generated_chars: 0` plus the
-                // request's size, written before the request is sent, so the
-                // viewer can say how much the model is reading while it
-                // reads. Always emitted (never rate-limited away: a turn
-                // starting within 2s of the last heartbeat would otherwise
-                // lose its only prompt size), and never proof of work — a
-                // request going out says nothing about the model producing.
-                // (#2889 review, M2) It must not consume the chunk rate gate
-                // either: stamping `last_heartbeat_at` here swallowed the
-                // turn's first real chunk (no heartbeat, no deadline reset),
-                // so a turn under 2 s never showed generation. Instead the
-                // next real chunk is owed an emission.
-                self.chunk_owed = true;
-                self.summary.heartbeats += 1;
-                self.emit(
-                    darkmux_flow::FlowAction::DispatchTurnHeartbeat,
-                    darkmux_flow::Level::Info,
-                    opening_heartbeat_payload(&event),
-                );
-                // (#2928) The opener is a transition: it goes live at once.
-                self.live_model(&event, opening_heartbeat_payload);
-            }
-            "model.streaming.end" => {
+        use darkmux_trajectory::TrajectoryEvent as E;
+        let Some(event) = darkmux_trajectory::parse_line(line) else { return };
+        self.summary.fold.apply(&event);
+        match &event {
+            E::ModelCompleted(m) => self.on_model_completed(m),
+            E::ToolCompleted(t) => self.on_tool_completed(t),
+            E::CompactionStart(c) => self.on_compaction_start(c),
+            E::CompactionCall(c) => self.on_compaction_call(c),
+            E::Compaction(c) => self.on_compaction(c),
+            E::Checkpoint(c) => self.on_checkpoint(c),
+            E::Reasoning(r) => self.on_reasoning(r),
+            E::FeedbackInjected(f) => self.on_feedback_injected(f),
+            E::StreamingStart(s) => self.on_stream_start(s),
+            E::StreamingEnd(_) => {
                 // (#2928) The stream ended: the live sampler stops refreshing.
                 if let Some(live) = self.live.as_mut() {
                     live.gate.end_stream();
                 }
-                let seq = event.get("seq").and_then(|v| v.as_u64());
-                let end = event.get("ts").and_then(|v| v.as_u64());
-                if let (Some((open_seq, start)), Some(end), Some(s)) = (self.open_stream.take(), end, seq) {
-                    if open_seq == Some(s) && end >= start {
-                        let e = self.generation_ms_by_seq.entry(s).or_insert(0);
-                        *e = e.saturating_add(end - start);
-                    }
+            }
+            E::Partial(p) => self.on_stream_tick(Chunk::of_partial(p)),
+            E::ToolCallWriting(w) => self.on_stream_tick(Chunk::of_writing(w)),
+            E::GateObservation(g) => {
+                self.on_detector(&event);
+                if let Some(w) = gate_degeneracy_warning(g) {
+                    self.surface_degeneracy_warning(w);
                 }
             }
-            // (#2889) `model.tool_call.writing` is the runtime's tick while
-            // the endpoint is silent and a tool call has been named. It rides
-            // the same coalescing as a chunk, so the heartbeat cadence the
-            // viewer sees is unchanged; it is NOT proof of work (see below).
-            "model.partial" | "model.tool_call.writing" => {
-                let is_chunk = event_type == "model.partial";
-                // (#2928) The live channel samples every chunk and tick on
-                // its own cadence, independent of the durable 2 s gate
-                // below, and writes no flow record.
-                self.live_model(&event, heartbeat_payload);
-                // Per-SSE-chunk events coalesced into a coarser heartbeat
-                // (rate-limited via HEARTBEAT_MIN_INTERVAL). Keeps
-                // topology edges animated during long streaming turns
-                // without flooding the flow stream + audit chain. (#231)
-                let now = Instant::now();
-                let window_open = match self.last_heartbeat_at {
-                    None => true,
-                    Some(prev) => now.duration_since(prev) >= HEARTBEAT_MIN_INTERVAL,
-                };
-                // (#2889 review, M2) A real chunk after an opener or a tick
-                // always emits: those two are not proof of work, so they
-                // must never be what keeps the next proof of work from
-                // resetting the deadline. Ticks themselves stay coalesced.
-                let should_emit = window_open || (is_chunk && self.chunk_owed);
-                if should_emit {
-                    self.last_heartbeat_at = Some(now);
-                    // A chunk settles the debt; a tick creates it.
-                    self.chunk_owed = !is_chunk;
-                    self.summary.heartbeats += 1;
-                    // (#1222 shakedown-3) Streamed chunks are the third
-                    // proof-of-work signal. A model.partial event only fires
-                    // when the model actually delivered tokens — transport-
-                    // level liveness, exactly what the watchdog exists to
-                    // check (a wedged server/network/container delivers no
-                    // chunks, so true hangs still die). Two dispatches were
-                    // killed mid-generation at 8+ minutes of LEGITIMATE
-                    // reasoning under a raised per-call cap because only
-                    // tool.completed/compaction reset the deadline.
-                    // Boundedness is not this guard's job (per-mole-hole,
-                    // #464): the per-call cap ends every turn, the stall
-                    // budget bounds repeated runaways, the detectors catch
-                    // patterns, max_turns/max_tokens bound totals. Reset
-                    // rides the heartbeat rate-limit gate, so it costs one
-                    // mutex write per HEARTBEAT_MIN_INTERVAL, not per chunk.
-                    //
-                    // (#2889) A writing tick is not a chunk: it shows only
-                    // that the runtime is waiting, which a wedged endpoint
-                    // also produces. It forwards a heartbeat but leaves the
-                    // deadline where the last real chunk put it.
-                    if let (true, Some(deadline)) = (is_chunk, &self.inactivity_deadline) {
-                        *lock_deadline(deadline) =
-                            Instant::now() + Duration::from_secs(self.inactivity_secs);
-                    }
-                    self.emit(
-                        darkmux_flow::FlowAction::DispatchTurnHeartbeat,
-                        darkmux_flow::Level::Info,
-                        heartbeat_payload(&event),
-                    );
-                }
-            }
-            // (#557 slice 2) Detector trajectory events → telemetry flow
-            // records. Each detector firing becomes one `category=telemetry,
-            // source=detector` record carrying a {kind, severity, detail}
-            // payload the observability viewer renders. The runtime already
-            // records these in its own trajectory; forwarding them into the
-            // one flow stream is what makes detector firings visible in the
-            // unified viewer (the keystone of #557). The kind/severity/detail
-            // mapping lives in the pure `detector_telemetry_payload` helper
-            // so it can be unit-tested without the process-global flow sink.
-            "dispatch.cycle.suspected"
-            | "dispatch.reasoning_loop.suspected"
-            | "dispatch.tool.repeated_failure"
-            | "dispatch.intra_turn_stall.recovered"
-            // (#2190) Empty-`tool_calls` recovery — its own detector kind,
-            // routed through the same pure mapping as its sibling above.
-            | "dispatch.empty_tool_calls.recovered"
-            | "dispatch.per_turn_cap.salvaged"
-            | "dispatch.tool.malformed_names"
-            // (#2836) A tool call the runtime threw away because the
-            // check-in cut it mid-`arguments`. Forwarded for the same
-            // reason as its siblings: the runtime already records it, and
-            // the loss is only actionable if it reaches the one stream the
-            // operator actually watches.
-            | "dispatch.tool_call.discarded"
-            // (#2190) The escalation record itself — see
-            // `detector_telemetry_payload`'s own arm for why this rides the
-            // same detector-telemetry path rather than a bespoke one.
-            | "dispatch.escalation.triggered"
-            // (#2887) The in-stream degeneracy gate's own findings. Only a
-            // DEGENERATE observation reaches here — `detector_telemetry_payload`
-            // drops a clean one, the same filter that keeps `dispatch.context`
-            // from flooding this stream. `dispatch.gate.abort` always forwards:
-            // it only ever fires when the gate actually ended the call.
-            | "dispatch.gate.observation"
-            | "dispatch.gate.abort" => {
-                // (#2169, merge-gate MUST FIX 1 split by `reason`) Live
-                // running totals — a call that never dispatches can't
-                // reach `tool.completed`/`self.summary.tool_calls` at
-                // all, so these are the ONLY place either bucket gets
-                // counted. Split by the runtime's `reason` field so a
-                // permission refusal (`real_tool_not_granted`) is never
-                // mixed into the "model produced garbage tool-call
-                // names" metric (`not_a_tool`) this issue exists to
-                // surface.
-                if event_type == "dispatch.tool.malformed_names" {
-                    let count = event.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                    match event.get("reason").and_then(|v| v.as_str()) {
-                        Some("real_tool_not_granted") => {
-                            self.summary.tool_calls_ungranted =
-                                self.summary.tool_calls_ungranted.saturating_add(count);
-                        }
-                        // "not_a_tool", or an older runtime image
-                        // predating the `reason` field (lenient-on-read
-                        // per the config-leniency contract) — bucket
-                        // under the not-a-tool count, matching this
-                        // field's pre-merge-gate meaning.
-                        _ => {
-                            self.summary.tool_calls_invalid_name =
-                                self.summary.tool_calls_invalid_name.saturating_add(count);
-                        }
-                    }
-                }
-                if let Some(payload) = detector_telemetry_payload(event_type, &event) {
-                    // (#1955) Same payload to the envelope. One producer, so
-                    // the viewer and the orchestrator cannot disagree about
-                    // what fired.
-                    self.summary.detections.push(payload.clone());
-                    self.emit_telemetry("detector", darkmux_flow::FlowAction::TelemetryDetector, payload);
-                }
-                if event_type == "dispatch.gate.observation" {
-                    if let Some(w) = degeneracy_warning(event_type, &event) {
-                        self.surface_degeneracy_warning(w);
-                    }
-                }
-            }
-            // (#557 slice 3) Per-turn context-window occupancy sawtooth.
-            // The runtime emits one `dispatch.context` trajectory event per
-            // turn carrying the EXACT prompt-token count (`used`) + the
-            // configured n_ctx (`max`, null when unconfigured). Forward it
-            // into the one flow stream as a `source=context` telemetry
-            // record the observability viewer reads as `{used, max}`.
-            "dispatch.context" => {
+            E::CycleSuspected(_)
+            | E::ReasoningLoopSuspected(_)
+            | E::RepeatedToolFailure(_)
+            | E::IntraTurnStallRecovered(_)
+            | E::EmptyToolCallsRecovered(_)
+            | E::PerTurnCapSalvaged(_)
+            | E::MalformedToolNames(_)
+            | E::ToolCallDiscarded(_)
+            | E::EscalationTriggered(_)
+            | E::GateAbort(_) => self.on_detector(&event),
+            E::Context(c) => {
+                // (#557 slice 3) Per-turn context-window occupancy: the exact
+                // prompt-token count and the configured n_ctx, as the
+                // sawtooth the viewer draws.
                 self.emit_telemetry("context", darkmux_flow::FlowAction::TelemetryContext, serde_json::json!({
-                    "used": event.get("used"),
-                    "max": event.get("max"),
+                    "used": c.used,
+                    "max": c.max,
                     "threshold": self.compaction_threshold,
                 }));
             }
-            // (#2094 finding 2) A rest IS host-side proof-of-work — the
-            // runtime deliberately sleeps between turns (GPU thermal/power
-            // relief), and this catch-all previously dropped that event on
-            // the floor entirely. Two consequences, both fixed here:
-            //
-            // (a) The host-side hard-kill watchdog's `inactivity_deadline`
-            //     never saw the rest as activity, so a long enough
-            //     `turn_delay_ms` could tick the deadline down toward the
-            //     hard kill during time the dispatch was deliberately idle
-            //     BY DESIGN, not stalled. Reset it exactly the way
-            //     `tool.completed`/`compaction` do — same signal class.
-            // (b) The rest was invisible on the flow stream entirely — no
-            //     `dispatch.rest` record, so a rested run's live view gave
-            //     no indication anything was happening between turns.
-            "runtime.rest" => {
-                let ms = event.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
-                self.summary.rest_ms = self.summary.rest_ms.saturating_add(ms);
-                self.summary.rests = self.summary.rests.saturating_add(1);
-                // (2026-08-30 fleet-observability finding) `reason` names
-                // WHY the loop slept — `"turn_delay"` for routine turn-to-
-                // turn cool-down, or the pace file's own operator/governor-
-                // supplied reason (`"thermal"`, `"paused"`, …) for a paced
-                // rest. Absent on an OLDER runtime image that predates this
-                // — defaults to `"turn_delay"`, the routine case, rather
-                // than silently mislabeling every legacy rest as paced.
-                let reason = event.get("reason").and_then(|v| v.as_str()).unwrap_or("turn_delay");
-                if reason != "turn_delay" {
-                    self.summary.paced_rest_ms = self.summary.paced_rest_ms.saturating_add(ms);
-                }
-                // (#2877) The runtime records a rest as it STARTS, so the
-                // margin must cover the rest itself as well as the usual
-                // inactivity window; a rest longer than the window would
-                // otherwise be killed while resting by design.
-                if let Some(deadline) = &self.inactivity_deadline {
-                    let new_deadline = Instant::now()
-                        + Duration::from_secs(self.inactivity_secs)
-                        + Duration::from_millis(ms);
-                    *lock_deadline(deadline) = new_deadline;
-                }
-                let payload = runtime_rest_payload(
-                    &event,
-                    ms,
-                    self.summary.rest_ms,
-                    self.summary.rests,
-                    reason,
-                    crate::host_source::provenance(),
-                );
-                self.emit(darkmux_flow::FlowAction::DispatchRest, darkmux_flow::Level::Info, payload);
+            E::Rest(r) => self.on_rest(r),
+            // The runtime's own bookends (the host emits the canonical
+            // dispatch bookends) and the events with no flow consumer are
+            // counted by the fold above and forwarded nowhere.
+            E::DispatchStart(_)
+            | E::DispatchComplete(_)
+            | E::ToolCallPromoted(_)
+            | E::PromotionSuppressed(_)
+            | E::CompactionSkipped(_)
+            | E::CompactionUnproductive(_)
+            | E::StaleContextTokens(_)
+            | E::PreSendBound(_)
+            | E::ReasoningBoundNotApplied(_)
+            | E::LegacyPromptSubmitted(_)
+            | E::Unknown => {}
+        }
+    }
+
+    /// A model call returned: its usage record, and the turn's record when
+    /// the call ended the turn.
+    fn on_model_completed(&mut self, m: &darkmux_trajectory::ModelCompleted) {
+        // (#1221) ONE `dispatch.turn` per LOGICAL turn, emitted when that turn
+        // ENDS. A `length` finish mid-checkpointing is a continuation, not a
+        // turn boundary: one long reasoning turn once wrote a turn record per
+        // API call (66 for a run whose `turns` was 1). Continuations emit
+        // `dispatch.checkpoint` instead.
+        if m.ends_turn() {
+            let mut payload = serde_json::json!({
+                "turn_seq": m.seq,
+                "finish_reason": cap_str(&m.finish_reason, MAX_TRAJ_FIELD_BYTES),
+                "tool_calls_count": m.tool_calls.as_ref().map_or(0, Vec::len),
+                "usage": m.usage,
+                // (#1483) The AUTHORITATIVE running turn count (monotonic,
+                // 1-based), so a viewer opened MID-dispatch reads the true
+                // count rather than counting from the tail it saw.
+                "turns_so_far": self.summary.fold.turns(),
+            });
+            // (#2863) The turn's model time (request sent to stream end),
+            // absent (not zero) when no stream was recorded, and reported
+            // once: a seq seen ending again never re-reports it.
+            if let Some(ms) = self.summary.fold.generation_ms(m.seq).filter(|_| self.generation_reported.insert(m.seq)) {
+                payload["generation_ms"] = serde_json::json!(ms);
             }
-            _ => {
-                // Other event types (dispatch.start/complete from the
-                // runtime side; model.streaming.start/end) are ignored —
-                // the CLI emits canonical dispatch bookends; streaming
-                // start/end events are runtime-internal observability
-                // with no flow-stream consumer yet.
+            // (#2963, FLOW 1.64.0) Each running call's file and tool name, in
+            // order, so the viewer names the call running now.
+            if let Some(paths) = turn_tool_paths(m) {
+                payload["tool_paths"] = paths;
             }
+            if let Some(names) = turn_tool_names(m) {
+                payload["tool_names"] = names;
+            }
+            self.emit(darkmux_flow::FlowAction::DispatchTurn, darkmux_flow::Level::Info, payload);
+        }
+        // (#795, #2902 step 1a) ONE usage record per CALL, usage or not: a
+        // call whose event carried no usage is marked `token_source:
+        // "absent"` and adds zero to every sum. The live odometer climbs
+        // DURING the dispatch because each call's record is its own.
+        let tokens_payload = turn_tokens_payload(
+            m,
+            &self.role_id,
+            &self.model,
+            self.endpoint.as_deref().unwrap_or_default(),
+            self.endpoint_id.as_deref(),
+        );
+        self.emit_telemetry("tokens", darkmux_flow::FlowAction::TelemetryTokens, tokens_payload);
+    }
+
+    /// A tool call ran: its record, the finding or mod it emitted, and
+    /// (when it worked) proof of work for the watchdog.
+    fn on_tool_completed(&mut self, t: &darkmux_trajectory::ToolCompleted) {
+        // (#464, #469) Tool completion is proof of work: reset the
+        // inactivity deadline, but ONLY for a call that worked. A model
+        // fast-failing with varying calls would otherwise keep the deadline
+        // alive indefinitely; the pathological patterns (cycles, failure
+        // cascades) have their own detectors.
+        if t.ok {
+            self.reset_deadline(Duration::ZERO);
+        }
+        // (#2265 review) Bound ONCE, then share: the flow record and the
+        // finding record must hold the SAME bytes, since `finding sync`
+        // replays the (bounded) flow record.
+        let bounded_emission = bound_emitted(t.emitted.as_ref());
+        let payload = serde_json::json!({
+            "tool_seq": t.tool_seq,
+            // (#1483) The AUTHORITATIVE running tool-call count (monotonic,
+            // 1-based), same mid-dispatch robustness as `turns_so_far`.
+            "tool_calls_so_far": self.summary.fold.tool_calls(),
+            "tool_name": cap_str(&t.tool_name, MAX_TRAJ_FIELD_BYTES),
+            // The arguments preview (search pattern / path / command), already
+            // capped by the runtime, re-bound here for the flow record.
+            "args": cap_str(&t.args, MAX_TRAJ_FIELD_BYTES),
+            "args_chars": t.args_chars,
+            // (#2272) An accepted `create_finding`'s emission, whole (bounded
+            // loudly), and its 1-based ordinal. `null` for every other call.
+            // The crawl's product rides THIS, never the `args` preview.
+            "emitted": bounded_emission.clone(),
+            "emit_seq": t.emit_seq,
+            "result_chars": t.result_chars,
+            // (#2007) The result itself, bounded by eliding its middle; the
+            // true length stays in `result_chars`.
+            "result": cap_result_middle(&t.result, MAX_TOOL_RESULT_BYTES),
+            "ok": t.ok,
+            // (#2008) The three-way outcome, forwarded as classified, so the
+            // viewer can render "exit 1" rather than a bare cross.
+            "outcome": t.outcome,
+            "exit_code": t.exit_code,
+            "failure_reason": t.failure_reason.as_deref().map(|r| cap_str(r, MAX_TRAJ_FIELD_BYTES)),
+        });
+        self.emit(darkmux_flow::FlowAction::DispatchTool, darkmux_flow::Level::Info, payload);
+        // (#2265) The tailer is the LIVE producer of the finding and mod
+        // records; `finding sync` replays the same stream for anything this
+        // missed, through the same write-once materializers.
+        self.materialize_finding(t, &bounded_emission);
+        self.materialize_mod(t, &bounded_emission);
+    }
+
+    /// (#2915) The runtime is about to call its compactor: one lean
+    /// `utility.start` (job `compaction`), attributed to the compactor like
+    /// the call's usage record (contract 8). Not proof of progress, so the
+    /// deadline stays where it was.
+    fn on_compaction_start(&mut self, c: &darkmux_trajectory::CompactionStart) {
+        let model = model_id(c.requested_model.as_deref()).or_else(|| self.compactor_model.clone()).unwrap_or_default();
+        // (#2915 review, MUST 1 / C4) One job id per compaction ATTEMPT (a
+        // refused attempt can repeat its generation); the event's own ms `ts`
+        // is the start time.
+        self.compaction_attempts += 1;
+        let job_id = format!("{}:compaction:{}", self.session_id, self.compaction_attempts);
+        self.open_compaction = Some((job_id.clone(), c.ts));
+        let mut payload = crate::usage::utility_start_payload(
+            crate::usage::UtilityJobKind::Compaction,
+            &job_id,
+            &model,
+            Some(&self.session_id),
+            self.inactivity_secs,
+            c.ts,
+        );
+        payload["generation"] = serde_json::json!(c.generation);
+        // (#2928) The same start on the live channel, at once: a compaction
+        // shorter than the durable stream's delivery window is otherwise
+        // never seen open.
+        let mut live = payload.clone();
+        live["event"] = serde_json::json!("start");
+        live["serves"] = serde_json::json!(self.session_id);
+        self.live_utility(live, Some(&model));
+        self.emit_telemetry_as(
+            COMPACTOR_ROLE,
+            Some(&model).filter(|m| !m.is_empty()).map(String::as_str),
+            crate::usage::UTILITY_SOURCE,
+            darkmux_flow::FlowAction::UtilityStart,
+            payload,
+        );
+    }
+
+    /// (#2902 step 1b) One COMPACTOR call, installed or refused: exactly one
+    /// usage record, attributed to the compactor (record `handle` + `model`),
+    /// never to the specialist (contract 8). Neither a turn nor a
+    /// compaction, so the fold does not count it.
+    fn on_compaction_call(&mut self, c: &darkmux_trajectory::CompactionCall) {
+        let mut payload = compaction_call_tokens_payload(
+            c,
+            self.compactor_model.as_deref(),
+            self.compactor_endpoint.as_deref().unwrap_or_default(),
+            &self.role_id,
+            &self.model,
+        );
+        // (#2915 review) The attempt this call served: its job id and ms
+        // times.
+        if let Some((job_id, started_at_ms)) = self.open_compaction.clone() {
+            crate::usage::stamp_utility_end(&mut payload, &job_id, started_at_ms, c.ts);
+            // (#2928) The job's end on the live channel, at once.
+            let live = serde_json::json!({
+                "event": "end",
+                "job": crate::usage::UtilityJobKind::Compaction,
+                "job_id": job_id,
+                "ended_at_ms": c.ts,
+                "duration_ms": c.ts.saturating_sub(started_at_ms),
+            });
+            let m = payload["requested_model"].as_str().map(str::to_string);
+            self.live_utility(live, m.as_deref());
+        }
+        let model = payload["requested_model"].as_str().map(str::to_string);
+        self.emit_telemetry_as(
+            COMPACTOR_ROLE,
+            model.as_deref(),
+            crate::usage::USAGE_SOURCE,
+            darkmux_flow::FlowAction::TelemetryTokens,
+            payload,
+        );
+    }
+
+    /// A compaction was installed: proof the dispatch is alive (#457), its
+    /// record, and the occupancy drop it made.
+    fn on_compaction(&mut self, c: &darkmux_trajectory::Compaction) {
+        self.reset_deadline(Duration::ZERO);
+        // (#2794) The record's `model` stays the SPECIALIST (the parent
+        // execution's identity, which consumers key on); the payload names
+        // the utility model that did the work, so cost attribution has the
+        // number it was missing rather than a wrong one (contract 8).
+        let payload = serde_json::json!({
+            "generation": c.generation,
+            "before_messages": c.before_messages,
+            "after_messages": c.after_messages,
+            "summary_chars": c.summary_chars,
+            "compactor_model": self.compactor_model,
+            "parent_model": self.model,
+        });
+        self.emit(darkmux_flow::FlowAction::DispatchCompaction, darkmux_flow::Level::Info, payload);
+        // (#557 slice 3) The drop in the context-occupancy sawtooth: the exact
+        // prompt-token count that triggered it, and a chars/4 estimate of the
+        // compacted buffer.
+        self.emit_telemetry("compaction", darkmux_flow::FlowAction::TelemetryCompaction, serde_json::json!({
+            "from": c.tokens_before,
+            "to": c.tokens_after,
+            "compactor_model": self.compactor_model,
+        }));
+    }
+
+    /// (#1221) The harness decided, mid-turn, whether the model keeps
+    /// thinking. Without its own record one long thought reads as a dozen
+    /// turns with nothing saying why. `verdict` is the decision and
+    /// `tail_ratio` its evidence; `bound`, `policy` and `would_conclude` ride
+    /// verbatim (#2165, #2887) so the surfaces can tell an enforced
+    /// conclusion from a recorded finding.
+    fn on_checkpoint(&mut self, c: &darkmux_trajectory::Checkpoint) {
+        let payload = serde_json::json!({
+            "turn_seq": c.seq,
+            "checkpoint": c.checkpoint,
+            "slice_tokens": c.slice_tokens,
+            "tail_ratio": c.tail_ratio,
+            "verdict": c.verdict,
+            "bound": c.bound,
+            "policy": c.policy,
+            "would_conclude": c.would_conclude,
+        });
+        self.emit(darkmux_flow::FlowAction::DispatchCheckpoint, darkmux_flow::Level::Info, payload);
+        if let Some(w) = checkpoint_degeneracy_warning(c) {
+            self.surface_degeneracy_warning(w);
+        }
+    }
+
+    /// (#204, #231) The turn's reasoning text, capped, for the viewer's
+    /// collapse/expand block.
+    fn on_reasoning(&mut self, r: &darkmux_trajectory::Reasoning) {
+        let payload = serde_json::json!({
+            "turn_seq": r.seq,
+            "reasoning_chars": r.reasoning_chars,
+            "reasoning_text": cap_str(&r.reasoning_text, MAX_REASONING_TEXT_BYTES),
+            "reasoning_format": r.reasoning_format.as_deref().unwrap_or("inline-think-tags"),
+        });
+        self.emit(darkmux_flow::FlowAction::DispatchReasoning, darkmux_flow::Level::Info, payload);
+    }
+
+    /// (#454) The runtime delivered system messages to the model: the
+    /// model-visible delivery, which fleet surfaces want to see.
+    fn on_feedback_injected(&mut self, f: &darkmux_trajectory::FeedbackInjected) {
+        let payload = serde_json::json!({
+            "turn_seq": f.seq,
+            "message_count": f.message_count,
+            "signal_kinds": f.signal_kinds,
+        });
+        self.emit(darkmux_flow::FlowAction::DispatchFeedbackInjected, darkmux_flow::Level::Info, payload);
+    }
+
+    /// (#2889) A stream opens: the opening heartbeat, with the request's size
+    /// and `generated_chars: 0`, before the request is sent. Always emitted,
+    /// and never proof of work. It must not consume the chunk rate gate
+    /// either (#2889 review, M2): the next real chunk is owed an emission.
+    fn on_stream_start(&mut self, s: &darkmux_trajectory::StreamingStart) {
+        self.chunk_owed = true;
+        self.summary.heartbeats += 1;
+        let payload = opening_heartbeat_payload(s);
+        self.emit(darkmux_flow::FlowAction::DispatchTurnHeartbeat, darkmux_flow::Level::Info, payload.clone());
+        // (#2928) The opener is a transition: it goes live at once.
+        self.live_model(s.ts, || payload);
+    }
+
+    /// A streamed chunk (`model.partial`) or a writing tick
+    /// (`model.tool_call.writing`, #2889): one coalesced heartbeat per
+    /// `HEARTBEAT_MIN_INTERVAL`, so topology edges stay animated without
+    /// flooding the stream.
+    fn on_stream_tick(&mut self, chunk: Chunk<'_>) {
+        // (#2928) The live channel samples every chunk and tick on its own
+        // cadence, independent of the durable gate below.
+        self.live_model(chunk.ts, || heartbeat_payload(&chunk));
+        let now = Instant::now();
+        let window_open = self
+            .last_heartbeat_at
+            .is_none_or(|prev| now.duration_since(prev) >= HEARTBEAT_MIN_INTERVAL);
+        // (#2889 review, M2) A real chunk after an opener or a tick always
+        // emits: those are not proof of work, so they must never be what
+        // keeps the next proof of work from resetting the deadline.
+        if !(window_open || (chunk.is_chunk && self.chunk_owed)) {
+            return;
+        }
+        self.last_heartbeat_at = Some(now);
+        // A chunk settles the debt; a tick creates it.
+        self.chunk_owed = !chunk.is_chunk;
+        self.summary.heartbeats += 1;
+        // (#1222) A streamed chunk is proof of work: a wedged server
+        // delivers none, so true hangs still die. A writing tick is not: a
+        // wedged endpoint produces those too (#2889).
+        if chunk.is_chunk {
+            self.reset_deadline(Duration::ZERO);
+        }
+        self.emit(darkmux_flow::FlowAction::DispatchTurnHeartbeat, darkmux_flow::Level::Info, heartbeat_payload(&chunk));
+    }
+
+    /// (#557 slice 2) A detector firing becomes one `category=telemetry,
+    /// source=detector` record (`{kind, severity, detail}`), and the same
+    /// payload goes to the envelope (#1955): one producer, so the viewer and
+    /// the orchestrator cannot disagree about what fired. A clean stream-gate
+    /// observation produces none.
+    fn on_detector(&mut self, event: &darkmux_trajectory::TrajectoryEvent) {
+        if let Some(payload) = detector_telemetry_payload(event) {
+            self.summary.detections.push(payload.clone());
+            self.emit_telemetry("detector", darkmux_flow::FlowAction::TelemetryDetector, payload);
+        }
+    }
+
+    /// (#2094) A rest is host-side proof of work: the runtime sleeps between
+    /// turns by design, so the watchdog must not count it as a stall, and the
+    /// live view must show it.
+    fn on_rest(&mut self, r: &darkmux_trajectory::Rest) {
+        // (#2877) The runtime records a rest as it STARTS, so the margin
+        // covers the rest itself as well as the usual inactivity window.
+        self.reset_deadline(Duration::from_millis(r.ms));
+        let payload = runtime_rest_payload(
+            r,
+            self.summary.fold.rest_ms(),
+            self.summary.fold.rest_count(),
+            crate::host_source::provenance(),
+        );
+        self.emit(darkmux_flow::FlowAction::DispatchRest, darkmux_flow::Level::Info, payload);
+    }
+
+    /// Push the shared inactivity deadline to `now + inactivity_secs +
+    /// extra`. `None` in test fixtures that do not exercise the watchdog.
+    fn reset_deadline(&self, extra: Duration) {
+        if let Some(deadline) = &self.inactivity_deadline {
+            *lock_deadline(deadline) = Instant::now() + Duration::from_secs(self.inactivity_secs) + extra;
         }
     }
 
@@ -10772,17 +9812,16 @@ impl TailerState {
     /// call, and a bare `exists()` on a replay. Nothing on any other tool call.
     fn materialize_finding(
         &self,
-        event: &serde_json::Value,
-        tool_ok: bool,
+        t: &darkmux_trajectory::ToolCompleted,
         bounded_emission: &serde_json::Value,
     ) {
         // A REJECTED citation (a wrong line, an unresolvable path, a spent
         // budget) is a FAILED tool call, and the store is write-once — a bad
         // record written here would be permanent.
-        if !tool_ok {
+        if !t.ok {
             return;
         }
-        let tool_name = event.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+        let tool_name = t.tool_name.as_str();
         if !crate::findings::is_finding_tool(tool_name) {
             return;
         }
@@ -10791,7 +9830,7 @@ impl TailerState {
         }
         // The SAME value the flow record carries, never the raw event field.
         let emitted = bounded_emission.clone();
-        let Some(seq) = event.get("emit_seq").and_then(|v| v.as_u64()) else {
+        let Some(seq) = t.emit_seq else {
             return;
         };
         let record = crate::findings::build_record(
@@ -10851,14 +9890,10 @@ impl TailerState {
     /// is unreachable from the current tool.
     fn materialize_mod(
         &self,
-        event: &serde_json::Value,
-        tool_ok: bool,
+        t: &darkmux_trajectory::ToolCompleted,
         bounded_emission: &serde_json::Value,
     ) {
-        if !tool_ok {
-            return;
-        }
-        if event.get("tool_name").and_then(|v| v.as_str()) != Some(crate::mods::MOD_TOOL_NAME) {
+        if !t.ok || t.tool_name != crate::mods::MOD_TOOL_NAME {
             return;
         }
         if bounded_emission.is_null() {
@@ -11038,38 +10073,75 @@ impl TailerState {
 /// the sum never sees), and `grok-4.3` does it on 30 of 30 recorded calls.
 /// The fallback stays for the runtime's older `model.completed` events,
 /// which have always written all three keys anyway.
-/// (#2877) Map a `model.partial` trajectory event to the `dispatch.turn.
-/// heartbeat` flow payload. Pure (no IO, no global sink) so the mapping is
-/// unit-testable in isolation from `handle_event`'s flow-record emission —
-/// same shape as `turn_tokens_payload` just above.
+/// A streamed chunk (`model.partial`) or a writing tick
+/// (`model.tool_call.writing`), as the heartbeat reads it.
+struct Chunk<'a> {
+    /// A real chunk (proof of work), not a writing tick.
+    is_chunk: bool,
+    seq: u64,
+    ts: u64,
+    partial_index: u64,
+    cumulative_chars: u64,
+    generated_chars: Option<u64>,
+    phase: Option<darkmux_trajectory::StreamPhase>,
+    tool_name: Option<&'a str>,
+}
+
+impl<'a> Chunk<'a> {
+    fn of_partial(p: &'a darkmux_trajectory::Partial) -> Self {
+        Self {
+            is_chunk: true,
+            seq: p.seq,
+            ts: p.ts,
+            partial_index: p.partial_index,
+            cumulative_chars: p.cumulative_chars,
+            generated_chars: p.generated_chars,
+            phase: p.phase,
+            tool_name: p.tool_name.as_deref(),
+        }
+    }
+
+    fn of_writing(w: &'a darkmux_trajectory::ToolCallWriting) -> Self {
+        Self {
+            is_chunk: false,
+            seq: w.seq,
+            ts: w.ts,
+            partial_index: w.partial_index,
+            cumulative_chars: w.cumulative_chars,
+            generated_chars: w.generated_chars,
+            phase: Some(w.phase),
+            tool_name: Some(&w.tool_name),
+        }
+    }
+}
+
+/// (#2877) The `dispatch.turn.heartbeat` flow payload for a chunk or a
+/// writing tick. Pure, so the mapping is unit-testable apart from the
+/// tailer's emission.
 ///
-/// `sampled_at_ms` and `generated_chars` are ADDITIVE (FLOW_SCHEMA_VERSION
-/// bump alongside this change): the trajectory's `model.partial` event
-/// already carries `ts` at millisecond precision (`trajectory::unix_ms`),
-/// and — once the runtime side of #2877 lands — a `generated_chars` count
-/// that includes reasoning text and tool-call arguments, unlike `cumulative_chars` (answer text
-/// only, stays 0 while a separate-field-reasoning model reasons). Both
-/// read via `.get()`, so an OLDER runtime's event (neither field present)
-/// still forwards a valid heartbeat — `.get()` on a missing key yields
-/// `None`, which `serde_json::json!` serializes as `null`, and the UI rate
-/// module falls back to `cumulative_chars` + the record's own flow `ts`.
+/// `sampled_at_ms` is the runtime's own millisecond clock and
+/// `generated_chars` counts reasoning and tool-call arguments too, unlike
+/// `cumulative_chars` (answer text only, which stays 0 while a
+/// separate-field-reasoning model reasons); the viewer's rate is measured
+/// on those two.
 ///
-/// (#2889) `phase` + `tool_name` are forwarded when the runtime stamped
-/// them (the model is writing a named tool call) and are ABSENT otherwise,
-/// never null: the keys mean "writing", so absence is the other reading.
-fn heartbeat_payload(event: &serde_json::Value) -> serde_json::Value {
+/// (#2889) `phase` + `tool_name` are present when the model is writing a
+/// named tool call and ABSENT otherwise, never null: the keys mean
+/// "writing", so absence is the other reading.
+fn heartbeat_payload(c: &Chunk<'_>) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "runtime": "internal",
-        "turn_seq": event.get("seq"),
-        "partial_index": event.get("partial_index"),
-        "cumulative_chars": event.get("cumulative_chars"),
-        "sampled_at_ms": event.get("ts"),
-        "generated_chars": event.get("generated_chars"),
+        "turn_seq": c.seq,
+        "partial_index": c.partial_index,
+        "cumulative_chars": c.cumulative_chars,
+        "sampled_at_ms": c.ts,
+        "generated_chars": c.generated_chars,
     });
-    for key in ["phase", "tool_name"] {
-        if let Some(v) = event.get(key).filter(|v| !v.is_null()) {
-            payload[key] = cap_json_str(Some(v), MAX_TRAJ_FIELD_BYTES);
-        }
+    if let Some(phase) = c.phase {
+        payload["phase"] = serde_json::json!(phase);
+    }
+    if let Some(name) = c.tool_name {
+        payload["tool_name"] = serde_json::json!(cap_str(name, MAX_TRAJ_FIELD_BYTES));
     }
     payload
 }
@@ -11078,87 +10150,69 @@ fn heartbeat_payload(event: &serde_json::Value) -> serde_json::Value {
 /// `generated_chars: 0` and `prompt_chars`, the size of the request about to
 /// be sent. The runtime splits that size into `system_chars` + `prompt_chars`
 /// (non-system messages); the model reads both, so the heartbeat carries the
-/// sum. A field the event lacks (an older runtime) counts as zero, and when
-/// both are absent `prompt_chars` is null — the viewer then keeps its
-/// sizeless PROMPT display.
-fn opening_heartbeat_payload(event: &serde_json::Value) -> serde_json::Value {
-    let system = event.get("system_chars").and_then(|v| v.as_u64());
-    let prompt = event.get("prompt_chars").and_then(|v| v.as_u64());
-    let total = match (system, prompt) {
-        (None, None) => None,
-        (s, p) => Some(s.unwrap_or(0) + p.unwrap_or(0)),
-    };
+/// sum.
+fn opening_heartbeat_payload(s: &darkmux_trajectory::StreamingStart) -> serde_json::Value {
     serde_json::json!({
         "runtime": "internal",
-        "turn_seq": event.get("seq"),
+        "turn_seq": s.seq,
         "cumulative_chars": 0,
-        "sampled_at_ms": event.get("ts"),
+        "sampled_at_ms": s.ts,
         "generated_chars": 0,
-        "prompt_chars": total,
+        "prompt_chars": s.system_chars.saturating_add(s.prompt_chars),
     })
 }
 
+/// (#2902 step 1a) One turn call's usage record, through the one accounting
+/// writer, from the SAME counts the fold sums (`UsageCounts::of`), so the
+/// records and every total derived from the trajectory are one number.
+/// `turn_seq` is the one field only a turn has; `reported_model` is the
+/// reply's own `model`, absent when it named none.
 fn turn_tokens_payload(
-    event: &serde_json::Value,
+    m: &darkmux_trajectory::ModelCompleted,
     role_id: &str,
     requested_model: &str,
     endpoint: &str,
     endpoint_id: Option<&str>,
 ) -> serde_json::Value {
-    // (#2902 step 1a) Through the one accounting writer. `turn_seq` is the
-    // one field only a turn has. (#2902 step 1b) `reported_model` is the
-    // runtime's `model.completed.reported_model`, the reply's own `model`;
-    // absent when the runtime (or an older image) wrote none.
     let mut payload = crate::usage::usage_payload(
         &crate::usage::CallFacts {
             call_kind: crate::usage::CallKind::Turn,
             role_id: Some(role_id),
             requested_model,
-            reported_model: event_model_id(event, "reported_model").as_deref(),
+            reported_model: model_id(m.reported_model.as_deref()).as_deref(),
             endpoint,
             endpoint_id,
         },
-        &turn_usage_counts(event),
+        &darkmux_trajectory::UsageCounts::of(m.usage.as_ref()),
     );
-    payload["turn_seq"] = event.get("seq").cloned().unwrap_or(serde_json::Value::Null);
+    payload["turn_seq"] = serde_json::json!(m.seq);
     payload
 }
 
-/// (#2902 step 1b) A model id a runtime model-call event names (`key` is
-/// `reported_model` on `model.completed`/`compaction.call`, or
-/// `requested_model` on `compaction.call`), when non-empty. Bounded like
-/// every other string this tailer lifts out of the container's trajectory
-/// (`MAX_TRAJ_FIELD_BYTES`): a served model id comes from the endpoint's
-/// reply, which darkmux does not control.
-fn event_model_id(event: &serde_json::Value, key: &str) -> Option<String> {
-    event
-        .get(key)
-        .and_then(|v| v.as_str())
-        .filter(|m| !m.is_empty())
-        .map(|m| cap_str(m, MAX_TRAJ_FIELD_BYTES))
+/// (#2902 step 1b) A model id a runtime event names, when non-empty,
+/// bounded like every other string lifted out of the container's
+/// trajectory: a served model id comes from the endpoint's reply, which
+/// darkmux does not control.
+fn model_id(m: Option<&str>) -> Option<String> {
+    m.filter(|m| !m.is_empty()).map(|m| cap_str(m, MAX_TRAJ_FIELD_BYTES))
 }
 
-/// (#2902 step 1b) Map a `compaction.call` trajectory event (one runtime
-/// COMPACTOR call) to its `telemetry.tokens` payload, through the one
-/// writer. Pure, like `turn_tokens_payload`.
-///
-/// - `requested_model` is the model the runtime put on the wire (the event
-///   names it); `compactor_model` (the tailer's own copy of the same id) is
-///   only the fallback for an event that omits it.
-/// - `endpoint` is the compactor's endpoint fact (the LMStudio base).
-/// - No `remote` verdict: a usage record states what was called, never a
-///   local/cloud classification (#2902's design).
-/// - `generation` names the compaction the call served, and
-///   `parent_role_id`/`parent_model` name the specialist execution it ran
-///   inside, so a reader can relate the two without blending them.
+/// (#2902 step 1b) One COMPACTOR call's usage record, through the one
+/// writer. `requested_model` is the model the runtime put on the wire;
+/// `compactor_model` (the tailer's own copy of the same id) is only the
+/// fallback for an event that omits it. `endpoint` is the compactor's
+/// endpoint fact (the LMStudio base). `generation` names the compaction the
+/// call served, and `parent_role_id`/`parent_model` the specialist
+/// execution it ran inside, so a reader can relate the two without
+/// blending them.
 fn compaction_call_tokens_payload(
-    event: &serde_json::Value,
+    c: &darkmux_trajectory::CompactionCall,
     compactor_model: Option<&str>,
     endpoint: &str,
     parent_role_id: &str,
     parent_model: &str,
 ) -> serde_json::Value {
-    let requested_model = event_model_id(event, "requested_model")
+    let requested_model = model_id(Some(&c.requested_model))
         .or_else(|| compactor_model.map(str::to_string))
         .unwrap_or_default();
     let mut payload = crate::usage::usage_payload(
@@ -11166,15 +10220,15 @@ fn compaction_call_tokens_payload(
             call_kind: crate::usage::CallKind::Compaction,
             role_id: Some(COMPACTOR_ROLE),
             requested_model: &requested_model,
-            reported_model: event_model_id(event, "reported_model").as_deref(),
+            reported_model: model_id(c.reported_model.as_deref()).as_deref(),
             endpoint,
             // A compactor call goes to the machine's LMStudio, never through
             // a hosted brain's endpoint.
             endpoint_id: None,
         },
-        &turn_usage_counts(event),
+        &darkmux_trajectory::UsageCounts::of(c.usage.as_ref()),
     );
-    payload["generation"] = event.get("generation").cloned().unwrap_or(serde_json::Value::Null);
+    payload["generation"] = serde_json::json!(c.generation);
     payload["parent_role_id"] = serde_json::json!(parent_role_id);
     payload["parent_model"] = serde_json::json!(parent_model);
     payload
@@ -11189,455 +10243,260 @@ fn compaction_call_tokens_payload(
 /// handle says WHICH job.
 const COMPACTOR_ROLE: &str = "compactor";
 
-/// (#795, #2902 step 1a) The counts a `model.completed` event reported.
-/// No `usage` object (upstream omitted it) is "not reported": the record
-/// then carries `token_source: "absent"` and no counts, rather than being
-/// skipped, because the call still happened. Inside a PRESENT usage object
-/// a missing prompt/completion count degrades to 0 (the runtime always
-/// writes both; pre-existing behavior). `total_tokens` stays the provider's
-/// own number when sent (#1444 review: the writer falls back to the sum
-/// only when it is absent). `reasoning_tokens`/`cached_tokens` stay
-/// tri-state (#1444).
-fn turn_usage_counts(event: &serde_json::Value) -> crate::usage::UsageCounts {
-    let Some(usage) = event.get("usage").filter(|u| u.is_object()) else {
-        return crate::usage::UsageCounts::default();
-    };
-    let count = |k: &str| usage.get(k).and_then(|n| n.as_u64());
-    crate::usage::UsageCounts {
-        prompt: Some(count("prompt_tokens").unwrap_or(0)),
-        completion: Some(count("completion_tokens").unwrap_or(0)),
-        total: count("total_tokens"),
-        reasoning: count("reasoning_tokens"),
-        cached: count("cached_tokens"),
-    }
+/// The detection policy a runtime event recorded, read through the one
+/// config vocabulary (a pre-4.0 spelling maps to its successor). `None`
+/// for an absent or unknown policy.
+fn recorded_policy(policy: Option<&str>) -> Option<darkmux_types::config::DetectionPolicy> {
+    use darkmux_types::config::DetectionPolicy;
+    use darkmux_types::config_enum::ConfigEnum;
+    let p = policy?;
+    DetectionPolicy::from_token(p).or_else(|| {
+        DetectionPolicy::RETIRED
+            .iter()
+            .find(|(old, _)| *old == p)
+            .and_then(|(_, new)| DetectionPolicy::from_token(new))
+    })
 }
 
-/// (#557 slice 2) Map a detector trajectory event to its telemetry
-/// payload — the `{kind, severity, detail}` object the observability
-/// viewer renders. Pure (no IO, no global sink) so the mapping is
-/// unit-testable in isolation from `handle_event`'s flow-record emission.
-///
-/// `event_type` is the already-extracted `event["type"]` string; `event`
-/// is the parsed trajectory line. Returns `None` for event types this
-/// helper doesn't map (the caller only invokes it for the five detector
-/// types, so `None` is defensive — it never fires on the happy path).
-///
-/// Field accessors are all safe (`unwrap_or` defaults) so a malformed or
-/// partial detector event still produces a renderable record rather than
-/// dropping the firing. `completion_tokens` on the intra-turn-stall event
-/// may be JSON null (upstream omitted `usage`); that renders as "unknown"
-/// rather than a misleading "0".
-fn detector_telemetry_payload(
-    event_type: &str,
-    event: &serde_json::Value,
-) -> Option<serde_json::Value> {
-    let str_field = |k: &str| event.get(k).and_then(|v| v.as_str()).unwrap_or("?");
-    let u64_field = |k: &str| event.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
-
-    let (kind, severity, detail) = match event_type {
-        "dispatch.cycle.suspected" => {
-            let tool_name = str_field("tool_name");
-            let count = u64_field("count");
-            let window_size = u64_field("window_size");
-            (
-                "cycle",
-                "warn",
-                format!(
-                    "`{tool_name}` called {count}× in the last {window_size} tool calls — repeated-tool-call cycle (#418)"
-                ),
-            )
-        }
-        "dispatch.reasoning_loop.suspected" => {
-            let count = u64_field("count");
-            let window_size = u64_field("window_size");
-            (
-                "reasoning-loop",
-                "warn",
-                format!(
-                    "same reasoning repeated {count}× in {window_size} turns — reasoning loop (#461)"
-                ),
-            )
-        }
-        "dispatch.tool.repeated_failure" => {
-            let tool_name = str_field("tool_name");
-            let failure_count = u64_field("failure_count");
-            (
-                "tool-failure",
-                "warn",
-                format!("{failure_count} failures of `{tool_name}` since it last succeeded (#419)"),
-            )
-        }
-        "dispatch.intra_turn_stall.recovered" => {
-            // completion_tokens may be JSON null (upstream omitted `usage`);
-            // render "unknown" rather than a misleading 0 that reads
-            // identical to a real small count.
-            let completion_tokens = event
-                .get("completion_tokens")
-                .and_then(|v| v.as_u64())
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            let recoveries_used = u64_field("recoveries_used");
-            let recoveries_budget = u64_field("recoveries_budget");
-            // (#2165) Name WHICH bound governed the stalled request + its
-            // provenance, not just a bare number — falls back to the
-            // pre-#2165 wording when `bound` is absent (an older runtime
-            // image; flow records are lenient-on-read).
-            //
-            // (#2190) Worded as "; request bound was X", NOT "at X" — "at"
-            // reads as "cut BY that bound", which is false here: this event
-            // only fires for the GENUINE runaway-reasoning shape (a turn cut
-            // while still writing reasoning at the bound the request
-            // carried). Live evidence of the old wording misleading a
-            // diagnosis: "... at an unrecognized bound
-            // (generation_checkpoint_interval) (built-in 4000)" was read as
-            // "the 4000-token bound cut this turn" when the turns that fired
-            // it were 286-648 tokens — nowhere near 4000.
-            let bound_clause = bound_detail_clause(event)
-                .unwrap_or_else(|| "the per-call cap".to_string());
-            (
-                "intra-turn-stall",
-                "info",
-                format!(
-                    "runaway-reasoning turn dropped + recovered; request bound was {bound_clause} \
-                     (budget {recoveries_used}/{recoveries_budget}, {completion_tokens} tokens) (#414)"
-                ),
-            )
-        }
-        // (#2190) Distinguished from `dispatch.intra_turn_stall.recovered`
-        // above: this fires when a turn returns `finish_reason=tool_calls`
-        // with an EMPTY `tool_calls` array — a protocol-shaped failure (the
-        // model claimed it was calling a tool and then didn't), not a
-        // reasoning loop cut at a bound. Conflating the two sent a live
-        // diagnosis down the wrong path twice (#2190): the dropped turns
-        // were 286-648 completion tokens, nowhere near any configured
-        // bound, so "runaway reasoning" was factually wrong.
-        "dispatch.empty_tool_calls.recovered" => {
-            let completion_tokens = event
-                .get("completion_tokens")
-                .and_then(|v| v.as_u64())
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            let recoveries_used = u64_field("recoveries_used");
-            let recoveries_budget = u64_field("recoveries_budget");
-            let bound_clause = bound_detail_clause(event)
-                .unwrap_or_else(|| "the per-call cap".to_string());
-            (
-                "empty_tool_calls",
-                "info",
-                format!(
-                    "the model returned finish_reason=tool_calls with no tool calls — turn \
-                     dropped + recovered; request bound was {bound_clause} \
-                     (budget {recoveries_used}/{recoveries_budget}, {completion_tokens} tokens) (#2190)"
-                ),
-            )
-        }
-        "dispatch.per_turn_cap.salvaged" => {
-            let completion_tokens = u64_field("completion_tokens");
-            let cap = u64_field("cap");
-            let salvaged_tool_calls = u64_field("salvaged_tool_calls");
-            // (#2165) Same bound-naming as above — this is the exact miss
-            // #2165 exists to close: a salvage record that said "hit cap
-            // 1000" with no way to tell whether that was the #1221
-            // reasoning check-in interval or an operator's
-            // `max_tokens_per_call` override. (#2190: same non-causal
-            // rewording as the intra-turn-stall arm above.)
-            let bound_clause = bound_detail_clause(event)
-                .unwrap_or_else(|| "the per-call cap".to_string());
-            (
-                "per-turn-cap",
-                "info",
-                format!(
-                    "{salvaged_tool_calls} tool call(s) salvaged; request bound was {bound_clause} \
-                     ({completion_tokens}/{cap} tokens) (#479)"
-                ),
-            )
-        }
-        // (#2836) A tool call destroyed by the check-in. `warn`, not
-        // `info`: unlike its per-turn-cap sibling (which SALVAGED calls and
-        // dispatched them), nothing here was recovered. The model committed
-        // to an action, the harness deleted it, and the model then read a
-        // thread where the action never happened — measured, it concludes
-        // it has already answered and stops.
-        "dispatch.tool_call.discarded" => {
-            let name = str_field("name");
-            let chars = u64_field("arguments_chars");
-            let plural = if chars == 1 { "" } else { "s" };
-            let cut = event
-                .get("cut")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            (
-                "discarded_tool_call",
-                "warn",
-                format!(
-                    "tool call `{name}` was cut after {chars} character{plural} of \
-                     arguments (cut={cut}) — the JSON does not parse, so it was neither \
-                     dispatched nor sent back; that turn's work is gone (#2836)"
-                ),
-            )
-        }
-        "dispatch.tool.malformed_names" => {
-            let count = u64_field("count");
-            let model = str_field("model");
-            let sample = str_field("sample_name_prefix");
-            // (merge-gate MUST FIX 1) `reason` discriminates the two
-            // causes the runtime's own `InvalidToolCallReason` names — an
-            // older runtime image predating the field (lenient-on-read)
-            // falls back to the pre-merge-gate not-a-tool wording, the
-            // same meaning this event carried before the split.
-            let reason = event.get("reason").and_then(|v| v.as_str()).unwrap_or("not_a_tool");
-            let detail = match reason {
-                "real_tool_not_granted" => format!(
-                    "{count} tool call(s) this turn named a REAL tool this dispatch's role \
-                     is not granted (model={model}, sample=\"{sample}\") — never dispatched, \
-                     coalesced into one feedback message (#2169)"
-                ),
-                _ => format!(
-                    "{count} tool call(s) this turn carried a `name` that is not a real \
-                     tool (model={model}, sample=\"{sample}\") — never dispatched, \
-                     coalesced into one feedback message (#2169)"
-                ),
-            };
-            ("malformed_tool_names", "warn", detail)
-        }
-        // (#2190) Fires once, at the exact moment a dispatch terminates via
-        // `TerminalReason::EscalationTriggered`, for ANY escalation reason.
-        // Stamps `model` + the prompt-token count AT THAT MOMENT directly
-        // onto the record — same shape as #2188's model/locality stamp — so
-        // "which model, at what context, stopped producing calls" reads off
-        // this one record instead of joining `telemetry.lms` (model) and
-        // `telemetry.context` (token count) by hand.
-        "dispatch.escalation.triggered" => {
-            let reason = str_field("reason");
-            let model = str_field("model");
-            let prompt_tokens = event
-                .get("prompt_tokens")
-                .and_then(|v| v.as_u64())
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            (
-                "escalation",
-                "warn",
-                format!(
-                    "escalated out of local-tier ({reason}) — model={model}, \
-                     prompt_tokens={prompt_tokens} (#2190)"
-                ),
-            )
-        }
-        // (#2887) The in-stream degeneracy gate's own finding. Forwarded
-        // ONLY when `degenerate` is true — the runtime records EVERY
-        // observation boundary (#2844, so the detector's threshold can be
-        // checked against a real distribution rather than the corpus it was
-        // set on), which is ~30 clean looks per real finding on a run that
-        // actually trips it (34 observations, 14 degenerate, on the run that
-        // surfaced this gap in #2887's issue). Forwarding all of them would
-        // turn the flow stream into that same noise; only a degenerate one
-        // is a finding.
-        // (#2887 F3/F4) `policy`/`acted` are read straight off the event —
-        // the RUNTIME stamps both now (`trajectory::append_gate_observation`/
-        // `append_gate_abort`), so this mapping stays pure (no process env,
-        // no host-side resolution that could disagree with, or postdate,
-        // what the runtime actually ran under). An event from a runtime
-        // image that predates this (no `policy` key at all) reads as
-        // `None`/absent here, never a guessed value — F3's own rule: missing
-        // means unknown, not "assume the host's current env".
-        "dispatch.gate.observation" => {
-            if !event.get("degenerate").and_then(|v| v.as_bool()).unwrap_or(false) {
-                return None;
-            }
-            let observation = u64_field("observation");
-            let slice_chars = u64_field("slice_chars");
-            let ratio = event
-                .get("tail_ratio")
-                .and_then(|v| v.as_f64())
-                .map(|r| format!("{r:.3}"))
-                .unwrap_or_else(|| "?".to_string());
-            let acted = event.get("acted").and_then(|v| v.as_bool()).unwrap_or(false);
-            let policy = event.get("policy").and_then(|v| v.as_str());
-            let base = format!(
-                "observation {observation}: tail_ratio={ratio} over {slice_chars} \
-                 characters — the degeneracy gate judged this repeating (#2836)"
-            );
-            // (#2947) `observe` is the retired spelling of `record`, still
-            // read here because archived trajectories carry it.
-            let detail = if acted {
-                format!("{base} and ended the call")
-            } else if matches!(policy, Some("record") | Some("observe")) {
-                format!("{base} — recorded, not concluded")
-            } else if policy == Some("warn") {
-                format!("{base} — warned, not concluded")
-            } else {
-                base
-            };
-            ("repetition", "warn", detail)
-        }
-        // (#2887) The gate actually ending the call — only ever fires when
-        // the policy in force may act (see `StreamGate::ingest`'s
-        // `Degenerate` variant), so unlike the observation above this always
-        // forwards, and `acted` is always true on this record type.
-        "dispatch.gate.abort" => {
-            let observation = u64_field("observation");
-            let slice_chars = u64_field("slice_chars");
-            let generated_chars = u64_field("generated_chars");
-            (
-                "repetition",
-                "warn",
-                format!(
-                    "observation {observation}: the degeneracy gate ended the call at \
-                     {slice_chars} characters ({generated_chars} from this call) (#2836)"
-                ),
-            )
-        }
-        _ => return None,
-    };
-
-    // (#237) The detail embeds a container-written `tool_name`; bound the
-    // assembled string so a pathologically large tool name can't bloat the
-    // telemetry record. kind/severity are fixed literals (not container-set).
-    let detail = cap_str(&detail, MAX_TRAJ_FIELD_BYTES);
-
+/// (#557 slice 2) Map a detector-class trajectory event to its telemetry
+/// payload: the `{kind, severity, detail}` object the observability viewer
+/// renders, plus the structured fields a reader filters on. Pure (no IO, no
+/// global sink), so the mapping is unit-testable apart from the tailer's
+/// emission. `None` for an event that is not a detector finding, and for a
+/// clean stream-gate observation (the same filter that keeps
+/// `dispatch.context` from flooding the stream).
+fn detector_telemetry_payload(event: &darkmux_trajectory::TrajectoryEvent) -> Option<serde_json::Value> {
+    let f = detector_finding(event)?;
     let mut payload = serde_json::json!({
-        "kind": kind,
-        "severity": severity,
-        "detail": detail,
+        "kind": f.kind,
+        "severity": f.severity,
+        "detail": cap_str(&f.detail, MAX_TRAJ_FIELD_BYTES),
     });
-
-    // (#2169) The issue's own spec names these three fields explicitly
-    // (`{kind, count, model, sample_name_prefix}`), riding alongside the
-    // `detail` string above rather than only inside it — a consumer
-    // aggregating "how many malformed calls this dispatch" or filtering by
-    // model shouldn't have to parse the human-readable sentence. `model`
-    // also already rides on the FlowRecord's own top-level `model` field
-    // (every `emit_telemetry` call stamps `Some(&self.model)`); repeating
-    // it in the payload keeps this event self-describing on its own,
-    // matching how `tool_name`/`failure_count` are both in `detail` AND
-    // implicitly the record's `handle`/`session_id` for the sibling
-    // detectors above.
-    if event_type == "dispatch.tool.malformed_names" {
-        payload["count"] = event.get("count").cloned().unwrap_or(serde_json::json!(0));
-        payload["model"] = event.get("model").cloned().unwrap_or(serde_json::Value::Null);
-        payload["sample_name_prefix"] =
-            event.get("sample_name_prefix").cloned().unwrap_or(serde_json::Value::Null);
-        // (merge-gate MUST FIX 1) Same lenient-on-read fallback as the
-        // `detail` branch above — an older runtime image predating this
-        // field reads as the pre-split meaning.
-        payload["reason"] = serde_json::json!(
-            event.get("reason").and_then(|v| v.as_str()).unwrap_or("not_a_tool")
-        );
+    if let (Some(dst), Some(serde_json::Value::Object(src))) = (payload.as_object_mut(), f.fields) {
+        dst.extend(src);
     }
-
-    // (#2836) Same explicit-field pattern as the block above. `cut` is the
-    // load-bearing one: it is how a reader tells a server-side check-in cut
-    // from the `runtime_abort:*` forms Stage 1 starts emitting, without
-    // inferring it from a runtime version.
-    if event_type == "dispatch.tool_call.discarded" {
-        payload["name"] = event.get("name").cloned().unwrap_or(serde_json::Value::Null);
-        payload["arguments_chars"] =
-            event.get("arguments_chars").cloned().unwrap_or(serde_json::json!(0));
-        payload["cut"] = serde_json::json!(
-            event.get("cut").and_then(|v| v.as_str()).unwrap_or("unknown")
-        );
-    }
-
-    // (#2190) Same explicit-field pattern as the malformed-names block above
-    // — `model` already rides the FlowRecord's own top-level field, but
-    // repeating it (plus the context fact `prompt_tokens`) directly in the
-    // payload is the whole point of this event: a reader shouldn't have to
-    // join two other record kinds to answer "which model, what context."
-    if event_type == "dispatch.escalation.triggered" {
-        payload["reason"] = event.get("reason").cloned().unwrap_or(serde_json::Value::Null);
-        payload["model"] = event.get("model").cloned().unwrap_or(serde_json::Value::Null);
-        payload["prompt_tokens"] =
-            event.get("prompt_tokens").cloned().unwrap_or(serde_json::Value::Null);
-    }
-
-    // (#2887 F3/F4) Same explicit-field pattern — the numbers the sentence
-    // above is built from, so a consumer aggregating "how repetitive" across
-    // a run doesn't have to parse the human-readable string. `turn_seq`
-    // (forwarded from the runtime's own `seq`, same field `dispatch.
-    // checkpoint` calls `turn_seq`) is what lets the viewer collapse the
-    // observation + abort + any checkpoint that follow ONE cut into a
-    // single flagged-turn finding instead of counting raw records.
-    // `policy`/`acted` are forwarded VERBATIM from the event — the runtime
-    // stamps both now, so there is nothing left for the host to compute or
-    // fill in; an event from an older runtime image that predates this
-    // carries neither key, and `.get()` on a missing key yields `null`
-    // rather than a guessed value (same lenient-on-read discipline `bound`
-    // already follows on `dispatch.checkpoint`).
-    if event_type == "dispatch.gate.observation" || event_type == "dispatch.gate.abort" {
-        payload["turn_seq"] = event.get("seq").cloned().unwrap_or(serde_json::Value::Null);
-        payload["observation"] = event.get("observation").cloned().unwrap_or(serde_json::Value::Null);
-        payload["tail_ratio"] = event.get("tail_ratio").cloned().unwrap_or(serde_json::Value::Null);
-        payload["slice_chars"] = event.get("slice_chars").cloned().unwrap_or(serde_json::Value::Null);
-        payload["generated_chars"] =
-            event.get("generated_chars").cloned().unwrap_or(serde_json::Value::Null);
-        payload["policy"] = event.get("policy").cloned().unwrap_or(serde_json::Value::Null);
-        payload["acted"] = event.get("acted").cloned().unwrap_or(serde_json::Value::Null);
-    }
-
-    // (#994 engagement-context capture) Key the firing to the file it happened
-    // in, so this *caution* can later be retrieved for the same file and fed
-    // into the next dispatch's brief. We derive `area.files` from the
-    // detector's own args. Slice 1 covered `dispatch.cycle.suspected`; #1001
-    // extended it to `dispatch.tool.repeated_failure` (now carries
-    // `canonical_args`) and added the firing-time `code_hash` (computed inside
-    // the container) for staleness ranking. (`symbols` remains a later
-    // refinement — the load-bearing staleness signal is the hash.)
-    if let Some(area) = detector_area(event_type, event) {
+    if let Some(area) = f.area {
         payload["area"] = area;
     }
-
-    // (#2165) Forward the runtime's `bound` verbatim, when the underlying
-    // trajectory event carries one (today: `per_turn_cap.salvaged` and
-    // `intra_turn_stall.recovered` — the cycle/reasoning-loop/tool-failure
-    // detectors aren't bound-hit detectors and never stamp one). This is
-    // the payload that ALSO feeds the envelope's `detections` array
-    // (`self.summary.detections.push(payload.clone())` at the call site),
-    // so a remote reader watching the flow stream OR reading the finished
-    // envelope gets the same provenance the runtime's own stderr line and
-    // trajectory.jsonl record carry — the surface the #2165 miss actually
-    // happened on.
-    if let Some(bound) = event.get("bound") {
-        payload["bound"] = bound.clone();
+    if let Some(bound) = f.bound {
+        payload["bound"] = bound;
     }
-
     Some(payload)
 }
 
-/// (#2165) The human-readable clause a detector's `detail` string splices
-/// in — "the reasoning check-in interval (built-in 1000)" — built from the
-/// runtime's own `bound` field on the trajectory event, forwarded verbatim
-/// into the flow payload above. Returns `None` when the event carries no
-/// `bound` (an older runtime image predating #2165), so callers fall back
-/// to the pre-#2165 generic wording rather than a broken sentence.
-fn bound_detail_clause(event: &serde_json::Value) -> Option<String> {
-    let bound = event.get("bound")?;
-    let kind = bound.get("kind").and_then(|v| v.as_str())?;
+/// One detector firing, as [`detector_telemetry_payload`] renders it.
+struct DetectorFinding {
+    kind: &'static str,
+    severity: &'static str,
+    detail: String,
+    /// The event's own structured fields, merged into the payload.
+    fields: Option<serde_json::Value>,
+    /// (#994) The file the firing is about, for cautions.
+    area: Option<serde_json::Value>,
+    /// (#2165) The request bound it names, forwarded verbatim.
+    bound: Option<serde_json::Value>,
+}
+
+impl DetectorFinding {
+    fn new(kind: &'static str, severity: &'static str, detail: String) -> Self {
+        Self { kind, severity, detail, fields: None, area: None, bound: None }
+    }
+    fn with_fields(mut self, fields: serde_json::Value) -> Self {
+        self.fields = Some(fields);
+        self
+    }
+    fn with_area(mut self, area: Option<serde_json::Value>) -> Self {
+        self.area = area;
+        self
+    }
+    fn with_bound(mut self, bound: Option<&serde_json::Value>) -> Self {
+        self.bound = bound.cloned();
+        self
+    }
+}
+
+/// Each detector-class event's finding. See [`detector_telemetry_payload`].
+fn detector_finding(event: &darkmux_trajectory::TrajectoryEvent) -> Option<DetectorFinding> {
+    use darkmux_trajectory::TrajectoryEvent as E;
+    match event {
+        E::CycleSuspected(e) => Some(DetectorFinding::new("cycle", "warn", format!(
+            "`{}` called {}× in the last {} tool calls — repeated-tool-call cycle (#418)",
+            e.tool_name, e.count, e.window_size
+        )).with_area(tool_target_area(&e.tool_name, &e.canonical_args, e.code_hash.as_deref()))),
+        E::ReasoningLoopSuspected(e) => Some(DetectorFinding::new("reasoning-loop", "warn", format!(
+            "same reasoning repeated {}× in {} turns — reasoning loop (#461)",
+            e.count, e.window_size
+        ))),
+        E::RepeatedToolFailure(e) => Some(DetectorFinding::new("tool-failure", "warn", format!(
+            "{} failures of `{}` since it last succeeded (#419)",
+            e.failure_count, e.tool_name
+        )).with_area(tool_target_area(&e.tool_name, &e.canonical_args, e.code_hash.as_deref()))),
+        E::IntraTurnStallRecovered(e) => Some(DetectorFinding::new("intra-turn-stall", "info", format!(
+            "runaway-reasoning turn dropped + recovered; request bound was {} (budget {}/{}, {} tokens) (#414)",
+            bound_clause(e.bound.as_ref()), e.recoveries_used, e.recoveries_budget, count_or_unknown(e.completion_tokens)
+        )).with_bound(e.bound.as_ref())),
+        E::EmptyToolCallsRecovered(e) => Some(DetectorFinding::new("empty_tool_calls", "info", format!(
+            "the model returned finish_reason=tool_calls with no tool calls — turn dropped + \
+             recovered; request bound was {} (budget {}/{}, {} tokens) (#2190)",
+            bound_clause(e.bound.as_ref()), e.recoveries_used, e.recoveries_budget, count_or_unknown(e.completion_tokens)
+        )).with_bound(e.bound.as_ref())),
+        E::PerTurnCapSalvaged(e) => Some(DetectorFinding::new("per-turn-cap", "info", format!(
+            "{} tool call(s) salvaged; request bound was {} ({}/{} tokens) (#479)",
+            e.salvaged_tool_calls, bound_clause(e.bound.as_ref()), e.completion_tokens, e.cap
+        )).with_bound(e.bound.as_ref())),
+        E::ToolCallDiscarded(e) => Some(DetectorFinding::new("discarded_tool_call", "warn", format!(
+            "tool call `{}` was cut after {} character{} of arguments (cut={}) — the JSON does \
+             not parse, so it was neither dispatched nor sent back; that turn's work is gone (#2836)",
+            e.name, e.arguments_chars, if e.arguments_chars == 1 { "" } else { "s" }, e.cut
+        )).with_fields(serde_json::json!({
+            "name": e.name,
+            "arguments_chars": e.arguments_chars,
+            "cut": e.cut,
+        }))),
+        E::MalformedToolNames(e) => Some(DetectorFinding::new("malformed_tool_names", "warn", malformed_detail(e))
+            .with_fields(serde_json::json!({
+                "count": e.count,
+                "model": e.model,
+                "sample_name_prefix": e.sample_name_prefix,
+                "reason": e.reason,
+            }))),
+        E::EscalationTriggered(e) => Some(DetectorFinding::new("escalation", "warn", format!(
+            "escalated out of local-tier ({}) — model={}, prompt_tokens={} (#2190)",
+            e.reason, e.model, e.prompt_tokens
+        )).with_fields(serde_json::json!({
+            "reason": e.reason,
+            "model": e.model,
+            "prompt_tokens": e.prompt_tokens,
+        }))),
+        E::GateObservation(g) => gate_observation_detail(g).map(|d| {
+            DetectorFinding::new("repetition", "warn", d).with_fields(serde_json::json!({
+                "turn_seq": g.seq,
+                "observation": g.observation,
+                "tail_ratio": g.tail_ratio,
+                "slice_chars": g.slice_chars,
+                "generated_chars": null,
+                "policy": g.policy,
+                "acted": g.acted,
+            }))
+        }),
+        E::GateAbort(g) => Some(DetectorFinding::new("repetition", "warn", format!(
+            "observation {}: the degeneracy gate ended the call at {} characters ({} from this call) (#2836)",
+            g.observation, g.slice_chars, g.generated_chars
+        )).with_fields(serde_json::json!({
+            "turn_seq": g.seq,
+            "observation": g.observation,
+            "tail_ratio": null,
+            "slice_chars": g.slice_chars,
+            "generated_chars": g.generated_chars,
+            "policy": g.policy,
+            "acted": g.acted,
+        }))),
+        E::DispatchStart(_)
+        | E::DispatchComplete(_)
+        | E::StreamingStart(_)
+        | E::Partial(_)
+        | E::ToolCallWriting(_)
+        | E::StreamingEnd(_)
+        | E::ModelCompleted(_)
+        | E::Reasoning(_)
+        | E::ToolCompleted(_)
+        | E::ToolCallPromoted(_)
+        | E::PromotionSuppressed(_)
+        | E::Rest(_)
+        | E::CompactionStart(_)
+        | E::CompactionCall(_)
+        | E::Compaction(_)
+        | E::CompactionSkipped(_)
+        | E::CompactionUnproductive(_)
+        | E::Context(_)
+        | E::StaleContextTokens(_)
+        | E::PreSendBound(_)
+        | E::Checkpoint(_)
+        | E::ReasoningBoundNotApplied(_)
+        | E::FeedbackInjected(_)
+        | E::LegacyPromptSubmitted(_)
+        | E::Unknown => None,
+    }
+}
+
+/// `completion_tokens` a stall event carries: `unknown` when the upstream
+/// response omitted `usage`, never a misleading 0.
+fn count_or_unknown(n: Option<u64>) -> String {
+    n.map_or_else(|| "unknown".to_string(), |n| n.to_string())
+}
+
+/// (#2169) A malformed-names firing names WHY the calls never ran: a
+/// permission refusal is not a garbage name.
+fn malformed_detail(e: &darkmux_trajectory::MalformedToolNames) -> String {
+    let (count, model, sample) = (e.count, &e.model, &e.sample_name_prefix);
+    match e.reason {
+        darkmux_trajectory::MalformedReason::RealToolNotGranted => format!(
+            "{count} tool call(s) this turn named a REAL tool this dispatch's role is not granted \
+             (model={model}, sample=\"{sample}\") — never dispatched, coalesced into one feedback \
+             message (#2169)"
+        ),
+        darkmux_trajectory::MalformedReason::NotATool => format!(
+            "{count} tool call(s) this turn carried a `name` that is not a real tool \
+             (model={model}, sample=\"{sample}\") — never dispatched, coalesced into one feedback \
+             message (#2169)"
+        ),
+    }
+}
+
+/// (#2887) A stream-gate observation is a finding only when the gate judged
+/// it degenerate; the detail says what the policy did about it.
+fn gate_observation_detail(g: &darkmux_trajectory::GateObservation) -> Option<String> {
+    use darkmux_types::config::DetectionPolicy;
+    if !g.degenerate {
+        return None;
+    }
+    let ratio = g.tail_ratio.map_or_else(|| "?".to_string(), |r| format!("{r:.3}"));
+    let base = format!(
+        "observation {}: tail_ratio={ratio} over {} characters — the degeneracy gate judged this \
+         repeating (#2836)",
+        g.observation, g.slice_chars
+    );
+    if g.acted == Some(true) {
+        return Some(format!("{base} and ended the call"));
+    }
+    Some(match recorded_policy(g.policy.as_deref()) {
+        Some(DetectionPolicy::Record) => format!("{base} — recorded, not concluded"),
+        Some(DetectionPolicy::Warn) => format!("{base} — warned, not concluded"),
+        Some(DetectionPolicy::Off) | Some(DetectionPolicy::Conclude) | None => base,
+    })
+}
+
+/// (#2165) The request bound a detector event names, in words: `the
+/// reasoning check-in interval (built-in 1000)`. The per-call cap when the
+/// runtime named none.
+fn bound_clause(bound: Option<&serde_json::Value>) -> String {
+    let Some(bound) = bound else { return "the per-call cap".to_string() };
+    let Some(kind) = bound.get("kind").and_then(|v| v.as_str()) else {
+        return "the per-call cap".to_string();
+    };
     let source = bound.get("source").and_then(|v| v.as_str()).unwrap_or("built-in");
     let value = bound
         .get("value")
         .and_then(|v| v.as_u64())
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "?".to_string());
-    Some(format!("{} ({source} {value})", bound_label(kind)))
+        .map_or_else(|| "?".to_string(), |v| v.to_string());
+    format!("{} ({source} {value})", bound_label(kind))
 }
 
-/// (#2165) The label a bound `kind` string reads as in prose — mirrors
-/// `runtime/src/bounds.rs`'s `BoundKind::label()` exactly (that crate can't
-/// be a dependency here — it's a standalone workspace, see its own
-/// `Cargo.toml` doc — so the wording is duplicated by hand; keep the two in
-/// sync when either changes). An unrecognized `kind` (a future runtime image
-/// emitting a bound this host binary predates) names the literal string
-/// rather than panicking or silently showing nothing.
-///
-/// (#2190) `"generation_checkpoint_interval"` was MISSING here — every real
-/// firing of that bound (#2171's non-reasoning check-in, the DEFAULT for a
-/// non-thinking model like Devstral) fell to the `other` arm and rendered
-/// "an unrecognized bound (generation_checkpoint_interval)", which reads as
-/// a broken formatter rather than a named, well-understood bound. Keep this
-/// match arm-for-arm with `BoundKind` in `runtime/src/bounds.rs` — a missing
-/// arm here is silent (the `other` fallback never panics), so nothing short
-/// of reading both files side by side catches the next one.
+/// (#994) The file a `read`/`edit`/`write` firing is about, with the file's
+/// firing-time content hash for staleness ranking. `None` for any other
+/// tool, or args that carry no `path`.
+fn tool_target_area(tool: &str, canonical_args: &str, code_hash: Option<&str>) -> Option<serde_json::Value> {
+    if !matches!(tool, "read" | "edit" | "write") {
+        return None;
+    }
+    let path = extract_tool_target_path(canonical_args)?;
+    let mut area = serde_json::json!({ "files": [cap_str(&path, MAX_TRAJ_FIELD_BYTES)] });
+    if let Some(h) = code_hash {
+        area["code_hash"] = serde_json::json!(cap_str(h, MAX_TRAJ_FIELD_BYTES));
+    }
+    Some(area)
+}
+
 fn bound_label(kind: &str) -> String {
     match kind {
         "reasoning_checkpoint_interval" => "the reasoning check-in interval".to_string(),
@@ -11648,56 +10507,6 @@ fn bound_label(kind: &str) -> String {
         "inactivity_timeout" => "the inactivity timeout".to_string(),
         other => format!("an unrecognized bound ({other})"),
     }
-}
-
-/// (#994 engagement-context capture, slice 1) Derive the `area` of the
-/// engagement a detector firing touched — the file the cycled tool call
-/// targeted — for stamping into the telemetry record's payload (`area.files`).
-///
-/// Today only `dispatch.cycle.suspected` carries the tool-call args
-/// (`canonical_args`, already a normalized JSON object for known tools — see
-/// `runtime/src/cycle_detector.rs::canonical_args`), so it is the only detector
-/// with a host-derivable file here, and only for the genuinely file-editing
-/// tools: `read`/`edit`/`write` carry a target-file `path`. A `search` cycle's
-/// `path` is the search *root directory* (not a target file) and a `bash`
-/// cycle carries a `command`, so neither keys a file — those, like the
-/// turn-level detectors (reasoning-loop / intra-turn-stall / per-turn-cap) and
-/// `dispatch.tool.repeated_failure` (no args today), return `None` → the caller
-/// omits `area` rather than recording a fileless or directory-as-file caution
-/// (those become a runtime-side slice 2).
-///
-/// Returns `None` when no file path is derivable.
-fn detector_area(event_type: &str, event: &serde_json::Value) -> Option<serde_json::Value> {
-    let path = match event_type {
-        // (#1001) Both the cycle detector and the tool-failure-cascade detector
-        // carry the tool's `canonical_args`. Allowlist the file-editing tools:
-        // their canonical `path` is a target file. `search`'s `path` is a
-        // directory and `bash` carries a `command`, so a firing in either is
-        // engagement-level, not file-scoped. Unknown tools (raw, unfiltered
-        // canonical args) fall through too. Clean-by-construction beats storing
-        // a directory in a field named `files`.
-        "dispatch.cycle.suspected" | "dispatch.tool.repeated_failure" => {
-            let tool = event.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
-            if !matches!(tool, "read" | "edit" | "write") {
-                return None;
-            }
-            let raw = event.get("canonical_args").and_then(|v| v.as_str())?;
-            extract_tool_target_path(raw)?
-        }
-        _ => return None,
-    };
-    // The path is container-written (the model chose it), so bound it the same
-    // way the detector `detail` is bounded (#237) — a pathologically long path
-    // can't bloat the telemetry record.
-    let path = cap_str(&path, MAX_TRAJ_FIELD_BYTES);
-    let mut area = serde_json::json!({ "files": [path] });
-    // (#1001) Forward the runtime's firing-time content hash when present, so
-    // retrieval can rank this caution down once the file has changed
-    // (staleness). Bounded like the path; absent for a non-file tool.
-    if let Some(h) = event.get("code_hash").and_then(|v| v.as_str()) {
-        area["code_hash"] = serde_json::Value::String(cap_str(h, MAX_TRAJ_FIELD_BYTES));
-    }
-    Some(area)
 }
 
 /// (#994) Parse the target file path from a tool call's canonicalized JSON
@@ -11722,8 +10531,11 @@ fn extract_tool_target_path(raw_args: &str) -> Option<String> {
 
 /// Cap a string at `max` bytes, truncating at a UTF-8 char boundary (so the
 /// result stays valid) and appending a marker that records the original size.
-/// Short strings are returned unchanged. The single primitive behind both
-/// `cap_json_str` and the detector-`detail` bound (#237).
+/// Short strings are returned unchanged. Container-written trajectory fields
+/// flow into flow-record payloads (flow stream, audit chain, Redis, viewer);
+/// bounding them at ingest stops an adversarial or buggy container from
+/// injecting a pathologically large string (#237 defense-in-depth, layered
+/// under the viewer's output encoding).
 fn cap_str(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -11740,12 +10552,6 @@ fn cap_str(s: &str, max: usize) -> String {
     )
 }
 
-/// Cap a JSON string value at `max` bytes (see `cap_str`). Non-string values
-/// pass through unchanged; `None` becomes JSON null. Container-written
-/// trajectory fields flow into flow-record payloads (→ flow stream, audit
-/// chain, Redis, viewer); bounding them at ingest stops an adversarial or buggy
-/// container from injecting a pathologically large string (#237 defense-in-
-/// depth, layered under the viewer's output encoding).
 /// (#2007) Cap a tool RESULT at `max` bytes by removing the MIDDLE, keeping
 /// both ends.
 ///
@@ -11803,51 +10609,17 @@ fn cap_result_middle(s: &str, max: usize) -> String {
     )
 }
 
-/// Cap a JSON tool-result value by eliding its middle (see
-/// [`cap_result_middle`]). Non-string values pass through; `None` is null.
-fn cap_json_result(value: Option<&serde_json::Value>, max: usize) -> serde_json::Value {
-    let Some(v) = value else {
-        return serde_json::Value::Null;
-    };
-    let Some(s) = v.as_str() else {
-        return v.clone();
-    };
-    if s.len() <= max {
-        return v.clone();
-    }
-    serde_json::Value::String(cap_result_middle(s, max))
-}
-
-/// (#2963) `dispatch.turn`'s `tool_paths`: the runtime's per-call `path`
-/// (`model.completed.tool_calls[i].path`, the path argument only, never the
-/// content), aligned by index with the turn's calls, `null` for a call
-/// without one. A path over `MAX_TRAJ_FIELD_BYTES` is `null`, not clipped,
-/// since a clipped path names a different file. `None` (the key is left
-/// out) when no call has a path. The viewer names `tool_paths[k]` while the
-/// turn's k-th call runs.
-/// (#2963) The runtime's `model.completed` keys this reads, spelled once
-/// here and pinned as literals by a test on each side (the runtime's are
-/// `trajectory::RUNS_KEY` / `CALLS_PLANNED_KEY`): `runs` is `false` on a
-/// call that will not run; `calls_planned` is `true` on a record whose calls
-/// carry those marks.
-const RUNS_KEY: &str = "runs";
-const CALLS_PLANNED_KEY: &str = "calls_planned";
-
 /// (#2963) The turn's tool calls that RUN, in order: the runtime marks a
 /// call it will not dispatch (ungranted, not a tool, cut off mid-arguments;
-/// its `plan_tool_calls`) `runs: false` on the `model.completed` entry.
-/// `None` when the record does not say `calls_planned: true` (a runtime
-/// older than the marks) or carries no `tool_calls` array: neither list is
-/// then written.
-fn running_tool_calls(event: &serde_json::Value) -> Option<Vec<&serde_json::Value>> {
-    // (#2963 review) Fail closed on version skew: a runtime older than the
-    // marks writes no `calls_planned`, and its calls must not read as "every
-    // call runs". No marker, no lists.
-    if event.get(CALLS_PLANNED_KEY).and_then(|v| v.as_bool()) != Some(true) {
+/// its `plan_tool_calls`) `runs: false`. `None` when the record does not
+/// say its calls were planned, or carries no calls: neither list is then
+/// written, so a call never reads as "running" without the runtime saying
+/// so.
+fn running_tool_calls(m: &darkmux_trajectory::ModelCompleted) -> Option<Vec<&darkmux_trajectory::ToolCallEntry>> {
+    if !m.calls_planned {
         return None;
     }
-    let calls = event.get("tool_calls")?.as_array()?;
-    Some(calls.iter().filter(|c| c.get(RUNS_KEY).and_then(|r| r.as_bool()) != Some(false)).collect())
+    Some(m.tool_calls.as_ref()?.iter().filter(|c| c.runs != Some(false)).collect())
 }
 
 /// (#2963 review, CONSIDER 2) A name the runtime knows as a tool: one some
@@ -11864,18 +10636,15 @@ fn is_known_runtime_tool(name: &str) -> bool {
 /// calls, so its length is how many will complete; `None` for a turn with
 /// none. The viewer names `tool_names[k]` (the word and the icon) while the
 /// turn's k-th running call runs.
-fn turn_tool_names(event: &serde_json::Value) -> Option<serde_json::Value> {
-    let running = running_tool_calls(event)?;
-    if event.get("tool_calls")?.as_array()?.is_empty() {
+fn turn_tool_names(m: &darkmux_trajectory::ModelCompleted) -> Option<serde_json::Value> {
+    let running = running_tool_calls(m)?;
+    if m.tool_calls.as_ref()?.is_empty() {
         return None;
     }
     Some(serde_json::Value::Array(
         running
             .into_iter()
-            .map(|c| match c.get("name").and_then(|n| n.as_str()) {
-                Some(n) if is_known_runtime_tool(n) => serde_json::json!(n),
-                _ => serde_json::Value::Null,
-            })
+            .map(|c| if is_known_runtime_tool(&c.name) { serde_json::json!(c.name) } else { serde_json::Value::Null })
             .collect(),
     ))
 }
@@ -11886,34 +10655,15 @@ fn turn_tool_names(event: &serde_json::Value) -> Option<serde_json::Value> {
 /// `MAX_TRAJ_FIELD_BYTES` is `null`, not clipped, since a clipped path names
 /// a different file. `None` (the key is left out) when no running call has
 /// a path.
-fn turn_tool_paths(event: &serde_json::Value) -> Option<serde_json::Value> {
-    let paths: Vec<serde_json::Value> = running_tool_calls(event)?
+fn turn_tool_paths(m: &darkmux_trajectory::ModelCompleted) -> Option<serde_json::Value> {
+    let paths: Vec<serde_json::Value> = running_tool_calls(m)?
         .into_iter()
-        .map(|c| match c.get("path").and_then(|p| p.as_str()) {
+        .map(|c| match c.path.as_deref() {
             Some(p) if !p.is_empty() && p.len() <= MAX_TRAJ_FIELD_BYTES => serde_json::json!(p),
             _ => serde_json::Value::Null,
         })
         .collect();
     paths.iter().any(|p| !p.is_null()).then_some(serde_json::Value::Array(paths))
-}
-
-fn cap_json_str(value: Option<&serde_json::Value>, max: usize) -> serde_json::Value {
-    let Some(v) = value else {
-        return serde_json::Value::Null;
-    };
-    let Some(s) = v.as_str() else {
-        return v.clone();
-    };
-    if s.len() <= max {
-        return v.clone();
-    }
-    serde_json::Value::String(cap_str(s, max))
-}
-
-/// `reasoning_text` cap — the large-text case (thinking-mode output). Delegates
-/// to the shared `cap_json_str` with the reasoning-specific bound. (#231 / S6)
-fn cap_reasoning_text(value: Option<&serde_json::Value>) -> serde_json::Value {
-    cap_json_str(value, MAX_REASONING_TEXT_BYTES)
 }
 
 /// Result of probing the host for the internal Docker runtime's two

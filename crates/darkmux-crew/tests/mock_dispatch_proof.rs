@@ -325,8 +325,9 @@ fn real_container_dispatch_round_trips_through_a_standalone_mock_model_process()
 
     assert_eq!(result.exit_code, 0, "the runtime container must exit 0 on a clean stop");
 
-    // The internal runtime's `--json` envelope: { result, final_assistant,
-    // metrics, trajectory_path }. `result` must be "stop" (the mock's fixed
+    // The envelope `dispatch` returns: the runtime's { result,
+    // final_assistant, trajectory_path } plus the host's `metrics`, the fold
+    // of the trajectory. `result` must be "stop" (the mock's fixed
     // response has finish_reason "stop", no tool_calls) and
     // `final_assistant` must contain the mock's scripted content —
     // PROVING the completion the agent loop acted on genuinely came back

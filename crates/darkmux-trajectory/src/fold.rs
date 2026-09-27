@@ -348,6 +348,30 @@ impl TrajectoryFold {
     pub fn started_at_ms(&self) -> Option<u64> {
         self.start.as_ref().map(|s| s.ts)
     }
+
+    /// Checkpoints whose verdict was to conclude.
+    pub fn checkpoints_concluded(&self) -> u32 {
+        u32::try_from(self.checkpoints.iter().filter(|c| c.verdict == Verdict::Conclude).count())
+            .unwrap_or(u32::MAX)
+    }
+
+    /// (#1959) The WORST and the MEAN novelty ratio across the run's
+    /// checkpoints, `None` when no checkpoint measured one.
+    ///
+    /// The last ratio alone INVERTED the ranking on two real crawls: a run
+    /// that decayed to 0.193, tripped the gate and recovered reported
+    /// `last = 0.997`, above a clean run's 0.976. Together, `min` answers
+    /// "did this ever degenerate" and `mean` "how much of the run was
+    /// compromised": low min + high mean is one excursion caught and
+    /// recovered, low both is chronic, high both is clean.
+    pub fn checkpoint_tail_ratios(&self) -> (Option<f64>, Option<f64>) {
+        let ratios: Vec<f64> = self.checkpoints.iter().filter_map(|c| c.tail_ratio).collect();
+        if ratios.is_empty() {
+            return (None, None);
+        }
+        let min = ratios.iter().copied().fold(f64::INFINITY, f64::min);
+        (Some(min), Some(ratios.iter().sum::<f64>() / ratios.len() as f64))
+    }
 }
 
 fn bump(counter: &mut u32, by: u32) {

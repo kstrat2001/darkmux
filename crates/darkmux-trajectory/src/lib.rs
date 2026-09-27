@@ -25,6 +25,26 @@ pub const TRAJECTORY_SUBDIR: &str = ".darkmux-runtime";
 /// The trajectory file inside [`TRAJECTORY_SUBDIR`].
 pub const TRAJECTORY_FILE: &str = "trajectory.jsonl";
 
+/// The counters of a runtime checkpoint (`<out_dir>/checkpoint.json`) the
+/// host reads. The loop seeds its turn cap from them across a resume; the
+/// host adds what the resumed run recorded to report the whole task's
+/// count. The runtime's own `RunCheckpoint` carries the same two fields
+/// (pinned by a test in the runtime crate).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
+pub struct CheckpointCounts {
+    pub turns: u32,
+    pub compactions: u32,
+}
+
+impl CheckpointCounts {
+    /// The counters of a checkpoint's JSON text; zero for one that does not
+    /// parse (the host validated it before resuming from it).
+    pub fn of(checkpoint_json: &str) -> Self {
+        serde_json::from_str(checkpoint_json).unwrap_or_default()
+    }
+}
+
 /// `<out_dir>/.darkmux-runtime/trajectory.jsonl`.
 pub fn trajectory_path(out_dir: &std::path::Path) -> std::path::PathBuf {
     out_dir.join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)

@@ -685,7 +685,7 @@ impl StepKind for MissionWorktreeStepKind {
 // `MissionEnvelope` summary.
 pub(crate) struct CoderStepResult {
     pub(crate) failed_verifiers: Vec<crew::step_kinds::FailedVerifier>,
-    pub(crate) tokens_total: u32,
+    pub(crate) tokens_total: u64,
 }
 
 /// Wraps the coder-dispatch half of the old hand-written sequence
@@ -942,10 +942,12 @@ impl StepKind for MissionCoderStepKind {
             style::dim(&format!("darkmux coder-phase: session id `{}`", ctx.session_id))
         );
 
+        // The coder's tokens: the fold of its own trajectory, the one
+        // reading every other surface quotes.
         let tokens = result
             .out_dir
             .as_deref()
-            .map(crew::dispatch_internal::read_token_totals)
+            .map(|out| darkmux_trajectory::TrajectoryFold::from_path(&darkmux_trajectory::trajectory_path(out)).tokens)
             .unwrap_or_default();
 
         if result.exit_code != 0 {
@@ -970,11 +972,11 @@ impl StepKind for MissionCoderStepKind {
                 &ctx.mission_id,
                 &ctx.phase_id,
                 &ctx.session_id,
-                serde_json::json!({ "exit_code": exit_code, "total_tokens": tokens.total() }),
+                serde_json::json!({ "exit_code": exit_code, "total_tokens": tokens.total }),
             );
             *result_slot.lock().expect("mission.coder result mutex poisoned") = Some(CoderStepResult {
                 failed_verifiers: Vec::new(),
-                tokens_total: tokens.total(),
+                tokens_total: tokens.total,
             });
             anyhow::bail!("coder dispatch exited {exit_code}");
         }
@@ -997,12 +999,12 @@ impl StepKind for MissionCoderStepKind {
             serde_json::json!({
                 "failed_verifiers": failed_verifiers,
                 "count": failed_verifiers.len(),
-                "total_tokens": tokens.total(),
+                "total_tokens": tokens.total,
             }),
         );
 
         let stdout = result.stdout.clone();
-        let tokens_total = tokens.total();
+        let tokens_total = tokens.total;
         *result_slot.lock().expect("mission.coder result mutex poisoned") = Some(CoderStepResult {
             failed_verifiers,
             tokens_total,
@@ -3015,11 +3017,11 @@ fn worktree_branch(wt_path: &Path) -> Option<String> {
 
 /// One-line tokens-off-meter readout. Tokens only — the operator multiplies
 /// by their own per-token rate (no currency in product, by design).
-fn print_token_line(t: &crew::dispatch_internal::TokenTotals) {
+fn print_token_line(t: &darkmux_trajectory::TokenSum) {
     println!(
         "  {} {} {}",
         style::dim("tokens off-meter:"),
-        style::accent(&format!("{}", t.total())),
+        style::accent(&format!("{}", t.total)),
         style::dim(&format!("({} prompt + {} completion)", t.prompt, t.completion))
     );
 }

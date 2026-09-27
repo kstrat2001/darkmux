@@ -29,8 +29,9 @@
 //! omitted, and a reply with no usage block at all carries no count keys and
 //! `token_source: "absent"`. `total_tokens` prefers the provider's own total
 //! and falls back to `prompt + completion` only when the provider reported a
-//! split without a total (arithmetic on reported numbers, the same precedence
-//! `turn_tokens_payload` and the map-item payload always used).
+//! split without a total (arithmetic on reported numbers):
+//! `darkmux_trajectory::UsageCounts::total_tokens`, the one rule every usage
+//! record, every token sum and every budget settle reads.
 //!
 //! The producers, each calling [`usage_payload`] (directly or through
 //! [`crate::single_shot::SingleShotReply::usage_payload`], the shared reply
@@ -225,24 +226,6 @@ pub fn utility_marker_record(action: darkmux_flow::FlowAction, job_role_id: &str
     rec
 }
 
-/// The token counts a reply reported. Every field is tri-state: `None`
-/// means the provider did not say, never zero.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct UsageCounts {
-    pub prompt: Option<u64>,
-    pub completion: Option<u64>,
-    pub total: Option<u64>,
-    pub reasoning: Option<u64>,
-    pub cached: Option<u64>,
-}
-
-impl UsageCounts {
-    /// True when the reply carried a usage block this record can count.
-    pub fn reported(&self) -> bool {
-        self.prompt.is_some() || self.completion.is_some() || self.total.is_some()
-    }
-}
-
 /// What darkmux knows about the call itself, independent of what it cost.
 #[derive(Clone, Copy, Debug)]
 pub struct CallFacts<'a> {
@@ -263,7 +246,7 @@ pub struct CallFacts<'a> {
 }
 
 /// THE writer: one call's canonical `telemetry.tokens` payload.
-pub fn usage_payload(facts: &CallFacts<'_>, counts: &UsageCounts) -> serde_json::Value {
+pub fn usage_payload(facts: &CallFacts<'_>, counts: &darkmux_trajectory::UsageCounts) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "call_kind": facts.call_kind,
         "purpose": call_purpose(facts.call_kind, facts.role_id),
@@ -287,16 +270,10 @@ pub fn usage_payload(facts: &CallFacts<'_>, counts: &UsageCounts) -> serde_json:
         return payload;
     }
     obj.insert("token_source".into(), serde_json::json!("provider"));
-    let total = counts
-        .total
-        .or_else(|| match (counts.prompt, counts.completion) {
-            (None, None) => None,
-            (p, c) => Some(p.unwrap_or(0).saturating_add(c.unwrap_or(0))),
-        });
     for (key, value) in [
         ("prompt_tokens", counts.prompt),
         ("completion_tokens", counts.completion),
-        ("total_tokens", total),
+        ("total_tokens", counts.total_tokens()),
         ("reasoning_tokens", counts.reasoning),
         ("cached_tokens", counts.cached),
     ] {
@@ -528,10 +505,10 @@ mod tests {
             endpoint: "h/m",
             endpoint_id,
         };
-        let counts = UsageCounts { total: Some(5), ..Default::default() };
+        let counts = darkmux_trajectory::UsageCounts { total: Some(5), ..Default::default() };
         assert_eq!(usage_payload(&facts(Some("azure")), &counts)["endpoint_id"], "azure");
         assert!(usage_payload(&facts(None), &counts).get("endpoint_id").is_none());
-        assert_eq!(usage_payload(&facts(Some("azure")), &UsageCounts::default())["endpoint_id"], "azure", "an absent-usage record still names its endpoint");
+        assert_eq!(usage_payload(&facts(Some("azure")), &darkmux_trajectory::UsageCounts::default())["endpoint_id"], "azure", "an absent-usage record still names its endpoint");
     }
     use super::*;
 
@@ -550,7 +527,7 @@ mod tests {
     fn provider_total_wins_over_the_sum() {
         let p = usage_payload(
             &facts(Some("served")),
-            &UsageCounts {
+            &darkmux_trajectory::UsageCounts {
                 prompt: Some(10),
                 completion: Some(5),
                 total: Some(40),
@@ -576,7 +553,7 @@ mod tests {
                 reported_model: None,
                 endpoint: "http://h:1234/v1",
             };
-            usage_payload(&f, &UsageCounts::default())["purpose"].clone()
+            usage_payload(&f, &darkmux_trajectory::UsageCounts::default())["purpose"].clone()
         };
         let utility = serde_json::json!(UsagePurpose::Utility);
         let work = serde_json::json!(UsagePurpose::Work);
@@ -611,7 +588,7 @@ mod tests {
                 reported_model: None,
                 endpoint: "http://h:1234/v1",
             };
-            usage_payload(&f, &UsageCounts::default())
+            usage_payload(&f, &darkmux_trajectory::UsageCounts::default())
         };
         assert_eq!(payload(CallKind::Compaction, Some("compactor"))["job"], "compaction");
         assert_eq!(
@@ -681,7 +658,7 @@ mod tests {
     fn a_split_without_a_total_sums() {
         let p = usage_payload(
             &facts(None),
-            &UsageCounts {
+            &darkmux_trajectory::UsageCounts {
                 prompt: Some(10),
                 completion: Some(5),
                 ..Default::default()
@@ -697,7 +674,7 @@ mod tests {
 
     #[test]
     fn no_usage_block_is_absent_with_no_counts() {
-        let p = usage_payload(&facts(None), &UsageCounts::default());
+        let p = usage_payload(&facts(None), &darkmux_trajectory::UsageCounts::default());
         assert_eq!(p["token_source"], "absent");
         for k in [
             "prompt_tokens",

@@ -48,51 +48,22 @@ pub struct SingleShotRequest<'a> {
 /// call, not this primitive's.
 pub struct SingleShotReply {
     pub content: String,
-    pub total_tokens: Option<u64>,
-    /// (#1361) `usage.prompt_tokens` / `usage.completion_tokens`, alongside
-    /// `total_tokens` — needed so callers can emit a `telemetry.tokens`
-    /// record shaped like `dispatch_internal.rs`'s per-turn one (the fleet
-    /// dashboard's `tokensOffMeter()` sums that family's `prompt_tokens`/
-    /// `completion_tokens` fields, not just the total).
-    pub prompt_tokens: Option<u64>,
-    pub completion_tokens: Option<u64>,
-    /// (#1444) `usage.completion_tokens_details.reasoning_tokens`.
+    /// The reply's `usage` block, tri-state as read: `None` for a count the
+    /// endpoint did not report, never a fabricated zero.
     ///
-    /// Whether this is a SUBSET of `completion_tokens` above or a third
-    /// token class outside it is PROVIDER-SCOPED: OpenAI and Azure document
-    /// `completion_tokens_details` as a breakdown of `completion_tokens`,
-    /// but other OpenAI-compatible layers do not, and 284 blocks in this
-    /// machine's own recorded corpus — spanning `gemini-3.1-pro-preview`,
-    /// `gemini-2.5-flash` and `grok-4.3`, all reachable from
-    /// `~/.darkmux/profiles.json` today — report a `total_tokens` GREATER
-    /// than prompt + completion. (Full evidence table: the runtime crate's
-    /// `lmstudio::CompletionTokensDetails::reasoning_tokens` doc.) Never
-    /// derive one of these fields from the other, in either direction.
-    ///
-    /// `None` when the endpoint's response carries no details object, or the
-    /// object is present but doesn't name the field — never a fabricated
-    /// zero. Populated on both the local and hosted dialects (the same
-    /// shared [`extract_reply`]); LMStudio (local) never sends this key
-    /// today, so a local call's value is always `None` in practice.
-    pub reasoning_tokens: Option<u64>,
-    /// (#1444) `usage.prompt_tokens_details.cached_tokens`. Same tri-state
-    /// contract as `reasoning_tokens` above.
-    pub cached_tokens: Option<u64>,
+    /// (#1444) `reasoning` is `usage.completion_tokens_details.reasoning_tokens`
+    /// and `cached` is `usage.prompt_tokens_details.cached_tokens`. Whether
+    /// reasoning is a SUBSET of `completion` or a third class outside it is
+    /// PROVIDER-SCOPED: OpenAI and Azure document the details as a breakdown
+    /// of `completion_tokens`, but 284 blocks in this machine's recorded
+    /// corpus (`gemini-3.1-pro-preview`, `gemini-2.5-flash`, `grok-4.3`)
+    /// report a `total_tokens` GREATER than prompt + completion. Never derive
+    /// one field from another, in either direction.
+    pub counts: darkmux_trajectory::UsageCounts,
     pub model: Option<String>,
 }
 
 impl SingleShotReply {
-    /// (#2902 step 1a) The counts this reply reported, tri-state as read.
-    pub fn usage_counts(&self) -> crate::usage::UsageCounts {
-        crate::usage::UsageCounts {
-            prompt: self.prompt_tokens,
-            completion: self.completion_tokens,
-            total: self.total_tokens,
-            reasoning: self.reasoning_tokens,
-            cached: self.cached_tokens,
-        }
-    }
-
     /// (#2902 step 1a) The shared reply seam's usage record: this call's
     /// canonical `telemetry.tokens` payload, through the one writer
     /// ([`crate::usage::usage_payload`]). `reported_model` is this reply's
@@ -118,7 +89,7 @@ impl SingleShotReply {
                 endpoint,
                 endpoint_id,
             },
-            &self.usage_counts(),
+            &self.counts,
         )
     }
 }
@@ -353,7 +324,7 @@ pub fn single_shot_chat_hosted(req: &HostedSingleShotRequest) -> Result<SingleSh
             "[darkmux-debug] hosted-call host={host} model={} max_tokens={} returned_tokens={:?} wall_ms={}",
             req.model,
             req.max_tokens,
-            reply.total_tokens,
+            reply.counts.total_tokens(),
             start.elapsed().as_millis()
         );
     }
@@ -371,32 +342,22 @@ pub(crate) fn extract_reply(resp: &serde_json::Value) -> SingleShotReply {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let total_tokens = resp.pointer("/usage/total_tokens").and_then(|v| v.as_u64());
-    let prompt_tokens = resp.pointer("/usage/prompt_tokens").and_then(|v| v.as_u64());
-    let completion_tokens = resp.pointer("/usage/completion_tokens").and_then(|v| v.as_u64());
-    // (#1444) Same tri-state contract as the fields above — `.pointer()`
-    // returns `None` for a missing intermediate object (no
-    // `completion_tokens_details` at all) exactly the same way it does
-    // for a missing leaf, so no extra branching is needed to distinguish
-    // "object absent" from "field absent inside a present object": both
-    // collapse to `None` here, and both mean "the endpoint didn't say".
-    let reasoning_tokens =
-        resp.pointer("/usage/completion_tokens_details/reasoning_tokens").and_then(|v| v.as_u64());
-    let cached_tokens =
-        resp.pointer("/usage/prompt_tokens_details/cached_tokens").and_then(|v| v.as_u64());
+    // (#1444) `.pointer()` returns `None` for a missing intermediate object
+    // (no `completion_tokens_details` at all) exactly as for a missing leaf:
+    // both mean "the endpoint didn't say".
+    let count = |path: &str| resp.pointer(path).and_then(|v| v.as_u64());
+    let counts = darkmux_trajectory::UsageCounts {
+        prompt: count("/usage/prompt_tokens"),
+        completion: count("/usage/completion_tokens"),
+        total: count("/usage/total_tokens"),
+        reasoning: count("/usage/completion_tokens_details/reasoning_tokens"),
+        cached: count("/usage/prompt_tokens_details/cached_tokens"),
+    };
     let model = resp
         .get("model")
         .and_then(|m| m.as_str())
         .map(str::to_string);
-    SingleShotReply {
-        content,
-        total_tokens,
-        prompt_tokens,
-        completion_tokens,
-        reasoning_tokens,
-        cached_tokens,
-        model,
-    }
+    SingleShotReply { content, counts, model }
 }
 
 #[cfg(test)]
@@ -736,9 +697,9 @@ mod tests {
         .expect("well-formed success body classifies as Ok");
         let reply = extract_reply(&resp);
         assert_eq!(reply.content, "ok");
-        assert_eq!(reply.total_tokens, Some(42));
-        assert_eq!(reply.prompt_tokens, Some(30));
-        assert_eq!(reply.completion_tokens, Some(12));
+        assert_eq!(reply.counts.total, Some(42));
+        assert_eq!(reply.counts.prompt, Some(30));
+        assert_eq!(reply.counts.completion, Some(12));
         assert_eq!(reply.model.as_deref(), Some("darkmux:qwen3.6-35b-a3b"));
     }
 
@@ -752,7 +713,7 @@ mod tests {
             .expect("empty-but-present content still classifies as Ok");
         let reply = extract_reply(&resp);
         assert_eq!(reply.content, "");
-        assert_eq!(reply.total_tokens, None);
+        assert_eq!(reply.counts.total, None);
         assert_eq!(reply.model, None);
     }
 
@@ -769,7 +730,7 @@ mod tests {
         .expect("message object without a content field classifies as Ok");
         let reply = extract_reply(&resp);
         assert_eq!(reply.content, "");
-        assert_eq!(reply.total_tokens, Some(128));
+        assert_eq!(reply.counts.total, Some(128));
         assert_eq!(reply.model.as_deref(), Some("m"));
     }
 
@@ -779,11 +740,11 @@ mod tests {
             .expect("content-only body classifies as Ok");
         let reply = extract_reply(&resp);
         assert_eq!(reply.content, "hi");
-        assert_eq!(reply.total_tokens, None);
-        assert_eq!(reply.prompt_tokens, None);
-        assert_eq!(reply.completion_tokens, None);
-        assert_eq!(reply.reasoning_tokens, None);
-        assert_eq!(reply.cached_tokens, None);
+        assert_eq!(reply.counts.total, None);
+        assert_eq!(reply.counts.prompt, None);
+        assert_eq!(reply.counts.completion, None);
+        assert_eq!(reply.counts.reasoning, None);
+        assert_eq!(reply.counts.cached, None);
         assert_eq!(reply.model, None);
     }
 
@@ -800,8 +761,8 @@ mod tests {
         )
         .expect("well-formed body without details objects classifies as Ok");
         let reply = extract_reply(&resp);
-        assert_eq!(reply.reasoning_tokens, None);
-        assert_eq!(reply.cached_tokens, None);
+        assert_eq!(reply.counts.reasoning, None);
+        assert_eq!(reply.counts.cached, None);
     }
 
     #[test]
@@ -819,9 +780,9 @@ mod tests {
         )
         .expect("well-formed hosted-reasoning body classifies as Ok");
         let reply = extract_reply(&resp);
-        assert_eq!(reply.reasoning_tokens, Some(1024));
-        assert_eq!(reply.cached_tokens, Some(64));
-        assert!(reply.reasoning_tokens.unwrap() <= reply.completion_tokens.unwrap());
+        assert_eq!(reply.counts.reasoning, Some(1024));
+        assert_eq!(reply.counts.cached, Some(64));
+        assert!(reply.counts.reasoning.unwrap() <= reply.counts.completion.unwrap());
     }
 
     /// (#1444 review) The counter-shape, with numbers lifted verbatim from
@@ -840,17 +801,17 @@ mod tests {
         .expect("a provider total exceeding prompt+completion classifies as Ok");
         let reply = extract_reply(&resp);
         assert_eq!(
-            reply.total_tokens,
+            reply.counts.total,
             Some(11598),
             "the endpoint's own total must survive verbatim, never be recomputed"
         );
         assert!(
-            reply.total_tokens.unwrap()
-                > reply.prompt_tokens.unwrap() + reply.completion_tokens.unwrap()
+            reply.counts.total.unwrap()
+                > reply.counts.prompt.unwrap() + reply.counts.completion.unwrap()
         );
         // This provider named no details object, so both stay honestly silent.
-        assert_eq!(reply.reasoning_tokens, None);
-        assert_eq!(reply.cached_tokens, None);
+        assert_eq!(reply.counts.reasoning, None);
+        assert_eq!(reply.counts.cached, None);
     }
 
     #[test]
@@ -863,7 +824,7 @@ mod tests {
         .expect("well-formed body with explicit zero reasoning_tokens classifies as Ok");
         let reply = extract_reply(&resp);
         assert_eq!(
-            reply.reasoning_tokens,
+            reply.counts.reasoning,
             Some(0),
             "a reported zero must stay Some(0), distinguishable from a never-reported None"
         );
@@ -881,7 +842,7 @@ mod tests {
         let resp = serde_json::json!({ "choices": [] });
         let reply = extract_reply(&resp);
         assert_eq!(reply.content, "");
-        assert_eq!(reply.total_tokens, None);
+        assert_eq!(reply.counts.total, None);
         assert_eq!(reply.model, None);
     }
 
@@ -898,7 +859,7 @@ mod tests {
         .expect("well-formed body with a float usage count still classifies as Ok");
         let reply = extract_reply(&resp);
         assert_eq!(
-            reply.total_tokens, None,
+            reply.counts.total, None,
             "a float-shaped total_tokens does not extract as a u64"
         );
     }
@@ -913,7 +874,7 @@ mod tests {
         .expect("well-formed body with a string usage count still classifies as Ok");
         let reply = extract_reply(&resp);
         assert_eq!(
-            reply.total_tokens, None,
+            reply.counts.total, None,
             "a string-shaped total_tokens does not extract as a u64"
         );
     }
