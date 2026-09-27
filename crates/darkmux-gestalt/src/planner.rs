@@ -45,7 +45,7 @@ use crate::estimator::FootprintEstimator;
 use crate::facts::{CallerIntent, CatalogFact, Facts, ResidentFact};
 use crate::ownership::is_darkmux_owned;
 use crate::plan::{
-    Action, EvictionOrder, ExecHint, OwnedTarget, Plan, PlannedAction, Precondition, Reason,
+    Action, EvictionOrder, OwnedTarget, Plan, PlannedAction, Precondition, Reason,
     Warning,
 };
 use crate::residency::{decide_residency, ResidencyDecision};
@@ -220,7 +220,6 @@ struct Acquisition<'a> {
     /// bookkeeping.
     removed: BTreeSet<usize>,
     pendings: Vec<Pending>,
-    exec_hint: ExecHint,
 }
 
 impl<'a> Acquisition<'a> {
@@ -253,7 +252,6 @@ impl<'a> Acquisition<'a> {
             unloads: Vec::new(),
             removed: BTreeSet::new(),
             pendings: Vec::new(),
-            exec_hint: ExecHint::Concurrent,
         }
     }
 
@@ -466,8 +464,7 @@ impl<'a> Acquisition<'a> {
 
     /// Auto never breaches (#1243): evict idle darkmux-owned residents,
     /// then refuse any load that cannot fit even alone after every
-    /// eviction; the survivors each fit alone, so if together they still
-    /// exceed, serialize them.
+    /// eviction.
     fn budget_fit_auto(&mut self, budget: u64, base: u64, need: u64) {
         let freed = self.evict_idle(base + need - budget, |freeing| Reason::BudgetEvict {
             freeing_bytes: freeing,
@@ -492,14 +489,11 @@ impl<'a> Acquisition<'a> {
                 );
             }
         }
-        if base + self.pending_sum() > budget {
-            self.exec_hint = ExecHint::Sequential;
-        }
     }
 
     /// #1140 pool-headroom arm (Auto only; single-pool v1 rule). Pool facts
     /// are advisory headroom, not an operator contract: the arm evicts to
-    /// make room and serializes when it can't, and refuses ONLY a
+    /// make room, and refuses ONLY a
     /// load-alongside behind a foreign duplicate (whose bytes darkmux may
     /// not free — the one shortfall with a nameable, un-evictable cause).
     /// Every other shortfall falls through to the executor's #1139
@@ -531,7 +525,6 @@ impl<'a> Acquisition<'a> {
         let effective = effective + freed;
         if need > effective {
             self.refuse_foreign_duplicates_over(effective);
-            self.serialize_if_each_fits_alone(effective);
         }
     }
 
@@ -559,23 +552,6 @@ impl<'a> Acquisition<'a> {
                     },
                 );
             }
-        }
-    }
-
-    /// Serialize when the surviving loads exceed the headroom together but
-    /// each fits alone (which takes at least two of them: one survivor that
-    /// fits alone cannot exceed the headroom by itself).
-    fn serialize_if_each_fits_alone(&mut self, effective: u64) {
-        if self.pending_sum() <= effective {
-            return;
-        }
-        let each_fits_alone = self
-            .pendings
-            .iter()
-            .filter(|p| is_load_like(&self.decisions[p.decision_idx].action))
-            .all(|p| p.est.unwrap_or(0) <= effective);
-        if each_fits_alone {
-            self.exec_hint = ExecHint::Sequential;
         }
     }
 
@@ -647,7 +623,6 @@ impl<'a> Acquisition<'a> {
             quarantined: Vec::new(),
             user_state_respected,
             warnings: self.warnings,
-            exec_hint: self.exec_hint,
         }
     }
 }
@@ -2067,9 +2042,9 @@ mod tests {
     }
 
     #[test]
-    fn budget_sequential_hint() {
-        // The #1243 serialize arm: two loads that each fit alone but not
-        // together — both Loads survive, hint says run them one at a time.
+    fn budget_loads_that_fit_alone_both_survive() {
+        // Two loads that each fit the #1243 budget alone but not together,
+        // nothing evictable: neither is refused, both Loads survive.
         let f = Facts {
             budget: Budget { max_darkmux_bytes: Some(30 * GB) },
             ..Default::default()
@@ -2084,7 +2059,6 @@ mod tests {
             plan,
             Plan {
                 actions: vec![load_action("a", 8_000), load_action("b", 8_000)],
-                exec_hint: ExecHint::Sequential,
                 ..Default::default()
             }
         );
@@ -2873,8 +2847,6 @@ mod tests {
         let swept = sweep();
         let mut reasons: BTreeSet<&str> = BTreeSet::new();
         let mut warnings: BTreeSet<&str> = BTreeSet::new();
-        let mut sequential_budget = false;
-        let mut sequential_pool = false;
         let mut budget_evict = false;
         let mut pool_evict = false;
         for Swept { desired, facts, opts, plan } in &swept {
@@ -2935,9 +2907,6 @@ mod tests {
                     }
                 }
             }
-            if plan.exec_hint == ExecHint::Sequential {
-                if facts.budget.max_darkmux_bytes.is_some() { sequential_budget = true } else { sequential_pool = true }
-            }
         }
         // Non-vacuity: the sweep genuinely reached every acquisition branch.
         for want in [
@@ -2954,42 +2923,14 @@ mod tests {
             assert!(warnings.contains(want), "sweep never produced {want}: {warnings:?}");
         }
         assert!(budget_evict && pool_evict, "both eviction arms reached");
-        assert!(sequential_budget && sequential_pool, "both serialize arms reached");
     }
 
     #[test]
-    fn pool_headroom_serializes_loads_that_fit_alone_but_not_together() {
-        // The #1140 arm's serialize branch: two loads, each within the
-        // pool headroom alone, together over it, nothing evictable — both
-        // loads stay, the hint becomes Sequential.
-        let f = Facts {
-            pools: BTreeMap::from([(
-                PoolId("unified".into()),
-                PoolFact { capacity_bytes: 64 * GB, available_bytes: 12 * GB },
-            )]),
-            ..Default::default()
-        };
-        let desired = [placement("b", 8_000), placement("a", 8_000)];
-        let est = est_map(&[("a", 10 * GB), ("b", 6 * GB)]);
-        let plan = plan_acquire(&desired, &f, additive_auto(), &est);
-        assert_eq!(plan.actions, vec![load_action("b", 8_000), load_action("a", 8_000)]);
-        assert_eq!(plan.exec_hint, ExecHint::Sequential);
-        // Equality edge: a load exactly the size of the headroom fits alone.
-        let plan = plan_acquire(&desired, &f, additive_auto(), &est_map(&[("a", 12 * GB), ("b", 6 * GB)]));
-        assert_eq!(plan.exec_hint, ExecHint::Sequential);
-        // A single load over the headroom has nothing to serialize against.
-        let plan = plan_acquire(&desired[1..], &Facts { pools: f.pools.clone(), ..Default::default() }, additive_auto(), &est_map(&[("a", 20 * GB)]));
-        assert_eq!(plan.exec_hint, ExecHint::Concurrent);
-    }
-
-    #[test]
-    fn pool_headroom_one_oversized_load_keeps_the_whole_plan_concurrent() {
-        // Characterizes CURRENT behavior: when one pending load cannot fit
-        // the pool headroom even alone (and has no foreign duplicate to
-        // name), the arm does not serialize the others either — the hint
-        // stays Concurrent and the executor's #1139 fast-fail owns the
-        // shortfall. `plan_waves` instead isolates such a load in its own
-        // wave and still packs the rest.
+    fn pool_headroom_shortfall_without_a_foreign_duplicate_is_never_refused() {
+        // The #1140 arm refuses only a load-alongside behind a foreign
+        // duplicate. Loads that exceed the pool headroom together, or even
+        // alone, with nothing evictable all stay Loads: the executor's
+        // #1139 fast-fail owns that shortfall.
         let f = Facts {
             pools: BTreeMap::from([(
                 PoolId("unified".into()),
@@ -3000,9 +2941,10 @@ mod tests {
         let desired = [placement("b", 8_000), placement("a", 8_000), placement("big", 8_000)];
         let est = est_map(&[("a", 10 * GB), ("b", 6 * GB), ("big", 20 * GB)]);
         let plan = plan_acquire(&desired, &f, additive_auto(), &est);
-        assert_eq!(plan.actions.len(), 3);
-        assert!(plan.actions.iter().all(|a| matches!(a.action, Action::Load { .. })));
-        assert_eq!(plan.exec_hint, ExecHint::Concurrent);
+        assert_eq!(
+            plan.actions,
+            vec![load_action("b", 8_000), load_action("a", 8_000), load_action("big", 8_000)]
+        );
     }
 
     fn battery() -> Vec<(Plan, &'static str)> {

@@ -372,15 +372,6 @@ pub enum Warning {
     LoadEstimateUnknown { model_key: String },
 }
 
-/// #1243 "serialize" arm: every pending load fits the limit alone but not
-/// together — the executor runs them one at a time, releasing between.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum ExecHint {
-    #[default]
-    Concurrent,
-    Sequential,
-}
-
 /// TOTAL-EQUALITY, DETERMINISTIC-ORDER plan. Ordering contract (tested):
 ///
 /// 0. REFUSAL phase (#2674): every [`Action::Block`], in desired-input
@@ -419,7 +410,6 @@ pub struct Plan {
     /// Emission order: per-desired decision warnings first (in desired-input
     /// order), then pass-1 warnings, then budget/headroom warnings.
     pub warnings: Vec<Warning>,
-    pub exec_hint: ExecHint,
 }
 
 #[cfg(test)]
