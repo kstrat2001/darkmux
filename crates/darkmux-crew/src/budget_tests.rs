@@ -385,6 +385,25 @@ fn warn_surfaces_the_breach_once_and_never_holds_the_call() {
     assert_eq!(env.actions().len(), 2);
 }
 
+/// (6th review MF) A budget record lands on its RUN's session: a hosted
+/// step's caller carries the bare `task-<id>` session every mission from
+/// one config shares, and a record that bypasses `mission_launch`'s
+/// `scope_to_run` would let mission A's `budget.stop` close mission B's
+/// wait. Scoped here, once, for every budget record with a mission; a
+/// caller with no mission (a standalone dispatch) keeps its own id.
+#[test]
+fn budget_records_are_scoped_to_their_run() {
+    let env = FakeEnv::full_window().stopped_after(1, "mission `m-a` is aborted");
+    let caller = BudgetCaller { session_id: Some("task-probe"), mission_id: Some("m-a"), ..Default::default() };
+    let _ = admit_with(budget(BudgetPolicy::Wait, Some(1_000), None, None), &caller, &env);
+    let sids: Vec<Option<String>> = env.emitted.borrow().iter().map(|r| r.session_id.clone()).collect();
+    assert_eq!(sids, vec![Some("task-probe-m-a".to_string()); 2], "wait and stop, both on mission A's run");
+    let env = FakeEnv::new(vec![(T0 - 60, 2_000)]);
+    let solo = BudgetCaller { session_id: Some("dispatch-coder-1"), ..Default::default() };
+    admit_with(budget(BudgetPolicy::Warn, Some(1_000), None, None), &solo, &env).unwrap();
+    assert_eq!(env.emitted.borrow()[0].session_id.as_deref(), Some("dispatch-coder-1"), "no mission: unchanged");
+}
+
 /// `wait` holds the call until the rolling window has room, says how
 /// long, records the pause (the run's time limits skip it), and resumes.
 #[test]

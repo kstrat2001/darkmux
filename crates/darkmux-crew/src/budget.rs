@@ -805,6 +805,15 @@ fn record(
     if caller.session_id.is_none() {
         rec.session_id = None;
     }
+    // (6th review MF) On the RUN's session: a hosted step's caller carries
+    // the bare `task-<id>` every mission from one config shares, and these
+    // records go straight to the flow sink, around `mission_launch`'s
+    // `scope_to_run`. Unscoped, mission A's `budget.stop` closed mission B's
+    // later wait on every surface. Idempotent: an already-scoped id, or one
+    // that is not a task/step form, is left alone.
+    if let (Some(sid), Some(mid)) = (rec.session_id.as_deref(), caller.mission_id) {
+        rec.session_id = Some(darkmux_types::session_id::scope_to_run(sid, mid));
+    }
     rec
 }
 

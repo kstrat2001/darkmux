@@ -302,6 +302,18 @@ pub fn spawn_session_emitter(
     spawn_with_client(client, session_id, role, model, mission_id)
 }
 
+/// (#2902 step 5, 6th review MF) The session id a beat is keyed on: the
+/// run's own (`scope_to_run`), the same id `mission_launch` stamps on the
+/// run's flow records. A hosted step passes the bare `task-<id>` every
+/// mission from one config shares, so a bare key named no run in
+/// particular and never matched its scoped records. Idempotent.
+fn presence_session_id(session_id: String, mission_id: Option<&str>) -> String {
+    match mission_id {
+        Some(mid) => darkmux_types::session_id::scope_to_run(&session_id, mid),
+        None => session_id,
+    }
+}
+
 /// (#2227) The emitter body, taking an explicit client. Split out of
 /// [`spawn_session_emitter`] purely so the TEARDOWN path — a beat thread
 /// blocked inside `write_session_beat`, joined by [`SessionEmitter::stop`] —
@@ -316,6 +328,7 @@ fn spawn_with_client(
     model: Option<String>,
     mission_id: Option<String>,
 ) -> Option<SessionEmitter> {
+    let session_id = presence_session_id(session_id, mission_id.as_deref());
     let machine_uid = darkmux_hardware::machine_uid().map(str::to_string);
     let display_name = crate::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
 
@@ -363,6 +376,17 @@ fn spawn_with_client(
 
 #[cfg(test)]
 mod tests {
+    /// (6th review MF) A hosted step's bare `task-<id>` beats under its run's
+    /// scoped id, the one its flow records carry; a standalone id, or one
+    /// already scoped, is unchanged.
+    #[test]
+    fn a_task_beat_is_keyed_on_its_runs_session() {
+        assert_eq!(presence_session_id("task-probe".into(), Some("m-b")), "task-probe-m-b");
+        assert_eq!(presence_session_id("task-probe-m-b".into(), Some("m-b")), "task-probe-m-b");
+        assert_eq!(presence_session_id("dispatch-coder-1".into(), Some("m-b")), "dispatch-coder-1");
+        assert_eq!(presence_session_id("task-probe".into(), None), "task-probe");
+    }
+
     use super::*;
 
     /// (#2344) A minimal, in-process, RESP-speaking fake Redis peer that
