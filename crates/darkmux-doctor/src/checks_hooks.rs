@@ -32,7 +32,7 @@ pub(crate) fn check_hooks() -> Vec<Check> {
     let rules = darkmux_types::config_access::hooks_rules();
     let outbox_dir = darkmux_types::config_access::hooks_outbox_dir();
     let today_actions = crate::today_flow_actions();
-    build_hooks_check(enabled, provenance, &rules, &outbox_dir, &today_actions)
+    build_hooks_check(enabled, provenance, &rules, &outbox_dir, &today_actions, &crate::resolved_config_path())
 }
 
 /// The literal `action=<value>` predicate from a `describe_match`
@@ -135,6 +135,7 @@ fn build_hooks_check(
     rules: &[darkmux_types::config::HookRule],
     outbox_dir: &std::path::Path,
     today_actions: &std::collections::HashSet<String>,
+    config_path: &std::path::Path,
 ) -> Vec<Check> {
     let name = "hooks";
     if !enabled {
@@ -415,8 +416,10 @@ fn build_hooks_check(
                     hint_lines.extend(reason_hint_lines.iter().cloned());
                 }
                 if !flags.is_empty() {
-                    hint_lines
-                        .push("Fix this rule in ~/.darkmux/config.json (or `darkmux config set hooks.rules ...`).".into());
+                    hint_lines.push(format!(
+                        "Fix this rule in {} (or `darkmux config set hooks.rules ...`).",
+                        config_path.display()
+                    ));
                 }
                 if hint_lines.is_empty() {
                     None
@@ -571,7 +574,7 @@ mod tests {
                 extras: Default::default(),
             },
         ];
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
         assert_eq!(checks.len(), 4, "1 overview + 3 per-rule checks");
 
         let overview = checks.iter().find(|c| c.name == "hooks").unwrap();
@@ -613,7 +616,7 @@ mod tests {
             attribution_headers: None,
             extras: Default::default(),
         }];
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.status, Status::Warn, "{}", rule.message);
         assert!(!rule.message.contains("URL REFUSED"), "a valid tailnet target is not refused: {}", rule.message);
@@ -636,7 +639,7 @@ mod tests {
             attribution_headers: None,
             extras: Default::default(),
         }];
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.status, Status::Pass, "{}", rule.message);
         assert!(rule.message.contains("[tailnet, signed]"), "{}", rule.message);
@@ -672,7 +675,7 @@ mod tests {
                 extras: Default::default(),
             },
         ];
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
         let telemetry = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(telemetry.status, Status::Warn, "{}", telemetry.message);
         assert!(telemetry.message.contains("observer must not join the observed"), "{}", telemetry.message);
@@ -707,7 +710,7 @@ mod tests {
         let mut today_actions = std::collections::HashSet::new();
         today_actions.insert("dispatch complete".to_string());
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &today_actions);
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &today_actions, std::path::Path::new(TEST_CONFIG_PATH));
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.status, Status::Warn, "{}", rule.message);
         assert!(rule.message.contains("NEVER MATCHED"), "{}", rule.message);
@@ -735,7 +738,7 @@ mod tests {
             extras: Default::default(),
         }];
         // Empty today_actions: no evidence of the alias, so no warn.
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.status, Status::Pass, "{}", rule.message);
         assert!(!rule.message.contains("NEVER MATCHED"), "{}", rule.message);
@@ -776,7 +779,7 @@ mod tests {
         let mut today_actions = std::collections::HashSet::new();
         today_actions.insert("dispatch complete".to_string()); // the other spelling, ALSO present today
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &today_actions);
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &today_actions, std::path::Path::new(TEST_CONFIG_PATH));
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.status, Status::Pass, "{}", rule.message);
         assert!(
@@ -868,7 +871,7 @@ mod tests {
         .unwrap();
         std::fs::write(tmp.path().join(format!("{key}.rejected")), "1").unwrap();
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
         checks.into_iter().find(|c| c.name == "hooks.rule.0").unwrap()
     }
 
@@ -1063,7 +1066,7 @@ mod tests {
         .unwrap();
         std::fs::write(tmp.path().join(format!("{key}.rejected")), "3").unwrap();
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.status, Status::Warn, "{}", rule.message);
         assert!(rule.message.contains("3 record(s) reported rejected by the receiver"), "{}", rule.message);
@@ -1086,7 +1089,7 @@ mod tests {
         .unwrap();
         std::fs::write(tmp.path().join(format!("{key}.rejected")), "1").unwrap();
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.status, Status::Warn, "{}", rule.message);
         // (#2196 fix-round 2, MUST FIX C) The fixture's 47-column raw
@@ -1149,7 +1152,7 @@ mod tests {
         .unwrap();
         std::fs::write(tmp.path().join(format!("{key}.rejected")), "3").unwrap();
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.message.matches("3 on the last delivery").count(), 1, "{}", rule.message);
         assert!(!rule.message.contains("()"), "no empty parens when there's no reason: {}", rule.message);
@@ -1173,7 +1176,7 @@ mod tests {
         std::fs::write(tmp.path().join(format!("{key}.last")), r#"{"ts":"2026-01-01T00:00:00Z","ok":true}"#).unwrap();
         std::fs::write(tmp.path().join(format!("{key}.rejected")), "400").unwrap();
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(
             rule.status,
@@ -1203,7 +1206,7 @@ mod tests {
         let rules = vec![rule_cfg];
         std::fs::write(tmp.path().join(format!("{key}.last")), r#"{"ts":"2026-01-01T00:00:00Z","ok":true}"#).unwrap();
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.status, Status::Pass, "{}", rule.message);
         assert!(!rule.message.contains("rejected"), "{}", rule.message);
@@ -1237,7 +1240,7 @@ mod tests {
         // silently left behind by whoever acts on this listing.
         std::fs::write(tmp.path().join("127.0.0.1-9999-deadbeefdeadbeef.rejected"), "5").unwrap();
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
         let stray = checks.iter().find(|c| c.name == "hooks.stray").expect("a stray-file check must be present");
         assert_eq!(stray.status, Status::Warn, "{}", stray.message);
         assert!(stray.message.contains("127.0.0.1-9999-deadbeefdeadbeef"), "{}", stray.message);
@@ -1258,7 +1261,7 @@ mod tests {
             attribution_headers: None,
             extras: Default::default(),
         }];
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
         assert!(checks.iter().all(|c| c.name != "hooks.stray"), "no stray files → no stray check emitted");
     }
 
@@ -1266,7 +1269,11 @@ mod tests {
     // ─── characterization: every branch of `build_hooks_check`, pinned ──────
 
     const LOOPBACK: &str = "http://127.0.0.1:8790/events";
-    const REMEDY: &str = "Fix this rule in ~/.darkmux/config.json (or `darkmux config set hooks.rules ...`).";
+    /// Stands in for `resolved_config_path()` — deliberately not under `~`,
+    /// so a remedy that names `~/.darkmux/config.json` regardless of
+    /// `DARKMUX_HOME` fails here.
+    const TEST_CONFIG_PATH: &str = "/darkmux-root/config.json";
+    const REMEDY: &str = "Fix this rule in /darkmux-root/config.json (or `darkmux config set hooks.rules ...`).";
 
     fn hook_rule(action: Option<&str>, http: Option<&str>) -> darkmux_types::config::HookRule {
         darkmux_types::config::HookRule {
@@ -1289,7 +1296,7 @@ mod tests {
     }
 
     fn checks_for(rules: &[darkmux_types::config::HookRule], dir: &std::path::Path) -> Vec<Check> {
-        build_hooks_check(true, "config.json", rules, dir, &std::collections::HashSet::new())
+        build_hooks_check(true, "config.json", rules, dir, &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH))
     }
 
     fn named<'a>(checks: &'a [Check], name: &str) -> &'a Check {
@@ -1300,7 +1307,7 @@ mod tests {
     fn disabled_is_one_pass_row_even_with_rules_configured() {
         let tmp = tempfile::TempDir::new().unwrap();
         let rules = vec![hook_rule(None, Some("http://10.0.0.5/x"))];
-        let checks = build_hooks_check(false, "env", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(false, "env", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
         assert_eq!(checks.len(), 1, "{checks:?}");
         assert_eq!(checks[0].name, "hooks");
         assert_eq!(checks[0].status, Status::Pass);
@@ -1311,7 +1318,7 @@ mod tests {
     #[test]
     fn enabled_with_no_rules_names_the_outbox_dir_and_an_example_rule() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let checks = build_hooks_check(true, "config.json", &[], tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &[], tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
         assert_eq!(checks.len(), 1, "{checks:?}");
         assert_eq!(checks[0].status, Status::Warn);
         assert_eq!(
