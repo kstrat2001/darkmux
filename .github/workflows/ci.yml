@@ -484,9 +484,9 @@ jobs:
   # The gating work is tracked in #2600 — read it before re-adding this job.
 
   # (4.0) The complexity ratchet: no new Rust function above cyclomatic
-  # complexity 15, no function's complexity above its recorded baseline, and
-  # no stale baseline entry (a gain is kept by `--prune`). See the script's
-  # header for the measure and the two files it reads. rust-code-analysis
+  # complexity 15 and no function above its recorded baseline. A function
+  # that got simpler, or was split or removed, passes with a notice naming
+  # `--prune`. See the script's header for the measure and the two files it reads. rust-code-analysis
   # reads sources, not a build, so this is ubuntu and about half a minute;
   # the tool is compiled once and cached by version. The TypeScript half runs
   # in the ui job.

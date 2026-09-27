@@ -25,9 +25,10 @@
 #   scripts/complexity-allowlist.json  deliberate exceptions, by hand:
 #       {"<key>": {"max": <= 25, "reason": "..."}}.
 #
-# It fails when a function in neither file is above 15, when one is above its
-# baseline or allowlist max, and when a baseline entry is stale (its function
-# fell, or is gone): `--prune` lowers it, which is how a gain is kept.
+# It fails only when a function in neither file is above 15, or one is above
+# its baseline or allowlist max. A gain never fails: a baseline entry whose
+# function fell, or is gone (split, renamed, deleted), passes with a notice
+# naming `--prune`, which lowers or drops it so the gain is kept.
 #
 # Stdlib only. `--self-test` proves each rule can fail.
 
@@ -186,12 +187,20 @@ def judge(measured, baseline, allowlist):
             limit, why = LIMIT, "the limit for a function not in the baseline"
         if cc > limit:
             problems.append(f"{key}: complexity {cc}, above {why} ({limit})")
+    return problems
+
+
+def gains(measured, baseline):
+    """Every baseline entry its function has beaten (fell, or is gone), as
+    lines to print. A notice, never a failure: a PR that simplifies or splits
+    a function must not go red for it."""
+    notes = []
     for key, was in sorted(baseline.items()):
         now = measured.get(key, 0)
         if now < was:
             state = "is gone or at most the limit" if now <= LIMIT else f"fell to {now}"
-            problems.append(f"{key}: baseline {was} is stale, the function {state} (run --prune to keep the gain)")
-    return problems
+            notes.append(f"{key}: baseline {was}, the function {state}")
+    return notes
 
 
 def pruned(measured, baseline):
@@ -227,8 +236,10 @@ def self_test():
     assert judge({"a::f": 16}, {}, {}), "a new function above the limit fails"
     assert not judge({"a::f": 15}, {}, {}), "a new function at the limit passes"
     assert judge({"a::g": 21}, {"a::g": 20}, {}), "a rise above the baseline fails"
-    assert judge({"a::g": 19}, {"a::g": 20}, {}), "a fall leaves a stale baseline"
-    assert judge({}, {"a::g": 20}, {}), "a gone function leaves a stale baseline"
+    assert not judge({"a::g": 19}, {"a::g": 20}, {}), "a fall passes"
+    assert not judge({}, {"a::g": 20}, {}), "a gone function passes"
+    assert gains({"a::g": 19}, {"a::g": 20}) and gains({}, {"a::g": 20}), "a fall or a gone function is noted"
+    assert not gains({"a::g": 20}, {"a::g": 20}), "no gain, no note"
     assert not judge({"a::h": 22}, {}, {"a::h": {"max": 22, "reason": "a dispatch table"}}), "an allowlisted max passes"
     assert judge({"a::h": 23}, {}, {"a::h": {"max": 22, "reason": "x"}}), "above an allowlisted max fails"
     assert judge({}, {}, {"a::h": {"max": 30, "reason": "x"}}), "an allowlist max above the ceiling fails"
@@ -281,6 +292,12 @@ def main():
     if "--prune" in args:
         store(BASELINE, lang, pruned(measured, baseline))
         baseline = load(BASELINE, lang)
+    notes = gains(measured, baseline)
+    if notes:
+        print(f"complexity-ratchet ({lang}): {len(notes)} baseline entr{'y' if len(notes) == 1 else 'ies'} beaten; "
+              f"keep the gain with `python3 scripts/complexity-ratchet.py --lang {lang} --prune` and commit the baseline:")
+        for n in notes:
+            print(f"  {n}")
     problems = judge(measured, baseline, allowlist)
     if problems:
         print(f"complexity-ratchet ({lang}): {len(problems)} problem(s). Split a function by responsibility rather than raise a limit.")
