@@ -79,7 +79,7 @@
 //! `Unknown` re-serializes as `{"state":"unknown"}` (the ordinary
 //! `Serialize` derive, unaware anything was discarded on read), a future
 //! code path that LOADS an envelope and then SAVES it back out — a
-//! `mission migrate`-style rewrite, a round-trip through an editing tool —
+//! layout-migration rewrite, a round-trip through an editing tool —
 //! would silently overwrite a newer machine's real (if unrecognized) value
 //! with this binary's own ignorance of it, permanently losing the original
 //! `state`. No such path exists today: `finalize_mission`

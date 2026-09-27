@@ -651,12 +651,11 @@ pub(crate) fn load_crews() -> Result<Vec<Crew>> {
     Ok(read_all_json::<Crew>(&user_dir)?.into_iter().map(|(_, c)| c).collect())
 }
 
-/// Load all missions from the new per-mission nested layout.
+/// Load all missions from the per-mission nested layout.
 ///
 /// Walks `<crew_root>/missions/` and for each **subdirectory** containing a
-/// `mission.json`, deserializes it.  Flat `.json` files directly under
-/// `<crew_root>/missions/` (pre-#148 legacy layout) are silently skipped —
-/// the migration verb (`darkmux mission migrate`) is the bridge.
+/// `mission.json`, deserializes it. A plain file directly under
+/// `<crew_root>/missions/` is not a mission and is skipped.
 ///
 /// Built-in missions (currently empty) are merged last, same as other loaders.
 pub fn load_missions() -> Result<Vec<Mission>> {
@@ -672,7 +671,7 @@ pub fn load_missions() -> Result<Vec<Mission>> {
         let entry = entry?;
         let path = entry.path();
         if !path.is_dir() {
-            // Skip legacy flat <id>.json files. Migration verb is the bridge.
+            // A plain file is not a mission directory.
             continue;
         }
         let mission_id = match path.file_name().and_then(|s| s.to_str()) {

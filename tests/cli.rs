@@ -1025,6 +1025,19 @@ fn retired_top_level_notebook_verb_is_unknown() {
         ));
 }
 
+/// (4.0) `mission migrate` (the pre-#148 flat-layout migration) is gone, with
+/// no alias: an operator on the flat layout runs it on 3.x before upgrading.
+#[test]
+fn retired_mission_migrate_verb_is_unknown() {
+    let tmp = TempDir::new().unwrap();
+    darkmux_cmd()
+        .env("DARKMUX_CREW_DIR", tmp.path())
+        .args(["mission", "migrate"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unrecognized subcommand 'migrate'"));
+}
+
 /// (#1426 phase 2) The `skills` top-level verb retired — `init` is the one
 /// setup/refresh verb (it refreshes the bundled darkmux-* skills on re-run,
 /// and `darkmux doctor` flags stale ones). The spelling has NO compat alias,
@@ -2320,125 +2333,6 @@ fn role_verbs_survive_a_leftover_role_naming_a_deleted_skill() {
         .args(["role", "show", "coder"])
         .assert()
         .success();
-}
-
-// ── mission migrate integration tests (#148 Task 8) ───────────────────────
-
-fn write_flat_mission_file(root: &std::path::Path, id: &str) {
-    let dir = root.join("missions");
-    fs::create_dir_all(&dir).unwrap();
-    let body = serde_json::json!({
-        "id": id,
-        "description": "test",
-        "phase_ids": [],
-        "created_ts": 1,
-    });
-    fs::write(
-        dir.join(format!("{id}.json")),
-        serde_json::to_string_pretty(&body).unwrap(),
-    )
-    .unwrap();
-}
-
-fn write_flat_phase_file(root: &std::path::Path, id: &str, mission_id: &str) {
-    let dir = root.join("phases");
-    fs::create_dir_all(&dir).unwrap();
-    let body = serde_json::json!({
-        "id": id,
-        "mission_id": mission_id,
-        "description": "test",
-        "depends_on": [],
-        "created_ts": 1,
-    });
-    fs::write(
-        dir.join(format!("{id}.json")),
-        serde_json::to_string_pretty(&body).unwrap(),
-    )
-    .unwrap();
-}
-
-/// Dry-run lists proposed moves but does NOT move files.
-#[test]
-fn mission_migrate_dry_run_shows_moves_without_moving() {
-    let tmp = TempDir::new().unwrap();
-    write_flat_mission_file(tmp.path(), "alpha");
-    write_flat_phase_file(tmp.path(), "s1", "alpha");
-
-    darkmux_cmd()
-        .env("DARKMUX_CREW_DIR", tmp.path())
-        .args(["mission", "migrate"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("alpha"))
-        .stdout(predicate::str::contains("s1"))
-        .stdout(predicate::str::contains("Re-run with --apply"));
-
-    // Files must NOT have been moved.
-    assert!(
-        tmp.path().join("missions/alpha.json").is_file(),
-        "dry-run must not move the flat mission file"
-    );
-    assert!(
-        tmp.path().join("phases/s1.json").is_file(),
-        "dry-run must not move the flat phase file"
-    );
-}
-
-/// `--apply` actually moves files to the per-mission nested layout.
-#[test]
-fn mission_migrate_apply_moves_files() {
-    let tmp = TempDir::new().unwrap();
-    write_flat_mission_file(tmp.path(), "alpha");
-    write_flat_phase_file(tmp.path(), "s1", "alpha");
-
-    darkmux_cmd()
-        .env("DARKMUX_CREW_DIR", tmp.path())
-        .args(["mission", "migrate", "--apply"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("applied"));
-
-    // New nested paths must exist.
-    assert!(
-        tmp.path().join("missions/alpha/mission.json").is_file(),
-        "mission.json should be at nested path after --apply"
-    );
-    assert!(
-        tmp.path().join("missions/alpha/phases/s1.json").is_file(),
-        "phase json should be at nested path after --apply"
-    );
-    // Old flat paths must be gone.
-    assert!(
-        !tmp.path().join("missions/alpha.json").exists(),
-        "flat mission file should be gone after --apply"
-    );
-    assert!(
-        !tmp.path().join("phases/s1.json").exists(),
-        "flat phase file should be gone after --apply"
-    );
-}
-
-/// Re-running `--apply` after a successful migration is a no-op (idempotent).
-#[test]
-fn mission_migrate_apply_is_idempotent() {
-    let tmp = TempDir::new().unwrap();
-    write_flat_mission_file(tmp.path(), "alpha");
-    write_flat_phase_file(tmp.path(), "s1", "alpha");
-
-    // First apply.
-    darkmux_cmd()
-        .env("DARKMUX_CREW_DIR", tmp.path())
-        .args(["mission", "migrate", "--apply"])
-        .assert()
-        .success();
-
-    // Second apply: must succeed and report nothing to do.
-    darkmux_cmd()
-        .env("DARKMUX_CREW_DIR", tmp.path())
-        .args(["mission", "migrate", "--apply"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("nothing to do"));
 }
 
 // ─── (#491) Phase 4 lab CLI verbs: register / unregister / fixtures / doctor ──

@@ -866,32 +866,6 @@ pub(crate) enum MissionCmd {
         #[arg(long)]
         reasoning: Option<String>,
     },
-    /// Migrate mission + phase storage from the pre-#148 flat layout
-    /// (`<crew>/missions/<id>.json`, `<crew>/phases/<id>.json`) into the
-    /// per-mission nested layout (`<crew>/missions/<id>/mission.json`,
-    /// `<crew>/missions/<id>/phases/<phase-id>.json`).
-    ///
-    /// ALSO synthesizes `config-snapshot.json` for every nested-layout
-    /// instance that doesn't have one yet (#1284 Packet 4a) — a
-    /// hand-authored mission minted before `mission launch` existed. Each
-    /// gets a trivial, task-less config built from its own mission/phase
-    /// JSONs, so it reads (in `mission status`, a future graph lens) as the
-    /// freeform/manual instance it always was, without hand-editing.
-    ///
-    /// Dry-run by default — prints the proposed moves + synthesis without
-    /// touching any files. Pass `--apply` to commit. Idempotent: re-running
-    /// after a successful apply is a no-op. Orphan phases (whose
-    /// `mission_id` has no matching mission on disk) are reported but never
-    /// auto-moved; operator resolves them manually. A mission whose
-    /// `phase_ids` reference a missing phase JSON skips ONLY that mission's
-    /// snapshot synthesis (warned, not fatal) — existing flat→nested
-    /// migration behavior is otherwise unchanged.
-    Migrate {
-        /// Apply the migration. Without this flag, only the proposed
-        /// moves are printed (dry-run).
-        #[arg(long)]
-        apply: bool,
-    },
     /// Dispatch a mission's next runnable phase on a fleet machine (#247,
     /// PR-D.1). One role applies to every dispatched phase — operator-explicit
     /// per the CLAUDE.md doctrine that mission planning is judgment-bearing

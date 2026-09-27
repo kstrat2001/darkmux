@@ -215,9 +215,8 @@ pub struct MissionGraph {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
     /// `true` when the mission has phase data but NO task/step graph
-    /// underneath any phase — a legacy pre-registry instance (#1284
-    /// Packet 4a's `mission migrate` target) or a freeform hand-authored
-    /// mission with step-less phases. The page renders a phases-only
+    /// underneath any phase — a pre-registry instance (#1284 Packet 4a) or
+    /// a freeform hand-authored mission with step-less phases. The page renders a phases-only
     /// graph with a note instead of an error.
     pub legacy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -69,6 +69,11 @@ darkmux release.
   is still set with the exact change to make. `darkmux config set
   dirs.notebook ...` now rejects the key. Existing entries on disk are
   untouched.
+- **`darkmux mission migrate` and the pre-#148 flat mission layout.**
+  Flat `<root>/missions/<id>.json` / `<root>/phases/<id>.json` files are
+  not read, and the doctor check that pointed at the verb is gone.
+  **Migration:** run `darkmux mission migrate --apply` on 3.x before
+  upgrading.
 
 ### Changed (breaking, 4.0)
 

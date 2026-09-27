@@ -82,7 +82,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 // ─── Paths ──────────────────────────────────────────────────────────────
 //
-// Per-mission nested layout (the target — see #148):
+// Per-mission nested layout (#148):
 //   <crew_root>/
 //     missions/
 //       <mission-id>/
@@ -90,15 +90,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 //         phases/
 //           <phase-id>.json
 //
-// Legacy flat layout (pre-#148):
-//   <crew_root>/
-//     missions/<mission-id>.json
-//     phases/<phase-id>.json
-//
-// Loaders + writers go through the new helpers below. The `legacy_*`
-// helpers exist for the `darkmux mission migrate` verb (Task 8) and the
-// `legacy-mission-layout` doctor check (Task 9). They are NOT used by any
-// normal CRUD path.
+// Loaders + writers go through the helpers below.
 //
 // Test isolation: `crew_root()` honors `DARKMUX_CREW_DIR` (see
 // `crew::loader::crew_root`). Tests should `std::env::set_var(
@@ -193,8 +185,8 @@ pub fn load_graph_report(mission_id: &str) -> Result<Option<crate::mission_confi
 }
 
 /// Load a mission's persisted config snapshot, if one exists. A
-/// hand-authored pre-Packet-4a instance has none until `mission migrate`
-/// synthesizes one — `Ok(None)`, not an error.
+/// hand-authored pre-Packet-4a instance has none — `Ok(None)`, not an
+/// error.
 pub fn load_config_snapshot(mission_id: &str) -> Result<Option<crate::mission_config::MissionConfig>> {
     let path = config_snapshot_path(mission_id);
     if !path.is_file() {
@@ -372,37 +364,6 @@ fn load_json_dir<T: serde::de::DeserializeOwned>(dir: &std::path::Path) -> Resul
         out.push(value);
     }
     Ok(out)
-}
-
-/// Pre-#148 flat mission path: `<missions_dir>/<id>.json`. Two layers
-/// of "legacy" stack here: this describes pre-#148 flat *content shape*,
-/// while the parent `missions_dir()` itself resolves the Beat-33 dual-
-/// read (canonical-first, pre-flatten-`crew/`-fallback). Held as public
-/// API for symmetry with the dir helpers; the migration verb constructs
-/// target paths via `mission_path(id)` and walks `legacy_missions_dir()`,
-/// so this per-id resolver isn't currently called.
-#[allow(dead_code)]
-pub(crate) fn legacy_mission_path(mission_id: &str) -> PathBuf {
-    crate::loader::missions_dir().join(format!("{mission_id}.json"))
-}
-
-/// Pre-#148 flat phase path: `<phases_dir>/<id>.json`. Held as
-/// public API for symmetry with the dir helpers; see
-/// `legacy_mission_path` for why.
-#[allow(dead_code)]
-pub(crate) fn legacy_phase_path(phase_id: &str) -> PathBuf {
-    crate::loader::phases_dir().join(format!("{phase_id}.json"))
-}
-
-/// Pre-#148 flat missions dir: `<missions_dir>/` (containing flat
-/// `<id>.json` files at the top level).
-pub fn legacy_missions_dir() -> PathBuf {
-    crate::loader::missions_dir()
-}
-
-/// Pre-#148 flat phases dir: `<phases_dir>/`.
-pub fn legacy_phases_dir() -> PathBuf {
-    crate::loader::phases_dir()
 }
 
 // ─── Time ───────────────────────────────────────────────────────────────
@@ -2455,17 +2416,6 @@ mod path_helper_tests {
             assert_eq!(mission_path("m"), root.join("missions/m/mission.json"));
             assert_eq!(phases_dir("m"), root.join("missions/m/phases"));
             assert_eq!(phase_path("m", "s"), root.join("missions/m/phases/s.json"));
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn legacy_resolvers() {
-        with_test_root(|root| {
-            assert_eq!(legacy_mission_path("m"), root.join("missions/m.json"));
-            assert_eq!(legacy_phase_path("s"), root.join("phases/s.json"));
-            assert_eq!(legacy_missions_dir(), root.join("missions"));
-            assert_eq!(legacy_phases_dir(), root.join("phases"));
         });
     }
 

@@ -211,7 +211,6 @@ pub fn run() -> DoctorReport {
         check_role_profiles(),
         check_role_tool_vocab_typos(),
         check_beat33_legacy_crew_dir(),
-        check_legacy_mission_layout(),
         check_legacy_compaction_extras(),
         check_mission_envelope_readability(),
     ]);
@@ -7430,76 +7429,6 @@ fn check_power_state() -> Check {
     }
 }
 
-/// Warn when legacy flat mission/phase files exist in the pre-#148 layout.
-/// Pass when neither legacy_missions_dir nor legacy_phases_dir contain any
-/// top-level .json files. Fail never — legacy files don't break the system,
-/// but they're a signal that `darkmux mission migrate --apply` should be run
-/// to consolidate into the per-mission layout. (#148)
-fn check_legacy_mission_layout() -> Check {
-    let missions_dir = darkmux_crew::lifecycle::legacy_missions_dir();
-    let phases_dir = darkmux_crew::lifecycle::legacy_phases_dir();
-
-    let mut legacy_count = 0u32;
-
-    // Count legacy flat .json files in missions dir
-    if let Ok(entries) = std::fs::read_dir(&missions_dir) {
-        for entry in entries.flatten() {
-            if let Ok(metadata) = entry.metadata() {
-                if metadata.is_file() {
-                    if let Some(ext) = entry.path().extension() {
-                        if ext == "json" {
-                            legacy_count += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Count legacy flat .json files in phases dir
-    if let Ok(entries) = std::fs::read_dir(&phases_dir) {
-        for entry in entries.flatten() {
-            if let Ok(metadata) = entry.metadata() {
-                if metadata.is_file() {
-                    if let Some(ext) = entry.path().extension() {
-                        if ext == "json" {
-                            legacy_count += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if legacy_count > 0 {
-        // Display the actual dirs the legacy files live under (resolved
-        // through dual-read so the path shown is the one the operator
-        // can cd into, regardless of canonical vs Beat-33-legacy layout).
-        let missions = darkmux_crew::loader::missions_dir();
-        let phases = darkmux_crew::loader::phases_dir();
-        Check {
-            name: "legacy mission layout".into(),
-            status: Status::Warn,
-            message: format!(
-                "{legacy_count} legacy flat file(s) at {}/<id>.json or {}/<id>.json",
-                missions.display(),
-                phases.display()
-            ),
-            hint: Some(
-                "Run `darkmux mission migrate --apply` to move them to the per-mission layout (#148)."
-                    .into(),
-            ),
-        }
-    } else {
-        Check {
-            name: "legacy mission layout".into(),
-            status: Status::Pass,
-            message: "no legacy flat files".into(),
-            hint: None,
-        }
-    }
-}
-
 /// Name of the mission-envelope readability check (#1881).
 const MISSION_ENVELOPE_READABILITY_CHECK_NAME: &str = "mission envelope readability";
 
@@ -13217,7 +13146,7 @@ mod tests {
         // crew-role-prompt-coverage [#141] + flow-sink-health [#170] +
         // machine_id [#167] + openai-base-url-conflict [#5] +
         // audit-integrity [#163] + utility-model-binding
-        // [#590] + legacy-mission-layout [#148] + beat-33-crew-dir [Beat 33
+        // [#590] + beat-33-crew-dir [Beat 33
         // directory flatten] + role-tool-vocab [#340] +
         // legacy-compaction-extras [#380] + redis-config [#661] +
         // remote-endpoint-credentials [#85/#91] + audit-write-drops [#877] +
@@ -13303,8 +13232,11 @@ mod tests {
         // `check_detection_policy` left the array for the generic
         // `check_enum_settings`, which contributes one row per registered
         // enum setting.
+        //
+        // (4.0 cleanup) 66: `check_legacy_mission_layout` left with the
+        // `mission migrate` verb it pointed at.
         let expected =
-            67 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            66 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

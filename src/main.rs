@@ -60,7 +60,6 @@ mod init;
 pub use darkmux_lab::lab;
 // `darkmux lab` command handlers — split out of main.rs alongside cli/fleet_cli.
 mod lab_cli;
-mod migrate;
 mod config_cmd;
 mod conventions;
 mod mission_status;
@@ -921,26 +920,6 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
                 "mission `{}` ← added phase `{}`{}",
                 mission_id, s.id, position
             );
-            Ok(0)
-        }
-        MissionCmd::Migrate { apply } => {
-            let plan = migrate::plan_migration()?;
-            migrate::print_plan(&plan);
-            if !apply {
-                if !plan.is_empty() {
-                    println!("\nRe-run with --apply to commit.");
-                }
-                return Ok(0);
-            }
-            let synthesized = migrate::apply_migration(&plan)?;
-            if !plan.is_empty() {
-                println!(
-                    "\nmigrate: applied {} move(s), synthesized {} of {} config-snapshot(s).",
-                    plan.mission_moves.len() + plan.phase_moves.len(),
-                    synthesized,
-                    plan.config_snapshots_missing.len()
-                );
-            }
             Ok(0)
         }
         MissionCmd::Dispatch {
