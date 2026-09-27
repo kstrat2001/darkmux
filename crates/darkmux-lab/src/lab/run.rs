@@ -852,12 +852,12 @@ mod tests {
     /// No `Drop` of its own: `IsolatedState` recorded the pre-guard value
     /// of each variable at construction, including the three re-pointed
     /// below, so its own restore hands all of them back exactly.
-    struct HomeGuard {
+    pub(super) struct HomeGuard {
         _isolated: darkmux_types::test_isolation::IsolatedState,
     }
 
     impl HomeGuard {
-        fn set(dir: &Path) -> Self {
+        pub(super) fn set(dir: &Path) -> Self {
             let isolated = darkmux_types::test_isolation::IsolatedState::new();
             // SAFETY: every caller holds `#[serial_test::serial]`.
             unsafe {
@@ -2127,3 +2127,7 @@ mod tests {
         assert_eq!(w2.manifest.workload.prompt.as_deref(), Some("Do the task."));
     }
 }
+
+#[cfg(test)]
+#[path = "run_tests.rs"]
+mod run_tests;
