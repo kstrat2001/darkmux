@@ -2138,11 +2138,9 @@ fn any_dispatch_live_in(dir: &std::path::Path, day: &str, now_ms: u64, max_age_m
 /// be judged live — absence of evidence is not evidence of life.
 ///
 /// (#2902 step 5) An open budget wait holds the session live until it
-/// lapses; past that, the staleness clock runs from the lapse.
+/// lapses (the quiet clock starts at the lapse, which is still ahead), and
+/// past that the staleness clock runs from the lapse.
 fn session_is_live(agg: &SessionAgg, now_ms: u64) -> bool {
-    if agg.wait_until_ms.is_some_and(|until| now_ms <= until) {
-        return true;
-    }
     let last_activity_ms = agg.last_activity_ts.as_deref().and_then(parse_flow_ts).map(|secs| secs.saturating_mul(1_000));
     let Some(quiet_from) = last_activity_ms.max(agg.wait_until_ms) else {
         return false;
@@ -5233,6 +5231,28 @@ mod tests {
         );
         let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), now_unix() * 1_000);
         assert!(ghosts.is_empty());
+    }
+
+    /// (#2902 step 5) A hosted call held by its budget writes its wait
+    /// before any bookend: its session is a run, running while it waits
+    /// (a long wait outlasts the staleness window), and a wait the operator
+    /// stopped reads aborted.
+    #[test]
+    fn ghost_runs_a_budget_held_call_is_a_run_before_its_start() {
+        let base_ts = "2000-01-01T00:00:00Z";
+        let base_ms = parse_flow_ts(base_ts).unwrap() * 1_000;
+        let wait = serde_json::json!({ "ts": base_ts, "action": "budget.wait", "session_id": "held", "payload": { "wait_seconds": 86_000 } });
+        let mut idx = HashMap::new();
+        fold_session_record(&mut idx, &wait);
+        let held = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), base_ms + 3 * 3_600_000);
+        assert_eq!(held.len(), 1, "a waiting session with no start yet is a run");
+        assert_eq!(held[0].status, RunStatus::Running, "running while it waits, hours past the staleness window");
+
+        let stop = serde_json::json!({ "ts": "2000-01-01T04:00:00Z", "action": "budget.stop", "session_id": "held", "payload": { "reason": "mission `m` is aborted" } });
+        fold_session_record(&mut idx, &stop);
+        let stopped = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), base_ms + 5 * 3_600_000);
+        assert_eq!(stopped[0].status, RunStatus::Abandoned);
+        assert_eq!(stopped[0].abandoned_reason, Some(AbandonReason::Aborted));
     }
 
     // ── ghost_runs: the staleness gate (#1642, #1633) ───────────────────

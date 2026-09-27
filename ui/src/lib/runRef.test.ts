@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { currentRun, grainOf, groupOfRecords, refAt, runIndex, runRecords, sessionRun, __runIndexBuilds } from "./runRef";
+import { currentRun, grainOf, groupOfRecords, recordsOfGroup, refAt, runIndex, runRecords, sessionRun, __runIndexBuilds } from "./runRef";
 import { lifecycleAt, DEFAULT_POLICY } from "./lifecycle";
 import { normAll, type RawRecord } from "../testing/records";
 
@@ -80,6 +80,13 @@ describe("attempts", () => {
   it("before the relaunch the run is closed, after it open", () => {
     expect(lifecycleAt(currentRun(g, Date.parse(at(100))), Date.parse(at(100)), DEFAULT_POLICY).phase).toBe("closed");
     expect(lifecycleAt(currentRun(g, Date.parse(at(400))), Date.parse(at(400)), DEFAULT_POLICY).phase).toBe("open");
+  });
+
+  it("an attempt a relaunch superseded with no close of its own reads stopped", () => {
+    const g2 = groupOfRecords(normAll([rec(0, "dispatch.start"), rec(300, "dispatch.start")]));
+    const t = Date.parse(at(310));
+    expect(lifecycleAt(recordsOfGroup(g2, { sessionId: "task-probe", missionId: null, attempt: 0 }), t, DEFAULT_POLICY).phase).toBe("stale");
+    expect(lifecycleAt(currentRun(g2, t), t, DEFAULT_POLICY).phase).toBe("open");
   });
 
   it("a wait before the start is the same attempt as the start", () => {

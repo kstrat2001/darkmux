@@ -245,6 +245,18 @@ describe("specOf", () => {
   });
 });
 
+describe("runningRuns: bookkeeping is not a run", () => {
+  // A mission's own lifecycle session (`mission.start`, no close yet) and a
+  // scheduler task session are open lifecycles, but no model work: the card
+  // counts runs, not bookkeeping.
+  it("an open mission lifecycle session alone reads idle", () => {
+    const data: NormRecord[] = [rec({ machine_uid: "u1", session_id: "mission-m1", mission_id: "m1", action: "mission.start" })];
+    const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", true, Date.parse("2026-08-08T00:01:00.000Z"));
+    expect(card.runsCount).toBe(0);
+    expect(card.stat).toBe("idle");
+  });
+});
+
 describe("buildFleetCard", () => {
   it("an absent machine reads 'offline' regardless of activity", () => {
     const data: NormRecord[] = [rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" })];
