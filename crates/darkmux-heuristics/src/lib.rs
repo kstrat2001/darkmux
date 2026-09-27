@@ -322,6 +322,9 @@ impl RulesTable {
 pub trait HeuristicsProvider: Sync {
     /// Stable identifier used in `_notes` and doctor output.
     fn id(&self) -> &'static str;
+    /// `true` only for the catch-all fallback, whose rules are not derived
+    /// from any measured tier (doctor warns when it is the active provider).
+    fn is_generic(&self) -> bool;
     /// Return `true` if this provider's rules apply to the given hardware.
     fn matches(&self, hw: &HardwareSpec) -> bool;
     /// This provider's rules table.
@@ -653,6 +656,16 @@ mod tests {
         assert_eq!(active_provider(&apple_silicon_128gb()).id(), "m-series-128");
         let linux = HardwareSpec { platform: Platform::Linux, ..apple_silicon_128gb() };
         assert_eq!(active_provider(&linux).id(), "generic");
+    }
+
+    #[test]
+    fn only_the_fallback_provider_is_generic() {
+        for (provider, _) in goldens() {
+            assert_eq!(provider.is_generic(), provider.id() == "generic", "{}", provider.id());
+        }
+        let linux = HardwareSpec { platform: Platform::Linux, ..apple_silicon_128gb() };
+        assert!(active_provider(&linux).is_generic());
+        assert!(!active_provider(&apple_silicon_32gb()).is_generic());
     }
 
     #[test]

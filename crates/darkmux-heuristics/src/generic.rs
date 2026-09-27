@@ -38,6 +38,10 @@ impl HeuristicsProvider for Provider {
         "generic"
     }
 
+    fn is_generic(&self) -> bool {
+        true
+    }
+
     fn matches(&self, _hw: &HardwareSpec) -> bool {
         true
     }

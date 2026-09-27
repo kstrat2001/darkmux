@@ -50,6 +50,10 @@ impl HeuristicsProvider for Provider {
         "m-series-32"
     }
 
+    fn is_generic(&self) -> bool {
+        false
+    }
+
     fn matches(&self, hw: &HardwareSpec) -> bool {
         matches!(hw.platform, Platform::AppleSilicon) && matches!(hw.ram_tier(), RamTier::Small)
     }
