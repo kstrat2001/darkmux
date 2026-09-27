@@ -736,7 +736,7 @@ jobs:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     permissions:
       contents: write   # pushes the badge branch (main only)
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -747,18 +747,52 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: coverage
+          # `runtime/` is its own Cargo workspace with its own target dir.
+          workspaces: |
+            .
+            runtime
 
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked
 
-      - name: Measure
-        run: |
-          cargo llvm-cov --workspace --summary-only --json --output-path cov.json
-          cargo llvm-cov --workspace --summary-only
+      - name: Coverage summary script self-test
+        run: python3 scripts/ci-coverage-summary.py --self-test
 
-      - name: Report, and name the zero-coverage regions
-        if: always()
-        run: python3 scripts/ci-coverage-summary.py cov.json --badge coverage-badge.json >> "$GITHUB_STEP_SUMMARY"
+      # Measuring and reporting are separate steps so that one red test cannot
+      # erase the report. `--no-fail-fast` runs every test binary, so the
+      # profile is complete even when one fails; this step still exits
+      # non-zero on any failing test, which is what fails the job. The report
+      # steps run on `!cancelled()` and read the profile this step left,
+      # whatever its verdict. `report` reuses that profile: the tests run once.
+      - name: Measure the workspace
+        run: cargo llvm-cov --workspace --no-report --no-fail-fast
+
+      # `cov.json` is the summary (the badge and the README number);
+      # `cov-full.json` carries every function's execution count, which is
+      # what per-function scoring (complexity against coverage) needs.
+      - name: Report the workspace, and name what never executes
+        if: ${{ !cancelled() }}
+        run: |
+          cargo llvm-cov report --summary-only --json --output-path cov.json
+          cargo llvm-cov report --json --output-path cov-full.json
+          cargo llvm-cov report --summary-only
+          python3 scripts/ci-coverage-summary.py cov.json --functions cov-full.json \
+            --badge coverage-badge.json >> "$GITHUB_STEP_SUMMARY"
+
+      # `runtime/` is not a workspace member, so `--workspace` above never
+      # measures it. Measured on its own, whatever the workspace step said.
+      - name: Measure runtime/
+        if: ${{ !cancelled() }}
+        run: cargo llvm-cov --manifest-path runtime/Cargo.toml --no-report --no-fail-fast
+
+      - name: Report runtime/, and name what never executes
+        if: ${{ !cancelled() }}
+        run: |
+          cargo llvm-cov report --manifest-path runtime/Cargo.toml --summary-only --json --output-path cov-runtime.json
+          cargo llvm-cov report --manifest-path runtime/Cargo.toml --json --output-path cov-runtime-full.json
+          cargo llvm-cov report --manifest-path runtime/Cargo.toml --summary-only
+          python3 scripts/ci-coverage-summary.py cov-runtime.json --functions cov-runtime-full.json \
+            --title "Coverage (runtime/)" >> "$GITHUB_STEP_SUMMARY"
 
       # The coverage run builds with every feature, so the `ts-export` tests
       # regenerate `ui/src/types/generated/*.ts` from the Rust types. A field
@@ -813,6 +847,27 @@ jobs:
         with:
           name: coverage-json
           path: cov.json
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-full-json
+          path: cov-full.json
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-runtime-json
+          path: cov-runtime.json
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-runtime-full-json
+          path: cov-runtime-full.json
           if-no-files-found: ignore
 
   mutants-full:

@@ -7434,7 +7434,7 @@ mod fleet_cache_wall_clock {
             let tmp = TempDir::new().unwrap();
             let sock_dir = TempDir::new().unwrap();
             let sock = sock_dir.path().join("live.sock");
-            assert!(live_hub::spawn_ingest(sock.clone(), 0).is_some());
+            assert!(live_hub::spawn_ingest(sock.clone(), 0, live_hub::OWNERSHIP_CHECK).is_some());
             let today = today_utc_date();
             let mut v = open_viewer(build_router_local(tmp.path().to_path_buf()), &today).await;
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -7466,6 +7466,17 @@ mod fleet_cache_wall_clock {
             assert!(!live_hub::accept_at(&at(now + 60_000), now), "nor a minute ahead");
         }
 
+        /// The `/health` body from a router serving `ingest`.
+        async fn health_body(ingest: Option<Arc<live_hub::IngestState>>) -> serde_json::Value {
+            let tmp = TempDir::new().unwrap();
+            let resp = build_router_full(tmp.path().to_path_buf(), worktrees_base_dir(), None, ingest)
+                .layer(axum::middleware::from_fn(assume_loopback_peer))
+                .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            serde_json::from_slice(&to_bytes(resp.into_body(), 1 << 20).await.unwrap()).unwrap()
+        }
+
         /// (#2928 review, C3) `/health` says which socket the daemon bound,
         /// by fingerprint and port (never the path: `/health` is open to the
         /// tailnet), so `doctor` can compare it with the one a dispatch uses.
@@ -7474,18 +7485,38 @@ mod fleet_cache_wall_clock {
         async fn health_names_the_bound_socket_by_fingerprint() {
             let sock_dir = TempDir::new().unwrap();
             let sock = sock_dir.path().join("live-4242.sock");
-            assert!(live_hub::spawn_ingest(sock.clone(), 4242).is_some());
-            let tmp = TempDir::new().unwrap();
-            let resp = build_router_local(tmp.path().to_path_buf())
-                .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&to_bytes(resp.into_body(), 1 << 20).await.unwrap()).unwrap();
+            let (_h, state) = live_hub::spawn_ingest(sock.clone(), 4242, live_hub::OWNERSHIP_CHECK).expect("bound");
+            let body = health_body(Some(state)).await;
             let live = &body["live"]["ingest"];
             assert_eq!(live["socket_id"], darkmux_flow::live::socket_fingerprint(&sock));
             assert_eq!(live["socket_port"], 4242);
             assert_eq!(live["bound"], true);
             assert!(!body.to_string().contains(sock_dir.path().to_str().unwrap()), "no filesystem path on /health");
+        }
+
+        /// Two ingests in one process (a test binary, or any future embedder
+        /// that serves twice): each router's `/health` names the socket ITS
+        /// daemon bound, never the one that happened to spawn first. And a
+        /// daemon whose ingest never bound says so (`null`) rather than
+        /// borrowing another's. A process-wide "first ingest wins" slot fails
+        /// this whenever another ingest spawned earlier in the process.
+        #[tokio::test]
+        #[serial]
+        async fn health_names_its_own_socket_when_two_daemons_share_a_process() {
+            let sock_dir = TempDir::new().unwrap();
+            let first = sock_dir.path().join("live-5001.sock");
+            let second = sock_dir.path().join("live-5002.sock");
+            let (_h1, s1) = live_hub::spawn_ingest(first.clone(), 5001, live_hub::OWNERSHIP_CHECK).expect("first bound");
+            let (_h2, s2) = live_hub::spawn_ingest(second.clone(), 5002, live_hub::OWNERSHIP_CHECK).expect("second bound");
+            let a = health_body(Some(s1)).await["live"]["ingest"].clone();
+            let b = health_body(Some(s2)).await["live"]["ingest"].clone();
+            assert_eq!(a["socket_id"], darkmux_flow::live::socket_fingerprint(&first));
+            assert_eq!(a["socket_port"], 5001);
+            assert_eq!(b["socket_id"], darkmux_flow::live::socket_fingerprint(&second));
+            assert_eq!(b["socket_port"], 5002);
+            assert_ne!(a["socket_id"], b["socket_id"]);
+            let none = health_body(None).await;
+            assert_eq!(none["live"]["ingest"], serde_json::Value::Null, "no ingest bound: null, not another daemon's");
         }
 
         /// (#2928 review, C5) A second daemon that replaces this one's
@@ -7496,7 +7527,7 @@ mod fleet_cache_wall_clock {
         fn a_replaced_socket_is_reported_and_never_deleted_on_shutdown() {
             let sock_dir = TempDir::new().unwrap();
             let sock = sock_dir.path().join("live-4343.sock");
-            let (handle, state) = live_hub::spawn_ingest_checking(sock.clone(), 4343, Duration::from_millis(50)).expect("bound");
+            let (handle, state) = live_hub::spawn_ingest(sock.clone(), 4343, Duration::from_millis(50)).expect("bound");
             assert!(state.bound());
             // The other daemon: unlink and bind its own at the same path.
             std::fs::remove_file(&sock).unwrap();
