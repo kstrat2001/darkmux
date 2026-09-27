@@ -471,11 +471,7 @@ mod tests {
     }
 
     /// Synthesized M1 Max 32 GB fixture — falls into the `Small` RAM tier
-    /// so `active_provider` returns `m_series_32`. Kept available for
-    /// future cross-tier coverage even when no current test uses it; the
-    /// allowance is intentional so adding a 32GB-tier regression doesn't
-    /// require re-declaring the fixture.
-    #[allow(dead_code)]
+    /// so `active_provider` returns `m_series_32`.
     fn apple_silicon_32gb() -> HardwareSpec {
         HardwareSpec {
             platform: Platform::AppleSilicon,
@@ -500,6 +496,143 @@ mod tests {
             trained_for_tool_use: true,
             model_type: "llm".into(),
         }
+    }
+
+    /// Every provider's full rules table, pinned cell by cell as literal
+    /// data written independently of the tables themselves: `(primary
+    /// n_ctx, compactor n_ctx)` per `[bucket][task]`, buckets Tiny..Xl,
+    /// tasks Fast/Mid/Long. A compactor, when present, is always
+    /// `DEFAULT_COMPACTOR_ID` and always carries the compaction settings.
+    type Golden = [[(u32, Option<u32>); 3]; 5];
+    const GOLDEN_128: Golden = [
+        [(32_000, None), (64_000, None), (131_072, None)],
+        [(32_000, None), (64_000, None), (131_072, None)],
+        [(32_000, None), (101_000, Some(68_000)), (262_144, Some(120_000))],
+        [(32_000, None), (64_000, Some(32_000)), (101_000, Some(64_000))],
+        [(32_000, None), (50_000, Some(32_000)), (101_000, Some(64_000))],
+    ];
+    const GOLDEN_64: Golden = [
+        [(32_000, None), (64_000, None), (131_072, None)],
+        [(32_000, None), (64_000, None), (131_072, None)],
+        [(32_000, None), (64_000, Some(32_000)), (131_072, Some(64_000))],
+        [(32_000, None), (32_000, None), (64_000, Some(32_000))],
+        [(16_000, None), (32_000, None), (32_000, None)],
+    ];
+    const GOLDEN_32: Golden = [
+        [(32_000, None), (64_000, None), (131_072, None)],
+        [(32_000, None), (64_000, None), (131_072, None)],
+        [(32_000, None), (64_000, None), (64_000, Some(32_000))],
+        [(16_000, None), (32_000, None), (64_000, None)],
+        [(8_000, None), (16_000, None), (32_000, None)],
+    ];
+    const GOLDEN_GENERIC: Golden = [
+        [(32_000, None), (32_000, None), (64_000, None)],
+        [(32_000, None), (32_000, None), (64_000, None)],
+        [(16_000, None), (32_000, None), (64_000, None)],
+        [(8_000, None), (16_000, None), (32_000, None)],
+        [(8_000, None), (16_000, None), (32_000, None)],
+    ];
+    const BUCKETS: [SizeBucket; 5] =
+        [SizeBucket::Tiny, SizeBucket::Small, SizeBucket::Medium, SizeBucket::Large, SizeBucket::Xl];
+    const TASKS: [TaskClass; 3] = [TaskClass::Fast, TaskClass::Mid, TaskClass::Long];
+    const ARCHS: [Architecture; 3] = [Architecture::Moe, Architecture::Dense, Architecture::Unknown];
+
+    fn goldens() -> [(&'static dyn HeuristicsProvider, &'static Golden); 4] {
+        [
+            (&m_series_128::PROVIDER, &GOLDEN_128),
+            (&m_series_64::PROVIDER, &GOLDEN_64),
+            (&m_series_32::PROVIDER, &GOLDEN_32),
+            (&generic::PROVIDER, &GOLDEN_GENERIC),
+        ]
+    }
+
+    #[test]
+    fn every_provider_rules_table_is_pinned_cell_by_cell() {
+        for (provider, golden) in goldens() {
+            for (b, bucket) in BUCKETS.iter().enumerate() {
+                for (t, task) in TASKS.iter().enumerate() {
+                    let (want_ctx, want_compactor) = golden[b][t];
+                    // The architecture is not an input to any table today:
+                    // every arch must read the same cell.
+                    for arch in ARCHS {
+                        let r = provider.suggest(*bucket, arch, *task, u32::MAX);
+                        let at = format!("{} {bucket:?}/{task:?}/{arch:?}", provider.id());
+                        assert_eq!(r.primary_n_ctx, want_ctx, "{at}: primary n_ctx");
+                        assert_eq!(r.compactor.as_ref().map(|c| c.n_ctx), want_compactor, "{at}: compactor n_ctx");
+                        if let Some(c) = &r.compactor {
+                            assert_eq!(c.model_id, DEFAULT_COMPACTOR_ID, "{at}: compactor model");
+                        }
+                        assert_eq!(
+                            r.include_compaction_settings,
+                            want_compactor.is_some(),
+                            "{at}: compaction settings ride with the compactor"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_provider_caps_the_primary_at_max_ctx_but_not_the_compactor() {
+        // The provider caps only the PRIMARY at the model's max context;
+        // the compactor clamp against the capped primary is
+        // `suggest_profile_for`'s job, not the table's.
+        for (provider, golden) in goldens() {
+            for (b, bucket) in BUCKETS.iter().enumerate() {
+                for (t, task) in TASKS.iter().enumerate() {
+                    let r = provider.suggest(*bucket, Architecture::Moe, *task, 1_000);
+                    let at = format!("{} {bucket:?}/{task:?}", provider.id());
+                    assert_eq!(r.primary_n_ctx, 1_000, "{at}: primary capped");
+                    assert_eq!(r.compactor.as_ref().map(|c| c.n_ctx), golden[b][t].1, "{at}: compactor uncapped");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn active_provider_picks_by_platform_and_ram_tier() {
+        let at = |ram: u32| HardwareSpec { total_ram_gb: ram, ..apple_silicon_128gb() };
+        assert_eq!(active_provider(&apple_silicon_32gb()).id(), "m-series-32");
+        assert_eq!(active_provider(&at(8)).id(), "m-series-32");
+        assert_eq!(active_provider(&at(33)).id(), "m-series-64");
+        assert_eq!(active_provider(&at(64)).id(), "m-series-64");
+        assert_eq!(active_provider(&at(65)).id(), "m-series-128");
+        assert_eq!(active_provider(&apple_silicon_128gb()).id(), "m-series-128");
+        let linux = HardwareSpec { platform: Platform::Linux, ..apple_silicon_128gb() };
+        assert_eq!(active_provider(&linux).id(), "generic");
+    }
+
+    #[test]
+    fn task_class_as_str_round_trips_through_parse() {
+        for task in TASKS {
+            assert_eq!(TaskClass::parse(task.as_str()), Some(task));
+        }
+        assert_eq!(TaskClass::Fast.as_str(), "fast");
+        assert_eq!(TaskClass::Mid.as_str(), "mid");
+        assert_eq!(TaskClass::Long.as_str(), "long");
+    }
+
+    #[test]
+    fn format_description_names_size_arch_task_and_falls_back_to_the_key() {
+        let mut m = meta("key-x", Some("4B"), None, 32_000, 0);
+        let cases = [
+            (SizeBucket::Tiny, Architecture::Moe, TaskClass::Fast, "(tiny MoE) tuned for single-turn / fast tasks."),
+            (SizeBucket::Small, Architecture::Dense, TaskClass::Mid, "(small dense) tuned for mid-range / mixed tasks."),
+            (SizeBucket::Medium, Architecture::Unknown, TaskClass::Long, "(medium unknown-arch) tuned for long agentic / multi-turn tasks."),
+            (SizeBucket::Large, Architecture::Moe, TaskClass::Fast, "(large MoE)"),
+            (SizeBucket::Xl, Architecture::Moe, TaskClass::Fast, "(XL MoE)"),
+        ];
+        for (bucket, arch, task, want) in cases {
+            let d = format_description(&m, bucket, arch, task);
+            assert!(d.starts_with("key-x display "), "{d}");
+            assert!(d.contains(want), "{d} should contain {want}");
+        }
+        m.display_name.clear();
+        assert_eq!(
+            format_description(&m, SizeBucket::Tiny, Architecture::Dense, TaskClass::Fast),
+            "key-x (tiny dense) tuned for single-turn / fast tasks."
+        );
     }
 
     #[test]
