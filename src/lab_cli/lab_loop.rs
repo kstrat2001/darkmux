@@ -137,9 +137,7 @@ pub(super) fn cmd_lab_loop(args: LabLoopArgs) -> Result<i32> {
     // Armed once, ahead of both the single-run and the two-run `--ab` shape.
     let _reap_watchdog = super::arm_signal_handling();
     let plan = args.plan()?;
-    for (env, value) in &plan.caps {
-        std::env::set_var(env, value);
-    }
+    apply_caps(&plan.caps);
     if args.ab {
         return run_ab_compare(&args, &plan);
     }
@@ -150,6 +148,14 @@ pub(super) fn cmd_lab_loop(args: LabLoopArgs) -> Result<i32> {
         loop_report::print_report(&report);
     }
     Ok(verdict_exit(report.verdict))
+}
+
+/// Set each cap on the live env-override tier (axis 1) for this process's
+/// dispatches.
+fn apply_caps(caps: &[(&'static str, String)]) {
+    for (env, value) in caps {
+        std::env::set_var(env, value);
+    }
 }
 
 /// One arm of the bench: a single dispatch, classified. `inject` carries the
@@ -391,6 +397,27 @@ mod tests {
             ]
         );
         assert!(bare("w").plan().unwrap().caps.is_empty());
+    }
+
+    /// The caps land on the process env the runtime's `config_access` reads.
+    #[test]
+    #[serial_test::serial]
+    fn apply_caps_sets_each_cap_on_the_process_env() {
+        let vars = [
+            "DARKMUX_RUNTIME_MAX_TURNS",
+            "DARKMUX_RUNTIME_MAX_TOKENS",
+            "DARKMUX_INACTIVITY_TIMEOUT_SECONDS",
+        ];
+        let prev: Vec<_> = vars.iter().map(|v| std::env::var_os(v)).collect();
+        apply_caps(&every_flag().plan().unwrap().caps);
+        let got: Vec<_> = vars.iter().map(|v| std::env::var(v).ok()).collect();
+        for (v, p) in vars.iter().zip(prev) {
+            match p {
+                Some(p) => std::env::set_var(v, p),
+                None => std::env::remove_var(v),
+            }
+        }
+        assert_eq!(got, [Some("7".into()), Some("900".into()), Some("33".into())]);
     }
 
     #[test]
