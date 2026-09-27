@@ -112,6 +112,11 @@ pub(crate) struct AppState {
     /// darkmux-owned by the namespace convention rather than a guess at
     /// operator state.
     lab_dir: Option<PathBuf>,
+    /// (#2928) The live-channel ingest THIS daemon bound, for `/health`.
+    /// `None` when it could not bind (or, in tests, was never spawned).
+    /// Carried per router rather than read from a process global, so
+    /// `/health` can only ever name the socket its own daemon holds.
+    live_ingest: Option<Arc<live_hub::IngestState>>,
 }
 
 /// (#925) RAII slot for one open SSE stream: decrements `AppState::sse_open`
@@ -357,14 +362,14 @@ pub(crate) fn build_router_with_worktrees_base(
     flows_dir: PathBuf,
     worktrees_base: PathBuf,
 ) -> Router {
-    build_router_full(flows_dir, worktrees_base, None)
+    build_router_full(flows_dir, worktrees_base, None, None)
 }
 
 /// Full router builder — flows dir + worktrees base + the lab observer's
-/// scan root. This is the SINGLE place routes are registered (#881 collapsed
-/// the prior duplicate builder; #1247 Part 3 added the `/lab/*` group here
-/// rather than a parallel builder), so the auth layers below land in exactly
-/// one place.
+/// scan root + the live-channel ingest this daemon bound. This is the SINGLE
+/// place routes are registered (#881 collapsed the prior duplicate builder;
+/// #1247 Part 3 added the `/lab/*` group here rather than a parallel
+/// builder), so the auth layers below land in exactly one place.
 ///
 /// **Auth wiring (#881, narrowed #1387):** when a bearer token is configured
 /// (`darkmux_flow::serve_token_present()`), a **remote-only** gate (`auth_mw`)
@@ -390,6 +395,7 @@ pub(crate) fn build_router_full(
     flows_dir: PathBuf,
     worktrees_base: PathBuf,
     lab_dir: Option<PathBuf>,
+    live_ingest: Option<Arc<live_hub::IngestState>>,
 ) -> Router {
     let state = AppState {
         flows_dir,
@@ -397,6 +403,7 @@ pub(crate) fn build_router_full(
         sse_open: Arc::new(AtomicUsize::new(0)),
         lab_dir,
         panels: panel::PanelState::default(),
+        live_ingest,
     };
     let auth_on = darkmux_flow::serve_token_present();
 
@@ -522,7 +529,7 @@ pub(crate) fn build_router_full_local(
     worktrees_base: PathBuf,
     lab_dir: Option<PathBuf>,
 ) -> Router {
-    build_router_full(flows_dir, worktrees_base, lab_dir).layer(from_fn(assume_loopback_peer))
+    build_router_full(flows_dir, worktrees_base, lab_dir, None).layer(from_fn(assume_loopback_peer))
 }
 
 /// (#881) Build a `401 Unauthorized` with a `WWW-Authenticate: Bearer` hint.
@@ -1249,7 +1256,6 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
         .build()?;
 
     rt.block_on(async move {
-        let app = build_router_full(flows_dir.clone(), worktrees_base_dir(), lab_dir.clone());
         let addr = listen_socket_addr(&bind, port)?;
         // (#881) Refuse a non-loopback bind without a configured token BEFORE we
         // bind the socket — exposing the read surface unauthenticated is the
@@ -1343,8 +1349,16 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
         // succeeded, which is what makes replacing a stale socket safe.
         // Always bound (#2928 review, C3): `runtime.live_sample_ms` is the
         // producers' cadence; a daemon always accepts.
-        let _live_handle = darkmux_flow::live::socket_path_for(&darkmux_flow::live::live_home(), addr.port())
-            .and_then(|p| live_hub::spawn_ingest(p, addr.port()));
+        let (_live_handle, live_ingest) = darkmux_flow::live::socket_path_for(&darkmux_flow::live::live_home(), addr.port())
+            .and_then(|p| live_hub::spawn_ingest(p, addr.port(), live_hub::OWNERSHIP_CHECK))
+            .unzip();
+        // Built only now, so `/health` carries the ingest this daemon bound.
+        let app = build_router_full(
+            flows_dir.clone(),
+            worktrees_base_dir(),
+            lab_dir.clone(),
+            live_ingest.clone(),
+        );
 
         // (#647) Presence edge-recording for playback. Self-emit this machine's
         // `machine.online` open-edge now (it's online), and spawn the reconciler
@@ -1387,7 +1401,7 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
         tokio::spawn(async move {
             shutdown_signal().await;
             host_sampler_stop.store(true, Ordering::SeqCst);
-            if let Some(st) = live_hub::ingest_state() {
+            if let Some(st) = &live_ingest {
                 st.remove_socket_if_ours();
             }
             // (#2476, reordered in review round 2 — MUST FIX 3) Reap the
@@ -1502,7 +1516,10 @@ fn current_exe_mtime() -> Option<u64> {
 /// The mtime is deliberately reported as a bare integer rather than the exe
 /// PATH: `/health` is auth-exempt even for non-loopback peers, and a path would
 /// disclose the operator's home directory to anything that can reach the port.
-async fn health(peer: Option<ConnectInfo<SocketAddr>>) -> axum::Json<serde_json::Value> {
+async fn health(
+    State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+) -> axum::Json<serde_json::Value> {
     // (#2916 re-review C9) A peer sees only the listener's coarse state.
     let loopback_caller = peer.is_some_and(|c| c.0.ip().is_loopback());
     axum::Json(serde_json::json!({
@@ -1524,7 +1541,7 @@ async fn health(peer: Option<ConnectInfo<SocketAddr>>) -> axum::Json<serde_json:
             "sample_ms": darkmux_types::config_access::live_sample_ms(),
             // (#2928 review, C3) Which socket this daemon bound, by
             // fingerprint and port; `null` when none.
-            "ingest": live_hub::ingest_state().map(|s| s.health_json()),
+            "ingest": state.live_ingest.as_ref().map(|s| s.health_json()),
             "received": live_hub::stats().received.load(Ordering::Relaxed),
             "rejected": live_hub::stats().rejected.load(Ordering::Relaxed),
             "handle_us": live_hub::stats().handle_ns.load(Ordering::Relaxed) / 1_000,
