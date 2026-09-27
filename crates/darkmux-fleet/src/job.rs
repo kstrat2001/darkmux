@@ -9,7 +9,7 @@
 //! on both sides.
 
 use anyhow::{anyhow, Result};
-use darkmux_types::session_id::SessionId;
+use darkmux_types::session_id::{SessionId, SessionKind};
 use serde::{Deserialize, Serialize};
 
 /// One unit of work one machine asks another to run: the body of a
@@ -240,9 +240,16 @@ pub(crate) const MAX_SESSION_ID_LEN: usize = 128;
 
 /// (#2916) A submitted session id is part of file names and flow-record
 /// join keys on the receiver. Its charset is the session grammar's (the
-/// type cannot hold anything else); its length is bounded here.
+/// type cannot hold anything else); its length is bounded here. The bound
+/// is on what the SENDER sent: the receiver executes under its relay of
+/// that session, which escapes and wraps it and so is longer, and is the
+/// receiver's own mint.
 fn validate_session_id(value: &SessionId) -> Result<()> {
-    if value.wire().len() > MAX_SESSION_ID_LEN {
+    let sent = match value.kind() {
+        SessionKind::Relay { sender, .. } => sender.as_ref(),
+        _ => value,
+    };
+    if sent.wire().len() > MAX_SESSION_ID_LEN {
         return Err(anyhow!("WorkJob.session_id must be at most {MAX_SESSION_ID_LEN} characters"));
     }
     Ok(())
@@ -387,6 +394,25 @@ mod tests {
         let run = darkmux_types::session_id::RunId::mission("m").unwrap();
         job.session_id = SessionId::adhoc(run, "coder", "n".repeat(MAX_SESSION_ID_LEN));
         assert!(job.validate().unwrap_err().to_string().contains("session_id"));
+    }
+
+    /// The receiver runs a job under its relay of the sender's session,
+    /// which escapes and wraps it, so the relay is longer than what the
+    /// sender sent. The bound is on the sender's session: a relay of one
+    /// that passed must still pass when the receiver executes it.
+    #[test]
+    fn the_bound_is_on_the_senders_session_not_the_receivers_relay() {
+        let mut job = make_valid_job();
+        let run = darkmux_types::session_id::RunId::standalone("dispatch-radio-host-1790546608-d324-0").unwrap();
+        let sent = SessionId::adhoc(run, "radio-host", "1790546608989285-0");
+        let room = MAX_SESSION_ID_LEN - sent.wire().len();
+        let sent = SessionId::adhoc(sent.run_id().clone(), "radio-host", format!("1790546608989285-0{}", "n".repeat(room)));
+        assert_eq!(sent.wire().len(), MAX_SESSION_ID_LEN);
+        job.session_id = sent.clone();
+        job.validate().expect("the sender's session is within the bound");
+        job.session_id = SessionId::relay(sent, "macbook-pro");
+        assert!(job.session_id.wire().len() > MAX_SESSION_ID_LEN);
+        job.validate().expect("the receiver's relay of a bounded session is admitted");
     }
 
     /// (#2916) The v5 wire shape refuses the fields v4 carried.

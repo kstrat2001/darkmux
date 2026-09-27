@@ -34,6 +34,7 @@ mod e2e;
 use e2e::fixture_reaper;
 
 use darkmux_flow::FlowAction;
+use darkmux_types::session_id::{SessionId, SessionKind};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -362,7 +363,7 @@ fn an_addressed_dispatch_runs_on_the_owning_machine_and_each_side_records_its_ha
     let beta = f.beta.flow_lines();
     let starts: Vec<_> = beta
         .iter()
-        .filter(|v| v["action"] == FlowAction::DispatchStart.as_str() && v["session_id"].as_str().is_some_and(|s| s.ends_with("-from-alpha")))
+        .filter(|v| v["action"] == FlowAction::DispatchStart.as_str() && relayed_from_alpha(v))
         .collect();
     assert_eq!(starts.len(), 1, "beta's dispatch start: {:?}", actions(&beta));
     let sid = starts[0]["session_id"].as_str().unwrap();
@@ -419,11 +420,19 @@ fn the_receiver_refuses_at_once_and_the_sender_shows_why() {
 }
 
 /// `dispatch start` records beta wrote for jobs alpha sent.
+/// Whether a record on beta is under beta's relay of a session alpha sent.
+fn relayed_from_alpha(v: &serde_json::Value) -> bool {
+    v["session_id"]
+        .as_str()
+        .and_then(|s| SessionId::parse(s).ok())
+        .is_some_and(|s| matches!(s.kind(), SessionKind::Relay { peer, .. } if peer == "alpha"))
+}
+
 fn beta_dispatch_starts(f: &Fleet) -> usize {
     f.beta
         .flow_lines()
         .iter()
-        .filter(|v| v["action"] == FlowAction::DispatchStart.as_str() && v["session_id"].as_str().is_some_and(|s| s.ends_with("-from-alpha")))
+        .filter(|v| v["action"] == FlowAction::DispatchStart.as_str() && relayed_from_alpha(v))
         .count()
 }
 
