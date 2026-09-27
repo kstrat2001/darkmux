@@ -1305,6 +1305,26 @@ mod tests {
         assert_eq!(role.residency, "remote");
     }
 
+    #[test]
+    fn resolved_model_reports_remote_only_for_an_unmanaged_model() {
+        // (#2902 step 3) `remote` is derived from `is_managed()`; a managed
+        // (local) model must read `remote: false`, an endpoint one `true`.
+        let registry = StepKindRegistry::new();
+        for (model, want_remote) in [
+            (local_model("m-local", 8000), false),
+            (remote_model("gpt-4-remote"), true),
+        ] {
+            let profiles = reg(vec![("fast", vec![model])], Some("fast"));
+            let cfg = doc(vec![phase("p1", vec![task("t1", Some("role-a"), vec![step("s1", "k")])])]);
+            let loaded = loaded_doc(cfg);
+            let pctx = ctx(profiles);
+            let show = build_show("m", &loaded, &registry, Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]), &[]);
+            let role = show.phases[0].tasks[0].role.as_ref().unwrap();
+            let m = role.model.as_ref().expect("a resolved role carries its model");
+            assert_eq!(m.remote, want_remote, "model {} remote flag", m.id);
+        }
+    }
+
     // ── residency ─────────────────────────────────────────────────────
 
     #[test]

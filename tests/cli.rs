@@ -813,6 +813,51 @@ fn profile_list_lists_from_explicit_config() {
         .stdout(predicate::str::contains("(default)"));
 }
 
+// (#2902 step 4) `profile list` shows an `endpoints` section only when the
+// registry defines endpoints, and says what each one is.
+#[test]
+fn profile_list_omits_the_endpoints_section_when_none_are_defined() {
+    let tmp = TempDir::new().unwrap();
+    let p = tmp.path().join("profiles.json");
+    fs::write(&p, fixture_json()).unwrap();
+    let out = darkmux_cmd()
+        .args(["profile", "list", "--profiles-file", p.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("endpoints"),
+        "no endpoints header without endpoints:\n{stdout}"
+    );
+}
+
+#[test]
+fn profile_list_names_each_defined_endpoint() {
+    let tmp = TempDir::new().unwrap();
+    let p = tmp.path().join("profiles.json");
+    let mut reg: serde_json::Value = serde_json::from_str(fixture_json()).unwrap();
+    reg["endpoints"] = serde_json::json!({ "hosted": { "url": "https://h.example/v1" } });
+    fs::write(&p, reg.to_string()).unwrap();
+    darkmux_cmd()
+        .args(["profile", "list", "--profiles-file", p.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("endpoints"))
+        .stdout(predicate::str::contains("hosted: unmanaged @ h.example"));
+}
+
+// `lab loop` rejects an out-of-range adaptive-trigger ratio before any
+// dispatch, loudly (a trust-the-bench surface). No model is touched.
+#[test]
+fn lab_loop_rejects_an_out_of_range_compact_threshold_ratio() {
+    darkmux_cmd()
+        .args(["lab", "loop", "quick-q", "--compact-threshold-ratio", "5"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--compact-threshold-ratio 5 is out of range"));
+}
+
 #[test]
 fn profile_list_errors_when_config_missing() {
     let mut cmd = darkmux_cmd();
