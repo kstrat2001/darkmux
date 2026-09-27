@@ -144,10 +144,6 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
             prosecutor_profile,
             defender_profile,
             judge_profile,
-            roster_profile,
-            exec_mode,
-            k,
-            bundler,
         } => {
             // (#2463) `lab eval` dispatches one internal-runtime call per
             // case (`darkmux_crew::dispatch`, the same `dispatch()`
@@ -187,10 +183,6 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
                 prosecutor_profile,
                 defender_profile,
                 judge_profile,
-                roster_profile,
-                exec_mode,
-                k_override: k,
-                bundler_cmd: bundler,
             })?;
             Ok(0)
         }

@@ -84,6 +84,11 @@ darkmux release.
   the role), the dispatch now fails with an error naming the fix, where 3.x
   printed a deprecation warning and ran against whatever was loaded.
   **Migration:** set `"default_profile"` in `profiles.json`.
+- **`darkmux lab eval --k`, `--roster-profile`, `--exec-mode` and
+  `--bundler`.** They configured the funnel mode deleted in #2310 P4d and
+  were accepted and silently ignored since; `--k` claimed a value above 1
+  was a loud error, and it was not. **Migration:** drop the flags; they
+  never changed a run.
 
 ### Changed (breaking, 4.0)
 

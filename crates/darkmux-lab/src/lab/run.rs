@@ -702,10 +702,6 @@ mod tests {
                 prosecutor_profile: None,
                 defender_profile: None,
                 judge_profile: None,
-                roster_profile: None,
-                exec_mode: None,
-                k_override: None,
-                bundler_cmd: None,
             })
             .unwrap_err()
             .to_string();

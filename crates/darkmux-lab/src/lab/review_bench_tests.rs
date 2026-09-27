@@ -883,22 +883,6 @@
         assert_eq!(anchor.value, Some(1.0));
     }
 
-    // ── funnel mode (#1222 Phase B packet 7) ──────────────────────────
-
-    // ── parse_exec_mode ─────────────────────────────────────────────
-
-    // ── funnel coverage gap review (#1222 Phase B packet 7) ────────────
-    //
-    // Everything below characterizes wiring the packet's own unit tests
-    // (above) didn't reach: score()'s treatment of a Confirmed flag with NO
-    // dedup anchor, `write_scores_artifact`'s funnel-specific artifact
-    // discipline (previously untested even for `debates.json` — no test in
-    // this module ever constructed a full `ReviewBenchOpts`), the real
-    // `run_funnel_case` pipeline's degenerate-envelope + `--bundler`
-    // plumbing (both reachable offline because a zero-bundle/failed-bundle
-    // run short-circuits BEFORE any chat dispatch), and `resolve_funnel_ctx`'s
-    // crew-not-found + `--k`/`--exec-mode` plumbing.
-
     fn funnel_case() -> Case {
         Case {
             id: "c1".into(),
@@ -959,10 +943,6 @@
             prosecutor_profile: None,
             defender_profile: None,
             judge_profile: None,
-            roster_profile: None,
-            exec_mode: None,
-            k_override: None,
-            bundler_cmd: None,
         };
 
         let path = write_scores_artifact(&scored, &meta, &debates, &opts, &scores_out, 0).unwrap();
@@ -999,10 +979,6 @@
             prosecutor_profile: None,
             defender_profile: None,
             judge_profile: None,
-            roster_profile: None,
-            exec_mode: None,
-            k_override: None,
-            bundler_cmd: None,
         };
         let err = run_review_bench(opts).unwrap_err();
         let msg = format!("{err:#}");
@@ -1038,10 +1014,6 @@
             prosecutor_profile: None,
             defender_profile: None,
             judge_profile: None,
-            roster_profile: None,
-            exec_mode: None,
-            k_override: None,
-            bundler_cmd: None,
         };
         let err = run_review_bench(opts).unwrap_err();
         let msg = format!("{err:#}");
@@ -1049,21 +1021,6 @@
         assert!(!msg.contains("pr-reviewer-specific"), "default role must pass the role guard: {msg}");
         assert!(msg.contains("requires --workdirs"), "should reach the workdirs preflight: {msg}");
     }
-
-    // ── run_funnel_case: the real pipeline, offline-testable ───────────
-    //
-    // `run_funnel_case`'s `chat` closure is hardcoded to the real
-    // `single_shot_chat` (a live LMStudio call) — but a zero-bundle or
-    // failed-bundle run short-circuits BEFORE `review::run_review` ever
-    // reaches the probe phase, so both the degenerate-envelope path and the
-    // `--bundler` wiring are reachable without any network dispatch.
-
-    // ── resolve_funnel_ctx: roster resolution + --k / --exec-mode plumbing ───
-    // (#1475) The funnel pins EVERY review seat to one profile (the
-    // `--roster-profile`/`--profile` name, else default_profile) through packet
-    // 3's per-run role→profile override — one canonical resolver shared with the
-    // operator path. `--roster-profile` (#1465, renamed from `--crew`) names
-    // that profile.
 
     // Every test below resolves `mission_config::load("review")`, which reads
     // the process-global DARKMUX_CREW_DIR. `#[serial_test::serial]` only

@@ -1647,37 +1647,6 @@ pub(crate) enum LabCmd {
         /// denser local or remote-endpoint profile while the advocates stay.
         #[arg(long = "judge-profile", requires = "dialectic")]
         judge_profile: Option<String>,
-        /// (#1475, the `--roster-profile` flag; renamed from `--crew` in #1465)
-        /// The one profile the bench pins EVERY review seat (probe / judge /
-        /// verify) to for a controlled funnel run — via the per-run role→profile
-        /// override. Falls back to --profile, else the registry's
-        /// `default_profile`.
-        #[arg(long = "roster-profile")]
-        roster_profile: Option<String>,
-        /// (#1222) Funnel model-cycling mode: "sequential" | "parallel" |
-        /// "auto" (default: auto — resolved once per run against the local
-        /// hardware tier).
-        #[arg(long = "exec-mode")]
-        exec_mode: Option<String>,
-        /// (#1475, RETIRED as a multiplier #1512/#1513 review) Historically
-        /// the probe draw BREADTH per probe role. Draw multiplication no
-        /// longer exists — one probe role now maps to exactly one dispatch
-        /// (#1512) — so this flag is back-compat-only: omitted or `1` is a
-        /// no-op; any value greater than 1 is a loud error (a `--k 3` run
-        /// would fire the SAME single dispatch per role while claiming a 3x
-        /// multiplier happened, a dishonest artifact). To change probe
-        /// recall breadth, edit the SET of probe roles the "review" mission
-        /// config declares instead (add/remove a probe task).
-        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
-        k: Option<u32>,
-        /// (#1222) Run an external bundler
-        /// (`<cmd> --worktree <dir> --diff <file>`) per case instead of the
-        /// built-in Rust bundler. This flag belongs to `lab eval` itself
-        /// (the bench harness) — it is unrelated to the `review` mission
-        /// config's own `bundler` input, which was deleted entirely along
-        /// with the funnel (#2310 P4d); this flag survives unchanged.
-        #[arg(long)]
-        bundler: Option<String>,
     },
     /// Loop lab (#986) — run ONE dispatch under a chosen harness config and
     /// classify how the loop behaved: productive / struggled / inert-false-pass

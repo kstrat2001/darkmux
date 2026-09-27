@@ -1038,6 +1038,23 @@ fn retired_mission_migrate_verb_is_unknown() {
         .stderr(predicate::str::contains("unrecognized subcommand 'migrate'"));
 }
 
+/// (4.0) `lab eval`'s `--k`, `--roster-profile`, `--exec-mode` and
+/// `--bundler` belonged to the deleted funnel mode (#2310 P4d): each was
+/// accepted and silently discarded. They are removed, so clap refuses them.
+/// `--help` after the flag keeps the pre-removal run of this test from
+/// dispatching anything: with the flag known, clap reaches `--help` and
+/// exits 0.
+#[test]
+fn lab_eval_dead_funnel_flags_are_removed() {
+    for (flag, value) in [("--k", "2"), ("--roster-profile", "p"), ("--exec-mode", "auto"), ("--bundler", "b")] {
+        darkmux_cmd()
+            .args(["lab", "eval", flag, value, "--help"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(format!("unexpected argument '{flag}'")));
+    }
+}
+
 /// (#1426 phase 2) The `skills` top-level verb retired — `init` is the one
 /// setup/refresh verb (it refreshes the bundled darkmux-* skills on re-run,
 /// and `darkmux doctor` flags stale ones). The spelling has NO compat alias,
@@ -1225,14 +1242,12 @@ fn lab_kind_families_carry_their_members() {
         assert!(fixture.contains(sub), "lab fixture --help keeps `{sub}`: {fixture}");
     }
 
-    // `lab eval` takes a role positional (default pr-reviewer) and the renamed
-    // roster flag.
+    // `lab eval` takes a role positional (default pr-reviewer). The retired
+    // `--crew` flag, and the `--roster-profile` it was renamed to (a dead
+    // funnel flag, removed in 4.0), must both be gone.
     let eval = help(&["lab", "eval"]);
     assert!(eval.to_lowercase().contains("role"), "lab eval --help names the role positional: {eval}");
-    assert!(eval.contains("--roster-profile"), "lab eval --help has --roster-profile: {eval}");
-    // The retired `--crew` flag must be gone. The word may still appear in the
-    // `--roster-profile` doc's "renamed from `--crew`" note, so assert the
-    // FLAG-DEFINITION form (`--crew <`) is absent, not the bare substring.
+    assert!(!eval.contains("--roster-profile"), "lab eval --help must not define --roster-profile: {eval}");
     assert!(!eval.contains("--crew <"), "lab eval --help must not define the retired --crew flag: {eval}");
 }
 
