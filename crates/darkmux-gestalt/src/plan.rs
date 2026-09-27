@@ -537,6 +537,42 @@ mod tests {
     }
 
     #[test]
+    fn reason_display_propagates_a_failing_writer() {
+        // Every multi-part rendering stops at the first failed write and
+        // returns the error, rather than swallowing it.
+        struct Refuses;
+        impl fmt::Write for Refuses {
+            fn write_str(&mut self, _: &str) -> fmt::Result {
+                Err(fmt::Error)
+            }
+        }
+        let multi_part = [
+            Reason::ForeignDuplicateNoCapacity {
+                foreign_identifier: "m-manual".into(),
+                foreign_bytes: Some(1),
+                est_bytes: 2,
+                limit_bytes: 3,
+            },
+            Reason::ForeignDuplicateNoCapacity {
+                foreign_identifier: "m-manual".into(),
+                foreign_bytes: None,
+                est_bytes: 2,
+                limit_bytes: 3,
+            },
+            Reason::UnknownModelKey { nearest: vec!["k".into()] },
+            Reason::ClaimedResidentInsufficientCtx {
+                identifier: "darkmux:m".into(),
+                resident_ctx: 1,
+                min_ctx: 2,
+                clearable: true,
+            },
+        ];
+        for r in &multi_part {
+            assert!(fmt::write(&mut Refuses, format_args!("{r}")).is_err(), "{r:?}");
+        }
+    }
+
+    #[test]
     fn plan_serializes_for_artifacts() {
         // Serialize-only: a plan can land in a run artifact (OwnedTarget's
         // private identifier included); the absence of Deserialize on

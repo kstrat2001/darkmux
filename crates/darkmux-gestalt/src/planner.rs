@@ -897,7 +897,7 @@ mod tests {
 
     use super::*;
     use crate::estimator::FixedEstimator;
-    use crate::facts::{Budget, Facts, PoolFact, PoolId, Pools, ResidentFact};
+    use crate::facts::{Budget, CatalogFact, Facts, PoolFact, PoolId, Pools, ResidentFact};
     use std::collections::BTreeMap;
 
     const GB: u64 = 1_000_000_000;
@@ -2645,6 +2645,266 @@ mod tests {
                 precondition: Precondition::None,
             }
         );
+    }
+
+    // ── the namespace contract, swept across every plan_acquire branch ───
+
+    /// One swept scenario: its inputs and the plan they produced.
+    struct Swept {
+        desired: Vec<Placement>,
+        facts: Facts,
+        opts: AcquireOpts,
+        plan: Plan,
+    }
+
+    /// Every combination of a small resident universe, desired set, catalog,
+    /// intent, scope, budget, pool and pin set, planned. The universe is
+    /// chosen so the sweep reaches every `plan_acquire` branch (asserted by
+    /// the non-vacuity check in the contract test below): an undersized and
+    /// an oversized owned resident, a foreign duplicate, an explicit-alias
+    /// resident, an idle owned resident (the eviction candidate and utility
+    /// binding), unrelated user state, and an unknown-size owned resident.
+    fn sweep() -> Vec<Swept> {
+        let own_a = [None, Some(4_096u64), Some(64_000)];
+        let desired_sets: Vec<Vec<Placement>> = vec![
+            vec![],
+            vec![placement("a", 32_000)],
+            vec![placement("a", 32_000), aliased("b", 32_000, "alias-b")],
+            vec![placement("b", 8_000), placement("a", 32_000)],
+            vec![placement("a", 32_000), placement_seat("a", 48_000, "second")],
+            vec![placement("zzz", 8_000)],
+            vec![placement("c", 8_000)],
+        ];
+        let catalog = Some(
+            ["a", "b", "c", "idle", "x", "nosize"]
+                .iter()
+                .map(|k| CatalogFact { model_key: k.to_string(), size_bytes: Some(GB) })
+                .collect::<Vec<_>>(),
+        );
+        let pools = |avail: u64| -> Pools {
+            BTreeMap::from([(
+                PoolId("unified".into()),
+                PoolFact { capacity_bytes: 64 * GB, available_bytes: avail },
+            )])
+        };
+        // "c" is deliberately unpriced: the LoadEstimateUnknown path.
+        let est = est_map(&[("a", 10 * GB), ("b", 6 * GB), ("zzz", GB)]);
+        let mut out = Vec::new();
+        for own in own_a {
+            for bits in 0u8..16 {
+                let mut residents = Vec::new();
+                if let Some(ctx) = own {
+                    residents.push(resident("darkmux:a", "a", ctx, Some(10 * GB)));
+                }
+                if bits & 1 != 0 {
+                    residents.push(resident("a-user", "a", 64_000, Some(12 * GB)));
+                }
+                if bits & 2 != 0 {
+                    residents.push(resident("alias-b", "b", 4_096, Some(6 * GB)));
+                }
+                if bits & 4 != 0 {
+                    residents.push(resident("darkmux:idle", "idle", 8_000, Some(20 * GB)));
+                }
+                if bits & 8 != 0 {
+                    residents.push(resident("user-x", "x", 8_000, Some(5 * GB)));
+                    residents.push(resident("darkmux:nosize", "nosize", 8_000, None));
+                }
+                for desired in &desired_sets {
+                    for cat in [None, catalog.clone()] {
+                        for budget in [None, Some(15 * GB), Some(40 * GB)] {
+                            for pool in [Pools::new(), pools(5 * GB), pools(12 * GB)] {
+                                for pinned in [&[][..], &["darkmux:a"], &["darkmux:idle"], &["user-x"]] {
+                                    for intent in [CallerIntent::Auto, CallerIntent::OperatorExplicit] {
+                                        for scope in [AcquireScope::Exclusive, AcquireScope::Additive] {
+                                            let facts = Facts {
+                                                residents: residents.clone(),
+                                                catalog: cat.clone(),
+                                                pools: pool.clone(),
+                                                budget: Budget { max_darkmux_bytes: budget },
+                                                utility_binding: Some("darkmux:idle".into()),
+                                            };
+                                            let opts = opts_pinned(intent, scope, pinned);
+                                            let plan = plan_acquire(desired, &facts, opts.clone(), &est);
+                                            out.push(Swept { desired: desired.clone(), facts, opts, plan });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Exhaustive (no wildcard) so a new Reason variant must be placed.
+    fn reason_label(r: &Reason) -> &'static str {
+        match r {
+            Reason::NoResident => "NoResident",
+            Reason::SufficientCtxResident => "SufficientCtxResident",
+            Reason::InsufficientCtx => "InsufficientCtx",
+            Reason::ForeignDuplicateLoadAlongside { .. } => "ForeignDuplicateLoadAlongside",
+            Reason::ForeignDuplicateNoCapacity { .. } => "ForeignDuplicateNoCapacity",
+            Reason::UnknownModelKey { .. } => "UnknownModelKey",
+            Reason::NoLongerDesired => "NoLongerDesired",
+            Reason::LastWanterReleased { .. } => "LastWanterReleased",
+            Reason::BudgetEvict { .. } => "BudgetEvict",
+            Reason::BudgetRefuse { .. } => "BudgetRefuse",
+            Reason::ClaimedResidentInsufficientCtx { clearable: true, .. } => "ClaimedClearable",
+            Reason::ClaimedResidentInsufficientCtx { clearable: false, .. } => "ClaimedSamePlan",
+        }
+    }
+
+    fn warning_label(w: &Warning) -> &'static str {
+        match w {
+            Warning::BudgetExceededOperatorOverride { .. } => "BudgetExceededOperatorOverride",
+            Warning::ResidentBytesUnknown { .. } => "ResidentBytesUnknown",
+            Warning::CtxDivergence { .. } => "CtxDivergence",
+            Warning::UtilityBindingEvicted { .. } => "UtilityBindingEvicted",
+            Warning::ForeignDuplicateResident { .. } => "ForeignDuplicateResident",
+            Warning::LoadEstimateUnknown { .. } => "LoadEstimateUnknown",
+        }
+    }
+
+    #[test]
+    fn namespace_contract_holds_on_every_swept_branch() {
+        // CLAUDE.md contract 4 (#1274), checked on every plan the sweep
+        // produces: darkmux only ever mutates or reuses what it owns (a
+        // `darkmux:*` identifier, or the exact alias a desired placement
+        // loads under); user state is never unloaded, never reused, never
+        // loaded under; a live pin is never unloaded; Exclusive scope lists
+        // every untouched foreign resident as respected.
+        let swept = sweep();
+        let mut reasons: BTreeSet<&str> = BTreeSet::new();
+        let mut warnings: BTreeSet<&str> = BTreeSet::new();
+        let mut sequential_budget = false;
+        let mut sequential_pool = false;
+        let mut budget_evict = false;
+        let mut pool_evict = false;
+        for Swept { desired, facts, opts, plan } in &swept {
+            let ctx = || format!("desired={desired:?}\nfacts={facts:?}\nopts={opts:?}\nplan={plan:?}");
+            let own_alias = |id: &str| desired.iter().any(|p| p.identifier == id);
+            let ours = |id: &str| is_darkmux_owned(id) || own_alias(id);
+            let resident_ids: BTreeSet<&str> =
+                facts.residents.iter().map(|r| r.identifier.as_str()).collect();
+            let live_pins: BTreeSet<&str> = opts
+                .pinned
+                .iter()
+                .map(String::as_str)
+                .filter(|id| is_darkmux_owned(id) && resident_ids.contains(id))
+                .collect();
+            let first_load = plan.actions.iter().position(|a| matches!(a.action, Action::Load { .. }));
+            let last_block = plan.actions.iter().rposition(|a| matches!(a.action, Action::Block { .. }));
+            for (i, pa) in plan.actions.iter().enumerate() {
+                reasons.insert(reason_label(&pa.reason));
+                if pa.action.is_mutating() {
+                    assert_ne!(pa.precondition, Precondition::None, "mutation without precondition\n{}", ctx());
+                    assert!(last_block.is_none_or(|b| b < i), "a mutation precedes a refusal\n{}", ctx());
+                }
+                match &pa.action {
+                    Action::Unload { target } => {
+                        let id = target.identifier();
+                        assert!(ours(id), "unloads user state {id}\n{}", ctx());
+                        assert!(resident_ids.contains(id), "phantom unload {id}\n{}", ctx());
+                        assert!(!live_pins.contains(id), "unloads a live pin {id}\n{}", ctx());
+                        assert!(first_load.is_none_or(|l| i < l), "an Unload follows a Load\n{}", ctx());
+                        if let Reason::BudgetEvict { .. } = pa.reason {
+                            if facts.budget.max_darkmux_bytes.is_some() { budget_evict = true } else { pool_evict = true }
+                        }
+                    }
+                    Action::Load { model_key, identifier, .. } => {
+                        assert!(
+                            desired.iter().any(|p| p.identifier == *identifier && p.model_key == *model_key),
+                            "loads something no placement asked for\n{}",
+                            ctx()
+                        );
+                        assert!(ours(identifier), "loads under a foreign identifier\n{}", ctx());
+                    }
+                    Action::Reuse { identifier, .. } => {
+                        assert!(ours(identifier), "reuses user state {identifier}\n{}", ctx());
+                    }
+                    Action::Block { .. } => {}
+                }
+            }
+            for w in &plan.warnings {
+                warnings.insert(warning_label(w));
+            }
+            let respected: BTreeSet<&str> = plan.user_state_respected.iter().map(String::as_str).collect();
+            match opts.scope {
+                AcquireScope::Additive => assert!(respected.is_empty(), "{}", ctx()),
+                AcquireScope::Exclusive => {
+                    for id in &resident_ids {
+                        let expected = !ours(id);
+                        assert_eq!(respected.contains(id), expected, "respected set for {id}\n{}", ctx());
+                    }
+                }
+            }
+            if plan.exec_hint == ExecHint::Sequential {
+                if facts.budget.max_darkmux_bytes.is_some() { sequential_budget = true } else { sequential_pool = true }
+            }
+        }
+        // Non-vacuity: the sweep genuinely reached every acquisition branch.
+        for want in [
+            "NoResident", "SufficientCtxResident", "InsufficientCtx", "ForeignDuplicateLoadAlongside",
+            "ForeignDuplicateNoCapacity", "UnknownModelKey", "NoLongerDesired", "BudgetEvict",
+            "BudgetRefuse", "ClaimedClearable", "ClaimedSamePlan",
+        ] {
+            assert!(reasons.contains(want), "sweep never produced {want}: {reasons:?}");
+        }
+        for want in [
+            "BudgetExceededOperatorOverride", "ResidentBytesUnknown", "CtxDivergence",
+            "UtilityBindingEvicted", "ForeignDuplicateResident", "LoadEstimateUnknown",
+        ] {
+            assert!(warnings.contains(want), "sweep never produced {want}: {warnings:?}");
+        }
+        assert!(budget_evict && pool_evict, "both eviction arms reached");
+        assert!(sequential_budget && sequential_pool, "both serialize arms reached");
+    }
+
+    #[test]
+    fn pool_headroom_serializes_loads_that_fit_alone_but_not_together() {
+        // The #1140 arm's serialize branch: two loads, each within the
+        // pool headroom alone, together over it, nothing evictable — both
+        // loads stay, the hint becomes Sequential.
+        let f = Facts {
+            pools: BTreeMap::from([(
+                PoolId("unified".into()),
+                PoolFact { capacity_bytes: 64 * GB, available_bytes: 12 * GB },
+            )]),
+            ..Default::default()
+        };
+        let desired = [placement("b", 8_000), placement("a", 8_000)];
+        let est = est_map(&[("a", 10 * GB), ("b", 6 * GB)]);
+        let plan = plan_acquire(&desired, &f, additive_auto(), &est);
+        assert_eq!(plan.actions, vec![load_action("b", 8_000), load_action("a", 8_000)]);
+        assert_eq!(plan.exec_hint, ExecHint::Sequential);
+        // A single load over the headroom has nothing to serialize against.
+        let plan = plan_acquire(&desired[1..], &Facts { pools: f.pools.clone(), ..Default::default() }, additive_auto(), &est_map(&[("a", 20 * GB)]));
+        assert_eq!(plan.exec_hint, ExecHint::Concurrent);
+    }
+
+    #[test]
+    fn pool_headroom_one_oversized_load_keeps_the_whole_plan_concurrent() {
+        // Characterizes CURRENT behavior: when one pending load cannot fit
+        // the pool headroom even alone (and has no foreign duplicate to
+        // name), the arm does not serialize the others either — the hint
+        // stays Concurrent and the executor's #1139 fast-fail owns the
+        // shortfall. `plan_waves` instead isolates such a load in its own
+        // wave and still packs the rest.
+        let f = Facts {
+            pools: BTreeMap::from([(
+                PoolId("unified".into()),
+                PoolFact { capacity_bytes: 64 * GB, available_bytes: 12 * GB },
+            )]),
+            ..Default::default()
+        };
+        let desired = [placement("b", 8_000), placement("a", 8_000), placement("big", 8_000)];
+        let est = est_map(&[("a", 10 * GB), ("b", 6 * GB), ("big", 20 * GB)]);
+        let plan = plan_acquire(&desired, &f, additive_auto(), &est);
+        assert_eq!(plan.actions.len(), 3);
+        assert!(plan.actions.iter().all(|a| matches!(a.action, Action::Load { .. })));
+        assert_eq!(plan.exec_hint, ExecHint::Concurrent);
     }
 
     fn battery() -> Vec<(Plan, &'static str)> {
