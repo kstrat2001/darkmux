@@ -775,6 +775,38 @@ export function buildFleetCardBase(
   };
 }
 
+/** (#2958) The word a card shows in place of its status until the first
+ *  data it is derived from has arrived: the same "no signal" a running
+ *  execution's line says when the page loses the daemon (#2886), so a card
+ *  that knows nothing yet reuses the existing word for "no information"
+ *  rather than a new indicator. */
+export const NO_SIGNAL_STAT = "no signal";
+
+/** One source a fleet card's status is read from, as far as the card is
+ *  concerned: not read at all on this mount (`unused`), asked and not yet
+ *  answered (`pending`), or answered, success or failure (`settled`). */
+export type CardSourceState = "unused" | "pending" | "settled";
+
+/** (#2958) Whether the fleet cards have their first real data. Until they
+ *  do, a card's "idle" (or "offline", or "0 running") is the value a card
+ *  falls back to when no record says otherwise, which is a claim about the
+ *  machine nobody has read yet: the operator watched the cards say "idle"
+ *  for the 3.3 s `/runs` took to answer while a run was live.
+ *
+ *  Every source a card's status is DERIVED from has to have answered once:
+ *  the flow window (sessions, activity), live presence (who is beating,
+ *  which sessions are running) and `/runs` (a lab run in flight, which never
+ *  rides the flow stream, #1923). A failed read counts as answered: it has
+ *  its own notice (`RunsUnreadableNotice`, `FleetCoverageNotice`), and
+ *  waiting on it would hold "no signal" forever. `/fleet/roster` and
+ *  `/machine/specs` are deliberately not waited on: they decide which cards
+ *  exist and what hardware they name, never whether a machine is idle. Only
+ *  the first answer counts; a later refetch keeps the last answer on
+ *  screen (TanStack keeps `status` at `success` while refetching). */
+export function cardsHaveFirstData(sources: { flow: CardSourceState; presence: CardSourceState; sessions: CardSourceState; runs: CardSourceState }): boolean {
+  return Object.values(sources).every((s) => s !== "pending");
+}
+
 /** (#2928 re-review, C-1) A card's live readings (the scope's rate and
  *  state, the per-execution pages, the utility strip) from its base, the
  *  page clock `t`, and the live overlay. Touches only the running sessions'

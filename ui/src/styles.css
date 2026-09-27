@@ -4000,7 +4000,10 @@ body {
 .mach.absent {
   opacity: 0.45;
 }
-.mach.absent .dot {
+.mach.absent .dot,
+/* (#2958) A card with no data yet: the absent dot's "no reading" color,
+   without dimming the card (it is not known to be offline either). */
+.mach.nosignal .dot {
   background: var(--dim);
   box-shadow: none;
 }
