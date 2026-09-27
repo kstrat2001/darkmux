@@ -124,9 +124,13 @@ darkmux release.
   and a `wait`, as a floor, and the window is flagged as not fully metered:
   `budget.warn` and `budget.wait` carry `unmetered_calls` beside any level
   they report (a warning whose only news is the flag has `level: null`),
-  and `darkmux doctor`'s endpoints check reads "spent at least".
-  **Migration:** none; an endpoint that reports full usage reads exactly as
-  before.
+  and `darkmux doctor`'s endpoints check reads "spent at least". A calls
+  budget is never flagged: a call count is exact. The limit: a call whose
+  provider reported NO usage at all adds nothing to the window's known
+  spend, so under a token `wait` budget such calls warn "not fully
+  metered" but never, on their own, make it wait (the conservative charge
+  applies only to a step's per-step cap). **Migration:** none; an
+  endpoint that reports full usage reads exactly as before.
 - **The per-step cap on hosted tokens is renamed, has no default, and
   never stops a step: a step that used to stop at 500,000 hosted tokens now
   runs to completion unless you set a cap** (#2902 step 5).

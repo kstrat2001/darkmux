@@ -283,7 +283,14 @@ pub type WindowEntries = Vec<(i64, Spend)>;
 /// An unknown spend is never read as small. Its known halves count toward
 /// the budget like any spend, so a window they fill still warns or waits;
 /// and under a token budget, a window holding one is surfaced as not fully
-/// metered (`unmetered`), on the same warning as any level it reaches.
+/// metered (`unmetered`), on the same warning as any level it reaches. A
+/// calls budget is never unmetered: a call count is exact.
+///
+/// The limit, stated plainly: a call whose provider reported NO usage at
+/// all adds 0 to the known spend. Under a token `wait` budget such calls
+/// warn "not fully metered" but never, on their own, make the window
+/// wait. The conservative charge ([`conservative_hosted_spend`]) feeds
+/// only a step's own per-step bucket, never this ledger.
 pub fn evaluate(b: &EndpointBudget, entries: &[(i64, Spend)], now: i64) -> Verdict {
     if !b.policy.counts() {
         return Verdict::Proceed;
