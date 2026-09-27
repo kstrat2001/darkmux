@@ -558,17 +558,18 @@ fn format_age_span(secs: u64) -> String {
 /// only exists on the machine that ran it (see [`peer_mission_runs`]'s doc).
 /// A no-op when `peer` is empty, which includes every standalone install —
 /// this is what keeps the local-only board byte-identical to before #1711.
-fn print_peer_missions(peer: &[Run], now: u64, width: Option<usize>) {
+fn peer_mission_lines(peer: &[Run], now: u64, width: Option<usize>) -> Vec<String> {
+    let mut out = Vec::new();
     if peer.is_empty() {
-        return;
+        return out;
     }
-    println!();
+    out.push(String::new());
     let header = format!(
         "OBSERVED ON THE FLEET ({}) — seen via the shared flow stream, not owned by this machine",
         peer.len()
     );
     for line in wrap_indented(&header, 0, width) {
-        println!("{}", style::dim(&line));
+        out.push(style::dim(&line));
     }
     let id_w = peer.iter().map(|r| r.id.chars().count()).max().unwrap_or(0).clamp(1, 40);
     let machine_w = peer
@@ -583,11 +584,12 @@ fn print_peer_missions(peer: &[Run], now: u64, width: Option<usize>) {
         let ts = r.updated_ts.or(r.completed_ts).or(r.started_ts).unwrap_or(now);
         let age = relative_age(now, ts);
         let status = peer_status_word(r.status, r.abandoned_reason);
-        println!(
+        out.push(format!(
             "  ◇ {id:<id_w$}  {machine:<machine_w$}  {age:>age_w$}  {status}",
             age_w = AGE_COLS,
-        );
+        ));
     }
+    out
 }
 
 /// Pure drift detection for one mission given its phases. `now` and
@@ -1443,7 +1445,6 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
     views.sort_by(board_order);
 
     let peer = peer_mission_runs(&flows_dir, &fleet.records, &known_mission_ids);
-    let fleet_complete = matches!(fleet.state, SourceState::Ok | SourceState::Off);
 
     // (#1562, restated for #1709) `--json` is deliberately NEVER filtered —
     // not by `--missions`, not by anything — because this branch returns
@@ -1468,8 +1469,8 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
         return run_json(&views, &peer, &fleet.state, &budget_waits);
     }
 
-    // Resolved once, above the early return, so every prose line in this
-    // renderer — including the empty-board hint — wraps to the same width.
+    // Resolved once, so every prose line — including the empty-board hint —
+    // wraps to the same width.
     let width = style::terminal_width();
     // (#1711) A peer mission means there IS something on the board, even
     // with zero local missions — "no missions yet, launch one" would be
@@ -1478,30 +1479,88 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
     // set, the peer section, and the fleet-scoped rollup.
     // (#2902 step 5) Printed before anything else, the empty board included:
     // a wait can hold a dispatch that owns no mission.
-    for line in budget_wait_lines(&budget_waits) {
-        for l in wrap_indented(&line, 2, width) {
-            println!("{}", style::warn(&l));
-        }
+    let mut lines: Vec<String> = budget_wait_lines(&budget_waits)
+        .iter()
+        .flat_map(|line| wrap_indented(line, 2, width))
+        .map(|l| style::warn(&l))
+        .collect();
+    lines.extend(if views.is_empty() && peer.is_empty() {
+        render_empty_board(&fleet.state, width)
+    } else {
+        // (#1569 packet A) Resolved ONCE per board, not per row: on a hub/peer
+        // this may spawn `tailscale serve status --json`, and doing that 82 times
+        // for an 82-mission board would be absurd. It short-circuits to loopback
+        // without spawning when the machine declares itself standalone, or when
+        // no links will be emitted at all.
+        //
+        // NB the old "isn't a TTY" spelling of that second case stopped being
+        // true in B1: a panel spawn is a pipe but sets CLICOLOR_FORCE, so it DOES
+        // resolve — bounded by the daemon's own panel cache.
+        let link_base = board_link_base();
+        let all_link = panel_deep_link(&link_base, "mission-status-all");
+        render_board(&Board {
+            views: &views,
+            peer: &peer,
+            fleet_state: &fleet.state,
+            now,
+            width,
+            limit,
+            unlimited,
+            missions_only,
+            link_base: &link_base,
+            all_link: all_link.as_deref(),
+        })
+    });
+    for line in lines {
+        println!("{line}");
     }
-    if views.is_empty() && peer.is_empty() {
-        // (#1582) The prose wraps; the command does not. Same rule the drift
-        // suggestions follow, for the same reason — this is the one command a
-        // brand-new operator will copy, and it is the worst possible one to
-        // break across a line with an indent injected into the middle.
-        for line in wrap_indented("no missions yet — launch one from a config with:", 2, width) {
-            println!("{}", style::dim(&line));
-        }
-        println!("  {} darkmux mission config list", style::dim("→"));
-        println!("  {} darkmux mission launch <config-id>", style::dim("→"));
-        if let Some(note) = fleet_scope_note(&fleet.state) {
-            println!();
-            for line in wrap_indented(&note, 0, width) {
-                println!("{}", style::warn(&line));
-            }
-        }
-        return Ok(0);
-    }
+    Ok(0)
+}
 
+/// Everything the human board renders from, resolved by [`run`] — so the
+/// renderer does no I/O of its own beyond the config-name lookups
+/// [`config_title_cached`] memoizes.
+struct Board<'a> {
+    views: &'a [MissionView<'a>],
+    peer: &'a [Run],
+    fleet_state: &'a SourceState,
+    now: u64,
+    width: Option<usize>,
+    limit: Option<usize>,
+    unlimited: bool,
+    missions_only: bool,
+    link_base: &'a str,
+    /// The "show every mission" deep link, present only inside a console
+    /// panel (see [`panel_deep_link`]).
+    all_link: Option<&'a str>,
+}
+
+/// The board when there are no missions at all, local or peer.
+fn render_empty_board(fleet_state: &SourceState, width: Option<usize>) -> Vec<String> {
+    let mut out = Vec::new();
+    // (#1582) The prose wraps; the command does not. Same rule the drift
+    // suggestions follow, for the same reason — this is the one command a
+    // brand-new operator will copy, and it is the worst possible one to
+    // break across a line with an indent injected into the middle.
+    for line in wrap_indented("no missions yet — launch one from a config with:", 2, width) {
+        out.push(style::dim(&line));
+    }
+    out.push(format!("  {} darkmux mission config list", style::dim("→")));
+    out.push(format!("  {} darkmux mission launch <config-id>", style::dim("→")));
+    if let Some(note) = fleet_scope_note(fleet_state) {
+        out.push(String::new());
+        for line in wrap_indented(&note, 0, width) {
+            out.push(style::warn(&line));
+        }
+    }
+    out
+}
+
+/// The human board: local sections, the peer section, and the rollup.
+fn render_board(b: &Board) -> Vec<String> {
+    let mut out = Vec::new();
+    let Board { views, peer, fleet_state, now, width, limit, unlimited, missions_only, link_base, all_link } = *b;
+    let fleet_complete = matches!(fleet_state, SourceState::Ok | SourceState::Off);
     // (#1709) RECENT-FIRST default, filter on request — the inversion of
     // #1562's named-first rule.
     //
@@ -1519,28 +1578,13 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
     // earlier. Meanwhile a full day of reviews and panel commands showed up
     // as a single grey "+61 run instances" footer. The board was accurate and
     // useless at the same time.
-    let (visible, hidden) = board_partition(&views, missions_only);
+    let (visible, hidden) = board_partition(views, missions_only);
 
-    println!(
-        "{}",
-        style::header(&format!(
+    out.push(style::header(&format!(
             "mission status — {} mission{}",
             visible.len(),
             if visible.len() == 1 { "" } else { "s" }
-        ))
-    );
-
-    // (#1569 packet A) Resolved ONCE per board, not per row: on a hub/peer
-    // this may spawn `tailscale serve status --json`, and doing that 82 times
-    // for an 82-mission board would be absurd. It short-circuits to loopback
-    // without spawning when the machine declares itself standalone, or when
-    // no links will be emitted at all.
-    //
-    // NB the old "isn't a TTY" spelling of that second case stopped being
-    // true in B1: a panel spawn is a pipe but sets CLICOLOR_FORCE, so it DOES
-    // resolve — bounded by the daemon's own panel cache.
-    let link_base = board_link_base();
-    let all_link = panel_deep_link(&link_base, "mission-status-all");
+        )));
     // The link is one affordance for the whole board, not one per section:
     // it goes to the same place from every group, and Active + Paused +
     // Finalized all overflowing would otherwise stack three identical rows.
@@ -1590,10 +1634,8 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
     let mut any_drift_hidden = false;
 
     for ((group, g), &shown) in groups.iter().zip(&shown_counts) {
-        println!(
-            "\n{}",
-            style::dim(&format!("{} ({})", status_word(*group).to_uppercase(), g.len()))
-        );
+        out.push(String::new());
+        out.push(style::dim(&format!("{} ({})", status_word(*group).to_uppercase(), g.len())));
         for v in g.iter().take(shown) {
             // (#2406) The progress numerator is `done()` — complete PLUS
             // degraded. A degraded phase is terminal and produced output;
@@ -1611,7 +1653,7 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
             // target is the name rather than a run of trailing whitespace.
             let name_cell = format!(
                 "{}{}",
-                style::link(&mission_url(&link_base, &v.m.id), &name),
+                style::link(&mission_url(link_base, &v.m.id), &name),
                 " ".repeat(layout.name_width.saturating_sub(name.chars().count()))
             );
             // (#1612) Dim, and blank-padded rather than omitted, so a board
@@ -1645,30 +1687,30 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
                 bar,
             );
             if layout.show_mix {
-                println!("{row}  {}", style::dim(&phase_mix(v)));
+                out.push(format!("{row}  {}", style::dim(&phase_mix(v))));
             } else {
                 // Narrow terminal: the mix is dropped rather than the name, the
                 // age or the progress, because it is the one column whose
                 // information the others already carry.
-                println!("{row}");
+                out.push(format!("{row}"));
             }
             // (#2299) A run whose config left steps out says so in one dim
             // line; nothing gray is ever drawn for the pruned steps themselves.
             if let Some(g) = v.graph.as_ref().filter(|g| g.pruned_anything()) {
-                println!("      {} {}", style::dim("·"), style::dim(&format!("graph: {}", g.summary_line())));
+                out.push(format!("      {} {}", style::dim("·"), style::dim(&format!("graph: {}", g.summary_line()))));
             }
             // (#2300) Growth is the opposite direction from pruning — tasks
             // the config never counted, minted at a phase boundary from a
             // step's output — so it gets its own line rather than being
             // folded into the "N of M steps minted" arithmetic above.
             if let Some(line) = v.graph.as_ref().and_then(|g| g.grown_line()) {
-                println!("      {} {}", style::dim("·"), style::dim(&format!("graph: {line}")));
+                out.push(format!("      {} {}", style::dim("·"), style::dim(&format!("graph: {line}"))));
             }
             // (#2406 CONSIDER 6) The description, when the row's title above
             // came from the config's `name` instead — one dim line, one
             // sentence, never the whole ~200-word document.
             if let Some(note) = description_note_cached(v.m, &mut config_name_cache) {
-                println!("      {} {}", style::dim("·"), style::dim(&note));
+                out.push(format!("      {} {}", style::dim("·"), style::dim(&note)));
             }
             for d in &v.drifts {
                 // The ⚠ marks the warning, not each of its lines — continuation
@@ -1676,7 +1718,7 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
                 // warning still reads as one warning.
                 for (i, line) in wrap_indented(&d.detail, 8, width).iter().enumerate() {
                     let marker = if i == 0 { style::warn("⚠") } else { " ".to_string() };
-                    println!("      {} {}", marker, style::warn(line.trim_start()));
+                    out.push(format!("      {} {}", marker, style::warn(line.trim_start())));
                 }
                 for cmd in &d.suggest {
                     // The command itself is printed verbatim and never wrapped
@@ -1684,9 +1726,9 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
                     // broken across lines by a renderer is worse than one that
                     // overflows. Only its trailing rationale is wrapped.
                     let (command, note) = split_suggestion(cmd);
-                    println!("        {} {}", style::dim("→"), command);
+                    out.push(format!("        {} {}", style::dim("→"), command));
                     for line in wrap_indented(note, 10, width) {
-                        println!("{}", style::dim(&line));
+                        out.push(style::dim(&line));
                     }
                 }
             }
@@ -1707,7 +1749,7 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
                 )
             };
             for line in wrap_indented(&more, 2, width) {
-                println!("{}", style::dim(&line));
+                out.push(style::dim(&line));
             }
             if hidden_drift > 0 {
                 any_drift_hidden = true;
@@ -1720,13 +1762,13 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
                     if all_link.is_some() { "" } else { " — run with `--all`" }
                 );
                 for line in wrap_indented(&warn, 2, width) {
-                    println!("{}", style::warn(&line));
+                    out.push(style::warn(&line));
                 }
             }
             if let Some(url) = &all_link {
                 if !all_link_shown {
                     all_link_shown = true;
-                    println!("  {}", style::link(url, "→ show every mission"));
+                    out.push(format!("  {}", style::link(url, "→ show every mission")));
                 }
             }
         }
@@ -1738,9 +1780,9 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
     // `--all` leaves `hidden` empty, so this never prints on a full board.
     let hidden_attention = hidden.iter().filter(|v| !v.drifts.is_empty()).count();
     if let Some(line) = hidden_run_summary(hidden.len(), hidden_attention) {
-        println!();
+        out.push(String::new());
         for l in wrap_indented(&line, 0, width) {
-            println!("{}", style::dim(&l));
+            out.push(style::dim(&l));
         }
     }
     // (#1709) The other half of the tab. A filter nobody can find is a
@@ -1755,7 +1797,7 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
     // the same way. A hint the operator cannot act on is worse than none.
     if !missions_only && all_link.is_none() && visible.iter().any(|v| is_minted_run(v.m)) {
         for l in wrap_indented("→ `--missions` for named missions only", 0, width) {
-            println!("{}", style::dim(&l));
+            out.push(style::dim(&l));
         }
     }
     // A hidden run needing attention is exactly the same "some are hidden"
@@ -1767,22 +1809,22 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
     // section so the operator's own machine stays visually primary, and
     // before the final rollup so the clean-board claim just below can be
     // qualified by what this printed (or admits it could not check). A
-    // no-op on a standalone install: `print_peer_missions` is a no-op on an
+    // no-op on a standalone install: `peer_mission_lines` is empty for an
     // empty slice and `fleet_scope_note` is `None` for `Off`.
     //
     // (#1711 review finding) The scope note prints BEFORE the rows it
     // qualifies, not after — same rule `run_list.rs`'s own `fleet_warning`
     // states: "an incomplete answer has to be qualified where the reader
     // meets it, not in a footnote under rows they have already believed."
-    if let Some(note) = fleet_scope_note(&fleet.state) {
-        println!();
+    if let Some(note) = fleet_scope_note(fleet_state) {
+        out.push(String::new());
         for line in wrap_indented(&note, 0, width) {
-            println!("{}", style::warn(&line));
+            out.push(style::warn(&line));
         }
     }
-    print_peer_missions(&peer, now, width);
+    out.extend(peer_mission_lines(peer, now, width));
 
-    println!();
+    out.push(String::new());
     // "above" is only true for the drifted missions that were PRINTED as full
     // rows; a section limit or the named-first default can leave others
     // unshown (each warns its own way above), so the rollup admits it rather
@@ -1796,9 +1838,9 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
         fleet_complete,
     );
     for line in wrap_indented(&summary, 0, width) {
-        println!("{}", if clean { style::success(&line) } else { style::warn(&line) });
+        out.push(format!("{}", if clean { style::success(&line) } else { style::warn(&line) }));
     }
-    Ok(0)
+    out
 }
 
 /// Split `views` into (visible, hidden). `include_minted == true` returns
