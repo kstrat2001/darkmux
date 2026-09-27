@@ -44,6 +44,7 @@ import { isPlainObject } from "./guards";
 /** An action the live channel synthesizes and the daemon never writes: a
  *  utility job's end as a live sample delivers it (`lib/liveChannel.ts`).
  *  Its durable twin is the job's usage record or `utility.error`. */
+// flow-action-guard:allow — a live-only action the daemon never writes
 type LiveOnlyAction = "utility.end";
 
 /** Every action spelling this build knows. */
@@ -175,6 +176,7 @@ const ACTION_WIRE = {
   ThermalTier5EjectFailed: "thermal.tier5_eject_failed",
   UtilityStart: "utility.start",
   UtilityError: "utility.error",
+  // flow-action-guard:allow — a live-only action the daemon never writes
   UtilityEnd: "utility.end",
 } as const satisfies Record<string, Action>;
 
@@ -242,6 +244,7 @@ export type EveryVariantNamed = [
  *  daemon serves it as written. Keyed by the generated union, so a retired
  *  spelling ts-rs adds without an entry here is a type error. */
 const RETIRED_WIRE: { readonly [W in RetiredAction]: true } = {
+  // flow-action-guard:allow-start — the retired spellings, keyed by the generated union
   "telemetry.process": true,
   "funnel.step": true,
   "funnel.ruling": true,
@@ -264,6 +267,7 @@ const RETIRED_WIRE: { readonly [W in RetiredAction]: true } = {
   "crawl.mission.completed": true,
   "crawl.unit.started": true,
   "crawl.unit.completed": true,
+  // flow-action-guard:allow-end
 };
 
 const KNOWN_ACTIONS: ReadonlySet<string> = new Set([...Object.values(ACTION_WIRE), ...Object.keys(RETIRED_WIRE)]);

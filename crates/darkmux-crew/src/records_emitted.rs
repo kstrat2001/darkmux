@@ -751,7 +751,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut lines = vec![serde_json::json!({
             "ts": "2023-11-14T10:00:00Z", "level": "info", "category": "work",
-            "tier": "local", "stage": "dispatch", "action": "dispatch start",
+            "tier": "local", "stage": "dispatch", "action": "dispatch.start",
             "handle": "coder", "mission_id": "m1", "session_id": "s1"
         })];
         for i in 0..50 {

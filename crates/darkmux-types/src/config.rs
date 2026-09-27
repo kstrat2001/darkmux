@@ -2357,7 +2357,7 @@ mod tests {
                 "outbox_dir": "~/.darkmux/hooks",
                 "rules": [
                     { "match": { "action": "crawl.*" }, "http": "http://127.0.0.1:8790/events" },
-                    { "match": { "action": "dispatch error", "session_id": "abc" }, "http": "http://localhost:9000/alerts" }
+                    { "match": { "action": "dispatch.error", "session_id": "abc" }, "http": "http://localhost:9000/alerts" }
                 ]
             }
         }"#;

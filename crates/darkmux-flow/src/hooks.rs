@@ -4620,12 +4620,15 @@ mod tests {
     /// its dotted twin when that twin matches exactly what the old glob did.
     #[test]
     fn an_old_spelling_rule_reads_as_its_current_action() {
+        // flow-action-guard:allow-start — an old spelling is this test's input
         assert_eq!(effective_action_pattern("dispatch complete"), "dispatch.complete");
         assert_eq!(effective_action_pattern("sprint start"), "phase.start");
+        // flow-action-guard:allow-end
         assert_eq!(effective_action_pattern("step *"), "step.*");
         assert_eq!(effective_action_pattern("dispatch.tool"), "dispatch.tool", "a current pattern is untouched");
         // Resolved once, at load: the write path's `hook_match` is a plain
         // glob and does no upgrade work per record.
+        // flow-action-guard:allow — an old spelling is this test's input
         let raw = HookMatch { action: Some("dispatch complete".to_string()), ..Default::default() };
         assert!(!hook_match(&raw, &record(crate::FlowAction::DispatchComplete)), "no per-write upgrade");
         let m = resolve_match(raw);
@@ -4640,6 +4643,7 @@ mod tests {
     #[test]
     fn a_loaded_rule_is_resolved_once_and_keeps_its_outbox_key() {
         let tmp = tempfile::TempDir::new().unwrap();
+        // flow-action-guard:allow — an old spelling is this test's input
         let configured = HookMatch { action: Some("dispatch complete".to_string()), ..Default::default() };
         let rule = HookRule {
             r#match: Some(configured.clone()),
@@ -4674,6 +4678,7 @@ mod tests {
             r#match: Some(HookMatch { action: Some(action.to_string()), ..Default::default() }),
             ..Default::default()
         };
+        // flow-action-guard:allow — an old spelling is this test's input
         let rules = vec![rule("dispatch *"), rule("step *"), rule("dispatchh.*"), rule("dispatch complete"), rule("*")];
         let bad: Vec<(usize, &str)> = unmatchable_rule_patterns(&rules);
         assert_eq!(bad, vec![(0, "dispatch *"), (2, "dispatchh.*")]);
@@ -4685,6 +4690,7 @@ mod tests {
     fn a_pre_4_0_outbox_line_is_delivered_with_its_current_spelling() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("r.outbox.jsonl");
+        // flow-action-guard:allow — an old spelling is this test's input
         let old = r#"{"action":"dispatch complete","handle":"h"}"#;
         let current = r#"{"action":"dispatch.turn","handle":"h"}"#;
         std::fs::write(&path, format!("{old}\n{current}\n")).unwrap();
@@ -4707,21 +4713,21 @@ mod tests {
 
     #[test]
     fn action_glob_trailing_wildcard() {
-        assert!(action_glob_matches("crawl.*", "crawl.finding"));
-        assert!(!action_glob_matches("crawl.*", "crawler"), "crawler must NOT match crawl.*");
-        assert!(!action_glob_matches("crawl.*", "crawl"), "no further segment to match the wildcard");
+        assert!(action_glob_matches("hook.*", "hook.fired"));
+        assert!(!action_glob_matches("hook.*", "hooker"), "hooker must NOT match hook.*");
+        assert!(!action_glob_matches("hook.*", "hook"), "no further segment to match the wildcard");
     }
 
     #[test]
     fn action_glob_bare_star_matches_everything_non_hook() {
-        assert!(action_glob_matches("*", "crawl.finding"));
-        assert!(action_glob_matches("*", "dispatch error"));
+        assert!(action_glob_matches("*", "hook.fired"));
+        assert!(action_glob_matches("*", "dispatch.error"));
     }
 
     #[test]
     fn action_glob_exact_match_no_wildcard() {
-        assert!(action_glob_matches("dispatch error", "dispatch error"));
-        assert!(!action_glob_matches("dispatch error", "dispatch start"));
+        assert!(action_glob_matches("dispatch.error", "dispatch.error"));
+        assert!(!action_glob_matches("dispatch.error", "dispatch.start"));
     }
 
     #[test]
@@ -7218,7 +7224,7 @@ mod tests {
         // Deterministic — the SAME rule content always yields the SAME key.
         assert_eq!(rule_key(&m, "http://127.0.0.1:8790/events"), key);
         // A DIFFERENT match yields a DIFFERENT key, even at the same host.
-        let m2 = HookMatch { action: Some("mission.other".to_string()), ..Default::default() };
+        let m2 = HookMatch { action: Some("mission.close".to_string()), ..Default::default() };
         assert_ne!(rule_key(&m2, "http://127.0.0.1:8790/events"), key);
     }
 

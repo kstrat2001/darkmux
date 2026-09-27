@@ -1338,7 +1338,7 @@
     fn scan_flow_missions_includes_a_mission_seen_only_in_the_fleet_stream() {
         let tmp = TempDir::new().unwrap(); // deliberately empty
         let fleet = vec![serde_json::json!({
-            "action": "dispatch start",
+            "action": "dispatch.start",
             "session_id": "S-peer",
             "mission_id": "m-on-the-hub",
             "machine_id": "m1-max-32gb-studio",
@@ -1375,6 +1375,7 @@
         // The SAME record on disk and in the stream — exactly what a Tee sink
         // produces for local work.
         let mut on_disk = record.clone();
+        // flow-action-guard:allow — an old spelling is this test's input
         on_disk["action"] = serde_json::json!("dispatch start");
         fs::write(
             tmp.path().join("2026-05-14.jsonl"),
@@ -2391,7 +2392,7 @@
     // `resolve_session_finds_matching_record` (same).
 
     const SPACED_DAY: &str = "{\"ts\":\"2026-05-14T09:00:00Z\",\"action\":\"dispatch start\",\"session_id\":\"S1\",\"mission_id\":\"m1\",\"machine_id\":\"mac\"}\n\
-         {\"ts\":\"2026-05-14T09:00:05Z\",\"action\":\"dispatch complete\",\"session_id\":\"S1\",\"mission_id\":\"m1\",\"machine_id\":\"mac\"}\n";
+         {\"ts\":\"2026-05-14T09:00:05Z\",\"action\":\"dispatch.complete\",\"session_id\":\"S1\",\"mission_id\":\"m1\",\"machine_id\":\"mac\"}\n";
 
     fn spaced_archive() -> TempDir {
         let tmp = TempDir::new().unwrap();
@@ -2455,7 +2456,7 @@
         std::fs::File::create(&path).unwrap();
         let stream = tail_lines(path.clone(), 0);
         tokio::pin!(stream);
-        std::fs::write(&path, "{\"action\":\"step result\",\"handle\":\"h\"}\n").unwrap();
+        std::fs::write(&path, "{\"action\":\"step.result\",\"handle\":\"h\"}\n").unwrap();
         let got = next_line(&mut stream, Duration::from_millis(1500)).await.expect("a line");
         let v: serde_json::Value = serde_json::from_str(&got).unwrap();
         assert_eq!(v["action"], "step.result");
@@ -2476,7 +2477,7 @@
             ])
         };
         let raw = redis::Value::Array(vec![
-            entry("2-0", r#"{"ts":"2026-05-14T09:00:05Z","action":"dispatch complete"}"#),
+            entry("2-0", r#"{"ts":"2026-05-14T09:00:05Z","action":"dispatch.complete"}"#),
             entry("1-0", r#"{"ts":"2026-05-14T09:00:00Z","action":"dispatch.start"}"#),
         ]);
         let records = super::records_from_xrevrange(raw, Some("2026-05-14")).unwrap();
@@ -2490,6 +2491,7 @@
     fn forwarded_line_upgrades_a_retired_spelling_and_leaves_a_current_one_verbatim() {
         let current = r#"{"z":1,"action":"dispatch.start"}"#.to_string();
         assert_eq!(forwarded_line(current.clone()), current);
+        // flow-action-guard:allow — an old spelling is this test's input
         let v: serde_json::Value = serde_json::from_str(&forwarded_line(r#"{"action":"mission close"}"#.to_string())).unwrap();
         assert_eq!(v["action"], "mission.close");
         assert_eq!(forwarded_line("not json".to_string()), "not json");
@@ -2945,8 +2947,8 @@
             // documents. The union sorts by `ts` (stable, so same-instant
             // records keep write order).
             let rec = |ts: &str, action: &str| serde_json::json!({ "ts": ts, "action": action, "handle": "h" });
-            let redis = vec![rec("2026-09-05T13:49:59Z", "telemetry.process"), rec("2026-09-05T16:21:49Z", "telemetry.process")];
-            let local = vec![rec("2026-09-05T00:08:17Z", "dispatch start"), rec("2026-09-05T13:01:32Z", "dispatch start")];
+            let redis = vec![rec("2026-09-05T13:49:59Z", "machine.telemetry"), rec("2026-09-05T16:21:49Z", "machine.telemetry")];
+            let local = vec![rec("2026-09-05T00:08:17Z", "dispatch.start"), rec("2026-09-05T13:01:32Z", "dispatch.start")];
             let out = super::union_flow_records(redis, local);
             let ts: Vec<&str> = out.iter().filter_map(|r| r.get("ts").and_then(|v| v.as_str())).collect();
             assert_eq!(
@@ -3214,7 +3216,7 @@
             buf.push('\n');
             for i in 0..telemetry_count {
                 buf.push_str(&format!(
-                    r#"{{"ts":"{today}T00:00:01Z","action":"telemetry.process","n":{i}}}"#
+                    r#"{{"ts":"{today}T00:00:01Z","action":"machine.telemetry","n":{i}}}"#
                 ));
                 buf.push('\n');
             }
@@ -3248,7 +3250,7 @@
             assert!(
                 telemetry_between
                     .iter()
-                    .all(|r| r["action"].as_str() == Some("telemetry.process")),
+                    .all(|r| r["action"].as_str() == Some("machine.telemetry")),
                 "everything between the bookends must be the telemetry ring, in file order"
             );
             for (i, r) in telemetry_between.iter().enumerate() {
@@ -3270,12 +3272,13 @@
             let telemetry_count = MAX_FLOW_FILE_RECORDS;
             let mut buf = String::new();
             buf.push_str(&format!(
+                // flow-action-guard:allow — an old spelling is this test's input
                 r#"{{"ts":"{today}T00:00:00Z","action":"dispatch start","session_id":"s1"}}"#
             ));
             buf.push('\n');
             for i in 0..telemetry_count {
                 buf.push_str(&format!(
-                    r#"{{"ts":"{today}T00:00:01Z","action":"telemetry.process","n":{i}}}"#
+                    r#"{{"ts":"{today}T00:00:01Z","action":"machine.telemetry","n":{i}}}"#
                 ));
                 buf.push('\n');
             }
@@ -3305,7 +3308,7 @@
             buf.push('\n');
             for i in 0..50 {
                 buf.push_str(&format!(
-                    r#"{{"ts":"{today}T00:00:01Z","action":"telemetry.process","n":{i}}}"#
+                    r#"{{"ts":"{today}T00:00:01Z","action":"machine.telemetry","n":{i}}}"#
                 ));
                 buf.push('\n');
             }
@@ -3715,7 +3718,7 @@
     fn resolve_session_finds_matching_record() {
         let tmp = TempDir::new().unwrap();
         let record = serde_json::json!({
-            "action": "step result",
+            "action": "step.result",
             "session_id": "abc123",
             "payload": {
                 "step_id": "s1-worktree-step",
@@ -3744,7 +3747,7 @@
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("2026-01-15.jsonl"),
-            r#"{"action":"step result","session_id":"other","payload":{"step_id":"s1-worktree-step","kind":"mission.worktree","worktree":"/tmp/wt","base":"main","branch":"x"}}\n"#,
+            r#"{"action":"step.result","session_id":"other","payload":{"step_id":"s1-worktree-step","kind":"mission.worktree","worktree":"/tmp/wt","base":"main","branch":"x"}}\n"#,
         )
         .unwrap();
 
@@ -3874,7 +3877,7 @@
         // Create a flows dir with a day file pointing at this worktree.
         let flows_dir = TempDir::new().unwrap();
         let record = serde_json::json!({
-            "action": "step result",
+            "action": "step.result",
             "session_id": "test-session-1",
             "payload": {
                 "step_id": "s1-worktree-step",
@@ -4001,13 +4004,13 @@
             "{}\n{}\n",
             serde_json::json!({
                 "ts": "2026-01-01T00:00:00Z", "level": "info", "category": "work",
-                "tier": "local", "stage": "dispatch", "action": "step result",
+                "tier": "local", "stage": "dispatch", "action": "step.result",
                 "handle": "bundle", "session_id": case_id, "source": "review",
                 "payload": {"step_id": "bundle", "kind": "review.bundle", "items_out": 5}
             }),
             serde_json::json!({
                 "ts": "2026-01-01T00:05:00Z", "level": "info", "category": "work",
-                "tier": "local", "stage": "dispatch", "action": "step result",
+                "tier": "local", "stage": "dispatch", "action": "step.result",
                 "handle": "judge", "session_id": case_id, "source": "review",
                 "payload": {"step_id": "judge", "kind": "dispatch.map", "items_in": 6, "items_out": 6}
             }),
@@ -4043,7 +4046,7 @@
         fs::create_dir_all(dir).unwrap();
         let record = serde_json::json!({
             "ts": "2026-01-01T00:00:00Z", "level": "info", "category": "work",
-            "tier": "local", "stage": "dispatch", "action": "step result",
+            "tier": "local", "stage": "dispatch", "action": "step.result",
             "handle": "bundle", "session_id": case_id, "source": "review",
             "payload": {"step_id": "bundle", "kind": "review.bundle", "items_out": 12}
         });
@@ -4704,7 +4707,7 @@
             "{}",
             serde_json::json!({
                 "ts": "2026-01-01T00:01:00Z", "level": "info", "category": "work",
-                "tier": "local", "stage": "dispatch", "action": "step result",
+                "tier": "local", "stage": "dispatch", "action": "step.result",
                 "handle": "dedup", "session_id": "demo-case-b", "source": "review",
                 "payload": {"step_id": "dedup", "kind": "review.dedup", "items_in": 1, "items_out": 12, "wall_ms": 0}
             })
@@ -6118,7 +6121,7 @@
         // would silently fall out of the window when run later.
         let flows = TempDir::new().unwrap();
         let rec = serde_json::json!({
-            "action": "dispatch complete",
+            "action": "dispatch.complete",
             "session_id": "step-ran-step",
             "payload": { "total_tokens": 12345, "total_turns": 7 }
         });
@@ -6290,7 +6293,7 @@
         // template's literal step id (the confirmed collision mechanism).
         let flows = TempDir::new().unwrap();
         let rec = serde_json::json!({
-            "action": "dispatch complete",
+            "action": "dispatch.complete",
             "session_id": "step-review-verify-step",
             "payload": { "total_tokens": 46_832, "total_turns": 5 }
         });
@@ -6889,12 +6892,14 @@ fn join_host_samples_joins_when_the_bookends_use_the_spaced_spelling_production_
     let mut records = vec![
         serde_json::json!({
             "ts": "2026-01-01T00:00:00Z",
+            // flow-action-guard:allow — an old spelling is this test's input
             "action": "dispatch start",
             "session_id": "s-1",
             "machine_uid": "m-1",
         }),
         serde_json::json!({
             "ts": "2026-01-01T00:00:10Z",
+            // flow-action-guard:allow — an old spelling is this test's input
             "action": "dispatch complete",
             "session_id": "s-1",
             "machine_uid": "m-1",
@@ -6950,7 +6955,7 @@ fn join_host_samples_windows_against_the_start_records_machine_not_just_the_firs
         // machine_uid than the one that actually ran the dispatch.
         serde_json::json!({
             "ts": "2026-01-01T00:00:00Z",
-            "action": "session.note",
+            "action": "operator.note",
             "session_id": "s-1",
             "machine_uid": "m-other",
         }),
@@ -7561,7 +7566,9 @@ mod fleet_cache_wall_clock {
             super::backfill_roster_machine_uids(&mut machines, tmp.path());
             machines[0].machine_uid.clone()
         };
+        // flow-action-guard:allow-start — an old spelling is this test's input
         assert_eq!(backfill("dispatch start"), Some("00000000-0000-4000-8000-000000000001".to_string()));
         assert_eq!(backfill("dispatch start"), backfill("dispatch.start"));
+        // flow-action-guard:allow-end
     }
 }

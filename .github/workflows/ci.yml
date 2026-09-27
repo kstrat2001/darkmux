@@ -827,11 +827,14 @@ jobs:
         # the allowlist mechanism (`// drift-guard:allow <verb> — <reason>`) live
         # in scripts/rs-drift-guard.py so both halves of the guard can't drift.
         run: python3 scripts/rs-drift-guard.py
-      - name: No flow action written as a string literal (4.0)
+      - name: No flow action outside the vocabulary (4.0)
         # Every flow action is a `darkmux_flow::FlowAction` variant; its wire
         # string lives only in darkmux-flow's action.rs (retired spellings in
         # legacy.rs). The guard reads its list from those two files, so it
         # cannot drift from the vocabulary, and self-tests before it scans.
+        # Production Rust may not write an action by hand at all; test code,
+        # the viewer, docs, skills, templates and fixtures may not carry an
+        # old spelling or a made-up `<scope>.<event>` string.
         run: |
           python3 scripts/flow-action-guard.py --self-test
           python3 scripts/flow-action-guard.py

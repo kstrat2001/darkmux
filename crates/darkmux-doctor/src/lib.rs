@@ -9781,6 +9781,7 @@ mod tests {
     fn unknown_flow_actions_warn_with_count_and_names_and_none_pass() {
         let mut tally = darkmux_flow::reader::UnknownActions::default();
         assert_eq!(unknown_flow_actions_check(&tally).status, Status::Pass);
+        // flow-action-guard:allow — an old spelling is this test's input
         for a in ["future.thing", "future.thing", "dispatch start", "other.x"] {
             tally.observe(&serde_json::json!({ "action": a }));
         }
@@ -12794,6 +12795,7 @@ mod tests {
 
         let c = super::removed_radio_router_staffing_status(true, None, false);
         assert_eq!(c.status, Status::Warn);
+        // flow-action-guard:allow — a retired config key, refused by name
         assert!(c.message.contains("radio.router_profile") && c.message.contains("1.28"), "{}", c.message);
 
         let c = super::removed_radio_router_staffing_status(false, Some("radio"), false);

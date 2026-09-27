@@ -471,6 +471,7 @@ export function parseRoute(): Route {
   // rewrite idempotent rather than oscillating.
   const dispatch = get("dispatch") || get("session");
   if (dispatch) {
+    // flow-action-guard:allow — a URL parameter, not an action
     return { kind: "dispatch", dispatchId: dispatch, missionId: get("dispatch.mission") || null };
   }
 
@@ -552,6 +553,7 @@ export function parseRoute(): Route {
 export function dispatchHash(sessionId: string, missionId: string | null): string {
   const p = new URLSearchParams();
   p.set("dispatch", sessionId);
+  // flow-action-guard:allow — a URL parameter, not an action
   if (missionId) p.set("dispatch.mission", missionId);
   return p.toString();
 }

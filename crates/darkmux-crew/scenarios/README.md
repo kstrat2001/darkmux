@@ -16,6 +16,7 @@ holds. That is the whole format.
 {"hold_ms": 120000, "thermal": {"state": "fair"}, "battery": {"charge_pct": 45}}
 ```
 
+<!-- flow-action-guard:allow-start — scenario fields, not actions -->
 | field | required | meaning |
 |---|---|---|
 | `hold_ms` | **yes** | How long this reading holds, in *simulated* milliseconds. `120000` is two minutes. Must be greater than zero. |
@@ -26,6 +27,7 @@ holds. That is the whole format.
 | `battery.charging` | no | Current actually flowing in. Defaults to `false`. Note this is **not** the opposite of `on_ac`: a laptop sitting at 100% on the charger is `on_ac: true, charging: false`. |
 | `battery.minutes_to_empty` | no | The OS estimate, when there is one. Defaults to absent, which is the common and correct case on AC. |
 | `note` | no | Free text. Ignored by the code, read by the next person. Use it to say what the frame is *for*. |
+<!-- flow-action-guard:allow-end -->
 
 Two things that are easy to miss, and both are load-bearing:
 

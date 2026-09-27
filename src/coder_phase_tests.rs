@@ -998,7 +998,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
                 "status": "clean",
                 "phases": [],
                 "records_emitted": {
-                    "by_action": {"dispatch start": 3, "dispatch.complete": 3, "dispatch.turn": 40},
+                    "by_action": {"dispatch.start": 3, "dispatch.complete": 3, "dispatch.turn": 40},
                     "total_records": 46,
                     "total_bytes": 12345,
                     "dispatch_seconds": 210.0,

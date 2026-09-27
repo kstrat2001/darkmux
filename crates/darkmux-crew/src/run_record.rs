@@ -514,6 +514,7 @@ mod tests {
     #[test]
     fn step_record_omits_item_counts_when_unknown_never_a_lying_zero() {
         let step = StepRecord {
+            // flow-action-guard:allow — a step id, not an action
             step_id: "dispatch.internal-step".into(),
             kind: "dispatch.internal".into(),
             items_in: None,
@@ -524,6 +525,7 @@ mod tests {
         assert_eq!(
             value,
             serde_json::json!({
+                // flow-action-guard:allow — a step id, not an action
                 "step_id": "dispatch.internal-step",
                 "kind": "dispatch.internal",
                 "wall_ms": 4200
@@ -832,6 +834,7 @@ mod tests {
         assert_omitted_defaults_read_back(
             "StepRecord",
             &StepRecord {
+                // flow-action-guard:allow — a step id, not an action
                 step_id: "dispatch.internal-step".into(),
                 kind: "dispatch.internal".into(),
                 items_in: None,

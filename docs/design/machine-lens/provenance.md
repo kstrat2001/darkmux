@@ -1,3 +1,4 @@
+<!-- flow-action-guard:allow-start — `machine.*` here are MachineLens payload fields, not actions -->
 # Machine page provenance — where every value comes from
 
 Every figure on the machine page traces to a probe on your own machine, through
@@ -823,3 +824,4 @@ read directly from `http://127.0.0.1:8765/machine/resources` +
 field values it cites are reproducible by curling the same daemon. Code
 references are to this worktree at the time of writing; line numbers
 drift, function names rarely do.*
+<!-- flow-action-guard:allow-end -->

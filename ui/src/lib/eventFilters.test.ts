@@ -50,6 +50,7 @@ describe("activityOf", () => {
     expect(activityOf(rec({ action: "machine.telemetry", category: "machinery", source: "host" }))).toBe(
       "host telemetry",
     );
+    // flow-action-guard:allow — a retired action, as an archive still holds it
     expect(activityOf(rec({ action: "telemetry.process", category: "telemetry", source: "process" }))).toBe(
       "host telemetry",
     );
@@ -84,6 +85,7 @@ describe("computeFacets / defaultFilterState", () => {
   // of arrival order.
   it("groups still-unmapped activity strings by namespace prefix, after the known ACT_ORDER entries", () => {
     const records = [
+      // flow-action-guard:allow-start — made-up actions: the test needs ones no mapping knows
       rec({ action: "hook.enqueue" }),
       rec({ action: "step.dispatch" }),
       rec({ action: "mission.debrief" }),
@@ -110,6 +112,7 @@ describe("computeFacets / defaultFilterState", () => {
 
   it("sortUnmappedActivities leaves a prefix-less value alone (groups with itself)", () => {
     expect(sortUnmappedActivities(["zeta", "mission.a", "alpha"])).toEqual(["alpha", "mission.a", "zeta"]);
+      // flow-action-guard:allow-end
   });
 });
 
@@ -631,7 +634,7 @@ describe("#2512 — the act default never turns on nothing for a corpus that has
     "machine.online",
     "machine.offline",
     "mission.start",
-    "phase.begin",
+    "phase.start",
   ];
 
   it("defaultFilterState: a corpus with no DEFAULT_ACTIVITIES member still shows something", () => {
@@ -697,7 +700,7 @@ describe("#2512 — the act default never turns on nothing for a corpus that has
 describe("#2770 — event log blanks when no offered activity is default-on AND the operator has unrelated history", () => {
   // The exact action kinds #2770 measured off a live busy fleet — none of
   // them map to a DEFAULT_ACTIVITIES value and none is failure-shaped.
-  const BUSY_NON_DEFAULT_ACTIONS = ["machine.telemetry", "dispatch.turn.heartbeat", "step.start", "dispatch.start", "phase.begin"];
+  const BUSY_NON_DEFAULT_ACTIONS = ["machine.telemetry", "dispatch.turn.heartbeat", "step.start", "dispatch.start", "phase.start"];
 
   // (operator, 2026-09-23) `machine.telemetry` ("host telemetry") and
   // `dispatch.turn.heartbeat` ("heartbeat") are PERIODIC_SAMPLE_ACTIVITIES

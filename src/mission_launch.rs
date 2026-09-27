@@ -6856,6 +6856,7 @@ mod tests {
             id: id.to_string(),
             task_id: format!("{id}-task"),
             gate: None,
+            // flow-action-guard:allow — a made-up step kind, not an action
             kind: "mission.test".to_string(),
             status,
             config: serde_json::Value::Null,

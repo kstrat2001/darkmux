@@ -271,7 +271,7 @@ darkmux mission add-phase &lt;mission-id&gt; \
   --phase-id &lt;new-id&gt; \
   --description "..." \
   --after &lt;existing-phase-id&gt;</code></pre>
-    <p>The verb writes the new Phase JSON, updates the Mission's <code>phase_ids</code> array (at the right position), and emits a <code>phase added</code> flow record. Idempotent on exact-match (same id + mission + description); errors on collision or dangling <code>--after</code>.</p>
+    <p>The verb writes the new Phase JSON, updates the Mission's <code>phase_ids</code> array (at the right position), and emits a <code>phase.added</code> flow record. Idempotent on exact-match (same id + mission + description); errors on collision or dangling <code>--after</code>.</p>
   </div>
 </section>
 

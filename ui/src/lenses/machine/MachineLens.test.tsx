@@ -308,10 +308,12 @@ describe("MachineLens", () => {
         { ts: newIso, machine_uid: "self-uid", machine_id: "MacBook-Pro" },
         // Distinct values per metric so each assertion below can only match
         // the ONE tile it names — cpu/mem/gpu never share an avg/now/max.
+        // flow-action-guard:allow-start — a retired action, as an archive still holds it
         { ts: oldIso, machine_uid: "self-uid", category: "telemetry", source: "process", action: "telemetry.process", payload: { cpu: 40, mem: 20, gpu: 60 } },
         { ts: newIso, machine_uid: "self-uid", category: "telemetry", source: "process", action: "telemetry.process", payload: { cpu: 80, mem: 50, gpu: 90 } },
         // A peer's own sample, same window — must NOT be averaged in.
         { ts: newIso, machine_uid: "peer-uid", category: "telemetry", source: "process", action: "telemetry.process", payload: { cpu: 999, mem: 999, gpu: 999 } },
+        // flow-action-guard:allow-end
       ],
     });
     renderMachine(null);

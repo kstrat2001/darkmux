@@ -340,16 +340,23 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    wire string lives in exactly one place: `crates/darkmux-flow/src/action.rs`. Producers
    build the enum; no constructor, builder or helper takes an action as a string, and
    `FlowAction`'s public deserializer refuses an unknown or retired action. Consumers match
-   on the enum, never on a string. The pre-4.0 spellings (`dispatch start`, `step result`,
+   on the enum, never on a string.
+   <!-- flow-action-guard:allow-start — names the old spellings to say where they live -->
+   The pre-4.0 spellings (`dispatch start`, `step result`,
    `mission close`, `note`, `verdict: <v>`, `sprint *`, ...) live only in
    `darkmux_flow::legacy`, and every reader goes through `darkmux_flow::reader`, which
    upgrades them on read; archives are append-only and are never rewritten. An action
    darkmux retired with no current equivalent (`telemetry.process`, `funnel.*`, ...) reads as
    `FlowAction::Retired`; one this build does not know reads as `FlowAction::Other` and is
-   counted by `darkmux doctor`. Neither can be written: every sink write goes through
+   counted by `darkmux doctor`.
+   <!-- flow-action-guard:allow-end -->
+   Neither can be written: every sink write goes through
    `FlowSinkWrite::write`, which refuses both before any sink sees the record.
-   `scripts/flow-action-guard.py` (CI) fails on a flow action written by hand (a literal, a
-   format string, a prefix test, `concat!`, or JSON inside a string) outside the vocabulary.
+   `scripts/flow-action-guard.py` (CI) fails on a flow action written by hand in production
+   Rust (a literal, a format string, a prefix test, `concat!`, or JSON inside a string), and,
+   in test code, the viewer, docs, skills, templates and fixtures, on any string that looks
+   like an action and is not a current one (an old spelling, or a made-up
+   `<scope>.<event>`); recorded archives are exempt.
    Hook rules written in an old exact spelling are read as the current action. The bookends
    `dispatch.start`/`dispatch.complete` are still emitted at BOTH grains today (the whole
    run, and an inner role execution); separating the run grain is the migration below. What

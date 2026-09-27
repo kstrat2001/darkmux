@@ -1032,6 +1032,7 @@ mod producer_registry_tests {
         // …but the same literal in code IS one.
         assert_eq!(
             audit(&["let a = \"machine.invented\";\n"]).unclassified,
+            // flow-action-guard:allow — an unknown literal the scanner under test must report
             vec!["machine.invented".to_string()]
         );
     }

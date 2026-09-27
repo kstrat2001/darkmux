@@ -116,6 +116,7 @@ describe("EventLogColumn", () => {
   it("states vocabulary skew beside the totals: records whose action this build does not know", () => {
     const records = [
       rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s-alpha" }),
+      // flow-action-guard:allow — an old spelling is this test's input
       rec({ ts: "2026-08-08T12:01:00.000Z", action: "dispatch start", session_id: "s-alpha" }),
       rec({ ts: "2026-08-08T12:02:00.000Z", action: "wibble.fired", session_id: "s-alpha" }),
     ];
@@ -1226,8 +1227,8 @@ describe("EventLogColumn — turns (#2863)", () => {
     it("does not re-render on the clock's tick when it shows no turn whose state can change", async () => {
       vi.useFakeTimers({ now: T + 11_000 });
       const fleetOnly = [
-        rec({ ts: at(0), action: "telemetry.heartbeat", session_id: "s-a", machine_id: "MacBook-Pro", payload: {} } as never),
-        rec({ ts: at(1), action: "telemetry.heartbeat", session_id: "s-b", machine_id: "MacBook-Pro", payload: {} } as never),
+        rec({ ts: at(0), action: "wibble.heartbeat", session_id: "s-a", machine_id: "MacBook-Pro", payload: {} } as never),
+        rec({ ts: at(1), action: "wibble.heartbeat", session_id: "s-b", machine_id: "MacBook-Pro", payload: {} } as never),
       ];
       let renders = 0;
       render(

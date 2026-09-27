@@ -59,6 +59,7 @@ describe("ingest: the typed fields", () => {
   it("does not read a spaced spelling as its dotted twin", () => {
     // The daemon serves one convention; a spaced action is an unknown one.
     const [spaced] = ingest([raw("dispatch start", 0)]);
+    // flow-action-guard:allow — an old spelling is this test's input
     expect(spaced.action).toBe("dispatch start");
     expect(spaced.action === ACTION.DispatchStart).toBe(false);
     expect(activityOf(spaced)).toBe("dispatch start");
@@ -81,6 +82,7 @@ describe("ingest: the typed fields", () => {
     expect(wireOf(a).stage).toBe("verify");
     expect(recKey(a)).not.toBe(recKey(b));
     expect(isKnownAction(a.action)).toBe(true);
+    // flow-action-guard:allow — an old spelling is this test's input
     expect(isKnownAction(ingest([raw("dispatch start", 0)])[0].action)).toBe(false);
   });
 
@@ -179,8 +181,10 @@ describe("vocabulary skew is loud", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       const recs = ingest([
+        // flow-action-guard:allow-start — a retired action, as an archive still holds it
         raw("telemetry.process", 0, { category: "telemetry", source: "process", payload: { cpu: 12 } }),
         raw("mission.compile.error", 1),
+        // flow-action-guard:allow-end
         raw("mission reopen", 2),
       ]);
       expect(recs.every((r) => isKnownAction(r.action))).toBe(true);

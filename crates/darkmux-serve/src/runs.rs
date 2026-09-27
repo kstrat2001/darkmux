@@ -3030,7 +3030,7 @@ mod tests {
         write_day_file(
             tmp.path(),
             &today(),
-            &[serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch start", "session_id": "s1"})],
+            &[serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch.start", "session_id": "s1"})],
         );
         let start_ms = parse_flow_ts("2026-01-01T00:00:00Z").unwrap() * 1000;
         assert!(any_dispatch_live_in(tmp.path(), &today(), start_ms + 5_000, 60_000));
@@ -3043,8 +3043,8 @@ mod tests {
             tmp.path(),
             &today(),
             &[
-                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch start", "session_id": "s1"}),
-                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:05Z", "action": "dispatch complete", "session_id": "s1"}),
+                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch.start", "session_id": "s1"}),
+                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:05Z", "action": "dispatch.complete", "session_id": "s1"}),
             ],
         );
         let start_ms = parse_flow_ts("2026-01-01T00:00:00Z").unwrap() * 1000;
@@ -3060,7 +3060,7 @@ mod tests {
         write_day_file(
             tmp.path(),
             &today(),
-            &[serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch start", "session_id": "s1"})],
+            &[serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch.start", "session_id": "s1"})],
         );
         let start_ms = parse_flow_ts("2026-01-01T00:00:00Z").unwrap() * 1000;
         assert!(
@@ -3076,9 +3076,9 @@ mod tests {
             tmp.path(),
             &today(),
             &[
-                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch start", "session_id": "s1"}),
-                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:01Z", "action": "dispatch complete", "session_id": "s1"}),
-                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:02Z", "action": "dispatch start", "session_id": "s2"}),
+                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch.start", "session_id": "s1"}),
+                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:01Z", "action": "dispatch.complete", "session_id": "s1"}),
+                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:02Z", "action": "dispatch.start", "session_id": "s2"}),
             ],
         );
         let start_ms = parse_flow_ts("2026-01-01T00:00:02Z").unwrap() * 1000;
@@ -3103,8 +3103,8 @@ mod tests {
             tmp.path(),
             &today(),
             &[
-                serde_json::json!({"level": "info", "category": "work", "tier": "operator", "stage": "scope", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "mission start", "session_id": "mission-m1"}),
-                serde_json::json!({"level": "info", "category": "work", "tier": "operator", "stage": "scope", "handle": "h", "ts": "2026-01-01T00:00:01Z", "action": "mission close", "session_id": "mission-m1"}),
+                serde_json::json!({"level": "info", "category": "work", "tier": "operator", "stage": "scope", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "mission.start", "session_id": "mission-m1"}),
+                serde_json::json!({"level": "info", "category": "work", "tier": "operator", "stage": "scope", "handle": "h", "ts": "2026-01-01T00:00:01Z", "action": "mission.close", "session_id": "mission-m1"}),
             ],
         );
         let ts_ms = parse_flow_ts("2026-01-01T00:00:01Z").unwrap() * 1000;
@@ -3942,8 +3942,8 @@ mod tests {
             flows.path(),
             &today(),
             &[
-                serde_json::json!({ "ts": at(m_ago), "action": "step start", "session_id": "task-shared", "mission_id": "m-ambiguous-e2e", "source": "scheduler" }),
-                serde_json::json!({ "ts": at(other_ago), "action": "step start", "session_id": "task-shared", "mission_id": "some-other-mission", "source": "scheduler" }),
+                serde_json::json!({ "ts": at(m_ago), "action": "step.start", "session_id": "task-shared", "mission_id": "m-ambiguous-e2e", "source": "scheduler" }),
+                serde_json::json!({ "ts": at(other_ago), "action": "step.start", "session_id": "task-shared", "mission_id": "some-other-mission", "source": "scheduler" }),
             ],
         );
         let status = local_dispatch_status(std::slice::from_ref(&m), flows.path(), &[]);
@@ -3997,7 +3997,7 @@ mod tests {
             flows.path(),
             &today(),
             &[
-                serde_json::json!({ "ts": at(300), "action": "dispatch start", "session_id": "fleet-ended", "mission_id": "fleet-only", "handle": "coder" }),
+                serde_json::json!({ "ts": at(300), "action": "dispatch.start", "session_id": "fleet-ended", "mission_id": "fleet-only", "handle": "coder" }),
                 serde_json::json!({ "ts": at(60), "action": "session.end", "session_id": "fleet-ended", "mission_id": "fleet-only" }),
             ],
         );
@@ -4020,8 +4020,8 @@ mod tests {
             flows.path(),
             &today(),
             &[
-                serde_json::json!({ "ts": at(3600), "action": "dispatch start", "session_id": "task-shared-ghost", "mission_id": "ghost-a", "handle": "coder" }),
-                serde_json::json!({ "ts": at(20), "action": "dispatch start", "session_id": "task-shared-ghost", "mission_id": "ghost-b", "handle": "coder" }),
+                serde_json::json!({ "ts": at(3600), "action": "dispatch.start", "session_id": "task-shared-ghost", "mission_id": "ghost-a", "handle": "coder" }),
+                serde_json::json!({ "ts": at(20), "action": "dispatch.start", "session_id": "task-shared-ghost", "mission_id": "ghost-b", "handle": "coder" }),
                 serde_json::json!({ "ts": at(5), "action": "dispatch turn", "session_id": "task-shared-ghost", "mission_id": "ghost-b" }),
             ],
         );
@@ -4067,7 +4067,7 @@ mod tests {
             &today(),
             &[serde_json::json!({
                 "ts": "2026-01-01T09:00:00Z",
-                "action": "dispatch start",
+                "action": "dispatch.start",
                 "session_id": "crew-dispatch-coder-local-status",
                 "handle": "coder",
             })],
@@ -4100,7 +4100,7 @@ mod tests {
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let record = |sid: &str| {
-            serde_json::json!({"ts": "2026-01-01T09:00:00Z", "action": "dispatch start", "session_id": sid, "handle": "coder"})
+            serde_json::json!({"ts": "2026-01-01T09:00:00Z", "action": "dispatch.start", "session_id": sid, "handle": "coder"})
         };
         write_day_file(flows.path(), &today(), &[record("s-today")]);
         write_day_file(flows.path(), &cutoff_date_string(5), &[record("s-five-days-ago")]);
@@ -4161,7 +4161,7 @@ mod tests {
             &cutoff_date_string(3),
             &[serde_json::json!({
                 "ts": iso(now - 3 * 86_400),
-                "action": "dispatch start",
+                "action": "dispatch.start",
                 "session_id": "crew-dispatch-coder-long",
                 "handle": "coder",
                 "model": "qwen3.6-35b-a3b",
@@ -4791,14 +4791,14 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-08-07T07:57:43Z",
-                    "action": "step start",
+                    "action": "step.start",
                     "session_id": "task-__panel_args__",
                     "mission_id": "acp-ephemeral-pr-view-1786089463406811000-1",
                     "source": "scheduler",
                 }),
                 serde_json::json!({
                     "ts": "2026-08-07T07:58:00Z",
-                    "action": "step start",
+                    "action": "step.start",
                     "session_id": "task-__panel_args__",
                     "mission_id": "acp-ephemeral-pr-list-1786091297730112000-2",
                     "source": "scheduler",
@@ -4827,14 +4827,14 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-08-07T07:57:43Z",
-                    "action": "step start",
+                    "action": "step.start",
                     "session_id": "crew-dispatch-coder-1",
                     "mission_id": "mission-a",
                     "source": "scheduler",
                 }),
                 serde_json::json!({
                     "ts": "2026-08-07T07:58:00Z",
-                    "action": "step complete",
+                    "action": "step.complete",
                     "session_id": "crew-dispatch-coder-1",
                     "mission_id": "mission-a",
                     "source": "scheduler",
@@ -4860,13 +4860,13 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-07-24T10:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "sess-1",
                     "handle": "reviewer",
                 }),
                 serde_json::json!({
                     "ts": "2026-07-24T10:05:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "sess-1",
                     "handle": "reviewer",
                     "model": "gpt-4o",
@@ -4890,7 +4890,7 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-07-24T10:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "sess-2",
                     "handle": "coder",
                 }),
@@ -4926,13 +4926,13 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-07-24T10:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "sess-3",
                     "handle": "coder",
                 }),
                 serde_json::json!({
                     "ts": "2026-07-24T10:00:05Z",
-                    "action": "dispatch error",
+                    "action": "dispatch.error",
                     "session_id": "sess-3",
                     "handle": "coder",
                 }),
@@ -4962,7 +4962,7 @@ mod tests {
             "2000-01-01",
             &[serde_json::json!({
                 "ts": "2000-01-01T09:00:00Z",
-                "action": "dispatch start",
+                "action": "dispatch.start",
                 "session_id": "ancient-orphan-sess",
                 "handle": "coder",
             })],
@@ -4989,7 +4989,7 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-07-24T10:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "ticking-sess",
                     "handle": "coder",
                 }),
@@ -5028,7 +5028,7 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-07-24T10:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "outoforder-sess",
                     "handle": "coder",
                 }),
@@ -5462,13 +5462,13 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-07-24T09:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "crew-dispatch-coder-xyz",
                     "handle": "coder",
                 }),
                 serde_json::json!({
                     "ts": "2026-07-24T09:10:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "crew-dispatch-coder-xyz",
                     "handle": "coder",
                     "model": "qwen3.6-35b-a3b",
@@ -5544,14 +5544,14 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2020-01-01T09:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "crew-dispatch-ancient-xyz",
                     "handle": "coder",
                     "machine_id": "flow-derived-machine-should-not-win",
                 }),
                 serde_json::json!({
                     "ts": "2020-01-01T09:10:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "crew-dispatch-ancient-xyz",
                     "handle": "coder",
                     "model": "qwen3.6-35b-a3b",
@@ -5630,14 +5630,14 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": format!("{day}T09:00:00Z"),
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "crew-dispatch-disagree-xyz",
                     "handle": "coder",
                     "machine_id": "peer-runner-that-actually-ran-it",
                 }),
                 serde_json::json!({
                     "ts": format!("{day}T09:10:00Z"),
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "crew-dispatch-disagree-xyz",
                     "handle": "coder",
                     "model": "qwen3.6-35b-a3b",
@@ -5744,7 +5744,7 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-07-24T09:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "darkmux-coding-crawl-error-discard-live-1787676109556",
                     "handle": "crawler",
                 }),
@@ -5818,13 +5818,13 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-07-24T09:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "darkmux-coding-crawl-error-discard-1787676109556",
                     "handle": "crawler",
                 }),
                 serde_json::json!({
                     "ts": "2026-07-24T09:10:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "darkmux-coding-crawl-error-discard-1787676109556",
                     "handle": "crawler",
                     "model": "qwen3.6-35b-a3b",
@@ -5867,26 +5867,26 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-07-24T09:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "darkmux-coding-crawl-error-discard-1787676109556",
                     "handle": "crawler",
                 }),
                 serde_json::json!({
                     "ts": "2026-07-24T09:10:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "darkmux-coding-crawl-error-discard-1787676109556",
                     "handle": "crawler",
                     "model": "qwen3.6-35b-a3b",
                 }),
                 serde_json::json!({
                     "ts": "2026-07-24T09:05:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "an-entirely-unrelated-standalone-session",
                     "handle": "coder",
                 }),
                 serde_json::json!({
                     "ts": "2026-07-24T09:06:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "an-entirely-unrelated-standalone-session",
                     "handle": "coder",
                     "model": "qwen3.6-35b-a3b",
@@ -5961,13 +5961,13 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-07-24T09:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "darkmux-coding-crawl-error-discard-1787676109556",
                     "handle": "crawler",
                 }),
                 serde_json::json!({
                     "ts": "2026-07-24T09:10:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "darkmux-coding-crawl-error-discard-1787676109556",
                     "handle": "crawler",
                     "model": "qwen3.6-35b-a3b",
@@ -6022,7 +6022,7 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-01-01T09:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": default_session,
                     "handle": "coder",
                     // mission_id DELIBERATELY absent — matches
@@ -6030,7 +6030,7 @@ mod tests {
                 }),
                 serde_json::json!({
                     "ts": "2026-01-01T09:05:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": default_session,
                     "handle": "coder",
                     "model": "qwen3.6-35b-a3b",
@@ -6096,14 +6096,14 @@ mod tests {
 
             all_records.push(serde_json::json!({
                 "ts": "2026-07-24T09:00:00Z",
-                "action": "dispatch start",
+                "action": "dispatch.start",
                 "session_id": session_id,
                 "handle": role,
                 "mission_id": mission_id,
             }));
             all_records.push(serde_json::json!({
                 "ts": "2026-07-24T09:10:00Z",
-                "action": "dispatch complete",
+                "action": "dispatch.complete",
                 "session_id": session_id,
                 "handle": role,
                 "mission_id": mission_id,
@@ -6170,22 +6170,22 @@ mod tests {
         // the 49-missions/1-session bucket #1918 measured live.
         for (mid, model) in [("mission-old-a", "legacy-model-a"), ("mission-old-b", "legacy-model-b")] {
             recs.push(serde_json::json!({
-                "ts": "2026-07-20T09:00:00Z", "action": "dispatch start",
+                "ts": "2026-07-20T09:00:00Z", "action": "dispatch.start",
                 "session_id": raw, "handle": "legacy-role", "mission_id": mid,
             }));
             recs.push(serde_json::json!({
-                "ts": "2026-07-20T09:10:00Z", "action": "dispatch complete",
+                "ts": "2026-07-20T09:10:00Z", "action": "dispatch.complete",
                 "session_id": raw, "handle": "legacy-role", "mission_id": mid, "model": model,
             }));
         }
         // The new mission's OWN, correctly scoped records — LATER, so
         // only the ambiguity filter (not ordering) can save them.
         recs.push(serde_json::json!({
-            "ts": "2026-07-24T09:00:00Z", "action": "dispatch start",
+            "ts": "2026-07-24T09:00:00Z", "action": "dispatch.start",
             "session_id": scoped_new, "handle": "coder", "mission_id": "mission-new",
         }));
         recs.push(serde_json::json!({
-            "ts": "2026-07-24T09:10:00Z", "action": "dispatch complete",
+            "ts": "2026-07-24T09:10:00Z", "action": "dispatch.complete",
             "session_id": scoped_new, "handle": "coder", "mission_id": "mission-new",
             "model": "correct-model",
         }));
@@ -6269,7 +6269,7 @@ mod tests {
                 // `mission_bookend_record` itself sets).
                 serde_json::json!({
                     "ts": "2026-01-01T08:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "bookend-mission-1",
                     "handle": "coder-phase",
                     "mission_id": "bookend-mission-1",
@@ -6283,14 +6283,14 @@ mod tests {
                 // borrow a later session's value the way role/model now do.
                 serde_json::json!({
                     "ts": "2026-01-01T09:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "crew-dispatch-coder-bookend",
                     "handle": "coder",
                     "machine_id": "different-peer",
                 }),
                 serde_json::json!({
                     "ts": "2026-01-01T09:10:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "crew-dispatch-coder-bookend",
                     "handle": "coder",
                     "model": "qwen3.6-35b-a3b",
@@ -6377,7 +6377,7 @@ mod tests {
                 // fixture above.
                 serde_json::json!({
                     "ts": "2026-01-01T08:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "collision-mission-1",
                     "handle": "coder-phase",
                     "mission_id": "collision-mission-1",
@@ -6389,7 +6389,7 @@ mod tests {
                 // id scheme colliding across missions).
                 serde_json::json!({
                     "ts": "2026-01-01T08:30:00Z",
-                    "action": "step start",
+                    "action": "step.start",
                     "session_id": "collision-mission-1",
                     "mission_id": "some-other-mission",
                     "source": "scheduler",
@@ -6401,7 +6401,7 @@ mod tests {
                 // from a field that was simply never populated.
                 serde_json::json!({
                     "ts": "2026-01-01T09:00:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "collision-mission-1",
                     "handle": "coder-phase",
                     "mission_id": "collision-mission-1",
@@ -6515,7 +6515,7 @@ mod tests {
                 // `earliest_by_start`'s pick if it weren't ambiguous.
                 serde_json::json!({
                     "ts": "2026-01-01T08:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "ambig-bookend-mission",
                     "handle": "coder-phase",
                     "mission_id": "ambig-bookend-mission",
@@ -6530,7 +6530,7 @@ mod tests {
                 // into the SAME bookend session, making it ambiguous.
                 serde_json::json!({
                     "ts": "2026-01-01T08:05:00Z",
-                    "action": "step start",
+                    "action": "step.start",
                     "session_id": "ambig-bookend-mission",
                     "mission_id": "some-other-mission",
                     "source": "scheduler",
@@ -6540,7 +6540,7 @@ mod tests {
                 // `machine`/`started_ts` actually recovered from it.
                 serde_json::json!({
                     "ts": "2026-01-01T09:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "crew-dispatch-coder-ambig",
                     "handle": "coder",
                     "mission_id": "ambig-bookend-mission",
@@ -6548,7 +6548,7 @@ mod tests {
                 }),
                 serde_json::json!({
                     "ts": "2026-01-01T09:10:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "crew-dispatch-coder-ambig",
                     "handle": "coder",
                     "mission_id": "ambig-bookend-mission",
@@ -6562,7 +6562,7 @@ mod tests {
                 // the row's first sort key.
                 serde_json::json!({
                     "ts": "2026-01-01T09:30:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "ambig-bookend-mission",
                     "handle": "coder-phase",
                     "mission_id": "ambig-bookend-mission",
@@ -6678,7 +6678,7 @@ mod tests {
                 // `earliest_by_start`'s `representative` pick.
                 serde_json::json!({
                     "ts": "2026-01-01T08:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "bookend-mission-2",
                     "handle": "coder-phase",
                     "mission_id": "bookend-mission-2",
@@ -6688,14 +6688,14 @@ mod tests {
                 // The coder step's OWN dispatch — a real role and model.
                 serde_json::json!({
                     "ts": "2026-01-01T09:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "crew-dispatch-coder-bookend2",
                     "handle": "coder",
                     "machine_id": "different-peer",
                 }),
                 serde_json::json!({
                     "ts": "2026-01-01T09:10:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "crew-dispatch-coder-bookend2",
                     "handle": "coder",
                     "model": "qwen3.6-35b-a3b",
@@ -6708,7 +6708,7 @@ mod tests {
                 // FRONT of `sessions_by_start` despite the late `ts`.
                 serde_json::json!({
                     "ts": "2026-01-01T09:20:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "startless-session",
                     "handle": "STALE-ROLE",
                     "model": "STALE-MODEL",
@@ -6766,7 +6766,7 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-01-01T08:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "bookend-only-1",
                     "handle": "cmd-gate-approve",
                     "mission_id": "bookend-only-1",
@@ -6774,7 +6774,7 @@ mod tests {
                 }),
                 serde_json::json!({
                     "ts": "2026-01-01T08:00:05Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "bookend-only-1",
                     "handle": "cmd-gate-approve",
                     "mission_id": "bookend-only-1",
@@ -6818,14 +6818,14 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-01-01T08:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "owner/repo@deadbeef",
                     "handle": "review-probe-mid,review-judge",
                     "mission_id": "review-1700000000-abcdef",
                 }),
                 serde_json::json!({
                     "ts": "2026-01-01T08:20:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "owner/repo@deadbeef",
                     "handle": "review-probe-mid,review-judge",
                     "model": "gpt-4o",
@@ -6879,7 +6879,7 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-01-01T09:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "crew-dispatch-coder-crashed",
                     "handle": "coder",
                 }),
@@ -6977,9 +6977,9 @@ mod tests {
             &[
                 // older mission — fully terminal, reusing the SAME probe
                 // task session id every review mission uses.
-                serde_json::json!({"ts":"2026-01-01T08:00:00Z","action":"mission start","session_id":"mission-review-1000000000-older","mission_id":"review-1000000000-older","source":"mission_lifecycle"}),
-                serde_json::json!({"ts":"2026-01-01T08:00:01Z","action":"dispatch start","session_id":"task-review-probe-mid-task","mission_id":"review-1000000000-older","role":"review-probe-mid"}),
-                serde_json::json!({"ts":"2026-01-01T08:20:00Z","action":"dispatch complete","session_id":"task-review-probe-mid-task","mission_id":"review-1000000000-older","model":"m-old"}),
+                serde_json::json!({"ts":"2026-01-01T08:00:00Z","action":"mission.start","session_id":"mission-review-1000000000-older","mission_id":"review-1000000000-older","source":"mission_lifecycle"}),
+                serde_json::json!({"ts":"2026-01-01T08:00:01Z","action":"dispatch.start","session_id":"task-review-probe-mid-task","mission_id":"review-1000000000-older","role":"review-probe-mid"}),
+                serde_json::json!({"ts":"2026-01-01T08:20:00Z","action":"dispatch.complete","session_id":"task-review-probe-mid-task","mission_id":"review-1000000000-older","model":"m-old"}),
                 // (#2487) The older mission's OWN run-level dispatch bookend,
                 // mirroring the active mission's `owner/repo@deadbeef` below.
                 // Before #2487 this row's `completed_ts` was read off the
@@ -6990,9 +6990,9 @@ mod tests {
                 // actually had: a bookend keyed on the older run's own commit
                 // sha, never reused across missions. The ordering assertion
                 // below therefore now tests ordering rather than tainted data.
-                serde_json::json!({"ts":"2026-01-01T08:00:00Z","action":"dispatch start","session_id":"owner/repo@cafebabe","mission_id":"review-1000000000-older","role":"deep+diff-review+probe-mid","handle":"deep+diff-review+probe-mid"}),
-                serde_json::json!({"ts":"2026-01-01T08:20:00Z","action":"dispatch complete","session_id":"owner/repo@cafebabe","mission_id":"review-1000000000-older"}),
-                serde_json::json!({"ts":"2026-01-01T08:20:01Z","action":"mission close","session_id":"mission-review-1000000000-older","mission_id":"review-1000000000-older"}),
+                serde_json::json!({"ts":"2026-01-01T08:00:00Z","action":"dispatch.start","session_id":"owner/repo@cafebabe","mission_id":"review-1000000000-older","role":"deep+diff-review+probe-mid","handle":"deep+diff-review+probe-mid"}),
+                serde_json::json!({"ts":"2026-01-01T08:20:00Z","action":"dispatch.complete","session_id":"owner/repo@cafebabe","mission_id":"review-1000000000-older"}),
+                serde_json::json!({"ts":"2026-01-01T08:20:01Z","action":"mission.close","session_id":"mission-review-1000000000-older","mission_id":"review-1000000000-older"}),
                 // active mission — mission-level bookend (its own unique
                 // session id, embeds the mission id — never reused) plus
                 // the run-level dispatch bookend (keyed on the commit sha in
@@ -7001,10 +7001,10 @@ mod tests {
                 // mission's exact session id and gets no fresh activity of
                 // its own here — exactly the ambiguous, excluded-from-
                 // liveness shape the real report hit.
-                serde_json::json!({"ts":"2026-01-01T09:39:00Z","action":"mission start","session_id":"mission-review-2000000000-active","mission_id":"review-2000000000-active","source":"mission_lifecycle"}),
-                serde_json::json!({"ts":"2026-01-01T09:39:01Z","action":"dispatch start","session_id":"owner/repo@deadbeef","mission_id":"review-2000000000-active","role":"deep+diff-review+probe-mid","handle":"deep+diff-review+probe-mid"}),
-                serde_json::json!({"ts": now, "action":"telemetry.process","session_id":"owner/repo@deadbeef","mission_id":"review-2000000000-active"}),
-                serde_json::json!({"ts":"2026-01-01T09:39:02Z","action":"step start","session_id":"task-review-probe-mid-task","mission_id":"review-2000000000-active","role":"review-probe-mid"}),
+                serde_json::json!({"ts":"2026-01-01T09:39:00Z","action":"mission.start","session_id":"mission-review-2000000000-active","mission_id":"review-2000000000-active","source":"mission_lifecycle"}),
+                serde_json::json!({"ts":"2026-01-01T09:39:01Z","action":"dispatch.start","session_id":"owner/repo@deadbeef","mission_id":"review-2000000000-active","role":"deep+diff-review+probe-mid","handle":"deep+diff-review+probe-mid"}),
+                serde_json::json!({"ts": now, "action":"machine.telemetry","session_id":"owner/repo@deadbeef","mission_id":"review-2000000000-active"}),
+                serde_json::json!({"ts":"2026-01-01T09:39:02Z","action":"step.start","session_id":"task-review-probe-mid-task","mission_id":"review-2000000000-active","role":"review-probe-mid"}),
             ],
         );
 
@@ -7101,13 +7101,13 @@ mod tests {
                 // The tracked mission's own session.
                 serde_json::json!({
                     "ts": "2026-07-24T09:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "crew-dispatch-coder-known",
                 }),
                 // A genuinely orphaned session — no mission ever minted.
                 serde_json::json!({
                     "ts": orphan_ts,
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "crew-dispatch-reviewer-orphan",
                     "handle": "reviewer",
                 }),
@@ -7177,21 +7177,21 @@ mod tests {
             &[
                 // The tracked mission's step session: records carry the
                 // session only (the scheduler's own shape), no mission_id.
-                serde_json::json!({ "ts": "2026-07-24T09:00:00Z", "action": "dispatch start", "session_id": "crew-dispatch-coder-known" }),
+                serde_json::json!({ "ts": "2026-07-24T09:00:00Z", "action": "dispatch.start", "session_id": "crew-dispatch-coder-known" }),
                 usage_record("2026-07-24T09:01:00Z", "crew-dispatch-coder-known", None, provider("turn", 120)),
                 usage_record("2026-07-24T09:02:00Z", "crew-dispatch-coder-known", None, provider("turn", 180)),
                 // Its complete must NOT be read: the run has usage records.
-                serde_json::json!({ "ts": "2026-07-24T09:03:00Z", "action": "dispatch complete", "session_id": "crew-dispatch-coder-known", "payload": { "total_tokens": 999 } }),
+                serde_json::json!({ "ts": "2026-07-24T09:03:00Z", "action": "dispatch.complete", "session_id": "crew-dispatch-coder-known", "payload": { "total_tokens": 999 } }),
                 // A ghost with a work turn and a compactor sub-execution.
-                serde_json::json!({ "ts": now, "action": "dispatch start", "session_id": "crew-dispatch-reviewer-orphan", "handle": "reviewer" }),
+                serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "crew-dispatch-reviewer-orphan", "handle": "reviewer" }),
                 usage_record(&now, "crew-dispatch-reviewer-orphan", None, provider("turn", 60)),
                 usage_record(&now, "crew-dispatch-reviewer-orphan", None, provider("compaction", 90)),
                 // A ghost whose only record reported nothing.
-                serde_json::json!({ "ts": now, "action": "dispatch start", "session_id": "crew-dispatch-silent", "handle": "reviewer" }),
+                serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "crew-dispatch-silent", "handle": "reviewer" }),
                 usage_record(&now, "crew-dispatch-silent", None, serde_json::json!({ "call_kind": "turn", "token_source": "absent" })),
                 // A legacy ghost: no usage record at all, tokens on its complete.
-                serde_json::json!({ "ts": "2026-07-24T09:10:00Z", "action": "dispatch start", "session_id": "crew-dispatch-legacy", "handle": "reviewer" }),
-                serde_json::json!({ "ts": "2026-07-24T09:11:00Z", "action": "dispatch complete", "session_id": "crew-dispatch-legacy", "payload": { "total_tokens": 700 } }),
+                serde_json::json!({ "ts": "2026-07-24T09:10:00Z", "action": "dispatch.start", "session_id": "crew-dispatch-legacy", "handle": "reviewer" }),
+                serde_json::json!({ "ts": "2026-07-24T09:11:00Z", "action": "dispatch.complete", "session_id": "crew-dispatch-legacy", "payload": { "total_tokens": 700 } }),
             ],
         );
         // A peer mission, seen only in the fleet stream.
@@ -7199,7 +7199,7 @@ mod tests {
         peer_usage["category"] = serde_json::json!("telemetry");
         peer_usage["source"] = serde_json::json!("tokens");
         peer_usage["payload"] = provider("single_shot", 500);
-        let fleet = vec![peer_record("mission start", &now), peer_usage];
+        let fleet = vec![peer_record("mission.start", &now), peer_usage];
 
         let runs = build_runs(flows.path(), None, &fleet);
         let tokens = |id: &str| runs.iter().find(|r| r.id == id).unwrap_or_else(|| panic!("{id} in {runs:?}")).tokens;
@@ -7228,9 +7228,9 @@ mod tests {
             flows.path(),
             &today(),
             &[
-                serde_json::json!({ "ts": now, "action": "dispatch start", "session_id": "lab-sess-1", "handle": "coder" }),
+                serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "lab-sess-1", "handle": "coder" }),
                 usage_record(&now, "lab-sess-1", None, serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": 4200 })),
-                serde_json::json!({ "ts": now, "action": "dispatch complete", "session_id": "lab-sess-1", "handle": "coder", "payload": { "total_tokens": 1 } }),
+                serde_json::json!({ "ts": now, "action": "dispatch.complete", "session_id": "lab-sess-1", "handle": "coder", "payload": { "total_tokens": 1 } }),
             ],
         );
         let runs = build_runs(flows.path(), Some(lab.path()), &[]);
@@ -7249,7 +7249,7 @@ mod tests {
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let now = darkmux_flow::ts_utc_now();
-        let start = serde_json::json!({ "ts": now, "action": "dispatch start", "session_id": "both-sinks", "handle": "coder", "source": "crew_dispatch" });
+        let start = serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "both-sinks", "handle": "coder", "source": "crew_dispatch" });
         let mut usage = usage_record(&now, "both-sinks", None, serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": 333 }));
         usage["handle"] = serde_json::json!("coder");
         write_day_file(flows.path(), &today(), &[start.clone(), usage.clone()]);
@@ -7282,7 +7282,7 @@ mod tests {
             flows.path(),
             &old_day,
             &[
-                serde_json::json!({ "ts": format!("{old_day}T12:00:00Z"), "action": "dispatch start", "session_id": "straddle", "handle": "coder" }),
+                serde_json::json!({ "ts": format!("{old_day}T12:00:00Z"), "action": "dispatch.start", "session_id": "straddle", "handle": "coder" }),
                 usage_record(&format!("{old_day}T12:01:00Z"), "straddle", None, serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": 900 })),
             ],
         );
@@ -7290,7 +7290,7 @@ mod tests {
         write_day_file(
             flows.path(),
             &today(),
-            &[serde_json::json!({ "ts": now, "action": "dispatch complete", "session_id": "straddle", "handle": "coder", "payload": { "total_tokens": 1000 } })],
+            &[serde_json::json!({ "ts": now, "action": "dispatch.complete", "session_id": "straddle", "handle": "coder", "payload": { "total_tokens": 1000 } })],
         );
         let built = build_runs_with_usage(flows.path(), None, &[], None);
         assert_eq!((built.usage.overall.total, built.usage.overall.legacy_completes), (1000, 1), "the bounded scan's reading");
@@ -7318,7 +7318,7 @@ mod tests {
             flows.path(),
             &old_day,
             &[
-                serde_json::json!({ "ts": format!("{old_day}T12:00:00Z"), "action": "dispatch start", "session_id": "old-session", "handle": "coder" }),
+                serde_json::json!({ "ts": format!("{old_day}T12:00:00Z"), "action": "dispatch.start", "session_id": "old-session", "handle": "coder" }),
                 usage_record(&format!("{old_day}T12:01:00Z"), "old-session", None, provider(1000)),
             ],
         );
@@ -7327,7 +7327,7 @@ mod tests {
             flows.path(),
             &today(),
             &[
-                serde_json::json!({ "ts": now, "action": "dispatch start", "session_id": "new-session", "handle": "coder" }),
+                serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "new-session", "handle": "coder" }),
                 usage_record(&now, "new-session", None, provider(40)),
             ],
         );
@@ -7389,8 +7389,8 @@ mod tests {
         let flows = TempDir::new().unwrap(); // deliberately EMPTY: the peer's
         // records were never written to this machine's flows dir.
         let fleet = vec![
-            peer_record("dispatch start", &darkmux_flow::ts_utc_now()),
-            peer_record("dispatch complete", &darkmux_flow::ts_utc_now()),
+            peer_record("dispatch.start", &darkmux_flow::ts_utc_now()),
+            peer_record("dispatch.complete", &darkmux_flow::ts_utc_now()),
         ];
         let runs = build_runs(flows.path(), None, &fleet);
         let row = runs
@@ -7422,8 +7422,8 @@ mod tests {
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let fleet = vec![
-            peer_record("dispatch start", &darkmux_flow::ts_utc_now()),
-            peer_record("dispatch complete", &darkmux_flow::ts_utc_now()),
+            peer_record("dispatch.start", &darkmux_flow::ts_utc_now()),
+            peer_record("dispatch.complete", &darkmux_flow::ts_utc_now()),
         ];
         let runs = build_runs(flows.path(), None, &fleet);
         let row = runs.iter().find(|r| r.id == "review-on-the-hub").unwrap();
@@ -7449,11 +7449,11 @@ mod tests {
         // same reason as the first of these, above.
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
-        let mut collided_record = peer_record("dispatch start", &darkmux_flow::ts_utc_now());
+        let mut collided_record = peer_record("dispatch.start", &darkmux_flow::ts_utc_now());
         collided_record["mission_id"] = serde_json::json!("review-on-a-different-hub");
         let fleet = vec![
-            peer_record("dispatch start", &darkmux_flow::ts_utc_now()),
-            peer_record("dispatch complete", &darkmux_flow::ts_utc_now()),
+            peer_record("dispatch.start", &darkmux_flow::ts_utc_now()),
+            peer_record("dispatch.complete", &darkmux_flow::ts_utc_now()),
             // Same session_id ("peer-session-1", from `peer_record`), a
             // DIFFERENT mission_id — the collision.
             collided_record,
@@ -7498,7 +7498,7 @@ mod tests {
         // `/runs`/`darkmux run list` are answering the SAME question, and
         // two different answers is exactly #1711's own complaint.
         let flows = TempDir::new().unwrap();
-        let fleet = vec![peer_record("mission start", &darkmux_flow::ts_utc_now())];
+        let fleet = vec![peer_record("mission.start", &darkmux_flow::ts_utc_now())];
         let known: HashSet<String> = HashSet::new();
 
         let via_build_runs = build_runs(flows.path(), None, &fleet);
@@ -7526,7 +7526,7 @@ mod tests {
         // from `load_missions()`) must never see it echoed back as a "peer"
         // row just because it also has flow records.
         let flows = TempDir::new().unwrap();
-        let fleet = vec![peer_record("mission start", &darkmux_flow::ts_utc_now())];
+        let fleet = vec![peer_record("mission.start", &darkmux_flow::ts_utc_now())];
         let mut known: HashSet<String> = HashSet::new();
         known.insert("review-on-the-hub".to_string());
 
@@ -7562,7 +7562,7 @@ mod tests {
         let flows = TempDir::new().unwrap();
         let rec = serde_json::json!({
             "ts": darkmux_flow::ts_utc_now(), "level": "info", "category": "work",
-            "tier": "local", "stage": "dispatch", "action": "mission start",
+            "tier": "local", "stage": "dispatch", "action": "mission.start",
             "handle": "review", "session_id": "orphan-s1", "machine_id": "this-reader",
             "mission_id": "orphan-local-1",
         });
@@ -7597,7 +7597,7 @@ mod tests {
         let flows = TempDir::new().unwrap();
         let rec = serde_json::json!({
             "ts": darkmux_flow::ts_utc_now(), "level": "info", "category": "work",
-            "tier": "local", "stage": "dispatch", "action": "mission start",
+            "tier": "local", "stage": "dispatch", "action": "mission.start",
             "handle": "review", "session_id": "peer-s1", "machine_id": "genuinely-a-peer",
             "mission_id": "peer-local-1",
         });
@@ -7627,10 +7627,10 @@ mod tests {
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let fleet = vec![
-            peer_record("dispatch start", &darkmux_flow::ts_utc_now()),
+            peer_record("dispatch.start", &darkmux_flow::ts_utc_now()),
             serde_json::json!({
                 "ts": darkmux_flow::ts_utc_now(),
-                "action": "mission close",
+                "action": "mission.close",
                 "source": "mission_lifecycle",
                 "session_id": "mission-review-on-the-hub",
                 "mission_id": "review-on-the-hub",
@@ -7669,7 +7669,7 @@ mod tests {
         // questions and this test pins the second one; `cutoff_date_string(1)`
         // is the same date arithmetic the window itself uses.
         let stale_ts = format!("{}T00:00:00Z", cutoff_date_string(1));
-        let fleet = vec![peer_record("dispatch start", &stale_ts)];
+        let fleet = vec![peer_record("dispatch.start", &stale_ts)];
         let runs = build_runs(flows.path(), None, &fleet);
         let row = runs.iter().find(|r| r.id == "review-on-the-hub").unwrap();
         assert_eq!(row.status, RunStatus::Abandoned);
@@ -7692,10 +7692,10 @@ mod tests {
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let fleet = vec![
-            peer_record("dispatch start", &darkmux_flow::ts_utc_now()),
+            peer_record("dispatch.start", &darkmux_flow::ts_utc_now()),
             serde_json::json!({
                 "ts": darkmux_flow::ts_utc_now(),
-                "action": "mission abort",
+                "action": "mission.abort",
                 "source": "mission_lifecycle",
                 "session_id": "mission-review-on-the-hub",
                 "mission_id": "review-on-the-hub",
@@ -7735,7 +7735,7 @@ mod tests {
         // same reason as the first of these, above.
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
-        let fleet = vec![peer_record("dispatch start", "2020-01-01T00:00:00Z")];
+        let fleet = vec![peer_record("dispatch.start", "2020-01-01T00:00:00Z")];
         let runs = build_runs(flows.path(), None, &fleet);
         assert!(
             !runs.iter().any(|r| r.id == "review-on-the-hub"),
@@ -7753,7 +7753,7 @@ mod tests {
         // The SAME record in the local day-file and in the fleet stream —
         // exactly what happens for this machine's own work, which is
         // written to both.
-        let rec = peer_record("dispatch start", &darkmux_flow::ts_utc_now());
+        let rec = peer_record("dispatch.start", &darkmux_flow::ts_utc_now());
         write_day_file(flows.path(), &today(), std::slice::from_ref(&rec));
         let idx = build_flow_session_index(flows.path(), std::slice::from_ref(&rec), RUNS_FLOW_SCAN_WINDOW_DAYS);
         let agg = idx.get("peer-session-1").expect("session present");
@@ -8070,7 +8070,7 @@ mod tests {
             flows.path(),
             &today(),
             &[
-                serde_json::json!({"ts": now, "action": "dispatch start", "session_id": sid, "handle": "coder"}),
+                serde_json::json!({"ts": now, "action": "dispatch.start", "session_id": sid, "handle": "coder"}),
                 serde_json::json!({"ts": now, "action": "dispatch.tool", "session_id": sid, "handle": "coder"}),
             ],
         );
@@ -8107,7 +8107,7 @@ mod tests {
             &today(),
             &[serde_json::json!({
                 "ts": "2026-01-01T00:00:00Z",
-                "action": "dispatch start",
+                "action": "dispatch.start",
                 "session_id": sid,
                 "handle": "coder",
             })],
@@ -8150,15 +8150,15 @@ mod tests {
             flows.path(),
             &today(),
             &[
-                serde_json::json!({"ts": now, "action": "dispatch start", "session_id": "lab-live-sess", "handle": "coder"}),
+                serde_json::json!({"ts": now, "action": "dispatch.start", "session_id": "lab-live-sess", "handle": "coder"}),
                 // an untracked ghost, still running
-                serde_json::json!({"ts": now, "action": "dispatch start", "session_id": "ghost-live", "handle": "reviewer"}),
+                serde_json::json!({"ts": now, "action": "dispatch.start", "session_id": "ghost-live", "handle": "reviewer"}),
                 // an untracked ghost that completed
-                serde_json::json!({"ts": "2026-07-24T09:00:00Z", "action": "dispatch start", "session_id": "ghost-done", "handle": "reviewer"}),
-                serde_json::json!({"ts": "2026-07-24T09:10:00Z", "action": "dispatch complete", "session_id": "ghost-done", "handle": "reviewer"}),
+                serde_json::json!({"ts": "2026-07-24T09:00:00Z", "action": "dispatch.start", "session_id": "ghost-done", "handle": "reviewer"}),
+                serde_json::json!({"ts": "2026-07-24T09:10:00Z", "action": "dispatch.complete", "session_id": "ghost-done", "handle": "reviewer"}),
                 // a peer's mission this daemon does not own
-                serde_json::json!({"ts": "2026-07-24T08:00:00Z", "action": "mission start", "session_id": "peer-sess", "mission_id": "peer-mission-1", "machine_id": "studio"}),
-                serde_json::json!({"ts": "2026-07-24T08:40:00Z", "action": "mission close", "session_id": "peer-sess", "mission_id": "peer-mission-1", "machine_id": "studio"}),
+                serde_json::json!({"ts": "2026-07-24T08:00:00Z", "action": "mission.start", "session_id": "peer-sess", "mission_id": "peer-mission-1", "machine_id": "studio"}),
+                serde_json::json!({"ts": "2026-07-24T08:40:00Z", "action": "mission.close", "session_id": "peer-sess", "mission_id": "peer-mission-1", "machine_id": "studio"}),
             ],
         );
 
@@ -8234,7 +8234,9 @@ mod tests {
             let s1 = idx.get("S1").expect("S1 indexed");
             (s1.has_start, s1.terminal_status, s1.start_ts.clone(), s1.terminal_ts.clone())
         };
+        // flow-action-guard:allow-start — an old spelling is this test's input
         let spaced = index("dispatch start", "dispatch complete");
+        // flow-action-guard:allow-end
         assert_eq!(spaced, index("dispatch.start", "dispatch.complete"));
         assert_eq!(spaced.1, Some(RunStatus::Complete));
         assert!(spaced.0, "the spaced start opens the session");

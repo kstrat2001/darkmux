@@ -361,7 +361,7 @@ describe("presence coverage is partial, not all-or-nothing (#2123)", () => {
    * terminal record, fresh telemetry: open on its own records. */
   const reviewSession: NormRecord[] = normAll([
     { ts: "2026-08-29T15:46:31Z", session_id: "owner/repo@deadbeef", action: "dispatch.start" },
-    { ts: "2026-08-29T16:07:12Z", session_id: "owner/repo@deadbeef", action: "telemetry.process" },
+    { ts: "2026-08-29T16:07:12Z", session_id: "owner/repo@deadbeef", action: "machine.telemetry" },
   ]);
   const phase = (data: NormRecord[], presence: Set<string>) =>
     lifecycleAt(sessionRun(data, "owner/repo@deadbeef", NOW)!, NOW, DEFAULT_POLICY, presence).phase;

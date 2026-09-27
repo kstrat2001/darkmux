@@ -629,7 +629,7 @@ mod tests {
         // too) — build one: usage record with no counts, then a complete.
         let only_absent = vec![
             serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":"s-abs","payload":{"token_source":"absent","call_kind":"turn"}}),
-            serde_json::json!({"action":"dispatch complete","session_id":"s-abs","payload":{"total_tokens":500}}),
+            serde_json::json!({"action":"dispatch.complete","session_id":"s-abs","payload":{"total_tokens":500}}),
         ];
         let idx = fold_all(&only_absent, None);
         assert_eq!(idx.breakdown.overall.total, 0, "an absent record silences the complete");
@@ -665,11 +665,11 @@ mod tests {
     fn since_never_turns_a_modern_run_into_a_legacy_one() {
         let usage = |ts: &str, total: u64| serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":"S1","ts":ts,"payload":{"call_kind":"turn","purpose":"work","requested_model":"m","endpoint":"http://h/v1","token_source":"provider","total_tokens":total}});
         let records = vec![
-            serde_json::json!({"action":"dispatch start","session_id":"S1","ts":"2026-09-26T08:00:00Z"}),
+            serde_json::json!({"action":"dispatch.start","session_id":"S1","ts":"2026-09-26T08:00:00Z"}),
             usage("2026-09-26T08:01:00Z", 120),
             usage("2026-09-26T08:02:00Z", 90),
             usage("2026-09-26T08:03:00Z", 180),
-            serde_json::json!({"action":"dispatch complete","session_id":"S1","ts":"2026-09-26T09:30:00Z","payload":{"total_tokens":300}}),
+            serde_json::json!({"action":"dispatch.complete","session_id":"S1","ts":"2026-09-26T09:30:00Z","payload":{"total_tokens":300}}),
         ];
         let whole = fold_all(&records, None);
         assert_eq!((whole.tokens_for_session("S1"), whole.breakdown.overall.legacy_completes), (Some(390), 0));
@@ -680,7 +680,7 @@ mod tests {
         assert!(bounded.breakdown.groups.is_empty(), "no (none) group: {:?}", bounded.breakdown.groups);
         // A genuinely legacy run in the same window is still counted.
         let mut with_legacy = records.clone();
-        with_legacy.push(serde_json::json!({"action":"dispatch complete","session_id":"S2","ts":"2026-09-26T09:40:00Z","payload":{"total_tokens":50}}));
+        with_legacy.push(serde_json::json!({"action":"dispatch.complete","session_id":"S2","ts":"2026-09-26T09:40:00Z","payload":{"total_tokens":50}}));
         let bounded = fold_all(&with_legacy, Some("2026-09-26T09:00:00Z"));
         assert_eq!((bounded.breakdown.overall.total, bounded.breakdown.overall.legacy_completes), (50, 1));
     }

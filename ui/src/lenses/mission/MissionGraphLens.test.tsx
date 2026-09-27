@@ -432,6 +432,7 @@ describe("MissionGraphLens", () => {
     expect(document.querySelector(".mproc")).toBeNull();
 
     seedLiveTail(queryClient, [
+      // flow-action-guard:allow — a retired action, as an archive still holds it
       { ts: new Date().toISOString(), action: "telemetry.process", category: "telemetry", source: "process", payload: { cpu: 41, gpu: 72, mem: 0.5 } },
     ]);
 
@@ -468,6 +469,7 @@ describe("MissionGraphLens", () => {
     const { queryClient } = renderLens();
     await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
     seedLiveTail(queryClient, [
+      // flow-action-guard:allow — a retired action, as an archive still holds it
       { ts: new Date().toISOString(), action: "telemetry.process", category: "telemetry", source: "process", payload: { cpu: 41, gpu: 72 } },
     ]);
     await new Promise((r) => setTimeout(r, 50));
@@ -484,6 +486,7 @@ describe("MissionGraphLens", () => {
     await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
 
     seedLiveTail(queryClient, [
+      // flow-action-guard:allow — a retired action, as an archive still holds it
       { ts: new Date().toISOString(), action: "telemetry.process", category: "telemetry", source: "process", payload: { cpu: 10, gpu: 5 } },
     ]);
 
@@ -506,6 +509,7 @@ describe("MissionGraphLens", () => {
     const nowSpy = vi.spyOn(Date, "now").mockReturnValue(t0);
     try {
       seedLiveTail(queryClient, [
+        // flow-action-guard:allow — a retired action, as an archive still holds it
         { ts: new Date(t0).toISOString(), action: "telemetry.process", category: "telemetry", source: "process", payload: { cpu: 10, gpu: 5 } },
       ]);
       await waitFor(() => expect(document.querySelector(".mproc")).not.toBeNull());

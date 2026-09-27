@@ -1331,7 +1331,7 @@ mod tests {
             &day_file,
             &serde_json::json!({
                 "ts": "2023-11-14T10:00:00Z", "level": "info", "category": "work",
-                "tier": "local", "stage": "dispatch", "action": "dispatch start",
+                "tier": "local", "stage": "dispatch", "action": "dispatch.start",
                 "handle": "coder", "mission_id": "m9", "session_id": "s1",
                 "machine_uid": "mac-1"
             }),
@@ -1349,7 +1349,7 @@ mod tests {
             &day_file,
             &serde_json::json!({
                 "ts": "2023-11-14T10:00:02Z", "level": "info", "category": "work",
-                "tier": "local", "stage": "dispatch", "action": "dispatch start",
+                "tier": "local", "stage": "dispatch", "action": "dispatch.start",
                 "handle": "coder", "mission_id": "sibling-mission", "session_id": "sX"
             }),
         );

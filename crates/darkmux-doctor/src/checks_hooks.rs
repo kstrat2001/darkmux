@@ -806,6 +806,7 @@ mod tests {
     /// match, and says so.
     #[test]
     fn hooks_check_warns_on_a_rule_written_against_a_retired_spelling() {
+        // flow-action-guard:allow — an old spelling is this test's input
         let rule = rule_row("dispatch complete");
         assert_eq!(rule.status, Status::Warn, "{}", rule.message);
         assert!(rule.message.contains("OLD SPELLING"), "{}", rule.message);

@@ -1619,7 +1619,7 @@ mod tests {
     fn fold_finals_step_result_record_folds_total_tokens() {
         let step_ids = ids(&["example-judge-step"]);
         let rec = serde_json::json!({
-            "action": "step result",
+            "action": "step.result",
             "payload": { "step_id": "example-judge-step", "total_tokens": 4200 }
         });
         let out = fold_step_finals(vec![rec], &step_ids, "m-this");
@@ -1656,12 +1656,12 @@ mod tests {
         let step_ids = ids(&["s1"]);
         let recs = vec![
             serde_json::json!({
-                "action": "step result",
+                "action": "step.result",
                 "mission_id": "m-this",
                 "payload": { "step_id": "s1", "total_tokens": 4200 }
             }),
             serde_json::json!({
-                "action": "step timing",
+                "action": "step.timing",
                 "mission_id": "m-this",
                 "payload": { "step_id": "s1", "kind": "procedural.shell", "wall_ms": 42 }
             }),
@@ -1686,7 +1686,7 @@ mod tests {
         let step_ids = ids(&["example-judge-step"]);
         let foreign = |extra: serde_json::Value| {
             let mut rec = serde_json::json!({
-                "action": "step result",
+                "action": "step.result",
                 "mission_id": "m-other",
                 "payload": { "total_tokens": 4200 }
             });
@@ -1714,12 +1714,12 @@ mod tests {
         let step_ids = ids(&["s1", "s2"]);
         let recs = vec![
             serde_json::json!({
-                "action": "step result",
+                "action": "step.result",
                 "mission_id": "m-this",
                 "payload": { "step_id": "s1", "total_tokens": 100 }
             }),
             serde_json::json!({
-                "action": "step result",
+                "action": "step.result",
                 "payload": { "step_id": "s2", "total_tokens": 200 }
             }),
         ];
@@ -1810,9 +1810,9 @@ mod tests {
         // Correlation key 3 (handle == step id) + max wins across a re-run.
         let step_ids = ids(&["s1"]);
         let recs = vec![
-            serde_json::json!({ "action": "dispatch complete", "handle": "s1",
+            serde_json::json!({ "action": "dispatch.complete", "handle": "s1",
                                 "payload": { "total_tokens": 100, "total_turns": 2 } }),
-            serde_json::json!({ "action": "dispatch complete", "handle": "s1",
+            serde_json::json!({ "action": "dispatch.complete", "handle": "s1",
                                 "payload": { "total_tokens": 900, "total_turns": 5 } }),
         ];
         let out = fold_step_finals(recs, &step_ids, "m-this");
@@ -1824,7 +1824,7 @@ mod tests {
     fn fold_finals_endpoint_bearing_step_result_folds_its_total() {
         let step_ids = ids(&["s1"]);
         let rec = serde_json::json!({
-            "action": "step result",
+            "action": "step.result",
             "payload": { "step_id": "s1", "total_tokens": 50, "endpoint": "https://api.example/v1" }
         });
         let out = fold_step_finals(vec![rec], &step_ids, "m-this");
@@ -1836,7 +1836,7 @@ mod tests {
         let step_ids = ids(&["mine"]);
         let recs = vec![
             // Foreign step — not in this mission's set.
-            serde_json::json!({ "action": "step result",
+            serde_json::json!({ "action": "step.result",
                                 "payload": { "step_id": "someone-else", "total_tokens": 999 } }),
             // A RUNNING per-turn increment for my step — NOT a finalized total,
             // stays the SSE channel's job, must not fold here.
@@ -1858,7 +1858,7 @@ mod tests {
     fn fold_finals_review_vocabulary_tokens_payload_folds() {
         let step_ids = ids(&["example-judge-step"]);
         let rec = serde_json::json!({
-            "action": "step result",
+            "action": "step.result",
             "payload": { "step_id": "example-judge-step", "kind": "dispatch.map", "tokens": 4200 }
         });
         let out = fold_step_finals(vec![rec], &step_ids, "m-this");
@@ -1871,7 +1871,7 @@ mod tests {
     fn fold_finals_total_tokens_wins_over_tokens_fallback() {
         let step_ids = ids(&["s1"]);
         let rec = serde_json::json!({
-            "action": "step result",
+            "action": "step.result",
             "payload": { "step_id": "s1", "total_tokens": 900, "tokens": 100 }
         });
         let out = fold_step_finals(vec![rec], &step_ids, "m-this");
@@ -1885,7 +1885,7 @@ mod tests {
     fn fold_finals_nonterminal_matched_record_folds_nothing() {
         let step_ids = ids(&["s1"]);
         let rec = serde_json::json!({
-            "action": "dispatch start", "handle": "s1",
+            "action": "dispatch.start", "handle": "s1",
             "payload": { "step_id": "s1", "endpoint": "azure:example.azure.com/gpt" }
         });
         let out = fold_step_finals(vec![rec], &step_ids, "m-this");
@@ -1974,7 +1974,7 @@ mod tests {
     }
 
     fn complete_rec(step: &str, tokens: u64) -> serde_json::Value {
-        serde_json::json!({ "action": "dispatch complete", "handle": step,
+        serde_json::json!({ "action": "dispatch.complete", "handle": step,
                             "payload": { "total_tokens": tokens } })
     }
 
@@ -2028,8 +2028,10 @@ mod tests {
             write_day_file(tmp.path(), "2026-07-17", &[rec]);
             backfill_step_finals(tmp.path(), &step_ids, "m-this", created_ts)["s1"].tokens
         };
+        // flow-action-guard:allow-start — an old spelling is this test's input
         assert_eq!(fold("dispatch complete"), Some(4200));
         assert_eq!(fold("dispatch complete"), fold("dispatch.complete"));
+        // flow-action-guard:allow-end
     }
 
     #[test]
