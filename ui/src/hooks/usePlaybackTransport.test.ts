@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { renderHook, act } from "@testing-library/react";
-import { usePlaybackTransport, speedLabel, DEFAULT_SPEED } from "./usePlaybackTransport";
+import { usePlaybackTransport, speedLabel, DEFAULT_SPEED, PLAY_TICK_MS } from "./usePlaybackTransport";
+import { playbackClockOf } from "../lib/pageClockRate";
+import { pageNowOf } from "../lib/restHand";
 
 /** Cycle to 1h/s. The default is real time, so a test that plays a
  *  recorded hour to its end picks the fast speed explicitly. */
@@ -122,6 +124,68 @@ describe("usePlaybackTransport", () => {
     expect(result.current.tickWallMs).toBe(before);
     act(() => result.current.scrub(result.current.tMin + 5));
     expect(result.current.tickWallMs).toBe(performance.now());
+    act(() => {
+      vi.advanceTimersByTime(250);
+    });
+    act(() => result.current.rewind());
+    expect(result.current.tickWallMs).toBe(performance.now());
+  });
+
+  // (#2961 second review, C1) No committed render may carry a clock that
+  // predicts the page ahead of `t`: play must stamp in the same batch that
+  // sets `playing`, or one render pairs rate = speed with the stamp from
+  // before the pause, and an animation extrapolating from it jumps ahead by
+  // the pause length times the speed.
+  it("every render's clock is at most one tick ahead of t, across scrub, play, pause and resume", () => {
+    vi.useFakeTimers();
+    const leads: { lead: number; speed: number }[] = [];
+    const { result } = renderHook(() => {
+      const tr = usePlaybackTransport(DAY);
+      const clock = playbackClockOf(tr, tr.t);
+      if (clock) leads.push({ lead: pageNowOf(clock, performance.now(), 0) - tr.t, speed: tr.speed });
+      return tr;
+    });
+    act(() => result.current.cycleSpeed()); // 5s/s
+    expect(result.current.speed).toBe(5);
+    act(() => result.current.scrub(result.current.tMin + 5));
+    act(() => result.current.togglePlay());
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+    act(() => result.current.togglePlay()); // pause
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    act(() => result.current.togglePlay()); // resume
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+    expect(leads.length).toBeGreaterThan(5);
+    for (const { lead, speed } of leads) expect(lead).toBeLessThanOrEqual(PLAY_TICK_MS * speed + 1e-6);
+  });
+
+  // (#2961 second review, C2) Pausing mid-tick keeps what was on screen: the
+  // partial tick lands in `t`, so the paused playhead equals the page time an
+  // animation had already extrapolated to.
+  it("pausing mid-tick at 60x folds the partial tick into t, so the paused playhead is what was on screen", () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() => usePlaybackTransport(DAY));
+    for (let i = 0; i < 3; i++) act(() => result.current.cycleSpeed());
+    expect(result.current.speed).toBe(60);
+    act(() => result.current.rewind());
+    act(() => result.current.togglePlay());
+    act(() => {
+      vi.advanceTimersByTime(290); // two ticks, then 90 ms into the third
+    });
+    const onScreen = pageNowOf(playbackClockOf(result.current, result.current.t)!, performance.now(), 0);
+    expect(onScreen - result.current.t).toBeCloseTo(90 * 60, 6);
+    act(() => result.current.togglePlay()); // pause
+    expect(result.current.playing).toBe(false);
+    expect(result.current.t).toBeCloseTo(onScreen, 6);
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(pageNowOf(playbackClockOf(result.current, result.current.t)!, performance.now(), 0)).toBeCloseTo(onScreen, 6);
   });
 
   it("speed is a real multiplier: at 1h/s one real second replays one recorded hour, at 1m/s one minute", () => {

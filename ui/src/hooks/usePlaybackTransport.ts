@@ -338,7 +338,19 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null, focus: Pla
     setT(tMin);
   }, [tMin, bumpSeek]);
   const togglePlay = useCallback(() => {
+    // (#2961) Both branches stamp `tickWallMs` in the same batch as the
+    // change of `playing`, so no committed render pairs the new rate with a
+    // stale stamp (an animation extrapolating the playhead would jump by the
+    // pause length times the speed).
+    const now = performance.now();
     if (playing) {
+      // Pausing lands the partial tick in flight (the time since the last
+      // tick, at the current speed) in `t`, so the paused playhead is what
+      // an animation had already extrapolated to, not up to a tick behind it.
+      const since = lastTick.current !== null ? Math.max(0, now - lastTick.current) : 0;
+      if (since > 0) setT((prev) => Math.min((prev ?? tMax) + since * speed, tMax));
+      lastTick.current = null;
+      setTickWallMs(now);
       setPlaying(false);
       return;
     }
@@ -350,8 +362,10 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null, focus: Pla
       bumpSeek();
       setT(tMin);
     }
+    lastTick.current = now;
+    setTickWallMs(now);
     setPlaying(true);
-  }, [playing, playheadT, tMin, tMax, bumpSeek]);
+  }, [playing, playheadT, tMin, tMax, speed, bumpSeek]);
   const cycleSpeed = useCallback(() => setSpeed((s) => SPEEDS[(SPEEDS.indexOf(s) + 1) % SPEEDS.length]), []);
 
   const visibleCount = useMemo(() => (records ? records.filter((r) => !(T(r.ts) > playheadT)).length : 0), [records, playheadT]);
