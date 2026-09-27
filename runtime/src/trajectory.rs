@@ -258,6 +258,7 @@ impl Trajectory {
         tools: &[&str],
     ) {
         self.write_event(&serde_json::json!({
+            // flow-action-guard:allow — a trajectory event type, not a flow action
             "type": "dispatch.start",
             "ts": unix_ms(),
             "model": model,
@@ -497,6 +498,7 @@ impl Trajectory {
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null);
         self.write_event(&serde_json::json!({
+            // flow-action-guard:allow — a trajectory event type, not a flow action
             "type": "dispatch.checkpoint",
             "seq": seq,
             "ts": unix_ms(),
@@ -1011,6 +1013,7 @@ impl Trajectory {
         signal_kinds: &[&str],
     ) {
         self.write_event(&serde_json::json!({
+            // flow-action-guard:allow — a trajectory event type, not a flow action
             "type": "dispatch.feedback.injected",
             "seq": seq,
             "ts": unix_ms(),
@@ -1344,6 +1347,7 @@ impl Trajectory {
     /// terminal outcome + wall time.
     pub fn append_dispatch_complete(&mut self, result: &str, wall_ms: u128) {
         self.write_event(&serde_json::json!({
+            // flow-action-guard:allow — a trajectory event type, not a flow action
             "type": "dispatch.complete",
             "ts": unix_ms(),
             "result": result,
