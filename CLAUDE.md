@@ -307,8 +307,9 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    per kind, refused at every consuming scope and at no other), `every_shipped_template_file_
    has_no_unknown_keys` (everything under `templates/builtin/` plus both example files), and
    `tests/cli.rs`'s `an_unknown_key_in_a_user_file_is_refused_by_every_consuming_entry_point`.
-   A crawl's workspace spec has no fixed location, so it is refused where the launch loads
-   it (its plan step), which is after the mission is minted: the one known gap.
+   A crawl's workspace spec has no fixed location: the mission-launch preflight checks the
+   spec a launch input names (`"workspace": "{{<input>}}"` in a step) before minting, and
+   `WorkspaceSpec::load` checks it again in the plan step.
 8. **Work-unit vocabulary** — the four operator-visible work nouns each denote ONE grain,
    and every surface (CLI verb, hash route, wire type, UI label, doc) uses them at that grain
    (#1974). The containment ladder is **mission > phase > task > step > role execution**:

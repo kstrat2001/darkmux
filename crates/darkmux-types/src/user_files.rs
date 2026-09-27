@@ -60,8 +60,10 @@ pub enum UserFileKind {
     Rule,
     Workload,
     LabFixture,
-    /// A crawl's `--input` workspace spec: not at a fixed location, so it is
-    /// checked where the launch loads it rather than by a directory scan.
+    /// A crawl's workspace spec: not at a fixed location, so no directory
+    /// scan finds it; the mission-launch preflight checks the one a launch
+    /// input names (`"workspace": "{{<input>}}"` in a step), and
+    /// `WorkspaceSpec::load` checks it again where a plan step reads it.
     WorkspaceSpec,
 }
 
@@ -99,9 +101,9 @@ impl UserFileKind {
     /// the config, the registry and the role library (skills route roles);
     /// a mission launch adds mission configs and rules; a lab run adds
     /// workloads and fixtures. Fleet submission reads only `config.json`.
-    /// Crews and the workspace spec have no preflight scope: nothing that
-    /// starts work reads the crew library, and the workspace spec is refused
-    /// where the launch loads it.
+    /// Crews and the workspace spec have no scope here: nothing that starts
+    /// work reads the crew library, and the workspace spec is checked by the
+    /// mission launch itself, which knows which input names it.
     pub fn scopes(self) -> &'static [Scope] {
         const EVERY: &[Scope] = &[Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun, Scope::FleetSubmission];
         const DISPATCHING: &[Scope] = &[Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun];

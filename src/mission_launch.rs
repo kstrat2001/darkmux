@@ -464,6 +464,9 @@ pub fn launch(
     if !missing.is_empty() {
         bail!("{}", missing_inputs_message(config, &missing));
     }
+    // (review C5) A workspace spec is read by the plan steps, after the
+    // mission is minted; the one an input names is checked here first.
+    refuse_bad_workspace_specs(config, &collected)?;
 
     // (#2310 P4f review, CONSIDER 3) `mod_seat_profile` names the profile
     // `review`'s optional endpoint create-mod seat dispatches to. A name
@@ -2469,6 +2472,40 @@ pub(crate) fn collect_inputs(
 /// An `ignored: true` input is never defaulted — the ignored-input warning
 /// keys on `collected.contains_key`, so a default would make every launch
 /// warn about an input the operator never typed.
+/// The inputs a step's `workspace` names (`"workspace": "{{<input>}}"`, the
+/// shape every plan step in a shipped config uses).
+fn workspace_spec_inputs(config: &MissionConfig) -> std::collections::BTreeSet<String> {
+    let steps = config.phases.iter().flat_map(|p| &p.tasks).flat_map(|t| &t.steps);
+    steps
+        .filter_map(|s| s.config.get("workspace").and_then(serde_json::Value::as_str))
+        .filter_map(|v| v.strip_prefix("{{")?.strip_suffix("}}").map(|n| n.trim().to_string()))
+        .collect()
+}
+
+/// (review C5) The launch preflight's check of the workspace spec a launch
+/// input names: the same unknown-key/wrong-type gate as every user file
+/// (`darkmux_types::user_files`), refused before anything is minted. A
+/// value that is not a file (unset, or a spec the plan derives) is left to
+/// the plan step.
+fn refuse_bad_workspace_specs(config: &MissionConfig, collected: &BTreeMap<String, serde_json::Value>) -> Result<()> {
+    use darkmux_types::user_files::{check_path, no_retired, UserFileKind};
+    let mut refusal =
+        darkmux_types::config_enum::PreflightRefusal::none(darkmux_types::config_enum::Scope::MissionLaunch);
+    for name in workspace_spec_inputs(config) {
+        let Some(path) = collected.get(&name).and_then(serde_json::Value::as_str).map(std::path::PathBuf::from) else {
+            continue;
+        };
+        if path.is_file() {
+            refusal.files.extend(check_path::<darkmux_crew::workspace_spec::WorkspaceSpec>(
+                UserFileKind::WorkspaceSpec,
+                &path,
+                &no_retired,
+            ));
+        }
+    }
+    Ok(refusal.into_result()?)
+}
+
 pub(crate) fn apply_input_defaults(
     config: &MissionConfig,
     collected: &mut BTreeMap<String, serde_json::Value>,
@@ -6477,6 +6514,27 @@ mod tests {
             !warn.contains("derived instance id"),
             "the stale #1503 consequence must be gone: {warn}"
         );
+    }
+
+    /// (review C5) Both shipped plan configs name their spec through the
+    /// `workspace` input, and a clean spec passes the launch check.
+    #[test]
+    fn the_workspace_spec_input_is_found_and_a_clean_spec_passes() {
+        for id in ["crawl", "review"] {
+            let loaded = mission_config::load(id).unwrap();
+            let names = workspace_spec_inputs(&loaded.config);
+            assert_eq!(names.into_iter().collect::<Vec<_>>(), ["workspace"], "{id}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let spec = dir.path().join("spec.json");
+        std::fs::write(&spec, r#"{"name": "w", "sources": [{"id": "a", "path": "/x"}]}"#).unwrap();
+        let crawl = mission_config::load("crawl").unwrap();
+        let mut collected = BTreeMap::new();
+        collected.insert("workspace".to_string(), serde_json::json!(spec.to_str().unwrap()));
+        assert!(refuse_bad_workspace_specs(&crawl.config, &collected).is_ok());
+        std::fs::write(&spec, r#"{"name": "w", "sources": [{"id": "a", "path": "/x"}], "sourcs": []}"#).unwrap();
+        let err = refuse_bad_workspace_specs(&crawl.config, &collected).unwrap_err().to_string();
+        assert!(err.contains("unknown key `sourcs`"), "{err}");
     }
 
     /// A config that declares no inputs has nothing to suggest, so the

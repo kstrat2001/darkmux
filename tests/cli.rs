@@ -13109,3 +13109,25 @@ fn a_mistyped_value_in_a_user_file_is_refused_by_every_consuming_entry_point() {
         assert!(written.is_empty(), "{args:?} wrote state before refusing: {written:?}");
     }
 }
+
+/// (review C5) The workspace spec a launch input names is read by the plan
+/// steps, after the mission is minted. The launch preflight checks it first,
+/// so a bad spec refuses before anything exists (a dry run too).
+#[test]
+fn a_bad_workspace_spec_is_refused_before_the_launch_mints() {
+    let mut cmd = darkmux_std_cmd();
+    let home = darkmux_home_of(&cmd);
+    fs::create_dir_all(&home).unwrap();
+    let spec = home.join("spec.json");
+    fs::write(&spec, r#"{"name": "w", "sources": [{"id": "a", "path": "/x"}], "sourcs": []}"#).unwrap();
+    cmd.args(["mission", "launch", "crawl", "--param"]).arg(format!("workspace={}", spec.display())).arg("--dry-run");
+    let out = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("mission launch: refusing to start: bad config"), "{stderr}");
+    assert!(stderr.contains("workspace spec") && stderr.contains("unknown key `sourcs`: did you mean `sources`?"), "{stderr}");
+    let mut written = Vec::new();
+    collect_files(&home, &mut written);
+    written.retain(|p| p != &spec && !p.components().any(|c| c.as_os_str() == "liveness"));
+    assert!(written.is_empty(), "wrote state before refusing: {written:?}");
+}
