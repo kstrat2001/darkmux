@@ -39,6 +39,7 @@ use crate::plain_text_tool_calls::promote_plain_text_tool_calls;
 use crate::reasoning_loop::{ReasoningLoopDetector, ReasoningLoopSignal};
 use crate::stream_gate::{AbortReason, CutSource, StreamGate, StreamOutcome};
 use crate::tools::{dispatch, Tool};
+use darkmux_trajectory::MalformedReason;
 use crate::trajectory::Trajectory;
 
 // (#457) Cap on tool-call turns inside a single dispatch — REMOVED
@@ -353,9 +354,10 @@ pub enum TerminalReason {
     /// (#377) Operator-set bound was hit and the dispatch escalated
     /// out of local-tier rather than continuing. The bound + the
     /// specific condition that fired live in [`EscalationReason`].
-    /// Salvageable state (final messages, partial work, completed
-    /// turns) is in the rest of [`LoopOutcome`] so the frontier-tier
-    /// handoff skill can pick up where local-tier left off. KISS-
+    /// Salvageable state (final messages, partial work) is in the rest
+    /// of [`LoopOutcome`], and the completed turns are in the
+    /// trajectory, so the frontier-tier handoff skill can pick up where
+    /// local-tier left off. KISS-
     /// doubled (Beat 44 closure): bound the cost, don't optimize it.
     EscalationTriggered(EscalationReason),
 }
@@ -503,47 +505,6 @@ pub struct LoopOutcome {
     /// terminal response.
     pub messages: Vec<Message>,
 
-    /// Number of model turns the loop took (each chat-completion call).
-    pub turns: u32,
-
-    /// Total prompt tokens summed across all calls. Used for cumulative
-    /// cost reporting; per-call usage drives compaction triggering.
-    pub total_prompt_tokens: u32,
-
-    /// Total completion tokens summed across all calls.
-    pub total_completion_tokens: u32,
-
-    /// (#1444) Sum of every turn's `usage.reasoning_tokens` that actually
-    /// reported one. Whether that sum sits INSIDE `total_completion_tokens`
-    /// above or outside it is PROVIDER-SPECIFIC: OpenAI and Azure document
-    /// the subset relation, other OpenAI-compatible layers do not — see
-    /// `lmstudio::CompletionTokensDetails::reasoning_tokens`'s doc for the
-    /// recorded counter-evidence. Never derive one field from the other.
-    ///
-    /// `None` when NO turn this dispatch ever reported a reasoning-tokens
-    /// figure (a local LMStudio dispatch, or a hosted non-reasoning model)
-    /// — distinct from `Some(0)`, which means at least one turn reported
-    /// the field and its values summed to zero. A turn that omits the
-    /// field doesn't flip an already-`Some` total back to `None`; it just
-    /// doesn't contribute — same "distinguish absent from zero" contract
-    /// as `Usage::reasoning_tokens` itself.
-    pub total_reasoning_tokens: Option<u32>,
-
-    /// (#1444) Sum of every turn's `usage.cached_tokens` that actually
-    /// reported one. Same tri-state contract as `total_reasoning_tokens`
-    /// above — this is prompt-side cache hits, unrelated to
-    /// `total_completion_tokens`.
-    ///
-    /// (#1444 review) On a RESUMED dispatch both totals cover only the turns
-    /// AFTER the resume, while `total_completion_tokens`/
-    /// `total_prompt_tokens` are seeded from the checkpoint and cover the
-    /// whole dispatch (see the accumulator's own comment in
-    /// `run_with_sleeper`). The two are therefore not comparable on a
-    /// resumed run at all — quite apart from the provider question above.
-    /// Nothing pins that today; a consumer must not read a resumed
-    /// dispatch's reasoning total as whole-dispatch.
-    pub total_cached_tokens: Option<u32>,
-
     /// (#1221) The turn's ANSWER text when the loop exits with a checkpoint
     /// prefill still pending.
     ///
@@ -553,42 +514,9 @@ pub struct LoopOutcome {
     /// answer. The loop knows which region is the answer; nothing downstream
     /// should have to infer it from message order or delimiters.
     pub final_answer: Option<String>,
-    /// Number of compaction events that fired during the loop.
-    /// Phase 6: middle-replace via the companion compactor model.
-    pub compactions: u32,
-
-    /// (#2263) `turns` above is the WHOLE dispatch's turn count — on a
-    /// resume, seeded from the checkpoint, because that's what the loop's
-    /// own `max_turns` budget needs. This is THIS INVOCATION's own
-    /// contribution: `turns` minus whatever the checkpoint seeded, `0` on
-    /// a fresh dispatch's very first call. On a never-resumed dispatch
-    /// this equals `turns` exactly (the seed is `0`) — a consumer that
-    /// reads this field unconditionally gets the right number either way.
-    /// Attribute a resumed dispatch's cost to the model that actually ran
-    /// it by reading these `_this_run` fields, never the whole-dispatch
-    /// ones above, whenever the number is going next to a model name.
-    pub turns_this_run: u32,
-    /// (#2263) This invocation's own contribution to `total_prompt_tokens`
-    /// above. See `turns_this_run`'s doc for the seeded-vs-this-run
-    /// distinction.
-    pub total_prompt_tokens_this_run: u32,
-    /// (#2263) This invocation's own contribution to
-    /// `total_completion_tokens` above. See `turns_this_run`'s doc.
-    pub total_completion_tokens_this_run: u32,
-    /// (#2263) This invocation's own contribution to `compactions` above.
-    /// See `turns_this_run`'s doc.
-    pub compactions_this_run: u32,
-
-    /// (#2094) Sum of every inter-turn rest this dispatch took, in
-    /// milliseconds — the AFTER-clamp duration actually slept. `wall_ms`
-    /// (computed by the caller from `trajectory.elapsed_ms()`) INCLUDES
-    /// this time; a caller wanting model-only time subtracts `rest_ms`.
-    pub rest_ms: u64,
-    /// (#2094) How many inter-turn rests fired during this dispatch.
-    pub rests: u32,
     /// (#2094 finding 8) The POST-CLAMP `turn_delay_ms` this dispatch
     /// actually applied — i.e. `resolve_turn_delay_ms`'s output, not the
-    /// operator's raw configured value. Distinct from `rest_ms`/`rests`
+    /// operator's raw configured value. Distinct from the recorded rests
     /// (which describe what actually happened): this is the CADENCE the
     /// runtime resolved once at startup and would apply to every rest,
     /// known even on a dispatch that took zero rests (e.g. a single-turn
@@ -600,20 +528,6 @@ pub struct LoopOutcome {
     pub failed_to_run: Vec<FailedExec>,
 }
 
-/// (#2263) What THIS invocation itself contributed to a counter the loop's
-/// own budgets need seeded cumulatively across a resume (`turns`,
-/// `total_prompt_tokens`, `total_completion_tokens`, `compactions` — see
-/// their own `resume_seed`-seeding at the top of `run_with_sleeper`).
-/// `saturating_sub`, not `-`: the seed can only ever be `<=` the live
-/// counter in practice (counters only grow after a resume, never shrink),
-/// but a hand-edited or corrupt checkpoint claiming a seed larger than
-/// what has since accumulated must degrade to `0`, never panic on
-/// underflow. `seed == 0` (a fresh, never-resumed dispatch) makes this an
-/// identity — `this_run_delta(0, x) == x` — which is what keeps the
-/// never-resumed path reporting exactly what it always has.
-fn this_run_delta(seed: u32, cumulative: u32) -> u32 {
-    cumulative.saturating_sub(seed)
-}
 
 /// (#2094) Injectable sleep abstraction for the global inter-turn rest.
 /// `run()` uses [`RealSleeper`] in production; tests inject a recording
@@ -679,6 +593,11 @@ fn resolve_turn_delay_ms(configured_ms: u64, budget_secs: u64) -> (u64, Option<S
 /// cost) and never left untouched (that would let the rest silently
 /// consume inactivity budget as if the dispatch had gone quiet). Pure +
 /// testable; mirrors `resolve_turn_delay_ms`'s shape.
+/// A reported token count as the loop's `u32` counters hold it.
+fn saturating_u32(n: u64) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
 fn extend_deadline_by_rest(deadline: std::time::Instant, rest_ms: u64) -> std::time::Instant {
     deadline + std::time::Duration::from_millis(rest_ms)
 }
@@ -753,8 +672,6 @@ fn apply_pace_duty_cycle_delay(
     sleeper: &dyn TurnSleeper,
     trajectory: &mut Trajectory,
     turns: u32,
-    rest_ms: &mut u64,
-    rests: &mut u32,
     last_proof_of_work: &mut std::time::Instant,
     inactivity_soft_warning_fired_in_window: &mut bool,
 ) {
@@ -784,8 +701,6 @@ fn apply_pace_duty_cycle_delay(
     // a live viewer can show the rest while it happens.
     trajectory.append_paced_rest(turns, delay_ms, "thermal-duty-cycle", pace.state.as_deref());
     sleeper.sleep(delay_ms);
-    *rest_ms = rest_ms.saturating_add(delay_ms);
-    *rests = rests.saturating_add(1);
     (*last_proof_of_work, *inactivity_soft_warning_fired_in_window) =
         absorb_rest_into_soft_inactivity_clock(*last_proof_of_work, delay_ms);
 }
@@ -820,8 +735,6 @@ fn honor_pace_pause(
     sleeper: &dyn TurnSleeper,
     trajectory: &mut Trajectory,
     turns: u32,
-    rest_ms: &mut u64,
-    rests: &mut u32,
     last_proof_of_work: &mut std::time::Instant,
     inactivity_soft_warning_fired_in_window: &mut bool,
 ) {
@@ -833,8 +746,6 @@ fn honor_pace_pause(
         sleeper,
         trajectory,
         turns,
-        rest_ms,
-        rests,
         last_proof_of_work,
         inactivity_soft_warning_fired_in_window,
     );
@@ -861,8 +772,6 @@ fn honor_pace_pause(
         // (#2877) Recorded as each increment starts; see the duty-cycle rest.
         trajectory.append_paced_rest(turns, PACE_POLL_INCREMENT_MS, &reason, pace.state.as_deref());
         sleeper.sleep(PACE_POLL_INCREMENT_MS);
-        *rest_ms = rest_ms.saturating_add(PACE_POLL_INCREMENT_MS);
-        *rests = rests.saturating_add(1);
         (*last_proof_of_work, *inactivity_soft_warning_fired_in_window) =
             absorb_rest_into_soft_inactivity_clock(*last_proof_of_work, PACE_POLL_INCREMENT_MS);
     }
@@ -1689,22 +1598,6 @@ fn run_with_sleeper(
     // messages opened the ORIGINAL dispatch, so re-seeding from scratch
     // would duplicate them.
     let resume_seed = resume_from;
-    // (#2263) The checkpoint's own counters at the moment THIS invocation
-    // resumed from it — captured once, up front, so every `LoopOutcome`
-    // return site below can report what THIS invocation itself contributed
-    // (`this_run_delta`) alongside the whole-dispatch cumulative counters
-    // the loop's own budgets need seeded (`turns`/`total_prompt_tokens`/
-    // `total_completion_tokens`/`compactions` themselves — unchanged,
-    // still correctly seeded for `max_turns`/`max_cumulative_tokens`/
-    // `bail_after_compactions` gating). All four are `0` when this is a
-    // fresh (non-resumed) dispatch, which is exactly what makes the
-    // never-resumed case a no-op: `this_run_delta(0, x) == x`.
-    let resume_seed_turns = resume_seed.as_ref().map(|c| c.turns).unwrap_or(0);
-    let resume_seed_prompt_tokens =
-        resume_seed.as_ref().map(|c| c.total_prompt_tokens).unwrap_or(0);
-    let resume_seed_completion_tokens =
-        resume_seed.as_ref().map(|c| c.total_completion_tokens).unwrap_or(0);
-    let resume_seed_compactions = resume_seed.as_ref().map(|c| c.compactions).unwrap_or(0);
     let mut messages = match &resume_seed {
         Some(ckpt) => ckpt.messages.clone(),
         None => initial_messages,
@@ -1844,22 +1737,9 @@ fn run_with_sleeper(
     // (#2114) Resumed counters pick up exactly where the checkpoint left
     // off; a fresh dispatch starts all four at zero as before.
     let mut turns: u32 = resume_seed.as_ref().map(|c| c.turns).unwrap_or(0);
-    let mut total_prompt_tokens: u32 = resume_seed.as_ref().map(|c| c.total_prompt_tokens).unwrap_or(0);
     let mut total_completion_tokens: u32 =
         resume_seed.as_ref().map(|c| c.total_completion_tokens).unwrap_or(0);
-    // (#1444) NOT carried across a checkpoint resume — `RunCheckpoint`
-    // doesn't persist these (a deliberate scope cut, same shape as the
-    // detector-state/`checkpoints_used` reset `RunCheckpoint::
-    // pending_tool_calls`'s own doc already names: a resumed dispatch gets
-    // a clean slate here too). A resumed dispatch's reasoning/cached totals
-    // therefore cover only the turns AFTER the resume, not the whole
-    // dispatch. Always starts fresh regardless of `resume_seed`.
-    let mut total_reasoning_tokens: Option<u32> = None;
-    let mut total_cached_tokens: Option<u32> = None;
     let mut compactions: u32 = resume_seed.as_ref().map(|c| c.compactions).unwrap_or(0);
-    // (#2094) Sum + count of the inter-turn rests taken this dispatch.
-    let mut rest_ms: u64 = resume_seed.as_ref().map(|c| c.rest_ms).unwrap_or(0);
-    let mut rests: u32 = resume_seed.as_ref().map(|c| c.rests).unwrap_or(0);
     let mut latest_prompt_tokens: u32 = 0;
     // (#2792 round-4) The endpoint's own count paired with the characters it
     // counted, carried across turns so the next estimate only has to guess
@@ -2100,8 +1980,6 @@ fn run_with_sleeper(
                     sleeper,
                     trajectory,
                     turns,
-                    &mut rest_ms,
-                    &mut rests,
                     &mut last_proof_of_work,
                     &mut inactivity_soft_warning_fired_in_window,
                 );
@@ -2143,11 +2021,8 @@ fn run_with_sleeper(
                 role_id: role_id.to_string(),
                 messages: messages.clone(),
                 turns,
-                total_prompt_tokens,
                 total_completion_tokens,
                 compactions,
-                rest_ms,
-                rests,
                 pending_hand_back: None,
                 pending_tool_calls: if remaining_is_empty { None } else { Some(remaining) },
                 pending_tool_calls_seq_base: if remaining_is_empty { 0 } else { tool_seq + 1 },
@@ -2323,18 +2198,6 @@ fn run_with_sleeper(
                             EscalationReason::CompactionLimitReached,
                         ),
                         messages,
-                        turns,
-                        total_prompt_tokens,
-                        total_completion_tokens,
-                        total_reasoning_tokens,
-                        total_cached_tokens,
-                        compactions,
-                        turns_this_run: this_run_delta(resume_seed_turns, turns),
-                        total_prompt_tokens_this_run: this_run_delta(resume_seed_prompt_tokens, total_prompt_tokens),
-                        total_completion_tokens_this_run: this_run_delta(resume_seed_completion_tokens, total_completion_tokens),
-                        compactions_this_run: this_run_delta(resume_seed_compactions, compactions),
-                        rest_ms,
-                        rests,
                         turn_delay_effective_ms: turn_delay_ms,
                         failed_to_run: failed_to_run.clone(),
                     });
@@ -2459,18 +2322,6 @@ fn run_with_sleeper(
                     final_answer: turn.pending_answer(),
                     terminal_reason: TerminalReason::MaxTurns,
                     messages,
-                    turns,
-                    total_prompt_tokens,
-                    total_completion_tokens,
-                    total_reasoning_tokens,
-                    total_cached_tokens,
-                    compactions,
-                    turns_this_run: this_run_delta(resume_seed_turns, turns),
-                    total_prompt_tokens_this_run: this_run_delta(resume_seed_prompt_tokens, total_prompt_tokens),
-                    total_completion_tokens_this_run: this_run_delta(resume_seed_completion_tokens, total_completion_tokens),
-                    compactions_this_run: this_run_delta(resume_seed_compactions, compactions),
-                    rest_ms,
-                    rests,
                     turn_delay_effective_ms: turn_delay_ms,
                     failed_to_run: failed_to_run.clone(),
                 });
@@ -2502,18 +2353,6 @@ fn run_with_sleeper(
                         EscalationReason::CumulativeTokensExceeded,
                     ),
                     messages,
-                    turns,
-                    total_prompt_tokens,
-                    total_completion_tokens,
-                    total_reasoning_tokens,
-                    total_cached_tokens,
-                    compactions,
-                    turns_this_run: this_run_delta(resume_seed_turns, turns),
-                    total_prompt_tokens_this_run: this_run_delta(resume_seed_prompt_tokens, total_prompt_tokens),
-                    total_completion_tokens_this_run: this_run_delta(resume_seed_completion_tokens, total_completion_tokens),
-                    compactions_this_run: this_run_delta(resume_seed_compactions, compactions),
-                    rest_ms,
-                    rests,
                     turn_delay_effective_ms: turn_delay_ms,
                     failed_to_run: failed_to_run.clone(),
                 });
@@ -2537,8 +2376,6 @@ fn run_with_sleeper(
             // (#2877) Recorded as the rest starts; see the duty-cycle rest.
             trajectory.append_rest(turns, turn_delay_ms);
             sleeper.sleep(turn_delay_ms);
-            rest_ms = rest_ms.saturating_add(turn_delay_ms);
-            rests = rests.saturating_add(1);
             // (#2094 finding 3b) Harness-owned time, not a stall: EXTEND
             // (never reset to "now") the soft-inactivity clock by exactly
             // the rest duration, and clear the edge-trigger flag so a
@@ -2589,11 +2426,8 @@ fn run_with_sleeper(
                 role_id: role_id.to_string(),
                 messages: messages.clone(),
                 turns,
-                total_prompt_tokens,
                 total_completion_tokens,
                 compactions,
-                rest_ms,
-                rests,
                 pending_hand_back,
                 pending_tool_calls: None,
                 pending_tool_calls_seq_base: 0,
@@ -2640,8 +2474,6 @@ fn run_with_sleeper(
                 sleeper,
                 trajectory,
                 turns,
-                &mut rest_ms,
-                &mut rests,
                 &mut last_proof_of_work,
                 &mut inactivity_soft_warning_fired_in_window,
             );
@@ -3087,37 +2919,24 @@ fn run_with_sleeper(
         // purpose is to discriminate per-call-cap stalls (count ≈
         // MAX_TOKENS_PER_CALL) from context-overflow stalls, so the
         // distinction matters.
-        let this_turn_completion_tokens: Option<u32> =
-            response.usage.as_ref().map(|u| u.completion_tokens);
-        if let Some(usage) = &response.usage {
-            total_prompt_tokens = total_prompt_tokens.saturating_add(usage.prompt_tokens);
-            total_completion_tokens =
-                total_completion_tokens.saturating_add(usage.completion_tokens);
-            // (#1444) Tri-state accumulation: a turn that DOES report the
-            // field promotes the running total from `None` to `Some` (or
-            // adds to an already-`Some` total); a turn that omits it leaves
-            // the running total untouched — it never resets an already-seen
-            // total back to `None`, and it never promotes `None` to
-            // `Some(0)` on its own. So the FINAL total is `None` only if
-            // NO turn in the whole dispatch ever reported the field.
-            if let Some(rt) = usage.reasoning_tokens() {
-                total_reasoning_tokens = Some(total_reasoning_tokens.unwrap_or(0).saturating_add(rt));
-            }
-            if let Some(ct) = usage.cached_tokens() {
-                total_cached_tokens = Some(total_cached_tokens.unwrap_or(0).saturating_add(ct));
-            }
+        let usage = response.usage.as_ref();
+        let this_turn_completion_tokens: Option<u32> = usage.and_then(|u| u.completion).map(saturating_u32);
+        total_completion_tokens = total_completion_tokens.saturating_add(this_turn_completion_tokens.unwrap_or(0));
+        // The prompt count is the ground truth everything below calibrates
+        // against, so all of it needs one the endpoint actually reported.
+        if let Some(prompt_tokens) = usage.and_then(|u| u.prompt).map(saturating_u32) {
             // (#854) Track endpoint staleness BEFORE overwriting the running
             // value: a count identical to last turn (while the thread grew)
-            // means the endpoint froze it. Deliberately inside the `Some(usage)`
+            // means the endpoint froze it. Deliberately inside the reported-prompt
             // arm: a usage-less turn (e.g. streaming without include_usage) is
             // BRIDGED — it neither increments nor resets the counter, so it
             // can't corrupt the run of identical reports. Don't "fix" this into
             // an unconditional reset; that would zero the counter on every
             // usage-less turn and defeat the detector.
             frozen_prompt_turns =
-                update_frozen_prompt_turns(prev_prompt_tokens, usage.prompt_tokens, frozen_prompt_turns);
-            prev_prompt_tokens = Some(usage.prompt_tokens);
-            latest_prompt_tokens = usage.prompt_tokens;
+                update_frozen_prompt_turns(prev_prompt_tokens, prompt_tokens, frozen_prompt_turns);
+            prev_prompt_tokens = Some(prompt_tokens);
+            latest_prompt_tokens = prompt_tokens;
             // (#2792 round-4) Ground truth for the request that just went
             // out, paired with the characters it carried. Everything the
             // local ruler cannot see — the chat template's per-message
@@ -3126,7 +2945,7 @@ fn run_with_sleeper(
             // adds on top.
             prompt_anchor = Some(PromptAnchor {
                 chars: request_message_chars,
-                tokens: usage.prompt_tokens,
+                tokens: prompt_tokens,
             });
             // (#557 Slice-3) Per-turn context-window occupancy sawtooth.
             // Emitted ONCE per turn, only when a real `usage` was seen
@@ -3525,18 +3344,6 @@ fn run_with_sleeper(
                     final_answer: turn.pending_answer(),
                     terminal_reason: TerminalReason::Stop,
                     messages,
-                    turns,
-                    total_prompt_tokens,
-                    total_completion_tokens,
-                    total_reasoning_tokens,
-                    total_cached_tokens,
-                    compactions,
-                    turns_this_run: this_run_delta(resume_seed_turns, turns),
-                    total_prompt_tokens_this_run: this_run_delta(resume_seed_prompt_tokens, total_prompt_tokens),
-                    total_completion_tokens_this_run: this_run_delta(resume_seed_completion_tokens, total_completion_tokens),
-                    compactions_this_run: this_run_delta(resume_seed_compactions, compactions),
-                    rest_ms,
-                    rests,
                     turn_delay_effective_ms: turn_delay_ms,
                     failed_to_run: failed_to_run.clone(),
                 });
@@ -3614,18 +3421,6 @@ fn run_with_sleeper(
                                 EscalationReason::EmptyToolCallsExhausted,
                             ),
                             messages,
-                            turns,
-                            total_prompt_tokens,
-                            total_completion_tokens,
-                            total_reasoning_tokens,
-                            total_cached_tokens,
-                            compactions,
-                            turns_this_run: this_run_delta(resume_seed_turns, turns),
-                            total_prompt_tokens_this_run: this_run_delta(resume_seed_prompt_tokens, total_prompt_tokens),
-                            total_completion_tokens_this_run: this_run_delta(resume_seed_completion_tokens, total_completion_tokens),
-                            compactions_this_run: this_run_delta(resume_seed_compactions, compactions),
-                            rest_ms,
-                            rests,
                             turn_delay_effective_ms: turn_delay_ms,
                             failed_to_run: failed_to_run.clone(),
                         });
@@ -3709,7 +3504,7 @@ fn run_with_sleeper(
                     partition_by_plan(trajectory_tool_calls.clone().unwrap_or_default(), &call_plan);
                 handle_invalid_tool_calls(
                     &ungranted_calls,
-                    InvalidToolCallReason::RealToolNotGranted,
+                    MalformedReason::RealToolNotGranted,
                     &allowed_tool_names,
                     model,
                     turns,
@@ -3719,7 +3514,7 @@ fn run_with_sleeper(
                 );
                 handle_invalid_tool_calls(
                     &not_a_tool_calls,
-                    InvalidToolCallReason::NotATool,
+                    MalformedReason::NotATool,
                     &allowed_tool_names,
                     model,
                     turns,
@@ -3774,18 +3569,6 @@ fn run_with_sleeper(
                                 EscalationReason::MalformedToolCallsExhausted,
                             ),
                             messages,
-                            turns,
-                            total_prompt_tokens,
-                            total_completion_tokens,
-                            total_reasoning_tokens,
-                            total_cached_tokens,
-                            compactions,
-                            turns_this_run: this_run_delta(resume_seed_turns, turns),
-                            total_prompt_tokens_this_run: this_run_delta(resume_seed_prompt_tokens, total_prompt_tokens),
-                            total_completion_tokens_this_run: this_run_delta(resume_seed_completion_tokens, total_completion_tokens),
-                            compactions_this_run: this_run_delta(resume_seed_compactions, compactions),
-                            rest_ms,
-                            rests,
                             turn_delay_effective_ms: turn_delay_ms,
                             failed_to_run: failed_to_run.clone(),
                         });
@@ -4069,11 +3852,8 @@ fn run_with_sleeper(
                         role_id: role_id.to_string(),
                         messages: messages.clone(),
                         turns,
-                        total_prompt_tokens,
                         total_completion_tokens,
                         compactions,
-                        rest_ms,
-                        rests,
                         pending_hand_back: None,
                         pending_tool_calls: if remaining_is_empty { None } else { Some(remaining) },
                         // (#2114 finding N6) A fresh (non-resumed) turn's
@@ -4430,21 +4210,6 @@ fn run_with_sleeper(
                                     EscalationReason::CompactionUnproductive,
                                 ),
                                 messages,
-                                turns,
-                                total_prompt_tokens,
-                                total_completion_tokens,
-                                total_reasoning_tokens,
-                                total_cached_tokens,
-                                compactions,
-                                turns_this_run: this_run_delta(resume_seed_turns, turns),
-                                total_prompt_tokens_this_run: this_run_delta(
-                                    resume_seed_prompt_tokens, total_prompt_tokens),
-                                total_completion_tokens_this_run: this_run_delta(
-                                    resume_seed_completion_tokens, total_completion_tokens),
-                                compactions_this_run: this_run_delta(
-                                    resume_seed_compactions, compactions),
-                                rest_ms,
-                                rests,
                                 turn_delay_effective_ms: turn_delay_ms,
                                 failed_to_run: failed_to_run.clone(),
                             });
@@ -4504,18 +4269,6 @@ fn run_with_sleeper(
                                     EscalationReason::CompactionLimitReached,
                                 ),
                                 messages,
-                                turns,
-                                total_prompt_tokens,
-                                total_completion_tokens,
-                                total_reasoning_tokens,
-                                total_cached_tokens,
-                                compactions,
-                                turns_this_run: this_run_delta(resume_seed_turns, turns),
-                                total_prompt_tokens_this_run: this_run_delta(resume_seed_prompt_tokens, total_prompt_tokens),
-                                total_completion_tokens_this_run: this_run_delta(resume_seed_completion_tokens, total_completion_tokens),
-                                compactions_this_run: this_run_delta(resume_seed_compactions, compactions),
-                                rest_ms,
-                                rests,
                                 turn_delay_effective_ms: turn_delay_ms,
                                 failed_to_run: failed_to_run.clone(),
                             });
@@ -4580,8 +4333,7 @@ fn run_with_sleeper(
                 // CAP HIT, not a context overflow. `is_some_and` returned false
                 // for unknown, which routed straight into the hard `Err` below
                 // — and that `Err` kills the whole dispatch, so `main.rs` emits
-                // `result: "error"` with no envelope, no metrics and no
-                // deliverable. Every banked checkpoint goes with it.
+                // `result: "error"` with no deliverable. Every banked checkpoint goes with it.
                 //
                 // This matters far more on this branch than before it: the
                 // per-call bound dropped from 10,000 to a 1,000-token
@@ -4639,18 +4391,6 @@ fn run_with_sleeper(
                             EscalationReason::IntraTurnStallExhausted,
                         ),
                         messages,
-                        turns,
-                        total_prompt_tokens,
-                        total_completion_tokens,
-                        total_reasoning_tokens,
-                        total_cached_tokens,
-                        compactions,
-                        turns_this_run: this_run_delta(resume_seed_turns, turns),
-                        total_prompt_tokens_this_run: this_run_delta(resume_seed_prompt_tokens, total_prompt_tokens),
-                        total_completion_tokens_this_run: this_run_delta(resume_seed_completion_tokens, total_completion_tokens),
-                        compactions_this_run: this_run_delta(resume_seed_compactions, compactions),
-                        rest_ms,
-                        rests,
                         turn_delay_effective_ms: turn_delay_ms,
                         failed_to_run: failed_to_run.clone(),
                     });
@@ -4915,7 +4655,7 @@ fn run_with_sleeper(
                         crate::trajectory::CheckpointVerdict {
                             slice_tokens: this_turn_completion_tokens,
                             tail_ratio,
-                            verdict: if degenerate { "conclude" } else { "continue" },
+                            verdict: if degenerate { darkmux_trajectory::Verdict::Conclude } else { darkmux_trajectory::Verdict::Continue },
                             judged_chars: carried.chars().count(),
                             policy: policy.as_str(),
                             would_conclude,
@@ -4991,18 +4731,6 @@ fn run_with_sleeper(
                                 EscalationReason::IntraTurnStallExhausted,
                             ),
                             messages,
-                            turns,
-                            total_prompt_tokens,
-                            total_completion_tokens,
-                            total_reasoning_tokens,
-                            total_cached_tokens,
-                            compactions,
-                            turns_this_run: this_run_delta(resume_seed_turns, turns),
-                            total_prompt_tokens_this_run: this_run_delta(resume_seed_prompt_tokens, total_prompt_tokens),
-                            total_completion_tokens_this_run: this_run_delta(resume_seed_completion_tokens, total_completion_tokens),
-                            compactions_this_run: this_run_delta(resume_seed_compactions, compactions),
-                            rest_ms,
-                            rests,
                             turn_delay_effective_ms: turn_delay_ms,
                             failed_to_run: failed_to_run.clone(),
                         });
@@ -5056,18 +4784,6 @@ fn run_with_sleeper(
                                 EscalationReason::GenerationCheckpointBudgetExhausted,
                             ),
                             messages,
-                            turns,
-                            total_prompt_tokens,
-                            total_completion_tokens,
-                            total_reasoning_tokens,
-                            total_cached_tokens,
-                            compactions,
-                            turns_this_run: this_run_delta(resume_seed_turns, turns),
-                            total_prompt_tokens_this_run: this_run_delta(resume_seed_prompt_tokens, total_prompt_tokens),
-                            total_completion_tokens_this_run: this_run_delta(resume_seed_completion_tokens, total_completion_tokens),
-                            compactions_this_run: this_run_delta(resume_seed_compactions, compactions),
-                            rest_ms,
-                            rests,
                             turn_delay_effective_ms: turn_delay_ms,
                             failed_to_run: failed_to_run.clone(),
                         });
@@ -5274,8 +4990,7 @@ fn run_streaming_turn(
         // dispatch.
         //
         // The read timeout used to propagate as an `Err`, which `main.rs`
-        // turns into `result: "error"` with no envelope, no metrics and no
-        // deliverable — every banked checkpoint of a long turn lost because
+        // turns into `result: "error"` with no deliverable — every banked checkpoint of a long turn lost because
         // the endpoint stopped talking at the end of it. The runtime already
         // knows how to end a call and hand the accumulation back; this routes
         // an idle stream into that path instead of off a cliff.
@@ -5472,8 +5187,9 @@ fn run_streaming_turn(
     let chars_per_token = response
         .usage
         .as_ref()
-        .filter(|u| u.completion_tokens > 0 && tool_calls_count == 0)
-        .map(|u| gate.generated_chars() as f32 / u.completion_tokens as f32);
+        .and_then(|u| u.completion)
+        .filter(|c| *c > 0 && tool_calls_count == 0)
+        .map(|c| gate.generated_chars() as f32 / c as f32);
     trajectory.append_model_streaming_end(
         seq,
         partial_count,
@@ -5714,64 +5430,19 @@ fn sanitize_sample_name_prefix(raw: &str) -> String {
         .collect()
 }
 
-/// (#2169, merge-gate MUST FIX 1) WHY a structured tool call is not
-/// dispatchable. Pre-merge-gate this was a single "invalid name" bucket,
-/// collapsing two genuinely different causes:
-///
-/// - [`Self::NotATool`] — `name` doesn't match ANY tool darkmux knows how
-///   to execute (`tools::Tool::from_name` returns `None`). The Devstral-2 +
-///   LM Studio Mistral-parser shape this issue was filed for: model content
-///   sliced around a `[TOOL_CALLS]` marker becomes the `name`.
-/// - [`Self::RealToolNotGranted`] — `name` IS a real darkmux tool
-///   (`Tool::from_name` returns `Some`), just not one THIS dispatch's role
-///   was granted (`tools: &[Tool]`, the role's `tool_palette.allow` list —
-///   not in `allowed_tool_names`). A merge-gate probe against the pre-fix
-///   code (no partition at all) confirmed this is a REAL, independent,
-///   pre-existing hole, not a hypothetical: give a role only `[Tool::Read]`
-///   and hand the model a structured `bash` call, and `tools::dispatch`
-///   executed it anyway — it matches purely on `Tool::from_name`, with zero
-///   awareness of which tools the CURRENT dispatch's role was granted.
-///   `allowed_tool_names` was, pre-fix, consulted ONLY by the plain-text
-///   promoter (`plain_text_tool_calls.rs`) — never by the structured path.
-///   This partition closes that hole as a side effect (every reason now
-///   routes through the SAME `allowed_tool_names`-gated check before
-///   `tools::dispatch` is ever called).
-///
-/// Distinguishing the two matters for BOTH surfaces this feature touches:
-/// telling a model "you called a fictional tool" when it actually named
-/// `bash` correctly (just without the grant) is actively misleading, not
-/// corrective; and mixing a permission refusal into the "model produced
-/// garbage tool-call names" telemetry (`tool_calls_invalid_name`) this
-/// issue exists to surface would corrupt exactly the signal #2169 built
-/// the detector to produce.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InvalidToolCallReason {
-    NotATool,
-    RealToolNotGranted,
-}
-
-impl InvalidToolCallReason {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::NotATool => "not_a_tool",
-            Self::RealToolNotGranted => "real_tool_not_granted",
-        }
-    }
-}
-
 /// Classify why `name` fell outside `allowed_tool_names` — see
-/// [`InvalidToolCallReason`]'s doc for what distinguishes the two cases.
+/// [`MalformedReason`]'s doc for what distinguishes the two cases.
 /// (#479, #2963) Whether a tool call's arguments parse: the one predicate
 /// the salvage's `retain_well_formed_tool_calls` and `plan_tool_calls` share.
 fn tool_call_is_well_formed(tc: &ToolCall) -> bool {
     serde_json::from_str::<serde_json::Value>(&tc.function.arguments).is_ok()
 }
 
-fn classify_invalid_tool_call(name: &str) -> InvalidToolCallReason {
+fn classify_invalid_tool_call(name: &str) -> MalformedReason {
     if crate::tools::Tool::from_name(name).is_some() {
-        InvalidToolCallReason::RealToolNotGranted
+        MalformedReason::RealToolNotGranted
     } else {
-        InvalidToolCallReason::NotATool
+        MalformedReason::NotATool
     }
 }
 
@@ -5782,7 +5453,7 @@ fn classify_invalid_tool_call(name: &str) -> InvalidToolCallReason {
 /// before `model.completed` was written) rather than re-deciding by name,
 /// so the calls that run are exactly the ones that record left unmarked; a
 /// `Discarded` call (cut off mid-arguments by the #479 salvage) falls in no
-/// bucket. See [`InvalidToolCallReason`]'s doc for why buckets (2) and (3)
+/// bucket. See [`MalformedReason`]'s doc for why buckets (2) and (3)
 /// are kept separate rather than one "invalid" bucket.
 ///
 /// Structured `tool_calls` come back from LM Studio's API already
@@ -5867,8 +5538,8 @@ fn plan_tool_calls(
                 CallFate::Runs
             } else {
                 match classify_invalid_tool_call(&call.function.name) {
-                    InvalidToolCallReason::RealToolNotGranted => CallFate::NotGranted,
-                    InvalidToolCallReason::NotATool => CallFate::NotATool,
+                    MalformedReason::RealToolNotGranted => CallFate::NotGranted,
+                    MalformedReason::NotATool => CallFate::NotATool,
                 }
             }
         })
@@ -5877,7 +5548,7 @@ fn plan_tool_calls(
 
 /// Handle ONE reason-bucket of a turn's non-dispatchable tool calls
 /// (#2169): never dispatch them, coalesce into ONE feedback message worded
-/// SPECIFICALLY for `reason` (see [`InvalidToolCallReason`]'s doc — the two
+/// SPECIFICALLY for `reason` (see [`MalformedReason`]'s doc — the two
 /// reasons need different wording, not just a different counter), emit ONE
 /// `dispatch.tool.malformed_names` trajectory event carrying `reason` +
 /// this bucket's own count + a sample name, and satisfy the OpenAI
@@ -5893,7 +5564,7 @@ fn plan_tool_calls(
 #[allow(clippy::too_many_arguments)]
 fn handle_invalid_tool_calls(
     calls: &[ToolCall],
-    reason: InvalidToolCallReason,
+    reason: MalformedReason,
     allowed_tool_names: &HashSet<String>,
     model: &str,
     turns: u32,
@@ -5909,22 +5580,21 @@ fn handle_invalid_tool_calls(
     // trajectory event's `count` already names how many there were.
     let sample_name_prefix = sanitize_sample_name_prefix(&calls[0].function.name);
     eprintln!(
-        "darkmux-runtime: ⚠ {reason_str} — {count} structured tool call(s) this turn \
+        "darkmux-runtime: ⚠ {reason:?} — {count} structured tool call(s) this turn \
          (model={model}, sample=\"{sample_name_prefix}\"); none dispatched, coalesced \
          into one feedback message. (#2169)",
-        reason_str = reason.as_str(),
     );
-    trajectory.append_malformed_tool_names(turns, count, model, &sample_name_prefix, reason.as_str());
+    trajectory.append_malformed_tool_names(turns, count, model, &sample_name_prefix, reason);
 
     let mut tool_names: Vec<&str> = allowed_tool_names.iter().map(String::as_str).collect();
     tool_names.sort_unstable();
     let tools_str = tool_names.join(", ");
 
     match reason {
-        InvalidToolCallReason::NotATool => {
+        MalformedReason::NotATool => {
             feedback_injector.queue_malformed_tool_names(count as usize, &tools_str);
         }
-        InvalidToolCallReason::RealToolNotGranted => {
+        MalformedReason::RealToolNotGranted => {
             // Unlike the not-a-tool case, these names ARE meaningful — the
             // model named a real tool, just one it doesn't have. Naming
             // which one(s) in the feedback is the corrective signal.
@@ -6604,8 +6274,6 @@ mod tests {
         let mut reader = pace::PaceReader::new();
         let sleeper = DutyCycleSleeper::default();
         let mut traj = Trajectory::open(tmp.path());
-        let mut rest_ms = 0u64;
-        let mut rests = 0u32;
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
 
@@ -6617,15 +6285,13 @@ mod tests {
             &sleeper,
             &mut traj,
             3,
-            &mut rest_ms,
-            &mut rests,
             &mut last_pow,
             &mut soft_fired,
         );
 
         assert_eq!(sleeper.calls.borrow().as_slice(), &[15_000], "sleeps exactly the host-set duration");
-        assert_eq!(rest_ms, 15_000);
-        assert_eq!(rests, 1);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_ms(), 15_000);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_count(), 1);
     }
 
     /// (#2877) A rest is recorded when it STARTS, so a live viewer can show
@@ -6663,12 +6329,11 @@ mod tests {
             flip_pause_off: None,
         };
         let mut traj = Trajectory::open(tmp.path());
-        let (mut rest_ms, mut rests) = (0u64, 0u32);
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
         apply_pace_duty_cycle_delay(
             &mut reader, tmp.path(), 900_000, 600, &sleeper, &mut traj, 3,
-            &mut rest_ms, &mut rests, &mut last_pow, &mut soft_fired,
+            &mut last_pow, &mut soft_fired,
         );
         assert_eq!(sleeper.rests_seen_at_sleep.borrow().as_slice(), &[1], "the rest event exists when the sleep begins");
     }
@@ -6684,13 +6349,12 @@ mod tests {
             flip_pause_off: Some(tmp.path().to_path_buf()),
         };
         let mut traj = Trajectory::open(tmp.path());
-        let (mut rest_ms, mut rests) = (0u64, 0u32);
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
         let mut expiry_warned = false;
         honor_pace_pause(
             &mut reader, tmp.path(), 900_000, 600, &mut expiry_warned, &sleeper, &mut traj, 3,
-            &mut rest_ms, &mut rests, &mut last_pow, &mut soft_fired,
+            &mut last_pow, &mut soft_fired,
         );
         assert_eq!(sleeper.rests_seen_at_sleep.borrow().as_slice(), &[1], "the poll increment's rest event exists when its sleep begins");
     }
@@ -6712,8 +6376,6 @@ mod tests {
         let mut reader = pace::PaceReader::new();
         let sleeper = DutyCycleSleeper::default();
         let mut traj = Trajectory::open(tmp.path());
-        let mut rest_ms = 0u64;
-        let mut rests = 0u32;
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
         let mut expiry_warned = false;
@@ -6727,8 +6389,6 @@ mod tests {
             &sleeper,
             &mut traj,
             3,
-            &mut rest_ms,
-            &mut rests,
             &mut last_pow,
             &mut soft_fired,
         );
@@ -6739,8 +6399,8 @@ mod tests {
             "the turn boundary must actually rest for the host-set duty-cycle delay — \
              this is tier 2's only mechanism"
         );
-        assert_eq!(rest_ms, 15_000);
-        assert_eq!(rests, 1);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_ms(), 15_000);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_count(), 1);
         // `pause: false` means the pause loop itself breaks immediately, so
         // the 15s above is the duty-cycle prelude and nothing else.
         assert_eq!(sleeper.calls.borrow().len(), 1, "no 2s pause-poll increments on a non-paused file");
@@ -6756,8 +6416,6 @@ mod tests {
         let mut reader = pace::PaceReader::new();
         let sleeper = DutyCycleSleeper::default();
         let mut traj = Trajectory::open(tmp.path());
-        let mut rest_ms = 0u64;
-        let mut rests = 0u32;
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
         let mut expiry_warned = false;
@@ -6771,15 +6429,13 @@ mod tests {
             &sleeper,
             &mut traj,
             3,
-            &mut rest_ms,
-            &mut rests,
             &mut last_pow,
             &mut soft_fired,
         );
 
         assert!(sleeper.calls.borrow().is_empty(), "nothing to duty-cycle, nothing to wait for");
-        assert_eq!(rest_ms, 0);
-        assert_eq!(rests, 0);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_ms(), 0);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_count(), 0);
     }
 
     #[test]
@@ -6792,8 +6448,6 @@ mod tests {
         let mut reader = pace::PaceReader::new();
         let sleeper = DutyCycleSleeper::default();
         let mut traj = Trajectory::open(tmp.path());
-        let mut rest_ms = 0u64;
-        let mut rests = 0u32;
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
 
@@ -6805,14 +6459,12 @@ mod tests {
             &sleeper,
             &mut traj,
             1,
-            &mut rest_ms,
-            &mut rests,
             &mut last_pow,
             &mut soft_fired,
         );
 
         assert_eq!(sleeper.calls.borrow().as_slice(), &[5_000], "clamped to half the 10s budget");
-        assert_eq!(rest_ms, 5_000);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_ms(), 5_000);
     }
 
     #[test]
@@ -6825,8 +6477,6 @@ mod tests {
         let mut reader = pace::PaceReader::new();
         let sleeper = DutyCycleSleeper::default();
         let mut traj = Trajectory::open(tmp.path());
-        let mut rest_ms = 0u64;
-        let mut rests = 0u32;
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
 
@@ -6838,15 +6488,13 @@ mod tests {
             &sleeper,
             &mut traj,
             1,
-            &mut rest_ms,
-            &mut rests,
             &mut last_pow,
             &mut soft_fired,
         );
 
         assert!(sleeper.calls.borrow().is_empty(), "a paused pace file must never trigger a duty-cycle sleep");
-        assert_eq!(rest_ms, 0);
-        assert_eq!(rests, 0);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_ms(), 0);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_count(), 0);
     }
 
     #[test]
@@ -6856,8 +6504,6 @@ mod tests {
         let mut reader = pace::PaceReader::new();
         let sleeper = DutyCycleSleeper::default();
         let mut traj = Trajectory::open(tmp.path());
-        let mut rest_ms = 0u64;
-        let mut rests = 0u32;
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
 
@@ -6869,8 +6515,6 @@ mod tests {
             &sleeper,
             &mut traj,
             1,
-            &mut rest_ms,
-            &mut rests,
             &mut last_pow,
             &mut soft_fired,
         );
@@ -6888,8 +6532,6 @@ mod tests {
         let mut reader = pace::PaceReader::new();
         let sleeper = DutyCycleSleeper::default();
         let mut traj = Trajectory::open(tmp.path());
-        let mut rest_ms = 0u64;
-        let mut rests = 0u32;
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
 
@@ -6901,14 +6543,12 @@ mod tests {
             &sleeper,
             &mut traj,
             1,
-            &mut rest_ms,
-            &mut rests,
             &mut last_pow,
             &mut soft_fired,
         );
 
         assert!(sleeper.calls.borrow().is_empty());
-        assert_eq!(rests, 0);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_count(), 0);
     }
 
     #[test]
@@ -6924,8 +6564,6 @@ mod tests {
         let mut reader = pace::PaceReader::new();
         let sleeper = DutyCycleSleeper::default();
         let mut traj = Trajectory::open(tmp.path());
-        let mut rest_ms = 0u64;
-        let mut rests = 0u32;
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
 
@@ -6937,8 +6575,6 @@ mod tests {
             &sleeper,
             &mut traj,
             1,
-            &mut rest_ms,
-            &mut rests,
             &mut last_pow,
             &mut soft_fired,
         );
@@ -6983,8 +6619,6 @@ mod tests {
         let mut reader = pace::PaceReader::new();
         let sleeper = DutyCycleSleeper::default();
         let mut traj = Trajectory::open(tmp.path());
-        let mut rest_ms = 0u64;
-        let mut rests = 0u32;
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
 
@@ -6997,8 +6631,6 @@ mod tests {
                 &sleeper,
                 &mut traj,
                 turn,
-                &mut rest_ms,
-                &mut rests,
                 &mut last_pow,
                 &mut soft_fired,
             );
@@ -7011,8 +6643,8 @@ mod tests {
              abandoned instruction — not honored at every turn boundary for the rest of the \
              dispatch"
         );
-        assert_eq!(rest_ms, 15_000);
-        assert_eq!(rests, 1);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_ms(), 15_000);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_count(), 1);
     }
 
     /// The inverse of the test above, so the guard cannot be "fixed" by
@@ -7031,8 +6663,6 @@ mod tests {
         let mut reader = pace::PaceReader::new();
         let sleeper = DutyCycleSleeper::default();
         let mut traj = Trajectory::open(tmp.path());
-        let mut rest_ms = 0u64;
-        let mut rests = 0u32;
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
 
@@ -7045,8 +6675,6 @@ mod tests {
                 &sleeper,
                 &mut traj,
                 turn,
-                &mut rest_ms,
-                &mut rests,
                 &mut last_pow,
                 &mut soft_fired,
             );
@@ -7070,8 +6698,6 @@ mod tests {
         let mut reader = pace::PaceReader::new();
         let sleeper = DutyCycleSleeper::default();
         let mut traj = Trajectory::open(tmp.path());
-        let mut rest_ms = 0u64;
-        let mut rests = 0u32;
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
 
@@ -7083,8 +6709,6 @@ mod tests {
             &sleeper,
             &mut traj,
             7,
-            &mut rest_ms,
-            &mut rests,
             &mut last_pow,
             &mut soft_fired,
         );
@@ -7265,14 +6889,14 @@ mod tests {
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
 
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
-        assert_eq!(outcome.turns, 3, "sanity: three logical turns");
+        assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 3, "sanity: three logical turns");
         assert_eq!(
             sleeper.calls.borrow().as_slice(),
             [500, 500],
             "rests fire BETWEEN turns only — 2 rests for 3 turns, never before the first"
         );
-        assert_eq!(outcome.rest_ms, 1000, "LoopOutcome carries the same sum the sleeper saw");
-        assert_eq!(outcome.rests, 2);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_ms(), 1000, "LoopOutcome carries the same sum the sleeper saw");
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_count(), 2);
         assert_eq!(
             outcome.turn_delay_effective_ms, 500,
             "(#2094 finding 8) the POST-CLAMP cadence actually applied, not the raw config"
@@ -7312,13 +6936,13 @@ mod tests {
             rests_seen_at_sleep: Default::default(),
             flip_pause_off: None,
         };
-        let outcome = run_with_sleeper(
+        run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
             Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
         )
         .expect("3-turn scripted dispatch returns Ok");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
-        assert_eq!(outcome.rests, 2);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_count(), 2);
         assert_eq!(
             sleeper.rests_seen_at_sleep.borrow().as_slice(),
             &[1, 2],
@@ -7382,7 +7006,7 @@ mod tests {
 
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
         assert_eq!(
-            outcome.turns, 3,
+            crate::trajectory::recorded(tmp.path()).turns(), 3,
             "the dispatch still completes normally once the pause lifts"
         );
         assert_eq!(
@@ -7464,7 +7088,7 @@ mod tests {
 
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
         assert_eq!(
-            outcome.turns, 3,
+            crate::trajectory::recorded(tmp.path()).turns(), 3,
             "a duty cycle is PACING, not a stop: every turn still runs, just slower"
         );
         let calls = sleeper.calls.borrow().clone();
@@ -7507,7 +7131,7 @@ mod tests {
         // honored exactly as a thermal one is — and, decisively, the
         // dispatch must still run to completion with the SAME turn count
         // once the pause lifts. "Nothing lost" is not a claim here; it is
-        // `outcome.turns == 3`.
+        // three recorded turns.
         use crate::lmstudio::{LmStudioClient, Message};
         use crate::tools::Tool;
         use crate::trajectory::Trajectory;
@@ -7548,7 +7172,7 @@ mod tests {
 
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
         assert_eq!(
-            outcome.turns, 3,
+            crate::trajectory::recorded(tmp.path()).turns(), 3,
             "a battery pause is a REST, not a stop: every turn the dispatch would have run still \
              runs once the pause lifts"
         );
@@ -7670,11 +7294,8 @@ mod tests {
                 Message::tool_result("call_1", "read", "<turn 1 file contents>"),
             ],
             turns: 1,
-            total_prompt_tokens: 100,
             total_completion_tokens: 20,
             compactions: 0,
-            rest_ms: 0,
-            rests: 0,
             pending_hand_back: None,
             pending_tool_calls: None,
             pending_tool_calls_seq_base: 0,
@@ -7757,7 +7378,7 @@ mod tests {
         .expect("2-turn scripted dispatch (tool call, then stop) returns Ok");
 
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
-        assert_eq!(outcome.turns, 2, "sanity: a tool-call turn followed by a stop turn");
+        assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 2, "sanity: a tool-call turn followed by a stop turn");
 
         let ckpt = checkpoint::read_checkpoint(&checkpoint::checkpoint_file_path(tmp.path()))
             .expect("checkpoint written at the turn-1/turn-2 boundary, before turn 2's request");
@@ -7850,17 +7471,15 @@ mod tests {
                 Message::tool_result("call_1", "read", "<turn 2 file contents>"),
             ],
             turns: 2,
-            total_prompt_tokens: 220,
             total_completion_tokens: 40,
             compactions: 0,
-            rest_ms: 0,
-            rests: 0,
             pending_hand_back: None,
             pending_tool_calls: None,
             pending_tool_calls_seq_base: 0,
             written_at_unix_ms: checkpoint::unix_ms(),
         };
 
+        let seed_turns = resume_checkpoint.turns;
         let outcome = run_with_sleeper(
             &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
             Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None,
@@ -7869,62 +7488,92 @@ mod tests {
         .expect("resumed dispatch returns Ok");
 
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
-        assert_eq!(
-            outcome.turns, 3,
-            "resumed at turns=2; one more call brings it to turn 3 and the loop stops"
-        );
         turn1_mock.assert_hits(0);
         turn2_mock.assert_hits(0);
         turn3_mock.assert_hits(1);
 
-        // (#2263) `turns`/`total_prompt_tokens`/`total_completion_tokens`/
-        // `compactions` are the WHOLE dispatch's cumulative counters,
-        // correctly seeded from the checkpoint for the loop's own budget
-        // math — that part was never broken. The bug was reporting THOSE
-        // seeded numbers as if they were this invocation's own work. The
-        // `_this_run` counterparts must report ONLY what turn 3 (the one
-        // real call this resumed process made) actually cost: turn 3's
-        // own usage (140 prompt + 5 completion from `chat_response_json`
-        // above), not the checkpoint's 220+40 plus turn 3's usage.
-        assert_eq!(
-            outcome.turns_this_run, 1,
-            "this invocation made exactly ONE call (turn 3) — not the whole \
-             dispatch's 3 turns, 2 of which belong to the resumed-from checkpoint"
-        );
-        assert_eq!(
-            outcome.total_prompt_tokens_this_run, 140,
-            "this invocation's own prompt tokens (turn 3 only) — the checkpoint's \
-             seeded 220 must NOT be added in, or this run's cost gets misattributed \
-             to whatever model made this resumed call"
-        );
-        assert_eq!(
-            outcome.total_completion_tokens_this_run, 5,
-            "this invocation's own completion tokens (turn 3 only), not the \
-             checkpoint's seeded 40 folded in"
-        );
-        assert_eq!(
-            outcome.compactions_this_run, 0,
-            "no compaction fired in this invocation (cfg is never_compact); must \
-             report 0, not whatever the checkpoint happened to seed"
-        );
-        // Sanity: the WHOLE-dispatch cumulative fields are unchanged by this
-        // fix — still seeded + accumulated, still what the loop's own
-        // max_turns/max_cumulative_tokens/bail_after_compactions budgets need.
-        assert_eq!(outcome.total_prompt_tokens, 360, "220 seeded + 140 this run");
-        assert_eq!(outcome.total_completion_tokens, 45, "40 seeded + 5 this run");
-        assert_eq!(outcome.compactions, 0);
+        // (#2263) What THIS invocation recorded is turn 3 alone: one call,
+        // turn 3's own usage (140 prompt + 5 completion from
+        // `chat_response_json` above), never the checkpoint's 220+40 folded
+        // in, or this run's cost gets misattributed to whatever model made
+        // the resumed call.
+        let this_run = crate::trajectory::recorded(tmp.path());
+        assert_eq!(this_run.turns(), 1, "this invocation made exactly ONE call (turn 3)");
+        assert_eq!(this_run.tokens.prompt, 140);
+        assert_eq!(this_run.tokens.completion, 5);
+        assert_eq!(this_run.compactions(), 0, "cfg is never_compact");
+        // The WHOLE dispatch's turn count, by the host's one rule (the loop
+        // writes no checkpoint after its terminal turn, so the one it resumed
+        // from is the seed, not the answer): turn 3, the turn it stopped on.
+        let seed = darkmux_trajectory::CheckpointCounts { turns: seed_turns, compactions: 0 };
+        assert_eq!(seed.cumulative_turns(&this_run), 3);
     }
 
-    /// (#2263) The inverted case: a dispatch that was NEVER resumed must
-    /// report IDENTICAL numbers in both the cumulative and `_this_run`
-    /// fields — the fix must not shift the ordinary (non-resumed) path's
-    /// output at all. `resume_from: None` below is the only difference
-    /// from the resumed scenario above; a 2-turn scripted dispatch (tool
-    /// call, then stop) matches `checkpoint_written_after_turn_1_has_
-    /// matching_message_count`'s own fixture shape.
+    /// (#2263) A resume from a #1221 hand-back checkpoint CONTINUES the
+    /// checkpoint's turn rather than starting the next: its call is recorded
+    /// under `seq` = the checkpoint's turn count, and the whole dispatch has
+    /// made that many turns, not one more.
     #[test]
     #[serial_test::serial]
-    fn a_never_resumed_dispatch_reports_the_same_numbers_in_both_fields() {
+    fn a_hand_back_resume_continues_the_checkpoints_turn() {
+        use crate::lmstudio::{LmStudioClient, Message};
+        use crate::trajectory::Trajectory;
+
+        std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        std::env::remove_var("DARKMUX_TURN_DELAY_MS");
+
+        let server = crate::test_support::GuardedMockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 140, 5));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("resume-hand-back").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let cfg = compaction::CompactionConfig::never_compact();
+        let resume_checkpoint = checkpoint::RunCheckpoint {
+            schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+            role_id: "test-role".to_string(),
+            messages: vec![Message::system("test"), Message::user("think it through")],
+            turns: 3,
+            total_completion_tokens: 60,
+            compactions: 0,
+            pending_hand_back: Some(checkpoint::PendingHandBack {
+                thought: "working through the first half".to_string(),
+                answer: String::new(),
+                think_closed: false,
+                is_reasoning: true,
+                carries_own_opener: false,
+            }),
+            pending_tool_calls: None,
+            pending_tool_calls_seq_base: 0,
+            written_at_unix_ms: checkpoint::unix_ms(),
+        };
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", vec![], &[], &mut traj, false, &cfg,
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None,
+            tmp.path(), "test-role", Some(resume_checkpoint), &RealSleeper,
+        )
+        .expect("a hand-back resume returns Ok");
+        drop(traj);
+
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+        let this_run = crate::trajectory::recorded(tmp.path());
+        assert_eq!(this_run.turn_detail.keys().copied().collect::<Vec<_>>(), vec![3], "the continued turn keeps its seq");
+        let seed = darkmux_trajectory::CheckpointCounts { turns: 3, compactions: 0 };
+        assert_eq!(seed.cumulative_turns(&this_run), 3, "three turns, not four");
+    }
+
+    /// (#2263) The inverted case: a dispatch that was NEVER resumed records
+    /// every turn it ran and every call's usage. `resume_from: None` below is
+    /// the only difference from the resumed scenario above; a 2-turn
+    /// scripted dispatch (tool call, then stop) matches
+    /// `checkpoint_written_after_turn_1_has_matching_message_count`'s own
+    /// fixture shape.
+    #[test]
+    #[serial_test::serial]
+    fn a_never_resumed_dispatch_records_every_turn_and_its_usage() {
         use crate::lmstudio::{LmStudioClient, Message};
         use crate::tools::Tool;
         use crate::trajectory::Trajectory;
@@ -7969,19 +7618,56 @@ mod tests {
         .expect("2-turn scripted dispatch (tool call, then stop) returns Ok");
 
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
-        assert_eq!(outcome.turns, 2);
-        assert_eq!(
-            outcome.turns_this_run, outcome.turns,
-            "never resumed — this_run must equal the whole-dispatch count exactly"
-        );
-        assert_eq!(outcome.total_prompt_tokens_this_run, outcome.total_prompt_tokens);
-        assert_eq!(outcome.total_completion_tokens_this_run, outcome.total_completion_tokens);
-        assert_eq!(outcome.compactions_this_run, outcome.compactions);
-        // Pin the actual numbers too, not just the equality — a bug that
-        // zeroed BOTH sides identically would still pass an equality-only
-        // assertion.
-        assert_eq!(outcome.total_prompt_tokens, 220, "100 (turn 1) + 120 (turn 2)");
-        assert_eq!(outcome.total_completion_tokens, 25, "20 (turn 1) + 5 (turn 2)");
+        let recorded = crate::trajectory::recorded(tmp.path());
+        assert_eq!(recorded.turns(), 2);
+        assert_eq!(recorded.compactions(), 0);
+        assert_eq!(recorded.tokens.prompt, 220, "100 (turn 1) + 120 (turn 2)");
+        assert_eq!(recorded.tokens.completion, 25, "20 (turn 1) + 5 (turn 2)");
+    }
+
+    /// A reply whose `usage` reports a completion count but no prompt count
+    /// (the shared provider parse keeps what was sent) still finishes its
+    /// turn, counts the completion it reported, and calibrates nothing on a
+    /// prompt count it never received: no context-window event, no zero.
+    #[test]
+    #[serial_test::serial]
+    fn a_reply_without_a_prompt_count_counts_what_it_reported_and_calibrates_nothing() {
+        use crate::lmstudio::{LmStudioClient, Message};
+        use crate::trajectory::Trajectory;
+
+        std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        std::env::remove_var("DARKMUX_TURN_DELAY_MS");
+
+        let server = crate::test_support::GuardedMockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(serde_json::json!({
+                "id": "chatcmpl-1",
+                "choices": [{ "index": 0, "message": { "role": "assistant", "content": "done" }, "finish_reason": "stop" }],
+                "usage": { "completion_tokens": 5 },
+            }));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("usage-no-prompt").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("hi")];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &[], &mut traj, false, &cfg,
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None,
+            tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("a short usage block does not fail the turn");
+        drop(traj);
+
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+        let recorded = crate::trajectory::recorded(tmp.path());
+        assert_eq!(recorded.tokens.completion, 5);
+        assert_eq!(recorded.tokens.prompt, 0);
+        let raw = std::fs::read_to_string(darkmux_trajectory::trajectory_path(tmp.path())).unwrap();
+        assert!(!raw.contains("\"dispatch.context\""), "no prompt count, no context-window event: {raw}");
     }
 
     #[test]
@@ -8065,11 +7751,8 @@ mod tests {
                 Message::tool_result("call_1", "read", "<call 1 result>"),
             ],
             turns: 1,
-            total_prompt_tokens: 100,
             total_completion_tokens: 20,
             compactions: 0,
-            rest_ms: 0,
-            rests: 0,
             pending_hand_back: None,
             pending_tool_calls: Some(vec![call2, call3]),
             // call_1 (index 0) already completed, so the next pending
@@ -8185,11 +7868,8 @@ mod tests {
                 Message::tool_result("call_1", "read", "<call 1 result>"),
             ],
             turns: 1,
-            total_prompt_tokens: 100,
             total_completion_tokens: 20,
             compactions: 0,
-            rest_ms: 0,
-            rests: 0,
             pending_hand_back: None,
             pending_tool_calls: Some(vec![call2, call3]),
             pending_tool_calls_seq_base: 1,
@@ -8311,11 +7991,8 @@ mod tests {
                 Message::tool_result("call_1", "read", "<call 1 result>"),
             ],
             turns: 1,
-            total_prompt_tokens: 100,
             total_completion_tokens: 20,
             compactions: 0,
-            rest_ms: 0,
-            rests: 0,
             pending_hand_back: None,
             pending_tool_calls: Some(vec![call2]),
             pending_tool_calls_seq_base: 1,
@@ -8443,11 +8120,8 @@ mod tests {
                 Message::tool_result("call_1", "read", "small"),            // 7
             ],
             turns: 3,
-            total_prompt_tokens: 300,
             total_completion_tokens: 60,
             compactions: 0,
-            rest_ms: 0,
-            rests: 0,
             pending_hand_back: None,
             pending_tool_calls: Some(vec![c2, c3]),
             pending_tool_calls_seq_base: 1,
@@ -8492,10 +8166,10 @@ mod tests {
         )
         .expect("3-turn scripted dispatch returns Ok");
 
-        assert_eq!(outcome.turns, 3, "sanity: still three turns");
+        assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 3, "sanity: still three turns");
         assert!(sleeper.calls.borrow().is_empty(), "delay=0 must never sleep");
-        assert_eq!(outcome.rest_ms, 0);
-        assert_eq!(outcome.rests, 0);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_ms(), 0);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_count(), 0);
         assert_eq!(
             outcome.turn_delay_effective_ms, 0,
             "(#2094 finding 8) known and zero, even though this dispatch never rested"
@@ -8527,20 +8201,20 @@ mod tests {
         let cfg = compaction::CompactionConfig::never_compact();
         let sleeper = RecordingSleeper::default();
 
-        let outcome = run_with_sleeper(
+        run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
             Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
         )
         .expect("single-turn dispatch returns Ok");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
 
-        assert_eq!(outcome.turns, 1);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 1);
         assert!(
             sleeper.calls.borrow().is_empty(),
             "a single turn has no prior turn to rest AFTER — never before the first request"
         );
-        assert_eq!(outcome.rest_ms, 0);
-        assert_eq!(outcome.rests, 0);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_ms(), 0);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_count(), 0);
     }
 
     /// (#2094 finding 3a) The rest guard's `!resuming_after_checkpoint`
@@ -8641,15 +8315,15 @@ mod tests {
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
 
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
-        assert_eq!(outcome.turns, 2, "sanity: two logical turns (the continuation is NOT a third)");
+        assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 2, "sanity: two logical turns (the continuation is NOT a third)");
         assert_eq!(
             sleeper.calls.borrow().as_slice(),
             [500],
             "exactly ONE rest — between turn 1 and turn 2 — never a second one before \
              the checkpoint continuation call"
         );
-        assert_eq!(outcome.rest_ms, 500);
-        assert_eq!(outcome.rests, 1);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_ms(), 500);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_count(), 1);
     }
 
     // ---------------------------------------------------------------
@@ -8747,7 +8421,7 @@ mod tests {
             None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
         )
         .expect("generation-bound salvage must drive the loop forward, not Err (#2171)");
-        assert!(outcome.turns >= 1);
+        assert!(crate::trajectory::recorded(tmp.path()).turns() >= 1);
 
         for m in &outcome.messages {
             if let Some(c) = &m.content {
@@ -8894,7 +8568,7 @@ mod tests {
         )
         .expect("a clean stream must complete");
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
-        assert_eq!(outcome.turns, 1, "one turn — no continuations, because nothing was cut");
+        assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 1, "one turn — no continuations, because nothing was cut");
 
         let traj_text =
             std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"))
@@ -9673,7 +9347,7 @@ mod tests {
              Err here means it carried the generation default instead (#2171 regression)",
         );
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
-        assert_eq!(outcome.turns, 2);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 2);
     }
 
     /// (#2171 test d, floor added on merge-gate review) A turn that keeps
@@ -9748,7 +9422,7 @@ mod tests {
              forever or fall through to MaxTurns"
         );
         assert_eq!(
-            outcome.turns, 1,
+            crate::trajectory::recorded(tmp.path()).turns(), 1,
             "every hit is a continuation of the SAME logical turn — turns must not move"
         );
         let traj_file = tmp.path().join(".darkmux-runtime").join("trajectory.jsonl");
@@ -10590,7 +10264,7 @@ mod tests {
             &cfg, Some(4), None, None, None, std::collections::BTreeMap::new(), None,
         );
 
-        let outcome = outcome.expect(
+        outcome.expect(
             "a compaction the thread shape makes impossible must be SKIPPED, not fatal — \
              propagating it ends the dispatch and discards every banked turn (#1221)",
         );
@@ -10599,7 +10273,7 @@ mod tests {
             "the scenario must actually have attempted a compaction, else it pins nothing"
         );
         assert!(
-            outcome.turns >= 1,
+            crate::trajectory::recorded(tmp.path()).turns() >= 1,
             "the dispatch must have continued doing work after the refused compaction"
         );
         // (#2797 merge-gate) A refused attempt must NOT burn the operator's
@@ -10643,13 +10317,13 @@ mod tests {
             .filter(|v| v["type"] == "compaction")
             .count();
         assert_eq!(
-            outcome.compactions as usize, installed,
+            crate::trajectory::recorded(tmp.path()).compactions() as usize, installed,
             "the counter must equal INSTALLED compactions ({installed}), not \
              installs + the {} refused attempt(s) that changed nothing",
             skipped.len()
         );
         assert!(
-            !skipped.is_empty() && outcome.compactions as usize != installed + skipped.len(),
+            !skipped.is_empty() && crate::trajectory::recorded(tmp.path()).compactions() as usize != installed + skipped.len(),
             "the scenario must contain at least one refusal that is excluded from \
              the count, else this pins nothing"
         );
@@ -11482,9 +11156,9 @@ mod tests {
         );
         // And it is still ONE logical turn: a blank call is not a boundary.
         assert_eq!(
-            outcome.turns, 1,
+            crate::trajectory::recorded(tmp.path()).turns(), 1,
             "an empty call mid-accumulation does not start a new turn (turns={})",
-            outcome.turns
+            crate::trajectory::recorded(tmp.path()).turns()
         );
     }
 
@@ -11639,10 +11313,10 @@ mod tests {
         );
         // A conclude is not a turn boundary: many API calls, still one turn.
         assert_eq!(
-            outcome.turns, 1,
+            crate::trajectory::recorded(tmp.path()).turns(), 1,
             "a conclude closes the thought, not the turn; turns={} means the loop \
              treated it as a boundary and restarted the thought",
-            outcome.turns
+            crate::trajectory::recorded(tmp.path()).turns()
         );
     }
 
@@ -11798,15 +11472,15 @@ mod tests {
         );
         // Sanity: bailed BEFORE MAX_TURNS — must have hit the cap.
         assert!(
-            outcome.turns < 100,
+            crate::trajectory::recorded(tmp.path()).turns() < 100,
             "cumulative bail must fire before MAX_TURNS; got turns={}",
-            outcome.turns
+            crate::trajectory::recorded(tmp.path()).turns()
         );
         // The cumulative-tokens sum must have crossed the cap.
         assert!(
-            outcome.total_completion_tokens >= 250_000,
+            crate::trajectory::recorded(tmp.path()).tokens.completion >= 250_000,
             "cumulative bail fires when sum >= 250000; got {}",
-            outcome.total_completion_tokens
+            crate::trajectory::recorded(tmp.path()).tokens.completion
         );
     }
 
@@ -11843,7 +11517,7 @@ mod tests {
             .expect("healthy stop should not bail");
 
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
-        assert!(outcome.total_completion_tokens < 250_000);
+        assert!(crate::trajectory::recorded(tmp.path()).tokens.completion < 250_000);
     }
 
     /// This test pairs with the existing
@@ -11895,9 +11569,9 @@ mod tests {
         );
         // Sanity: hit the cap.
         assert!(
-            outcome.turns >= 100,
+            crate::trajectory::recorded(tmp.path()).turns() >= 100,
             "expected >= MAX_TURNS turns; got {}",
-            outcome.turns
+            crate::trajectory::recorded(tmp.path()).turns()
         );
     }
 
@@ -12148,7 +11822,7 @@ mod tests {
     /// recover the call from content, flip finish_reason to
     /// `tool_calls`, and the loop must continue (NOT exit after one
     /// turn). Asserts:
-    ///   - outcome.turns > 1 (the bail was promoted, not exited)
+    ///   - more than one recorded turn (the bail was promoted, not exited)
     ///   - terminal_reason is MaxTurns (mock keeps returning bail
     ///     shape; we run out the clock — that's fine, what matters
     ///     is the first turn didn't terminate as Stop)
@@ -12198,9 +11872,9 @@ mod tests {
             .expect("promoted XML tool call should drive the loop, not error");
 
         assert!(
-            outcome.turns > 1,
+            crate::trajectory::recorded(tmp.path()).turns() > 1,
             "promotion must continue the loop past turn 1; got turns={} (pre-#406 silent bail at turn 1)",
-            outcome.turns
+            crate::trajectory::recorded(tmp.path()).turns()
         );
         // The mock keeps returning the bail shape, so the loop runs
         // until MAX_TURNS. That's the right outcome for this synthetic
@@ -12401,7 +12075,7 @@ mod tests {
         let cfg = compaction::CompactionConfig::never_compact();
         // Cap turns at 3 so the loop terminates if salvage works (it'll
         // run turn 1 → salvage dispatch → turn 2 → ... → MAX_TURNS).
-        let outcome = run(
+        run(
             &client,
             &client,
             "test-model",
@@ -12423,9 +12097,9 @@ mod tests {
         );
 
         assert!(
-            outcome.turns >= 1,
+            crate::trajectory::recorded(tmp.path()).turns() >= 1,
             "salvage must let the loop continue past turn 1 (got turns={})",
-            outcome.turns
+            crate::trajectory::recorded(tmp.path()).turns()
         );
         // The trajectory should contain the per_turn_cap.salvaged event.
         let traj_path = tmp.path().join(".darkmux-runtime/trajectory.jsonl");
@@ -12759,7 +12433,7 @@ mod tests {
             "an all-invalid-name turn must still progress to turn 2's clean stop, not stall: {:?}",
             outcome.terminal_reason
         );
-        assert_eq!(outcome.turns, 2, "the loop must advance past the all-invalid turn");
+        assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 2, "the loop must advance past the all-invalid turn");
     }
 
     // ─── (#2169 merge-gate MUST FIX 1 + 2) real-tool-not-granted bucket ──
@@ -13171,7 +12845,7 @@ mod tests {
             outcome.terminal_reason
         );
         assert_eq!(
-            outcome.turns, MAX_CONSECUTIVE_MALFORMED_TURNS,
+            crate::trajectory::recorded(tmp.path()).turns(), MAX_CONSECUTIVE_MALFORMED_TURNS,
             "must escalate at exactly the Kth consecutive all-invalid turn, not before or after"
         );
     }
@@ -13390,12 +13064,12 @@ mod tests {
         let tools = [Tool::Echo, Tool::Read];
         let cfg = compaction::CompactionConfig::never_compact();
 
-        let outcome = run(
+        run(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
             Some(4), None, None, None, std::collections::BTreeMap::new(), None,
         )
         .expect("salvage must drive the loop (#479)");
-        assert!(outcome.turns >= 1);
+        assert!(crate::trajectory::recorded(tmp.path()).turns() >= 1);
 
         let traj_path = tmp.path().join(".darkmux-runtime/trajectory.jsonl");
         let raw = std::fs::read_to_string(&traj_path).expect("trajectory file exists");
@@ -13450,12 +13124,12 @@ mod tests {
         let tools = [Tool::Read];
         let cfg = compaction::CompactionConfig::never_compact();
 
-        let outcome = run(
+        run(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
             Some(4), None, None, None, std::collections::BTreeMap::new(), None,
         )
         .expect("salvage must drive the loop (#479)");
-        assert!(outcome.turns >= 1);
+        assert!(crate::trajectory::recorded(tmp.path()).turns() >= 1);
 
         let traj_path = tmp.path().join(".darkmux-runtime/trajectory.jsonl");
         let raw = std::fs::read_to_string(&traj_path).expect("trajectory file exists");
@@ -13512,7 +13186,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(
+        run(
             &client,
             &client,
             "test-model",
@@ -13532,7 +13206,7 @@ mod tests {
             "a length-finish at the OVERRIDDEN cap must salvage — an Err here \
              means the override never reached salvage detection (#1221)",
         );
-        assert!(outcome.turns >= 1);
+        assert!(crate::trajectory::recorded(tmp.path()).turns() >= 1);
         let traj_path = tmp.path().join(".darkmux-runtime/trajectory.jsonl");
         let raw = std::fs::read_to_string(&traj_path).expect("trajectory file exists");
         assert!(
@@ -13762,7 +13436,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(
+        run(
             &client,
             &client,
             "test-model",
@@ -13784,9 +13458,9 @@ mod tests {
         );
 
         assert!(
-            outcome.turns >= 1,
+            crate::trajectory::recorded(tmp.path()).turns() >= 1,
             "salvage must still drive the loop when feedback is disabled (got turns={})",
-            outcome.turns
+            crate::trajectory::recorded(tmp.path()).turns()
         );
         // Trajectory event still fires — observability isn't gated on
         // the feedback-injection switch.
@@ -13981,13 +13655,13 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, None, std::collections::BTreeMap::new(), None)
+        run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, None, std::collections::BTreeMap::new(), None)
             .expect("recovered call from length-truncated response should drive the loop");
 
         assert!(
-            outcome.turns > 1,
+            crate::trajectory::recorded(tmp.path()).turns() > 1,
             "promotion must continue the loop even when finish_reason=length; got turns={}",
-            outcome.turns
+            crate::trajectory::recorded(tmp.path()).turns()
         );
     }
 
@@ -14040,9 +13714,9 @@ mod tests {
             .expect("promoted XML tool call from reasoning_content should drive the loop");
 
         assert!(
-            outcome.turns > 1,
+            crate::trajectory::recorded(tmp.path()).turns() > 1,
             "reasoning-channel promotion must keep the loop alive past turn 1; got turns={}",
-            outcome.turns
+            crate::trajectory::recorded(tmp.path()).turns()
         );
         assert_eq!(outcome.terminal_reason, TerminalReason::MaxTurns);
     }
@@ -14096,7 +13770,7 @@ mod tests {
         // yet) so it falls through to `turn1`; from request 2 on, `turn2`
         // matches and wins. Same ordering as
         // `loop_accumulates_reasoning_and_cached_tokens_across_turns_tri_state`.
-        // `assert_eq!(outcome.turns, 2)` pins the routing so it cannot
+        // Two recorded turns pin the routing so it cannot
         // silently regress again — and `GuardedMockServer`'s own Drop-time
         // check (#2599) now independently requires both `turn1` and
         // `turn2` below to have been hit at least once.
@@ -14237,7 +13911,7 @@ mod tests {
         // request from `turn1`, run to the 100-turn cap, and still satisfy
         // every assertion below — which is exactly what it did.
         assert_eq!(
-            outcome.turns, 2,
+            crate::trajectory::recorded(tmp.path()).turns(), 2,
             "turn 1 must be answered by the tool_calls mock and turn 2 by the stop mock; \
              a higher count means turn1's mock is shadowing turn2's again"
         );
@@ -14312,11 +13986,11 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, Some(10_000), Some(10_000), std::collections::BTreeMap::new(), None)
+        run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, Some(10_000), Some(10_000), std::collections::BTreeMap::new(), None)
             .expect("clean single-turn dispatch");
 
         captured.assert();
-        assert_eq!(outcome.turns, 1);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 1);
     }
 
     /// (#2164) `max_tokens_per_call` (the ANSWER bound) still bounds the
@@ -14353,14 +14027,14 @@ mod tests {
         let tools = [Tool::Read];
         let cfg = compaction::CompactionConfig::never_compact();
 
-        let outcome = run(
+        run(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
             Some(100), None, Some(3000), Some(100), std::collections::BTreeMap::new(), None,
         )
         .expect("a fresh turn's first call, sent under the answer bound, dispatches cleanly");
 
         captured.assert();
-        assert_eq!(outcome.turns, 1);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 1);
     }
 
     /// Smoke: mock returns finish_reason=stop on first call. Loop
@@ -14399,13 +14073,13 @@ mod tests {
             .expect("loop should terminate cleanly on first-turn stop");
 
         stop_mock.assert();
-        assert_eq!(outcome.turns, 1);
-        assert_eq!(outcome.compactions, 0);
-        assert_eq!(outcome.total_prompt_tokens, 1234);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 1);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).compactions(), 0);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).tokens.prompt, 1234);
         // (#1444) `chat_response_json` never emits `completion_tokens_details`/
         // `prompt_tokens_details` — the LMStudio-local shape. Absent, not zero.
-        assert_eq!(outcome.total_reasoning_tokens, None);
-        assert_eq!(outcome.total_cached_tokens, None);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).tokens.reasoning, None);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).tokens.cached, None);
         // #325: pin the Stop terminal_reason on this clean-exit path.
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
     }
@@ -14498,16 +14172,16 @@ mod tests {
         let tools = [Tool::Read, Tool::Edit, Tool::Bash];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, None, std::collections::BTreeMap::new(), None)
+        run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, None, std::collections::BTreeMap::new(), None)
             .expect("two-turn loop should terminate cleanly on turn 2's stop");
 
         turn1.assert();
         turn2.assert();
-        assert_eq!(outcome.turns, 2);
-        assert_eq!(outcome.total_completion_tokens, 950, "600 + 350 — reasoning_tokens is INCLUDED, not additional");
-        assert_eq!(outcome.total_reasoning_tokens, Some(800), "500 + 300 summed across both turns");
+        assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 2);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).tokens.completion, 950, "600 + 350 — reasoning_tokens is INCLUDED, not additional");
+        assert_eq!(crate::trajectory::recorded(tmp.path()).tokens.reasoning, Some(800), "500 + 300 summed across both turns");
         assert_eq!(
-            outcome.total_cached_tokens,
+            crate::trajectory::recorded(tmp.path()).tokens.cached,
             Some(20),
             "only turn 1 reported cached_tokens; turn 2's silence must not reset or corrupt it"
         );
@@ -14534,7 +14208,7 @@ mod tests {
     /// this is just a struct literal.
     ///
     /// Asserts:
-    ///   - outcome.compactions == 1
+    ///   - one recorded compaction
     ///   - compactor mock was hit exactly once
     ///   - primary mock was hit at least twice (before + after compaction)
     #[test]
@@ -14662,9 +14336,9 @@ mod tests {
         // For now: if the loop ever returns Ok (would require the
         // mock to drive a stop after compaction), enforce counter
         // parity; otherwise rely on the mock-hit assertion above.
-        if let Ok(o) = outcome {
+        if outcome.is_ok() {
             assert!(
-                o.compactions >= 1,
+                crate::trajectory::recorded(tmp.path()).compactions() >= 1,
                 "runtime returned Ok but compactions counter is 0 \
                  despite mock recording {} compactor hit(s) — \
                  telemetry drift",
@@ -15039,7 +14713,7 @@ mod tests {
             "bail must produce the specific escalation variant, not a generic terminal"
         );
         assert_eq!(
-            outcome.compactions, 1,
+            crate::trajectory::recorded(tmp.path()).compactions(), 1,
             "the bound-crossing compaction is counted"
         );
         assert_eq!(
@@ -15143,7 +14817,7 @@ mod tests {
             "with bail_after_compactions=None, MAX_TURNS is the only bound that fires"
         );
         assert!(
-            outcome.compactions >= 1,
+            crate::trajectory::recorded(tmp.path()).compactions() >= 1,
             "compaction still fires; bail just doesn't kick in"
         );
     }
@@ -15250,10 +14924,10 @@ mod tests {
              not keep burning turns"
         );
         assert!(
-            outcome.turns < 12,
+            crate::trajectory::recorded(tmp.path()).turns() < 12,
             "it must escalate BEFORE max_turns, else it is not bounding anything: \
              turns={}",
-            outcome.turns
+            crate::trajectory::recorded(tmp.path()).turns()
         );
 
         let raw = std::fs::read_to_string(
@@ -15383,11 +15057,8 @@ mod tests {
             role_id: "test-role".into(),
             messages: checkpoint_messages,
             turns: 2,
-            total_prompt_tokens: 900,
             total_completion_tokens: 40,
             compactions: 0,
-            rest_ms: 0,
-            rests: 0,
             pending_hand_back: None,
             // The catch-up block runs only when the checkpoint carries an
             // undispatched call — that is what "catch-up" means.
@@ -15404,7 +15075,7 @@ mod tests {
             written_at_unix_ms: checkpoint::unix_ms(),
         };
 
-        let outcome = run_with_sleeper(
+        run_with_sleeper(
             &client, &client, "test-primary", vec![], &tools, &mut traj, false, &cfg,
             Some(4), None, None, None, Some(u32::MAX), None,
             std::collections::BTreeMap::new(), None,
@@ -15433,7 +15104,7 @@ mod tests {
 
         assert!(skipped >= 1, "the refused catch-up compaction must be recorded");
         assert_eq!(
-            outcome.compactions as usize, installed,
+            crate::trajectory::recorded(tmp.path()).compactions() as usize, installed,
             "the counter must equal INSTALLED compactions ({installed}), not installs \
              plus the {skipped} refused catch-up attempt(s)"
         );
@@ -15538,13 +15209,10 @@ mod tests {
             role_id: "test-role".to_string(),
             messages: checkpoint_messages,
             turns: 2,
-            total_prompt_tokens: 200,
             total_completion_tokens: 40,
             // (#2114 finding 1 test) bail_after_compactions - 1: the
             // catch-up's own compaction is the ONE that crosses the bound.
             compactions: 0,
-            rest_ms: 0,
-            rests: 0,
             pending_hand_back: None,
             pending_tool_calls: Some(vec![c2]),
             pending_tool_calls_seq_base: 1,
@@ -15564,7 +15232,7 @@ mod tests {
             "the resume catch-up's own compaction must escalate at the bound, not just the \
              main loop's"
         );
-        assert_eq!(outcome.compactions, 1, "the bound-crossing compaction is counted");
+        assert_eq!(crate::trajectory::recorded(tmp.path()).compactions(), 1, "the bound-crossing compaction is counted");
         assert_eq!(compactor_mock.hits(), 1, "exactly one compactor call, during catch-up");
         primary_mock.assert_hits(0);
     }
@@ -15630,9 +15298,9 @@ mod tests {
             "post-nudge turn produced clean stop"
         );
         assert!(
-            outcome.turns >= 2,
+            crate::trajectory::recorded(tmp.path()).turns() >= 2,
             "expected at least 2 turns (stall + recovery); got {}",
-            outcome.turns
+            crate::trajectory::recorded(tmp.path()).turns()
         );
         // The useless turn must have been popped from history — only
         // the post-nudge assistant message survives.
@@ -15960,7 +15628,7 @@ mod tests {
              got {:?}",
             outcome.terminal_reason
         );
-        assert_eq!(outcome.turns, 1, "every hit is a continuation of the same logical turn");
+        assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 1, "every hit is a continuation of the same logical turn");
     }
 
     /// (#2633) The degeneracy gate must actually RUN on the generation-bound
@@ -16135,7 +15803,7 @@ mod tests {
              same block over and over'). Got {:?}",
             outcome.terminal_reason
         );
-        assert_eq!(outcome.turns, 1, "every hit is a continuation of the SAME logical turn");
+        assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 1, "every hit is a continuation of the SAME logical turn");
     }
 
     /// (#2633 fix-pass) The SECOND half of the budget block's ordering: it
@@ -16301,7 +15969,7 @@ mod tests {
              under the wrong ordering, and it is here so a future change that trades one \
              region for the other is caught in both directions. Got {delivered:?}"
         );
-        assert_eq!(outcome.turns, 1, "every hit is a continuation of the SAME logical turn");
+        assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 1, "every hit is a continuation of the SAME logical turn");
     }
 
     /// (#2258) The INVERTED direction of the fixture above — a fix that
@@ -16586,10 +16254,10 @@ mod tests {
         // already ran the loop back through chat(); the 3rd sees the
         // budget exhausted and escalates.
         assert_eq!(
-            outcome.turns, MAX_STALL_RECOVERIES + 1,
+            crate::trajectory::recorded(tmp.path()).turns(), MAX_STALL_RECOVERIES + 1,
             "expected exactly MAX_STALL_RECOVERIES+1 turns (=={}); got {}",
             MAX_STALL_RECOVERIES + 1,
-            outcome.turns
+            crate::trajectory::recorded(tmp.path()).turns()
         );
     }
 
@@ -16640,7 +16308,7 @@ mod tests {
              got {:?}",
             outcome.terminal_reason
         );
-        assert_eq!(outcome.turns, MAX_STALL_RECOVERIES + 1);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), MAX_STALL_RECOVERIES + 1);
     }
 
     /// (#2229) Sibling of `a_mixed_turn_resets_the_consecutive_malformed_
@@ -16790,7 +16458,7 @@ mod tests {
         // `MaxTurns` alone would also be produced by the run dying early on
         // a mock miss (an unmatched request 404s), which is not what this
         // test is about.
-        assert_eq!(outcome.turns, 5, "all five scripted turns must have run");
+        assert_eq!(crate::trajectory::recorded(tmp.path()).turns(), 5, "all five scripted turns must have run");
     }
 
     /// (#2229 round-2 blocker 1) The budget pays DOWN by one per productive
@@ -16893,7 +16561,7 @@ mod tests {
             outcome.terminal_reason
         );
         assert_eq!(
-            outcome.turns, 5,
+            crate::trajectory::recorded(tmp.path()).turns(), 5,
             "the second stall of the second cycle is the one that finds the budget already \
              at {MAX_STALL_RECOVERIES}"
         );
@@ -16924,7 +16592,7 @@ mod tests {
     ///
     /// Turn-granular, that escalates on turn 3. With the reset firing on the
     /// mid-turn continuation it escalates on turn 4 instead, having silently
-    /// refunded turn 1's own recovery — so `outcome.turns` is what
+    /// refunded turn 1's own recovery — so the recorded turn count is what
     /// discriminates.
     #[test]
     #[serial_test::serial]
@@ -17017,7 +16685,7 @@ mod tests {
             outcome.terminal_reason
         );
         assert_eq!(
-            outcome.turns, 3,
+            crate::trajectory::recorded(tmp.path()).turns(), 3,
             "turn 1 spent a recovery at its second call; the THIRD call of that same turn \
              is a checkpoint continuation, not a new turn, so dispatching a tool there must \
              not refund it. Escalating on turn 4 means it did."
@@ -17325,9 +16993,9 @@ mod tests {
                 outcome.terminal_reason
             );
             assert_eq!(
-                outcome.turns, expected_turns,
+                crate::trajectory::recorded(tmp.path()).turns(), expected_turns,
                 "budget={budget}: expected exactly budget+1 turns (=={expected_turns}); got {}",
-                outcome.turns
+                crate::trajectory::recorded(tmp.path()).turns()
             );
         }
     }
@@ -17593,7 +17261,7 @@ mod reasoning_feedback_probe {
             "PROBE: first-request hits={}, reasoning-echoed hits={}, outcome={:?}",
             first.hits(),
             echoed.hits(),
-            outcome.as_ref().map(|o| (&o.terminal_reason, o.turns)).map_err(|e| e.to_string())
+            outcome.as_ref().map(|o| (&o.terminal_reason, crate::trajectory::recorded(tmp.path()).turns())).map_err(|e| e.to_string())
         );
         if let Ok(o) = &outcome {
             for (i, m) in o.messages.iter().enumerate() {

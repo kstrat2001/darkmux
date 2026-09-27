@@ -30,11 +30,11 @@ name: CI
 #     workflow's own header and the `darkmux-point-release` skill.
 #   * The runtime/ crate (excluded from the parent workspace, own Cargo.lock —
 #     #463) now runs as its OWN parallel job instead of appending to this
-#     one's sequential steps, with its OWN paths-filter scoped to `runtime/**`
-#     — it has zero dependency on the parent workspace's sources (confirmed:
-#     its `include_str!`s only ever resolve within `runtime/`), so a
-#     workspace-only PR skips it entirely and a runtime-only PR skips the
-#     (much heavier) workspace job.
+#     one's sequential steps, with its OWN paths-filter: `runtime/**` plus
+#     `crates/darkmux-trajectory/**`, its one path dependency on the parent
+#     tree (the trajectory event types it shares with the host). A
+#     workspace-only PR that leaves that crate alone skips it, and a
+#     runtime-only PR skips the (much heavier) workspace job.
 
 on:
   pull_request:
@@ -353,10 +353,10 @@ jobs:
 
       # The runtime crate is EXCLUDED from the parent cargo workspace (#463 —
       # it builds against musl in the darkmux-runtime Docker image) and is its
-      # own workspace root with its own Cargo.lock. Its `include_str!`s only
-      # ever resolve within `runtime/` (confirmed 2026-07-13) — zero
-      # dependency on the parent workspace's sources — so this job's filter
-      # is scoped to `runtime/**` alone, letting it run IN PARALLEL with
+      # own workspace root with its own Cargo.lock. Its one dependency on the
+      # parent tree is the path dependency crates/darkmux-trajectory (the
+      # trajectory event types it shares with the host), so this job's filter
+      # is `runtime/**` plus that crate, letting it run IN PARALLEL with
       # `build-test-lint` above instead of appending to that job's sequential
       # steps (the change that fixed this job's chronic near-timeout).
       - name: Detect runtime-relevant changes
@@ -366,6 +366,7 @@ jobs:
           filters: |
             runtime:
               - 'runtime/**'
+              - 'crates/darkmux-trajectory/**'
               - '.github/workflows/ci.yml'
 
       - name: Install Rust stable toolchain

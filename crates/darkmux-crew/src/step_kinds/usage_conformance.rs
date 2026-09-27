@@ -19,8 +19,8 @@
 //!
 //! Scope: host-side only. The runtime's own calls (turns and compaction,
 //! #2902 step 1b) are rostered in `runtime/src/usage_conformance.rs`; their
-//! records are written here by the container tailer (`handle_event`'s
-//! `model.completed` and `compaction.call` arms), driven by
+//! records are written here by the container tailer (`on_model_completed` and
+//! `on_compaction_call`), driven by
 //! `usage_conformance_container_turn` and `usage_conformance_compaction_call`. No other workspace crate
 //! calls a transport directly: `darkmux-lab` and the binary reach models
 //! through `dispatch::dispatch` / `dispatch_local_single_shot` (checked
@@ -148,7 +148,7 @@ const ROSTER: &[CallSite] = &[
 /// makes the HTTP call inside Docker); its record is written by the host
 /// tailer from each `model.completed` event, driven by
 /// `dispatch_internal::tests::usage_conformance_container_turn`.
-const CONTAINER_TURN: (&str, &str) = ("src/dispatch_internal.rs", "handle_event");
+const CONTAINER_TURN: (&str, &str) = ("src/dispatch_internal.rs", "on_model_completed");
 
 const TRANSPORTS: &[&str] = &[
     "remote_chat_completion(",

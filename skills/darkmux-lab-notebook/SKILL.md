@@ -34,7 +34,7 @@ One run prints one JSON object. The fields an entry is built from:
 - **Rate:** `tok_per_s` (over billed generation only), `billed_gen_fraction`, `gen_ms_billed`.
 - **Detection:** `gates.stream.{observations,aborts,degenerate_turns,min_tail_ratio}` for the streaming gate, and `gates.checkpoint.{observations,degenerate_turns,concluded_turns,min_tail_ratio,policy}` for the per-call-cap gate. `gates.checkpoint.policy` is the detection policy in force; under the `"observe"` policy a turn can appear in `gates.checkpoint.degenerate_turns` without appearing in `gates.checkpoint.concluded_turns`, which is the policy working, not a missing cut. Also `suspect_turns`.
 - **Host:** `gpu_w_busy`, `pkg_w_busy`, `pkg_j_busy`, `gpu_duty_pct`, `thermal_states_busy`, `throttled_samples`, `mem_pct_busy_max`.
-- **Trust:** `checks`. Every figure above still prints when a check fails; the check tells you whether it may be quoted. Read `checks` before quoting anything, and carry the caveat into the entry (for example, when `checks.tokens_reconcile` is false, say so next to any token figure).
+- **Trust:** `checks`. Every figure above still prints when a check fails; the check tells you whether it may be quoted. Read `checks` before quoting anything, and carry the caveat into the entry (for example, when `checks.all_streams_billed` is false, say so next to `tok_per_s`).
 
 Several run ids print a set instead: `runs` (one object each, as above), `summary` (median with min and max, never a bare mean), `errors`, `duplicates`, and with `--baseline`, a `baseline` set plus `cross_arm_overlap`. Quote the set's ranges, not one run's numbers, when the entry is about a series.
 

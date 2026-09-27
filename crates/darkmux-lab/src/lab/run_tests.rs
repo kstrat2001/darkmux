@@ -236,8 +236,6 @@ fn a_claim_skips_every_existing_dir_and_surfaces_other_errors() {
     assert_eq!(claim().0, "w-p-100-3");
     let second = claim().0;
     assert_eq!(second, "w-p-100-3.2");
-    // The stamp still reads back from a later claim's id.
-    assert_eq!(crate::lab::stats::run_id_epoch_ms(&second), Some(100_000));
     let (id, dir) = claim();
     assert_eq!(id, "w-p-100-3.3");
     assert_eq!(dir, root.join("w-p-100-3.3"));

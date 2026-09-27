@@ -685,7 +685,7 @@ impl StepKind for MissionWorktreeStepKind {
 // `MissionEnvelope` summary.
 pub(crate) struct CoderStepResult {
     pub(crate) failed_verifiers: Vec<crew::step_kinds::FailedVerifier>,
-    pub(crate) tokens_total: u32,
+    pub(crate) tokens_total: u64,
 }
 
 /// Wraps the coder-dispatch half of the old hand-written sequence
@@ -942,11 +942,7 @@ impl StepKind for MissionCoderStepKind {
             style::dim(&format!("darkmux coder-phase: session id `{}`", ctx.session_id))
         );
 
-        let tokens = result
-            .out_dir
-            .as_deref()
-            .map(crew::dispatch_internal::read_token_totals)
-            .unwrap_or_default();
+        let tokens = coder_tokens(&result);
 
         if result.exit_code != 0 {
             let exit_code = result.exit_code;
@@ -970,11 +966,11 @@ impl StepKind for MissionCoderStepKind {
                 &ctx.mission_id,
                 &ctx.phase_id,
                 &ctx.session_id,
-                serde_json::json!({ "exit_code": exit_code, "total_tokens": tokens.total() }),
+                serde_json::json!({ "exit_code": exit_code, "total_tokens": tokens.total }),
             );
             *result_slot.lock().expect("mission.coder result mutex poisoned") = Some(CoderStepResult {
                 failed_verifiers: Vec::new(),
-                tokens_total: tokens.total(),
+                tokens_total: tokens.total,
             });
             anyhow::bail!("coder dispatch exited {exit_code}");
         }
@@ -997,12 +993,12 @@ impl StepKind for MissionCoderStepKind {
             serde_json::json!({
                 "failed_verifiers": failed_verifiers,
                 "count": failed_verifiers.len(),
-                "total_tokens": tokens.total(),
+                "total_tokens": tokens.total,
             }),
         );
 
         let stdout = result.stdout.clone();
-        let tokens_total = tokens.total();
+        let tokens_total = tokens.total;
         *result_slot.lock().expect("mission.coder result mutex poisoned") = Some(CoderStepResult {
             failed_verifiers,
             tokens_total,
@@ -3021,13 +3017,20 @@ fn worktree_branch(wt_path: &Path) -> Option<String> {
     if b.is_empty() || b == "HEAD" { None } else { Some(b) }
 }
 
+/// The coder's tokens: the dispatch's own fold of its trajectory, the one
+/// reading every other surface quotes. Never re-read from the out-dir, which
+/// the model can write to.
+fn coder_tokens(result: &crew::dispatch::DispatchResult) -> darkmux_trajectory::TokenSum {
+    result.trajectory.as_ref().map(|fold| fold.tokens).unwrap_or_default()
+}
+
 /// One-line tokens-off-meter readout. Tokens only — the operator multiplies
 /// by their own per-token rate (no currency in product, by design).
-fn print_token_line(t: &crew::dispatch_internal::TokenTotals) {
+fn print_token_line(t: &darkmux_trajectory::TokenSum) {
     println!(
         "  {} {} {}",
         style::dim("tokens off-meter:"),
-        style::accent(&format!("{}", t.total())),
+        style::accent(&format!("{}", t.total)),
         style::dim(&format!("({} prompt + {} completion)", t.prompt, t.completion))
     );
 }

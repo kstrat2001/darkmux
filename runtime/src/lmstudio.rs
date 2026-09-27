@@ -14,6 +14,7 @@
 //! for Mac). Overridable via [`LmStudioClient::with_base_url`] for tests.
 
 use anyhow::{anyhow, Context, Result};
+use darkmux_trajectory::UsageCounts;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader};
 use std::time::Duration;
@@ -275,7 +276,7 @@ pub struct ChatResponse {
     #[serde(default, deserialize_with = "lenient_model_id")]
     pub model: Option<String>,
     pub choices: Vec<Choice>,
-    pub usage: Option<Usage>,
+    pub usage: Option<UsageCounts>,
 }
 
 impl ChatResponse {
@@ -297,127 +298,6 @@ pub struct Choice {
 
     /// `stop`, `tool_calls`, `length`, or backend-specific.
     pub finish_reason: String,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct Usage {
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
-    pub total_tokens: u32,
-    /// (#1444) `completion_tokens_details` — present only on hosted
-    /// reasoning-family models (Azure/OpenAI o-series, GPT-5.1-class
-    /// deployments). Provider-optional: `None` when the response omits the
-    /// object entirely, distinct from `Some(CompletionTokensDetails {
-    /// reasoning_tokens: None })` (the object is present but doesn't name
-    /// `reasoning_tokens`) — either way [`Usage::reasoning_tokens`] returns
-    /// `None`, never a fabricated zero. LMStudio (the local backend) never
-    /// sends this key today; a local dispatch's `Usage` always parses it as
-    /// `None`.
-    #[serde(default)]
-    pub completion_tokens_details: Option<CompletionTokensDetails>,
-    /// (#1444) `prompt_tokens_details` — same provider-optional shape as
-    /// `completion_tokens_details` above, carrying `cached_tokens` (prompt
-    /// tokens served from the provider's own cache, billed at a reduced
-    /// rate on providers that report it).
-    #[serde(default)]
-    pub prompt_tokens_details: Option<PromptTokensDetails>,
-}
-
-/// See [`Usage::completion_tokens_details`].
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct CompletionTokensDetails {
-    /// **Included in `completion_tokens` ON THE PROVIDERS THAT DOCUMENT IT
-    /// THAT WAY. This is provider-scoped, NOT a universal invariant.**
-    ///
-    /// OpenAI and Azure OpenAI (same wire shape) describe
-    /// `completion_tokens_details` as a BREAKDOWN of `completion_tokens`:
-    /// reasoning tokens are billed as output tokens and counted inside the
-    /// parent field, not on top of it, so summing
-    /// `completion_tokens + reasoning_tokens` would double-count *there*.
-    /// Do NOT generalize that to every OpenAI-compatible layer.
-    ///
-    /// **Counter-evidence, from this machine's own recorded corpus** (#1444
-    /// review, 2026-09-09 — every `.jsonl` under `~/.darkmux` walked
-    /// read-only, with derived `telemetry.tokens` payloads and the synthetic
-    /// `docs/demo` fixture excluded): 20,522 recorded provider `usage`
-    /// blocks satisfy `total == prompt + completion`, and **284 do not**.
-    /// Every one of the 284 reports `total_tokens` GREATER than the sum —
-    /// a third token class living OUTSIDE `completion_tokens`. They span
-    /// three endpoint families, not one:
-    ///
-    /// | endpoint / model | `total == p + c` | `total > p + c` |
-    /// |---|---|---|
-    /// | `openai:generativelanguage.googleapis.com` / `gemini-3.1-pro-preview` | 57 | 219 |
-    /// | `openai:generativelanguage.googleapis.com` / `gemini-2.5-flash` | 36 | 35 |
-    /// | `openai:api.x.ai` / `grok-4.3` | 0 | 30 |
-    ///
-    /// Samples: `prompt=9970 completion=128 total=11598` (third addend
-    /// 1500); `prompt=12423 completion=256 total=17627` (4948). `grok-4.3`
-    /// mismatches on 30 of its 30 recorded calls.
-    ///
-    /// Stated precisely, because this is easy to overclaim: both ENDPOINTS
-    /// are configured in `~/.darkmux/profiles.json` today
-    /// (`https://generativelanguage.googleapis.com/v1beta/openai` as the
-    /// `seat-gemini-35-flash-lite` seat, `https://api.x.ai/v1` as
-    /// `seat-grok-420-nonreasoning`), but the three mismatching MODEL IDS
-    /// above are not themselves pinned in any profile right now, and the
-    /// tiers that ARE pinned show zero mismatches in the corpus
-    /// (`gemini-3.5-flash-lite` 53/53 equal, `grok-4.20-0309-non-reasoning`
-    /// 46/46 equal). That does not make handling this optional: every one of
-    /// the 284 was a real dispatch from this machine, and seats get
-    /// repointed at different tiers through the same endpoints routinely —
-    /// a consumer that bakes in the subset assumption breaks silently the
-    /// next time one is aimed at a reasoning tier.
-    ///
-    /// The corroboration an earlier draft of this doc cited does NOT bear on
-    /// the question and has been removed: `loop_runner::MAX_TOKENS_PER_CALL`'s
-    /// empirical note is about a per-call CAP, not about the arithmetic of
-    /// `completion_tokens`, and it is about LMStudio — the one backend that
-    /// never emits `completion_tokens_details` at all (see
-    /// [`Usage::completion_tokens_details`]). It says nothing about the
-    /// providers that can produce the field.
-    ///
-    /// **UNVERIFIED — documentation, not measurement.** That the third
-    /// addend is specifically thinking tokens, and that these compat layers
-    /// name it `reasoning_tokens` under `completion_tokens_details`, are
-    /// both unexecuted claims. The recorded flow payloads PREDATE #1444 and
-    /// so carry no details object to read it from; settling it needs a live
-    /// capture of a raw response body from one of those endpoints.
-    ///
-    /// The rule that follows for every consumer: treat `reasoning_tokens` as
-    /// a subset of `completion_tokens` only where the provider documents it
-    /// so, and never reconstruct `total_tokens` arithmetically when the
-    /// provider reported its own.
-    #[serde(default)]
-    pub reasoning_tokens: Option<u32>,
-}
-
-/// See [`Usage::prompt_tokens_details`].
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct PromptTokensDetails {
-    #[serde(default)]
-    pub cached_tokens: Option<u32>,
-}
-
-impl Usage {
-    /// Billed reasoning tokens for this call, when the provider reported
-    /// them. Whether they are a SUBSET of `completion_tokens` or a third
-    /// class outside it is PROVIDER-SPECIFIC — see
-    /// [`CompletionTokensDetails::reasoning_tokens`]'s doc for the recorded
-    /// counter-evidence. `None` means "the provider didn't say", not "zero
-    /// reasoning tokens were spent" — collapses both the object-absent and
-    /// field-absent shapes to the same honest unknown.
-    pub fn reasoning_tokens(&self) -> Option<u32> {
-        self.completion_tokens_details
-            .as_ref()
-            .and_then(|d| d.reasoning_tokens)
-    }
-
-    /// Prompt tokens served from the provider's cache, when reported.
-    /// `None` means "the provider didn't say", not "zero cache hits".
-    pub fn cached_tokens(&self) -> Option<u32> {
-        self.prompt_tokens_details.as_ref().and_then(|d| d.cached_tokens)
-    }
 }
 
 /// (#2902) The request shape an endpoint accepts, handed in by the host as
@@ -724,7 +604,7 @@ pub struct ChatChunk {
     /// Some servers (LMStudio included, when `stream_options.include_usage`
     /// is on) emit `usage` on the final chunk. Optional everywhere.
     #[serde(default)]
-    pub usage: Option<Usage>,
+    pub usage: Option<UsageCounts>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -812,7 +692,7 @@ pub struct ChunkAccumulator {
     /// fragments arrive. Converted to `ToolCall` on `into_response()`.
     tool_call_slots: Vec<ToolCall>,
     finish_reason: Option<String>,
-    usage: Option<Usage>,
+    usage: Option<UsageCounts>,
     /// Reasoning content arrived via the separate-field stream. Empty
     /// when the model uses inline `<think>` tags (those land in the
     /// regular `content` stream and get extracted post-turn in
@@ -1387,106 +1267,20 @@ impl Iterator for TickingStream {
 mod tests {
     use super::*;
 
-    // ─── Usage: reasoning_tokens / cached_tokens (#1444) ──────
+    // ─── usage: the shared provider parse (#1444) ──────
 
-    /// A provider response that omits `completion_tokens_details` /
-    /// `prompt_tokens_details` entirely (LMStudio, and every non-reasoning
-    /// hosted model) must parse to `None` for both accessors — never a
-    /// fabricated zero.
+    /// The reply's `usage` goes through `darkmux_trajectory::UsageCounts`'
+    /// one parse, so a block the provider sent short (no `total_tokens`)
+    /// still reads, and never sinks the reply it arrived in.
     #[test]
-    fn usage_reasoning_and_cached_tokens_absent_when_provider_omits_details() {
-        let usage: Usage = serde_json::from_str(
-            r#"{"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}"#,
+    fn a_reply_whose_usage_omits_a_count_still_parses() {
+        let resp: ChatResponse = serde_json::from_str(
+            r#"{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":9,"completion_tokens":2}}"#,
         )
-        .expect("usage without details objects parses");
-        assert_eq!(usage.reasoning_tokens(), None);
-        assert_eq!(usage.cached_tokens(), None);
-    }
-
-    /// A provider that sends the details OBJECT but not the specific field
-    /// inside it (e.g. `completion_tokens_details: {}`) must ALSO parse to
-    /// `None` — the object being present names no zero on its own.
-    #[test]
-    fn usage_reasoning_and_cached_tokens_absent_when_details_object_empty() {
-        let usage: Usage = serde_json::from_str(
-            r#"{"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150,
-                "completion_tokens_details": {}, "prompt_tokens_details": {}}"#,
-        )
-        .expect("usage with empty details objects parses");
-        assert_eq!(usage.reasoning_tokens(), None);
-        assert_eq!(usage.cached_tokens(), None);
-    }
-
-    /// A provider that genuinely reports zero reasoning/cached tokens
-    /// (`Some(0)`) must be distinguishable from "didn't say" (`None`) —
-    /// the whole point of the tri-state.
-    #[test]
-    fn usage_reasoning_and_cached_tokens_true_zero_is_some_zero_not_none() {
-        let usage: Usage = serde_json::from_str(
-            r#"{"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150,
-                "completion_tokens_details": {"reasoning_tokens": 0},
-                "prompt_tokens_details": {"cached_tokens": 0}}"#,
-        )
-        .expect("usage with explicit zero details parses");
-        assert_eq!(usage.reasoning_tokens(), Some(0));
-        assert_eq!(usage.cached_tokens(), Some(0));
-    }
-
-    /// The GPT-5.1-class / Azure Foundry shape this issue was filed
-    /// against: on THAT provider family `reasoning_tokens` is a genuine,
-    /// nonzero SUBSET of `completion_tokens` (75 prompt + 1186 completion,
-    /// 1024 of the completion spent on reasoning, total_tokens =
-    /// prompt + completion).
-    ///
-    /// The `total == prompt + completion` assertion below is a claim about
-    /// THIS FIXTURE'S provider family, never a universal invariant — see
-    /// `usage_total_tokens_may_exceed_prompt_plus_completion` immediately
-    /// after it, and [`CompletionTokensDetails::reasoning_tokens`]'s doc for
-    /// the 284 recorded blocks that violate it.
-    #[test]
-    fn usage_reasoning_and_cached_tokens_present_nonzero() {
-        let usage: Usage = serde_json::from_str(
-            r#"{"prompt_tokens": 75, "completion_tokens": 1186, "total_tokens": 1261,
-                "completion_tokens_details": {"reasoning_tokens": 1024},
-                "prompt_tokens_details": {"cached_tokens": 64}}"#,
-        )
-        .expect("usage with real reasoning/cached tokens parses");
-        assert_eq!(usage.reasoning_tokens(), Some(1024));
-        assert_eq!(usage.cached_tokens(), Some(64));
-        assert!(usage.reasoning_tokens().unwrap() <= usage.completion_tokens);
-        assert_eq!(usage.total_tokens, usage.prompt_tokens + usage.completion_tokens);
-    }
-
-    /// (#1444 review) The counter-shape: a provider whose own `total_tokens`
-    /// EXCEEDS `prompt_tokens + completion_tokens`, i.e. bills a third token
-    /// class outside `completion_tokens`. The numbers are lifted verbatim
-    /// from this machine's recorded corpus (`~/.darkmux/flows/2026-07-05.jsonl`,
-    /// `gemini-2.5-flash` via `openai:generativelanguage.googleapis.com`):
-    /// `prompt=9970 completion=128 total=11598`, a third addend of 1500.
-    ///
-    /// Pins two things a future refactor must not break:
-    ///   1. `Usage` parses such a body without complaint — nothing in this
-    ///      type may start "correcting" or recomputing `total_tokens`.
-    ///   2. `total_tokens` survives as the PROVIDER's number. Any consumer
-    ///      that reconstructs a total as `prompt + completion` understates
-    ///      this call's real burn by 1500 tokens.
-    #[test]
-    fn usage_total_tokens_may_exceed_prompt_plus_completion() {
-        let usage: Usage = serde_json::from_str(
-            r#"{"prompt_tokens": 9970, "completion_tokens": 128, "total_tokens": 11598}"#,
-        )
-        .expect("a provider total exceeding prompt+completion must still parse");
-        assert_eq!(usage.total_tokens, 11598);
-        assert!(
-            usage.total_tokens > usage.prompt_tokens + usage.completion_tokens,
-            "recorded corpus: 284 blocks across gemini-3.1-pro-preview, gemini-2.5-flash \
-             and grok-4.3 bill a third token class outside completion_tokens — \
-             'total == prompt + completion' is provider-scoped, never universal"
-        );
-        // And the details accessors stay honestly silent about it: this
-        // provider named no details object, so there is nothing to report.
-        assert_eq!(usage.reasoning_tokens(), None);
-        assert_eq!(usage.cached_tokens(), None);
+        .expect("a short usage block does not fail the reply");
+        let usage = resp.usage.expect("the block is kept");
+        assert_eq!((usage.prompt, usage.completion, usage.total), (Some(9), Some(2), None));
     }
 
     // ─── build_streaming_request_body (#360) ──────────────────
@@ -2051,37 +1845,28 @@ mod tests {
                 delta: Delta::default(),
                 finish_reason: Some("stop".to_string()),
             }],
-            usage: Some(Usage {
-                prompt_tokens: 42,
-                completion_tokens: 7,
-                total_tokens: 49,
+            usage: Some(UsageCounts {
+                prompt: Some(42),
+                completion: Some(7),
+                total: Some(49),
                 // (#1444 review) NOT `..Default::default()`. The streaming
                 // path is the ONLY route a hosted reasoning-family model's
-                // details reach `LoopOutcome`, and defaulting them here
-                // would pin nothing: today `into_response` clones the whole
-                // `Usage`, so the fields ride along for free — but a
-                // refactor to field-by-field reconstruction would drop them
-                // and leave the entire feature inert with no test red.
-                // Populating them makes that refactor fail here.
-                completion_tokens_details: Some(CompletionTokensDetails {
-                    reasoning_tokens: Some(5),
-                }),
-                prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: Some(16) }),
+                // details reach the trajectory; populating them here makes a
+                // refactor that drops them in `into_response` fail.
+                reasoning: Some(5),
+                cached: Some(16),
             }),
         };
         acc.ingest(&final_chunk);
         let resp = acc.into_response();
         assert_eq!(resp.choices[0].finish_reason, "stop");
         let usage = resp.usage.expect("usage captured from final chunk");
-        assert_eq!(usage.prompt_tokens, 42);
-        assert_eq!(usage.completion_tokens, 7);
-        assert_eq!(usage.total_tokens, 49);
+        assert_eq!((usage.prompt, usage.completion, usage.total), (Some(42), Some(7), Some(49)));
         assert_eq!(
-            usage.reasoning_tokens(),
-            Some(5),
-            "the details object must survive the chunk stream, not just prompt/completion/total"
+            (usage.reasoning, usage.cached),
+            (Some(5), Some(16)),
+            "the details must survive the chunk stream, not just prompt/completion/total"
         );
-        assert_eq!(usage.cached_tokens(), Some(16));
     }
 
     #[test]

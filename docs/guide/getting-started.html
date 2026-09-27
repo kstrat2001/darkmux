@@ -160,15 +160,15 @@ matches no registered profile</div>
 
 I analyze diffs to identify correctness, security, and testing issues while reporting findings classified as MUST FIX or CONSIDER. I never modify implementation code, create commits or PRs, run remote git operations, or attempt to install project toolchains.
 
---- metrics ---
+--- run ---
+result:            stop
 turns:             1
 compactions:       0
 prompt tokens:     3527
 completion tokens: 277
-total messages:    3
+rest:              0ms over 0 rest(s)
 wall:              2933ms
-darkmux-runtime: trajectory → /darkmux-out/.darkmux-runtime/trajectory.jsonl
-darkmux-runtime: metrics → /darkmux-out/.darkmux-runtime/metrics.json</div>
+darkmux-runtime: trajectory → /darkmux-out/.darkmux-runtime/trajectory.jsonl</div>
     </div>
     <p class="session-caption">Every dispatch writes a flow record and a trajectory. The message is positional; <code>git diff | darkmux dispatch pr-reviewer</code> pipes one in. With no <code>--workdir</code>, the workspace is a fresh temporary directory, as above.</p>
   </div>

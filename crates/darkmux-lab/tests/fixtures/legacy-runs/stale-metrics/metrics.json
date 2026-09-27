@@ -1,0 +1,15 @@
+{
+  "runtime": "darkmux-runtime",
+  "version": "0.1.0",
+  "model": "qwen3.6-35b-a3b-turboquant-mlx",
+  "started_at_unix_ms": 1779979143813,
+  "wall_ms": 439012,
+  "result": "stop",
+  "turns": 9,
+  "compactions": 1,
+  "total_prompt_tokens": 175557,
+  "total_completion_tokens": 4843,
+  "total_messages": 22,
+  "max_turns_reached": false,
+  "final_assistant_preview": "\n\n**Gaps identified:**\n1. `assertRefreshTokenPepperConfigured` \u2014 completely untested; this is the boot-time fail-closed guard that prevents deployment with a dev placeholder pepper.\n2. `revokeRefreshTokenChain` \"already revoked\" early-exit \u2014 untested; without it, a double-revoke could hit the DB unnecessarily or behave unexpectedly.\n3. `verifyRefreshToken` empty-input short-circuit \u2014 untested; an "
+}

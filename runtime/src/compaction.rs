@@ -164,7 +164,7 @@ pub struct CompactorCall {
     /// The reply's own `model`, when the server named one.
     pub reported_model: Option<String>,
     /// The reply's usage block, when it carried one.
-    pub usage: Option<crate::lmstudio::Usage>,
+    pub usage: Option<darkmux_trajectory::UsageCounts>,
 }
 
 impl CompactorCall {
@@ -5493,7 +5493,7 @@ mod tests {
         assert_eq!(c.generation, 3);
         assert_eq!(c.requested_model, DEFAULT_COMPACTOR_MODEL);
         assert_eq!(c.reported_model.as_deref(), Some("test-compactor"));
-        assert_eq!(c.usage.as_ref().map(|u| u.total_tokens), Some(580));
+        assert_eq!(c.usage.as_ref().and_then(|u| u.total), Some(580));
     }
 
     /// A compaction that is REFUSED after its calls returned still spent
@@ -5551,7 +5551,7 @@ mod tests {
         assert_eq!(calls[0].generation, 7);
         assert_eq!(calls[0].requested_model, DEFAULT_COMPACTOR_MODEL);
         assert_eq!(calls[0].reported_model.as_deref(), Some("test-compactor"));
-        assert_eq!(calls[0].usage.as_ref().map(|u| u.prompt_tokens), Some(500));
+        assert_eq!(calls[0].usage.as_ref().and_then(|u| u.prompt), Some(500));
     }
 
     /// The structured path's retry: attempt 1 replies with nothing usable,

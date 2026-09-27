@@ -21,8 +21,8 @@
 //! thing standing in for "the model" is the scripted mock-model process.
 //!
 //! **Requires Docker** (a running daemon + `darkmux-runtime:latest` built
-//! locally — `docker build --build-arg DARKMUX_VERSION=<version> -t darkmux-runtime:latest runtime/` from the
-//! repo root) and a build of `tools/darkmux-mock-model` (built on demand
+//! locally — `docker build --build-arg DARKMUX_VERSION=<version> -f runtime/Dockerfile -t darkmux-runtime:latest .`
+//! from the repo root) and a build of `tools/darkmux-mock-model` (built on demand
 //! below via `cargo build`, so the only manual precondition is Docker).
 //! `#[ignore]`d by default so `cargo test --workspace` never requires
 //! Docker; run explicitly with:
@@ -325,8 +325,9 @@ fn real_container_dispatch_round_trips_through_a_standalone_mock_model_process()
 
     assert_eq!(result.exit_code, 0, "the runtime container must exit 0 on a clean stop");
 
-    // The internal runtime's `--json` envelope: { result, final_assistant,
-    // metrics, trajectory_path }. `result` must be "stop" (the mock's fixed
+    // The envelope `dispatch` returns: the runtime's { result,
+    // final_assistant, trajectory_path } plus the host's `metrics`, the fold
+    // of the trajectory. `result` must be "stop" (the mock's fixed
     // response has finish_reason "stop", no tool_calls) and
     // `final_assistant` must contain the mock's scripted content —
     // PROVING the completion the agent loop acted on genuinely came back
@@ -435,6 +436,11 @@ fn real_container_dispatch_executes_a_scripted_multi_turn_tool_call_sequence() {
         "the script's two turns must have driven exactly two loop iterations — proves the \
          tool-call turn genuinely round-tripped before the trigger-matched stop turn fired, \
          not that the loop got lucky and matched the fallback stop response first"
+    );
+    assert_eq!(
+        result.trajectory.as_ref().map(|fold| fold.turns()),
+        Some(2),
+        "the result carries the tailer's fold, the same reading the envelope's turns came from"
     );
     let final_assistant = envelope
         .get("final_assistant")

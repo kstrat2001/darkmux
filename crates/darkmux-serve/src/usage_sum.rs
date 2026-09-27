@@ -505,7 +505,7 @@ mod tests {
     /// saturates rather than wrapping (release) or panicking (debug).
     #[test]
     fn sums_saturate_instead_of_overflowing() {
-        let huge = UsageAmount { total: u64::MAX, prompt: u64::MAX, completion: u64::MAX, cached: Some(u64::MAX), purpose: UsagePurpose::Utility, reported: true };
+        let huge = UsageAmount { total: u64::MAX, prompt: u64::MAX, completion: u64::MAX, cached: Some(u64::MAX), purpose: UsagePurpose::Utility, reported: true, spend: Some(u64::MAX) };
         let mut sum = UsageSum::default();
         sum.add(&huge);
         sum.add(&huge);

@@ -3340,7 +3340,10 @@ mod tests {
         //   1.65.0 — (#2902 step 5) `endpoint_id` on usage records and the
         //            `budget.warn` / `budget.wait` / `budget.resume` / `budget.stop` actions.
         //   2.0.0 — (4.0) MAJOR: one wire spelling per action, dotted on
-        //            write; retired spellings upgrade on read.
+        //            write; retired spellings upgrade on read. Also drops
+        //            `dispatch.complete`'s `cumulative_prompt_tokens` /
+        //            `cumulative_completion_tokens` (their source,
+        //            `metrics.json`, is retired).
         assert_eq!(FLOW_SCHEMA_VERSION, "2.0.0");
     }
 

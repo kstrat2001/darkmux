@@ -195,11 +195,11 @@ impl ToolOutcome {
     }
 
     /// The wire discriminator written into records.
-    pub fn as_str(&self) -> &'static str {
+    pub fn kind(&self) -> darkmux_trajectory::ToolOutcomeKind {
         match self {
-            Self::Ok => "ok",
-            Self::Reported { .. } => "reported",
-            Self::Failed { .. } => "failed",
+            Self::Ok => darkmux_trajectory::ToolOutcomeKind::Ok,
+            Self::Reported { .. } => darkmux_trajectory::ToolOutcomeKind::Reported,
+            Self::Failed { .. } => darkmux_trajectory::ToolOutcomeKind::Failed,
         }
     }
 }

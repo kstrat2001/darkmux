@@ -57,7 +57,7 @@ The third one is opt-in (the daemon binds localhost by default for safety). To e
 |---|---|---|
 | **[LMStudio](https://lmstudio.ai/)** | Loads/unloads models. darkmux drives it via the `lms` CLI. | macOS / Windows / Linux installer |
 | **At least one model in LMStudio** | Nothing to dispatch to without one. | Download via the LMStudio UI; verify with `lms ls`. |
-| **[Docker](https://www.docker.com/products/docker-desktop)** | Hosts darkmux's internal Rust runtime, the default for `darkmux dispatch` and `darkmux lab run`. Each dispatch runs in a per-invocation `darkmux-runtime` container with kernel-enforced workspace isolation. darkmux pulls the version-pinned image from GHCR on demand (or `docker build --build-arg DARKMUX_VERSION=<version> -t darkmux-runtime:latest runtime/` from a source checkout at that version; a local image whose version label does not match the binary is skipped, #2923). **Required only for that dispatch + lab path:** the `machine` / `profile` read core needs only LMStudio + a model. | Docker Desktop or equivalent daemon |
+| **[Docker](https://www.docker.com/products/docker-desktop)** | Hosts darkmux's internal Rust runtime, the default for `darkmux dispatch` and `darkmux lab run`. Each dispatch runs in a per-invocation `darkmux-runtime` container with kernel-enforced workspace isolation. darkmux pulls the version-pinned image from GHCR on demand (or `docker build --build-arg DARKMUX_VERSION=<version> -f runtime/Dockerfile -t darkmux-runtime:latest .` from the root of a source checkout at that version; a local image whose version label does not match the binary is skipped, #2923). **Required only for that dispatch + lab path:** the `machine` / `profile` read core needs only LMStudio + a model. | Docker Desktop or equivalent daemon |
 
 > **`brew install` needs no toolchain.** Homebrew handles the build for you (and bottled binaries, once published, ship precompiled). The **Rust toolchain** is required only if you build from source (Option B below), which documents `rustup` at its first step.
 
@@ -106,7 +106,7 @@ cargo install --path .      # builds the self-contained binary, drops it on $PAT
 #    build-arg stamps the version label; dispatch skips an image whose label
 #    does not match the installed binary (#2923).
 docker build --build-arg DARKMUX_VERSION="$(darkmux --version | awk '{print $2}')" \
-  -t darkmux-runtime:latest runtime/
+  -f runtime/Dockerfile -t darkmux-runtime:latest .
 
 # 4. Bootstrap config + agent skills
 darkmux init                # writes ~/.darkmux/config.json + ~/.darkmux/profiles.json,
@@ -262,7 +262,7 @@ The `m-series-128` provider's rules are empirically validated against lab measur
 ```bash
 # build the image once from the darkmux repo root, stamped with the version
 docker build --build-arg DARKMUX_VERSION="$(darkmux --version | awk '{print $2}')" \
-  -t darkmux-runtime:latest runtime/
+  -f runtime/Dockerfile -t darkmux-runtime:latest .
 ```
 
 **Which image runs (#2923).** Dispatch reads the image's

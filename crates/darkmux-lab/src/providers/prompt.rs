@@ -162,10 +162,9 @@ impl WorkloadProvider for PromptProvider {
             turns: 1,
             compactions: 0,
             // (#2094) A single-turn provider never rests (nothing to rest
-            // BETWEEN); not read from metrics.json here.
+            // BETWEEN).
             rest_ms: 0,
             tokens_before: vec![],
-            summary_chars: vec![],
             mode: None,
             // (#2494) The typed twin of the note below; `None` when the
             // workload declares no verify, so a run nothing checked never

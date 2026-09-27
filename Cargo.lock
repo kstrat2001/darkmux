@@ -706,6 +706,7 @@ dependencies = [
  "darkmux-lab",
  "darkmux-profiles",
  "darkmux-serve",
+ "darkmux-trajectory",
  "darkmux-types",
  "dirs",
  "futures",
@@ -735,6 +736,7 @@ dependencies = [
  "darkmux-gestalt",
  "darkmux-hardware",
  "darkmux-profiles",
+ "darkmux-trajectory",
  "darkmux-types",
  "dirs",
  "httpmock",
@@ -858,6 +860,7 @@ dependencies = [
  "darkmux-gestalt",
  "darkmux-hardware",
  "darkmux-profiles",
+ "darkmux-trajectory",
  "darkmux-types",
  "dirs",
  "regex",
@@ -912,6 +915,14 @@ dependencies = [
  "tower-http",
  "ts-rs",
  "ureq",
+]
+
+[[package]]
+name = "darkmux-trajectory"
+version = "4.0.0-rc.1"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

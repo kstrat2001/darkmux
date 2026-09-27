@@ -27,7 +27,44 @@ darkmux release.
   `mission debrief` unchanged.
   A non-note record tagged `--source orchestrator` (a `flow catch`, say) now
   files under its own action in the event log, not under "note".
-
+- **`metrics.json`: the runtime no longer writes it, and nothing reads it.**
+  Every count (turns, compactions, tokens, rests) is now a fold of the
+  run's `trajectory.jsonl`, the one log the live tailer, `lab run stats`,
+  `lab run inspect` and `lab loop` all read (the new `darkmux-trajectory`
+  crate). The file was written only on a clean exit, so a killed run kept
+  whichever run's copy was there before: in one measured archive, 37 of
+  241 disagreed with their own trajectory, and every time the file was the
+  wrong one. The checks and flags that existed only to catch that
+  disagreement are gone with it: `RunChecks.tokens_reconcile`,
+  `turns_match_trajectory`, `rest_matches_trajectory`, `metrics_stale`,
+  `missing_required_events`, `checkpoint_parse_consistent` and
+  `checkpoint_events_seen`, and the `STALE-METRICS`, `TOKENS`, `PARSE` and
+  `COUNTS` flags (`RUN_STATS` 2.0.0). A lab run records no copy of the file
+  (coding-task manifest v7, tool-bench v3). **Migration:** read totals from
+  `darkmux lab run stats <run> --json` or the envelope's `metrics` block,
+  never from `metrics.json`; an old run directory still reports its totals
+  from its trajectory, and a leftover `metrics.json` in it is ignored.
+- **The runtime's own totals output.** Its plain-text summary is now a
+  `--- run ---` block (result, turns, compactions, tokens, rests, wall)
+  read from the trajectory, and its `--json` envelope carries no `metrics`
+  block: the host writes that block from the fold, so `darkmux dispatch
+  --json` still has one. `metrics.this_run` and `metrics.total_messages`
+  are gone: every figure in the block is this invocation's own, and only
+  `cumulative_turns`/`cumulative_compactions` count the whole task. The
+  same holds on `dispatch.complete`: for a resumed dispatch its `rest_ms`
+  and `rests` are now this invocation's rests (they were the whole task's,
+  seeded from the checkpoint), like its token counts. A checkpoint no
+  longer carries the prompt-token and rest running totals, which nothing
+  read; an older checkpoint that has them still resumes.
+  **Migration:** read `metrics.prompt_tokens` (and the rest) where you
+  read `metrics.this_run.*`; sum a task's rests over its runs'
+  `dispatch.complete` records.
+- **`dispatch.complete`'s `cumulative_prompt_tokens` /
+  `cumulative_completion_tokens`** (FLOW_SCHEMA 2.0.0). Their one source
+  was `metrics.json`. A usage record (`telemetry.tokens`) now omits a
+  count the provider did not report rather than writing 0. **Migration:**
+  a task's whole token total is the sum of its sessions' `telemetry.tokens`
+  records; `cumulative_turns`/`cumulative_compactions` stay.
 - **`radio.router_profile`, `DARKMUX_RADIO_ROUTER_PROFILE`, and the
   `role_profiles.radio-router` binding** (#2914). The radio routing seat
   now runs on the machine's one utility model (below), so there is no
@@ -185,6 +222,27 @@ darkmux release.
   `policy: {stale_after_ms, budget_wait_grace_ms}`, the numbers it judged
   by, and `/health` gains the same object as `lifecycle_policy`, which is
   where the viewer reads it (both additive). **Migration:** none.
+- **A call that reports no prompt count has an unknown spend, and is
+  never charged as small.** A usage record whose provider sent a
+  completion count but no prompt count (and no total) now carries no
+  `total_tokens`: a split missing a half is not a total. A hosted
+  `dispatch.single_shot`, `dispatch.map` item or `darkmux dispatch` to an
+  endpoint settles such a call (and one with no usage at all) against its
+  per-step cap at the whole granted `max_tokens` PLUS the prompt it sent,
+  estimated from the request at four characters a token (it had been
+  settling the completion alone, or the cap alone: the cap bounds only the
+  completion). Under an endpoint's `limits.window` token budget, the
+  halves such a call did report still count toward `warn_at`, the budget
+  and a `wait`, as a floor, and the window is flagged as not fully metered:
+  `budget.warn` and `budget.wait` carry `unmetered_calls` beside any level
+  they report (a warning whose only news is the flag has `level: null`),
+  and `darkmux doctor`'s endpoints check reads "spent at least". A calls
+  budget is never flagged: a call count is exact. The limit: a call whose
+  provider reported NO usage at all adds nothing to the window's known
+  spend, so under a token `wait` budget such calls warn "not fully
+  metered" but never, on their own, make it wait (the conservative charge
+  applies only to a step's per-step cap). **Migration:** none; an
+  endpoint that reports full usage reads exactly as before.
 - **The per-step cap on hosted tokens is renamed, has no default, and
   never stops a step: a step that used to stop at 500,000 hosted tokens now
   runs to completion unless you set a cap** (#2902 step 5).
@@ -725,8 +783,8 @@ darkmux release.
   reports an image dispatch would refuse as refused, not "will pull".
   **Behavior change for
   source builds:** a local runtime image must now be built with
-  `docker build --build-arg DARKMUX_VERSION=<version> -t darkmux-runtime:latest runtime/`
-  to be used. `--image darkmux-runtime:<any tag>` (e.g. `:4.0-rc`) is now
+  `docker build --build-arg DARKMUX_VERSION=<version> -f runtime/Dockerfile -t darkmux-runtime:latest .`
+  (from the repo root) to be used. `--image darkmux-runtime:<any tag>` (e.g. `:4.0-rc`) is now
   treated as darkmux's own image: version checked, run directly, never
   injected. A BYO `--image` (#703) now extracts its injected runtime from
   the matching image too. `darkmux doctor`'s `runtime image freshness`

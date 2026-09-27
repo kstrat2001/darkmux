@@ -856,6 +856,14 @@ pub struct DispatchResult {
     /// `/darkmux-out`). `None` when the dispatch path doesn't produce
     /// out-of-band bookkeeping (e.g. the remote single-shot path).
     pub out_dir: Option<PathBuf>,
+    /// This dispatch's trajectory, as the live tailer folded it while the
+    /// container ran: the dispatch's one reading of its trajectory. Callers
+    /// take their counts from here and never re-read the trajectory from
+    /// `out_dir`, which the model can write to. `None` when the dispatch path
+    /// produces no trajectory (the single-shot and remote paths), or when the
+    /// result was rebuilt from a crew-of-one step's packed output, which
+    /// carries the envelope and not the fold.
+    pub trajectory: Option<darkmux_trajectory::TrajectoryFold>,
 }
 
 /// Process-local monotonic counter — guarantees uniqueness for rapid

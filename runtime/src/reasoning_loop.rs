@@ -419,18 +419,7 @@ mod tests {
 
 // ── intra-turn degeneracy (#1221) ─────────────────────────────────────────
 
-/// Below this, a reasoning slice is treated as looping rather than working.
-///
-/// Deliberately far from BOTH measured clusters. Real productive reasoning —
-/// the 40,608-char pepper-grinder turn, its body alone, a resumed
-/// continuation, and a checkpoint accumulation — all scored **1.000**.
-/// Synthetic loops scored **0.013-0.015**. A threshold anywhere in 0.1-0.8
-/// separates them, so 0.25 sits with enormous margin on both sides.
-///
-/// The asymmetry is the reason to keep it low: a false CLEAN costs one more
-/// checkpoint, while a false DEGENERATE destroys an analysis pass. When in
-/// doubt this must let the model keep working.
-pub const DEGENERATE_TAIL_RATIO: f32 = 0.25;
+use darkmux_trajectory::DEGENERATE_TAIL_RATIO;
 
 /// Distinct-window ratio over the TAIL of one reasoning slice.
 ///
@@ -859,7 +848,7 @@ pub fn slice_is_degenerate(slice: &str, checkpoint_interval: u32) -> bool {
     if let Some(r) =
         tail_repetition_ratio(slice, TAIL_WINDOW_TOKENS, tail_sample_tokens(checkpoint_interval))
     {
-        if r < DEGENERATE_TAIL_RATIO {
+        if f64::from(r) < DEGENERATE_TAIL_RATIO {
             return true;
         }
     }
@@ -936,7 +925,7 @@ mod degeneracy_tests {
             .collect();
         let lr = tail_repetition_ratio(&looping, TAIL_WINDOW_TOKENS, tail_sample_tokens(1000)).unwrap();
         let pr = tail_repetition_ratio(&productive, TAIL_WINDOW_TOKENS, tail_sample_tokens(1000)).unwrap();
-        assert!(lr < DEGENERATE_TAIL_RATIO, "loop {lr} must be below {DEGENERATE_TAIL_RATIO}");
+        assert!(f64::from(lr) < DEGENERATE_TAIL_RATIO, "loop {lr} must be below {DEGENERATE_TAIL_RATIO}");
         assert!(pr > 0.9, "productive {pr} must be near 1.0");
     }
 }
@@ -968,7 +957,7 @@ mod checkpoint_gate_sensitivity {
             )
             .expect("a 20x repeat is long enough to judge");
             assert!(
-                r < DEGENERATE_TAIL_RATIO,
+                f64::from(r) < DEGENERATE_TAIL_RATIO,
                 "verbatim looping at interval={interval} scored {r:.4}, which is NOT \
                  below the {DEGENERATE_TAIL_RATIO} threshold — the gate cannot fire on \
                  the exact failure it exists to catch"

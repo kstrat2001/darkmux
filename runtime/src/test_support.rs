@@ -619,8 +619,14 @@ mod self_tests {
         let captured = Arc::new(Mutex::new(String::new()));
         let captured_in_hook = Arc::clone(&captured);
         let previous_hook = std::panic::take_hook();
+        // A panic hook is process-global: another test panicking on its own
+        // thread while this one runs would otherwise overwrite the capture
+        // (last writer wins). Only this thread's panic is the one asked about.
+        let this_thread = std::thread::current().id();
         std::panic::set_hook(Box::new(move |info| {
-            *captured_in_hook.lock().unwrap() = info.to_string();
+            if std::thread::current().id() == this_thread {
+                *captured_in_hook.lock().unwrap() = info.to_string();
+            }
         }));
         let result = std::panic::catch_unwind(f);
         std::panic::set_hook(previous_hook);
