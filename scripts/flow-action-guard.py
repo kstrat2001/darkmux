@@ -30,9 +30,9 @@
 #     which is not a current action (`dispatch.started`).
 # In code, the string must be a whole literal; in docs, a whole code span
 # (`...` or <code>...</code>); in fixtures, a JSON `"action"` value. An old
-# SPACED spelling in TypeScript/JavaScript counts only on a line that names
-# an action, because the viewer's activity labels (`"dispatch start"`) share
-# those words.
+# spelling in TypeScript/JavaScript that is also one of the viewer's activity
+# labels (`"dispatch start"`, read from `ACT_ORDER`) counts only on a line
+# that names an action; every other old spelling counts wherever it is.
 #
 # Not flow actions, though they share the grammar, and each READ from its own
 # source: the step-kind ids (`fn id(&self)` in crates/ and src/), the
@@ -71,6 +71,7 @@ TRAJECTORY_EVENTS_RS = "crates/darkmux-trajectory/src/event.rs"
 CONFIG_KEYS_RS = "src/config_cmd.rs"
 STAGE_TS = "ui/src/types/generated/Stage.ts"
 CLI_RS = "src/cli.rs"
+ACTIVITY_TS = "ui/src/lib/eventFilters.ts"
 VOCAB_SOURCES = (ACTION_RS, LEGACY_RS, TRAJECTORY_EVENTS_RS)
 GENERATED_TS = "ui/src/types/generated/"
 ARCHIVES = (
@@ -83,12 +84,14 @@ ARCHIVES = (
     "CHANGELOG.md",
 )
 RUST_ROOTS = ("crates/", "src/", "runtime/", "plugins/", "tests/")
-TSJS_ROOTS = ("tests/", "ui/src/")
+TSJS_ROOTS = ("tests/", "ui/src/", "ui/verify/", "ui/scripts/", "scripts/")
+TSJS_EXTS = ("ts", "tsx", "js", "mjs", "cjs")
 FILE_EXTS = {"rs", "ts", "tsx", "js", "mjs", "cjs", "json", "jsonl", "md", "html",
              "py", "sh", "toml", "yml", "yaml", "txt", "css", "lock", "log", "png", "svg"}
 ALLOW = "flow-action-guard:allow"
 ALLOW_START = "flow-action-guard:allow-start"
 ALLOW_END = "flow-action-guard:allow-end"
+UNCLOSED = "<an allow-start with no allow-end>"
 PLAIN = re.compile(r'(?<![A-Za-z0-9_#])"((?:[^"\\]|\\.)*)"')
 RAW = re.compile(r'r(#+)"(.*?)"\1')
 TS_LIT = re.compile(r'''"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|`((?:[^`\\]|\\.)*)`''')
@@ -103,9 +106,10 @@ class Vocab:
     """The flow-action vocabulary and the other dotted vocabularies that share
     its grammar, every one read from its own source."""
 
-    def __init__(self, current, old, scopes, others, verbs=()):
+    def __init__(self, current, old, scopes, others, verbs=(), labels=()):
         self.current = set(current)
         self.verbs = set(verbs)
+        self.labels = set(labels)
         self.old = set(old)
         self.written = self.current | self.old
         self.others = set(others)
@@ -146,7 +150,18 @@ def vocabulary(root):
     # The one-word old spellings (`note`, `catch`) are left out: as literals
     # they are ordinary words far more often than actions.
     multiword = {w for w in old | retired if re.search(r"[ .\-]", w)}
-    return Vocab(current, multiword, scopes, other_vocabularies(root), mission_verbs(root))
+    return Vocab(current, multiword, scopes, other_vocabularies(root), mission_verbs(root), activity_labels(root))
+
+
+def activity_labels(root):
+    """The viewer's activity labels (`ACT_ORDER`): a few share their words
+    with an old spelling (`dispatch start`), so in TypeScript those count only
+    on a line that names an action."""
+    body = read(root, ACTIVITY_TS).split("export const ACT_ORDER: string[] = [", 1)[1].split("];", 1)[0]
+    labels = set(re.findall(r'"([^"]+)"', body))
+    if len(labels) < 10:
+        sys.exit(f"flow-action-guard: activity label parse is broken ({len(labels)})")
+    return labels
 
 
 def mission_verbs(root):
@@ -247,7 +262,7 @@ def ts_hits(line, vocab):
     for m in TS_LIT.finditer(code):
         lit = next(g for g in m.groups() if g is not None)
         why = vocab.judge(lit, strict=False)
-        if why and (" " not in lit or names_action):
+        if why and (lit not in vocab.labels or names_action):
             found.append(lit)
         elif any(vocab.judge(a, strict=False) for a in JSON_ACTION.findall(lit)):
             found.append(lit)
@@ -319,12 +334,14 @@ def has_allow(line):
 def marked_violations(lines, hits_at):
     """Every hit `hits_at(i, line)` names, less the ones a marker covers: a
     marker on the line covers one hit there; a marker-only line covers one hit
-    on the line below; a start/end pair covers every line between."""
+    on the line below; a start/end pair covers every line between. A start
+with no end is itself a violation: it would silence the rest of the file."""
     out = []
     in_block = False
+    opened = 0
     for i, line in enumerate(lines):
         if ALLOW_START in line:
-            in_block = True
+            in_block, opened = True, i
         if ALLOW_END in line:
             in_block = False
             continue
@@ -334,6 +351,8 @@ def marked_violations(lines, hits_at):
         above = i > 0 and has_allow(lines[i - 1]) and not hits_at(i - 1, lines[i - 1])
         allowed = int(has_allow(line)) + int(above and not has_allow(line))
         out.extend((i + 1, hit) for hit in hits[allowed:])
+    if in_block:
+        out.append((opened + 1, UNCLOSED))
     return out
 
 
@@ -352,7 +371,7 @@ def checker_for(rel):
     ext = rel.rsplit(".", 1)[-1] if "." in os.path.basename(rel) else ""
     if ext == "rs" and rel.startswith(RUST_ROOTS):
         return lambda text, v: rust_violations(text, v, all_test=is_rust_test_file(rel))
-    if ext in ("ts", "tsx", "js", "mjs", "cjs") and rel.startswith(TSJS_ROOTS):
+    if ext in TSJS_EXTS and (rel.startswith(TSJS_ROOTS) or re.fullmatch(r"ui/[^/]+", rel)):
         return ts_violations
     if ext in ("json", "jsonl"):
         return fixture_violations
@@ -374,7 +393,8 @@ def scan(root, vocab):
         except UnicodeDecodeError:
             continue
         for line_no, lit in check(text, vocab):
-            found.append(f"{rel}:{line_no}: \"{lit}\" ({vocab.judge(lit, True) or 'builds or tests an action'})")
+            why = "an unclosed marker block" if lit == UNCLOSED else vocab.judge(lit, True) or "builds or tests an action"
+            found.append(f"{rel}:{line_no}: \"{lit}\" ({why})")
     return found
 
 
@@ -382,10 +402,11 @@ def scan(root, vocab):
 
 SELF_TEST_VOCAB = Vocab(
     current={"dispatch.start", "mission.run.finalize", "hook.fired"},
-    old={"dispatch start", "mission.run.start", "tier-decision", "mission abort"},
+    old={"dispatch start", "dispatch complete", "mission reopen", "mission.run.start", "tier-decision", "mission abort"},
     scopes={"dispatch", "mission", "hook"},
     others={"dispatch.map", "dispatch.start", "tier-decision"},
     verbs={"mission abort"},
+    labels={"dispatch start"},
 )
 
 RUST_CASES = [
@@ -410,6 +431,8 @@ RUST_CASES = [
     ('// flow-action-guard:allow — one only\nf("dispatch.start", "dispatch start")', 1),
     ('f("dispatch.start") // flow-action-guard:allow — this line\ng("dispatch start")', 1),
     ('// flow-action-guard:allow-start — a block\nf("dispatch start");\ng("dispatch start");\n// flow-action-guard:allow-end\nh("dispatch start");', 1),
+    ('// flow-action-guard:allow-start — never closed\nf("dispatch start");', 1),
+    ('// flow-action-guard:allow-start — never closed\nlet a = 1;', 1),
     # A test module: a current spelling is fine, an old or made-up one is not.
     ('fn f() {}\n#[cfg(test)]\nmod tests {\n    let a = "dispatch.start";\n}', 0),
     ('#[cfg(test)]\nmod tests {\n    let a = "dispatch start";\n}', 1),
@@ -429,6 +452,8 @@ TS_CASES = [
     ("const a = `dispatch.started`;", 1),
     ('const a = "dispatch.start";', 0),
     ('const label = "dispatch start";', 0),
+    ('raw("dispatch complete", 0);', 1),
+    ('raw("mission reopen", 0);', 1),
     ('expect(r.action).toBe("mission abort");', 1),
     ('// action "dispatch start" in a comment', 0),
     (' * the retired `mission.run.start`', 0),
@@ -473,7 +498,10 @@ def self_test():
     for rel, want in [("docs/demo/x.jsonl", None), ("tests/parity/corpus/a.jsonl", None),
                       ("crates/darkmux-flow/src/legacy.rs", None), ("ui/src/types/generated/FlowAction.ts", None),
                       ("tests/fixtures/a.jsonl", fixture_violations), ("ui/src/lib/flow.ts", ts_violations),
-                      ("skills/x/SKILL.md", doc_violations), ("docs/guide/a.html", doc_violations)]:
+                      ("skills/x/SKILL.md", doc_violations), ("docs/guide/a.html", doc_violations),
+                      ("ui/verify/a.spec.ts", ts_violations), ("ui/scripts/a.mjs", ts_violations),
+                      ("ui/vite.config.ts", ts_violations), ("scripts/slop-chop/a.mjs", ts_violations),
+                      ("ui/node_modules/x/a.js", None)]:
         assert checker_for(rel) is want, f"{rel}: wrong checker"
     assert checker_for("crates/darkmux-flow/src/lib.rs") is not None
     print("flow-action-guard self-test passed")

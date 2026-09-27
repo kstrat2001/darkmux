@@ -184,8 +184,8 @@ describe("vocabulary skew is loud", () => {
         // flow-action-guard:allow-start — a retired action, as an archive still holds it
         raw("telemetry.process", 0, { category: "telemetry", source: "process", payload: { cpu: 12 } }),
         raw("mission.compile.error", 1),
-        // flow-action-guard:allow-end
         raw("mission reopen", 2),
+        // flow-action-guard:allow-end
       ]);
       expect(recs.every((r) => isKnownAction(r.action))).toBe(true);
       expect(unknownActionCount(recs)).toBe(0);
