@@ -922,27 +922,45 @@ export interface StepMeter {
 export type StepPhases = ReadonlyMap<string, LifecyclePhase>;
 export const NO_STEP_PHASES: StepPhases = new Map();
 
-/** The records {@link stepForRecord} attributes to each step: a step's run,
- *  whatever sessions it spans (its task session's step bookends, its
- *  dispatch's own). Time order, as given. */
-export function recordsByStep(records: readonly NormRecord[], idx: GraphIndex, missionId: string): Map<string, NormRecord[]> {
-  const out = new Map<string, NormRecord[]>();
+/** A step's records by session: each session a run of its own. */
+export type StepSessions = ReadonlyMap<string, readonly NormRecord[]>;
+
+/** The records {@link stepForRecord} attributes to each step, by session:
+ *  a step spans its task session's step bookends and one dispatch session
+ *  per item it fans out (`dispatch.map`, review's seats and draws), and
+ *  each session is a run of its own. Time order, as given. */
+export function recordsByStep(records: readonly NormRecord[], idx: GraphIndex, missionId: string): Map<string, Map<string, NormRecord[]>> {
+  const out = new Map<string, Map<string, NormRecord[]>>();
   for (const rec of records) {
-    const sid = stepForRecord(rec, idx, missionId);
-    if (!sid) continue;
-    const list = out.get(sid);
+    const stepId = stepForRecord(rec, idx, missionId);
+    if (!stepId) continue;
+    const sessions = out.get(stepId) ?? new Map<string, NormRecord[]>();
+    out.set(stepId, sessions);
+    const key = rec.session_id ?? "";
+    const list = sessions.get(key);
     if (list) list.push(rec);
-    else out.set(sid, [rec]);
+    else sessions.set(key, [rec]);
   }
   return out;
 }
 
+/** How far along a phase is, for picking a step's from its sessions': in
+ *  flight outranks everything, so one working item keeps the step alive. */
+const PHASE_RANK: Record<LifecyclePhase, number> = { not_started: 0, closed: 1, stale: 2, waiting: 3, open: 4 };
+
 /** Each step's run lifecycle phase as of `now` (`lib/lifecycle.ts`), the
- *  one every surface judges a run by: a budget wait, staleness and a close
- *  read here as they do on the run page. */
-export function stepPhasesAt(byStep: ReadonlyMap<string, readonly NormRecord[]>, now: number, policy: LifecyclePolicy): StepPhases {
+ *  one every surface judges a run by: each of its sessions judged on its
+ *  own, and the step in flight while any of them is. */
+export function stepPhasesAt(byStep: ReadonlyMap<string, StepSessions>, now: number, policy: LifecyclePolicy): StepPhases {
   const out = new Map<string, LifecyclePhase>();
-  for (const [stepId, recs] of byStep) out.set(stepId, lifecycleAt(currentRun(groupOfRecords(recs), now), now, policy).phase);
+  for (const [stepId, sessions] of byStep) {
+    let phase: LifecyclePhase = "not_started";
+    for (const recs of sessions.values()) {
+      const p = lifecycleAt(currentRun(groupOfRecords(recs), now), now, policy).phase;
+      if (PHASE_RANK[p] > PHASE_RANK[phase]) phase = p;
+    }
+    out.set(stepId, phase);
+  }
   return out;
 }
 

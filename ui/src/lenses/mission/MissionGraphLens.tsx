@@ -622,7 +622,7 @@ export function MissionGraphLens({
   // Each step's run phase as of `now`, from the records attributed to it:
   // the lifecycle every surface reads, so a step reads generating exactly
   // while its run is in flight on the run page too.
-  const stepRecords = useMemo(() => (idx ? recordsByStep(ascendingRecords, idx, missionId) : new Map<string, NormRecord[]>()), [ascendingRecords, idx, missionId]);
+  const stepRecords = useMemo(() => (idx ? recordsByStep(ascendingRecords, idx, missionId) : new Map<string, Map<string, NormRecord[]>>()), [ascendingRecords, idx, missionId]);
   const phases = useMemo(() => stepPhasesAt(stepRecords, now, policy), [stepRecords, now, policy]);
   const proc = useProcReadout(flowTailQuery.data);
 

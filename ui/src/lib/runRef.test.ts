@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { currentRun, grainOf, groupOfRecords, recordsOfGroup, refAt, runIndex, runRecords, sessionRun, __runIndexBuilds } from "./runRef";
+import { currentRun, grainOf, groupOfRecords, recordsOfGroup, refAt, runIndex, runRecords, sessionRouteRecords, sessionRun, __runIndexBuilds } from "./runRef";
 import { lifecycleAt, DEFAULT_POLICY } from "./lifecycle";
 import { normAll, type RawRecord } from "../testing/records";
 
@@ -34,10 +34,21 @@ describe("runIndex: a session id two missions share", () => {
     expect(sessionRun(shared, "task-probe", Date.parse(at(100)))?.ref.missionId).toBe("A");
   });
 
-  it("a session route naming a mission reads that mission's run, whichever ran last", () => {
+  it("a session route naming a mission reads that mission's run, whichever ran last (one it does not carry reads as a link naming none)", () => {
     expect(sessionRun(shared, "task-probe", Date.parse(at(620)), "A")?.ref.missionId).toBe("A");
     expect(sessionRun(shared, "task-probe", Date.parse(at(620)), "B")?.ref.missionId).toBe("B");
-    expect(sessionRun(shared, "task-probe", Date.parse(at(620)), "C")).toBeNull();
+    expect(sessionRun(shared, "task-probe", Date.parse(at(620)), "C")?.ref.missionId).toBe("B");
+  });
+
+  it("a route naming a mission the session's records do not carry reads the session as a link naming none", () => {
+    // An older archive, or a session of mission-less bookends: the link's
+    // mission names nothing here, and an empty page is worse than the run.
+    const bare = normAll([rec(0, "dispatch.start"), rec(60, "dispatch.complete")]);
+    expect(sessionRouteRecords(bare, "task-probe", "gone")).toEqual(bare);
+    // Several missions on the session and the named one absent: all of them,
+    // not the first mission's run.
+    expect(sessionRouteRecords(shared, "task-probe", "C")).toEqual(shared);
+    expect(sessionRun(bare, "task-probe", Date.parse(at(100)), "gone")?.ref.sessionId).toBe("task-probe");
   });
 });
 

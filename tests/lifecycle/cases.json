@@ -1,5 +1,5 @@
 {
-  "$comment": "One lifecycle spec, two executors: ui/src/lib/lifecycle.corpus.test.ts (the viewer's lifecycleAt) and crates/darkmux-serve/src/runs.rs's lifecycle_corpus test (the daemon's session fold). Each case is the records of one or more runs, an as-of instant (both executors judge the records at or before it; an untimed record is always in), the run judged (`run`: a session and optionally a mission; absent, the session a `#dispatch=<id>` link names, as the session's current run), and the phase and status every surface must state for it then. A case the daemon cannot judge says why in server_skip_reason; the only such input is session presence.",
+  "$comment": "One lifecycle spec, two executors: ui/src/lib/lifecycle.corpus.test.ts (the viewer's lifecycleAt) and crates/darkmux-serve/src/runs.rs's lifecycle_corpus test (the daemon's session fold). Each case is the records of one or more runs, an as-of instant (both executors judge the records at or before it; an untimed record is always in), the run judged (`run`: a session and optionally a mission, which the daemon reads as `/runs` reads that mission's row, by its own attempts on the session; absent, the session a `#dispatch=<id>` link names, as the session's current run), and the phase and status every surface must state for it then. A case the daemon cannot judge says why in server_skip_reason; the only such input is session presence.",
   "policy": {
     "stale_after_ms": 1200000,
     "budget_wait_grace_ms": 60000
@@ -783,9 +783,7 @@
         "mission_id": "A"
       },
       "phase": "closed",
-      "status": "complete",
-      "server": false,
-      "server_skip_reason": "/runs judges a session by its current attempt; an earlier mission of a session several missions share has no row of its own there (#1918: such a session is no mission's drill target)"
+      "status": "complete"
     },
     {
       "name": "the later mission's run owns the mission-less close",
@@ -912,9 +910,7 @@
       },
       "phase": "stale",
       "status": "abandoned",
-      "abandoned_reason": "noterminal",
-      "server": false,
-      "server_skip_reason": "/runs judges a session by its current attempt; an earlier mission of a session several missions share has no row of its own there (#1918: such a session is no mission's drill target)"
+      "abandoned_reason": "noterminal"
     },
     {
       "name": "a later mission starting on a shared session does not stop an earlier mission's run still in flight",
@@ -947,9 +943,7 @@
         "mission_id": "A"
       },
       "phase": "open",
-      "status": "running",
-      "server": false,
-      "server_skip_reason": "/runs judges a session by its current attempt; an earlier mission of a session several missions share has no row of its own there (#1918: such a session is no mission's drill target)"
+      "status": "running"
     },
     {
       "name": "presence holds open only the session's current run, not an earlier mission's",
@@ -1166,6 +1160,118 @@
       ],
       "phase": "closed",
       "status": "complete"
+    },
+    {
+      "name": "a mission-less session.end closes the run still open at its time, not a later mission's finished one",
+      "as_of": "2026-09-27T10:00:30Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "A"
+        },
+        {
+          "ts": "2026-09-27T10:00:05Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "B"
+        },
+        {
+          "ts": "2026-09-27T10:00:10Z",
+          "action": "dispatch.complete",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "B"
+        },
+        {
+          "ts": "2026-09-27T10:00:20Z",
+          "action": "session.end",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "run": {
+        "session_id": "task-probe",
+        "mission_id": "A"
+      },
+      "phase": "closed",
+      "status": "abandoned",
+      "abandoned_reason": "noterminal"
+    },
+    {
+      "name": "a mission-less session.end after a later mission's clean finish leaves that finish alone",
+      "as_of": "2026-09-27T10:00:30Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "A"
+        },
+        {
+          "ts": "2026-09-27T10:00:05Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "B"
+        },
+        {
+          "ts": "2026-09-27T10:00:10Z",
+          "action": "dispatch.complete",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "B"
+        },
+        {
+          "ts": "2026-09-27T10:00:20Z",
+          "action": "session.end",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "run": {
+        "session_id": "task-probe",
+        "mission_id": "B"
+      },
+      "phase": "closed",
+      "status": "complete"
+    },
+    {
+      "name": "an untimed opener mid-stream is segmented after every timed record",
+      "as_of": "2026-09-27T10:00:30Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "s1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        },
+        {
+          "ts": "2026-09-27T10:00:10Z",
+          "action": "dispatch.complete",
+          "session_id": "s1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        },
+        {
+          "ts": "not-a-time",
+          "action": "dispatch.start",
+          "session_id": "s1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        },
+        {
+          "ts": "2026-09-27T10:00:20Z",
+          "action": "dispatch.turn",
+          "session_id": "s1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "stale",
+      "status": "abandoned",
+      "abandoned_reason": "noterminal"
     }
   ]
 }

@@ -20,10 +20,11 @@
  *    first opening record (a `dispatch.start`, a `budget.wait`, a
  *    `mission.start`, a `step.start`, or, when nothing opened yet, any
  *    turn, heartbeat, tool call or rest). A record naming a mission joins
- *    that mission's latest attempt; one naming none joins the attempt open
- *    at its time. A `dispatch.start` in an attempt that already has one, or
- *    any reopening record after the attempt closed, starts the next
- *    attempt (a relaunch under the same id). The attempt current as of t is
+ *    that mission's latest attempt; one naming none joins the latest
+ *    attempt still open at its time, or the latest opened when none is. A
+ *    `dispatch.start` in an attempt that already has one, or any reopening
+ *    record after the attempt closed, starts the next attempt (a relaunch
+ *    under the same id). The attempt current as of t is
  *    the latest one opened by t.
  * 2. Close. An attempt closes on its earliest closing record: a dispatch or
  *    step terminal, `session.end`, `budget.stop`, `mission.close` or
@@ -114,6 +115,20 @@ export interface Lifecycle {
 /** Session ids presence reports live. */
 export type Presence = ReadonlySet<string>;
 export const NO_PRESENCE: Presence = new Set<string>();
+
+/** The instant runs are judged at, and the presence they are judged with. */
+export interface Judgement {
+  readonly asOf: number;
+  readonly presence: Presence;
+}
+
+/** The one rule for what a page judges its runs at: a parked playhead's
+ *  instant, with no presence (presence is a fact about now); else now, with
+ *  the sessions presence reports live. The run page, the fleet lens and the
+ *  event log all read it. */
+export function judgementAt(playhead: number | null, now: number, live: Presence): Judgement {
+  return playhead === null ? { asOf: now, presence: live } : { asOf: playhead, presence: NO_PRESENCE };
+}
 
 /** One attempt of a run (rule 1). */
 export interface Attempt {
@@ -210,13 +225,20 @@ function latestOf(attempts: readonly Building[], m: string): Building | null {
   return null;
 }
 
+/** The latest attempt still open (no close yet), or `null`. */
+function latestOpen(attempts: readonly Building[]): Building | null {
+  for (let i = attempts.length - 1; i >= 0; i--) if (attempts[i].close === null) return attempts[i];
+  return null;
+}
+
 /** The attempt a record joins (rule 1): a record naming a mission joins
  *  that mission's latest attempt, or adopts the current attempt when that
- *  one names no mission yet; a record naming none joins the attempt open
- *  (or latest opened) at its time. `null`: it belongs to no attempt yet. */
+ *  one names no mission yet; a record naming none joins the latest attempt
+ *  still open at its time, or the latest opened when none is. `null`: it
+ *  belongs to no attempt yet. */
 function targetFor(attempts: readonly Building[], m: string | null): Building | null {
   const cur = attempts.at(-1) ?? null;
-  if (!m) return cur;
+  if (!m) return latestOpen(attempts) ?? cur;
   return latestOf(attempts, m) ?? (cur && cur.missionId === null ? cur : null);
 }
 
