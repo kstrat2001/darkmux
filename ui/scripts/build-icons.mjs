@@ -15,7 +15,7 @@
  * directory, and playwright is `ui/`'s dependency:
  *     node ui/scripts/build-icons.mjs
  */
-import { chromium } from "playwright";
+import { chromium } from "@playwright/test";
 import { readFileSync, writeFileSync, mkdirSync, copyFileSync, readdirSync } from "fs";
 import { dirname, resolve } from "path";
 import { fileURLToPath } from "url";

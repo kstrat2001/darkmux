@@ -89,7 +89,7 @@ const WALL_HINT_TITLE =
  * a run the gate flagged 14 times still read CLEAN. */
 export const CLEAN_DETECTORS = ["cycle", "tool failure", "reasoning loop", "edit drift", "repetition"] as const;
 
-export interface SessionHeader {
+interface SessionHeader {
   /** Pre-uppercased (`.sub h2{text-transform:uppercase}` in legacy CSS —
    * this port uppercases the string directly, per `lib/format.ts`'s
    * "uppercase the STRING directly" discipline, rather than depending on a
@@ -354,9 +354,9 @@ function runOffset(deltaMs: number): string {
  *  the emitter — `dispatch_internal`'s detector payload has always carried it
  *  — and is NOT derived from the record's `level`, which is `Info` for every
  *  detector record and therefore says nothing. */
-export type SignalSeverity = "warn" | "info";
+type SignalSeverity = "warn" | "info";
 
-export interface Signal {
+interface Signal {
   kind: string;
   severity: SignalSeverity;
   detail: string;
@@ -371,7 +371,7 @@ export interface Signal {
   offsetLabel: string;
 }
 
-export interface SignalGroup {
+interface SignalGroup {
   kind: string;
   severity: SignalSeverity;
   count: number;
@@ -382,7 +382,7 @@ export interface SignalGroup {
  *  can expand it in place. `chars` is the AUTHORITATIVE length from the
  *  record (`prompt_chars`) when present, so a truncated payload still reports
  *  its true size rather than the size of what survived. */
-export interface Disclosure {
+interface Disclosure {
   id: string;
   label: string;
   chars: number;

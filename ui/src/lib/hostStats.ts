@@ -31,7 +31,7 @@ export interface ProcSamplePoint {
   gpu?: number;
 }
 
-export interface MetricAggregate {
+interface MetricAggregate {
   /** The latest sample's value — `null` when this metric never reported. */
   now: number | null;
   /** Mean over every reading this metric reported. */

@@ -316,7 +316,7 @@ function srcbadgeText(route: Route, replayDate: string | null = null): string {
  * — the 24H fleet window can run into yesterday, so "today" was sometimes
  * wrong on top of being redundant with the pill's own dot. "LIVE" is never
  * wrong: it names the TRANSPORT state, not a calendar day. */
-export const LIVE_CHIP = "LIVE";
+const LIVE_CHIP = "LIVE";
 
 /** The catalog toggle's own glyph for a route that names a specific
  * recording — the mission id once a mission has closed, or a past date.

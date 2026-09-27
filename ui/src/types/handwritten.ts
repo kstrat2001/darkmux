@@ -121,7 +121,7 @@ export interface PresenceBeat {
 
 /** `GET /machine/specs`. Source:
  * `crates/darkmux-serve/src/lib.rs::machine_specs_handler`. */
-export interface LoadedModel {
+interface LoadedModel {
   identifier: string;
   model: string;
   status: string;
@@ -129,7 +129,7 @@ export interface LoadedModel {
   context: number;
 }
 
-export interface UtilityModel {
+interface UtilityModel {
   id: string;
   loaded: boolean;
   /** (#2915) The binding's declared window (`internal.utility.n_ctx`);
@@ -225,7 +225,7 @@ export interface MachineResourcesModel {
  * `ui/src/lenses/lab/labSeries.ts` exercises) still type-checks; a run's own
  * REAL emitted seats always carry both. Source:
  * `crates/darkmux-lab/src/lab/review.rs::SeatStaffingSnapshot`. */
-export interface SeatStaffing {
+interface SeatStaffing {
   name: string;
   model?: string;
   k?: number;
@@ -239,7 +239,7 @@ export interface SeatStaffing {
  * `probes` is optional here (the real struct always sends the array, even
  * empty) to match `labKnobSummary`'s own `st.probes || []` null-guard and
  * the lab-series test spec's minimal fixtures (`{ judge: {...} }` alone). */
-export interface StaffingSnapshot {
+interface StaffingSnapshot {
   probes?: SeatStaffing[];
   judge?: SeatStaffing;
 }
@@ -256,7 +256,7 @@ export interface StaffingSnapshot {
  * `tests/parity/corpus/lab-runs.json`) but stay optional here because the
  * runs-lens's own test fixtures predate the field. Source:
  * `crates/darkmux-serve/src/lib.rs::LabRunSummary`. */
-export interface LabRun {
+interface LabRun {
   dir: string;
   mtime_ms: number;
   case_ids: string[];
@@ -370,7 +370,7 @@ export interface FlowRecordsResponse {
  * estimate note); `warn` is a real degradation; `error` means the reading
  * itself is untrustworthy (a probe/enumeration failure). Source:
  * `crates/darkmux-profiles/src/model_ledger.rs::{Severity,LedgerMessage}`. */
-export interface LedgerMessage {
+interface LedgerMessage {
   severity: "info" | "warn" | "error";
   text: string;
 }
@@ -471,7 +471,7 @@ export interface MachineResources {
  * `peak_pct`/`mean_pct`/`p95_pct` naming FEEDS these numbers (never
  * re-derived), but the wire shape is whatever `/machine/resources`
  * actually promises callers. */
-export interface MachineLoadMetric {
+interface MachineLoadMetric {
   mean: number | null;
   p95: number | null;
   max: number | null;
@@ -481,7 +481,7 @@ export interface MachineLoadMetric {
  * "Performance" / "Efficiency" on current hardware). `name`/`cores` are
  * always present when the cluster itself is reported; `pct`/`mhz` are
  * null when IOReport is unavailable on this host. */
-export interface CpuCluster {
+interface CpuCluster {
   name: string;
   cores: number;
   pct: number | null;
@@ -494,13 +494,13 @@ export interface CpuCluster {
  * parse, it just falls through styling as unrecognized. */
 export type ThermalState = "nominal" | "fair" | "serious" | "critical" | string;
 
-export interface MachineThermalNow {
+interface MachineThermalNow {
   state: ThermalState;
   /** `pmset -g therm CPU_Speed_Limit` — 100 when no limit is in effect. */
   cpu_speed_limit_pct: number;
 }
 
-export interface MachineThermalWindow {
+interface MachineThermalWindow {
   worst_state: ThermalState;
   above_nominal_ms: number;
   min_cpu_speed_limit_pct: number;
@@ -527,14 +527,14 @@ export interface MachineThermalWindow {
   level_entries?: Record<string, number>;
 }
 
-export interface MachinePowerNow {
+interface MachinePowerNow {
   cpu: number;
   gpu: number;
   ane: number;
   total: number;
 }
 
-export interface MachinePowerWindow {
+interface MachinePowerWindow {
   total: MachineLoadMetric;
   gpu: MachineLoadMetric;
   cpu: MachineLoadMetric;
@@ -693,7 +693,7 @@ export interface MachineLoad {
  * empty in the recorded corpus — no session was live at record time), widen
  * this interface if a future lens needs them.
  * Source: `crates/darkmux-flow/src/presence.rs`. */
-export interface LiveSessionBeat {
+interface LiveSessionBeat {
   session_id: string;
   /** The mission the execution runs under, when it does. */
   mission_id?: string;

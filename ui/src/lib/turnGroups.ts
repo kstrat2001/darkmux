@@ -20,7 +20,7 @@ import { DEFAULT_POLICY, isRunning, lifecycleAt, NO_PRESENCE, type LifecyclePoli
  * own `turn_seq` uses it; any other takes the most recent turn before it in
  * time. */
 
-export interface TurnInfo {
+interface TurnInfo {
   seq: number;
   /** "answered" when the turn ended the run's work; otherwise its tool count. */
   why: string;

@@ -60,7 +60,7 @@ import { BrainGlyph } from "./ActivityIcon";
  * glowing icon for the tool while in TOOLS, and nothing otherwise.
  */
 
-export type TokenScopeSize = "mini" | "card" | "tile";
+type TokenScopeSize = "mini" | "card" | "tile";
 
 export interface TokenScopeProps {
   /** Current tok/s reading. Callers pass whatever `tokenRate.ts`'s

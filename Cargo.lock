@@ -709,7 +709,6 @@ dependencies = [
  "darkmux-trajectory",
  "darkmux-types",
  "dirs",
- "futures",
  "libc",
  "predicates",
  "redis",
@@ -719,10 +718,8 @@ dependencies = [
  "serial_test",
  "tempfile",
  "tokio",
- "tokio-stream",
  "tokio-util",
  "tower",
- "tower-http",
  "ureq",
 ]
 
@@ -777,7 +774,6 @@ dependencies = [
  "darkmux-hardware",
  "darkmux-profiles",
  "darkmux-types",
- "dirs",
  "serde",
  "serde_json",
 ]

@@ -69,10 +69,10 @@ export interface Tag<K extends string, W extends string> {
 }
 
 export type NormAction = Tag<"action", string>;
-export type NormLevel = Tag<"level", string>;
-export type NormCategory = Tag<"category", string>;
-export type NormStage = Tag<"stage", string>;
-export type NormTier = Tag<"tier", string>;
+type NormLevel = Tag<"level", string>;
+type NormCategory = Tag<"category", string>;
+type NormStage = Tag<"stage", string>;
+type NormTier = Tag<"tier", string>;
 
 declare const normBrand: unique symbol;
 
@@ -230,7 +230,9 @@ type Covers<U, O> = [Exclude<U, ValuesOf<O>>] extends [never] ? true : false;
 type Assert<T extends true> = T;
 /** Compile-time proof that every member of each generated union has a name
  *  above: one `Assert` per union, so a variant ts-rs adds without a name
- *  here fails to typecheck on its own line. */
+ *  here fails to typecheck on its own line. Exported only so the compiler
+ *  keeps it; nothing imports it.
+ *  @public */
 export type EveryVariantNamed = [
   Assert<Covers<Action, typeof ACTION_WIRE>>,
   Assert<Covers<Level, typeof LEVEL_WIRE>>,

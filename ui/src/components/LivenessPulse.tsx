@@ -29,7 +29,7 @@
  *
  *  12s = poll (5s) + heartbeat (2s) + margin. A genuinely stuck dispatch
  *  still stops pulsing well inside the watchdog's own inactivity budget. */
-export const PULSE_QUIET_AFTER_MS = 12_000;
+const PULSE_QUIET_AFTER_MS = 12_000;
 
 export interface LivenessPulseProps {
   /** Has the run reached a terminal record? This is the SEMANTIC question —

@@ -838,6 +838,17 @@ jobs:
         run: |
           python3 scripts/flow-action-guard.py --self-test
           python3 scripts/flow-action-guard.py
+      # (4.0) No dependency a crate declares and never uses. cargo-machete
+      # reads sources, not the build, so it runs on stable in seconds and
+      # covers every manifest under the repo: the workspace, runtime/ and
+      # plugins/. A false positive goes in the crate's
+      # `[package.metadata.cargo-machete] ignored` list with a reason.
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete@0.9.2
+      - name: No unused Rust dependencies
+        run: cargo machete
       - name: No engagement-private identifiers (this repo is PUBLIC)
         # darkmux is public OSS developed alongside private client work, so an
         # employer name, a private repo, a hosted endpoint or a tracker key can
@@ -989,6 +1000,14 @@ jobs:
         if: steps.filter.outputs.ui == 'true'
         working-directory: ui
         run: bun run lint
+
+      # No file nothing reaches and no export nothing imports (tests count as
+      # importers). The generated ts-rs bindings are exempt: they mirror Rust
+      # types whether or not the viewer reads each one yet.
+      - name: UI dead code (knip)
+        if: steps.filter.outputs.ui == 'true'
+        working-directory: ui
+        run: bun run knip
 
       # (#2212) slop-chop's mechanical stages: the AST survey and the
       # truth-table oracle. Plain `node --test` — no vitest, no bundler — and

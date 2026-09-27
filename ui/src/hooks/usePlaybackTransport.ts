@@ -122,7 +122,7 @@ function focusRuns(focus: Exclude<PlaybackFocus, { kind: "day" }>): { runs: read
  * live viewer saw it. The cycle steps UP from there (1s/s → 5s/s → 30s/s →
  * 1m/s → 10m/s → 1h/s) and wraps; 5s/s and 30s/s sit between real time and
  * 1m/s, which on its own "goes direct to hyper mode" (operator). */
-export const SPEEDS = [1, 5, 30, 60, 600, 3600] as const;
+const SPEEDS = [1, 5, 30, 60, 600, 3600] as const;
 export type Speed = (typeof SPEEDS)[number];
 export const DEFAULT_SPEED: Speed = 1;
 export const PLAY_TICK_MS = 100;

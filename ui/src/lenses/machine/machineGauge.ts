@@ -21,11 +21,9 @@
 import { GIB, KIB, MIB, memBytes, memPct, memStateCls } from "../../lib/format";
 import type { MachineResources, MachineResourcesModel } from "../../types/handwritten";
 
-export type Severity = "green" | "amber" | "red" | "unknown";
-
 // ── The gauge (the semicircle hero) ─────────────────────────────────────
 
-export interface GaugeTick {
+interface GaugeTick {
   pct: number; // 0-100, position along the sweep
   label: string;
 }
@@ -205,7 +203,7 @@ export function resolveGaugeScale(limit: number | null, poolCap: number | null, 
  * marker, redline) reads from, so none of them can disagree about what the
  * scale means. */
 /** One segment of the stacked band, as percentages of the dial's scale. */
-export interface BandSegment {
+interface BandSegment {
   startPct: number;
   lengthPct: number;
 }
@@ -406,8 +404,8 @@ export function gaugeFaceCaption(state: string | null | undefined, pressureRed: 
 
 // ── The tell-tale lamp row ───────────────────────────────────────────────
 
-export type LampKey = "residency" | "unpriced" | "pressure" | "overLimit" | "stale" | "warn";
-export type LampSeverity = "dim" | "warn" | "bad";
+type LampKey = "residency" | "unpriced" | "pressure" | "overLimit" | "stale" | "warn";
+type LampSeverity = "dim" | "warn" | "bad";
 
 export interface LampView {
   key: LampKey;
@@ -579,7 +577,7 @@ export function odometerTiles(pressure: MachineResources["pressure"]): OdometerV
 
 // ── Model rows: the scaling rule + residency diffing ────────────────────
 
-export type RowStatus = "live" | "new" | "ghost";
+type RowStatus = "live" | "new" | "ghost";
 // `"expected"` is a RESERVED, not-yet-buildable fourth status — docs/design/machine-lens/proposal.md
 // §8 names the `EXPECTED · not yet resident` row explicitly as blocked on a
 // server-side `expected[]` set (staffing-derived) that does not exist today.

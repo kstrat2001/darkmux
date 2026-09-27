@@ -80,7 +80,7 @@ export const ACTIVITY_WINDOW_PRESETS: { label: string; minutes: number }[] = [
 
 export const DEFAULT_ACTIVITY_WINDOW_MIN = 1440;
 
-export interface TimelineBar {
+interface TimelineBar {
   /** The session id — still the click-through target (`#dispatch=<sid>`,
    * `FleetLens.tsx`) and the `data-arg` shown to the operator, unchanged.
    * NOT guaranteed unique within a lane on its own (#2125) — a review
@@ -102,7 +102,7 @@ export interface TimelineBar {
   title: string;
 }
 
-export interface TimelineLane {
+interface TimelineLane {
   uid: string;
   name: string;
   bars: TimelineBar[];

@@ -58,7 +58,7 @@ import { uidOf } from "./flow";
 import type { ProcSamplePoint } from "./hostStats";
 import { ACTION, CATEGORY, byTime, recordsAsOf, recordsSince, type NormRecord } from "./ingest";
 
-export const DRAWER_ROLLING_WINDOW_MS = 10 * 60 * 1000;
+const DRAWER_ROLLING_WINDOW_MS = 10 * 60 * 1000;
 export const DRAWER_ROLLING_SCOPE_LABEL = "last 10 min";
 
 /** How far back `findLastKnownSample` will look for a stray older reading

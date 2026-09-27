@@ -695,7 +695,7 @@ function windowMinutesLabel(spanMs: number): string {
  * nearest minute; a span under a minute reads as "less than 1 min" rather
  * than rounding down to a misleading "0 min". Capped at 10 (the ring's own
  * ceiling) so a clock/measurement wobble can't read "11 min". */
-export function daemonWindowLabel(spanMs: number): string {
+function daemonWindowLabel(spanMs: number): string {
   return `last ${windowMinutesLabel(spanMs)} · daemon sampler`;
 }
 

@@ -39,7 +39,7 @@ export interface FlowReadFailure {
  *  which says the records exist and were refused. The daemon answers 401 to a
  *  remote read without the serve token (#881); reading that as an empty day
  *  would show "idle" to a viewer who was never shown the records. */
-export function isFailedRead(r: FetchResult<unknown> | undefined): r is Extract<FetchResult<unknown>, { ok: false }> {
+function isFailedRead(r: FetchResult<unknown> | undefined): r is Extract<FetchResult<unknown>, { ok: false }> {
   if (!r || r.ok) return false;
   return r.status !== 404;
 }

@@ -47,7 +47,7 @@ function notify(): void {
   listeners.forEach((l) => l());
 }
 
-export function subscribe(listener: () => void): () => void {
+function subscribe(listener: () => void): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);
 }
@@ -174,7 +174,7 @@ let installed = false;
  * instance (idempotent — safe to call more than once, e.g. from a test that
  * re-imports the module in isolation). Exported so a test can assert the
  * listeners are live without relying on import-time side effects alone. */
-export function installGlobalModalKeyboardHandlers(): void {
+function installGlobalModalKeyboardHandlers(): void {
   if (installed || typeof document === "undefined") return;
   installed = true;
   document.addEventListener("keydown", handleTabTrap, true);

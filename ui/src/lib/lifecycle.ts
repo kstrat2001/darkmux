@@ -190,7 +190,7 @@ const hasReason = (r: NormRecord): boolean => {
 };
 
 /** The edge a closing record implies; `null` for any other record. */
-export function closeEdgeOf(r: NormRecord): CloseEdge | null {
+function closeEdgeOf(r: NormRecord): CloseEdge | null {
   switch (r.action) {
     case ACTION.DispatchComplete:
     case ACTION.StepComplete:
@@ -346,7 +346,7 @@ function openWaitUntil(recs: readonly NormRecord[], policy: LifecyclePolicy): nu
 /** Whether `lastActivityMs` is more than the policy's window before `asOf`.
  *  No activity at all is stale: absence of evidence is not evidence of life.
  *  The one staleness rule; the mission graph's step meter asks it too. */
-export function isStale(lastActivityMs: number | null, asOf: number, policy: LifecyclePolicy): boolean {
+function isStale(lastActivityMs: number | null, asOf: number, policy: LifecyclePolicy): boolean {
   return lastActivityMs === null || asOf - lastActivityMs > policy.staleAfterMs;
 }
 

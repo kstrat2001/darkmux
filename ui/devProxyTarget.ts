@@ -36,7 +36,7 @@
 
 /// The built-in default, matching `SERVE_BIND_DEFAULT` / `SERVE_PORT_DEFAULT`
 /// on the Rust side.
-export const DEFAULT_BIND = "127.0.0.1";
+const DEFAULT_BIND = "127.0.0.1";
 export const DEFAULT_PORT = "8765";
 
 /**
