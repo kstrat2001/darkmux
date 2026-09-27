@@ -191,15 +191,9 @@ const BUILTIN_MISSIONS: &[(&str, &str)] = &[];
 const BUILTIN_PHASES: &[(&str, &str)] = &[];
 
 /// The user-side crew root: `DARKMUX_CREW_DIR` if set, else `<paths.crew>`
-/// from the active workspace.
-///
-/// **Deprecated direction (Beat 33):** prefer the per-subdir helpers
-/// `roles_dir()`, `missions_dir()`, `phases_dir()`, `crews_dir()`,
-/// and `skills_dir()` for new code. They resolve the post-flatten
-/// `<root>/<subdir>/` layout with a backward-
-/// compatibility fallback to the legacy `<root>/crew/<subdir>/` layout.
-/// `crew_root()` is retained for callers that need the parent directory
-/// itself (e.g., daemon banner messages).
+/// from the active workspace. Its one reader is the operator's
+/// autonomous-dispatch preamble override. User state (roles, missions,
+/// phases, crews, skills) lives under [`user_state_root`], never here.
 pub(crate) fn crew_root() -> PathBuf {
     // env(DARKMUX_CREW_DIR) > config.dirs.crew > <root>/crew (#661 Slice 3).
     // (#1012) ForceUser, NOT Auto: crew manifests are operator/fleet-level state.
@@ -227,36 +221,16 @@ pub fn user_state_root() -> PathBuf {
         .unwrap_or_else(|| resolve(ResolveScope::ForceUser).root)
 }
 
-/// Resolve a user-state subdirectory with backward-compat fallback.
-///
-/// Resolution order:
-///   1. `<root>/<subdir>/` (post-flatten canonical) — if exists
-///   2. `<root>/crew/<subdir>/` (pre-flatten legacy) — if exists
-///   3. `<root>/<subdir>/` (canonical, returned even when missing so a
-///      fresh write creates the new layout)
-///
-/// Writes follow reads: if legacy exists and canonical doesn't, BOTH
-/// reads AND new writes go to legacy. State never silently splits
-/// across the two locations. Operators migrate explicitly via the
-/// `mv` script that `darkmux doctor` emits when it detects the legacy
-/// layout (PR-3b).
-fn resolve_user_subdir(subdir: &str) -> PathBuf {
-    let root = user_state_root();
-    let canonical = root.join(subdir);
-    if canonical.exists() {
-        return canonical;
-    }
-    let legacy = root.join("crew").join(subdir);
-    if legacy.exists() {
-        return legacy;
-    }
-    canonical
+/// A user-state subdirectory: `<root>/<subdir>/`. The pre-Beat-33
+/// `<root>/crew/<subdir>/` layout is not read; `darkmux doctor` fails on it
+/// and prints the move script.
+fn user_subdir(subdir: &str) -> PathBuf {
+    user_state_root().join(subdir)
 }
 
-/// User-side roles directory. Post-Beat-33: `<root>/roles/`. Falls back
-/// to `<root>/crew/roles/` for operators on the legacy layout.
+/// User-side roles directory: `<root>/roles/`.
 pub(crate) fn roles_dir() -> PathBuf {
-    resolve_user_subdir("roles")
+    user_subdir("roles")
 }
 
 /// Public read of the user-tier roles directory, for `darkmux doctor`'s
@@ -292,30 +266,24 @@ pub fn user_role_manifest_path(role_id: &str) -> Option<PathBuf> {
     entries.into_iter().find(|p| id_of(p).as_deref() == Some(role_id))
 }
 
-/// User-side missions directory. Post-Beat-33: `<root>/missions/`.
-/// Falls back to `<root>/crew/missions/` for operators on the legacy
-/// layout.
+/// User-side missions directory: `<root>/missions/`.
 pub fn missions_dir() -> PathBuf {
-    resolve_user_subdir("missions")
+    user_subdir("missions")
 }
 
-/// User-side phases directory. Post-Beat-33: `<root>/phases/`. Falls
-/// back to `<root>/crew/phases/` for operators on the legacy layout.
+/// User-side phases directory: `<root>/phases/`.
 pub fn phases_dir() -> PathBuf {
-    resolve_user_subdir("phases")
+    user_subdir("phases")
 }
 
-/// User-side crews directory (operator overrides). Post-Beat-33:
-/// `<root>/crews/`. Falls back to `<root>/crew/crews/` for legacy.
+/// User-side crews directory (operator overrides): `<root>/crews/`.
 pub(crate) fn crews_dir() -> PathBuf {
-    resolve_user_subdir("crews")
+    user_subdir("crews")
 }
 
-/// User-side skills directory (operator overrides). Post-Beat-33:
-/// `<root>/skills/`. Falls back to `<root>/crew/skills/`
-/// for legacy.
+/// User-side skills directory (operator overrides): `<root>/skills/`.
 pub(crate) fn skills_dir() -> PathBuf {
-    resolve_user_subdir("skills")
+    user_subdir("skills")
 }
 
 /// User-side mission-configs directory (#1284 Packet 1) — the top tier of

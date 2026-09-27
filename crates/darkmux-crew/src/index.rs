@@ -491,8 +491,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
 /// (path, role-or-cap-or-..-id, content) tuples. Only enumerates the
 /// caller-resolved directory; builtins are intentionally excluded so
 /// drift detection scopes to operator-owned state. Caller is
-/// responsible for resolving the right dir (e.g., `loader::roles_dir()`)
-/// so the post-Beat-33 dual-read fallback is honored.
+/// responsible for resolving the right dir (e.g., `loader::roles_dir()`).
 fn enumerate_user_files(dir: &Path) -> Result<Vec<(PathBuf, String, Vec<u8>)>> {
     if !dir.exists() {
         return Ok(Vec::new());
@@ -526,10 +525,9 @@ fn enumerate_user_files(dir: &Path) -> Result<Vec<(PathBuf, String, Vec<u8>)>> {
     Ok(out)
 }
 
-/// Resolve the per-kind directory through the loader's dual-read helpers
-/// so the index respects the post-Beat-33 layout (canonical-first,
-/// legacy fallback). Centralized here so populate() + status_at() never
-/// drift apart.
+/// Resolve the per-kind directory through the loader's helpers, so the
+/// index reads exactly the directories the loader does. Centralized here so
+/// populate() + status_at() never drift apart.
 fn kind_to_dir(kind: &str) -> PathBuf {
     match kind {
         "role" => loader::roles_dir(),
@@ -769,8 +767,7 @@ fn populate(conn: &mut Connection) -> Result<()> {
 
     // source_files — scan user-side disk only (builtins are version-gated by
     // the stored darkmux_version in meta_kv, not by per-file mtime). Each
-    // kind's directory is resolved through the loader's dual-read helpers
-    // so the legacy <root>/crew/<subdir>/ layout still indexes correctly.
+    // kind's directory is resolved through the loader's helpers.
     let kinds: &[&str] = &["role", "skill", "crew", "mission", "phase"];
     for kind in kinds {
         let dir = kind_to_dir(kind);
@@ -1081,8 +1078,7 @@ fn status_at(path: &Path) -> Result<StatusReport> {
         .unwrap_or(0);
 
     // Drift detection: compare on-disk state to source_files. Each kind's
-    // directory is resolved through the loader's dual-read helpers so
-    // a legacy <root>/crew/<subdir>/ layout still drift-detects correctly.
+    // directory is resolved through the loader's helpers.
     let kinds: &[&str] = &["role", "skill", "crew", "mission", "phase"];
 
     // Build set of all paths currently recorded.
@@ -1913,17 +1909,12 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn index_picks_up_legacy_layout_roles() {
-        // Regression for the Beat-33 dual-read miss: index.rs previously
-        // had its own private crew_root() that bypassed the loader's
-        // dual-read helpers. An operator on the legacy <root>/crew/roles/
-        // layout would `darkmux crew index rebuild` and silently record
-        // zero source_files — then status would report every role as
-        // `deleted` against the empty snapshot.
+    fn index_does_not_read_a_legacy_crew_layout() {
+        // (4.0) The index resolves each kind through the loader's helpers,
+        // which no longer fall back to the pre-Beat-33 `<root>/crew/<subdir>/`
+        // layout. A role left there is invisible to the index, as it is to
+        // the loader; `darkmux doctor` fails on the leftover directory.
         let guard = CrewDirGuard::new();
-        // Seed a role at the LEGACY path (<root>/crew/roles/) instead of
-        // the canonical (<root>/roles/) — emulates an operator who hasn't
-        // run PR-3b's mv script yet.
         let legacy_roles = guard.path().join("crew").join("roles");
         std::fs::create_dir_all(&legacy_roles).unwrap();
         std::fs::write(
@@ -1935,25 +1926,11 @@ mod tests {
         let idx = index_path(guard.path());
         rebuild_at(&idx).unwrap();
 
-        // Drift detection should see the legacy-layout file. If the dual-
-        // read miss recurs, the file is invisible to the index and the
-        // status report will be "clean" against an empty snapshot — a
-        // silent data-integrity failure for legacy-layout operators.
         let conn = open_index(&idx).unwrap();
-        let mut stmt = conn
-            .prepare("SELECT path FROM source_files WHERE kind = 'role'")
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM source_files WHERE kind = 'role'", [], |r| r.get(0))
             .unwrap();
-        let rows: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(0))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
-        assert_eq!(rows.len(), 1, "legacy-layout role should index — got rows={:?}", rows);
-        assert!(
-            rows[0].contains("/crew/roles/alpha.json"),
-            "indexed path should be the legacy location, got: {}",
-            rows[0]
-        );
+        assert_eq!(count, 0, "a legacy-layout role must not index");
     }
 
     #[serial_test::serial]

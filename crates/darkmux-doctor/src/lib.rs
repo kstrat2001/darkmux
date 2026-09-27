@@ -505,9 +505,10 @@ fn check_legacy_compaction_extras() -> Check {
 
 /// Detect operators still on the pre-Beat-33 `<root>/crew/{roles,
 /// missions,phases,crews,skills,role-model-pins.json}` layout
-/// and emit an mv-script they can copy-paste to flatten. The loader's
-/// dual-read keeps the legacy layout working, so this is a Warn (not
-/// Fail) — operator-sovereignty: doctor proposes, operator runs.
+/// and emit an mv-script they can copy-paste to flatten. 4.0 no longer
+/// reads that layout (the loader resolves `<root>/<subdir>/` only), so
+/// state left there is invisible: a Fail. Operator-sovereignty still
+/// holds: doctor proposes, operator runs.
 ///
 /// The script writes to stderr-friendly stdout (the hint field), so a
 /// fresh-Claude session can read it back and offer to execute. Doctor
@@ -634,14 +635,14 @@ fn check_beat33_legacy_crew_dir() -> Check {
 
     Check {
         name: "beat-33 crew/ layout".into(),
-        status: Status::Warn,
+        status: Status::Fail,
         message: format!(
-            "operator state still under {}/ (found: {listed_str}); flattening is recommended",
+            "operator state still under {}/ (found: {listed_str}); darkmux does not read it",
             legacy_dir.display()
         ),
         hint: Some(format!(
-            "darkmux still reads the legacy layout via the loader's dual-read fallback — no \
-             rush. When you're ready to flatten, copy-paste this — each line is state-checked \
+            "darkmux no longer reads the pre-flatten `crew/` layout, so the state listed above \
+             is invisible until it moves. Copy-paste this; each line is state-checked \
              against your actual destination (a plain `mv -n` for an absent destination, a \
              per-entry merge for one that already exists, never a directory nested into \
              another):\n\n{script}\n\n\
@@ -650,9 +651,8 @@ fn check_beat33_legacy_crew_dir() -> Check {
              `LEFTOVERS in ...` line naming the directory it stayed in — compare those two \
              copies yourself and delete the stale one. A clean run prints nothing.\n\n\
              Note: if you set DARKMUX_CREW_DIR explicitly, this check assumes the env var \
-             points at the post-flatten root (e.g. `~/.darkmux/`). If you instead set it \
-             at the legacy `crew/` dir (`~/.darkmux/crew/`), the dual-read keeps working \
-             but this script's paths are computed from the env var value as-given.",
+             points at the post-flatten root (e.g. `~/.darkmux/`), and this script's paths \
+             are computed from the env var value as-given.",
             script = script_lines.join("\n")
         )),
     }
@@ -15148,7 +15148,7 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn beat33_legacy_crew_dir_warns_with_mv_script_when_subdirs_present() {
+    fn beat33_legacy_crew_dir_fails_with_mv_script_when_subdirs_present() {
         let guard = CrewRootGuard::new();
         // Seed the legacy layout with the subdirs an upgrading operator
         // would actually have.
@@ -15157,7 +15157,7 @@ mod tests {
         std::fs::write(guard.path().join("crew").join("role-model-pins.json"), "{}").unwrap();
 
         let check = check_beat33_legacy_crew_dir();
-        assert_eq!(check.status, Status::Warn);
+        assert_eq!(check.status, Status::Fail);
         assert!(check.message.contains("operator state still under"));
         assert!(check.message.contains("missions"));
         assert!(check.message.contains("roles"));
@@ -15166,7 +15166,7 @@ mod tests {
         let hint = check
             .hint
             .as_ref()
-            .expect("warn must carry an mv-script hint");
+            .expect("the failure must carry an mv-script hint");
         // Script must be operator-runnable: mv -n (no-clobber) for safety,
         // plus a final rmdir to clean up the now-empty parent.
         assert!(hint.contains("mv -n"));
@@ -15174,11 +15174,10 @@ mod tests {
         assert!(hint.contains("/crew/missions"));
         assert!(hint.contains("/crew/role-model-pins.json"));
         assert!(hint.contains("rmdir"));
-        // Operator-sovereignty: the hint explicitly notes that nothing is
-        // urgent (loader's dual-read keeps the legacy layout working).
-        // Strip newlines before substring-match so rustfmt re-wrapping
-        // doesn't move the assertion's goalposts.
-        assert!(hint.replace('\n', " ").contains("no rush"));
+        // 4.0 dropped the dual read: the hint must say the legacy layout is
+        // no longer read, not that it keeps working. Strip newlines before
+        // substring-matching so rewrapping doesn't move the goalposts.
+        assert!(hint.replace('\n', " ").contains("darkmux no longer reads"));
     }
 
     #[serial_test::serial]
@@ -15191,7 +15190,7 @@ mod tests {
         std::fs::create_dir_all(guard.path().join("crew").join("operator-private-stuff")).unwrap();
 
         let check = check_beat33_legacy_crew_dir();
-        assert_eq!(check.status, Status::Warn);
+        assert_eq!(check.status, Status::Fail);
         assert!(check.message.contains("roles"));
         assert!(
             !check.message.contains("operator-private-stuff"),
@@ -15228,8 +15227,8 @@ mod tests {
         std::fs::write(guard.path().join("missions").join("m2.json"), "{}").unwrap();
 
         let check = check_beat33_legacy_crew_dir();
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
-        let hint = check.hint.expect("warn must carry an mv-script hint");
+        assert_eq!(check.status, Status::Fail, "{}", check.message);
+        let hint = check.hint.expect("the failure must carry an mv-script hint");
         let flat = hint.replace('\n', " ");
 
         // The corrupting line must NEVER appear when the destination
@@ -15308,8 +15307,8 @@ mod tests {
         std::fs::write(dest.join("collide.json"), r#"{"from":"already-flattened"}"#).unwrap();
 
         let check = check_beat33_legacy_crew_dir();
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
-        let hint = check.hint.expect("warn must carry an mv-script hint");
+        assert_eq!(check.status, Status::Fail, "{}", check.message);
+        let hint = check.hint.expect("the failure must carry an mv-script hint");
         let script = beat33_script_from_hint(&hint);
         assert!(
             script.contains("mv -n"),
@@ -15382,7 +15381,7 @@ mod tests {
         std::fs::write(dest.join("already-here.json"), "{}").unwrap();
 
         let check = check_beat33_legacy_crew_dir();
-        let hint = check.hint.expect("warn must carry an mv-script hint");
+        let hint = check.hint.expect("the failure must carry an mv-script hint");
         let script = beat33_script_from_hint(&hint);
         let out = std::process::Command::new("bash")
             .arg("-c")

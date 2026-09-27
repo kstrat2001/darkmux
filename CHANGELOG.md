@@ -74,6 +74,10 @@ darkmux release.
   not read, and the doctor check that pointed at the verb is gone.
   **Migration:** run `darkmux mission migrate --apply` on 3.x before
   upgrading.
+- **The pre-Beat-33 `<root>/crew/{roles,missions,phases,crews,skills}`
+  fallback read.** User state resolves under `<root>/<subdir>/` only;
+  `darkmux doctor` now FAILS on a leftover `crew/` subdir and prints the
+  move script. **Migration:** run the script `darkmux doctor` prints.
 
 ### Changed (breaking, 4.0)
 

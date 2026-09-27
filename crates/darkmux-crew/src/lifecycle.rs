@@ -221,9 +221,8 @@ pub fn save_phase(phase: &Phase) -> Result<()> {
 /// phase JSONs under `sprints/` (the old directory name), not `phases/`. If
 /// the canonical `phases/` subdir doesn't exist yet for this mission but the
 /// legacy `sprints/` one does, reads (and any subsequent writes, via
-/// `save_json`'s create-on-write) route there instead — same "writes follow
-/// reads" convention `loader::resolve_user_subdir` uses for the Beat-33
-/// flatten, so the rename never orphans an operator's real existing mission
+/// `save_json`'s create-on-write) route there instead ("writes follow
+/// reads"), so the rename never orphans an operator's real existing mission
 /// data. A mission with neither subdir yet (brand new) gets the canonical
 /// path so a fresh write creates the new-name layout.
 pub fn phases_dir(mission_id: &str) -> PathBuf {
