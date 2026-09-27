@@ -1284,7 +1284,13 @@ describe("FleetLens pager (#2881)", () => {
       </QueryClientProvider>,
     );
     await waitFor(() => expect(document.querySelector(".mach-scope__rate")).not.toBeNull());
-    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("—");
+    // (#2955 review) Now the whole status line, a bare "—" said nothing:
+    // "— tok/s", as the thinking case reads "— think tok/s". A known state
+    // (generating) with no number yet keeps the reading style and the lit
+    // dot; only "no signal" (no state at all) takes the dim, plain line.
+    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("— tok/s");
+    expect(document.querySelector(".mach-scope__rate")).toBe(document.querySelector(".mach .stat"));
+    expect(document.querySelector(".mach")!.className).not.toContain("nosignal");
     expect(latestTokenScopeProps()).toMatchObject({ tokensPerSec: null, state: "generating" });
   });
 
@@ -1416,7 +1422,10 @@ describe("FleetLens pager (#2881)", () => {
     await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
     fireEvent.click(screen.getByLabelText("next execution"));
     expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("reviewer");
-    expect(document.querySelector(".mach-scope__rate")!.textContent?.toLowerCase()).toBe("no signal");
+    // (#2955 review) The plain no-signal status line, dim dot, not the reading.
+    expect(document.querySelector(".mach .stat")!.textContent).toBe("no signal");
+    expect(document.querySelector(".mach-scope__rate")).toBeNull();
+    expect(document.querySelector(".mach")!.className).toContain("nosignal");
     expect(latestTokenScopeProps()).toMatchObject({ state: "nosignal" });
   });
 });
@@ -2211,13 +2220,16 @@ describe("savings hero: nothing leaks while loading (#2830)", () => {
       });
       renderFleetLens({ connected: false });
 
-      const rate = await waitFor(() => {
-        const el = document.querySelector(".mach-scope__rate");
-        expect(el, "the rate line should be mounted").toBeTruthy();
-        return el as HTMLElement;
-      });
-      expect(rate.textContent?.toLowerCase()).toContain("no signal");
-      expect(rate.textContent?.toLowerCase()).not.toContain("stalled");
+      // (#2955 review) "no signal" looks the same everywhere: the plain
+      // status line with the dim dot (`.mach.nosignal`), never the lit
+      // reading style, even on a card whose machine is running.
+      await waitFor(() => expect(document.querySelector('[data-testid="fleet-token-scope"]')).not.toBeNull());
+      const card = document.querySelector(".mach")!;
+      await waitFor(() => expect(card.querySelector(".stat")!.textContent).toBe("no signal"));
+      expect(card.querySelector(".mach-scope__rate"), "not the reading style").toBeNull();
+      expect(card.className, "the dim dot").toContain("nosignal");
+      expect(card.className, "the machine is still running").toContain("active");
+      expect(latestTokenScopeProps()).toMatchObject({ state: "nosignal" });
     });
   });
 });

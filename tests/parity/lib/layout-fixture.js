@@ -282,10 +282,27 @@ const STATES = [
     // A stall seen with the page's live connection down: the page cannot
     // tell a stalled model from a dropped stream, so the run page says "no
     // signal" under its lamps. Live only (playback has no connection).
-    id: "no-signal", date: "2026-08-21", now: "12:00:50", runText: "no signal", rateText: null, runPlayback: false, fleet: false, blockStream: true,
+    // (#2955 review) The fleet card too: its machine is running, and its
+    // status line is the plain dim-dot "no signal" (`fleetStat`), not a lit
+    // reading. Live only on the card as on the run page.
+    id: "no-signal", date: "2026-08-21", now: "12:00:50", runText: "no signal", rateText: null, fleetStat: "no signal", runPlayback: false, fleetPlayback: false, blockStream: true,
     recs: (b, d) => [...b.prefix(d), b.opener(d), b.beat(d, "12:00:10", 2, 500, 500), tick(d, "12:00:50")],
   },
 ];
+
+/** (#2955 review) Two executions generating on the fixture machine: the
+ *  fleet card's pager state ("‹ 1/2 coder ›"). Not in `STATES`: the run page
+ *  suite measures one execution, and only the fleet card has a pager. */
+const MULTI = {
+  id: "multi-exec",
+  date: "2026-07-26",
+  now: "12:00:12",
+  recs: (b, d) => {
+    const b2 = build("layout-exec-multi-exec-2");
+    const gen = (x) => [...x.prefix(d), x.opener(d), x.beat(d, "12:00:10", 2, 900, 900), x.beat(d, "12:00:12", 2, 1800, 1800)];
+    return [...gen(b), ...gen(b2)];
+  },
+};
 
 /** The fleet hero with and without its part lines: an idle machine whose
  *  usage records do or do not report cached tokens and a utility call. */
@@ -305,13 +322,13 @@ const HEROES = [
   ],
 }));
 
-for (const s of [...STATES, ...HEROES]) {
+for (const s of [...STATES, ...HEROES, MULTI]) {
   s.sid = `layout-exec-${s.id}`;
   s.records = s.recs(build(s.sid), s.date);
   s.nowMs = Date.parse(at(s.date, s.now)) + 500;
 }
 
-const ALL = [...STATES, ...HEROES];
+const ALL = [...STATES, ...HEROES, MULTI];
 const byDate = new Map(ALL.map((s) => [s.date, s.records]));
 
 /** A date well after every fixture day: a page pinned here reads each
@@ -402,4 +419,4 @@ const VIEWPORTS = {
   phone: { width: 390, height: 844 },
 };
 
-module.exports = { STATES, HEROES, ALL, PLAYBACK_NOW, VIEWPORTS, installLayoutRoutes, measure };
+module.exports = { STATES, HEROES, MULTI, ALL, PLAYBACK_NOW, VIEWPORTS, installLayoutRoutes, measure };

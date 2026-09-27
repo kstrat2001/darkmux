@@ -27,7 +27,7 @@ import { tokensOffMeter } from "./savings";
 import { hybridNote } from "./hybridNote";
 import { NotesDialog } from "../../components/NotesDialog";
 import { openModalEl } from "../../lib/dialogManager";
-import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, rosterOnlyEntries, rosterAliasFor, specUnknownLabel, cardFace, type CardSourcesAnswered } from "./cards";
+import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, rosterOnlyEntries, rosterAliasFor, specUnknownLabel, cardFace, NO_SIGNAL_STAT, type CardSourcesAnswered } from "./cards";
 import { useLatch } from "../../hooks/useLatch";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
 import type { MachineSpecs } from "../../types/handwritten";
@@ -1048,6 +1048,12 @@ export function FleetLens({
           // live readouts (tube, rate line, pager) draw on `face.tube`, so an
           // offline card shows its powered-off screen and nothing live.
           const face = cardFace(card, showsReading, answered);
+          // (#2955 review) The page's execution has no live state: the
+          // page lost the daemon (`liveStateWhileConnected`'s downgrade).
+          // Its status line is the plain "no signal" every other card
+          // shows, with the dim dot, not a lit reading; the tube shows
+          // static and the card stays active (its machine IS running).
+          const readingNoSignal = face.tube === "reading" && selectedExec != null && selectedExec.state === null;
           // `card.liveTokRate !== null` (the scope's mount gate below) only
           // ever holds when at least one execution is running, so
           // `selectedExec` is non-null everywhere it's read below — this is
@@ -1089,7 +1095,7 @@ export function FleetLens({
             // (#2958) `face`, not the card's raw flags: "offline" waits on
             // the sources that could contradict it. `nosignal` gives the dot
             // the absent dot's no-reading gray, without dimming the card.
-            className={`mach${face.active ? " active" : ""}${face.absent ? " absent" : ""}${face.noSignal ? " nosignal" : ""}`}
+            className={`mach${face.active ? " active" : ""}${face.absent ? " absent" : ""}${face.noSignal || readingNoSignal ? " nosignal" : ""}`}
             data-act="machine"
             data-arg={encodeMachineKey(machineKeyCtx, card.uid)}
             role="button"
@@ -1183,8 +1189,10 @@ export function FleetLens({
                   reading, "dispatch in flight" says less than "42 tok/s" or
                   "processing ~36k" does, and a second line grew the desktop
                   card 23px whenever a model ran. Same slot either way, so
-                  the text beside the tube is always two rows. */}
-              {face.tube === "reading" && selectedExec ? (
+                  one execution's text beside the tube is two rows, as an
+                  idle card's is. (A second execution still adds the pager
+                  row below; the layout spec's fixme records it.) */}
+              {face.tube === "reading" && selectedExec && !readingNoSignal ? (
                 <div
                   className="stat mach-scope__rate"
                   data-tone={selectedExec.state ?? "none"}
@@ -1214,17 +1222,17 @@ export function FleetLens({
                       // says "think" for the same opening seconds.
                       selectedExec.tokensPerSec != null
                       ? `${fmtN(Math.round(selectedExec.tokensPerSec))} ${selectedExec.thinking ? "think tok/s" : "tok/s"}`
-                      : selectedExec.thinking
+                      : // (#2955 review) The whole status line now, so the
+                        // unit stays beside the "not yet measured" mark.
+                        selectedExec.thinking
                         ? "— think tok/s"
-                        : "—"
-                    : // (#2886 pass 3) `state: null` here (rather than the
-                      // "no live execution" case, ruled out since
-                      // `card.liveTokRate !== null` implies something IS
-                      // running) is `liveStateWhileConnected`'s
-                      // disconnection downgrade, applied per execution — say
-                      // so, not "stalled".
+                        : "— tok/s"
+                    : // (#2886 pass 3) `state: null` (the disconnection
+                      // downgrade) renders the plain status line below
+                      // (`readingNoSignal`), so this arm only narrows the
+                      // type for `liveStateLabel`.
                       selectedExec.state === null
-                      ? "no signal"
+                      ? NO_SIGNAL_STAT
                       : // (#2890, operator) The prompt's estimated size lives
                         // here, not in the tube (whose center is the brain for
                         // all of PROMPT). "processing ~36k", not "processing
@@ -1266,7 +1274,7 @@ export function FleetLens({
                   <span className="dot" />
                   {/* (#2958) "idle" before its sources answer is a default,
                       not a reading: see `cardFace`. */}
-                  {face.stat}
+                  {readingNoSignal ? NO_SIGNAL_STAT : face.stat}
                 </div>
               )}
               {/* (#2881) The pager: shown only with 2+ running executions —

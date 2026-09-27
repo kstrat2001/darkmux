@@ -15,7 +15,7 @@
 // Each state first asserts the words it must show, so a fixture that slid
 // into another state fails here rather than measuring one state N times.
 const { test, expect } = require("@playwright/test");
-const { STATES, PLAYBACK_NOW, VIEWPORTS, installLayoutRoutes, measure } = require("./lib/layout-fixture.js");
+const { STATES, MULTI, PLAYBACK_NOW, VIEWPORTS, installLayoutRoutes, measure } = require("./lib/layout-fixture.js");
 
 const RUN = {
   modelbox: ".session-run .modelbox",
@@ -35,6 +35,25 @@ const CARD = { card: ".mach", cardScope: ".mach-scope", rateLine: ".mach-scope__
 // runs, the live reading itself (`.stat.mach-scope__rate`). One line in
 // every state, so measured across all of them.
 const STAT = ".mach .stat";
+// (#2955 review) Status lines that overflow their one-line slot on a phone
+// and are ellipsized, already on origin/main before #2955 (measured there:
+// scrollWidth 203 > clientWidth 184). Owned by the fixme at the end of this
+// file; every other state with a reading must fit.
+const PHONE_OVERFLOW = new Set(["toolgen-named", "armed-toolgen"]);
+
+/** (#2955 review) How the status line LOOKS: its words' color and weight,
+ *  and its dot's color. "no signal" must look the same on every card. */
+async function statLook(page) {
+  return page.locator(STAT).first().evaluate((e) => {
+    const cs = getComputedStyle(e);
+    const probe = document.createElement("span");
+    probe.style.color = "var(--dim)";
+    e.appendChild(probe);
+    const dim = getComputedStyle(probe).color;
+    probe.remove();
+    return { color: cs.color, weight: cs.fontWeight, dot: getComputedStyle(e.querySelector(".dot")).backgroundColor, dim };
+  });
+}
 
 // (#2950 review, CONSIDER 2) A REST reason must FIT its one-line slot, not
 // just be in it: `toHaveText` (inner text included) reads the whole string
@@ -166,11 +185,17 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
     });
 
     test(`fleet card: one size across its running states (${vpName}, ${mode})`, async ({ browser }) => {
-      const states = STATES.filter((s) => s.fleet !== false);
+      const states = STATES.filter((s) => s.fleet !== false && (mode === "live" || s.fleetPlayback !== false));
       const rows = [];
       for (const state of states) {
         const { ctx, page } = await openState(browser, viewport, state, { mode, surface: "fleet" });
         await expect(page.locator(CARD.card).first()).toBeVisible();
+        // (#2955 review) A running machine whose page lost the daemon: the
+        // plain "no signal" status line, not a lit reading.
+        if (state.fleetStat) {
+          await expect(page.locator(STAT).first(), `${state.id}: the status words`).toHaveText(state.fleetStat);
+          await expect(page.locator(CARD.card).first(), `${state.id}: a running card, dim dot`).toHaveClass(/\bactive\b.*\bnosignal\b|\bnosignal\b.*\bactive\b/);
+        }
         if (state.rateTextPhone) {
           // (#2950) The words the card SHOWS (`innerText` skips the hidden
           // form): with the state on a desktop card, without it on a phone.
@@ -179,6 +204,8 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
           await expectFits(page.locator(CARD.rateLine).first(), `${state.id}: fleet card status line (${vpName}, ${mode})`);
         } else if (state.rateText) {
           await expect(page.locator(CARD.rateLine).first(), `${state.id}: the card must reach this state`).toHaveText(state.rateText instanceof RegExp ? state.rateText : new RegExp(state.rateText));
+          // (#2955 review) Every reading fits its one line, not just REST's.
+          if (!(vpName === "phone" && PHONE_OVERFLOW.has(state.id))) await expectFits(page.locator(CARD.rateLine).first(), `${state.id}: fleet card status line (${vpName}, ${mode})`);
         } else {
           await expect(page.locator(CARD.rateLine)).toHaveCount(0);
         }
@@ -202,7 +229,7 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
           }, state.id);
           expect(got, `${state.id}: the status line's color is its state's`).toBe(want);
         }
-        rows.push({ state: state.id, running: !!state.rateText, ...(await measure(page, { ...CARD, stat: STAT })) });
+        rows.push({ state: state.id, running: !!state.rateText, look: await statLook(page), ...(await measure(page, { ...CARD, stat: STAT })) });
         await ctx.close();
       }
       expect(rows.map((r) => r.state)).toEqual(
@@ -215,10 +242,22 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
       }
       // (#2915) The strip is one size in EVERY state, idle included.
       expect(sizeGroups(rows, "util"), `the utility strip changed size (${vpName}, ${mode})`).toHaveLength(1);
+      // (#2955 review) "no signal" looks like every other plain status
+      // line ("idle"'s words), with the dim dot, never the reading's lit
+      // style. Live only: a replay has no connection to lose.
+      if (mode === "live") {
+        const ns = rows.find((r) => r.state === "no-signal");
+        const idle = rows.find((r) => r.state === "finished");
+        expect(ns, "the disconnected state was measured").toBeTruthy();
+        expect({ color: ns.look.color, weight: ns.look.weight }, "no signal: the plain status words").toEqual({ color: idle.look.color, weight: idle.look.weight });
+        expect(ns.look.dot, "no signal: the dim dot").toBe(ns.look.dim);
+      }
       // (#2955, operator 2026-09-27) The card is also the same size idle and
       // running, on a desktop as on a phone: the reading rides the status
-      // line, so no state adds a line. Idle states here: a finished run and
-      // a mission between model steps ("dispatch in flight", no reading).
+      // line instead of a line of its own. Idle states here: a finished run
+      // and a mission between model steps ("dispatch in flight", no
+      // reading). One execution only: a second one adds the pager row (the
+      // fixme below).
       expect(rows.filter((r) => !r.running).map((r) => r.state)).toEqual(expect.arrayContaining(["finished", "between-steps"]));
       for (const key of ["card", "cardScope", "stat"]) {
         const groups = sizeGroups(rows, key);
@@ -293,6 +332,58 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
 // (the sub line's wording), not introduced here; the fix (the words, or one
 // line reserved) is the operator's design call, so it is recorded, not decided.
 test.fixme("run page MODEL section: the same size live and finished with the thermal governor armed (owner: the operator's call on ACTIVE TIME's sub line)", async () => {});
+
+// (#2955 review) The pager: with two executions running, the card grows the
+// pager row ("‹ 1/2 coder ›", 32px tap targets) under the status line. On a
+// phone the tube beside the text already sets the card's height, so it
+// stays one size (measured, and pinned live below). On a desktop it does
+// not: 318px with the pager vs 282px with one execution, measured on
+// origin/main + #2955's branch. Where the pager lives is its own design
+// call, so the desktop case is recorded here, not decided here.
+async function pagerRows(browser, viewport) {
+  const rows = [];
+  for (const state of [STATES.find((s) => s.id === "generating"), MULTI]) {
+    const { ctx, page } = await openState(browser, viewport, state, { mode: "live", surface: "fleet" });
+    await expect(page.locator(CARD.card)).toHaveCount(1);
+    await expect(page.locator(".mach-scope__pager"), `${state.id}: the pager`).toHaveCount(state === MULTI ? 1 : 0);
+    if (state === MULTI) await expect(page.locator(".mach-scope__pager-n")).toHaveText("1/2");
+    await page.waitForTimeout(400);
+    rows.push({ state: state.id, ...(await measure(page, { card: CARD.card, cardScope: CARD.cardScope })) });
+    await ctx.close();
+  }
+  return rows;
+}
+test("fleet card: the same size with a second execution's pager (phone, live)", async ({ browser }) => {
+  const rows = await pagerRows(browser, VIEWPORTS.phone);
+  for (const key of ["card", "cardScope"]) {
+    const groups = sizeGroups(rows, key);
+    expect(groups, `${key} changed size with the pager (phone):\n  ${groups.join("\n  ")}`).toHaveLength(1);
+  }
+});
+test.fixme("fleet card: the same size with a second execution's pager (desktop, live) (owner: the operator's call on where the pager lives)", async ({ browser }) => {
+  const rows = await pagerRows(browser, VIEWPORTS.desktop);
+  for (const key of ["card", "cardScope"]) {
+    const groups = sizeGroups(rows, key);
+    expect(groups, `${key} changed size with the pager (desktop):\n  ${groups.join("\n  ")}`).toHaveLength(1);
+  }
+});
+
+// (#2955 review) On a phone, "tool gen · write · 18s" does not fit the fleet
+// card's status line and is ellipsized (scrollWidth 203 > clientWidth 184 at
+// 390px). The same on origin/main before #2955 (its own rate line, same
+// width, a size larger); not introduced by moving it onto the status line.
+// The fix (a phone form of the words, as REST's reason has) is a design
+// call, so it is recorded here, not decided here.
+test.fixme("fleet card: the tool gen status line fits on a phone (owner: the operator's call on its phone wording)", async ({ browser }) => {
+  for (const id of PHONE_OVERFLOW) {
+    const state = STATES.find((s) => s.id === id);
+    const { ctx, page } = await openState(browser, VIEWPORTS.phone, state, { mode: "live", surface: "fleet" });
+    await expect(page.locator(CARD.rateLine).first(), `${id}: the card must reach this state`).toHaveText(new RegExp(state.rateText));
+    await page.waitForTimeout(400);
+    await expectFits(page.locator(CARD.rateLine).first(), `${id}: fleet card status line (phone)`);
+    await ctx.close();
+  }
+});
 
 // (#2915 review, C7) The machine page's Utility section is ONE size whatever
 // the machine's utility jobs are doing: quiet, routing, compacting, a job
