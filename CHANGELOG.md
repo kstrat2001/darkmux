@@ -115,15 +115,18 @@ darkmux release.
   completion count but no prompt count (and no total) now carries no
   `total_tokens`: a split missing a half is not a total. A hosted
   `dispatch.single_shot`, `dispatch.map` item or `darkmux dispatch` to an
-  endpoint settles such a call against its per-step cap at the whole
-  granted `max_tokens`, as it already did for a reply with no usage at all
-  (it had been settling the completion alone). Under an endpoint's
-  `limits.window` token budget, a window holding such a call, or a call
-  with no usage, is `unmetered`: `budget.warn` names how many calls could
-  not be counted and gives the known spend as a floor, under `warn` and
-  `wait` alike (there is no number to wait on), and `darkmux doctor`'s
-  endpoints check reads "spent at least". **Migration:** none; an endpoint
-  that reports full usage reads exactly as before.
+  endpoint settles such a call (and one with no usage at all) against its
+  per-step cap at the whole granted `max_tokens` PLUS the prompt it sent,
+  estimated from the request at four characters a token (it had been
+  settling the completion alone, or the cap alone: the cap bounds only the
+  completion). Under an endpoint's `limits.window` token budget, the
+  halves such a call did report still count toward `warn_at`, the budget
+  and a `wait`, as a floor, and the window is flagged as not fully metered:
+  `budget.warn` and `budget.wait` carry `unmetered_calls` beside any level
+  they report (a warning whose only news is the flag has `level: null`),
+  and `darkmux doctor`'s endpoints check reads "spent at least".
+  **Migration:** none; an endpoint that reports full usage reads exactly as
+  before.
 - **The per-step cap on hosted tokens is renamed, has no default, and
   never stops a step: a step that used to stop at 500,000 hosted tokens now
   runs to completion unless you set a cap** (#2902 step 5).

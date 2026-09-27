@@ -961,8 +961,9 @@ fn announce_wait(
         Some(mid) => format!("`darkmux mission abort {mid}` ends the wait without sending"),
         None => "Ctrl-C ends the wait without sending".to_string(),
     };
+    let floor = if br.unmetered > 0 { "at least " } else { "" };
     let message = format!(
-        "darkmux: endpoint `{}` has reached its budget ({} of {} {} in the last {}); calls to it are \
+        "darkmux: endpoint `{}` has reached its budget ({floor}{} of {} {} in the last {}); calls to it are \
          waiting, {when}. {how_to_stop}.",
         b.endpoint_id,
         br.spent,
@@ -982,6 +983,7 @@ fn announce_wait(
             "metric": br.metric,
             "spent": br.spent,
             "limit": br.limit,
+            "unmetered_calls": br.unmetered,
             "period": b.period,
             "resume_at": resume_at.map(darkmux_flow::ts_utc_at),
             "wait_seconds": resume_at.map(|r| (r - now).max(0)),

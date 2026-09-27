@@ -301,6 +301,20 @@ fn completion_only_spend_still_fills_a_wait_budget() {
     assert_eq!((breach.level, breach.spent, breach.unmetered), (Some(BreachLevel::AtLimit), 2_000_000, 5));
 }
 
+/// The wait a partial window causes says its spend is a floor, and how many
+/// calls it could not fully count.
+#[test]
+fn a_wait_on_a_partial_window_names_its_floor() {
+    let env = FakeEnv::new(vec![]);
+    for i in 1..=5 {
+        env.records.borrow_mut().push((T0 - 100 + i, Spend::partial(400_000)));
+    }
+    admit_with(budget(BudgetPolicy::Wait, Some(100_000), None, None), &BudgetCaller::default(), &env).unwrap();
+    let w = env.payload(darkmux_flow::FlowAction::BudgetWait);
+    assert_eq!((w["spent"].as_u64(), w["unmetered_calls"].as_u64()), (Some(2_000_000), Some(5)), "{w}");
+    assert!(w["message"].as_str().unwrap().contains("at least 2000000 of 100000"), "{w}");
+}
+
 /// (re-review N4) The level (over the known spend) and the unmetered flag
 /// are independent: an early warning that arrives after an unmetered-only
 /// one is news and is said, and a newly unmetered window at the same level

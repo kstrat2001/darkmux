@@ -104,7 +104,10 @@ pub enum TrajectoryEvent {
 /// every count is built from those, so a wrong one is skipped, not
 /// guessed. A TEXT or opaque field of the wrong type (an older runtime's
 /// non-string `args`, say) reads as absent instead of dropping the event
-/// and every count it feeds. A line of the retired openclaw format is read
+/// and every count it feeds. The token counts inside a `usage` block are
+/// read one by one on every path, the strict one included: a count that is
+/// not a whole number reads as unreported ([`crate::Usage`]), never as a
+/// reason to drop the event. A line of the retired openclaw format is read
 /// by [`crate::legacy`], never as a current event.
 pub fn parse_line(line: &str) -> Option<TrajectoryEvent> {
     let line = line.trim();

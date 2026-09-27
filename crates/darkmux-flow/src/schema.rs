@@ -53,6 +53,14 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           checkpoint and this invocation's trajectory by
 //           `darkmux_trajectory::CheckpointCounts` (a hand-back resume
 //           continues the checkpoint's turn rather than adding one).
+//
+//           Also (4.0): a usage record whose provider sent no prompt count
+//           (and no total) carries no `total_tokens`: its full spend is
+//           unknown. The endpoint budget counts the halves it did report as
+//           a floor, and `budget.warn` / `budget.wait` add
+//           `unmetered_calls`, the calls in the window whose full spend is
+//           unknown; `budget.warn`'s `level` is `null` when that is its only
+//           news.
 //   1.65.0 (#2902 step 5, budgets): additive, four actions and one usage
 //           field.
 //
@@ -68,13 +76,15 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           or `step` (step scope: the step id, or `dispatch` for a bare
 //           hosted dispatch), and a human `message`:
 //           - `budget.warn` (level `warn`): a budget was reached, or its
-//             `warn_at` fraction was, and the call went ahead. Adds
-//             `policy`, `level` (`early` | `at_limit`), `metric` (`tokens` |
-//             `calls`), `spent`, `limit`, and for an endpoint `period` and
-//             `warn_at`.
+//             `warn_at` fraction was, or (endpoint scope, token budget) the
+//             window is not fully metered, and the call went ahead. Adds
+//             `policy`, `level` (`early` | `at_limit`, or `null` when the
+//             only news is an unmetered window), `metric` (`tokens` |
+//             `calls`), `spent`, `limit`, and for an endpoint `period`,
+//             `warn_at` and `unmetered_calls`.
 //           - `budget.wait` (level `warn`, endpoint scope only): calls are
 //             held under the `wait` policy. Adds `policy` (`wait`), `metric`,
-//             `spent`, `limit`, `period`, `resume_at` (a record-`ts`-shaped
+//             `spent`, `limit`, `unmetered_calls`, `period`, `resume_at` (a record-`ts`-shaped
 //             string) and `wait_seconds`, and `pid` (the waiting process,
 //             so a reader can tell a live wait from a dead one). A wait
 //             still waiting at `resume_at` is announced again with its new

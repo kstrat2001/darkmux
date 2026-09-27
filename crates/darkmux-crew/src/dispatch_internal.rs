@@ -7628,8 +7628,11 @@ fn build_dispatch_complete_payload(
         "reasoning_tokens": fold.tokens.reasoning,
         "cached_tokens": fold.tokens.cached,
         // (#2263) The WHOLE task's counts across every resume, by the one
-        // rule (`CheckpointCounts::cumulative_turns`). Equal to
-        // `total_turns`/`total_compactions` for a run that was never resumed.
+        // rule (`CheckpointCounts`): the turns are the later of the
+        // checkpoint's count and the last `seq` this run recorded (a
+        // max-of-seq, not a sum), the compactions the checkpoint's plus this
+        // run's. Equal to `total_turns`/`total_compactions` for a run that
+        // was never resumed.
         "cumulative_turns": resume_seed.cumulative_turns(fold),
         "cumulative_compactions": resume_seed.cumulative_compactions(fold),
     });
