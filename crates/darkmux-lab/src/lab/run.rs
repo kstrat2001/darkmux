@@ -299,7 +299,7 @@ impl OneRun<'_> {
             Err(e) => {
                 lifecycle.finish_error(&e);
                 let id = run_dir.file_name().unwrap_or_default().to_string_lossy();
-                eprintln!("[lab] run {id} failed: {e:#}");
+                eprintln!("[lab] run {id} failed: {}", lifecycle::error_summary(&e));
                 Ok(ProviderRun::Errored(e))
             }
         }
@@ -321,7 +321,7 @@ fn errored_outcome(
     elapsed: std::time::Duration,
     e: &anyhow::Error,
 ) -> RunOutcome {
-    let error = format!("{e:#}");
+    let error = lifecycle::error_summary(e);
     RunOutcome {
         notes: vec![format!("provider={provider_id}"), format!("error: {error}")],
         run_id,
