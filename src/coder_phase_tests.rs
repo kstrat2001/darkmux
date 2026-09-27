@@ -1073,10 +1073,6 @@ edit loop detected on src/widget.rs in an earlier dispatch
         assert!(found, "the close nudge must emit a stage=debrief mission.debrief.prompt record");
     }
 
-    // (#1463) The `session_note_scan_matches_session_and_source` test retired
-    // with `session_has_orchestrator_note` — that scan only backed the retired
-    // `ship` verb's adjudication-note nudge.
-
     fn phase(id: &str, mission: &str, status: PhaseStatus) -> Phase {
         Phase {
             id: id.to_string(),

@@ -24,9 +24,6 @@ import { UtilityGlyph } from "../../components/UtilityGlyph";
 import { scopeStateOf } from "../../lib/scopeMorph";
 import { liveStateLabel, reasonForLine } from "../../lib/tokenRate";
 import { tokensOffMeter } from "./savings";
-import { hybridNote } from "./hybridNote";
-import { NotesDialog } from "../../components/NotesDialog";
-import { openModalEl } from "../../lib/dialogManager";
 import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, rosterOnlyEntries, rosterAliasFor, specUnknownLabel, cardFace, NO_SIGNAL_STAT, type CardSourcesAnswered } from "./cards";
 import { useLatch } from "../../hooks/useLatch";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
@@ -150,20 +147,11 @@ function Chip({ value, label, cls, loading, part }: { value?: string | number; l
  */
 const SavingsHero = memo(function SavingsHero({
   tokens: t,
-  note,
   liveMode,
-  data,
-  nowMs,
   settled,
 }: {
   tokens: ReturnType<typeof tokensOffMeter>;
-  note: ReturnType<typeof hybridNote>;
   liveMode: boolean;
-  /** The window this hero's numbers derive from — passed through to
-   *  `NotesDialog` so "history →" opens the SAME notes those numbers came
-   *  from, not a second, differently-scoped fetch. */
-  data: FlowRecord[];
-  nowMs: number;
   /** (#2817) False while the flow window is still loading. A zero is a
    *  MEASUREMENT — "darkmux dispatched no tokens in this window" — and
    *  rendering one before the window has arrived states a fact nobody has
@@ -274,23 +262,6 @@ const SavingsHero = memo(function SavingsHero({
           <Chip value={t.runs} loading={!settled} label={`dispatch${t.runs === 1 ? "" : "es"}`} />
         </div>
       </div>
-      <div className="hybnote">
-        <b className="hybpre">Orchestrator note:</b> {note.text}
-        {/* (#1640) Legacy's real `<a class="hyblink" data-act="notes">history
-            →</a>` (viewer.html:1584) — restored now that `NotesDialog`
-            exists to open. Previously a plain, deliberately non-interactive
-            `<span>` (a trap control would have looked clickable and done
-            nothing, before the modal existed to back it). */}
-        {note.hasHistory ? (
-          <a className="hyblink" data-act="notes" href="#" onClick={(e) => {
-            e.preventDefault();
-            openModalEl("nmodalbg");
-          }}>
-            {" "}history →
-          </a>
-        ) : null}
-      </div>
-      <NotesDialog data={data} nowMs={nowMs} />
     </div>
   );
 });
@@ -298,7 +269,7 @@ const SavingsHero = memo(function SavingsHero({
 /**
  * The fleet default view — `renderFleet()` (viewer.html:1667-1741): the
  * savings hero, one card per machine, and the recent-activity timeline.
- * `/next`'s default (no-hash) route. See `savings.ts`/`hybridNote.ts`/
+ * `/next`'s default (no-hash) route. See `savings.ts`/
  * `cards.ts`/`timeline.ts` for the ported pure logic this component
  * composes.
  *
@@ -779,10 +750,10 @@ export function FleetLens({
   );
 
 
-  // (#1869) The token hero + hybrid note are "as of the playhead" — legacy's
+  // (#1869) The token hero is "as of the playhead" — legacy's
   // own `visible()` gate (`DATA.filter(r=>T(r.ts)<=state.t)`), restored at
-  // this call site rather than inside `tokensOffMeter`/`hybridNote`
-  // themselves (see `savings.ts`'s module doc for the full reasoning). In
+  // this call site rather than inside `tokensOffMeter`
+  // itself (see `savings.ts`'s module doc for the full reasoning). In
   // replay, `playheadT` is the scrubbable
   // position `PlaybackLens` passes as its `playhead` prop, so this is what
   // makes scrubbing before a session's completion drop that session's
@@ -805,8 +776,8 @@ export function FleetLens({
   // until the clock reaches it, the same rule the fleet cards apply
   // (`cards.ts`). `recordsAsOf` keeps that from costing a whole-window filter
   // on every 1 Hz tick: with nothing ahead of now it returns the window
-  // itself, the same reference each tick, so the hero's token sums and note
-  // do not recompute; with a record ahead, it filters once and re-filters
+  // itself, the same reference each tick, so the hero's token sums do not
+  // recompute; with a record ahead, it filters once and re-filters
   // only when the window changes or now crosses that record. A replay keeps
   // its plain playhead filter, which runs only when the playhead moves.
   const scopedData = useMemo(
@@ -816,7 +787,6 @@ export function FleetLens({
     [flowWindow.data, playhead, wallNow],
   );
   const tokens = useMemo(() => tokensOffMeter(scopedData), [scopedData]);
-  const note = useMemo(() => hybridNote(scopedData, tokens), [scopedData, tokens]);
 
   // (#2928) The live channel's overlay: at the live edge of a live route
   // only (`livePolling` is false on a static build, `playhead` is set on a
@@ -998,13 +968,7 @@ export function FleetLens({
     <div className="fleet-lens" data-state={flowWindow.settled ? "loaded" : "loading"}>
       <SavingsHero
         tokens={tokens}
-        note={note}
         liveMode={liveMode}
-        data={scopedData}
-        // (#2928 re-review, C-1) The wall second at the live edge: the hero
-        // reads no live sample, and a precise clock re-rendered it per
-        // sample.
-        nowMs={playhead == null ? liveEdgeClock * 1000 : playheadT}
         // (#2965) Its zeros are a negative claim off the same read: a failed
         // one keeps the loading silhouette rather than counting up to "0".
         settled={flowWindow.settled && flowWindow.failure === null}

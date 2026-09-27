@@ -4,10 +4,10 @@ import { closeOpenModal, isModalOpen, useOpenModalId, type ModalId } from "../li
 
 /**
  * The shared modal shell — viewer.html's `.modalbg`/`.modal`/`.mhd`/`.mx`
- * structure (`#modalbg`/`#nmodalbg`/`#imodalbg`), one component instead of
- * three near-duplicate blocks of markup. Three call sites use this:
- * `FiltersDialog` (in `EventLogColumn.tsx`), `NotesDialog` (in
- * `FleetLens.tsx`), `AboutDialog` (in `Masthead.tsx`).
+ * structure (`#modalbg`/`#imodalbg`), one component instead of
+ * near-duplicate blocks of markup. Two call sites use this:
+ * `FiltersDialog` (in `EventLogColumn.tsx`) and `MachineDrawer`'s machine
+ * info dialog (opened from `Masthead.tsx`).
  *
  * **Rendered through a portal into `document.body`, always mounted,
  * `style.display` toggled — never conditionally unmounted.** This matches
@@ -37,11 +37,10 @@ import { closeOpenModal, isModalOpen, useOpenModalId, type ModalId } from "../li
  * subtree because the scope is looked up by id, not by React tree position.
  *
  * A host that truly UNMOUNTS is the other half, and the portal cannot help
- * there — `NotesDialog` lives inside `FleetLens`, which unmounts on a route
- * change, taking the portal with it while `openId` stayed set. Returning to
- * fleet then resurrected the dialog with no user action. The unmount effect
- * below closes it instead, without consuming the remembered focus target
- * (the element that opened it is gone too).
+ * there: unmounting takes the portal with it while `openId` stays set, and
+ * remounting the host would then resurrect the dialog with no user action.
+ * The unmount effect below closes it instead, without consuming the
+ * remembered focus target (the element that opened it is gone too).
  *
  * Focus-on-open mirrors legacy's `openModalEl`:
  * `m.querySelector(".mx").focus()` (viewer.html:2930) — the close button
@@ -51,7 +50,6 @@ export function Dialog({
   id,
   titleId,
   title,
-  wide,
   className,
   children,
   footer,
@@ -59,12 +57,8 @@ export function Dialog({
   id: ModalId;
   titleId: string;
   title: ReactNode;
-  /** Notes is wider than Filters/About in legacy (`.nmodal`, viewer.html:574
-   *  — prose reads better wide). Fixed at `.dialog--wide`'s own 540px. */
-  wide?: boolean;
-  /** (#2116) An extra class appended after `wide`'s own, so a caller can
-   * add its OWN width rule without widening every `.dialog` (About,
-   * Machine info) or coupling to Notes' fixed 540px. `FiltersDialog` is
+  /** (#2116) An extra class, so a caller can add its OWN width rule without
+   * widening every `.dialog` (About, Machine info). `FiltersDialog` is
    * the first user — the activity facet can run to ~40 checkboxes on a
    * busy day, which needs `min(90vw, 720px)` on desktop and its own
    * multi-column grid; About and Machine info stay short kv lists that
@@ -105,7 +99,7 @@ export function Dialog({
     >
       {open ? (
         <div
-          className={`dialog${wide ? " dialog--wide" : ""}${className ? ` ${className}` : ""}`}
+          className={`dialog${className ? ` ${className}` : ""}`}
           role="dialog"
           aria-modal="true"
           aria-labelledby={titleId}

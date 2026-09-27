@@ -13,7 +13,6 @@ function buildDom() {
       <button id="mid-focusable">mid</button>
       <a id="last-focusable" href="#">last</a>
     </div>
-    <div id="nmodalbg"></div>
     <div id="imodalbg"></div>
   `;
   // jsdom does no layout, so every element's `offsetParent` is always
@@ -49,8 +48,8 @@ afterEach(() => {
 });
 
 describe("dialogManager — exclusivity", () => {
-  it("MODAL_IDS lists exactly the three legacy dialog ids", () => {
-    expect(MODAL_IDS).toEqual(["modalbg", "nmodalbg", "imodalbg"]);
+  it("MODAL_IDS lists exactly the two dialog ids", () => {
+    expect(MODAL_IDS).toEqual(["modalbg", "imodalbg"]);
   });
 
   it("openModalEl opens the named dialog", () => {
@@ -58,7 +57,7 @@ describe("dialogManager — exclusivity", () => {
     openModalEl("modalbg");
     expect(getOpenId()).toBe("modalbg");
     expect(isModalOpen("modalbg")).toBe(true);
-    expect(isModalOpen("nmodalbg")).toBe(false);
+    expect(isModalOpen("imodalbg")).toBe(false);
   });
 
   // RED-PROVED: with the exclusivity guard removed (`openModalEl` just sets
