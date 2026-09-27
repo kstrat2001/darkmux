@@ -382,7 +382,16 @@ export function toolCallPath(f: Record<string, unknown>): string | null {
     if (raw) path = raw.value;
   }
   if (!path && f.tool_name === "write" && typeof f.result === "string") path = pathFromResult(f.result);
-  const clean = path ? path.replace(CONTAINER_ROOT, "") : "";
+  return path ? cleanToolPath(path) : null;
+}
+
+/** (#2963) A tool call's path as the viewer shows it: the container prefix
+ *  dropped, control characters escaped; `null` when nothing is left. Shared
+ *  by `toolCallPath` and the turn record's `tool_paths` list, so the two
+ *  compare equal for the same file. */
+export function cleanToolPath(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const clean = raw.replace(CONTAINER_ROOT, "");
   return clean ? escapeBidiControls(clean) : null;
 }
 

@@ -900,36 +900,74 @@ describe("tools vs reading prompt, from the tool COMPLETION records", () => {
     expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "read" });
   });
 
-  // (#2963) The run page's readout names the FILE of the call it names, so
-  // the path travels with the name: the same completed record, reset with it.
+  // (#2963) The run page's readout names the file of the call RUNNING NOW.
+  // `dispatch.turn` carries `tool_paths` (FLOW 1.64.0), one entry per call
+  // of the turn in the model's order; while the turn's k-th call runs (k =
+  // calls completed so far in this turn) the file is `tool_paths[k]`. A
+  // completed call's own file never stands in for a later call's.
   const pathTool = (atMs: number, name: string, path: string): FlowRecord =>
     ({ ts: new Date(atMs).toISOString(), action: "dispatch.tool", session_id: SID, payload: { tool_name: name, args: JSON.stringify({ path, content: "x" }) } }) as unknown as FlowRecord;
+  const turnWithPaths = (atMs: number, seq: number, paths: (string | null)[]): FlowRecord =>
+    ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn", session_id: SID, payload: { turn_seq: seq, tool_calls_count: paths.length, tool_paths: paths } }) as unknown as FlowRecord;
+  const writingBeat = (atMs: number, name: string): FlowRecord =>
+    ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: 900, turn_seq: 2, phase: "writing_tool_call", tool_name: name } }) as unknown as FlowRecord;
 
-  it("(#2963) carries the named call's file beside its name", () => {
-    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 3), pathTool(5_000, "read", "/workspace/src/a.ts"), pathTool(6_000, "write", "/workspace/src/b.ts")];
-    expect(deriveLiveState(recs, 7_000)).toEqual({ state: "tools", toolName: "write", toolPath: "src/b.ts" });
+  it("(#2963) never shows a previous call's file while a later call runs (no tool_paths)", () => {
+    // Call 1 read a.ts and completed; call 2 is running. The record set says
+    // nothing about call 2's file, so there is none, never a.ts.
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 2), pathTool(5_000, "read", "/workspace/src/a.ts")];
+    expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "read" });
   });
 
-  it("(#2963) a later completion that names no file drops the earlier file", () => {
-    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 3), pathTool(5_000, "read", "src/a.ts"), namedTool(6_000, "bash")];
-    expect(deriveLiveState(recs, 7_000)).toEqual({ state: "tools", toolName: "bash" });
+  it("(#2963) the running call's file comes from the turn's tool_paths, by how many calls have completed", () => {
+    const paths = ["/workspace/src/a.ts", "/workspace/src/b.ts", "src/c.ts"];
+    const base = [start(0), beat(1_000, 0), beat(3_000, 800), turnWithPaths(4_000, 1, paths)];
+    expect(deriveLiveState(base, 4_500)).toEqual({ state: "tools", toolPath: "src/a.ts" });
+    const one = [...base, pathTool(5_000, "read", "/workspace/src/a.ts")];
+    expect(deriveLiveState(one, 5_500)).toEqual({ state: "tools", toolName: "read", toolPath: "src/b.ts" });
+    const two = [...one, pathTool(6_000, "read", "/workspace/src/b.ts")];
+    expect(deriveLiveState(two, 6_500)).toEqual({ state: "tools", toolName: "read", toolPath: "src/c.ts" });
   });
 
-  it("(#2963) never carries the previous turn's file into this one", () => {
-    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 1), pathTool(5_000, "read", "src/a.ts"), beat(6_000, 0), beat(8_000, 900), turn(9_000, 2, 2)];
+  it("(#2963) a call with no path in the list has no file", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnWithPaths(4_000, 1, ["src/a.ts", null]), pathTool(5_000, "read", "src/a.ts")];
+    expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "read" });
+  });
+
+  it("(#2963) a completion whose file disagrees with the list stops the list for the rest of the turn", () => {
+    // The list and the completions fell out of step (a call the runtime
+    // discarded, say): from then on no index is trusted.
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnWithPaths(4_000, 1, ["src/a.ts", "src/b.ts", "src/c.ts"]), pathTool(5_000, "read", "src/b.ts")];
+    expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "read" });
+    // Once out of step, a later completion that happens to agree does not restore it.
+    const later = [...recs, pathTool(6_000, "read", "src/b.ts")];
+    expect(deriveLiveState(later, 6_500)).toEqual({ state: "tools", toolName: "read" });
+  });
+
+  it("(#2963) a list shorter than the turn's calls: no file past its end", () => {
+    const short = { ts: new Date(4_000).toISOString(), action: "dispatch.turn", session_id: SID, payload: { turn_seq: 1, tool_calls_count: 3, tool_paths: ["src/a.ts"] } } as unknown as FlowRecord;
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), short, pathTool(5_000, "read", "src/a.ts")];
+    expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "read" });
+  });
+
+  it("(#2963) never carries the previous turn's list into this one", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnWithPaths(4_000, 1, ["src/a.ts"]), pathTool(5_000, "read", "src/a.ts"), beat(6_000, 0), beat(8_000, 900), turn(9_000, 2, 2)];
     expect(deriveLiveState(recs, 10_000)).toEqual({ state: "tools" });
   });
 
-  it("(#2963) a name from the next call's writing heartbeat never takes the previous call's file", () => {
-    const writingBeat = (atMs: number): FlowRecord =>
-      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: 900, turn_seq: 2, phase: "writing_tool_call", tool_name: "write" } }) as unknown as FlowRecord;
-    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 1), pathTool(5_000, "read", "src/a.ts"), beat(6_000, 0), writingBeat(8_000), turn(9_000, 2, 1)];
-    expect(deriveLiveState(recs, 10_000)).toEqual({ state: "tools", toolName: "write" });
+  it("(#2963) the writing heartbeat's name rides with the running call's file", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnWithPaths(4_000, 1, ["src/a.ts"]), pathTool(5_000, "read", "src/a.ts"), beat(6_000, 0), writingBeat(8_000, "write"), turnWithPaths(9_000, 2, ["src/new.ts"])];
+    expect(deriveLiveState(recs, 10_000)).toEqual({ state: "tools", toolName: "write", toolPath: "src/new.ts" });
   });
 
-  it("(#2963) a file only in the past of a playback cut is not read", () => {
-    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 3), namedTool(5_000, "read"), pathTool(9_000, "write", "src/b.ts")];
-    expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "read" });
+  it("(#2963) escapes control characters in a listed path", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnWithPaths(4_000, 1, ["src/a\u202Eb.ts"])];
+    expect(deriveLiveState(recs, 5_000)).toEqual({ state: "tools", toolPath: "src/a⟨U+202E⟩b.ts" });
+  });
+
+  it("(#2963) a completion after the playback cut does not advance the index", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnWithPaths(4_000, 1, ["src/a.ts", "src/b.ts"]), pathTool(9_000, "read", "src/a.ts")];
+    expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolPath: "src/a.ts" });
   });
 
   it("carries the name through executionTokenReading and aggregateLiveState", () => {
@@ -1443,16 +1481,20 @@ describe("(#2915) compacting", () => {
 // action and the file ("write · src/lib/tokenRate.ts"), for read, write and
 // edit only. Anything else, or no file, has no line.
 describe("toolReadout (#2963)", () => {
-  it("names the action and the file for read, write and edit", () => {
+  it("names the action and the running call's file for read, write and edit", () => {
     expect(toolReadout({ state: "tools", toolName: "write", toolPath: "src/lib/tokenRate.ts" })).toEqual({ action: "write", path: "src/lib/tokenRate.ts" });
     expect(toolReadout({ state: "tools", toolName: "read", toolPath: "README.md" })).toEqual({ action: "read", path: "README.md" });
     expect(toolReadout({ state: "tools", toolName: "edit", toolPath: "a/b.rs" })).toEqual({ action: "edit", path: "a/b.rs" });
   });
 
-  it("has no line for another tool, a call with no file, or while the call is generated", () => {
+  it("the action word alone when the running call's file is unknown", () => {
+    expect(toolReadout({ state: "tools", toolName: "write" })).toEqual({ action: "write" });
+  });
+
+  it("has no line for another tool, no tool name, or while the call is generated", () => {
     expect(toolReadout({ state: "tools", toolName: "search", toolPath: "src" })).toBeNull();
     expect(toolReadout({ state: "tools", toolName: "bash", toolPath: "src/a.ts" })).toBeNull();
-    expect(toolReadout({ state: "tools", toolName: "write" })).toBeNull();
+    expect(toolReadout({ state: "tools", toolPath: "src/a.ts" })).toBeNull();
     expect(toolReadout({ state: "tools", toolName: "write", toolPath: "src/a.ts", writing: true, writingSeconds: 3 })).toBeNull();
     expect(toolReadout({ state: "prompt", toolName: "write", toolPath: "src/a.ts" })).toBeNull();
   });

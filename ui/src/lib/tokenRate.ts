@@ -1,7 +1,7 @@
 import type { FlowRecord } from "../types/handwritten";
 import { isTurnUsage } from "./usageRecords";
 import { isDispatchStart, isDispatchTerminal } from "./flow";
-import { toolCallPath } from "./recordDetail";
+import { cleanToolPath, toolCallPath } from "./recordDetail";
 import { UTILITY_JOB, UTILITY_JOB_DEFAULT_STALL_MS, isUtilityEnd, isUtilityStart, utilityJobOf } from "./utilityJobs";
 
 /** (#2877) Live token-rate scope — pure derivation from flow records
@@ -490,12 +490,13 @@ export interface LiveStateReading {
    *  (the icon falls back to the gear). A previous turn's tool never carries
    *  over. */
   toolName?: string;
-  /** (#2963) Alongside `toolName`, when the SAME completed call named a file
-   *  (`toolCallPath` of its record: the `path` argument, or a write's
-   *  result). Absent when the name came from a writing heartbeat (nothing
-   *  carries a call's arguments before it completes) or the call named no
-   *  file. So while a turn's second call runs, this is the FIRST call's
-   *  file, exactly as `toolName` is the first call's name. */
+  /** (#2963) Present only when `state === "tools"` and the file of the call
+   *  RUNNING NOW is known: the turn record's `tool_paths[k]` (FLOW 1.64.0),
+   *  k = calls of this turn completed so far. Absent when the turn record
+   *  carries no list (an older host), the list has no entry for the call,
+   *  or a completion disagreed with the list (the two fell out of step).
+   *  Never a completed call's own file: while a later call runs, that is a
+   *  previous call's. */
   toolPath?: string;
   /** (#2890) Present (always `true`) only when `state === "generating"` and
    *  the model is reasoning, not writing visible text: since the previous
@@ -597,8 +598,12 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
   // (#2890) The latest completed tool of the current turn, reset at each turn
   // boundary so an earlier turn's tool never names this one.
   let turnToolName: string | null = null;
-  // (#2963) The file of the call `turnToolName` names, from that same record.
-  let turnToolPath: string | null = null;
+  // (#2963) The turn's `tool_paths` (one per call, the model's order), how
+  // many of its calls have completed, and whether every completion so far
+  // agreed with the list. `null` list: the turn record carried none.
+  let turnPaths: (string | null)[] | null = null;
+  let completedInTurn = 0;
+  let pathsInStep = true;
   // (#2889) The tool the model most recently WROTE (a writing heartbeat's
   // `tool_name`). At the turn's end it seeds `turnToolName`, so the tool
   // darkmux is about to run keeps its icon instead of dropping to the gear
@@ -615,23 +620,34 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
     } else if (isDispatchStart(r.action)) {
       pendingTools = null;
       turnToolName = null;
-      turnToolPath = null;
+      turnPaths = null;
+      completedInTurn = 0;
+      pathsInStep = true;
       writtenTool = null;
       m = { atMs, kind: "prompt" };
     } else if (r.action === "dispatch.turn") {
       const calls = num(fields(r).tool_calls_count);
       pendingTools = calls;
       turnToolName = writtenTool;
-      turnToolPath = null;
       writtenTool = null;
+      const listed = fields(r).tool_paths;
+      turnPaths = Array.isArray(listed) ? listed.map((p) => cleanToolPath(p)) : null;
+      completedInTurn = 0;
+      pathsInStep = true;
       m = { atMs, kind: calls !== null && calls > 0 ? "tools" : "prompt" };
     } else if (r.action === "dispatch.tool") {
       if (pendingTools !== null && pendingTools > 0) pendingTools -= 1;
       const name = fields(r).tool_name;
-      if (typeof name === "string" && name) {
-        turnToolName = name;
-        turnToolPath = toolCallPath(fields(r));
+      if (typeof name === "string" && name) turnToolName = name;
+      // (#2963) This completion is call `completedInTurn` of the list. When
+      // its own file is readable and is not the list's entry, the list and
+      // the completions are out of step (a call the runtime discarded, say),
+      // and no later index is trusted this turn.
+      if (turnPaths !== null && pathsInStep) {
+        const own = toolCallPath(fields(r));
+        if (own !== null && own !== (turnPaths[completedInTurn] ?? null)) pathsInStep = false;
       }
+      completedInTurn += 1;
       m = { atMs, kind: pendingTools === null || pendingTools > 0 ? "tools" : "prompt" };
     } else if (isUtilityStart(r) && utilityJobOf(r) === UTILITY_JOB.compaction) {
       // (#2915) This execution's compactor is running. A routing job (or any
@@ -718,8 +734,13 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
       if (elapsed > (found.stallAfterMs ?? UTILITY_JOB_DEFAULT_STALL_MS)) return { state: "stalled" };
       return { state: "prompt", compacting: true, compactingSeconds: Math.max(0, Math.floor(elapsed / 1000)) };
     }
-    if (found.kind === "tools" && turnToolName !== null) {
-      return turnToolPath !== null ? { state: "tools", toolName: turnToolName, toolPath: turnToolPath } : { state: "tools", toolName: turnToolName };
+    if (found.kind === "tools") {
+      const reading: LiveStateReading = { state: "tools" };
+      if (turnToolName !== null) reading.toolName = turnToolName;
+      // (#2963) The running call's own file, or none.
+      const running = turnPaths !== null && pathsInStep ? (turnPaths[completedInTurn] ?? null) : null;
+      if (running !== null) reading.toolPath = running;
+      return reading;
     }
     if (found.kind === "prompt") return prompt();
     return { state: found.kind };
@@ -931,15 +952,17 @@ export function liveStateLabel(reading: LiveStateReading): string {
 /** (#2963) The tools that take a file, whose readout line names it. */
 const FILE_TOOLS = new Set(["read", "write", "edit"]);
 
-/** (#2963) The run page's readout line while darkmux runs a tool that took a
- *  file: its action and the file ("write · src/lib/tokenRate.ts"). `null`
- *  for any other tool, a call that named no file, and while the model is
- *  still generating the call (TOOL GEN keeps its own words). The caller
+/** (#2963) The run page's readout line while darkmux runs a tool that takes
+ *  a file: its action and the RUNNING call's file ("write ·
+ *  src/lib/tokenRate.ts"), or the action alone when that file is unknown
+ *  (never an earlier call's). `null` for any other tool and while the model
+ *  is still generating the call (TOOL GEN keeps its own words). The caller
  *  trims a long file from the LEFT so its name stays in view. */
-export function toolReadout(reading: LiveStateReading): { action: string; path: string } | null {
-  if (reading.state !== "tools" || reading.writing || !reading.toolPath) return null;
+export function toolReadout(reading: LiveStateReading): { action: string; path?: string } | null {
+  if (reading.state !== "tools" || reading.writing) return null;
   const action = (reading.toolName ?? "").trim().toLowerCase();
-  return FILE_TOOLS.has(action) ? { action, path: reading.toolPath } : null;
+  if (!FILE_TOOLS.has(action)) return null;
+  return reading.toolPath ? { action, path: reading.toolPath } : { action };
 }
 
 export interface AggregatedTokenRate {

@@ -148,13 +148,14 @@ export function ScopeLamps({
 
 /** The readout line under the lamps (`.modelbox__note`): "no signal", a
  *  finished average's qualifier, TOOL GEN, compacting, why REST rests, or
- *  (#2963) the action and file of a read/write/edit darkmux is running. A
+ *  (#2963) the action of a read/write/edit darkmux is running and, when
+ *  known, the running call's file. A
  *  tool's line puts the file in its own box that trims from the LEFT, so a
  *  long path loses its leading folders and keeps its file name; the whole
  *  line is the hover. One line either way (`styles.css`). */
-export function ScopeNote({ note, tool }: { note: string | null; tool?: { action: string; path: string } }) {
+export function ScopeNote({ note, tool }: { note: string | null; tool?: { action: string; path?: string } }) {
   if (!note) return null;
-  if (!tool) return <div className="modelbox__note">{note}</div>;
+  if (!tool?.path) return <div className="modelbox__note">{note}</div>;
   return (
     <div className="modelbox__note modelbox__note--tool" title={note}>
       <span className="modelbox__note-act">{`${tool.action} · `}</span>
@@ -192,9 +193,10 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
   clockMs?: number;
   lamps: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; restReason?: string; toolName?: string; writing?: true; writingSeconds?: number; thinking?: boolean; compacting?: true; compactingSeconds?: number };
   note: string | null;
-  /** (#2963) Present when `note` is a tool's action and file: the two
-   *  parts, so the line can trim the file from the left (`ScopeNote`). */
-  noteTool?: { action: string; path: string };
+  /** (#2963) Present when `note` is a tool's line: the action and, when the
+   *  running call's file is known, the file, so the line can trim the file
+   *  from the left (`ScopeNote`). */
+  noteTool?: { action: string; path?: string };
 } | null {
   const live = view.liveTokScope;
   if (live) {
@@ -267,7 +269,11 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
                   // Nothing when the record names no reason.
                   live.restReason
                 : toolLine
-                  ? `${toolLine.action} · ${toolLine.path}`
+                  ? toolLine.path
+                    ? `${toolLine.action} · ${toolLine.path}`
+                    : // (#2963) The running call's file unknown: the action
+                      // alone, never an earlier call's file.
+                      toolLine.action
                   : null,
       ...(toolLine ? { noteTool: toolLine } : {}),
     };

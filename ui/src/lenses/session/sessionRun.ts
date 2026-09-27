@@ -244,8 +244,8 @@ export interface SessionRunView {
         /** (#2890) Present only when `state === "tools"`: the tool the scope's
          *  center draws as an icon. See `LiveStateReading.toolName`. */
         toolName?: string;
-        /** (#2963) Alongside `toolName`: the file that same completed call
-         *  named. See `LiveStateReading.toolPath`. */
+        /** (#2963) The file of the call running now, when known. See
+         *  `LiveStateReading.toolPath`. */
         toolPath?: string;
         /** (#2889) Present only while the model WRITES a tool call — see
          *  `LiveStateReading.writing` / `writingSeconds`. */
