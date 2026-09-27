@@ -45,7 +45,7 @@
 //! token fold uses ([`crate::usage::usage_contribution`]). Both `purpose`s
 //! count, work and utility: a budget is about what the ENDPOINT served, and
 //! a provider bills a utility call like any other. Records written before
-//! `endpoint_id` existed (flow < 1.64.0) carry no id and are not counted.
+//! `endpoint_id` existed (flow < 1.65.0) carry no id and are not counted.
 //! Another machine's spend at the same endpoint is not seen: the window
 //! reads this machine's flow log.
 //!

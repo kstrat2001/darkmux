@@ -280,7 +280,7 @@ darkmux release.
   naming the nearest valid key. Budgets apply to
   calls darkmux sends to an endpoint it does not manage; `tokens_per_dispatch`
   and `concurrent_calls` are still shown and not enforced, and
-  `remote.concurrent_cap` still applies. FLOW 1.64.0 (`endpoint_id` on usage
+  `remote.concurrent_cap` still applies. FLOW 1.65.0 (`endpoint_id` on usage
   records, the four `budget.*` actions: warn, wait, resume, stop).
 
 - **`darkmux machine trust <name>` / `machine untrust <name>`** (#2916).
