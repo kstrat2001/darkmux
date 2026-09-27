@@ -3714,6 +3714,9 @@ mod tests {
         // An unparseable env value falls through (to no budget), never panics.
         unsafe { std::env::set_var(k, "half-a-million"); }
         assert_eq!(remote_max_tokens_per_step(), None);
+        // (zero doctrine) `0` on a darkmux bound is unbounded: no cap.
+        unsafe { std::env::set_var(k, "0"); }
+        assert_eq!(remote_max_tokens_per_step(), None, "0 is no cap");
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),
