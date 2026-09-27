@@ -381,6 +381,18 @@ pub fn fleet_mode_with_source(
 /// The identity provider `init` writes and an absent `fleet.identity.provider`
 /// resolves to.
 pub const FLEET_IDENTITY_PROVIDER_DEFAULT: &str = "tailscale";
+/// (#2916 stage 2) The busy policy `init` writes and an absent
+/// `fleet.busy_policy` resolves to.
+pub const FLEET_BUSY_POLICY_DEFAULT: &str = "refuse";
+
+/// (#2916 stage 2) What the fleet listener does with a job whose seat is
+/// busy: `env(DARKMUX_FLEET_BUSY_POLICY) > config.fleet.busy_policy >
+/// "refuse"`. An unregistered value is an error (#2947), never read as
+/// `refuse`: the listener refuses to start on it.
+pub fn fleet_busy_policy() -> Result<crate::config::BusyPolicy, crate::config_enum::BadEnumValue> {
+    resolve_enum("fleet.busy_policy").map(|(v, _)| v)
+}
+
 /// The work-submission listener's built-in port: one above the viewer's
 /// 8765, which `tailscale serve` owns on the overlay side of a hub.
 pub const FLEET_LISTENER_PORT_DEFAULT: u16 = 8766;

@@ -335,7 +335,17 @@ use std::path::Path;
 //           would be a major by the rule above; 4.0 is the clean-break
 //           release). An older binary reading this file ignores both new
 //           keys and falls back to its own 500000 default.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.32";
+//   1.33 (#2916 stage 2, darkmux 4.0): additive `fleet.busy_policy`, the
+//           receiver's answer to a fleet job that finds its seat busy:
+//           `refuse` (answer at once, naming what is running) or `queue`
+//           (hold it and tell the sender it is waiting). A job on a local
+//           model has capacity one per model; a job on a hosted endpoint
+//           runs concurrently up to this machine's `remote.concurrent_cap`,
+//           and the policy applies past that cap. Written VISIBLY by `init`
+//           as `refuse`. A string read leniently and refused where it is
+//           consumed (#2947): an older binary ignores the field and keeps
+//           its one-job-at-a-time listener.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.33";
 
 /// (#2902 step 5) A setting RENAMED in 4.0, with no alias. `config set`
 /// refuses the old key naming the new one; `darkmux doctor` (Warn) and every
@@ -1180,6 +1190,10 @@ pub struct FleetConfig {
     /// by `config set`: its `node_id` is resolved through the identity
     /// provider, never typed. An absent or empty map accepts no work.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub accept_work: Option<BTreeMap<String, AcceptWorkEntry>>,
+    /// (#2916 stage 2) What this machine's fleet listener does with a job
+    /// whose seat is busy: `refuse` or `queue`. See [`BusyPolicy`]. A
+    /// string, read leniently and refused where it is consumed (#2947).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub busy_policy: Option<String>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -1822,6 +1836,28 @@ crate::config_enum!(IdentityProvider, "identity provider", [
     Tailscale = "tailscale" => "the tailnet's own daemon answers who is connecting (`whois`)",
 ]);
 
+/// (#2916 stage 2) What a machine's fleet listener does with a submitted job
+/// whose seat is already in use (`fleet.busy_policy`). A job on a LOCAL model
+/// holds that model for its whole run (one request at a time per instance);
+/// a job on a HOSTED endpoint runs beside others up to this machine's
+/// `remote.concurrent_cap`. Past either limit, this policy decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusyPolicy {
+    Refuse,
+    Queue,
+}
+
+impl BusyPolicy {
+    pub fn as_str(self) -> &'static str {
+        crate::config_enum::ConfigEnum::token(self)
+    }
+}
+
+crate::config_enum!(BusyPolicy, "busy policy", [
+    Refuse = "refuse" => "answer at once that the seat is busy, naming what is running",
+    Queue = "queue" => "hold the job until its seat frees, telling the sender it is waiting",
+]);
+
 impl DarkmuxConfig {
     /// The full, self-documenting default config that `darkmux init` writes —
     /// every common knob present and visible, so the operator tunes the *file*,
@@ -1958,6 +1994,8 @@ impl DarkmuxConfig {
                     extras: Default::default(),
                 }),
                 accept_work: Some(BTreeMap::new()),
+                // (#2916 stage 2) Visible, so the busy answer is discoverable.
+                busy_policy: Some(crate::config_access::FLEET_BUSY_POLICY_DEFAULT.to_string()),
                 extras: Default::default(),
             }),
             remote: Some(RemoteConfig {
