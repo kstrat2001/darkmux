@@ -693,6 +693,17 @@ mod tests {
     }
 
     #[test]
+    fn this_binary_reports_its_own_build_string_as_a_development_build() {
+        // The wrapper reads THIS binary's build: a git build (a tag other
+        // than `release`) is a development build and reports its full build
+        // string; a release or tagless build is not one.
+        let build = darkmux_types::build_version();
+        let tagged = build.len() > env!("CARGO_PKG_VERSION").len();
+        let want = (tagged && !build.ends_with("(release)")).then(|| build.clone());
+        assert_eq!(host_dev_build(), want, "build = {build}");
+    }
+
+    #[test]
     fn an_image_that_cannot_be_inspected_is_refused_and_nothing_is_pulled() {
         let mut f = FakeImages::default().serving(&pinned(), Some(HOST));
         f.unreadable.insert(RUNTIME_IMAGE.to_string());
