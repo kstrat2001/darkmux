@@ -1,135 +1,28 @@
-//! `darkmux lab` command handlers — extracted from `main.rs` (mechanical,
-//! zero behavior change) alongside the `fleet_cli`/`cli` split. `LabCmd`
-//! itself (the arg surface) lives in `cli.rs`; this module owns the
-//! dispatch logic `cli::run` calls into, plus the `lab loop` (#986)
-//! single-run bench that used to live directly below `cmd_lab` in
-//! `main.rs`.
+//! `darkmux lab` command handlers. `LabCmd` itself (the arg surface) lives in
+//! `cli.rs`; this module owns the dispatch logic `cli::run` calls into. Each
+//! `LabCmd` arm unpacks its arguments and hands them to one handler below;
+//! `lab loop` (#986) lives in the `lab_loop` submodule.
+
+mod lab_loop;
 
 use anyhow::Result;
 
-use crate::cli::{FixtureCmd, LabCmd, RunCmd, WorkloadCmd};
+use crate::cli::{FixtureCmd, LabCmd, ProfilesFileArg, RunCmd, WorkloadCmd};
 use crate::lab;
 use crate::workloads;
 
 pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
     match sub {
-        // (#1465) `lab workload list` — the retired flat `lab workloads` leaf,
-        // now the sole member of the `workload` kind-family.
-        LabCmd::Workload { sub } => match sub {
-            WorkloadCmd::List => {
-                // (#2553 cleanup) No empty-list branch: `list_available`
-                // unconditionally inserts every `EMBEDDED_WORKLOADS` id, a
-                // fixed non-empty compiled-in set, so `lab_workloads()` can
-                // never return empty — the branch that used to print
-                // "no workloads found — check templates/builtin/workloads/"
-                // was dead code, and doubly so after this PR dropped the
-                // cwd-relative `templates/builtin/workloads/` search that
-                // path's own text referred to.
-                for id in lab::run::lab_workloads() {
-                    println!("{id}");
-                }
-                Ok(0)
-            }
-        },
-        // (#1465) `lab run` takes EITHER a workload positional (dispatch) OR a
-        // run sub-verb (list/inspect/compare — the retired flat `lab runs`/
-        // `lab inspect`/`lab compare` leaves). `args_conflicts_with_subcommands`
-        // guarantees the two forms never mix.
+        LabCmd::Workload { sub } => cmd_lab_workload(sub),
+        LabCmd::Run { sub: Some(run_sub), .. } => cmd_lab_run_sub(run_sub),
         LabCmd::Run {
             workload,
             profile,
             runs,
-            profiles: crate::cli::ProfilesFileArg { profiles },
+            profiles: ProfilesFileArg { profiles },
             quiet,
-            sub,
-        } => match sub {
-            Some(run_sub) => cmd_lab_run_sub(run_sub),
-            None => {
-                let workload_id = workload.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "specify a workload to dispatch (`lab run <workload>`) or a run \
-                         sub-verb (`lab run list` / `lab run inspect <id>` / \
-                         `lab run compare <a> <b>`)"
-                    )
-                })?;
-                // (#2262) `lab run` installed no signal handling at all — the
-                // same gap #2131 closed for every `mission launch` launcher.
-                // Without `arm()`, a caught SIGTERM/SIGINT/SIGHUP kills this
-                // process via the OS default disposition: no unwind, no
-                // `Drop`, the docker container (or curl child, for a
-                // tool-less hosted role/profile) orphaned. `lab::run::
-                // lab_run` already writes an explicit terminal
-                // `lifecycle.json` on ANY dispatch `Err` (see
-                // `RunLifecycle`'s own doc + the `lifecycle.finish_error`/
-                // `finish_interrupted` calls in `run.rs`, #2462), and
-                // `dispatch_internal.rs`'s own `DispatchBookendGuard` already
-                // guarantees a `dispatch.error` liveness bookend — so the
-                // only two things actually missing are: (1) install the
-                // handlers so a signal becomes a flag instead of an outright
-                // kill, and (2) something to notice that flag and kill the
-                // blocked child. Armed ONCE, ahead of the whole (possibly
-                // `--runs N`) dispatch loop below — `is_set()` never resets,
-                // so one signal ends the whole invocation, matching every
-                // other launcher's shape. See `spawn_reap_watchdog`'s own doc
-                // for why the docker path is already self-killing and this
-                // watchdog exists for the curl-only remote path.
-                crate::launch_guard::arm();
-                let _reap_watchdog = crate::launch_guard::spawn_reap_watchdog();
-                let outcomes = match lab::run::lab_run(lab::run::RunOpts {
-                    workload_id,
-                    profile_name: profile,
-                    runs,
-                    config_path: profiles,
-                    quiet,
-                    loop_override: None,
-                    inject_context: None,
-                }) {
-                    Ok(o) => o,
-                    Err(e) => {
-                        // (#2462) `lab_run`'s own terminal `lifecycle.json`
-                        // write is already durable by the time it returns
-                        // this `Err` (the RAII guard finalizes before
-                        // propagating — see `run.rs`'s match arm). Matching
-                        // `mission launch`'s own shape
-                        // (`reap_and_exit_on_signal`'s doc), a run a signal
-                        // actually ended now exits 130 instead of the
-                        // default-error 1 — so a wrapper script can tell
-                        // "the operator stopped this" from the exit code
-                        // alone, the same way it already can for `mission
-                        // launch`. A no-op (falls through to the ordinary
-                        // `Err` return below) when no signal was ever
-                        // observed.
-                        //
-                        // (#2462 review) `report_*`, NOT the bare
-                        // `reap_and_exit_on_signal`: the force-exit runs
-                        // before `main`'s own error printing, so a bare
-                        // call exits 130 having discarded the interrupt
-                        // message this change exists to produce. See that
-                        // function's doc for the measurement, and for why
-                        // this site keeps the hard exit where
-                        // `radio_cli.rs` dropped it.
-                        crate::launch_guard::report_reap_and_exit_on_signal(&e);
-                        return Err(e);
-                    }
-                };
-                if !quiet {
-                    println!("\n{} run(s) complete:", outcomes.len());
-                    for o in &outcomes {
-                        println!("  {} — {}", o.run_id, o.notes.join(" | "));
-                    }
-                }
-                // (#2494) Gate on BOTH the dispatch path and the workload's
-                // own verify. `o.ok` alone meant `darkmux lab run <w> &&
-                // echo PASS` printed PASS on a run whose tests failed — the
-                // most machine-readable green available, and the one CI
-                // keys on. `verify_passed == Some(false)` is a failure; a
-                // `None` (nothing declared a verify) is not.
-                let all_ok = outcomes
-                    .iter()
-                    .all(|o| o.ok && o.verify_passed != Some(false));
-                Ok(if all_ok { 0 } else { 1 })
-            }
-        },
+            sub: None,
+        } => cmd_lab_run_dispatch(workload, profile, runs, profiles, quiet),
         LabCmd::Eval {
             role,
             cases_dir,
@@ -148,52 +41,23 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
             exec_mode,
             k,
             bundler,
-        } => {
-            // (#2463) `lab eval` dispatches one internal-runtime call per
-            // case (`darkmux_crew::dispatch`, the same `dispatch()`
-            // primitive `darkmux dispatch` uses) in a plain loop with no
-            // signal handling at all — the #2262 gap, unfixed here. Each
-            // dispatch already gets its own `dispatch.error` bookend from
-            // `DispatchBookendGuard`, and the docker path already
-            // self-kills on a caught signal via the trajectory tailer's
-            // `interrupt::is_set()` poll — so, same as `dispatch`/`lab
-            // run`, the only two things missing are (1) installing the
-            // handlers so SIGTERM/SIGINT/SIGHUP become a flag instead of
-            // an outright kill, and (2) the watchdog that kills a
-            // registered child for a role that resolves to the tool-less
-            // remote `curl` path (no poll seam of its own). No new
-            // finalize/envelope guard — a run killed mid-corpus loses only
-            // the cases not yet scored, same as `Ctrl-C`-before-#2463 did;
-            // `scores.json` still isn't written until the loop completes.
-            crate::launch_guard::arm();
-            let _reap_watchdog = crate::launch_guard::spawn_reap_watchdog();
-            lab::review_bench::run_review_bench(lab::review_bench::ReviewBenchOpts {
-                role,
-                cases_dir: std::path::PathBuf::from(cases_dir),
-                profile_name: profile,
-                config_path: profiles,
-                timeout_seconds: timeout,
-                scores_out,
-                mode: if dialectic {
-                    lab::review_bench::BenchMode::Dialectic
-                } else if agentic {
-                    lab::review_bench::BenchMode::Agentic
-                } else if freeform {
-                    lab::review_bench::BenchMode::FreeForm
-                } else {
-                    lab::review_bench::BenchMode::Strict
-                },
-                workdirs,
-                prosecutor_profile,
-                defender_profile,
-                judge_profile,
-                roster_profile,
-                exec_mode,
-                k_override: k,
-                bundler_cmd: bundler,
-            })?;
-            Ok(0)
-        }
+        } => cmd_lab_eval(lab::review_bench::ReviewBenchOpts {
+            role,
+            cases_dir: std::path::PathBuf::from(cases_dir),
+            profile_name: profile,
+            config_path: profiles,
+            timeout_seconds: timeout,
+            scores_out,
+            mode: bench_mode(freeform, agentic, dialectic),
+            workdirs,
+            prosecutor_profile,
+            defender_profile,
+            judge_profile,
+            roster_profile,
+            exec_mode,
+            k_override: k,
+            bundler_cmd: bundler,
+        }),
         LabCmd::Loop {
             workload,
             profile,
@@ -209,7 +73,7 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
             ab,
             inject_from_mission,
             json,
-        } => cmd_lab_loop(LabLoopArgs {
+        } => lab_loop::cmd_lab_loop(lab_loop::LabLoopArgs {
             workload,
             profile,
             profiles,
@@ -228,213 +92,209 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
         LabCmd::Characterize {
             workload,
             profile,
-            profiles: crate::cli::ProfilesFileArg { profiles },
-        } => {
-            // (#2463) `characterize()` is a thin wrapper over `lab_run`
-            // (single run) — the exact `lab_run` gap `LabCmd::Run` above
-            // was already fixed for in #2262. Same fix, same reasoning:
-            // `lab_run` already writes a terminal `lifecycle.json` on any
-            // dispatch `Err`, so only the handlers + curl-path watchdog
-            // are missing.
-            crate::launch_guard::arm();
-            let _reap_watchdog = crate::launch_guard::spawn_reap_watchdog();
-            let report = lab::characterize::characterize(&lab::characterize::CharacterizeOpts {
-                workload,
-                profile,
-                config: profiles,
-            })?;
-            lab::characterize::print_report(&report);
-            Ok(if report.outcomes.iter().all(|o| o.ok) {
-                0
-            } else {
-                1
-            })
-        }
+            profiles: ProfilesFileArg { profiles },
+        } => cmd_lab_characterize(lab::characterize::CharacterizeOpts {
+            workload,
+            profile,
+            config: profiles,
+        }),
         LabCmd::Tune {
             workload,
             profile,
             runs,
-            profiles: crate::cli::ProfilesFileArg { profiles },
-        } => {
-            // (#2463) `tune()` is `lab_run` with `--runs N` — same gap,
-            // same fix as `LabCmd::Run`/`LabCmd::Characterize` above.
-            // Armed ONCE ahead of the whole multi-run loop (`lab_run`
-            // itself loops over `runs`), matching `LabCmd::Run`'s own
-            // placement.
-            crate::launch_guard::arm();
-            let _reap_watchdog = crate::launch_guard::spawn_reap_watchdog();
-            let report = lab::tune::tune(&lab::tune::TuneOpts {
-                workload,
-                profile,
-                runs,
-                config: profiles,
-            })?;
-            lab::tune::print_report(&report);
-            Ok(if report.outcomes.iter().all(|o| o.ok) {
-                0
-            } else {
-                1
-            })
-        }
-        // (#1465) `lab fixture list|register|unregister` — the retired flat
-        // `lab fixtures`/`lab register`/`lab unregister` leaves folded into the
-        // `fixture` kind-family.
-        LabCmd::Fixture { sub } => match sub {
-            FixtureCmd::List => {
-                let msg = lab::fixture_cli::cmd_list()?;
-                println!("{msg}");
-                Ok(0)
+            profiles: ProfilesFileArg { profiles },
+        } => cmd_lab_tune(lab::tune::TuneOpts {
+            workload,
+            profile,
+            runs,
+            config: profiles,
+        }),
+        LabCmd::Fixture { sub } => cmd_lab_fixture(sub),
+        LabCmd::Doctor => cmd_lab_doctor(),
+    }
+}
+
+/// Install the SIGTERM/SIGINT/SIGHUP handlers and the reap watchdog for a
+/// verb that dispatches through `lab_run` (or `dispatch`, for `lab eval`).
+/// Without the handlers a signal kills the process with no unwind, orphaning
+/// the dispatch's docker container or `curl` child (#2262, #2463). `lab_run`
+/// already writes a terminal `lifecycle.json` on any dispatch `Err`, and the
+/// dispatch's own bookend guard emits `dispatch.error`, so the handlers and
+/// the watchdog (which kills a registered `curl` child on the tool-less
+/// hosted path, see `spawn_reap_watchdog`) are all a lab verb adds. Called
+/// once, ahead of the verb's whole run loop: `interrupt::is_set()` never
+/// resets, so one signal ends the whole invocation. Hold the returned guard
+/// for the verb's lifetime.
+fn arm_signal_handling() -> crate::launch_guard::WatchdogStopGuard {
+    crate::launch_guard::arm();
+    crate::launch_guard::spawn_reap_watchdog()
+}
+
+/// Exit code for a verb whose outcome is "did every dispatch complete".
+fn exit_code_all_dispatched(outcomes: &[lab::run::RunOutcome]) -> i32 {
+    if outcomes.iter().all(|o| o.ok) {
+        0
+    } else {
+        1
+    }
+}
+
+/// (#1465) `lab workload list`. `list_available` always includes the fixed,
+/// non-empty `EMBEDDED_WORKLOADS` set, so there is no empty-list case.
+fn cmd_lab_workload(sub: WorkloadCmd) -> Result<i32> {
+    match sub {
+        WorkloadCmd::List => {
+            for id in lab::run::lab_workloads() {
+                println!("{id}");
             }
-            FixtureCmd::Register {
-                path,
-                name,
-                force,
-                if_absent,
-            } => {
-                let msg = lab::fixture_cli::cmd_register(&path, name, force, if_absent)?;
-                println!("{msg}");
-                Ok(0)
-            }
-            FixtureCmd::Unregister { name } => {
-                let msg = lab::fixture_cli::cmd_unregister(&name)?;
-                println!("{msg}");
-                Ok(0)
-            }
-        },
-        LabCmd::Doctor => {
-            let report = lab::doctor::lab_doctor()?;
-            // Warnings first so actionable items don't get buried
-            // behind a long list of passes when many fixtures are
-            // registered. Reviewer suggestion (#498 QA).
-            for w in &report.warnings {
-                println!("[warn] {w}");
-            }
-            for p in &report.passes {
-                println!("[ok]  {p}");
-            }
-            println!();
-            println!(
-                "{} pass, {} warn ({} fixture{} checked)",
-                report.passes.len(),
-                report.warnings.len(),
-                report.fixture_count,
-                if report.fixture_count == 1 { "" } else { "s" }
-            );
-            Ok(if report.has_warnings() { 1 } else { 0 })
+            Ok(0)
         }
     }
 }
 
-/// (#1465) The `lab run` sub-verbs — list/inspect/compare recorded runs.
-/// Split out of `cmd_lab` when the flat `lab runs`/`lab inspect`/`lab compare`
-/// leaves folded into the `run` kind-family; the handler bodies are the
-/// pre-#1465 arm bodies verbatim, zero behavior change.
+/// (#1465) `lab run <workload>`: dispatch a workload `runs` times. `lab run`
+/// takes EITHER this positional OR a run sub-verb (`cmd_lab_run_sub`);
+/// `args_conflicts_with_subcommands` keeps the two forms from mixing.
+fn cmd_lab_run_dispatch(
+    workload: Option<String>,
+    profile: Option<String>,
+    runs: u32,
+    profiles: Option<String>,
+    quiet: bool,
+) -> Result<i32> {
+    let workload_id = workload.ok_or_else(|| {
+        anyhow::anyhow!(
+            "specify a workload to dispatch (`lab run <workload>`) or a run \
+             sub-verb (`lab run list` / `lab run inspect <id>` / \
+             `lab run compare <a> <b>`)"
+        )
+    })?;
+    let _reap_watchdog = arm_signal_handling();
+    let outcomes = lab::run::lab_run(lab::run::RunOpts {
+        workload_id,
+        profile_name: profile,
+        runs,
+        config_path: profiles,
+        quiet,
+        loop_override: None,
+        inject_context: None,
+    })
+    .inspect_err(|e| {
+        // (#2462) A run a signal ended exits 130, matching `mission
+        // launch`, so a wrapper script can tell "the operator stopped this"
+        // from a failure by exit code alone. A no-op when no signal was
+        // observed. `report_*`, not the bare `reap_and_exit_on_signal`: the
+        // force-exit runs before `main` prints the error, so the bare call
+        // would discard the interrupt message.
+        crate::launch_guard::report_reap_and_exit_on_signal(e);
+    })?;
+    if !quiet {
+        println!("\n{} run(s) complete:", outcomes.len());
+        for o in &outcomes {
+            println!("  {} — {}", o.run_id, o.notes.join(" | "));
+        }
+    }
+    // (#2494) Gate on BOTH the dispatch path and the workload's own verify,
+    // so `lab run <w> && echo PASS` never prints PASS over failed tests. A
+    // `None` verify (nothing declared one) is not a failure.
+    let all_ok = outcomes
+        .iter()
+        .all(|o| o.ok && o.verify_passed != Some(false));
+    Ok(if all_ok { 0 } else { 1 })
+}
+
+/// `lab eval`'s condition flags, most specific first. clap already refuses
+/// the conflicting combinations; the order here only decides which flag a
+/// caller that bypasses clap would get.
+fn bench_mode(freeform: bool, agentic: bool, dialectic: bool) -> lab::review_bench::BenchMode {
+    use lab::review_bench::BenchMode;
+    if dialectic {
+        BenchMode::Dialectic
+    } else if agentic {
+        BenchMode::Agentic
+    } else if freeform {
+        BenchMode::FreeForm
+    } else {
+        BenchMode::Strict
+    }
+}
+
+/// `lab eval`: one dispatch per labeled case. A run killed mid-corpus loses
+/// only the cases not yet scored; `scores.json` is written when the loop
+/// completes.
+fn cmd_lab_eval(opts: lab::review_bench::ReviewBenchOpts) -> Result<i32> {
+    let _reap_watchdog = arm_signal_handling();
+    lab::review_bench::run_review_bench(opts)?;
+    Ok(0)
+}
+
+/// `lab characterize`: a single `lab_run`, reported.
+fn cmd_lab_characterize(opts: lab::characterize::CharacterizeOpts) -> Result<i32> {
+    let _reap_watchdog = arm_signal_handling();
+    let report = lab::characterize::characterize(&opts)?;
+    lab::characterize::print_report(&report);
+    Ok(exit_code_all_dispatched(&report.outcomes))
+}
+
+/// `lab tune`: `lab_run` with `--runs N`, reported as a distribution.
+fn cmd_lab_tune(opts: lab::tune::TuneOpts) -> Result<i32> {
+    let _reap_watchdog = arm_signal_handling();
+    let report = lab::tune::tune(&opts)?;
+    lab::tune::print_report(&report);
+    Ok(exit_code_all_dispatched(&report.outcomes))
+}
+
+/// (#1465, #491) `lab fixture list|register|unregister`.
+fn cmd_lab_fixture(sub: FixtureCmd) -> Result<i32> {
+    let msg = match sub {
+        FixtureCmd::List => lab::fixture_cli::cmd_list()?,
+        FixtureCmd::Register {
+            path,
+            name,
+            force,
+            if_absent,
+        } => lab::fixture_cli::cmd_register(&path, name, force, if_absent)?,
+        FixtureCmd::Unregister { name } => lab::fixture_cli::cmd_unregister(&name)?,
+    };
+    println!("{msg}");
+    Ok(0)
+}
+
+/// `lab doctor`: warnings first, so actionable items aren't buried behind a
+/// long list of passes (#498 QA).
+fn cmd_lab_doctor() -> Result<i32> {
+    let report = lab::doctor::lab_doctor()?;
+    for w in &report.warnings {
+        println!("[warn] {w}");
+    }
+    for p in &report.passes {
+        println!("[ok]  {p}");
+    }
+    println!();
+    println!(
+        "{} pass, {} warn ({} fixture{} checked)",
+        report.passes.len(),
+        report.warnings.len(),
+        report.fixture_count,
+        if report.fixture_count == 1 { "" } else { "s" }
+    );
+    Ok(if report.has_warnings() { 1 } else { 0 })
+}
+
+/// (#1465) The `lab run` sub-verbs: list, inspect, stats and compare
+/// recorded runs.
 fn cmd_lab_run_sub(sub: RunCmd) -> Result<i32> {
     match sub {
         RunCmd::List { limit, all } => {
-            let lim = if all { None } else { Some(limit) };
-            let summaries = lab::list::list_runs(lim)?;
+            let summaries = lab::list::list_runs((!all).then_some(limit))?;
             print!(
                 "{}",
                 lab::list::format_table(&summaries, &darkmux_types::config_access::lab_dir())
             );
             Ok(0)
         }
-        RunCmd::Inspect { run, summary } => {
-            let report = lab::inspect::lab_inspect(&run)?;
-            println!("run:         {}", report.run_id);
-            println!("workload:    {}", report.workload_id);
-            println!("wall:        {}s", report.walltime_ms / 1000);
-            // (#2094 finding 7) Shown next to wall — a rested run's wall
-            // clock must never be misread as a slow model. Milliseconds,
-            // not truncated-to-integer-seconds: `rest_ms` is small enough
-            // relative to typical dispatch walltimes that a seconds
-            // display can round a real, knob-driven rest down to "0s" and
-            // read as if no rest happened at all. `0` when the run
-            // predates the feature or took no rests; not gated on
-            // verify/mode outcome — a failed or Slow-classified run shows
-            // its rest exactly the same as a clean Fast one whenever it's
-            // known (populated straight off `report.rest_ms`, which
-            // `CodingTaskProvider::inspect` fills best-effort regardless
-            // of the run's own verdict).
-            if report.rest_ms > 0 {
-                println!("rest:        {}ms", report.rest_ms);
-            }
-            println!("turns:       {}", report.turns);
-            println!("compactions: {}", report.compactions);
-            // (#2494) The workload's OWN result, distinct from the dispatch
-            // path's `ok`. Printed unconditionally when known so a failed
-            // verify cannot be missed; the "not checked" case says so in
-            // those words rather than being silently omitted, which would
-            // read as a pass.
-            match &report.verify {
-                Some(v) if v.passed => println!("verify:      ok"),
-                Some(v) if v.details.is_empty() => println!("verify:      FAILED"),
-                Some(v) => println!("verify:      FAILED — {}", v.details),
-                None => println!("verify:      not checked"),
-            }
-            if !report.tokens_before.is_empty() {
-                let listed: Vec<String> =
-                    report.tokens_before.iter().map(|n| n.to_string()).collect();
-                println!("tokensBefore: {}", listed.join(", "));
-            }
-            if let Some(m) = report.mode {
-                println!(
-                    "mode:        {}",
-                    match m {
-                        workloads::types::RunMode::Fast => "fast",
-                        workloads::types::RunMode::Slow => "slow",
-                    }
-                );
-            }
-            println!("notes:");
-            for n in &report.notes {
-                println!("  - {n}");
-            }
-            if summary {
-                let run_dir = lab::inspect::resolve_run_path(&run);
-                let summaries = lab::inspect::read_compaction_summaries(&run_dir)?;
-                println!();
-                if summaries.is_empty() {
-                    println!("compaction summaries: (none — no trajectory.jsonl recorded)");
-                } else {
-                    println!("compaction summaries: {}", summaries.len());
-                    for (i, s) in summaries.iter().enumerate() {
-                        println!();
-                        println!(
-                            "─── summary {} of {} (turn {}, tokensBefore={}, {} chars) ───",
-                            i + 1,
-                            summaries.len(),
-                            s.turn_index,
-                            s.tokens_before,
-                            s.summary_chars
-                        );
-                        println!("{}", s.summary_text);
-                    }
-                }
-            }
-            Ok(0)
-        }
-        RunCmd::Stats { runs, baseline, json } => {
-            use lab::stats_render as render;
-            if runs.len() == 1 && baseline.is_empty() {
-                let s = lab::stats::run_stats(&runs[0])?;
-                if json.json {
-                    println!("{}", serde_json::to_string_pretty(&s)?);
-                } else {
-                    print!("{}", render::run_text(&s));
-                }
-                return Ok(0);
-            }
-            let cand = render::load_set(&runs);
-            let base = (!baseline.is_empty()).then(|| render::load_set(&baseline));
-            if json.json {
-                println!("{}", serde_json::to_string_pretty(&render::sets_json(&cand, base.as_ref()))?);
-            } else {
-                print!("{}", render::sets_text(&cand, base.as_ref()));
-            }
-            Ok(render::exit_code(&cand, base.as_ref()))
-        }
+        RunCmd::Inspect { run, summary } => cmd_lab_run_inspect(&run, summary),
+        RunCmd::Stats { runs, baseline, json } => cmd_lab_run_stats(&runs, &baseline, json.json),
         RunCmd::Compare { run_a, run_b } => {
             let result = lab::compare::lab_compare(&run_a, &run_b)?;
             for n in &result.notes {
@@ -445,269 +305,127 @@ fn cmd_lab_run_sub(sub: RunCmd) -> Result<i32> {
     }
 }
 
-/// Flattened args for `darkmux lab loop` (#986). Kept as a struct so the
-/// handler signature stays one parameter rather than a dozen.
-struct LabLoopArgs {
-    workload: String,
-    profile: Option<String>,
-    profiles: Option<String>,
-    max_turns: Option<u32>,
-    max_tokens: Option<u32>,
-    timeout: Option<u64>,
-    compact_threshold_tokens: Option<u32>,
-    compact_threshold_ratio: Option<f32>,
-    compact_strategy: Option<String>,
-    bail_after_compactions: Option<u32>,
-    context_window: Option<u32>,
-    ab: bool,
-    inject_from_mission: Option<String>,
-    json: bool,
+/// `lab run inspect <run> [--summary]`.
+fn cmd_lab_run_inspect(run: &str, summary: bool) -> Result<i32> {
+    let report = lab::inspect::lab_inspect(run)?;
+    print_inspection(&report);
+    if summary {
+        let run_dir = lab::inspect::resolve_run_path(run);
+        print_compaction_summaries(&lab::inspect::read_compaction_summaries(&run_dir)?);
+    }
+    Ok(0)
 }
 
-/// Parse the `--compact-strategy` flag into the typed enum. Accepts the two
-/// strategies the runtime supports, kebab- or snake-cased.
-fn parse_compact_strategy(raw: &str) -> Result<darkmux_types::CompactionStrategy> {
-    match raw.trim().to_lowercase().replace('_', "-").as_str() {
-        "narrative" => Ok(darkmux_types::CompactionStrategy::Narrative),
-        "structured-slot" => Ok(darkmux_types::CompactionStrategy::StructuredSlot),
-        other => anyhow::bail!(
-            "unknown --compact-strategy `{other}` (expected `narrative` or `structured-slot`)"
-        ),
+fn print_inspection(report: &workloads::types::InspectionReport) {
+    println!("run:         {}", report.run_id);
+    println!("workload:    {}", report.workload_id);
+    println!("wall:        {}s", report.walltime_ms / 1000);
+    // (#2094 finding 7) Shown next to wall so a rested run's wall clock is
+    // never misread as a slow model. Milliseconds, because a seconds display
+    // can round a real rest down to "0s". `0` means the run predates the
+    // field or took no rests.
+    if report.rest_ms > 0 {
+        println!("rest:        {}ms", report.rest_ms);
     }
-}
-
-/// `darkmux lab loop` (#986) — single-run loop-engineering bench. Runs ONE
-/// dispatch under the chosen harness config, then classifies how the loop
-/// behaved via `lab::loop_report`.
-///
-/// Two loop-variation axes:
-///   - **Caps** (`--max-turns` / `--max-tokens` / `--timeout`) resolve through
-///     `config_access`'s live env tier, so we set the documented env override
-///     for this dispatch. This process is single-shot (it exits right after),
-///     so a process-wide `set_var` is the simplest honest mechanism — it's the
-///     same tier an operator would `export` for one run.
-///   - **Compaction** (`--compact-*` / `--bail-after-compactions` /
-///     `--context-window`) overlays onto the profile-derived
-///     `CompactionDispatchArgs` via the provider (`loop_override`).
-fn cmd_lab_loop(args: LabLoopArgs) -> Result<i32> {
-    use darkmux_lab::lab::loop_report::{analyze_run, LoopCompactionOverride};
-
-    // (#2463) `lab loop` calls `lab_run` (via `run_arm` below) either once
-    // or twice (the `--ab` baseline/treatment pair) — same underlying gap
-    // #2262 fixed for `LabCmd::Run`, unfixed here. Armed ONCE, ahead of
-    // both the single-run and `--ab` two-run shapes, matching `LabCmd::
-    // Run`'s own placement ahead of ITS (possibly `--runs N`) loop —
-    // `lab_run` already writes a terminal `lifecycle.json` on any dispatch
-    // `Err`, so the handlers + curl-path watchdog are the only things
-    // missing.
-    crate::launch_guard::arm();
-    let _reap_watchdog = crate::launch_guard::spawn_reap_watchdog();
-
-    // ── build the compaction overlay (axis 2) ───────────────────────
-    let strategy = match args.compact_strategy.as_deref() {
-        Some(s) => Some(parse_compact_strategy(s)?),
-        None => None,
-    };
-    // Validate the adaptive-trigger ratio upfront (parity with
-    // --compact-strategy) — this is a trust-the-bench surface, so reject an
-    // out-of-range value loudly rather than letting it flow into the runtime.
-    if let Some(r) = args.compact_threshold_ratio {
-        if !(0.1..=0.9).contains(&r) {
-            anyhow::bail!(
-                "--compact-threshold-ratio {r} is out of range (expected 0.1–0.9)"
-            );
-        }
+    println!("turns:       {}", report.turns);
+    println!("compactions: {}", report.compactions);
+    println!("verify:      {}", verify_line(report.verify.as_ref()));
+    if !report.tokens_before.is_empty() {
+        let listed: Vec<String> = report.tokens_before.iter().map(|n| n.to_string()).collect();
+        println!("tokensBefore: {}", listed.join(", "));
     }
-    let loop_override = LoopCompactionOverride {
-        threshold_tokens: args.compact_threshold_tokens,
-        threshold_ratio: args.compact_threshold_ratio,
-        context_window: args.context_window,
-        strategy,
-        bail_after_compactions: args.bail_after_compactions,
-    };
-
-    // ── self-describing loop-config summary for the report ───────────
-    let mut loop_config: Vec<String> = Vec::new();
-    if let Some(p) = args.profile.as_deref() {
-        loop_config.push(format!("profile={p}"));
-    }
-    if let Some(p) = args.profiles.as_deref() {
-        loop_config.push(format!("profiles-file={p}"));
-    }
-    if let Some(n) = args.max_turns {
-        loop_config.push(format!("max-turns={n}"));
-    }
-    if let Some(n) = args.max_tokens {
-        loop_config.push(format!("max-tokens={n}"));
-    }
-    if let Some(n) = args.timeout {
-        loop_config.push(format!("timeout={n}s"));
-    }
-    if let Some(n) = args.compact_threshold_tokens {
-        loop_config.push(format!("compact-threshold-tokens={n}"));
-    }
-    if let Some(r) = args.compact_threshold_ratio {
-        loop_config.push(format!("compact-threshold-ratio={r}"));
-    }
-    if let Some(s) = args.compact_strategy.as_deref() {
-        loop_config.push(format!("compact-strategy={s}"));
-    }
-    if let Some(n) = args.bail_after_compactions {
-        loop_config.push(format!("bail-after-compactions={n}"));
-    }
-    if let Some(n) = args.context_window {
-        loop_config.push(format!("context-window={n}"));
-    }
-    if loop_config.is_empty() {
-        loop_config.push("profile defaults (no overrides)".to_string());
-    }
-
-    // ── apply caps via the live env-override tier (axis 1) ───────────
-    if let Some(n) = args.max_turns {
-        std::env::set_var("DARKMUX_RUNTIME_MAX_TURNS", n.to_string());
-    }
-    if let Some(n) = args.max_tokens {
-        std::env::set_var("DARKMUX_RUNTIME_MAX_TOKENS", n.to_string());
-    }
-    if let Some(n) = args.timeout {
-        std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", n.to_string());
-    }
-
-    // ── run one arm of the bench (single dispatch + classify) ────────
-    // Cloned inputs so the A/B path (#1004) can call it twice with only the
-    // injected context varying. `inject` carries the engagement-context for the
-    // "with" arm; `None` is the baseline. quiet in --json mode so stdout stays
-    // pure JSON.
-    use darkmux_lab::lab::loop_report::Verdict;
-    let run_arm = |inject: Option<String>| -> Result<darkmux_lab::lab::loop_report::LoopReport> {
-        let outcomes = darkmux_lab::lab::run::lab_run(darkmux_lab::lab::run::RunOpts {
-            workload_id: args.workload.clone(),
-            profile_name: args.profile.clone(),
-            runs: 1,
-            config_path: args.profiles.clone(),
-            quiet: args.json,
-            // When no compaction flag was set, pass `None` so the dispatch takes
-            // the exact `lab run` compaction path (caps still apply via env).
-            loop_override: if loop_override.is_empty() {
-                None
-            } else {
-                Some(loop_override.clone())
-            },
-            inject_context: inject,
-        })?;
-        let outcome = outcomes
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("loop lab produced no run outcome"))?;
-        analyze_run(
-            &outcome.run_dir,
-            &outcome.run_id,
-            outcome.ok,
-            outcome.verify_passed,
-            outcome.duration_ms,
-            loop_config.clone(),
-        )
-    };
-
-    // Exit 0 when the loop achieved the task (productive or struggled-through);
-    // non-zero when it failed or — critically — falsely passed while inert.
-    let verdict_exit = |v: Verdict| match v {
-        Verdict::Productive | Verdict::Struggled => 0,
-        Verdict::InertFalsePass | Verdict::Failed => 1,
-    };
-
-    // ── (#1004) engagement-context A/B ───────────────────────────────
-    if args.ab {
-        let ws = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        // (#2902 re-review C4) Budget the brief for the model that reads it:
-        // the workload's dispatch role picks it.
-        let role = darkmux_lab::lab::run::workload_dispatch_role(&args.workload);
-        let ctx = crate::coder_phase::injected_context_for_lab(
-            args.inject_from_mission.as_deref(),
-            &ws,
-            role.as_deref(),
-            args.profile.as_deref(),
-            args.profiles.as_deref(),
+    if let Some(m) = report.mode {
+        println!(
+            "mode:        {}",
+            match m {
+                workloads::types::RunMode::Fast => "fast",
+                workloads::types::RunMode::Slow => "slow",
+            }
         );
-        if ctx.trim().is_empty() {
-            anyhow::bail!(
-                "--ab: nothing to inject — no authored lessons for this repo{}. \
-                 Record a lesson (`darkmux memory lesson add`){}, then retry.",
-                args.inject_from_mission
-                    .as_deref()
-                    .map(|m| format!(" and no detected cautions for mission `{m}`"))
-                    .unwrap_or_default(),
-                if args.inject_from_mission.is_some() {
-                    ""
-                } else {
-                    " or pass --inject-from-mission <id> to add a mission's cautions"
-                }
-            );
-        }
-        let ctx_chars = ctx.len();
-        if !args.json {
-            eprintln!("… A/B: baseline run (WITHOUT engagement-context)");
-        }
-        let without = run_arm(None)?;
-        if !args.json {
-            eprintln!("… A/B: treatment run (WITH {ctx_chars} chars of engagement-context)");
-        }
-        let with = run_arm(Some(ctx))?;
+    }
+    println!("notes:");
+    for n in &report.notes {
+        println!("  - {n}");
+    }
+}
 
-        // Run ids are second-stamped; the two arms are sequential with a
-        // multi-second dispatch between, so they normally differ. Guard the
-        // (improbable) same-second collision — a shared run dir would merge
-        // trajectories and confound the very comparison this feature makes —
-        // so a confounded A/B is surfaced, never silently trusted (#44).
-        if with.run_id == without.run_id {
-            anyhow::bail!(
-                "A/B run-id collision (`{}`): both arms wrote the same run dir, so the \
-                 comparison would mix trajectories. Re-run `--ab` (the arms are sequential; \
-                 a second-boundary collision won't recur).",
-                with.run_id
-            );
-        }
+/// (#2494) The workload's OWN result, distinct from the dispatch path's `ok`.
+/// "not checked" is said in words: an omitted line would read as a pass.
+fn verify_line(verify: Option<&workloads::types::VerifyReport>) -> String {
+    match verify {
+        Some(v) if v.passed => "ok".to_string(),
+        Some(v) if v.details.is_empty() => "FAILED".to_string(),
+        Some(v) => format!("FAILED — {}", v.details),
+        None => "not checked".to_string(),
+    }
+}
 
-        // Rank the verdicts so the shift is a single signed comparison.
-        let rank = |v: Verdict| match v {
-            Verdict::Productive => 3,
-            Verdict::Struggled => 2,
-            Verdict::InertFalsePass => 1,
-            Verdict::Failed => 0,
-        };
-        let shift = match rank(with.verdict).cmp(&rank(without.verdict)) {
-            std::cmp::Ordering::Greater => "improved",
-            std::cmp::Ordering::Less => "regressed",
-            std::cmp::Ordering::Equal => "no-change",
-        };
+fn print_compaction_summaries(summaries: &[lab::inspect::CompactionSummary]) {
+    println!();
+    if summaries.is_empty() {
+        println!("compaction summaries: (none — no trajectory.jsonl recorded)");
+        return;
+    }
+    println!("compaction summaries: {}", summaries.len());
+    for (i, s) in summaries.iter().enumerate() {
+        println!();
+        println!(
+            "─── summary {} of {} (turn {}, tokensBefore={}, {} chars) ───",
+            i + 1,
+            summaries.len(),
+            s.turn_index,
+            s.tokens_before,
+            s.summary_chars
+        );
+        println!("{}", s.summary_text);
+    }
+}
 
-        if args.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "ab": true,
-                    "injected_context_chars": ctx_chars,
-                    "verdict_shift": shift,
-                    "without": without,
-                    "with": with,
-                }))?
-            );
+/// (#2855) `lab run stats`: one run alone prints the single-run view; a set,
+/// or one run with a baseline, prints the set view.
+fn cmd_lab_run_stats(runs: &[String], baseline: &[String], json: bool) -> Result<i32> {
+    use lab::stats_render as render;
+    if runs.len() == 1 && baseline.is_empty() {
+        let s = lab::stats::run_stats(&runs[0])?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&s)?);
         } else {
-            println!("\n── engagement-context A/B (#1004) ──");
-            println!("  without context: {}", without.verdict.as_str());
-            println!("  with context:    {} ({ctx_chars} chars injected)", with.verdict.as_str());
-            println!("  verdict shift:   {shift}");
+            print!("{}", render::run_text(&s));
         }
-        // The "with" arm is the configuration the operator would ship.
-        return Ok(verdict_exit(with.verdict));
+        return Ok(0);
+    }
+    let cand = render::load_set(runs);
+    let base = (!baseline.is_empty()).then(|| render::load_set(baseline));
+    if json {
+        println!("{}", serde_json::to_string_pretty(&render::sets_json(&cand, base.as_ref()))?);
+    } else {
+        print!("{}", render::sets_text(&cand, base.as_ref()));
+    }
+    Ok(render::exit_code(&cand, base.as_ref()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lab::review_bench::BenchMode;
+
+    #[test]
+    fn bench_mode_picks_the_most_specific_condition_flag() {
+        assert_eq!(bench_mode(false, false, false), BenchMode::Strict);
+        assert_eq!(bench_mode(true, false, false), BenchMode::FreeForm);
+        assert_eq!(bench_mode(false, true, false), BenchMode::Agentic);
+        assert_eq!(bench_mode(false, false, true), BenchMode::Dialectic);
+        assert_eq!(bench_mode(true, true, false), BenchMode::Agentic);
+        assert_eq!(bench_mode(true, true, true), BenchMode::Dialectic);
     }
 
-    // ── single run (default) ─────────────────────────────────────────
-    let report = run_arm(None)?;
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        darkmux_lab::lab::loop_report::print_report(&report);
+    #[test]
+    fn verify_line_says_not_checked_rather_than_omitting_it() {
+        use workloads::types::VerifyReport;
+        let v = |passed, details: &str| VerifyReport { passed, details: details.to_string() };
+        assert_eq!(verify_line(None), "not checked");
+        assert_eq!(verify_line(Some(&v(true, "whatever"))), "ok");
+        assert_eq!(verify_line(Some(&v(false, ""))), "FAILED");
+        assert_eq!(verify_line(Some(&v(false, "missing ack"))), "FAILED — missing ack");
     }
-    Ok(verdict_exit(report.verdict))
 }
