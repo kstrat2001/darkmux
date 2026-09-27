@@ -7,8 +7,8 @@
 // and ignored `session.end`, while `machActive` (the card pill) counted it — the
 // two derivations diverged, so an idle machine's bar spanned the whole window
 // (the card read "idle" while the bar read "active"). Fixed by routing every
-// "is this session done / where does its bar end" decision through the shared
-// `sessionCloseEdge` helper.
+// "is this session done / where does its bar end" decision through the one
+// lifecycle (`ui/src/lib/lifecycle.ts`).
 //
 // This is the FIRST test on the viewer's lifecycle render semantics: the engine's
 // Rust suite can't reach the inline JS, and the only other JS-level gate is the

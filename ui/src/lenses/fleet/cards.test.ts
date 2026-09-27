@@ -89,10 +89,10 @@ describe("machActive", () => {
   // -> still active. Without this, a `machActive` hardwired to `false` in
   // replay would pass the test above and look correct. (Playback parity,
   // Change A, finding #7) The start record is now placed just before `T_MAX`
-  // — inside `FLOW_LIVE_TTL_MS` — rather than relying on the fixture's
-  // far-past default `ts`: `sessionRunning` no longer reads "no close edge"
-  // alone as running forever; see the orphan case below and
-  // `flow.sessionRunning.parity.test.ts` for the regression this guards.
+  // — inside the staleness window — rather than relying on the fixture's
+  // far-past default `ts`: the lifecycle never reads "no close edge" alone
+  // as running forever; see the orphan case below and
+  // `tests/lifecycle/cases.json` for the regression this guards.
   it("replay: a session with NO close-edge IS active, on the same empty live set", () => {
     const data: NormRecord[] = [
       rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start", ts: new Date(T_MAX - 60_000).toISOString() }),
@@ -102,7 +102,7 @@ describe("machActive", () => {
 
   // (Playback parity, Change A, finding #7) The case the OLD replay
   // algorithm could not express at all: no close edge, but stale well past
-  // `FLOW_LIVE_TTL_MS` as of the playhead — an orphaned session the
+  // the staleness window as of the playhead — an orphaned session the
   // container's own watchdog would already have killed. The old "no close
   // edge => active" rule read this as running forever.
   it("replay: a session with NO close-edge but stale past the TTL is NOT active", () => {
@@ -110,7 +110,7 @@ describe("machActive", () => {
     expect(machActive(data, new Set(), "m1", T_MAX)).toBe(false);
   });
 
-  // `session.end` alone closes a session (`sessionCloseEdge`) — an abandoned
+  // `session.end` alone closes a session (`lib/lifecycle.ts`) — an abandoned
   // or hard-killed dispatch never emits `dispatch.complete`, and reading only
   // the dispatch terminal drew such a machine active forever.
   it("replay: session.end alone closes it, with no dispatch terminal at all", () => {
@@ -126,9 +126,8 @@ describe("machActive", () => {
   // `visible()` gate (`machActive(m){return visible().some(...)}`), which
   // this port had dropped as an unconditional no-op. A scrubbable playhead
   // makes it a real case: a session that hasn't started yet as of the
-  // playhead must not read "in flight", even though `sessionRunning`'s
-  // close-edge check (finding no close, because there's nothing to close
-  // yet) would otherwise call it running.
+  // playhead must not read "in flight": its lifecycle reads `not_started`
+  // there.
   it("replay: a session that hasn't started yet as of the playhead is NOT active", () => {
     const playhead = Date.parse("2026-08-08T00:00:00.000Z"); // before the fixture's own default ts
     const data: NormRecord[] = [
@@ -338,8 +337,8 @@ describe("buildFleetCard", () => {
   });
 
   // (#2060 review) The INVERTED order, and the only case that actually pins
-  // the `|| isTopLevel` half of the drill-in preference. `sessionsOn`
-  // preserves record order, so when the SEAT's record comes first the
+  // the "prefer the mission's own session" half of the drill-in preference.
+  // The run index preserves record order, so when the SEAT's record comes first the
   // mission's own session arrives with a representative already recorded —
   // `!existing` alone would keep the seat and drill-in would land on it.
   // With the mission-first fixture above, `!existing` picks the mission
@@ -529,15 +528,15 @@ describe("buildFleetCard", () => {
     // session" — the OLD divergent behavior the audit's finding #3 named
     // directly ("live: dispatch in flight · 89 tok/s · 1 running; playback:
     // dispatch in flight · 1 specialist" for the SAME instant). A replay
-    // caller's `liveSet` is empty in practice (there is no presence to read
-    // about a past day), and the session's own freshness — via
-    // `sessionRunning`'s TTL fallback, not presence — is what makes it read
+    // caller's presence is empty in practice (there is no presence to read
+    // about a past day), and the session's own freshness — its lifecycle's
+    // staleness window, not presence — is what makes it read
     // as running, in both modes, so the tok/s scope is a fact about the
     // recorded instant rather than a live-only instrument.
     it("computes a real rate for a running-shaped session in replay too (parity)", () => {
       // Record `ts` (not just the heartbeat payload's `sampled_at_ms`) has
-      // to be FRESH as of `T_MAX` too — `sessionRunning`'s TTL fallback
-      // measures staleness off the record's own `ts`, matching a real flow
+      // to be FRESH as of `T_MAX` too — the lifecycle measures staleness off
+      // the record's own `ts`, matching a real flow
       // record where the two are close together. Both defaulted to the
       // fixture's far-past `rec()` default `ts` here would make the
       // session read as an orphan (finding #7's own fix), which is a
@@ -688,7 +687,7 @@ describe("buildFleetCard", () => {
   // session id `darkmux-coding-{workload}-{epoch_millis}`
   // (`providers/coding_task.rs`, via `session_id::session_id`). They share
   // no join key, and the lab dispatch carries NO `mission_id`, so
-  // `topLevelRunSessionIds` treats it as standalone and has nothing to
+  // `topLevelRuns` treats it as standalone and has nothing to
   // collapse it into.
   it("(#1923) a lab run in its DISPATCH phase counts ONCE, not once per source", () => {
     const labSession = "darkmux-coding-long-agentic-1756000000000";

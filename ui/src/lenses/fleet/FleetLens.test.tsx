@@ -355,7 +355,7 @@ describe("FleetLens", () => {
   // (#1923) A machine whose lab run is BETWEEN dispatches — the COW clone,
   // the baseline hash, the verify command, scoring — has no dispatch in
   // flight, so no contract-2 bookends and no presence key: flow sees nothing
-  // and `machActive`/`sessionsOn` have nothing to read. The `/runs` lab row
+  // and `machActive` has no run to read. The `/runs` lab row
   // (written at start, RAII-guarded) is the only source that stays "running"
   // across that whole span, and without it the card reads "idle" /
   // "0 running" while the run is very much live.
@@ -1110,7 +1110,7 @@ describe("FleetLens pager (#2881)", () => {
   });
 
   // (#2886 pass 5, MUST — fresh-reviewer finding F2) A mission's seats all
-  // collapse to ONE top-level run (`topLevelRunSessionIds`), but the pager
+  // collapse to ONE top-level run (`topLevelRuns`), but the pager
   // shows one page per seat — so `runsCount` (1) and `card.executions.length`
   // (9) genuinely disagree here, unlike the plain-dispatches case above
   // where they agree by construction.
@@ -2271,9 +2271,8 @@ describe("savings hero: nothing leaks while loading (#2830)", () => {
     // timers are installed, so `todayUTC()` here would read the REAL
     // wall-clock date and build timestamps chronologically AFTER
     // FROZEN_NOW, which fails every `T(ts) <= t` liveness check silently
-    // (found live: `machActive` read false, `sessionRunning` still read
-    // true via a different path, so the card rendered "idle" with a
-    // contradictory "1 running" tap target).
+    // (found live: the card rendered "idle" with a contradictory
+    // "1 running" tap target).
     // Anchored so the LAST heartbeat sits 2s before FROZEN_NOW (10:02:00) —
     // fresh under STALL_AFTER_MS (30s).
     const t1a = "2026-06-15T10:00:00.000Z";
@@ -2392,8 +2391,8 @@ describe("(#2911) the fleet card ticks while an execution is live", () => {
     // across ticks", which pins the window half: the merged array stayed the
     // same object. It does NOT pin that the card's lookups use the index (a
     // lookup reverted to a whole-window scan builds nothing either); that
-    // half is pinned where each lookup lives, in `flow.test.ts`
-    // (`sessionRunning`) and `cards.test.ts` (the heartbeat reads).
+    // half is pinned where each lookup lives, in `flow.test.ts` (the run
+    // index) and `cards.test.ts` (the heartbeat reads).
     vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
     vi.setSystemTime(new Date(FROZEN_NOW));
     mockFleetFetch({
