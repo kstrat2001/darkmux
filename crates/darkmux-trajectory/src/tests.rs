@@ -170,6 +170,12 @@ fn streams_pair_with_the_latest_open_one_on_their_turn() {
     assert_eq!(f.generation_ms(2), Some(95900));
     assert_eq!(f.generation_ms(3), None, "an open stream's time is unknown");
     assert_eq!(f.streams.iter().map(|s| s.content_chars).sum::<u64>(), 47, "chars sum across streams");
+    let repeated_end = fold(&[
+        r#"{"type":"model.streaming.start","seq":1,"ts":0}"#,
+        r#"{"type":"model.streaming.end","seq":1,"ts":10}"#,
+        r#"{"type":"model.streaming.end","seq":1,"ts":50}"#,
+    ]);
+    assert_eq!(repeated_end.generation_ms(1), Some(10), "an end only closes a stream that is still open");
 }
 
 #[test]
