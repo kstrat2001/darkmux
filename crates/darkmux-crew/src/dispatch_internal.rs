@@ -11715,7 +11715,7 @@ fn turn_tool_paths(event: &serde_json::Value) -> Option<serde_json::Value> {
             _ => serde_json::Value::Null,
         })
         .collect();
-    paths.iter().any(|p| !p.is_null()).then(|| serde_json::Value::Array(paths))
+    paths.iter().any(|p| !p.is_null()).then_some(serde_json::Value::Array(paths))
 }
 
 fn cap_json_str(value: Option<&serde_json::Value>, max: usize) -> serde_json::Value {
