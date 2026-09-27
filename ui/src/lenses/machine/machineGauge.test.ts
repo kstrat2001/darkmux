@@ -30,6 +30,7 @@ import {
   sortResidencyRows,
 } from "./machineGauge";
 import type { MachineResources, MachineResourcesModel } from "../../types/handwritten";
+import { maxOf, minOf } from "../../lib/numbers";
 
 function resources(overrides: Partial<MachineResources> = {}): MachineResources {
   return {
@@ -722,7 +723,7 @@ describe("gaugeRampStops", () => {
       0.5,
       (1 - Math.cos((3 * Math.PI) / 4)) / 2,
       1,
-    ].map((v) => expect.closeTo(v, 12)));
+    ].map((v): unknown => expect.closeTo(v, 12)));
     // and the offsets are strictly increasing, or the gradient would fold.
     for (let i = 1; i < stops.length; i++) expect(stops[i].offset).toBeGreaterThan(stops[i - 1].offset);
   });
@@ -785,8 +786,8 @@ describe("sevenSegmentPolygons", () => {
       // the lit one is the middle bar: its points sit around the cell's mid-height.
       const lit = segs.find((s) => s.lit)!;
       const ys = lit.points.split(" ").map((p) => Number(p.split(",")[1]));
-      expect(Math.min(...ys)).toBeGreaterThan(SEVEN_SEG_CELL.h * 0.4);
-      expect(Math.max(...ys)).toBeLessThan(SEVEN_SEG_CELL.h * 0.6);
+      expect(minOf(ys) ?? NaN).toBeGreaterThan(SEVEN_SEG_CELL.h * 0.4);
+      expect(maxOf(ys) ?? NaN).toBeLessThan(SEVEN_SEG_CELL.h * 0.6);
     }
   });
 
@@ -798,7 +799,7 @@ describe("sevenSegmentPolygons", () => {
     const cx = pts.reduce((a, [x]) => a + x, 0) / pts.length;
     const cy = pts.reduce((a, [, y]) => a + y, 0) / pts.length;
     const W = SEVEN_SEG_CELL.w, H = SEVEN_SEG_CELL.h;
-    const wide = Math.max(...pts.map(([x]) => x)) - Math.min(...pts.map(([x]) => x)) > W / 2;
+    const wide = (maxOf(pts.map(([x]) => x)) ?? NaN) - (minOf(pts.map(([x]) => x)) ?? NaN) > W / 2;
     if (wide) return cy < H / 4 ? "top" : cy > (3 * H) / 4 ? "bottom" : "middle";
     return `${cy < H / 2 ? "upper" : "lower"}-${cx < W / 2 ? "left" : "right"}`;
   };

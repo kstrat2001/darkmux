@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { useLiveTail } from "./useLiveTail";
 import { queryKeys } from "../lib/queryKeys";
+import type { fetchJson } from "../lib/fetcher";
 
 /** A controllable mock `EventSource` — enough surface for `startFlowTail`
  * (`lib/sse.ts`) to drive, PLUS `onopen`/`onerror` simulation this packet's
@@ -56,8 +57,7 @@ function makeFetchImpl(responder: (path: string) => { ok: true; data: unknown } 
   const impl = (async (path: string) => {
     calls.push(path);
     return responder(path);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  }) as any;
+  }) as typeof fetchJson;
   return { impl, calls };
 }
 

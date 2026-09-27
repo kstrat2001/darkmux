@@ -696,7 +696,6 @@ export function TokenScope({
     // `targetRef` so a heartbeat never re-creates the canvas/observer/listener.
     // `reduce` IS a dependency (#2911): flipping it is exactly a change of
     // which of the two setups above should be running.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reduce]);
 
   useEffect(() => {

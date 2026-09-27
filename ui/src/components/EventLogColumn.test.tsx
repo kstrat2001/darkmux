@@ -10,6 +10,9 @@ import { norm, type RawRecord } from "../testing/records";
 import { closeOpenModal } from "../lib/dialogManager";
 import { PageJudgementContext } from "../hooks/useJudgement";
 
+/** The part of the persisted filter state these tests read back. */
+type StoredFilters = { q: string; act: { include: string[]; exclude: string[] } };
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // `ui/src/components/` -> repo root is three levels up.
 const REPO_ROOT = path.resolve(__dirname, "../../..");
@@ -487,7 +490,7 @@ describe("EventLogColumn", () => {
     fireEvent.change(within(paneA).getByPlaceholderText("filter events…"), { target: { value: "s-cloud" } });
     expect(paneA.querySelectorAll('[data-act="rec"]').length).toBe(1);
 
-    const storedAfterA = JSON.parse(window.sessionStorage.getItem("dmux.eventfilters")!);
+    const storedAfterA = JSON.parse(window.sessionStorage.getItem("dmux.eventfilters")!) as StoredFilters;
     expect(storedAfterA.q).toBe("s-cloud");
 
     // Pane B receives a fresh `records` array (a routine live-poll tick),
@@ -515,7 +518,7 @@ describe("EventLogColumn", () => {
       />,
     );
 
-    const storedAfterB = JSON.parse(window.sessionStorage.getItem("dmux.eventfilters")!);
+    const storedAfterB = JSON.parse(window.sessionStorage.getItem("dmux.eventfilters")!) as StoredFilters;
     expect(storedAfterB.q).toBe("s-cloud");
   });
 
@@ -545,7 +548,7 @@ describe("EventLogColumn", () => {
     expect(header.checked).toBe(true);
     fireEvent.click(header);
     expect(container.querySelectorAll('[data-act="rec"]').length).toBe(0);
-    const stored = JSON.parse(window.sessionStorage.getItem("dmux.eventfilters")!);
+    const stored = JSON.parse(window.sessionStorage.getItem("dmux.eventfilters")!) as StoredFilters;
     expect([...stored.act.exclude].sort()).toEqual(["reasoning", "tool call"]);
     expect(stored.act.include).toEqual([]);
     // Back on: the same header, now unchecked, re-includes exactly those two.

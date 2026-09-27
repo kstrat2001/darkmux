@@ -19,6 +19,8 @@
  * memory).
  */
 
+import { maxOf } from "./numbers";
+
 /** The bare shape every `telemetry.process` record's `payload` carries —
  * see `run_telemetry_sampler`'s doc in `dispatch_internal.rs` for the
  * producer side. All three are independently optional (a failed host read
@@ -55,9 +57,9 @@ export interface HostAggregate {
 const EMPTY_METRIC: MetricAggregate = { now: null, avg: null, high: null, p95: null };
 
 function aggregateMetric(valuesInOrder: number[]): MetricAggregate {
-  if (valuesInOrder.length === 0) return EMPTY_METRIC;
+  const high = maxOf(valuesInOrder);
+  if (high === undefined) return EMPTY_METRIC;
   const now = valuesInOrder[valuesInOrder.length - 1];
-  const high = Math.max(...valuesInOrder);
   const avg = valuesInOrder.reduce((a, b) => a + b, 0) / valuesInOrder.length;
   const sorted = [...valuesInOrder].sort((a, b) => a - b);
   // Nearest-rank, same convention as the Rust-side `reduce_metric`.

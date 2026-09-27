@@ -11,6 +11,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "knip": "knip --no-progress",
     "types:regen": "(cd .. && cargo test -p darkmux-serve export_bindings --lib && cargo test -p darkmux-flow --features ts-export export_bindings --lib && cargo test -p darkmux-crew --features ts-export export_bindings --lib && cargo test -p darkmux-lab --features ts-export export_bindings --lib)",
     "types:check": "bun run types:regen && git diff --exit-code -- src/types/generated"
   },
@@ -27,8 +29,12 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^6.0.5",
+    "eslint": "^9.39.5",
+    "eslint-plugin-react-hooks": "^7.1.1",
     "jsdom": "^30.0.1",
+    "knip": "^6.38.0",
     "typescript": "^5.6.3",
+    "typescript-eslint": "^8.70.1",
     "vite": "^8.2.1",
     "vite-plugin-singlefile": "^2.3.3",
     "vitest": "^4.1.10"

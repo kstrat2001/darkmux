@@ -3,6 +3,7 @@ import { render } from "@testing-library/react";
 import { MachineHealthRegion } from "./MachineHealthRegion";
 import { advanceResidency } from "./machineGauge";
 import type { MachineResources, MachineResourcesModel } from "../../types/handwritten";
+import { maxOf, minOf } from "../../lib/numbers";
 
 // #1806 Stage 2/3's structural DOM claims, at the component level — the
 // browser-level proof lives in `tests/e2e/viewer-machine.spec.js` (XSS
@@ -295,8 +296,8 @@ describe("MachineHealthRegion — the center readout is centered on the hub", ()
     const { container } = renderRegion(BASE);
     const cells = odoCellExtents(container);
     expect(cells.length).toBe(4); // "19.4"
-    const left = Math.min(...cells.map((c) => c.left));
-    const right = Math.max(...cells.map((c) => c.right));
+    const left = minOf(cells.map((c) => c.left)) ?? NaN;
+    const right = maxOf(cells.map((c) => c.right)) ?? NaN;
     // CX is 120. The old single <text x=120 textAnchor="middle"> centered the
     // number AND the unit as one run, so the figure itself always sat left of
     // the hub by half of " GB" — the nit this fixes. The glyphs changed from
@@ -367,7 +368,7 @@ describe("MachineHealthRegion — the center readout is centered on the hub", ()
     const { container } = renderRegion(wide, { residencyRows: residencyRowsFor(wide) });
     const cells = odoCellExtents(container);
     expect(cells.length).toBe(5);
-    expect((Math.min(...cells.map((c) => c.left)) + Math.max(...cells.map((c) => c.right))) / 2).toBeCloseTo(120, 6);
+    expect(((minOf(cells.map((c) => c.left)) ?? NaN) + (maxOf(cells.map((c) => c.right)) ?? NaN)) / 2).toBeCloseTo(120, 6);
 
     // Both sources unreadable — the readout falls back through pool.used to
     // machine.current, and with neither present renders "—", never a 0.

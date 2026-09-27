@@ -3,6 +3,7 @@ import { computeTMax, computeTMin } from "../lib/flow";
 import { recordsAsOf, type NormRecord } from "../lib/ingest";
 import { isMissionLifecycle, spanOf } from "../lib/lifecycle";
 import { runIndex, type RunGroup } from "../lib/runRef";
+import { maxOf, minOf } from "../lib/numbers";
 
 /** (#2346) What the transport's `tMin`/`tMax` scope to. `day` (the
  * default) is the pre-existing behavior — the whole loaded day. A
@@ -79,8 +80,8 @@ function focusRange(dayRecords: NormRecord[], focus: PlaybackFocus): { tMin: num
   const starts = spans.flatMap((s) => (s.startMs === null ? [] : [s.startMs]));
   const ends = spans.flatMap((s) => (s.endMs === null ? [] : [s.endMs]));
   return {
-    tMin: starts.length ? Math.min(...starts) : computeTMin(scoped),
-    tMax: ends.length ? Math.max(...ends) : computeTMax(scoped),
+    tMin: minOf(starts) ?? computeTMin(scoped),
+    tMax: maxOf(ends) ?? computeTMax(scoped),
   };
 }
 

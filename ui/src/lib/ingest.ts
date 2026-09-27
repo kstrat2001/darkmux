@@ -25,9 +25,9 @@
  *    whatever the cut, so a malformed record is visible and wrong-looking,
  *    never silently dropped (a terminal with a bad clock still closes its
  *    run).
- * 2. It contributes nothing to time arithmetic: `timesOf` skips it, so it
- *    moves no minimum, maximum, span, rate or "last activity". A pick by
- *    time (the latest name, the earliest start) takes it only when no timed
+ * 2. It contributes nothing to time arithmetic: it moves no minimum,
+ *    maximum, span, rate or "last activity". A pick by time
+ *    (`latestByTime`, `earliestByTime`) takes it only when no timed
  *    candidate exists, so a malformed record can always be outvoted.
  * 3. It sorts after every timed record (`byTime`), in arrival order.
  */
@@ -387,14 +387,6 @@ export const isDispatchFamily = (a: NormAction | undefined): boolean => a !== un
 
 // ─── time policy ──────────────────────────────────────────────────────────
 
-/** `tMs` of every timed record, in order. The one way to do arithmetic on a
- *  set's timestamps (policy rule 2). */
-export function timesOf(records: readonly NormRecord[]): number[] {
-  const out: number[] = [];
-  for (const r of records) if (r.tMs !== null) out.push(r.tMs);
-  return out;
-}
-
 /** Ascending by `tMs`, untimed records last (policy rule 3). Stable. */
 export function byTime(a: NormRecord, b: NormRecord): number {
   if (a.tMs === null) return b.tMs === null ? 0 : 1;
@@ -419,6 +411,21 @@ export function latestByTime<R extends NormRecord>(records: readonly R[]): R | u
     if (r.tMs === null) {
       if (best === undefined || best.tMs === null) best = r;
     } else if (best === undefined || best.tMs === null || r.tMs >= best.tMs) {
+      best = r;
+    }
+  }
+  return best;
+}
+
+/** The earliest record by time, under policy rule 2: the earliest timed one
+ *  (the first in arrival order on a tie), and an untimed one (the first) only
+ *  when none is timed. `latestByTime`'s mirror. */
+export function earliestByTime<R extends NormRecord>(records: readonly R[]): R | undefined {
+  let best: R | undefined;
+  for (const r of records) {
+    if (r.tMs === null) {
+      if (best === undefined) best = r;
+    } else if (best === undefined || best.tMs === null || r.tMs < best.tMs) {
       best = r;
     }
   }

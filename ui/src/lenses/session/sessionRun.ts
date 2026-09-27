@@ -65,7 +65,8 @@ import { PURPOSE, sumUsage } from "../../lib/usageRecords";
 import type { DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
 import { toolOutcome } from "../../lib/recordDetail";
 import type { RunStatus } from "../../types/generated/RunStatus";
-import { ACTION, CATEGORY, byTime, isDispatchTerminal, latestByTime, recordsAsOf, timesOf, type NormRecord } from "../../lib/ingest";
+import { ACTION, CATEGORY, byTime, isDispatchTerminal, latestByTime, recordsAsOf, type NormRecord } from "../../lib/ingest";
+import { maxOf } from "../../lib/numbers";
 
 /** The run-time figure's long hover text, shared by SYSTEM's WALL CLOCK and
  *  (#2890) the MODEL section's ACTIVE TIME, which show the same number. */
@@ -458,7 +459,7 @@ function contextFigures(tel: readonly NormRecord[]): { samples: number; nctx: nu
   return {
     samples: cx.length,
     nctx: cx.length && Number.isFinite(max0) && max0 > 0 ? max0 : 0,
-    ctxPeak: cx.length ? Math.max(...cx.map(used)) : 0,
+    ctxPeak: maxOf(cx.map(used)) ?? 0,
     ctxNow: cx.length ? used(latestByTime(cx)) : 0,
   };
 }
@@ -1508,8 +1509,7 @@ export function runRegions(
   // alive whether or not a heartbeat happens to have landed recently, and
   // keying only on heartbeats would make a busy run look dead.
   const attemptRecs = visible.filter(inAttempt);
-  const attemptTimes = timesOf(attemptRecs);
-  const lastBeatMs = attemptTimes.length ? Math.max(...attemptTimes) : null;
+  const lastBeatMs = latestByTime(attemptRecs)?.tMs ?? null;
 
   const { runWallMs, wallElapsed, wallBase, wallSub } = wallClock(ctx, nowMs);
 

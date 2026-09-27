@@ -568,9 +568,9 @@ describe("MissionGraphLens step drill-in (#2189)", () => {
     const onStepHeader = vi.fn();
     const { rerender } = renderLens("m1", undefined, { selectedStepId: "a-step", onStepHeader });
     await waitFor(() => {
-      const fields = onStepHeader.mock.calls.at(-1)?.[0];
+      const fields = onStepHeader.mock.calls.at(-1)?.[0] as { key: string }[] | null | undefined;
       expect(fields).not.toBeNull();
-      expect(fields.some((f: { key: string }) => f.key === "unit")).toBe(true);
+      expect(fields?.some((f) => f.key === "unit")).toBe(true);
     });
 
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });

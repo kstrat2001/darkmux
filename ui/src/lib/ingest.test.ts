@@ -18,7 +18,7 @@ import {
   latestByTime,
   recKey,
   tagText,
-  timesOf,
+  earliestByTime,
   unknownActionCount,
   wireOf,
   type NormRecord,
@@ -230,7 +230,8 @@ describe("the bad-timestamp policy", () => {
   });
 
   it("an untimed record adds nothing to time arithmetic", () => {
-    expect(timesOf(data)).toEqual([T0 + 10_000, T0 + 30_000, T0 + 20_000]);
+    expect(latestByTime(data)?.tMs).toBe(T0 + 30_000);
+    expect(earliestByTime(data)?.tMs).toBe(T0 + 10_000);
   });
 
   it("an untimed record sorts after every timed one", () => {

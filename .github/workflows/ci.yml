@@ -981,6 +981,15 @@ jobs:
         working-directory: ui
         run: bun run test
 
+      # The viewer's lint gate: no `any` and no unsafe use of one, so a JSON
+      # value stays `unknown` until it is narrowed at the ingest or fetch
+      # boundary; and no spread into Math.max/Math.min, which throws a
+      # RangeError past roughly 100k elements (a busy day of records).
+      - name: UI lint
+        if: steps.filter.outputs.ui == 'true'
+        working-directory: ui
+        run: bun run lint
+
       # (#2212) slop-chop's mechanical stages: the AST survey and the
       # truth-table oracle. Plain `node --test` — no vitest, no bundler — and
       # they import `typescript` from ui/node_modules installed above.
