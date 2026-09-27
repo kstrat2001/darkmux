@@ -43,6 +43,7 @@
 import { ACTION, byTime, isAsOf, isDispatchTerminal, latestByTime, recordsAsOf, timesOf, type NormAction, type NormRecord } from "./ingest";
 import type { RunState } from "./flow";
 import type { RunGroup, RunRecords } from "./runRef";
+import type { RunsPolicy } from "../types/generated/RunsPolicy";
 
 export type LifecyclePhase = "not_started" | "open" | "waiting" | "closed" | "stale";
 
@@ -67,8 +68,16 @@ export interface LifecyclePolicy {
   readonly budgetWaitGraceMs: number;
 }
 
-/** The daemon's defaults, for a page that has not read `/runs` yet. */
-export const DEFAULT_POLICY: LifecyclePolicy = { staleAfterMs: 300_000, budgetWaitGraceMs: 60_000 };
+/** The daemon's defaults (twice the runtime's default 600 s inactivity
+ *  budget; one minute of grace), for a page that has not read `/runs` yet
+ *  or one served without it. */
+export const DEFAULT_POLICY: LifecyclePolicy = { staleAfterMs: 1_200_000, budgetWaitGraceMs: 60_000 };
+
+/** The policy `/runs` publishes (`RunsPolicy`), else the default: a daemon
+ *  from before it published one answers without it. */
+export function policyOf(p: RunsPolicy | undefined): LifecyclePolicy {
+  return p ? { staleAfterMs: p.stale_after_ms, budgetWaitGraceMs: p.budget_wait_grace_ms } : DEFAULT_POLICY;
+}
 
 export interface Close {
   readonly edge: CloseEdge;

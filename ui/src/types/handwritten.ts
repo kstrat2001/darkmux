@@ -13,12 +13,16 @@
  */
 
 import type { Run } from "./generated/Run";
+import type { RunsPolicy } from "./generated/RunsPolicy";
 
 /** `GET /runs` — the wrapper `runs_handler` builds around `Vec<Run>`.
  * Source: `crates/darkmux-serve/src/lib.rs::runs_handler`. */
 export interface RunsResponse {
   runs: Run[];
   generated_at_ms: number;
+  /** The lifecycle policy every row was judged by. Absent from a daemon
+   *  that predates it. */
+  policy?: RunsPolicy;
 }
 
 /**

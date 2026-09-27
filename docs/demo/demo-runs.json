@@ -8,6 +8,10 @@
       }
     }
   },
+  "policy": {
+    "budget_wait_grace_ms": 60000,
+    "stale_after_ms": 1200000
+  },
   "runs": [
     {
       "completed_ts": 1790326159,

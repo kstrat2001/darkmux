@@ -2033,6 +2033,34 @@ pub(crate) fn stale_after_ms() -> u64 {
     darkmux_types::config_access::inactivity_timeout_seconds().saturating_mul(2_000)
 }
 
+/// (#2902 step 5) How long past its announced resume time a budget wait
+/// stays open with no further word from its waiter. A waiter still held at
+/// its resume time announces again (a new `budget.wait`), and one whose
+/// window has room writes `budget.resume` within one poll; a wait silent
+/// this long past its resume time has lost its process.
+pub(crate) const BUDGET_WAIT_GRACE_MS: u64 = 60_000;
+
+/// The lifecycle policy every `/runs` row is judged by, published on the
+/// response so the viewer judges flow sessions by the same numbers
+/// (`ui/src/lib/lifecycle.ts`, one spec in `tests/lifecycle/cases.json`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct RunsPolicy {
+    /// [`stale_after_ms`]: twice the runtime's inactivity budget.
+    #[cfg_attr(test, ts(type = "number"))]
+    pub stale_after_ms: u64,
+    /// [`BUDGET_WAIT_GRACE_MS`].
+    #[cfg_attr(test, ts(type = "number"))]
+    pub budget_wait_grace_ms: u64,
+}
+
+/// The policy as the daemon resolves it now (`runtime.inactivity_timeout_seconds`
+/// follows config, like every other `/runs` staleness decision).
+pub fn runs_policy() -> RunsPolicy {
+    RunsPolicy { stale_after_ms: stale_after_ms(), budget_wait_grace_ms: BUDGET_WAIT_GRACE_MS }
+}
+
 /// (#2413) Best-effort, LOCAL-ONLY: is at least one dispatch bookend-open
 /// (a `dispatch start` with no matching `dispatch complete`/`error` yet,
 /// within [`stale_after_ms`] of `now_ms`) on THIS machine? Feeds the
@@ -2108,12 +2136,18 @@ fn any_dispatch_live_in(dir: &std::path::Path, day: &str, now_ms: u64, max_age_m
 /// the three `Run` kinds. A session with no activity timestamp at all
 /// (shouldn't happen for anything actually indexed, but never assume) can't
 /// be judged live — absence of evidence is not evidence of life.
+///
+/// (#2902 step 5) An open budget wait holds the session live until it
+/// lapses; past that, the staleness clock runs from the lapse.
 fn session_is_live(agg: &SessionAgg, now_ms: u64) -> bool {
-    let Some(last_activity_secs) = agg.last_activity_ts.as_deref().and_then(parse_flow_ts) else {
+    if agg.wait_until_ms.is_some_and(|until| now_ms <= until) {
+        return true;
+    }
+    let last_activity_ms = agg.last_activity_ts.as_deref().and_then(parse_flow_ts).map(|secs| secs.saturating_mul(1_000));
+    let Some(quiet_from) = last_activity_ms.max(agg.wait_until_ms) else {
         return false;
     };
-    let idle_ms = now_ms.saturating_sub(last_activity_secs.saturating_mul(1_000));
-    idle_ms <= stale_after_ms()
+    now_ms.saturating_sub(quiet_from) <= stale_after_ms()
 }
 
 /// Representative role/model/route for a lab run's `/runs` row, off its
@@ -2298,6 +2332,15 @@ struct SessionAgg {
     /// terminal. Same raw-ISO-string convention as `start_ts`/`terminal_ts`
     /// — parsed via [`parse_flow_ts`] only where a numeric is needed.
     last_activity_ts: Option<String>,
+    /// (#2902 step 5) A `budget.wait` was seen: a hosted call held by its
+    /// budget before its first bookend is a run.
+    has_wait: bool,
+    /// When the session's open budget wait lapses (epoch ms: its `ts`, plus
+    /// its `wait_seconds`, plus [`BUDGET_WAIT_GRACE_MS`]); `None` while no
+    /// wait is open.
+    wait_until_ms: Option<u64>,
+    /// The session's terminal was a `budget.stop` that names why.
+    stopped_by_operator: bool,
 }
 
 impl SessionAgg {
@@ -2357,119 +2400,8 @@ fn build_flow_session_index_in(
 
     let fleet_seen: std::collections::HashSet<String> =
         fleet.iter().filter(|v| within_window(v)).map(crate::flow_record_identity).collect();
-    let fold = |idx: &mut HashMap<String, SessionAgg>, v: &serde_json::Value| {
-        let Some(session_id) = v.get("session_id").and_then(|s| s.as_str()) else {
-            return;
-        };
-        if session_id.is_empty() {
-            return;
-        }
-        let agg = idx.entry(session_id.to_string()).or_default();
-
-        if agg.mission_id.is_none() {
-            if let Some(mid) = v.get("mission_id").and_then(|m| m.as_str()) {
-                if !mid.is_empty() {
-                    agg.mission_id = Some(mid.to_string());
-                }
-            }
-        }
-        // (#1918) Unconditional, unlike `mission_id` above — this tracks
-        // EVERY distinct value this session has ever named, not just the
-        // first, because the ambiguity question ("does this session belong
-        // to more than one mission") can only be answered by seeing them
-        // all. A `HashSet` insert of the same value from the session's own
-        // other steps is a no-op, so an ordinary multi-step mission never
-        // trips this — only a session that genuinely spans more than one
-        // mission grows past one entry.
-        if let Some(mid) = v.get("mission_id").and_then(|m| m.as_str()) {
-            if !mid.is_empty() {
-                agg.mission_ids_seen.insert(mid.to_string());
-            }
-        }
-        if agg.role.is_none() {
-            if let Some(handle) = v.get("handle").and_then(|h| h.as_str()) {
-                if !handle.is_empty() {
-                    agg.role = Some(handle.to_string());
-                }
-            }
-        }
-        if agg.model.is_none() {
-            if let Some(model) = v.get("model").and_then(|m| m.as_str()) {
-                if !model.is_empty() {
-                    agg.model = Some(model.to_string());
-                }
-            }
-        }
-        if agg.machine.is_none() {
-            if let Some(mach) = v.get("machine_id").and_then(|m| m.as_str()) {
-                if !mach.is_empty() {
-                    agg.machine = Some(mach.to_string());
-                }
-            }
-        }
-        if agg.source.is_none() {
-            if let Some(src) = v.get("source").and_then(|s| s.as_str()) {
-                if !src.is_empty() {
-                    agg.source = Some(src.to_string());
-                }
-            }
-        }
-
-        let action = darkmux_flow::reader::action_of(v);
-        let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
-
-        // (#1642, #1633) EVERY record for this session updates the liveness
-        // clock — not just lifecycle ones (see `SessionAgg::last_activity_ts`'s
-        // doc). ISO-8601 `YYYY-MM-DDTHH:MM:SSZ` sorts correctly as a plain
-        // string (same property `earliest_by_start` relies on), so a lexical
-        // compare is enough to keep the NEWEST seen even if records are ever
-        // visited out of chronological order.
-        if !ts.is_empty() {
-            let is_newer = match agg.last_activity_ts.as_deref() {
-                Some(current) => ts > current,
-                None => true,
-            };
-            if is_newer {
-                agg.last_activity_ts = Some(ts.to_string());
-            }
-        }
-
-        // Check EVERY dispatch lifecycle record's payload for `endpoint` —
-        // not just start (#1518, applied server-side; see `SessionAgg::endpoint`'s doc).
-        let is_bookend = matches!(
-            action,
-            Some(FlowAction::DispatchStart | FlowAction::DispatchComplete | FlowAction::DispatchError)
-        );
-        if agg.endpoint.is_none() && is_bookend {
-            if let Some(ep) = v
-                .get("payload")
-                .and_then(|p| p.get("endpoint"))
-                .and_then(|e| e.as_str())
-            {
-                if !ep.is_empty() {
-                    agg.endpoint = Some(ep.to_string());
-                }
-            }
-        }
-
-        if action == Some(FlowAction::DispatchStart) {
-            agg.has_start = true;
-            if agg.start_ts.is_none() && !ts.is_empty() {
-                agg.start_ts = Some(ts.to_string());
-            }
-        } else if let Some(status) = action.as_ref().and_then(terminal_status_for_action) {
-            // Keep the FIRST terminal seen — a session emits at most one in
-            // practice; favoring the first keeps this deterministic if a
-            // replay/retry ever produced more than one.
-            if agg.terminal_status.is_none() {
-                agg.terminal_status = Some(status);
-                agg.terminal_ts = Some(ts.to_string());
-            }
-        }
-    };
-
     for v in fleet.iter().filter(|v| within_window(v)) {
-        fold(&mut idx, v);
+        fold_session_record(&mut idx, v);
         if let Some(u) = usage.as_deref_mut() {
             u.add(v);
         }
@@ -2478,13 +2410,153 @@ fn build_flow_session_index_in(
         if !fleet_seen.is_empty() && fleet_seen.contains(&crate::flow_record_identity(v)) {
             return std::ops::ControlFlow::Continue(());
         }
-        fold(&mut idx, v);
+        fold_session_record(&mut idx, v);
         if let Some(u) = usage.as_deref_mut() {
             u.add(v);
         }
         std::ops::ControlFlow::Continue(())
     });
     idx
+}
+
+/// Fold one flow record into its session's [`SessionAgg`]: the one pass
+/// [`build_flow_session_index_in`] makes over the window.
+fn fold_session_record(idx: &mut HashMap<String, SessionAgg>, v: &serde_json::Value) {
+    let Some(session_id) = v.get("session_id").and_then(|s| s.as_str()) else {
+        return;
+    };
+    if session_id.is_empty() {
+        return;
+    }
+    let agg = idx.entry(session_id.to_string()).or_default();
+
+    if agg.mission_id.is_none() {
+        if let Some(mid) = v.get("mission_id").and_then(|m| m.as_str()) {
+            if !mid.is_empty() {
+                agg.mission_id = Some(mid.to_string());
+            }
+        }
+    }
+    // (#1918) Unconditional, unlike `mission_id` above — this tracks
+    // EVERY distinct value this session has ever named, not just the
+    // first, because the ambiguity question ("does this session belong
+    // to more than one mission") can only be answered by seeing them
+    // all. A `HashSet` insert of the same value from the session's own
+    // other steps is a no-op, so an ordinary multi-step mission never
+    // trips this — only a session that genuinely spans more than one
+    // mission grows past one entry.
+    if let Some(mid) = v.get("mission_id").and_then(|m| m.as_str()) {
+        if !mid.is_empty() {
+            agg.mission_ids_seen.insert(mid.to_string());
+        }
+    }
+    if agg.role.is_none() {
+        if let Some(handle) = v.get("handle").and_then(|h| h.as_str()) {
+            if !handle.is_empty() {
+                agg.role = Some(handle.to_string());
+            }
+        }
+    }
+    if agg.model.is_none() {
+        if let Some(model) = v.get("model").and_then(|m| m.as_str()) {
+            if !model.is_empty() {
+                agg.model = Some(model.to_string());
+            }
+        }
+    }
+    if agg.machine.is_none() {
+        if let Some(mach) = v.get("machine_id").and_then(|m| m.as_str()) {
+            if !mach.is_empty() {
+                agg.machine = Some(mach.to_string());
+            }
+        }
+    }
+    if agg.source.is_none() {
+        if let Some(src) = v.get("source").and_then(|s| s.as_str()) {
+            if !src.is_empty() {
+                agg.source = Some(src.to_string());
+            }
+        }
+    }
+
+    let action = darkmux_flow::reader::action_of(v);
+    let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
+
+    // (#1642, #1633) EVERY record for this session updates the liveness
+    // clock — not just lifecycle ones (see `SessionAgg::last_activity_ts`'s
+    // doc). ISO-8601 `YYYY-MM-DDTHH:MM:SSZ` sorts correctly as a plain
+    // string (same property `earliest_by_start` relies on), so a lexical
+    // compare is enough to keep the NEWEST seen even if records are ever
+    // visited out of chronological order.
+    if !ts.is_empty() {
+        let is_newer = match agg.last_activity_ts.as_deref() {
+            Some(current) => ts > current,
+            None => true,
+        };
+        if is_newer {
+            agg.last_activity_ts = Some(ts.to_string());
+        }
+    }
+
+    // Check EVERY dispatch lifecycle record's payload for `endpoint` —
+    // not just start (#1518, applied server-side; see `SessionAgg::endpoint`'s doc).
+    let is_bookend = matches!(
+        action,
+        Some(FlowAction::DispatchStart | FlowAction::DispatchComplete | FlowAction::DispatchError)
+    );
+    if agg.endpoint.is_none() && is_bookend {
+        if let Some(ep) = v
+            .get("payload")
+            .and_then(|p| p.get("endpoint"))
+            .and_then(|e| e.as_str())
+        {
+            if !ep.is_empty() {
+                agg.endpoint = Some(ep.to_string());
+            }
+        }
+    }
+
+    if action == Some(FlowAction::DispatchStart) {
+        agg.has_start = true;
+        if agg.start_ts.is_none() && !ts.is_empty() {
+            agg.start_ts = Some(ts.to_string());
+        }
+    } else if let Some(status) = action.as_ref().and_then(terminal_status_for_action) {
+        // Keep the FIRST terminal seen — a session emits at most one in
+        // practice; favoring the first keeps this deterministic if a
+        // replay/retry ever produced more than one.
+        if agg.terminal_status.is_none() {
+            agg.terminal_status = Some(status);
+            agg.terminal_ts = Some(ts.to_string());
+            agg.stopped_by_operator = action == Some(FlowAction::BudgetStop) && names_a_reason(v);
+        }
+        agg.wait_until_ms = None;
+    }
+    fold_budget_wait(agg, action.as_ref(), ts, v);
+}
+
+/// (#2902 step 5) A hosted call's budget gate writes `budget.wait` BEFORE
+/// any dispatch bookend (contract 2 opens the bookends around the model call
+/// only), so a waiting session is a run with no start yet. The wait holds it
+/// live until its announced resume time plus [`BUDGET_WAIT_GRACE_MS`];
+/// `budget.resume` ends it (and a terminal, in [`fold_session_record`]).
+fn fold_budget_wait(agg: &mut SessionAgg, action: Option<&FlowAction>, ts: &str, v: &serde_json::Value) {
+    if action == Some(&FlowAction::BudgetWait) {
+        agg.has_wait = true;
+        agg.wait_until_ms = parse_flow_ts(ts).map(|secs| {
+            let wait_secs = darkmux_crew::usage::payload_of(v).get("wait_seconds").and_then(|w| w.as_f64()).unwrap_or(0.0).max(0.0);
+            secs.saturating_mul(1_000).saturating_add((wait_secs * 1_000.0) as u64).saturating_add(BUDGET_WAIT_GRACE_MS)
+        });
+    } else if action == Some(&FlowAction::BudgetResume) {
+        agg.wait_until_ms = None;
+    }
+}
+
+/// Whether a record's payload names a non-empty `reason`: every reason a
+/// `budget.stop` producer writes is an operator's stop (an interrupt,
+/// `mission abort`/`finalize`, an abandoned phase).
+fn names_a_reason(v: &serde_json::Value) -> bool {
+    darkmux_crew::usage::payload_of(v).get("reason").and_then(|r| r.as_str()).is_some_and(|r| !r.is_empty())
 }
 
 /// The `RunStatus` a session's TERMINAL flow action implies — `None` for
@@ -2498,8 +2570,9 @@ fn terminal_status_for_action(action: &FlowAction) -> Option<RunStatus> {
     }
     // The presence reconciler's crash/kill/timeout close-edge: a session
     // whose heartbeat disappeared with no clean dispatch terminal ever
-    // landing (`presence_reconciler.rs`'s own doc).
-    (*action == FlowAction::SessionEnd).then_some(RunStatus::Abandoned)
+    // landing (`presence_reconciler.rs`'s own doc). (#2902 step 5) And a
+    // budget wait ended because its run was stopped; nothing was sent.
+    matches!(action, FlowAction::SessionEnd | FlowAction::BudgetStop).then_some(RunStatus::Abandoned)
 }
 
 /// The chronologically-EARLIEST session by `start_ts` (lexical compare —
@@ -2549,7 +2622,7 @@ fn ghost_runs(
 ) -> Vec<Run> {
     let mut out = Vec::new();
     for (session_id, agg) in flow_index {
-        if !agg.has_start {
+        if !agg.has_start && !agg.has_wait {
             continue;
         }
         if known_session_ids.contains(session_id) {
@@ -2580,7 +2653,11 @@ fn ghost_runs(
         // own doc) — so an Abandoned ghost always means "no ending
         // recorded", whether it came from `session.end` or the staleness
         // gate above.
-        let abandoned_reason = (status == RunStatus::Abandoned).then_some(AbandonReason::NoTerminal);
+        let abandoned_reason = (status == RunStatus::Abandoned).then_some(if agg.stopped_by_operator {
+            AbandonReason::Aborted
+        } else {
+            AbandonReason::NoTerminal
+        });
         out.push(Run {
             id: session_id.clone(),
             kind: RunKind::Dispatch,
@@ -4534,6 +4611,77 @@ mod tests {
             "the shipped default inactivity budget"
         );
         assert_eq!(stale_after_ms(), 600 * 2_000, "a 20-minute staleness window by default");
+    }
+
+    // ── the lifecycle corpus: one spec, two executors ────────────────────
+
+    /// What the daemon states about one corpus case's session as of `now_ms`:
+    /// `(phase, status, abandoned_reason)`, in the corpus's vocabulary. The
+    /// daemon has no `waiting` phase of its own (a held call is `Running`),
+    /// so `open` and `waiting` both read `running` here.
+    fn daemon_judgement(agg: &SessionAgg, now_ms: u64) -> (&'static str, RunStatus, Option<AbandonReason>) {
+        if let Some(status) = agg.terminal_status {
+            let reason = (status == RunStatus::Abandoned)
+                .then_some(if agg.stopped_by_operator { AbandonReason::Aborted } else { AbandonReason::NoTerminal });
+            return ("closed", status, reason);
+        }
+        if !agg.has_start && !agg.has_wait {
+            return ("not_started", RunStatus::Planned, None);
+        }
+        if session_is_live(agg, now_ms) {
+            return ("running", RunStatus::Running, None);
+        }
+        ("stale", RunStatus::Abandoned, Some(AbandonReason::NoTerminal))
+    }
+
+    /// `tests/lifecycle/cases.json`, asserted against the daemon's session
+    /// fold and [`session_is_live`]: the same file the viewer's
+    /// `lifecycle.corpus.test.ts` asserts against `lifecycleAt`. A case the
+    /// daemon cannot judge names why (`server_skip_reason`); every other
+    /// case must agree, and the corpus's policy must be the one `/runs`
+    /// publishes at the shipped default.
+    #[test]
+    #[serial_test::serial]
+    fn lifecycle_corpus() {
+        let _default = InactivityBudgetGuard::unset();
+        let doc: serde_json::Value = serde_json::from_str(include_str!("../../../tests/lifecycle/cases.json")).expect("the corpus parses");
+        let policy = runs_policy();
+        assert_eq!(doc["policy"]["stale_after_ms"].as_u64(), Some(policy.stale_after_ms), "the corpus is judged at the published policy");
+        assert_eq!(doc["policy"]["budget_wait_grace_ms"].as_u64(), Some(policy.budget_wait_grace_ms));
+        let cases = doc["cases"].as_array().expect("cases");
+        let mut judged = 0;
+        for case in cases {
+            let name = case["name"].as_str().unwrap_or("?");
+            if case.get("server").and_then(|v| v.as_bool()) == Some(false) {
+                assert!(case["server_skip_reason"].as_str().is_some_and(|r| !r.is_empty()), "{name}: a skipped case says why");
+                continue;
+            }
+            let mut idx: HashMap<String, SessionAgg> = HashMap::new();
+            for r in case["records"].as_array().expect("records") {
+                fold_session_record(&mut idx, r);
+            }
+            let now_ms = parse_flow_ts(case["as_of"].as_str().expect("as_of")).expect("as_of parses") * 1_000;
+            let sid = case["records"][0]["session_id"].as_str().expect("session_id");
+            let (phase, status, reason) = daemon_judgement(&idx[sid], now_ms);
+            let want_phase = match case["phase"].as_str().expect("phase") {
+                "open" | "waiting" => "running",
+                other => other,
+            };
+            assert_eq!(phase, want_phase, "{name}: phase");
+            assert_eq!(serde_json::to_value(status).unwrap(), case["status"], "{name}: status");
+            assert_eq!(reason.map(|r| serde_json::to_value(r).unwrap()), case.get("abandoned_reason").cloned(), "{name}: abandoned_reason");
+            judged += 1;
+        }
+        assert!(judged >= 15, "the daemon judges most of the corpus, not a token few ({judged})");
+    }
+
+    /// The policy `/runs` publishes follows the daemon's own config, the
+    /// same knob every staleness decision above reads.
+    #[test]
+    #[serial_test::serial]
+    fn the_published_policy_follows_the_inactivity_budget() {
+        let _budget = InactivityBudgetGuard::seconds(60);
+        assert_eq!(runs_policy(), RunsPolicy { stale_after_ms: 120_000, budget_wait_grace_ms: 60_000 });
     }
 
     // ── earliest_by_start: pairs, not bare aggs (#1915) ──────────────────

@@ -54,6 +54,7 @@
  *   reads the `flowTail` cache slot that mount writes. The header badge is
  *   the liveness indicator; this lens paints no pill.
  */
+import { useLifecyclePolicy } from "../../hooks/useLifecyclePolicy";
 import { clkhm, fmtElapsed } from "../../lib/format";
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient, skipToken } from "@tanstack/react-query";
@@ -615,6 +616,7 @@ export function MissionGraphLens({
   // status as well as the steps.
   const missionRunning = !!graph && workStatusKind(normalizeMissionStatus(graph.mission_status)) === "running";
   const now = useNow(anyRunning || missionRunning);
+  const policy = useLifecyclePolicy();
   const proc = useProcReadout(flowTailQuery.data);
 
   // Needs `now` (elapsed time for a still-running step) — computed here,
@@ -622,8 +624,8 @@ export function MissionGraphLens({
   // above.
   const stepHeaderFields = useMemo(() => {
     if (!selectedStep) return null;
-    return buildStepHeaderFields(selectedStep, metrics, now, selectedStepRecords);
-  }, [selectedStep, metrics, now, selectedStepRecords]);
+    return buildStepHeaderFields(selectedStep, metrics, now, selectedStepRecords, policy);
+  }, [selectedStep, metrics, now, selectedStepRecords, policy]);
 
   useEffect(() => {
     onStepHeader?.(stepHeaderFields);
@@ -787,6 +789,7 @@ export function MissionGraphLens({
             edges={graph.edges}
             metrics={metrics}
             now={now}
+            policy={policy}
             note={graph.note}
             expanded={expanded}
             onToggleTask={toggleTask}
@@ -799,6 +802,7 @@ export function MissionGraphLens({
             edges={graph.edges}
             metrics={metrics}
             now={now}
+            policy={policy}
             note={graph.note}
             minimapOn={minimapOn}
             selectedStepId={selectedStepId}

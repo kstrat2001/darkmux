@@ -4823,6 +4823,20 @@
         assert_eq!(run["tracked"], true);
     }
 
+    /// `/runs` publishes the lifecycle policy its rows were judged by, the
+    /// numbers the viewer judges flow sessions by (`ui/src/lib/lifecycle.ts`).
+    #[tokio::test]
+    async fn runs_handler_publishes_its_lifecycle_policy() {
+        let flows = TempDir::new().unwrap();
+        let app = build_router_full_local(flows.path().to_path_buf(), worktrees_base_dir(), None);
+        let response = app.oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap()).await.unwrap();
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let policy = crate::runs::runs_policy();
+        assert_eq!(json["policy"]["stale_after_ms"].as_u64(), Some(policy.stale_after_ms));
+        assert_eq!(json["policy"]["budget_wait_grace_ms"].as_u64(), Some(policy.budget_wait_grace_ms));
+    }
+
     #[tokio::test]
     async fn runs_handler_includes_lab_runs_with_kind_lab() {
         let flows = TempDir::new().unwrap();

@@ -970,7 +970,7 @@ export interface StepHeaderField {
  * home in `GraphStep`/`StepMetrics` yet. Scanned NEWEST-FIRST so the most
  * recent record wins when more than one carries the same key (a crawl unit
  * can emit `source`/`rule` more than once while working through a batch). */
-export function buildStepHeaderFields(step: GraphStep, metrics: MetricsMap, now: number, stepRecords: NormRecord[]): StepHeaderField[] {
+export function buildStepHeaderFields(step: GraphStep, metrics: MetricsMap, now: number, stepRecords: NormRecord[], policy: LifecyclePolicy = DEFAULT_POLICY): StepHeaderField[] {
   const fields: StepHeaderField[] = [];
   fields.push({ key: "unit", label: "unit", value: step.label || step.id });
   if (step.kind) fields.push({ key: "kind", label: "kind", value: step.kind });
@@ -999,7 +999,7 @@ export function buildStepHeaderFields(step: GraphStep, metrics: MetricsMap, now:
   fields.push({ key: "status", label: "status", value: step.status || "planned" });
 
   const m = metrics[step.id];
-  const meter = stepMeterFor(step, metrics, now);
+  const meter = stepMeterFor(step, metrics, now, policy);
   const startMs = stepStartMs(step, m);
   if (startMs) {
     const endMs = m && m.endTs ? m.endTs : meter.generating ? now : 0;

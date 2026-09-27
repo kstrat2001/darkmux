@@ -1,3 +1,4 @@
+import { useLifecyclePolicy } from "../../hooks/useLifecyclePolicy";
 import { encodeMachineKey } from "../../lib/machineKey";
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { fitTubes } from "./tubeFit";
@@ -835,6 +836,7 @@ export function FleetLens({
   // presence hook is disabled there), so its runs are judged from records
   // up to the playhead alone.
   const presence = liveSessionIds;
+  const policy = useLifecyclePolicy();
   // (#2814) SELF IS NEVER UNKNOWN — and before this, self could be ABSENT.
   //
   // `machineUids` unions flow-derived uids with currently-beating presence
@@ -900,6 +902,7 @@ export function FleetLens({
           // alias-set lookup `specOf`/`nameOf` already use for this uid.
           runsForMachine(runs, machineNames(flowWindow.data, liveMachines, m)),
           roster,
+          policy,
         );
         // (#2768, corrected by the #2802 regression fix) A roster entry
         // whose declared hardware identity matches this uid still prevents a
@@ -937,13 +940,15 @@ export function FleetLens({
           playheadT,
           specBeats,
           undefined,
+          undefined,
+          policy,
         ),
         name: entry.id,
         rosterOnly: true,
       })),
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
-    [uids, rosterOnly, flowWindow.data, liveEdgeClock, liveMachines, specs, presence, liveMode, specBeats, runs, roster],
+    [uids, rosterOnly, flowWindow.data, liveEdgeClock, liveMachines, specs, presence, liveMode, specBeats, runs, roster, policy],
   );
   const cards = useMemo(
     () => baseCards.map((b) => withLiveReadings(b, playheadT, connected, lastContactMs, liveOverlay)),
@@ -984,9 +989,10 @@ export function FleetLens({
         fixedRange,
         specs,
         roster,
+        policy,
       ),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
-    [flowWindow.data, liveMachines, uids, presence, flowWindow.tMax, windowMinutesNum, liveMode, tMin, liveEdgeClock, fixedRange?.[0], fixedRange?.[1], specs, roster],
+    [flowWindow.data, liveMachines, uids, presence, flowWindow.tMax, windowMinutesNum, liveMode, tMin, liveEdgeClock, fixedRange?.[0], fixedRange?.[1], specs, roster, policy],
   );
 
   return (

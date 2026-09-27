@@ -9,7 +9,8 @@ import { fetchJson, type FetchResult } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useSessionLiveness } from "../../hooks/useSessionLiveness";
 import { flowToRenderModel, type StatusClass } from "../../lib/flow";
-import { DEFAULT_POLICY, NO_PRESENCE, isRunning, lifecycleAt, type Presence } from "../../lib/lifecycle";
+import { NO_PRESENCE, isRunning, lifecycleAt, type Presence } from "../../lib/lifecycle";
+import { useLifecyclePolicy } from "../../hooks/useLifecyclePolicy";
 import { sessionRun } from "../../lib/runRef";
 import { ACTION, CATEGORY, ingest, recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { useNowMs } from "../../lib/clock";
@@ -536,6 +537,7 @@ export function SessionReplay({
   // Presence, as the lifecycle's additive input: it holds this run open
   // against the staleness clock, never against a record that closed it.
   const presence = useMemo<Presence>(() => (isLive ? new Set([sessionId]) : NO_PRESENCE), [isLive, sessionId]);
+  const policy = useLifecyclePolicy();
 
   // (#2065) A static build has no `/flow-session/<id>` to reach — the demo's
   // dispatch-row tap 404'd here. Read the committed file instead (the same
@@ -693,7 +695,7 @@ export function SessionReplay({
   const clockNow = playhead ?? wallNow;
   const pageRun = hasRecords ? sessionRun(data, sessionId, clockNow) : null;
   const plausiblyRunning =
-    pageRun !== null && isRunning(lifecycleAt(pageRun, clockNow, DEFAULT_POLICY, presence)) && !endedByPresence;
+    pageRun !== null && isRunning(lifecycleAt(pageRun, clockNow, policy, presence)) && !endedByPresence;
   // (#2757) `playhead === null` — a non-null playhead means the operator has
   // actively parked the shell's transport away from the live edge (`App.tsx`'s
   // `isPlayheadReady`: `transport.scrubbed && transport.t < transport.tMax`;
@@ -789,7 +791,7 @@ export function SessionReplay({
   // "right now", not about the playhead's moment.
   const effectiveConnected = connected || playhead !== null;
   const effectiveLastContactMs = playhead !== null ? null : lastContactMs;
-  const view = runRegions(data, sessionId, clockOverride, effectiveConnected, effectiveLastContactMs, ticking ? liveOverlay : null, presence);
+  const view = runRegions(data, sessionId, clockOverride, effectiveConnected, effectiveLastContactMs, ticking ? liveOverlay : null, presence, policy);
   // `animate: plausiblyRunning`, not `ticking` — `ticking` is now purely the
   // "should the shared clock subscribe" perf gate (see its own doc above)
   // and is unconditionally `false` in playback (`playhead === null` fails
