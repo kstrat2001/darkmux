@@ -1166,6 +1166,27 @@ describe("FleetLens pager (#2881)", () => {
     expect(scopeProps()).toMatchObject({ centerLabel: "13s", centerUnit: "resting" });
   });
 
+  // (#2950) The card's status line says why it rests, from the rest record's
+  // own `reason`/`state`, the way it says which tool is being generated.
+  it("a resting execution's status line says why, with the whole reason on hover", async () => {
+    const recs = threeExecutionRecords
+      .filter((r) => r.session_id === "s2")
+      .map((r) => (r.action === "dispatch.rest" ? ({ ...r, payload: { ms: 15_000, reason: "thermal", state: "serious" } } as FlowRecord) : r));
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={recs} tMax={D0 + 5000} tMin={D0} playhead={D0 + 5000} historical />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".mach-scope__rate")).not.toBeNull());
+    // (Operator, 2026-09-27) Both forms are in the line; CSS shows the full
+    // one at desktop width and the one without the state on a phone
+    // (`.mach-scope__why--*` in styles.css; the parity layout suite checks
+    // which one is visible at each width).
+    expect(document.querySelector(".mach-scope__why--full")!.textContent).toBe("thermal · serious");
+    expect(document.querySelector(".mach-scope__why--word")!.textContent).toBe("thermal");
+    expect(document.querySelector(".mach-scope__rate")!.getAttribute("title")).toBe("resting: thermal · serious");
+  });
+
   it("an arrow click changes the page and does not fire the card's machine drill-in", async () => {
     renderThree(5);
     await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());

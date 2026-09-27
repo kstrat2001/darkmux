@@ -223,6 +223,9 @@ export interface SessionRunView {
         /** Present only when `state === "rest"` — whole seconds left in the
          *  reported rest window. */
         restSecondsLeft?: number;
+        /** (#2950) Present only when `state === "rest"` and the rest's own
+         *  record says why. See `LiveStateReading.restReason`. */
+        restReason?: string;
         /** (#2886 pass 4, finding 7) `true` exactly when `state === null`
          *  because the connection was lost/half-open, NOT because there is
          *  genuinely no live execution to have a state for (a mission
@@ -1833,6 +1836,9 @@ export function runRegions(
             // Every lamp is off; nothing claims a state.
             state: tokRateLiveState?.state ?? null,
             restSecondsLeft: tokRateLiveState?.restSecondsLeft,
+            ...(tokRateLiveState?.state === "rest" && tokRateLiveState.restReason !== undefined
+              ? { restReason: tokRateLiveState.restReason }
+              : {}),
             noSignal: tokRateNoSignal,
             toolName: tokRateLiveState?.state === "tools" ? tokRateLiveState.toolName : undefined,
             ...(tokRateLiveState?.state === "tools" && tokRateLiveState.writing

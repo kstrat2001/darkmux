@@ -45,9 +45,19 @@ function build(sid) {
   const beat = (d, hms, turn, gen, visible, more = {}) =>
     rec(at(d, hms), "dispatch.turn.heartbeat", { turn_seq: turn, sampled_at_ms: msOf(d, hms), generated_chars: gen, cumulative_chars: visible, ...more });
   // Turn 1: read the prompt, generate, call one tool, which completes.
-  const prefix = (d, extra = {}, withUsage = true) =>
+  const prefix = (d, extra = {}, withUsage = true, armed = false) =>
     [
-      rec(at(d, "12:00:00"), "dispatch start", { prompt_chars: 3000 }, { source: "crew_dispatch", category: "work", model: "darkmux:qwen-layout" }),
+      // (#2950) `armed`: the run's resolved bounds say the thermal governor
+      // is on, as every dispatch since #2165 records it (`dispatch_internal.rs`
+      // `thermal_pacing_enabled`). Only an armed governor writes a thermal
+      // rest, so a thermal REST state is always armed, and ACTIVE TIME then
+      // names its thermal rest from the run's start ("0 s thermal rest").
+      rec(
+        at(d, "12:00:00"),
+        "dispatch start",
+        { prompt_chars: 3000, ...(armed ? { bounds: { thermal_pacing_enabled: { value: true, source: "config" } } } : {}) },
+        { source: "crew_dispatch", category: "work", model: "darkmux:qwen-layout" },
+      ),
       beat(d, "12:00:01", 1, 0, 0, { prompt_chars: 16000 }),
       beat(d, "12:00:03", 1, 600, 600),
       beat(d, "12:00:05", 1, 1400, 1400),
@@ -109,8 +119,45 @@ const STATES = [
     ],
   },
   {
-    id: "rest", date: "2026-08-15", now: "12:00:12", runText: "rest", rateText: "rest",
+    // A rest record with no `reason` (a host from before #2167): no line.
+    id: "rest", date: "2026-08-15", now: "12:00:12", runText: /run state: rest \d+s$/, rateText: /^rest \d+s$/, noteText: null,
     recs: (b, d) => [...b.prefix(d), b.rec(at(d, "12:00:08"), "dispatch.rest", { ms: 20000 }), tick(d, "12:00:12")],
+  },
+  // (#2950) REST says why, from the rest record's own `reason`/`state`, in
+  // the readout slot TOOL GEN uses (`noteText`: the run page's line under
+  // the lamps; `null` where the record names no reason, so no line). One
+  // state per reason a producer writes, and one this build does not know.
+  // (Operator, 2026-09-27) A phone-width fleet card drops the state
+  // (`rateTextPhone`, the line's VISIBLE text); the run page and a desktop
+  // card keep it.
+  ...[
+    ["rest-turn-delay", "2026-09-10", { reason: "turn_delay" }, "turn delay \\(config\\)", "turn delay \\(config\\)"],
+    ["rest-thermal", "2026-09-12", { reason: "thermal", state: "serious" }, "thermal · serious", "thermal"],
+    ["rest-pacing", "2026-09-14", { reason: "thermal-duty-cycle", state: "fair" }, "thermal pacing · fair", "thermal pacing"],
+    ["rest-battery", "2026-09-16", { reason: "battery", state: "18%" }, "battery · 18%", "battery"],
+    ["rest-episode-limit", "2026-09-18", { reason: "thermal-episode-limit", state: "serious" }, "thermal hold · serious", "thermal hold"],
+    ["rest-unknown", "2026-09-20", { reason: "solar-flare" }, "solar-flare", "solar-flare"],
+  ].map(([id, date, why, words, phoneWords]) => ({
+    id, date, now: "12:00:12",
+    runText: new RegExp(`run state: rest \\d+s · ${words}$`),
+    // The readout lines carry the words alone; the tube counts down.
+    noteText: new RegExp(`^${words}$`),
+    rateText: new RegExp(`^${words}$`),
+    rateTextPhone: new RegExp(`^${phoneWords}$`),
+    // A thermal rest exists only on a run whose thermal governor is armed.
+    armed: why.reason.startsWith("thermal"),
+    recs: (b, d) => [...b.prefix(d, {}, true, why.reason.startsWith("thermal")), b.rec(at(d, "12:00:08"), "dispatch.rest", { ms: 20000, turn: 1, ...why }), tick(d, "12:00:12")],
+  })),
+  // (#2950) The same run config's non-rest states, so the thermal REST
+  // states are measured against states of a run like theirs (armed), not
+  // against a run whose ACTIVE TIME has no thermal line at all.
+  {
+    id: "armed-generating", date: "2026-09-22", now: "12:00:12", runText: /run state: generating$/, rateText: / tok\/s$/, armed: true,
+    recs: (b, d) => [...b.prefix(d, {}, true, true), b.opener(d), b.beat(d, "12:00:10", 2, 900, 900), b.beat(d, "12:00:12", 2, 1800, 1800)],
+  },
+  {
+    id: "armed-toolgen", date: "2026-09-24", now: "12:00:30", runText: "tool gen · write · 18s", noteText: "tool gen · write · 18s", rateText: "tool gen", armed: true,
+    recs: (b, d) => [...b.prefix(d, {}, true, true), ...b.writing(d, "write")],
   },
   {
     // The run page's playback transport ends at the run's own last record,
@@ -229,7 +276,7 @@ const byDate = new Map(ALL.map((s) => [s.date, s.records]));
 
 /** A date well after every fixture day: a page pinned here reads each
  *  fixture day as history (playback), never as today. */
-const PLAYBACK_NOW = Date.parse("2026-09-20T12:00:00Z");
+const PLAYBACK_NOW = Date.parse("2026-09-28T12:00:00Z");
 
 /**
  * Serve the fixture days to the page: `/flow/<date>`, `/flow-session/<id>`,

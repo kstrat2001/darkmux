@@ -468,6 +468,14 @@ export interface LiveStateReading {
    * (`Math.ceil` of the ms remaining) — present only when `state ===
    * "rest"`. */
   restSecondsLeft?: number;
+  /** (#2950) Present only when `state === "rest"` and the rest's own record
+   *  says why (`reason`, with its `state` when it carries one): the plain
+   *  words `restReasonLabel` makes of them ("thermal · serious", "battery ·
+   *  18%", "turn delay (config)"). Absent when the record names no reason. */
+  restReason?: string;
+  /** (#2950) Alongside `restReason`: the reason without its state
+   *  (`restReasonWord`), for the phone-width fleet card. */
+  restReasonWord?: string;
   /** (#2890) Present only when `state === "tools"` and a tool of the CURRENT
    *  turn has completed: the latest completed call's `tool_name`, which the
    *  scope's TOOLS center draws as an icon. `dispatch.tool` is emitted on
@@ -512,6 +520,10 @@ interface StateMarker {
   atMs: number;
   kind: "prompt" | "tools" | "rest" | "compacting";
   restMs?: number;
+  /** (#2950) `rest` only: `restReasonLabel` / `restReasonWord` of the
+   *  record's own fields. */
+  restReason?: string;
+  restReasonWord?: string;
   /** (#2915) `compacting` only: the job's own bound. */
   stallAfterMs?: number;
 }
@@ -624,8 +636,16 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
       // announce-only sibling (`pause: false, delay_ms`, no `ms`) is the
       // governor changing its PACING, not a rest (same filter
       // `sessionRun.ts`'s REST tiles already apply).
-      const ms = num(fields(r).ms);
-      if (ms !== null && ms > 0) m = { atMs, kind: "rest", restMs: ms };
+      const f = fields(r);
+      const ms = num(f.ms);
+      if (ms !== null && ms > 0) {
+        m = { atMs, kind: "rest", restMs: ms };
+        const why = restReasonLabel(f.reason, f.state);
+        if (why !== null) {
+          m.restReason = why;
+          m.restReasonWord = restReasonWord(f.reason) ?? why;
+        }
+      }
     }
     if (m && (!marker || m.atMs >= marker.atMs)) marker = m;
   }
@@ -660,7 +680,14 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
         : { state: "prompt" };
     if (found.kind === "rest" && found.restMs != null) {
       const remaining = found.restMs - (nowMs - found.atMs);
-      if (remaining > 0) return { state: "rest", restSecondsLeft: Math.ceil(remaining / 1000) };
+      if (remaining > 0) {
+        const reading: LiveStateReading = { state: "rest", restSecondsLeft: Math.ceil(remaining / 1000) };
+        if (found.restReason !== undefined) {
+          reading.restReason = found.restReason;
+          reading.restReasonWord = found.restReasonWord ?? found.restReason;
+        }
+        return reading;
+      }
       return prompt();
     }
     if (found.kind === "compacting") {
@@ -791,6 +818,55 @@ export function aggregateLiveState(perExecutionRecords: FlowRecord[][], nowMs: n
   return best;
 }
 
+/** (#2950) The plain words for WHY a runtime rested, from a completed
+ *  rest's own `dispatch.rest` record (the host tailer's `runtime.rest`
+ *  translation, `crates/darkmux-crew/src/dispatch_internal.rs`
+ *  `runtime_rest_payload`). Every reason a producer writes today:
+ *
+ *  - `turn_delay`: the operator's configured `runtime.turn_delay_ms`
+ *    (`runtime/src/trajectory.rs` `append_rest`);
+ *  - `thermal-duty-cycle`: the thermal governor pacing turns (tier 2);
+ *  - `thermal`: a thermal pause (tier 3); `thermal-critical`: the thermal
+ *    breaker tripped; `thermal-episode-limit`: the tier-4 hold. All four
+ *    carry the OS thermal `state` the decision was made on;
+ *  - `battery`: the power policy's pause (`power_policy.rs` `PACE_REASON`),
+ *    whose `state` is the charge it read ("18%");
+ *  - `paused`: a pace file that paused with no reason of its own
+ *    (`runtime/src/pace.rs` `reason_or_default`).
+ *
+ *  `state`, when the record carries one, follows after " · ". A reason this
+ *  build does not know shows its raw word, never a guess. `null` when the
+ *  record names no reason: a host from before reasons were stamped (before
+ *  #2167) wrote none, and in that window a reasonless rest could be a pace
+ *  pause as well as a turn delay, so the record does not say which. */
+const REST_REASON_WORDS: Record<string, string> = {
+  turn_delay: "turn delay (config)",
+  "thermal-duty-cycle": "thermal pacing",
+  thermal: "thermal",
+  "thermal-critical": "thermal breaker",
+  // The governor's tier-4 OperatorHold: a pause that waits for the operator.
+  "thermal-episode-limit": "thermal hold",
+  battery: "battery",
+  paused: "paused",
+};
+
+export function restReasonLabel(reason: unknown, state: unknown): string | null {
+  const word = restReasonWord(reason);
+  if (word === null) return null;
+  const s = typeof state === "string" ? state.trim() : "";
+  return s ? `${word} · ${s}` : word;
+}
+
+/** (#2950, operator 2026-09-27) The reason's words WITHOUT its state
+ *  ("thermal pacing", "battery"): what a phone-width fleet card shows, where
+ *  the state no longer fits on the line. `null` exactly when
+ *  `restReasonLabel` is. */
+export function restReasonWord(reason: unknown): string | null {
+  const r = typeof reason === "string" ? reason.trim() : "";
+  if (!r) return null;
+  return Object.prototype.hasOwnProperty.call(REST_REASON_WORDS, r) ? REST_REASON_WORDS[r] : r;
+}
+
 /** The short word (or `"rest Ns"`) a caller renders for every state except
  * `"generating"` — that one is deliberately NOT handled here, since its
  * center readout is the tok/s NUMBER, a decision that belongs to the
@@ -800,7 +876,10 @@ export function aggregateLiveState(perExecutionRecords: FlowRecord[][], nowMs: n
 export function liveStateLabel(reading: LiveStateReading): string {
   switch (reading.state) {
     case "rest":
-      return `rest ${reading.restSecondsLeft ?? 0}s`;
+      // (#2950) With why, when the rest's record says: "rest 12s · thermal ·
+      // serious" (the run page's lamp status reads it whole). The two
+      // readout lines show `restReason` alone, beside the tube's countdown.
+      return [`rest ${reading.restSecondsLeft ?? 0}s`, ...(reading.restReason ? [reading.restReason] : [])].join(" · ");
     case "prompt":
       // (#2915) Compacting: the elapsed seconds, counting like REST.
       if (reading.compacting) return `compacting · ${reading.compactingSeconds ?? 0}s`;
@@ -981,6 +1060,12 @@ export interface ExecutionTokenReading {
   state: LiveState | null;
   /** Present only when `state === "rest"`. */
   restSecondsLeft?: number;
+  /** (#2950) Present only when `state === "rest"` and the rest's record says
+   *  why. See `LiveStateReading.restReason`. */
+  restReason?: string;
+  /** (#2950) Alongside `restReason`: without its state. See
+   *  `LiveStateReading.restReasonWord`. */
+  restReasonWord?: string;
   /** This execution's own current reading. `null` outside `"generating"`
    *  (the caller renders the state word instead) or while generating with
    *  no same-turn heartbeat pair yet — mirrors `FleetCard.liveTokRate`'s
@@ -1036,6 +1121,9 @@ export function executionTokenReading(
     role: executionRole(records),
     state,
     restSecondsLeft: state === "rest" ? liveState?.restSecondsLeft : undefined,
+    ...(state === "rest" && liveState?.restReason !== undefined
+      ? { restReason: liveState.restReason, restReasonWord: liveState.restReasonWord ?? liveState.restReason }
+      : {}),
     tokensPerSec: reading?.tokensPerSec ?? null,
     carried: reading?.carried ?? false,
     toolName: state === "tools" ? liveState?.toolName : undefined,

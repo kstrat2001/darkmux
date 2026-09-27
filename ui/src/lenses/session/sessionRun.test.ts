@@ -227,6 +227,28 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(liveView.metrics).toEqual(durableView.metrics);
   });
 
+  // (#2950) The live channel carries no rests, so why a run rests is read
+  // from the durable `dispatch.rest` record, live and in playback alike.
+  it("a resting run's scope carries the rest record's own reason, with or without the live overlay", async () => {
+    const { LiveStore } = await import("../../lib/liveChannel");
+    const beat1Ms = Date.parse("2026-01-01T00:00:01Z");
+    const beat2Ms = Date.parse("2026-01-01T00:00:03Z");
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:00:01Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat1Ms, generated_chars: 40 } },
+      { ts: "2026-01-01T00:00:03Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat2Ms, generated_chars: 120 } },
+      { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 10_000, reason: "thermal-duty-cycle", state: "fair", turn: 1 } },
+    ];
+    const store = new LiveStore();
+    store.ingest(JSON.stringify({ v: 1, kind: "model", session_id: "s1", at_ms: beat2Ms + 250, cadence_ms: 250, fields: { sampled_at_ms: beat2Ms + 250, generated_chars: 220 } }), beat2Ms + 250);
+    const now = Date.parse("2026-01-01T00:00:06Z");
+    for (const view of [runRegions(flowToRenderModel(data), "s1", now), runRegions(flowToRenderModel(data), "s1", now, true, null, store.snapshot())]) {
+      expect(view.liveTokScope).toMatchObject({ state: "rest", restSecondsLeft: 8, restReason: "thermal pacing · fair" });
+    }
+    // Once the rest has elapsed, no reading keeps its reason.
+    expect(runRegions(flowToRenderModel(data), "s1", Date.parse("2026-01-01T00:00:20Z")).liveTokScope?.restReason).toBeUndefined();
+  });
+
   it("a run with heartbeats but a long gap since the last one reads as stalled", () => {
     const beat1Ms = Date.parse("2026-01-01T00:00:01Z");
     const beat2Ms = Date.parse("2026-01-01T00:00:03Z");

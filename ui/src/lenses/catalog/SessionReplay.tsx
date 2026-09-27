@@ -88,7 +88,7 @@ export function ScopeLamps({
   noSignal = false,
   finished = false,
 }: {
-  reading: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; toolName?: string; writing?: true; writingSeconds?: number; thinking?: boolean; compacting?: true; compactingSeconds?: number };
+  reading: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; restReason?: string; toolName?: string; writing?: true; writingSeconds?: number; thinking?: boolean; compacting?: true; compactingSeconds?: number };
   /** (#2886 pass 3) `state: null` is ALSO what a disconnection-downgraded
    *  stall reads as (`liveStateWhileConnected`) — visually identical
    *  (every lamp off) but a different fact, so the aria text says which. */
@@ -113,6 +113,7 @@ export function ScopeLamps({
         : liveStateLabel({
             state: reading.state,
             restSecondsLeft: reading.restSecondsLeft,
+            restReason: reading.restReason,
             toolName: reading.toolName,
             writing: reading.writing,
             writingSeconds: reading.writingSeconds,
@@ -162,7 +163,7 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
   centerCarried: boolean;
   /** (#2915) The tube shows a utility job (compacting), not the work model. */
   utility?: true;
-  lamps: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; toolName?: string; writing?: true; writingSeconds?: number; thinking?: boolean; compacting?: true; compactingSeconds?: number };
+  lamps: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; restReason?: string; toolName?: string; writing?: true; writingSeconds?: number; thinking?: boolean; compacting?: true; compactingSeconds?: number };
   note: string | null;
 } | null {
   const live = view.liveTokScope;
@@ -200,6 +201,7 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
       lamps: {
         state: live.state,
         restSecondsLeft: live.restSecondsLeft,
+        ...(state === "rest" && live.restReason !== undefined ? { restReason: live.restReason } : {}),
         toolName: state === "tools" ? live.toolName : undefined,
         writing: live.writing,
         writingSeconds: live.writingSeconds,
@@ -220,7 +222,14 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
               ? // (#2915) "compacting · Ns" in the same readout slot, counting
                 // with the page's clock; the tube center carries no timer.
                 liveStateLabel({ state: "prompt", compacting: true, compactingSeconds: live.compactingSeconds })
-              : null,
+              : state === "rest" && live.restReason !== undefined
+                ? // (#2950) Why it rests, from the rest's own record, in the
+                  // same slot: "thermal · serious". The words only: the
+                  // countdown is already the tube's center (TOOL GEN's
+                  // seconds are not, which is why its line carries them).
+                  // Nothing when the record names no reason.
+                  live.restReason
+                : null,
     };
   }
   const fin = view.finishedTokRate;

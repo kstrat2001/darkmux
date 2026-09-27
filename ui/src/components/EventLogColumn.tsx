@@ -28,6 +28,7 @@ import { useIsMobile } from "../hooks/useIsMobile";
 import { ActivityIcon } from "./ActivityIcon";
 import { recordDetail, recordObject } from "../lib/recordDetail";
 import { turnItems } from "../lib/turnGroups";
+import { restReasonLabel } from "../lib/tokenRate";
 import { openModalEl } from "../lib/dialogManager";
 
 /** Row cap — `renderLog()`'s `all.slice(-50).reverse()` (viewer.html:2443):
@@ -1353,7 +1354,13 @@ export function EventLogColumn({
                             starts (#2877), so this row appears at the start
                             of the rest it describes. */}
                         rest {Math.round(ms / 1000)} s
-                        {typeof f.state === "string" ? ` · thermal: ${f.state}` : ""}
+                        {/* (#2950) Why, in the words the scope's readout
+                            uses. It read "thermal: <state>" for every
+                            state, so a battery rest said "thermal: 18%". */}
+                        {(() => {
+                          const why = restReasonLabel(f.reason, f.state);
+                          return why ? ` · ${why}` : "";
+                        })()}
                       </span>
                     </div>
                   );
@@ -1365,9 +1372,12 @@ export function EventLogColumn({
                 // means the run actually stopped. Branch on `pause`, and
                 // build the detail text from the record's OWN `reason`/
                 // `state` rather than assuming which governor sent it.
-                const reason = typeof f.reason === "string" ? f.reason : null;
-                const state = typeof f.state === "string" ? f.state : null;
-                const detail = [reason, state].filter(Boolean).join(": ");
+                // (#2950) In the same words as the rest rows and the scope
+                // (`restReasonLabel`: "thermal hold · serious", "battery ·
+                // 12%"), so the log speaks one language. A record with a
+                // state and no reason keeps its state, bare.
+                const state = typeof f.state === "string" && f.state.trim() ? f.state.trim() : null;
+                const detail = restReasonLabel(f.reason, f.state) ?? state;
                 if (f.pause === true) {
                   // (#2863 review round 2, finding 3) A real pause — the
                   // thermal governor's Paused/Breaker events, the tier-4
@@ -1391,7 +1401,11 @@ export function EventLogColumn({
                   return (
                     <div key={key} className={`eventlog__rec eventlog__rec--pacing${isSel ? " sel" : ""}${arriveCls}`} {...common}>
                       <span className="eventlog__ractivity">
-                        pacing · {Math.round(delay / 1000)} s between turns{state ? ` · thermal: ${state}` : ""}
+                        {/* (#2950) "thermal pacing · fair · 15 s between
+                            turns"; the reason's own words say it is pacing,
+                            so "pacing" leads only when the record names no
+                            reason. */}
+                        {restReasonLabel(f.reason, f.state) ?? ["pacing", ...(state ? [state] : [])].join(" · ")} · {Math.round(delay / 1000)} s between turns
                       </span>
                     </div>
                   );
@@ -1403,7 +1417,14 @@ export function EventLogColumn({
                 // would claim an ongoing delay that ended.
                 return (
                   <div key={key} className={`eventlog__rec eventlog__rec--pacing${isSel ? " sel" : ""}${arriveCls}`} {...common}>
-                    <span className="eventlog__ractivity">resumed{detail ? ` · ${detail}` : ""}</span>
+                    <span className="eventlog__ractivity">
+                      {/* (#2950) A duty-cycle EXIT ends the pacing, and
+                          "resumed · thermal pacing" read as the pacing
+                          resuming, so that one says it ended. */}
+                      {f.reason === "thermal-duty-cycle"
+                        ? ["thermal pacing ended", ...(state ? [state] : [])].join(" · ")
+                        : `resumed${detail ? ` · ${detail}` : ""}`}
+                    </span>
                   </div>
                 );
               }
