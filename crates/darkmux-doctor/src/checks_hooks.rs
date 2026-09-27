@@ -404,18 +404,36 @@ fn rule_hint(reason_lines: &[String], error_lines: &[String], flags: &[RuleFlag]
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
-/// (#2093 merge-gate finding 17) True when a rule's match risks the
-/// observer joining the observed (this project's own doctrine,
-/// CLAUDE.md's "The observer must not join the observed") — matching
-/// `telemetry.*` / category `telemetry`, or a bare `*` action with no other
-/// predicate, which (among everything else) catches every telemetry record.
-/// Reads the typed match, so a payload value that merely spells one of
-/// these is not mistaken for it.
+/// The telemetry records darkmux writes today (`Category::Telemetry`):
+/// the dispatch instruments and the host sampler. Each is tried at `info`
+/// and at `warn`, the level detector firings are written at.
+const TELEMETRY_ACTIONS: &[&str] = &[
+    "telemetry.tokens",
+    "telemetry.detector",
+    "telemetry.runtime",
+    "telemetry.lms",
+    "telemetry.context",
+    "telemetry.compaction",
+    "machine.telemetry",
+];
+
+/// (#2093 merge-gate finding 17) True when a rule would deliver a telemetry
+/// record — the observer joining the observed (this project's own doctrine,
+/// CLAUDE.md's "The observer must not join the observed"). Decided by the
+/// sink's own [`darkmux_flow::hooks::hook_match`] against synthetic
+/// telemetry records, so the check and the matcher are one rule: however a
+/// rule spells its category or glob, it is flagged exactly when it would
+/// match. A rule narrowed by a payload predicate or an id never matches a
+/// synthetic record, so it is not flagged.
 fn hooks_match_risks_observing_the_observer(m: &HookMatch) -> bool {
-    let bare_star = m.action.as_deref() == Some("*") && HookMatch { action: None, ..m.clone() }.is_empty();
-    m.category.as_deref() == Some("telemetry")
-        || m.action.as_deref().is_some_and(|a| a.starts_with("telemetry."))
-        || bare_star
+    TELEMETRY_ACTIONS.iter().flat_map(|action| ["info", "warn"].map(|level| (action, level))).any(|(action, level)| {
+        let record: darkmux_flow::FlowRecord = serde_json::from_value(serde_json::json!({
+            "ts": "", "level": level, "category": "telemetry", "tier": "local",
+            "stage": "dispatch", "action": action, "handle": ""
+        }))
+        .expect("a synthetic telemetry record is a valid FlowRecord");
+        darkmux_flow::hooks::hook_match(m, &record)
+    })
 }
 
 /// (#2093 merge-gate finding 15) The `hooks.stray` row, when any outbox file
@@ -1485,11 +1503,35 @@ mod tests {
         let mut rule = hook_rule(None, Some(LOOPBACK));
         rule.r#match = Some(darkmux_types::config::HookMatch {
             action: Some("*".into()),
-            level: Some("warn".into()),
+            category: Some("work".into()),
             ..Default::default()
         });
         let checks = checks_for(&[rule], tmp.path());
         assert_eq!(named(&checks, "hooks.rule.0").status, Status::Pass);
+    }
+
+    fn observer_row(m: darkmux_types::config::HookMatch) -> Check {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut rule = hook_rule(None, Some(LOOPBACK));
+        rule.r#match = Some(m);
+        named(&checks_for(&[rule], tmp.path()), "hooks.rule.0").clone()
+    }
+
+    /// The observer check IS the matcher: whatever `hook_match` would send a
+    /// telemetry record to is flagged, however the rule spells it — a padded,
+    /// capitalized category; a glob that reaches `machine.telemetry`; a
+    /// bare `*` narrowed only to the level detector firings are written at.
+    #[test]
+    fn the_observer_check_flags_whatever_the_matcher_would_send_telemetry_to() {
+        use darkmux_types::config::HookMatch;
+        for m in [
+            HookMatch { category: Some(" Telemetry ".into()), ..Default::default() },
+            HookMatch { action: Some("machine.*".into()), ..Default::default() },
+            HookMatch { action: Some("*".into()), level: Some("warn".into()), ..Default::default() },
+        ] {
+            let row = observer_row(m);
+            assert!(row.message.contains("observer must not join the observed"), "{}", row.message);
+        }
     }
 
     #[test]
@@ -1698,7 +1740,7 @@ mod tests {
 
     /// The text of the first `<pre><code>` block after `after` in `html`,
     /// with the handful of entities the guide uses decoded.
-    fn guide_block<'a>(html: &'a str, after: &str) -> String {
+    fn guide_block(html: &str, after: &str) -> String {
         let from = html.find(after).unwrap_or_else(|| panic!("the guide has no {after:?}"));
         let open = from + html[from..].find("<pre><code>").unwrap() + "<pre><code>".len();
         let close = open + html[open..].find("</code></pre>").unwrap();
