@@ -1657,6 +1657,29 @@ mod tests {
         assert!(error_lines > 1, "{block:?}");
     }
 
+    /// The guide's `darkmux doctor` example is the row doctor prints for the
+    /// guide's own Jira rule, flags included — only the adapter hash is a
+    /// placeholder. Reads the published page, so the example cannot drift
+    /// from the renderer unnoticed.
+    #[test]
+    #[serial_test::serial]
+    fn the_guide_shows_the_row_doctor_prints_for_its_jira_rule() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let adapters = darkmux_types::config_access::hooks_adapters_dir();
+        std::fs::create_dir_all(&adapters).unwrap();
+        std::fs::write(adapters.join("jira-issue.jq"), ".").unwrap();
+        let hash = darkmux_flow::hook_transform::load_adapter(&adapters, "jira-issue.jq").unwrap().short_hash;
+        let mut m = darkmux_types::config::HookMatch { action: Some("dispatch.tool".into()), ..Default::default() };
+        m.extras.insert("payload.tool_name".into(), serde_json::json!("create_finding"));
+        let mut rule = hook_rule(None, Some("http://100.64.1.2:8080/rest/api/3/issue"));
+        rule.r#match = Some(m);
+        rule.transform = Some("jira-issue.jq".into());
+        let checks = checks_for(&[rule], state.path());
+        let row = named(&checks, "hooks.rule.0").message.replace(&hash, "a1b2c3d4e5f6a7b8");
+        let guide = include_str!("../../../docs/guide/crawl-and-hooks.html");
+        assert!(guide.contains(&format!("<pre><code>#0: {row}</code></pre>")), "the guide must show: #0: {row}");
+    }
+
     /// A clean last delivery after earlier give-ups clears the flag: the
     /// `.last` sidecar holds only the latest terminal outcome.
     #[test]
