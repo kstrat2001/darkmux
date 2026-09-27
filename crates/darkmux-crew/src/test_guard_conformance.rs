@@ -399,7 +399,7 @@ mod tests {
                 category: darkmux_flow::Category::Work,
                 tier: darkmux_flow::Tier::Local,
                 stage: darkmux_flow::Stage::Dispatch,
-                action: "dispatch.tool".to_string(),
+                action: darkmux_flow::FlowAction::DispatchTool,
                 handle: "conformance".to_string(),
                 phase_id: None,
                 session_id: Some("sess-conformance".to_string()),

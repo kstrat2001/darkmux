@@ -72,16 +72,11 @@ use std::time::Duration;
 
 use darkmux_types::{BudgetPolicy, ModelEndpoint, WindowBudget};
 
-/// The flow-record telemetry `source` every budget record carries.
+/// The flow-record telemetry `source` every budget record carries. The
+/// actions are `FlowAction::Budget*`: `budget.warn` (level Warn),
+/// `budget.wait` (Warn, carries when it will resume), `budget.resume` (Info,
+/// carries how long it waited) and `budget.stop` (Warn).
 pub const BUDGET_SOURCE: &str = "budget";
-/// A budget was reached (or its `warn_at` fraction was) under `warn`, or a
-/// per-step cap was crossed. Level Warn. The call went ahead.
-pub const BUDGET_WARN_ACTION: &str = "budget.warn";
-/// A call is waiting on a budget (`wait`). Level Warn. Carries when it will
-/// resume, when that is known.
-pub const BUDGET_WAIT_ACTION: &str = "budget.wait";
-/// A waiting call went ahead. Level Info. Carries how long it waited.
-pub const BUDGET_RESUME_ACTION: &str = "budget.resume";
 
 /// The longest single sleep while waiting: the wait re-reads the window
 /// (and the endpoint's limits, so a raised or switched-off budget releases
@@ -435,7 +430,7 @@ fn parse_entry(line: &[u8]) -> Option<(String, i64, u64)> {
     if line.len() < NEEDLE.len() || !line.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
         return None;
     }
-    let v: serde_json::Value = serde_json::from_slice(line).ok()?;
+    let v = darkmux_flow::reader::parse_value(std::str::from_utf8(line).ok()?)?;
     let amount = crate::usage::usage_contribution(&v)?;
     let id = crate::usage::payload_of(&v).get("endpoint_id")?.as_str()?.to_string();
     let ts = crate::records_emitted::parse_ts_secs(v.get("ts")?.as_str()?)?;
@@ -738,7 +733,7 @@ fn stopped_wait(
 fn stop_record(endpoint_id: &str, reason: &str, waited_ms: u64, message: &str, caller: &BudgetCaller<'_>, env: &dyn BudgetEnv) {
     env.emit(record(
         darkmux_flow::Level::Warn,
-        BUDGET_STOP_ACTION,
+        darkmux_flow::FlowAction::BudgetStop,
         caller,
         serde_json::json!({
             "scope": "endpoint",
@@ -787,7 +782,7 @@ pub fn human_duration(secs: u64) -> String {
 
 fn record(
     level: darkmux_flow::Level,
-    action: &str,
+    action: darkmux_flow::FlowAction,
     caller: &BudgetCaller<'_>,
     payload: serde_json::Value,
 ) -> darkmux_flow::FlowRecord {
@@ -839,7 +834,7 @@ fn warn(b: &EndpointBudget, br: &Breach, caller: &BudgetCaller<'_>, env: &dyn Bu
     env.say(&message);
     env.emit(record(
         darkmux_flow::Level::Warn,
-        BUDGET_WARN_ACTION,
+        darkmux_flow::FlowAction::BudgetWarn,
         caller,
         serde_json::json!({
             "scope": "endpoint",
@@ -888,7 +883,7 @@ fn announce_wait(
     env.say(&message);
     env.emit(record(
         darkmux_flow::Level::Warn,
-        BUDGET_WAIT_ACTION,
+        darkmux_flow::FlowAction::BudgetWait,
         caller,
         serde_json::json!({
             "scope": "endpoint",
@@ -918,7 +913,7 @@ fn resume_if_waited(b: &EndpointBudget, caller: &BudgetCaller<'_>, env: &dyn Bud
     env.say(&message);
     env.emit(record(
         darkmux_flow::Level::Info,
-        BUDGET_RESUME_ACTION,
+        darkmux_flow::FlowAction::BudgetResume,
         caller,
         serde_json::json!({
             "scope": "endpoint",
@@ -955,10 +950,6 @@ pub enum PacerEvent {
     /// nothing more is sent. Reported once.
     Stopped { reason: String },
 }
-
-/// (review MF1) The flow-record action when a budget wait ends because its
-/// run was stopped. Level Warn. Nothing was sent after it.
-pub const BUDGET_STOP_ACTION: &str = "budget.stop";
 
 /// What the other governors hold on the pace file this tick, so the pacer
 /// neither overwrites nor drops them.
@@ -1219,7 +1210,7 @@ pub fn settle_step(
     env.say(&message);
     env.emit(record(
         darkmux_flow::Level::Warn,
-        BUDGET_WARN_ACTION,
+        darkmux_flow::FlowAction::BudgetWarn,
         caller,
         serde_json::json!({
             "scope": "step", "step": step, "policy": "warn",
@@ -1277,15 +1268,11 @@ pub fn active_waits(dir: &Path, now: i64, lookback_secs: u64, alive: &dyn Fn(u32
         let stem = darkmux_flow::day_utc_at(day);
         day += 86_400;
         let Ok(text) = std::fs::read_to_string(dir.join(format!("{stem}.jsonl"))) else { continue };
-        for line in text.lines() {
-            if !line.contains("\"budget.") {
-                continue;
-            }
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-            let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("");
-            let waiting = match action {
-                BUDGET_WAIT_ACTION => true,
-                BUDGET_RESUME_ACTION | BUDGET_STOP_ACTION => false,
+        // Cheap pre-filter: only a budget record can be one of the three.
+        for v in text.lines().filter(|l| l.contains("\"budget.")).filter_map(darkmux_flow::reader::parse_value) {
+            let waiting = match darkmux_flow::reader::action_of(&v) {
+                Some(darkmux_flow::FlowAction::BudgetWait) => true,
+                Some(darkmux_flow::FlowAction::BudgetResume | darkmux_flow::FlowAction::BudgetStop) => false,
                 _ => continue,
             };
             let p = crate::usage::payload_of(&v);

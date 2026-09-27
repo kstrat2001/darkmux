@@ -226,8 +226,8 @@ fn container_free_single_shot_dispatch_round_trips_through_a_real_http_mock_serv
     let mut saw_complete = false;
     for record in &records {
         match record.get("action").and_then(Value::as_str) {
-            Some("dispatch start") => saw_start = true,
-            Some("dispatch complete") | Some("dispatch error") => saw_complete = true,
+            Some("dispatch.start") => saw_start = true,
+            Some("dispatch.complete") | Some("dispatch.error") => saw_complete = true,
             _ => {}
         }
     }
@@ -389,8 +389,8 @@ fn container_free_single_shot_dispatch_stamps_mission_id_resolved_from_phase() {
     let mut saw_complete = false;
     for record in &records {
         match record.get("action").and_then(Value::as_str) {
-            Some("dispatch start") => saw_start = true,
-            Some("dispatch complete") | Some("dispatch error") => saw_complete = true,
+            Some("dispatch.start") => saw_start = true,
+            Some("dispatch.complete") | Some("dispatch.error") => saw_complete = true,
             _ => {}
         }
         // The fix under test: EVERY record this dispatch emits must carry

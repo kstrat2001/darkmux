@@ -588,7 +588,7 @@ impl StepKind for DispatchInternalStepKind {
                     category: darkmux_flow::Category::Work,
                     tier: darkmux_flow::Tier::Local,
                     stage: darkmux_flow::Stage::Dispatch,
-                    action: "step result".to_string(),
+                    action: darkmux_flow::FlowAction::StepResult,
                     handle: step.id.clone(),
                     phase_id: None,
                     session_id: Some(darkmux_types::session_id::task(&step.task_id)),
@@ -775,7 +775,7 @@ impl DispatchSingleShotStepKind {
     fn bookend_record(
         step: &Step,
         model: &str,
-        action: &str,
+        action: darkmux_flow::FlowAction,
         level: darkmux_flow::Level,
         endpoint_label: Option<&str>,
         extra: serde_json::Value,
@@ -797,7 +797,7 @@ impl DispatchSingleShotStepKind {
             category: darkmux_flow::Category::Work,
             tier: darkmux_flow::Tier::Local,
             stage: darkmux_flow::Stage::Dispatch,
-            action: action.to_string(),
+            action,
             handle: step.id.clone(),
             phase_id: None,
             session_id: Some(darkmux_types::session_id::task(&step.task_id)),
@@ -986,7 +986,7 @@ impl DispatchSingleShotStepKind {
             Self::bookend_record(
                 step,
                 wire_model.as_ref(),
-                "dispatch start",
+                darkmux_flow::FlowAction::DispatchStart,
                 darkmux_flow::Level::Info,
                 endpoint_label.as_deref(),
                 serde_json::json!({}),
@@ -994,7 +994,7 @@ impl DispatchSingleShotStepKind {
             Self::bookend_record(
                 step,
                 wire_model.as_ref(),
-                "dispatch error",
+                darkmux_flow::FlowAction::DispatchError,
                 darkmux_flow::Level::Error,
                 endpoint_label.as_deref(),
                 serde_json::json!({
@@ -1081,7 +1081,7 @@ impl DispatchSingleShotStepKind {
                 category: darkmux_flow::Category::Work,
                 tier: darkmux_flow::Tier::Local,
                 stage: darkmux_flow::Stage::Dispatch,
-                action: "step result".to_string(),
+                action: darkmux_flow::FlowAction::StepResult,
                 handle: step.id.clone(),
                 phase_id: None,
                 session_id: Some(darkmux_types::session_id::task(&step.task_id)),
@@ -1134,7 +1134,7 @@ impl DispatchSingleShotStepKind {
             endpoint_label.clone().unwrap_or_else(|| crate::usage::lmstudio_endpoint(None));
         let usage_record = crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
-            crate::usage::USAGE_ACTION,
+            darkmux_flow::FlowAction::TelemetryTokens,
             crate::usage::USAGE_SOURCE,
             &step.id,
             &darkmux_types::session_id::task(&step.task_id),
@@ -1165,7 +1165,7 @@ impl DispatchSingleShotStepKind {
         bookend.close(Self::bookend_record(
             step,
             wire_model.as_ref(),
-            "dispatch complete",
+            darkmux_flow::FlowAction::DispatchComplete,
             darkmux_flow::Level::Info,
             endpoint_label.as_deref(),
             serde_json::json!({
@@ -1571,7 +1571,7 @@ impl DispatchMapStepKind {
             category: darkmux_flow::Category::Work,
             tier: darkmux_flow::Tier::Local,
             stage: darkmux_flow::Stage::Dispatch,
-            action: "step result".to_string(),
+            action: darkmux_flow::FlowAction::StepResult,
             handle: step.id.clone(),
             phase_id: None,
             session_id: Some(darkmux_types::session_id::task(&step.task_id)),
@@ -1626,7 +1626,7 @@ impl DispatchMapStepKind {
     fn bookend_record(
         step: &Step,
         model: &str,
-        action: &str,
+        action: darkmux_flow::FlowAction,
         level: darkmux_flow::Level,
         endpoint_label: Option<&str>,
         extra: serde_json::Value,
@@ -1648,7 +1648,7 @@ impl DispatchMapStepKind {
             category: darkmux_flow::Category::Work,
             tier: darkmux_flow::Tier::Local,
             stage: darkmux_flow::Stage::Dispatch,
-            action: action.to_string(),
+            action,
             handle: step.id.clone(),
             phase_id: None,
             // The SAME session id the item/aggregate records use — that is
@@ -1688,7 +1688,7 @@ impl DispatchMapStepKind {
             category: darkmux_flow::Category::Work,
             tier: darkmux_flow::Tier::Local,
             stage: darkmux_flow::Stage::Dispatch,
-            action: "step result".to_string(),
+            action: darkmux_flow::FlowAction::StepResult,
             handle: step.id.clone(),
             phase_id: None,
             session_id: Some(darkmux_types::session_id::task(&step.task_id)),
@@ -1724,7 +1724,7 @@ impl DispatchMapStepKind {
             category: darkmux_flow::Category::Work,
             tier: darkmux_flow::Tier::Local,
             stage: darkmux_flow::Stage::Dispatch,
-            action: "step result".to_string(),
+            action: darkmux_flow::FlowAction::StepResult,
             handle: step.id.clone(),
             phase_id: None,
             session_id: Some(darkmux_types::session_id::task(&step.task_id)),
@@ -1869,7 +1869,7 @@ impl DispatchMapStepKind {
             Self::bookend_record(
                 step,
                 wire_model.as_ref(),
-                "dispatch start",
+                darkmux_flow::FlowAction::DispatchStart,
                 darkmux_flow::Level::Info,
                 endpoint_label.as_deref(),
                 serde_json::json!({ "items_in": items.len() }),
@@ -1877,7 +1877,7 @@ impl DispatchMapStepKind {
             Self::bookend_record(
                 step,
                 wire_model.as_ref(),
-                "dispatch error",
+                darkmux_flow::FlowAction::DispatchError,
                 darkmux_flow::Level::Error,
                 endpoint_label.as_deref(),
                 serde_json::json!({
@@ -2019,7 +2019,7 @@ impl DispatchMapStepKind {
                 push(
                     crate::dispatch::build_telemetry_record(
                         darkmux_flow::Level::Info,
-                        crate::usage::USAGE_ACTION,
+                        darkmux_flow::FlowAction::TelemetryTokens,
                         crate::usage::USAGE_SOURCE,
                         &step.id,
                         &darkmux_types::session_id::task(&step.task_id),
@@ -2071,7 +2071,7 @@ impl DispatchMapStepKind {
         let mut done = Self::bookend_record(
             step,
             wire_model.as_ref(),
-            "dispatch complete",
+            darkmux_flow::FlowAction::DispatchComplete,
             if ok_count == results.len() { darkmux_flow::Level::Info } else { darkmux_flow::Level::Warn },
             endpoint_label.as_deref(),
             serde_json::json!({
@@ -3694,7 +3694,7 @@ mod tests {
         let item_records: Vec<&darkmux_flow::FlowRecord> = out
             .flow_records
             .iter()
-            .filter(|r| r.action == "step result" && r.payload.as_ref().and_then(|p| p.get("index")).is_some())
+            .filter(|r| r.action == darkmux_flow::FlowAction::StepResult && r.payload.as_ref().and_then(|p| p.get("index")).is_some())
             .collect();
         assert_eq!(item_records.len(), 2, "one `step result` record per item: {:?}", out.flow_records);
         for rec in &item_records {
@@ -3709,7 +3709,7 @@ mod tests {
         let aggregate = out
             .flow_records
             .iter()
-            .find(|r| r.action == "step result" && r.payload.as_ref().and_then(|p| p.get("items_in")).is_some())
+            .find(|r| r.action == darkmux_flow::FlowAction::StepResult && r.payload.as_ref().and_then(|p| p.get("items_in")).is_some())
             .expect("aggregate_record must be present");
         assert_eq!(
             aggregate.model.as_deref(),
@@ -3718,7 +3718,7 @@ mod tests {
         );
 
         let telemetry_records: Vec<&darkmux_flow::FlowRecord> =
-            out.flow_records.iter().filter(|r| r.action == "telemetry.tokens").collect();
+            out.flow_records.iter().filter(|r| r.action == darkmux_flow::FlowAction::TelemetryTokens).collect();
         assert_eq!(
             telemetry_records.len(),
             2,
@@ -3808,7 +3808,7 @@ mod tests {
             })
             .collect();
         let bookends: Vec<&darkmux_flow::FlowRecord> =
-            emitted.iter().filter(|r| r.action.starts_with("dispatch ")).collect();
+            emitted.iter().filter(|r| matches!(r.action, darkmux_flow::FlowAction::DispatchStart | darkmux_flow::FlowAction::DispatchComplete | darkmux_flow::FlowAction::DispatchError)).collect();
         assert_eq!(
             bookends.len(),
             2,
@@ -3931,7 +3931,7 @@ mod tests {
         // "dispatch error" the Drop impl emits when `run_single_shot`
         // returns early via `?` WITHOUT ever reaching `close` — is a
         // SEPARATE construction site (line ~994, `Self::bookend_record(step,
-        // wire_model.as_ref(), "dispatch error", ...)`), and nothing
+        // wire_model.as_ref(), darkmux_flow::FlowAction::DispatchError, ...)`), and nothing
         // exercised it: mutating that call back to the bare `model` compiled
         // and left the whole suite green, because no test ever forced the
         // dispatch itself to fail on the STREAMING path.
@@ -3986,7 +3986,7 @@ mod tests {
             })
             .collect();
         let error_bookends: Vec<&darkmux_flow::FlowRecord> =
-            emitted.iter().filter(|r| r.action == "dispatch error").collect();
+            emitted.iter().filter(|r| r.action == darkmux_flow::FlowAction::DispatchError).collect();
         assert_eq!(
             error_bookends.len(),
             1,
@@ -4070,7 +4070,7 @@ mod tests {
             })
             .collect();
         let error_bookends: Vec<&darkmux_flow::FlowRecord> =
-            emitted.iter().filter(|r| r.action == "dispatch error").collect();
+            emitted.iter().filter(|r| r.action == darkmux_flow::FlowAction::DispatchError).collect();
         assert_eq!(
             error_bookends.len(),
             1,
@@ -5046,8 +5046,8 @@ mod tests {
             )
         });
         assert!(out.ok, "{out:?}");
-        assert_eq!(env.actions(), vec![crate::budget::BUDGET_WARN_ACTION.to_string()]);
-        let w = env.payload(crate::budget::BUDGET_WARN_ACTION);
+        assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWarn]);
+        let w = env.payload(darkmux_flow::FlowAction::BudgetWarn);
         assert_eq!((w["scope"].as_str(), w["spent"].as_u64(), w["limit"].as_u64()), (Some("step"), Some(12), Some(10)), "{w}");
     }
 
@@ -5070,7 +5070,7 @@ mod tests {
             )
         });
         assert!(out.ok, "{out:?}");
-        assert_eq!(env.actions(), vec![crate::budget::BUDGET_WARN_ACTION.to_string()], "the gate fired");
+        assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWarn], "the gate fired");
     }
 
     /// (#2902 step 5 review C1) The endpoint gate fires on the hosted
@@ -5101,7 +5101,7 @@ mod tests {
         assert!(!msg.contains("dispatch.single_shot (hosted)"), "nothing was sent: {msg}");
         assert_eq!(
             env.actions(),
-            vec![crate::budget::BUDGET_WAIT_ACTION.to_string(), crate::budget::BUDGET_STOP_ACTION.to_string()],
+            vec![darkmux_flow::FlowAction::BudgetWait, darkmux_flow::FlowAction::BudgetStop],
             "the ended wait is recorded as a stop"
         );
     }
@@ -5152,8 +5152,8 @@ mod tests {
         let recs = as_values(&out.flow_records);
         let rec = crate::usage::assert_one_usage_record(&recs, crate::usage::CallKind::SingleShot, "single_shot (named)");
         assert_eq!(rec["payload"]["endpoint_id"], "azure", "{rec}");
-        assert_eq!(env.actions(), vec![crate::budget::BUDGET_WARN_ACTION.to_string()]);
-        let w = env.payload(crate::budget::BUDGET_WARN_ACTION);
+        assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWarn]);
+        let w = env.payload(darkmux_flow::FlowAction::BudgetWarn);
         assert_eq!(w["scope"], "step");
         assert_eq!(w["spent"], 12, "the reply's total, not the 5-token grant: {w}");
         assert_eq!(w["limit"], 10);
@@ -6248,7 +6248,7 @@ mod tests {
         let out = out.expect("the overridden hosted transport must not fail the step");
 
         let telemetry: Vec<&darkmux_flow::FlowRecord> =
-            out.flow_records.iter().filter(|r| r.action == "telemetry.tokens").collect();
+            out.flow_records.iter().filter(|r| r.action == darkmux_flow::FlowAction::TelemetryTokens).collect();
         assert_eq!(telemetry.len(), 2, "one per item that reported usage: {:?}", out.flow_records);
         for (i, rec) in telemetry.iter().enumerate() {
             let payload = rec.payload.as_ref().expect("telemetry payload");
@@ -6304,7 +6304,7 @@ mod tests {
         let out = out.expect("dispatch.map's local per-item dispatch must not fail outright");
 
         let telemetry: Vec<&darkmux_flow::FlowRecord> =
-            out.flow_records.iter().filter(|r| r.action == "telemetry.tokens").collect();
+            out.flow_records.iter().filter(|r| r.action == darkmux_flow::FlowAction::TelemetryTokens).collect();
         assert_eq!(telemetry.len(), 2, "one per item that reported usage: {:?}", out.flow_records);
         for (i, rec) in telemetry.iter().enumerate() {
             let payload = rec.payload.as_ref().expect("telemetry payload");
@@ -6378,29 +6378,29 @@ mod tests {
             .collect();
         let actions: Vec<&str> = emitted.iter().map(|r| r.action.as_str()).collect();
         assert!(
-            actions.contains(&"dispatch start"),
+            actions.contains(&"dispatch.start"),
             "a hosted map must OPEN its liveness edge; got {actions:?}"
         );
         assert!(
-            actions.contains(&"dispatch complete"),
+            actions.contains(&"dispatch.complete"),
             "...and close it; got {actions:?}"
         );
         // Exactly one of each — the drop guard must not double-emit alongside
         // the clean close.
         assert_eq!(
-            actions.iter().filter(|a| **a == "dispatch start").count(),
+            actions.iter().filter(|a| **a == "dispatch.start").count(),
             1,
             "one start per run; got {actions:?}"
         );
         assert_eq!(
-            actions.iter().filter(|a| a.starts_with("dispatch ") && **a != "dispatch start").count(),
+            actions.iter().filter(|a| matches!(**a, "dispatch.complete" | "dispatch.error")).count(),
             1,
             "exactly one terminal per open; got {actions:?}"
         );
 
         let terminal = emitted
             .iter()
-            .find(|r| r.action == "dispatch complete")
+            .find(|r| r.action == darkmux_flow::FlowAction::DispatchComplete)
             .expect("terminal present");
         let payload = terminal.payload.as_ref().expect("terminal carries a payload");
         assert_eq!(
@@ -6490,7 +6490,7 @@ mod tests {
             })
             .collect();
         let bookends: Vec<&darkmux_flow::FlowRecord> =
-            emitted.iter().filter(|r| r.action.starts_with("dispatch ")).collect();
+            emitted.iter().filter(|r| matches!(r.action, darkmux_flow::FlowAction::DispatchStart | darkmux_flow::FlowAction::DispatchComplete | darkmux_flow::FlowAction::DispatchError)).collect();
         assert_eq!(bookends.len(), 2, "expected a start and a complete bookend: {emitted:?}");
         for rec in &bookends {
             assert_eq!(
@@ -6833,7 +6833,7 @@ mod tests {
         );
 
         // Bookends — the half this kind never had at all.
-        let actions: Vec<String> = rx
+        let actions: Vec<darkmux_flow::FlowAction> = rx
             .into_iter()
             .filter_map(|sig| match sig {
                 crate::step_kinds::WaveSignal::Record(r) => Some(r.action),
@@ -6841,14 +6841,14 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            actions.iter().filter(|a| *a == "dispatch start").count(),
+            actions.iter().filter(|a| **a == darkmux_flow::FlowAction::DispatchStart).count(),
             1,
             "exactly one liveness start; got {actions:?}"
         );
         assert_eq!(
             actions
                 .iter()
-                .filter(|a| a.starts_with("dispatch ") && *a != "dispatch start")
+                .filter(|a| matches!(a, darkmux_flow::FlowAction::DispatchComplete | darkmux_flow::FlowAction::DispatchError))
                 .count(),
             1,
             "exactly one terminal per open — the Drop guard must not double-emit alongside \
@@ -7550,7 +7550,7 @@ mod tests {
                 crate::step_kinds::WaveSignal::Record(r) => Some(serde_json::to_value(r).unwrap()),
                 _ => None,
             })
-            .filter(|r| r["action"] == crate::usage::USAGE_ACTION)
+            .filter(|r| r["action"] == "telemetry.tokens")
             .collect();
         let n = *hits.lock().unwrap();
         (n, recs)

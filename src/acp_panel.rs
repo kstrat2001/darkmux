@@ -653,7 +653,7 @@ pub fn run_ephemeral(
     let mut bookend = crate::flow::BookendGuard::new(&mut dispatch_sink, move |_id, _kind| {
         crate::mission_launch::mission_bookend_record(
             crate::flow::Level::Error,
-            "dispatch error",
+            darkmux_flow::FlowAction::DispatchError,
             &config_id_for_abort,
             &correlation_id_for_abort,
             serde_json::json!({
@@ -668,7 +668,7 @@ pub fn run_ephemeral(
         "dispatch",
         crate::mission_launch::mission_bookend_record(
             crate::flow::Level::Info,
-            "dispatch start",
+            darkmux_flow::FlowAction::DispatchStart,
             &config.id,
             &correlation_id,
             serde_json::json!({ "runtime": "ephemeral" }),
@@ -752,7 +752,7 @@ pub fn run_ephemeral(
                 "dispatch",
                 crate::mission_launch::mission_bookend_record(
                     crate::flow::Level::Error,
-                    "dispatch error",
+                    darkmux_flow::FlowAction::DispatchError,
                     &config.id,
                     &correlation_id,
                     serde_json::json!({
@@ -773,7 +773,7 @@ pub fn run_ephemeral(
                 "dispatch",
                 crate::mission_launch::mission_bookend_record(
                     crate::flow::Level::Error,
-                    "dispatch error",
+                    darkmux_flow::FlowAction::DispatchError,
                     &config.id,
                     &correlation_id,
                     serde_json::json!({
@@ -791,7 +791,7 @@ pub fn run_ephemeral(
         "dispatch",
         crate::mission_launch::mission_bookend_record(
             if outcome.success { crate::flow::Level::Info } else { crate::flow::Level::Error },
-            if outcome.success { "dispatch complete" } else { "dispatch error" },
+            if outcome.success { darkmux_flow::FlowAction::DispatchComplete } else { darkmux_flow::FlowAction::DispatchError },
             &config.id,
             &correlation_id,
             serde_json::json!({
@@ -847,7 +847,7 @@ pub(crate) fn emit_cmd_audit(verb: &str, args: &str, cwd: &Path, gate_confirmed:
         category: crate::flow::Category::Audit,
         tier: crate::flow::Tier::Operator,
         stage: crate::flow::Stage::Review,
-        action: "gh.verb.executed".to_string(),
+        action: darkmux_flow::FlowAction::GhVerbExecuted,
         handle,
         phase_id: None,
         session_id: None,
@@ -1640,9 +1640,9 @@ mod tests {
         let mission_records: Vec<&serde_json::Value> =
             records.iter().filter(|r| r["source"] == "mission").collect();
         let starts: Vec<&&serde_json::Value> =
-            mission_records.iter().filter(|r| r["action"] == "dispatch start").collect();
+            mission_records.iter().filter(|r| r["action"] == "dispatch.start").collect();
         let completes: Vec<&&serde_json::Value> =
-            mission_records.iter().filter(|r| r["action"] == "dispatch complete").collect();
+            mission_records.iter().filter(|r| r["action"] == "dispatch.complete").collect();
         assert_eq!(
             starts.len(),
             1,
@@ -1716,7 +1716,7 @@ mod tests {
             .filter(|r| {
                 let action = r.get("action").and_then(|v| v.as_str()).unwrap_or("");
                 let source = r.get("source").and_then(|v| v.as_str()).unwrap_or("");
-                source == "scheduler" && (action == "step start" || action == "step complete")
+                source == "scheduler" && (action == "step.start" || action == "step.complete")
             })
             .collect();
         assert!(
@@ -1793,9 +1793,9 @@ mod tests {
         let mission_records: Vec<&serde_json::Value> =
             records.iter().filter(|r| r["source"] == "mission").collect();
         let starts: Vec<&&serde_json::Value> =
-            mission_records.iter().filter(|r| r["action"] == "dispatch start").collect();
+            mission_records.iter().filter(|r| r["action"] == "dispatch.start").collect();
         let errors: Vec<&&serde_json::Value> =
-            mission_records.iter().filter(|r| r["action"] == "dispatch error").collect();
+            mission_records.iter().filter(|r| r["action"] == "dispatch.error").collect();
         assert_eq!(starts.len(), 1, "{mission_records:#?}");
         assert_eq!(
             errors.len(),

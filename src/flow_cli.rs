@@ -1,7 +1,7 @@
 //! CLI dispatcher for `darkmux flow` shortcut verbs.
 
 use crate::flow;
-use crate::flow::{Category, FlowRecord, Level, Stage, Tier};
+use crate::flow::{Category, FlowAction, FlowRecord, Level, Stage, Tier};
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 
@@ -47,8 +47,10 @@ pub enum FlowCmd {
         tier: Tier,
         #[arg(long)]
         stage: Stage,
-        #[arg(long)]
-        action: String,
+        /// One of the flow actions this darkmux knows (`dispatch.start`,
+        /// `operator.note`, ...); anything else is refused.
+        #[arg(long, value_parser = FlowAction::parse_known)]
+        action: FlowAction,
         #[arg(long)]
         handle: String,
         /// Optional phase identifier.
@@ -79,6 +81,7 @@ pub enum FlowCmd {
     /// Typical use: the frontier orchestrator runs this verb before
     /// dispatching (or before deciding to hold work in frontier) and
     /// captures the reasoning in operator-readable prose.
+    // flow-action-guard:allow — the CLI subcommand name, not an action
     #[command(name = "tier-decision")]
     TierDecision {
         /// `dispatch` (work routed to local) or `direct` (work held in
@@ -281,14 +284,10 @@ impl flow::FlowSink for DrainCountingSink {
                 return Ok(());
             }
         }
-        match record.action.as_str() {
-            "hook.fired" => {
-                self.delivered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            "hook.failed" => {
-                self.failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            _ => {}
+        if record.action == FlowAction::HookFired {
+            self.delivered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else if record.action == FlowAction::HookFailed {
+            self.failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(())
     }
@@ -588,13 +587,12 @@ fn print_integrity_check(
 ///
 /// Returns `Some(string)` when the line should be printed, `None` otherwise.
 /// When `session` is `Some(s)`, only records whose `session_id` equals `s`
-/// are returned. When `json` is true, the raw line is returned; otherwise
-/// a concise one-line summary is built from available fields.
+/// are returned. When `json` is true, the line is returned as the flow
+/// reader forwards it (verbatim, unless its action is a retired spelling);
+/// otherwise a concise one-line summary is built from available fields.
 fn tail_match(line: &str, session: Option<&str>, json: bool) -> Option<String> {
-    let parsed = match serde_json::from_str::<serde_json::Value>(line) {
-        Ok(v) => v,
-        Err(_) => return None, // unparseable line — skip
-    };
+    let forwarded = flow::reader::upgrade_line(line)?;
+    let parsed: serde_json::Value = serde_json::from_str(&forwarded).ok()?;
 
     if let Some(s) = session {
         if parsed.get("session_id").and_then(|v| v.as_str()) != Some(s) {
@@ -603,7 +601,7 @@ fn tail_match(line: &str, session: Option<&str>, json: bool) -> Option<String> {
     }
 
     if json {
-        Some(line.to_string())
+        Some(forwarded.into_owned())
     } else {
         use darkmux_types::style;
         let ts = parsed.get("ts").and_then(|v| v.as_str()).unwrap_or("");
@@ -690,7 +688,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "note".to_string(),
+            action: FlowAction::OperatorNote,
             handle: text,
             phase_id,
             session_id,
@@ -712,7 +710,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             category: Category::Audit,
             tier: Tier::Operator,
             stage: Stage::Review,
-            action: "catch".to_string(),
+            action: FlowAction::OperatorCatch,
             handle: text,
             phase_id,
             session_id,
@@ -783,7 +781,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             // `action` is the operator-facing event name; `handle` carries
             // role-chosen for searchability. When no role is chosen
             // (decision=direct), handle is the decision itself.
-            action: "tier-decision".to_string(),
+            action: FlowAction::TierDecision,
             handle: role_chosen.clone().unwrap_or_else(|| decision.clone()),
             phase_id,
             session_id,
@@ -1037,7 +1035,7 @@ mod tests {
         assert_eq!(rec["tier"], "operator");
         assert_eq!(rec["level"], "info");
         assert_eq!(rec["category"], "work");
-        assert_eq!(rec["action"], "note");
+        assert_eq!(rec["action"], "operator.note");
         assert_eq!(rec["handle"], "hello");
     }
 
@@ -1067,7 +1065,7 @@ mod tests {
             category: Category::Machinery,
             tier: Tier::Local,
             stage: Stage::Dispatch,
-            action: "x".to_string(),
+            action: FlowAction::OperatorNote,
             handle: "y".to_string(),
             phase_id: None,
             session_id: None,
@@ -1082,7 +1080,7 @@ mod tests {
         assert_eq!(rec["category"], "machinery");
         assert_eq!(rec["tier"], "local");
         assert_eq!(rec["stage"], "dispatch");
-        assert_eq!(rec["action"], "x");
+        assert_eq!(rec["action"], "operator.note");
         assert_eq!(rec["handle"], "y");
     }
 
@@ -1095,7 +1093,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "test-optional".to_string(),
+            action: FlowAction::OperatorNote,
             handle: "opt-handle".to_string(),
             phase_id: Some("66".to_string()),
             session_id: Some("abc".to_string()),
@@ -1156,7 +1154,7 @@ mod tests {
         assert_eq!(rec["category"], "audit");
         assert_eq!(rec["tier"], "frontier");
         assert_eq!(rec["stage"], "tier-decision");
-        assert_eq!(rec["action"], "tier-decision");
+        assert_eq!(rec["action"], "tier.decision");
         // handle carries role-chosen when dispatch + role known.
         assert_eq!(rec["handle"], "coder");
         assert_eq!(rec["phase_id"], "113-s1");
@@ -1217,8 +1215,17 @@ mod tests {
     }
 
     #[test]
-    fn tail_match_json_mode_returns_raw_line() {
-        let line = r#"{"ts":"2025-01-01T00:00:00Z","action":"note"}"#;
+    fn tail_match_json_mode_returns_a_current_line_verbatim() {
+        let line = r#"{"ts":"2025-01-01T00:00:00Z","action":"operator.note"}"#;
         assert_eq!(tail_match(line, None, true), Some(line.to_string()));
+    }
+
+    /// A pre-4.0 line tails with its current spelling, in both modes.
+    #[test]
+    fn tail_match_upgrades_a_retired_spelling() {
+        let line = r#"{"ts":"2025-01-01T00:00:00Z","action":"note","session_id":"abc"}"#;
+        let json: serde_json::Value = serde_json::from_str(&tail_match(line, None, true).unwrap()).unwrap();
+        assert_eq!(json["action"], "operator.note");
+        assert!(tail_match(line, None, false).unwrap().contains("operator.note"));
     }
 }

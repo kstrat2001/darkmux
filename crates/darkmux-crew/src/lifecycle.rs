@@ -546,7 +546,7 @@ pub(crate) fn load_phase_by_id(phase_id: &str) -> Result<Phase> {
                 category: Category::Machinery,
                 tier: Tier::Operator,
                 stage: Stage::Scope,
-                action: "ambiguous-phase-id".into(),
+                action: darkmux_flow::FlowAction::PhaseIdAmbiguous,
                 handle: format!(
                     "phase id `{phase_id}` found in {count} missions; using `{}`",
                     chosen.mission_id
@@ -593,14 +593,14 @@ fn load_mission(id: &str) -> Result<Mission> {
 
 // ─── Flow record emission ──────────────────────────────────────────────
 
-fn emit_phase_transition_record(phase_id: &str, mission_id: &str, action: &str) {
+fn emit_phase_transition_record(phase_id: &str, mission_id: &str, action: darkmux_flow::FlowAction) {
     let _ = flow::record(FlowRecord {
         ts: flow::ts_utc_now(),
         level: Level::Info,
         category: Category::Work,
         tier: Tier::Operator,
         stage: Stage::Scope,
-        action: action.to_string(),
+        action,
         handle: phase_id.to_string(),
         phase_id: Some(phase_id.to_string()),
         session_id: Some(darkmux_types::session_id::mission(mission_id)),
@@ -625,7 +625,7 @@ fn emit_phase_transition_record(phase_id: &str, mission_id: &str, action: &str) 
 #[allow(dead_code)]
 // Kept for back-compat + test ergonomics; CLI path uses
 // `emit_mission_transition_record_with_reasoning` directly.
-fn emit_mission_transition_record(mission_id: &str, action: &str) {
+fn emit_mission_transition_record(mission_id: &str, action: darkmux_flow::FlowAction) {
     emit_mission_transition_record_with_reasoning(mission_id, action, None);
 }
 
@@ -635,7 +635,7 @@ fn emit_mission_transition_record(mission_id: &str, action: &str) {
 /// for routing events (#136).
 fn emit_mission_transition_record_with_reasoning(
     mission_id: &str,
-    action: &str,
+    action: darkmux_flow::FlowAction,
     reasoning: Option<&str>,
 ) {
     emit_mission_transition_record_with_reasoning_and_payload(mission_id, action, reasoning, None);
@@ -651,7 +651,7 @@ fn emit_mission_transition_record_with_reasoning(
 /// the 3-arg wrapper above with `payload: None` — behavior unchanged.
 fn emit_mission_transition_record_with_reasoning_and_payload(
     mission_id: &str,
-    action: &str,
+    action: darkmux_flow::FlowAction,
     reasoning: Option<&str>,
     payload: Option<serde_json::Value>,
 ) {
@@ -661,7 +661,7 @@ fn emit_mission_transition_record_with_reasoning_and_payload(
         category: Category::Work,
         tier: Tier::Operator,
         stage: Stage::Scope,
-        action: action.to_string(),
+        action,
         handle: mission_id.to_string(),
         phase_id: None,
         session_id: Some(darkmux_types::session_id::mission(mission_id)),
@@ -703,7 +703,7 @@ fn emit_phase_added_record_with_reasoning(
         category: Category::Work,
         tier: Tier::Operator,
         stage: Stage::Scope,
-        action: "phase added".to_string(),
+        action: darkmux_flow::FlowAction::PhaseAdded,
         handle: phase_id.to_string(),
         phase_id: Some(phase_id.to_string()),
         session_id: Some(darkmux_types::session_id::mission(mission_id)),
@@ -1044,7 +1044,7 @@ fn phase_start_impl(id: &str, refuse_terminal_mission: bool) -> Result<Phase> {
     phase.started_ts = Some(now_unix());
     phase.abandoned_ts = None; // restart clears the prior abandonment
     save_json(&phase_path(&phase.mission_id, id), &phase)?;
-    emit_phase_transition_record(id, &phase.mission_id, "phase start");
+    emit_phase_transition_record(id, &phase.mission_id, darkmux_flow::FlowAction::PhaseStart);
     Ok(phase)
 }
 
@@ -1072,7 +1072,7 @@ pub fn phase_complete(id: &str) -> Result<Phase> {
     phase.status = PhaseStatus::Complete;
     phase.completed_ts = Some(now_unix());
     save_json(&phase_path(&phase.mission_id, id), &phase)?;
-    emit_phase_transition_record(id, &phase.mission_id, "phase complete");
+    emit_phase_transition_record(id, &phase.mission_id, darkmux_flow::FlowAction::PhaseComplete);
     Ok(phase)
 }
 
@@ -1097,7 +1097,7 @@ pub fn phase_abandon(id: &str) -> Result<Phase> {
     phase.status = PhaseStatus::Abandoned;
     phase.abandoned_ts = Some(now_unix());
     save_json(&phase_path(&phase.mission_id, id), &phase)?;
-    emit_phase_transition_record(id, &phase.mission_id, "phase abandon");
+    emit_phase_transition_record(id, &phase.mission_id, darkmux_flow::FlowAction::PhaseAbandon);
     Ok(phase)
 }
 
@@ -1144,7 +1144,7 @@ pub fn mission_start_with_reasoning_and_payload(
     mission.status = MissionStatus::Active;
     mission.started_ts = Some(now_unix());
     save_json(&mission_path(id), &mission)?;
-    emit_mission_transition_record_with_reasoning_and_payload(id, "mission start", reasoning, payload);
+    emit_mission_transition_record_with_reasoning_and_payload(id, darkmux_flow::FlowAction::MissionStart, reasoning, payload);
     Ok(mission)
 }
 
@@ -1210,9 +1210,9 @@ pub fn mission_terminal_with_reasoning_and_payload(
     mission.finalized_ts = Some(now_unix());
     save_json(&mission_path(id), &mission)?;
     let action = if matches!(terminal, MissionStatus::Aborted) {
-        "mission abort"
+        darkmux_flow::FlowAction::MissionAbort
     } else {
-        "mission close"
+        darkmux_flow::FlowAction::MissionClose
     };
     emit_mission_transition_record_with_reasoning_and_payload(id, action, reasoning, payload);
     Ok(mission)
@@ -1237,7 +1237,7 @@ pub fn mission_pause_with_reasoning(id: &str, reasoning: Option<&str>) -> Result
     mission.status = MissionStatus::Paused;
     mission.paused_ts = Some(now_unix());
     save_json(&mission_path(id), &mission)?;
-    emit_mission_transition_record_with_reasoning(id, "mission pause", reasoning);
+    emit_mission_transition_record_with_reasoning(id, darkmux_flow::FlowAction::MissionPause, reasoning);
     Ok(mission)
 }
 
@@ -1259,7 +1259,7 @@ pub fn mission_resume_with_reasoning(id: &str, reasoning: Option<&str>) -> Resul
     }
     mission.status = MissionStatus::Active;
     save_json(&mission_path(id), &mission)?;
-    emit_mission_transition_record_with_reasoning(id, "mission resume", reasoning);
+    emit_mission_transition_record_with_reasoning(id, darkmux_flow::FlowAction::MissionResume, reasoning);
     Ok(mission)
 }
 
@@ -2338,7 +2338,7 @@ mod tests {
         let path = std::path::PathBuf::from(flows_dir).join(format!("{day}.jsonl"));
         let raw = std::fs::read_to_string(&path).expect("flow file should have been created");
         let found = raw.lines().any(|line| {
-            line.contains("\"action\":\"phase added\"")
+            line.contains("\"action\":\"phase.added\"")
                 && line.contains("\"handle\":\"new-phase\"")
                 && line.contains("\"source\":\"mission_lifecycle\"")
         });
@@ -2377,7 +2377,7 @@ mod tests {
         )
         .unwrap();
 
-        let records = records_with_action(&g, "mission start");
+        let records = records_with_action(&g, "mission.start");
         assert_eq!(records.len(), 1, "{records:?}");
         let payload = &records[0]["payload"];
         assert_eq!(payload["workspace"], "acme");
@@ -2395,7 +2395,7 @@ mod tests {
         seed_mission("m-plain-1", MissionStatus::Active);
         mission_start_with_reasoning("m-plain-1", None).unwrap();
 
-        let records = records_with_action(&g, "mission start");
+        let records = records_with_action(&g, "mission.start");
         assert_eq!(records.len(), 1, "{records:?}");
         assert!(records[0].as_object().unwrap().get("payload").is_none() || records[0]["payload"].is_null());
     }
@@ -2421,7 +2421,7 @@ mod tests {
         )
         .unwrap();
 
-        let records = records_with_action(&g, "mission close");
+        let records = records_with_action(&g, "mission.close");
         assert_eq!(records.len(), 1, "{records:?}");
         let payload = &records[0]["payload"];
         assert_eq!(payload["units_completed"], 8);

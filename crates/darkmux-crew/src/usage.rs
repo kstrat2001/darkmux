@@ -54,8 +54,6 @@
 //!
 //! `usage_conformance` (tests) drives each one and holds the roster.
 
-/// The flow-record action every usage record carries.
-pub const USAGE_ACTION: &str = "telemetry.tokens";
 /// The flow-record telemetry `source` every usage record carries.
 pub const USAGE_SOURCE: &str = "tokens";
 
@@ -143,17 +141,6 @@ pub fn call_purpose(call_kind: CallKind, role_id: Option<&str>) -> UsagePurpose 
     }
 }
 
-/// (#2915) The flow-record action a utility job writes when it STARTS. Its
-/// usage record (`telemetry.tokens`) marks the end; a job whose model call
-/// fails ends with [`UTILITY_ERROR_ACTION`] instead. Lean like the job: no
-/// session is minted, no bookends, no run, no presence (the amended
-/// contract 2). A compaction's start keeps the session of the execution it
-/// serves, as its usage records do.
-pub const UTILITY_START_ACTION: &str = "utility.start";
-/// (#2915) The flow-record action a utility job writes when its model call
-/// fails after [`UTILITY_START_ACTION`]: the end of a job that has no usage
-/// record (no reply, nothing countable).
-pub const UTILITY_ERROR_ACTION: &str = "utility.error";
 /// (#2915) The telemetry `source` `utility.start` / `utility.error` carry.
 pub const UTILITY_SOURCE: &str = "utility";
 
@@ -226,15 +213,15 @@ pub fn utility_start_payload(
 }
 
 /// (#2915) A host-side (sessionless) utility job's lifecycle marker:
-/// `action` is [`UTILITY_START_ACTION`] or [`UTILITY_ERROR_ACTION`], `handle`
+/// `action` is [`darkmux_flow::FlowAction::UtilityStart`] or [`darkmux_flow::FlowAction::UtilityError`], `handle`
 /// the job's role id, the same attribution its usage record carries.
-pub fn utility_marker_record(action: &str, job_role_id: &str, model: &str, payload: serde_json::Value) -> darkmux_flow::FlowRecord {
+pub fn utility_marker_record(action: darkmux_flow::FlowAction, job_role_id: &str, model: &str, payload: serde_json::Value) -> darkmux_flow::FlowRecord {
     let mut rec = utility_usage_record(job_role_id, model, payload);
-    rec.action = action.to_string();
-    rec.source = Some(UTILITY_SOURCE.to_string());
-    if action == UTILITY_ERROR_ACTION {
+    if action == darkmux_flow::FlowAction::UtilityError {
         rec.level = darkmux_flow::Level::Warn;
     }
+    rec.action = action;
+    rec.source = Some(UTILITY_SOURCE.to_string());
     rec
 }
 
@@ -334,7 +321,7 @@ pub fn utility_usage_record(job_role_id: &str, model: &str, payload: serde_json:
         category: darkmux_flow::Category::Telemetry,
         tier: darkmux_flow::Tier::Local,
         stage: darkmux_flow::Stage::Dispatch,
-        action: USAGE_ACTION.to_string(),
+        action: darkmux_flow::FlowAction::TelemetryTokens,
         handle: job_role_id.to_string(),
         phase_id: None,
         session_id: None,
@@ -381,10 +368,11 @@ pub(crate) fn assert_one_usage_record<'a>(
     assert_eq!(
         usage.len(),
         1,
-        "{path}: one model call must emit exactly one `{USAGE_ACTION}` record, got {usage:#?}"
+        "{path}: one model call must emit exactly one `telemetry.tokens` record, got {usage:#?}"
     );
     let rec = usage[0];
-    assert_eq!(rec["action"], USAGE_ACTION, "{path}");
+    // flow-action-guard:allow — a test-only assertion on the wire form
+    assert_eq!(rec["action"], "telemetry.tokens", "{path}");
     let p = &rec["payload"];
     assert_eq!(p["call_kind"], serde_json::json!(kind), "{path}: call_kind: {p}");
     assert!(
@@ -659,8 +647,8 @@ mod tests {
         assert_eq!(p["stall_after_seconds"], 600);
         let r = utility_start_payload(UtilityJobKind::RadioRouting, "j-2", "u4b", None, 30, 5);
         assert!(r.get("serves").is_none(), "absent, never null: {r}");
-        let rec = utility_marker_record(UTILITY_START_ACTION, "radio-router", "u4b", r);
-        assert_eq!(rec.action, UTILITY_START_ACTION);
+        let rec = utility_marker_record(darkmux_flow::FlowAction::UtilityStart, "radio-router", "u4b", r);
+        assert_eq!(rec.action, darkmux_flow::FlowAction::UtilityStart);
         assert_eq!(rec.source.as_deref(), Some(UTILITY_SOURCE));
         assert!(rec.session_id.is_none(), "a host-side utility job has no session");
     }

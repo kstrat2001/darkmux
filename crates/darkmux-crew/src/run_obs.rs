@@ -69,7 +69,7 @@ mod tests {
             category: darkmux_flow::Category::Work,
             tier: darkmux_flow::Tier::Local,
             stage: darkmux_flow::Stage::Dispatch,
-            action: "step result".to_string(),
+            action: darkmux_flow::FlowAction::StepResult,
             handle: "s1".to_string(),
             phase_id: None,
             session_id: None,

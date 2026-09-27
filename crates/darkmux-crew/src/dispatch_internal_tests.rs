@@ -358,7 +358,7 @@
         assert!(err.contains("stopped waiting on endpoint `azure`'s budget") && err.contains("nothing was sent"), "{err}");
         assert_eq!(
             env.actions(),
-            vec![crate::budget::BUDGET_WAIT_ACTION.to_string(), crate::budget::BUDGET_STOP_ACTION.to_string()],
+            vec![darkmux_flow::FlowAction::BudgetWait, darkmux_flow::FlowAction::BudgetStop],
             "the ended wait is recorded as a stop"
         );
         assert!(rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(), "the endpoint received no request");
@@ -410,7 +410,7 @@
         assert!(err.contains("stopped waiting on endpoint `azure`'s budget") && err.contains("nothing was sent"), "{err}");
         assert_eq!(
             env.actions(),
-            vec![crate::budget::BUDGET_WAIT_ACTION.to_string(), crate::budget::BUDGET_STOP_ACTION.to_string()],
+            vec![darkmux_flow::FlowAction::BudgetWait, darkmux_flow::FlowAction::BudgetStop],
             "the ended wait is recorded as a stop"
         );
     }
@@ -464,7 +464,7 @@
         assert!(interrupted, "the stopped run is ended the way an interrupt ends it");
         // (5th review C6) Stopped before any wait was announced: no orphan
         // `budget.stop` (a stop record always follows its wait).
-        assert!(!env.actions().contains(&crate::budget::BUDGET_STOP_ACTION.to_string()), "{:?}", env.actions());
+        assert!(!env.actions().contains(&darkmux_flow::FlowAction::BudgetStop), "{:?}", env.actions());
         let pace: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(crate::pace_file::path(out.path())).unwrap()).unwrap();
         assert_eq!((pace["pause"].as_bool(), pace["reason"].as_str()), (Some(true), Some("budget")), "{pace}");
@@ -3197,8 +3197,8 @@
             );
         }
         let actions: Vec<&str> = records.iter().filter_map(|r| r["action"].as_str()).collect();
-        assert!(actions.contains(&"dispatch start"), "must have emitted dispatch start: {actions:?}");
-        assert!(actions.contains(&"dispatch complete"), "must have emitted dispatch complete: {actions:?}");
+        assert!(actions.contains(&"dispatch.start"), "must have emitted dispatch start: {actions:?}");
+        assert!(actions.contains(&"dispatch.complete"), "must have emitted dispatch complete: {actions:?}");
     }
 
     /// (#1645 fix-pass CONSIDER 3) `dispatch_opts_for` (the `dispatch.
@@ -10540,7 +10540,7 @@
             "gpt-remote",
             Some("m1"),
             Some("p1"),
-            "dispatch start",
+            darkmux_flow::FlowAction::DispatchStart,
             serde_json::json!({}),
         );
         assert_eq!(
@@ -10558,7 +10558,7 @@
             "gpt-remote",
             None,
             None,
-            "dispatch start",
+            darkmux_flow::FlowAction::DispatchStart,
             serde_json::json!({}),
         );
         assert!(bare.mission_id.is_none(), "a None mission_id must never be fabricated into Some");
@@ -11345,7 +11345,7 @@
             );
             guard.open(crate::dispatch::build_dispatch_record_with_payload(
                 darkmux_flow::Level::Info,
-                "dispatch start",
+                darkmux_flow::FlowAction::DispatchStart,
                 "coder",
                 "sess-orphan",
                 Some("darkmux:qwen3.6"),
@@ -11369,7 +11369,7 @@
 
         let rec = drain_flow_records_for_session(tmp.path(), "sess-orphan")
             .into_iter()
-            .find(|v| v["action"] == "dispatch error")
+            .find(|v| v["action"] == "dispatch.error")
             .expect("armed guard should emit a dispatch.error terminal on drop");
         assert_eq!(rec["session_id"], "sess-orphan");
         assert_eq!(rec["mission_id"], "pre-1.0-compat-sweep");
@@ -11406,7 +11406,7 @@
             );
             guard.open(crate::dispatch::build_dispatch_record_with_payload(
                 darkmux_flow::Level::Info,
-                "dispatch start",
+                darkmux_flow::FlowAction::DispatchStart,
                 "coder",
                 "sess-clean",
                 Some("darkmux:qwen3.6"),
@@ -11430,7 +11430,7 @@
 
         let emitted = drain_flow_records_for_session(tmp.path(), "sess-clean")
             .into_iter()
-            .any(|v| v["action"] == "dispatch error");
+            .any(|v| v["action"] == "dispatch.error");
         assert!(!emitted, "disarmed guard must not emit any terminal record");
     }
 
@@ -11466,7 +11466,7 @@
             );
             guard.open(crate::dispatch::build_dispatch_record_with_payload(
                 darkmux_flow::Level::Info,
-                "dispatch start",
+                darkmux_flow::FlowAction::DispatchStart,
                 "coder",
                 "sess-panic",
                 Some("darkmux:qwen3.6"),
@@ -11492,7 +11492,7 @@
 
         let rec = drain_flow_records_for_session(tmp.path(), "sess-panic")
             .into_iter()
-            .find(|v| v["action"] == "dispatch error")
+            .find(|v| v["action"] == "dispatch.error")
             .expect("guard should emit a dispatch.error terminal on panic unwind");
         assert_eq!(rec["session_id"], "sess-panic");
         assert_eq!(rec["mission_id"], "pre-1.0-compat-sweep");
@@ -16170,7 +16170,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             }),
         };
         let rec = build_machine_scoped_telemetry_record(&sample, 12_345, 5000);
-        assert_eq!(rec.action, "machine.telemetry");
+        assert_eq!(rec.action, darkmux_flow::FlowAction::MachineTelemetry);
         assert!(matches!(rec.category, darkmux_flow::Category::Machinery));
         assert_eq!(rec.source.as_deref(), Some("host"));
         // (#2413) The whole point: no dispatch-scoped fields on a
@@ -16444,7 +16444,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         use crate::host_source::Provenance;
         use std::sync::Mutex;
         let collected: Mutex<Vec<(String, serde_json::Value)>> = Mutex::new(Vec::new());
-        let sink = |action: &str, payload: serde_json::Value| {
+        let sink = |action: darkmux_flow::FlowAction, payload: serde_json::Value| {
             collected.lock().expect("not poisoned").push((action.to_string(), payload));
         };
         let scripted = Provenance::Scripted {
@@ -16453,8 +16453,8 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             span_ms: 2_000,
         };
         let emit = super::stamping_emitter(&sink, &scripted);
-        emit("thermal.tier5_eject", serde_json::json!({ "ejected": [], "user_loaded_count": 0 }));
-        emit("thermal.tier5_eject_failed", serde_json::json!({ "error": "lms unreachable" }));
+        emit(darkmux_flow::FlowAction::ThermalTier5Eject, serde_json::json!({ "ejected": [], "user_loaded_count": 0 }));
+        emit(darkmux_flow::FlowAction::ThermalTier5EjectFailed, serde_json::json!({ "error": "lms unreachable" }));
 
         let seen = collected.lock().expect("not poisoned");
         assert_eq!(seen.len(), 2, "the wrapper must forward every record, not swallow any");
@@ -16472,11 +16472,11 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
 
         // Real hardware: forwarded, unmarked.
         let collected_real: Mutex<Vec<(String, serde_json::Value)>> = Mutex::new(Vec::new());
-        let sink_real = |action: &str, payload: serde_json::Value| {
+        let sink_real = |action: darkmux_flow::FlowAction, payload: serde_json::Value| {
             collected_real.lock().expect("not poisoned").push((action.to_string(), payload));
         };
         super::stamping_emitter(&sink_real, &Provenance::Real)(
-            "thermal.tier5_eject",
+            darkmux_flow::FlowAction::ThermalTier5Eject,
             serde_json::json!({ "ejected": [] }),
         );
         let seen = collected_real.lock().expect("not poisoned");
@@ -17699,8 +17699,8 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(), "the endpoint was called");
         let rec = crate::usage::assert_one_usage_record(&records, crate::usage::CallKind::SingleShot, "dispatch_remote (named)");
         assert_eq!(rec["payload"]["endpoint_id"], "azure", "{rec}");
-        assert_eq!(env.actions(), vec![crate::budget::BUDGET_WARN_ACTION.to_string()]);
-        let w = env.payload(crate::budget::BUDGET_WARN_ACTION);
+        assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWarn]);
+        let w = env.payload(darkmux_flow::FlowAction::BudgetWarn);
         assert_eq!((w["scope"].as_str(), w["spent"].as_u64(), w["limit"].as_u64()), (Some("step"), Some(9), Some(5)), "{w}");
     }
 
@@ -17810,7 +17810,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         );
         let starts: Vec<&serde_json::Value> = records
             .iter()
-            .filter(|r| r["action"] == crate::usage::UTILITY_START_ACTION)
+            .filter(|r| r["action"] == "utility.start")
             .collect();
         assert_eq!(starts.len(), 1, "{records:#?}");
         let st = starts[0];
@@ -17824,8 +17824,8 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(p["serves"], "sess-utility-start", "{p}");
         assert_eq!(p["stall_after_seconds"], 600, "the dispatch's inactivity window: {p}");
         assert_eq!(p["generation"], 3, "{p}");
-        let start_at = records.iter().position(|r| r["action"] == crate::usage::UTILITY_START_ACTION).unwrap();
-        let usage_at = records.iter().position(|r| r["action"] == crate::usage::USAGE_ACTION).unwrap();
+        let start_at = records.iter().position(|r| r["action"] == "utility.start").unwrap();
+        let usage_at = records.iter().position(|r| r["action"] == "telemetry.tokens").unwrap();
         assert!(start_at < usage_at, "the start precedes the call's usage record");
         assert_eq!(records[usage_at]["payload"]["job"], "compaction", "the end names the same job");
         // (#2915 review, MUST 1 / C4) One job id across the start and its
@@ -18031,7 +18031,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(p["total_tokens"], 9, "provider total wins over 4+2");
         // The complete record keeps its own counts: the telemetry record is
         // additive, it does not move them.
-        let complete = records.iter().find(|r| r["action"] == "dispatch complete").unwrap();
+        let complete = records.iter().find(|r| r["action"] == "dispatch.complete").unwrap();
         assert_eq!(complete["payload"]["total_tokens"], 9);
         assert_eq!(rec["mission_id"], complete["mission_id"], "same run key as the terminal");
     }
