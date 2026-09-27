@@ -970,6 +970,15 @@ fn cmd_mission_dispatch(
 ) -> Result<i32> {
     use crew::loader::{load_missions, load_roles, load_phases};
 
+    // (#2947 review C1) Bad enum config refuses before any phase is flipped
+    // Planned -> Running: the dispatch-scope settings always (the work is a
+    // dispatch wherever it runs), and the fleet-submission ones when the
+    // work is sent to another machine.
+    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
+    if machine.is_some() {
+        darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::FleetSubmission)?;
+    }
+
     // 0. CLI-boundary charset validation (Wave-E.5 #255 — security-
     //    auditor MEDIUM from PR-D.1 review). `mission_id` flows into
     //    the session_id format string + WorkJob payload + audit chain
@@ -2149,6 +2158,32 @@ fn model_ctx_label(m: &types::ProfileModel, registry: &darkmux_types::ProfileReg
 
 #[cfg(test)]
 mod tests {
+    /// (#2947 review C1) `mission dispatch` refuses bad enum config before
+    /// it looks up the mission or flips a phase: the dispatch-scope values
+    /// always, and the fleet-submission ones with `--machine`.
+    #[serial_test::serial]
+    #[test]
+    fn mission_dispatch_refuses_bad_enum_config_before_touching_the_mission() {
+        let prev = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
+        unsafe { std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "seroius") };
+        let local = super::cmd_mission_dispatch("no-such-mission-2947", "coder", None, 5, true);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT"),
+            }
+        }
+        let msg = format!("{:#}", local.unwrap_err());
+        assert!(msg.contains("dispatch: refusing to start") && msg.contains("`seroius`"), "{msg}");
+
+        let remote = {
+            let _g = darkmux_types::config_access::set_config_for_test(crate::fleet_cli::tests::bad_provider_config());
+            super::cmd_mission_dispatch("no-such-mission-2947", "coder", Some("peer-x"), 5, true)
+        };
+        let msg = format!("{:#}", remote.unwrap_err());
+        assert!(msg.contains("fleet work submission: refusing to start"), "{msg}");
+    }
+
     use super::*;
 
     /// (#2902 re-review C2) `profile list` tells a quarantined endpoint
