@@ -15,7 +15,7 @@ import { useCountUp } from "../hooks/useCountUp";
 import { usePrefersReducedMotion } from "../hooks/usePrefersReducedMotion";
 import { SWEEP_PER_PHASE, stepLobes, wavePhaseStep, type LobeBlend } from "../lib/scopeWave";
 import { ToolIcon } from "./ToolIcon";
-import { REST_HAND_TOP, REST_TRAIL_TURNS, pageNowAt, restHandFrame, type PageClockAnchor, type RestHandFrame } from "../lib/restHand";
+import { REST_HAND_TOP, pageNowAt, restHandFrame, restStrokeSegments, type PageClockAnchor, type RestHandFrame } from "../lib/restHand";
 import { BrainGlyph } from "./ActivityIcon";
 
 /**
@@ -155,6 +155,9 @@ interface ScopeClocks {
   /** (#2890) The wave's WHOLE lobe count now, the one it is leaving, and how
    *  far the crossfade between them has run; stepped by `lib/scopeWave.ts`. */
   lobes: LobeBlend;
+  /** (#2961) How far REST's seconds hand has replaced the breathing ring,
+   *  0..1, eased so the ring leaves (and comes back) without a pop. */
+  handMix: number;
 }
 
 /** Mix a channel toward white by `k`, the hot core of a dot. */
@@ -229,6 +232,35 @@ export function waveAt(t: number, from: number, to: number, mix: number, phase: 
   return (1 - mix) * one(from) + mix * one(to);
 }
 
+/** (#2961) REST's drawn circle: from 12 o'clock to `progress` of a turn,
+ *  each segment as bright as its age says (`restStrokeSegments`), scaled by
+ *  `k`. The TOOLS comet's cheap technique: ONE soft blurred stroke under the
+ *  newest quarter turn, then the segments unblurred (canvas blur is paid per
+ *  stroke; a blur per segment cost ~16 ms a frame). */
+function drawRestStroke(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number, p: ScopeParams, progress: number, k: number) {
+  if (progress <= 0.002 || k <= 0) return;
+  const { r: cr, g: cg, b: cb } = p;
+  const turn = Math.PI * 2;
+  const head = REST_HAND_TOP + turn * progress;
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, r * p.sx, r * p.sy, 0, Math.max(REST_HAND_TOP, head - Math.PI * 0.5), head);
+  ctx.strokeStyle = rgba(cr, cg, cb, 0.35 * k);
+  ctx.lineWidth = 4;
+  ctx.shadowColor = rgba(cr, cg, cb, 0.8);
+  ctx.shadowBlur = 9 * k;
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+  for (const seg of restStrokeSegments(progress)) {
+    const b = seg.brightness * k;
+    ctx.beginPath();
+    // The small overlap closes hairline gaps between segments.
+    ctx.ellipse(cx, cy, r * p.sx, r * p.sy, 0, REST_HAND_TOP + turn * seg.from, REST_HAND_TOP + turn * seg.to + 0.004);
+    ctx.strokeStyle = rgba(cr, cg, cb, 0.95 * b);
+    ctx.lineWidth = 1.2 + 1.8 * b;
+    ctx.stroke();
+  }
+}
+
 /** One frame of the scope, from the current morph parameters `p`. Ported
  *  from the prototype's `draw()`: an afterglow fill (a low-alpha fill rather
  *  than a hard clear, so the previous frame bleeds through), then, each
@@ -274,9 +306,16 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
   const rBase = R * p.rscale * (1 + 0.06 * p.breath * (breathe - 0.5));
   const amp = R * (0.03 + 0.16 * active) * (1 - 0.8 * p.breath);
 
+  // (#2961) While a REST countdown runs the seconds hand draws the circle
+  // itself, so the breathing ring steps aside: `handMix` eases toward 1 while
+  // there is a hand and back to 0 without one (at once on a still frame).
+  const handTarget = hand ? 1 : 0;
+  c.handMix = dt > 0 ? c.handMix + (handTarget - c.handMix) * (1 - Math.exp(-10 * dt)) : handTarget;
+  const ringVis = p.ring * (1 - c.handMix);
+
   // The main trace.
-  if (p.ring > 0.01) {
-    const bright = Math.min(1, p.ring * (1 - 0.3 * p.breath * (1 - breathe)));
+  if (ringVis > 0.01) {
+    const bright = Math.min(1, ringVis * (1 - 0.3 * p.breath * (1 - breathe)));
     for (const [lw, a] of TRACE_PASSES) {
       ctx.beginPath();
       for (let i = 0; i <= 240; i++) {
@@ -388,37 +427,21 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
     ctx.shadowBlur = 0;
   }
   // REST (idle breathes without a dot, #2890).
-  if (p.breath > 0.05 && p.drift > 0.05) {
-    const vis = p.breath * Math.min(1, p.drift);
-    if (hand) {
-      // (#2961) A seconds hand in sync with the countdown: its angle comes
-      // from the rest's own end time (`lib/restHand.ts`), so it reaches 12
-      // o'clock exactly when the number drops. The trail is the TOOLS
-      // comet's technique: ONE blurred stroke under the leading half, then
-      // unblurred taper segments (blur is paid per stroke).
+  if (hand) {
+    // (#2961, design B) A REST countdown: no breathing ring; the dot DRAWS
+    // the circle over each second, from 12 o'clock clockwise to itself,
+    // dimmer along its length by age, and reaches 12 exactly when the number
+    // drops (`lib/restHand.ts`). There the finished circle fades out fast
+    // while the next one starts. Radius without the breath: the circle is
+    // drawn, not breathed.
+    const vis = c.handMix;
+    if (vis > 0.01) {
+      const rs = R * p.rscale;
+      if (hand.closedFade > 0.01) drawRestStroke(ctx, cx, cy, rs, p, 1, hand.closedFade * vis);
+      if (hand.stroke) drawRestStroke(ctx, cx, cy, rs, p, hand.progress, vis);
       const head = hand.angle;
-      if (hand.trail) {
-        const len = Math.PI * 2 * REST_TRAIL_TURNS;
-        const n = 36;
-        ctx.beginPath();
-        ctx.ellipse(cx, cy, rBase * p.sx, rBase * p.sy, 0, head - len * 0.5, head);
-        ctx.strokeStyle = rgba(cr, cg, cb, 0.4 * vis);
-        ctx.lineWidth = 3;
-        ctx.shadowColor = rgba(cr, cg, cb, 0.8);
-        ctx.shadowBlur = 8 * vis;
-        ctx.stroke();
-        ctx.shadowBlur = 0;
-        for (let i = 0; i < n; i++) {
-          const f = 1 - i / n;
-          ctx.beginPath();
-          ctx.ellipse(cx, cy, rBase * p.sx, rBase * p.sy, 0, head - len * ((i + 1) / n), head - len * (i / n));
-          ctx.strokeStyle = rgba(cr, cg, cb, 0.85 * f * f * vis);
-          ctx.lineWidth = 1.2 + 2.4 * f;
-          ctx.stroke();
-        }
-      }
       ctx.beginPath();
-      ctx.arc(cx + Math.cos(head) * rBase * p.sx, cy + Math.sin(head) * rBase * p.sy, Math.max(1.6, R * 0.045), 0, Math.PI * 2);
+      ctx.arc(cx + Math.cos(head) * rs * p.sx, cy + Math.sin(head) * rs * p.sy, Math.max(1.6, R * 0.045), 0, Math.PI * 2);
       ctx.fillStyle = rgba(lift(cr, 0.6), lift(cg, 0.6), lift(cb, 0.6), 0.95 * vis);
       ctx.shadowColor = rgba(cr, cg, cb, 0.9);
       ctx.shadowBlur = 12 * vis;
@@ -427,26 +450,26 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
       // The tick: a short amber flash at 12 o'clock (~180 ms, `hand.glow`).
       if (hand.glow > 0.01) {
         const k = hand.glow * vis;
-        const tx = cx + Math.cos(REST_HAND_TOP) * rBase * p.sx;
-        const ty = cy + Math.sin(REST_HAND_TOP) * rBase * p.sy;
-        const gr = R * 0.26;
+        const tx = cx + Math.cos(REST_HAND_TOP) * rs * p.sx;
+        const ty = cy + Math.sin(REST_HAND_TOP) * rs * p.sy;
+        const gr = R * 0.22;
         const g = ctx.createRadialGradient(tx, ty, 0, tx, ty, gr);
-        g.addColorStop(0, rgba(lift(cr, 0.7), lift(cg, 0.7), lift(cb, 0.7), 0.9 * k));
-        g.addColorStop(0.35, rgba(cr, cg, cb, 0.45 * k));
+        g.addColorStop(0, rgba(lift(cr, 0.7), lift(cg, 0.7), lift(cb, 0.7), 0.8 * k));
         g.addColorStop(1, rgba(cr, cg, cb, 0));
         ctx.fillStyle = g;
         ctx.beginPath();
         ctx.arc(tx, ty, gr, 0, Math.PI * 2);
         ctx.fill();
       }
-    } else {
-      // No end time to phase from: the older slow drifting dot.
-      const a = c.breathT * 0.32;
-      ctx.beginPath();
-      ctx.arc(cx + Math.cos(a) * rBase * p.sx, cy + Math.sin(a) * rBase * p.sy, Math.max(1.2, R * 0.03), 0, Math.PI * 2);
-      ctx.fillStyle = rgba(lift(cr, 0.5), lift(cg, 0.5), lift(cb, 0.5), 0.55 * vis);
-      ctx.fill();
     }
+  } else if (p.breath > 0.05 && p.drift > 0.05) {
+    // No end time to phase from (older records): the breathing ring with its
+    // slow drifting dot, as before.
+    const a = c.breathT * 0.32;
+    ctx.beginPath();
+    ctx.arc(cx + Math.cos(a) * rBase * p.sx, cy + Math.sin(a) * rBase * p.sy, Math.max(1.2, R * 0.03), 0, Math.PI * 2);
+    ctx.fillStyle = rgba(lift(cr, 0.5), lift(cg, 0.5), lift(cb, 0.5), 0.55 * p.breath * Math.min(1, p.drift));
+    ctx.fill();
   }
   // STALL: the ember left after the collapse, pulsing slowly.
   if (p.ember > 0.01) {
@@ -505,7 +528,7 @@ export function TokenScope({
   const state: ScopeState = stateProp ?? legacyState(stalled, resting, tone);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const morphRef = useRef<ScopeMorph>(createMorph());
-  const clocksRef = useRef<ScopeClocks>({ phase: Math.random() * 6, breathT: Math.random() * 6, sweep: Math.random() * 6, inwardT: Math.random(), lobes: { cur: 3, prev: 3, mix: 1 } });
+  const clocksRef = useRef<ScopeClocks>({ phase: Math.random() * 6, breathT: Math.random() * 6, sweep: Math.random() * 6, inwardT: Math.random(), lobes: { cur: 3, prev: 3, mix: 1 }, handMix: 0 });
   // GEN's live rate, or a finished run's average for its echo (#2890).
   const rate = state === "generating" || state === "finished" ? Math.max(0, tokensPerSec ?? 0) : 0;
   // The trace takes the state's color, read once per state change from the
@@ -607,11 +630,15 @@ export function TokenScope({
         const last = lastShownRef.current;
         if (!last || last.end !== t.restEnd || last.n !== hand.shown) {
           const sameRest = last !== null && last.end === t.restEnd;
-          const flares = sameRest ? last.flares + (hand.shown < last.n && hand.trail ? 1 : 0) : 0;
+          const flares = sameRest ? last.flares + (hand.shown < last.n && hand.stroke ? 1 : 0) : 0;
           const next = { end: t.restEnd, n: hand.shown, flares };
           lastShownRef.current = next;
           flushSync(() => setRestNum(next));
         }
+        // The tick glow and the finished circle's fade belong to a tick seen
+        // in this rest: never on the rest's first second (there was no
+        // circle before it) or right after the scope mounts.
+        if ((lastShownRef.current?.flares ?? 0) === 0) hand = { ...hand, glow: 0, closedFade: 0 };
       }
       if (w && h) drawFrame(ctx!, w, h, p, clocksRef.current, morphRef.current.clock, dt, hand);
       rafId = requestAnimationFrame(frame);

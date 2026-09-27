@@ -1,11 +1,15 @@
 import { describe, it, expect } from "vitest";
 import {
+  REST_CLOSED_FADE_MS,
   REST_HAND_TOP,
+  REST_STROKE_FLOOR,
   REST_TICK_GLOW_MS,
   pageNowAt,
   restHandAngle,
   restHandFrame,
   restShownSeconds,
+  restStrokeBrightness,
+  restStrokeSegments,
 } from "./restHand";
 import { deriveLiveState } from "./tokenRate";
 import type { FlowRecord } from "../types/handwritten";
@@ -95,19 +99,66 @@ describe("restHand", () => {
     expect(restHandFrame(END, tick + 450, 5, false).glow).toBeCloseTo(0.5, 9);
   });
 
-  it("a rest ending: the number reaches 0, the hand rests at the top, no trail or glow", () => {
+  it("a rest ending: the number reaches 0, the dot rests at the top, nothing drawn, no glow or fade", () => {
     for (const now of [END, END + 1, END + 5000]) {
-      expect(restHandFrame(END, now, 1, false)).toEqual({ angle: REST_HAND_TOP, shown: 0, trail: false, glow: 0 });
+      expect(restHandFrame(END, now, 1, false)).toEqual({ angle: REST_HAND_TOP, shown: 0, progress: 0, stroke: false, glow: 0, closedFade: 0 });
     }
     // The last second still runs normally.
-    expect(restHandFrame(END, END - 400, 1, false)).toMatchObject({ shown: 1, trail: true });
+    expect(restHandFrame(END, END - 400, 1, false)).toMatchObject({ shown: 1, stroke: true, progress: 0.6 });
   });
 
-  it("reduced motion: one still frame, the hand at the top, no trail or glow; the number still counts", () => {
+  it("reduced motion: one still frame, the dot at 12 with no stroke, glow or fade; the number still counts", () => {
     for (const now of [END - 4000, END - 3700, END - 3001]) {
       const f = restHandFrame(END, now, 1, true);
-      expect(f).toEqual({ angle: REST_HAND_TOP, shown: restShownSeconds(END, now), trail: false, glow: 0 });
+      expect(f).toEqual({ angle: REST_HAND_TOP, shown: restShownSeconds(END, now), progress: 0, stroke: false, glow: 0, closedFade: 0 });
     }
+  });
+
+  // (#2961, design B) The dot draws the circle over each second.
+  it("the drawn stroke runs from 12 o'clock to the dot: its length is the progress, 1 − frac(seconds left)", () => {
+    for (const [left, progress] of [[7.75, 0.25], [7.5, 0.5], [7.1, 0.9], [7.999, 0.001]] as const) {
+      const f = restHandFrame(END, END - left * 1000, 1, false);
+      expect(f.progress).toBeCloseTo(progress, 9);
+      expect(f.stroke).toBe(true);
+      const segs = restStrokeSegments(f.progress);
+      expect(segs[0].from).toBe(0);
+      expect(segs[segs.length - 1].to).toBeCloseTo(f.progress, 12);
+      for (let i = 1; i < segs.length; i++) expect(segs[i].from).toBeCloseTo(segs[i - 1].to, 12);
+    }
+    expect(restStrokeSegments(0)).toEqual([]);
+  });
+
+  it("the stroke fades by age: 1.0 at the dot, 1 − 0.75·progress at 12, 0.25 when the circle closes", () => {
+    expect(REST_STROKE_FLOOR).toBe(0.25);
+    expect(restStrokeBrightness(0)).toBe(1);
+    expect(restStrokeBrightness(1)).toBe(0.25);
+    expect(restStrokeBrightness(0.4)).toBeCloseTo(0.7, 12);
+    for (const progress of [0.3, 0.6, 1]) {
+      const segs = restStrokeSegments(progress);
+      const halfSeg = progress / segs.length / 2;
+      // Oldest (at 12) and newest (at the dot), each at its midpoint's age.
+      expect(segs[0].brightness).toBeCloseTo(1 - 0.75 * (progress - halfSeg), 12);
+      expect(segs[segs.length - 1].brightness).toBeCloseTo(1 - 0.75 * halfSeg, 12);
+      // Brighter toward the dot, all along.
+      for (let i = 1; i < segs.length; i++) expect(segs[i].brightness).toBeGreaterThan(segs[i - 1].brightness);
+    }
+    // A closed circle starts at ~25% and ends at ~100%.
+    const closed = restStrokeSegments(1);
+    expect(closed[0].brightness).toBeCloseTo(0.25, 1);
+    expect(closed[closed.length - 1].brightness).toBeCloseTo(1, 1);
+  });
+
+  it("at the tick the finished circle fades out over ~220 ms of wall time while the next one starts", () => {
+    const tick = END - 6000;
+    expect(REST_CLOSED_FADE_MS).toBe(220);
+    expect(restHandFrame(END, tick, 1, false)).toMatchObject({ closedFade: 1, progress: 0 });
+    expect(restHandFrame(END, tick + 110, 1, false).closedFade).toBeCloseTo(0.5, 9);
+    expect(restHandFrame(END, tick + 220, 1, false).closedFade).toBeCloseTo(0, 9);
+    expect(restHandFrame(END, tick + 700, 1, false).closedFade).toBe(0);
+    // At 5s/s, 110 wall ms is 550 page ms.
+    expect(restHandFrame(END, tick + 550, 5, false).closedFade).toBeCloseTo(0.5, 9);
+    // Paused: nothing fades, so there is no fading circle.
+    expect(restHandFrame(END, tick + 10, 0, false).closedFade).toBe(0);
   });
 
   it("agrees with the countdown the page derives: deriveLiveState's seconds left and end time", () => {

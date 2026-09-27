@@ -1,7 +1,10 @@
 /**
- * (#2961) REST's seconds hand: the dot on the breathing ring that loops once
- * per second and reaches 12 o'clock exactly when the countdown in the tube's
- * center drops a number.
+ * (#2961) REST's seconds hand, design B (operator, 2026-09-27): while a REST
+ * countdown runs, the breathing ring is gone and the dot DRAWS the circle
+ * over each second, from 12 o'clock clockwise to itself, dimmer along its
+ * length by how long ago each part was drawn. It reaches 12 exactly when the
+ * countdown in the tube's center drops a number; there the finished circle
+ * fades out quickly while the next one starts.
  *
  * Everything here is a pure function of the rest's END time and the page's
  * clock, so the hand and the number cannot drift apart: the angle is
@@ -23,9 +26,12 @@
 /** Where 12 o'clock is, in canvas radians (0 is 3 o'clock, y points down). */
 export const REST_HAND_TOP = -Math.PI / 2;
 
-/** The trail's length, in turns (operator, 2026-09-27: longer than the
- *  prototype's 0.45). */
-export const REST_TRAIL_TURNS = 0.7;
+/** How bright the stroke is at 12 when the circle closes (a segment drawn a
+ *  full second ago), relative to the newest segment at the dot. */
+export const REST_STROKE_FLOOR = 0.25;
+
+/** How long the finished circle takes to fade out after a tick, in wall ms. */
+export const REST_CLOSED_FADE_MS = 220;
 
 /** The tick glow at 12 o'clock, in wall ms. */
 export const REST_TICK_GLOW_MS = 180;
@@ -63,9 +69,9 @@ export function restShownSeconds(restEndMs: number, pageNowMs: number): number {
   return Math.ceil(restSecondsLeftExact(restEndMs, pageNowMs));
 }
 
-/** The fraction of the current second the hand has swept, 0 at the tick (the
- *  moment the number drops) and approaching 1 just before the next. 0 once
- *  the rest has ended. */
+/** The fraction of the current second the dot has drawn, `1 − frac(seconds
+ *  left)`: 0 at the tick (the moment the number drops), approaching 1 just
+ *  before the next. 0 once the rest has ended. */
 export function restHandProgress(restEndMs: number, pageNowMs: number): number {
   const s = restSecondsLeftExact(restEndMs, pageNowMs);
   if (s <= 0) return 0;
@@ -73,42 +79,83 @@ export function restHandProgress(restEndMs: number, pageNowMs: number): number {
   return frac === 0 ? 0 : 1 - frac;
 }
 
-/** The hand's angle: the top plus `1 − frac(seconds left)` of a turn,
- *  normalized to `[top, top + 2π)`. At a tick it is exactly the top. */
+/** The dot's angle: the top plus `progress` of a turn, in `[top, top + 2π)`.
+ *  At a tick it is exactly the top. */
 export function restHandAngle(restEndMs: number, pageNowMs: number): number {
   return REST_HAND_TOP + 2 * Math.PI * restHandProgress(restEndMs, pageNowMs);
 }
 
+/** The stroke's brightness for a part drawn `ageTurns` ago (0 = just drawn
+ *  at the dot, 1 = a full second ago, at 12 when the circle closes):
+ *  `1 − (1 − floor)·age`, so 1.0 at the dot and 0.25 at a closed circle's
+ *  start. Clamped to that range. */
+export function restStrokeBrightness(ageTurns: number): number {
+  const age = Math.min(1, Math.max(0, ageTurns));
+  return 1 - (1 - REST_STROKE_FLOOR) * age;
+}
+
+/** One unblurred segment of the stroke, in turns from 12 o'clock. */
+export interface RestStrokeSegment {
+  from: number;
+  to: number;
+  brightness: number;
+}
+
+/** The stroke from 12 o'clock to `progress` of a turn, cut into segments
+ *  (about 96 per full turn), each as bright as its midpoint's age. The
+ *  segments cover `[0, progress]` exactly. */
+export function restStrokeSegments(progress: number): RestStrokeSegment[] {
+  if (!(progress > 0)) return [];
+  const p = Math.min(1, progress);
+  const n = Math.max(2, Math.ceil(p * 96));
+  const out: RestStrokeSegment[] = [];
+  for (let i = 0; i < n; i++) {
+    const from = (i / n) * p;
+    const to = ((i + 1) / n) * p;
+    out.push({ from, to, brightness: restStrokeBrightness(p - (from + to) / 2) });
+  }
+  return out;
+}
+
 /** What one frame of the hand draws. */
 export interface RestHandFrame {
-  /** The hand's angle (canvas radians). */
+  /** The dot's angle (canvas radians). */
   angle: number;
   /** The number the center shows (`ceil` of the seconds left). */
   shown: number;
-  /** Draw the trail (the rest is running and motion is allowed). */
-  trail: boolean;
+  /** How much of this second's circle is drawn, in turns (0..1). */
+  progress: number;
+  /** Draw this second's stroke (the rest is running and motion is allowed). */
+  stroke: boolean;
   /** The tick glow at 12 o'clock, 0..1 (0 = none). */
   glow: number;
+  /** The finished circle (the previous second's), fading out after the
+   *  tick: 1 at the tick, 0 after `REST_CLOSED_FADE_MS` of wall time. */
+  closedFade: number;
 }
 
 /**
  * One frame of the hand at page time `pageNowMs`.
  *
  * `rate` (page ms per wall ms) converts the page time since the last tick to
- * wall time for the glow, whose ~180 ms is a visual duration. While the page
- * clock stands still (`rate` 0: paused, or a frozen view) nothing moves, so
- * there is no glow. `reduced` (prefers-reduced-motion): one still frame, the
- * hand at the top, no trail or glow; the number still counts.
+ * wall time for the glow and the finished circle's fade, which are visual
+ * durations. While the page clock stands still (`rate` 0: paused, or a
+ * frozen view) nothing fades, so neither shows. `reduced`
+ * (prefers-reduced-motion): one still frame, the dot at 12 with no stroke,
+ * glow or fade, like every other state's still frame; the number still
+ * counts.
  */
 export function restHandFrame(restEndMs: number, pageNowMs: number, rate: number, reduced: boolean): RestHandFrame {
   const shown = restShownSeconds(restEndMs, pageNowMs);
-  if (reduced) return { angle: REST_HAND_TOP, shown, trail: false, glow: 0 };
+  if (reduced) return { angle: REST_HAND_TOP, shown, progress: 0, stroke: false, glow: 0, closedFade: 0 };
   const running = restSecondsLeftExact(restEndMs, pageNowMs) > 0;
   const progress = restHandProgress(restEndMs, pageNowMs);
   let glow = 0;
+  let closedFade = 0;
   if (running && rate > 0) {
     const wallSinceTick = (progress * 1000) / rate;
     glow = Math.max(0, 1 - wallSinceTick / REST_TICK_GLOW_MS);
+    closedFade = Math.max(0, 1 - wallSinceTick / REST_CLOSED_FADE_MS);
   }
-  return { angle: REST_HAND_TOP + 2 * Math.PI * progress, shown, trail: running, glow };
+  return { angle: REST_HAND_TOP + 2 * Math.PI * progress, shown, progress, stroke: running, glow, closedFade };
 }

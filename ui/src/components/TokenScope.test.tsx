@@ -420,13 +420,27 @@ describe("(#2961) REST's seconds hand", () => {
   function harness(reduced: boolean) {
     const arcs: { x: number; y: number; r: number }[] = [];
     let ellipses = 0;
+    let lineTos = 0;
+    // The alpha of every stroked ellipse (the drawn circle's segments and its
+    // glow stroke), in drawing order.
+    let strokes: { alpha: number; a0: number; a1: number; blur: number }[] = [];
+    let path: { a0: number; a1: number } | null = null;
     const ctx: unknown = new Proxy({} as Record<string | symbol, unknown>, {
       get: (t, k) =>
         k in t
           ? t[k]
           : (...a: number[]) => {
               if (k === "arc") arcs.push({ x: a[0], y: a[1], r: a[2] });
-              if (k === "ellipse") ellipses += 1;
+              if (k === "ellipse") {
+                ellipses += 1;
+                path = { a0: a[5], a1: a[6] };
+              }
+              if (k === "lineTo") lineTos += 1;
+              if (k === "beginPath") path = null;
+              if (k === "stroke" && path) {
+                const m = /rgba\([^)]*,([\d.e-]+)\)$/.exec(String(t.strokeStyle));
+                strokes.push({ alpha: m ? Number(m[1]) : NaN, ...path, blur: Number(t.shadowBlur ?? 0) });
+              }
               return ctx;
             },
       set: (t, k, v) => {
@@ -459,11 +473,13 @@ describe("(#2961) REST's seconds hand", () => {
       frames.delete(id);
       arcs.length = 0;
       ellipses = 0;
+      lineTos = 0;
+      strokes = [];
       act(() => cb(wallMs));
     };
     // The hand's head: the dot of radius max(1.6, R * 0.045), R = 80.
     const head = () => arcs.find((a) => Math.abs(a.r - 3.6) < 1e-9) ?? null;
-    return { step, head, arcs, ellipses: () => ellipses };
+    return { step, head, arcs, ellipses: () => ellipses, lineTos: () => lineTos, strokes: () => strokes };
   }
 
   const END = 1_000_000;
@@ -492,8 +508,64 @@ describe("(#2961) REST's seconds hand", () => {
     expect(q.x).toBeGreaterThan(100);
     expect(q.y).toBeCloseTo(100, 6);
     expect(num(container)?.textContent).toBe("5s");
-    // The trail is drawn (the comet's ellipse strokes).
-    expect(h.ellipses()).toBeGreaterThan(30);
+  });
+
+  // (#2961, design B) The dot draws the circle; the breathing ring is gone.
+  it("during a countdown there is no breathing ring: only the drawn circle, from 12 to the dot, dimmer by age", () => {
+    const h = harness(false);
+    // 5.5 s left at wall 0.
+    render(<TokenScope tokensPerSec={0} size="tile" state="rest" centerLabel="6s" centerUnit="resting" restEndMs={END} clockMs={END - 5_500} clockRate={1} />);
+    for (const t of [100, 200, 300, 400]) h.step(t);
+    // Wall 750: 4.75 s left, a quarter of the circle drawn.
+    h.step(750);
+    // The breathing ring is a 240-point polyline; none of it is drawn.
+    expect(h.lineTos()).toBe(0);
+    const segs = h.strokes().filter((x) => x.blur === 0);
+    const glow = h.strokes().filter((x) => x.blur > 0);
+    // One soft glow stroke, never a blur per segment.
+    expect(glow).toHaveLength(1);
+    // The segments cover 12 o'clock to the dot: a quarter turn.
+    expect(segs[0].a0).toBeCloseTo(-Math.PI / 2, 9);
+    expect(segs[segs.length - 1].a1).toBeCloseTo(-Math.PI / 2 + Math.PI / 2 + 0.004, 9);
+    // Dimmer by age: oldest (at 12) about 0.95 * (1 - 0.75 * 0.25), newest about 0.95.
+    expect(segs[0].alpha).toBeCloseTo(0.95 * (1 - 0.75 * 0.25), 1);
+    expect(segs[segs.length - 1].alpha).toBeCloseTo(0.95, 1);
+    for (let i = 1; i < segs.length; i++) expect(segs[i].alpha).toBeGreaterThan(segs[i - 1].alpha);
+  });
+
+  it("at a tick the finished circle (with its age gradient) fades out over ~220 ms while the next one starts", () => {
+    const h = harness(false);
+    // 5.5 s left at wall 0: ticks at 500 and 1500.
+    render(<TokenScope tokensPerSec={0} size="tile" state="rest" centerLabel="6s" centerUnit="resting" restEndMs={END} clockMs={END - 5_500} clockRate={1} />);
+    for (let t = 100; t <= 1400; t += 100) h.step(t);
+    // 100 ms before the second tick: 0.9 of the circle (ceil(0.9 * 96) = 87
+    // segments), and no fading one.
+    expect(h.strokes().filter((x) => x.blur === 0)).toHaveLength(87);
+    h.step(1500 + 22);
+    // 22 ms after the tick: the full circle (96 segments) at ~90%, plus the
+    // new second's stroke (a few segments).
+    const at = h.strokes().filter((x) => x.blur === 0);
+    const closed = at.slice(0, 96);
+    expect(closed[0].a0).toBeCloseTo(-Math.PI / 2, 9);
+    expect(closed[95].a1).toBeCloseTo(-Math.PI / 2 + 2 * Math.PI + 0.004, 9);
+    const k = 1 - 22 / 220;
+    expect(closed[95].alpha).toBeCloseTo(0.95 * k, 1);
+    expect(closed[0].alpha).toBeCloseTo(0.95 * 0.25 * k, 1);
+    expect(at.length).toBeGreaterThan(96);
+    // 250 ms after the tick the finished circle is gone.
+    h.step(1750);
+    expect(h.strokes().filter((x) => x.blur === 0).length).toBeLessThan(40);
+  });
+
+  it("the rest's first second has no fading circle and no tick glow (there was no circle before it)", () => {
+    const h = harness(false);
+    // Mount 10 ms after a whole second: a tick-aligned moment, but the first.
+    render(<TokenScope tokensPerSec={0} size="tile" state="rest" centerLabel="5s" centerUnit="resting" restEndMs={END} clockMs={END - 4_990} clockRate={1} />);
+    h.step(0);
+    h.step(10);
+    expect(h.strokes().filter((x) => x.blur === 0).length).toBeLessThan(10);
+    // No radial glow at 12: the only full-radius arcs are the dot.
+    expect(h.arcs.filter((a) => Math.abs(a.r - 80 * 0.22) < 1e-9)).toHaveLength(0);
   });
 
   it("follows the page clock's rate: at 5s/s a tick every 200 ms of wall time", () => {
@@ -533,7 +605,7 @@ describe("(#2961) REST's seconds hand", () => {
     expect(num(container)?.textContent).toBe("2s");
   });
 
-  it("reduced motion: one still frame, the hand at the top, no trail or flare; the number is the caller's", () => {
+  it("reduced motion: one still frame, the dot at 12, no ring, stroke, glow or flare; the number is the caller's", () => {
     const h = harness(true);
     const { container, rerender } = render(
       <TokenScope tokensPerSec={0} size="tile" state="rest" centerLabel="7s" centerUnit="resting" restEndMs={END} clockMs={END - 6_750} clockRate={1} />,
@@ -542,6 +614,7 @@ describe("(#2961) REST's seconds hand", () => {
     expect(top.x).toBeCloseTo(100, 6);
     expect(top.y).toBeLessThan(100);
     expect(h.ellipses()).toBe(0);
+    expect(h.lineTos()).toBe(0);
     expect(num(container)?.textContent).toBe("7s");
     rerender(<TokenScope tokensPerSec={0} size="tile" state="rest" centerLabel="6s" centerUnit="resting" restEndMs={END} clockMs={END - 5_750} clockRate={1} />);
     expect(num(container)?.textContent).toBe("6s");
@@ -555,5 +628,8 @@ describe("(#2961) REST's seconds hand", () => {
     expect(num(container)?.textContent).toBe("3s");
     expect(h.head()).toBeNull();
     expect(h.ellipses()).toBe(0);
+    // The breathing ring is still there, with its small drifting dot.
+    expect(h.lineTos()).toBeGreaterThanOrEqual(240);
+    expect(h.arcs.some((a) => Math.abs(a.r - 80 * 0.03) < 1e-9)).toBe(true);
   });
 });
