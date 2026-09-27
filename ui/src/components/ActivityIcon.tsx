@@ -51,7 +51,7 @@ const GLYPH: Record<IconKey, React.ReactNode> = {
       <path d="M6 7v4a4 4 0 0 0 4 4h6M6 17V7" />
     </>
   ),
-  // Speech bubble — an orchestrator note.
+  // Speech bubble — a `flow note` record.
   note: <path d="M20 15a2 2 0 0 1-2 2H8l-4 4V6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2z" />,
   // Pulse — telemetry (host / lms / runtime / tokens / detector).
   pulse: <path d="M3 12h4l2-6 4 12 2-6h6" />,

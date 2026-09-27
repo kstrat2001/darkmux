@@ -20,58 +20,20 @@ async function boot(page) {
 
 const openCount = (page) =>
   page.evaluate(() =>
-    ['modalbg', 'nmodalbg', 'imodalbg'].filter((id) => {
+    ['modalbg', 'imodalbg'].filter((id) => {
       const m = document.getElementById(id);
       return m && m.style.display !== 'none' && m.style.display !== '';
     })
   );
 
-// (#1640, resolution) The port gap this comment block originally documented
-// is closed — `ui/src/lib/dialogManager.ts` + `ui/src/components/Dialog.tsx`
-// (+ `FiltersDialog.tsx`/`NotesDialog.tsx`/`AboutDialog.tsx`) now implement
-// exactly the machinery described below (`openModalEl`/`closeOpenModal`/
-// `restoreModalFocus`/`MODAL_IDS`, Tab-trap, single-Escape-closes-topmost,
-// focus-restore), and all four tests below are un-fixme'd and passing
-// against the real dialogs. The paragraph is kept verbatim below as the
-// historical record of what the fixme'd state looked like and why these
-// tests are shaped the way they are — including one deliberate, documented
-// deviation: `openModalEl` is exposed as `window.openModalEl` (see
-// `dialogManager.ts`'s own module doc) specifically so the third test's
-// approach — described two paragraphs down — still works, even though this
-// port otherwise avoids page globals by design.
-//
-// (port gap, as originally reported — kept verbatim below)
-// All four tests in this file exercise the shared modal focus-trap/
-// Escape/restore-focus machinery legacy built around `#modalbg`/
-// `#nmodalbg`/`#imodalbg` (`openModalEl`/`closeOpenModal`/`restoreModalFocus`,
-// `MODAL_IDS`) — and the port has not built ANY of the three dialogs those
-// tests need to open. Confirmed directly against the source, not inferred:
-//
-// - The full checkbox-per-facet FILTERS modal (`#modalbg`) is a named,
-//   deliberate cut — `EventLogColumn.tsx`'s own module doc: "The filter
-//   MODAL is a named, deliberate cut, not a half-build. `.fbtn` here
-//   toggles the quick filter directly instead of opening a modal with
-//   checkboxes." There is no `[data-act="filters"]` element in the port at
-//   all.
-// - The notes-history modal (`#nmodalbg`) and the about/build-info modal
-//   (`#imodalbg`) are both named follow-ups too — `Masthead.tsx`'s own
-//   module doc: "Deliberately NOT wired to an about-modal... Named here as
-//   a follow-up rather than half-wiring a modal with no content behind
-//   it," and the hybrid-note's "history →" is "a plain marker... Restore
-//   the link when the modal lands."
-// - `openModalEl`/`state`/every legacy global these tests call directly
-//   (test 3) don't exist on any page the port serves — React holds this
-//   state internally, not on `window`.
-//
-// This is real, substantial, security/accessibility-relevant work still to
-// do before `viewer.html` can be deleted without a coverage loss: the
-// managed-focus behavior this file's own header names (Tab-trap, Shift+Tab
-// wrap, single-Escape-closes-topmost, focus-restore-on-close) has NO
-// equivalent anywhere in the port today because there is no modal for it
-// to apply to. Kept here verbatim (fixme, not deleted) as the tracked
-// record of what a dialog implementation needs to satisfy once one exists
-// — these tests double as an executable spec for THAT future work, not
-// just a regression gate for behavior already shipped.
+// (#1640) These tests exercise the shared modal machinery in
+// `ui/src/lib/dialogManager.ts` + `ui/src/components/Dialog.tsx`
+// (`openModalEl`/`closeOpenModal`/`restoreModalFocus`/`MODAL_IDS`, Tab-trap,
+// single-Escape-closes-topmost, focus-restore) against the real Filters
+// (`#modalbg`) and machine-info (`#imodalbg`) dialogs. `openModalEl` is
+// exposed as `window.openModalEl` (see `dialogManager.ts`'s own module doc)
+// so the third test can open a second dialog while the first is open; the port
+// otherwise avoids page globals by design.
 
 test('Tab cannot walk out of an open dialog', async ({ page }) => {
   // The overlays are opaque `position:fixed;inset:0`, but nothing kept focus

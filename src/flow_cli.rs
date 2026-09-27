@@ -9,7 +9,9 @@ use clap::Subcommand;
 /// Top-level `flow` subcommand enum.
 #[derive(Subcommand)]
 pub enum FlowCmd {
-    /// Record an operator-narrative observation.
+    /// Record an operator-narrative observation. With `--session-id <sid>
+    /// --source adjudication` it records a reviewer correction against a
+    /// dispatch, which later coder briefs in that mission carry (#849).
     Note {
         #[arg(long)]
         text: String,

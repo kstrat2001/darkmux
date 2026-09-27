@@ -6367,7 +6367,7 @@ fn integrity_check_never_claims_exit_zero_on_a_run_that_exits_nonzero() {
         std::fs::create_dir_all(&staging).unwrap();
         darkmux_cmd()
             .env("DARKMUX_AUDIT_DIR", &staging)
-            .args(["flow", "note", "--text", text, "--source", "orchestrator"])
+            .args(["flow", "note", "--text", text])
             .assert()
             .success();
         let produced = std::fs::read_dir(&staging)

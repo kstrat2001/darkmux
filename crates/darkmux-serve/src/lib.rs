@@ -4548,8 +4548,8 @@ fn read_flow_records_from_redis(
     // the fleet has been busy long enough (XLEN floats a little above the
     // cap — trimming is lazy), and an oldest-first `XRANGE - + COUNT N`
     // then silently DROPS the newest entries — the live view loses exactly
-    // the most recent records at exactly the busiest moment (found live:
-    // the operator's orchestrator note "not showing"). XREVRANGE makes
+    // the most recent records at exactly the busiest moment (found live: a
+    // just-written record "not showing"). XREVRANGE makes
     // cap-saturation cut the OLDEST entries instead, which the date filter
     // below mostly discards anyway. Entries are reversed after parsing so
     // callers still see chronological order.

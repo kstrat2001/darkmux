@@ -2104,7 +2104,6 @@ pub(crate) fn lab_context_window(role: Option<&str>, profile: Option<&str>, prof
 /// Bounded: the most-recent `ADJUDICATION_LOOKBACK_DAYS` day-files. Returned
 /// **newest-first** and NOT count-capped (#1011) — corrections are the highest-
 /// authority block, so the proportional budget keeps the freshest from the front.
-/// Mirrors `session_has_orchestrator_note`.
 ///
 /// (#1426) The SCAN itself now lives in `crew::corrections` — the single
 /// definition of "what a correction is", shared with `darkmux memory correction

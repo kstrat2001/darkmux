@@ -469,37 +469,6 @@ describe("FleetLens", () => {
     expect(container.querySelector('.fleetcov[data-state="runs-unreadable"]')).toBeNull();
   });
 
-  it("renders a real 'history →' link (#1640) when notes history exists, and it opens the notes dialog", async () => {
-    const today = todayUTC();
-    mockFleetFetch({
-      flowToday: [
-        { ts: `${today}T09:00:00.000Z`, action: "note", source: "orchestrator", handle: "shipped the thing" },
-        { ts: `${today}T10:00:00.000Z`, action: "note", source: "orchestrator", handle: "shipped another thing" },
-      ],
-    });
-    const { container } = renderFleetLens();
-    await waitFor(() => expect(screen.getByText(/shipped another thing/)).toBeInTheDocument());
-    const link = container.querySelector('[data-act="notes"]');
-    expect(link).toBeInTheDocument();
-    expect(link!.textContent).toMatch(/history/i);
-
-    expect(document.getElementById("nmodalbg")!.style.display).toBe("none");
-    fireEvent.click(link!);
-    expect(document.getElementById("nmodalbg")!.style.display).toBe("flex");
-    // Both notes render, newest first (`openNotes()`'s `.reverse()`).
-    const rows = document.querySelectorAll(".dialog__nrow");
-    expect(rows.length).toBe(2);
-    expect(rows[0].textContent).toContain("shipped another thing");
-    expect(rows[1].textContent).toContain("shipped the thing");
-  });
-
-  it("no history link when there are no orchestrator notes", async () => {
-    mockFleetFetch({});
-    const { container } = renderFleetLens();
-    await waitFor(() => expect(screen.getByText(/going hybrid takes nerve/i)).toBeInTheDocument());
-    expect(container.querySelector('[data-act="notes"]')).not.toBeInTheDocument();
-  });
-
   it("(#2068) the unattributed tile is ALWAYS in the hero, dimmed at zero, so a dispatch starting or finishing never re-flows the page", async () => {
     const today = todayUTC();
     mockFleetFetch({
@@ -803,7 +772,7 @@ describe("FleetLens", () => {
   it("the savings hero renders tokens-only — no currency symbol or rate figure, even with non-zero savings (#803 regression coverage, restored post-#1806)", async () => {
     // Legacy's equivalent coverage
     // (`savings_hero_breakdown_is_classed_and_currency_free`, a source-text
-    // scan of `viewer.html`'s `hybridNote`..`renderFleet` region) retired
+    // scan of `viewer.html`'s savings-hero..`renderFleet` region) retired
     // with that file. This exercises the RENDERED hero instead — a fixture
     // with real, non-zero local tokens, so the assertion isn't vacuously
     // true against an empty "0" hero.
@@ -2560,11 +2529,9 @@ describe("(#2911) a record stamped ahead of the viewer's clock", () => {
   const records = () => {
     const today = todayUTC();
     return [
-      { ts: `${today}T09:00:00.000Z`, action: "note", source: "orchestrator", handle: "the earlier note" },
       { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
       // FROZEN_NOW is 10:02; both of these are two minutes in its future.
       { ts: `${today}T10:04:00.000Z`, machine_uid: "u1", session_id: "s1", action: "dispatch.complete", payload: { total_tokens: 600 } },
-      { ts: `${today}T10:04:00.000Z`, action: "note", source: "orchestrator", handle: "the future-stamped note" },
     ];
   };
 
@@ -2574,16 +2541,13 @@ describe("(#2911) a record stamped ahead of the viewer's clock", () => {
     expect(Date.now()).toBeLessThan(Date.parse(`${todayUTC()}T10:04:00.000Z`));
     mockFleetFetch({ flowToday: records() });
     renderFleetLens();
-    await waitFor(() => expect(screen.getByText(/the earlier note/)).toBeInTheDocument());
-    expect(document.querySelector(".savings .savnum")?.textContent).toBe("0");
-    expect(screen.queryByText(/the future-stamped note/)).not.toBeInTheDocument();
+    await waitFor(() => expect(document.querySelector(".savings .savnum")?.textContent).toBe("0"));
     // The dispatch is running (its completion is still ahead), so the lens
     // ticks; 2m05s of ticks carry the clock past 10:04.
     act(() => {
       vi.advanceTimersByTime(125_000);
     });
     await waitFor(() => expect(document.querySelector(".savings .savnum")?.textContent).toBe("600"));
-    expect(screen.getByText(/the future-stamped note/)).toBeInTheDocument();
   });
 
   it("is excluded under a playhead before it", async () => {
@@ -2599,9 +2563,7 @@ describe("(#2911) a record stamped ahead of the viewer's clock", () => {
         />
       </QueryClientProvider>,
     );
-    await waitFor(() => expect(screen.getByText(/the earlier note/)).toBeInTheDocument());
-    expect(document.querySelector(".savings .savnum")?.textContent).toBe("0");
-    expect(screen.queryByText(/the future-stamped note/)).not.toBeInTheDocument();
+    await waitFor(() => expect(document.querySelector(".savings .savnum")?.textContent).toBe("0"));
   });
 
   it("with nothing ahead of now, a tick hands the hero the window itself: no filter, no token recompute", async () => {
@@ -2635,7 +2597,7 @@ describe("(#2911) a record stamped ahead of the viewer's clock", () => {
     vi.setSystemTime(new Date(FROZEN_NOW));
     mockFleetFetch({ flowToday: records() });
     renderFleetLens();
-    await waitFor(() => expect(screen.getByText(/the earlier note/)).toBeInTheDocument());
+    await waitFor(() => expect(document.querySelector(".savings .savnum")?.textContent).toBe("0"));
     const filters = __asOfFilterRuns();
     const calls = vi.mocked(tokensOffMeter).mock.calls.length;
     for (let i = 0; i < 3; i++) {

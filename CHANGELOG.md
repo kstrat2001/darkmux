@@ -16,6 +16,18 @@ darkmux release.
 
 ### Removed (breaking, 4.0)
 
+- **The fleet page's orchestrator note** (#2983): the "Orchestrator note:"
+  line under the token panel, its `history →` list, and the stock sentence
+  it showed when no note existed. The panel is one line shorter; nothing
+  else on the page changed size. **Migration:** the fleet page no longer shows an
+  orchestrator note; `darkmux flow note --source orchestrator` is no longer
+  rendered anywhere. The verb still writes the record, old note records in
+  flow archives still read, and `--session-id <sid> --source adjudication`
+  notes keep feeding coder briefs, `darkmux memory correction list`, and
+  `mission debrief` unchanged.
+  A non-note record tagged `--source orchestrator` (a `flow catch`, say) now
+  files under its own action in the event log, not under "note".
+
 - **`radio.router_profile`, `DARKMUX_RADIO_ROUTER_PROFILE`, and the
   `role_profiles.radio-router` binding** (#2914). The radio routing seat
   now runs on the machine's one utility model (below), so there is no
