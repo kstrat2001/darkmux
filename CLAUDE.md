@@ -414,9 +414,9 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    `config set --help`) lists the valid values with their meanings. `--skip-preflight` does not
    waive it: that flag skips a Docker probe, and a bad config value is not a probe result.
 
-   Retired spellings are refused too, naming the replacement ("`enforce` was renamed to `cut`
+   Retired spellings are refused too, naming the replacement ("`enforce` was renamed to `conclude`
    in 4.0"): a rename never reads the old word as the new one. Policy values name the action
-   (`off` / `record` / `warn` / the rule's own verb, e.g. `cut`), never `enforce`/`observe`.
+   (`off` / `record` / `warn` / the rule's own verb, e.g. `conclude`), never `enforce`/`observe`.
 
    The mechanism is two declarations in `darkmux-types/src/config_enum.rs`, and everything else
    derives from them with no per-setting code: a `ConfigEnum` (implemented with `config_enum!`,

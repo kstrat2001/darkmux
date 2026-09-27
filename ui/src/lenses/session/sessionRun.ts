@@ -1752,14 +1752,14 @@ export function runRegions(
     const citation = acc.sawGate ? "#2836" : "#1221";
     const timesClause = acc.gateAbortCount > 1 ? ` ${acc.gateAbortCount}×` : "";
     // (#2947) Policy values name the action: `record` (silent measure) and
-    // `warn` (surfaced, not cut). `observe` is the pre-4.0 spelling of
+    // `warn` (surfaced, not concluded). `observe` is the pre-4.0 spelling of
     // `record`; archived runs still carry it, so both read the same.
     const detail = acc.acted
       ? `turn ${acc.turnSeq}: judged repeating${ratioClause} and ended it${timesClause} (${citation})`
       : effectivePolicy === "record" || effectivePolicy === "observe"
-        ? `turn ${acc.turnSeq}: judged repeating${ratioClause} — recorded, not cut (#2846)`
+        ? `turn ${acc.turnSeq}: judged repeating${ratioClause} — recorded, not concluded (#2846)`
         : effectivePolicy === "warn"
-          ? `turn ${acc.turnSeq}: judged repeating${ratioClause} — warned, not cut (#2947)`
+          ? `turn ${acc.turnSeq}: judged repeating${ratioClause} — warned, not concluded (#2947)`
           : `turn ${acc.turnSeq}: judged repeating${ratioClause} (${citation})`;
     finds.push({
       kind: "repetition",

@@ -291,12 +291,12 @@ use std::path::Path;
 //           channel, exactly as before.
 //   1.31 (#2947, darkmux 4.0): VALUE change, no field change.
 //           `runtime.detection.degeneracy.policy` values now name the
-//           action: `off` / `record` / `warn` / `cut` (was `off` / `observe`
-//           / `enforce`). `init` writes `cut`. Bumped although no field
-//           changed, because a config written by `init` at 1.30 or earlier
+//           action: `off` / `record` / `warn` / `conclude` (was `off` /
+//           `observe` / `enforce`). `init` writes `conclude`. Bumped although
+//           no field changed, because a config written by `init` at 1.30 or earlier
 //           carries `"policy": "enforce"`, which this binary REFUSES (the
 //           retired spelling is refused with its replacement named, never
-//           read as `cut`): the file still loads (lenient read), but every
+//           read as `conclude`): the file still loads (lenient read), but every
 //           dispatch, mission launch and lab run refuses until the value is
 //           changed, and `darkmux doctor` prints the exact `config set`.
 //           Also added under the same rule: `hooks.rules[].match.level` /
@@ -308,6 +308,9 @@ use std::path::Path;
 //           rule (`config_enum`): still read leniently as strings, but an
 //           unregistered value is refused where it is consumed and reported
 //           as Fail by `darkmux doctor`, never resolved to a fallback.
+//           (The acting value was briefly spelled `cut` on the #2947
+//           branch and renamed to `conclude` before anything shipped, so
+//           `cut` is not a retired spelling.)
 pub const CONFIG_SCHEMA_VERSION: &str = "1.31";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
@@ -790,7 +793,9 @@ pub struct RuntimeBehaviorConfig {
 /// reported against the raw string instead of taking the document with it.
 ///
 /// (#2947, operator 2026-09-27) The values NAME THE ACTION: `off`, `record`,
-/// `warn`, and the rule's own verb (`cut` for the degeneracy detector).
+/// `warn`, and the rule's own verb (`conclude` for the degeneracy
+/// detector: it closes the model's thought so it answers from what it has,
+/// and escalates if the output keeps repeating; nothing is discarded).
 /// `enforce` and `observe` are retired in 4.0: `enforce` hid different
 /// actions per rule, and `observe` read like "warns" when it only recorded.
 /// Both are refused with the new word (`config_enum!`'s `retired` list).
@@ -798,7 +803,7 @@ pub struct RuntimeBehaviorConfig {
 pub enum DetectionPolicy {
     /// Do not run the detector at all. Zero CPU, measures nothing.
     Off,
-    /// Detect and RECORD, silently, what a cut would have done; never act
+    /// Detect and RECORD, silently, what concluding would have done; never act
     /// and never warn. The setting that makes a controlled comparison
     /// possible: the check-in cadence, the per-call token cap and therefore
     /// the usable prompt budget are all unchanged, so the only variable is
@@ -807,12 +812,13 @@ pub enum DetectionPolicy {
     /// Detect, and on a finding SURFACE a warning (a stderr line for the
     /// dispatch, a `dispatch.degeneracy.warning` flow record the viewer
     /// shows, and the run envelope's `degeneracy_warnings`), without
-    /// cutting anything.
+    /// concluding anything.
     Warn,
-    /// Detect and cut the repeating output. The shipped behavior,
-    /// unchanged. (Was `enforce`.)
+    /// Detect, and on repeating output conclude: close the model's thought
+    /// so it answers from what it has, escalating if it keeps repeating.
+    /// The shipped behavior, unchanged. (Was `enforce`.)
     #[default]
-    Cut,
+    Conclude,
 }
 
 impl DetectionPolicy {
@@ -822,7 +828,7 @@ impl DetectionPolicy {
     }
     /// Whether a finding may change what the dispatch does.
     pub fn acts(self) -> bool {
-        matches!(self, DetectionPolicy::Cut)
+        matches!(self, DetectionPolicy::Conclude)
     }
     /// Whether a finding is surfaced as a warning without acting.
     pub fn warns(self) -> bool {
@@ -840,11 +846,11 @@ impl DetectionPolicy {
 // default: see `config_enum`'s module doc for the rule.
 crate::config_enum!(DetectionPolicy, "detection policy", [
     Off = "off" => "the detector does not run (zero CPU, measures nothing)",
-    Record = "record" => "measure and record what a cut would have done, silently; never act",
-    Warn = "warn" => "measure; on a finding surface a warning (stderr, flow record, envelope); never cut",
-    Cut = "cut" => "measure and cut the repeating output (the shipped behavior)",
+    Record = "record" => "measure and record what concluding would have done, silently; never act",
+    Warn = "warn" => "measure; on a finding surface a warning (stderr, flow record, envelope); never conclude",
+    Conclude = "conclude" => "measure; on repeating output close the thought so the model answers, escalating if it keeps repeating (the shipped behavior)",
 ], retired: [
-    "enforce" => Cut,
+    "enforce" => Conclude,
     "observe" => Record,
 ]);
 
@@ -1811,7 +1817,7 @@ impl DarkmuxConfig {
                 // `thermal`: the operator tunes the file, not the source.
                 detection: Some(DetectionConfig {
                     degeneracy: Some(DetectorConfig {
-                        policy: Some(DetectionPolicy::Cut.as_str().to_string()),
+                        policy: Some(DetectionPolicy::Conclude.as_str().to_string()),
                         extras: Default::default(),
                     }),
                     extras: Default::default(),

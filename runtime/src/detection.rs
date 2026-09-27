@@ -13,7 +13,7 @@
 ///
 /// (#2947) The values name the action, and match the host's
 /// `darkmux_types::config::DetectionPolicy` token for token: `off`,
-/// `record`, `warn`, `cut`. `enforce`/`observe` are retired in 4.0.
+/// `record`, `warn`, `conclude`. `enforce`/`observe` are retired in 4.0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetectionPolicy {
     /// Do not run the detector at all. Cheapest, and measures nothing.
@@ -34,8 +34,9 @@ pub enum DetectionPolicy {
     /// `dispatch.degeneracy.warning` flow record, the envelope's count),
     /// keyed on this token in the trajectory's `policy` field.
     Warn,
-    /// Detect and cut. The shipped behavior.
-    Cut,
+    /// Detect and conclude: close the model's thought so it answers from
+    /// what it has, escalating if it keeps repeating. The shipped behavior.
+    Conclude,
 }
 
 impl DetectionPolicy {
@@ -45,14 +46,14 @@ impl DetectionPolicy {
     }
     /// Whether a finding may change what the dispatch does.
     pub fn acts(self) -> bool {
-        matches!(self, DetectionPolicy::Cut)
+        matches!(self, DetectionPolicy::Conclude)
     }
     pub fn as_str(self) -> &'static str {
         match self {
             DetectionPolicy::Off => "off",
             DetectionPolicy::Record => "record",
             DetectionPolicy::Warn => "warn",
-            DetectionPolicy::Cut => "cut",
+            DetectionPolicy::Conclude => "conclude",
         }
     }
     /// Exact parse of the token the host forwards. `None` for anything
@@ -62,7 +63,7 @@ impl DetectionPolicy {
             "off" => Some(DetectionPolicy::Off),
             "record" => Some(DetectionPolicy::Record),
             "warn" => Some(DetectionPolicy::Warn),
-            "cut" => Some(DetectionPolicy::Cut),
+            "conclude" => Some(DetectionPolicy::Conclude),
             _ => None,
         }
     }
@@ -77,10 +78,10 @@ impl DetectionPolicy {
 /// unknown or retired value at preflight before any container starts. The
 /// runtime image is version-checked against the host (#2923), so the two
 /// vocabularies cannot disagree in a real dispatch. An absent variable (the
-/// runtime run by hand, outside darkmux) reads as the shipped `cut`, the
+/// runtime run by hand, outside darkmux) reads as the shipped `conclude`, the
 /// same value the host would have forwarded by default. An UNRECOGNIZED
 /// token is a host/runtime mismatch that should be impossible; it reads as
-/// `cut` (the armed direction) and says so on stderr every time, rather
+/// `conclude` (the armed direction) and says so on stderr every time, rather
 /// than silently.
 ///
 /// Read per call rather than cached so a test's `set_var` takes effect,
@@ -88,15 +89,15 @@ impl DetectionPolicy {
 /// behave in this crate.
 pub fn degeneracy_policy() -> DetectionPolicy {
     match std::env::var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY") {
-        Err(_) => DetectionPolicy::Cut,
+        Err(_) => DetectionPolicy::Conclude,
         Ok(raw) => DetectionPolicy::parse(&raw).unwrap_or_else(|| {
             eprintln!(
                 "darkmux-runtime: DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=`{raw}` is not a \
-                 policy this runtime knows (off, record, warn, cut); running as `cut`. The host \
+                 policy this runtime knows (off, record, warn, conclude); running as `conclude`. The host \
                  refuses such a value at preflight, so this runtime and its host are \
                  mismatched versions (#2947)."
             );
-            DetectionPolicy::Cut
+            DetectionPolicy::Conclude
         }),
     }
 }
@@ -107,7 +108,7 @@ mod tests {
 
     #[test]
     fn policies_split_measuring_from_acting() {
-        assert!(DetectionPolicy::Cut.measures() && DetectionPolicy::Cut.acts());
+        assert!(DetectionPolicy::Conclude.measures() && DetectionPolicy::Conclude.acts());
         // `record` and `warn` both measure and never act; the host tells
         // them apart (warn surfaces each finding).
         assert!(DetectionPolicy::Record.measures() && !DetectionPolicy::Record.acts());
@@ -119,7 +120,7 @@ mod tests {
     /// round-trips, and the retired spellings are not tokens.
     #[test]
     fn the_runtime_parses_exactly_the_host_vocabulary() {
-        for p in [DetectionPolicy::Off, DetectionPolicy::Record, DetectionPolicy::Warn, DetectionPolicy::Cut] {
+        for p in [DetectionPolicy::Off, DetectionPolicy::Record, DetectionPolicy::Warn, DetectionPolicy::Conclude] {
             assert_eq!(DetectionPolicy::parse(p.as_str()), Some(p));
         }
         assert_eq!(DetectionPolicy::parse("enforce"), None);

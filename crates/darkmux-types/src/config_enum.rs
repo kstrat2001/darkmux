@@ -570,7 +570,7 @@ pub static ENUM_SETTINGS: &[EnumSetting] = &[
     EnumSetting::of::<crate::config::DetectionPolicy>(
         "runtime.detection.degeneracy.policy",
         Some("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY"),
-        "cut",
+        "conclude",
         DISPATCHING,
         read_detection_degeneracy_policy,
     ),
@@ -787,12 +787,12 @@ mod tests {
     /// The degeneracy policy's rename, stated as the operator decided it.
     #[test]
     fn the_detection_policy_vocabulary_names_the_action() {
-        assert_eq!(DetectionPolicy::TOKENS, &["off", "record", "warn", "cut"]);
-        assert_eq!(DetectionPolicy::RETIRED, &[("enforce", "cut"), ("observe", "record")]);
-        assert_eq!(DetectionPolicy::default(), DetectionPolicy::Cut);
+        assert_eq!(DetectionPolicy::TOKENS, &["off", "record", "warn", "conclude"]);
+        assert_eq!(DetectionPolicy::RETIRED, &[("enforce", "conclude"), ("observe", "record")]);
+        assert_eq!(DetectionPolicy::default(), DetectionPolicy::Conclude);
         let s = setting("runtime.detection.degeneracy.policy").unwrap();
-        assert_eq!(s.shipped, Some("cut"));
-        assert!(DetectionPolicy::Cut.measures() && DetectionPolicy::Cut.acts() && !DetectionPolicy::Cut.warns());
+        assert_eq!(s.shipped, Some("conclude"));
+        assert!(DetectionPolicy::Conclude.measures() && DetectionPolicy::Conclude.acts() && !DetectionPolicy::Conclude.warns());
         assert!(DetectionPolicy::Warn.measures() && !DetectionPolicy::Warn.acts() && DetectionPolicy::Warn.warns());
         assert!(DetectionPolicy::Record.measures() && !DetectionPolicy::Record.acts() && !DetectionPolicy::Record.warns());
         assert!(!DetectionPolicy::Off.measures() && !DetectionPolicy::Off.acts() && !DetectionPolicy::Off.warns());

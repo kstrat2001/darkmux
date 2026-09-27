@@ -9072,7 +9072,7 @@ mod tests {
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .find(|v| v["type"] == "dispatch.gate.observation" && v["degenerate"] == true)
             .expect("a degenerate observation record must exist");
-        assert_eq!(observation["policy"], "cut", "got {observation}");
+        assert_eq!(observation["policy"], "conclude", "got {observation}");
         assert_eq!(
             observation["acted"], true,
             "the degenerate observation that led to the abort must say it \
@@ -9084,7 +9084,7 @@ mod tests {
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .find(|v| v["type"] == "dispatch.gate.abort")
             .expect("the stream gate itself must have aborted the call");
-        assert_eq!(abort["policy"], "cut", "got {abort}");
+        assert_eq!(abort["policy"], "conclude", "got {abort}");
         assert_eq!(abort["acted"], true, "got {abort}");
     }
 

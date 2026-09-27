@@ -45,7 +45,7 @@
     },
     "detection": {
       "degeneracy": {
-        "policy": "cut"
+        "policy": "conclude"
       }
     },
     "liveness_retention_hours": 168

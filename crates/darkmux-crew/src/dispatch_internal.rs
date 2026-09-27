@@ -6873,8 +6873,8 @@ pub(crate) struct DegeneracyWarning {
 /// RUNTIME stamps with the policy it actually ran under, never the host's
 /// current env), and only for a finding: a checkpoint whose judge
 /// `would_conclude`, or a stream-gate observation judged `degenerate`.
-/// `record` and `cut` produce none here: `record` is silent by design, and
-/// `cut` already surfaces the cut itself.
+/// `record` and `conclude` produce none here: `record` is silent by design,
+/// and `conclude` already surfaces the conclusion itself.
 pub(crate) fn degeneracy_warning(event_type: &str, event: &serde_json::Value) -> Option<DegeneracyWarning> {
     if event.get("policy").and_then(|v| v.as_str()) != Some("warn") {
         return None;
@@ -6892,8 +6892,8 @@ pub(crate) fn degeneracy_warning(event_type: &str, event: &serde_json::Value) ->
     let ratio_text = ratio.map(|r| format!(" (tail_ratio={r:.3})")).unwrap_or_default();
     Some(DegeneracyWarning {
         line: format!(
-            "darkmux dispatch: warning: turn {turn}: the output is repeating{ratio_text}; not cut \
-             (runtime.detection.degeneracy.policy = warn). Set it to `cut` to end repeating output."
+            "darkmux dispatch: warning: turn {turn}: the output is repeating{ratio_text}; not concluded \
+             (runtime.detection.degeneracy.policy = warn). Set it to `conclude` to close a repeating thought."
         ),
         payload: serde_json::json!({
             "turn_seq": turn,
@@ -7200,7 +7200,7 @@ struct TrajectorySummary {
     checkpoints: u32,
     checkpoints_concluded: u32,
     /// (#2947) Findings the degeneracy detector surfaced as warnings under
-    /// the `warn` policy (it measured, found repetition, and did not cut).
+    /// the `warn` policy (it measured, found repetition, and did not conclude).
     degeneracy_warnings: u32,
     /// (#1959) The WORST and the MEAN novelty ratio across the run's
     /// checkpoints, replacing the LAST one.
@@ -11308,9 +11308,9 @@ fn detector_telemetry_payload(
             let detail = if acted {
                 format!("{base} and ended the call")
             } else if matches!(policy, Some("record") | Some("observe")) {
-                format!("{base} — recorded, not cut")
+                format!("{base} — recorded, not concluded")
             } else if policy == Some("warn") {
-                format!("{base} — warned, not cut")
+                format!("{base} — warned, not concluded")
             } else {
                 base
             };

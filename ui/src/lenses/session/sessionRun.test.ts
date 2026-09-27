@@ -1605,7 +1605,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // (#2887) Companion to the above: under `observe` policy the record still
   // flags (never CLEAN) but its wording says so was NOT enforced — the
   // operator-visible distinction the issue asks for.
-  it("(#2887) an observe-policy gate finding reads 'recorded, not cut', never CLEAN", () => {
+  it("(#2887) an observe-policy gate finding reads 'recorded, not concluded', never CLEAN", () => {
     const data: FlowRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
@@ -1631,7 +1631,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.signalGroups.find((g) => g.kind === "repetition")).toBeDefined();
     const sig = view.signalGroups.find((g) => g.kind === "repetition")!.signals[0];
     // (#2947) An archived pre-4.0 `observe` run reads as `record`.
-    expect(sig.detail).toMatch(/recorded, not cut/);
+    expect(sig.detail).toMatch(/recorded, not concluded/);
   });
 
   // (#2887) A reasoning checkpoint that WOULD have concluded under an
@@ -1660,13 +1660,13 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     const view = runRegions(flowToRenderModel(data), "s1");
     const group = view.signalGroups.find((g) => g.kind === "repetition");
     expect(group).toBeDefined();
-    expect(group!.signals[0].detail).toMatch(/recorded, not cut/);
+    expect(group!.signals[0].detail).toMatch(/recorded, not concluded/);
   });
 
-  // (#2947) The 4.0 vocabulary: `record` reads "recorded, not cut" and
-  // `warn` reads "warned, not cut" — never CLEAN, never "ended it".
+  // (#2947) The 4.0 vocabulary: `record` reads "recorded, not concluded" and
+  // `warn` reads "warned, not concluded" — never CLEAN, never "ended it".
   it("(#2947) record and warn policy checkpoints flag, worded by what the policy did", () => {
-    for (const [policy, want] of [["record", /recorded, not cut/], ["warn", /warned, not cut/]] as const) {
+    for (const [policy, want] of [["record", /recorded, not concluded/], ["warn", /warned, not concluded/]] as const) {
       const data: FlowRecord[] = [
         { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
         {
@@ -1718,7 +1718,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     const group = view.signalGroups.find((g) => g.kind === "repetition");
     expect(group).toBeDefined();
     expect(group!.signals[0].detail).toMatch(/ended it/);
-    expect(group!.signals[0].detail).not.toMatch(/not cut/);
+    expect(group!.signals[0].detail).not.toMatch(/not concluded/);
   });
 
   // (#2887) A checkpoint that never judged the turn repetitive at all
@@ -1855,7 +1855,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     const view = runRegions(flowToRenderModel(data), "s1");
     const group = view.signalGroups.find((g) => g.kind === "repetition");
     expect(group).toBeDefined();
-    expect(group!.signals[0].detail).toMatch(/recorded, not cut/);
+    expect(group!.signals[0].detail).toMatch(/recorded, not concluded/);
   });
 
   // (#2887 F4, fixed per a fresh reviewer's N1, gate fields fixed per F2)

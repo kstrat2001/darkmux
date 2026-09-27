@@ -85,10 +85,12 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.63.0";
 //           VALUES: the `policy` string on `dispatch.checkpoint`,
 //           `dispatch.gate.observation` / `.abort` records and on
 //           `dispatch.start`'s `bounds.detection_degeneracy_policy.value` is
-//           now `off` / `record` / `warn` / `cut`. `enforce` is now `cut`
+//           now `off` / `record` / `warn` / `conclude`. `enforce` is now `conclude`
 //           and `observe` is now `record`; records written before this
 //           version carry the old spellings, and consumers read BOTH (the
-//           archive is append-only and is never rewritten). The bounds
+//           archive is append-only and is never rewritten). The acting
+//           value was spelled `cut` on the #2947 branch before it shipped;
+//           no record carries `cut`. The bounds
 //           `source` is `env` / `config` / `built-in`; the `*-invalid`
 //           sources are gone (an invalid value refuses at preflight now).
 //

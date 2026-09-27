@@ -189,8 +189,8 @@ pub struct CheckpointGate {
     /// The detection policy in force: what the checkpoint records say ran,
     /// or, when the run made none (a clean run, or any run under `off`), what
     /// `dispatch start.bounds` says the host resolved. Without the fallback a
-    /// healthy `cut` run and an `off` run read identically. The string is
-    /// passed through as recorded: `off`/`record`/`warn`/`cut`, or
+    /// healthy `conclude` run and an `off` run read identically. The string is
+    /// passed through as recorded: `off`/`record`/`warn`/`conclude`, or
     /// `enforce`/`observe` in a run recorded before 4.0 (#2947).
     pub policy: Option<String>,
 }

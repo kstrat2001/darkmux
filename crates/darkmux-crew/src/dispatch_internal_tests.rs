@@ -4449,7 +4449,7 @@
             // (#2094) Nonzero here so the complete-vector assertion below
             // pins the forwarded `-e DARKMUX_TURN_DELAY_MS=<n>` pair too.
             turn_delay_ms: 3000,
-            detection_policy: darkmux_types::config::DetectionPolicy::Cut,
+            detection_policy: darkmux_types::config::DetectionPolicy::Conclude,
             // (#2094 finding 1) A distinct, non-default value so the
             // complete-vector assertion below pins the forwarded
             // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<n>` pair too.
@@ -4546,7 +4546,7 @@
         // say whether its gate was armed is not comparable against one that
         // can.
         assert_eq!(argv[26], "-e");
-        assert_eq!(argv[27], "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=cut");
+        assert_eq!(argv[27], "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=conclude");
         // (#2846, review finding I2) The assertion above pins the DEFAULT, so
         // by itself it cannot tell "forwarded" from "hardcoded". Pin a
         // NON-default value too. (#2947) The argv builder forwards the
@@ -4690,7 +4690,7 @@
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: false,
             turn_delay_ms: 0,
-            detection_policy: darkmux_types::config::DetectionPolicy::Cut,
+            detection_policy: darkmux_types::config::DetectionPolicy::Conclude,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,
@@ -4921,7 +4921,7 @@
             // cover "both string forms" mattered.
             feedback_injection: false,
             turn_delay_ms: 0,
-            detection_policy: darkmux_types::config::DetectionPolicy::Cut,
+            detection_policy: darkmux_types::config::DetectionPolicy::Conclude,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,
@@ -5046,7 +5046,7 @@
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: true,
             turn_delay_ms: 0,
-            detection_policy: darkmux_types::config::DetectionPolicy::Cut,
+            detection_policy: darkmux_types::config::DetectionPolicy::Conclude,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,
@@ -5105,7 +5105,7 @@
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: true,
             turn_delay_ms: 0,
-            detection_policy: darkmux_types::config::DetectionPolicy::Cut,
+            detection_policy: darkmux_types::config::DetectionPolicy::Conclude,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,
@@ -6331,7 +6331,7 @@
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: true,
             turn_delay_ms: 0,
-            detection_policy: darkmux_types::config::DetectionPolicy::Cut,
+            detection_policy: darkmux_types::config::DetectionPolicy::Conclude,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,
@@ -10029,7 +10029,7 @@
         assert_eq!(record["payload"]["acted"], false);
         let detail = record["payload"]["detail"].as_str().unwrap();
         // (#2947) An archived pre-4.0 `observe` record reads as `record`.
-        assert!(detail.contains("recorded, not cut"), "got {detail:?}");
+        assert!(detail.contains("recorded, not concluded"), "got {detail:?}");
     }
 
     /// (#2887 F3/F4) `dispatch.gate.abort` forwards `policy`/`acted`
@@ -12776,7 +12776,7 @@
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: false,
             turn_delay_ms: 0,
-            detection_policy: darkmux_types::config::DetectionPolicy::Cut,
+            detection_policy: darkmux_types::config::DetectionPolicy::Conclude,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,
@@ -13720,7 +13720,7 @@ fn summary_with(detections: Vec<serde_json::Value>) -> super::TrajectorySummary 
 }
 
 /// (#2947) The pure mapping behind the `warn` policy: a finding under
-/// `warn` warns, the same finding under `record` / `cut` / an archived
+/// `warn` warns, the same finding under `record` / `conclude` / an archived
 /// `observe` does not, and a non-finding never does.
 #[test]
 fn only_a_warn_policy_finding_produces_a_degeneracy_warning() {
@@ -13732,12 +13732,12 @@ fn only_a_warn_policy_finding_produces_a_degeneracy_warning() {
         serde_json::json!({"type":"dispatch.gate.observation","seq":5,"tail_ratio":0.2,"policy":policy,"degenerate":degenerate})
     };
     let w = degeneracy_warning("dispatch.checkpoint", &cp("warn", true)).expect("a warn finding warns");
-    assert!(w.line.contains("turn 4") && w.line.contains("not cut") && w.line.contains("policy = warn"), "{}", w.line);
+    assert!(w.line.contains("turn 4") && w.line.contains("not concluded") && w.line.contains("policy = warn"), "{}", w.line);
     assert_eq!(w.payload["source"], "checkpoint");
     assert_eq!(w.payload["acted"], false);
     let g = degeneracy_warning("dispatch.gate.observation", &gate("warn", true)).expect("a warn gate finding warns");
     assert_eq!(g.payload["source"], "stream_gate");
-    for policy in ["record", "cut", "observe", "enforce", "off"] {
+    for policy in ["record", "conclude", "observe", "enforce", "off"] {
         assert!(degeneracy_warning("dispatch.checkpoint", &cp(policy, true)).is_none(), "{policy}");
         assert!(degeneracy_warning("dispatch.gate.observation", &gate(policy, true)).is_none(), "{policy}");
     }

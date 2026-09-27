@@ -3254,7 +3254,7 @@ mod tests {
         //            visible while it runs.
         //   1.62.0 — (#2928) `dispatch complete.payload.live`: the live
         //            channel's own cost. The samples are never records.
-        //   1.63.0 — (#2947) policy tokens off/record/warn/cut (was
+        //   1.63.0 — (#2947) policy tokens off/record/warn/conclude (was
         //            off/observe/enforce) and the additive
         //            `dispatch.degeneracy.warning` action.
         assert_eq!(FLOW_SCHEMA_VERSION, "1.63.0");
