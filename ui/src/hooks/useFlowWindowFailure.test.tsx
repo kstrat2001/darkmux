@@ -64,6 +64,47 @@ describe("useFlowWindow — a failed day read is reported, not folded into a qui
     expect(result.current.data).toEqual([]);
   });
 
+  // (#2965, CI) A static host (the published demo, the e2e and parity
+  // harnesses) cannot answer a missing day `200 []` the way the daemon does:
+  // it answers 404. That is an empty day, not a failed read; counting it put
+  // a notice row on every harness page and shifted the mission lens down.
+  it("a 404 day is an empty day, not a failure", async () => {
+    stubFlow({ today: 404, yesterday: 404 });
+    const { result } = render();
+    await waitFor(() => expect(result.current.settled).toBe(true));
+    expect(result.current.failure).toBeNull();
+    expect(result.current.data).toEqual([]);
+  });
+
+  // (#2965 review) Only 404 means "no such day". The daemon answers 401 when
+  // serve auth is on and a remote read lacks the token (#881): an empty day
+  // there would show "idle" to a viewer who was refused the records. 403 is
+  // the same class.
+  for (const status of [401, 403]) {
+    it(`a ${status} day is a failure, naming its status`, async () => {
+      stubFlow({ today: status, yesterday: status });
+      const { result } = render();
+      await waitFor(() => expect(result.current.settled).toBe(true));
+      expect(result.current.failure).toMatchObject({ status, today: true, yesterday: true });
+      expect(result.current.failure!.message).toContain(String(status));
+    });
+  }
+
+  it("a network error is a failure", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new TypeError("Failed to fetch"))));
+    const { result } = render();
+    await waitFor(() => expect(result.current.settled).toBe(true));
+    expect(result.current.failure).toMatchObject({ status: null, today: true, yesterday: true });
+  });
+
+  it("a malformed body is a failure", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("<html>not json", { status: 200 }))));
+    const { result } = render();
+    await waitFor(() => expect(result.current.settled).toBe(true));
+    expect(result.current.failure).toMatchObject({ status: 200, today: true, yesterday: true });
+    expect(result.current.failure!.message).toMatch(/not valid JSON/);
+  });
+
   for (const which of ["today", "yesterday"] as const) {
     it(`only ${which} fails: still a failure, since that day's records are missing`, async () => {
       stubFlow({ today: which === "today" ? 500 : 200, yesterday: which === "yesterday" ? 500 : 200 });

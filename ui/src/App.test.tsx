@@ -1865,6 +1865,45 @@ describe("App — presence coverage on the masthead", () => {
     }
   });
 
+  // (#2965, CI) The static-host shape: a missing day answers 404, not the
+  // daemon's `200 []`. That is an empty day, and the page shows no notice.
+  it("shows no flow-read notice when a missing day answers 404, as a static host does", async () => {
+    mockPresence({ machines: [BEAT("a")], meta: { sources: { fleet: { state: "ok" } }, complete: true } });
+    const presenceFetch = vi.mocked(fetch).getMockImplementation()!;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) =>
+        /^\/flow\/\d{4}-\d{2}-\d{2}$/.test(String(url))
+          ? Promise.resolve(new Response("not found", { status: 404, statusText: "Not Found" }))
+          : presenceFetch(url),
+      ),
+    );
+    const { container } = renderApp();
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.filter(([u]) => /^\/flow\/\d{4}-\d{2}-\d{2}$/.test(String(u))).length).toBe(2));
+    await waitFor(() => expect(container.querySelector(".mach .stat")?.textContent).toBe("idle"));
+    expect(container.querySelector('.fleetcov[data-state="flow-unreadable"]')).toBeNull();
+    expect(container.textContent).not.toContain("couldn't load events");
+  });
+
+  // (#2965 review) A refused read is a failure: the daemon answers 401 to a
+  // remote read without the serve token (#881). The notice names the status.
+  it("shows the flow-read notice, naming the status, when a day read is refused with 401", async () => {
+    mockPresence({ machines: [BEAT("a")], meta: { sources: { fleet: { state: "ok" } }, complete: true } });
+    const presenceFetch = vi.mocked(fetch).getMockImplementation()!;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) =>
+        /^\/flow\/\d{4}-\d{2}-\d{2}$/.test(String(url))
+          ? Promise.resolve(new Response("unauthorized", { status: 401, statusText: "Unauthorized" }))
+          : presenceFetch(url),
+      ),
+    );
+    const { container } = renderApp();
+    await waitFor(() => expect(container.querySelector('.fleetcov[data-state="flow-unreadable"]')).toBeTruthy());
+    expect(container.querySelector('.fleetcov[data-state="flow-unreadable"]')!.textContent).toContain("401 Unauthorized");
+    await waitFor(() => expect(container.querySelector(".mach .stat")?.textContent).toBe("no signal"));
+  });
+
   it("shows no flow-read notice when the flow reads succeed — the inverted case", async () => {
     mockPresence({ machines: [BEAT("a")], meta: { sources: { fleet: { state: "ok" } }, complete: true } });
     const { container } = renderApp();

@@ -31,6 +31,19 @@ export interface FlowReadFailure {
   yesterday: boolean;
 }
 
+/** (#2965) Whether a day's answer is a FAILED read, as opposed to an empty
+ *  day. Only 404 is an empty day: the daemon answers a missing day `200 []`,
+ *  but a static host (the published demo, the e2e and parity harnesses)
+ *  answers 404. Every other non-OK answer is a failure: a network error
+ *  (`status: null`), a 5xx, a body that did not parse, and any other 4xx,
+ *  which says the records exist and were refused. The daemon answers 401 to a
+ *  remote read without the serve token (#881); reading that as an empty day
+ *  would show "idle" to a viewer who was never shown the records. */
+export function isFailedRead(r: FetchResult<unknown> | undefined): r is Extract<FetchResult<unknown>, { ok: false }> {
+  if (!r || r.ok) return false;
+  return r.status !== 404;
+}
+
 /** (#2911) How finely the flow window's trailing edge follows the clock. */
 export const FLOW_WINDOW_EDGE_GRAIN_MS = 60_000;
 
@@ -110,7 +123,7 @@ export function useFlowWindow(nowMs: number): FlowWindowResult {
   // this a single failed read held the page at "no signal" until a reload.
   // A healthy day is never polled (`false`): the tail keeps it current.
   const retryFailed = (q: { state: { data?: FetchResult<unknown> } }) =>
-    q.state.data && !q.state.data.ok ? RECONCILE_BACKSTOP_MS : false;
+    isFailedRead(q.state.data) ? RECONCILE_BACKSTOP_MS : false;
   const results = useQueries({
     queries: [
       {
@@ -160,8 +173,8 @@ export function useFlowWindow(nowMs: number): FlowWindowResult {
   // (#2965) `fetchJson` never throws, so a failed read is a SUCCESSFUL query
   // carrying `ok: false`, the same shape `RunsBoard` and the presence
   // coverage read.
-  const yFail = yQuery.data && !yQuery.data.ok ? yQuery.data : null;
-  const tFail = tQuery.data && !tQuery.data.ok ? tQuery.data : null;
+  const yFail = isFailedRead(yQuery.data) ? yQuery.data : null;
+  const tFail = isFailedRead(tQuery.data) ? tQuery.data : null;
   const first = tFail ?? yFail;
   const failure = useMemo<FlowReadFailure | null>(
     () => (first ? { status: first.status, message: first.message, today: tFail !== null, yesterday: yFail !== null } : null),
