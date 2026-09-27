@@ -672,8 +672,6 @@ fn apply_pace_duty_cycle_delay(
     sleeper: &dyn TurnSleeper,
     trajectory: &mut Trajectory,
     turns: u32,
-    rest_ms: &mut u64,
-    rests: &mut u32,
     last_proof_of_work: &mut std::time::Instant,
     inactivity_soft_warning_fired_in_window: &mut bool,
 ) {
@@ -703,8 +701,6 @@ fn apply_pace_duty_cycle_delay(
     // a live viewer can show the rest while it happens.
     trajectory.append_paced_rest(turns, delay_ms, "thermal-duty-cycle", pace.state.as_deref());
     sleeper.sleep(delay_ms);
-    *rest_ms = rest_ms.saturating_add(delay_ms);
-    *rests = rests.saturating_add(1);
     (*last_proof_of_work, *inactivity_soft_warning_fired_in_window) =
         absorb_rest_into_soft_inactivity_clock(*last_proof_of_work, delay_ms);
 }
@@ -739,8 +735,6 @@ fn honor_pace_pause(
     sleeper: &dyn TurnSleeper,
     trajectory: &mut Trajectory,
     turns: u32,
-    rest_ms: &mut u64,
-    rests: &mut u32,
     last_proof_of_work: &mut std::time::Instant,
     inactivity_soft_warning_fired_in_window: &mut bool,
 ) {
@@ -752,8 +746,6 @@ fn honor_pace_pause(
         sleeper,
         trajectory,
         turns,
-        rest_ms,
-        rests,
         last_proof_of_work,
         inactivity_soft_warning_fired_in_window,
     );
@@ -780,8 +772,6 @@ fn honor_pace_pause(
         // (#2877) Recorded as each increment starts; see the duty-cycle rest.
         trajectory.append_paced_rest(turns, PACE_POLL_INCREMENT_MS, &reason, pace.state.as_deref());
         sleeper.sleep(PACE_POLL_INCREMENT_MS);
-        *rest_ms = rest_ms.saturating_add(PACE_POLL_INCREMENT_MS);
-        *rests = rests.saturating_add(1);
         (*last_proof_of_work, *inactivity_soft_warning_fired_in_window) =
             absorb_rest_into_soft_inactivity_clock(*last_proof_of_work, PACE_POLL_INCREMENT_MS);
     }
@@ -1747,13 +1737,9 @@ fn run_with_sleeper(
     // (#2114) Resumed counters pick up exactly where the checkpoint left
     // off; a fresh dispatch starts all four at zero as before.
     let mut turns: u32 = resume_seed.as_ref().map(|c| c.turns).unwrap_or(0);
-    let mut total_prompt_tokens: u32 = resume_seed.as_ref().map(|c| c.total_prompt_tokens).unwrap_or(0);
     let mut total_completion_tokens: u32 =
         resume_seed.as_ref().map(|c| c.total_completion_tokens).unwrap_or(0);
     let mut compactions: u32 = resume_seed.as_ref().map(|c| c.compactions).unwrap_or(0);
-    // (#2094) Sum + count of the inter-turn rests taken this dispatch.
-    let mut rest_ms: u64 = resume_seed.as_ref().map(|c| c.rest_ms).unwrap_or(0);
-    let mut rests: u32 = resume_seed.as_ref().map(|c| c.rests).unwrap_or(0);
     let mut latest_prompt_tokens: u32 = 0;
     // (#2792 round-4) The endpoint's own count paired with the characters it
     // counted, carried across turns so the next estimate only has to guess
@@ -1994,8 +1980,6 @@ fn run_with_sleeper(
                     sleeper,
                     trajectory,
                     turns,
-                    &mut rest_ms,
-                    &mut rests,
                     &mut last_proof_of_work,
                     &mut inactivity_soft_warning_fired_in_window,
                 );
@@ -2037,11 +2021,8 @@ fn run_with_sleeper(
                 role_id: role_id.to_string(),
                 messages: messages.clone(),
                 turns,
-                total_prompt_tokens,
                 total_completion_tokens,
                 compactions,
-                rest_ms,
-                rests,
                 pending_hand_back: None,
                 pending_tool_calls: if remaining_is_empty { None } else { Some(remaining) },
                 pending_tool_calls_seq_base: if remaining_is_empty { 0 } else { tool_seq + 1 },
@@ -2395,8 +2376,6 @@ fn run_with_sleeper(
             // (#2877) Recorded as the rest starts; see the duty-cycle rest.
             trajectory.append_rest(turns, turn_delay_ms);
             sleeper.sleep(turn_delay_ms);
-            rest_ms = rest_ms.saturating_add(turn_delay_ms);
-            rests = rests.saturating_add(1);
             // (#2094 finding 3b) Harness-owned time, not a stall: EXTEND
             // (never reset to "now") the soft-inactivity clock by exactly
             // the rest duration, and clear the edge-trigger flag so a
@@ -2447,11 +2426,8 @@ fn run_with_sleeper(
                 role_id: role_id.to_string(),
                 messages: messages.clone(),
                 turns,
-                total_prompt_tokens,
                 total_completion_tokens,
                 compactions,
-                rest_ms,
-                rests,
                 pending_hand_back,
                 pending_tool_calls: None,
                 pending_tool_calls_seq_base: 0,
@@ -2498,8 +2474,6 @@ fn run_with_sleeper(
                 sleeper,
                 trajectory,
                 turns,
-                &mut rest_ms,
-                &mut rests,
                 &mut last_proof_of_work,
                 &mut inactivity_soft_warning_fired_in_window,
             );
@@ -2947,11 +2921,7 @@ fn run_with_sleeper(
         // distinction matters.
         let usage = response.usage.as_ref();
         let this_turn_completion_tokens: Option<u32> = usage.and_then(|u| u.completion).map(saturating_u32);
-        if let Some(usage) = usage {
-            total_prompt_tokens = total_prompt_tokens.saturating_add(saturating_u32(usage.prompt.unwrap_or(0)));
-            total_completion_tokens =
-                total_completion_tokens.saturating_add(this_turn_completion_tokens.unwrap_or(0));
-        }
+        total_completion_tokens = total_completion_tokens.saturating_add(this_turn_completion_tokens.unwrap_or(0));
         // The prompt count is the ground truth everything below calibrates
         // against, so all of it needs one the endpoint actually reported.
         if let Some(prompt_tokens) = usage.and_then(|u| u.prompt).map(saturating_u32) {
@@ -3882,11 +3852,8 @@ fn run_with_sleeper(
                         role_id: role_id.to_string(),
                         messages: messages.clone(),
                         turns,
-                        total_prompt_tokens,
                         total_completion_tokens,
                         compactions,
-                        rest_ms,
-                        rests,
                         pending_hand_back: None,
                         pending_tool_calls: if remaining_is_empty { None } else { Some(remaining) },
                         // (#2114 finding N6) A fresh (non-resumed) turn's
@@ -6307,8 +6274,6 @@ mod tests {
         let mut reader = pace::PaceReader::new();
         let sleeper = DutyCycleSleeper::default();
         let mut traj = Trajectory::open(tmp.path());
-        let mut rest_ms = 0u64;
-        let mut rests = 0u32;
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
 
@@ -6320,15 +6285,13 @@ mod tests {
             &sleeper,
             &mut traj,
             3,
-            &mut rest_ms,
-            &mut rests,
             &mut last_pow,
             &mut soft_fired,
         );
 
         assert_eq!(sleeper.calls.borrow().as_slice(), &[15_000], "sleeps exactly the host-set duration");
-        assert_eq!(rest_ms, 15_000);
-        assert_eq!(rests, 1);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_ms(), 15_000);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_count(), 1);
     }
 
     /// (#2877) A rest is recorded when it STARTS, so a live viewer can show
@@ -6366,12 +6329,11 @@ mod tests {
             flip_pause_off: None,
         };
         let mut traj = Trajectory::open(tmp.path());
-        let (mut rest_ms, mut rests) = (0u64, 0u32);
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
         apply_pace_duty_cycle_delay(
             &mut reader, tmp.path(), 900_000, 600, &sleeper, &mut traj, 3,
-            &mut rest_ms, &mut rests, &mut last_pow, &mut soft_fired,
+            &mut last_pow, &mut soft_fired,
         );
         assert_eq!(sleeper.rests_seen_at_sleep.borrow().as_slice(), &[1], "the rest event exists when the sleep begins");
     }
@@ -6387,13 +6349,12 @@ mod tests {
             flip_pause_off: Some(tmp.path().to_path_buf()),
         };
         let mut traj = Trajectory::open(tmp.path());
-        let (mut rest_ms, mut rests) = (0u64, 0u32);
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
         let mut expiry_warned = false;
         honor_pace_pause(
             &mut reader, tmp.path(), 900_000, 600, &mut expiry_warned, &sleeper, &mut traj, 3,
-            &mut rest_ms, &mut rests, &mut last_pow, &mut soft_fired,
+            &mut last_pow, &mut soft_fired,
         );
         assert_eq!(sleeper.rests_seen_at_sleep.borrow().as_slice(), &[1], "the poll increment's rest event exists when its sleep begins");
     }
@@ -6415,8 +6376,6 @@ mod tests {
         let mut reader = pace::PaceReader::new();
         let sleeper = DutyCycleSleeper::default();
         let mut traj = Trajectory::open(tmp.path());
-        let mut rest_ms = 0u64;
-        let mut rests = 0u32;
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
         let mut expiry_warned = false;
@@ -6430,8 +6389,6 @@ mod tests {
             &sleeper,
             &mut traj,
             3,
-            &mut rest_ms,
-            &mut rests,
             &mut last_pow,
             &mut soft_fired,
         );
@@ -6442,8 +6399,8 @@ mod tests {
             "the turn boundary must actually rest for the host-set duty-cycle delay — \
              this is tier 2's only mechanism"
         );
-        assert_eq!(rest_ms, 15_000);
-        assert_eq!(rests, 1);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_ms(), 15_000);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_count(), 1);
         // `pause: false` means the pause loop itself breaks immediately, so
         // the 15s above is the duty-cycle prelude and nothing else.
         assert_eq!(sleeper.calls.borrow().len(), 1, "no 2s pause-poll increments on a non-paused file");
@@ -6459,8 +6416,6 @@ mod tests {
         let mut reader = pace::PaceReader::new();
         let sleeper = DutyCycleSleeper::default();
         let mut traj = Trajectory::open(tmp.path());
-        let mut rest_ms = 0u64;
-        let mut rests = 0u32;
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
         let mut expiry_warned = false;
@@ -6474,15 +6429,13 @@ mod tests {
             &sleeper,
             &mut traj,
             3,
-            &mut rest_ms,
-            &mut rests,
             &mut last_pow,
             &mut soft_fired,
         );
 
         assert!(sleeper.calls.borrow().is_empty(), "nothing to duty-cycle, nothing to wait for");
-        assert_eq!(rest_ms, 0);
-        assert_eq!(rests, 0);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_ms(), 0);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_count(), 0);
     }
 
     #[test]
@@ -6495,8 +6448,6 @@ mod tests {
         let mut reader = pace::PaceReader::new();
         let sleeper = DutyCycleSleeper::default();
         let mut traj = Trajectory::open(tmp.path());
-        let mut rest_ms = 0u64;
-        let mut rests = 0u32;
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
 
@@ -6508,14 +6459,12 @@ mod tests {
             &sleeper,
             &mut traj,
             1,
-            &mut rest_ms,
-            &mut rests,
             &mut last_pow,
             &mut soft_fired,
         );
 
         assert_eq!(sleeper.calls.borrow().as_slice(), &[5_000], "clamped to half the 10s budget");
-        assert_eq!(rest_ms, 5_000);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_ms(), 5_000);
     }
 
     #[test]
@@ -6528,8 +6477,6 @@ mod tests {
         let mut reader = pace::PaceReader::new();
         let sleeper = DutyCycleSleeper::default();
         let mut traj = Trajectory::open(tmp.path());
-        let mut rest_ms = 0u64;
-        let mut rests = 0u32;
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
 
@@ -6541,15 +6488,13 @@ mod tests {
             &sleeper,
             &mut traj,
             1,
-            &mut rest_ms,
-            &mut rests,
             &mut last_pow,
             &mut soft_fired,
         );
 
         assert!(sleeper.calls.borrow().is_empty(), "a paused pace file must never trigger a duty-cycle sleep");
-        assert_eq!(rest_ms, 0);
-        assert_eq!(rests, 0);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_ms(), 0);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_count(), 0);
     }
 
     #[test]
@@ -6559,8 +6504,6 @@ mod tests {
         let mut reader = pace::PaceReader::new();
         let sleeper = DutyCycleSleeper::default();
         let mut traj = Trajectory::open(tmp.path());
-        let mut rest_ms = 0u64;
-        let mut rests = 0u32;
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
 
@@ -6572,8 +6515,6 @@ mod tests {
             &sleeper,
             &mut traj,
             1,
-            &mut rest_ms,
-            &mut rests,
             &mut last_pow,
             &mut soft_fired,
         );
@@ -6591,8 +6532,6 @@ mod tests {
         let mut reader = pace::PaceReader::new();
         let sleeper = DutyCycleSleeper::default();
         let mut traj = Trajectory::open(tmp.path());
-        let mut rest_ms = 0u64;
-        let mut rests = 0u32;
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
 
@@ -6604,14 +6543,12 @@ mod tests {
             &sleeper,
             &mut traj,
             1,
-            &mut rest_ms,
-            &mut rests,
             &mut last_pow,
             &mut soft_fired,
         );
 
         assert!(sleeper.calls.borrow().is_empty());
-        assert_eq!(rests, 0);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_count(), 0);
     }
 
     #[test]
@@ -6627,8 +6564,6 @@ mod tests {
         let mut reader = pace::PaceReader::new();
         let sleeper = DutyCycleSleeper::default();
         let mut traj = Trajectory::open(tmp.path());
-        let mut rest_ms = 0u64;
-        let mut rests = 0u32;
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
 
@@ -6640,8 +6575,6 @@ mod tests {
             &sleeper,
             &mut traj,
             1,
-            &mut rest_ms,
-            &mut rests,
             &mut last_pow,
             &mut soft_fired,
         );
@@ -6686,8 +6619,6 @@ mod tests {
         let mut reader = pace::PaceReader::new();
         let sleeper = DutyCycleSleeper::default();
         let mut traj = Trajectory::open(tmp.path());
-        let mut rest_ms = 0u64;
-        let mut rests = 0u32;
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
 
@@ -6700,8 +6631,6 @@ mod tests {
                 &sleeper,
                 &mut traj,
                 turn,
-                &mut rest_ms,
-                &mut rests,
                 &mut last_pow,
                 &mut soft_fired,
             );
@@ -6714,8 +6643,8 @@ mod tests {
              abandoned instruction — not honored at every turn boundary for the rest of the \
              dispatch"
         );
-        assert_eq!(rest_ms, 15_000);
-        assert_eq!(rests, 1);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_ms(), 15_000);
+        assert_eq!(crate::trajectory::recorded(tmp.path()).rest_count(), 1);
     }
 
     /// The inverse of the test above, so the guard cannot be "fixed" by
@@ -6734,8 +6663,6 @@ mod tests {
         let mut reader = pace::PaceReader::new();
         let sleeper = DutyCycleSleeper::default();
         let mut traj = Trajectory::open(tmp.path());
-        let mut rest_ms = 0u64;
-        let mut rests = 0u32;
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
 
@@ -6748,8 +6675,6 @@ mod tests {
                 &sleeper,
                 &mut traj,
                 turn,
-                &mut rest_ms,
-                &mut rests,
                 &mut last_pow,
                 &mut soft_fired,
             );
@@ -6773,8 +6698,6 @@ mod tests {
         let mut reader = pace::PaceReader::new();
         let sleeper = DutyCycleSleeper::default();
         let mut traj = Trajectory::open(tmp.path());
-        let mut rest_ms = 0u64;
-        let mut rests = 0u32;
         let mut last_pow = std::time::Instant::now();
         let mut soft_fired = false;
 
@@ -6786,8 +6709,6 @@ mod tests {
             &sleeper,
             &mut traj,
             7,
-            &mut rest_ms,
-            &mut rests,
             &mut last_pow,
             &mut soft_fired,
         );
@@ -7373,11 +7294,8 @@ mod tests {
                 Message::tool_result("call_1", "read", "<turn 1 file contents>"),
             ],
             turns: 1,
-            total_prompt_tokens: 100,
             total_completion_tokens: 20,
             compactions: 0,
-            rest_ms: 0,
-            rests: 0,
             pending_hand_back: None,
             pending_tool_calls: None,
             pending_tool_calls_seq_base: 0,
@@ -7553,11 +7471,8 @@ mod tests {
                 Message::tool_result("call_1", "read", "<turn 2 file contents>"),
             ],
             turns: 2,
-            total_prompt_tokens: 220,
             total_completion_tokens: 40,
             compactions: 0,
-            rest_ms: 0,
-            rests: 0,
             pending_hand_back: None,
             pending_tool_calls: None,
             pending_tool_calls_seq_base: 0,
@@ -7621,11 +7536,8 @@ mod tests {
             role_id: "test-role".to_string(),
             messages: vec![Message::system("test"), Message::user("think it through")],
             turns: 3,
-            total_prompt_tokens: 300,
             total_completion_tokens: 60,
             compactions: 0,
-            rest_ms: 0,
-            rests: 0,
             pending_hand_back: Some(checkpoint::PendingHandBack {
                 thought: "working through the first half".to_string(),
                 answer: String::new(),
@@ -7839,11 +7751,8 @@ mod tests {
                 Message::tool_result("call_1", "read", "<call 1 result>"),
             ],
             turns: 1,
-            total_prompt_tokens: 100,
             total_completion_tokens: 20,
             compactions: 0,
-            rest_ms: 0,
-            rests: 0,
             pending_hand_back: None,
             pending_tool_calls: Some(vec![call2, call3]),
             // call_1 (index 0) already completed, so the next pending
@@ -7959,11 +7868,8 @@ mod tests {
                 Message::tool_result("call_1", "read", "<call 1 result>"),
             ],
             turns: 1,
-            total_prompt_tokens: 100,
             total_completion_tokens: 20,
             compactions: 0,
-            rest_ms: 0,
-            rests: 0,
             pending_hand_back: None,
             pending_tool_calls: Some(vec![call2, call3]),
             pending_tool_calls_seq_base: 1,
@@ -8085,11 +7991,8 @@ mod tests {
                 Message::tool_result("call_1", "read", "<call 1 result>"),
             ],
             turns: 1,
-            total_prompt_tokens: 100,
             total_completion_tokens: 20,
             compactions: 0,
-            rest_ms: 0,
-            rests: 0,
             pending_hand_back: None,
             pending_tool_calls: Some(vec![call2]),
             pending_tool_calls_seq_base: 1,
@@ -8217,11 +8120,8 @@ mod tests {
                 Message::tool_result("call_1", "read", "small"),            // 7
             ],
             turns: 3,
-            total_prompt_tokens: 300,
             total_completion_tokens: 60,
             compactions: 0,
-            rest_ms: 0,
-            rests: 0,
             pending_hand_back: None,
             pending_tool_calls: Some(vec![c2, c3]),
             pending_tool_calls_seq_base: 1,
@@ -15157,11 +15057,8 @@ mod tests {
             role_id: "test-role".into(),
             messages: checkpoint_messages,
             turns: 2,
-            total_prompt_tokens: 900,
             total_completion_tokens: 40,
             compactions: 0,
-            rest_ms: 0,
-            rests: 0,
             pending_hand_back: None,
             // The catch-up block runs only when the checkpoint carries an
             // undispatched call — that is what "catch-up" means.
@@ -15312,13 +15209,10 @@ mod tests {
             role_id: "test-role".to_string(),
             messages: checkpoint_messages,
             turns: 2,
-            total_prompt_tokens: 200,
             total_completion_tokens: 40,
             // (#2114 finding 1 test) bail_after_compactions - 1: the
             // catch-up's own compaction is the ONE that crosses the bound.
             compactions: 0,
-            rest_ms: 0,
-            rests: 0,
             pending_hand_back: None,
             pending_tool_calls: Some(vec![c2]),
             pending_tool_calls_seq_base: 1,

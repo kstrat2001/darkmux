@@ -39,9 +39,15 @@ darkmux release.
   block: the host writes that block from the fold, so `darkmux dispatch
   --json` still has one. `metrics.this_run` and `metrics.total_messages`
   are gone: every figure in the block is this invocation's own, and only
-  `cumulative_turns`/`cumulative_compactions` add a resumed dispatch's
-  checkpoint seed. **Migration:** read `metrics.prompt_tokens` (and the
-  rest) where you read `metrics.this_run.*`.
+  `cumulative_turns`/`cumulative_compactions` count the whole task. The
+  same holds on `dispatch.complete`: for a resumed dispatch its `rest_ms`
+  and `rests` are now this invocation's rests (they were the whole task's,
+  seeded from the checkpoint), like its token counts. A checkpoint no
+  longer carries the prompt-token and rest running totals, which nothing
+  read; an older checkpoint that has them still resumes.
+  **Migration:** read `metrics.prompt_tokens` (and the rest) where you
+  read `metrics.this_run.*`; sum a task's rests over its runs'
+  `dispatch.complete` records.
 - **`dispatch.complete`'s `cumulative_prompt_tokens` /
   `cumulative_completion_tokens`** (FLOW_SCHEMA 2.0.0). Their one source
   was `metrics.json`. A usage record (`telemetry.tokens`) now omits a

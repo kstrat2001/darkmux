@@ -94,15 +94,16 @@ pub struct RunCheckpoint {
     /// turn IN PROGRESS here — its model call already happened and
     /// advanced this counter before any of that turn's tool calls ran.
     pub turns: u32,
-    pub total_prompt_tokens: u32,
+    /// Completion tokens spent across every resume: the resumed loop's
+    /// cumulative completion cap (`max_cumulative_completion_tokens`) reads
+    /// it. (An older checkpoint also carries prompt-token and rest totals
+    /// that nothing read; they are ignored on load and no longer written.)
     pub total_completion_tokens: u32,
     /// darkmux compaction rewrites `messages` itself (the middle is
     /// replaced with a summary message), so the compacted history IS
     /// `messages` above — this counter is the only side state
     /// compaction carries across a resume.
     pub compactions: u32,
-    pub rest_ms: u64,
-    pub rests: u32,
     /// Pending #1221 hand-back, if the loop was mid-checkpoint-
     /// continuation when this was written. `None` on a clean turn
     /// boundary (the common case).
@@ -324,11 +325,8 @@ mod tests {
             role_id: "coder".to_string(),
             messages: vec![Message::system("sys"), Message::user("hi")],
             turns: 1,
-            total_prompt_tokens: 10,
             total_completion_tokens: 5,
             compactions: 0,
-            rest_ms: 0,
-            rests: 0,
             pending_hand_back: None,
             pending_tool_calls: None,
             pending_tool_calls_seq_base: 0,
@@ -344,6 +342,27 @@ mod tests {
         let loaded = read_checkpoint(&checkpoint_file_path(out_dir.path())).unwrap();
         assert_eq!(loaded.turns, 1);
         assert_eq!(loaded.messages.len(), 2);
+    }
+
+    /// A checkpoint carries only what a resume reads. The prompt-token,
+    /// rest-time and rest-count running totals had no reader on either side
+    /// (the host folds the trajectory, the loop rests per turn), so they are
+    /// not written; an older checkpoint that still carries them resumes.
+    /// `total_completion_tokens` stays: the resumed loop's cumulative
+    /// completion cap (`max_cumulative_completion_tokens`) reads it.
+    #[test]
+    fn a_checkpoint_carries_only_what_a_resume_reads() {
+        let v = serde_json::to_value(sample()).unwrap();
+        for dead in ["total_prompt_tokens", "rest_ms", "rests"] {
+            assert!(v.get(dead).is_none(), "{dead} has no reader: {v}");
+        }
+        assert_eq!(v["total_completion_tokens"], 5);
+        let mut old = v;
+        old["total_prompt_tokens"] = serde_json::json!(10);
+        old["rest_ms"] = serde_json::json!(400);
+        old["rests"] = serde_json::json!(1);
+        let loaded: RunCheckpoint = serde_json::from_value(old).expect("an older checkpoint still resumes");
+        assert_eq!(loaded.total_completion_tokens, 5);
     }
 
     /// The host reports a resumed run's whole-task turn count as the
