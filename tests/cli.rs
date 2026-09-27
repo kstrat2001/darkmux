@@ -12169,7 +12169,9 @@ fn bare_config_set_lists_every_enum_value_and_config_list_keeps_captured_stderr_
         assert!(out.status.success());
         assert!(out.stderr.is_empty(), "captured `config list` wrote stderr: {}", String::from_utf8_lossy(&out.stderr));
     }
-    for s in ENUM_SETTINGS {
+    // Scalar settings: a per-item one (`hooks.rules[].match.level`) has no
+    // `config set` key of its own.
+    for s in ENUM_SETTINGS.iter().filter(|s| !s.is_per_item()) {
         let out = darkmux_cmd().args(["config", "set", s.key]).output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert_eq!(out.status.code(), Some(2), "`config set {}` with no value must exit 2", s.key);

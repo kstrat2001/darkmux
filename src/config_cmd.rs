@@ -317,7 +317,10 @@ fn key_type(key: &str) -> Option<Ty> {
         // deeper path (`role_profiles.a.b`); the map is role -> profile name.
         return (!role.is_empty() && !role.contains('.')).then_some(Ty::Str);
     }
-    if let Some(setting) = config_enum::setting(key) {
+    // Scalar enum settings only: a per-item one (`hooks.rules[].match.
+    // level`) has no `config set` key of its own; it is validated when
+    // `hooks.rules` is set as a whole (see `set_at`).
+    if let Some(setting) = config_enum::setting(key).filter(|s| !s.is_per_item()) {
         return Some(Ty::Enum(setting));
     }
     KEYS.iter().find(|(k, _)| *k == key).map(|(_, t)| *t)
@@ -335,7 +338,7 @@ fn show_value_help_on_list(stderr_is_tty: bool, under_panel: bool) -> bool {
 fn all_keys() -> Vec<(&'static str, Ty)> {
     KEYS.iter()
         .copied()
-        .chain(config_enum::ENUM_SETTINGS.iter().map(|s| (s.key, Ty::Enum(s))))
+        .chain(config_enum::ENUM_SETTINGS.iter().filter(|s| !s.is_per_item()).map(|s| (s.key, Ty::Enum(s))))
         .collect()
 }
 
@@ -418,8 +421,21 @@ fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
     // Sanity: the result must still deserialize as a DarkmuxConfig (it will —
     // every key maps to a typed field of the right type), so a write can never
     // produce a config the loader would reject.
-    serde_json::from_value::<DarkmuxConfig>(root.clone())
+    let parsed_cfg = serde_json::from_value::<DarkmuxConfig>(root.clone())
         .context("the resulting config.json would not parse — aborting the write")?;
+    // (#2947 review C2) A structured key that carries enum-valued fields
+    // (`hooks.rules` and its `match.level` / `match.category`) is checked
+    // against every per-item registry entry under it, so a typo is refused
+    // here rather than silently matching nothing.
+    let bad: Vec<String> = config_enum::ENUM_SETTINGS
+        .iter()
+        .filter(|s| s.is_per_item() && s.key.starts_with(&format!("{key}[].")))
+        .flat_map(|s| config_enum::bad_in(s, &parsed_cfg, |_| None))
+        .map(|b| format!("{}. {}", b.summary(), b.valid_line()))
+        .collect();
+    if !bad.is_empty() {
+        bail!("invalid value for `{key}`:\n  {}", bad.join("\n  "));
+    }
 
     let pretty = serde_json::to_string_pretty(&root).context("serializing config.json")?;
     std::fs::write(path, pretty + "\n").with_context(|| format!("writing {}", path.display()))?;
@@ -1127,7 +1143,7 @@ mod tests {
     /// covered by registering it.
     #[test]
     fn every_registered_enum_setting_is_validated_and_described_by_config_set() {
-        for s in config_enum::ENUM_SETTINGS {
+        for s in config_enum::ENUM_SETTINGS.iter().filter(|s| !s.is_per_item()) {
             let f = tmp();
             let err = set_at(f.path(), s.key, "zz-unknown").unwrap_err().to_string();
             assert!(err.contains(s.key) && err.contains("`zz-unknown`"), "{}: {err}", s.key);
@@ -1176,7 +1192,7 @@ mod tests {
         use config_enum::{preflight, SetIn, Scope, ENUM_SETTINGS};
         let help = config_enum::help_block();
         for s in ENUM_SETTINGS {
-            let mut tiers: Vec<(SetIn, &str)> = vec![(SetIn::Config(s.key), "zz-bad-config")];
+            let mut tiers: Vec<(SetIn, &str)> = vec![(SetIn::Config(config_enum::config_path_of(s)), "zz-bad-config")];
             if let Some(var) = s.env {
                 tiers.push((SetIn::Env(var), "zz-bad-env"));
             }
@@ -1187,10 +1203,8 @@ mod tests {
                         _guard = None;
                         unsafe { std::env::set_var(var, raw) };
                     }
-                    SetIn::Config(key) => {
-                        let mut root = Value::Object(Default::default());
-                        set_path(&mut root, key, Value::String(raw.into()));
-                        let cfg: DarkmuxConfig = serde_json::from_value(root).unwrap();
+                    SetIn::Config(_) => {
+                        let cfg = config_enum::config_with_value(s, raw);
                         _guard = Some(darkmux_types::config_access::set_config_for_test(cfg));
                     }
                 }
@@ -1209,7 +1223,10 @@ mod tests {
                     }
                 }
                 // Doctor.
-                let row = darkmux_doctor::check_enum_settings().into_iter().find(|c| c.name == s.key).unwrap();
+                let row = darkmux_doctor::check_enum_settings()
+                    .into_iter()
+                    .find(|c| c.status == darkmux_doctor::Status::Fail)
+                    .unwrap_or_else(|| panic!("{} via {set_in}: no doctor Fail row", s.key));
                 assert_eq!(row.status, darkmux_doctor::Status::Fail, "{} via {set_in}: {row:?}", s.key);
                 assert!(row.message.contains(&format!("`{raw}`")), "{row:?}");
                 if let SetIn::Env(var) = &set_in {
@@ -1219,7 +1236,21 @@ mod tests {
             }
             // config set refuses (the file tier's write surface).
             let f = tmp();
-            assert!(set_at(f.path(), s.key, "zz-bad").is_err(), "{}: config set accepted a bad value", s.key);
+            match s.key.split_once("[].") {
+                // A per-item setting is written through its list key.
+                Some((list, item)) => {
+                    let mut rule = Value::Object(Default::default());
+                    set_path(&mut rule, item, Value::String("zz-bad".into()));
+                    rule["http"] = Value::String("http://127.0.0.1:9/x".into());
+                    let json = serde_json::to_string(&Value::Array(vec![rule])).unwrap();
+                    let err = set_at(f.path(), list, &json).unwrap_err().to_string();
+                    assert!(err.contains("`zz-bad`"), "{}: {err}", s.key);
+                }
+                None => {
+                    assert!(set_at(f.path(), s.key, "zz-bad").is_err(), "{}: config set accepted a bad value", s.key);
+                }
+            }
+            assert_eq!(std::fs::read_to_string(f.path()).unwrap(), "", "{}: a refused value was written", s.key);
             // Help.
             for (t, m) in s.values {
                 assert!(help.contains(t) && help.contains(m), "{}: help lacks `{t}`", s.key);
@@ -1341,7 +1372,7 @@ mod tests {
                 Ty::Float => serde_json::json!(0.5),
                 Ty::Str => Value::String("standalone".into()),
                 // (#2947) The entry's own shipped token.
-                Ty::Enum(s) => Value::String(s.shipped.into()),
+                Ty::Enum(s) => Value::String(s.shipped.expect("a scalar enum setting has a shipped value").into()),
                 Ty::StrList => serde_json::json!(["sentinel"]),
                 // An empty array is valid JSON that parses cleanly to an
                 // empty `Vec<HookRule>` — sufficient to prove the KEY

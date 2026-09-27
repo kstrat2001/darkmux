@@ -1963,25 +1963,23 @@ fn check_machine_id_resolution() -> Check {
 /// changes.
 pub fn check_enum_settings() -> Vec<Check> {
     use darkmux_types::config_enum::ENUM_SETTINGS;
-    ENUM_SETTINGS
-        .iter()
-        .map(|s| match darkmux_types::config_access::resolve_enum_token(s) {
-            Ok((token, source)) => {
-                let meaning = s.values.iter().find(|(t, _)| *t == token).map(|(_, m)| *m).unwrap_or("");
-                let from = match (source, s.env) {
-                    (darkmux_types::config_access::Source::Env, Some(var)) => format!("from {var}"),
-                    (darkmux_types::config_access::Source::Config, _) => "from config.json".to_string(),
-                    _ => "default".to_string(),
-                };
-                Check {
-                    name: s.key.into(),
-                    status: Status::Pass,
-                    message: format!("`{token}` ({from}): {meaning}"),
-                    hint: None,
-                }
-            }
-            Err(bad) => Check {
-                name: s.key.into(),
+    let mut rows = Vec::new();
+    for s in ENUM_SETTINGS {
+        let bad = darkmux_types::config_access::enum_bad_values(s);
+        if bad.is_empty() {
+            rows.push(enum_setting_pass_row(s));
+            continue;
+        }
+        // One Fail row per bad value. A per-item setting's row is named by
+        // the item's concrete path (`hooks.rules[2].match.level`), a
+        // scalar's by its key.
+        for b in bad {
+            let name = match &b.set_in {
+                darkmux_types::config_enum::SetIn::Config(path) if s.is_per_item() => path.clone(),
+                _ => s.key.to_string(),
+            };
+            rows.push(Check {
+                name,
                 status: Status::Fail,
                 // (#2947 review C6) Say what actually happens: which entry
                 // points refuse, or, for a setting no work-starting entry
@@ -1989,15 +1987,37 @@ pub fn check_enum_settings() -> Vec<Check> {
                 message: match s.no_scope_reason {
                     None => format!(
                         "{}. Refused at preflight by: {} (#2947)",
-                        bad.summary(),
+                        b.summary(),
                         s.scopes.iter().map(|sc| sc.label()).collect::<Vec<_>>().join(", ")
                     ),
-                    Some(reason) => format!("{}. Nothing refuses to start over it: {reason} (#2947)", bad.summary()),
+                    Some(reason) => format!("{}. Nothing refuses to start over it: {reason} (#2947)", b.summary()),
                 },
-                hint: Some(format!("{}. {}", bad.valid_line(), bad.fix())),
-            },
-        })
-        .collect()
+                hint: Some(format!("{}. {}", b.valid_line(), b.fix())),
+            });
+        }
+    }
+    rows
+}
+
+/// The Pass row for an enum setting with no bad value.
+fn enum_setting_pass_row(s: &darkmux_types::config_enum::EnumSetting) -> Check {
+    if s.is_per_item() {
+        return Check {
+            name: s.key.into(),
+            status: Status::Pass,
+            message: "every value set is valid (or none is set)".into(),
+            hint: None,
+        };
+    }
+    let (token, source) = darkmux_types::config_access::resolve_enum_token(s)
+        .expect("enum_bad_values found no bad value, so the scalar resolves");
+    let meaning = s.values.iter().find(|(t, _)| *t == token).map(|(_, m)| *m).unwrap_or("");
+    let from = match (source, s.env) {
+        (darkmux_types::config_access::Source::Env, Some(var)) => format!("from {var}"),
+        (darkmux_types::config_access::Source::Config, _) => "from config.json".to_string(),
+        _ => "default".to_string(),
+    };
+    Check { name: s.key.into(), status: Status::Pass, message: format!("`{token}` ({from}): {meaning}"), hint: None }
 }
 
 /// Normalize an OpenAI-style base URL for comparison: strip a trailing `/v1`
@@ -9274,7 +9294,7 @@ mod tests {
     fn every_registered_enum_setting_fails_doctor_on_an_unknown_value() {
         use darkmux_types::config_enum::ENUM_SETTINGS;
         let row = |key: &str| -> Check {
-            check_enum_settings().into_iter().find(|c| c.name == key).expect("one row per registry entry")
+            check_enum_settings().into_iter().find(|c| c.name == key).expect("a row for the setting")
         };
         assert_eq!(check_enum_settings().len(), ENUM_SETTINGS.len());
         for s in ENUM_SETTINGS {
@@ -9287,10 +9307,15 @@ mod tests {
 
             // Config tier.
             {
-                let _g = darkmux_types::config_access::set_config_for_test(cfg_with_string(s.key, "zz-unknown"));
-                let c = row(s.key);
-                assert_eq!(c.status, Status::Fail, "{}: {c:?}", s.key);
-                assert!(c.message.contains("`zz-unknown`") && c.message.contains(s.key), "{c:?}");
+                let _g = darkmux_types::config_access::set_config_for_test(
+                    darkmux_types::config_enum::config_with_value(s, "zz-unknown"),
+                );
+                let path = darkmux_types::config_enum::config_path_of(s);
+                let fails: Vec<Check> =
+                    check_enum_settings().into_iter().filter(|c| c.status == Status::Fail).collect();
+                assert_eq!(fails.len(), 1, "{}: one Fail row per bad value: {fails:?}", s.key);
+                let c = fails.into_iter().next().unwrap();
+                assert!(c.message.contains("`zz-unknown`") && c.message.contains(&path), "{c:?}");
                 assert!(c.message.contains("config.json"), "names where it was set: {c:?}");
                 // (#2947 review C6) The row's claim matches the registry:
                 // the entry points that refuse, or the stated reason none do.
@@ -9324,19 +9349,6 @@ mod tests {
         }
     }
 
-    /// A `DarkmuxConfig` with `value` at the dotted string `key`, built
-    /// through JSON so it goes through the same lenient read a hand-edited
-    /// `config.json` does.
-    fn cfg_with_string(key: &str, value: &str) -> darkmux_types::config::DarkmuxConfig {
-        let mut root = serde_json::json!({});
-        let parts: Vec<&str> = key.split('.').collect();
-        let mut cur = &mut root;
-        for p in &parts[..parts.len() - 1] {
-            cur = cur.as_object_mut().unwrap().entry(p.to_string()).or_insert(serde_json::json!({}));
-        }
-        cur[parts[parts.len() - 1]] = serde_json::Value::String(value.to_string());
-        serde_json::from_value(root).expect("lenient read")
-    }
 
     // (#2846) Was missing `serial` while every sibling had it. It REMOVES
     // DARKMUX_TURN_DELAY_MS, so unserialized it raced

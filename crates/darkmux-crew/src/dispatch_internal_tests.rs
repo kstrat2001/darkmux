@@ -4449,7 +4449,7 @@
             // (#2094) Nonzero here so the complete-vector assertion below
             // pins the forwarded `-e DARKMUX_TURN_DELAY_MS=<n>` pair too.
             turn_delay_ms: 3000,
-            detection_policy: darkmux_types::config::DetectionPolicy::Enforce,
+            detection_policy: darkmux_types::config::DetectionPolicy::Cut,
             // (#2094 finding 1) A distinct, non-default value so the
             // complete-vector assertion below pins the forwarded
             // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<n>` pair too.
@@ -4556,7 +4556,7 @@
         // darkmux-types and by the dispatch preflight conformance test.
         {
             let observe = DockerRunConfig {
-                detection_policy: darkmux_types::config::DetectionPolicy::Observe,
+                detection_policy: darkmux_types::config::DetectionPolicy::Record,
                 ..config.clone()
             };
             let argv2 = build_docker_run_argv(&observe);
@@ -4690,7 +4690,7 @@
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: false,
             turn_delay_ms: 0,
-            detection_policy: darkmux_types::config::DetectionPolicy::Enforce,
+            detection_policy: darkmux_types::config::DetectionPolicy::Cut,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,
@@ -4921,7 +4921,7 @@
             // cover "both string forms" mattered.
             feedback_injection: false,
             turn_delay_ms: 0,
-            detection_policy: darkmux_types::config::DetectionPolicy::Enforce,
+            detection_policy: darkmux_types::config::DetectionPolicy::Cut,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,
@@ -5046,7 +5046,7 @@
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: true,
             turn_delay_ms: 0,
-            detection_policy: darkmux_types::config::DetectionPolicy::Enforce,
+            detection_policy: darkmux_types::config::DetectionPolicy::Cut,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,
@@ -5105,7 +5105,7 @@
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: true,
             turn_delay_ms: 0,
-            detection_policy: darkmux_types::config::DetectionPolicy::Enforce,
+            detection_policy: darkmux_types::config::DetectionPolicy::Cut,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,
@@ -6331,7 +6331,7 @@
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: true,
             turn_delay_ms: 0,
-            detection_policy: darkmux_types::config::DetectionPolicy::Enforce,
+            detection_policy: darkmux_types::config::DetectionPolicy::Cut,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,
@@ -12723,7 +12723,7 @@
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: false,
             turn_delay_ms: 0,
-            detection_policy: darkmux_types::config::DetectionPolicy::Enforce,
+            detection_policy: darkmux_types::config::DetectionPolicy::Cut,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,

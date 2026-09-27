@@ -58,6 +58,10 @@ pub trait ConfigEnum: Copy + Eq + std::fmt::Debug + 'static {
     const TABLE: &'static [(&'static str, &'static str)];
     /// Just the tokens, in declaration order.
     const TOKENS: &'static [&'static str];
+    /// Retired spellings: `(old token, the token it was renamed to)`. An old
+    /// token is still refused (it is not a value), but the refusal names
+    /// the new word instead of only listing the valid ones.
+    const RETIRED: &'static [(&'static str, &'static str)];
 
     /// The canonical token (lowercase, as stored in `config.json`).
     fn token(self) -> &'static str;
@@ -93,13 +97,32 @@ pub trait ConfigEnum: Copy + Eq + std::fmt::Debug + 'static {
 #[macro_export]
 macro_rules! config_enum {
     ($ty:ident, $kind:literal, [ $( $variant:ident = $token:literal => $meaning:literal ),+ $(,)? ]) => {
+        $crate::config_enum!($ty, $kind, [ $( $variant = $token => $meaning ),+ ], retired: []);
+    };
+    (
+        $ty:ident, $kind:literal,
+        [ $( $variant:ident = $token:literal => $meaning:literal ),+ $(,)? ],
+        retired: [ $( $old:literal => $new:ident ),* $(,)? ]
+    ) => {
+        impl $ty {
+            #[doc(hidden)]
+            #[allow(dead_code)]
+            const fn __config_enum_token(self) -> &'static str {
+                match self { $( $ty::$variant => $token ),+ }
+            }
+        }
         impl $crate::config_enum::ConfigEnum for $ty {
             const RUST_NAME: &'static str = stringify!($ty);
             const KIND: &'static str = $kind;
             const TABLE: &'static [(&'static str, &'static str)] = &[ $( ($token, $meaning) ),+ ];
             const TOKENS: &'static [&'static str] = &[ $( $token ),+ ];
+            // A retired spelling names the VARIANT it became, and its token
+            // comes from the same exhaustive match as `token()`, so a rename
+            // can never point at a word that is not a value.
+            const RETIRED: &'static [(&'static str, &'static str)] =
+                &[ $( ($old, $ty::$new.__config_enum_token()) ),* ];
             fn token(self) -> &'static str {
-                match self { $( $ty::$variant => $token ),+ }
+                self.__config_enum_token()
             }
             fn from_token(canonical: &str) -> Option<Self> {
                 match canonical { $( $token => Some($ty::$variant), )+ _ => None }
@@ -142,11 +165,25 @@ impl Scope {
     }
 }
 
-/// One enum-typed setting. Built only through [`EnumSetting::of`], which is
-/// what keeps `values` bound to a real [`ConfigEnum`].
+/// How a registered setting's raw value(s) are read from the config.
+#[derive(Clone, Copy)]
+pub enum Read {
+    /// One value: a scalar key, with the env tier above it when the entry
+    /// has an env var.
+    One(fn(&DarkmuxConfig) -> Option<&str>),
+    /// One value per item of a list (`hooks.rules[].match.level`): each as
+    /// `(its concrete path, raw value)`. No env tier and no shipped value:
+    /// an absent field means the item does not constrain it.
+    Each(fn(&DarkmuxConfig) -> Vec<(String, String)>),
+}
+
+/// One enum-typed setting. Built only through [`EnumSetting::of`] /
+/// [`EnumSetting::each`], which is what keeps `values` bound to a real
+/// [`ConfigEnum`].
 #[derive(Clone, Copy)]
 pub struct EnumSetting {
-    /// The dotted `config.json` key.
+    /// The dotted `config.json` key (for a per-item setting, the pattern,
+    /// e.g. `hooks.rules[].match.level`).
     pub key: &'static str,
     /// The env var that overrides it, if it has one.
     pub env: Option<&'static str>,
@@ -156,17 +193,20 @@ pub struct EnumSetting {
     pub kind: &'static str,
     /// [`ConfigEnum::TABLE`].
     pub values: &'static [(&'static str, &'static str)],
-    /// The value an absent setting resolves to. A token of `values`
-    /// (`every_shipped_value_is_a_registered_token` pins it).
-    pub shipped: &'static str,
+    /// [`ConfigEnum::RETIRED`].
+    pub retired: &'static [(&'static str, &'static str)],
+    /// The value an absent setting resolves to (a token of `values`,
+    /// pinned by `every_shipped_value_is_a_registered_token`). `None` for a
+    /// per-item setting, where absent means "no constraint".
+    pub shipped: Option<&'static str>,
     /// The entry points that could consume this setting, and so refuse on
     /// a bad value, even for a run that would not read it (conservative on
     /// purpose: bad config is bad config). Empty only with a `no_scope_reason`.
     pub scopes: &'static [Scope],
     /// Why no entry point preflights this setting, when `scopes` is empty.
     pub no_scope_reason: Option<&'static str>,
-    /// Reads the stored (raw, unparsed) string from the config document.
-    pub read: fn(&DarkmuxConfig) -> Option<&str>,
+    /// Reads the stored (raw, unparsed) value(s) from the config document.
+    pub read: Read,
 }
 
 impl EnumSetting {
@@ -183,10 +223,31 @@ impl EnumSetting {
             rust_name: T::RUST_NAME,
             kind: T::KIND,
             values: T::TABLE,
-            shipped,
+            retired: T::RETIRED,
+            shipped: Some(shipped),
             scopes,
             no_scope_reason: None,
-            read,
+            read: Read::One(read),
+        }
+    }
+
+    /// A per-item setting: one value per list item, no env tier.
+    pub const fn each<T: ConfigEnum>(
+        key: &'static str,
+        scopes: &'static [Scope],
+        read: fn(&DarkmuxConfig) -> Vec<(String, String)>,
+    ) -> Self {
+        EnumSetting {
+            key,
+            env: None,
+            rust_name: T::RUST_NAME,
+            kind: T::KIND,
+            values: T::TABLE,
+            retired: T::RETIRED,
+            shipped: None,
+            scopes,
+            no_scope_reason: None,
+            read: Read::Each(read),
         }
     }
 
@@ -196,11 +257,23 @@ impl EnumSetting {
         self
     }
 
+    /// Whether this is a per-item (list) setting.
+    pub fn is_per_item(&self) -> bool {
+        matches!(self.read, Read::Each(_))
+    }
+
     /// The canonical token for `raw` (trimmed, case-insensitive), or `None`.
-    /// What `darkmux config set` stores.
+    /// What `darkmux config set` stores. A retired spelling is `None`: it
+    /// is not a value.
     pub fn canonical(&self, raw: &str) -> Option<&'static str> {
         let lower = raw.trim().to_ascii_lowercase();
         self.values.iter().map(|(t, _)| *t).find(|t| *t == lower)
+    }
+
+    /// The token a retired spelling was renamed to, if `raw` is one.
+    pub fn renamed(&self, raw: &str) -> Option<&'static str> {
+        let lower = raw.trim().to_ascii_lowercase();
+        self.retired.iter().find(|(old, _)| *old == lower).map(|(_, new)| *new)
     }
 
     /// `a, b, c`.
@@ -208,17 +281,22 @@ impl EnumSetting {
         self.values.iter().map(|(t, _)| *t).collect::<Vec<_>>().join(", ")
     }
 
-    /// One line per value: `  <token>  <meaning>`, the shipped one marked.
+    /// One line per value: `  <token>  <meaning>`, the shipped one marked,
+    /// then one line per retired spelling.
     pub fn values_help(&self, indent: &str) -> String {
         let width = self.values.iter().map(|(t, _)| t.len()).max().unwrap_or(0);
-        self.values
+        let mut lines: Vec<String> = self
+            .values
             .iter()
             .map(|(t, m)| {
-                let mark = if *t == self.shipped { " (default)" } else { "" };
+                let mark = if Some(*t) == self.shipped { " (default)" } else { "" };
                 format!("{indent}{t:<width$}  {m}{mark}")
             })
-            .collect::<Vec<_>>()
-            .join("\n")
+            .collect();
+        for (old, new) in self.retired {
+            lines.push(format!("{indent}(`{old}` was renamed to `{new}` in 4.0 and is refused)"));
+        }
+        lines.join("\n")
     }
 
     /// The `docs/ENVIRONMENT.md` phrase its row must carry, exactly:
@@ -227,6 +305,17 @@ impl EnumSetting {
         let list = self.values.iter().map(|(t, _)| format!("`{t}`")).collect::<Vec<_>>().join(", ");
         format!("Valid values: {list}.")
     }
+
+    fn bad(&self, raw: &str, set_in: SetIn) -> BadEnumValue {
+        BadEnumValue {
+            key: self.key,
+            kind: self.kind,
+            raw: raw.to_string(),
+            renamed_to: self.renamed(raw),
+            set_in,
+            values: self.values,
+        }
+    }
 }
 
 /// Where a bad value was set. Always one of the two operator-written
@@ -234,7 +323,9 @@ impl EnumSetting {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SetIn {
     Env(&'static str),
-    Config(&'static str),
+    /// The concrete `config.json` path (for a per-item setting, with its
+    /// index: `hooks.rules[2].match.level`).
+    Config(String),
 }
 
 impl std::fmt::Display for SetIn {
@@ -254,6 +345,8 @@ pub struct BadEnumValue {
     pub key: &'static str,
     pub kind: &'static str,
     pub raw: String,
+    /// When `raw` is a retired spelling: the token it was renamed to.
+    pub renamed_to: Option<&'static str>,
     pub set_in: SetIn,
     pub values: &'static [(&'static str, &'static str)],
 }
@@ -261,18 +354,27 @@ pub struct BadEnumValue {
 impl BadEnumValue {
     /// The one-line summary (no value list), for a doctor row's message.
     pub fn summary(&self) -> String {
-        format!(
-            "`{}` (from {}) is not a valid {} for `{}`",
-            self.raw, self.set_in, self.kind, self.key
-        )
+        let base = format!("`{}` (from {}) is not a valid {} for `{}`", self.raw, self.set_in, self.kind, self.key);
+        match self.renamed_to {
+            Some(new) => format!("{base}: `{}` was renamed to `{new}` in 4.0", self.raw.trim().to_ascii_lowercase()),
+            None => base,
+        }
     }
 
     /// The fix, for a doctor hint or the tail of a refusal.
     pub fn fix(&self) -> String {
-        let tokens = self.values.iter().map(|(t, _)| *t).collect::<Vec<_>>().join("|");
+        let tokens = match self.renamed_to {
+            Some(new) => new.to_string(),
+            None => format!("<{}>", self.values.iter().map(|(t, _)| *t).collect::<Vec<_>>().join("|")),
+        };
         match &self.set_in {
-            SetIn::Env(var) => format!("export {var}=<{tokens}>, or unset {var} to use config.json"),
-            SetIn::Config(key) => format!("darkmux config set {key} <{tokens}>"),
+            SetIn::Env(var) => format!("export {var}={tokens}, or unset {var} to use config.json"),
+            // A per-item path (`hooks.rules[2]...`) has no `config set` form:
+            // hook rules are set as a whole.
+            SetIn::Config(path) if path.contains('[') => {
+                format!("edit `{path}` in ~/.darkmux/config.json to {tokens}")
+            }
+            SetIn::Config(key) => format!("darkmux config set {key} {tokens}"),
         }
     }
 
@@ -291,38 +393,71 @@ impl std::fmt::Display for BadEnumValue {
 
 impl std::error::Error for BadEnumValue {}
 
-/// Resolve one setting against an explicit config and env lookup:
+/// Resolve one SCALAR setting against an explicit config and env lookup:
 /// `env > config.json > shipped`. Pure, so the precedence and the refusal
 /// are unit-tested without the process-wide config tier. An empty or
 /// whitespace-only value at either tier is unset (falls through), the same
 /// rule every other accessor in `config_access` follows.
+///
+/// Scalar-only by construction: a per-item setting has no single value to
+/// resolve, and asking for one is a programming error (it panics naming the
+/// key). Validate a per-item setting with [`bad_in`].
 pub fn resolve_in(
     setting: &EnumSetting,
     cfg: &DarkmuxConfig,
     env: impl Fn(&str) -> Option<String>,
 ) -> Result<(&'static str, Source), BadEnumValue> {
-    let bad = |raw: &str, set_in: SetIn| BadEnumValue {
-        key: setting.key,
-        kind: setting.kind,
-        raw: raw.to_string(),
-        set_in,
-        values: setting.values,
+    let Read::One(read) = setting.read else {
+        panic!("`{}` is a per-item enum setting; resolve_in is for scalar settings (#2947)", setting.key)
     };
     if let Some(var) = setting.env {
         if let Some(raw) = env(var).filter(|s| !s.trim().is_empty()) {
-            return setting.canonical(&raw).map(|t| (t, Source::Env)).ok_or_else(|| bad(&raw, SetIn::Env(var)));
+            return setting.canonical(&raw).map(|t| (t, Source::Env)).ok_or_else(|| setting.bad(&raw, SetIn::Env(var)));
         }
     }
-    if let Some(raw) = (setting.read)(cfg).filter(|s| !s.trim().is_empty()) {
-        return setting.canonical(raw).map(|t| (t, Source::Config)).ok_or_else(|| bad(raw, SetIn::Config(setting.key)));
+    if let Some(raw) = read(cfg).filter(|s| !s.trim().is_empty()) {
+        return setting
+            .canonical(raw)
+            .map(|t| (t, Source::Config))
+            .ok_or_else(|| setting.bad(raw, SetIn::Config(setting.key.to_string())));
     }
-    Ok((setting.shipped, Source::BuiltIn))
+    Ok((setting.shipped.expect("a scalar setting has a shipped value"), Source::BuiltIn))
+}
+
+/// Every bad value of one setting, scalar or per-item. The general
+/// validator: [`preflight`], [`bad_values`] and `darkmux doctor` use it.
+pub fn bad_in(setting: &EnumSetting, cfg: &DarkmuxConfig, env: impl Fn(&str) -> Option<String>) -> Vec<BadEnumValue> {
+    match setting.read {
+        Read::One(_) => resolve_in(setting, cfg, env).err().into_iter().collect(),
+        Read::Each(read) => read(cfg)
+            .into_iter()
+            .filter(|(_, raw)| !raw.trim().is_empty() && setting.canonical(raw).is_none())
+            .map(|(path, raw)| setting.bad(&raw, SetIn::Config(path)))
+            .collect(),
+    }
+}
+
+/// (#2947 review C2) The bad `match.level` / `match.category` values in a
+/// set of hook rules: what `HookSink::new` refuses (the whole hooks sink,
+/// the established rule for a bad hook rule). Reads every per-item registry
+/// entry under `hooks.rules[]`, so a new hook enum field registered there is
+/// checked here with no change.
+pub fn bad_hook_rule_values(rules: &[crate::config::HookRule]) -> Vec<BadEnumValue> {
+    let cfg = DarkmuxConfig {
+        hooks: Some(crate::config::HooksConfig { rules: Some(rules.to_vec()), ..Default::default() }),
+        ..Default::default()
+    };
+    ENUM_SETTINGS
+        .iter()
+        .filter(|s| s.key.starts_with("hooks.rules[]."))
+        .flat_map(|s| bad_in(s, &cfg, |_| None))
+        .collect()
 }
 
 /// Every bad value in the registry right now, resolved through the live
 /// tiers. `darkmux doctor`'s generic check reports each as Fail.
 pub fn bad_values() -> Vec<BadEnumValue> {
-    ENUM_SETTINGS.iter().filter_map(|s| crate::config_access::resolve_enum_token(s).err()).collect()
+    ENUM_SETTINGS.iter().flat_map(crate::config_access::enum_bad_values).collect()
 }
 
 /// The refusal a [`preflight`] returns: every bad value the scope
@@ -357,7 +492,7 @@ pub fn preflight(scope: Scope) -> Result<(), PreflightRefusal> {
     let bad: Vec<BadEnumValue> = ENUM_SETTINGS
         .iter()
         .filter(|s| s.scopes.contains(&scope))
-        .filter_map(|s| crate::config_access::resolve_enum_token(s).err())
+        .flat_map(crate::config_access::enum_bad_values)
         .collect();
     if bad.is_empty() {
         Ok(())
@@ -377,7 +512,8 @@ pub fn help_block() -> String {
     let mut out = String::from("Enum-valued settings (any other value is refused):\n");
     for s in ENUM_SETTINGS {
         let env = s.env.map(|e| format!(" (env {e})")).unwrap_or_default();
-        out.push_str(&format!("  {}{env}\n{}\n", s.key, s.values_help("      ")));
+        let per_item = if s.is_per_item() { " (per item; absent = no constraint)" } else { "" };
+        out.push_str(&format!("  {}{env}{per_item}\n{}\n", s.key, s.values_help("      ")));
     }
     out
 }
@@ -397,6 +533,31 @@ fn read_fleet_mode(c: &DarkmuxConfig) -> Option<&str> {
 fn read_fleet_identity_provider(c: &DarkmuxConfig) -> Option<&str> {
     c.fleet.as_ref()?.identity.as_ref()?.provider.as_deref()
 }
+/// `(hooks.rules[i].match.<field>, raw)` for every rule that sets `field`.
+fn hook_match_values(c: &DarkmuxConfig, field: &str, get: fn(&crate::config::HookMatch) -> Option<&str>) -> Vec<(String, String)> {
+    let rules = c.hooks.as_ref().and_then(|h| h.rules.as_ref());
+    rules
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(i, r)| {
+            let raw = r.r#match.as_ref().and_then(get)?;
+            Some((format!("hooks.rules[{i}].match.{field}"), raw.to_string()))
+        })
+        .collect()
+}
+fn read_hook_match_levels(c: &DarkmuxConfig) -> Vec<(String, String)> {
+    hook_match_values(c, "level", |m| m.level.as_deref())
+}
+fn read_hook_match_categories(c: &DarkmuxConfig) -> Vec<(String, String)> {
+    hook_match_values(c, "category", |m| m.category.as_deref())
+}
+
+/// Why the hook-rule enums preflight no entry point: the hooks sink is
+/// built by every process that writes flow records, and refuses there.
+const HOOK_RULE_NO_SCOPE: &str = "it is checked where the hooks sink is built (every process that \
+     writes flow records): a bad value refuses the WHOLE hooks sink, loudly, and the run continues \
+     without it, the established rule for any bad hook rule (#2093)";
 
 /// Every consumer that runs a model: the thermal governor and the
 /// degeneracy detector both ride every dispatch, so every entry point that
@@ -409,7 +570,7 @@ pub static ENUM_SETTINGS: &[EnumSetting] = &[
     EnumSetting::of::<crate::config::DetectionPolicy>(
         "runtime.detection.degeneracy.policy",
         Some("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY"),
-        "enforce",
+        "cut",
         DISPATCHING,
         read_detection_degeneracy_policy,
     ),
@@ -446,38 +607,58 @@ pub static ENUM_SETTINGS: &[EnumSetting] = &[
         &[Scope::FleetSubmission],
         read_fleet_identity_provider,
     ),
+    // (#2947 review C2) A typo here used to match nothing, silently.
+    EnumSetting::each::<crate::config::HookLevel>("hooks.rules[].match.level", &[], read_hook_match_levels)
+        .with_no_scope_reason(HOOK_RULE_NO_SCOPE),
+    EnumSetting::each::<crate::config::HookCategory>("hooks.rules[].match.category", &[], read_hook_match_categories)
+        .with_no_scope_reason(HOOK_RULE_NO_SCOPE),
 ];
+
+/// A config carrying `raw` at `setting`'s location: its dotted key for a
+/// scalar setting, or one list item for a per-item one
+/// (`hooks.rules[].match.level` becomes `{"hooks":{"rules":[{"match":
+/// {"level": raw}}]}}`). Built through JSON, so it goes through the same
+/// lenient read a hand-edited `config.json` does. For conformance tests in
+/// any crate that iterate [`ENUM_SETTINGS`].
+#[cfg(any(test, feature = "test-support"))]
+pub fn config_with_value(setting: &EnumSetting, raw: &str) -> DarkmuxConfig {
+    fn nest(path: &str, leaf: serde_json::Value) -> serde_json::Value {
+        path.rsplit('.').fold(leaf, |acc, seg| serde_json::json!({ (seg): acc }))
+    }
+    let root = match setting.key.split_once("[].") {
+        Some((list, item)) => nest(list, serde_json::json!([nest(item, serde_json::json!(raw))])),
+        None => nest(setting.key, serde_json::json!(raw)),
+    };
+    serde_json::from_value(root).expect("a string at an enum key always deserializes (lenient read)")
+}
+
+/// Where [`config_with_value`] puts the value, as a bad value names it.
+#[cfg(any(test, feature = "test-support"))]
+pub fn config_path_of(setting: &EnumSetting) -> String {
+    setting.key.replace("[].", "[0].")
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DetectionPolicy, FleetMode, IdentityProvider, ThermalState};
+    use crate::config::{DetectionPolicy, FleetMode, HookCategory, HookLevel, IdentityProvider, ThermalState};
 
     fn no_env(_: &str) -> Option<String> {
         None
     }
 
-    fn cfg_with(key: &str, value: &str) -> DarkmuxConfig {
-        let mut root = serde_json::json!({});
-        let parts: Vec<&str> = key.split('.').collect();
-        let mut cur = &mut root;
-        for p in &parts[..parts.len() - 1] {
-            cur = cur.as_object_mut().unwrap().entry(p.to_string()).or_insert(serde_json::json!({}));
-        }
-        cur[parts[parts.len() - 1]] = serde_json::Value::String(value.to_string());
-        serde_json::from_value(root).expect("a string at an enum key always deserializes (lenient read)")
-    }
-
     #[test]
     fn every_shipped_value_is_a_registered_token() {
         for s in ENUM_SETTINGS {
-            assert!(
-                s.values.iter().any(|(t, _)| *t == s.shipped),
-                "{}: shipped value `{}` is not one of its own values ({})",
-                s.key,
-                s.shipped,
-                s.tokens_joined()
-            );
+            match s.shipped {
+                Some(v) => assert!(
+                    s.values.iter().any(|(t, _)| *t == v),
+                    "{}: shipped value `{v}` is not one of its own values ({})",
+                    s.key,
+                    s.tokens_joined()
+                ),
+                None => assert!(s.is_per_item(), "{}: a scalar setting needs a shipped value", s.key),
+            }
         }
     }
 
@@ -487,6 +668,10 @@ mod tests {
             for (t, m) in s.values {
                 assert!(!m.trim().is_empty(), "{}: `{t}` has no meaning", s.key);
                 assert_eq!(*t, t.trim().to_ascii_lowercase(), "{}: `{t}` is not canonical", s.key);
+            }
+            for (old, new) in s.retired {
+                assert!(s.canonical(old).is_none(), "{}: retired `{old}` is still a value", s.key);
+                assert!(s.canonical(new).is_some(), "{}: `{old}` renamed to non-value `{new}`", s.key);
             }
         }
     }
@@ -516,24 +701,27 @@ mod tests {
         assert_eq!(keys.len(), n, "duplicate registry key");
     }
 
-    /// The config tier: a present value resolves canonically, a bad one is
-    /// refused naming the config key, an absent one is the shipped value.
+    /// The config tier: a present value is valid in any case, a bad one is
+    /// refused naming its concrete path, and absent / blank is not bad.
     #[test]
-    fn resolve_in_config_tier() {
+    fn bad_in_config_tier() {
         for s in ENUM_SETTINGS {
             let (first, _) = s.values[0];
-            let cfg = cfg_with(s.key, &format!("  {}  ", first.to_ascii_uppercase()));
-            assert_eq!(resolve_in(s, &cfg, no_env), Ok((first, Source::Config)), "{}", s.key);
-
-            let cfg = cfg_with(s.key, "definitely-not-a-value");
-            let err = resolve_in(s, &cfg, no_env).unwrap_err();
-            assert_eq!(err.set_in, SetIn::Config(s.key));
-            assert_eq!(err.raw, "definitely-not-a-value");
-
-            assert_eq!(resolve_in(s, &DarkmuxConfig::default(), no_env), Ok((s.shipped, Source::BuiltIn)));
-            // Blank is unset, not bad.
-            let cfg = cfg_with(s.key, "   ");
-            assert_eq!(resolve_in(s, &cfg, no_env), Ok((s.shipped, Source::BuiltIn)), "{}", s.key);
+            let good = config_with_value(s, &format!("  {}  ", first.to_ascii_uppercase()));
+            assert!(bad_in(s, &good, no_env).is_empty(), "{}", s.key);
+            if !s.is_per_item() {
+                assert_eq!(resolve_in(s, &good, no_env), Ok((first, Source::Config)), "{}", s.key);
+                assert_eq!(
+                    resolve_in(s, &DarkmuxConfig::default(), no_env),
+                    Ok((s.shipped.unwrap(), Source::BuiltIn))
+                );
+            }
+            let bad = bad_in(s, &config_with_value(s, "definitely-not-a-value"), no_env);
+            assert_eq!(bad.len(), 1, "{}: {bad:?}", s.key);
+            assert_eq!(bad[0].set_in, SetIn::Config(config_path_of(s)));
+            assert_eq!(bad[0].raw, "definitely-not-a-value");
+            assert!(bad_in(s, &DarkmuxConfig::default(), no_env).is_empty());
+            assert!(bad_in(s, &config_with_value(s, "   "), no_env).is_empty(), "{}: blank is unset", s.key);
         }
     }
 
@@ -544,7 +732,7 @@ mod tests {
     fn resolve_in_env_tier_refuses_rather_than_falling_through() {
         for s in ENUM_SETTINGS.iter().filter(|s| s.env.is_some()) {
             let var = s.env.unwrap();
-            let good_cfg = cfg_with(s.key, s.values[0].0);
+            let good_cfg = config_with_value(s, s.values[0].0);
             let env_bad = |k: &str| (k == var).then(|| "nope".to_string());
             let err = resolve_in(s, &good_cfg, env_bad).unwrap_err();
             assert_eq!(err.set_in, SetIn::Env(var), "{}", s.key);
@@ -559,14 +747,55 @@ mod tests {
     #[test]
     fn a_bad_value_message_names_value_source_and_valid_values() {
         for s in ENUM_SETTINGS {
-            let err = resolve_in(s, &cfg_with(s.key, "zzz-typo"), no_env).unwrap_err();
+            let err = bad_in(s, &config_with_value(s, "zzz-typo"), no_env).remove(0);
             let msg = err.to_string();
             assert!(msg.contains("`zzz-typo`"), "{msg}");
-            assert!(msg.contains(&format!("config.json key `{}`", s.key)), "{msg}");
+            assert!(msg.contains(&format!("config.json key `{}`", config_path_of(s))), "{msg}");
             for (t, m) in s.values {
                 assert!(msg.contains(t) && msg.contains(m), "{}: `{t}` / its meaning missing: {msg}", s.key);
             }
         }
+    }
+
+    /// (#2947 rename) Conformance for retired spellings, generic over the
+    /// registry: every retired spelling of every entry is refused (it is not
+    /// a value) at both tiers, and the refusal names the word it was renamed
+    /// to, in its summary and in its fix.
+    #[test]
+    fn every_retired_spelling_is_refused_naming_its_replacement() {
+        let mut exercised = 0;
+        for s in ENUM_SETTINGS {
+            for (old, new) in s.retired {
+                let mut bads = bad_in(s, &config_with_value(s, &old.to_ascii_uppercase()), no_env);
+                if let Some(var) = s.env {
+                    let env = |k: &str| (k == var).then(|| old.to_string());
+                    bads.extend(bad_in(s, &DarkmuxConfig::default(), env));
+                }
+                assert!(!bads.is_empty(), "{}: retired `{old}` accepted", s.key);
+                for b in bads {
+                    assert_eq!(b.renamed_to, Some(*new));
+                    let msg = b.to_string();
+                    assert!(msg.contains(&format!("`{old}` was renamed to `{new}` in 4.0")), "{msg}");
+                    assert!(b.fix().contains(new), "{}", b.fix());
+                }
+                exercised += 1;
+            }
+        }
+        assert!(exercised >= 2, "no retired spellings exercised");
+    }
+
+    /// The degeneracy policy's rename, stated as the operator decided it.
+    #[test]
+    fn the_detection_policy_vocabulary_names_the_action() {
+        assert_eq!(DetectionPolicy::TOKENS, &["off", "record", "warn", "cut"]);
+        assert_eq!(DetectionPolicy::RETIRED, &[("enforce", "cut"), ("observe", "record")]);
+        assert_eq!(DetectionPolicy::default(), DetectionPolicy::Cut);
+        let s = setting("runtime.detection.degeneracy.policy").unwrap();
+        assert_eq!(s.shipped, Some("cut"));
+        assert!(DetectionPolicy::Cut.measures() && DetectionPolicy::Cut.acts() && !DetectionPolicy::Cut.warns());
+        assert!(DetectionPolicy::Warn.measures() && !DetectionPolicy::Warn.acts() && DetectionPolicy::Warn.warns());
+        assert!(DetectionPolicy::Record.measures() && !DetectionPolicy::Record.acts() && !DetectionPolicy::Record.warns());
+        assert!(!DetectionPolicy::Off.measures() && !DetectionPolicy::Off.acts() && !DetectionPolicy::Off.warns());
     }
 
     #[test]
@@ -585,6 +814,8 @@ mod tests {
         check::<ThermalState>();
         check::<FleetMode>();
         check::<IdentityProvider>();
+        check::<HookLevel>();
+        check::<HookCategory>();
         check::<crate::endpoint::ManagedBackend>();
         check::<crate::endpoint::Dialect>();
     }

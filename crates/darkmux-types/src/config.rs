@@ -768,20 +768,31 @@ pub struct RuntimeBehaviorConfig {
 /// So the field on [`DetectorConfig`] is a plain `Option<String>` and the
 /// token is resolved at the accessor, where an unrecognized value can be
 /// reported against the raw string instead of taking the document with it.
+///
+/// (#2947, operator 2026-09-27) The values NAME THE ACTION: `off`, `record`,
+/// `warn`, and the rule's own verb (`cut` for the degeneracy detector).
+/// `enforce` and `observe` are retired in 4.0: `enforce` hid different
+/// actions per rule, and `observe` read like "warns" when it only recorded.
+/// Both are refused with the new word (`config_enum!`'s `retired` list).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DetectionPolicy {
-    /// Detect and act on what is found. The shipped behavior.
-    #[default]
-    Enforce,
-    /// Detect and RECORD, but never act. The record carries what the
-    /// detector would have done, so the counterfactual is measurable
-    /// without paying for it. This is the setting that makes a controlled
-    /// comparison possible: the check-in cadence, the per-call token cap
-    /// and therefore the usable prompt budget are all unchanged, so the
-    /// only variable is whether the verdict is obeyed.
-    Observe,
-    /// Do not run the detector at all. Cheapest, and measures nothing.
+    /// Do not run the detector at all. Zero CPU, measures nothing.
     Off,
+    /// Detect and RECORD, silently, what a cut would have done; never act
+    /// and never warn. The setting that makes a controlled comparison
+    /// possible: the check-in cadence, the per-call token cap and therefore
+    /// the usable prompt budget are all unchanged, so the only variable is
+    /// whether the verdict is obeyed. (Was `observe`.)
+    Record,
+    /// Detect, and on a finding SURFACE a warning (a stderr line for the
+    /// dispatch, a `dispatch.degeneracy.warning` flow record the viewer
+    /// shows, and the run envelope's `degeneracy_warnings`), without
+    /// cutting anything.
+    Warn,
+    /// Detect and cut the repeating output. The shipped behavior,
+    /// unchanged. (Was `enforce`.)
+    #[default]
+    Cut,
 }
 
 impl DetectionPolicy {
@@ -791,21 +802,71 @@ impl DetectionPolicy {
     }
     /// Whether a finding may change what the dispatch does.
     pub fn acts(self) -> bool {
-        matches!(self, DetectionPolicy::Enforce)
+        matches!(self, DetectionPolicy::Cut)
+    }
+    /// Whether a finding is surfaced as a warning without acting.
+    pub fn warns(self) -> bool {
+        matches!(self, DetectionPolicy::Warn)
     }
     pub fn as_str(self) -> &'static str {
         crate::config_enum::ConfigEnum::token(self)
     }
 }
 
-// (#2947) The value table: tokens, meanings, and (through the macro's
-// exhaustive match) the parser. An unknown value is refused at the accessor
-// (`config_access::detection_degeneracy_policy`), never resolved to
-// `enforce`: see `config_enum`'s module doc for the rule.
+// (#2947) The value table: tokens, meanings, retired spellings, and
+// (through the macro's exhaustive match) the parser. An unknown or retired
+// value is refused at the accessor
+// (`config_access::detection_degeneracy_policy`), never resolved to a
+// default: see `config_enum`'s module doc for the rule.
 crate::config_enum!(DetectionPolicy, "detection policy", [
-    Enforce = "enforce" => "detect and act on what is found (the shipped behavior)",
-    Observe = "observe" => "detect and record, never act; the record carries the counterfactual",
-    Off = "off" => "do not run the detector at all",
+    Off = "off" => "the detector does not run (zero CPU, measures nothing)",
+    Record = "record" => "measure and record what a cut would have done, silently; never act",
+    Warn = "warn" => "measure; on a finding surface a warning (stderr, flow record, envelope); never cut",
+    Cut = "cut" => "measure and cut the repeating output (the shipped behavior)",
+], retired: [
+    "enforce" => Cut,
+    "observe" => Record,
+]);
+
+/// (#2947 review C2) The flow-record `level` a hook rule's `match.level`
+/// names. The config vocabulary of `darkmux_flow::Level` (declared here so
+/// the registry, which lives in this leaf crate, can hold it; darkmux-flow's
+/// `hook_match_vocabulary_matches_the_flow_schema` pins the two together).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+crate::config_enum!(HookLevel, "flow record level", [
+    Error = "error" => "records at error level",
+    Warn = "warn" => "records at warn level",
+    Info = "info" => "records at info level",
+    Debug = "debug" => "records at debug level",
+    Trace = "trace" => "records at trace level",
+]);
+
+/// (#2947 review C2) The flow-record `category` a hook rule's
+/// `match.category` names; the config vocabulary of
+/// `darkmux_flow::Category` (same arrangement as [`HookLevel`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookCategory {
+    Work,
+    Machinery,
+    Audit,
+    Review,
+    Telemetry,
+}
+
+crate::config_enum!(HookCategory, "flow record category", [
+    Work = "work" => "records of the work itself (dispatches, missions)",
+    Machinery = "machinery" => "records of darkmux's own machinery",
+    Audit = "audit" => "audit-trail records (decisions, notes)",
+    Review = "review" => "review records",
+    Telemetry = "telemetry" => "per-dispatch instrument samples",
 ]);
 
 /// (#2846) One detector's settings. Split per detector rather than one global
@@ -1730,7 +1791,7 @@ impl DarkmuxConfig {
                 // `thermal`: the operator tunes the file, not the source.
                 detection: Some(DetectionConfig {
                     degeneracy: Some(DetectorConfig {
-                        policy: Some(DetectionPolicy::Enforce.as_str().to_string()),
+                        policy: Some(DetectionPolicy::Cut.as_str().to_string()),
                         extras: Default::default(),
                     }),
                     extras: Default::default(),

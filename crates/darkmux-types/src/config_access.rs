@@ -342,6 +342,12 @@ pub fn resolve_enum_token(
     crate::config_enum::resolve_in(setting, config(), env_str)
 }
 
+/// Every bad value of one registered setting (scalar or per-item) through
+/// the live tiers. What preflight and doctor use.
+pub fn enum_bad_values(setting: &crate::config_enum::EnumSetting) -> Vec<crate::config_enum::BadEnumValue> {
+    crate::config_enum::bad_in(setting, config(), env_str)
+}
+
 /// [`resolve_enum_token`], typed. `T` must be the enum the entry was
 /// registered with ([`EnumSetting::of`](crate::config_enum::EnumSetting::of)
 /// takes the table from `T`, so a token that resolved is one `T` parses).
