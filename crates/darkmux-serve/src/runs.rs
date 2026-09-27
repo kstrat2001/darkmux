@@ -186,7 +186,7 @@ pub enum AbandonReason {
 pub enum DispatchSessionEvidence {
     /// darkmux POSITIVELY recorded this mission's dispatch session ending —
     /// the presence reconciler's crash/kill/timeout close-edge (a
-    /// `session.end` record, see [`terminal_status_for_action`]). This is
+    /// `session.end` record, see `run_lifecycle.rs`'s `ending_of`). This is
     /// an observation, not an absence: something darkmux was watching
     /// stopped, and darkmux saw it stop.
     RecordedEnd,
@@ -1335,7 +1335,7 @@ fn mission_to_run(
     // `mission_run_status` lets one mission read Running off ANOTHER
     // mission's activity clock: the agg is permanently non-terminal (its
     // records are `step start`/`step complete`, which
-    // `terminal_status_for_action` maps to `None`), so it both disables the
+    // `run_lifecycle.rs`'s `ending_of` maps to `None`), so it both disables the
     // all-terminal branch and keeps `session_is_live` true. `is_ambiguous`
     // is the detector that already exists for exactly this corruption.
     // Membership (`sessions`) deliberately keeps them — claiming the
@@ -1571,7 +1571,7 @@ fn mission_run_status_and_evidence(
                 if mission.status != MissionStatus::Paused && most_recent_terminal_is_abandoned {
                     // A `session.end` terminal really did land — darkmux
                     // OBSERVED this session stop (see
-                    // `terminal_status_for_action`), never a guess from
+                    // `run_lifecycle.rs`'s `ending_of`), never a guess from
                     // silence.
                     return (RunStatus::Abandoned, Some(DispatchSessionEvidence::RecordedEnd));
                 }
@@ -2141,11 +2141,7 @@ fn any_dispatch_live_in(dir: &std::path::Path, day: &str, now_ms: u64, max_age_m
 /// lapses (the quiet clock starts at the lapse, which is still ahead), and
 /// past that the staleness clock runs from the lapse.
 fn session_is_live(agg: &SessionAgg, now_ms: u64) -> bool {
-    let last_activity_ms = agg.last_activity_ts.as_deref().and_then(parse_flow_ts).map(|secs| secs.saturating_mul(1_000));
-    let Some(quiet_from) = last_activity_ms.max(agg.wait_until_ms) else {
-        return false;
-    };
-    now_ms.saturating_sub(quiet_from) <= stale_after_ms()
+    crate::run_lifecycle::quiet_clock_live(agg.last_activity_ts.as_deref(), agg.wait_until_ms, now_ms, stale_after_ms())
 }
 
 /// Representative role/model/route for a lab run's `/runs` row, off its
@@ -2319,7 +2315,7 @@ struct SessionAgg {
     start_ts: Option<String>,
     /// The terminal outcome this session reached, from whichever of
     /// `dispatch complete` / `dispatch error` / `session.end` landed first
-    /// (see [`terminal_status_for_action`]) — `None` while still running.
+    /// (see `run_lifecycle.rs`'s `ending_of`) — `None` while still running.
     terminal_status: Option<RunStatus>,
     terminal_ts: Option<String>,
     /// (#1642, #1633) The newest `ts` seen on ANY record for this session —
@@ -2339,9 +2335,26 @@ struct SessionAgg {
     wait_until_ms: Option<u64>,
     /// The session's terminal was a `budget.stop` that names why.
     stopped_by_operator: bool,
+    /// The session's attempts (`run_lifecycle.rs`), whose current one the
+    /// attempt-scoped fields above describe once settled.
+    lifecycle: crate::run_lifecycle::RunFold,
 }
 
 impl SessionAgg {
+    /// The attempt-scoped fields, from the current attempt.
+    fn settle(&mut self) {
+        let Some(a) = self.lifecycle.latest() else { return };
+        let ending = a.ending();
+        self.has_start = a.has_start;
+        self.has_wait = a.waited;
+        self.start_ts = a.start_ts.clone();
+        self.last_activity_ts = a.last_activity_ts.clone();
+        self.wait_until_ms = a.wait_until_ms;
+        self.terminal_status = ending.map(|e| e.status);
+        self.terminal_ts = a.close.as_ref().map(|(ts, _)| ts.clone());
+        self.stopped_by_operator = ending.and_then(|e| e.reason) == Some(AbandonReason::Aborted);
+    }
+
     /// (#1918) `true` when this session's records name more than one
     /// distinct `mission_id` — the read-side detector for the scheduler
     /// defect (see [`SessionAgg::mission_ids_seen`]'s own doc). Every
@@ -2414,6 +2427,7 @@ fn build_flow_session_index_in(
         }
         std::ops::ControlFlow::Continue(())
     });
+    settle_session_index(&mut idx);
     idx
 }
 
@@ -2480,22 +2494,6 @@ fn fold_session_record(idx: &mut HashMap<String, SessionAgg>, v: &serde_json::Va
     let action = darkmux_flow::reader::action_of(v);
     let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
 
-    // (#1642, #1633) EVERY record for this session updates the liveness
-    // clock — not just lifecycle ones (see `SessionAgg::last_activity_ts`'s
-    // doc). ISO-8601 `YYYY-MM-DDTHH:MM:SSZ` sorts correctly as a plain
-    // string (same property `earliest_by_start` relies on), so a lexical
-    // compare is enough to keep the NEWEST seen even if records are ever
-    // visited out of chronological order.
-    if !ts.is_empty() {
-        let is_newer = match agg.last_activity_ts.as_deref() {
-            Some(current) => ts > current,
-            None => true,
-        };
-        if is_newer {
-            agg.last_activity_ts = Some(ts.to_string());
-        }
-    }
-
     // Check EVERY dispatch lifecycle record's payload for `endpoint` —
     // not just start (#1518, applied server-side; see `SessionAgg::endpoint`'s doc).
     let is_bookend = matches!(
@@ -2514,63 +2512,17 @@ fn fold_session_record(idx: &mut HashMap<String, SessionAgg>, v: &serde_json::Va
         }
     }
 
-    if action == Some(FlowAction::DispatchStart) {
-        agg.has_start = true;
-        if agg.start_ts.is_none() && !ts.is_empty() {
-            agg.start_ts = Some(ts.to_string());
-        }
-    } else if let Some(status) = action.as_ref().and_then(terminal_status_for_action) {
-        // Keep the FIRST terminal seen — a session emits at most one in
-        // practice; favoring the first keeps this deterministic if a
-        // replay/retry ever produced more than one.
-        if agg.terminal_status.is_none() {
-            agg.terminal_status = Some(status);
-            agg.terminal_ts = Some(ts.to_string());
-            agg.stopped_by_operator = action == Some(FlowAction::BudgetStop) && names_a_reason(v);
-        }
-        agg.wait_until_ms = None;
-    }
-    fold_budget_wait(agg, action.as_ref(), ts, v);
+    let mission = v.get("mission_id").and_then(|m| m.as_str()).filter(|m| !m.is_empty());
+    agg.lifecycle.fold(action.as_ref(), mission, ts, v);
 }
 
-/// (#2902 step 5) A hosted call's budget gate writes `budget.wait` BEFORE
-/// any dispatch bookend (contract 2 opens the bookends around the model call
-/// only), so a waiting session is a run with no start yet. The wait holds it
-/// live until its announced resume time plus [`BUDGET_WAIT_GRACE_MS`];
-/// `budget.resume` ends it (and a terminal, in [`fold_session_record`]).
-fn fold_budget_wait(agg: &mut SessionAgg, action: Option<&FlowAction>, ts: &str, v: &serde_json::Value) {
-    if action == Some(&FlowAction::BudgetWait) {
-        agg.has_wait = true;
-        agg.wait_until_ms = parse_flow_ts(ts).map(|secs| {
-            let wait_secs = darkmux_crew::usage::payload_of(v).get("wait_seconds").and_then(|w| w.as_f64()).unwrap_or(0.0).max(0.0);
-            secs.saturating_mul(1_000).saturating_add((wait_secs * 1_000.0) as u64).saturating_add(BUDGET_WAIT_GRACE_MS)
-        });
-    } else if action == Some(&FlowAction::BudgetResume) {
-        agg.wait_until_ms = None;
+/// The attempt-scoped fields of every session, from its lifecycle fold's
+/// current attempt (`run_lifecycle.rs`): what `/runs` judges a session by.
+/// Run once the fold has seen every record.
+fn settle_session_index(idx: &mut HashMap<String, SessionAgg>) {
+    for agg in idx.values_mut() {
+        agg.settle();
     }
-}
-
-/// Whether a record's payload names a non-empty `reason`: every reason a
-/// `budget.stop` producer writes is an operator's stop (an interrupt,
-/// `mission abort`/`finalize`, an abandoned phase).
-fn names_a_reason(v: &serde_json::Value) -> bool {
-    darkmux_crew::usage::payload_of(v).get("reason").and_then(|r| r.as_str()).is_some_and(|r| !r.is_empty())
-}
-
-/// The `RunStatus` a session's TERMINAL flow action implies — `None` for
-/// any non-terminal action (turns, tools, telemetry, the start itself).
-fn terminal_status_for_action(action: &FlowAction) -> Option<RunStatus> {
-    if *action == FlowAction::DispatchComplete {
-        return Some(RunStatus::Complete);
-    }
-    if *action == FlowAction::DispatchError {
-        return Some(RunStatus::Error);
-    }
-    // The presence reconciler's crash/kill/timeout close-edge: a session
-    // whose heartbeat disappeared with no clean dispatch terminal ever
-    // landing (`presence_reconciler.rs`'s own doc). (#2902 step 5) And a
-    // budget wait ended because its run was stopped; nothing was sent.
-    matches!(action, FlowAction::SessionEnd | FlowAction::BudgetStop).then_some(RunStatus::Abandoned)
 }
 
 /// The chronologically-EARLIEST session by `start_ts` (lexical compare —
@@ -2647,8 +2599,8 @@ fn ghost_runs(
         // (#1907) There is no per-dispatch abort action — `mission abort`
         // is mission-scoped, and a standalone session's only terminals are
         // `dispatch complete`/`dispatch error`/the presence reconciler's
-        // `session.end` crash-close-edge (see `terminal_status_for_action`'s
-        // own doc) — so an Abandoned ghost always means "no ending
+        // `session.end` crash-close-edge (see `run_lifecycle.rs`'s
+        // `ending_of`) — so an Abandoned ghost always means "no ending
         // recorded", whether it came from `session.end` or the staleness
         // gate above.
         let abandoned_reason = (status == RunStatus::Abandoned).then_some(if agg.stopped_by_operator {
@@ -4613,17 +4565,18 @@ mod tests {
 
     // ── the lifecycle corpus: one spec, two executors ────────────────────
 
-    /// What the daemon states about one corpus case's session as of `now_ms`:
-    /// `(phase, status, abandoned_reason)`, in the corpus's vocabulary. The
-    /// daemon has no `waiting` phase of its own (a held call is `Running`),
-    /// so `open` and `waiting` both read `running` here.
+    /// What the daemon states about one corpus case's session as of `now_ms`
+    /// — `(phase, status, abandoned_reason)`, in the corpus's vocabulary —
+    /// read exactly as `/runs` reads it: the settled session's current
+    /// attempt. The daemon has no `waiting` phase of its own (a held call is
+    /// `Running`), so `open` and `waiting` both read `running` here.
     fn daemon_judgement(agg: &SessionAgg, now_ms: u64) -> (&'static str, RunStatus, Option<AbandonReason>) {
         if let Some(status) = agg.terminal_status {
             let reason = (status == RunStatus::Abandoned)
                 .then_some(if agg.stopped_by_operator { AbandonReason::Aborted } else { AbandonReason::NoTerminal });
             return ("closed", status, reason);
         }
-        if !agg.has_start && !agg.has_wait {
+        if agg.lifecycle.latest().is_none() {
             return ("not_started", RunStatus::Planned, None);
         }
         if session_is_live(agg, now_ms) {
@@ -4633,11 +4586,13 @@ mod tests {
     }
 
     /// `tests/lifecycle/cases.json`, asserted against the daemon's session
-    /// fold and [`session_is_live`]: the same file the viewer's
-    /// `lifecycle.corpus.test.ts` asserts against `lifecycleAt`. A case the
-    /// daemon cannot judge names why (`server_skip_reason`); every other
-    /// case must agree, and the corpus's policy must be the one `/runs`
-    /// publishes at the shipped default.
+    /// fold (`run_lifecycle.rs`) and [`session_is_live`]: the same file the
+    /// viewer's `lifecycle.corpus.test.ts` asserts against `lifecycleAt`.
+    /// Each case's records up to its instant (an unparsable `ts` is always
+    /// in) are folded as `/runs` folds a day file; a case the daemon cannot
+    /// judge names why (`server_skip_reason`); every other case must agree,
+    /// and the corpus's policy must be the one `/runs` publishes at the
+    /// shipped default.
     #[test]
     #[serial_test::serial]
     fn lifecycle_corpus() {
@@ -4646,21 +4601,32 @@ mod tests {
         let policy = runs_policy();
         assert_eq!(doc["policy"]["stale_after_ms"].as_u64(), Some(policy.stale_after_ms), "the corpus is judged at the published policy");
         assert_eq!(doc["policy"]["budget_wait_grace_ms"].as_u64(), Some(policy.budget_wait_grace_ms));
-        let cases = doc["cases"].as_array().expect("cases");
         let mut judged = 0;
-        for case in cases {
+        for case in doc["cases"].as_array().expect("cases") {
             let name = case["name"].as_str().unwrap_or("?");
             if case.get("server").and_then(|v| v.as_bool()) == Some(false) {
                 assert!(case["server_skip_reason"].as_str().is_some_and(|r| !r.is_empty()), "{name}: a skipped case says why");
                 continue;
             }
+            let now_s = parse_flow_ts(case["as_of"].as_str().expect("as_of")).expect("as_of parses");
             let mut idx: HashMap<String, SessionAgg> = HashMap::new();
             for r in case["records"].as_array().expect("records") {
-                fold_session_record(&mut idx, r);
+                let ts = r["ts"].as_str().and_then(parse_flow_ts);
+                if ts.is_none_or(|t| t <= now_s) {
+                    fold_session_record(&mut idx, r);
+                }
             }
-            let now_ms = parse_flow_ts(case["as_of"].as_str().expect("as_of")).expect("as_of parses") * 1_000;
-            let sid = case["records"][0]["session_id"].as_str().expect("session_id");
-            let (phase, status, reason) = daemon_judgement(&idx[sid], now_ms);
+            settle_session_index(&mut idx);
+            let sid = case["run"]["session_id"].as_str().or(case["records"][0]["session_id"].as_str()).expect("session_id");
+            let Some(agg) = idx.get(sid) else {
+                assert_eq!(case["phase"], "not_started", "{name}: no record of the session is in yet");
+                judged += 1;
+                continue;
+            };
+            if let Some(m) = case["run"]["mission_id"].as_str() {
+                assert_eq!(agg.lifecycle.latest().and_then(|a| a.mission), Some(m.to_string()), "{name}: the daemon judges a session's current run");
+            }
+            let (phase, status, reason) = daemon_judgement(agg, now_s * 1_000);
             let want_phase = match case["phase"].as_str().expect("phase") {
                 "open" | "waiting" => "running",
                 other => other,
@@ -4670,7 +4636,7 @@ mod tests {
             assert_eq!(reason.map(|r| serde_json::to_value(r).unwrap()), case.get("abandoned_reason").cloned(), "{name}: abandoned_reason");
             judged += 1;
         }
-        assert!(judged >= 15, "the daemon judges most of the corpus, not a token few ({judged})");
+        assert!(judged >= 30, "the daemon judges the corpus, not a token few ({judged})");
     }
 
     /// The policy `/runs` publishes follows the daemon's own config, the
@@ -4865,12 +4831,11 @@ mod tests {
     /// 60s TTL can still let one through — the "benign edge" noted on
     /// `remove_presence_key`'s own doc) — so the schema decision not to
     /// bump `FLOW_SCHEMA_VERSION` over #2344 rests on this: even when both
-    /// records exist for the same session, `terminal_status_for_action`'s
-    /// "keep the FIRST terminal seen" (file/write order, not a timestamp
-    /// sort) already resolves to the dispatch's own terminal, because
-    /// `session.end` can only ever be written AFTER the reconciler notices
-    /// the presence key gone — strictly later than the terminal that caused
-    /// its removal.
+    /// records exist for the same session, the attempt's outcome is its
+    /// dispatch terminal whenever it has one (`run_lifecycle.rs`, rule 3),
+    /// whichever closing record came first — and `session.end` is only ever
+    /// written AFTER the reconciler notices the presence key gone, strictly
+    /// later than the terminal that caused its removal.
     #[test]
     fn build_flow_session_index_dispatch_error_wins_over_a_later_redundant_session_end() {
         let tmp = TempDir::new().unwrap();
@@ -5244,12 +5209,14 @@ mod tests {
         let wait = serde_json::json!({ "ts": base_ts, "action": "budget.wait", "session_id": "held", "payload": { "wait_seconds": 86_000 } });
         let mut idx = HashMap::new();
         fold_session_record(&mut idx, &wait);
+        settle_session_index(&mut idx);
         let held = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), base_ms + 3 * 3_600_000);
         assert_eq!(held.len(), 1, "a waiting session with no start yet is a run");
         assert_eq!(held[0].status, RunStatus::Running, "running while it waits, hours past the staleness window");
 
         let stop = serde_json::json!({ "ts": "2000-01-01T04:00:00Z", "action": "budget.stop", "session_id": "held", "payload": { "reason": "mission `m` is aborted" } });
         fold_session_record(&mut idx, &stop);
+        settle_session_index(&mut idx);
         let stopped = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), base_ms + 5 * 3_600_000);
         assert_eq!(stopped[0].status, RunStatus::Abandoned);
         assert_eq!(stopped[0].abandoned_reason, Some(AbandonReason::Aborted));
@@ -7801,7 +7768,7 @@ mod tests {
     /// exists only when this daemon can see the run directory.
     fn untracked_cell_is_reachable(kind: RunKind, status: RunStatus) -> bool {
         match (kind, status) {
-            // `ghost_runs`: `terminal_status_for_action` yields Complete
+            // `ghost_runs`: `run_lifecycle.rs`'s `ending_of` yields Complete
             // (`dispatch complete`), Error (`dispatch error`) and
             // Abandoned (`session.end`); the staleness gate yields Running
             // or Abandoned.

@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import type { Route } from "./route";
+import { dispatchHash, type Route } from "./route";
 import { canonicalOptPairs } from "../lenses/console/panels";
 
 /**
@@ -144,9 +144,7 @@ export function canonicalHash(route: Route): string | null {
       // (#1974) Writes the CANONICAL `dispatch=` spelling, which is what
       // makes the `session=` alias one-release rather than permanent: an
       // old bookmark parses, then gets rewritten here to the new form.
-      const p = new URLSearchParams();
-      p.set("dispatch", route.dispatchId);
-      return p.toString();
+      return dispatchHash(route.dispatchId, route.missionId);
     }
     case "mission": {
       // (#2189, step drill-in) `mission=<id>` is still written DIRECTLY by

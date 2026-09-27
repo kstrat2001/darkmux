@@ -54,6 +54,7 @@ mod panel;
 /// for the full attribution → roster → presence → fetch decision chain.
 mod peer_graph;
 mod runs;
+mod run_lifecycle;
 pub use runs::{
     build_runs, build_runs_with_usage, build_runs_within, local_dispatch_status, peer_mission_runs,
     AbandonReason, DispatchSessionEvidence, Run, RunKind, RunStatus, RunsWithUsage,
@@ -1580,6 +1581,10 @@ async fn health(
         // (#2916 re-review C3) The open-file soft limit this daemon runs
         // with (raised at start), for this machine only.
         "open_file_limit": if loopback_caller { current_open_file_limit() } else { None },
+        // The lifecycle policy every run is judged by (`/runs`' own rows,
+        // and the viewer's surfaces): cheap to read, so a page learns two
+        // numbers without building the run union.
+        "lifecycle_policy": runs::runs_policy(),
         // (#2928) The live channel as this daemon runs it: the cadence knob
         // and the ingest's own counters, so its cost and its traffic are
         // readable without a debugger. Never a sample itself.

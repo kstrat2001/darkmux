@@ -50,6 +50,10 @@ function graphSnapshot() {
   };
 }
 
+// The judge's run opens on its dispatch bookend, as a real seat's does: the
+// step meter is a projection of the step's run lifecycle, and a run with no
+// opening record has not started.
+const judgeStart = { ts: new Date(STARTED_SECS * 1000).toISOString(), action: 'dispatch.start', category: 'dispatch', source: 'crew', session_id: 'step-judge-1', level: 'info', payload: {} };
 const judgeTok = { ts: `${TODAY}T10:00:00Z`, action: 'telemetry.tokens', category: 'telemetry', source: 'tokens', session_id: 'step-judge-1', level: 'info', payload: { total_tokens: 5000 } };
 const verifyTok = { ts: `${TODAY}T10:00:01Z`, action: 'telemetry.tokens', category: 'telemetry', source: 'tokens', session_id: 'step-verify-1', level: 'info', payload: { total_tokens: 18000 } };
 
@@ -71,7 +75,7 @@ test('elapsed reads a sane clock, model chip is full, and a planned step shows n
 
   await page.clock.setFixedTime(FIXED_NOW_MS);
   await page.setViewportSize({ width: 390, height: 900 });
-  await routeAll(page, [judgeTok, verifyTok]);
+  await routeAll(page, [judgeStart, judgeTok, verifyTok]);
   await page.goto(`/index-live.html#mission=${MISSION_ID}`);
 
   const taskHd = page.locator('.tltask .tlt-hd');
@@ -109,9 +113,12 @@ test('elapsed reads a sane clock, model chip is full, and a planned step shows n
 });
 
 // (#1913) Both directions of the staleness boundary, pinned explicitly —
-// unpinned before this fix. `stepMeterFor` reads `lastSignal` (the judge's own
-// token record) in preference to `startedTs` for freshness, so only the
-// token's distance from "now" needs to move to walk the boundary.
+// unpinned before this fix. The step meter reads the judge's run lifecycle,
+// whose quiet clock runs from its newest record (the token), so only the
+// token's distance from "now" needs to move to walk the boundary; the run
+// opened earlier, past the window, on its dispatch bookend.
+const openedLongAgo = { ...judgeStart, ts: new Date(FIXED_NOW_MS - STALE_AFTER_MS - 5000).toISOString() };
+
 test('a judge seat 1s under STALE_AFTER_MS still renders the generating meter', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(String(e)));
@@ -123,7 +130,7 @@ test('a judge seat 1s under STALE_AFTER_MS still renders the generating meter', 
     action: 'telemetry.tokens', category: 'telemetry', source: 'tokens',
     session_id: 'step-judge-1', level: 'info', payload: { total_tokens: 1000 },
   };
-  await routeAll(page, [tok]);
+  await routeAll(page, [openedLongAgo, tok]);
   await page.goto(`/index-live.html#mission=${MISSION_ID}`);
 
   const taskHd = page.locator('.tltask .tlt-hd');
@@ -146,7 +153,7 @@ test('a judge seat 1s past STALE_AFTER_MS renders no generating meter', async ({
     action: 'telemetry.tokens', category: 'telemetry', source: 'tokens',
     session_id: 'step-judge-1', level: 'info', payload: { total_tokens: 1000 },
   };
-  await routeAll(page, [tok]);
+  await routeAll(page, [openedLongAgo, tok]);
   await page.goto(`/index-live.html#mission=${MISSION_ID}`);
 
   const taskHd = page.locator('.tltask .tlt-hd');

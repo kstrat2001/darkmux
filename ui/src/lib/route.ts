@@ -174,8 +174,12 @@ export type Route =
    * `dispatchId` is still the flow `session_id` on the wire — that FIELD
    * keeps its name (renaming it strands every archive, and #1974 demotes
    * "session" to an internal join key rather than deleting it). An open
-   * string, same precedent as `machine.machine` above. */
-  | { kind: "dispatch"; dispatchId: string }
+   * string, same precedent as `machine.machine` above.
+   *
+   * `missionId` (`dispatch.mission=<id>`, see {@link dispatchHash}) names
+   * which mission's run the link means when several missions share the
+   * session id (#2125); `null` reads the run that opened last. */
+  | { kind: "dispatch"; dispatchId: string; missionId: string | null }
   /** `#mission=<id>` — the mission-graph lens (#1868). A FULL NAVIGATION in
    * the LEGACY viewer (`location.href = "/mission/<id>/graph"`, a separate
    * document with its own vendored React Flow bundle); this port instead
@@ -467,7 +471,7 @@ export function parseRoute(): Route {
   // rewrite idempotent rather than oscillating.
   const dispatch = get("dispatch") || get("session");
   if (dispatch) {
-    return { kind: "dispatch", dispatchId: dispatch };
+    return { kind: "dispatch", dispatchId: dispatch, missionId: get("dispatch.mission") || null };
   }
 
   const raw = (location.hash || "").replace(/^#/, "");
@@ -539,4 +543,15 @@ export function parseRoute(): Route {
     return { kind: "playback", date: raw };
   }
   return { kind: "fleet" };
+}
+
+/** The hash of a run's detail view: its session id, and the mission whose
+ *  run it is when it has one, since a session id alone names the run that
+ *  opened last of every mission sharing it (#2125). The one way a link to a
+ *  run is written. */
+export function dispatchHash(sessionId: string, missionId: string | null): string {
+  const p = new URLSearchParams();
+  p.set("dispatch", sessionId);
+  if (missionId) p.set("dispatch.mission", missionId);
+  return p.toString();
 }

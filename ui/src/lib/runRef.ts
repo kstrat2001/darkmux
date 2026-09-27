@@ -5,15 +5,16 @@
  * scheduler's session ids are deterministic (`task-<task_id>`, a review's
  * `task-review-probe-mid-task`), so two missions routinely share one id; a
  * lookup by session alone pairs one mission's start with another's end
- * (#2125). The pair is the `RunGroup`; within it, each relaunch under the
- * same id is an `Attempt` (see `lifecycle.ts`'s `attemptsOf`); a `RunRef`
- * names one attempt of one group.
+ * (#2125). A session's records segment into attempts, every mission's
+ * together in time order (`lifecycle.ts`'s `segmentSession`); the attempts
+ * of one mission are its `RunGroup`, and a `RunRef` names one attempt of one
+ * group.
  *
  * Attribution. A record naming a `mission_id` belongs to that mission's
- * group. A record naming none (a `session.end`, some bookends) belongs to
- * its session's mission when the session has exactly ONE; when it has
- * several, the record is kept apart in a `(session, null)` group of its own
- * rather than guessed into one of them.
+ * attempt. A record naming none (the presence reconciler's `session.end`,
+ * some bookends) belongs to the attempt open, or latest opened, at its time:
+ * in a session two missions share, a close with no mission closes the run
+ * that was running, never a group of its own.
  *
  * The index is built once per window ARRAY (a `WeakMap` on its identity):
  * a window array is never mutated after it is first read, and every
@@ -21,7 +22,7 @@
  */
 
 import { ACTION, isAsOf, type NormRecord } from "./ingest";
-import { attemptsOf, type Attempt } from "./lifecycle";
+import { segmentSession, type Attempt, type SessionSegments } from "./lifecycle";
 
 /** One attempt of one run. `attempt` indexes `RunGroup.attempts`. */
 export interface RunRef {
@@ -37,7 +38,13 @@ export interface RunGroup {
   readonly sessionId: string;
   readonly missionId: string | null;
   readonly records: readonly NormRecord[];
+  /** This mission's attempts, time order. */
   readonly attempts: readonly Attempt[];
+  /** Every attempt of the session, every mission's, time order: presence
+   *  speaks for the latest only. Missions launched from one config share a
+   *  task session and run at once (#2125), so another mission's later
+   *  attempt never supersedes this group's. */
+  readonly sessionAttempts: readonly Attempt[];
   readonly grain: Grain;
   /** A run-grain group's mission's OTHER runs, whose activity is this run's
    *  (a mission's whole-run bookend never beats; its steps do). Empty for
@@ -51,8 +58,11 @@ export interface RunRecords {
   readonly group: RunGroup;
   /** The named attempt; `null` when the group has none (nothing opened). */
   readonly attempt: Attempt | null;
-  /** The attempt after it, whose opening supersedes this one. */
+  /** Its mission's attempt after it, whose opening supersedes this one. */
   readonly next: Attempt | null;
+  /** The session's attempt after it, any mission's: once that opened,
+   *  presence on the session speaks for it, not for this one. */
+  readonly sessionNext: Attempt | null;
 }
 
 /** What kind of unit a group is (contract 8's grains):
@@ -109,60 +119,38 @@ export function grainOf(records: readonly NormRecord[]): Grain {
 
 const groupKey = (sessionId: string, missionId: string | null): string => `${sessionId}\u0000${missionId ?? ""}`;
 
-/** Each session's distinct mission ids. */
-function missionsBySession(data: readonly NormRecord[]): Map<string, Set<string>> {
-  const out = new Map<string, Set<string>>();
-  for (const r of data) {
-    if (!r.session_id || !r.mission_id) continue;
-    let set = out.get(r.session_id);
-    if (!set) out.set(r.session_id, (set = new Set()));
-    set.add(r.mission_id);
-  }
-  return out;
-}
-
-/** The mission a record is attributed to (the module doc's rule). */
-function attributedMission(r: NormRecord, missions: Map<string, Set<string>>): string | null {
-  if (r.mission_id) return r.mission_id;
-  const only = missions.get(r.session_id ?? "");
-  return only && only.size === 1 ? [...only][0] : null;
-}
-
-interface Building {
-  key: string;
-  sessionId: string;
-  missionId: string | null;
-  records: NormRecord[];
-  uids: Set<string>;
-}
-
-function collect(data: readonly NormRecord[]): { byKey: Map<string, Building>; keyOf: Map<NormRecord, string> } {
-  const missions = missionsBySession(data);
-  const byKey = new Map<string, Building>();
-  const keyOf = new Map<NormRecord, string>();
-  for (const r of data) {
-    if (!r || !r.session_id) continue;
-    const missionId = attributedMission(r, missions);
-    const key = groupKey(r.session_id, missionId);
-    let b = byKey.get(key);
-    if (!b) byKey.set(key, (b = { key, sessionId: r.session_id, missionId, records: [], uids: new Set() }));
-    b.records.push(r);
-    b.uids.add(r.machine_uid || "unknown");
-    keyOf.set(r, key);
-  }
-  return { byKey, keyOf };
-}
-
-function pushTo<K>(m: Map<K, RunGroup[]>, k: K, g: RunGroup): void {
+function pushTo<K, V>(m: Map<K, V[]>, k: K, v: V): void {
   const list = m.get(k);
-  if (list) list.push(g);
-  else m.set(k, [g]);
+  if (list) list.push(v);
+  else m.set(k, [v]);
 }
 
 const NO_GROUPS: readonly RunGroup[] = [];
 
-function makeGroup(sessionId: string, missionId: string | null, records: readonly NormRecord[]): RunGroup {
-  return { key: groupKey(sessionId, missionId), sessionId, missionId, records, attempts: attemptsOf(records), grain: grainOf(records), siblings: NO_GROUPS };
+/** One session's groups: one per mission its attempts name (`null` for
+ *  attempts naming none), plus one per mission whose records belong to no
+ *  attempt. Records keep window order. */
+function sessionGroups(sessionId: string, recs: readonly NormRecord[], seg: SessionSegments): { groups: RunGroup[]; keyOf: Map<NormRecord, string> } {
+  const members = new Map<string | null, { attempts: Attempt[]; recs: Set<NormRecord> }>();
+  const memberOf = (m: string | null) => members.get(m) ?? members.set(m, { attempts: [], recs: new Set() }).get(m)!;
+  for (const a of seg.attempts) {
+    const e = memberOf(a.missionId);
+    e.attempts.push(a);
+    for (const r of a.records) e.recs.add(r);
+  }
+  for (const [m, strays] of seg.strays) for (const r of strays) memberOf(m).recs.add(r);
+  const keyOf = new Map<NormRecord, string>();
+  const groups = [...members].map(([m, e]) => {
+    const key = groupKey(sessionId, m);
+    for (const r of e.recs) keyOf.set(r, key);
+    const records = recs.filter((r) => e.recs.has(r));
+    return makeGroup(sessionId, m, records, e.attempts, seg.attempts);
+  });
+  return { groups, keyOf };
+}
+
+function makeGroup(sessionId: string, missionId: string | null, records: readonly NormRecord[], attempts: readonly Attempt[], sessionAttempts: readonly Attempt[]): RunGroup {
+  return { key: groupKey(sessionId, missionId), sessionId, missionId, records, attempts, sessionAttempts, grain: grainOf(records), siblings: NO_GROUPS };
 }
 
 /** Each run-grain group's siblings: its mission's other groups. */
@@ -174,18 +162,27 @@ function linkSiblings(byMission: Map<string, RunGroup[]>): void {
   }
 }
 
+/** The window's records by session, window order. */
+function bySessionId(data: readonly NormRecord[]): Map<string, NormRecord[]> {
+  const out = new Map<string, NormRecord[]>();
+  for (const r of data) if (r && r.session_id) pushTo(out, r.session_id, r);
+  return out;
+}
+
 function buildIndex(data: readonly NormRecord[]): RunIndex {
-  const { byKey, keyOf } = collect(data);
   const groups: RunGroup[] = [];
-  const byGroupKey = new Map<string, RunGroup>();
+  const keyOf = new Map<NormRecord, string>();
+  for (const [sid, recs] of bySessionId(data)) {
+    const built = sessionGroups(sid, recs, segmentSession(recs));
+    groups.push(...built.groups);
+    for (const [r, k] of built.keyOf) keyOf.set(r, k);
+  }
+  const byGroupKey = new Map(groups.map((g) => [g.key, g]));
   const byUid = new Map<string, RunGroup[]>();
   const bySession = new Map<string, RunGroup[]>();
   const byMission = new Map<string, RunGroup[]>();
-  for (const b of byKey.values()) {
-    const g = makeGroup(b.sessionId, b.missionId, b.records);
-    groups.push(g);
-    byGroupKey.set(g.key, g);
-    for (const uid of b.uids) pushTo(byUid, uid, g);
+  for (const g of groups) {
+    for (const uid of new Set(g.records.map((r) => r.machine_uid || "unknown"))) pushTo(byUid, uid, g);
     pushTo(bySession, g.sessionId, g);
     if (g.missionId) pushTo(byMission, g.missionId, g);
   }
@@ -230,7 +227,14 @@ export function refAt(group: RunGroup, asOf: number): RunRef {
 
 /** The records of `ref` as a `RunRecords`, from `group` (already in hand). */
 export function recordsOfGroup(group: RunGroup, ref: RunRef): RunRecords {
-  return { ref, group, attempt: group.attempts[ref.attempt] ?? null, next: group.attempts[ref.attempt + 1] ?? null };
+  const attempt = group.attempts[ref.attempt] ?? null;
+  return {
+    ref,
+    group,
+    attempt,
+    next: group.attempts[ref.attempt + 1] ?? null,
+    sessionNext: attempt ? (group.sessionAttempts[attempt.index + 1] ?? null) : null,
+  };
 }
 
 /** The records of `ref` in window `data`; `null` when the window holds no
@@ -255,13 +259,33 @@ function openingRank(run: RunRecords, asOf: number): number {
   return run.attempt.opening.tMs ?? Infinity;
 }
 
-/** A session route's run: of the session's groups, the one whose current
- *  attempt opened most recently as of `asOf`. A `#dispatch=<id>` link names
- *  a session only, so when two missions share the id this picks the one that
- *  ran last, never a blend of both. `null` for a session with no records. */
-export function sessionRun(data: readonly NormRecord[], sessionId: string, asOf: number): RunRecords | null {
+/** The groups a session route means: the named mission's alone when the
+ *  route names one (`#dispatch=<id>&dispatch.mission=<id>`), else every
+ *  mission's on the session. */
+function routeGroups(data: readonly NormRecord[], sessionId: string, missionId: string | null): readonly RunGroup[] {
+  const groups = runIndex(data).groupsOfSession(sessionId);
+  return missionId === null ? groups : groups.filter((g) => g.missionId === missionId);
+}
+
+/** `data` as a session route naming a mission means it: the session's own
+ *  records narrowed to that mission's run, every other session's kept (a
+ *  run page reads its mission's other sessions too). Unchanged when the
+ *  route names no mission. The run page and the event log both read
+ *  through this, so they show the run `sessionRun` heads. */
+export function sessionRouteRecords<R extends NormRecord>(data: readonly R[], sessionId: string, missionId: string | null): R[] {
+  if (missionId === null) return data as R[];
+  const own = new Set<NormRecord>(routeGroups(data, sessionId, missionId)[0]?.records ?? []);
+  return data.filter((r) => r.session_id !== sessionId || own.has(r));
+}
+
+/** A session route's run: of the route's groups (`routeGroups`), the one
+ *  whose current attempt opened most recently as of `asOf`. A link naming
+ *  a session only picks, when two missions share the id, the one that ran
+ *  last, never a blend of both. `null` for a session (or named mission)
+ *  with no records. */
+export function sessionRun(data: readonly NormRecord[], sessionId: string, asOf: number, missionId: string | null = null): RunRecords | null {
   let best: RunRecords | null = null;
-  for (const g of runIndex(data).groupsOfSession(sessionId)) {
+  for (const g of routeGroups(data, sessionId, missionId)) {
     const run = currentRun(g, asOf);
     if (best === null || openingRank(run, asOf) > openingRank(best, asOf)) best = run;
   }
@@ -276,9 +300,8 @@ export function groupOfRecords(records: readonly NormRecord[]): RunGroup {
   let g = loneCache.get(records);
   if (!g) {
     const first = records.find((r) => r.session_id) ?? records[0];
-    const sessionId = first?.session_id ?? "";
-    const missionId = first?.mission_id ?? null;
-    g = makeGroup(sessionId, missionId, records);
+    const seg = segmentSession(records);
+    g = makeGroup(first?.session_id ?? "", first?.mission_id ?? null, records, seg.attempts, seg.attempts);
     loneCache.set(records, g);
   }
   return g;

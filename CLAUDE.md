@@ -386,15 +386,16 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    draft of this entry claimed it "costs nothing in liveness" because the scheduler already
    emits `step.start`/`step.complete`/`step.error` per step (`scheduler.rs`'s
    `step_lifecycle_record`) under a `mission.start`. That is
-   true and irrelevant: four consumers key specifically on DISPATCH bookends at the session
-   grain, and step bookends do not feed any of them —
-   `terminal_status_for_action` (`crates/darkmux-serve/src/runs.rs`, which matches only
-   `dispatch.complete`/`dispatch.error`), the runs board's representative-session pick
-   (`runs.rs:3307`'s regression test records that the whole-run bookend wins that pick, and
-   that losing it already blanked role/model once), fleet card activity
-   (`ui/src/lenses/fleet/cards.ts:59`, filtering `action === "dispatch.start"` with no
-   `source` check), and the status line's last-dispatch (`ui/src/lib/metaLine.ts:28`).
-   Delete the emission first and those surfaces go dark.
+   true and irrelevant: the consumers key specifically on DISPATCH bookends at the session
+   grain, and step bookends do not feed any of them. The run lifecycle — ONE rule with two
+   executors judged by the same corpus (`tests/lifecycle/cases.json`): the viewer's
+   `ui/src/lib/lifecycle.ts` and the daemon's `crates/darkmux-serve/src/run_lifecycle.rs`
+   — opens an attempt on `dispatch.start` and takes its outcome from the dispatch terminal,
+   and every surface (fleet card, timeline, run page, runs board, radio's busy check) is a
+   projection of it. The runs board's representative-session pick prefers the whole-run
+   bookend (losing it already blanked role/model once), and the status line's last-dispatch
+   (`ui/src/lib/metaLine.ts`) reads `dispatch.start`. Delete the emission first and those
+   surfaces go dark.
 
    Note also that #1899 PRESCRIBED the whole-run pair for every generic launch three days
    before this entry was written (`src/mission_launch.rs:~684`: "telemetry + the whole-run

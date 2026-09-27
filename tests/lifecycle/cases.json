@@ -1,5 +1,5 @@
 {
-  "$comment": "One lifecycle spec, two executors: ui/src/lib/lifecycle.corpus.test.ts (the viewer's lifecycleAt) and crates/darkmux-serve/src/runs.rs's lifecycle_corpus test (the daemon's session fold and session_is_live). Each case is one run's records, an as-of instant and the phase and status every surface must state for it. A case the daemon cannot judge says why in server_skip_reason.",
+  "$comment": "One lifecycle spec, two executors: ui/src/lib/lifecycle.corpus.test.ts (the viewer's lifecycleAt) and crates/darkmux-serve/src/runs.rs's lifecycle_corpus test (the daemon's session fold). Each case is the records of one or more runs, an as-of instant (both executors judge the records at or before it; an untimed record is always in), the run judged (`run`: a session and optionally a mission; absent, the session a `#dispatch=<id>` link names, as the session's current run), and the phase and status every surface must state for it then. A case the daemon cannot judge says why in server_skip_reason; the only such input is session presence.",
   "policy": {
     "stale_after_ms": 1200000,
     "budget_wait_grace_ms": 60000
@@ -194,9 +194,7 @@
         }
       ],
       "phase": "not_started",
-      "status": "planned",
-      "server": false,
-      "server_skip_reason": "the server judges a session as of now; it has no as-of cut"
+      "status": "planned"
     },
     {
       "name": "a close after the as-of instant does not close it yet",
@@ -217,9 +215,7 @@
         }
       ],
       "phase": "open",
-      "status": "running",
-      "server": false,
-      "server_skip_reason": "the server judges a session as of now; it has no as-of cut"
+      "status": "running"
     },
     {
       "name": "a budget wait before any start is waiting until its resume time",
@@ -456,9 +452,7 @@
         }
       ],
       "phase": "open",
-      "status": "running",
-      "server": false,
-      "server_skip_reason": "the server folds a session's first terminal and has no attempts"
+      "status": "running"
     },
     {
       "name": "a relaunch under the same session id after a clean finish is open",
@@ -486,9 +480,7 @@
         }
       ],
       "phase": "open",
-      "status": "running",
-      "server": false,
-      "server_skip_reason": "the server folds a session's first terminal and has no attempts"
+      "status": "running"
     },
     {
       "name": "a relaunch supersedes an attempt that never closed; the new attempt closes on its own terminal",
@@ -516,9 +508,7 @@
         }
       ],
       "phase": "closed",
-      "status": "complete",
-      "server": false,
-      "server_skip_reason": "the server folds a session's first terminal and has no attempts"
+      "status": "complete"
     },
     {
       "name": "presence holds a silent run open",
@@ -608,9 +598,7 @@
         }
       ],
       "phase": "closed",
-      "status": "complete",
-      "server": false,
-      "server_skip_reason": "the server reads a mission's status from its mission record, not its lifecycle session"
+      "status": "complete"
     },
     {
       "name": "a mission aborted by the operator is abandoned as aborted",
@@ -633,9 +621,7 @@
       ],
       "phase": "closed",
       "status": "abandoned",
-      "abandoned_reason": "aborted",
-      "server": false,
-      "server_skip_reason": "the server reads a mission's status from its mission record, not its lifecycle session"
+      "abandoned_reason": "aborted"
     },
     {
       "name": "before its wait is announced a held call has not started",
@@ -653,9 +639,7 @@
         }
       ],
       "phase": "not_started",
-      "status": "planned",
-      "server": false,
-      "server_skip_reason": "the server judges a session as of now; it has no as-of cut"
+      "status": "planned"
     },
     {
       "name": "a wait re-announced at its resume time waits to the new resume time",
@@ -711,6 +695,477 @@
       ],
       "phase": "closed",
       "status": "error"
+    },
+    {
+      "name": "a mission-less session.end in a shared session closes the run open at its time",
+      "as_of": "2026-09-27T10:12:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "A"
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "dispatch.complete",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "A"
+        },
+        {
+          "ts": "2026-09-27T10:10:00Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "B"
+        },
+        {
+          "ts": "2026-09-27T10:10:10Z",
+          "action": "dispatch.turn.heartbeat",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "B"
+        },
+        {
+          "ts": "2026-09-27T10:11:40Z",
+          "action": "session.end",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "closed",
+      "status": "abandoned",
+      "abandoned_reason": "noterminal"
+    },
+    {
+      "name": "the same mission-less session.end leaves the earlier mission's clean finish alone",
+      "as_of": "2026-09-27T10:12:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "A"
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "dispatch.complete",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "A"
+        },
+        {
+          "ts": "2026-09-27T10:10:00Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "B"
+        },
+        {
+          "ts": "2026-09-27T10:10:10Z",
+          "action": "dispatch.turn.heartbeat",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "B"
+        },
+        {
+          "ts": "2026-09-27T10:11:40Z",
+          "action": "session.end",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "run": {
+        "session_id": "task-probe",
+        "mission_id": "A"
+      },
+      "phase": "closed",
+      "status": "complete",
+      "server": false,
+      "server_skip_reason": "/runs judges a session by its current attempt; an earlier mission of a session several missions share has no row of its own there (#1918: such a session is no mission's drill target)"
+    },
+    {
+      "name": "the later mission's run owns the mission-less close",
+      "as_of": "2026-09-27T10:12:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "A"
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "dispatch.complete",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "A"
+        },
+        {
+          "ts": "2026-09-27T10:10:00Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "B"
+        },
+        {
+          "ts": "2026-09-27T10:10:10Z",
+          "action": "dispatch.turn.heartbeat",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "B"
+        },
+        {
+          "ts": "2026-09-27T10:11:40Z",
+          "action": "session.end",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "run": {
+        "session_id": "task-probe",
+        "mission_id": "B"
+      },
+      "phase": "closed",
+      "status": "abandoned",
+      "abandoned_reason": "noterminal"
+    },
+    {
+      "name": "before the mission-less close the later mission's run is open",
+      "as_of": "2026-09-27T10:10:50Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "A"
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "dispatch.complete",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "A"
+        },
+        {
+          "ts": "2026-09-27T10:10:00Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "B"
+        },
+        {
+          "ts": "2026-09-27T10:10:10Z",
+          "action": "dispatch.turn.heartbeat",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "B"
+        },
+        {
+          "ts": "2026-09-27T10:11:40Z",
+          "action": "session.end",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "run": {
+        "session_id": "task-probe",
+        "mission_id": "B"
+      },
+      "phase": "open",
+      "status": "running"
+    },
+    {
+      "name": "an earlier mission's run silent past the window reads stopped beside a later mission on its session",
+      "as_of": "2026-09-27T12:00:10Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "A"
+        },
+        {
+          "ts": "2026-09-27T10:00:10Z",
+          "action": "dispatch.turn.heartbeat",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "A"
+        },
+        {
+          "ts": "2026-09-27T12:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "B"
+        }
+      ],
+      "run": {
+        "session_id": "task-probe",
+        "mission_id": "A"
+      },
+      "phase": "stale",
+      "status": "abandoned",
+      "abandoned_reason": "noterminal",
+      "server": false,
+      "server_skip_reason": "/runs judges a session by its current attempt; an earlier mission of a session several missions share has no row of its own there (#1918: such a session is no mission's drill target)"
+    },
+    {
+      "name": "a later mission starting on a shared session does not stop an earlier mission's run still in flight",
+      "as_of": "2026-09-27T10:00:30Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "A"
+        },
+        {
+          "ts": "2026-09-27T10:00:10Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "B"
+        },
+        {
+          "ts": "2026-09-27T10:00:20Z",
+          "action": "dispatch.turn",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "A"
+        }
+      ],
+      "run": {
+        "session_id": "task-probe",
+        "mission_id": "A"
+      },
+      "phase": "open",
+      "status": "running",
+      "server": false,
+      "server_skip_reason": "/runs judges a session by its current attempt; an earlier mission of a session several missions share has no row of its own there (#1918: such a session is no mission's drill target)"
+    },
+    {
+      "name": "presence holds open only the session's current run, not an earlier mission's",
+      "as_of": "2026-09-27T12:00:10Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "A"
+        },
+        {
+          "ts": "2026-09-27T10:00:10Z",
+          "action": "dispatch.turn.heartbeat",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "A"
+        },
+        {
+          "ts": "2026-09-27T12:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "B"
+        }
+      ],
+      "run": {
+        "session_id": "task-probe",
+        "mission_id": "A"
+      },
+      "presence": [
+        "task-probe"
+      ],
+      "phase": "stale",
+      "status": "abandoned",
+      "abandoned_reason": "noterminal",
+      "server": false,
+      "server_skip_reason": "/runs does not read session presence"
+    },
+    {
+      "name": "presence holds the session's current run open",
+      "as_of": "2026-09-27T12:21:40Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "A"
+        },
+        {
+          "ts": "2026-09-27T10:00:10Z",
+          "action": "dispatch.turn.heartbeat",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "A"
+        },
+        {
+          "ts": "2026-09-27T12:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "B"
+        }
+      ],
+      "run": {
+        "session_id": "task-probe",
+        "mission_id": "B"
+      },
+      "presence": [
+        "task-probe"
+      ],
+      "phase": "open",
+      "status": "running",
+      "server": false,
+      "server_skip_reason": "/runs does not read session presence"
+    },
+    {
+      "name": "presence never opens a run that has not started",
+      "as_of": "2026-09-27T10:05:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:10:00Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "presence": [
+        "task-probe"
+      ],
+      "phase": "not_started",
+      "status": "planned",
+      "server": false,
+      "server_skip_reason": "/runs does not read session presence"
+    },
+    {
+      "name": "a dispatch terminal is the outcome even when a session.end closed the run first",
+      "as_of": "2026-09-27T10:02:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "session.end",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        },
+        {
+          "ts": "2026-09-27T10:01:01Z",
+          "action": "dispatch.complete",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "closed",
+      "status": "complete"
+    },
+    {
+      "name": "a close with nothing opened is not a run",
+      "as_of": "2026-09-27T10:00:10Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "session.end",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "not_started",
+      "status": "planned"
+    },
+    {
+      "name": "a budget.resume in the same second as its wait ends the wait",
+      "as_of": "2026-09-27T10:25:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "s1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        },
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "budget.wait",
+          "session_id": "s1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "wait_seconds": 1800
+          }
+        },
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "budget.resume",
+          "session_id": "s1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "stale",
+      "status": "abandoned",
+      "abandoned_reason": "noterminal"
+    },
+    {
+      "name": "a relaunch does not inherit the earlier attempt's budget wait",
+      "as_of": "2026-09-27T10:30:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "s1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        },
+        {
+          "ts": "2026-09-27T10:00:30Z",
+          "action": "budget.wait",
+          "session_id": "s1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "wait_seconds": 1800
+          }
+        },
+        {
+          "ts": "2026-09-27T10:05:00Z",
+          "action": "dispatch.start",
+          "session_id": "s1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "stale",
+      "status": "abandoned",
+      "abandoned_reason": "noterminal"
+    },
+    {
+      "name": "a terminal from a skewed clock that arrives before its start closes the run",
+      "as_of": "2026-09-27T10:00:20Z",
+      "records": [
+        {
+          "ts": "2026-09-27T09:59:55Z",
+          "action": "dispatch.complete",
+          "session_id": "s1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        },
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "s1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "closed",
+      "status": "complete"
     }
   ]
 }

@@ -64,6 +64,7 @@ import type { NormRecord } from "../../lib/ingest";
 import type { RunStatus } from "../../types/generated/RunStatus";
 import { DEFAULT_POLICY, endMs, lifecycleAt, spanOf, toRunState, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
 import { currentRun, runIndex, type RunGroup } from "../../lib/runRef";
+import { dispatchHash } from "../../lib/route";
 
 /** The live-only window presets (#1151) — minutes, matching legacy's
  * `[{l:'10m',m:10},{l:'1h',m:60},{l:'4h',m:240},{l:'24h',m:1440}]` verbatim.
@@ -89,6 +90,10 @@ export interface TimelineBar {
    * identity of ONE bar. Always distinct across bars in the same lane,
    * unlike `sid` alone. Use this for React `key`s / dedup, never `sid`. */
   key: string;
+  /** The bar's click-through: its run's detail view, naming the mission so
+   *  a session id several missions share opens this bar's run
+   *  (`dispatchHash`). */
+  hash: string;
   leftPct: number;
   widthPct: number;
   /** (#2813) The canonical run status: the bar's CSS class too (`.sbar.<status>`). */
@@ -154,7 +159,7 @@ function barFor(g: RunGroup, w: BarWindow): TimelineBar | null {
   const role = ((first.start ?? first.opening).handle || "").replace(/^darkmux\//, "");
   const state = toRunState(l);
   const key = g.missionId ? `${g.sessionId}\x1f${g.missionId}` : g.sessionId;
-  return { sid: g.sessionId, key, leftPct, widthPct, status: state.status, title: `${role} · ${g.sessionId} · ${statusLabel(state)}` };
+  return { sid: g.sessionId, key, hash: dispatchHash(g.sessionId, g.missionId), leftPct, widthPct, status: state.status, title: `${role} · ${g.sessionId} · ${statusLabel(state)}` };
 }
 
 export function buildActivityTimeline(

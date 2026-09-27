@@ -166,6 +166,8 @@ function mockFleetFetch(opts: {
   /** (#2965) Further days that answer `200 []`: the mock names today and
    *  yesterday when it is built, so a day reached by a rollover needs this. */
   emptyDays?: string[];
+  /** Session ids `/fleet/sessions/live` reports beating. */
+  sessions?: string[];
 } = {}) {
   const today = todayUTC();
   const yesterday = prevDateUTC(today);
@@ -201,8 +203,9 @@ function mockFleetFetch(opts: {
       );
     }
     if (path === "/fleet/sessions/live") {
+      const sessions = (opts.sessions ?? []).map((session_id) => ({ session_id }));
       return Promise.resolve(
-        new Response(JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }),
+        new Response(JSON.stringify({ sessions, meta: { sources: { fleet: { state: "ok" } }, complete: true } }), { status: 200 }),
       );
     }
     if (path === "/machine/specs") {
@@ -230,6 +233,41 @@ function gate(): { promise: Promise<void>; open: () => void } {
   });
   return { promise, open };
 }
+
+describe("FleetLens: presence is a fact about now", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  // A run silent for two hours whose session presence still beats: at the
+  // live edge presence holds it running; with the playhead parked an hour
+  // in, the same card judges from the records alone.
+  const now = Date.parse(`${todayUTC()}T12:00:00.000Z`);
+  const start = now - 2 * 3_600_000;
+  const records = [{ ts: new Date(start).toISOString(), action: "dispatch.start", session_id: "s1", machine_uid: "u1", machine_id: "MacBook-Pro", handle: "coder" }];
+
+  async function cardText(playhead?: number): Promise<string> {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(now);
+    mockFleetFetch({ flowToday: records, sessions: ["s1"] });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderFleetLens(playhead === undefined ? {} : { playhead }, qc);
+    await waitFor(() => expect(qc.getQueryState(queryKeys.fleetSessionsLive())?.status).toBe("success"));
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    return document.querySelector(".mach")!.textContent ?? "";
+  }
+
+  it("at the live edge presence holds the silent run running", async () => {
+    await cardText();
+    await waitFor(() => expect(document.querySelector(".mach")!.textContent).toContain("1 running"));
+  });
+
+  it("a scrubbed playhead on a live day judges from records alone, however presence reads now", async () => {
+    const text = await cardText(start + 3_600_000);
+    expect(text).not.toContain("1 running");
+  });
+});
 
 describe("FleetLens", () => {
   it("always renders the hero, even at zero — never hides it while there's no data yet", async () => {

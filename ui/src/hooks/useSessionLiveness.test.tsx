@@ -98,7 +98,7 @@ function stubFetch() {
   return { calls, sliceFetches: () => calls.filter((u) => u.startsWith("/flow-session/")).length };
 }
 
-const ROUTE: Route = { kind: "dispatch", dispatchId: SID };
+const ROUTE: Route = { kind: "dispatch", dispatchId: SID, missionId: null };
 
 afterEach(() => {
   vi.unstubAllGlobals();

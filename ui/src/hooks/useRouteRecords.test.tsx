@@ -79,7 +79,7 @@ describe("useRouteRecords", () => {
   });
 
   it("gives a SESSION route that session's records, never the live window", async () => {
-    const route: Route = { kind: "dispatch", dispatchId: "s-1" };
+    const route: Route = { kind: "dispatch", dispatchId: "s-1", missionId: null };
     const { result } = renderHook(() => useRouteRecords(route, LIVE), { wrapper: wrapper() });
 
     await waitFor(() => expect(result.current.loading).toBe(false));
@@ -107,7 +107,7 @@ describe("useRouteRecords", () => {
 
   it("shows EMPTY rather than live records when a historical fetch FAILS", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 500, json: async () => ({}) }));
-    const route: Route = { kind: "dispatch", dispatchId: "missing" };
+    const route: Route = { kind: "dispatch", dispatchId: "missing", missionId: null };
     const { result } = renderHook(() => useRouteRecords(route, LIVE), { wrapper: wrapper() });
 
     await waitFor(() => expect(result.current.loading).toBe(false));
@@ -183,7 +183,7 @@ describe("useRouteRecords — the static-demo flow-src route (#1801)", () => {
           .join("\n") + "\n",
       ),
     );
-    const route: Route = { kind: "dispatch", dispatchId: "s1" };
+    const route: Route = { kind: "dispatch", dispatchId: "s1", missionId: null };
 
     const { result } = renderHook(() => useRouteRecords(route, LIVE), { wrapper: wrapper() });
     await waitFor(() => expect(result.current.loading).toBe(false));
@@ -259,7 +259,7 @@ function mockFetchLive(opts: { liveIds: string[]; records: () => unknown[] }) {
 describe("useRouteRecords — a session that is still running", () => {
   it("is not historical while presence still reports it live", async () => {
     vi.stubGlobal("fetch", mockFetchLive({ liveIds: ["s-live"], records: () => [{ action: "a" }] }));
-    const route: Route = { kind: "dispatch", dispatchId: "s-live" };
+    const route: Route = { kind: "dispatch", dispatchId: "s-live", missionId: null };
     const { result } = renderHook(() => useRouteRecords(route, LIVE), { wrapper: wrapper() });
 
     await waitFor(() => expect(result.current.historical).toBe(false));
@@ -270,7 +270,7 @@ describe("useRouteRecords — a session that is still running", () => {
 
   it("stays historical when presence does not list it", async () => {
     vi.stubGlobal("fetch", mockFetchLive({ liveIds: ["someone-else"], records: () => [{ action: "a" }] }));
-    const route: Route = { kind: "dispatch", dispatchId: "s-done" };
+    const route: Route = { kind: "dispatch", dispatchId: "s-done", missionId: null };
     const { result } = renderHook(() => useRouteRecords(route, LIVE), { wrapper: wrapper() });
 
     await waitFor(() => expect(result.current.loading).toBe(false));
@@ -281,7 +281,7 @@ describe("useRouteRecords — a session that is still running", () => {
     let batch = [{ action: "turn-1" }];
     vi.stubGlobal("fetch", mockFetchLive({ liveIds: ["s-live"], records: () => batch }));
 
-    const route: Route = { kind: "dispatch", dispatchId: "s-live" };
+    const route: Route = { kind: "dispatch", dispatchId: "s-live", missionId: null };
     const { result } = renderHook(() => useRouteRecords(route, LIVE), { wrapper: wrapper() });
 
     await waitFor(() => expect(result.current.records).toEqual([{ action: "turn-1", tMs: null }]));

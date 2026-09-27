@@ -100,3 +100,20 @@ describe("every surface states the same lifecycle (the PR 4 promise)", () => {
     expect(buildFleetCard(data, new Map(), null, new Set(), false, U, false, t).runsCount).toBe(1);
   });
 });
+
+// One time-pick rule: a run's start and latest activity are read by a scan,
+// never by spreading its timestamps into `Math.max`/`Math.min`, whose
+// argument count a long run outgrows.
+describe("a long run", () => {
+  it("is judged without spreading its timestamps into an argument list", () => {
+    const raw: RawRecord[] = [rec(0, "dispatch.start")];
+    for (let i = 1; i <= 300_000; i++) raw.push(rec(i / 100, "dispatch.turn"));
+    const data = normAll(raw);
+    const t = T0 + 3_000_000;
+    const run = sessionRun(data, "s1", t);
+    expect(run).not.toBeNull();
+    const lc = lifecycleAt(run!, t, DEFAULT_POLICY);
+    expect(lc.startMs).toBe(T0);
+    expect(lc.lastActivityMs).toBe(T0 + 3_000_000);
+  });
+});

@@ -243,6 +243,19 @@
         assert!(!json["flow_schema_version"].as_str().unwrap().is_empty());
     }
 
+    /// `/health` carries the lifecycle policy: the viewer's one cheap read of
+    /// the numbers every run is judged by, never a `/runs` build.
+    #[tokio::test]
+    async fn health_carries_the_lifecycle_policy() {
+        let app = build_router_local(PathBuf::new());
+        let response = app.oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap()).await.unwrap();
+        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let policy = crate::runs::runs_policy();
+        assert_eq!(json["lifecycle_policy"]["stale_after_ms"].as_u64(), Some(policy.stale_after_ms));
+        assert_eq!(json["lifecycle_policy"]["budget_wait_grace_ms"].as_u64(), Some(policy.budget_wait_grace_ms));
+    }
+
     /// (#1530 dogfood) The viewer document carries cache VALIDATORS. Serving
     /// a ~256 KB page with no `ETag` and no `Cache-Control` left the browser
     /// to pick between a full re-download every load and a heuristically

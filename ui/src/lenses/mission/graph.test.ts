@@ -32,7 +32,9 @@ import {
   stepForRecord,
   stepLead,
   stepMeterFor,
+  stepPhasesAt,
   stepSeat,
+  recordsByStep,
   tsToMs,
   type GraphNode,
   type MetricsMap,
@@ -675,7 +677,7 @@ describe("stepMeterFor wall time (#2269)", () => {
   it("a running step's wall time is start → now, the same number the pulse shows", () => {
     const step = { id: "s", label: "u-0002", kind: "dispatch.internal", status: "running" };
     const m = { ...base, startTs: T0, endTs: 0, lastTs: T0 + 40_000 };
-    const meter = stepMeterFor(step, { s: m }, T0 + 45_000);
+    const meter = stepMeterFor(step, { s: m }, T0 + 45_000, new Map([["s", "open"]]));
     expect(meter.generating).toBe(true);
     expect(meter.wallMs).toBe(45_000);
     expect(meter.elapsedMs).toBe(45_000);
@@ -690,21 +692,38 @@ describe("stepMeterFor wall time (#2269)", () => {
   });
 });
 
+// The meter is a projection of the step's run lifecycle (`stepPhasesAt`),
+// the rule every surface judges a run by, fed the records the graph
+// attributes to the step.
 describe("stepMeterFor liveness", () => {
   const step = { id: "a-step", label: "Shell", kind: "dispatch.internal", status: "running" };
+  const T0 = Date.parse("2026-08-19T00:00:00Z");
+  const iso = (ms: number) => new Date(ms).toISOString();
+  const meterAt = (raw: RawRecord[], now: number) => {
+    const byStep = recordsByStep(raw.map((r) => rec({ handle: "a-step", session_id: "task-a", ...r })), indexGraph(baseGraph()), "m1");
+    return stepMeterFor(step, {}, now, stepPhasesAt(byStep, now, DEFAULT_POLICY));
+  };
 
   it("shows a generating pulse while the last signal is within the liveness window", () => {
-    const now = 10_000_000;
-    const m: MetricsMap = { "a-step": { tokRun: 0, tokFinal: 0, turnRun: 0, turnFinal: 0, toolRun: 0, toolFinal: 0, usageSeen: false, startTs: now - 5000, endTs: 0, lastTs: now - 1000 } };
-    expect(stepMeterFor(step, m, now).generating).toBe(true);
+    expect(meterAt([{ action: "dispatch.start", ts: iso(T0) }, { action: "dispatch.turn", ts: iso(T0 + 4_000) }], T0 + 5_000).generating).toBe(true);
   });
 
   it("stops claiming 'generating' once the last signal is older than the liveness window (a hard-killed dispatch)", () => {
-    const now = 10_000_000;
-    const m: MetricsMap = {
-      "a-step": { tokRun: 0, tokFinal: 0, turnRun: 0, turnFinal: 0, toolRun: 0, toolFinal: 0, usageSeen: false, startTs: now - DEFAULT_POLICY.staleAfterMs - 5000, endTs: 0, lastTs: now - DEFAULT_POLICY.staleAfterMs - 1000 },
-    };
-    expect(stepMeterFor(step, m, now).generating).toBe(false);
+    expect(meterAt([{ action: "dispatch.start", ts: iso(T0) }], T0 + DEFAULT_POLICY.staleAfterMs + 1_000).generating).toBe(false);
+  });
+
+  it("keeps generating through an announced budget wait, as the run page does", () => {
+    const records = [{ action: "dispatch.start", ts: iso(T0) }, { action: "budget.wait", ts: iso(T0 + 1_000), payload: { wait_seconds: 1800 } }];
+    expect(meterAt(records, T0 + 25 * 60_000).generating).toBe(true);
+  });
+
+  it("is not generating once its run closed, whatever the node status says", () => {
+    const records = [{ action: "dispatch.start", ts: iso(T0) }, { action: "dispatch.complete", ts: iso(T0 + 2_000) }];
+    expect(meterAt(records, T0 + 3_000).generating).toBe(false);
+  });
+
+  it("is not generating with no records of its own", () => {
+    expect(meterAt([], T0).generating).toBe(false);
   });
 });
 

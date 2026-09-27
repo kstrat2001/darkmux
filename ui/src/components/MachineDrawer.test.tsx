@@ -921,7 +921,7 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
     stubDaemonFetch();
     render(
       <MachineDrawer
-        route={{ kind: "dispatch", dispatchId: "d1" }}
+        route={{ kind: "dispatch", dispatchId: "d1", missionId: null }}
         routeRecords={[proc("2026-01-01T00:00:00Z", 30, 55, 40)]}
         flowWindow={[]}
         localUid={null}
@@ -956,7 +956,7 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
     stubDaemonFetch();
     render(
       <MachineDrawer
-        route={{ kind: "dispatch", dispatchId: "d1" }}
+        route={{ kind: "dispatch", dispatchId: "d1", missionId: null }}
         routeRecords={[proc("2026-01-01T00:00:00Z", 30, 55, 40)]}
         flowWindow={[]}
         localUid={null}
@@ -1001,7 +1001,7 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
     stubDaemonFetch(RESOURCES_WITHOUT_LOAD);
     render(
       <MachineDrawer
-        route={{ kind: "dispatch", dispatchId: "d1" }}
+        route={{ kind: "dispatch", dispatchId: "d1", missionId: null }}
         routeRecords={[proc("2026-01-01T00:00:00Z", 30, 55, 40)]}
         flowWindow={[]}
         localUid={null}

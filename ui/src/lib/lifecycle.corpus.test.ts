@@ -7,11 +7,13 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { lifecycleAt, toRunState, type LifecyclePolicy } from "./lifecycle";
-import { currentRun, groupOfRecords } from "./runRef";
+import { currentRun, runIndex, sessionRun } from "./runRef";
+import type { NormRecord } from "./ingest";
 import { normAll, type RawRecord } from "../testing/records";
 
 interface Case {
   name: string;
+  run?: { session_id: string; mission_id?: string };
   as_of: string;
   records: RawRecord[];
   presence?: string[];
@@ -26,6 +28,15 @@ const corpus = JSON.parse(readFileSync(path.join(path.dirname(fileURLToPath(impo
 };
 const policy: LifecyclePolicy = { staleAfterMs: corpus.policy.stale_after_ms, budgetWaitGraceMs: corpus.policy.budget_wait_grace_ms };
 
+/** The run a case judges: its `run` (a session, and a mission when named),
+ *  else the session a `#dispatch=<id>` link names, as that route reads it. */
+function judgedRun(data: NormRecord[], c: Case, asOf: number) {
+  const sid = c.run?.session_id ?? String(data[0].session_id);
+  if (c.run?.mission_id === undefined) return sessionRun(data, sid, asOf)!;
+  const g = runIndex(data).groupsOfSession(sid).find((x) => x.missionId === c.run!.mission_id)!;
+  return currentRun(g, asOf);
+}
+
 describe("lifecycle corpus (tests/lifecycle/cases.json)", () => {
   it("is not empty", () => {
     expect(corpus.cases.length).toBeGreaterThan(20);
@@ -33,7 +44,7 @@ describe("lifecycle corpus (tests/lifecycle/cases.json)", () => {
   for (const c of corpus.cases) {
     it(c.name, () => {
       const asOf = Date.parse(c.as_of);
-      const run = currentRun(groupOfRecords(normAll(c.records)), asOf);
+      const run = judgedRun(normAll(c.records), c, asOf);
       const l = lifecycleAt(run, asOf, policy, new Set(c.presence ?? []));
       expect(l.phase).toBe(c.phase);
       const state = toRunState(l);

@@ -8,6 +8,7 @@ import { getSource } from "../lib/source";
 import { useDay } from "./useDay";
 import type { FlowWindowResult } from "./useFlowWindow";
 import { ingest, type NormRecord } from "../lib/ingest";
+import { sessionRouteRecords } from "../lib/runRef";
 
 /**
  * Which records does THIS route actually mean? (#1800 P1)
@@ -78,6 +79,9 @@ function recordsOf(result: { ok: true; data: unknown } | { ok: false } | undefin
 export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): RouteRecords {
   const date = route.kind === "playback" ? route.date : null;
   const sessionId = route.kind === "dispatch" ? route.dispatchId : null;
+  // A link naming the run's mission lists that run alone, the one the
+  // page's header reads (`sessionRun` with the same mission).
+  const missionId = route.kind === "dispatch" ? route.missionId : null;
   // (#1801) `date` is `null` on a playback route ONLY when a static build
   // forced it (`route.ts`'s own doc) — so reading the source's flow file directly
   // here, rather than re-deriving it from `date === null`, is the "one
@@ -150,7 +154,7 @@ export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): Rou
     // module doc explains why that matters).
     const all = day.records ?? [];
     return {
-      records: sessionId !== null ? all.filter((r) => r.session_id === sessionId) : all,
+      records: sessionId !== null ? sessionRouteRecords(all.filter((r) => r.session_id === sessionId), sessionId, missionId) : all,
       loading: day.loading,
       historical: true,
       error: null,
@@ -170,7 +174,7 @@ export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): Rou
     const recs = recordsOf(sessionQuery.data);
     const err = sessionQuery.data && !sessionQuery.data.ok ? sessionQuery.data : null;
     return {
-      records: recs ?? [],
+      records: sessionRouteRecords(recs ?? [], sessionId, missionId),
       loading: sessionQuery.data === undefined,
       // A running session is not a historical slice, and saying so is what
       // lets the log keep its live affordances (the window label, the

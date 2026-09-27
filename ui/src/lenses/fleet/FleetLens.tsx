@@ -1,3 +1,4 @@
+import { NO_PRESENCE } from "../../lib/lifecycle";
 import { useLifecyclePolicy } from "../../hooks/useLifecyclePolicy";
 import { encodeMachineKey } from "../../lib/machineKey";
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
@@ -31,6 +32,7 @@ import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW
 import type { MachineSpecs } from "../../types/handwritten";
 import { runsForMachine } from "../runs/format";
 import { recordsAsOf, type NormRecord } from "../../lib/ingest";
+import { dispatchHash } from "../../lib/route";
 
 /** `ICON.machine` (viewer.html:935) — the generic processor/chip glyph
  * every fleet card renders, since `MACH_ICON` (the per-machine form-factor
@@ -103,7 +105,7 @@ function machineDrillHash(machineKey: string): string {
  * "several things running here". */
 function machineRunsHash(machineKey: string, runningSessionIds: string[]): string | null {
   if (runningSessionIds.length === 0) return null;
-  if (runningSessionIds.length === 1) return `dispatch=${encodeURIComponent(runningSessionIds[0])}`;
+  if (runningSessionIds.length === 1) return dispatchHash(runningSessionIds[0], null);
   return machineDrillHash(machineKey);
 }
 
@@ -399,12 +401,12 @@ const TimelineLanes = memo(function TimelineLanes({ timeline }: { timeline: Retu
                 role="button"
                 tabIndex={0}
                 onClick={() => {
-                  location.hash = `dispatch=${encodeURIComponent(bar.sid)}`;
+                  location.hash = bar.hash;
                 }}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" || e.key === " ") {
                     e.preventDefault();
-                    location.hash = `dispatch=${encodeURIComponent(bar.sid)}`;
+                    location.hash = bar.hash;
                   }
                 }}
               />
@@ -802,10 +804,10 @@ export function FleetLens({
   // most of the feed's cost. A replay keys on the playhead itself.
   const liveEdgeClock = playhead == null ? Math.floor(playheadT / 1000) : playheadT;
   // Session presence: an ADDITIVE input to each run's lifecycle
-  // (`lib/lifecycle.ts`), never a subtraction. A replay reads none (the
-  // presence hook is disabled there), so its runs are judged from records
-  // up to the playhead alone.
-  const presence = liveSessionIds;
+  // (`lib/lifecycle.ts`), never a subtraction. It is a fact about NOW: a
+  // replay reads none (the presence hook is disabled there), and a scrubbed
+  // playhead on a live day judges from records up to the playhead alone.
+  const presence = playhead == null ? liveSessionIds : NO_PRESENCE;
   const policy = useLifecyclePolicy();
   // (#2814) SELF IS NEVER UNKNOWN — and before this, self could be ABSENT.
   //

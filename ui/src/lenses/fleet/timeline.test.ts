@@ -255,6 +255,15 @@ describe("buildActivityTimeline — reused step session ids across missions (#21
     expect(bars).toHaveLength(2);
   });
 
+  it("links each bar to its OWN mission's run, not whichever ran last on the session", () => {
+    const tl = buildActivityTimeline(data, new Map(), uids, new Set(), TMAX, TMAX, 1440);
+    const hashes = tl.lanes[0].bars.filter((b) => b.sid === REUSED_SID).map((b) => b.hash);
+    expect(hashes.sort()).toEqual([
+      `dispatch=${REUSED_SID}&dispatch.mission=review-newer`,
+      `dispatch=${REUSED_SID}&dispatch.mission=review-older`,
+    ]);
+  });
+
   it("gives each bar its OWN mission's start/end, not a cross-mission blend", () => {
     const tl = buildActivityTimeline(data, new Map(), uids, new Set(), TMAX, TMAX, 1440);
     const bars = tl.lanes[0].bars.filter((b) => b.sid === REUSED_SID);

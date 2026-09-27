@@ -1,3 +1,5 @@
+import { getSource } from "../lib/source";
+import { useLifecyclePolicy } from "../hooks/useLifecyclePolicy";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { handleNamesExecution } from "../lib/usageRecords";
 import { useThrottledValue } from "../hooks/useThrottledValue";
@@ -630,7 +632,13 @@ export function EventLogColumn({
   // fleet list to one session would move that session from its rows to the
   // header, and the layout would shift under the operator's own filter.
   // Grouped once per change, not on every render (playback re-renders often).
-  const listItems = useMemo(() => turnItems(visibleRecs, records), [visibleRecs, records]);
+  // Turn headers read each run's lifecycle as of now on a daemon (a run gone
+  // silent has ended), as of the newest record in a static recording.
+  const policy = useLifecyclePolicy();
+  const listItems = useMemo(
+    () => turnItems(visibleRecs, records, getSource().kind === "static" ? undefined : Date.now(), policy),
+    [visibleRecs, records, policy],
+  );
   // (#2878) Arrival motion. Keyed off `records` (the FULL, unfiltered set
   // this pane was given), never `visibleRecs`/`listItems` — a record
   // revealed by loosening a filter is not "new", only one this pane never

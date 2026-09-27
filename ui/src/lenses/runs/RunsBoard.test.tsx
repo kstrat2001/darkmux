@@ -277,7 +277,7 @@ describe("RunsBoard", () => {
       expect(row).toHaveAttribute("role", "button");
 
       fireEvent.click(row);
-      expect(window.location.hash).toBe("#dispatch=peer-session-1");
+      expect(window.location.hash).toBe("#dispatch=peer-session-1&dispatch.mission=peer-mission-with-session");
       expect(screen.queryByText(/needs a running daemon/i)).not.toBeInTheDocument();
     } finally {
       window.location.hash = "";
