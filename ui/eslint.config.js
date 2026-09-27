@@ -28,6 +28,10 @@ export default tseslint.config({
         selector: "CallExpression[callee.object.name='Math'][callee.property.name=/^(max|min)$/] > SpreadElement",
         message: "A spread into Math.max/Math.min throws a RangeError on a large array. Use latestByTime/earliestByTime for record times, or maxOf/minOf.",
       },
+      {
+        selector: "CallExpression[callee.property.name=/^(apply|call)$/][callee.object.object.name='Math'][callee.object.property.name=/^(max|min)$/]",
+        message: "Math.max/Math.min.apply passes every element as an argument and throws a RangeError on a large array, as a spread does. Use latestByTime/earliestByTime for record times, or maxOf/minOf.",
+      },
     ],
   },
 });
