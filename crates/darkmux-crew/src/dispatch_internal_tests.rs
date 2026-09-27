@@ -14980,6 +14980,13 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             perms.set_mode(0o755);
             std::fs::set_permissions(&fake_docker_path, perms).unwrap();
         }
+        // (#2976) Exec it once so the call under test does not pay macOS's
+        // first-exec cost for a freshly written executable (measured 2.4s
+        // to 32s on a loaded host; the second exec takes milliseconds). The
+        // warm-up's own record line is removed, so the file holds only what
+        // the code under test ran.
+        std::process::Command::new(&fake_docker_path).arg("warm-up").status().unwrap();
+        std::fs::remove_file(&record_path).unwrap();
         let prev_path = std::env::var("PATH").ok();
         // SAFETY: every caller is `#[serial]`.
         unsafe {
