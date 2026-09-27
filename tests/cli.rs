@@ -12705,3 +12705,98 @@ fn lab_eval_refuses_an_empty_or_missing_cases_dir() {
         .failure()
         .stderr(predicate::str::contains(format!("reading cases dir {}", missing.display())));
 }
+
+/// (#2463) SIGTERM mid-dispatch for a lab verb other than `lab run`: the
+/// verb must have armed the signal handlers, so the blocked `curl` is reaped,
+/// the process exits non-zero, and the run's `lifecycle.json` is finalized
+/// `interrupted` rather than left `running` (which is what an unarmed
+/// process, killed by the default disposition, leaves behind).
+fn assert_lab_verb_sigterm_finalizes_interrupted(verb_args: &[&str], label: &str) {
+    let stub = HangingStubServer::start();
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let os_home = TempDir::new().unwrap();
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(&profiles_path, hanging_endpoint_profiles_json(stub.port)).unwrap();
+    let workloads_dir = home.path().join("workloads");
+    fs::create_dir_all(&workloads_dir).unwrap();
+    fs::write(
+        workloads_dir.join("sigterm-lab-verb.json"),
+        r#"{"workload": {"id": "sigterm-lab-verb", "provider": "prompt",
+            "description": "SIGTERM lab-verb fixture (#2463)",
+            "role": "dialectic-judge", "prompt": "hang please"}}"#,
+    )
+    .unwrap();
+
+    let stderr_path = home.path().join("stderr.log");
+    let mut child = darkmux_std_cmd()
+        .env("HOME", os_home.path())
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_REDIS_URL", "")
+        .args(verb_args)
+        .args(["sigterm-lab-verb", "--profile", "hang", "--profiles-file"])
+        .arg(&profiles_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(fs::File::create(&stderr_path).unwrap()))
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawning darkmux {label}: {e}"));
+    let pid = child.id();
+
+    assert!(
+        stub.wait_for_a_connection(std::time::Duration::from_secs(20)),
+        "{label} never reached a dispatch call to the stub server within 20s"
+    );
+    assert!(child.try_wait().unwrap().is_none(), "{label} must still be blocked before SIGTERM");
+    let kill = std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status().unwrap();
+    assert!(kill.success());
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        assert!(std::time::Instant::now() < deadline, "{label} did not exit within 5s of SIGTERM");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(!status.success(), "a signal-interrupted {label} must not exit 0");
+    assert!(
+        stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(3)),
+        "{label}: the blocked curl was never torn down"
+    );
+    assert_no_surviving_remote_curl(pid, label);
+
+    let runs_dir = home.path().join("runs");
+    let run_id = fs::read_dir(&runs_dir)
+        .unwrap_or_else(|e| panic!("{label}: reading {}: {e}", runs_dir.display()))
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .next()
+        .unwrap_or_else(|| panic!("{label}: no run dir was minted"));
+    let lifecycle: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(runs_dir.join(&run_id).join("lifecycle.json"))
+            .unwrap_or_else(|e| panic!("{label}: reading lifecycle.json: {e}")),
+    )
+    .unwrap();
+    assert_eq!(
+        lifecycle["status"], "interrupted",
+        "{label}: a signal-ended run must be archived `interrupted`: {lifecycle} / stderr: {}",
+        fs::read_to_string(&stderr_path).unwrap_or_default()
+    );
+}
+
+#[test]
+fn lab_loop_sigterm_mid_dispatch_finalizes_lifecycle_interrupted() {
+    assert_lab_verb_sigterm_finalizes_interrupted(&["lab", "loop"], "lab loop");
+}
+
+#[test]
+fn lab_characterize_sigterm_mid_dispatch_finalizes_lifecycle_interrupted() {
+    assert_lab_verb_sigterm_finalizes_interrupted(&["lab", "characterize"], "lab characterize");
+}
+
+#[test]
+fn lab_tune_sigterm_mid_dispatch_finalizes_lifecycle_interrupted() {
+    assert_lab_verb_sigterm_finalizes_interrupted(&["lab", "tune"], "lab tune");
+}

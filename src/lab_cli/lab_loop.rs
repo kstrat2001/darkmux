@@ -196,9 +196,8 @@ fn verdict_exit(v: Verdict) -> i32 {
     }
 }
 
-/// (#1004) Run the baseline and treatment arms and report the shift. The
-/// exit code follows the WITH arm: that is the configuration the operator
-/// would ship.
+/// (#1004) Run the baseline and treatment arms and report the shift; the
+/// exit code is [`ab_exit`]'s.
 fn run_ab_compare(args: &LabLoopArgs, plan: &LoopPlan) -> Result<i32> {
     let ctx = ab_context(args)?;
     let ctx_chars = ctx.len();
@@ -222,7 +221,13 @@ fn run_ab_compare(args: &LabLoopArgs, plan: &LoopPlan) -> Result<i32> {
         with.run_id
     );
     print!("{}", render_ab(args.json, ctx_chars, &without, &with)?);
-    Ok(verdict_exit(with.verdict))
+    Ok(ab_exit(&without, &with))
+}
+
+/// The `--ab` exit code follows the WITH arm: that is the configuration the
+/// operator would ship. The baseline arm never decides it.
+fn ab_exit(_without: &LoopReport, with: &LoopReport) -> i32 {
+    verdict_exit(with.verdict)
 }
 
 /// The engagement context the treatment arm injects: the repo's authored
@@ -399,17 +404,24 @@ mod tests {
         assert!(bare("w").plan().unwrap().caps.is_empty());
     }
 
-    /// The caps land on the process env the runtime's `config_access` reads.
+    /// `cmd_lab_loop` applies the caps to the process env the runtime's
+    /// `config_access` reads before its first dispatch: an unknown workload
+    /// fails the dispatch after the caps are already set.
     #[test]
     #[serial_test::serial]
-    fn apply_caps_sets_each_cap_on_the_process_env() {
+    fn cmd_lab_loop_sets_each_cap_on_the_process_env_before_dispatch() {
         let vars = [
             "DARKMUX_RUNTIME_MAX_TURNS",
             "DARKMUX_RUNTIME_MAX_TOKENS",
             "DARKMUX_INACTIVITY_TIMEOUT_SECONDS",
         ];
         let prev: Vec<_> = vars.iter().map(|v| std::env::var_os(v)).collect();
-        apply_caps(&every_flag().plan().unwrap().caps);
+        let result = cmd_lab_loop(LabLoopArgs {
+            workload: "no-such-wl".into(),
+            profile: None,
+            profiles: None,
+            ..every_flag()
+        });
         let got: Vec<_> = vars.iter().map(|v| std::env::var(v).ok()).collect();
         for (v, p) in vars.iter().zip(prev) {
             match p {
@@ -417,6 +429,8 @@ mod tests {
                 None => std::env::remove_var(v),
             }
         }
+        let err = result.err().expect("an unknown workload must fail the dispatch").to_string();
+        assert!(err.contains("no-such-wl"), "{err}");
         assert_eq!(got, [Some("7".into()), Some("900".into()), Some("33".into())]);
     }
 
@@ -461,6 +475,13 @@ mod tests {
         assert_eq!(verdict_exit(Verdict::Struggled), 0);
         assert_eq!(verdict_exit(Verdict::InertFalsePass), 1);
         assert_eq!(verdict_exit(Verdict::Failed), 1);
+    }
+
+    #[test]
+    fn ab_exit_follows_the_with_arm_in_both_directions() {
+        let (failed, productive) = (report("a", Verdict::Failed), report("b", Verdict::Productive));
+        assert_eq!(ab_exit(&failed, &productive), 0, "Failed -> Productive ships a passing config");
+        assert_eq!(ab_exit(&productive, &failed), 1, "Productive -> Failed ships a failing one");
     }
 
     #[test]
