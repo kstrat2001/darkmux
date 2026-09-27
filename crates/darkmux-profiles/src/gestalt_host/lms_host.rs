@@ -841,27 +841,42 @@ mod tests {
         OwnedTarget::claim(identifier, None).expect("darkmux-namespaced")
     }
 
+    /// (#2976) A path that a stub's long-lived background process touches
+    /// only when it finishes. The adapter returning while this path is still
+    /// absent proves it did not wait that process out. That is the claim the
+    /// timing tests below make, stated as an event instead of an `elapsed <
+    /// 5s` bound, which failed under host load: exec'ing a freshly written
+    /// stub alone can take seconds on a busy Mac.
+    ///
+    /// The process runs in a `( … ) &` subshell, so killing the stub's own
+    /// shell never kills it and never stops the touch: only waiting it out
+    /// can produce the marker. The 60s sleep is the one time bound left, and
+    /// it only has to outlast a slow host, not a tight deadline.
+    #[cfg(unix)]
+    fn outlives_marker(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("long-lived-process-finished")
+    }
+
     #[cfg(unix)]
     #[test]
     fn load_deadline_kills_hung_child_and_returns_typed_timeout() {
         // THE #1276 regression test: a load that would block far past the
-        // bound (the stub sleeps 30 s; today's `load_with_identifier` would
-        // sit in `Command::status()` for all 30) is killed at the 200 ms
+        // bound (the stub's grandchild sleeps 60 s; an unbounded
+        // `Command::status()` would sit for all 60) is killed at the 200 ms
         // deadline and surfaces as a typed Timeout naming the phase.
         //
-        // `sleep 30 & wait` (not a bare `sleep 30`) pins the WORST shape:
+        // `( … ) & wait` (not a bare `sleep`) pins the WORST shape:
         // the shell forks the sleep instead of exec-ing it, so the kill hits
         // only the direct child while a grandchild survives holding the
         // stderr pipe open — the case that flaked the first version of this
         // test by blocking `run_bounded` in a drain-thread join.
         let dir = tempfile::TempDir::new().unwrap();
-        let stub = write_stub(dir.path(), "sleep 30 &\nwait");
+        let marker = outlives_marker(dir.path());
+        let stub = write_stub(dir.path(), &format!("(sleep 60; touch '{}') &\nwait", marker.display()));
         let mut host = LmsHost::with_bin(stub.to_string_lossy());
-        let started = Instant::now();
         let err = host
             .load("qwen/qwen3-4b-2507", "darkmux:qwen3-4b", 32768, Deadline(Duration::from_millis(200)))
             .unwrap_err();
-        let elapsed = started.elapsed();
         match err {
             HostError::Timeout { phase, waited } => {
                 assert_eq!(phase, "load");
@@ -869,10 +884,7 @@ mod tests {
             }
             other => panic!("expected Timeout, got {other:?}"),
         }
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "the child was killed at the deadline, not waited out ({elapsed:?})"
-        );
+        assert!(!marker.exists(), "the child was killed at the deadline, not waited out");
     }
 
     #[cfg(unix)]
@@ -943,23 +955,22 @@ mod tests {
     fn exit_returns_promptly_even_when_grandchild_holds_stderr_open() {
         // The drain-thread subtlety: the child exits 0 immediately (the live
         // CLI shape), but a backgrounded grandchild inherited its stderr
-        // write end and lives on for 30 s — the pipe never hits EOF. The
+        // write end and lives on for 60 s — the pipe never hits EOF. The
         // call must still return within the bounded PIPE_GRACE with the
         // stderr the child DID write (classified), not block on pipe close.
         let dir = tempfile::TempDir::new().unwrap();
+        let marker = outlives_marker(dir.path());
         let stub = write_stub(
             dir.path(),
-            "sleep 30 &\necho 'Cannot find a model with the identifier \"darkmux:m\".' >&2\nexit 0",
+            &format!(
+                "(sleep 60; touch '{}') &\necho 'Cannot find a model with the identifier \"darkmux:m\".' >&2\nexit 0",
+                marker.display()
+            ),
         );
         let mut host = LmsHost::with_bin(stub.to_string_lossy());
-        let started = Instant::now();
         let err = host.unload(&owned("darkmux:m"), Deadline(Duration::from_secs(10))).unwrap_err();
         assert_eq!(err, HostError::NotResident { identifier: "darkmux:m".into() });
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "returned within the pipe grace, not on grandchild exit ({:?})",
-            started.elapsed()
-        );
+        assert!(!marker.exists(), "returned within the pipe grace, not on grandchild exit");
     }
 
     #[cfg(unix)]
@@ -968,22 +979,21 @@ mod tests {
         // A grandchild writing at a sub-cap cadence must not extend the wait
         // for its lifetime: the old quiet-interval collection reset its
         // 200 ms timer on EVERY chunk, so a 100 ms-cadence writer held the
-        // "grace" open for its whole 30 s life (demonstrated). The total
-        // bound drains what arrived and moves on (#1276).
+        // "grace" open for its whole life (demonstrated; 60 s here). The
+        // total bound drains what arrived and moves on (#1276).
         let dir = tempfile::TempDir::new().unwrap();
+        let marker = outlives_marker(dir.path());
         let stub = write_stub(
             dir.path(),
-            "( i=0; while [ $i -lt 300 ]; do echo tick >&2; sleep 0.1; i=$((i+1)); done ) &\necho 'Cannot find a model with the identifier \"darkmux:m\".' >&2\nexit 0",
+            &format!(
+                "( i=0; while [ $i -lt 600 ]; do echo tick >&2; sleep 0.1; i=$((i+1)); done; touch '{}' ) &\necho 'Cannot find a model with the identifier \"darkmux:m\".' >&2\nexit 0",
+                marker.display()
+            ),
         );
         let mut host = LmsHost::with_bin(stub.to_string_lossy());
-        let started = Instant::now();
         let err = host.unload(&owned("darkmux:m"), Deadline(Duration::from_secs(10))).unwrap_err();
         assert_eq!(err, HostError::NotResident { identifier: "darkmux:m".into() });
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "total-bounded grace, not per-chunk quiet interval ({:?})",
-            started.elapsed()
-        );
+        assert!(!marker.exists(), "total-bounded grace, not per-chunk quiet interval");
     }
 
     #[cfg(unix)]
@@ -1046,22 +1056,21 @@ esac"#,
         // load deadline flaked under parallel-suite CPU contention): the
         // list bound is the small term, the load deadline stays generous.
         let dir = tempfile::TempDir::new().unwrap();
+        let marker = outlives_marker(dir.path());
         let stub = write_stub(
             dir.path(),
-            "case \"$1\" in\n  ps) sleep 30 ;;\n  load) exit 0 ;;\nesac",
+            &format!(
+                "case \"$1\" in\n  ps) (sleep 60; touch '{}') & wait ;;\n  load) exit 0 ;;\nesac",
+                marker.display()
+            ),
         );
         let mut host = LmsHost::with_bin(stub.to_string_lossy())
             .with_list_bound(Duration::from_millis(300));
-        let started = Instant::now();
         let report = host
             .load("qwen/qwen3-4b-2507", "darkmux:qwen3-4b", 32768, Deadline(Duration::from_secs(30)))
             .expect("the load succeeded; only provenance degraded");
         assert_eq!(report.resolved_ctx, None, "re-list timeout → unknown ctx, not a failure");
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "the re-list was killed at its bound, not waited out ({:?})",
-            started.elapsed()
-        );
+        assert!(!marker.exists(), "the re-list was killed at its bound, not waited out");
     }
 
     #[cfg(unix)]
@@ -1072,13 +1081,13 @@ esac"#,
         // typed Timeout at the adapter-level list bound instead of hanging
         // plan assembly (#1276).
         let dir = tempfile::TempDir::new().unwrap();
-        let stub = write_stub(dir.path(), "sleep 30");
+        let marker = outlives_marker(dir.path());
+        let stub = write_stub(dir.path(), &format!("(sleep 60; touch '{}') &\nwait", marker.display()));
         let mut host =
             LmsHost::with_bin(stub.to_string_lossy()).with_list_bound(Duration::from_millis(200));
-        let started = Instant::now();
         let err = host.list_resident().unwrap_err();
         assert!(matches!(err, HostError::Timeout { phase: "ps", .. }), "{err:?}");
-        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(!marker.exists(), "the wedged `ps` was killed at the list bound, not waited out");
     }
 
     #[cfg(unix)]
