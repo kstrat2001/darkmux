@@ -8,18 +8,14 @@ import {
   UNNAMED_MACHINE,
   displayNameOf,
   buildFlowWindow,
-  liveSessionSet,
-  flowLiveSessions,
   bodyTruncated,
   missionReplayDate,
-  sessionRecords,
-  sessionRunning,
-  dispatchEnd,
-  __sessionIndexBuilds,
 } from "./flow";
 import { ingest, ingestJsonl, recordsAsOf, __asOfFilterRuns, type NormRecord } from "./ingest";
 import { norm, normAll, type RawRecord } from "../testing/records";
 import { tokensOffMeter } from "../lenses/fleet/savings";
+import { DEFAULT_POLICY, lifecycleAt } from "./lifecycle";
+import { runIndex, sessionRun, __runIndexBuilds } from "./runRef";
 
 /**
  * (#1801) The static-demo record pipeline: `ingestJsonl` (the flowSrc
@@ -348,7 +344,7 @@ describe("nameOf recency", () => {
  * heartbeat) never writes a beat for ANY of its sessions. On a
  * Redis-enabled multi-machine fleet (the operator's real topology — a
  * Studio hub whose OWN `dispatch.internal` work keeps presence non-empty
- * almost continuously), the pre-fix `liveSessionSet` treated ANY non-empty
+ * almost continuously), the pre-#2123 live-set merge treated ANY non-empty
  * presence set as globally authoritative and never even looked at the
  * flow-derived fallback — so a genuinely-live review mission's own session,
  * never beaten, read as not-running. This is the fleet card's "0 running"
@@ -358,45 +354,35 @@ describe("nameOf recency", () => {
  * main; the operator's daemon was almost certainly serving a stale binary
  * built before an earlier session-liveness fix).
  */
-describe("liveSessionSet — presence coverage is partial, not all-or-nothing (#2123)", () => {
+describe("presence coverage is partial, not all-or-nothing (#2123)", () => {
   const NOW = Date.parse("2026-08-29T16:07:30Z");
 
   /** A review-shaped session: `dispatch.start` a few minutes ago, no
-   * terminal record, fresh telemetry — exactly what `flowLiveSessions`
-   * needs to call it live. */
+   * terminal record, fresh telemetry: open on its own records. */
   const reviewSession: NormRecord[] = normAll([
     { ts: "2026-08-29T15:46:31Z", session_id: "owner/repo@deadbeef", action: "dispatch.start" },
     { ts: "2026-08-29T16:07:12Z", session_id: "owner/repo@deadbeef", action: "telemetry.process" },
   ]);
+  const phase = (data: NormRecord[], presence: Set<string>) =>
+    lifecycleAt(sessionRun(data, "owner/repo@deadbeef", NOW)!, NOW, DEFAULT_POLICY, presence).phase;
 
-  it("BEFORE the fix would have shadowed a genuinely-live session under unrelated presence (regression guard)", () => {
+  it("unrelated presence never shadows a run its own records hold open (regression guard)", () => {
     // Presence has a beat, but for a DIFFERENT session entirely — the
     // Studio hub's own dispatch.internal work, not this machine's review
     // mission.
-    const presence = new Set(["some-other-machines-dispatch-internal-session"]);
-    const result = liveSessionSet(reviewSession, presence, NOW, true);
-    expect(result.has("owner/repo@deadbeef")).toBe(true);
-    // Presence's own coverage must still be honored, not discarded.
-    expect(result.has("some-other-machines-dispatch-internal-session")).toBe(true);
+    expect(phase(reviewSession, new Set(["some-other-machines-dispatch-internal-session"]))).toBe("open");
   });
 
-  it("still returns the flow-derived set untouched when presence is empty (Redis off/degraded)", () => {
-    const result = liveSessionSet(reviewSession, new Set(), NOW, true);
-    expect(result).toEqual(flowLiveSessions(reviewSession, NOW, true));
+  it("with presence empty (Redis off/degraded) the records alone decide", () => {
+    expect(phase(reviewSession, new Set())).toBe("open");
   });
 
-  it("still returns presence untouched when the flow-derived fallback finds nothing live (e.g. everything already terminal)", () => {
+  it("presence never reopens a run its records closed", () => {
     const terminal: NormRecord[] = normAll([
       { ts: "2026-08-29T15:46:31Z", session_id: "owner/repo@deadbeef", action: "dispatch.start" },
       { ts: "2026-08-29T15:50:00Z", session_id: "owner/repo@deadbeef", action: "dispatch.complete" },
     ]);
-    const presence = new Set(["some-other-session"]);
-    expect(liveSessionSet(terminal, presence, NOW, true)).toEqual(presence);
-  });
-
-  it("replay mode stays presence-agnostic (flowLiveSessions itself gates off liveMode)", () => {
-    const presence = new Set(["a-replayed-session"]);
-    expect(liveSessionSet(reviewSession, presence, NOW, false)).toEqual(presence);
+    expect(phase(terminal, new Set(["owner/repo@deadbeef"]))).toBe("closed");
   });
 });
 
@@ -431,7 +417,8 @@ describe("bodyTruncated + ingest's body shapes through the guard (#2206)", () =>
 });
 
 describe("missionReplayDate (header owns liveness — a RUNNING mission is live, not a recording)", () => {
-  const rec = (action: string, ts: string) => norm({ ts, action });
+  // Mission lifecycle records ride the mission's own session (`mission-<id>`).
+  const rec = (action: string, ts: string) => norm({ ts, action, session_id: "mission-m", mission_id: "m" });
   it("is null while the mission has no terminal record, whatever day its records carry", () => {
     const records = [rec("mission.start", "2026-09-03T17:10:00Z"), rec("dispatch.start", "2026-09-03T17:11:00Z")];
     expect(missionReplayDate(records)).toBeNull();
@@ -452,78 +439,68 @@ describe("missionReplayDate (header owns liveness — a RUNNING mission is live,
   });
 });
 
-describe("(#2911) sessionRecords — the per-window session index", () => {
+describe("(#2911) runIndex — the per-window run index", () => {
   const rec = (sid: unknown, action: string, ts: string) => norm({ ts, session_id: sid, action } as RawRecord);
   const dup = rec("b", "dispatch.turn", "2026-09-26T10:00:04Z");
   const data: NormRecord[] = [
     rec("a", "dispatch.start", "2026-09-26T10:00:00Z"),
     rec("b", "dispatch.start", "2026-09-26T10:00:01Z"),
     rec(undefined, "machine.telemetry", "2026-09-26T10:00:02Z"),
-    // An empty id is still a string, and the scan matched it for `""`.
     rec("", "dispatch.start", "2026-09-26T10:00:02Z"),
     rec("a", "dispatch.complete", "2026-09-26T10:00:03Z"),
-    // The same record object twice: the scan returns it twice, in place.
+    // The same record object twice: the index keeps it twice, in place.
     dup,
     rec("a", "dispatch.turn", "2026-09-26T10:00:05Z"),
     dup,
-    // A malformed id is not a string. The scan compared with `===`, so a
-    // caller holding the same value (a sid read off such a record) found it.
-    rec(42, "dispatch.start", "2026-09-26T10:00:06Z"),
-    rec(null, "note", "2026-09-26T10:00:07Z"),
-    // `NaN === NaN` is false, so the scan found nothing for it.
-    rec(Number.NaN, "note", "2026-09-26T10:00:08Z"),
   ];
+  const recordsOf = (d: readonly NormRecord[], sid: string) => runIndex(d).groupsOfSession(sid).flatMap((g) => g.records);
 
-  it("is exactly the whole-window scan it replaces, in window order", () => {
-    for (const sid of ["a", "b", "missing", "", "42", 42, undefined, null, Number.NaN] as unknown as string[]) {
-      expect(sessionRecords(data, sid)).toEqual(data.filter((r) => r.session_id === sid));
+  it("groups exactly the records a whole-window scan finds, in window order", () => {
+    for (const sid of ["a", "b", "missing"]) {
+      expect(recordsOf(data, sid)).toEqual(data.filter((r) => r.session_id === sid));
     }
-    expect(sessionRecords(data, 42 as unknown as string)).toHaveLength(1);
-    expect(sessionRecords(data, "42")).toHaveLength(0);
-    expect(sessionRecords(data, "b")).toEqual([data[1], dup, dup]);
-    expect(dispatchEnd(data, "a")).toBe(data[4]);
-    expect(dispatchEnd(data, "b")).toBeUndefined();
+    expect(recordsOf(data, "b")).toEqual([data[1], dup, dup]);
   });
 
-  it("hands out groups (and the shared miss) as readonly, so a push cannot corrupt later lookups", () => {
-    // Type-level: `bun run typecheck` fails if either return widens back to a
-    // mutable array (the directives below would then be unused). Never run.
+  it("a record with no session id belongs to no run", () => {
+    expect(runIndex(data).groups.every((g) => g.sessionId !== "")).toBe(true);
+    expect(runIndex(data).groupOf(data[2])).toBeNull();
+  });
+
+  it("hands out groups as readonly, so a push cannot corrupt later lookups", () => {
+    // Type-level: `bun run typecheck` fails if a group widens back to a
+    // mutable array (the directive below would then be unused). Never run.
     const typeOnly = () => {
-      // @ts-expect-error a session's group is readonly
-      sessionRecords(data, "a").push(data[0]);
-      // @ts-expect-error the shared miss is readonly
-      sessionRecords(data, "missing").push(data[0]);
+      // @ts-expect-error a run's records are readonly
+      runIndex(data).groupsOfSession("a")[0].records.push(data[0]);
     };
     void typeOnly;
-    expect(sessionRecords(data, "missing")).toBe(sessionRecords([...data], "other-miss"));
   });
 
-  // Pins that `sessionRunning` reads a session's records THROUGH the index
-  // (the #2911 cost fix), not with a whole-window scan that happens to agree.
-  // The instrument deliberately breaks the never-mutated-after-read contract:
-  // a record appended after the index is built is invisible to the index and
+  // Pins that a lifecycle reads a run's records THROUGH the index (the #2911
+  // cost fix), not with a whole-window scan that happens to agree. The
+  // instrument deliberately breaks the never-mutated-after-read contract: a
+  // record appended after the index is built is invisible to the index and
   // visible to any scan, so the two routes give different answers.
-  it("sessionRunning answers from the window's index, not a whole-window scan", () => {
+  it("answers from the window's index, not a whole-window scan", () => {
     const t = Date.parse("2026-09-26T10:00:10Z");
     const win: NormRecord[] = [rec("x", "dispatch.start", "2026-09-26T10:00:00Z")];
-    expect(sessionRunning(win, new Set(), "s", t)).toBe(false);
+    expect(sessionRun(win, "s", t)).toBeNull();
     win.push(rec("s", "dispatch.start", "2026-09-26T10:00:09Z"));
-    expect(sessionRunning(win, new Set(), "s", t)).toBe(false);
-    // Control: a fresh array (a fresh index) does see it, so the `false`
-    // above is the index talking, not a record that never counted.
-    expect(sessionRunning([...win], new Set(), "s", t)).toBe(true);
+    expect(sessionRun(win, "s", t)).toBeNull();
+    // Control: a fresh array (a fresh index) does see it.
+    expect(lifecycleAt(sessionRun([...win], "s", t)!, t, DEFAULT_POLICY).phase).toBe("open");
   });
 
   it("indexes a window once, and a new window array gets its own index", () => {
     const win = [...data];
-    const before = __sessionIndexBuilds();
-    const first = sessionRecords(win, "a");
-    expect(sessionRecords(win, "a")).toBe(first);
-    sessionRecords(win, "b");
-    expect(__sessionIndexBuilds()).toBe(before + 1);
+    const before = __runIndexBuilds();
+    const first = runIndex(win);
+    expect(runIndex(win)).toBe(first);
+    expect(__runIndexBuilds()).toBe(before + 1);
     const next = [...win, rec("a", "dispatch.turn", "2026-09-26T10:00:04Z")];
-    expect(sessionRecords(next, "a")).toHaveLength(4);
-    expect(__sessionIndexBuilds()).toBe(before + 2);
+    expect(recordsOf(next, "a")).toHaveLength(4);
+    expect(__runIndexBuilds()).toBe(before + 2);
   });
 });
 

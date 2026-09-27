@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { computeTMax, computeTMin } from "../lib/flow";
-import { ACTION, isDispatchTerminal, recordsAsOf, timesOf, type NormRecord } from "../lib/ingest";
+import { recordsAsOf, type NormRecord } from "../lib/ingest";
+import { isMissionLifecycle, spanOf } from "../lib/lifecycle";
+import { runIndex, type RunGroup } from "../lib/runRef";
 
 /** (#2346) What the transport's `tMin`/`tMax` scope to. `day` (the
  * default) is the pre-existing behavior — the whole loaded day. A
@@ -53,12 +55,12 @@ function focusRecordsSignature(focus: PlaybackFocus): string {
   return recs.length ? `${recs.length}:${recs[recs.length - 1].ts}` : "0";
 }
 
-/** The focus's own span. `dispatch` prefers the session's `dispatch.start`/
- * terminal (`dispatch.complete`/`dispatch.error`) records, and falls
- * back to the session's earliest/latest record when a bookend is missing
- * (a session mid-flight has no terminal yet; an oddly-shaped record set
- * has no bookend at all). `mission` mirrors it with the mission lifecycle
- * actions (`missionReplayDate`'s own vocabulary, `lib/flow.ts`).
+/** The focus's own span, from its runs' lifecycles (`lib/lifecycle.ts`'s
+ * `spanOf`): a dispatch is its session's runs, first start to last close; a
+ * mission is its own lifecycle session, `mission.start` to its close or
+ * abort. Where a bookend is missing (a run mid-flight has no close yet; an
+ * oddly-shaped record set has no start), the focus's earliest/latest record
+ * stands in.
  *
  * `dayRecords` is used ONLY as the fallback range — never to find the
  * focus's own records (see the `PlaybackFocus` doc above for why that was
@@ -71,24 +73,26 @@ function focusRecordsSignature(focus: PlaybackFocus): string {
  * not just the range). */
 function focusRange(dayRecords: NormRecord[], focus: PlaybackFocus): { tMin: number; tMax: number } {
   if (focus.kind === "day") return { tMin: computeTMin(dayRecords), tMax: computeTMax(dayRecords) };
-
-  const scoped =
-    focus.kind === "dispatch"
-      ? focus.records.filter((r) => r.session_id === focus.sessionId)
-      : focus.records.filter((r) => r.mission_id === focus.missionId);
+  const { runs, scoped } = focusRuns(focus);
   if (!scoped.length) return { tMin: computeTMin(dayRecords), tMax: computeTMax(dayRecords) };
-
-  const startMatch = (r: NormRecord): boolean =>
-    focus.kind === "dispatch" ? r.action === ACTION.DispatchStart : r.action === ACTION.MissionStart;
-  const endMatch = (r: NormRecord): boolean =>
-    focus.kind === "dispatch" ? isDispatchTerminal(r.action) : r.action === ACTION.MissionClose || r.action === ACTION.MissionAbort;
-
-  const starts = timesOf(scoped.filter(startMatch));
-  const ends = timesOf(scoped.filter(endMatch));
+  const spans = runs.map(spanOf);
+  const starts = spans.flatMap((s) => (s.startMs === null ? [] : [s.startMs]));
+  const ends = spans.flatMap((s) => (s.endMs === null ? [] : [s.endMs]));
   return {
     tMin: starts.length ? Math.min(...starts) : computeTMin(scoped),
     tMax: ends.length ? Math.max(...ends) : computeTMax(scoped),
   };
+}
+
+/** The runs a dispatch or mission focus spans, and the records its fallback
+ *  range reads. */
+function focusRuns(focus: Exclude<PlaybackFocus, { kind: "day" }>): { runs: readonly RunGroup[]; scoped: NormRecord[] } {
+  const ix = runIndex(focus.records);
+  if (focus.kind === "dispatch") {
+    const runs = ix.groupsOfSession(focus.sessionId);
+    return { runs, scoped: runs.flatMap((g) => g.records) };
+  }
+  return { runs: ix.groupsOfMission(focus.missionId).filter(isMissionLifecycle), scoped: focus.records.filter((r) => r.mission_id === focus.missionId) };
 }
 
 /** (#2071) The playback transport, owned by the app shell rather than the

@@ -102,3 +102,25 @@ describe("grainOf", () => {
     expect(grainOf(normAll([rec(0, "step.start"), rec(1, "mission.start")]))).toBe("lifecycle");
   });
 });
+
+describe("a mission's whole-run bookend (lifecycle rule 6)", () => {
+  // The bookend never beats; its step does, on its own session. The run is
+  // in flight while its step is, and waits while its step waits.
+  const data = normAll([
+    rec(0, "dispatch.start", { session_id: "m1", mission_id: "m1", source: "mission" }),
+    rec(5, "step.start", { session_id: "task-probe-m1", mission_id: "m1" }),
+    rec(10, "budget.wait", { session_id: "task-probe-m1", mission_id: "m1", payload: { wait_seconds: 86_000 } }),
+  ]);
+  const bookend = runIndex(data).groupsOfSession("m1")[0];
+
+  it("reads its mission's other runs as its own activity", () => {
+    expect(bookend.grain).toBe("run");
+    expect(bookend.siblings.map((g) => g.sessionId)).toEqual(["task-probe-m1"]);
+    const t = Date.parse(at(3 * 3600));
+    expect(lifecycleAt(currentRun(bookend, t), t, DEFAULT_POLICY).phase).toBe("waiting");
+  });
+
+  it("an execution's siblings are not its activity", () => {
+    expect(runIndex(data).groupsOfSession("task-probe-m1")[0].siblings).toEqual([]);
+  });
+});

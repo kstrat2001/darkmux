@@ -263,10 +263,9 @@ const STATES = [
     recs: (b, d) => [...b.prefix(d, {}, true, true), ...b.writing(d, "write")],
   },
   {
-    // The run page's playback transport ends at the run's own last record,
-    // so a stall (which needs the clock 30s past the last heartbeat) exists
-    // only live there; the fleet's day transport reaches it through `tick`.
-    id: "stalled", date: "2026-08-17", now: "12:00:50", runText: "stalled", rateText: "stalled", runPlayback: false,
+    // A stall needs the clock 30s past the last heartbeat; the fleet's day
+    // transport reaches it through `tick`.
+    id: "stalled", date: "2026-08-17", now: "12:00:50", runText: "stalled", rateText: "stalled",
     recs: (b, d) => [...b.prefix(d), b.opener(d), b.beat(d, "12:00:10", 2, 500, 500), tick(d, "12:00:50")],
   },
   {
@@ -348,7 +347,7 @@ const STATES = [
     // (#2955 review) The fleet card too: its machine is running, and its
     // status line is the plain dim-dot "no signal" (`fleetStat`), not a lit
     // reading. Live only on the card as on the run page.
-    id: "no-signal", date: "2026-08-21", now: "12:00:50", runText: "no signal", rateText: null, fleetStat: "no signal", runPlayback: false, fleetPlayback: false, blockStream: true,
+    id: "no-signal", date: "2026-08-21", now: "12:00:50", runText: "no signal", rateText: null, fleetStat: "no signal", fleetPlayback: false, blockStream: true,
     recs: (b, d) => [...b.prefix(d), b.opener(d), b.beat(d, "12:00:10", 2, 500, 500), tick(d, "12:00:50")],
   },
 ];

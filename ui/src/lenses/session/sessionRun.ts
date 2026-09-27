@@ -53,33 +53,23 @@
  * golden moves — asserted directly in `lib/format.test.ts`.
  */
 
-import { dispatchErrored, dispatchKilled, statusLabel, runStateFrom, computeTMax } from "../../lib/flow";
+import { statusClass, statusLabel, computeTMax, type RunState, type StatusClass } from "../../lib/flow";
+import { DEFAULT_POLICY, NO_PRESENCE, endMs, isRunning, lifecycleAt, recordedWallMs, toRunState, type Close, type CloseEdge, type Lifecycle, type LifecyclePhase, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
+import { runIndex, sessionRun, type RunGroup, type RunRecords } from "../../lib/runRef";
 import { fmtElapsed, clk, clkAt, fmtC } from "../../lib/format";
 import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
 import { aggregateLiveState, aggregateTokenRate, averageGenerationRate, lastHeartbeatMs, liveStateWhileConnected } from "../../lib/tokenRate";
-import type { LiveState } from "../../lib/tokenRate";
+import type { LiveState, LiveStateReading } from "../../lib/tokenRate";
 import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";
 import { PURPOSE, sumUsage } from "../../lib/usageRecords";
 import type { DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
 import { toolOutcome } from "../../lib/recordDetail";
-import { ACTION, CATEGORY, byTime, isAsOf, isDispatchTerminal, latestByTime, recordsAsOf, timesOf, type NormRecord } from "../../lib/ingest";
+import { ACTION, CATEGORY, byTime, isDispatchTerminal, latestByTime, recordsAsOf, timesOf, type NormRecord } from "../../lib/ingest";
 
 /** The run-time figure's long hover text, shared by SYSTEM's WALL CLOCK and
  *  (#2890) the MODEL section's ACTIVE TIME, which show the same number. */
 const WALL_HINT_TITLE =
   "run time — the runtime's own measure of this execution, INCLUDING any thermal rest. A mission step's badge covers a WIDER span (setup and gate included) and reads longer.";
-
-export type PillCls = "run" | "err" | "done" | "canceled";
-
-/** `statusVisual()`'s `cls` half (viewer.html:1151-1155) — `statusLabel`
- * (already ported in `lib/flow.ts`) gives the SAME vocabulary's `lbl` half;
- * this maps back to the class the two vocabularies share. */
-function pillClsFor(label: string): PillCls {
-  if (label === "running") return "run";
-  if (label === "errored" || label === "killed") return "err";
-  if (label === "complete") return "done";
-  return "canceled";
-}
 
 /** (#2863) The detectors a clean run passed, in the order the old sentence
  * named them (`cycle, tool-failure, reasoning-loop, edit-drift`). One list,
@@ -103,7 +93,7 @@ export interface SessionHeader {
    * "uppercase the STRING directly" discipline, rather than depending on a
    * stylesheet rule this port is free to change). */
   pillLabel: string;
-  pillCls: PillCls;
+  pillCls: StatusClass;
   /** Pre-uppercased, same reason. */
   role: string;
   sid: string;
@@ -287,6 +277,9 @@ export interface SessionRunView {
    *  impossible. */
   hasModelWork: boolean;
   live: boolean;
+  /** Where the run stands (`lib/lifecycle.ts`): the pulse tells a finished
+   *  run (`closed`) from one that went silent with no ending (`stale`). */
+  phase: LifecyclePhase;
   /** (#1972) When the most recent proof-of-life record landed, or `null` if
    *  none has. The pulse pauses when this goes quiet — see `LivenessPulse`. */
   lastBeatMs: number | null;
@@ -477,8 +470,8 @@ function contextFigures(tel: readonly NormRecord[]): { samples: number; nctx: nu
  *  crew-of-one graph where the run IS the one execution — and silently
  *  empty for any mission with real work inside it.
  *
- *  This walks every OTHER `session_id` present in `data` that shares this
- *  run's `mission_id`, and sums the MODEL-scoped numbers off each one that
+ *  This walks every OTHER run of this run's mission (`runRef.ts`'s
+ *  `groupsOfMission`), and sums the MODEL-scoped numbers off each one that
  *  did real model work — skipping a utility role's sub-execution so its
  *  tokens never fold into a specialist's total.
  *
@@ -493,51 +486,44 @@ function contextFigures(tel: readonly NormRecord[]): { samples: number; nctx: nu
  *  here — this fix targets the reported defect (a run session with zero
  *  telemetry finding real numbers on its inner sessions), not per-seat
  *  breakdown. */
-function rollUpMissionModelWork(data: NormRecord[], missionId: string, excludeSid: string): MissionModelRollup {
-  const candidateSids = new Set<string>();
-  for (const r of data) {
-    if (r.mission_id === missionId && r.session_id && r.session_id !== excludeSid) candidateSids.add(r.session_id);
+function rollUpMissionModelWork(siblings: readonly RunGroup[]): MissionModelRollup {
+  const acc: MissionModelRollup = { hasEvidence: false, turns: null, tokIn: null, tokOut: null, ctxPeak: 0, ctxNow: 0, nctx: 0, loadLines: [] };
+  for (const g of siblings) {
+    const fig = executionFigures(g.records);
+    if (fig) addFigures(acc, fig);
   }
-  let turns: number | null = null;
-  let tokIn: number | null = null;
-  let tokOut: number | null = null;
-  let ctxPeak = 0;
-  let ctxNow = 0;
-  let nctx = 0;
-  const loadLines: string[] = [];
-  let hasEvidence = false;
-  for (const csid of candidateSids) {
-    const own = data.filter((r) => r.session_id === csid);
-    const tel = own.filter((r) => r.category === CATEGORY.Telemetry);
-    const rt = tel.filter((r) => r.source === "runtime").slice(-1)[0] ?? null;
-    // (#2902 step 2a) This inner execution's own tokens, utility excluded.
-    const cTok = executionTokens(own);
-    const cx = contextFigures(tel);
-    const loads = tel.filter(
-      (r) => r.source === "lms" && (r.fields as Record<string, unknown> | undefined)?.event === "load",
-    );
-    const cTurns = rt ? Number((rt.fields as Record<string, unknown>).turns) : null;
-    const cTokIn = cTok ? cTok.prompt : null;
-    const cTokOut = cTok ? cTok.completion : null;
-    const { nctx: cNctx, ctxPeak: cCtxPeak, ctxNow: cCtxNow } = cx;
-    const csHasEvidence = loads.length > 0 || cTurns != null || cTokIn != null || cTokOut != null || cx.samples > 0;
-    if (!csHasEvidence) continue;
-    hasEvidence = true;
-    if (cTurns != null) turns = (turns ?? 0) + cTurns;
-    if (cTokIn != null) tokIn = (tokIn ?? 0) + cTokIn;
-    if (cTokOut != null) tokOut = (tokOut ?? 0) + cTokOut;
-    ctxPeak = Math.max(ctxPeak, cCtxPeak);
-    ctxNow = Math.max(ctxNow, cCtxNow);
-    nctx = Math.max(nctx, cNctx);
-    // Every inner execution records each model resident when it started, so
-    // one model appears once per execution; list it once.
-    for (const l of loads) {
-      const f = l.fields as Record<string, unknown>;
-      const line = `${f.model} · ${f.gb ?? "?"}GB`;
-      if (!loadLines.includes(line)) loadLines.push(line);
-    }
+  return acc;
+}
+
+/** One inner execution's MODEL numbers, or `null` when it did no model
+ *  work. (#2902 step 2a) Its own tokens, utility excluded. */
+function executionFigures(own: readonly NormRecord[]): (ModelFigures & { loads: NormRecord[] }) | null {
+  const tel = own.filter((r) => r.category === CATEGORY.Telemetry);
+  const rt = bySource(tel, "runtime").slice(-1)[0] ?? null;
+  const tok = executionTokens(own);
+  const cx = contextFigures(tel);
+  const loads = bySource(tel, "lms").filter(isLoad);
+  const turns = rt ? Number((rt.fields as Record<string, unknown>).turns) : null;
+  const fig = { turns, tokIn: tok ? tok.prompt : null, tokOut: tok ? tok.completion : null, ctxPeak: cx.ctxPeak, ctxNow: cx.ctxNow, nctx: cx.nctx, loads };
+  return loads.length > 0 || turns != null || tok != null || cx.samples > 0 ? fig : null;
+}
+
+const addOpt = (a: number | null, b: number | null): number | null => (b == null ? a : (a ?? 0) + b);
+
+function addFigures(acc: MissionModelRollup, f: ModelFigures & { loads: NormRecord[] }): void {
+  acc.hasEvidence = true;
+  acc.turns = addOpt(acc.turns, f.turns);
+  acc.tokIn = addOpt(acc.tokIn, f.tokIn);
+  acc.tokOut = addOpt(acc.tokOut, f.tokOut);
+  acc.ctxPeak = Math.max(acc.ctxPeak, f.ctxPeak);
+  acc.ctxNow = Math.max(acc.ctxNow, f.ctxNow);
+  acc.nctx = Math.max(acc.nctx, f.nctx);
+  // Every inner execution records each model resident when it started, so
+  // one model appears once per execution; list it once.
+  for (const l of f.loads) {
+    const line = `${loadFields(l).model} · ${loadFields(l).gb ?? "?"}GB`;
+    if (!acc.loadLines.includes(line)) acc.loadLines.push(line);
   }
-  return { hasEvidence, turns, tokIn, tokOut, ctxPeak, ctxNow, nctx, loadLines };
 }
 
 /** (#2887 N2) `version >= min`, comparing dotted numeric components
@@ -555,6 +541,893 @@ function flowSchemaAtLeast(version: string | null, min: string): boolean {
     if (a !== b) return a > b;
   }
   return true;
+}
+
+/** Where the page's run stands as of `nowMs`: every lifecycle fact
+ *  `runRegions` reads, from `lifecycle.ts` and nowhere else. */
+interface RunContext {
+  run: RunRecords | null;
+  l: Lifecycle | null;
+  /** The attempt's `dispatch.start`: the brief's payload. */
+  d: NormRecord | null;
+  /** The run's first record: where its name falls back to. */
+  firstSessRec: NormRecord | null;
+  /** FINITE, or it poisons every downstream comparison: the attempt's
+   *  start, else the run's first record, else `now`. */
+  startTs: number;
+  /** Whether a record belongs to this attempt. A record with an unparsable
+   *  `ts` belongs to its run's latest attempt: visible and wrong-looking,
+   *  never silently dropped. */
+  inAttempt: (r: NormRecord) => boolean;
+  closeTs: number | null;
+  /** Where the run's time ends: its close, or its last sign of life when
+   *  it stopped with no ending recorded; `null` while it runs. */
+  endTs: number | null;
+  /** The dispatch terminal the outcome was read from (`wall_ms`, the
+   *  endpoint, the tokens); `null` for any other close. */
+  c: NormRecord | null;
+  done: boolean;
+  /** (#1988) The close came from a terminal timestamped before the run's
+   *  own start: honored, and said so. */
+  skewedClose: boolean;
+  state: RunState;
+}
+
+function runContext(data: NormRecord[], sid: string, nowMs: number, policy: LifecyclePolicy, presence: Presence): RunContext {
+  const run = sessionRun(data, sid, nowMs);
+  return run ? contextOf(run, lifecycleAt(run, nowMs, policy, presence), nowMs) : noRunContext(nowMs);
+}
+
+/** A session with no records in the window: nothing opened, nothing to
+ *  read. */
+function noRunContext(nowMs: number): RunContext {
+  return {
+    run: null,
+    l: null,
+    d: null,
+    firstSessRec: null,
+    startTs: nowMs,
+    inAttempt: () => false,
+    closeTs: null,
+    endTs: null,
+    c: null,
+    done: false,
+    skewedClose: false,
+    state: { status: "planned", killed: false },
+  };
+}
+
+function contextOf(run: RunRecords, l: Lifecycle, nowMs: number): RunContext {
+  const members = new Set<NormRecord>(run.attempt ? run.attempt.records : run.group.records);
+  const firstSessRec = run.group.records[0] ?? null;
+  const done = !isRunning(l);
+  return {
+    run,
+    l,
+    d: run.attempt ? run.attempt.start : null,
+    firstSessRec,
+    startTs: l.startMs ?? firstSessRec?.tMs ?? nowMs,
+    inAttempt: (r) => members.has(r),
+    endTs: done ? endMs(l, nowMs) : null,
+    done,
+    state: toRunState(l),
+    ...closeFacts(l.close),
+  };
+}
+
+/** What the page reads off a run's close: when, whether its clock was
+ *  skewed, and the dispatch terminal its payload comes from. */
+function closeFacts(close: Close | null): Pick<RunContext, "closeTs" | "skewedClose" | "c"> {
+  if (!close) return { closeTs: null, skewedClose: false, c: null };
+  return { closeTs: close.atMs, skewedClose: close.skewed, c: isDispatchTerminal(close.record.action) ? close.record : null };
+}
+
+/** The attempt's telemetry, by source. */
+interface AttemptTelemetry {
+  tel: NormRecord[];
+  lms: NormRecord[];
+  /** Host cpu/ram/gpu samples: the retired per-session `telemetry.process`
+   *  and the machine's own `machine.telemetry` over the run's window. */
+  procs: NormRecord[];
+  rt: NormRecord | null;
+  dets: NormRecord[];
+  loads: NormRecord[];
+  /** The models loaded, first-seen order. */
+  distinct: string[];
+  comps: NormRecord[];
+}
+
+const bySource = (recs: readonly NormRecord[], source: string): NormRecord[] => recs.filter((r) => r.source === source);
+
+const isLoad = (r: NormRecord): boolean => (r.fields as Record<string, unknown> | undefined)?.event === "load";
+
+function attemptTelemetry(visible: readonly NormRecord[], ctx: RunContext): AttemptTelemetry {
+  const tel = visible.filter((r) => ctx.inAttempt(r) && r.category === CATEGORY.Telemetry);
+  const lms = bySource(tel, "lms");
+  const loads = lms.filter(isLoad);
+  return {
+    tel,
+    lms,
+    procs: [...bySource(tel, "process"), ...hostSamplesOf(visible, ctx)],
+    rt: bySource(tel, "runtime").slice(-1)[0] ?? null,
+    dets: bySource(tel, "detector"),
+    loads,
+    distinct: [...new Set(loads.map((r) => (r.fields as Record<string, unknown>).model as string))],
+    comps: bySource(tel, "compaction"),
+  };
+}
+
+/** (#2413 M4) The machine's host samples over this run's window. The
+ * retired per-dispatch `telemetry.process` record rode this session's own
+ * `session_id` (and still matches through `attemptTelemetry`'s `process`
+ * source, for historical runs); its replacement, `machine.telemetry`, is
+ * machine-scoped (`category: "machinery"`, no `session_id`), so it cannot
+ * belong to an attempt. The server joins the samples covering the run's
+ * window into the same record set (darkmux-serve's
+ * `join_host_samples_into_session_records`, keyed on machine_uid and the
+ * dispatch window), so here it is a plain time-window filter.
+ *
+ * (#2413 round 3 CONSIDER 3) Gated on the run's own machine (its start
+ * record's, else its first record's) too: a multi-machine playback fixture
+ * would otherwise render every machine's samples on every run's pane. */
+function hostSamplesOf(visible: readonly NormRecord[], ctx: RunContext): NormRecord[] {
+  const runMachineUid = ctx.d?.machine_uid ?? ctx.firstSessRec?.machine_uid ?? null;
+  const inWindow = (t: number) => t >= ctx.startTs && (ctx.closeTs == null || t <= ctx.closeTs);
+  return visible.filter(
+    (r) => r.action === ACTION.MachineTelemetry && (runMachineUid == null || r.machine_uid === runMachineUid) && (r.tMs === null || inWindow(r.tMs)),
+  );
+}
+
+/** (#2011) The run's duration and the run-time tile's figures. A finished
+ * run's duration is its dispatch terminal's own `wall_ms` (the runtime's
+ * measure, `recordedWallMs`), not recomputed from two timestamps: a page
+ * whose records go stale keeps counting, and taking the number from the
+ * record that ENDS the run means the worst a stale page can do is show a
+ * stale label, never invent a duration. It also avoids two arithmetic
+ * hazards: a terminal timestamped before its own start (the skewed close)
+ * subtracting to a negative, and an unparsable `ts` to `NaN`. A close with
+ * no payload (a `session.end`, an archived record) falls back to its end
+ * minus its start. (U3-7/U5-2) `fmtElapsed` says hours past an hour.
+ * (#2860) How it ended rides the tile's `sub` line, never the figure, which
+ * is contracted to one short `nowrap` value. */
+function wallClock(ctx: RunContext, nowMs: number): { runWallMs: number; wallElapsed: string; wallBase: string; wallSub: string | undefined } {
+  const recorded = recordedWallMs(ctx.l?.close ?? null);
+  const runWallMs = recorded ?? (ctx.endTs !== null ? ctx.endTs - ctx.startTs : NaN);
+  const wallElapsed = ctx.done ? fmtElapsed(runWallMs) : fmtElapsed(nowMs - ctx.startTs);
+  return {
+    runWallMs,
+    wallElapsed,
+    wallBase: ctx.done ? wallElapsed : `${wallElapsed} so far`,
+    wallSub: errorOutcome(ctx.l?.close?.edge),
+  };
+}
+
+const RUNTIME_LABEL: Record<string, string> = {
+  internal: "internal container",
+  direct: "direct client (hosted · no container)",
+  openclaw: "openclaw shell-out",
+};
+
+/** (#2834) The route line: the dialect and address the dispatch record
+ *  names, read as facts. `openai:` names the request FORMAT, not a vendor,
+ *  so a local server speaking it is labelled by its address, never as
+ *  having left the machine. */
+function routeLabel(ep: string | undefined): string {
+  if (!ep) return "LMStudio · local · this machine";
+  const i = ep.indexOf(":");
+  const kind = i >= 0 ? ep.slice(0, i) : "";
+  const rest = i >= 0 ? ep.slice(i + 1) : ep;
+  const label = kind === "azure" ? "Azure OpenAI" : kind === "openai" ? "OpenAI" : kind || "endpoint";
+  return `${label} · ${rest}`;
+}
+
+function briefRowsOf(sp: DispatchStartPayload, model: string | null, d: NormRecord | null, route: string, timing: string): BriefEntry[] {
+  const rows: BriefEntry[] = [];
+  pushKv(rows, "route", route);
+  pushKv(rows, "runtime", sp.runtime ? (RUNTIME_LABEL[sp.runtime] ?? sp.runtime) : "");
+  pushKv(rows, "image", sp.image);
+  pushKv(rows, "model", model);
+  pushKv(rows, "workspace", sp.workspace);
+  if (d?.mission_id) {
+    rows.push({ kind: "label", text: "mission" });
+    rows.push({
+      kind: "value",
+      text: `${d.mission_id}${d.phase_id ? ` · phase ${d.phase_id}` : ""}`,
+      href: `#mission=${encodeURIComponent(d.mission_id)}`,
+    });
+  }
+  pushKv(rows, "timing", timing);
+  return rows;
+}
+
+/** (#1973) The prompt, as a disclosure holding the text itself (never only
+ *  its length), whose summary reads `prompt · <n> chars`. A record that
+ *  reports a length but carries no text says so in the brief instead,
+ *  rather than offering an expander onto nothing. */
+function promptOf(sp: DispatchStartPayload): { promptLines: BriefEntry[]; disclosures: Disclosure[] } {
+  if (sp.prompt) {
+    const chars = sp.prompt_chars ?? sp.prompt.length;
+    const truncated = sp.prompt_chars != null && sp.prompt.length < sp.prompt_chars;
+    return { promptLines: [], disclosures: [{ id: "prompt", label: "prompt", chars, truncated, text: sp.prompt }] };
+  }
+  if (sp.prompt_chars == null) return { promptLines: [], disclosures: [] };
+  return { promptLines: [{ kind: "label", text: "prompt" }, { kind: "value", text: `${sp.prompt_chars} chars` }], disclosures: [] };
+}
+
+/** The MODEL pane's numbers. */
+interface ModelFigures {
+  turns: number | null;
+  tokIn: number | null;
+  tokOut: number | null;
+  ctxPeak: number;
+  ctxNow: number;
+  nctx: number;
+}
+
+/** (#2759) The MODEL pane's numbers: this run's own when it has telemetry,
+ *  else its mission's rolled-up ones. Only these roll up (contract 8's own
+ *  scope for the fix): WALL CLOCK and COMPACTIONS stay this run's own, as
+ *  HARNESS metrics about running this bookend pair. */
+function effectiveFigures(own: ModelFigures, ownEvidence: boolean, rollup: MissionModelRollup | null): ModelFigures {
+  if (ownEvidence || !rollup) return own;
+  const ctx = rollup.hasEvidence ? rollup : own;
+  return {
+    turns: rollup.turns ?? own.turns,
+    tokIn: rollup.tokIn ?? own.tokIn,
+    tokOut: rollup.tokOut ?? own.tokOut,
+    ctxPeak: ctx.ctxPeak,
+    ctxNow: ctx.ctxNow,
+    nctx: ctx.nctx,
+  };
+}
+
+/** (operator, 2026-09-05) The context tile's three slots: `label` names the
+ *  number and never restates it, `headline` IS the number (the peak once
+ *  done, the use now while live), and `sub` carries the window ceiling (and,
+ *  live, the peak so far), in `fmtC`'s compact form (`262k`). */
+function ctxTile(f: ModelFigures, done: boolean): { headline: number; label: string; sub: string | undefined } {
+  if (!f.nctx) return { headline: done ? f.ctxPeak : f.ctxNow, label: "CONTEXT", sub: undefined };
+  if (done) return { headline: f.ctxPeak, label: "CTX PEAK", sub: `of ${fmtC(f.nctx)}` };
+  return { headline: f.ctxNow, label: "CTX NOW", sub: `peak ${fmtC(f.ctxPeak)} · of ${fmtC(f.nctx)}` };
+}
+
+interface ScopeInputs {
+  policy: LifecyclePolicy;
+  presence: Presence;
+  connected: boolean;
+  lastContactMs: number | null;
+}
+
+/** (#2877 pass 2) The live scope's readings: ONE state derivation
+ *  (`lib/tokenRate.ts`'s `aggregateLiveState`, the most informative reading
+ *  among the run's executions wins) and the rate. `stalled` is DERIVED from
+ *  the state, so the two cannot disagree.
+ *
+ *  (#2886 pass 3/4) A stall is downgraded to no reading when the page has
+ *  lost the daemon (`liveStateWhileConnected`): no record could have arrived
+ *  either way, and a false STALL is worse than saying nothing. `lastContactMs`
+ *  closes the half-open gap. `noSignal` is true ONLY when that downgrade is
+ *  what produced the empty reading: a genuinely idle run (a mission between
+ *  model steps) must not read "no signal". */
+function scopeReadings(sets: NormRecord[][], nowMs: number, inp: ScopeInputs) {
+  const raw = aggregateLiveState(sets, nowMs, inp.policy, inp.presence);
+  const halfOpen = inp.lastContactMs != null ? { lastContactMs: inp.lastContactMs, lastHeartbeatMs: lastHeartbeatMs(sets) } : undefined;
+  const state = liveStateWhileConnected(raw, inp.connected, halfOpen);
+  return {
+    tokRateLiveState: state,
+    tokRateStalled: state?.state === "stalled",
+    tokRateNoSignal: raw?.state === "stalled" && state === null,
+    liveTokRate: aggregateTokenRate(sets, nowMs, inp.policy, inp.presence),
+  };
+}
+
+const finiteOrUndefined = (v: unknown): number | undefined => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+};
+
+/** (#1973, #2107) Host CPU / RAM / GPU over the run, average and peak,
+ *  through the ONE aggregation the machine drawer also uses
+ *  (`lib/hostStats.ts`'s `aggregateHostSamples`), so the two surfaces never
+ *  report different numbers for overlapping samples. (#2413 M4) The retired
+ *  `telemetry.process` payload names bare `cpu`/`mem`/`gpu`, the
+ *  machine-scoped `machine.telemetry` names `cpu_pct`/`mem_pct`/`gpu_pct`;
+ *  both read. */
+function hostAggregate(procs: readonly NormRecord[]) {
+  return aggregateHostSamples(
+    procs.map((r) => {
+      const f = r.fields as Record<string, unknown> | undefined;
+      return {
+        cpu: finiteOrUndefined(f?.cpu ?? f?.cpu_pct),
+        mem: finiteOrUndefined(f?.mem ?? f?.mem_pct),
+        gpu: finiteOrUndefined(f?.gpu ?? f?.gpu_pct),
+      };
+    }),
+  );
+}
+
+/** One metric tile. See `SessionRunView.metrics`. */
+type Tile = SessionRunView["metrics"][number];
+
+/** (#2008) A run's tool calls, and how many failed by `toolOutcome`'s rule
+ *  (the event log row's): a command that ran and exited non-zero is the
+ *  tool working, not a failure. */
+function toolCounts(records: readonly NormRecord[]): { calls: number; failed: number } {
+  let calls = 0;
+  let failed = 0;
+  for (const r of records) {
+    if (r.action !== ACTION.DispatchTool) continue;
+    calls += 1;
+    if (toolOutcome((r.fields || r.payload || {}) as Record<string, unknown>) === "failed") failed += 1;
+  }
+  return { calls, failed };
+}
+
+/** (#2890) ACTIVE TIME's sub line: a live run's "so far" (the narrow cell
+ *  holds the bare time), how it ended, and the thermal rest the figure
+ *  INCLUDES, shown when the governor was armed or a rest occurred. */
+function activeTimeSub(done: boolean, outcome: string | undefined, thermal: RestKind | undefined, thermalArmed: boolean): string | undefined {
+  const rest = thermalArmed || thermal ? `${fmtElapsed(thermal?.totalMs ?? 0)} thermal rest` : undefined;
+  return [done ? undefined : "so far", outcome, rest].filter(Boolean).join(" · ") || undefined;
+}
+
+/** The context tile, with (#2890) a thin bar under the figure: now and
+ *  peak against the window, as percentages of it. */
+function ctxTileOf(f: ModelFigures, t: { headline: number; label: string; sub: string | undefined }): Tile {
+  const tile: Tile = { value: f.nctx ? fmtC(t.headline) : "—", label: t.label, sub: t.sub };
+  if (f.nctx > 0) tile.bar = { nowPct: pctOf(f.ctxNow, f.nctx), peakPct: pctOf(f.ctxPeak, f.nctx) };
+  return tile;
+}
+
+const pctOf = (part: number, whole: number): number => Math.min(100, Math.max(0, (part / whole) * 100));
+
+/** (#2886) A finished run's average generation rate: billed tokens over
+ *  generation time (`averageGenerationRate`), an exact average. Three
+ *  outcomes: every paired turn billed reads the plain average; some
+ *  excluded (a checkpointed turn) reads "avg · M of N turns"; all excluded
+ *  reads "—" ("avg · unbilled"), never the wall-clock fallback, which is only
+ *  for a runtime that predates `generation_ms` ("avg · wall clock"). The
+ *  sub line appears only when it says more than "avg". */
+function finishedRate(sets: NormRecord[][], tokOut: number | null, runWallMs: number): { average: string; sub: string | null } {
+  const genRate = averageGenerationRate(sets);
+  if (genRate == null) {
+    const wallRate = tokOut != null && runWallMs > 0 ? tokOut / (runWallMs / 1000) : null;
+    return { average: wallRate != null ? String(Math.round(wallRate)) : "—", sub: "avg · wall clock" };
+  }
+  if (genRate.tokensPerSec == null) return { average: "—", sub: "avg · unbilled" };
+  const partial = genRate.billedTurns !== genRate.totalTurns;
+  return { average: String(Math.round(genRate.tokensPerSec)), sub: partial ? `avg · ${genRate.billedTurns} of ${genRate.totalTurns} turns` : null };
+}
+
+/** How many rests of one kind a run took, and for how long. */
+interface RestKind {
+  label: string;
+  count: number;
+  totalMs: number;
+}
+
+/** (rest-reason cards) Which kind of rest a `dispatch.rest`'s reason names. */
+function restKindOf(reason: unknown): { key: string; label: string } {
+  const r = String(reason ?? "").trim();
+  if (r.startsWith("thermal")) return { key: "thermal", label: "THERMAL REST" };
+  if (r === "turn_delay") return { key: "turn_delay", label: "TURN DELAY" };
+  if (r.startsWith("battery")) return { key: "battery", label: "BATTERY PAUSE" };
+  if (r.startsWith("operator")) return { key: "operator_hold", label: "OPERATOR HOLD" };
+  const key = r || "rest";
+  return { key, label: `${key.toUpperCase()} REST` };
+}
+
+/** The attempt's rests by kind. A record with `delay_ms` and no `ms` is the
+ *  governor changing its PACING, not a rest (`dispatch_internal.rs`'s
+ *  `emit_rest`): only a real `ms` is one rest. */
+function restsByKind(records: readonly NormRecord[]): Map<string, RestKind> {
+  const out = new Map<string, RestKind>();
+  for (const r of records) {
+    if (r.action !== ACTION.DispatchRest) continue;
+    const f = (r.fields || r.payload || {}) as Record<string, unknown>;
+    if (typeof f.ms !== "number" || !Number.isFinite(f.ms) || f.ms <= 0) continue;
+    const { key, label } = restKindOf(f.reason);
+    const cur = out.get(key) ?? { label, count: 0, totalMs: 0 };
+    cur.count += 1;
+    cur.totalMs += f.ms;
+    out.set(key, cur);
+  }
+  return out;
+}
+
+/** Which rest protections were ARMED for this dispatch (`dispatch.start`'s
+ *  `bounds`), so a card shows at 0 rests when configured: "configured and
+ *  never fired" differs from "not configured". No recorded bounds (before
+ *  #2165) reads as unknown, never off. Operator hold has no knob to arm. */
+function restArmed(bounds: DispatchStartPayload["bounds"]): Record<string, boolean> {
+  const delay = bounds?.turn_delay_ms?.value;
+  return {
+    thermal: bounds?.thermal_pacing_enabled?.value === true,
+    turn_delay: typeof delay === "number" && delay > 0,
+    battery: bounds?.battery_pause_enabled?.value === true,
+  };
+}
+
+const STATIC_REST_LABELS: Record<string, string> = {
+  thermal: "THERMAL REST",
+  turn_delay: "TURN DELAY",
+  battery: "BATTERY PAUSE",
+  operator_hold: "OPERATOR HOLD",
+};
+const REST_KIND_ORDER = ["thermal", "turn_delay", "battery", "operator_hold"];
+
+/** (rest-reason cards) One SYSTEM tile per rest KIND, in a fixed order
+ *  (then any kind this file does not name, longest first), for a kind that
+ *  was armed or occurred. `thermalInModel` skips thermal rest when ACTIVE
+ *  TIME already names it. */
+function restTiles(rests: Map<string, RestKind>, armed: Record<string, boolean>, thermalInModel: boolean): Tile[] {
+  const extra = [...rests.keys()].filter((k) => !REST_KIND_ORDER.includes(k)).sort((a, b) => (rests.get(b)?.totalMs ?? 0) - (rests.get(a)?.totalMs ?? 0));
+  const tiles: Tile[] = [];
+  for (const key of [...REST_KIND_ORDER, ...extra]) {
+    const occurred = rests.get(key);
+    if ((key === "thermal" && thermalInModel) || (!armed[key] && !occurred)) continue;
+    tiles.push(restTile(key, occurred));
+  }
+  return tiles;
+}
+
+function restTile(key: string, occurred: RestKind | undefined): Tile {
+  const count = occurred?.count ?? 0;
+  const totalMs = occurred?.totalMs ?? 0;
+  return { value: fmtElapsed(totalMs), label: STATIC_REST_LABELS[key] ?? occurred?.label ?? key.toUpperCase(), sub: restSub(key, count, totalMs) };
+}
+
+/** "N rests", and for turn delays the length of each. */
+function restSub(key: string, count: number, totalMs: number): string {
+  const rests = `${count} rest${count === 1 ? "" : "s"}`;
+  return key === "turn_delay" && count > 0 ? `${rests} · ${Math.round(totalMs / count / 1000)} s each` : rests;
+}
+
+/** (operator, 2026-09-05) A host figure's tile: the AVERAGE is the value
+ *  (one figure on one line), the peak its `sub`, and (#2863) "avg" a small
+ *  `unit` beside the value. */
+function avgHighTile(label: string, m: { avg: number | null; high: number | null }): Tile {
+  return { value: `${roundPct(m.avg)}%`, label, sub: `${roundPct(m.high)}% high`, unit: "avg" };
+}
+
+/** The CPU / RAM / GPU tiles for whichever figures were sampled. (#2413 M4)
+ *  A model-work run whose host join came up empty says so ("no host
+ *  samples", the machine drawer's words) rather than silently dropping the
+ *  tiles; a run with no model work has nothing to sample. */
+function hostTiles(agg: ReturnType<typeof hostAggregate>, hasModelWork: boolean): Tile[] {
+  const tiles: Tile[] = [];
+  if (agg.cpu.high != null) tiles.push(avgHighTile("CPU", agg.cpu));
+  if (agg.mem.high != null) tiles.push(avgHighTile("RAM", agg.mem));
+  if (agg.gpu.high != null) tiles.push(avgHighTile("GPU", agg.gpu));
+  if (hasModelWork && tiles.length === 0) tiles.push({ value: "—", label: "HOST", sub: "no host samples for this run" });
+  return tiles;
+}
+
+/** (#2863) Model names compared WITHOUT darkmux's namespace: since #2240 a
+ *  local dispatch names the model `darkmux:<key>` on the wire, while LM
+ *  Studio's load telemetry reports the bare key. */
+const bareModel = (m: unknown): string => String(m ?? "").replace(/^darkmux:/, "");
+
+const loadFields = (r: NormRecord): Record<string, unknown> => r.fields as Record<string, unknown>;
+
+type ModelEntry = { name: string; gb: number | null; ran: boolean | null };
+
+/** The loaded-models track, the model that ran first. `endpointModel` is
+ *  the model an endpoint-served run names (it has no loads to list); a run
+ *  that loaded nothing itself falls back to its mission's (`rollupLines`,
+ *  unlabeled: primary/also-loaded compare this run's own fields), then to
+ *  "no telemetry yet". */
+function modelTrackOf(loads: readonly NormRecord[], primaryModel: string | null, endpointModel: string | null, rollupLines: string[]): { modelEntries?: ModelEntry[]; modelTrackLines: string[] } {
+  if (endpointModel !== null) return { modelTrackLines: [endpointModel] };
+  const isRan = (r: NormRecord) => primaryModel != null && bareModel(loadFields(r).model) === bareModel(primaryModel);
+  const ordered = [...loads].sort((a, b) => Number(isRan(b)) - Number(isRan(a)));
+  if (!ordered.length) return { modelTrackLines: rollupLines.length ? rollupLines : ["no telemetry yet"] };
+  return {
+    modelEntries: ordered.map((r) => modelEntryOf(loadFields(r), primaryModel == null ? null : isRan(r))),
+    modelTrackLines: ordered.map((r) => modelLineOf(loadFields(r), primaryModel == null ? null : isRan(r))),
+  };
+}
+
+function modelEntryOf(f: Record<string, unknown>, ran: boolean | null): ModelEntry {
+  return { name: String(f.model ?? "?"), gb: typeof f.gb === "number" ? f.gb : null, ran };
+}
+
+function modelLineOf(f: Record<string, unknown>, ran: boolean | null): string {
+  const tag = ran === null ? "" : ran ? " · primary" : " · also loaded";
+  return `${f.model} · ${f.gb ?? "?"}GB${tag}`;
+}
+
+// ── signals ────────────────────────────────────────────────────────────
+
+interface SignalInputs {
+  skewedClose: boolean;
+  lms: NormRecord[];
+  loads: NormRecord[];
+  distinct: string[];
+  d: NormRecord | null;
+  dets: NormRecord[];
+  /** `dispatch.checkpoint` is NOT a detector telemetry record (`category=
+   *  work`, no `source`), so it never reaches `dets`: read straight off the
+   *  attempt's records. */
+  checkpoints: NormRecord[];
+}
+
+/** (#1973) The SIGNALS card. Was "detections", one flat list of grey
+ *  strings with no times: the emitter has ALWAYS sent a severity (`warn` for
+ *  cycle / reasoning-loop / tool-failure, `info` for `intra-turn-stall`, a
+ *  RECOVERY), and a cycle in the first ten seconds looked exactly like one
+ *  an hour in. Signals now carry their severity and their offset into the
+ *  run, grouped by kind. */
+function runSignals(inp: SignalInputs): { signalGroups: SignalGroup[]; signalsLabel: string; repetitionOff: boolean; repetitionRecorded: boolean } {
+  const facts = runPolicyFacts(inp.d);
+  const finds: Signal[] = [
+    ...(inp.skewedClose ? [SKEW_SIGNAL] : []),
+    ...modelSwapSignals(inp.lms, inp.loads, inp.distinct),
+    ...detectorSignals(inp.dets, facts.runStartMs),
+    ...(facts.repetitionOff ? [] : repetitionSignals(turnFlags(inp.dets, inp.checkpoints), facts)),
+  ];
+  return {
+    signalGroups: groupSignals(finds),
+    signalsLabel: finds.length ? `signals (${finds.length})` : "signals",
+    repetitionOff: facts.repetitionOff,
+    repetitionRecorded: facts.repetitionRecorded,
+  };
+}
+
+/** (#1988) The page reconstructed this run's outcome from a terminal record
+ *  that precedes its own start. Honored rather than hidden (a finished
+ *  dispatch must not read RUNNING forever), but NOT presented as if the
+ *  timeline were sound: clock skew is itself worth an operator's attention
+ *  on a fleet. */
+const SKEW_SIGNAL: Signal = {
+  kind: "clock-skew",
+  severity: "warn",
+  detail:
+    "this run's terminal record is timestamped BEFORE its own start — the outcome is read from it anyway, but elapsed time and signal offsets on this page are unreliable.",
+  fix: "check the clocks on the machines that produced these records.",
+  atMs: null,
+  offsetLabel: "",
+};
+
+const isUtilitySeat = (role: unknown): boolean => role === "compactor" || role === "utility";
+
+/** (#1934) A mid-run model swap. Two model ids loaded in one run is not a
+ * swap: a correct `deep`/`balanced` profile loads a primary and a compactor
+ * BY CONSTRUCTION, and a resident leftover from an earlier session is
+ * ambient. The producer tags each `telemetry.lms` load/unload with `role`
+ * (`primary` / `compactor` / `utility` / `resident`, `telemetry_sampler.rs`'s
+ * `role_for_load`) and marks the sampler's first tick `baseline` (the
+ * starting lineup, never an event). A genuine swap is what happens to a
+ * SPECIALIST seat after that: a new specialist model going resident, or one
+ * being unloaded at all.
+ *
+ * UNTAGGED RECORD SETS ARE NOT JUDGED. Records from before the tags (and
+ * hand-authored fixtures, and the committed demo corpus) carry neither
+ * field; judging them admitted every load and said "X was unloaded mid-run"
+ * for sets with no unload at all, a false factual claim. So the seat reading
+ * applies only when EVERY lms record carries a `role`; otherwise the
+ * detector declines and says so (`untaggedTrackSignal`). */
+function modelSwapSignals(lms: NormRecord[], loads: NormRecord[], distinct: string[]): Signal[] {
+  if (lms.length === 0) return [];
+  const untagged = lms.some((r) => typeof ((r.fields ?? {}) as Record<string, unknown>).role !== "string");
+  const signal = untagged ? untaggedTrackSignal(distinct) : taggedSwapSignal(lms, loads);
+  return signal ? [signal] : [];
+}
+
+/** `info`, not `warn`: nothing is known to have gone wrong. Emitted exactly
+ *  where the old count-based rule would have raised a `warn`, so a
+ *  historical run is neither silently blind nor crying wolf. */
+function untaggedTrackSignal(distinct: string[]): Signal | null {
+  if (distinct.length <= 1) return null;
+  return {
+    kind: "model-track-unclassified",
+    severity: "info",
+    detail: `${distinct.length} models loaded in one run (${distinct.join(" → ")}), but these records carry no seat tag — a real mid-run swap and a correct primary+compactor staffing look identical here, so this run is not judged either way.`,
+    fix: "runs recorded at flow schema 1.45.0 or later tag each load with its seat; the swap reading returns for those.",
+    atMs: null,
+    offsetLabel: "",
+  };
+}
+
+/** Whether a load/unload is a specialist-seat event after the baseline. */
+function isSwapEvent(r: NormRecord): boolean {
+  const f = r.fields as Record<string, unknown> | undefined;
+  if (!f || isUtilitySeat(f.role)) return false;
+  if (f.event === "unload") return true;
+  return f.event === "load" && !(f.role != null && f.baseline === true);
+}
+
+const modelsOf = (recs: readonly NormRecord[]): string[] => [...new Set(recs.map((r) => loadFields(r).model as string))];
+
+/** The seat reading. TWO KNOWN NARROWINGS, both deliberate: a compactor or
+ *  utility model EVICTED mid-run is invisible here (right for a utility
+ *  LOAD, wrong for an UNLOAD; compactor thrash wants its own signal,
+ *  #2565); and a `resident` model going resident mid-run fires, including
+ *  one the operator loaded for unrelated use (it cannot be excluded: a
+ *  genuine second specialist also tags `resident`). The GATE is "did
+ *  anything happen to a specialist seat after the starting point"; the
+ *  model counts only shape the WORDING, each branch keyed on the thing it
+ *  claims. Synthesized from the load track, so it has no record of its own
+ *  and no timestamp: `null` says so. */
+function taggedSwapSignal(lms: NormRecord[], loads: NormRecord[]): Signal | null {
+  const swaps = lms.filter(isSwapEvent);
+  if (swaps.length === 0) return null;
+  const specialistModels = modelsOf(loads.filter((r) => !isUtilitySeat(loadFields(r).role)));
+  const unloaded = modelsOf(swaps.filter((r) => loadFields(r).event === "unload"));
+  const loadedMidRun = modelsOf(swaps.filter((r) => loadFields(r).event === "load"));
+  const detail = swapDetail(specialistModels, unloaded, loadedMidRun);
+  if (!detail) return null;
+  return { kind: "jit-model-swap", severity: "warn", detail, fix: "pin one model for the run, or pre-warm the swap target.", atMs: null, offsetLabel: "" };
+}
+
+function swapDetail(specialistModels: string[], unloaded: string[], loadedMidRun: string[]): string | null {
+  if (specialistModels.length > 1) {
+    return `${specialistModels.length} models loaded in one run (${specialistModels.join(" → ")}) — mid-run swap stalls the dispatch while the new model loads.`;
+  }
+  if (unloaded.length > 0) return `${unloaded.join(", ")} was unloaded mid-run — the seat's reload stalls the dispatch while the model loads.`;
+  if (loadedMidRun.length > 0) return `${loadedMidRun.join(", ")} loaded mid-run rather than before it — the dispatch stalls while the model loads.`;
+  return null;
+}
+
+/** What the run's `dispatch.start` says about its detectors. */
+interface RunPolicyFacts {
+  runStartMs: number | null;
+  /** (#2887 F2) The run-level policy the dispatch ran under
+   *  (`payload.bounds.detection_degeneracy_policy.value`, the value the host
+   *  stamps for the container): the one "what was this run configured to
+   *  do" answer, whatever an individual record carries. `null` when unknown,
+   *  and unknown is never read as "off". */
+  runDegeneracyPolicy: string | null;
+  repetitionOff: boolean;
+  /** (#2887 N2) Whether the run's `flow_schema` is 1.56.0 or later, when
+   *  the degeneracy gate's findings started reaching the flow stream. An
+   *  older (or unstamped) run cannot tell "never flagged" from "no forwarder
+   *  yet", and must render as unmeasured, never as a clean tick. */
+  repetitionRecorded: boolean;
+}
+
+function runPolicyFacts(d: NormRecord | null): RunPolicyFacts {
+  const sf = d?.fields as Record<string, unknown> | undefined;
+  const block = (sf?.bounds as Record<string, unknown> | undefined)?.detection_degeneracy_policy as Record<string, unknown> | undefined;
+  const runDegeneracyPolicy = typeof block?.value === "string" ? block.value : null;
+  return {
+    runStartMs: d ? d.tMs : null,
+    runDegeneracyPolicy,
+    repetitionOff: runDegeneracyPolicy === "off",
+    repetitionRecorded: flowSchemaAtLeast(typeof sf?.flow_schema === "string" ? sf.flow_schema : null, "1.56.0"),
+  };
+}
+
+const offsetLabelOf = (atMs: number | null, runStartMs: number | null): string =>
+  atMs != null && runStartMs != null ? runOffset(atMs - runStartMs) : "";
+
+/** One signal per detector record, except `repetition` (#2887 F4: grouped
+ *  by turn in `repetitionSignals`, since one cut writes an observation, an
+ *  abort and a checkpoint). (#1989) A missing `kind` is named
+ *  `unknown-signal`, never the string "undefined"; an unknown severity
+ *  degrades to `warn`, never `info` (quietly downgrading is how a new
+ *  detector ships invisible); a non-string `detail` is serialized, never
+ *  `[object Object]`. */
+function detectorSignals(dets: NormRecord[], runStartMs: number | null): Signal[] {
+  const out: Signal[] = [];
+  for (const r of dets) {
+    const f = r.fields as Record<string, unknown>;
+    if (f.kind === "repetition") continue;
+    out.push({
+      kind: typeof f.kind === "string" && f.kind ? f.kind : "unknown-signal",
+      severity: f.severity === "info" ? "info" : "warn",
+      detail: signalDetail(f.detail),
+      atMs: r.tMs,
+      offsetLabel: offsetLabelOf(r.tMs, runStartMs),
+    });
+  }
+  return out;
+}
+
+/** (#2887 F4) One flagged TURN, not one raw record. */
+type TurnFlag = {
+  turnSeq: number | string;
+  acted: boolean;
+  /** (#2887 N4) How many DISTINCT calls the gate itself ended for this turn,
+   *  counted off `dispatch.gate.abort` records alone (never the degenerate
+   *  observation naming the same cut). */
+  gateAbortCount: number;
+  /** Whether a gate-sourced record contributed at all, vs. the flag coming
+   *  only from the checkpoint's post-hoc judge (#2836 the in-stream gate,
+   *  #1221 the reasoning check-in: independent detectors). */
+  sawGate: boolean;
+  policy: string | null;
+  atMs: number | null;
+  ratio: string | null;
+};
+
+/** One record's contribution to a turn's flag. */
+type FlagPart = Omit<TurnFlag, "turnSeq" | "gateAbortCount" | "sawGate"> & { turnSeqRaw: unknown; seatKey: string; isGateAbort: boolean; isGateSourced: boolean };
+
+/** (#2887 N3) `turn_seq` alone is not a safe key: a dispatch session id is
+ *  TASK-scoped, so sibling seats fanned out in one task share it and can
+ *  each be on their own "turn 2". `handle` (the role) and `payload.step_id`
+ *  attribute a record even then. */
+const seatKeyFor = (r: NormRecord, f: Record<string, unknown>): string => `${r.handle ?? ""}::${typeof f.step_id === "string" ? f.step_id : ""}`;
+
+const ratioOf = (f: Record<string, unknown>): string | null => (typeof f.tail_ratio === "number" ? f.tail_ratio.toFixed(3) : null);
+const policyOf = (f: Record<string, unknown>): string | null => (typeof f.policy === "string" ? f.policy : null);
+
+/** A repetition detector record's part. Only `dispatch.gate.abort` writes
+ *  `generated_chars`, and an abort's own existence IS the acted outcome
+ *  (#2887 F2: an older host forwards `acted` as an explicit `null`). */
+function gatePart(r: NormRecord): FlagPart | null {
+  const f = r.fields as Record<string, unknown>;
+  if (f.kind !== "repetition") return null;
+  const isGateAbort = f.generated_chars != null;
+  return { turnSeqRaw: f.turn_seq, seatKey: seatKeyFor(r, f), acted: f.acted === true || isGateAbort, isGateAbort, isGateSourced: true, policy: policyOf(f), atMs: r.tMs, ratio: ratioOf(f) };
+}
+
+/** A checkpoint's part, when it flags: `would_conclude` (the judge found
+ *  the turn repetitive) or a `conclude` verdict (F1: a checkpoint from
+ *  before #2846 carries only `verdict`). */
+function checkpointPart(r: NormRecord): FlagPart | null {
+  const f = r.fields as Record<string, unknown>;
+  const acted = f.verdict === "conclude";
+  if (f.would_conclude !== true && !acted) return null;
+  return { turnSeqRaw: f.turn_seq, seatKey: seatKeyFor(r, f), acted, isGateAbort: false, isGateSourced: false, policy: policyOf(f), atMs: r.tMs, ratio: ratioOf(f) };
+}
+
+/** The repetition flags by turn. (#2887 N3) A record with no numeric
+ *  `turn_seq` never collapses with another such record just because both
+ *  read "?": each keeps a group of its own. */
+function turnFlags(dets: NormRecord[], checkpoints: NormRecord[]): TurnFlag[] {
+  const byTurn = new Map<string, TurnFlag>();
+  const parts = [...dets.map(gatePart), ...checkpoints.map(checkpointPart)];
+  for (const p of parts) {
+    if (!p) continue;
+    const turnSeq = typeof p.turnSeqRaw === "number" ? p.turnSeqRaw : "?";
+    const key = turnSeq === "?" ? `${p.seatKey}::?::${byTurn.size}` : `${p.seatKey}::${turnSeq}`;
+    const existing = byTurn.get(key);
+    if (existing) mergeFlag(existing, p);
+    else byTurn.set(key, { turnSeq, acted: p.acted, gateAbortCount: p.isGateAbort ? 1 : 0, sawGate: p.isGateSourced, policy: p.policy, atMs: p.atMs, ratio: p.ratio });
+  }
+  return [...byTurn.values()];
+}
+
+/** The earlier of two times, a missing one never winning. */
+const earliestOf = (a: number | null, b: number | null): number | null => (a == null ? b : b == null ? a : Math.min(a, b));
+
+function mergeFlag(acc: TurnFlag, p: FlagPart): void {
+  if (p.acted) acc.acted = true;
+  if (p.isGateAbort) acc.gateAbortCount += 1;
+  if (p.isGateSourced) acc.sawGate = true;
+  if (p.policy && !acc.policy) acc.policy = p.policy;
+  acc.atMs = earliestOf(acc.atMs, p.atMs);
+  if (p.ratio && !acc.ratio) acc.ratio = p.ratio;
+}
+
+/** One `repetition` signal per flagged turn. (#2887 F2) `off` means the gate
+ *  never ran, so its caller asks nothing then: a stray repetition-shaped
+ *  record must not manufacture a finding for a detector that was not
+ *  measuring. */
+function repetitionSignals(flags: TurnFlag[], facts: RunPolicyFacts): Signal[] {
+  return flags.map((acc) => ({
+    kind: "repetition",
+    severity: "warn" as const,
+    detail: repetitionDetail(acc, facts.runDegeneracyPolicy ?? acc.policy),
+    atMs: acc.atMs,
+    offsetLabel: offsetLabelOf(acc.atMs, facts.runStartMs),
+  }));
+}
+
+/** The turn's line, in the words of the policy the RUN ran under (#2887
+ *  F2), citing the detector that produced it (#2887 N4: #2836 whenever the
+ *  gate contributed, #1221 for a checkpoint-only flag). (#2947) Policy
+ *  values name the action: `record` (silent measure; `observe` is its
+ *  pre-4.0 spelling, still read) and `warn` (surfaced, not concluded). */
+function repetitionDetail(acc: TurnFlag, policy: string | null): string {
+  const ratio = acc.ratio ? ` (tail_ratio=${acc.ratio})` : "";
+  const citation = acc.sawGate ? "#2836" : "#1221";
+  if (acc.acted) return `turn ${acc.turnSeq}: judged repeating${ratio} and ended it${acc.gateAbortCount > 1 ? ` ${acc.gateAbortCount}×` : ""} (${citation})`;
+  if (policy === "record" || policy === "observe") return `turn ${acc.turnSeq}: judged repeating${ratio} — recorded, not concluded (#2846)`;
+  if (policy === "warn") return `turn ${acc.turnSeq}: judged repeating${ratio} — warned, not concluded (#2947)`;
+  return `turn ${acc.turnSeq}: judged repeating${ratio} (${citation})`;
+}
+
+const SEV_RANK: Record<SignalSeverity, number> = { warn: 0, info: 1 };
+
+/** Severity first, then most recent first inside each (a recovery never
+ *  outranks a struggle), grouped by kind so eleven cycle detections are one
+ *  row that says 11. A group takes the highest severity it holds. */
+function groupSignals(finds: Signal[]): SignalGroup[] {
+  const sorted = [...finds].sort((a, b) => SEV_RANK[a.severity] - SEV_RANK[b.severity] || (b.atMs ?? 0) - (a.atMs ?? 0));
+  const byKind = new Map<string, Signal[]>();
+  for (const f of sorted) byKind.set(f.kind, [...(byKind.get(f.kind) ?? []), f]);
+  return [...byKind].map(([kind, signals]) => ({
+    kind,
+    severity: signals.some((x) => x.severity === "warn") ? ("warn" as const) : ("info" as const),
+    count: signals.length,
+    signals,
+  }));
+}
+
+/** The header's role: the run's start record's handle (else its first
+ *  record's), without darkmux's role namespace. */
+function roleOf(r: NormRecord | null): string {
+  const handle = r ? r.handle : "unknown";
+  return String(handle || "").replace(/^darkmux\//, "").toUpperCase();
+}
+
+/** The model the brief names: the start record's, else the endpoint's
+ *  deployment, else the first model loaded. */
+function modelOf(d: NormRecord | null, endpoint: string | undefined, distinct: string[]): string | null {
+  if (d?.model) return d.model;
+  if (endpoint) return endpoint.slice(endpoint.lastIndexOf("/") + 1);
+  return distinct[0] ?? null;
+}
+
+/** (#2759) EVIDENCE of model work in a run's own telemetry: actual numbers,
+ *  not a start record (a run-grain session has a start and nothing else, and
+ *  is exactly the case the mission rollup exists for). */
+function hasTelemetryEvidence(f: { loads: NormRecord[]; turnsValue: number | null; tokIn: number | null; tokOut: number | null; ctxSamples: number; comps: NormRecord[] }): boolean {
+  return f.loads.length > 0 || f.turnsValue != null || f.tokIn != null || f.tokOut != null || f.ctxSamples > 0 || f.comps.length > 0;
+}
+
+type LiveTokScope = NonNullable<SessionRunView["liveTokScope"]>;
+
+/** (#2877) The live scope's data for a run still in progress. */
+function liveTokScopeOf(
+  reading: LiveStateReading | null,
+  rate: { tokensPerSec: number; carried: boolean } | null,
+  stalled: boolean,
+  noSignal: boolean,
+  nowMs: number,
+): LiveTokScope {
+  return {
+    tokensPerSec: rate?.tokensPerSec ?? null,
+    carried: rate?.carried ?? false,
+    stalled,
+    // null: no live execution right now (a mission between model steps), or
+    // downgraded for a lost connection. Every lamp is off.
+    state: reading?.state ?? null,
+    restSecondsLeft: reading?.restSecondsLeft,
+    clockMs: nowMs,
+    noSignal,
+    toolName: undefined,
+    ...stateExtras(reading),
+  };
+}
+
+/** The fields only one state carries (see `LiveStateReading`). */
+function stateExtras(r: LiveStateReading | null): Partial<LiveTokScope> {
+  switch (r?.state) {
+    case "rest":
+      return restExtras(r);
+    case "tools":
+      return toolExtras(r);
+    case "generating":
+      return r.thinking ? { thinking: true } : {};
+    case "prompt":
+      return r.compacting ? { compacting: true, compactingSeconds: r.compactingSeconds } : {};
+    case "stalled":
+    case undefined:
+      return {};
+  }
+}
+
+function restExtras(r: LiveStateReading): Partial<LiveTokScope> {
+  return { ...(r.restEndMs !== undefined ? { restEndMs: r.restEndMs } : {}), ...(r.restReason !== undefined ? { restReason: r.restReason } : {}) };
+}
+
+function toolExtras(r: LiveStateReading): Partial<LiveTokScope> {
+  return {
+    toolName: r.toolName,
+    ...(r.toolPath !== undefined ? { toolPath: r.toolPath } : {}),
+    ...(r.writing ? { writing: true as const, writingSeconds: r.writingSeconds } : {}),
+  };
+}
+
+/** How an errored run ended, for the run-time tile's sub line. */
+function errorOutcome(edge: CloseEdge | undefined): string | undefined {
+  if (edge?.kind !== "error") return undefined;
+  if (edge.killed) return "killed (timeout)";
+  return `errored${edge.exitCode != null ? ` (exit ${edge.exitCode})` : ""}`;
 }
 
 /** `runRegions()` — viewer.html:2064-2285, minus the two SVG chart regions
@@ -604,111 +1477,26 @@ export function runRegions(
    *  alone, never into turns, tokens or the event rows. `null` derives from
    *  durable records exactly as before. */
   live: LiveOverlay | null = null,
+  /** Session presence (`hooks/useSessionLiveness.ts`): holds a silent run
+   *  open, never a closed one. */
+  presence: Presence = NO_PRESENCE,
+  /** The daemon's lifecycle policy (`/runs.policy`). */
+  policy: LifecyclePolicy = DEFAULT_POLICY,
 ): SessionRunView {
   const tMax = computeTMax(data);
   const nowMs = nowOverride != null ? Math.max(nowOverride, tMax) : tMax;
 
-  // (#1988) A start record serves two purposes: it is the PAYLOAD source
-  // (the brief) and the CLOCK source (the attempt window). A bad clock
-  // (`tMs === null`) must not cost the payload, so the brief falls back to a
-  // start with no usable time while the clock walks outward below.
-  const allSidStarts = data.filter((r) => r.session_id === sid && r.action === ACTION.DispatchStart);
-  const sidStarts = allSidStarts.filter((r) => r.tMs !== null && r.tMs <= nowMs).sort(byTime);
-  // Prefer a start with a usable clock; fall back to ANY start so the brief
-  // survives a malformed timestamp rather than vanishing with it.
-  const d = sidStarts.length ? sidStarts[sidStarts.length - 1] : (allSidStarts[allSidStarts.length - 1] ?? null);
-  const firstSessRec = data.find((r) => r.session_id === sid) ?? null;
-  // `startTs` must be FINITE or it poisons every downstream comparison. Walk
-  // outward for a usable clock: the start record, then the session's first
-  // record, then its earliest parsable one, then `now`.
-  const sessionTimes = timesOf(data.filter((r) => r.session_id === sid));
-  const startTs =
-    d?.tMs ??
-    firstSessRec?.tMs ??
-    (sessionTimes.length ? Math.min(...sessionTimes) : null) ??
-    nowMs;
-  // A record whose own `ts` is unparsable is INCLUDED, not silently dropped.
-  // Excluding it is what hid a legitimate terminal; a malformed record should
-  // be visible and wrong-looking, never invisible.
-  const inAttempt = (r: NormRecord) => {
-    if (r.session_id !== sid) return false;
-    return r.tMs === null || r.tMs >= startTs;
-  };
-
-  // (#1988) The close edge is selected WITHOUT requiring `ts >= startTs`.
-  //
-  // Requiring it meant a terminal record timestamped before its own start —
-  // ordinary cross-machine clock skew, which this function's own `nowMs`
-  // clamp above already anticipates — was filtered out, so a finished
-  // dispatch reported as perpetually in flight. Guarding the elapsed-time
-  // arithmetic against skew while leaving the terminal SELECTION exposed to
-  // it was the inconsistency.
-  // (#2902 step 5) A hosted call's gate writes `budget.stop` when its run
-  // is stopped mid-wait, BEFORE any bookend (the call is never sent): with
-  // no `dispatch.start` at or after it, it is this run's close.
-  const startAfter = (r: NormRecord) =>
-    data.some((o) => o.session_id === sid && o.action === ACTION.DispatchStart && byTime(o, r) >= 0);
-  const isTerminal = (r: NormRecord) =>
-    isDispatchTerminal(r.action) || r.action === ACTION.SessionEnd || (r.action === ACTION.BudgetStop && !startAfter(r));
-  const sessionTerminals = data.filter((r) => r.session_id === sid && isTerminal(r)).sort(byTime);
-  const inAttemptCloses = sessionTerminals.filter(inAttempt);
-  // Prefer terminals inside the attempt window; fall back to any terminal on
-  // the session, so a skewed one is honored rather than hidden. `skewedClose`
-  // records that the fallback fired, so the page can SAY so instead of
-  // quietly presenting a reconstructed timeline as fact.
-  const skewedClose = inAttemptCloses.length === 0 && sessionTerminals.length > 0;
-  const attemptCloses = inAttemptCloses.length ? inAttemptCloses : sessionTerminals;
-  const close = attemptCloses[0] ?? null;
-  // Not a `budget.stop`: it closes the run but is no completion, and reading
-  // it as one would call a stopped wait a clean finish.
-  const c = attemptCloses.find((r) => r.action !== ACTION.SessionEnd && r.action !== ACTION.BudgetStop) ?? null;
-  // A close with an unparsable `ts` still terminates the run (the as-of cut
-  // keeps an untimed record).
-  const closeTs = close ? close.tMs : null;
-  const done = !!close && isAsOf(close, nowMs);
-
+  // The run this page shows, and where it stands, from the one lifecycle
+  // (`lib/lifecycle.ts`) every surface reads: its attempt as of `nowMs`
+  // (the latest start, #1988's skewed close honored and flagged), its close
+  // edge, and whether it is still in flight.
+  const ctx = runContext(data, sid, nowMs, policy, presence);
+  const { run, l, d, firstSessRec, startTs, inAttempt, endTs, c, done, skewedClose, state } = ctx;
   const visible = recordsAsOf(data, nowMs);
-  const tel = visible.filter((r) => inAttempt(r) && r.category === CATEGORY.Telemetry);
-  const lms = tel.filter((r) => r.source === "lms");
-  // (#2413 M4) Host cpu/ram/gpu samples used to ride the per-dispatch
-  // `telemetry.process` record — `category: "telemetry"`, `source:
-  // "process"`, this session's own `session_id` — so `tel`'s filters
-  // above caught it for free. M3 retired that producer; the replacement,
-  // `machine.telemetry`, is machine-scoped: `category: "machinery"`
-  // (NOT "telemetry"), `source: "host"`, and no `session_id` at all — so
-  // `inAttempt` (which requires a session_id match) silently excludes it
-  // and this pane's CPU/RAM/GPU tiles would vanish. The server already
-  // joins the machine-scoped samples covering this run's window into the
-  // SAME record set this session's own records arrive in (darkmux-serve's
-  // `join_host_samples_into_session_records`, keyed on machine_uid + the
-  // dispatch.start..terminal window) — so here it's a plain time-window
-  // filter instead of `inAttempt`'s session match. Historical (pre-#2413)
-  // `telemetry.process` records with this session's own `session_id`
-  // still match via the `tel`/`source==="process"` half below —
-  // lenient-on-read, both curves render.
-  // (#2413 round 3 CONSIDER 3) `d`'s own `machine_uid` (the dispatch.start
-  // record — falls back to the session's first record for the same reason
-  // `startTs` does above) gates the join client-side too: without it, a
-  // multi-machine playback fixture (records from more than one machine's
-  // day file, e.g. a fleet view) would render every machine's samples
-  // on every run's SYSTEM pane, not just the run's own machine's.
-  const runMachineUid = d?.machine_uid ?? firstSessRec?.machine_uid ?? null;
-  const hostSamples = visible.filter(
-    (r) =>
-      r.action === ACTION.MachineTelemetry &&
-      (runMachineUid == null || r.machine_uid === runMachineUid) &&
-      (r.tMs === null || (r.tMs >= startTs && (closeTs == null || r.tMs <= closeTs))),
-  );
-  const procs = [...tel.filter((r) => r.source === "process"), ...hostSamples];
-  const rt = tel.filter((r) => r.source === "runtime").slice(-1)[0] ?? null;
-  const dets = tel.filter((r) => r.source === "detector");
-  const loads = lms.filter((r) => (r.fields as Record<string, unknown> | undefined)?.event === "load");
-  const distinct = [...new Set(loads.map((r) => (r.fields as Record<string, unknown>).model as string))];
+  const { tel, lms, procs, rt, dets, loads, distinct, comps } = attemptTelemetry(visible, ctx);
 
-  const handle = d ? d.handle : firstSessRec ? firstSessRec.handle : "unknown";
   const turnsValue = rt ? Number((rt.fields as Record<string, unknown>).turns) : null;
 
-  const comps = tel.filter((r) => r.source === "compaction");
   const { samples: ctxSamples, nctx, ctxPeak, ctxNow } = contextFigures(tel);
 
   // (#1972) Proof of life: the newest record belonging to THIS attempt. Not
@@ -719,77 +1507,14 @@ export function runRegions(
   const attemptTimes = timesOf(attemptRecs);
   const lastBeatMs = attemptTimes.length ? Math.max(...attemptTimes) : null;
 
-  // (#2011) The finished run's DURATION is read from the terminal record's
-  // own `wall_ms` — the runtime's measure, taken between its start and
-  // terminal record writes (`dispatch_internal.rs`'s
-  // `dispatch_complete_payload`) — instead of being recomputed here from two
-  // timestamps. Same shape as #1960/#1973/#2007: a payload in hand, and a
-  // renderer deriving its own answer beside it.
-  //
-  // Why it matters beyond tidiness. The `so far` branch below is driven by
-  // the shared 1s clock (#1972), so a page whose records go STALE keeps
-  // counting: a run left open overnight rendered ~10 hours of elapsed time
-  // for a ten-minute dispatch, with nothing on screen saying it was wrong.
-  // Taking the number from the record that ENDS the run means the worst a
-  // stale page can do is show a stale LABEL — it can no longer invent a
-  // duration. (The staleness itself is fixed separately, in
-  // `hooks/useSessionLiveness.ts`; this is the half that makes the failure
-  // survivable when a fetch is missed anyway.)
-  //
-  // It also removes two arithmetic hazards that are already reachable in
-  // this function: a terminal timestamped BEFORE its own start (the
-  // `skewedClose` case above) subtracts to a negative, and an unparsable
-  // `ts` subtracts to `NaN`.
-  //
-  // Read off `c`, not `close`: a `session.end` close-edge carries no payload
-  // at all (`presence_reconciler.rs`'s `build_session_end_record` sets
-  // `payload: None`), and archived records predate the field — so the
-  // subtraction stays as the fallback rather than being deleted.
-  const recordedWallMs = (c?.payload as DispatchCompletePayload | undefined)?.wall_ms;
-  const runWallMs =
-    typeof recordedWallMs === "number" && Number.isFinite(recordedWallMs)
-      ? recordedWallMs
-      : closeTs !== null
-        ? closeTs - startTs
-        : NaN;
+  const { runWallMs, wallElapsed, wallBase, wallSub } = wallClock(ctx, nowMs);
 
-  // (U3-7/U5-2) `fmtElapsed`, not the retired `fmtDuration`: a dispatch
-  // that runs past an hour used to read "75:23" here.
-  const wallElapsed = done ? fmtElapsed(runWallMs) : fmtElapsed(nowMs - startTs);
-  const wallBase = done ? wallElapsed : `${wallElapsed} so far`;
-  const exitCode = (c?.payload as DispatchCompletePayload | undefined)?.exit_code;
-  // (#2860) How the run ended goes on the tile's `sub` line, not appended to
-  // the figure: the value is `nowrap` because it is contracted to be one
-  // short figure (`styles.css`, `.session-run .mv`), and "3:38 · errored
-  // (exit 1)" ran through the neighbouring tile on a phone.
-  const wallOutcome =
-    done && c && dispatchErrored(c)
-      ? dispatchKilled(c)
-        ? "killed (timeout)"
-        : `errored${exitCode != null ? ` (exit ${exitCode})` : ""}`
-      : undefined;
-  // (rest-reason cards) WALL CLOCK used to append a "incl. N rest" breakdown
-  // here (#2863). That breakdown now lives as its own per-kind SYSTEM tiles
-  // (THERMAL REST / TURN DELAY / BATTERY PAUSE / OPERATOR HOLD, built below
-  // via `restKindTiles`) — a card showing a count AND whether the
-  // protection was even armed, rather than one crowded sub-line. WALL CLOCK
-  // goes back to naming only what it always named: run time + outcome.
-  const wallSub = wallOutcome;
-
-  const role = String(handle || "").replace(/^darkmux\//, "").toUpperCase();
-  const svLabel = statusLabel(
-    runStateFrom({
-      open: !done,
-      errored: !!c && dispatchErrored(c),
-      killed: !!c && dispatchKilled(c),
-      clean: done && !!c && !dispatchErrored(c),
-    }),
-  );
+  const role = roleOf(d ?? firstSessRec);
+  const svLabel = statusLabel(state);
 
   const sp = (d?.payload ?? {}) as DispatchStartPayload;
-  const dp = (c?.payload ?? {}) as DispatchCompletePayload;
-  const remoteEp = sp.endpoint || dp.endpoint;
-  const model = d?.model ? d.model : remoteEp ? remoteEp.slice(remoteEp.lastIndexOf("/") + 1) : (distinct[0] as string | undefined) ?? null;
+  const remoteEp = sp.endpoint || (c?.payload as DispatchCompletePayload | undefined)?.endpoint;
+  const model = modelOf(d, remoteEp, distinct);
 
   // (#2902 step 2a) The plain sum of this attempt's usage records, utility
   // excluded; a legacy run with none reads its `dispatch complete` through
@@ -803,67 +1528,10 @@ export function runRegions(
   // one quantity, so they read from one source — deriving it twice is how
   // they end up disagreeing by a second at a rounding boundary. The two
   // CLOCK stamps stay record-derived: they are timestamps, not a duration.
-  const briefTiming = `${clk(startTs)}${done ? ` → ${clkAt(closeTs)} (${fmtElapsed(runWallMs)})` : " · running"}`;
-  const RUNTIME_LABEL: Record<string, string> = {
-    internal: "internal container",
-    direct: "direct client (hosted · no container)",
-    openclaw: "openclaw shell-out",
-  };
+  const briefTiming = `${clk(startTs)}${done ? ` → ${clkAt(endTs)} (${fmtElapsed(runWallMs)})` : " · running"}`;
   const ep = remoteEp;
-  const route = ep
-    ? (() => {
-        const i = ep.indexOf(":");
-        const kind = i >= 0 ? ep.slice(0, i) : "";
-        const rest = i >= 0 ? ep.slice(i + 1) : ep;
-        // (#2834) The dialect and the address are FACTS darkmux read off
-        // the dispatch record. "off-fleet" was an inference on top of them,
-        // and a wrong one: `openai:` names the request FORMAT, not a
-        // vendor, so a local inference server on 127.0.0.1 speaking the
-        // OpenAI-compatible protocol was labelled as having left the
-        // machine. The address is right there for the operator to read;
-        // darkmux does not need to editorialize about where it points.
-        const label = kind === "azure" ? "Azure OpenAI" : kind === "openai" ? "OpenAI" : kind || "endpoint";
-        return `${label} · ${rest}`;
-      })()
-    : "LMStudio · local · this machine";
-
-  const briefRows: BriefEntry[] = [];
-  pushKv(briefRows, "route", route);
-  pushKv(briefRows, "runtime", sp.runtime ? RUNTIME_LABEL[sp.runtime] ?? sp.runtime : "");
-  pushKv(briefRows, "image", sp.image);
-  pushKv(briefRows, "model", model);
-  pushKv(briefRows, "workspace", sp.workspace);
-  if (d?.mission_id) {
-    briefRows.push({ kind: "label", text: "mission" });
-    briefRows.push({
-      kind: "value",
-      text: `${d.mission_id}${d.phase_id ? ` · phase ${d.phase_id}` : ""}`,
-      href: `#mission=${encodeURIComponent(d.mission_id)}`,
-    });
-  }
-  pushKv(briefRows, "timing", briefTiming);
-
-  const promptLines: BriefEntry[] = [];
-  const disclosures: Disclosure[] = [];
-  if (sp.prompt) {
-    const chars = sp.prompt_chars ?? sp.prompt.length;
-    const isTrunc = sp.prompt_chars != null && sp.prompt.length < sp.prompt_chars;
-    // (#1973) The text itself — which this function used to read the length of
-    // and then drop on the floor.
-    //
-    // NO brief note here. The disclosure's own summary already reads
-    // `prompt · <n> chars`, so pushing one would print the same sentence twice,
-    // a few pixels apart — the same duplication the run brief's bare "run"
-    // heading was removed for (see `briefLines` below). The summary IS the
-    // one-liner now, and it is the one that expands.
-    disclosures.push({ id: "prompt", label: "prompt", chars, truncated: isTrunc, text: sp.prompt });
-  } else if (sp.prompt_chars != null) {
-    // A record that reports a length but carries no text: say so in the brief,
-    // rather than offering an expander onto nothing. This is the ONLY case
-    // that still produces a brief prompt line.
-    promptLines.push({ kind: "label", text: "prompt" });
-    promptLines.push({ kind: "value", text: `${sp.prompt_chars} chars` });
-  }
+  const briefRows = briefRowsOf(sp, model, d, routeLabel(ep), briefTiming);
+  const { promptLines, disclosures } = promptOf(sp);
 
   // No "run" heading inside the block: the region's own `<h2>` directly above
   // already reads `RUN · <ROLE> (<session> on <machine>)`, so a second bare
@@ -881,43 +1549,14 @@ export function runRegions(
   // session's shape: `d` exists, every other field is empty). Gating the
   // mission-wide rollup on `d != null` would never fire for the one case it
   // exists to fix, so this checks for actual numbers instead.
-  const ownHasTelemetryEvidence =
-    loads.length > 0 || turnsValue != null || tokIn != null || tokOut != null || ctxSamples > 0 || comps.length > 0;
-  const missionIdForRollup = d?.mission_id ?? firstSessRec?.mission_id ?? null;
+  const ownHasTelemetryEvidence = hasTelemetryEvidence({ loads, turnsValue, tokIn, tokOut, ctxSamples, comps });
+  const missionIdForRollup = run?.group.missionId ?? null;
+  const missionRuns = missionIdForRollup ? runIndex(data).groupsOfMission(missionIdForRollup) : [];
   const rollup =
-    !ownHasTelemetryEvidence && missionIdForRollup ? rollUpMissionModelWork(data, missionIdForRollup, sid) : null;
-  // Only the four MODEL-pane numbers roll up (contract 8's own scope for
-  // this fix — see the run-detail issue's "Direction"). WALL CLOCK and
-  // COMPACTIONS stay scoped to this session's own attempt window below,
-  // deliberately: they are HARNESS metrics about running THIS bookend pair,
-  // not about the model's work inside it.
-  const effTurnsValue = ownHasTelemetryEvidence ? turnsValue : (rollup?.turns ?? turnsValue);
-  const effTokIn = ownHasTelemetryEvidence ? tokIn : (rollup?.tokIn ?? tokIn);
-  const effTokOut = ownHasTelemetryEvidence ? tokOut : (rollup?.tokOut ?? tokOut);
-  const effCtxPeak = ownHasTelemetryEvidence || !rollup?.hasEvidence ? ctxPeak : rollup.ctxPeak;
-  const effCtxNow = ownHasTelemetryEvidence || !rollup?.hasEvidence ? ctxNow : rollup.ctxNow;
-  const effNctx = ownHasTelemetryEvidence || !rollup?.hasEvidence ? nctx : rollup.nctx;
-
-  // ── metrics ────────────────────────────────────────────────────────
-  // (operator, 2026-09-05) This used to be ONE string that did the whole
-  // tile's talking — `CTX PEAK 19K / 262.144K WINDOW` — printed as the
-  // tile's LABEL while the tile's VALUE printed the same "19K" a second
-  // time right above it. Two defects rode together: the label restated the
-  // value, and `nctx / 1000` (a bare division, no formatter) produced
-  // `262.144K` for a 262144-token window instead of a compact `262k`.
-  //
-  // The fix splits the one string into the three slots every metric tile
-  // now has: `label` names WHAT the number is (never repeats it), `value`
-  // IS the number, and `sub` carries the qualifying fact — the window
-  // ceiling, and, while live, the peak-so-far — that used to be crammed
-  // into the label. `fmtC` (the same compact formatter TOKENS IN/OUT
-  // already use) replaces the hand-rolled `/1000 + toFixed + "K"` division,
-  // which both fixes the format and gets the casing that formatter uses
-  // (`262k`, not `262.144K`) — matching TOKENS IN/OUT rather than the
-  // uppercase `K` this tile used to invent on its own.
-  const ctxHeadline = done ? effCtxPeak : effCtxNow;
-  const ctxLabel = !effNctx ? "CONTEXT" : done ? "CTX PEAK" : "CTX NOW";
-  const ctxSub = !effNctx ? undefined : done ? `of ${fmtC(effNctx)}` : `peak ${fmtC(effCtxPeak)} · of ${fmtC(effNctx)}`;
+    !ownHasTelemetryEvidence && missionIdForRollup ? rollUpMissionModelWork(missionRuns.filter((g) => g !== run?.group)) : null;
+  const eff = effectiveFigures({ turns: turnsValue, tokIn, tokOut, ctxPeak, ctxNow, nctx }, ownHasTelemetryEvidence, rollup);
+  const { turns: effTurnsValue, tokIn: effTokIn, tokOut: effTokOut } = eff;
+  const ctxTileFigures = ctxTile(eff, done);
 
   // (#1973) Did this unit do MODEL work at all?
   //
@@ -932,13 +1571,11 @@ export function runRegions(
   // A dispatch that has started but reported nothing yet is model work with
   // no telemetry, and must keep its pane — otherwise a live run would render
   // no model metrics until its first turn landed, and then grow a pane.
-  // (#2902 step 5) A hosted call held by its endpoint's budget writes its
-  // `budget.wait` BEFORE `dispatch start` (the gate runs before the
-  // bookends): it is model work waiting to be sent, and its pane (where
-  // REST reads "budget · <endpoint>") must not grow in when it is.
-  const heldByBudget = data.some((r) => r.session_id === sid && r.action === ACTION.BudgetWait);
-  const hasModelWork =
-    d != null || heldByBudget || loads.length > 0 || turnsValue != null || tokIn != null || tokOut != null || ctxSamples > 0 || comps.length > 0;
+  // A run of execution grain (`runRef.ts`: a dispatch, or a hosted call
+  // held by its budget before its first bookend, whose pane, where REST
+  // reads "budget · <endpoint>", must not grow in when the call is sent).
+  const executionGrain = run !== null && run.group.grain !== "lifecycle";
+  const hasModelWork = executionGrain || ownHasTelemetryEvidence;
   // (#2759) The MODEL pane's own gate. Own-session evidence keeps the
   // existing behavior byte-for-byte (including the `d != null` "started, no
   // telemetry yet" case); otherwise a rolled-up execution elsewhere in the
@@ -952,352 +1589,62 @@ export function runRegions(
   // carries heartbeats — its INNER role executions do (same fact
   // `rollUpMissionModelWork`'s doc above names) — so when this session has
   // no telemetry of its own but rolled up a mission's, the heartbeats live
-  // on those same candidate sibling sessions `rollUpMissionModelWork`
-  // walked. Re-deriving that candidate set here (rather than threading it
-  // out of that function) keeps this additive and keeps the rollup
-  // function's contract — MissionModelRollup's four numbers — unchanged.
-  const tokRateSids: string[] =
-    ownHasTelemetryEvidence || !missionIdForRollup
-      ? [sid]
-      : (() => {
-          const set = new Set<string>();
-          for (const r of data) {
-            if (r.mission_id === missionIdForRollup && r.session_id) set.add(r.session_id);
-          }
-          return set.size ? [...set] : [sid];
-        })();
-  const tokRateRecordSets = tokRateSids.map((s) => mergeLive(data.filter((r) => r.session_id === s), live?.bySession.get(s)));
-  // (#2877 pass 2) ONE state derivation, `lib/tokenRate.ts::deriveLiveState`,
-  // aggregated across the same sibling-session candidates the tok/s reading
-  // already sums (`aggregateLiveState`'s own doc: the best/most-informative
-  // reading wins). `tokRateStalled` is now DERIVED from it rather than a
-  // second, separately-computed "every candidate stale" check — the two
-  // used to be able to disagree (a marker explaining the gap on every
-  // candidate would still read "stalled" under the old rule); they can't
-  // any more, because there is only one rule now.
-  // (#2886 pass 3, "STALL while disconnected"; pass 4 finding 5, "half-open
-  // connection race") Downgrades a "stalled" reading to `null` (no live
-  // execution — every lamp off, no rate) when the page itself has lost its
-  // connection to the daemon: no new record could have arrived either way,
-  // so a false STALL claim is worse than saying nothing. `connected`
-  // defaults to `true` for every caller that doesn't pass it, so this is a
-  // no-op everywhere except the real `SessionReplay.tsx` render.
-  // `lastContactMs` (also defaulted, also a no-op when absent) additionally
-  // closes the half-open gap: a stall is trusted only once the daemon has
-  // answered AFTER this session's own last heartbeat's deadline — see
-  // `lib/tokenRate.ts::liveStateWhileConnected`'s own doc.
-  const rawTokRateLiveState = aggregateLiveState(tokRateRecordSets, nowMs);
-  const tokRateLiveState = liveStateWhileConnected(
-    rawTokRateLiveState,
-    connected,
-    lastContactMs != null ? { lastContactMs, lastHeartbeatMs: lastHeartbeatMs(tokRateRecordSets) } : undefined,
-  );
-  // `tokRateStalled` reads the ADJUSTED state, so it can never disagree
-  // with what `liveTokScope.state` below shows.
-  const tokRateStalled = tokRateLiveState?.state === "stalled";
-  // (#2886 pass 4, do-it — fresh-reviewer finding 7, "fix the aria
-  // relabeling a real idle state as no signal") `state === null` is ALSO
-  // what a genuine "no live execution" reading looks like (a mission
-  // between model steps, or nothing running) — that is NOT a connectivity
-  // problem and must not read "no signal". This is `true` ONLY when the
-  // downgrade above is what produced the `null` — i.e. the raw reading
-  // (before any connection knowledge) WAS a stall, and connection evidence
-  // is what erased it.
-  const tokRateNoSignal = rawTokRateLiveState?.state === "stalled" && tokRateLiveState === null;
-  // Computed once, here, and read both by `liveTokScope` below and nowhere
-  // else — a single call, not one per read site.
-  const liveTokRate = aggregateTokenRate(tokRateRecordSets, nowMs);
+  // on the same mission runs `rollUpMissionModelWork` walked.
+  const ownRuns = run ? [run.group] : [];
+  const tokRateRuns = ownHasTelemetryEvidence || missionRuns.length === 0 ? ownRuns : missionRuns;
+  const tokRateRecordSets = tokRateRuns.map((g) => mergeLive(g.records as NormRecord[], live?.bySession.get(g.sessionId)));
+  const { tokRateLiveState, tokRateStalled, tokRateNoSignal, liveTokRate } = scopeReadings(tokRateRecordSets, nowMs, { policy, presence, connected, lastContactMs });
 
-  // (#1973) Host telemetry — CPU / RAM / GPU — was FETCHED and thrown away:
-  // `const procs = ...` followed by `void procs` to silence the unused
-  // warning, with a comment parking it for "a future packet". That is the
-  // fifth instance of one shape in this lens (tool arguments, session
-  // records, the prompt, and now this): the data is in hand and the renderer
-  // drops it.
-  //
-  // (#2107) PEAK alone answered "did this saturate the machine" but not how
-  // hard it was driven ON AVERAGE — the same gap the host-side reduction
-  // (`dispatch_internal.rs`'s `HostStats`) closed for the envelope. `avg`
-  // now rides beside `high` in the SAME tile ("add the avg to the card with
-  // the high" — operator), through the ONE aggregation
-  // (`lib/hostStats.ts::aggregateHostSamples`) the global machine drawer
-  // also uses, so the two surfaces can't report different numbers for
-  // overlapping samples.
-  const toNum = (v: unknown): number | undefined => {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : undefined;
-  };
-  const hostAgg = aggregateHostSamples(
-    procs.map((r) => {
-      const f = r.fields as Record<string, unknown> | undefined;
-      // (#2413 M4) The retired `telemetry.process` payload used bare
-      // `cpu`/`mem`/`gpu`; the machine-scoped `machine.telemetry`
-      // replacement uses `cpu_pct`/`mem_pct`/`gpu_pct` (see
-      // `host_probe::sample_full_json`) — read either so both curves
-      // aggregate through the same code.
-      return {
-        cpu: toNum(f?.cpu ?? f?.cpu_pct),
-        mem: toNum(f?.mem ?? f?.mem_pct),
-        gpu: toNum(f?.gpu ?? f?.gpu_pct),
-      };
-    }),
-  );
-  const cpuPeak = hostAgg.cpu.high;
-  const ramPeak = hostAgg.mem.high;
-  const gpuPeak = hostAgg.gpu.high;
-  // (operator, 2026-09-05, second pass) Used to be ONE string —
-  // `41% avg · 94% high` — crammed into the value slot. The value slot
-  // holds exactly one figure on one line, always (same rule as every other
-  // tile now): the AVERAGE is the primary figure an operator reads at a
-  // glance, so it becomes `value`; the peak qualifies it, so it becomes
-  // `sub` — the same value/label/sub split CTX got, applied here because
-  // this was the OTHER place a tile's value was a multi-stat phrase rather
-  // than a figure.
-  // (#2863) "avg" names the big figure, so it rides beside it as a `unit`
-  // (rendered small, same line) rather than leading the sub line, where it
-  // read as a label for the peak beneath it.
-  const avgHighSplit = (m: { avg: number | null; high: number | null }): { value: string; sub: string; unit: string } => ({
-    value: `${roundPct(m.avg)}%`,
-    sub: `${roundPct(m.high)}% high`,
-    unit: "avg",
-  });
-
+  const hostAgg = hostAggregate(procs);
   // Built as a list with its scope recorded AS EACH TILE IS ADDED, rather
-  // than as a fixed array plus hardcoded indices. The indices are now
-  // conditional (host tiles only exist when host telemetry does), and an
-  // audit already flagged the hardcoded form as a positional contract nothing
-  // enforced — this makes the two unable to drift because there is only one.
+  // than as a fixed array plus hardcoded indices: the indices are
+  // conditional (host tiles only exist when host telemetry does), and this
+  // makes the list and its grouping unable to drift because there is only one.
   const metrics: SessionRunView["metrics"] = [];
   const modelIdx: number[] = [];
   const systemIdx: number[] = [];
-  const push = (into: number[], value: string, label: string, hint?: string, hintTitle?: string, sub?: string, unit?: string, bar?: { nowPct: number; peakPct: number }) => {
+  const push = (into: number[], t: Tile) => {
     into.push(metrics.length);
-    metrics.push(bar ? { value, label, hint, hintTitle, sub, unit, bar } : { value, label, hint, hintTitle, sub, unit });
+    metrics.push(t);
   };
-  // (#2890) Whether run time is shown as the MODEL section's ACTIVE TIME cell
-  // (any unit with a model section) or as SYSTEM's WALL CLOCK (a unit with
-  // none, such as a `procedural.shell` step).
+  // (#2890) Run time is the MODEL section's ACTIVE TIME cell for any unit
+  // with a model section, SYSTEM's WALL CLOCK for a unit with none (a
+  // `procedural.shell` step).
   const activeInModel = effHasModelWork;
-  // (rest-reason cards) One SYSTEM tile per rest KIND — THERMAL REST / TURN
-  // DELAY / BATTERY PAUSE / OPERATOR HOLD, plus a generic label for a
-  // reason string this file doesn't recognize — replacing the single
-  // blended "incl. N rest" WALL CLOCK sub-line stripped out above. A card
-  // shows even at 0 rests when the protection was ARMED for this dispatch
-  // (`sp.bounds`), so an operator can tell "configured and never fired"
-  // from "not configured at all"; a run with no recorded `bounds` (older
-  // runs, before #2165) shows a card only for a kind that actually
-  // occurred — this mirrors `config_access`'s own `env > config > built-in`
-  // leniency posture: absent data reads as "unknown", never "off".
-  const restKindOf = (reason: unknown): { key: string; label: string } => {
-    const r = String(reason ?? "").trim();
-    if (r.startsWith("thermal")) return { key: "thermal", label: "THERMAL REST" };
-    if (r === "turn_delay") return { key: "turn_delay", label: "TURN DELAY" };
-    if (r.startsWith("battery")) return { key: "battery", label: "BATTERY PAUSE" };
-    if (r.startsWith("operator")) return { key: "operator_hold", label: "OPERATOR HOLD" };
-    const key = r || "rest";
-    return { key, label: `${key.toUpperCase()} REST` };
-  };
-  const restByKind = new Map<string, { label: string; count: number; totalMs: number }>();
-  for (const r of attemptRecs) {
-    if (r.action !== ACTION.DispatchRest) continue;
-    const f = (r.fields || r.payload || {}) as Record<string, unknown>;
-    // A record carrying `delay_ms` with no `ms` is the governor changing
-    // its PACING, not a rest (`emit_rest`/`emit_rest_with_extra`,
-    // `dispatch_internal.rs`) — only a record with a real `ms` is one rest.
-    if (typeof f.ms !== "number" || !Number.isFinite(f.ms) || f.ms <= 0) continue;
-    const { key, label } = restKindOf(f.reason);
-    const cur = restByKind.get(key) ?? { label, count: 0, totalMs: 0 };
-    cur.count += 1;
-    cur.totalMs += f.ms;
-    restByKind.set(key, cur);
-  }
-  const restBounds = sp.bounds;
-  const restConfiguredByKind: Record<string, boolean> = {
-    thermal: restBounds?.thermal_pacing_enabled?.value === true,
-    turn_delay: typeof restBounds?.turn_delay_ms?.value === "number" && restBounds.turn_delay_ms.value > 0,
-    battery: restBounds?.battery_pause_enabled?.value === true,
-    // operator_hold has no config knob to arm — always falls through to
-    // "shown only if it actually occurred", per operator design.
-  };
-  const STATIC_REST_LABELS: Record<string, string> = {
-    thermal: "THERMAL REST",
-    turn_delay: "TURN DELAY",
-    battery: "BATTERY PAUSE",
-    operator_hold: "OPERATOR HOLD",
-  };
-  const restKindOrder = ["thermal", "turn_delay", "battery", "operator_hold"];
-  const extraKinds = [...restByKind.keys()]
-    .filter((k) => !restKindOrder.includes(k))
-    .sort((a, b) => (restByKind.get(b)?.totalMs ?? 0) - (restByKind.get(a)?.totalMs ?? 0));
+  const rests = restsByKind(attemptRecs);
+  const armed = restArmed(sp.bounds);
   // (#2890) The MODEL section's cells, in the order the operator reads them:
-  // turns, tool calls, active time, tokens in, tokens out, context. TOOL
-  // CALLS and ACTIVE TIME came up from the machine's section; each figure is
-  // on the page once.
-  push(modelIdx, effTurnsValue != null ? String(effTurnsValue) : "—", "TURNS");
+  // turns, tool calls, active time, tokens in, tokens out, context.
+  push(modelIdx, { value: effTurnsValue != null ? String(effTurnsValue) : "—", label: "TURNS" });
   if (activeInModel) {
-    // Every `dispatch.tool` record of the same executions the turn and token
-    // counts describe (this session, or the mission's inner executions when
-    // those numbers rolled up). "Failed" is `toolOutcome`'s rule, the one the
-    // event log row uses: a command that ran and exited non-zero is the tool
-    // working, not a failure (#2008).
-    const toolSids = new Set(tokRateSids);
-    let toolCalls = 0;
-    let toolFailed = 0;
-    for (const r of toolSids.size === 1 && toolSids.has(sid) ? attemptRecs : visible) {
-      if (r.action !== ACTION.DispatchTool || !toolSids.has(r.session_id ?? "")) continue;
-      toolCalls += 1;
-      if (toolOutcome((r.fields || r.payload || {}) as Record<string, unknown>) === "failed") toolFailed += 1;
-    }
-    push(modelIdx, String(toolCalls), "TOOL CALLS", undefined, undefined, `${toolFailed} failed`);
-    // The same run time WALL CLOCK shows, with the thermal rest it includes
-    // named under it in the approved prototype's words ("1:00 thermal
-    // rest"; the hover title says the figure INCLUDES it) (the THERMAL REST tile's own rule: shown when the
-    // governor was armed for this dispatch or a rest actually occurred).
-    const thermal = restByKind.get("thermal");
-    const thermalShown = restConfiguredByKind.thermal === true || thermal != null;
-    // (#2890) The grid cell is narrow: the value is the bare time, and a
-    // live run's "so far" moves to the sub line instead of clipping the value.
-    const activeSub = [done ? undefined : "so far", wallSub, thermalShown ? `${fmtElapsed(thermal?.totalMs ?? 0)} thermal rest` : undefined].filter(Boolean).join(" · ") || undefined;
-    push(modelIdx, wallElapsed, "ACTIVE TIME", undefined, WALL_HINT_TITLE, activeSub);
+    // The tool calls of the same executions the turn and token counts
+    // describe (this run's attempt, or its mission's executions when those
+    // numbers rolled up).
+    const tools = toolCounts(tokRateRuns === ownRuns ? attemptRecs : recordsAsOf(tokRateRuns.flatMap((g) => g.records), nowMs));
+    push(modelIdx, { value: String(tools.calls), label: "TOOL CALLS", sub: `${tools.failed} failed` });
+    push(modelIdx, { value: wallElapsed, label: "ACTIVE TIME", hintTitle: WALL_HINT_TITLE, sub: activeTimeSub(done, wallSub, rests.get("thermal"), armed.thermal === true) });
   }
-  push(modelIdx, effTokIn != null ? fmtC(effTokIn) : "—", "TOKENS IN");
-  push(modelIdx, effTokOut != null ? fmtC(effTokOut) : "—", "TOKENS OUT");
-  // (#2890) A thin bar under the context figure: now and peak against the
-  // window, as percentages of it.
-  const ctxBar =
-    effNctx > 0
-      ? {
-          nowPct: Math.min(100, Math.max(0, (effCtxNow / effNctx) * 100)),
-          peakPct: Math.min(100, Math.max(0, (effCtxPeak / effNctx) * 100)),
-        }
-      : undefined;
-  push(modelIdx, effNctx ? fmtC(ctxHeadline) : "—", ctxLabel, undefined, undefined, ctxSub, undefined, ctxBar);
-  // (#2877) The fifth MODEL tile, TOK/S. A FINISHED run gets a plain text
-  // tile like its four neighbors here — "the scope goes... the tile shows
-  // the final measured tok/s" (issue text). A run still in progress does
-  // NOT push here at all; `SessionReplay.tsx` renders `liveTokScope` (the
-  // live canvas + centered number) as the fifth tile instead, since a
-  // pushed string tile has no way to host a component. Final rate: total
-  // billed output tokens over the run's own wall clock — the same two
-  // numbers TOKENS OUT and WALL CLOCK already show, so this tile's number
-  // is reconcilable against its neighbors rather than a third, opaque
-  // measurement.
-  let finishedTokRate: SessionRunView["finishedTokRate"] = null;
-  if (done && effHasModelWork) {
-    // The model's generation rate: billed tokens over generation time, an
-    // exact average, not an estimate. Wall clock is only the fallback for a
-    // runtime that predates `generation_ms`, and the label says so.
-    //
-    // (#2886) `genRate` now also says how many of the turns that PAIRED a
-    // `generation_ms` with billed tokens actually went into the average —
-    // a checkpointed turn is excluded (see `averageGenerationRate`'s own
-    // doc). Three outcomes, per the issue's acceptance:
-    // 1. Every paired turn billed: the ordinary "avg" label, unchanged.
-    // 2. Some excluded, at least one remains: "avg · M of N turns" so the
-    //    reader knows the average is partial, not silently wrong.
-    // 3. Turns existed but ALL were checkpointed (`tokensPerSec: null`):
-    //    show "—", never the wall-clock fallback — that fallback is for
-    //    when there is NO generation_ms data at all (an older runtime),
-    //    not for "every measured turn turned out to be unbillable".
-    const genRate = averageGenerationRate(tokRateRecordSets);
-    const wallRate = effTokOut != null && runWallMs > 0 ? effTokOut / (runWallMs / 1000) : null;
-    let finalTokPerSec: number | null;
-    let tokSub: string;
-    if (genRate == null) {
-      finalTokPerSec = wallRate;
-      tokSub = "avg · wall clock";
-    } else if (genRate.tokensPerSec == null) {
-      finalTokPerSec = null;
-      tokSub = "avg · unbilled";
-    } else {
-      finalTokPerSec = genRate.tokensPerSec;
-      tokSub = genRate.billedTurns === genRate.totalTurns ? "avg" : `avg · ${genRate.billedTurns} of ${genRate.totalTurns} turns`;
-    }
-    // (#2890) No TOK/S tile any more: a finished run keeps the scope as the
-    // MODEL hero with this average in its center ("avg tok/s" is the unit
-    // there). The sub line appears only when it says more than "avg".
-    finishedTokRate = {
-      average: finalTokPerSec != null ? String(Math.round(finalTokPerSec)) : "—",
-      sub: tokSub === "avg" ? null : tokSub,
-    };
-  }
-  // (U3-6) The mission graph's per-step badge shows the STEP SPAN — setup,
-  // the model's work, and the gate — while this tile is the dispatch's own
-  // `wall_ms`, the runtime's measure of the execution alone. On a real
-  // mission the same step read 10:36 there and 10:07 here with nothing on
-  // either screen saying why. The flow record carries no step span (see
-  // `DispatchCompletePayload`: no step start/end field exists), so this side
-  // cannot show BOTH numbers — it can only stop being anonymous, which is
-  // what the label does. `StepRow.tsx` carries the matching half.
-  //
-  // (#2890) When this unit did model work, the same figure is the MODEL
-  // section's ACTIVE TIME cell (pushed above, with thermal rest under it);
-  // SYSTEM keeps WALL CLOCK only for a unit with no model section.
-  if (!activeInModel) {
-    push(
-      systemIdx,
-      wallBase,
-      "WALL CLOCK",
-      "run time",
-      WALL_HINT_TITLE,
-      wallSub,
-    );
-  }
-  // (#1973) COMPACTIONS is a HARNESS metric, not a model one — operator call,
-  // and it is the reading contract 8 supports: the harness DECIDES to compact
-  // and performs it through a UTILITY role's sub-execution. The specialist
-  // neither chooses it nor does it; it only experiences the result.
-  // An earlier comment here argued the opposite — that an operator reads it
-  // as "what happened to this model's context" — which describes the EFFECT
-  // rather than the actor, and is exactly the blending the sub-execution rule
-  // exists to stop.
-  // Gated on model work for the same reason the model pane is: a
-  // `procedural.shell` step has no context to compact, so `0 COMPACTIONS`
-  // would assert "the harness compacted nothing" where the truth is "there
-  // was nothing here that could be compacted".
-  if (hasModelWork) push(systemIdx, String(comps.length), "COMPACTIONS");
-  for (const key of [...restKindOrder, ...extraKinds]) {
-    // (#2890) Thermal rest rides under ACTIVE TIME in MODEL when that cell
-    // exists, so it is not shown twice.
-    if (key === "thermal" && activeInModel) continue;
-    const occurred = restByKind.get(key);
-    const configured = restConfiguredByKind[key] === true;
-    if (!configured && !occurred) continue;
-    const label = STATIC_REST_LABELS[key] ?? occurred?.label ?? key.toUpperCase();
-    const count = occurred?.count ?? 0;
-    const totalMs = occurred?.totalMs ?? 0;
-    const sub =
-      key === "turn_delay" && count > 0
-        ? `${count} rest${count === 1 ? "" : "s"} · ${Math.round(totalMs / count / 1000)} s each`
-        : `${count} rest${count === 1 ? "" : "s"}`;
-    push(systemIdx, fmtElapsed(totalMs), label, undefined, undefined, sub);
-  }
-  if (cpuPeak != null) {
-    const s = avgHighSplit(hostAgg.cpu);
-    push(systemIdx, s.value, "CPU", undefined, undefined, s.sub, s.unit);
-  }
-  if (ramPeak != null) {
-    const s = avgHighSplit(hostAgg.mem);
-    push(systemIdx, s.value, "RAM", undefined, undefined, s.sub, s.unit);
-  }
-  if (gpuPeak != null) {
-    const s = avgHighSplit(hostAgg.gpu);
-    push(systemIdx, s.value, "GPU", undefined, undefined, s.sub, s.unit);
-  }
-  // (#2413 M4) CPU/RAM/GPU used to silently vanish here whenever the
-  // machine-scoped join below found nothing for this run's window — no
-  // tile, no explanation, indistinguishable from "the pane doesn't cover
-  // host stats". `hasModelWork` gates it the same as COMPACTIONS above: a
-  // Tier-1-only run genuinely has nothing to sample, so no explicit tile
-  // there either — this is specifically for a model-work run whose join
-  // came up empty (historical pre-#2413 data with no machine_uid, or a
-  // machine-scoped sampler that simply never ran during this window).
-  // Wording matches the machine drawer's own "no host samples" tile
-  // (`machineStatsContent.tsx`) rather than inventing a second phrase for
-  // the same fact.
-  if (hasModelWork && cpuPeak == null && ramPeak == null && gpuPeak == null) {
-    push(systemIdx, "—", "HOST", undefined, undefined, "no host samples for this run");
-  }
+  push(modelIdx, { value: effTokIn != null ? fmtC(effTokIn) : "—", label: "TOKENS IN" });
+  push(modelIdx, { value: effTokOut != null ? fmtC(effTokOut) : "—", label: "TOKENS OUT" });
+  push(modelIdx, ctxTileOf(eff, ctxTileFigures));
+  // (#2877, #2890) A finished run's average generation rate: the MODEL
+  // hero scope's center once the run is done. A run still in progress shows
+  // the live scope instead (`liveTokScope`).
+  const finishedTokRate = done && effHasModelWork ? finishedRate(tokRateRecordSets, effTokOut, runWallMs) : null;
+  // (U3-6) The mission graph's per-step badge shows the STEP SPAN (setup, the
+  // model's work, the gate) while this tile is the dispatch's own `wall_ms`,
+  // the execution alone; the flow record carries no step span, so this tile
+  // names what it measures. (#2890) With a model section the same figure is
+  // ACTIVE TIME above; SYSTEM keeps WALL CLOCK only for a unit with none.
+  if (!activeInModel) push(systemIdx, { value: wallBase, label: "WALL CLOCK", hint: "run time", hintTitle: WALL_HINT_TITLE, sub: wallSub });
+  // (#1973) COMPACTIONS is a HARNESS metric: the harness decides to compact
+  // and performs it through a utility role's sub-execution. Gated on model
+  // work: a `procedural.shell` step has no context to compact, and
+  // `0 COMPACTIONS` would assert something impossible.
+  if (hasModelWork) push(systemIdx, { value: String(comps.length), label: "COMPACTIONS" });
+  // (#2890) Thermal rest rides under ACTIVE TIME when that cell exists.
+  for (const t of restTiles(rests, armed, activeInModel)) push(systemIdx, t);
+  for (const t of hostTiles(hostAgg, hasModelWork)) push(systemIdx, t);
 
   // (#1973) Indices into `metrics`, not a second copy — one ordered list, one
   // grouping over it, so the two cannot drift apart. TURNS/TOKENS/CTX/
@@ -1342,476 +1689,17 @@ export function runRegions(
   // load telemetry reports the bare key; compared as-is they never matched,
   // and every model on a real run, including the one that ran, read "also
   // loaded". The model that ran is listed first.
-  const bare = (m: unknown) => String(m ?? "").replace(/^darkmux:/, "");
-  const isRan = (r: NormRecord) =>
-    primaryModel != null && bare((r.fields as Record<string, unknown>).model) === bare(primaryModel);
-  const orderedLoads = [...loads].sort((a, b) => Number(isRan(b)) - Number(isRan(a)));
-  const modelEntries =
-    !ep && orderedLoads.length
-      ? orderedLoads.map((r) => {
-          const f = r.fields as Record<string, unknown>;
-          return {
-            name: String(f.model ?? "?"),
-            gb: typeof f.gb === "number" ? f.gb : null,
-            ran: primaryModel == null ? null : isRan(r),
-          };
-        })
-      : undefined;
-  const modelTrackLines = ep
-    ? [model || "unknown"]
-    : orderedLoads.length
-      ? orderedLoads.map((r) => {
-          const f = r.fields as Record<string, unknown>;
-          const tag = primaryModel == null ? "" : isRan(r) ? " · primary" : " · also loaded";
-          return `${f.model} · ${f.gb ?? "?"}GB${tag}`;
-        })
-      : rollup && rollup.loadLines.length
-        ? rollup.loadLines
-        : ["no telemetry yet"];
+  const { modelEntries, modelTrackLines } = modelTrackOf(loads, primaryModel, ep ? (model || "unknown") : null, rollup?.loadLines ?? []);
 
-  // ── signals ────────────────────────────────────────────────────────
-  //
-  // (#1973) Was "detections", rendered as one flat list of grey strings with
-  // a `⚠` in front of every entry and no times at all.
-  //
-  // Two things were wrong with that beyond the styling. First, the emitter
-  // has ALWAYS sent a severity — `dispatch_internal`'s detector payload is
-  // `{kind, severity, detail}` with `warn` for cycle / reasoning-loop /
-  // tool-failure and `info` for `intra-turn-stall`, which is a RECOVERY, not
-  // a problem. The viewer read `kind` and `detail` and dropped `severity`, so
-  // a successful recovery rendered identically to a doom loop. Second, with
-  // no timestamps a cycle detected in the first ten seconds looked exactly
-  // like one detected an hour in, which is most of what tells you whether a
-  // run was struggling from the start or drifted late.
-  const finds: Signal[] = [];
-  if (skewedClose) {
-    // (#1988) The page reconstructed this run's outcome from a terminal
-    // record that precedes its own start. That is honored rather than hidden
-    // — a finished dispatch must not read RUNNING forever — but it is NOT
-    // presented as if the timeline were sound. Saying so is the difference
-    // between a repaired reading and a quietly wrong one, and clock skew is
-    // itself worth an operator's attention on a fleet.
-    finds.push({
-      kind: "clock-skew",
-      severity: "warn",
-      detail:
-        "this run's terminal record is timestamped BEFORE its own start — the outcome is read from it anyway, but elapsed time and signal offsets on this page are unreliable.",
-      fix: "check the clocks on the machines that produced these records.",
-      atMs: null,
-      offsetLabel: "",
-    });
-  }
-  // (#1934) `distinct.length > 1` used to fire on ANY two model ids seen
-  // loaded in one run — which a correct `deep`/`balanced` profile trips BY
-  // CONSTRUCTION (primary + compactor, sometimes + the internal utility
-  // model too), and which also counted a merely-resident leftover from an
-  // earlier session that this run never touched at all. Both are staffing
-  // or ambient noise, not a swap.
-  //
-  // The producer now tags each `telemetry.lms` load/unload with `role`
-  // (`"primary"` / `"compactor"` / `"utility"` / `"resident"` — see
-  // `role_for_load` in `telemetry_sampler.rs`) and marks a load `baseline`
-  // when it is the sampler's FIRST tick emitting whatever was already
-  // resident before this attempt did anything (never itself a swap — it is
-  // the starting lineup, not an event). A genuine swap only exists in what
-  // happens to a SPECIALIST seat (never `compactor`/`utility` — those are
-  // declared staffing, doing exactly their job) AFTER that starting point:
-  // a new specialist model going resident mid-run, or any specialist model
-  // being unloaded at all (an eviction the run must reload from, whether or
-  // not a replacement load has landed yet).
-  //
-  // UNTAGGED RECORD SETS ARE NOT JUDGED. Records written before this fix
-  // shipped (and hand-authored fixtures, and the committed demo corpus)
-  // carry neither field. The first revision of this fix claimed those "fall
-  // back to the pre-#1934 reading"; they did not. `isUtilitySeat(undefined)`
-  // is false and `isBaselineLoad` requires a `role`, so on untagged data
-  // EVERY load and unload was admitted and the gate went from a count
-  // (`n > 1`) to a presence (`n > 0`) — measured on this repo's own public
-  // demo corpus, firings went from 8 of 11 sessions to 11 of 11, and three
-  // of the new ones rendered "X was unloaded mid-run" for a record set
-  // containing no unload at all. That is a false factual claim in the
-  // signals pane, not noise.
-  //
-  // So: the seat reading applies only when EVERY lms record in the set
-  // carries a `role`. Otherwise the detector declines, and says so — an
-  // `info` naming what it cannot tell apart, emitted exactly where the old
-  // count-based rule would have raised a `warn`, so a historical run is
-  // neither silently blind nor crying wolf.
-  const lmsFields = lms.map((r) => (r.fields ?? {}) as Record<string, unknown>);
-  const anyUntaggedLms = lmsFields.some((f) => typeof f.role !== "string");
-  const isUtilitySeat = (role: unknown) => role === "compactor" || role === "utility";
-  const isBaselineLoad = (f: Record<string, unknown>) => f.event === "load" && f.role != null && f.baseline === true;
-  if (lms.length > 0 && anyUntaggedLms) {
-    if (distinct.length > 1) {
-      finds.push({
-        kind: "model-track-unclassified",
-        // `info`, not `warn`: nothing here is known to have gone wrong. The
-        // run may have swapped a model mid-flight or may have staffed a
-        // compactor exactly as its profile declares, and these records
-        // cannot tell those apart.
-        severity: "info",
-        detail: `${distinct.length} models loaded in one run (${distinct.join(" → ")}), but these records carry no seat tag — a real mid-run swap and a correct primary+compactor staffing look identical here, so this run is not judged either way.`,
-        fix: "runs recorded at flow schema 1.45.0 or later tag each load with its seat; the swap reading returns for those.",
-        atMs: null,
-        offsetLabel: "",
-      });
-    }
-  } else if (lms.length > 0) {
-    // The seat reading, per the rule stated above. TWO KNOWN NARROWINGS in
-    // it, both deliberate, neither hidden:
-    //
-    // 1. The `isUtilitySeat` exclusion returns before the unload branch, so
-    //    a COMPACTOR OR UTILITY MODEL BEING EVICTED MID-RUN IS INVISIBLE
-    //    HERE. That is right for a utility LOAD (staffing doing its job) and
-    //    wrong for a utility UNLOAD — compactor thrash under memory pressure
-    //    is real, measurable, and exactly the residency churn darkmux exists
-    //    to surface. It is not surfaced anywhere today. Deliberately not
-    //    folded into `jit-model-swap`, which is a claim about the
-    //    SPECIALIST seat and would be mislabeled carrying this; it wants its
-    //    own signal. Tracked as #2565.
-    // 2. A `"resident"` model going resident MID-RUN fires. That includes a
-    //    model the operator loaded from their own unrelated LMStudio use,
-    //    which per #1274 is user state this run never touched. It cannot be
-    //    excluded: a genuine swap-in of a second specialist ALSO tags
-    //    `"resident"` (the dispatch declared no seat for it), so excluding
-    //    the class would blind the detector to the only case it exists for.
-    //    The leftover-resident half of #1934 is fixed at the SEED tick,
-    //    where `baseline` distinguishes them; after it, the record carries
-    //    no information that separates the two.
-    const specialistLoads = loads.filter((r) => !isUtilitySeat((r.fields as Record<string, unknown>).role));
-    const specialistModels = [...new Set(specialistLoads.map((r) => (r.fields as Record<string, unknown>).model as string))];
-    const swapEvents = lms.filter((r) => {
-      const f = r.fields as Record<string, unknown> | undefined;
-      if (!f || isUtilitySeat(f.role)) return false;
-      if (f.event === "unload") return true;
-      return f.event === "load" && !isBaselineLoad(f);
-    });
-    // The detail line must describe what the RECORDS say happened. The
-    // first revision had two branches keyed on the model COUNT, so a set
-    // with a single specialist model and no unload at all still rendered
-    // "X was unloaded mid-run" — stating an event that never happened.
-    // Three branches, each keyed on the thing it claims:
-    const unloadedModels = [
-      ...new Set(
-        swapEvents
-          .filter((r) => (r.fields as Record<string, unknown>).event === "unload")
-          .map((r) => (r.fields as Record<string, unknown>).model as string),
-      ),
-    ];
-    const midRunLoadedModels = [
-      ...new Set(
-        swapEvents
-          .filter((r) => (r.fields as Record<string, unknown>).event === "load")
-          .map((r) => (r.fields as Record<string, unknown>).model as string),
-      ),
-    ];
-    // The GATE is still "did anything happen to a specialist seat after the
-    // starting point" — `swapEvents`. `specialistModels` only shapes the
-    // WORDING; on its own it counts the baseline lineup, which is precisely
-    // the staffing this fix exists to stop firing on.
-    let detail: string | null = null;
-    if (swapEvents.length === 0) {
-      detail = null;
-    } else if (specialistModels.length > 1) {
-      detail = `${specialistModels.length} models loaded in one run (${specialistModels.join(" → ")}) — mid-run swap stalls the dispatch while the new model loads.`;
-    } else if (unloadedModels.length > 0) {
-      detail = `${unloadedModels.join(", ")} was unloaded mid-run — the seat's reload stalls the dispatch while the model loads.`;
-    } else if (midRunLoadedModels.length > 0) {
-      detail = `${midRunLoadedModels.join(", ")} loaded mid-run rather than before it — the dispatch stalls while the model loads.`;
-    }
-    if (detail) {
-      finds.push({
-        kind: "jit-model-swap",
-        // Synthesized from the load track rather than emitted by a detector, so
-        // it has no record of its own and therefore no timestamp — `null` says
-        // so, instead of borrowing one and implying a moment it did not have.
-        severity: "warn",
-        detail,
-        fix: "pin one model for the run, or pre-warm the swap target.",
-        atMs: null,
-        offsetLabel: "",
-      });
-    }
-  }
-  const runStartMs = d ? d.tMs : null;
-  // (#2887 F2) The run-level policy the dispatch actually ran under, read
-  // from `dispatch.start`'s own `payload.bounds.detection_degeneracy_
-  // policy.value` — the SAME resolved value the host stamps into the
-  // container's env for this run, so it is the one true "what was this run
-  // configured to do" answer, independent of whether any individual
-  // gate/checkpoint record happens to carry its own `policy` field (an
-  // older runtime image may not). `null` when unknown (no dispatch.start in
-  // the window, or a record predating this field) — unknown is never
-  // treated as "off".
-  const runDegeneracyPolicy = (() => {
-    const sf = d?.fields as Record<string, unknown> | undefined;
-    const bounds = sf?.bounds as Record<string, unknown> | undefined;
-    const block = bounds?.detection_degeneracy_policy as Record<string, unknown> | undefined;
-    return typeof block?.value === "string" ? block.value : null;
-  })();
-  const repetitionOff = runDegeneracyPolicy === "off";
-  // (#2887 N2) A run recorded before FLOW_SCHEMA_VERSION 1.56.0 has no way
-  // to tell "the gate genuinely never flagged anything" from "the forwarder
-  // that reports flags didn't exist yet for this run" — the degeneracy
-  // gate's own findings only started reaching the flow stream at 1.56.0
-  // (see `schema.rs`'s own history entry, which also names this stamp's
-  // real scope: it proves the HOST forwarder's version, not that the
-  // runtime IMAGE the container ran actually executed the gate — that
-  // narrower gap is `darkmux doctor`'s job, not this field's). `dispatch.
-  // start`'s `payload.flow_schema` (the SAME `FLOW_SCHEMA_VERSION` constant
-  // the host stamped this run's records against) is the one place that can
-  // say which case applies. Absent entirely on any run older than this
-  // field itself, which reads the same as "too old" — both must render as
-  // unmeasured, never as a checked-and-clean tick.
-  const runFlowSchema = (() => {
-    const sf = d?.fields as Record<string, unknown> | undefined;
-    return typeof sf?.flow_schema === "string" ? sf.flow_schema : null;
-  })();
-  const repetitionRecorded = flowSchemaAtLeast(runFlowSchema, "1.56.0");
-
-  for (const r of dets) {
-    const f = r.fields as Record<string, unknown>;
-    // (#2887 F4) `repetition`-kind detector records are handled below,
-    // grouped by turn — NOT pushed one-per-record here. Under enforce a
-    // single cut produces a degenerate observation AND an abort AND
-    // (usually) a concluding checkpoint for the SAME turn; pushed through
-    // this generic per-record loop that reads as three-to-six findings for
-    // one operator-visible event.
-    if (f.kind === "repetition") continue;
-    const atMs = r.tMs;
-    finds.push({
-      // (#1989) `String(f.kind)` turned a missing field into the literal
-      // string `undefined`, rendered verbatim as a group heading — an
-      // operator scanning SIGNALS reads that as a finding named "undefined".
-      // `unknown-signal` says what actually happened instead, and matches the
-      // discipline the severity line below already had: a malformed payload
-      // must stay VISIBLE and be named honestly, never silently mangled.
-      kind: typeof f.kind === "string" && f.kind ? f.kind : "unknown-signal",
-      // Unknown severities degrade to `warn`, never to `info`: a signal this
-      // build does not recognize is more likely to matter than not, and
-      // quietly downgrading it is how a new detector ships invisible.
-      severity: f.severity === "info" ? "info" : "warn",
-      // (#1989) A non-string `detail` used to stringify to `[object Object]`,
-      // destroying real diagnostic content rather than formatting it oddly.
-      // Serializing keeps the data where a human can read it — the operator
-      // can act on a JSON blob and cannot act on `[object Object]`.
-      detail: signalDetail(f.detail),
-      atMs,
-      offsetLabel: atMs != null && runStartMs != null ? runOffset(atMs - runStartMs) : "",
-    });
-  }
-
-  // (#2887 F4) One flagged TURN, not one raw record. Under enforce the
-  // runtime writes a degenerate `dispatch.gate.observation`, a
-  // `dispatch.gate.abort` for the SAME moment, and a concluding
-  // `dispatch.checkpoint` for the same turn — three (or, across a turn's
-  // several continuations, more) records for what the operator experiences
-  // as ONE cut. Every one of those record kinds names the turn it belongs
-  // to (`turn_seq`, forwarded from the runtime's own `seq`), so they
-  // collapse here into a single Signal per distinct turn.
-  //
-  // `dispatch.checkpoint` is NOT a detector telemetry record (`category=
-  // work`, `source` unset — it rides `self.emit`, not `self.emit_
-  // telemetry`), so it never reached `dets`/`tel` above; read it straight
-  // off `visible` instead, scoped to this session's attempt window the same
-  // way every other region here is.
-  const checkpoints = visible.filter((r) => inAttempt(r) && r.action === ACTION.DispatchCheckpoint);
-
-  // (#2887 N3) `turn_seq` alone is not a safe key. A dispatch session id is
-  // TASK-scoped (`darkmux_types::session_id::task` — see this project's own
-  // "task-scoped session id trap" note): sibling seats fanned out within one
-  // task can share ONE session_id, so two concurrent seats can each be on
-  // their own "turn 2" at the same time. What DOES individually attribute a
-  // record even when its session id is a shared grouping key is the pair
-  // `dispatch.internal`'s own doc names for exactly this reason:
-  // `payload.step_id` (present only inside a mission graph step — absent
-  // for a standalone `darkmux dispatch`) and `handle` (the role). Combined
-  // with `turn_seq` this is the merge key below.
-  const seatKeyFor = (r: NormRecord, f: Record<string, unknown>): string =>
-    `${r.handle ?? ""}::${typeof f.step_id === "string" ? f.step_id : ""}`;
-
-  type TurnFlag = {
-    turnSeq: number | string;
-    acted: boolean;
-    // (#2887 N4) How many DISTINCT calls the gate itself ended for this
-    // turn — counted off `dispatch.gate.abort`-sourced records specifically
-    // (identified by `generated_chars`, a field only an abort ever
-    // populates — see the loop below), never off the DEGENERATE
-    // OBSERVATION that names the SAME cut, which would double the count.
-    gateAbortCount: number;
-    // Whether a gate-sourced record (observation or abort) contributed at
-    // all, vs. the flag coming ONLY from the checkpoint's own post-hoc
-    // judge — the two are independent detectors (#2836 the in-stream gate,
-    // #1221 the reasoning check-in) that usually but not always co-occur:
-    // the checkpoint's judge can conclude a turn the stream gate's
-    // per-observation-boundary sampling never crossed.
-    sawGate: boolean;
-    policy: string | null;
-    atMs: number | null;
-    ratio: string | null;
-  };
-  const byTurn = new Map<string, TurnFlag>();
-  const mergeTurn = (
-    turnSeqRaw: unknown,
-    seatKey: string,
-    acted: boolean,
-    isGateAbort: boolean,
-    isGateSourced: boolean,
-    policy: string | null,
-    atMs: number | null,
-    ratio: string | null,
-  ) => {
-    const turnSeq = typeof turnSeqRaw === "number" ? turnSeqRaw : "?";
-    // (#2887 N3) A record with no numeric `turn_seq` must never collapse
-    // with ANOTHER such record just because both read "?" — a fresh
-    // per-record suffix keeps every unknown-turn record its own group
-    // rather than silently merging unrelated findings.
-    const key =
-      turnSeq === "?" ? `${seatKey}::?::${byTurn.size}` : `${seatKey}::${turnSeq}`;
-    const existing = byTurn.get(key);
-    if (!existing) {
-      byTurn.set(key, {
-        turnSeq,
-        acted,
-        gateAbortCount: isGateAbort ? 1 : 0,
-        sawGate: isGateSourced,
-        policy,
-        atMs,
-        ratio,
-      });
-      return;
-    }
-    if (acted) existing.acted = true;
-    if (isGateAbort) existing.gateAbortCount += 1;
-    if (isGateSourced) existing.sawGate = true;
-    if (policy && !existing.policy) existing.policy = policy;
-    if (atMs != null && (existing.atMs == null || atMs < existing.atMs)) existing.atMs = atMs;
-    if (ratio && !existing.ratio) existing.ratio = ratio;
-  };
-
-  // (#2887 F2) `off` means the gate never ran — there is nothing to flag,
-  // and any stray repetition-shaped record in the window (a policy change
-  // mid-investigation, a malformed fixture) must not manufacture a finding
-  // for a detector this run's own bounds say was not measuring anything.
-  if (!repetitionOff) {
-    for (const r of dets) {
-      const f = r.fields as Record<string, unknown>;
-      if (f.kind !== "repetition") continue;
-      const atMs = r.tMs;
-      const ratio = typeof f.tail_ratio === "number" ? f.tail_ratio.toFixed(3) : null;
-      // Only `dispatch.gate.abort` ever populates `generated_chars` (the
-      // runtime's own trajectory shape — `append_gate_observation` never
-      // writes it); a degenerate OBSERVATION for the SAME cut carries
-      // `acted:true` too, and must not be double-counted as a second abort.
-      const isGateAbort = f.generated_chars != null;
-      // (#2887 F2 second pass) `f.acted === true` alone is NOT a safe
-      // "did this end the call" test — a run recorded by a host predating
-      // the runtime-stamped `acted` field forwards it as an explicit
-      // `null` (see `detector_telemetry_payload`'s `.unwrap_or(Value::
-      // Null)`), so `f.acted === true` reads `false` for a REAL abort. An
-      // abort record's own existence IS the acted outcome regardless of
-      // whether the field is present (same fact `append_gate_abort`'s own
-      // doc states server-side: `"acted": true` is written unconditionally
-      // there) — `isGateAbort` alone already proves it.
-      const acted = f.acted === true || isGateAbort;
-      mergeTurn(
-        f.turn_seq,
-        seatKeyFor(r, f),
-        acted,
-        isGateAbort,
-        true,
-        typeof f.policy === "string" ? f.policy : null,
-        atMs,
-        ratio,
-      );
-    }
-    // A checkpoint counts as a flag when `would_conclude` is `true` (the
-    // judge found the turn repetitive under a runtime that measures) OR
-    // `verdict === "conclude"` (F1: a HISTORICAL checkpoint from before
-    // #2846 shipped `would_conclude` at all carries only `verdict` — a
-    // conclude with no `would_conclude` key must still flag, or every
-    // pre-#2846 enforced conclusion on record reads CLEAN).
-    for (const r of checkpoints) {
-      const f = r.fields as Record<string, unknown>;
-      const acted = f.verdict === "conclude";
-      const flagged = f.would_conclude === true || acted;
-      if (!flagged) continue;
-      const atMs = r.tMs;
-      const ratio = typeof f.tail_ratio === "number" ? f.tail_ratio.toFixed(3) : null;
-      mergeTurn(
-        f.turn_seq,
-        seatKeyFor(r, f),
-        acted,
-        false,
-        false,
-        typeof f.policy === "string" ? f.policy : null,
-        atMs,
-        ratio,
-      );
-    }
-  }
-
-  for (const acc of byTurn.values()) {
-    // (#2887 F2) Prefer the RUN-LEVEL policy for the recorded/warned/concluded
-    // wording — it is the one resolved value every record in this run
-    // shares, where an individual record's own `policy` field may be
-    // absent (an older runtime image) or, in principle, stale.
-    const effectivePolicy = runDegeneracyPolicy ?? acc.policy;
-    const ratioClause = acc.ratio ? ` (tail_ratio=${acc.ratio})` : "";
-    // (#2887 N4) Cite the detector that actually produced this finding:
-    // #2836 (the in-stream degeneracy gate) whenever a gate-sourced record
-    // contributed, #1221 (the reasoning check-in) for a checkpoint-only
-    // flag the stream gate never saw.
-    const citation = acc.sawGate ? "#2836" : "#1221";
-    const timesClause = acc.gateAbortCount > 1 ? ` ${acc.gateAbortCount}×` : "";
-    // (#2947) Policy values name the action: `record` (silent measure) and
-    // `warn` (surfaced, not concluded). `observe` is the pre-4.0 spelling of
-    // `record`; archived runs still carry it, so both read the same.
-    const detail = acc.acted
-      ? `turn ${acc.turnSeq}: judged repeating${ratioClause} and ended it${timesClause} (${citation})`
-      : effectivePolicy === "record" || effectivePolicy === "observe"
-        ? `turn ${acc.turnSeq}: judged repeating${ratioClause} — recorded, not concluded (#2846)`
-        : effectivePolicy === "warn"
-          ? `turn ${acc.turnSeq}: judged repeating${ratioClause} — warned, not concluded (#2947)`
-          : `turn ${acc.turnSeq}: judged repeating${ratioClause} (${citation})`;
-    finds.push({
-      kind: "repetition",
-      severity: "warn",
-      detail,
-      atMs: acc.atMs,
-      offsetLabel: acc.atMs != null && runStartMs != null ? runOffset(acc.atMs - runStartMs) : "",
-    });
-  }
-
-  // Severity first, then most recent first inside each severity. A run with
-  // twenty signals is read top-down for "what went wrong", and a recovery
-  // never outranks a struggle.
-  const SEV_RANK: Record<SignalSeverity, number> = { warn: 0, info: 1 };
-  finds.sort((a, b) => SEV_RANK[a.severity] - SEV_RANK[b.severity] || (b.atMs ?? 0) - (a.atMs ?? 0));
-
-  // Grouped by kind so eleven cycle detections are one row that says 11,
-  // not eleven rows that bury everything else.
-  const groupOrder: string[] = [];
-  const byKind = new Map<string, Signal[]>();
-  for (const f of finds) {
-    if (!byKind.has(f.kind)) {
-      byKind.set(f.kind, []);
-      groupOrder.push(f.kind);
-    }
-    byKind.get(f.kind)!.push(f);
-  }
-  const signalGroups: SignalGroup[] = groupOrder.map((kind) => {
-    const signals = byKind.get(kind)!;
-    return {
-      kind,
-      // A group takes the highest severity it contains — a kind that fired
-      // once as a recovery and once as a struggle is a struggle.
-      severity: signals.some((x) => x.severity === "warn") ? "warn" : "info",
-      count: signals.length,
-      signals,
-    };
+  const { signalGroups, signalsLabel, repetitionOff, repetitionRecorded } = runSignals({
+    skewedClose,
+    lms,
+    loads,
+    distinct,
+    d,
+    dets,
+    checkpoints: visible.filter((r) => inAttempt(r) && r.action === ACTION.DispatchCheckpoint),
   });
-  const signalsLabel = finds.length ? `signals (${finds.length})` : "signals";
 
 
 
@@ -1826,7 +1714,7 @@ export function runRegions(
     // record has scrolled out of the window still names its machine.
     header: {
       pillLabel: svLabel.toUpperCase(),
-      pillCls: pillClsFor(svLabel),
+      pillCls: statusClass(state),
       role,
       sid,
       machineName: String(d?.machine_id || firstSessRec?.machine_id || ""),
@@ -1835,38 +1723,7 @@ export function runRegions(
     disclosures,
     metrics,
     metricScope,
-    liveTokScope:
-      effHasModelWork && !done
-        ? {
-            tokensPerSec: liveTokRate?.tokensPerSec ?? null,
-            carried: liveTokRate?.carried ?? false,
-            stalled: tokRateStalled,
-            // null: no live execution right now (a mission between model
-            // steps), OR downgraded by `liveStateWhileConnected` above.
-            // Every lamp is off; nothing claims a state.
-            state: tokRateLiveState?.state ?? null,
-            restSecondsLeft: tokRateLiveState?.restSecondsLeft,
-            ...(tokRateLiveState?.state === "rest" && tokRateLiveState.restEndMs !== undefined
-              ? { restEndMs: tokRateLiveState.restEndMs }
-              : {}),
-            clockMs: nowMs,
-            ...(tokRateLiveState?.state === "rest" && tokRateLiveState.restReason !== undefined
-              ? { restReason: tokRateLiveState.restReason }
-              : {}),
-            noSignal: tokRateNoSignal,
-            toolName: tokRateLiveState?.state === "tools" ? tokRateLiveState.toolName : undefined,
-            ...(tokRateLiveState?.state === "tools" && tokRateLiveState.toolPath !== undefined
-              ? { toolPath: tokRateLiveState.toolPath }
-              : {}),
-            ...(tokRateLiveState?.state === "tools" && tokRateLiveState.writing
-              ? { writing: true as const, writingSeconds: tokRateLiveState.writingSeconds }
-              : {}),
-            ...(tokRateLiveState?.state === "generating" && tokRateLiveState.thinking ? { thinking: true as const } : {}),
-            ...(tokRateLiveState?.state === "prompt" && tokRateLiveState.compacting
-              ? { compacting: true as const, compactingSeconds: tokRateLiveState.compactingSeconds }
-              : {}),
-          }
-        : null,
+    liveTokScope: effHasModelWork && !done ? liveTokScopeOf(tokRateLiveState, liveTokRate, tokRateStalled, tokRateNoSignal, nowMs) : null,
     finishedTokRate,
     showModelCard,
     modelTrackLabel,
@@ -1879,6 +1736,7 @@ export function runRegions(
     // and never shown.
     hasModelWork: effHasModelWork,
     live: !done,
+    phase: l?.phase ?? "not_started",
     lastBeatMs,
     signalsLabel,
     signalGroups,

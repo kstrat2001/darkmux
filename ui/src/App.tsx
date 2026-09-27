@@ -41,7 +41,9 @@ import { fetchJson } from "./lib/fetcher";
 import { queryKeys } from "./lib/queryKeys";
 import type { MachineSpecs } from "./types/handwritten";
 import type { Route } from "./lib/route";
-import { ingest, isDispatchTerminal, recordsAsOf, type NormRecord } from "./lib/ingest";
+import { ingest, recordsAsOf, type NormRecord } from "./lib/ingest";
+import { DEFAULT_POLICY, lifecycleAt, recordedWallMs } from "./lib/lifecycle";
+import { sessionRun } from "./lib/runRef";
 
 /**
  * The app shell. A `switch` over the parsed [[Route]] (see `lib/route.ts` for
@@ -122,25 +124,16 @@ import { ingest, isDispatchTerminal, recordsAsOf, type NormRecord } from "./lib/
 // no reason to allocate one per render when nothing needs it).
 const EMPTY_FLOW_RECORDS: NormRecord[] = [];
 
-/** (#2346) The LATEST terminal record's own `wall_ms` payload — the SAME
- * field the run detail's own WALL CLOCK tile reads (`sessionRun.ts`'s
- * `recordedWallMs`) — or `null` when there is no terminal yet (a live run)
- * or it carries no such field (an archived record, or a `session.end`
- * close-edge with `payload: None`). One producer for both readouts: a flow
- * record's own `ts` is second-precision, but `wall_ms` is the runtime's own
- * sub-second measured duration, so recomputing "elapsed" from bookend
- * timestamps instead can disagree with the run detail's WALL CLOCK by up to
- * a second — small next to the bug this feature fixes (hours), but still
- * two clocks describing the same run differently, which is exactly what
- * this whole feature exists to stop doing. */
-function terminalWallMs(records: NormRecord[]): number | null {
-  for (let i = records.length - 1; i >= 0; i--) {
-    if (isDispatchTerminal(records[i].action)) {
-      const wallMs = records[i].payload?.wall_ms;
-      return typeof wallMs === "number" && Number.isFinite(wallMs) ? wallMs : null;
-    }
-  }
-  return null;
+/** (#2346) The dispatch's own measured duration at rest: the same
+ * `recordedWallMs` the run detail's WALL CLOCK tile reads, off the run's
+ * close as of the end of its records. A flow record's own `ts` is
+ * second-precision, so recomputing "elapsed" from bookend timestamps could
+ * disagree with the run detail by up to a second: two clocks describing the
+ * same run differently, which is what this exists to stop. `null` while the
+ * run has no dispatch terminal. */
+function terminalWallMs(records: NormRecord[], sessionId: string): number | null {
+  const run = sessionRun(records, sessionId, Infinity);
+  return run ? recordedWallMs(lifecycleAt(run, Infinity, DEFAULT_POLICY).close) : null;
 }
 
 export function App() {
@@ -302,7 +295,7 @@ export function App() {
   // where the playhead currently sits, so `t - tMin` is what's meaningful
   // there — the readout only prefers `wall_ms` at rest.
   const isFocusAtRest = !(transport.scrubbed && transport.t < transport.tMax);
-  const dispatchTerminalWallMs = playbackFocus.kind === "dispatch" && isFocusAtRest ? terminalWallMs(playbackFocus.records) : null;
+  const dispatchTerminalWallMs = playbackFocus.kind === "dispatch" && isFocusAtRest ? terminalWallMs(playbackFocus.records, playbackFocus.sessionId) : null;
   // Lenses and the log scope to the playhead only once it has MOVED
   // (`transport.scrubbed`): at rest the playhead is the loaded day's end,
   // which can sit before the end of a run that crossed midnight, and the

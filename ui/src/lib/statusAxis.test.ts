@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { statusLabel, runStateFrom, type RunState } from "./flow";
+import { statusLabel, type RunState } from "./flow";
+import { toRunState, type CloseEdge, type Lifecycle } from "./lifecycle";
+import { norm } from "../testing/records";
 import type { RunStatus } from "../types/generated/RunStatus";
 import type { AbandonReason } from "../types/generated/AbandonReason";
 
@@ -78,57 +80,34 @@ describe("the status axis is the canonical one", () => {
 });
 
 describe("a lens may select a status, never invent one", () => {
-  const cases: Array<{
-    name: string;
-    predicates: { open: boolean; errored: boolean; killed: boolean; clean: boolean };
-    status: RunStatus;
-    label: string;
-  }> = [
-    {
-      name: "in flight",
-      predicates: { open: true, errored: false, killed: false, clean: false },
-      status: "running",
-      label: "running",
-    },
-    {
-      name: "failed",
-      predicates: { open: false, errored: true, killed: false, clean: false },
-      status: "error",
-      label: "errored",
-    },
-    {
-      name: "killed / timed out",
-      predicates: { open: false, errored: true, killed: true, clean: false },
-      status: "error",
-      label: "killed",
-    },
-    {
-      name: "finished cleanly",
-      predicates: { open: false, errored: false, killed: false, clean: true },
-      status: "complete",
-      label: "complete",
-    },
-    {
-      name: "done with no terminal record (the old `canceled`)",
-      predicates: { open: false, errored: false, killed: false, clean: false },
-      status: "abandoned",
-      label: "no ending recorded",
-    },
+  // `toRunState` is the ONLY lifecycle -> status map (`lib/lifecycle.ts`):
+  // every phase and close edge lands on a canonical status.
+  const at = (phase: Lifecycle["phase"], edge?: CloseEdge): Lifecycle => ({
+    phase,
+    startMs: 0,
+    lastActivityMs: 0,
+    close: edge ? { edge, atMs: 1, skewed: false, record: norm({ ts: "2026-09-27T10:00:00Z", action: "dispatch.complete" }) } : null,
+    waitUntilMs: null,
+  });
+  const cases: Array<{ name: string; l: Lifecycle; status: RunStatus; label: string }> = [
+    { name: "in flight", l: at("open"), status: "running", label: "running" },
+    { name: "held by a budget wait", l: at("waiting"), status: "running", label: "running" },
+    { name: "not started as of the instant", l: at("not_started"), status: "planned", label: "planned" },
+    { name: "failed", l: at("closed", { kind: "error", killed: false, exitCode: 1 }), status: "error", label: "errored" },
+    { name: "killed / timed out", l: at("closed", { kind: "error", killed: true, exitCode: 137 }), status: "error", label: "killed" },
+    { name: "finished cleanly", l: at("closed", { kind: "complete" }), status: "complete", label: "complete" },
+    { name: "closed by the presence reconciler", l: at("closed", { kind: "session_end" }), status: "abandoned", label: "no ending recorded" },
+    { name: "a wait the operator stopped", l: at("closed", { kind: "budget_stop", byOperator: true }), status: "abandoned", label: "aborted" },
+    { name: "a mission aborted", l: at("closed", { kind: "mission_abort" }), status: "abandoned", label: "aborted" },
+    { name: "silent past the staleness window (the old `canceled`)", l: at("stale"), status: "abandoned", label: "no ending recorded" },
   ];
 
   for (const c of cases) {
     it(`maps ${c.name} onto ${c.status}`, () => {
-      const state = runStateFrom(c.predicates);
+      const state = toRunState(c.l);
       expect(state.status).toBe(c.status);
       expect(ALL_STATUSES).toContain(state.status);
       expect(statusLabel(state)).toBe(c.label);
     });
   }
-
-  it("`open` wins over every other predicate — a live run is running", () => {
-    // Guards the ordering inside `runStateFrom`: a run that is still open can
-    // carry a stale terminal record from an earlier attempt.
-    const state = runStateFrom({ open: true, errored: true, killed: true, clean: true });
-    expect(state.status).toBe("running");
-  });
 });

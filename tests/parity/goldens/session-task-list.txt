@@ -18,12 +18,12 @@ github
 task-list
 
 === stage ===
-RUNNING FETCH-RENDER (task-list on MacBook-Pro)
+COMPLETE LIST-STEP (task-list on MacBook-Pro)
 route
 LMStudio · local · this machine
 timing
-07:36:48 · running
-17:51:54 so far
+01:28:40 → 01:28:42 (0:02)
+0:02
 WALL CLOCK
 CLEAN
 no detector flagged this run

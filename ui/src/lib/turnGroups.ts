@@ -1,4 +1,5 @@
-import { ACTION, byTime, isDispatchTerminal, type NormRecord } from "./ingest";
+import { ACTION, byTime, type NormRecord } from "./ingest";
+import { groupOfRecords } from "./runRef";
 
 /** (#2863) A run's event list, grouped by the turn each event belongs to.
  *
@@ -61,6 +62,15 @@ function num(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
+/** (#2863 review round 2, finding 2) Whether the attempt `rec` belongs to
+ *  has closed (`lib/lifecycle.ts`), deciding whether an unfinished turn's
+ *  header says "did not finish" (the run ended; this turn has no closing
+ *  record) or "in progress" (the run has not ended yet, so "did not finish"
+ *  would be a claim about the future). */
+function attemptClosed(all: readonly NormRecord[], rec: NormRecord): boolean {
+  return groupOfRecords(all).attempts.some((a) => a.close !== null && a.records.includes(rec));
+}
+
 /** Whether a list is one session's, with turns to group by. */
 export function groupsByTurn(all: NormRecord[]): boolean {
   const sessions = new Set(all.map((r) => r.session_id).filter(Boolean));
@@ -105,13 +115,6 @@ export function turnItems(visible: NormRecord[], all: NormRecord[]): TurnItem[] 
   // (a checkpoint before the turn that would have completed it) — used to
   // synthesize that group's header below.
   const seqForKey = new Map<string, number>();
-  // (#2863 review round 2, finding 2) Whether THIS execution has emitted a
-  // terminal (`dispatch complete`/`dispatch error`) record at all, by the
-  // time the forward pass finishes — read below to decide whether an
-  // unfinished turn's header says "did not finish" (the run ended; this
-  // turn has no closing record) or "in progress" (the run has not ended
-  // yet, so "did not finish" would be a claim about the future).
-  const terminalForExec = new Map<number, boolean>();
   for (const r of ordered) {
     const f = fields(r);
     if (r.action === ACTION.DispatchStart) {
@@ -119,7 +122,6 @@ export function turnItems(visible: NormRecord[], all: NormRecord[]): TurnItem[] 
       current = null;
       currentSeqNum = null;
     }
-    if (isDispatchTerminal(r.action)) terminalForExec.set(exec, true);
     const seq = num(f.turn_seq);
     const own = seq === null ? null : key(seq);
     // (#2863 review, finding 3) ANY record naming its own `turn_seq` advances
@@ -220,8 +222,7 @@ export function turnItems(visible: NormRecord[], all: NormRecord[]): TurnItem[] 
         // about the PAST — the run ended and this turn has no closing
         // record. A checkpoint with no terminal record YET does not mean
         // the turn never will finish; it means the run is still going.
-        const execNum = Number(t.split(":")[0]);
-        const finished = terminalForExec.get(execNum) === true;
+        const finished = attemptClosed(all, anchor);
         h = {
           kind: "turn",
           rec: anchor,

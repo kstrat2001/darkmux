@@ -1,3 +1,4 @@
+import { DEFAULT_POLICY } from "./lifecycle";
 import { describe, expect, it } from "vitest";
 import { PEPPER_SID, pepperAt, pepperRecords } from "../testing/pepperGrinderRun";
 import {
@@ -506,14 +507,16 @@ describe("deriveLiveState", () => {
     expect(aggregateLiveState([[wait, stopped]], 21_000)).toBeNull();
   });
 
-  // (5th review C1) A waiter that died mid-wait writes nothing more. Past its
-  // resume time plus the grace it is not a live execution, and not REST.
-  it("a budget wait silent past its resume time plus the grace is not live", () => {
+  // A waiter that died mid-wait writes nothing more. Past its resume time
+  // plus the grace the staleness clock runs from there (lifecycle rule 4):
+  // live until the policy's window runs out, then not.
+  it("a budget wait silent past its resume time plus the grace goes stale one window later", () => {
     const at = (ms: number) => new Date(ms).toISOString();
     const wait = norm({ ts: at(1_000), action: "budget.wait", session_id: SID, payload: { endpoint_id: "azure", wait_seconds: 60 } });
-    expect(liveExecutions([[wait]], 61_000 + 59_000)).toHaveLength(1);
-    expect(liveExecutions([[wait]], 61_000 + 61_000)).toEqual([]);
-    expect(aggregateLiveState([[wait]], 61_000 + 61_000)).toBeNull();
+    const lapse = 61_000 + DEFAULT_POLICY.budgetWaitGraceMs;
+    expect(liveExecutions([[wait]], lapse + DEFAULT_POLICY.staleAfterMs)).toHaveLength(1);
+    expect(liveExecutions([[wait]], lapse + DEFAULT_POLICY.staleAfterMs + 1)).toEqual([]);
+    expect(aggregateLiveState([[wait]], lapse + DEFAULT_POLICY.staleAfterMs + 1)).toBeNull();
   });
 
   // (5th review C7) A day window's wait reads as a compact duration, and a

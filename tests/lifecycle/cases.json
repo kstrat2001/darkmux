@@ -636,6 +636,81 @@
       "abandoned_reason": "aborted",
       "server": false,
       "server_skip_reason": "the server reads a mission's status from its mission record, not its lifecycle session"
+    },
+    {
+      "name": "before its wait is announced a held call has not started",
+      "as_of": "2026-09-27T09:59:59Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "budget.wait",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "endpoint_id": "azure",
+            "wait_seconds": 600
+          }
+        }
+      ],
+      "phase": "not_started",
+      "status": "planned",
+      "server": false,
+      "server_skip_reason": "the server judges a session as of now; it has no as-of cut"
+    },
+    {
+      "name": "a wait re-announced at its resume time waits to the new resume time",
+      "as_of": "2026-09-27T10:06:01Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "budget.wait",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "endpoint_id": "azure",
+            "wait_seconds": 60
+          }
+        },
+        {
+          "ts": "2026-09-27T10:01:01Z",
+          "action": "budget.wait",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "endpoint_id": "azure",
+            "wait_seconds": 600
+          }
+        }
+      ],
+      "phase": "waiting",
+      "status": "running"
+    },
+    {
+      "name": "a terminal ends a wait",
+      "as_of": "2026-09-27T10:01:01Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "budget.wait",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "endpoint_id": "azure",
+            "wait_seconds": 600
+          }
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "dispatch.error",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "exit_code": 1
+          }
+        }
+      ],
+      "phase": "closed",
+      "status": "error"
     }
   ]
 }

@@ -20,7 +20,8 @@
  */
 
 import type { UtilityJobKind } from "../types/generated/UtilityJobKind";
-import { sessionRecords, uidOf } from "./flow";
+import { uidOf } from "./flow";
+import { runIndex } from "./runRef";
 import { CALL_KIND, PURPOSE, isUsageRecord, usagePurpose, type UsagePayload } from "./usageRecords";
 import { mergeLive } from "./liveChannel";
 import { ACTION, isAsOf, isDispatchTerminal, type NormAction, type NormRecord } from "./ingest";
@@ -346,7 +347,8 @@ export function utilityStrip(
   if (served.size) {
     const seen = new Set<NormRecord>(own);
     const extra: NormRecord[] = [];
-    for (const sid of served) for (const r of sessionRecords(data as NormRecord[], sid)) if (!seen.has(r)) extra.push(r);
+    const ix = runIndex(data);
+    for (const sid of served) for (const g of ix.groupsOfSession(sid)) for (const r of g.records) if (!seen.has(r)) extra.push(r);
     recs = [...own, ...extra];
   }
   const live = machineUtilityJob(recs, t);

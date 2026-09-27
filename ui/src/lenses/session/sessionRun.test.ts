@@ -1495,15 +1495,16 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.signalGroups[0].signals.map((x) => x.offsetLabel)).toEqual(["+0:20", "+0:10"]);
   });
 
-  it("no dispatch.start at all falls back to the first record on the session, and reads 'no start'", () => {
+  it("no dispatch.start at all falls back to the first record on the session for its name", () => {
     const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "step.start", handle: "fetch-render" },
       { ts: "2026-01-01T00:00:05Z", session_id: "s1", action: "step.complete" },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(view.header.role).toBe("FETCH-RENDER");
-    // Still "running" — no terminal edge exists at all.
-    expect(view.header.pillLabel).toBe("RUNNING");
+    // The step's own terminal closes it (`lib/lifecycle.ts`): the page says
+    // what the mission graph says about the same step.
+    expect(view.header.pillLabel).toBe("COMPLETE");
   });
 
   it("(operator, 2026-09-05) the CTX tile splits label/value/sub — the label never restates the value", () => {

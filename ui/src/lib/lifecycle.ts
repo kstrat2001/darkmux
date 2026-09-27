@@ -35,11 +35,14 @@
  * 5. Stale. An open attempt whose last record is more than `staleAfterMs`
  *    before t has stopped with no ending recorded. So has an attempt a later
  *    one superseded.
+ * 6. A mission's whole-run bookend (`runRef.ts`'s `run` grain) never beats
+ *    itself; its steps do. Its activity and its waits are its mission's
+ *    other runs' too, so it is in flight while any of them is.
  */
 
 import { ACTION, byTime, isAsOf, isDispatchTerminal, latestByTime, recordsAsOf, timesOf, type NormAction, type NormRecord } from "./ingest";
 import type { RunState } from "./flow";
-import type { RunRecords } from "./runRef";
+import type { RunGroup, RunRecords } from "./runRef";
 
 export type LifecyclePhase = "not_started" | "open" | "waiting" | "closed" | "stale";
 
@@ -214,6 +217,7 @@ export function attemptsOf(records: readonly NormRecord[]): Attempt[] {
     }
   }
   if (attempts.length) attempts[0].records.unshift(...lead);
+  else if (orphans.length) attempts.push({ opening: orphans[0], start: null, records: lead, close: orphans[0], skewed: false });
   assignOrphans(attempts, orphans);
   return attempts;
 }
@@ -258,14 +262,29 @@ function startOf(a: Attempt): number | null {
   return a.start?.tMs ?? a.opening.tMs ?? (ts.length ? Math.min(...ts) : null);
 }
 
-/** The phase of an attempt that has opened and not closed (rules 4, 5). */
+/** The records whose activity keeps an open attempt alive: its own, and
+ *  for a mission's whole-run bookend, every other run of its mission (rule
+ *  6). */
+function activityOf(run: RunRecords, recs: readonly NormRecord[], asOf: number): (readonly NormRecord[])[] {
+  return [recs, ...run.group.siblings.map((g) => recordsAsOf(g.records, asOf))];
+}
+
+/** The phase of an attempt that has opened and not closed (rules 4-6). */
 function openPhase(run: RunRecords, recs: readonly NormRecord[], asOf: number, policy: LifecyclePolicy, presence: Presence): Pick<Lifecycle, "phase" | "waitUntilMs"> {
   if (run.next && isAsOf(run.next.opening, asOf)) return { phase: "stale", waitUntilMs: null };
   if (presence.has(run.ref.sessionId)) return { phase: "open", waitUntilMs: null };
-  const until = openWaitUntil(recs, policy);
+  const sets = activityOf(run, recs, asOf);
+  const until = maxOf(sets.map((set) => openWaitUntil(set, policy)));
   if (until !== null && asOf <= until) return { phase: "waiting", waitUntilMs: until };
-  const quietFrom = Math.max(latestTime(recs) ?? -Infinity, until ?? -Infinity);
-  return { phase: isStale(Number.isFinite(quietFrom) ? quietFrom : null, asOf, policy) ? "stale" : "open", waitUntilMs: null };
+  const quietFrom = maxOf([...sets.map(latestTime), until]);
+  return { phase: isStale(quietFrom, asOf, policy) ? "stale" : "open", waitUntilMs: null };
+}
+
+/** The largest of `xs`, ignoring `null`s; `null` when there is none. */
+function maxOf(xs: readonly (number | null)[]): number | null {
+  let best: number | null = null;
+  for (const x of xs) if (x !== null && (best === null || x > best)) best = x;
+  return best;
 }
 
 /** `run`'s lifecycle as of `asOf`. */
@@ -320,4 +339,40 @@ export function toRunState(l: Lifecycle): RunState {
     case "closed":
       return closedState(l.close?.edge ?? { kind: "session_end" });
   }
+}
+
+/** (#2011, #2346) The run's own measured duration: the `wall_ms` its
+ *  dispatch terminal carries (the runtime's sub-second measure, taken
+ *  between its start and terminal writes), or `null` when it closed any
+ *  other way or the record predates the field. The run page's run-time tile
+ *  and playback's elapsed readout both read it, so the two agree. */
+export function recordedWallMs(close: Close | null): number | null {
+  if (!close || !isDispatchTerminal(close.record.action)) return null;
+  const w = (close.record.payload as { wall_ms?: unknown } | undefined)?.wall_ms;
+  return typeof w === "number" && Number.isFinite(w) ? w : null;
+}
+
+/** A run's span over every attempt it had: the first attempt's start to the
+ *  last one's close (`null` while it has none). What playback's focus range
+ *  covers. */
+export function spanOf(group: RunGroup): { startMs: number | null; endMs: number | null } {
+  const first = group.attempts[0];
+  const last = group.attempts[group.attempts.length - 1];
+  return { startMs: first ? startOf(first) : null, endMs: last?.close?.tMs ?? null };
+}
+
+const MISSION_LIFECYCLE: ReadonlySet<NormAction> = new Set<NormAction>([ACTION.MissionStart, ACTION.MissionClose, ACTION.MissionAbort]);
+
+/** Whether `group` is a mission's own lifecycle session (it carries the
+ *  mission's start or end). */
+export const isMissionLifecycle = (group: RunGroup): boolean =>
+  group.records.some((r) => r.action !== undefined && MISSION_LIFECYCLE.has(r.action));
+
+/** Whether a mission's lifecycle session has closed (a `mission.close` or
+ *  `mission.abort`), in whatever record set it is read from. */
+export function missionClosed(groups: readonly RunGroup[]): boolean {
+  return groups.some((g) => {
+    const last = g.attempts[g.attempts.length - 1];
+    return isMissionLifecycle(g) && last?.close != null;
+  });
 }

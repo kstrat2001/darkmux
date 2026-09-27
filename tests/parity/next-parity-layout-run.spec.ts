@@ -84,9 +84,14 @@ function sizeGroups(rows, key) {
 }
 
 for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
-  for (const mode of ["live", "playback"]) {
+  // Live only. A run page at rest judges its run as of the wall clock
+  // (`lib/lifecycle.ts`), so a page pinned weeks after a fixture day reads
+  // each unfinished run as stopped with no ending recorded, which is the
+  // `finished` state measured here already. A recorded run is replayed at
+  // the transport's playhead, which this spec cannot set on a run page.
+  for (const mode of ["live"]) {
     test(`run page MODEL section: one size in every state (${vpName}, ${mode})`, async ({ browser }) => {
-      const states = STATES.filter((s) => mode === "live" || s.runPlayback !== false);
+      const states = STATES;
       const rows = [];
       const noteRows = [];
       for (const state of states) {

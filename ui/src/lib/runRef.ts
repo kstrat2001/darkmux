@@ -38,6 +38,11 @@ export interface RunGroup {
   readonly missionId: string | null;
   readonly records: readonly NormRecord[];
   readonly attempts: readonly Attempt[];
+  readonly grain: Grain;
+  /** A run-grain group's mission's OTHER runs, whose activity is this run's
+   *  (a mission's whole-run bookend never beats; its steps do). Empty for
+   *  every other grain. */
+  readonly siblings: readonly RunGroup[];
 }
 
 /** One run's records: what every lifecycle and grain predicate takes. */
@@ -156,6 +161,19 @@ function pushTo<K>(m: Map<K, RunGroup[]>, k: K, g: RunGroup): void {
 
 const NO_GROUPS: readonly RunGroup[] = [];
 
+function makeGroup(sessionId: string, missionId: string | null, records: readonly NormRecord[]): RunGroup {
+  return { key: groupKey(sessionId, missionId), sessionId, missionId, records, attempts: attemptsOf(records), grain: grainOf(records), siblings: NO_GROUPS };
+}
+
+/** Each run-grain group's siblings: its mission's other groups. */
+function linkSiblings(byMission: Map<string, RunGroup[]>): void {
+  for (const groups of byMission.values()) {
+    for (const g of groups) {
+      if (g.grain === "run") (g as { siblings: readonly RunGroup[] }).siblings = groups.filter((o) => o !== g);
+    }
+  }
+}
+
 function buildIndex(data: readonly NormRecord[]): RunIndex {
   const { byKey, keyOf } = collect(data);
   const groups: RunGroup[] = [];
@@ -164,13 +182,14 @@ function buildIndex(data: readonly NormRecord[]): RunIndex {
   const bySession = new Map<string, RunGroup[]>();
   const byMission = new Map<string, RunGroup[]>();
   for (const b of byKey.values()) {
-    const g: RunGroup = { key: b.key, sessionId: b.sessionId, missionId: b.missionId, records: b.records, attempts: attemptsOf(b.records) };
+    const g = makeGroup(b.sessionId, b.missionId, b.records);
     groups.push(g);
     byGroupKey.set(g.key, g);
     for (const uid of b.uids) pushTo(byUid, uid, g);
     pushTo(bySession, g.sessionId, g);
     if (g.missionId) pushTo(byMission, g.missionId, g);
   }
+  linkSiblings(byMission);
   return {
     groups,
     groupsOn: (uid) => byUid.get(uid) ?? NO_GROUPS,
@@ -259,7 +278,7 @@ export function groupOfRecords(records: readonly NormRecord[]): RunGroup {
     const first = records.find((r) => r.session_id) ?? records[0];
     const sessionId = first?.session_id ?? "";
     const missionId = first?.mission_id ?? null;
-    g = { key: groupKey(sessionId, missionId), sessionId, missionId, records, attempts: attemptsOf(records) };
+    g = makeGroup(sessionId, missionId, records);
     loneCache.set(records, g);
   }
   return g;

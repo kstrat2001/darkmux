@@ -1,3 +1,4 @@
+import { DEFAULT_POLICY } from "../../lib/lifecycle";
 import { describe, expect, it } from "vitest";
 import {
   applyFlowRecord,
@@ -32,7 +33,6 @@ import {
   stepLead,
   stepMeterFor,
   stepSeat,
-  STEP_LIVENESS_WINDOW_MS,
   tsToMs,
   type GraphNode,
   type MetricsMap,
@@ -702,7 +702,7 @@ describe("stepMeterFor liveness", () => {
   it("stops claiming 'generating' once the last signal is older than the liveness window (a hard-killed dispatch)", () => {
     const now = 10_000_000;
     const m: MetricsMap = {
-      "a-step": { tokRun: 0, tokFinal: 0, turnRun: 0, turnFinal: 0, toolRun: 0, toolFinal: 0, usageSeen: false, startTs: now - STEP_LIVENESS_WINDOW_MS - 5000, endTs: 0, lastTs: now - STEP_LIVENESS_WINDOW_MS - 1000 },
+      "a-step": { tokRun: 0, tokFinal: 0, turnRun: 0, turnFinal: 0, toolRun: 0, toolFinal: 0, usageSeen: false, startTs: now - DEFAULT_POLICY.staleAfterMs - 5000, endTs: 0, lastTs: now - DEFAULT_POLICY.staleAfterMs - 1000 },
     };
     expect(stepMeterFor(step, m, now).generating).toBe(false);
   });
