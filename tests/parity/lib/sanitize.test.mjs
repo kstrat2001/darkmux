@@ -102,3 +102,20 @@ test("fields OUTSIDE battery_health are unaffected by this block's numeric polic
   assert.equal(now.sampled_at_ms, 1234567890, "generic numeric fields elsewhere in the corpus pass through — unchanged scope");
   assert.equal(now.sampler_cost_ms, 4.2);
 });
+
+// (#2957) A hardware uid is replaced by the repo's recognizable fake shape,
+// the one `scripts/engagement-sentinel-guard.py` permits. The inputs are
+// INVENTED and ASSEMBLED from fragments so this source line is not itself a
+// UUID-shaped literal the guard would refuse.
+test("machine_uid is replaced by a stable, distinct uid under the fake prefix", () => {
+  const invented = (tail) => ["C0FFEE12", "3456", "789A", "BCDE", tail].join("-");
+  const a = invented("F0123456789A");
+  const b = invented("F0123456789B");
+  const scrub = (uid) => JSON.parse(sanitizeText(JSON.stringify({ machine_uid: uid })).text).machine_uid;
+  const FAKE = /^00000000-0000-4000-8000-[0-9A-F]{12}$/;
+  assert.match(scrub(a), FAKE);
+  assert.match(scrub(b), FAKE);
+  assert.notEqual(scrub(a), a, "the original never survives");
+  assert.equal(scrub(a), scrub(a), "stable: the same machine keeps one synthetic uid");
+  assert.notEqual(scrub(a), scrub(b), "distinct machines stay distinct");
+});

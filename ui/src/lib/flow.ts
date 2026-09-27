@@ -508,7 +508,7 @@ export interface SelfIdentity {
  * an empty window and handed back the NAME as a uid, so `nameOf` echoed it
  * and every label read correctly by accident. Resolving the real uid is the
  * fix, and on its own it turns "runs on MacBook-Pro" into
- * "runs on F9ACF59C-…". Both halves ship together or the second one is a
+ * "runs on <uid head>-…". Both halves ship together or the second one is a
  * regression.
  *
  * A FLOOR, not an override, and the shape of the condition is what makes it

@@ -169,9 +169,18 @@ function syntheticHex40(original) {
   return stableHex(original, "sha40").slice(0, 40);
 }
 
+// (#2957) The synthetic is shaped `00000000-0000-4000-8000-<12 hex>`: the
+// fixed prefix is the repo's recognizable FAKE uid form, the one
+// `scripts/engagement-sentinel-guard.py` permits, and the 12-hex tail keeps
+// distinct originals distinct. The earlier all-digest form was synthetic in
+// fact but indistinguishable from a real hardware UUID to the guard and to a
+// reader: the same collision `syntheticIpv4` below avoids by forcing its
+// octet out of CGNAT. The tail is the first 12 hex of the SAME digest the
+// old form led with, so the committed corpus was rewritten to exactly what a
+// re-record now produces.
 function syntheticUuid(original) {
   const digest = stableHex(original, "uuid").toUpperCase();
-  return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-${digest.slice(12, 16)}-${digest.slice(16, 20)}-${digest.slice(20, 32)}`;
+  return `00000000-0000-4000-8000-${digest.slice(0, 12)}`;
 }
 
 function syntheticIpv4(original) {
@@ -274,7 +283,8 @@ const PATH_FIELDS = new Set(["bundle_id"]);
 
 // Hardware UUID fields — synthetic stable UUID, not a character-preserving
 // scramble (a scrambled-but-same-shape UUID would still look like a real
-// hardware identifier; a hash-derived UUID is unambiguously synthetic).
+// hardware identifier; a hash-derived UUID under the fake prefix is
+// unambiguously synthetic, see `syntheticUuid`).
 const UUID_FIELDS = new Set(["machine_uid"]);
 
 // Known-safe fields: identifier shapes (darkmux-generated, not client

@@ -13,7 +13,7 @@
       "reasoning": "nostrud do aliqua veniam id elit mollit du",
       "mission_id": "sanity-review-shape-1784702742-76e0c1",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929"
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06"
     },
     {
       "ts": "2026-07-22T06:45:43Z",
@@ -28,7 +28,7 @@
       "source": "phase_lifecycle",
       "mission_id": "sanity-review-shape-1784702742-76e0c1",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929"
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06"
     },
     {
       "ts": "2026-07-22T06:45:48Z",
@@ -43,7 +43,7 @@
       "source": "phase_lifecycle",
       "mission_id": "sanity-review-shape-1784702742-76e0c1",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929"
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06"
     },
     {
       "ts": "2026-07-22T06:45:48Z",
@@ -58,7 +58,7 @@
       "source": "phase_lifecycle",
       "mission_id": "sanity-review-shape-1784702742-76e0c1",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929"
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06"
     },
     {
       "ts": "2026-07-22T06:45:49Z",
@@ -73,7 +73,7 @@
       "source": "phase_lifecycle",
       "mission_id": "sanity-review-shape-1784702742-76e0c1",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929"
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06"
     },
     {
       "ts": "2026-07-22T06:45:49Z",
@@ -88,7 +88,7 @@
       "source": "phase_lifecycle",
       "mission_id": "sanity-review-shape-1784702742-76e0c1",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929"
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06"
     },
     {
       "ts": "2026-07-22T06:45:49Z",
@@ -103,7 +103,7 @@
       "source": "phase_lifecycle",
       "mission_id": "sanity-review-shape-1784702742-76e0c1",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929"
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06"
     },
     {
       "ts": "2026-07-22T06:45:49Z",
@@ -118,7 +118,7 @@
       "reasoning": "minim excepteur s",
       "mission_id": "sanity-review-shape-1784702742-76e0c1",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929"
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06"
     }
   ],
   "count": 8,

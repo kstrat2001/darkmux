@@ -752,6 +752,10 @@ jobs:
         # tests/parity/lib/sanitize.mjs, which already owns it for the parity
         # scrubber. One list read twice cannot drift; two lists kept in sync by
         # hand is how the first leak happened.
+        #
+        # The same script also refuses UUID-shaped strings outside the fake
+        # form `00000000-0000-4000-8000-<12 hex>` (#2957): a real hardware
+        # uid reached seven test files as ordinary fixture data.
         run: |
           python3 scripts/engagement-sentinel-guard.py --self-test
           python3 scripts/engagement-sentinel-guard.py
