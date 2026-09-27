@@ -458,18 +458,33 @@ fn check_beat33_legacy_crew_dir() -> Check {
     }
 
     // Inventory what's actually under <root>/crew/ so the message is
-    // specific. We only care about the post-Beat-33 promoted subdirs +
-    // the pinned file; anything else under crew/ is operator-authored
-    // territory we won't recommend moving.
+    // specific. We only care about the post-Beat-33 promoted subdirs + the
+    // retired pins file; anything else under crew/ is operator-authored
+    // territory we won't recommend moving. The pins file is NOT promoted
+    // state: nothing reads it (the role-model-pins table retired), so it is
+    // only ever named for deletion, never moved.
     let promoted_subdirs = ["roles", "missions", "phases", "crews", "skills"];
-    let promoted_file = "role-model-pins.json";
+    let pins_file = "role-model-pins.json";
     let mut present_subdirs: Vec<&str> = promoted_subdirs
         .iter()
         .filter(|s| legacy_dir.join(s).is_dir())
         .copied()
         .collect();
-    let pins_present = legacy_dir.join(promoted_file).is_file();
+    let pins_present = legacy_dir.join(pins_file).is_file();
     present_subdirs.sort();
+    let pins_note = format!(
+        "{}/{pins_file}: delete it; nothing reads it (the role-model-pins table retired).",
+        legacy_dir.display()
+    );
+
+    if present_subdirs.is_empty() && pins_present {
+        return Check {
+            name: "beat-33 crew/ layout".into(),
+            status: Status::Warn,
+            message: format!("{}/{pins_file} is a retired file darkmux never reads", legacy_dir.display()),
+            hint: Some(pins_note),
+        };
+    }
 
     if present_subdirs.is_empty() && !pins_present {
         // <root>/crew/ exists but is empty / has no promoted content.
@@ -541,28 +556,14 @@ fn check_beat33_legacy_crew_dir() -> Check {
             ));
         }
     }
-    if pins_present {
-        script_lines.push(format!(
-            "mv -n \"{legacy}/{file}\" \"{root}/{file}\"",
-            legacy = legacy_dir.display(),
-            root = root.display(),
-            file = promoted_file
-        ));
-    }
     script_lines.push(format!(
         "rmdir \"{legacy}\" || echo \"note: {legacy} is not empty — whatever remains is either \
          operator-authored (darkmux never proposes moving that) or a LEFTOVERS line above\"",
         legacy = legacy_dir.display()
     ));
 
-    let mut listed = present_subdirs
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect::<Vec<_>>();
-    if pins_present {
-        listed.push(promoted_file.to_string());
-    }
-    let listed_str = listed.join(", ");
+    let listed_str = present_subdirs.join(", ");
+    let pins_hint = if pins_present { format!("\n\nAlso: {pins_note}") } else { String::new() };
 
     Check {
         name: "beat-33 crew/ layout".into(),
@@ -583,7 +584,7 @@ fn check_beat33_legacy_crew_dir() -> Check {
              copies yourself and delete the stale one. A clean run prints nothing.\n\n\
              Note: if you set DARKMUX_CREW_DIR explicitly, this check assumes the env var \
              points at the post-flatten root (e.g. `~/.darkmux/`), and this script's paths \
-             are computed from the env var value as-given.",
+             are computed from the env var value as-given.{pins_hint}",
             script = script_lines.join("\n")
         )),
     }
@@ -14803,7 +14804,9 @@ mod tests {
         assert!(check.message.contains("operator state still under"));
         assert!(check.message.contains("missions"));
         assert!(check.message.contains("roles"));
-        assert!(check.message.contains("role-model-pins.json"));
+        // The Fail names what 4.0 stopped reading; the pins file never was
+        // read, so it rides in the hint as a deletion, not in the message.
+        assert!(!check.message.contains("role-model-pins.json"), "{}", check.message);
 
         let hint = check
             .hint
@@ -14814,12 +14817,32 @@ mod tests {
         assert!(hint.contains("mv -n"));
         assert!(hint.contains("/crew/roles"));
         assert!(hint.contains("/crew/missions"));
-        assert!(hint.contains("/crew/role-model-pins.json"));
+        // Nothing reads the retired pins file, so the script never moves
+        // it; the hint says to delete it instead.
+        assert!(!hint.contains("role-model-pins.json\" \""), "no mv line for the pins file: {hint}");
+        assert!(hint.contains("role-model-pins.json") && hint.contains("nothing reads it"), "{hint}");
         assert!(hint.contains("rmdir"));
         // 4.0 dropped the dual read: the hint must say the legacy layout is
         // no longer read, not that it keeps working. Strip newlines before
         // substring-matching so rewrapping doesn't move the goalposts.
         assert!(hint.replace('\n', " ").contains("darkmux no longer reads"));
+    }
+
+    /// (4.0) A `crew/` holding ONLY the retired `role-model-pins.json` is
+    /// not state darkmux stopped reading: nothing ever reads that file. Warn
+    /// and say to delete it, rather than Fail on a harmless leftover.
+    #[serial_test::serial]
+    #[test]
+    fn beat33_pins_only_warns_to_delete_the_unread_file() {
+        let guard = CrewRootGuard::new();
+        std::fs::create_dir_all(guard.path().join("crew")).unwrap();
+        std::fs::write(guard.path().join("crew").join("role-model-pins.json"), "{}").unwrap();
+        let check = check_beat33_legacy_crew_dir();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("role-model-pins.json"), "{}", check.message);
+        let hint = check.hint.expect("names the fix");
+        assert!(hint.contains("delete it; nothing reads it"), "{hint}");
+        assert!(!hint.contains("mv -n"), "nothing to move: {hint}");
     }
 
     #[serial_test::serial]
