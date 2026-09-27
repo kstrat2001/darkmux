@@ -18311,3 +18311,108 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let lines = lines.lock().unwrap().clone();
         assert_eq!(lines.len(), 1, "{lines:?}");
     }
+
+    /// (#2869 C1) The stop path must drain the WHOLE backlog. A container
+    /// that wrote more than two polls' worth (16 MiB) before exiting lost
+    /// the tail: the loop polls once, sees `stop`, and flushed only once
+    /// more. Driven through `run_tailer` with the stop flag already set, the
+    /// production stop sequence.
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record()
+    fn run_tailer_final_flush_drains_a_backlog_larger_than_two_polls() {
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let tmp = TempDir::new().unwrap();
+        let rt = tmp.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        // 20 lines of ~1 MiB: over two polls' worth, few lines to parse.
+        let pad_line = format!("{{\"type\":\"noop.pad\",\"p\":\"{}\"}}\n", "x".repeat(1024 * 1024));
+        let mut body = pad_line.repeat(20);
+        body.push_str("{\"type\":\"compaction\",\"seq\":1,\"generation\":1,\"before_messages\":40,\"after_messages\":7,\"summary_chars\":1500}\n");
+        fs::write(rt.join("trajectory.jsonl"), &body).unwrap();
+        let stop = Arc::new(AtomicBool::new(true));
+        let summary = run_tailer(
+            tmp.path().to_path_buf(),
+            "sess-2869-drain".into(),
+            "coder".into(),
+            "darkmux:m".into(),
+            None,
+            None,
+            None,
+            stop,
+            Arc::new(Mutex::new(Instant::now() + Duration::from_secs(600))),
+            600,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(summary.compactions, 1, "the event at the end of a 20 MiB backlog was dropped");
+    }
+
+    /// (#2869 C6) A truncation reset clears the discard state too: after an
+    /// oversize line was being skipped, a rewritten (truncated) file's first
+    /// event must be read, not swallowed as "the rest of the oversize line".
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record()
+    fn tailer_truncation_reset_clears_the_discard_state() {
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let tmp = TempDir::new().unwrap();
+        let rt = tmp.path().join("out/.darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        let path = rt.join("trajectory.jsonl");
+        fs::write(&path, "Z".repeat(400)).unwrap();
+        let mut state = TailerState::new_for_test(path.clone(), "sess-2869-trunc".into(), "coder".into(), "darkmux:m".into());
+        state.warning_sink = Arc::new(|_: &str| {});
+        state.max_poll_bytes = 64;
+        state.max_pending_bytes = 128;
+        for _ in 0..10 {
+            state.poll_and_emit();
+        }
+        assert!(state.discarding_line, "precondition: an oversize line is being discarded");
+        fs::write(&path, "{\"type\":\"compaction\",\"seq\":1,\"generation\":1,\"before_messages\":40,\"after_messages\":7,\"summary_chars\":1500}\n").unwrap();
+        for _ in 0..10 {
+            state.poll_and_emit();
+        }
+        assert_eq!(state.summary.compactions, 1, "the first event after truncation was discarded");
+    }
+
+    /// (#2869 C5) `metrics.json` is small by construction; a multi-MiB one
+    /// is refused under the small-file cap rather than read (the 1 GiB
+    /// default applied before).
+    #[test]
+    fn read_token_totals_refuses_an_oversize_metrics_file() {
+        let tmp = TempDir::new().unwrap();
+        let rt = tmp.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        let pad = "x".repeat(5 * 1024 * 1024);
+        fs::write(rt.join("metrics.json"), format!(r#"{{"total_prompt_tokens": 7, "pad": "{pad}"}}"#)).unwrap();
+        assert_eq!(read_token_totals(tmp.path()).prompt, 0, "a 5 MiB metrics.json was read");
+    }
+
+    #[test]
+    fn resume_checkpoint_refuses_an_oversize_origin_file() {
+        let tmp = TempDir::new().unwrap();
+        let resume_from = tmp.path().join("prior-out");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&resume_from).unwrap();
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(
+            resume_from.join(CHECKPOINT_FILENAME),
+            r#"{"schema_version":3,"messages":[],"role_id":"coder"}"#,
+        )
+        .unwrap();
+        let ws_canon = ws.canonicalize().unwrap();
+        let pad = "x".repeat(5 * 1024 * 1024);
+        fs::write(
+            resume_from.join(RESUME_ORIGIN_FILENAME),
+            serde_json::json!({ "workspace": ws_canon.display().to_string(), "workspace_read_only": false, "pad": pad })
+                .to_string(),
+        )
+        .unwrap();
+        let err = validate_resume_checkpoint(&resume_from, "coder", &ws_canon, false)
+            .expect_err("a 5 MiB origin file must be refused");
+        assert!(format!("{err:#}").contains("exceeds"), "{err:#}");
+    }
+

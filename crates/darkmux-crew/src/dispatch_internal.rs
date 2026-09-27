@@ -857,7 +857,7 @@ pub(crate) fn validate_resume_checkpoint(
     let origin_contents = crate::contained_file::read_contained_to_string(
         resume_from,
         Path::new(RESUME_ORIGIN_FILENAME),
-        crate::contained_file::DEFAULT_MAX_BYTES,
+        crate::contained_file::SMALL_FILE_MAX_BYTES,
     )
     .map_err(|e| {
         anyhow!(
@@ -7150,6 +7150,19 @@ pub(crate) fn read_out_dir_text(out_dir: &Path, rel: &str) -> Option<String> {
     read_out_dir_text_with(out_dir, rel, &stderr_warning_sink)
 }
 
+/// (#2869) The read cap for an out-dir file: the small cap for the files
+/// the host parses whole and that are a few hundred bytes when genuine
+/// (`metrics.json`, the resume origin file), the default for the streams
+/// (trajectory, findings).
+fn out_dir_read_cap(rel: &str) -> u64 {
+    let name = Path::new(rel).file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name == "metrics.json" || name == RESUME_ORIGIN_FILENAME {
+        crate::contained_file::SMALL_FILE_MAX_BYTES
+    } else {
+        crate::contained_file::DEFAULT_MAX_BYTES
+    }
+}
+
 /// (#2869) Whether this is the first refusal of `path` in this process.
 /// The end-of-dispatch reads open the same `metrics.json` up to four times;
 /// the operator hears about a refused file once. Out-dirs are unique per
@@ -7165,8 +7178,8 @@ fn first_refusal_of(path: &Path) -> bool {
 
 /// [`read_out_dir_text`] with the warning sink injected (tests capture it).
 pub(crate) fn read_out_dir_text_with(out_dir: &Path, rel: &str, sink: &dyn Fn(&str)) -> Option<String> {
-    use crate::contained_file::{read_contained_to_string, DEFAULT_MAX_BYTES};
-    match read_contained_to_string(out_dir, Path::new(rel), DEFAULT_MAX_BYTES) {
+    use crate::contained_file::read_contained_to_string;
+    match read_contained_to_string(out_dir, Path::new(rel), out_dir_read_cap(rel)) {
         Ok(body) => Some(body),
         Err(e) => {
             let path = out_dir.join(rel);
@@ -7978,8 +7991,10 @@ fn run_tailer(
         state.live_flush(crate::usage::unix_ms_now());
         if stop_flag.load(Ordering::SeqCst) {
             // Final flush — pick up anything written between the last
-            // sleep tick and the container's exit signal.
-            state.poll_and_emit();
+            // sleep tick and the container's exit signal. (#2869) One poll
+            // reads at most `max_poll_bytes`, so drain until a poll makes
+            // no progress (bounded), or a large backlog loses its tail.
+            state.drain_to_end();
             state.live_flush_final();
             break;
         }
@@ -8007,7 +8022,7 @@ fn run_tailer(
             // it away for free. The container is about to be killed
             // either way; that doesn't make the last poll tick's data
             // stale.
-            state.poll_and_emit();
+            state.drain_to_end();
             darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
             break;
         }
@@ -9500,6 +9515,9 @@ const TAILER_MAX_POLL_BYTES: u64 = 8 * 1024 * 1024;
 /// Real events are bounded far below this; a line past it is dropped.
 const TAILER_MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
 
+/// (#2869) Most polls the tailer's final drain makes after stop.
+const TAILER_MAX_DRAIN_POLLS: usize = 128;
+
 /// any partial-line tail bytes carried across polls, and the last
 /// heartbeat instant for rate limiting.
 ///
@@ -10009,7 +10027,7 @@ impl TailerState {
     /// opened with no-follow at `.darkmux-runtime/trajectory.jsonl` and
     /// must be a regular file; a symlink or FIFO planted there is never
     /// read, and the tailer says so once through its warning sink.
-    fn poll_and_emit(&mut self) {
+    fn poll_and_emit(&mut self) -> u64 {
         use crate::contained_file::{open_path_tail, ContainedFileError};
         use std::io::{Read, Seek, SeekFrom};
 
@@ -10024,26 +10042,29 @@ impl TailerState {
                         self.trajectory_path.display()
                     ));
                 }
-                return;
+                return 0;
             }
-            Err(_) => return,
+            Err(_) => return 0,
         };
         let size = match file.metadata() {
             Ok(m) => m.len(),
-            Err(_) => return,
+            Err(_) => return 0,
         };
         // File truncated below our offset (shouldn't happen in practice
         // since the runtime writes append-only, but defensive): reset.
         if size < self.offset {
             self.offset = 0;
             self.pending.clear();
+            // (#2869) A rewritten file starts clean: the oversize line
+            // being skipped belonged to the old contents.
+            self.discarding_line = false;
         }
         if size <= self.offset {
-            return;
+            return 0;
         }
 
         if file.seek(SeekFrom::Start(self.offset)).is_err() {
-            return;
+            return 0;
         }
         // (#2869) Bounded: never size a buffer from `fstat` (the model can
         // make the file claim any size, e.g. a sparse petabyte, and a
@@ -10053,9 +10074,10 @@ impl TailerState {
         let budget = (size - self.offset).min(self.max_poll_bytes);
         let mut buf = Vec::new();
         if (&mut file).take(budget).read_to_end(&mut buf).is_err() {
-            return;
+            return 0;
         }
-        self.offset += buf.len() as u64;
+        let read = buf.len() as u64;
+        self.offset += read;
 
         // (#2869) A line being discarded (it outgrew the cap) is skipped up
         // to and including its newline.
@@ -10066,7 +10088,7 @@ impl TailerState {
                     self.discarding_line = false;
                     bytes = &bytes[i + 1..];
                 }
-                None => return,
+                None => return read,
             }
         }
 
@@ -10092,6 +10114,19 @@ impl TailerState {
                     self.trajectory_path.display(),
                     self.max_pending_bytes
                 ));
+            }
+        }
+        read
+    }
+
+    /// (#2869) Poll until a poll reads nothing, at most
+    /// [`TAILER_MAX_DRAIN_POLLS`] times (1 GiB at the default poll size), so
+    /// a stopped dispatch's whole backlog is read but a file still growing
+    /// under a runaway writer cannot hold the tailer forever.
+    fn drain_to_end(&mut self) {
+        for _ in 0..TAILER_MAX_DRAIN_POLLS {
+            if self.poll_and_emit() == 0 {
+                break;
             }
         }
     }

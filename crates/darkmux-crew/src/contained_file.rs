@@ -41,7 +41,7 @@
 
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Component, Path};
 
 /// Default read cap for runtime bookkeeping files (trajectory, metrics,
@@ -49,6 +49,11 @@ use std::path::{Component, Path};
 /// cap exists so a model cannot make the host buffer an unbounded file,
 /// not to police ordinary sizes.
 pub const DEFAULT_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// (#2869) Read cap for small, fixed-shape bookkeeping files the host
+/// parses whole (`metrics.json`, the resume origin file). A real one is a
+/// few hundred bytes.
+pub const SMALL_FILE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Why a contained read did not produce a file.
 #[derive(Debug)]
@@ -303,19 +308,40 @@ pub fn read_contained_to_string(
 }
 
 /// Copy `root/rel` to `dst` (created or truncated), bounded by `max_bytes`.
-/// `dst` is host-owned and is written normally. Nothing is written when the
-/// source is refused or missing. Returns the number of bytes copied.
+/// `dst` is host-owned and is written normally. Streams rather than
+/// buffering the whole file. Nothing is left at `dst` when the source is
+/// refused, missing, or turns out larger than the cap mid-copy. Returns the
+/// number of bytes copied.
 pub fn copy_contained(
     root: &Path,
     rel: &Path,
     dst: &Path,
     max_bytes: u64,
 ) -> Result<u64, ContainedFileError> {
-    let bytes = read_contained(root, rel, max_bytes)?;
+    let mut file = open_contained(root, rel)?;
+    let too_big = || {
+        ContainedFileError::Refused(format!("`{}` exceeds the {max_bytes}-byte read cap", rel.display()))
+    };
+    if file.metadata()?.len() > max_bytes {
+        return Err(too_big());
+    }
     let mut out = File::create(dst).map_err(ContainedFileError::Io)?;
-    out.write_all(&bytes).map_err(ContainedFileError::Io)?;
-    Ok(bytes.len() as u64)
+    let copied = io::copy(&mut (&mut file).take(max_bytes + 1), &mut out);
+    let fail = |e: ContainedFileError| {
+        drop(std::fs::remove_file(dst));
+        Err(e)
+    };
+    match copied {
+        Ok(n) if n > max_bytes => fail(too_big()),
+        Ok(n) => Ok(n),
+        Err(e) => fail(ContainedFileError::Io(e)),
+    }
 }
+
+/// (#2869) Deepest directory nesting [`copy_tree_nofollow`] walks. The
+/// walk holds one fd per level; this keeps it well under a 256-fd process
+/// limit (the CLI does not raise its limit the way `darkmux serve` does).
+pub const MAX_TREE_DEPTH: usize = 128;
 
 /// What [`copy_tree_nofollow`] did beyond copying regular files.
 #[derive(Debug, Default)]
@@ -332,23 +358,38 @@ pub struct TreeCopyReport {
 }
 
 /// Whether a symlink at `link_dir/<name>` (with `link_dir` relative to the
-/// copy root) whose target is `target` resolves, lexically, to a path
-/// inside the root. Absolute targets never do.
+/// copy root) whose target is `target` is safe to recreate: it resolves
+/// inside the root no matter what the other recreated links are.
+///
+/// (#2869 F1) The target must be a LEADING run of `..` (and `.`), then
+/// plain names only. A `..` after a name is refused, because the kernel
+/// resolves that name first and it may itself be a recreated link:
+/// `sub/up -> ..` is fine alone, but `sub/up/sub/up/../x` climbs one level
+/// per `up/..` pair while cancelling lexically. With `..` only leading, the
+/// climb is taken from the link's own (real, never-symlinked) directory
+/// and bounded by its depth, and every later name descends; by induction
+/// over the other recreated links, which obey the same rule, the result
+/// stays inside the root. Absolute targets are refused.
 fn relative_link_stays_inside(link_dir: &Path, target: &Path) -> bool {
-    let mut depth: usize = link_dir
+    let depth: usize = link_dir
         .components()
         .filter(|c| matches!(c, Component::Normal(_)))
         .count();
+    let mut ups = 0usize;
+    let mut seen_name = false;
     for c in target.components() {
         match c {
-            Component::Normal(_) => depth += 1,
             Component::CurDir => {}
             Component::ParentDir => {
-                if depth == 0 {
+                if seen_name {
                     return false;
                 }
-                depth -= 1;
+                ups += 1;
+                if ups > depth {
+                    return false;
+                }
             }
+            Component::Normal(_) => seen_name = true,
             Component::RootDir | Component::Prefix(_) => return false,
         }
     }
@@ -360,29 +401,32 @@ fn relative_link_stays_inside(link_dir: &Path, target: &Path) -> bool {
 ///
 /// `src` itself is opened `O_DIRECTORY|O_NOFOLLOW` (its parents are the
 /// caller's, trusted, and opened by path). From there the walk carries a
-/// directory fd down the recursion: each directory is listed through its
-/// own fd (`fdopendir`), each entry's type comes from `fstatat(...,
-/// AT_SYMLINK_NOFOLLOW)` relative to that fd, a subdirectory is opened with
-/// `openat(O_DIRECTORY|O_NOFOLLOW)` and a file with
-/// `openat(O_NOFOLLOW|O_NONBLOCK)` then checked `S_ISREG` on the open fd.
-/// So a directory renamed away and replaced with a link after it was
+/// directory fd down the recursion: each directory is listed through a
+/// close-on-exec dup of its own fd (`fdopendir`), each entry's type comes
+/// from `fstatat(..., AT_SYMLINK_NOFOLLOW)` relative to that fd, a
+/// subdirectory is opened with `openat(O_DIRECTORY|O_NOFOLLOW)` and a file
+/// with `openat(O_NOFOLLOW|O_NONBLOCK)` then checked `S_ISREG` on the open
+/// fd. So a directory renamed away and replaced with a link after it was
 /// opened is still read through the fd we hold (its original contents),
 /// and one replaced before it was opened fails the no-follow open and is
-/// skipped.
+/// skipped, reported as whatever it became.
 ///
-/// A symlink is recreated verbatim when its target is RELATIVE and stays
-/// inside the tree (real checkouts commit these: `node_modules/.bin/*`,
-/// docs links); an absolute or escaping one is skipped and reported. The
-/// recreated link points at the COPY, whose entries were all vetted, so a
-/// chain through a skipped link dangles rather than escapes.
+/// The destination side is written the same way: through a directory fd
+/// per level (`mkdirat`, `openat(O_CREAT|O_EXCL|O_NOFOLLOW)`, `symlinkat`,
+/// `fclonefileat`), so nothing already sitting in `dst` (a planted link, or
+/// a case-folded name collision on a case-insensitive volume) is ever
+/// followed or overwritten; such a collision fails the copy.
 ///
-/// Regular files keep their permission bits. On macOS the bytes are cloned
-/// from the verified fd (`fclonefileat`, copy-on-write on APFS), falling
-/// back to a plain copy across volumes; elsewhere `std::io::copy`, which
-/// uses `copy_file_range` on Linux.
+/// A symlink is recreated verbatim only under
+/// [`relative_link_stays_inside`]'s rule (real checkouts commit these:
+/// `node_modules/.bin/*`, `lib-alias -> lib`); any other link is skipped
+/// and reported.
 ///
-/// `dst` is the caller's fresh, host-owned directory (created if absent)
-/// and is written by path.
+/// The walk holds one fd per level and refuses a tree deeper than
+/// [`MAX_TREE_DEPTH`]. Regular files keep their permission bits. On macOS
+/// the bytes are cloned from the verified fd (`fclonefileat`, copy-on-write
+/// on APFS), falling back to a plain copy across volumes; elsewhere
+/// `std::io::copy`, which uses `copy_file_range` on Linux.
 #[cfg(unix)]
 pub fn copy_tree_nofollow(src: &Path, dst: &Path) -> io::Result<TreeCopyReport> {
     let mut report = TreeCopyReport::default();
@@ -399,8 +443,15 @@ pub fn copy_tree_nofollow(src: &Path, dst: &Path) -> io::Result<TreeCopyReport> 
             ),
             _ => e,
         })?;
+    // `dst` is the caller's fresh, host-owned scratch directory; it is
+    // created by path, then held as an fd like the source.
     std::fs::create_dir_all(dst)?;
-    tree::walk(&root_fd, src, Path::new(""), dst, &mut report)?;
+    let dst_fd: std::os::fd::OwnedFd = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dst)?
+        .into();
+    tree::walk(&root_fd, src, Path::new(""), &dst_fd, 0, &mut report)?;
     Ok(report)
 }
 
@@ -412,12 +463,15 @@ pub fn copy_tree_nofollow(_src: &Path, _dst: &Path) -> io::Result<TreeCopyReport
 }
 
 #[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
+#[cfg(unix)]
 mod tree {
-    use super::{relative_link_stays_inside, TreeCopyReport};
+    use super::{relative_link_stays_inside, TreeCopyReport, MAX_TREE_DEPTH};
     use std::ffi::{CStr, CString, OsStr, OsString};
     use std::fs::File;
     use std::io;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -426,25 +480,55 @@ mod tree {
         CString::new(name.as_bytes()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
     }
 
+    fn check(rc: libc::c_int) -> io::Result<()> {
+        if rc < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
     pub(super) fn openat(dir: &OwnedFd, name: &OsStr, flags: libc::c_int) -> io::Result<OwnedFd> {
+        openat_mode(dir, name, flags, 0)
+    }
+
+    fn openat_mode(dir: &OwnedFd, name: &OsStr, flags: libc::c_int, mode: libc::c_uint) -> io::Result<OwnedFd> {
         let c = cstr(name)?;
         // SAFETY: live fd, valid C string.
-        let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags | libc::O_CLOEXEC) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags | libc::O_CLOEXEC, mode) };
+        check(fd)?;
         // SAFETY: freshly returned, unowned fd.
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
+    /// (#2869 C2) A close-on-exec duplicate, so a concurrent fork+exec
+    /// (another step's shell command) never inherits it.
+    pub(super) fn dup_cloexec(fd: &OwnedFd) -> io::Result<OwnedFd> {
+        // SAFETY: duplicating a live fd.
+        let d = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        check(d)?;
+        // SAFETY: freshly returned, unowned fd.
+        Ok(unsafe { OwnedFd::from_raw_fd(d) })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn errno_ptr() -> *mut libc::c_int {
+        // SAFETY: always valid for the calling thread.
+        unsafe { libc::__error() }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn errno_ptr() -> *mut libc::c_int {
+        // SAFETY: always valid for the calling thread.
+        unsafe { libc::__errno_location() }
+    }
+
     /// Entry names of the directory `dir` refers to, read through a dup of
-    /// that fd (never by path). `.` and `..` excluded.
+    /// that fd (never by path). `.` and `..` excluded. A `readdir` error
+    /// (errno set on a NULL return) is an error, not a short listing.
     fn list(dir: &OwnedFd) -> io::Result<Vec<OsString>> {
-        // SAFETY: dup of a live fd; fdopendir takes ownership of the dup.
-        let dupfd = unsafe { libc::dup(dir.as_raw_fd()) };
-        if dupfd < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let dupfd = dup_cloexec(dir)?.into_raw_fd();
+        // SAFETY: fdopendir takes ownership of the dup on success.
         let dp = unsafe { libc::fdopendir(dupfd) };
         if dp.is_null() {
             let e = io::Error::last_os_error();
@@ -454,40 +538,57 @@ mod tree {
         // The dup shares the file offset with `dir`; start from the top.
         unsafe { libc::rewinddir(dp) };
         let mut out = Vec::new();
-        loop {
-            // SAFETY: `dp` is a valid DIR*; the returned entry is valid until
-            // the next readdir on it, and we copy the name out immediately.
+        let result = loop {
+            // SAFETY: resetting this thread's errno so a NULL from readdir
+            // can be told apart as end-of-directory vs error.
+            unsafe { *errno_ptr() = 0 };
+            // SAFETY: `dp` is a valid DIR*; the entry is valid until the
+            // next readdir on it, and the name is copied out immediately.
             let ent = unsafe { libc::readdir(dp) };
             if ent.is_null() {
-                break;
+                let errno = unsafe { *errno_ptr() };
+                break if errno == 0 { Ok(()) } else { Err(io::Error::from_raw_os_error(errno)) };
             }
             let name = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) }.to_bytes();
             if name != b"." && name != b".." {
                 out.push(OsString::from_vec(name.to_vec()));
             }
-        }
+        };
         unsafe { libc::closedir(dp) };
-        Ok(out)
+        result.map(|()| out)
     }
 
     fn lstat_at(dir: &OwnedFd, name: &OsStr) -> io::Result<libc::stat> {
         let c = cstr(name)?;
         // SAFETY: zeroed stat is a valid out-param; fd and string are live.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        let rc = unsafe { libc::fstatat(dir.as_raw_fd(), c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        check(unsafe { libc::fstatat(dir.as_raw_fd(), c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) })?;
         Ok(st)
+    }
+
+    fn type_name(mode: libc::mode_t) -> &'static str {
+        match mode & libc::S_IFMT {
+            libc::S_IFDIR => "directory",
+            libc::S_IFREG => "regular file",
+            libc::S_IFLNK => "symlink",
+            libc::S_IFIFO => "fifo",
+            libc::S_IFSOCK => "socket",
+            libc::S_IFCHR => "character device",
+            libc::S_IFBLK => "block device",
+            _ => "unknown file type",
+        }
+    }
+
+    /// What `name` is NOW (for the message when it changed under us).
+    fn now_is(dir: &OwnedFd, name: &OsStr) -> &'static str {
+        lstat_at(dir, name).map(|st| type_name(st.st_mode)).unwrap_or("gone")
     }
 
     fn readlink_at(dir: &OwnedFd, name: &OsStr) -> io::Result<PathBuf> {
         let c = cstr(name)?;
         let mut buf = vec![0u8; libc::PATH_MAX as usize + 1];
         // SAFETY: buffer is writable for its full length.
-        let n = unsafe {
-            libc::readlinkat(dir.as_raw_fd(), c.as_ptr(), buf.as_mut_ptr().cast(), buf.len())
-        };
+        let n = unsafe { libc::readlinkat(dir.as_raw_fd(), c.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -495,48 +596,80 @@ mod tree {
         Ok(PathBuf::from(OsString::from_vec(buf)))
     }
 
-    /// Copy the verified regular file `from` to `dst_dir/name`.
-    fn copy_file(from: File, dst_dir: &Path, name: &OsStr, mode: u32) -> io::Result<()> {
-        let dst = dst_dir.join(name);
+    /// Copy the verified regular file `from` to `dst_dir/name`, created
+    /// exclusively relative to the destination directory's fd.
+    fn copy_file(from: File, dst_dir: &OwnedFd, name: &OsStr, mode: u32) -> io::Result<()> {
+        let mode = mode & 0o7777;
         #[cfg(target_os = "macos")]
         {
-            let dst_dir_fd: OwnedFd = File::open(dst_dir)?.into();
             let c = cstr(name)?;
             // `CLONE_NOFOLLOW` from <sys/clonefile.h>; the libc crate does
-            // not export it. Never follow at the destination either.
+            // not export it. fclonefileat never overwrites (EEXIST).
             const CLONE_NOFOLLOW: u32 = 0x0001;
             // SAFETY: both fds live, valid C string.
-            let rc = unsafe {
-                libc::fclonefileat(from.as_raw_fd(), dst_dir_fd.as_raw_fd(), c.as_ptr(), CLONE_NOFOLLOW)
-            };
+            let rc = unsafe { libc::fclonefileat(from.as_raw_fd(), dst_dir.as_raw_fd(), c.as_ptr(), CLONE_NOFOLLOW) };
             if rc == 0 {
                 #[cfg(test)]
                 super::CLONED_FILES.with(|n| n.set(n.get() + 1));
-                std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(mode & 0o7777))?;
+                // SAFETY: live fd, valid C string; does not follow a link.
+                check(unsafe {
+                    libc::fchmodat(dst_dir.as_raw_fd(), c.as_ptr(), mode as libc::mode_t, libc::AT_SYMLINK_NOFOLLOW)
+                })?;
                 return Ok(());
+            }
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EEXIST) {
+                return Err(e);
             }
             // Not clonable (another volume, not APFS): plain copy below.
         }
+        let to = openat_mode(
+            dst_dir,
+            name,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+            0o600,
+        )?;
+        let mut to = File::from(to);
         let mut from = from;
-        let mut to = File::create(&dst)?;
         io::copy(&mut from, &mut to)?;
-        to.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))?;
+        to.set_permissions(std::fs::Permissions::from_mode(mode))?;
         Ok(())
+    }
+
+    fn mkdir_at(dst_dir: &OwnedFd, name: &OsStr) -> io::Result<OwnedFd> {
+        let c = cstr(name)?;
+        // SAFETY: live fd, valid C string. EEXIST (anything already there,
+        // including a link) is an error: nothing pre-existing is reused.
+        check(unsafe { libc::mkdirat(dst_dir.as_raw_fd(), c.as_ptr(), 0o777) })?;
+        openat(dst_dir, name, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+    }
+
+    fn symlink_at(target: &Path, dst_dir: &OwnedFd, name: &OsStr) -> io::Result<()> {
+        let t = cstr(target.as_os_str())?;
+        let c = cstr(name)?;
+        // SAFETY: live fd, valid C strings.
+        check(unsafe { libc::symlinkat(t.as_ptr(), dst_dir.as_raw_fd(), c.as_ptr()) })
     }
 
     pub(super) fn walk(
         dir: &OwnedFd,
         src_dir: &Path,
         rel: &Path,
-        dst_dir: &Path,
+        dst_dir: &OwnedFd,
+        depth: usize,
         report: &mut TreeCopyReport,
     ) -> io::Result<()> {
+        if depth > MAX_TREE_DEPTH {
+            return Err(io::Error::other(format!(
+                "{} is nested deeper than {MAX_TREE_DEPTH} directories; refusing to copy it",
+                src_dir.display()
+            )));
+        }
         let names = list(dir)?;
         #[cfg(test)]
         super::run_after_list_hook(src_dir);
         for name in names {
             let rel_entry = rel.join(&name);
-            let skip = |report: &mut TreeCopyReport, why: String| report.skipped.push((rel_entry.clone(), why));
             let st = match lstat_at(dir, &name) {
                 Ok(st) => st,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
@@ -544,25 +677,28 @@ mod tree {
             };
             #[cfg(test)]
             super::run_before_open_hook(&src_dir.join(&name));
+            let changed = |report: &mut TreeCopyReport, was: &str| {
+                let why = format!("changed from a {was} to a {} during the copy", now_is(dir, &name));
+                report.skipped.push((rel_entry.clone(), why));
+            };
             match st.st_mode & libc::S_IFMT {
                 libc::S_IFDIR => {
                     let sub = match openat(dir, &name, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW) {
                         Ok(fd) => fd,
                         Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) => {
-                            skip(report, "changed from a directory to a symlink during the copy".into());
+                            changed(report, "directory");
                             continue;
                         }
                         Err(e) => return Err(e),
                     };
-                    let dst_sub = dst_dir.join(&name);
-                    std::fs::create_dir_all(&dst_sub)?;
-                    walk(&sub, &src_dir.join(&name), &rel_entry, &dst_sub, report)?;
+                    let dst_sub = mkdir_at(dst_dir, &name)?;
+                    walk(&sub, &src_dir.join(&name), &rel_entry, &dst_sub, depth + 1, report)?;
                 }
                 libc::S_IFREG => {
                     let fd = match openat(dir, &name, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK) {
                         Ok(fd) => fd,
                         Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::EMLINK)) => {
-                            skip(report, "changed from a file to a symlink during the copy".into());
+                            changed(report, "regular file");
                             continue;
                         }
                         Err(e) => return Err(e),
@@ -570,7 +706,7 @@ mod tree {
                     let file = File::from(fd);
                     let meta = file.metadata()?;
                     if !meta.file_type().is_file() {
-                        skip(report, "changed to a non-regular file during the copy".into());
+                        changed(report, "regular file");
                         continue;
                     }
                     copy_file(file, dst_dir, &name, meta.permissions().mode())?;
@@ -579,16 +715,19 @@ mod tree {
                 libc::S_IFLNK => {
                     let target = readlink_at(dir, &name)?;
                     if target.is_relative() && relative_link_stays_inside(rel, &target) {
-                        std::os::unix::fs::symlink(&target, dst_dir.join(&name))?;
+                        symlink_at(&target, dst_dir, &name)?;
                         report.links_recreated.push(rel_entry);
                     } else {
-                        skip(
-                            report,
-                            format!("symlink to `{}` points outside the tree (not recreated)", target.display()),
-                        );
+                        report.skipped.push((
+                            rel_entry,
+                            format!(
+                                "symlink to `{}` could resolve outside the tree (not recreated)",
+                                target.display()
+                            ),
+                        ));
                     }
                 }
-                _ => skip(report, "not a regular file, directory or symlink".into()),
+                other => report.skipped.push((rel_entry, format!("{} (not copied)", type_name(other)))),
             }
         }
         Ok(())
@@ -786,6 +925,155 @@ mod tests {
         assert!(!relative_link_stays_inside(Path::new(""), Path::new("..")));
         assert!(!relative_link_stays_inside(Path::new("a"), Path::new("/etc/hosts")));
         assert!(relative_link_stays_inside(Path::new("a/b"), Path::new("./../../c")));
+        // (#2869 F1) `..` after a Normal component is refused: the kernel
+        // resolves the Normal first, and it may itself be a recreated link.
+        assert!(!relative_link_stays_inside(Path::new(""), Path::new("x/..")));
+        assert!(!relative_link_stays_inside(Path::new(""), Path::new("sub/up/../s")));
+        assert!(relative_link_stays_inside(Path::new("node_modules/.bin"), Path::new("../pkg/bin.js")));
+    }
+
+    /// (#2869 F1, the review's probe) `sub/up -> ..` is a legitimate in-tree
+    /// link, but `esc -> sub/up/sub/up/../HOST-SECRET` climbs through it:
+    /// lexically `up/..` cancels, physically `sub/up` is the root and `..`
+    /// from it is the directory ABOVE the copy. Recreating `esc` would let
+    /// `test_command` read a host file through the scratch checkout.
+    #[test]
+    fn copy_tree_nofollow_does_not_recreate_a_link_that_climbs_through_another_link() {
+        let (t, root, _s) = setup();
+        symlink("..", root.join("sub/up")).unwrap();
+        symlink("sub/up/sub/up/../HOST-SECRET", root.join("esc")).unwrap();
+        fs::write(t.path().join("HOST-SECRET"), "HOST").unwrap();
+        let dst = t.path().join("dst");
+
+        let report = copy_tree_nofollow(&root, &dst).unwrap();
+
+        assert!(
+            fs::read_to_string(dst.join("esc")).is_err(),
+            "dst/esc resolves to a host file outside the copy"
+        );
+        assert!(report.skipped.iter().any(|(p, _)| p == Path::new("esc")), "{:?}", report.skipped);
+        assert_eq!(fs::read_link(dst.join("sub/up")).unwrap(), Path::new(".."), "the plain in-tree link stays");
+    }
+
+    /// (#2869 C3) One fd is held per directory level; a tree deeper than
+    /// the cap is refused with a clear error instead of hitting EMFILE.
+    #[test]
+    fn copy_tree_nofollow_refuses_a_tree_deeper_than_the_cap() {
+        let (t, root, _s) = setup();
+        let mut deep = root.clone();
+        for _ in 0..(MAX_TREE_DEPTH + 2) {
+            deep.push("d");
+        }
+        fs::create_dir_all(&deep).unwrap();
+        let err = copy_tree_nofollow(&root, &t.path().join("dst")).unwrap_err();
+        assert!(err.to_string().contains("deeper than"), "{err}");
+    }
+
+    /// (#2869 C2) The fd `fdopendir` consumes is a close-on-exec dup, so a
+    /// concurrent fork+exec (a gate's `test_command`) never inherits it.
+    #[test]
+    fn dup_cloexec_sets_close_on_exec() {
+        let f = File::open(".").unwrap();
+        let fd: std::os::fd::OwnedFd = f.into();
+        let d = tree::dup_cloexec(&fd).unwrap();
+        use std::os::fd::AsRawFd;
+        // SAFETY: querying flags of a live fd.
+        let flags = unsafe { libc::fcntl(d.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0, "flags {flags}");
+    }
+
+    /// (#2869 C4) Destination writes never follow a link already sitting in
+    /// the destination: a planted `dst/f.txt -> <host file>` is not written
+    /// through, and a planted `dst/sub -> <host dir>` is not written into.
+    #[test]
+    fn copy_tree_nofollow_does_not_write_through_links_in_the_destination() {
+        let (t, root, _s) = setup();
+        fs::write(root.join("f.txt"), "FROM-SRC").unwrap();
+        fs::write(root.join("sub/g.txt"), "FROM-SRC").unwrap();
+        let host_file = t.path().join("host-file");
+        fs::write(&host_file, "ORIGINAL").unwrap();
+        let host_dir = t.path().join("host-dir");
+        fs::create_dir_all(&host_dir).unwrap();
+
+        let dst = t.path().join("dst");
+        fs::create_dir_all(&dst).unwrap();
+        symlink(&host_file, dst.join("f.txt")).unwrap();
+        let _ = copy_tree_nofollow(&root, &dst);
+        assert_eq!(fs::read_to_string(&host_file).unwrap(), "ORIGINAL", "wrote through a dst file link");
+
+        let dst2 = t.path().join("dst2");
+        fs::create_dir_all(&dst2).unwrap();
+        symlink(&host_dir, dst2.join("sub")).unwrap();
+        let _ = copy_tree_nofollow(&root, &dst2);
+        assert!(!host_dir.join("g.txt").exists(), "wrote into a dst directory link");
+    }
+
+    /// (#2869 C6) An entry swapped between the type check and the open is
+    /// reported as what it actually became, not always "symlink".
+    #[test]
+    fn a_swapped_entry_is_reported_as_its_actual_type() {
+        let (t, root, _s) = setup();
+        fs::create_dir_all(root.join("d")).unwrap();
+        let dst = t.path().join("dst");
+        let report = copy_with_swap_before_open(&root, "d", |p| {
+            fs::remove_dir(p).unwrap();
+            let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+            // SAFETY: valid NUL-terminated path.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        }, &dst);
+        let why = &report.skipped.iter().find(|(p, _)| p == Path::new("d")).expect("skipped").1;
+        assert!(why.contains("fifo") && !why.contains("symlink"), "{why}");
+    }
+
+    /// (#2869 C5) An over-cap source leaves nothing at the destination.
+    #[test]
+    fn copy_contained_leaves_nothing_behind_for_an_over_cap_file() {
+        let (t, root, _s) = setup();
+        fs::write(root.join("sub/big"), vec![b'x'; 64]).unwrap();
+        let dst = t.path().join("big-copy");
+        let err = copy_contained(&root, Path::new("sub/big"), &dst, 10).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+        assert!(!dst.exists(), "a partial copy was left behind");
+        assert_eq!(copy_contained(&root, Path::new("sub/big"), &dst, 64).unwrap(), 64);
+        assert_eq!(fs::read(&dst).unwrap().len(), 64);
+    }
+
+    /// Timing: the fd-walk copy against the pre-#2869 std walk. Not a
+    /// gate; run with `--run-ignored only --no-capture` to print numbers.
+    #[test]
+    #[ignore]
+    fn bench_tree_copy_35k_files() {
+        fn std_copy(src: &Path, dst: &Path) {
+            fs::create_dir_all(dst).unwrap();
+            for e in fs::read_dir(src).unwrap() {
+                let e = e.unwrap();
+                let ft = e.file_type().unwrap();
+                if ft.is_dir() {
+                    std_copy(&e.path(), &dst.join(e.file_name()));
+                } else if ft.is_file() {
+                    fs::copy(e.path(), dst.join(e.file_name())).unwrap();
+                }
+            }
+        }
+        let t = TempDir::new().unwrap();
+        let src = t.path().join("src");
+        for d in 0..350 {
+            let dir = src.join(format!("d{}/e{}", d / 20, d));
+            fs::create_dir_all(&dir).unwrap();
+            for f in 0..100 {
+                fs::write(dir.join(format!("f{f}.rs")), format!("// file {d}/{f}\n{}", "x".repeat(200))).unwrap();
+            }
+        }
+        for round in 0..3 {
+            let a = std::time::Instant::now();
+            std_copy(&src, &t.path().join(format!("std{round}")));
+            let std_ms = a.elapsed().as_millis();
+            let b = std::time::Instant::now();
+            let r = copy_tree_nofollow(&src, &t.path().join(format!("fd{round}"))).unwrap();
+            let fd_ms = b.elapsed().as_millis();
+            assert_eq!(r.files, 35_000);
+            eprintln!("round {round}: std fs::copy walk {std_ms} ms, copy_tree_nofollow {fd_ms} ms");
+        }
     }
 
     /// Swap `src/<name>` for `with` between the walk's type check and its

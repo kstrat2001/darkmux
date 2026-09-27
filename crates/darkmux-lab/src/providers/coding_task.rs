@@ -1385,8 +1385,8 @@ fn sum_rest_ms_from_events(events: &[serde_json::Value]) -> u64 {
 /// read: `root` may be a model-writable sandbox. A refusal is warned and
 /// treated as absent, so `inspect` falls back to the trajectory counts.
 fn read_metrics_json(root: &Path, rel: &Path) -> Option<InternalRuntimeMetrics> {
-    use darkmux_crew::contained_file::{read_contained_to_string, DEFAULT_MAX_BYTES};
-    let raw = match read_contained_to_string(root, rel, DEFAULT_MAX_BYTES) {
+    use darkmux_crew::contained_file::{read_contained_to_string, SMALL_FILE_MAX_BYTES};
+    let raw = match read_contained_to_string(root, rel, SMALL_FILE_MAX_BYTES) {
         Ok(raw) => raw,
         Err(e) => {
             if e.is_refused() {
@@ -1472,7 +1472,9 @@ pub(crate) fn preserve_runtime_artifacts(
     run_dir: &Path,
     names: &[&str],
 ) -> PreservedArtifacts {
-    use darkmux_crew::contained_file::{copy_contained, ContainedFileError, DEFAULT_MAX_BYTES};
+    use darkmux_crew::contained_file::{
+        copy_contained, ContainedFileError, DEFAULT_MAX_BYTES, SMALL_FILE_MAX_BYTES,
+    };
     let mut out = PreservedArtifacts::default();
     for name in names {
         // (#2869) `out_dir` is writable by the model's tools, so `fs::copy`
@@ -1481,7 +1483,10 @@ pub(crate) fn preserve_runtime_artifacts(
         // `.darkmux-runtime/<name>` with O_NOFOLLOW at every component and
         // copies only a regular file, bounded in size.
         let rel = Path::new(".darkmux-runtime").join(name);
-        match copy_contained(out_dir, &rel, &run_dir.join(name), DEFAULT_MAX_BYTES) {
+        // metrics.json is a few hundred bytes when genuine; the streams
+        // (trajectory, findings) get the default cap.
+        let cap = if *name == "metrics.json" { SMALL_FILE_MAX_BYTES } else { DEFAULT_MAX_BYTES };
+        match copy_contained(out_dir, &rel, &run_dir.join(name), cap) {
             Ok(_) => out.copied.push((*name).to_string()),
             Err(ContainedFileError::NotFound) => {}
             Err(ContainedFileError::Refused(reason)) => {
