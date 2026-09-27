@@ -236,7 +236,8 @@ use std::path::Path;
 //   1.27 (#2846): one additive block under `runtime`.
 //           `detection{}` — per-detector policy. `degeneracy.policy` is
 //           `enforce` (act) / `observe` (measure, never act) / `off` (do
-//           not measure). Written visibly by `init` at `enforce`, so an
+//           not measure); renamed in 1.31 (#2947). Written visibly by
+//           `init` at `enforce`, so an
 //           older binary ignoring the block behaves exactly as the
 //           default does.
 //           The value is stored as a STRING, not a derived enum: this
@@ -245,7 +246,8 @@ use std::path::Path;
 //           config on one typo. Same reason `fleet.mode` is a string.
 //           Parsing happens at the accessor, which reports an
 //           unrecognized value as `config-invalid` rather than coercing
-//           it silently.
+//           it silently. (Superseded by the #2947 note below: an
+//           unrecognized value is now refused, not reported and armed.)
 //   1.28 (#2914, darkmux 4.0): REMOVED `radio.router_profile` (added in
 //           1.7). The radio ROUTING seat runs on the machine's one utility
 //           model (`internal.utility` in profiles.json) and is never staffed
@@ -287,7 +289,29 @@ use std::path::Path;
 //           100..=1000 at the accessor, which reports the clamp. `Option<u64>`,
 //           lenient-on-read: an older binary ignores it and has no live
 //           channel, exactly as before.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.30";
+//   1.31 (#2947, darkmux 4.0): VALUE change, no field change.
+//           `runtime.detection.degeneracy.policy` values now name the
+//           action: `off` / `record` / `warn` / `conclude` (was `off` /
+//           `observe` / `enforce`). `init` writes `conclude`. Bumped although
+//           no field changed, because a config written by `init` at 1.30 or earlier
+//           carries `"policy": "enforce"`, which this binary REFUSES (the
+//           retired spelling is refused with its replacement named, never
+//           read as `conclude`): the file still loads (lenient read), but every
+//           dispatch, mission launch and lab run refuses until the value is
+//           changed, and `darkmux doctor` prints the exact `config set`.
+//           Also added under the same rule: `hooks.rules[].match.level` /
+//           `.category` are validated against the flow vocabulary (a typo
+//           used to match nothing); no shape change there either.
+//           The same release makes every enum-valued key (the policy,
+//           `runtime.thermal.pause_at` / `resume_at`, `fleet.mode`,
+//           `fleet.identity.provider`, the hook `match` fields) follow one
+//           rule (`config_enum`): still read leniently as strings, but an
+//           unregistered value is refused where it is consumed and reported
+//           as Fail by `darkmux doctor`, never resolved to a fallback.
+//           (The acting value was briefly spelled `cut` on the #2947
+//           branch and renamed to `conclude` before anything shipped, so
+//           `cut` is not a retired spelling.)
+pub const CONFIG_SCHEMA_VERSION: &str = "1.31";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -767,20 +791,34 @@ pub struct RuntimeBehaviorConfig {
 /// So the field on [`DetectorConfig`] is a plain `Option<String>` and the
 /// token is resolved at the accessor, where an unrecognized value can be
 /// reported against the raw string instead of taking the document with it.
+///
+/// (#2947, operator 2026-09-27) The values NAME THE ACTION: `off`, `record`,
+/// `warn`, and the rule's own verb (`conclude` for the degeneracy
+/// detector: it closes the model's thought so it answers from what it has,
+/// and escalates if the output keeps repeating; nothing is discarded).
+/// `enforce` and `observe` are retired in 4.0: `enforce` hid different
+/// actions per rule, and `observe` read like "warns" when it only recorded.
+/// Both are refused with the new word (`config_enum!`'s `retired` list).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DetectionPolicy {
-    /// Detect and act on what is found. The shipped behavior.
-    #[default]
-    Enforce,
-    /// Detect and RECORD, but never act. The record carries what the
-    /// detector would have done, so the counterfactual is measurable
-    /// without paying for it. This is the setting that makes a controlled
-    /// comparison possible: the check-in cadence, the per-call token cap
-    /// and therefore the usable prompt budget are all unchanged, so the
-    /// only variable is whether the verdict is obeyed.
-    Observe,
-    /// Do not run the detector at all. Cheapest, and measures nothing.
+    /// Do not run the detector at all. Zero CPU, measures nothing.
     Off,
+    /// Detect and RECORD, silently, what concluding would have done; never act
+    /// and never warn. The setting that makes a controlled comparison
+    /// possible: the check-in cadence, the per-call token cap and therefore
+    /// the usable prompt budget are all unchanged, so the only variable is
+    /// whether the verdict is obeyed. (Was `observe`.)
+    Record,
+    /// Detect, and on a finding SURFACE a warning (a stderr line for the
+    /// dispatch, a `dispatch.degeneracy.warning` flow record the viewer
+    /// shows, and the run envelope's `degeneracy_warnings`), without
+    /// concluding anything.
+    Warn,
+    /// Detect, and on repeating output conclude: close the model's thought
+    /// so it answers from what it has, escalating if it keeps repeating.
+    /// The shipped behavior, unchanged. (Was `enforce`.)
+    #[default]
+    Conclude,
 }
 
 impl DetectionPolicy {
@@ -790,33 +828,72 @@ impl DetectionPolicy {
     }
     /// Whether a finding may change what the dispatch does.
     pub fn acts(self) -> bool {
-        matches!(self, DetectionPolicy::Enforce)
+        matches!(self, DetectionPolicy::Conclude)
     }
-    /// Strict-but-non-fatal parse. Returns `None` for an unrecognized value,
-    /// kept distinct from `Some(Enforce)` so a caller (`darkmux doctor`,
-    /// `darkmux config set`) can flag the typo against the raw string rather
-    /// than silently coercing it — the same split [`FleetMode::parse`]
-    /// makes, and for the same reason.
-    ///
-    /// Callers that must produce a value resolve `None` to `Enforce`: the
-    /// ARMED direction on purpose, since a typo that disarmed a guard would
-    /// be silent.
-    pub fn parse_lenient(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "enforce" => Some(DetectionPolicy::Enforce),
-            "observe" => Some(DetectionPolicy::Observe),
-            "off" => Some(DetectionPolicy::Off),
-            _ => None,
-        }
+    /// Whether a finding is surfaced as a warning without acting.
+    pub fn warns(self) -> bool {
+        matches!(self, DetectionPolicy::Warn)
     }
     pub fn as_str(self) -> &'static str {
-        match self {
-            DetectionPolicy::Enforce => "enforce",
-            DetectionPolicy::Observe => "observe",
-            DetectionPolicy::Off => "off",
-        }
+        crate::config_enum::ConfigEnum::token(self)
     }
 }
+
+// (#2947) The value table: tokens, meanings, retired spellings, and
+// (through the macro's exhaustive match) the parser. An unknown or retired
+// value is refused at the accessor
+// (`config_access::detection_degeneracy_policy`), never resolved to a
+// default: see `config_enum`'s module doc for the rule.
+crate::config_enum!(DetectionPolicy, "detection policy", [
+    Off = "off" => "the detector does not run (zero CPU, measures nothing)",
+    Record = "record" => "measure and record what concluding would have done, silently; never act",
+    Warn = "warn" => "measure; on a finding surface a warning (stderr, flow record, envelope); never conclude",
+    Conclude = "conclude" => "measure; on repeating output close the thought so the model answers, escalating if it keeps repeating (the shipped behavior)",
+], retired: [
+    "enforce" => Conclude,
+    "observe" => Record,
+]);
+
+/// (#2947 review C2) The flow-record `level` a hook rule's `match.level`
+/// names. The config vocabulary of `darkmux_flow::Level` (declared here so
+/// the registry, which lives in this leaf crate, can hold it; darkmux-flow's
+/// `hook_match_vocabulary_matches_the_flow_schema` pins the two together).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+crate::config_enum!(HookLevel, "flow record level", [
+    Error = "error" => "records at error level",
+    Warn = "warn" => "records at warn level",
+    Info = "info" => "records at info level",
+    Debug = "debug" => "records at debug level",
+    Trace = "trace" => "records at trace level",
+]);
+
+/// (#2947 review C2) The flow-record `category` a hook rule's
+/// `match.category` names; the config vocabulary of
+/// `darkmux_flow::Category` (same arrangement as [`HookLevel`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookCategory {
+    Work,
+    Machinery,
+    Audit,
+    Review,
+    Telemetry,
+}
+
+crate::config_enum!(HookCategory, "flow record category", [
+    Work = "work" => "records of the work itself (dispatches, missions)",
+    Machinery = "machinery" => "records of darkmux's own machinery",
+    Audit = "audit" => "audit-trail records (decisions, notes)",
+    Review = "review" => "review records",
+    Telemetry = "telemetry" => "per-dispatch instrument samples",
+]);
 
 /// (#2846) One detector's settings. Split per detector rather than one global
 /// policy because the detectors are independent: an engine whose reasoning
@@ -1006,9 +1083,10 @@ pub struct FleetConfig {
 /// (#2916) The identity source for fleet work submission: the overlay
 /// network whose own daemon answers "which node is on the other end of this
 /// connection". `provider` is a VALUE (`"tailscale"` is the one this darkmux
-/// knows); an unknown value resolves to no provider, and no provider means
-/// every submission is refused (fail closed). Stored as a string, like
-/// `fleet.mode`, so a typo never fails the whole-config parse.
+/// knows); an unknown value is bad config (#2947): fleet work submission
+/// refuses it at preflight on both sides, and `darkmux doctor` reports
+/// Fail. Stored as a string, like `fleet.mode`, so a typo never fails the
+/// whole-config parse.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FleetIdentityConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub provider: Option<String>,
@@ -1588,26 +1666,61 @@ impl FleetMode {
     /// The canonical lowercase token — the `config.json` value and the
     /// `DARKMUX_FLEET_MODE` env token.
     pub fn as_str(self) -> &'static str {
-        match self {
-            FleetMode::Standalone => "standalone",
-            FleetMode::Hub => "hub",
-            FleetMode::Peer => "peer",
-        }
-    }
-
-    /// Parse an operator-declared token (trimmed, case-insensitive). Returns
-    /// `None` for an unrecognized value — kept distinct from "standalone" so a
-    /// caller (e.g. `darkmux doctor`, #934) can flag a typo against the raw
-    /// string rather than this silently coercing it.
-    pub fn parse(s: &str) -> Option<FleetMode> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "standalone" => Some(FleetMode::Standalone),
-            "hub" => Some(FleetMode::Hub),
-            "peer" => Some(FleetMode::Peer),
-            _ => None,
-        }
+        crate::config_enum::ConfigEnum::token(self)
     }
 }
+
+// (#2947) Parsing (trimmed, case-insensitive) comes from `ConfigEnum::parse`;
+// an unrecognized token is refused at `config_access::fleet_mode`, never
+// read as `standalone`.
+crate::config_enum!(FleetMode, "fleet position", [
+    Standalone = "standalone" => "a single machine that coordinates nothing",
+    Hub = "hub" => "the always-on coordinator",
+    Peer = "peer" => "a machine that points at a hub",
+]);
+
+/// (#2947) An OS thermal state, as `runtime.thermal.pause_at` / `resume_at`
+/// name one. Declared in severity order, mildest first: the governor ranks a
+/// state by its position (`darkmux_crew::host_probe::thermal::THERMAL_STATES`
+/// is this enum's token list), so the order is load-bearing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThermalState {
+    Nominal,
+    Fair,
+    Serious,
+    Critical,
+}
+
+impl ThermalState {
+    pub fn as_str(self) -> &'static str {
+        crate::config_enum::ConfigEnum::token(self)
+    }
+}
+
+crate::config_enum!(ThermalState, "thermal state", [
+    Nominal = "nominal" => "no thermal pressure",
+    Fair = "fair" => "slightly elevated; the OS may start to throttle",
+    Serious = "serious" => "high; the OS is throttling",
+    Critical = "critical" => "the OS is throttling hard; the breaker's own threshold",
+]);
+
+/// (#2947) The overlay network that verifies which machine is on the other
+/// end of a fleet connection (`fleet.identity.provider`). A VALUE, never a
+/// field or type name, per the no-vendor-names-in-identifiers rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityProvider {
+    Tailscale,
+}
+
+impl IdentityProvider {
+    pub fn as_str(self) -> &'static str {
+        crate::config_enum::ConfigEnum::token(self)
+    }
+}
+
+crate::config_enum!(IdentityProvider, "identity provider", [
+    Tailscale = "tailscale" => "the tailnet's own daemon answers who is connecting (`whois`)",
+]);
 
 impl DarkmuxConfig {
     /// The full, self-documenting default config that `darkmux init` writes —
@@ -1704,7 +1817,7 @@ impl DarkmuxConfig {
                 // `thermal`: the operator tunes the file, not the source.
                 detection: Some(DetectionConfig {
                     degeneracy: Some(DetectorConfig {
-                        policy: Some(DetectionPolicy::Enforce.as_str().to_string()),
+                        policy: Some(DetectionPolicy::Conclude.as_str().to_string()),
                         extras: Default::default(),
                     }),
                     extras: Default::default(),
@@ -1868,6 +1981,7 @@ impl DarkmuxConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config_enum::ConfigEnum;
 
     /// (#1323) The config seam's self-defending conformance test: a project-local
     /// `.darkmux/config.json` (created for missions/phases/lessons) must NEVER

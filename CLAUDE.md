@@ -257,9 +257,12 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
 6. **Frozen model-facing text** — measured prompts/personas live in ONE artifact with golden
    tests generated from the reference implementation; assembly and request bodies are
    byte-locked (#1256). "Frozen" means one hash, not one intention.
-7. **Config leniency** — registries and config files are lenient-on-read; semantic validation
+7. **Config leniency** — registries and config files are lenient-on-read: one bad value never
+   fails the whole-file parse, so it can never discard the other settings. Semantic validation
    lives at resolution/consumption time and in `darkmux doctor`, never on the hot load path
-   (#1269).
+   (#1269). Lenient READING is not lenient CONSUMING: a value that fails validation is refused
+   where it is consumed and named by doctor, never quietly replaced by a default. For enum-valued
+   settings that rule is contract 9.
 8. **Work-unit vocabulary** — the four operator-visible work nouns each denote ONE grain,
    and every surface (CLI verb, hash route, wire type, UI label, doc) uses them at that grain
    (#1974). The containment ladder is **mission > phase > task > step > role execution**:
@@ -399,6 +402,45 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    information about the semantics.
 
    Conformance: every detail hash route is named for the `RunKind` it opens.
+
+9. **Enum-valued settings** — an unregistered value in an enum-typed setting is bad config
+   (#2947). It is never resolved to a fallback, in either direction. Every entry point that COULD
+   consume it refuses at preflight, before minting anything, even when one particular run through
+   it would not read the value (a tool-less remote dispatch and the thermal ladder, say): bad
+   config is bad config, and a refusal must not depend on which code path a run happens to take.
+   The refusal names the raw value, where it was
+   set (env var or `config.json` key) and the valid values; `darkmux doctor` reports it as Fail;
+   `darkmux config set` refuses it; and help (`config set <key>` with no value, `config list`,
+   `config set --help`) lists the valid values with their meanings. `--skip-preflight` does not
+   waive it: that flag skips a Docker probe, and a bad config value is not a probe result.
+   A setting that no work-starting entry point reads is refused by no preflight, by design, and
+   its registry entry carries a `no_scope_reason` that doctor prints instead of claiming a
+   refusal: today `fleet.mode` (a bad value only makes viewer links use the direct address, with
+   a warning) and a hook rule's `match.level` / `match.category` (a bad value turns the hooks sink
+   off, loudly, while the run continues without it).
+
+   Retired spellings are refused too, naming the replacement ("`enforce` was renamed to `conclude`
+   in 4.0"): a rename never reads the old word as the new one. Policy values name the action
+   (`off` / `record` / `warn` / the rule's own verb, e.g. `conclude`), never `enforce`/`observe`.
+
+   The mechanism is two declarations in `darkmux-types/src/config_enum.rs`, and everything else
+   derives from them with no per-setting code: a `ConfigEnum` (implemented with `config_enum!`,
+   one row per value, its token and one-line meaning, plus any retired spellings, with an
+   exhaustive `match` so the value list cannot drift from the Rust enum) and an entry in
+   `ENUM_SETTINGS` (key, env var, shipped value, and the consuming `Scope`s: dispatch, mission
+   launch, lab run, fleet submission; or a per-item entry such as `hooks.rules[].match.level`,
+   checked where the list is loaded).
+   Storage stays a string parsed at the accessor, so contract 7's lenient read holds. A new enum
+   setting is those two declarations plus a one-line accessor over `config_access::resolve_enum`.
+   Conformance: `config_cmd::every_enum_setting_obeys_the_rule_on_every_surface` iterates the
+   registry across preflight, doctor, `config set` and help; `tests/cli.rs`'s
+   `every_enum_setting_is_refused_by_every_cli_entry_point_that_consumes_it` spawns each entry
+   point; and `config_enum::every_enum_in_the_config_schema_is_registered` fails on an unregistered
+   enum of any visibility in darkmux-types, an unregistered `config_enum!` anywhere, or a
+   hand-rolled string-literal token match at a config accessor. Its limit: a string compared
+   with `==` against a literal outside those files is not seen, and stays a review question. `docs/ENVIRONMENT.md`'s value lists are drift-tested
+   against the registry. Per-endpoint `profiles.json` enums (`managed`, `dialect`) share the
+   `ConfigEnum` value tables but keep their own refuse-at-use path through `Lenient<T>`.
 
 Enforcement is structural, not procedural: every contract gets a conformance test where one
 is expressible (golden files, emission-sequence assertions, boundary tests), and every review

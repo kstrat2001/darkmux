@@ -1692,6 +1692,13 @@ async fn run_no_slash_route(
     seat: AnsweringSeat,
     sessions: &Sessions,
 ) -> Result<()> {
+    // (#2947 review C4) Bad enum config refuses before the routing call,
+    // said in the panel as it is, rather than the routing dispatch failing
+    // and the turn degrading into an "answering seat failed" fallback.
+    if let Err(bad) = darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::Dispatch) {
+        cx.send_notification(agent_chunk(session_id, format!("darkmux radio: {bad}\n")))?;
+        return Ok(());
+    }
     let text_owned = text.to_string();
     let mut routing = tokio::task::spawn_blocking(move || {
         let catalog = crate::radio::compile_catalog();
@@ -3036,6 +3043,29 @@ mod tests {
             chunk_text(&first)
         );
 
+        let final_response = recv_json(&mut reader).await;
+        assert_end_turn(&final_response);
+    }
+
+    /// (#2947 review C4) A no-slash prompt with bad enum config refuses in
+    /// the panel before the routing call is made (the router panics if it
+    /// is reached), and the turn still ends cleanly.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_no_slash_prompt_with_bad_enum_config_refuses_before_routing() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _bad = EnvGuard::set("DARKMUX_THERMAL_PAUSE_AT", Path::new("seroius"));
+        let router = |_msg: &str| -> Result<String> {
+            panic!("bad config must refuse before the router is called");
+        };
+        let (mut writer, mut reader) = spawn_test_agent(router, never_answer);
+        let cwd = std::env::temp_dir();
+        let session_id = handshake(&mut writer, &mut reader, &cwd).await;
+        send_prompt(&mut writer, &session_id, "what is running right now").await;
+        let first = recv_json(&mut reader).await;
+        let text = chunk_text(&first);
+        assert!(text.contains("refusing to start: bad config") && text.contains("`seroius`"), "{text}");
         let final_response = recv_json(&mut reader).await;
         assert_end_turn(&final_response);
     }

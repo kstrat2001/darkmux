@@ -12060,3 +12060,141 @@ fn lab_run_stats_a_set_with_an_unreadable_run_exits_1() {
         .assert()
         .code(1);
 }
+
+// ===== (#2947) bad enum config refuses at every entry point =============
+
+/// For every registered enum setting with an env var, and every CLI entry
+/// point its `scopes` names, spawn that entry point with an unregistered
+/// value and assert it refuses, naming the raw value, the env var, and
+/// every valid value. This is the half the in-process conformance test
+/// (`config_cmd::every_enum_setting_obeys_the_rule_on_every_surface`)
+/// cannot prove: that the entry point actually CALLS the preflight.
+///
+/// `PATH` is emptied for the child, so if a preflight were ever removed the
+/// command still cannot reach Docker, `lms` or any model: it fails for some
+/// other reason, and the assertions on the refusal text turn it red. The
+/// config-file tier is not exercised here: under `cargo test` the child's
+/// config tier is empty by construction (see the spawn helpers' doc), so
+/// that tier is covered in-process instead.
+#[test]
+fn every_enum_setting_is_refused_by_every_cli_entry_point_that_consumes_it() {
+    use darkmux_types::config_enum::{Scope, ENUM_SETTINGS};
+    let empty_path = TempDir::new().unwrap();
+    let mut exercised = 0;
+    for s in ENUM_SETTINGS {
+        let Some(var) = s.env else { continue };
+        for scope in s.scopes {
+            let cases: &[&[&str]] = match scope {
+                // `--skip-preflight` too: it skips the Docker/daemon probe,
+                // never the bad-config refusal.
+                Scope::Dispatch => &[
+                    &["dispatch", "code-reviewer", "hello"],
+                    &["dispatch", "--skip-preflight", "code-reviewer", "hello"],
+                ],
+                Scope::MissionLaunch => &[&["mission", "launch", "review", "--dry-run"]],
+                Scope::LabRun => &[&["lab", "run", "quick-q"]],
+                // No CLI verb starts fleet submission on its own; covered
+                // by darkmux-fleet's `configured_provider` test.
+                Scope::FleetSubmission => continue,
+            };
+            for args in cases {
+                let mut cmd = darkmux_std_cmd();
+                cmd.env("PATH", empty_path.path()).env(var, "zz-bad-env").args(*args);
+                // The isolated roots the helper picked, read off the
+                // command it built, so what the refused run WROTE can be
+                // checked.
+                let roots: Vec<std::path::PathBuf> = cmd
+                    .get_envs()
+                    .filter(|(k, _)| *k == "HOME" || *k == "DARKMUX_HOME")
+                    .filter_map(|(_, v)| v.map(std::path::PathBuf::from))
+                    .collect();
+                assert_eq!(roots.len(), 2, "the spawn helper no longer sets both roots");
+                let out = cmd.output().unwrap();
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert!(!out.status.success(), "{args:?} with {var}=zz-bad-env succeeded: {stderr}");
+                // The ENTRY POINT's own refusal, by its label: a refusal
+                // from a primitive further down (`dispatch:` under `lab
+                // run`) would mean the entry point minted first.
+                let lead = format!("{}: refusing to start: bad config", scope.label());
+                assert!(
+                    stderr.contains(&lead) && stderr.contains("`zz-bad-env`"),
+                    "{args:?} did not refuse at its own preflight ({lead}) for {var}: {stderr}"
+                );
+                assert!(stderr.contains(var), "{args:?}: the refusal must name {var}: {stderr}");
+                for (t, _) in s.values {
+                    assert!(stderr.contains(t), "{args:?}: valid value `{t}` missing: {stderr}");
+                }
+                // Nothing minted: the only file a refused entry point may
+                // leave is its process-start liveness marker.
+                let mut written = Vec::new();
+                for root in &roots {
+                    collect_files(root, &mut written);
+                }
+                written.retain(|p| !p.components().any(|c| c.as_os_str() == "liveness"));
+                assert!(written.is_empty(), "{args:?} wrote state before refusing: {written:?}");
+                exercised += 1;
+            }
+        }
+    }
+    assert!(exercised >= 12, "only {exercised} (setting, entry point) pairs exercised");
+}
+
+fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_files(&p, out);
+        } else {
+            out.push(p);
+        }
+    }
+}
+
+/// (#2947) `config set <key>` with no value prints that key's values with
+/// their meanings (and exits 2, review C7: a forgotten value still fails a
+/// script). `config list` prints its value help only to a terminal, so a
+/// captured run (a pipe, or the daemon's config-list console panel, which
+/// shows stderr as a warning; review C5) has EMPTY stderr.
+#[test]
+fn bare_config_set_lists_every_enum_value_and_config_list_keeps_captured_stderr_empty() {
+    use darkmux_types::config_enum::ENUM_SETTINGS;
+    for panel in [None, Some("config-list")] {
+        let mut cmd = darkmux_cmd();
+        cmd.args(["config", "list"]);
+        if let Some(p) = panel {
+            cmd.env("DARKMUX_PANEL", p);
+        }
+        let out = cmd.output().unwrap();
+        assert!(out.status.success());
+        assert!(out.stderr.is_empty(), "captured `config list` wrote stderr: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    // Scalar settings: a per-item one (`hooks.rules[].match.level`) has no
+    // `config set` key of its own.
+    for s in ENUM_SETTINGS.iter().filter(|s| !s.is_per_item()) {
+        let out = darkmux_cmd().args(["config", "set", s.key]).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(2), "`config set {}` with no value must exit 2", s.key);
+        for (t, m) in s.values {
+            assert!(stdout.contains(t) && stdout.contains(m), "`config set {}` lacks {t}: {stdout}", s.key);
+        }
+    }
+}
+
+/// (#2947 review C4) `darkmux radio` refuses bad enum config up front, under
+/// its own label, rather than degrading into an answering-seat fallback.
+#[test]
+fn radio_refuses_bad_enum_config_before_routing() {
+    let empty_path = TempDir::new().unwrap();
+    let out = darkmux_cmd()
+        .env("PATH", empty_path.path())
+        .env("DARKMUX_THERMAL_PAUSE_AT", "seroius")
+        .args(["radio", "what is running"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("radio: dispatch: refusing to start: bad config"), "{stderr}");
+    assert!(!stdout.contains("falling back") && !stderr.contains("falling back"), "{stdout}{stderr}");
+}

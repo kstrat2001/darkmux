@@ -27,10 +27,12 @@ use std::net::IpAddr;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// The identity provider values this darkmux knows. `config set
-/// fleet.identity.provider` refuses anything else; a hand-edited unknown
-/// value resolves to no provider, which refuses every submission.
-pub const KNOWN_IDENTITY_PROVIDERS: &[&str] = &["tailscale"];
+/// The identity provider values this darkmux knows: the token list of
+/// `darkmux_types::config::IdentityProvider` (#2947), so `config set`, help,
+/// doctor and this factory share one list. A hand-edited unknown value is
+/// refused by the fleet-submission preflight in [`configured_provider`].
+pub const KNOWN_IDENTITY_PROVIDERS: &[&str] =
+    <darkmux_types::config::IdentityProvider as darkmux_types::config_enum::ConfigEnum>::TOKENS;
 
 /// How long one provider call may take before it counts as "cannot answer".
 /// Measured 2026-09-27 on the laptop: ~25 ms per call (10 runs, 25-41 ms).
@@ -141,10 +143,16 @@ fn default_tool_path(name: &str, known: &[&str], path_var: Option<&std::ffi::OsS
 }
 
 /// The configured provider: `fleet.identity.provider` + `fleet.identity.bin`.
+///
+/// (#2947) Runs the fleet-submission preflight first: a bad enum value
+/// refuses with the standard message (value, where it was set, valid
+/// values) before any provider is built. Both sides of a submission (the
+/// daemon's listener and the sender) build their provider here.
 pub fn configured_provider() -> Result<Box<dyn IdentityProvider>> {
-    let value = darkmux_types::config_access::fleet_identity_provider();
+    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::FleetSubmission)?;
+    let value = darkmux_types::config_access::fleet_identity_provider()?;
     let bin = darkmux_types::config_access::fleet_identity_bin();
-    provider_for(&value, bin.as_deref())
+    provider_for(value.as_str(), bin.as_deref())
 }
 
 /// A provider that asks the overlay network's command-line tool: `whois
@@ -434,6 +442,35 @@ pub fn test_node(node_id: &str, name: &str, addr: &str) -> NodeIdentity {
 
 #[cfg(test)]
 mod tests {
+    /// (#2947) The fleet-submission preflight: a hand-edited unknown
+    /// `fleet.identity.provider` is refused when either side builds its
+    /// provider, with the registry's message (value, where it was set,
+    /// valid values), before any provider tool is run.
+    #[serial_test::serial]
+    #[test]
+    fn configured_provider_refuses_an_unregistered_provider_value() {
+        let cfg = darkmux_types::config::DarkmuxConfig {
+            fleet: Some(darkmux_types::config::FleetConfig {
+                identity: Some(darkmux_types::config::FleetIdentityConfig {
+                    provider: Some("zz-bad-provider".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let _g = darkmux_types::config_access::set_config_for_test(cfg);
+        let err = match configured_provider() {
+            Ok(_) => panic!("an unknown provider built a provider"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("fleet work submission: refusing to start: bad config"), "{err}");
+        assert!(err.contains("`zz-bad-provider`") && err.contains("fleet.identity.provider"), "{err}");
+        for t in KNOWN_IDENTITY_PROVIDERS {
+            assert!(err.contains(t), "{err}");
+        }
+    }
+
     use super::*;
 
     const WHOIS: &str = r#"{"Node":{"ID":123,"StableID":"nSTABLE1","Name":"laptop.tailnet-example.ts.net.",

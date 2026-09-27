@@ -803,11 +803,14 @@ pub struct ThermalGovernorConfig {
 impl ThermalGovernorConfig {
     /// Resolve from the standard `env > config.json > default` precedence
     /// (`darkmux_types::config_access::thermal_*`).
-    pub fn from_env() -> Self {
-        Self {
+    ///
+    /// (#2947) Fallible: an unrecognized `pause_at`/`resume_at` is an error
+    /// naming the value, never passed through for the bands to disarm on.
+    pub fn from_env() -> Result<Self, darkmux_types::config_enum::BadEnumValue> {
+        Ok(Self {
             enabled: darkmux_types::config_access::thermal_enabled(),
-            pause_at: darkmux_types::config_access::thermal_pause_at(),
-            resume_at: darkmux_types::config_access::thermal_resume_at(),
+            pause_at: darkmux_types::config_access::thermal_pause_at()?.as_str().to_string(),
+            resume_at: darkmux_types::config_access::thermal_resume_at()?.as_str().to_string(),
             resume_hold_ms: darkmux_types::config_access::thermal_resume_hold_ms(),
             max_pause_ms: darkmux_types::config_access::thermal_max_pause_ms(),
             min_cpu_speed_limit_pct: darkmux_types::config_access::thermal_min_cpu_speed_limit_pct(),
@@ -816,7 +819,7 @@ impl ThermalGovernorConfig {
             ratchet_factor: darkmux_types::config_access::thermal_ratchet_factor(),
             episode_threshold: darkmux_types::config_access::thermal_episode_threshold(),
             tier4_enabled: darkmux_types::config_access::thermal_tier4_enabled(),
-        }
+        })
     }
 }
 

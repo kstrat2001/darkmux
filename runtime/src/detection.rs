@@ -10,11 +10,14 @@
 //! variable, the same shape `pace::max_pause_ms` uses.
 
 /// What authority one detector has over the dispatch it watches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// (#2947) The values name the action, and match the host's
+/// `darkmux_types::config::DetectionPolicy` token for token: `off`,
+/// `record`, `warn`, `conclude`. `enforce`/`observe` are retired in 4.0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetectionPolicy {
-    /// Detect and act. The shipped behavior.
-    #[default]
-    Enforce,
+    /// Do not run the detector at all. Cheapest, and measures nothing.
+    Off,
     /// Detect and RECORD, but never act. The record carries what the
     /// detector would have done.
     ///
@@ -25,9 +28,15 @@ pub enum DetectionPolicy {
     /// widened cap cannot be attributed to the missing gate. Policy changes
     /// only whether the verdict is obeyed; cadence, per-call cap and prompt
     /// budget are untouched.
-    Observe,
-    /// Do not run the detector at all. Cheapest, and measures nothing.
-    Off,
+    Record,
+    /// Detect and never act, exactly like `Record` inside the container;
+    /// the HOST surfaces each finding as a warning (a stderr line, a
+    /// `dispatch.degeneracy.warning` flow record, the envelope's count),
+    /// keyed on this token in the trajectory's `policy` field.
+    Warn,
+    /// Detect and conclude: close the model's thought so it answers from
+    /// what it has, escalating if it keeps repeating. The shipped behavior.
+    Conclude,
 }
 
 impl DetectionPolicy {
@@ -37,37 +46,60 @@ impl DetectionPolicy {
     }
     /// Whether a finding may change what the dispatch does.
     pub fn acts(self) -> bool {
-        matches!(self, DetectionPolicy::Enforce)
+        matches!(self, DetectionPolicy::Conclude)
     }
     pub fn as_str(self) -> &'static str {
         match self {
-            DetectionPolicy::Enforce => "enforce",
-            DetectionPolicy::Observe => "observe",
             DetectionPolicy::Off => "off",
+            DetectionPolicy::Record => "record",
+            DetectionPolicy::Warn => "warn",
+            DetectionPolicy::Conclude => "conclude",
         }
     }
-    /// Lenient parse. An unrecognized value resolves to `Enforce`, which is
-    /// the ARMED direction on purpose: a typo must never silently disarm a
-    /// guard. `darkmux doctor` surfaces the unparseable value host-side.
-    pub fn parse_lenient(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "observe" => DetectionPolicy::Observe,
-            "off" => DetectionPolicy::Off,
-            _ => DetectionPolicy::Enforce,
+    /// Exact parse of the token the host forwards. `None` for anything
+    /// else, including the retired `enforce`/`observe`.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "off" => Some(DetectionPolicy::Off),
+            "record" => Some(DetectionPolicy::Record),
+            "warn" => Some(DetectionPolicy::Warn),
+            "conclude" => Some(DetectionPolicy::Conclude),
+            _ => None,
         }
     }
 }
 
-/// `env(DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY) > Enforce`.
+/// `env(DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY)`, as the host forwards
+/// it.
+///
+/// (#2947) There is no silent fallback here any more. The host ALWAYS
+/// forwards the variable (`dispatch_internal::build_docker_run_argv`), and
+/// always with a token it resolved through the registry, which refuses an
+/// unknown or retired value at preflight before any container starts. The
+/// runtime image is version-checked against the host (#2923), so the two
+/// vocabularies cannot disagree in a real dispatch. An absent variable (the
+/// runtime run by hand, outside darkmux) reads as the shipped `conclude`, the
+/// same value the host would have forwarded by default. An UNRECOGNIZED
+/// token is a host/runtime mismatch that should be impossible; it reads as
+/// `conclude` (the armed direction) and says so on stderr every time, rather
+/// than silently.
 ///
 /// Read per call rather than cached so a test's `set_var` takes effect,
 /// matching how `DARKMUX_TURN_DELAY_MS` and the other host-forwarded knobs
 /// behave in this crate.
 pub fn degeneracy_policy() -> DetectionPolicy {
-    std::env::var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY")
-        .ok()
-        .map(|s| DetectionPolicy::parse_lenient(&s))
-        .unwrap_or_default()
+    match std::env::var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY") {
+        Err(_) => DetectionPolicy::Conclude,
+        Ok(raw) => DetectionPolicy::parse(&raw).unwrap_or_else(|| {
+            eprintln!(
+                "darkmux-runtime: DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=`{raw}` is not a \
+                 policy this runtime knows (off, record, warn, conclude); running as `conclude`. The host \
+                 refuses such a value at preflight, so this runtime and its host are \
+                 mismatched versions (#2947)."
+            );
+            DetectionPolicy::Conclude
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -76,18 +108,22 @@ mod tests {
 
     #[test]
     fn policies_split_measuring_from_acting() {
-        assert!(DetectionPolicy::Enforce.measures() && DetectionPolicy::Enforce.acts());
-        // The whole point of `observe`: it still measures, it never acts.
-        assert!(DetectionPolicy::Observe.measures() && !DetectionPolicy::Observe.acts());
+        assert!(DetectionPolicy::Conclude.measures() && DetectionPolicy::Conclude.acts());
+        // `record` and `warn` both measure and never act; the host tells
+        // them apart (warn surfaces each finding).
+        assert!(DetectionPolicy::Record.measures() && !DetectionPolicy::Record.acts());
+        assert!(DetectionPolicy::Warn.measures() && !DetectionPolicy::Warn.acts());
         assert!(!DetectionPolicy::Off.measures() && !DetectionPolicy::Off.acts());
     }
 
+    /// (#2947) The runtime's vocabulary is the host's: every token
+    /// round-trips, and the retired spellings are not tokens.
     #[test]
-    fn an_unrecognized_value_stays_armed() {
-        // The lenient direction is deliberate. A typo that disarmed a guard
-        // would be silent, and silence is how a guard stops being one.
-        assert_eq!(DetectionPolicy::parse_lenient("obsrve"), DetectionPolicy::Enforce);
-        assert_eq!(DetectionPolicy::parse_lenient(""), DetectionPolicy::Enforce);
-        assert_eq!(DetectionPolicy::parse_lenient("  OBSERVE "), DetectionPolicy::Observe);
+    fn the_runtime_parses_exactly_the_host_vocabulary() {
+        for p in [DetectionPolicy::Off, DetectionPolicy::Record, DetectionPolicy::Warn, DetectionPolicy::Conclude] {
+            assert_eq!(DetectionPolicy::parse(p.as_str()), Some(p));
+        }
+        assert_eq!(DetectionPolicy::parse("enforce"), None);
+        assert_eq!(DetectionPolicy::parse("observe"), None);
     }
 }

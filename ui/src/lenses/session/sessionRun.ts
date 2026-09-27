@@ -289,7 +289,8 @@ export interface SessionRunView {
    * at all, so the SIGNALS card must not claim "repetition: clean" (which
    * asserts the detector looked and found nothing); it renders the
    * checklist cell as "off" instead. `false` covers both "ran, found
-   * nothing" (enforce/observe with no findings) and "unknown" (no
+   * nothing" (conclude/warn/record with no findings; enforce/observe in runs
+   * recorded before 4.0) and "unknown" (no
    * `dispatch.start`, or an older record predating this field) — an
    * unknown run-level policy must NOT render as off, since that would be
    * claiming something the data doesn't say either. */
@@ -1738,7 +1739,7 @@ export function runRegions(
   }
 
   for (const acc of byTurn.values()) {
-    // (#2887 F2) Prefer the RUN-LEVEL policy for the observed/enforced
+    // (#2887 F2) Prefer the RUN-LEVEL policy for the recorded/warned/concluded
     // wording — it is the one resolved value every record in this run
     // shares, where an individual record's own `policy` field may be
     // absent (an older runtime image) or, in principle, stale.
@@ -1750,11 +1751,16 @@ export function runRegions(
     // flag the stream gate never saw.
     const citation = acc.sawGate ? "#2836" : "#1221";
     const timesClause = acc.gateAbortCount > 1 ? ` ${acc.gateAbortCount}×` : "";
+    // (#2947) Policy values name the action: `record` (silent measure) and
+    // `warn` (surfaced, not concluded). `observe` is the pre-4.0 spelling of
+    // `record`; archived runs still carry it, so both read the same.
     const detail = acc.acted
       ? `turn ${acc.turnSeq}: judged repeating${ratioClause} and ended it${timesClause} (${citation})`
-      : effectivePolicy === "observe"
-        ? `turn ${acc.turnSeq}: judged repeating${ratioClause} — flagged (observed), not enforced (#2846)`
-        : `turn ${acc.turnSeq}: judged repeating${ratioClause} (${citation})`;
+      : effectivePolicy === "record" || effectivePolicy === "observe"
+        ? `turn ${acc.turnSeq}: judged repeating${ratioClause} — recorded, not concluded (#2846)`
+        : effectivePolicy === "warn"
+          ? `turn ${acc.turnSeq}: judged repeating${ratioClause} — warned, not concluded (#2947)`
+          : `turn ${acc.turnSeq}: judged repeating${ratioClause} (${citation})`;
     finds.push({
       kind: "repetition",
       severity: "warn",

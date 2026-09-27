@@ -77,7 +77,12 @@ pub fn fleet_submission_checks(f: &FleetSubmissionFacts) -> Vec<Check> {
     let mut rows = Vec::new();
     if f.listener_enabled || trusted_any {
         rows.push(token_row(f));
-        rows.push(identity_row(f));
+        // (#2947) An unknown provider value is bad config, reported ONCE by
+        // the generic `fleet.identity.provider` enum-settings row (value,
+        // where it was set, valid values). No second Fail row here.
+        if !matches!(f.provider, ProviderReport::Unknown { .. }) {
+            rows.push(identity_row(f));
+        }
         rows.push(listener_row(f));
         rows.push(trust_row(f));
     }
@@ -328,6 +333,16 @@ mod tests {
         assert!(t.message.contains("node `laptop`, online"), "{}", t.message);
         assert_eq!(row(&rows, "fleet listener").message, "listening on 100.64.0.2:8766");
         assert!(row(&rows, "fleet identity").message.contains("this machine is `studio`"));
+    }
+
+    /// (#2947) A bad provider value gets no `fleet identity` row: the
+    /// generic enum-settings row is the one Fail for it.
+    #[test]
+    fn an_unknown_provider_value_is_left_to_the_enum_settings_row() {
+        let f = FleetSubmissionFacts { provider: ProviderReport::Unknown { value: "zz".into() }, ..facts() };
+        let rows = fleet_submission_checks(&f);
+        assert!(rows.iter().all(|c| c.name != "fleet identity"), "{rows:?}");
+        assert_eq!(rows.len(), 3);
     }
 
     #[test]

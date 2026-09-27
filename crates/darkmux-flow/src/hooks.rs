@@ -198,13 +198,16 @@ pub fn hook_match(m: &HookMatch, record: &FlowRecord) -> bool {
             return false;
         }
     }
+    // (#2947 review C-d) Trimmed, the same way the registry validates
+    // them: `" warn "` passes validation, so it must also MATCH, or a
+    // padded value is accepted and then silently matches nothing.
     if let Some(v) = m.category.as_deref() {
-        if !category_wire(record.category).eq_ignore_ascii_case(v) {
+        if !category_wire(record.category).eq_ignore_ascii_case(v.trim()) {
             return false;
         }
     }
     if let Some(v) = m.level.as_deref() {
-        if !level_wire(record.level).eq_ignore_ascii_case(v) {
+        if !level_wire(record.level).eq_ignore_ascii_case(v.trim()) {
             return false;
         }
     }
@@ -3837,6 +3840,16 @@ impl HookSink {
         report_sink: Arc<dyn FlowSink>,
         max_outbox_mb_override: Option<u64>,
     ) -> Result<Self> {
+        // (#2947 review C2) An unregistered `match.level` / `match.category`
+        // used to match nothing, silently. It is bad config: refuse the
+        // WHOLE sink, loudly (the established rule for a bad rule here, see
+        // the bad-destination case below), naming the rule, the value and
+        // the valid values. `darkmux doctor` reports the same value as Fail.
+        let bad = darkmux_types::config_enum::bad_hook_rule_values(rules);
+        if !bad.is_empty() {
+            let lines: Vec<String> = bad.iter().map(|b| format!("{}. {}", b.summary(), b.valid_line())).collect();
+            anyhow::bail!("hook rule value refused (#2947):\n  {}", lines.join("\n  "));
+        }
         // (#2183) Resolved rule-by-rule (not the batch `resolve_rules`)
         // so a `transform` that fails to load can be isolated to THAT
         // rule alone — "a missing or unparseable adapter is a load-time
@@ -4700,6 +4713,72 @@ mod tests {
         assert!(ok, "last_delivery_ts populated after a successful delivery");
         let summaries = summarize_configured_rules(&rules, tmp.path());
         assert!(summaries[0].last_error.is_none(), "a successful delivery clears/omits last_error");
+    }
+
+    /// (#2947 review C2) A `match.level` / `match.category` outside the
+    /// flow vocabulary refuses the whole sink, naming the rule path, the
+    /// value and the valid values; valid values in any case are accepted.
+    #[test]
+    fn a_bad_match_level_or_category_refuses_the_sink() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rule = |level: Option<&str>, category: Option<&str>| HookRule {
+            r#match: Some(HookMatch {
+                level: level.map(str::to_string),
+                category: category.map(str::to_string),
+                ..Default::default()
+            }),
+            http: Some("http://127.0.0.1:9/x".to_string()),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        };
+        for (level, category, path) in [
+            (Some("warning"), None, "hooks.rules[0].match.level"),
+            (None, Some("audits"), "hooks.rules[0].match.category"),
+        ] {
+            let report: Arc<dyn FlowSink> = Arc::new(NullSink);
+            let err = match HookSink::new(&[rule(level, category)], tmp.path().to_path_buf(), report) {
+                Ok(_) => panic!("{path}: a bad value built the sink"),
+                Err(e) => format!("{e:#}"),
+            };
+            assert!(err.contains(path) && err.contains("refused"), "{err}");
+        }
+        let report: Arc<dyn FlowSink> = Arc::new(NullSink);
+        assert!(HookSink::new(&[rule(Some("WARN"), Some("Audit"))], tmp.path().to_path_buf(), report).is_ok());
+    }
+
+    /// (#2947 review C-d) A padded `match.level` / `match.category` is
+    /// VALID (the registry trims), so it must also match: validation and
+    /// matching read the value the same way.
+    #[test]
+    fn a_padded_level_or_category_validates_and_matches() {
+        let m = HookMatch { level: Some(" Info ".into()), category: Some(" work ".into()), ..Default::default() };
+        let rule = HookRule { r#match: Some(m.clone()), ..Default::default() };
+        assert!(darkmux_types::config_enum::bad_hook_rule_values(&[rule]).is_empty(), "padded is valid");
+        assert!(hook_match(&m, &record("dispatch start")), "and a valid value must match");
+        let other = HookMatch { level: Some(" warn ".into()), ..Default::default() };
+        assert!(!hook_match(&other, &record("dispatch start")), "a different level still does not");
+    }
+
+    /// (#2947 review C2) The hook-rule config vocabulary (declared in
+    /// darkmux-types so the registry can hold it) is exactly the flow
+    /// schema's own `Level` / `Category` serde spellings, minus the
+    /// read-only `unknown` catch-all. A new level or category added to the
+    /// schema without the config enum fails here.
+    #[test]
+    fn hook_match_vocabulary_matches_the_flow_schema() {
+        use clap::ValueEnum;
+        use darkmux_types::config_enum::ConfigEnum;
+        let spell = |v: serde_json::Value| v.as_str().unwrap().to_string();
+        let levels: Vec<String> =
+            crate::Level::value_variants().iter().map(|l| spell(serde_json::to_value(l).unwrap())).collect();
+        let cats: Vec<String> =
+            crate::Category::value_variants().iter().map(|c| spell(serde_json::to_value(c).unwrap())).collect();
+        assert_eq!(levels, darkmux_types::config::HookLevel::TOKENS);
+        assert_eq!(cats, darkmux_types::config::HookCategory::TOKENS);
     }
 
     #[test]

@@ -77,8 +77,28 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.62.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.63.0";
 // Version history:
+//   1.63.0 (#2947): the degeneracy detector's policy vocabulary names the
+//           action, and one additive action.
+//
+//           VALUES: the `policy` string on `dispatch.checkpoint`,
+//           `dispatch.gate.observation` / `.abort` records and on
+//           `dispatch.start`'s `bounds.detection_degeneracy_policy.value` is
+//           now `off` / `record` / `warn` / `conclude`. `enforce` is now `conclude`
+//           and `observe` is now `record`; records written before this
+//           version carry the old spellings, and consumers read BOTH (the
+//           archive is append-only and is never rewritten). The acting
+//           value was spelled `cut` on the #2947 branch before it shipped;
+//           no record carries `cut`. The bounds
+//           `source` is `env` / `config` / `built-in`; the `*-invalid`
+//           sources are gone (an invalid value refuses at preflight now).
+//
+//           ACTION: `dispatch.degeneracy.warning` (level `warn`), one per
+//           finding the detector surfaced under the `warn` policy. Payload:
+//           `turn_seq`, `source` (`checkpoint` | `stream_gate`),
+//           `tail_ratio`, `policy` (`warn`), `acted` (`false`). Additive:
+//           an older reader ignores the action.
 //   1.62.0 (#2928, the live channel): additive, one payload block.
 //           `dispatch complete.payload.live`: the live channel's own cost for
 //           the execution — `enabled` (false for a dispatch that did not
@@ -297,7 +317,8 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.62.0";
 //           (null on an observation, only ever populated by an abort — also
 //           the field a consumer uses to tell the two record shapes apart
 //           without a dedicated discriminator key), `policy`
-//           (`"enforce"`/`"observe"`/`"off"`) and `acted` (true on every
+//           (`"enforce"`/`"observe"`/`"off"`; renamed in 1.63.0 to
+//           `"conclude"`/`"record"`/`"off"`, plus `"warn"`) and `acted` (true on every
 //           `dispatch.gate.abort`, AND on the degenerate observation whose
 //           verdict ended the call — under `enforce` that observation is
 //           written for the same moment as the abort that follows it, and

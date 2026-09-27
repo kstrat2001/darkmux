@@ -1842,6 +1842,12 @@ pub struct DockerRunConfig {
     /// to rest — the call site force-overrides this field to `0` whenever
     /// the dispatch is agentic-remote, regardless of config (#2094 finding 4).
     pub turn_delay_ms: u64,
+    /// (#2846, #2947) The resolved degeneracy-detector policy, forwarded as
+    /// `-e DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=<token>`. A resolved
+    /// value, not re-read here: `build_docker_run_argv` cannot fail, and a
+    /// bad policy is refused at the dispatch preflight instead of being
+    /// forwarded as a guess.
+    pub detection_policy: darkmux_types::config::DetectionPolicy,
     /// (#2094 finding 1) The resolved `runtime.inactivity_timeout_seconds`
     /// setting (`darkmux_types::config_access::inactivity_timeout_seconds()`),
     /// forwarded into the container as
@@ -2048,7 +2054,7 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     args.push("-e".to_string());
     args.push(format!(
         "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY={}",
-        darkmux_types::config_access::detection_degeneracy_policy().as_str()
+        config.detection_policy.as_str()
     ));
 
     // (#2094 finding 1) Forward the resolved `inactivity_timeout_seconds`
@@ -3764,6 +3770,8 @@ fn dispatch_remote(
 /// follow-up when a real second caller needs it; left unbuilt here rather
 /// than adding speculative shape for a consumer that doesn't exist yet.
 pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> {
+    // (#2947) Bad enum config refuses before anything, same as `dispatch`.
+    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
     darkmux_flow::daemon_probe::nudge_if_daemon_unreachable("dispatch");
     crate::dispatch::require_licensed_adjacent_ack(&opts.role_id)
         .context("licensed-adjacent role dispatch requires acknowledgment")?;
@@ -4894,6 +4902,14 @@ pub(crate) fn resume_from_bare_hosted_refusal(role_id: &str) -> String {
 }
 
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
+    // (#2947) Bad enum config refuses FIRST: before the daemon nudge, the
+    // ack gate, any session id or flow record. Every host-side dispatch
+    // (radio, acp, mission steps, crawl units, lab providers, the fleet
+    // runner) comes through here or `dispatch_local_single_shot`, so this
+    // is the one place that covers them all. Deliberately NOT gated on
+    // `opts.skip_preflight`: that flag skips the Docker/daemon probe, and a
+    // bad config value is not a probe result that could be stale.
+    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
     // 0. Pre-flight: nudge the operator if the daemon isn't up. The
     //    dispatch will still write flow records to disk, but they
     //    won't be observable in the viewer until the daemon comes up.
@@ -5537,7 +5553,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         opts.timeout_override_seconds,
         allowed_tools.as_deref(),
         &opts.brief_refs,
-    );
+    )?;
     // (#1187 follow-up) Mirror `dispatch_remote`'s `"endpoint": label` field —
     // its absence, not just its presence, is meaningful to the viewer (no
     // field ⇒ rendered as local LMStudio), so this must be set whenever the
@@ -5858,6 +5874,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             darkmux_types::config_access::turn_delay_ms(),
             agentic_pm.is_some(),
         ),
+        detection_policy: darkmux_types::config_access::detection_degeneracy_policy()?,
         inactivity_timeout_seconds,
         inactivity_timeout_seconds_source,
         // (#2110/#2109) Resolved through config_access now that
@@ -6187,6 +6204,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // crawl mission's `STOP` file, when this dispatch is a crawl unit.
         host_out.clone(),
         opts.record_context.clone(),
+        crate::thermal_governor::ThermalGovernorConfig::from_env()?,
     );
 
     // (#2642) External, whole-`dispatch()`-level panic-injection hook for
@@ -6449,7 +6467,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             agentic_pm.is_some(),
             opts.max_turns_override,
             opts.timeout_override_seconds,
-        ),
+        )?,
         thermal_ladder_summary,
     );
 
@@ -6654,8 +6672,8 @@ fn dispatch_start_payload_json(
     timeout_override_seconds: Option<u32>,
     tools_requested: Option<&[String]>,
     brief_refs: &[crate::brief_refs::BriefRef],
-) -> serde_json::Value {
-    serde_json::json!({
+) -> Result<serde_json::Value, darkmux_types::config_enum::BadEnumValue> {
+    Ok(serde_json::json!({
         "runtime": "internal",
         // (#1126) The resolved runtime image (operator `--image` or the default
         // darkmux image) — the environment the coder ran in. The viewer's run
@@ -6702,7 +6720,7 @@ fn dispatch_start_payload_json(
             is_agentic_remote,
             max_turns_override,
             timeout_override_seconds,
-        ),
+        )?,
         // (#2887 N2) The flow schema this run's own records were written
         // against, from the ONE constant every writer shares
         // (`darkmux_flow::FLOW_SCHEMA_VERSION`). Additive — see that
@@ -6717,7 +6735,7 @@ fn dispatch_start_payload_json(
         // definition (no `telemetry.detector` record for it exists to
         // carry a schema stamp of its own).
         "flow_schema": darkmux_flow::FLOW_SCHEMA_VERSION,
-    })
+    }))
 }
 
 /// (#2165) The dispatch's resolved runtime bounds, WITH provenance, exactly
@@ -6753,7 +6771,7 @@ fn resolved_runtime_bounds_json(
     is_agentic_remote: bool,
     max_turns_override: Option<u32>,
     timeout_override_seconds: Option<u32>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, darkmux_types::config_enum::BadEnumValue> {
     fn vs(value: Option<serde_json::Value>, source: darkmux_types::config_access::Source) -> serde_json::Value {
         serde_json::json!({
             "value": value.unwrap_or(serde_json::Value::Null),
@@ -6798,8 +6816,11 @@ fn resolved_runtime_bounds_json(
     // operator-facing, so it names the real provenance rather than
     // borrowing the nearest enum variant — unlike the container's env-var
     // wire format, this one has no fixed vocabulary to round-trip through.
+    // (#2947) Fallible, never a fallback: a bad policy is refused at the
+    // dispatch preflight before this runs, and if it somehow is not, the
+    // stamp errors rather than claiming a regime nobody wrote.
     let (dg_policy, dg_source) =
-        darkmux_types::config_access::detection_degeneracy_policy_with_source();
+        darkmux_types::config_access::detection_degeneracy_policy_with_source()?;
     // (run-page rest-reason cards) Thermal/battery pacing enablement, so a
     // SYSTEM-section card can tell "armed and never fired" (0 rests, still
     // shown) from "not configured for this dispatch" (no card at all).
@@ -6817,7 +6838,7 @@ fn resolved_runtime_bounds_json(
         Some(n) => serde_json::json!({ "value": n, "source": "cli" }),
         None => vs(Some(inactivity_timeout_seconds.into()), s_inact),
     };
-    serde_json::json!({
+    Ok(serde_json::json!({
         "max_tokens_per_call": vs(max_tokens_per_call.map(Into::into), s_mtpc),
         "reasoning_checkpoint_interval_tokens": vs(reasoning_checkpoint_interval_tokens.map(Into::into), s_rci),
         "inactivity_timeout_seconds": inactivity_timeout_block,
@@ -6831,11 +6852,65 @@ fn resolved_runtime_bounds_json(
         // earlier engine comparison unreadable.
         "detection_degeneracy_policy": {
             "value": dg_policy.as_str(),
-            "source": dg_source,
+            "source": dg_source.as_str(),
         },
         "thermal_pacing_enabled": vs(Some(thermal_pacing_enabled.into()), s_thermal),
         "battery_pause_enabled": vs(Some(battery_pause_enabled.into()), s_batt_en),
         "battery_pause_floor_pct": vs(Some(battery_pause_floor_pct.into()), s_batt_floor),
+    }))
+}
+
+/// (#2947) One `warn`-policy degeneracy finding: the stderr line and the
+/// `dispatch.degeneracy.warning` record payload.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DegeneracyWarning {
+    pub line: String,
+    pub payload: serde_json::Value,
+    /// The turn the finding is in (the event's `seq`), the dedupe key.
+    pub turn_seq: Option<u64>,
+}
+
+/// (#2947 review C-a) The production warning sink: one line on this
+/// process's stderr, styled as a warning.
+fn stderr_warning_sink(line: &str) {
+    eprintln!("{}", darkmux_types::style::warn(line));
+}
+
+/// (#2947) Pure: the warning a runtime trajectory event calls for, or
+/// `None`. Only under the `warn` policy (read off the event, which the
+/// RUNTIME stamps with the policy it actually ran under, never the host's
+/// current env), and only for a finding: a checkpoint whose judge
+/// `would_conclude`, or a stream-gate observation judged `degenerate`.
+/// `record` and `conclude` produce none here: `record` is silent by design,
+/// and `conclude` already surfaces the conclusion itself.
+pub(crate) fn degeneracy_warning(event_type: &str, event: &serde_json::Value) -> Option<DegeneracyWarning> {
+    if event.get("policy").and_then(|v| v.as_str()) != Some("warn") {
+        return None;
+    }
+    let (found, source) = match event_type {
+        "dispatch.checkpoint" => (event.get("would_conclude").and_then(|v| v.as_bool()) == Some(true), "checkpoint"),
+        "dispatch.gate.observation" => (event.get("degenerate").and_then(|v| v.as_bool()) == Some(true), "stream_gate"),
+        _ => return None,
+    };
+    if !found {
+        return None;
+    }
+    let turn = event.get("seq").cloned().unwrap_or(serde_json::Value::Null);
+    let ratio = event.get("tail_ratio").and_then(|v| v.as_f64());
+    let ratio_text = ratio.map(|r| format!(" (tail_ratio={r:.3})")).unwrap_or_default();
+    Some(DegeneracyWarning {
+        turn_seq: event.get("seq").and_then(|v| v.as_u64()),
+        line: format!(
+            "darkmux dispatch: warning: turn {turn}: the output is repeating{ratio_text}; not concluded \
+             (runtime.detection.degeneracy.policy = warn). Set it to `conclude` to close a repeating thought."
+        ),
+        payload: serde_json::json!({
+            "turn_seq": turn,
+            "source": source,
+            "tail_ratio": ratio,
+            "policy": "warn",
+            "acted": false,
+        }),
     })
 }
 
@@ -6982,6 +7057,9 @@ fn enrich_envelope_with_summary(
     // block can.
     if let Some(f) = read_findings_summary(out_dir) {
         obj.insert("findings".into(), f);
+    }
+    if summary.degeneracy_warnings > 0 {
+        obj.insert("degeneracy_warnings".into(), serde_json::json!(summary.degeneracy_warnings));
     }
     if summary.checkpoints > 0 {
         obj.insert(
@@ -7130,6 +7208,9 @@ struct TrajectorySummary {
     // and aggregate it by hand to learn otherwise.
     checkpoints: u32,
     checkpoints_concluded: u32,
+    /// (#2947) Findings the degeneracy detector surfaced as warnings under
+    /// the `warn` policy (it measured, found repetition, and did not conclude).
+    degeneracy_warnings: u32,
     /// (#1959) The WORST and the MEAN novelty ratio across the run's
     /// checkpoints, replacing the LAST one.
     ///
@@ -8496,6 +8577,7 @@ fn spawn_guarded_sampler(
     phase_id: Option<String>,
     host_out: PathBuf,
     record_context: Option<serde_json::Value>,
+    thermal_config: crate::thermal_governor::ThermalGovernorConfig,
 ) -> (StopFlagGuard, thread::JoinHandle<(HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary)>) {
     let guard = StopFlagGuard(Arc::clone(sampler_stop));
     let stop = Arc::clone(sampler_stop);
@@ -8512,6 +8594,7 @@ fn spawn_guarded_sampler(
             phase_id,
             host_out,
             record_context,
+            thermal_config,
         )
     });
     (guard, handle)
@@ -8534,6 +8617,10 @@ fn run_telemetry_sampler(
     phase_id: Option<String>,
     host_out: PathBuf,
     record_context: Option<serde_json::Value>,
+    // (#2947) Resolved by the caller, where a bad `pause_at`/`resume_at` is
+    // an error the dispatch returns, rather than on this thread, which has
+    // no way to refuse.
+    thermal_config: crate::thermal_governor::ThermalGovernorConfig,
 ) -> (HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary) {
     // (#2107) Relative to THIS sampler's own start, not wall-clock — the
     // reduction only needs the gaps BETWEEN samples, and a relative clock
@@ -8573,7 +8660,7 @@ fn run_telemetry_sampler(
     let thermal_ladder_state_file =
         crate::thermal_governor::ladder_state_file_path_from_record_context(record_context.as_ref());
     let thermal_governor =
-        crate::thermal_governor::ThermalGovernor::new(crate::thermal_governor::ThermalGovernorConfig::from_env())
+        crate::thermal_governor::ThermalGovernor::new(thermal_config)
             .owned_by(mission_id.as_deref())
             .seeded_from_mission(thermal_ladder_state_file.as_deref());
     // (#2774 round-3 MF1) A `pause_at`/`resume_at` pair that leaves a tier
@@ -9311,6 +9398,17 @@ struct TailerState {
     /// the inactivity deadline) regardless of the 2 s coalescing window.
     chunk_owed: bool,
     summary: TrajectorySummary,
+    /// (#2947 review M-A) Turn seqs the `warn` policy already warned on.
+    /// Under `conclude` the first degenerate finding in a turn acts and the
+    /// turn ends; under `warn` the turn keeps streaming, so every later
+    /// gate observation and every continuation's `would_conclude`
+    /// checkpoint in the SAME turn is the same finding again. One warning
+    /// per turn is what "warn where `conclude` would have acted" means.
+    warned_turns: std::collections::HashSet<u64>,
+    /// (#2947 review C-a) Where a `warn`-policy warning line goes. The
+    /// production default prints it on stderr (`style::warn`); a test
+    /// captures it.
+    warning_sink: Arc<dyn Fn(&str) + Send + Sync>,
     /// (#457) Shared with the watchdog thread. Tailer writes a new
     /// deadline (`now + inactivity_secs`) when a `compaction` event
     /// fires; watchdog reads each tick to decide whether to kill the
@@ -9475,6 +9573,8 @@ impl TailerState {
             last_heartbeat_at: None,
             chunk_owed: false,
             summary: TrajectorySummary::default(),
+            warned_turns: std::collections::HashSet::new(),
+            warning_sink: Arc::new(stderr_warning_sink),
             inactivity_deadline: Some(inactivity_deadline),
             inactivity_secs,
             compaction_threshold: None,
@@ -9693,6 +9793,8 @@ impl TailerState {
             last_heartbeat_at: None,
             chunk_owed: false,
             summary: TrajectorySummary::default(),
+            warned_turns: std::collections::HashSet::new(),
+            warning_sink: Arc::new(stderr_warning_sink),
             inactivity_deadline: None,
             inactivity_secs: 600,
             compaction_threshold: None,
@@ -10192,7 +10294,8 @@ impl TailerState {
                     // trajectory.jsonl — without this, the #2165 fix never
                     // reached the surface the miss actually happened on.
                     "bound": event.get("bound"),
-                    // (#2887) `policy` (enforce/observe/off) and
+                    // (#2887) `policy` (off/record/warn/conclude; `enforce` /
+                    // `observe` in runs recorded before 4.0) and
                     // `would_conclude` (the judge's verdict BEFORE policy is
                     // applied) already ride the runtime's own trajectory
                     // event (`trajectory::append_checkpoint`) but were
@@ -10210,6 +10313,9 @@ impl TailerState {
                     event.get("verdict").and_then(|v| v.as_str()) == Some("conclude"),
                 );
                 self.emit("dispatch.checkpoint", darkmux_flow::Level::Info, payload);
+                if let Some(w) = degeneracy_warning(event_type, &event) {
+                    self.surface_degeneracy_warning(w);
+                }
             }
             "model.reasoning" => {
                 // The runtime emits these when it parses <think>...</think>
@@ -10417,6 +10523,11 @@ impl TailerState {
                     self.summary.detections.push(payload.clone());
                     self.emit_telemetry("detector", "telemetry.detector", payload);
                 }
+                if event_type == "dispatch.gate.observation" {
+                    if let Some(w) = degeneracy_warning(event_type, &event) {
+                        self.surface_degeneracy_warning(w);
+                    }
+                }
             }
             // (#557 slice 3) Per-turn context-window occupancy sawtooth.
             // The runtime emits one `dispatch.context` trajectory event per
@@ -10488,6 +10599,24 @@ impl TailerState {
                 // with no flow-stream consumer yet.
             }
         }
+    }
+
+    /// (#2947) The `warn` detection policy's surfaces, all three: a line on
+    /// this process's stderr (the dispatch's CLI), a Warn-level
+    /// `dispatch.degeneracy.warning` flow record the viewer shows, and the
+    /// envelope's `degeneracy_warnings` count. Nothing is cut: the runtime
+    /// never acts under `warn`.
+    fn surface_degeneracy_warning(&mut self, w: DegeneracyWarning) {
+        // (#2947 review M-A) Once per turn: the first finding is where
+        // `conclude` would have acted; the rest of that turn repeats it.
+        if let Some(turn) = w.turn_seq {
+            if !self.warned_turns.insert(turn) {
+                return;
+            }
+        }
+        (self.warning_sink)(&w.line);
+        self.summary.degeneracy_warnings = self.summary.degeneracy_warnings.saturating_add(1);
+        self.emit("dispatch.degeneracy.warning", darkmux_flow::Level::Warn, w.payload);
     }
 
     fn emit(&self, action: &str, level: darkmux_flow::Level, mut payload: serde_json::Value) {
@@ -11205,10 +11334,14 @@ fn detector_telemetry_payload(
                 "observation {observation}: tail_ratio={ratio} over {slice_chars} \
                  characters — the degeneracy gate judged this repeating (#2836)"
             );
+            // (#2947) `observe` is the retired spelling of `record`, still
+            // read here because archived trajectories carry it.
             let detail = if acted {
                 format!("{base} and ended the call")
-            } else if policy == Some("observe") {
-                format!("{base} — flagged (observed), not enforced")
+            } else if matches!(policy, Some("record") | Some("observe")) {
+                format!("{base} — recorded, not concluded")
+            } else if policy == Some("warn") {
+                format!("{base} — warned, not concluded")
             } else {
                 base
             };

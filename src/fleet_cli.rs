@@ -36,6 +36,10 @@ pub(crate) fn cmd_machine_add(
         eprintln!("{msg}");
         return Ok(2);
     }
+    // (#2947 review C1) `machine add` pins the new entry through the
+    // identity provider; a bad `fleet.identity.provider` refuses before the
+    // roster is written, not after.
+    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::FleetSubmission)?;
     // (#2916 re-review C7) Machine names are case-insensitive: an entry that
     // differs only in case is the SAME machine, updated under its existing
     // spelling rather than added twice.
@@ -1156,7 +1160,12 @@ pub(crate) fn fleet_submission_doctor_checks() -> Vec<crate::doctor::Check> {
     use crate::doctor::{FleetSubmissionFacts, ProviderReport, TrustView};
     let listener_enabled = darkmux_types::config_access::fleet_listener_enabled();
     let port = darkmux_types::config_access::fleet_listener_port();
-    let value = darkmux_types::config_access::fleet_identity_provider();
+    // (#2947) The raw value on a bad one, so the Unknown row names what was
+    // written; the generic enum-settings row carries the valid values.
+    let value = match darkmux_types::config_access::fleet_identity_provider() {
+        Ok(p) => p.as_str().to_string(),
+        Err(bad) => bad.raw,
+    };
     let (provider_report, nodes, local_addr) = match fleet::configured_provider() {
         Err(_) => (ProviderReport::Unknown { value: value.clone() }, None, None),
         Ok(p) => match p.local_node() {
@@ -1385,7 +1394,7 @@ pub(crate) fn cmd_machine_untrust(name: &str) -> Result<i32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // ── machine add: loopback refusal + self by machine_id (#2924) ──────
@@ -1726,6 +1735,38 @@ mod tests {
         let mut offline = healthy.clone();
         fleet::add_machine(&mut offline, "mini-1", "mini.tailnet.example", None, Some("UID-C")).unwrap();
         assert!(roster_needs_history(&offline, &live), "a uid nobody live answers to needs history");
+    }
+
+    /// A config whose `fleet.identity.provider` is an unregistered value.
+    pub(crate) fn bad_provider_config() -> darkmux_types::config::DarkmuxConfig {
+        darkmux_types::config::DarkmuxConfig {
+            fleet: Some(darkmux_types::config::FleetConfig {
+                identity: Some(darkmux_types::config::FleetIdentityConfig {
+                    provider: Some("zz-bad-provider".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// (#2947 review C1) `machine add` refuses a bad identity provider
+    /// before it writes the roster.
+    #[serial_test::serial]
+    #[test]
+    fn machine_add_refuses_a_bad_identity_provider_before_writing_the_roster() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet_file = tmp.path().join("fleet.json");
+        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &fleet_file) };
+        let r = {
+            let _g = darkmux_types::config_access::set_config_for_test(bad_provider_config());
+            cmd_machine_add("peer-x", "peer-x.tailnet.example:8765", None, false)
+        };
+        unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
+        let msg = format!("{:#}", r.unwrap_err());
+        assert!(msg.contains("fleet work submission: refusing to start") && msg.contains("`zz-bad-provider`"), "{msg}");
+        assert!(!fleet_file.exists(), "the roster was written before the refusal");
     }
 
     /// C-2: pin the history gate at its real call site. The laptop shape (a

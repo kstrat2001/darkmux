@@ -135,7 +135,7 @@ fn check_build_info() -> Check {
 }
 
 pub fn run() -> DoctorReport {
-    let checks = vec![
+    let mut checks = vec![
         check_build_info(),
         check_profile_registry(),
         check_crews_residue(),
@@ -166,7 +166,6 @@ pub fn run() -> DoctorReport {
         check_rules_registry(),
         check_flow_sink_health(),
         check_machine_id_resolution(),
-        check_fleet_mode(),
         check_openai_base_url_conflict(),
         check_redis_config(),
         check_gh_allowlist(),
@@ -179,7 +178,6 @@ pub fn run() -> DoctorReport {
         check_step_command_timeout(),
         check_dispatch_free_concurrency(),
         check_turn_delay(),
-        check_detection_policy(),
         check_reasoning_checkpoint_interval(),
         check_max_stall_recoveries(),
         check_host_sampler_interval(),
@@ -190,7 +188,11 @@ pub fn run() -> DoctorReport {
         check_host_sampler(),
         check_liveness_retention(),
         check_generation_checkpoint_interval(),
-        check_thermal_governor(),
+    ];
+    // (#2947) `None` when a thermal threshold is bad config; that value's
+    // own enum-settings row reports it.
+    checks.extend(check_thermal_governor());
+    checks.extend(vec![
         check_host_probe(),
         check_quarantined_mirrors(),
         checks_power::check_power_posture(),
@@ -212,8 +214,8 @@ pub fn run() -> DoctorReport {
         check_legacy_mission_layout(),
         check_legacy_compaction_extras(),
         check_mission_envelope_readability(),
-    ];
-    let checks = [checks, check_hooks(), eureka_checks()].concat();
+    ]);
+    let checks = [checks, check_enum_settings(), check_hooks(), eureka_checks()].concat();
     DoctorReport { checks }
 }
 
@@ -1949,48 +1951,73 @@ fn check_machine_id_resolution() -> Check {
 }
 
 
-/// Surface the machine's declared fleet position (#933) with provenance, and
-/// flag an unrecognized `fleet.mode`. `standalone` (default), `hub`, and `peer`
-/// are Pass; a typo is a Warn that names the bad token + the valid set (treated
-/// as `standalone` until corrected). Local-machine only — cross-machine fleet
-/// coherence (two-hub split-brain etc.) is `doctor --fleet` (#935).
-fn check_fleet_mode() -> Check {
-    use darkmux_types::config::{DarkmuxConfig, FleetMode};
-    let name = "fleet.mode";
-    // Provenance is presence-only (env-set / config-set / neither); the displayed
-    // token comes from `raw`. (#934 will centralize this env/config/default
-    // attribution into a config_access helper so every finding shares it.)
-    let env_set = std::env::var("DARKMUX_FLEET_MODE")
-        .ok()
-        .is_some_and(|s| !s.trim().is_empty());
-    let cfg_set = DarkmuxConfig::load_resolved()
-        .fleet
-        .and_then(|f| f.mode)
-        .is_some_and(|s| !s.trim().is_empty());
-    let raw = darkmux_types::config_access::fleet_mode_raw();
-    let provenance = if env_set {
-        "from DARKMUX_FLEET_MODE env"
-    } else if cfg_set {
-        "from config.json"
-    } else {
-        "default"
-    };
-    match FleetMode::parse(&raw) {
-        Some(_) => Check {
-            name: name.into(),
-            status: Status::Pass,
-            message: format!("`{raw}` ({provenance})"),
-            hint: None,
-        },
-        None => Check {
-            name: name.into(),
-            status: Status::Warn,
-            message: format!("`{raw}` ({provenance}) is not a recognized fleet.mode — treated as `standalone`"),
-            hint: Some(
-                "Valid values: `standalone` (single machine), `hub` (always-on coordinator), `peer` (points at a hub). Set `fleet.mode` in ~/.darkmux/config.json, or export DARKMUX_FLEET_MODE.".into(),
-            ),
-        },
+/// (#2947) THE doctor check for enum-typed settings: one row per entry of
+/// `darkmux_types::config_enum::ENUM_SETTINGS`, with no per-setting code.
+/// A registered value is Pass, naming the value, its tier and its meaning;
+/// an unregistered one is **Fail**, naming the raw value, where it was set,
+/// every valid value with its meaning, and the fix. Replaces the
+/// hand-written `fleet.mode` (#933/#934) and detection-policy (#2846)
+/// checks, which each reported a typo as a Warn over a silent fallback.
+///
+/// A new enum setting gets this row by being registered: nothing here
+/// changes.
+pub fn check_enum_settings() -> Vec<Check> {
+    use darkmux_types::config_enum::ENUM_SETTINGS;
+    let mut rows = Vec::new();
+    for s in ENUM_SETTINGS {
+        let bad = darkmux_types::config_access::enum_bad_values(s);
+        if bad.is_empty() {
+            rows.push(enum_setting_pass_row(s));
+            continue;
+        }
+        // One Fail row per bad value. A per-item setting's row is named by
+        // the item's concrete path (`hooks.rules[2].match.level`), a
+        // scalar's by its key.
+        for b in bad {
+            let name = match &b.set_in {
+                darkmux_types::config_enum::SetIn::Config(path) if s.is_per_item() => path.clone(),
+                _ => s.key.to_string(),
+            };
+            rows.push(Check {
+                name,
+                status: Status::Fail,
+                // (#2947 review C6) Say what actually happens: which entry
+                // points refuse, or, for a setting no work-starting entry
+                // point reads, the registry's own stated reason.
+                message: match s.no_scope_reason {
+                    None => format!(
+                        "{}. Refused at preflight by: {} (#2947)",
+                        b.summary(),
+                        s.scopes.iter().map(|sc| sc.label()).collect::<Vec<_>>().join(", ")
+                    ),
+                    Some(reason) => format!("{}. Nothing refuses to start over it: {reason} (#2947)", b.summary()),
+                },
+                hint: Some(format!("{}. {}", b.valid_line(), b.fix())),
+            });
+        }
     }
+    rows
+}
+
+/// The Pass row for an enum setting with no bad value.
+fn enum_setting_pass_row(s: &darkmux_types::config_enum::EnumSetting) -> Check {
+    if s.is_per_item() {
+        return Check {
+            name: s.key.into(),
+            status: Status::Pass,
+            message: "every value set is valid (or none is set)".into(),
+            hint: None,
+        };
+    }
+    let (token, source) = darkmux_types::config_access::resolve_enum_token(s)
+        .expect("enum_bad_values found no bad value, so the scalar resolves");
+    let meaning = s.values.iter().find(|(t, _)| *t == token).map(|(_, m)| *m).unwrap_or("");
+    let from = match (source, s.env) {
+        (darkmux_types::config_access::Source::Env, Some(var)) => format!("from {var}"),
+        (darkmux_types::config_access::Source::Config, _) => "from config.json".to_string(),
+        _ => "default".to_string(),
+    };
+    Check { name: s.key.into(), status: Status::Pass, message: format!("`{token}` ({from}): {meaning}"), hint: None }
 }
 
 /// Normalize an OpenAI-style base URL for comparison: strip a trailing `/v1`
@@ -3113,67 +3140,6 @@ fn classify_live_channel(
 /// "warn on a laptop with 0" clause is deliberately not implemented; the
 /// issue itself names this as conditional ("if the hardware crate exposes
 /// that cheaply"). Showing the resolved value is what's left.
-/// (#2846) Surface the resolved degeneracy-detector policy, and FLAG a
-/// value that was set but could not be parsed.
-///
-/// The runtime's parse is deliberately lenient and resolves an unrecognized
-/// value to `enforce`. That direction is right — a typo must never disarm a
-/// guard — but silent leniency is its own hazard: `POLICY=observ` (missing
-/// `e`) produces a fully armed run while the operator's shell history says
-/// `observe`, and the only evidence is a `source` field in a bounds stamp
-/// that nobody reads. This is the check that makes the leniency safe, and it
-/// is the half `turn_delay_ms`'s own unparseable-value check already has.
-fn check_detection_policy() -> Check {
-    use darkmux_types::config::DetectionPolicy;
-    let name = "detection policy (degeneracy)";
-    let (policy, source) =
-        darkmux_types::config_access::detection_degeneracy_policy_with_source();
-    if source.ends_with("-invalid") {
-        let raw = if source == "env-invalid" {
-            std::env::var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY").unwrap_or_default()
-        } else {
-            darkmux_types::config::DarkmuxConfig::load_resolved()
-                .runtime
-                .and_then(|r| r.detection)
-                .and_then(|d| d.degeneracy)
-                .and_then(|g| g.policy)
-                .unwrap_or_default()
-        };
-        let where_ = if source == "env-invalid" {
-            "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY"
-        } else {
-            "runtime.detection.degeneracy.policy"
-        };
-        return Check {
-            name: name.into(),
-            status: Status::Warn,
-            message: format!(
-                "`{raw}` is not a valid policy; running as `enforce` (armed). \
-                 Set via {where_}"
-            ),
-            hint: Some(
-                "Valid values: enforce, observe, off. \
-                 `darkmux config set runtime.detection.degeneracy.policy observe`"
-                    .into(),
-            ),
-        };
-    }
-    let detail = match policy {
-        DetectionPolicy::Enforce => "detects and acts on repeating output",
-        DetectionPolicy::Observe => {
-            "detects and RECORDS repeating output, never acts \
-             (`would_conclude` carries the counterfactual)"
-        }
-        DetectionPolicy::Off => "does not measure repeating output at all",
-    };
-    Check {
-        name: name.into(),
-        status: Status::Pass,
-        message: format!("{} ({source}) — {detail}", policy.as_str()),
-        hint: None,
-    }
-}
-
 fn check_turn_delay() -> Check {
     let name = "runtime.turn_delay_ms";
     // (#2094 finding 9) `env_raw` is the RAW string, if the env var is set
@@ -3795,7 +3761,10 @@ fn check_generation_checkpoint_interval() -> Check {
 /// actually watches thermal samples lives in
 /// `darkmux_crew::thermal_governor` and is exercised by its own tests, not
 /// by doctor.
-fn check_thermal_governor() -> Check {
+/// (#2947) `None` when `pause_at`/`resume_at` is bad config: that value is
+/// reported ONCE, as Fail, by its generic enum-settings row, and there is no
+/// ladder to describe (every run refuses at preflight).
+fn check_thermal_governor() -> Option<Check> {
     let name = "runtime.thermal";
     let env_raw = std::env::var("DARKMUX_THERMAL_ENABLED")
         .ok()
@@ -3814,15 +3783,26 @@ fn check_thermal_governor() -> Check {
     };
     let enabled = darkmux_types::config_access::thermal_enabled();
     if !enabled {
-        return Check {
+        return Some(Check {
             name: name.into(),
             status: Status::Pass,
             message: format!("disabled ({provenance}) — no thermal pausing or breaking"),
             hint: None,
-        };
+        });
     }
-    let pause_at = darkmux_types::config_access::thermal_pause_at();
-    let resume_at = darkmux_types::config_access::thermal_resume_at();
+    // (#2947) A bad `pause_at`/`resume_at` is reported ONCE, as Fail, by
+    // its generic enum-settings row (`check_enum_settings`), which names the
+    // value, where it was set and the valid values. This check describes
+    // the ladder a VALID pair produces; with a bad one there is no ladder
+    // to describe (every run refuses at preflight), so it adds no row.
+    let (pause_at, resume_at) = match (
+        darkmux_types::config_access::thermal_pause_at(),
+        darkmux_types::config_access::thermal_resume_at(),
+    ) {
+        (Ok(p), Ok(r)) => (p.as_str().to_string(), r.as_str().to_string()),
+        // One row per bad value (review): the enum-settings row is it.
+        _ => return None,
+    };
     let resume_hold_ms = darkmux_types::config_access::thermal_resume_hold_ms();
     let max_pause_ms = darkmux_types::config_access::thermal_max_pause_ms();
     let min_cpu = darkmux_types::config_access::thermal_min_cpu_speed_limit_pct();
@@ -4090,15 +4070,15 @@ fn check_thermal_governor() -> Check {
                 seen.push(remedy);
             }
         }
-        return Check {
+        return Some(Check {
             name: name.into(),
             status: Status::Warn,
             message: sentences.join(" "),
             hint: Some(seen.join(" ")),
-        };
+        });
     }
 
-    Check {
+    Some(Check {
         name: name.into(),
         status: Status::Pass,
         message: format!(
@@ -4117,7 +4097,7 @@ fn check_thermal_governor() -> Check {
             }
         ),
         hint: None,
-    }
+    })
 }
 
 /// (#2108) Which host-probe SOURCES actually resolved on this machine, and
@@ -5206,8 +5186,16 @@ pub fn viewer_link_base(port: u16) -> String {
         return direct;
     }
     match darkmux_types::config_access::fleet_mode() {
-        darkmux_types::config::FleetMode::Standalone => direct,
-        _ => tailnet_viewer_url(&bind, port).unwrap_or(direct),
+        Ok(darkmux_types::config::FleetMode::Standalone) => direct,
+        Ok(_) => tailnet_viewer_url(&bind, port).unwrap_or(direct),
+        // (#2947) Not read as `standalone` silently: this renders links, it
+        // starts no work, so it says what is wrong and uses the direct
+        // address (the one link that is true whatever the fleet position).
+        // `darkmux doctor` reports the same value as Fail.
+        Err(bad) => {
+            eprintln!("{}", darkmux_types::style::warn(&format!("{bad} (viewer links use the direct address)")));
+            direct
+        }
     }
 }
 
@@ -9295,36 +9283,72 @@ mod tests {
     // ─── (#2094) check_turn_delay — resolved state + provenance + clamp warn ─
 
     #[serial_test::serial]
-    /// (#2846, review finding I1) A set-but-unparseable policy must be
-    /// SURFACED, not silently resolved. The lenient direction is correct;
-    /// the silence is the hazard, because the operator's shell says
-    /// `observe` while the run is armed.
-    // Attribute order matches every other env-mutating test in this file:
-    // `serial` must wrap `test`, not the reverse.
+    /// (#2947) Conformance: for EVERY registered enum setting, an unknown
+    /// value set through the env tier (when the setting has one) and
+    /// through the config tier is a **Fail** row naming the raw value,
+    /// where it was set, and every valid value; a valid value is Pass.
+    /// Iterates the registry, so a new setting is covered by registering
+    /// it, with no test of its own.
     #[serial_test::serial]
     #[test]
-    fn an_unparseable_detection_policy_warns_rather_than_resolving_silently() {
-        let prev = std::env::var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY").ok();
-        unsafe {
-            std::env::set_var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY", "observ");
-        }
-        let check = check_detection_policy();
-        unsafe {
-            match &prev {
-                Some(v) => std::env::set_var(
-                    "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY", v),
-                None => std::env::remove_var(
-                    "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY"),
+    fn every_registered_enum_setting_fails_doctor_on_an_unknown_value() {
+        use darkmux_types::config_enum::ENUM_SETTINGS;
+        let row = |key: &str| -> Check {
+            check_enum_settings().into_iter().find(|c| c.name == key).expect("a row for the setting")
+        };
+        assert_eq!(check_enum_settings().len(), ENUM_SETTINGS.len());
+        for s in ENUM_SETTINGS {
+            // Clean: the shipped value, Pass.
+            let prev = s.env.map(|v| (v, std::env::var(v).ok()));
+            if let Some(v) = s.env {
+                unsafe { std::env::remove_var(v) };
+            }
+            assert_eq!(row(s.key).status, Status::Pass, "{}: {:?}", s.key, row(s.key));
+
+            // Config tier.
+            {
+                let _g = darkmux_types::config_access::set_config_for_test(
+                    darkmux_types::config_enum::config_with_value(s, "zz-unknown"),
+                );
+                let path = darkmux_types::config_enum::config_path_of(s);
+                let fails: Vec<Check> =
+                    check_enum_settings().into_iter().filter(|c| c.status == Status::Fail).collect();
+                assert_eq!(fails.len(), 1, "{}: one Fail row per bad value: {fails:?}", s.key);
+                let c = fails.into_iter().next().unwrap();
+                assert!(c.message.contains("`zz-unknown`") && c.message.contains(&path), "{c:?}");
+                assert!(c.message.contains("config.json"), "names where it was set: {c:?}");
+                // (#2947 review C6) The row's claim matches the registry:
+                // the entry points that refuse, or the stated reason none do.
+                match s.no_scope_reason {
+                    None => {
+                        for sc in s.scopes {
+                            assert!(c.message.contains(sc.label()), "{}: row omits `{}`: {c:?}", s.key, sc.label());
+                        }
+                    }
+                    Some(reason) => {
+                        assert!(c.message.contains(reason), "{}: row omits the no-scope reason: {c:?}", s.key);
+                        assert!(!c.message.contains("Refused at preflight"), "{}: claims a refusal: {c:?}", s.key);
+                    }
+                }
+                let hint = c.hint.clone().unwrap_or_default();
+                for (t, _) in s.values {
+                    assert!(hint.contains(t), "{}: valid value `{t}` missing from {hint}", s.key);
+                }
+            }
+            // Env tier.
+            if let Some(v) = s.env {
+                unsafe { std::env::set_var(v, "zz-unknown-env") };
+                let c = row(s.key);
+                unsafe { std::env::remove_var(v) };
+                assert_eq!(c.status, Status::Fail, "{}: {c:?}", s.key);
+                assert!(c.message.contains("`zz-unknown-env`") && c.message.contains(v), "{c:?}");
+            }
+            if let Some((v, Some(old))) = prev {
+                unsafe { std::env::set_var(v, old) };
             }
         }
-        assert_eq!(check.status, Status::Warn, "got: {check:?}");
-        assert!(
-            check.message.contains("observ") && check.message.contains("enforce"),
-            "the warning must name BOTH the typo and what is actually running; \
-             got: {}",
-            check.message
-        );
     }
+
 
     // (#2846) Was missing `serial` while every sibling had it. It REMOVES
     // DARKMUX_TURN_DELAY_MS, so unserialized it raced
@@ -11384,18 +11408,20 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn thermal_governor_warns_on_unrecognized_pause_at() {
+    fn an_unrecognized_pause_at_is_one_fail_row_not_two() {
         // (#2110/#2109 review finding 6) A typo'd pause_at silently
-        // inverts the governor's intent (see Ty::ThermalState's doc in
-        // src/config_cmd.rs) — this must surface as a loud Warn, not fold
-        // silently into the informational Pass message.
+        // inverted the governor's intent. (#2947) It is now bad config:
+        // the thermal row does not describe a ladder that no run will get
+        // (every entry point refuses), it says so as a Fail.
         let prev = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
         unsafe { std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "seroius") };
 
-        let check = check_thermal_governor();
-        assert_eq!(check.status, Status::Warn);
-        assert!(check.message.contains("seroius"), "{}", check.message);
-        assert!(check.message.contains("unrecognized thermal state"), "{}", check.message);
+        // (#2947) One row per bad value: the thermal row steps aside and
+        // the generic `runtime.thermal.pause_at` row is the Fail.
+        assert!(check_thermal_governor().is_none(), "a second row for the same bad value");
+        let generic = check_enum_settings().into_iter().find(|c| c.name == "runtime.thermal.pause_at").unwrap();
+        assert_eq!(generic.status, Status::Fail);
+        assert!(generic.message.contains("seroius") && generic.message.contains("DARKMUX_THERMAL_PAUSE_AT"), "{}", generic.message);
 
         unsafe {
             match prev {
@@ -11415,7 +11441,7 @@ mod tests {
         let prev = std::env::var("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES").ok();
         unsafe { std::env::set_var("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES", "0") };
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Warn);
         assert!(check.message.contains("speed_limit_hold_samples"), "{}", check.message);
         assert!(check.message.contains("coerced to 1"), "{}", check.message);
@@ -11442,7 +11468,7 @@ mod tests {
             std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "fair");
         }
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("pause_at"), "{}", check.message);
         assert!(check.message.contains("resume_at"), "{}", check.message);
@@ -11465,7 +11491,7 @@ mod tests {
             std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "fair");
             std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "nominal");
         }
-        let nominal_resume = check_thermal_governor();
+        let nominal_resume = check_thermal_governor().expect("a thermal row");
         assert_eq!(
             nominal_resume.status,
             Status::Warn,
@@ -11483,7 +11509,7 @@ mod tests {
             std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "serious");
             std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "fair");
         }
-        let ok_check = check_thermal_governor();
+        let ok_check = check_thermal_governor().expect("a thermal row");
         assert_eq!(
             ok_check.status,
             Status::Pass,
@@ -11496,7 +11522,7 @@ mod tests {
             std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "fair");
             std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "serious");
         }
-        let inverted = check_thermal_governor();
+        let inverted = check_thermal_governor().expect("a thermal row");
         assert_eq!(inverted.status, Status::Warn, "{}", inverted.message);
 
         unsafe {
@@ -11524,7 +11550,7 @@ mod tests {
             std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "fair");
         }
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         let lower = check.message.to_ascii_lowercase();
         assert!(
@@ -11569,12 +11595,12 @@ mod tests {
         unsafe { std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", " Serious ") };
 
         assert_eq!(
-            darkmux_types::config_access::thermal_pause_at(),
+            darkmux_types::config_access::thermal_pause_at().unwrap().as_str(),
             "serious",
             "the resolved value must be the canonical token the governor's band resolution \
              (thermal_bands::ThermalBands) matches against"
         );
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(
             check.message.contains("pause at `serious`"),
@@ -11600,7 +11626,7 @@ mod tests {
         let prev = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
         unsafe { std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "critical") };
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(
             check.message.contains("breaker"),
@@ -11646,7 +11672,7 @@ mod tests {
                 std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", pause_at);
                 std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "nominal");
             }
-            let check = check_thermal_governor();
+            let check = check_thermal_governor().expect("a thermal row");
             assert_eq!(
                 check.status,
                 Status::Warn,
@@ -11709,7 +11735,7 @@ mod tests {
             notes.disarm_notes()
         );
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         let hint = check.hint.clone().unwrap_or_default();
         for note in notes.disarm_notes() {
@@ -11778,7 +11804,7 @@ mod tests {
         let _resume = EnvGuard::set("DARKMUX_THERMAL_RESUME_AT", "fair");
         let _max = EnvGuard::set("DARKMUX_THERMAL_MAX_PAUSE_MS", "0");
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(
             !check.message.contains("after 0ms"),
@@ -11807,7 +11833,7 @@ mod tests {
         let _resume = EnvGuard::set("DARKMUX_THERMAL_RESUME_AT", "fair");
         let _floor = EnvGuard::set("DARKMUX_THERMAL_MIN_CPU_SPEED_LIMIT_PCT", "0");
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(
             !check.message.contains("< 0%"),
@@ -11844,7 +11870,7 @@ mod tests {
         let _floor = EnvGuard::set("DARKMUX_THERMAL_MIN_CPU_SPEED_LIMIT_PCT", "50");
         let _hold = EnvGuard::set("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES", "3");
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(
             check.message.contains("after 900000ms of one pause episode"),
@@ -11879,7 +11905,7 @@ mod tests {
 
         for value in ["101", "500"] {
             let _floor = EnvGuard::set("DARKMUX_THERMAL_MIN_CPU_SPEED_LIMIT_PCT", value);
-            let check = check_thermal_governor();
+            let check = check_thermal_governor().expect("a thermal row");
             assert_eq!(check.status, Status::Warn, "floor={value}: {}", check.message);
             assert!(
                 check.message.contains("min_cpu_speed_limit_pct") && check.message.contains(value),
@@ -11903,7 +11929,7 @@ mod tests {
         // with no cap recorded reads exactly 100, which is NOT below it.
         // Pinned so the guard above cannot drift down onto a real setting.
         let _floor = EnvGuard::set("DARKMUX_THERMAL_MIN_CPU_SPEED_LIMIT_PCT", "100");
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Pass, "floor=100: {}", check.message);
         assert!(
             check.message.contains("cpu_speed_limit_pct < 100%"),
@@ -11945,7 +11971,7 @@ mod tests {
             "this test needs a pair that DOES produce a disarm note"
         );
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         // Both verdicts, in one pass — neither hides the other.
         assert!(
@@ -11992,7 +12018,7 @@ mod tests {
         let _hold = EnvGuard::set("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES", "0");
         let _ratchet = EnvGuard::set("DARKMUX_THERMAL_RATCHET_FACTOR", "0");
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("DISARMED"), "{}", check.message);
         assert!(
@@ -12026,7 +12052,7 @@ mod tests {
         let _resume = EnvGuard::set("DARKMUX_THERMAL_RESUME_AT", "fair");
         let _hold = EnvGuard::set("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES", "0");
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(
             !check.message.contains("  "),
@@ -12056,7 +12082,7 @@ mod tests {
         let _duty = EnvGuard::set("DARKMUX_THERMAL_DUTY_DELAY_MS", "0");
         let _ratchet = EnvGuard::set("DARKMUX_THERMAL_RATCHET_FACTOR", "2");
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(
             !check.message.contains("starts at 0ms"),
@@ -12073,7 +12099,7 @@ mod tests {
         // The non-degenerate rendering is pinned too, so the branch above
         // cannot be "fixed" by calling every duty delay inert.
         let _live = EnvGuard::set("DARKMUX_THERMAL_DUTY_DELAY_MS", "15000");
-        let live = check_thermal_governor();
+        let live = check_thermal_governor().expect("a thermal row");
         assert_eq!(live.status, Status::Pass, "{}", live.message);
         assert!(
             live.message.contains("starts at 15000ms and ratchets x2"),
@@ -12119,6 +12145,27 @@ mod tests {
         assert_eq!(viewer_link_base(8765), "http://127.0.0.1:8765/");
         assert_eq!(viewer_link_base(9999), "http://127.0.0.1:9999/", "port is honored");
 
+        darkmux_types::style::set_colorize_override(None);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLEET_MODE", v),
+                None => std::env::remove_var("DARKMUX_FLEET_MODE"),
+            }
+        }
+    }
+
+    /// (#2947) A bad `fleet.mode` is not read as `standalone` silently:
+    /// link rendering starts no work, so it keeps the direct address (the
+    /// one link true whatever the position) and says what is wrong on
+    /// stderr. Pinned here so a regression to a tailnet spawn on a typo, or
+    /// a panic, is red.
+    #[test]
+    #[serial_test::serial]
+    fn viewer_link_base_on_a_bad_fleet_mode_uses_the_direct_link() {
+        let prev = std::env::var("DARKMUX_FLEET_MODE").ok();
+        unsafe { std::env::set_var("DARKMUX_FLEET_MODE", "hubb") };
+        darkmux_types::style::set_colorize_override(Some(true));
+        assert_eq!(viewer_link_base(8765), "http://127.0.0.1:8765/");
         darkmux_types::style::set_colorize_override(None);
         unsafe {
             match prev {
@@ -13251,7 +13298,13 @@ mod tests {
         // (#2913) `check_removed_notebook_settings`, and (#2912/#2913 review)
         // `check_retired_role_leftovers` and `check_role_skill_references`.
         // (#2928) 69: `check_live_channel` joined the static array.
-        let expected = 69 + darkmux_eureka::all_rules().len();
+        //
+        // (#2947) 67 static rows now: `check_fleet_mode` and
+        // `check_detection_policy` left the array for the generic
+        // `check_enum_settings`, which contributes one row per registered
+        // enum setting.
+        let expected =
+            67 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

@@ -72,6 +72,47 @@ darkmux release.
 
 ### Changed (breaking, 4.0)
 
+- **The degeneracy detector's policy values name the action: `off`,
+  `record`, `warn`, `conclude`** (#2947). `enforce` is now `conclude` (still
+  the default, behavior unchanged: on repeating output the runtime closes
+  the model's thought so it answers from what it has, and escalates if it
+  keeps repeating; nothing is discarded) and `observe` is now `record`. New:
+  `warn` measures and, on each finding, prints a warning for the dispatch,
+  writes a Warn-level `dispatch.degeneracy.warning` flow record and counts
+  `degeneracy_warnings` in the run envelope, without concluding anything.
+  The old spellings are refused with the new word ("`enforce` was renamed
+  to `conclude` in 4.0"); there is no alias and no automatic migration.
+  CONFIG 1.31, FLOW 1.63.0. **Migration:** a `config.json` written by an
+  earlier `darkmux init` carries `"policy": "enforce"`, so every dispatch
+  refuses until you run
+  `darkmux config set runtime.detection.degeneracy.policy conclude` (or
+  `record` where you had `observe`); `darkmux doctor` prints the exact
+  command.
+- **An unrecognized value in an enum-valued setting is refused, not
+  guessed** (#2947). `runtime.detection.degeneracy.policy` used to run as
+  `enforce`, `fleet.mode` used to read as `standalone`, and a typo in
+  `runtime.thermal.pause_at` / `resume_at` used to pass through and disarm
+  the thermal governor's soft tiers. Now `darkmux dispatch`, `mission
+  launch` (dry runs included), `mission dispatch`, `lab run` / `lab eval`,
+  `radio` and the ACP panel refuse before starting anything, naming the
+  value, where it was set (env var or `config.json` key) and the valid
+  values. Fleet work submission does the same for
+  `fleet.identity.provider`: `machine add` refuses before writing the
+  roster, and a receiving machine refuses a submission synchronously (503)
+  before accepting it. `--skip-preflight` does not waive any of this.
+  `darkmux doctor` reports every bad value as Fail.
+  Two kinds of setting are, by design, refused by no preflight, and doctor
+  says so: `fleet.mode` (no command that starts work reads it; a bad value
+  only makes viewer links use the direct address, with a warning), and a
+  hook rule's `match.level` / `match.category`: a bad value turns the
+  hooks sink off, loudly, while the run itself continues without it.
+  `darkmux config set <key>` with no value (exit 2), `config list` (at a
+  terminal) and `config set --help` list every valid value with its
+  meaning. The config file is still read leniently (a typo in one of these
+  keys never discards the other settings); what changed is that the value
+  is refused where it is used (CONFIG 1.31, above). **Migration:** run
+  `darkmux doctor`; fix any Fail row it names with the fix it prints.
+
 - **Fleet work no longer travels through Redis; `--machine` submits
   straight to the target machine, which checks who is asking** (#2916,
   stage 1). The `darkmux:work` queue could not say who wrote an entry and

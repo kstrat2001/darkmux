@@ -1177,7 +1177,7 @@
             None,
             None,
             &[],
-        );
+        ).unwrap();
 
         // The wiring itself: this key would be ABSENT entirely if the
         // `"bounds": resolved_runtime_bounds_json(is_agentic_remote)` line
@@ -1234,7 +1234,7 @@
             None,
             None,
             &[],
-        );
+        ).unwrap();
         assert_eq!(payload["bounds"]["turn_delay_ms"]["source"], serde_json::json!("forced-agentic-remote"));
         assert_eq!(payload["turn_delay_ms"], serde_json::json!(0), "the top-level stamp is also forced");
     }
@@ -1264,7 +1264,7 @@
         ] {
             unsafe { std::env::remove_var(k) };
         }
-        let bounds = resolved_runtime_bounds_json(false, None, None);
+        let bounds = resolved_runtime_bounds_json(false, None, None).unwrap();
         assert_eq!(
             bounds["max_tokens_per_call"],
             serde_json::json!({"value": null, "source": "built-in"}),
@@ -1300,7 +1300,7 @@
         ] {
             unsafe { std::env::remove_var(k) };
         }
-        let bounds = resolved_runtime_bounds_json(false, None, None);
+        let bounds = resolved_runtime_bounds_json(false, None, None).unwrap();
         assert_eq!(
             bounds["thermal_pacing_enabled"],
             serde_json::json!({"value": true, "source": "built-in"}),
@@ -1331,7 +1331,7 @@
         unsafe { std::env::set_var("DARKMUX_THERMAL_ENABLED", "false") };
         unsafe { std::env::set_var("DARKMUX_POWER_PAUSE_RUNNING_BELOW_MIN", "off") };
         unsafe { std::env::set_var("DARKMUX_POWER_MIN_BATTERY_PCT", "35") };
-        let bounds = resolved_runtime_bounds_json(false, None, None);
+        let bounds = resolved_runtime_bounds_json(false, None, None).unwrap();
         assert_eq!(bounds["thermal_pacing_enabled"], serde_json::json!({"value": false, "source": "env"}));
         assert_eq!(bounds["battery_pause_enabled"], serde_json::json!({"value": false, "source": "env"}));
         assert_eq!(bounds["battery_pause_floor_pct"], serde_json::json!({"value": 35, "source": "env"}));
@@ -1357,7 +1357,7 @@
         unsafe { std::env::set_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL", "4000") };
         unsafe { std::env::set_var("DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL", "500") };
         unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "120") };
-        let bounds = resolved_runtime_bounds_json(false, None, None);
+        let bounds = resolved_runtime_bounds_json(false, None, None).unwrap();
         assert_eq!(bounds["max_tokens_per_call"], serde_json::json!({"value": 4000, "source": "env"}));
         assert_eq!(
             bounds["reasoning_checkpoint_interval_tokens"],
@@ -1403,7 +1403,7 @@
     #[serial]
     fn resolved_runtime_bounds_json_max_turns_names_launcher_when_the_override_wins() {
         unsafe { std::env::remove_var("DARKMUX_RUNTIME_MAX_TURNS") };
-        let bounds = resolved_runtime_bounds_json(false, Some(15), None);
+        let bounds = resolved_runtime_bounds_json(false, Some(15), None).unwrap();
         assert_eq!(bounds["max_turns"], serde_json::json!({"value": 15, "source": "launcher"}));
     }
 
@@ -1411,7 +1411,7 @@
     #[serial]
     fn resolved_runtime_bounds_json_max_turns_names_env_when_the_operator_set_one() {
         unsafe { std::env::set_var("DARKMUX_RUNTIME_MAX_TURNS", "5") };
-        let bounds = resolved_runtime_bounds_json(false, Some(15), None);
+        let bounds = resolved_runtime_bounds_json(false, Some(15), None).unwrap();
         assert_eq!(
             bounds["max_turns"],
             serde_json::json!({"value": 5, "source": "env"}),
@@ -1502,7 +1502,7 @@
     fn resolved_runtime_bounds_json_inactivity_timeout_names_cli_when_the_override_wins() {
         let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
         unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "1200") };
-        let bounds = resolved_runtime_bounds_json(false, None, Some(30));
+        let bounds = resolved_runtime_bounds_json(false, None, Some(30)).unwrap();
         assert_eq!(
             bounds["inactivity_timeout_seconds"],
             serde_json::json!({"value": 30, "source": "cli"}),
@@ -1522,7 +1522,7 @@
     fn resolved_runtime_bounds_json_inactivity_timeout_passes_through_with_no_override() {
         let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
         unsafe { std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS") };
-        let bounds = resolved_runtime_bounds_json(false, None, None);
+        let bounds = resolved_runtime_bounds_json(false, None, None).unwrap();
         assert_eq!(
             bounds["inactivity_timeout_seconds"],
             serde_json::json!({"value": 600, "source": "built-in"})
@@ -1537,7 +1537,7 @@
     fn resolved_runtime_bounds_json_turn_delay_ms_passes_through_for_a_local_dispatch() {
         let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
         unsafe { std::env::set_var("DARKMUX_TURN_DELAY_MS", "3000") };
-        let bounds = resolved_runtime_bounds_json(false, None, None);
+        let bounds = resolved_runtime_bounds_json(false, None, None).unwrap();
         assert_eq!(
             bounds["turn_delay_ms"],
             serde_json::json!({"value": 3000, "source": "env"}),
@@ -1568,7 +1568,7 @@
     fn resolved_runtime_bounds_json_turn_delay_ms_is_self_explaining_when_forced_agentic_remote() {
         let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
         unsafe { std::env::set_var("DARKMUX_TURN_DELAY_MS", "5000") };
-        let bounds = resolved_runtime_bounds_json(true, None, None);
+        let bounds = resolved_runtime_bounds_json(true, None, None).unwrap();
         assert_eq!(
             bounds["turn_delay_ms"],
             serde_json::json!({
@@ -1595,7 +1595,7 @@
     fn resolved_runtime_bounds_json_turn_delay_ms_forced_shape_holds_even_at_the_default() {
         let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
         unsafe { std::env::remove_var("DARKMUX_TURN_DELAY_MS") };
-        let bounds = resolved_runtime_bounds_json(true, None, None);
+        let bounds = resolved_runtime_bounds_json(true, None, None).unwrap();
         assert_eq!(
             bounds["turn_delay_ms"],
             serde_json::json!({
@@ -2723,6 +2723,44 @@
                  #2162 filed): {msg}"
             );
         }
+    }
+
+    /// (#2947) Both host-side dispatch primitives refuse an unregistered
+    /// value in every `Dispatch`-scope setting FIRST, with the registry's
+    /// message, even with `skip_preflight` set (that flag skips the Docker
+    /// probe, never the bad-config refusal). Every model-bearing path
+    /// (radio, acp, mission steps, crawl units, lab providers, the fleet
+    /// runner) routes through one of these two.
+    #[serial_test::serial]
+    #[test]
+    fn both_dispatch_primitives_refuse_bad_enum_config_first() {
+        use darkmux_types::config_enum::{Scope, ENUM_SETTINGS};
+        let mut exercised = 0;
+        for s in ENUM_SETTINGS.iter().filter(|s| s.scopes.contains(&Scope::Dispatch)) {
+            let var = s.env.expect("every Dispatch-scope setting today has an env var");
+            let prev = std::env::var(var).ok();
+            unsafe { std::env::set_var(var, "zz-bad-dispatch") };
+            let errs = [
+                crate::dispatch_internal::dispatch(dispatch_preflight_probe_opts()).unwrap_err(),
+                crate::dispatch_internal::dispatch_local_single_shot(dispatch_preflight_probe_opts()).unwrap_err(),
+            ];
+            unsafe {
+                match &prev {
+                    Some(v) => std::env::set_var(var, v),
+                    None => std::env::remove_var(var),
+                }
+            }
+            for e in errs {
+                let msg = format!("{e:#}");
+                assert!(msg.contains("dispatch: refusing to start: bad config"), "{}: {msg}", s.key);
+                assert!(msg.contains("`zz-bad-dispatch`") && msg.contains(var), "{}: {msg}", s.key);
+                for (t, _) in s.values {
+                    assert!(msg.contains(t), "{}: `{t}` missing: {msg}", s.key);
+                }
+            }
+            exercised += 1;
+        }
+        assert!(exercised >= 3, "only {exercised} Dispatch-scope settings exercised");
     }
 
     /// Opts that reach `dispatch()`'s workdir preflight and then bail: a
@@ -4411,6 +4449,7 @@
             // (#2094) Nonzero here so the complete-vector assertion below
             // pins the forwarded `-e DARKMUX_TURN_DELAY_MS=<n>` pair too.
             turn_delay_ms: 3000,
+            detection_policy: darkmux_types::config::DetectionPolicy::Conclude,
             // (#2094 finding 1) A distinct, non-default value so the
             // complete-vector assertion below pins the forwarded
             // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<n>` pair too.
@@ -4507,23 +4546,22 @@
         // say whether its gate was armed is not comparable against one that
         // can.
         assert_eq!(argv[26], "-e");
-        assert_eq!(argv[27], "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=enforce");
+        assert_eq!(argv[27], "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=conclude");
         // (#2846, review finding I2) The assertion above pins the DEFAULT, so
-        // by itself it cannot tell "resolved correctly" from "hardcoded" —
-        // proven by mutation: replacing the resolution with a literal
-        // `"enforce"` kept all 2253 tests green. Pin a NON-default value too,
-        // the same discipline 5e below states for the timeout source.
+        // by itself it cannot tell "forwarded" from "hardcoded". Pin a
+        // NON-default value too. (#2947) The argv builder forwards the
+        // RESOLVED policy the dispatch hands it in `detection_policy`; the
+        // resolution itself (and its refusal of an unknown value) is
+        // `config_access::detection_degeneracy_policy`, tested in
+        // darkmux-types and by the dispatch preflight conformance test.
         {
-            unsafe {
-                std::env::set_var(
-                    "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY", "observe");
-            }
-            let argv2 = build_docker_run_argv(&config);
-            unsafe {
-                std::env::remove_var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY");
-            }
+            let observe = DockerRunConfig {
+                detection_policy: darkmux_types::config::DetectionPolicy::Record,
+                ..config.clone()
+            };
+            let argv2 = build_docker_run_argv(&observe);
             assert_eq!(
-                argv2[27], "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=observe",
+                argv2[27], "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=record",
                 "the forwarded value must track the RESOLVED policy, not a literal"
             );
         }
@@ -4652,6 +4690,7 @@
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: false,
             turn_delay_ms: 0,
+            detection_policy: darkmux_types::config::DetectionPolicy::Conclude,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,
@@ -4882,6 +4921,7 @@
             // cover "both string forms" mattered.
             feedback_injection: false,
             turn_delay_ms: 0,
+            detection_policy: darkmux_types::config::DetectionPolicy::Conclude,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,
@@ -5006,6 +5046,7 @@
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: true,
             turn_delay_ms: 0,
+            detection_policy: darkmux_types::config::DetectionPolicy::Conclude,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,
@@ -5064,6 +5105,7 @@
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: true,
             turn_delay_ms: 0,
+            detection_policy: darkmux_types::config::DetectionPolicy::Conclude,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,
@@ -6289,6 +6331,7 @@
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: true,
             turn_delay_ms: 0,
+            detection_policy: darkmux_types::config::DetectionPolicy::Conclude,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,
@@ -7826,6 +7869,137 @@
         assert_eq!(records[1]["payload"]["rests"], 2);
     }
 
+    /// (#2947 review M-A, C-a) `warn` warns ONCE per turn, where `conclude`
+    /// would have acted. Under `warn` the turn keeps streaming, so the same
+    /// turn produces more degenerate gate observations and a continuation's
+    /// `would_conclude` checkpoint; the reviewer found two warn-eligible
+    /// events in turn 1 of the runtime's own warn fixture. Fed that real
+    /// sequence (two gate observations then a checkpoint, all `seq` 1): one
+    /// warning line through the sink, one record, count 1. A second turn
+    /// warns again.
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
+    fn a_warn_policy_turn_warns_once_however_many_findings_it_has() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let lines_c = lines.clone();
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            "sess-warn-once".into(),
+            "coder".into(),
+            "darkmux:m".into(),
+        );
+        state.warning_sink = Arc::new(move |l: &str| lines_c.lock().unwrap().push(l.to_string()));
+        let gate = |seq: u64, obs: u64| {
+            format!(
+                r#"{{"type":"dispatch.gate.observation","seq":{seq},"ts":{obs},"tail_ratio":0.01,"degenerate":true,"acted":false,"policy":"warn","observation":{obs},"slice_chars":4002,"interval_tokens":1000}}"#
+            )
+        };
+        state.handle_event(&gate(1, 1));
+        state.handle_event(&gate(1, 2));
+        state.handle_event(r#"{"type":"dispatch.checkpoint","seq":1,"ts":3,"tail_ratio":0.01,"verdict":"continue","policy":"warn","would_conclude":true}"#);
+        let after_turn_1 = (state.summary.degeneracy_warnings, lines.lock().unwrap().clone());
+        state.handle_event(&gate(2, 1));
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+        assert_eq!(after_turn_1.0, 1, "one warning for turn 1, however many findings");
+        assert_eq!(after_turn_1.1.len(), 1, "{:?}", after_turn_1.1);
+        assert!(
+            after_turn_1.1[0].contains("turn 1") && after_turn_1.1[0].contains("policy = warn"),
+            "{}",
+            after_turn_1.1[0]
+        );
+        assert_eq!(state.summary.degeneracy_warnings, 2, "turn 2 warns again");
+        assert_eq!(lines.lock().unwrap().len(), 2);
+        let mut records = Vec::new();
+        for e in std::fs::read_dir(tmp.path()).unwrap().flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            {
+                for l in std::fs::read_to_string(&p).unwrap().lines() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
+                        if v["session_id"] == "sess-warn-once" && v["action"] == "dispatch.degeneracy.warning" {
+                            records.push(v);
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(records.len(), 2, "one record per turn: {records:?}");
+        assert_eq!(records[0]["payload"]["turn_seq"], 1);
+        assert_eq!(records[1]["payload"]["turn_seq"], 2);
+    }
+
+    /// (#2947) The tailer turns a `warn`-policy finding into the flow
+    /// surface: one Warn-level `dispatch.degeneracy.warning` record per
+    /// finding (checkpoint AND stream gate), counted for the envelope; a
+    /// `record`-policy finding produces none.
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
+    fn a_warn_policy_finding_emits_a_warning_record_and_counts_it() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            "sess-warn".into(),
+            "coder".into(),
+            "darkmux:m".into(),
+        );
+        state.handle_event(r#"{"type":"dispatch.checkpoint","seq":3,"ts":1,"tail_ratio":0.1,"verdict":"continue","policy":"warn","would_conclude":true}"#);
+        state.handle_event(r#"{"type":"dispatch.gate.observation","seq":4,"ts":2,"tail_ratio":0.2,"degenerate":true,"acted":false,"policy":"warn","observation":1,"slice_chars":4000}"#);
+        state.handle_event(r#"{"type":"dispatch.checkpoint","seq":5,"ts":3,"tail_ratio":0.1,"verdict":"continue","policy":"record","would_conclude":true}"#);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+        assert_eq!(state.summary.degeneracy_warnings, 2);
+        let mut records = Vec::new();
+        for e in std::fs::read_dir(tmp.path()).unwrap().flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            {
+                for l in std::fs::read_to_string(&p).unwrap().lines() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
+                        if v["session_id"] == "sess-warn" && v["action"] == "dispatch.degeneracy.warning" {
+                            records.push(v);
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert!(records.iter().all(|r| r["level"] == "warn"), "{records:?}");
+        assert_eq!(records[0]["payload"]["source"], "checkpoint");
+        assert_eq!(records[1]["payload"]["source"], "stream_gate");
+    }
+
     /// (2026-08-30 fleet-observability finding) A manual pace pause (a
     /// paced `runtime.rest` event carrying `reason`/`state`) and a plain
     /// turn-delay rest were indistinguishable on the flow stream except by
@@ -8673,7 +8847,7 @@
         ];
         let with = dispatch_start_payload_json(
             "img", "msg", "sys", std::path::Path::new("/ws"), false, None, None, None, &refs,
-        );
+        ).unwrap();
         assert_eq!(
             with["brief_refs"],
             serde_json::json!([
@@ -8685,7 +8859,7 @@
         // absent key would be indistinguishable from an older writer's record.
         let without = dispatch_start_payload_json(
             "img", "msg", "sys", std::path::Path::new("/ws"), false, None, None, None, &[],
-        );
+        ).unwrap();
         assert_eq!(without["brief_refs"], serde_json::json!([]));
     }
 
@@ -9930,10 +10104,8 @@
         assert_eq!(record["payload"]["policy"], "observe");
         assert_eq!(record["payload"]["acted"], false);
         let detail = record["payload"]["detail"].as_str().unwrap();
-        assert!(
-            detail.contains("observed") && detail.contains("not enforced"),
-            "got {detail:?}"
-        );
+        // (#2947) An archived pre-4.0 `observe` record reads as `record`.
+        assert!(detail.contains("recorded, not concluded"), "got {detail:?}");
     }
 
     /// (#2887 F3/F4) `dispatch.gate.abort` forwards `policy`/`acted`
@@ -12680,6 +12852,7 @@
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: false,
             turn_delay_ms: 0,
+            detection_policy: darkmux_types::config::DetectionPolicy::Conclude,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,
@@ -13620,6 +13793,63 @@ fn summary_with(detections: Vec<serde_json::Value>) -> super::TrajectorySummary 
         detections,
         ..Default::default()
     }
+}
+
+/// (#2947) The pure mapping behind the `warn` policy: a finding under
+/// `warn` warns, the same finding under `record` / `conclude` / an archived
+/// `observe` does not, and a non-finding never does.
+#[test]
+fn only_a_warn_policy_finding_produces_a_degeneracy_warning() {
+    use super::degeneracy_warning;
+    let cp = |policy: &str, would: bool| {
+        serde_json::json!({"type":"dispatch.checkpoint","seq":4,"tail_ratio":0.12,"policy":policy,"would_conclude":would})
+    };
+    let gate = |policy: &str, degenerate: bool| {
+        serde_json::json!({"type":"dispatch.gate.observation","seq":5,"tail_ratio":0.2,"policy":policy,"degenerate":degenerate})
+    };
+    let w = degeneracy_warning("dispatch.checkpoint", &cp("warn", true)).expect("a warn finding warns");
+    assert!(w.line.contains("turn 4") && w.line.contains("not concluded") && w.line.contains("policy = warn"), "{}", w.line);
+    assert_eq!(w.payload["source"], "checkpoint");
+    assert_eq!(w.payload["acted"], false);
+    let g = degeneracy_warning("dispatch.gate.observation", &gate("warn", true)).expect("a warn gate finding warns");
+    assert_eq!(g.payload["source"], "stream_gate");
+    for policy in ["record", "conclude", "observe", "enforce", "off"] {
+        assert!(degeneracy_warning("dispatch.checkpoint", &cp(policy, true)).is_none(), "{policy}");
+        assert!(degeneracy_warning("dispatch.gate.observation", &gate(policy, true)).is_none(), "{policy}");
+    }
+    assert!(degeneracy_warning("dispatch.checkpoint", &cp("warn", false)).is_none(), "no finding, no warning");
+    assert!(degeneracy_warning("dispatch.gate.observation", &gate("warn", false)).is_none());
+    assert!(degeneracy_warning("dispatch.turn", &cp("warn", true)).is_none());
+}
+
+/// (#2947) The `warn` policy's envelope surface: the count reaches the
+/// caller, and a run with none carries no field.
+#[test]
+fn degeneracy_warnings_reach_the_envelope() {
+    let mut summary = summary_with(vec![]);
+    summary.degeneracy_warnings = 2;
+    let out = super::enrich_envelope_with_summary(
+        r#"{"result":"stop"}"#.to_string(),
+        &summary,
+        &super::HostStats::default(),
+        &no_extras(),
+        no_findings_dir(),
+        serde_json::json!({}),
+        None,
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["degeneracy_warnings"], 2, "{out}");
+    let out = super::enrich_envelope_with_summary(
+        r#"{"result":"stop"}"#.to_string(),
+        &summary_with(vec![]),
+        &super::HostStats::default(),
+        &no_extras(),
+        no_findings_dir(),
+        serde_json::json!({}),
+        None,
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(v.get("degeneracy_warnings").is_none(), "{out}");
 }
 
 #[test]
@@ -14744,6 +14974,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 None,
                 host_out_for_closure,
                 None,
+                crate::thermal_governor::ThermalGovernorConfig::from_env().unwrap(),
             );
             *handle_holder_for_closure.lock().unwrap() = Some(handle);
             panic!("simulated panic between the sampler's spawn and dispatch()'s own stores");
@@ -16442,7 +16673,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
             None,
             &[],
-        );
+        ).unwrap();
         assert!(none["tools_requested"].is_null(), "{}", none);
         let names = vec!["read".to_string(), "search".to_string(), "bash".to_string(), "create_finding".to_string()];
         let some = dispatch_start_payload_json(
@@ -16455,7 +16686,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
             Some(&names),
             &[],
-        );
+        ).unwrap();
         assert_eq!(some["tools_requested"], serde_json::json!(["read", "search", "bash", "create_finding"]));
     }
 

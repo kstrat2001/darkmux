@@ -126,7 +126,7 @@ fn the_shipped_defaults_match_config_access() {
     }
 
     let d = shipped_defaults();
-    let a = ThermalGovernorConfig::from_env();
+    let a = ThermalGovernorConfig::from_env().unwrap();
     assert_eq!(d.pause_at, a.pause_at);
     assert_eq!(d.resume_at, a.resume_at);
     assert_eq!(d.resume_hold_ms, a.resume_hold_ms);

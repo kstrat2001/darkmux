@@ -205,6 +205,11 @@ pub(crate) fn dispatch_reconciled_with(
     local_dispatch: impl FnOnce(DispatchOpts) -> Result<DispatchResult>,
     host_factory: &(dyn Fn() -> Box<dyn ModelHost> + Sync),
 ) -> Result<DispatchResult> {
+    // (#2947 review M1) Bad enum config refuses BEFORE the residency lease
+    // and `ensure_wave_loaded`: without this, the fleet receiver's runner
+    // reconciled (and could evict / load) models, and only then did
+    // `dispatch()`'s own preflight refuse.
+    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
     match claim {
         SeatClaim::LocalModel(placement) => {
             // Scoped to exactly this reconcile-and-dispatch window — a
@@ -405,6 +410,40 @@ mod tests {
     /// by swapping the two statements in `dispatch_reconciled_with` and
     /// observing this test fail (`left: []`, no reconcile ops yet present
     /// when the dispatch closure ran).
+    /// (#2947 review M1, the reviewer's probe committed) A bad enum value
+    /// refuses with NO host operation first: no residency listing, no load,
+    /// no eviction, and the dispatch closure never runs.
+    #[serial_test::serial]
+    #[test]
+    fn a_bad_enum_value_refuses_before_any_residency_operation() {
+        let _env = LeaseTestEnv::new();
+        let host = Arc::new(Mutex::new(MockHost::new().cataloged("m", 1_000)));
+        let factory = host_factory_over(host.clone());
+        let prev = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
+        unsafe { std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "seroius") };
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let d2 = dispatched.clone();
+        let result = dispatch_reconciled_with(
+            test_opts("coder"),
+            SeatClaim::LocalModel(placement("m", 8_000)),
+            move |_| {
+                d2.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("the dispatch must never be reached")
+            },
+            factory.as_ref(),
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT"),
+            }
+        }
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains("dispatch: refusing to start: bad config") && msg.contains("`seroius`"), "{msg}");
+        assert_eq!(host.lock().unwrap().ops, Vec::<HostOp>::new(), "host touched before the refusal");
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    }
+
     #[serial_test::serial]
     #[test]
     fn dispatch_reconciled_evicts_a_darkmux_owned_orphan_before_dispatching() {

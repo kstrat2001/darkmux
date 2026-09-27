@@ -12,7 +12,8 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Subcommand;
-use darkmux_types::config::{DarkmuxConfig, FleetMode};
+use darkmux_types::config::DarkmuxConfig;
+use darkmux_types::config_enum::{self, EnumSetting};
 use darkmux_types::paths::{ResolveScope, resolve};
 use serde_json::Value;
 use std::path::Path;
@@ -26,12 +27,18 @@ pub enum ConfigCmd {
     /// a profile — #1475). The role id must be a real one (`darkmux role
     /// list`) — a typo'd or invented role id is settable but resolves nothing
     /// (#1547; `darkmux doctor` flags it).
+    ///
+    /// With no VALUE, prints what the key accepts: for an enum-valued key,
+    /// every valid value with its meaning (#2947).
+    #[command(after_long_help = config_enum::help_block())]
     Set {
         /// Dotted config key (e.g. `redis.host`, `fleet.mode`,
         /// `runtime.strict_selection`, `role_profiles.<role-id>`).
         key: String,
-        /// The value. Coerced to the key's type (bool/number/string).
-        value: String,
+        /// The value. Coerced to the key's type (bool/number/string); an
+        /// enum-valued key accepts only its listed values. Omit it to list
+        /// what the key accepts.
+        value: Option<String>,
     },
     /// Print a key's value as stored in config.json (the durable setting).
     /// `darkmux doctor` shows the fully RESOLVED value with provenance
@@ -40,7 +47,11 @@ pub enum ConfigCmd {
         /// Dotted config key.
         key: String,
     },
-    /// Print the full config.json (the durable settings on this machine).
+    /// Print the full config.json (the durable settings on this machine),
+    /// then, at a terminal (on stderr, so the JSON on stdout stays
+    /// parseable), every enum-valued setting with its valid values and
+    /// their meanings.
+    #[command(after_long_help = config_enum::help_block())]
     List,
 }
 
@@ -52,46 +63,15 @@ enum Ty {
     Bool,
     Uint,
     Float,
-    /// A string constrained to the `FleetMode` token set (#933).
-    FleetMode,
-    /// (#2916) A string constrained to the identity providers this darkmux
-    /// knows (`darkmux_fleet::KNOWN_IDENTITY_PROVIDERS`). An unknown value
-    /// would load fine and then refuse every submission, so the write
-    /// surface refuses it up front.
-    IdentityProvider,
-    /// (#2846) A string constrained to the `DetectionPolicy` token set
-    /// (`enforce`/`observe`/`off`). Validated here rather than left as
-    /// `Ty::Str` for the reason `ThermalState` is: the runtime's own parse
-    /// is deliberately LENIENT and resolves an unknown value to `enforce`,
-    /// so a typo written through `config set` would be silently armed and
-    /// the operator would never learn the key did not take. Leniency on the
-    /// hot load path and strictness at the write surface is contract 7's
-    /// split, not a contradiction.
-    DetectionPolicy,
-    /// (#2110/#2109 review finding 6) A string constrained to
-    /// `darkmux_crew::host_probe::thermal::THERMAL_STATES`
-    /// (`nominal`/`fair`/`serious`/`critical`) — `runtime.thermal.pause_at`
-    /// / `.resume_at`. Without this, a typo (`"seroius"`) silently parsed
-    /// as `Ty::Str`, and the governor's old `severity()` helper ranked an
-    /// unrecognized name WORSE than `critical` via
-    /// `unwrap_or(THERMAL_STATES.len())` — inverting either knob's intent
-    /// with no error anywhere in the path: a typo'd `pause_at` made
-    /// `sev >= severity(pause_at)` (4) all but unreachable for any real OS
-    /// reading, silently disabling the governor's soft pause (the
-    /// breaker's own hardcoded `"critical"` check was unaffected); a
-    /// typo'd `resume_at` made `sev <= severity(resume_at)` (4) true for
-    /// every reading, so the hysteresis hold filled up regardless of
-    /// actual temperature and the pause cleared almost immediately even on
-    /// a machine still hot.
-    ///
-    /// (#2774 round-4 C3) That helper is gone: the governor now resolves
-    /// `darkmux_crew::thermal_bands::ThermalBands`, which has no rank for
-    /// an unrecognized name and DISARMS the soft tiers with a stated
-    /// reason instead of inventing one. This validation is still the first
-    /// line of defense — it stops the token reaching a config file at
-    /// all — but a typo that gets in by hand is now loud rather than
-    /// silently inverting.
-    ThermalState,
+    /// (#2947) A value of a registered enum setting
+    /// (`darkmux_types::config_enum::ENUM_SETTINGS`). The ONLY way `config
+    /// set` constrains a string to a token set: there is no per-enum
+    /// variant, so a key cannot be validated here without being in the
+    /// registry, which is what gives it the preflight refusal, the doctor
+    /// Fail and the help listing too. (Replaces the per-enum `FleetMode`,
+    /// `IdentityProvider`, `DetectionPolicy` and `ThermalState` variants,
+    /// each of which duplicated its own value list.)
+    Enum(&'static EnumSetting),
     /// (#1685) Comma-separated list of non-empty, trimmed strings, coerced
     /// to a JSON array — `darkmux config set cmd.allowed pr-list,pr-merge`.
     /// REPLACES the whole array (there is no incremental add); an empty
@@ -182,11 +162,11 @@ const KEYS: &[(&str, Ty)] = &[
     // above and `redis.maxlen` below — never "retain nothing").
     ("runtime.liveness_retention_hours", Ty::Uint),
     // (#2110/#2109) The thermal governor + breaker's tuning block —
-    // see `ThermalConfig`'s own doc.
-    ("runtime.detection.degeneracy.policy", Ty::DetectionPolicy),
+    // see `ThermalConfig`'s own doc. (#2947) The enum-valued keys
+    // (`runtime.detection.degeneracy.policy`, `runtime.thermal.pause_at` /
+    // `resume_at`, `fleet.mode`, `fleet.identity.provider`) are NOT listed
+    // here: `key_type` resolves them from `config_enum::ENUM_SETTINGS`.
     ("runtime.thermal.enabled", Ty::Bool),
-    ("runtime.thermal.pause_at", Ty::ThermalState),
-    ("runtime.thermal.resume_at", Ty::ThermalState),
     ("runtime.thermal.resume_hold_ms", Ty::Uint),
     ("runtime.thermal.max_pause_ms", Ty::Uint),
     ("runtime.thermal.min_cpu_speed_limit_pct", Ty::Uint),
@@ -197,12 +177,11 @@ const KEYS: &[(&str, Ty)] = &[
     ("runtime.thermal.ratchet_factor", Ty::Uint),
     ("runtime.thermal.episode_threshold", Ty::Uint),
     ("runtime.thermal.tier4_enabled", Ty::Bool),
-    ("fleet.mode", Ty::FleetMode),
-    // (#2916) Fleet work submission. `fleet.accept_work.*` is deliberately
+    // (#2916) Fleet work submission (`fleet.identity.provider` is an enum
+    // setting, resolved from the registry). `fleet.accept_work.*` is deliberately
     // NOT here: an allow-list entry's `node_id` is resolved through the
     // identity provider by `darkmux machine trust`, never typed, so the map
     // has no `config set` form at all.
-    ("fleet.identity.provider", Ty::IdentityProvider),
     ("fleet.identity.bin", Ty::Str),
     ("fleet.listener.enabled", Ty::Bool),
     ("fleet.listener.port", Ty::Uint),
@@ -286,7 +265,10 @@ const SECRET_KEYS: &[(&str, &str)] = &[
     ("runtime.serve_token", "darkmux-serve-token"),
 ];
 
-pub fn run(cmd: ConfigCmd) -> Result<()> {
+/// Returns the process exit code: `0`, or `2` for `config set <key>` with
+/// no value (it describes the key, and still fails a script that forgot the
+/// value, as the old missing-argument usage error did; #2947 review C7).
+pub fn run(cmd: ConfigCmd) -> Result<i32> {
     // (#1323) ForceUser, not Auto — `darkmux config get/set/list` operates on
     // the user-scope config.json, matching `DarkmuxConfig::load_resolved`. Under
     // Auto a stray project-local `.darkmux/` (missions/phases/lessons) would
@@ -294,18 +276,33 @@ pub fn run(cmd: ConfigCmd) -> Result<()> {
     // level; there is no legitimate per-project config.
     let path = resolve(ResolveScope::ForceUser).config;
     match cmd {
-        ConfigCmd::Set { key, value } => {
+        ConfigCmd::Set { key, value: Some(value) } => {
             let msg = set_at(&path, &key, &value)?;
             println!("{msg}");
+        }
+        ConfigCmd::Set { key, value: None } => {
+            println!("{}", describe_key_at(&path, &key)?);
+            eprintln!("darkmux config set: no value given for `{key}` (nothing was written)");
+            return Ok(2);
         }
         ConfigCmd::Get { key } => {
             println!("{}", get_at(&path, &key)?);
         }
         ConfigCmd::List => {
             println!("{}", list_at(&path)?);
+            // (#2947) stderr, so `darkmux config list | jq` still parses,
+            // and only for a person at a terminal: the serve daemon's
+            // config-list console panel keeps the last stderr lines and
+            // shows them as a warning (review C5).
+            if show_value_help_on_list(
+                std::io::IsTerminal::is_terminal(&std::io::stderr()),
+                std::env::var_os("DARKMUX_PANEL").is_some(),
+            ) {
+                eprintln!("\n{}", config_enum::help_block());
+            }
         }
     }
-    Ok(())
+    Ok(0)
 }
 
 /// Look up a key's type, or `None` if it isn't a known settable key. Static
@@ -320,7 +317,77 @@ fn key_type(key: &str) -> Option<Ty> {
         // deeper path (`role_profiles.a.b`); the map is role -> profile name.
         return (!role.is_empty() && !role.contains('.')).then_some(Ty::Str);
     }
+    // Scalar enum settings only: a per-item one (`hooks.rules[].match.
+    // level`) has no `config set` key of its own; it is validated when
+    // `hooks.rules` is set as a whole (see `set_at`).
+    if let Some(setting) = config_enum::setting(key).filter(|s| !s.is_per_item()) {
+        return Some(Ty::Enum(setting));
+    }
     KEYS.iter().find(|(k, _)| *k == key).map(|(_, t)| *t)
+}
+
+/// (#2947 review C5) Whether `config list` prints the enum value help on
+/// stderr: only to a terminal, and never under a console panel.
+fn show_value_help_on_list(stderr_is_tty: bool, under_panel: bool) -> bool {
+    stderr_is_tty && !under_panel
+}
+
+/// Every statically settable key with its type: `KEYS` plus the enum
+/// settings the registry owns (#2947). The dynamic `role_profiles.<role>`
+/// map is not enumerable and is not included.
+fn all_keys() -> Vec<(&'static str, Ty)> {
+    KEYS.iter()
+        .copied()
+        .chain(config_enum::ENUM_SETTINGS.iter().filter(|s| !s.is_per_item()).map(|s| (s.key, Ty::Enum(s))))
+        .collect()
+}
+
+/// (#2947) `darkmux config set <key>` with no value: what the key accepts
+/// and what is stored. For an enum-valued key, every valid value with its
+/// meaning, the env var that overrides it, and the shipped default.
+fn describe_key_at(path: &Path, key: &str) -> Result<String> {
+    let Some(ty) = key_type(key) else {
+        bail!("unknown config key `{key}`{}", suggestion(key));
+    };
+    let stored_value = load_object(path).ok().and_then(|root| get_path(&root, key).cloned());
+    let stored = stored_value.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "(unset)".to_string());
+    Ok(match ty {
+        Ty::Enum(s) => {
+            // (#2947 review C7) A stored value that is not one of the values
+            // is said to be so here, not just echoed.
+            let stored = match stored_value.as_ref() {
+                Some(Value::String(raw)) if s.canonical(raw).is_none() => match s.renamed(raw) {
+                    // (#2947 review C-f) Name the replacement, as doctor does.
+                    Some(new) => format!(
+                        "{stored} - not a valid value: `{}` was renamed to `{new}` in 4.0",
+                        raw.trim().to_ascii_lowercase()
+                    ),
+                    None => format!("{stored} - not a valid value; runs that read it refuse to start"),
+                },
+                Some(v) if !v.is_string() => format!("{stored} - not a valid value (not a string)"),
+                _ => stored,
+            };
+            let env = s.env.map(|e| format!("\n  env override: {e}")).unwrap_or_default();
+            format!(
+                "`{key}` takes one of these values ({}):\n{}\n  stored in config.json: {stored}{env}\n  \
+                 set it with: darkmux config set {key} <value>",
+                s.kind,
+                s.values_help("    ")
+            )
+        }
+        other => format!(
+            "`{key}` takes {}.\n  stored in config.json: {stored}\n  set it with: darkmux config set {key} <value>",
+            match other {
+                Ty::Str => "a string",
+                Ty::Bool => "a boolean (true/false, 1/0, yes/no, on/off)",
+                Ty::Uint => "a non-negative integer",
+                Ty::Float => "a number",
+                Ty::StrList => "a comma-separated list",
+                Ty::Json => "a JSON value",
+                Ty::Enum(_) => unreachable!("handled above"),
+            }
+        ),
+    })
 }
 
 /// Set `key` to `value` in the config.json at `path`, returning the operator
@@ -359,8 +426,21 @@ fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
     // Sanity: the result must still deserialize as a DarkmuxConfig (it will —
     // every key maps to a typed field of the right type), so a write can never
     // produce a config the loader would reject.
-    serde_json::from_value::<DarkmuxConfig>(root.clone())
+    let parsed_cfg = serde_json::from_value::<DarkmuxConfig>(root.clone())
         .context("the resulting config.json would not parse — aborting the write")?;
+    // (#2947 review C2) A structured key that carries enum-valued fields
+    // (`hooks.rules` and its `match.level` / `match.category`) is checked
+    // against every per-item registry entry under it, so a typo is refused
+    // here rather than silently matching nothing.
+    let bad: Vec<String> = config_enum::ENUM_SETTINGS
+        .iter()
+        .filter(|s| s.is_per_item() && s.key.starts_with(&format!("{key}[].")))
+        .flat_map(|s| config_enum::bad_in(s, &parsed_cfg, |_| None))
+        .map(|b| format!("{}. {}", b.summary(), b.valid_line()))
+        .collect();
+    if !bad.is_empty() {
+        bail!("invalid value for `{key}`:\n  {}", bad.join("\n  "));
+    }
 
     let pretty = serde_json::to_string_pretty(&root).context("serializing config.json")?;
     std::fs::write(path, pretty + "\n").with_context(|| format!("writing {}", path.display()))?;
@@ -539,42 +619,27 @@ fn parse_value(ty: Ty, raw: &str) -> Result<Value> {
                 .map(Value::Number)
                 .ok_or_else(|| anyhow!("`{raw}` is not a finite number"))?
         }
-        Ty::FleetMode => {
-            let mode = FleetMode::parse(raw)
-                .ok_or_else(|| anyhow!("invalid fleet.mode `{raw}` — valid: standalone, hub, peer"))?;
-            // Store the canonical lowercase token regardless of the input casing.
-            Value::String(mode.as_str().to_string())
-        }
-        Ty::IdentityProvider => {
-            let lower = raw.trim().to_ascii_lowercase();
-            if !darkmux_fleet::KNOWN_IDENTITY_PROVIDERS.contains(&lower.as_str()) {
-                bail!(
-                    "unknown identity provider `{raw}` — valid: {}",
-                    darkmux_fleet::KNOWN_IDENTITY_PROVIDERS.join(", ")
-                );
+        // (#2947) One arm for every enum setting: the registry's own value
+        // list, stored as its canonical token.
+        Ty::Enum(setting) => match setting.canonical(raw) {
+            Some(token) => Value::String(token.to_string()),
+            None => {
+                let list = setting
+                    .values
+                    .iter()
+                    .map(|(t, m)| format!("  {t}  {m}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                // (#2947) A retired spelling names its replacement first.
+                if let Some(new) = setting.renamed(raw) {
+                    bail!(
+                        "`{raw}` was renamed to `{new}` in 4.0: `darkmux config set {} {new}` — valid values:\n{list}",
+                        setting.key
+                    )
+                }
+                bail!("`{raw}` is not a valid {} — valid values:\n{list}", setting.kind)
             }
-            Value::String(lower)
-        }
-        Ty::DetectionPolicy => {
-            let lower = raw.trim().to_ascii_lowercase();
-            match darkmux_types::config::DetectionPolicy::parse_lenient(&lower) {
-                Some(p) => Value::String(p.as_str().to_string()),
-                None => bail!(
-                    "invalid detection policy `{raw}` — valid: enforce, observe, off"
-                ),
-            }
-        }
-        Ty::ThermalState => {
-            let lower = raw.trim().to_ascii_lowercase();
-            let states = darkmux_crew::host_probe::thermal::THERMAL_STATES;
-            if !states.contains(&lower.as_str()) {
-                bail!(
-                    "invalid thermal state `{raw}` — valid: {}",
-                    states.join(", ")
-                );
-            }
-            Value::String(lower)
-        }
+        },
         Ty::StrList => Value::Array(
             raw.split(',')
                 .map(str::trim)
@@ -614,7 +679,8 @@ fn get_path<'a>(root: &'a Value, key: &str) -> Option<&'a Value> {
 /// "Did you mean" suffix for an unknown key — up to 3 closest known keys by
 /// Levenshtein distance (≤ 3), else a pointer to `config list`.
 fn suggestion(key: &str) -> String {
-    let near = nearest(key, KEYS.iter().map(|(k, _)| *k));
+    let keys = all_keys();
+    let near = nearest(key, keys.iter().map(|(k, _)| *k));
     if near.is_empty() {
         " — run `darkmux config list` to see the settable keys".to_string()
     } else {
@@ -1009,7 +1075,8 @@ mod tests {
         // the_env_tier_does` for the shared vocabulary.
         assert!(set_at(f.path(), "redis.enabled", "yes").is_ok());
         assert!(set_at(f.path(), "redis.enabled", "maybe").is_err(), "an unrecognized token is refused");
-        assert!(set_at(f.path(), "fleet.mode", "hubb").unwrap_err().to_string().contains("invalid fleet.mode"));
+        let err = set_at(f.path(), "fleet.mode", "hubb").unwrap_err().to_string();
+        assert!(err.contains("fleet.mode") && err.contains("`hubb`") && err.contains("standalone"), "{err}");
     }
 
     #[test]
@@ -1019,7 +1086,7 @@ mod tests {
         // Ty::ThermalState's own doc). This proves it's now rejected.
         let f = tmp();
         let err = set_at(f.path(), "runtime.thermal.pause_at", "seroius").unwrap_err().to_string();
-        assert!(err.contains("invalid thermal state"), "{err}");
+        assert!(err.contains("not a valid thermal state"), "{err}");
         assert!(err.contains("serious"), "error should list valid values: {err}");
     }
 
@@ -1079,6 +1146,233 @@ mod tests {
         assert_eq!(v["redis"]["host"], Value::String("h".into()));
     }
 
+    /// (#2947) Conformance, `config set` half: for EVERY registered enum
+    /// setting, an unknown value is refused (naming the key, the raw value
+    /// and every valid value with its meaning) and leaves the file
+    /// untouched; every valid value is accepted in any case and stored
+    /// canonically; and `config set <key>` with no value lists every valid
+    /// value with its meaning. Iterates the registry, so a new setting is
+    /// covered by registering it.
+    #[test]
+    fn every_registered_enum_setting_is_validated_and_described_by_config_set() {
+        for s in config_enum::ENUM_SETTINGS.iter().filter(|s| !s.is_per_item()) {
+            let f = tmp();
+            let err = set_at(f.path(), s.key, "zz-unknown").unwrap_err().to_string();
+            assert!(err.contains(s.key) && err.contains("`zz-unknown`"), "{}: {err}", s.key);
+            for (t, m) in s.values {
+                assert!(err.contains(t) && err.contains(m), "{}: `{t}` / meaning missing: {err}", s.key);
+            }
+            assert_eq!(std::fs::read_to_string(f.path()).unwrap(), "", "{}: a refused value wrote the file", s.key);
+            for (t, _) in s.values {
+                set_at(f.path(), s.key, &format!(" {} ", t.to_ascii_uppercase())).unwrap();
+                assert_eq!(get_at(f.path(), s.key).unwrap(), format!("\"{t}\""), "{}", s.key);
+            }
+            let help = describe_key_at(f.path(), s.key).unwrap();
+            for (t, m) in s.values {
+                assert!(help.contains(t) && help.contains(m), "{}: `{t}` missing from {help}", s.key);
+            }
+        }
+    }
+
+    /// (#2947) THE conformance test for the enum-settings rule, over every
+    /// surface at once. For EVERY registry entry, an unknown value set via
+    /// the env tier (when the entry has an env var) and via the config
+    /// file tier must:
+    ///
+    /// - make `preflight(scope)` refuse for every scope the entry lists,
+    ///   naming the raw value, where it was set, and every valid value (and
+    ///   leave every scope the entry does NOT list alone). A listed scope
+    ///   refuses even when one particular run through it would never read
+    ///   the setting (a tool-less remote dispatch and the thermal ladder,
+    ///   say): the scopes are where the setting COULD be consumed, and bad
+    ///   config is bad config;
+    /// - make its `darkmux doctor` row Fail;
+    /// - be refused by `darkmux config set`;
+    /// - and the help block must list its values with their meanings.
+    ///
+    /// It iterates `ENUM_SETTINGS`, so a new enum setting is held to all of
+    /// it by being registered. That the ENTRY POINTS call `preflight` is
+    /// proven separately, by spawning them (`tests/cli.rs`,
+    /// `every_enum_setting_is_refused_by_every_cli_entry_point_that_consumes_it`
+    /// and `radio_refuses_bad_enum_config_before_routing`) and by calling
+    /// the primitives (darkmux-crew, darkmux-lab, darkmux-fleet,
+    /// darkmux-serve's listener), since a direct `preflight` call cannot
+    /// show that.
+    #[serial_test::serial]
+    #[test]
+    fn every_enum_setting_obeys_the_rule_on_every_surface() {
+        use config_enum::{preflight, SetIn, Scope, ENUM_SETTINGS};
+        let help = config_enum::help_block();
+        for s in ENUM_SETTINGS {
+            let mut tiers: Vec<(SetIn, &str)> = vec![(SetIn::Config(config_enum::config_path_of(s)), "zz-bad-config")];
+            if let Some(var) = s.env {
+                tiers.push((SetIn::Env(var), "zz-bad-env"));
+            }
+            for (set_in, raw) in tiers {
+                let _guard;
+                match &set_in {
+                    SetIn::Env(var) => {
+                        _guard = None;
+                        unsafe { std::env::set_var(var, raw) };
+                    }
+                    SetIn::Config(_) => {
+                        let cfg = config_enum::config_with_value(s, raw);
+                        _guard = Some(darkmux_types::config_access::set_config_for_test(cfg));
+                    }
+                }
+                // Preflight, per scope.
+                for scope in Scope::ALL {
+                    let r = preflight(scope);
+                    if s.scopes.contains(&scope) {
+                        let msg = r.expect_err(&format!("{} via {set_in}: {scope:?} must refuse", s.key)).to_string();
+                        assert!(msg.contains(&format!("`{raw}`")), "{msg}");
+                        assert!(msg.contains(&set_in.to_string()), "names where it was set: {msg}");
+                        for (t, m) in s.values {
+                            assert!(msg.contains(t) && msg.contains(m), "{}: `{t}` missing: {msg}", s.key);
+                        }
+                    } else {
+                        assert!(r.is_ok(), "{} via {set_in}: {scope:?} does not consume it but refused: {r:?}", s.key);
+                    }
+                }
+                // Doctor.
+                let row = darkmux_doctor::check_enum_settings()
+                    .into_iter()
+                    .find(|c| c.status == darkmux_doctor::Status::Fail)
+                    .unwrap_or_else(|| panic!("{} via {set_in}: no doctor Fail row", s.key));
+                assert_eq!(row.status, darkmux_doctor::Status::Fail, "{} via {set_in}: {row:?}", s.key);
+                assert!(row.message.contains(&format!("`{raw}`")), "{row:?}");
+                if let SetIn::Env(var) = &set_in {
+                    unsafe { std::env::remove_var(var) };
+                }
+                drop(_guard);
+            }
+            // config set refuses (the file tier's write surface).
+            let f = tmp();
+            match s.key.split_once("[].") {
+                // A per-item setting is written through its list key.
+                Some((list, item)) => {
+                    let mut rule = Value::Object(Default::default());
+                    set_path(&mut rule, item, Value::String("zz-bad".into()));
+                    rule["http"] = Value::String("http://127.0.0.1:9/x".into());
+                    let json = serde_json::to_string(&Value::Array(vec![rule])).unwrap();
+                    let err = set_at(f.path(), list, &json).unwrap_err().to_string();
+                    assert!(err.contains("`zz-bad`"), "{}: {err}", s.key);
+                }
+                None => {
+                    assert!(set_at(f.path(), s.key, "zz-bad").is_err(), "{}: config set accepted a bad value", s.key);
+                }
+            }
+            assert_eq!(std::fs::read_to_string(f.path()).unwrap(), "", "{}: a refused value was written", s.key);
+            // Help.
+            for (t, m) in s.values {
+                assert!(help.contains(t) && help.contains(m), "{}: help lacks `{t}`", s.key);
+            }
+            // Clean again: every scope passes.
+            for scope in Scope::ALL {
+                assert!(preflight(scope).is_ok(), "{}: {scope:?} still refusing after cleanup", s.key);
+            }
+        }
+    }
+
+    /// (#2947 rename) `config set` refuses every retired spelling of every
+    /// registered scalar setting and suggests the new word; doctor says the
+    /// same (the summary carries the rename).
+    #[serial_test::serial]
+    #[test]
+    fn config_set_and_doctor_name_the_replacement_for_a_retired_spelling() {
+        let mut exercised = 0;
+        for s in config_enum::ENUM_SETTINGS.iter().filter(|s| !s.is_per_item()) {
+            for (old, new) in s.retired {
+                let f = tmp();
+                let err = set_at(f.path(), s.key, old).unwrap_err().to_string();
+                assert!(err.contains(&format!("renamed to `{new}`")), "{err}");
+                assert!(err.contains(&format!("darkmux config set {} {new}", s.key)), "{err}");
+                let _g = darkmux_types::config_access::set_config_for_test(config_enum::config_with_value(s, old));
+                let row = darkmux_doctor::check_enum_settings()
+                    .into_iter()
+                    .find(|c| c.status == darkmux_doctor::Status::Fail)
+                    .expect("doctor fails a retired spelling");
+                assert!(row.message.contains(&format!("was renamed to `{new}` in 4.0")), "{row:?}");
+                assert!(row.hint.unwrap_or_default().contains(&format!("config set {} {new}", s.key)));
+                exercised += 1;
+            }
+        }
+        assert!(exercised >= 2);
+    }
+
+    /// (#2947 review C7) `config set <key>` with no value names a stored
+    /// invalid value as invalid.
+    #[test]
+    fn describe_names_a_stored_invalid_value_as_invalid() {
+        let f = tmp();
+        std::fs::write(f.path(), r#"{"fleet":{"mode":"hubb"}}"#).unwrap();
+        let out = describe_key_at(f.path(), "fleet.mode").unwrap();
+        assert!(out.contains("\"hubb\" - not a valid value"), "{out}");
+        std::fs::write(f.path(), r#"{"fleet":{"mode":"hub"}}"#).unwrap();
+        let out = describe_key_at(f.path(), "fleet.mode").unwrap();
+        assert!(!out.contains("not a valid value"), "{out}");
+        // (#2947 review C-f) A stored retired spelling names its replacement.
+        std::fs::write(f.path(), r#"{"runtime":{"detection":{"degeneracy":{"policy":"enforce"}}}}"#).unwrap();
+        let out = describe_key_at(f.path(), "runtime.detection.degeneracy.policy").unwrap();
+        // On the STORED line, not merely in the value list's retired note.
+        assert!(
+            out.contains("stored in config.json: \"enforce\" - not a valid value: `enforce` was renamed to `conclude` in 4.0"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn config_list_value_help_is_for_a_terminal_only() {
+        assert!(show_value_help_on_list(true, false));
+        assert!(!show_value_help_on_list(false, false), "piped or captured stderr gets nothing");
+        assert!(!show_value_help_on_list(true, true), "a console panel gets nothing");
+    }
+
+    /// (#2947) Help lists every registered enum setting's values with their
+    /// meanings: the block `config list` prints and `config set --help` /
+    /// `config list --help` carry as their long help.
+    #[test]
+    fn the_help_block_lists_every_enum_setting_with_its_values_and_meanings() {
+        let help = config_enum::help_block();
+        for s in config_enum::ENUM_SETTINGS {
+            assert!(help.contains(s.key), "{} missing from help", s.key);
+            if let Some(e) = s.env {
+                assert!(help.contains(e), "{e} missing from help");
+            }
+            for (t, m) in s.values {
+                assert!(help.contains(t) && help.contains(m), "{}: `{t}` missing from help", s.key);
+            }
+        }
+        use clap::CommandFactory;
+        let mut cmd = crate::cli::Cli::command();
+        let config = cmd.find_subcommand_mut("config").expect("config verb");
+        for verb in ["set", "list"] {
+            let long = config
+                .find_subcommand_mut(verb)
+                .expect(verb)
+                .render_long_help()
+                .to_string();
+            for s in config_enum::ENUM_SETTINGS {
+                assert!(long.contains(s.key), "`config {verb} --help` does not list {}", s.key);
+            }
+        }
+    }
+
+    /// (#2947) The unregistered-enum guard, `config set` half: no key in the
+    /// static `KEYS` table is also a registry key (the registry owns every
+    /// enum key), and `Ty` has no way to constrain a string other than
+    /// `Ty::Enum(<registry entry>)`, so a new enum-valued key cannot be
+    /// validated here without being registered. What this cannot see: a
+    /// key typed `Ty::Str` whose values are an enum in meaning; that shape
+    /// is caught only if it has a Rust enum (see darkmux-types'
+    /// `every_enum_in_the_config_schema_is_registered`).
+    #[test]
+    fn no_static_key_shadows_an_enum_setting() {
+        for (k, _) in KEYS {
+            assert!(config_enum::setting(k).is_none(), "`{k}` is in KEYS AND the enum registry");
+        }
+    }
+
     /// Drift guard: every visible key `with_defaults()` writes must be settable
     /// via `config set` — so adding a visible config field without a registry
     /// entry fails here, not silently at an operator's `config set`.
@@ -1117,17 +1411,14 @@ mod tests {
     /// set, leaves EVERY extras map empty, i.e. it resolves to a typed field.
     #[test]
     fn every_keys_entry_resolves_to_a_typed_field() {
-        for (key, ty) in KEYS {
+        for (key, ty) in all_keys() {
             let sentinel = match ty {
                 Ty::Bool => Value::Bool(true),
                 Ty::Uint => serde_json::json!(1),
                 Ty::Float => serde_json::json!(0.5),
-                // a valid FleetMode token doubles as the generic string sentinel
-                Ty::Str | Ty::FleetMode => Value::String("standalone".into()),
-                Ty::IdentityProvider => Value::String("tailscale".into()),
-                // a valid THERMAL_STATES token, same reasoning as FleetMode above
-                Ty::DetectionPolicy => Value::String("enforce".into()),
-                Ty::ThermalState => Value::String("nominal".into()),
+                Ty::Str => Value::String("standalone".into()),
+                // (#2947) The entry's own shipped token.
+                Ty::Enum(s) => Value::String(s.shipped.expect("a scalar enum setting has a shipped value").into()),
                 Ty::StrList => serde_json::json!(["sentinel"]),
                 // An empty array is valid JSON that parses cleanly to an
                 // empty `Vec<HookRule>` — sufficient to prove the KEY

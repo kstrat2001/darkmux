@@ -4820,7 +4820,7 @@ fn run_with_sleeper(
                     // bound exactly that shape became unreachable.
                     // (#2846) Measure, then decide separately whether the
                     // measurement is allowed to change anything. Splitting
-                    // these two is the whole feature: `observe` keeps every
+                    // these two is the whole feature: `record` keeps every
                     // other variable identical (check-in cadence, per-call
                     // cap, and therefore the usable prompt budget) and
                     // changes only whether the verdict is obeyed.
@@ -5309,9 +5309,9 @@ fn run_streaming_turn(
                 // (#2846) `would_abort` carries the suppressed finding. The
                 // record says the output WAS repeating even though the call
                 // was allowed to continue, which is the counterfactual the
-                // `observe` policy exists to produce. Recording it as `false`
-                // here would make an observe run indistinguishable from a
-                // clean one, and the policy would measure nothing.
+                // `record` (and `warn`) policy exists to produce. Recording it
+                // as `false` here would make such a run indistinguishable from
+                // a clean one, and the policy would measure nothing.
                 trajectory.append_gate_observation(
                     seq,
                     gate.observations(),
@@ -9058,7 +9058,7 @@ mod tests {
         // (#2887 F3) The gate stamps its own policy + outcome now, rather
         // than leaving a downstream host to reconstruct them from its own
         // (possibly stale, possibly absent) environment. Under the default
-        // (enforce) policy this test runs with, the degenerate observation
+        // (conclude) policy this test runs with, the degenerate observation
         // and the abort it produced both say `acted:true` — this IS the
         // call that ended the stream. Parsed per-record (not a raw
         // substring match) so the assertion pins the FIELD ON THE RIGHT
@@ -9072,11 +9072,11 @@ mod tests {
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .find(|v| v["type"] == "dispatch.gate.observation" && v["degenerate"] == true)
             .expect("a degenerate observation record must exist");
-        assert_eq!(observation["policy"], "enforce", "got {observation}");
+        assert_eq!(observation["policy"], "conclude", "got {observation}");
         assert_eq!(
             observation["acted"], true,
             "the degenerate observation that led to the abort must say it \
-             acted — under enforce it is the SAME moment as the abort \
+             acted — under conclude it is the SAME moment as the abort \
              below; got {observation}"
         );
         let abort = traj_text
@@ -9084,14 +9084,14 @@ mod tests {
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .find(|v| v["type"] == "dispatch.gate.abort")
             .expect("the stream gate itself must have aborted the call");
-        assert_eq!(abort["policy"], "enforce", "got {abort}");
+        assert_eq!(abort["policy"], "conclude", "got {abort}");
         assert_eq!(abort["acted"], true, "got {abort}");
     }
 
-    /// (#2846) `observe` measures and records without acting.
+    /// (#2846) `record` (was `observe`) measures and records without acting.
     ///
     /// The same degenerate stream the test above feeds to the default
-    /// `enforce` policy, where it escalates the dispatch. Under `observe`
+    /// `conclude` policy, where it escalates the dispatch. Under `record`
     /// the check-in must still fire on the same cadence, the tail ratio
     /// must still be computed, the record must say the gate WOULD have
     /// concluded, and the dispatch must NOT be cut.
@@ -9104,7 +9104,7 @@ mod tests {
     /// untouched.
     #[test]
     #[serial_test::serial]
-    fn observe_policy_records_the_would_be_cut_without_cutting() {
+    fn record_policy_records_the_would_be_conclusion_without_acting() {
         let looped: String = "the same thing over and over ".repeat(400);
         let server = crate::test_support::GuardedMockServer::start();
         let pieces: Vec<&str> = looped.split_inclusive(' ').collect();
@@ -9115,9 +9115,9 @@ mod tests {
                 .header("content-type", "text/event-stream")
                 .body(body.clone());
         });
-        std::env::set_var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY", "observe");
+        std::env::set_var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY", "record");
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempfile::Builder::new().prefix("degen-observe").tempdir().unwrap();
+        let tmp = tempfile::Builder::new().prefix("degen-record").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let cfg = compaction::CompactionConfig::never_compact();
         let outcome = run_with_sleeper(
@@ -9129,17 +9129,17 @@ mod tests {
             tmp.path(), "test-role", None, &RealSleeper,
         );
         std::env::remove_var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY");
-        let outcome = outcome.expect("observe must not make a degenerate turn fatal");
+        let outcome = outcome.expect("record must not make a degenerate turn fatal");
 
         let traj_text =
             std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"))
                 .unwrap();
 
         // The STREAM gate is what this fixture reaches: the endpoint returns
-        // `finish_reason: "stop"`, so under `observe` the call is never cut
+        // `finish_reason: "stop"`, so under `record` the call is never cut
         // short and therefore never produces a length-finish for the
         // checkpoint gate to judge. That absence is the POINT — under
-        // `enforce` the same fixture is aborted mid-stream (asserted by
+        // `conclude` the same fixture is aborted mid-stream (asserted by
         // `a_degenerate_stream_is_ended_by_the_runtime_not_the_endpoint`).
         assert!(
             traj_text.contains("dispatch.gate.observation"),
@@ -9155,7 +9155,7 @@ mod tests {
         assert_ne!(
             outcome.terminal_reason,
             TerminalReason::EscalationTriggered(EscalationReason::IntraTurnStallExhausted),
-            "observe must not escalate the dispatch the way enforce does"
+            "record must not escalate the dispatch the way conclude does"
         );
         // There are TWO gates. The stream gate (`runtime/src/stream_gate.rs`)
         // judges mid-stream and ABORTS the call client-side; the checkpoint
@@ -9169,17 +9169,105 @@ mod tests {
              an effect; got:\n{traj_text}"
         );
         // (#2887 F3) Same policy/acted stamping this issue adds to the
-        // enforce path above — under observe the degenerate observation
-        // must say `policy:"observe"` and `acted:false`: the judge found it
+        // conclude path above — under record the degenerate observation
+        // must say `policy:"record"` and `acted:false`: the judge found it
         // repeating, but nothing ended the call because of it. Parsed
-        // per-record, same discipline as the enforce test's own version of
+        // per-record, same discipline as the conclude test's own version of
         // this assertion.
         let observation = traj_text
             .lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .find(|v| v["type"] == "dispatch.gate.observation" && v["degenerate"] == true)
             .expect("a degenerate observation record must exist");
-        assert_eq!(observation["policy"], "observe", "got {observation}");
+        assert_eq!(observation["policy"], "record", "got {observation}");
+        assert_eq!(
+            observation["acted"], false,
+            "a degenerate observation under observe must say it did NOT \
+             act — that is the entire point of the policy; got {observation}"
+        );
+    }
+
+    /// (#2947) `warn` behaves exactly like `record` inside the container
+    /// (it measures and never cuts), and stamps `policy:"warn"` on the
+    /// finding, which is what the HOST keys its warning surfaces on.
+    #[test]
+    #[serial_test::serial]
+    fn warn_policy_never_cuts_and_stamps_warn_for_the_host() {
+        let looped: String = "the same thing over and over ".repeat(400);
+        let server = crate::test_support::GuardedMockServer::start();
+        let pieces: Vec<&str> = looped.split_inclusive(' ').collect();
+        let body = sse(&pieces, "stop", 2_000);
+        server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(body.clone());
+        });
+        std::env::set_var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY", "warn");
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("degen-warn").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let cfg = compaction::CompactionConfig::never_compact();
+        let outcome = run_with_sleeper(
+            &client, &client, "m",
+            vec![Message::system("s"), Message::user("go")],
+            &[Tool::Read], &mut traj, true, &cfg,
+            Some(3), None, Some(9_000), Some(1_000), Some(1_000),
+            None, std::collections::BTreeMap::new(), None,
+            tmp.path(), "test-role", None, &RealSleeper,
+        );
+        std::env::remove_var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY");
+        let outcome = outcome.expect("record must not make a degenerate turn fatal");
+
+        let traj_text =
+            std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"))
+                .unwrap();
+
+        // The STREAM gate is what this fixture reaches: the endpoint returns
+        // `finish_reason: "stop"`, so under `record` the call is never cut
+        // short and therefore never produces a length-finish for the
+        // checkpoint gate to judge. That absence is the POINT — under
+        // `conclude` the same fixture is aborted mid-stream (asserted by
+        // `a_degenerate_stream_is_ended_by_the_runtime_not_the_endpoint`).
+        assert!(
+            traj_text.contains("dispatch.gate.observation"),
+            "observe must still MEASURE; a policy that records nothing is \
+             indistinguishable from `off`; got:\n{traj_text}"
+        );
+        assert!(
+            traj_text.contains("\"degenerate\":true"),
+            "observe must record that the output WAS repeating, or the \
+             counterfactual it exists to provide is not in the artifact; \
+             got:\n{traj_text}"
+        );
+        assert_ne!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::IntraTurnStallExhausted),
+            "record must not escalate the dispatch the way conclude does"
+        );
+        // There are TWO gates. The stream gate (`runtime/src/stream_gate.rs`)
+        // judges mid-stream and ABORTS the call client-side; the checkpoint
+        // gate judges at the per-call cap. A policy that suppresses only the
+        // second one still lets the first cut generation short, which is a
+        // second variable and destroys this feature's entire reason to exist.
+        assert!(
+            !traj_text.contains("dispatch.gate.abort"),
+            "observe must not let the STREAM gate abort either; the claim is \
+             that only the verdict's EFFECT changes, and an aborted stream is \
+             an effect; got:\n{traj_text}"
+        );
+        // (#2887 F3) Same policy/acted stamping this issue adds to the
+        // conclude path above — under warn the degenerate observation
+        // must say `policy:"record"` and `acted:false`: the judge found it
+        // repeating, but nothing ended the call because of it. Parsed
+        // per-record, same discipline as the conclude test's own version of
+        // this assertion.
+        let observation = traj_text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["type"] == "dispatch.gate.observation" && v["degenerate"] == true)
+            .expect("a degenerate observation record must exist");
+        assert_eq!(observation["policy"], "warn", "got {observation}");
         assert_eq!(
             observation["acted"], false,
             "a degenerate observation under observe must say it did NOT \
