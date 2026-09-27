@@ -1051,6 +1051,17 @@ impl DestinationProblem {
     }
 }
 
+/// How a summary's `url` reads to an operator: a rule with no destination
+/// has an empty `url`, shown as `(no destination)` rather than as nothing.
+/// Shared by `darkmux doctor` and `flow status`.
+pub fn display_url(url: &str) -> &str {
+    if url.is_empty() {
+        "(no destination)"
+    } else {
+        url
+    }
+}
+
 /// A rule's one destination, once [`destination`] has accepted it.
 enum Destination<'a> {
     Http(&'a str),

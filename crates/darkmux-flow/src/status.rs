@@ -658,7 +658,7 @@ pub fn format_status_human(status: &FlowStatus) -> String {
                 flags.push("STALLED");
             }
             let flag_str = if flags.is_empty() { String::new() } else { format!(" [{}]", flags.join("; ")) };
-            let _ = writeln!(out, "  #{}: {} -> {}{flag_str}", r.index, r.match_desc, r.url);
+            let _ = writeln!(out, "  #{}: {} -> {}{flag_str}", r.index, r.match_desc, crate::hooks::display_url(&r.url));
             let _ = writeln!(out, "      undelivered: {}", r.undelivered);
             match &r.last_delivery_ts {
                 Some(ts) => {
@@ -1228,6 +1228,8 @@ mod hooks_status_tests {
         let both = render_hook_rules(&[hook_rule(Some("http://127.0.0.1:8790/e"), Some("/tmp/x"))]);
         assert!(both.contains("[DESTINATION REFUSED]"), "{both}");
         assert!(!both.contains("URL REFUSED"), "{both}");
+        let neither = render_hook_rules(&[hook_rule(None, None)]);
+        assert!(neither.contains("-> (no destination) [DESTINATION REFUSED]"), "{neither}");
         let bad_url = render_hook_rules(&[hook_rule(Some("http://10.0.0.5/e"), None)]);
         assert!(bad_url.contains("[URL REFUSED]"), "{bad_url}");
         let fine = render_hook_rules(&[hook_rule(Some("http://127.0.0.1:8790/e"), None)]);

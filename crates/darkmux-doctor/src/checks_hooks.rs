@@ -142,7 +142,7 @@ fn rule_check(s: &HookRuleSummary, rule_match: &HookMatch, today_actions: &HashS
     let message = format!(
         "{} -> {} [{}, {}]{} (undelivered: {}){flag_str}",
         s.match_desc,
-        s.url,
+        darkmux_flow::hooks::display_url(&s.url),
         target_kind(s),
         signing(s),
         transform_suffix(s),
@@ -372,8 +372,10 @@ fn target_kind(s: &HookRuleSummary) -> &'static str {
     }
 }
 
+/// `n/a` where no request is ever signed: a `file` rule, or a rule refused
+/// for its destination fields.
 fn signing(s: &HookRuleSummary) -> &'static str {
-    if s.is_file {
+    if s.is_file || s.destination_problem.is_some() {
         "n/a"
     } else if s.signed {
         "signed"
@@ -1543,10 +1545,27 @@ mod tests {
         assert_eq!(
             row.message,
             format!(
-                "action=crawl.* -> {LOOPBACK} [refused, unsigned] (undelivered: 0) [DESTINATION REFUSED — names \
+                "action=crawl.* -> {LOOPBACK} [refused, n/a] (undelivered: 0) [DESTINATION REFUSED — names \
                  BOTH `http` and `file` — a rule needs exactly one destination; refused at load]"
             ),
             "the URL itself is fine; what is refused is naming two destinations"
+        );
+    }
+
+    /// A rule refused for its destination fields has no transport, so no
+    /// transport flag either: a tailnet URL on it is never dialed, and
+    /// "unsigned" says nothing about it.
+    #[test]
+    fn a_both_destinations_rule_with_a_tailnet_url_gets_no_transport_flags() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut rule = hook_rule(Some("crawl.*"), Some("http://100.64.1.2:8790/e"));
+        rule.file = Some("/tmp/x.jsonl".into());
+        let checks = checks_for(&[rule], tmp.path());
+        let row = named(&checks, "hooks.rule.0");
+        assert_eq!(
+            row.message,
+            "action=crawl.* -> http://100.64.1.2:8790/e [refused, n/a] (undelivered: 0) [DESTINATION REFUSED — \
+             names BOTH `http` and `file` — a rule needs exactly one destination; refused at load]"
         );
     }
 
@@ -1558,7 +1577,7 @@ mod tests {
         assert_eq!(row.status, Status::Fail, "{}", row.message);
         assert_eq!(
             row.message,
-            "action=crawl.* ->  [refused, unsigned] (undelivered: 0) [DESTINATION REFUSED — has no \
+            "action=crawl.* -> (no destination) [refused, n/a] (undelivered: 0) [DESTINATION REFUSED — has no \
              destination — set exactly one of `http` or `file`; refused at load]",
             "there is no URL to refuse; what is missing is a destination"
         );
