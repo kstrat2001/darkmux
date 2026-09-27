@@ -487,10 +487,16 @@ export function isAfter(r: NormRecord, t: number): boolean {
   return r.tMs === null || r.tMs > t;
 }
 
+/** Whether `r` is at or after `t` under policy rule 1: an untimed record
+ *  is, as for `isAfter`. */
+export function isAtOrAfter(r: NormRecord, t: number): boolean {
+  return r.tMs === null || r.tMs >= t;
+}
+
 /** The records of `data` at or after `t` (a window's trailing edge), under
  *  the same policy: an untimed record is kept. */
 export function recordsSince<R extends NormRecord>(data: readonly R[], t: number): R[] {
-  return data.filter((r) => r.tMs === null || r.tMs >= t);
+  return data.filter((r) => isAtOrAfter(r, t));
 }
 
 /** The record as the wire carried it, without the fields `ingest` adds. For

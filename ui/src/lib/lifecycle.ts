@@ -46,7 +46,7 @@
  *    other runs' too, so it is in flight while any of them is.
  */
 
-import { ACTION, byTime, isAsOf, isDispatchTerminal, latestByTime, recordsAsOf, timesOf, type NormAction, type NormRecord } from "./ingest";
+import { ACTION, byTime, isAsOf, isAtOrAfter, isDispatchTerminal, latestByTime, recordsAsOf, type NormAction, type NormRecord } from "./ingest";
 import type { RunState } from "./flow";
 import type { RunGroup, RunRecords } from "./runRef";
 import type { RunsPolicy } from "../types/generated/RunsPolicy";
@@ -298,7 +298,7 @@ function openWaitUntil(recs: readonly NormRecord[], policy: LifecyclePolicy): nu
   const wait = latestByTime(recs.filter((r) => r.action === ACTION.BudgetWait));
   if (!wait || wait.tMs === null) return null;
   const at = wait.tMs;
-  const ended = recs.some((r) => r !== wait && (r.tMs === null || r.tMs >= at) && (r.action === ACTION.BudgetResume || isClosing(r)));
+  const ended = recs.some((r) => r !== wait && isAtOrAfter(r, at) && (r.action === ACTION.BudgetResume || isClosing(r)));
   return ended ? null : at + waitSecondsOf(wait) * 1000 + policy.budgetWaitGraceMs;
 }
 
@@ -309,21 +309,19 @@ export function isStale(lastActivityMs: number | null, asOf: number, policy: Lif
   return lastActivityMs === null || asOf - lastActivityMs > policy.staleAfterMs;
 }
 
-const latestTime = (recs: readonly NormRecord[]): number | null => {
-  const ts = timesOf(recs);
-  return ts.length ? Math.max(...ts) : null;
-};
+const latestTime = (recs: readonly NormRecord[]): number | null => latestByTime(recs)?.tMs ?? null;
 
 function startOf(a: Attempt): number | null {
-  const ts = timesOf(a.records);
-  return a.start?.tMs ?? a.opening.tMs ?? (ts.length ? Math.min(...ts) : null);
+  return a.start?.tMs ?? a.opening.tMs ?? [...a.records].sort(byTime)[0]?.tMs ?? null;
 }
 
 /** The records whose activity keeps an open attempt alive: its own, and
  *  for a mission's whole-run bookend, every other run of its mission (rule
  *  6). */
 function activityOf(run: RunRecords, recs: readonly NormRecord[], asOf: number): (readonly NormRecord[])[] {
-  return [recs, ...run.group.siblings.map((g) => recordsAsOf(g.records, asOf))];
+  const sets: (readonly NormRecord[])[] = [recs];
+  for (const g of run.group.siblings) sets.push(recordsAsOf(g.records, asOf));
+  return sets;
 }
 
 /** The phase of an attempt that has opened and not closed (rules 4-6). */
