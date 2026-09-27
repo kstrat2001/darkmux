@@ -634,7 +634,6 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
       m = { atMs, kind: "prompt" };
     } else if (r.action === "dispatch.turn") {
       const calls = num(fields(r).tool_calls_count);
-      pendingTools = calls;
       turnToolName = calls === null || calls === 1 ? writtenTool : null;
       writtenTool = null;
       const named = fields(r).tool_names;
@@ -643,7 +642,12 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
       turnPaths = Array.isArray(listed) ? listed.map((p) => cleanToolPath(p)) : null;
       completedInTurn = 0;
       listsInStep = true;
-      m = { atMs, kind: calls !== null && calls > 0 ? "tools" : "prompt" };
+      // (#2963 review, MUST FIX 1) `tool_names` lists only the calls that
+      // RUN; `tool_calls_count` also counts the ones the runtime refused
+      // (ungranted, not a tool, cut off), which never complete. With the
+      // list, its length is how many completions end TOOLS.
+      pendingTools = turnNames !== null ? turnNames.length : calls;
+      m = { atMs, kind: pendingTools !== null && pendingTools > 0 ? "tools" : "prompt" };
     } else if (r.action === "dispatch.tool") {
       if (pendingTools !== null && pendingTools > 0) pendingTools -= 1;
       // (#2963) This completion is call `completedInTurn` of the lists. When
@@ -652,7 +656,9 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
       // and no later index is trusted this turn.
       const name = fields(r).tool_name;
       if (listsInStep && turnNames !== null && typeof name === "string" && name && name !== (turnNames[completedInTurn] ?? null)) listsInStep = false;
-      if (listsInStep && turnPaths !== null) {
+      // (#2963 review, CONSIDER 4) Only a tool that takes a path is
+      // compared on it: a stray `path` key on a bash call is not its file.
+      if (listsInStep && turnPaths !== null && typeof name === "string" && PATH_TOOLS.has(name)) {
         const own = toolCallPath(fields(r));
         if (own !== null && own !== (turnPaths[completedInTurn] ?? null)) listsInStep = false;
       }
@@ -961,6 +967,10 @@ export function liveStateLabel(reading: LiveStateReading): string {
       return "";
   }
 }
+
+/** (#2963) The runtime's tools that take a `path` argument
+ *  (`runtime/src/tools/mod.rs`, `Tool::takes_path`). */
+const PATH_TOOLS = new Set(["read", "write", "edit", "search"]);
 
 /** (#2963) The tools that take a file, whose readout line names it. */
 const FILE_TOOLS = new Set(["read", "write", "edit"]);

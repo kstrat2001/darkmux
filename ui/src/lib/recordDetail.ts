@@ -368,8 +368,9 @@ function parseToolArgs(f: Record<string, unknown>): Record<string, unknown> | nu
 /** (#2963) The file a completed tool call named, from its `dispatch.tool`
  *  record's own fields: the call's `path` argument (parsed, or read out of
  *  arguments the per-call cap cut short), else, for `write`, the path its
- *  result names. The container prefix is dropped and control characters are
- *  escaped, exactly as the event log's row shows it (`recordObject`), so the
+ *  result names. The container prefix and a leading `./` are dropped and
+ *  bidi and zero-width characters are escaped (`cleanToolPath`): the event
+ *  log row's reading (`recordObject`), plus the `./`, so the
  *  run page's readout and the log never name different files. `null` when
  *  the call named none. */
 export function toolCallPath(f: Record<string, unknown>): string | null {
@@ -386,12 +387,16 @@ export function toolCallPath(f: Record<string, unknown>): string | null {
 }
 
 /** (#2963) A tool call's path as the viewer shows it: the container prefix
- *  dropped, control characters escaped; `null` when nothing is left. Shared
+ *  and any leading `./` dropped, bidi and zero-width characters escaped
+ *  (`escapeBidiControls`); `null` when nothing is left. Shared
  *  by `toolCallPath` and the turn record's `tool_paths` list, so the two
  *  compare equal for the same file. */
 export function cleanToolPath(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
-  const clean = raw.replace(CONTAINER_ROOT, "");
+  // (#2963 review, CONSIDER 4) A leading `./` names the same file as none:
+  // a listed `./src/a.ts` and a write result's `/workspace/src/a.ts` must
+  // compare equal.
+  const clean = raw.replace(CONTAINER_ROOT, "").replace(/^(?:\.\/)+/, "");
   return clean ? escapeBidiControls(clean) : null;
 }
 

@@ -936,6 +936,58 @@ describe("tools vs reading prompt, from the tool COMPLETION records", () => {
     expect(deriveLiveState(after, 5_500)).toEqual({ state: "tools", toolName: "read", toolPath: "src/b.ts" });
   });
 
+  // (#2963 review, MUST FIX 1) The lists hold only the calls that RUN: a
+  // call the runtime refused (ungranted, not a tool, cut off) is not in
+  // them, while `tool_calls_count` still counts it. The list's length is
+  // how many will complete.
+  const turnRunning = (atMs: number, seq: number, count: number, calls: [string, string | null][]): FlowRecord =>
+    ({
+      ts: new Date(atMs).toISOString(),
+      action: "dispatch.turn",
+      session_id: SID,
+      payload: { turn_seq: seq, tool_calls_count: count, tool_names: calls.map(([n]) => n), tool_paths: calls.map(([, p]) => p) },
+    }) as unknown as FlowRecord;
+
+  it("(#2963) after an ungranted call, the readout shows the running `read · y.rs`", () => {
+    // The model asked for [write x.rs (ungranted), read y.rs]; only the read runs.
+    const base = [start(0), beat(1_000, 0), beat(3_000, 800), turnRunning(4_000, 1, 2, [["read", "/workspace/src/y.rs"]])];
+    expect(deriveLiveState(base, 4_500)).toEqual({ state: "tools", toolName: "read", toolPath: "src/y.rs" });
+  });
+
+  it("(#2963) once every call that runs has completed, it is PROMPT, whatever the raw count says", () => {
+    // [read a, write b (ungranted)]: the read completes and nothing else will.
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnRunning(4_000, 1, 2, [["read", "src/a.ts"]]), pathTool(5_000, "read", "src/a.ts")];
+    expect(deriveLiveState(recs, 6_000).state).toBe("prompt");
+  });
+
+  it("(#2963) a turn none of whose calls run is PROMPT at once", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnRunning(4_000, 1, 1, [])];
+    expect(deriveLiveState(recs, 4_500).state).toBe("prompt");
+  });
+
+  it("(#2963 review, CONSIDER 4) a stray `path` on a tool that takes none does not put the lists out of step", () => {
+    const bash = { ts: new Date(5_000).toISOString(), action: "dispatch.tool", session_id: SID, payload: { tool_name: "bash", args: JSON.stringify({ command: "ls", path: "elsewhere" }) } } as unknown as FlowRecord;
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnRunning(4_000, 1, 2, [["bash", null], ["read", "src/b.ts"]]), bash];
+    expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "read", toolPath: "src/b.ts" });
+  });
+
+  it("(#2963 review, CONSIDER 4) a write whose path was cut off matches the listed path through its result, `./` or not", () => {
+    // The capped args lost the path; the viewer falls back to the result's
+    // resolved path, which must equal the listed `./src/a.ts`.
+    const args = JSON.stringify({ content: "x".repeat(600), path: "./src/a.ts" }).slice(0, 512);
+    const write = { ts: new Date(5_000).toISOString(), action: "dispatch.tool", session_id: SID, payload: { tool_name: "write", args, result: "Wrote 600 bytes to /workspace/src/a.ts" } } as unknown as FlowRecord;
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turnRunning(4_000, 1, 2, [["write", "./src/a.ts"], ["read", "./src/b.ts"]]), write];
+    expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "read", toolPath: "src/b.ts" });
+  });
+
+  it("(#2963 review, CONSIDER 5) with no lists, the written tool's name goes once its call completes", () => {
+    // An older record: no count and no lists. The heartbeat named the call
+    // being written; once a completion arrives, that call is done, and the
+    // record set says nothing about what (if anything) runs next.
+    const recs = [start(0), beat(1_000, 0), writingBeat(2_000, "write"), turnEnd(3_000, 1), namedTool(4_000, "write")];
+    expect(deriveLiveState(recs, 4_500)).toEqual({ state: "tools" });
+  });
+
   it("(#2963) never shows a previous call's word or file while a later call runs (no lists)", () => {
     const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 2), pathTool(5_000, "read", "/workspace/src/a.ts")];
     expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools" });
@@ -986,10 +1038,10 @@ describe("tools vs reading prompt, from the tool COMPLETION records", () => {
     expect(deriveLiveState(recs, 11_000)).toEqual({ state: "tools", toolName: "edit", toolPath: "src/last.ts" });
   });
 
-  it("(#2963) lists shorter than the turn's calls: nothing past their end", () => {
-    const short = { ts: new Date(4_000).toISOString(), action: "dispatch.turn", session_id: SID, payload: { turn_seq: 1, tool_calls_count: 3, tool_paths: ["src/a.ts"], tool_names: ["read"] } } as unknown as FlowRecord;
+  it("(#2963) a paths list shorter than the names: no file past its end", () => {
+    const short = { ts: new Date(4_000).toISOString(), action: "dispatch.turn", session_id: SID, payload: { turn_seq: 1, tool_calls_count: 3, tool_paths: ["src/a.ts"], tool_names: ["read", "read", "read"] } } as unknown as FlowRecord;
     const recs = [start(0), beat(1_000, 0), beat(3_000, 800), short, pathTool(5_000, "read", "src/a.ts")];
-    expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools" });
+    expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "read" });
   });
 
   it("(#2963) never carries the previous turn's lists into this one", () => {

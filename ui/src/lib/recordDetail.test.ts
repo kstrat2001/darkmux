@@ -427,6 +427,11 @@ describe("toolCallPath (#2963)", () => {
     expect(toolCallPath({ tool_name: "write", args })).toBe("real.ts");
   });
 
+  it("(#2963 review, CONSIDER 4) drops a leading `./`, so `./src/a.ts` and `/workspace/src/a.ts` name one file", () => {
+    expect(toolCallPath({ tool_name: "read", args: '{"path":"./src/a.ts"}' })).toBe("src/a.ts");
+    expect(toolCallPath({ tool_name: "read", args: '{"path":"/workspace/./src/a.ts"}' })).toBe("src/a.ts");
+  });
+
   it("escapes bidi and zero-width control characters in the path", () => {
     expect(toolCallPath({ tool_name: "write", args: JSON.stringify({ path: "src/a\u202Egnp.ts" }) })).toBe("src/a⟨U+202E⟩gnp.ts");
   });
