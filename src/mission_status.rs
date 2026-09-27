@@ -1468,6 +1468,13 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
     // actively wrong advice while a peer's mission is running. Fall through
     // to the normal renderer instead, which prints an empty local section
     // set, the peer section, and the fleet-scoped rollup.
+    // (#2902 step 5) Printed before anything else, the empty board included:
+    // a wait can hold a dispatch that owns no mission.
+    for line in budget_wait_lines(&budget_waits) {
+        for l in wrap_indented(&line, 2, width) {
+            println!("{}", style::warn(&l));
+        }
+    }
     if views.is_empty() && peer.is_empty() {
         // (#1582) The prose wraps; the command does not. Same rule the drift
         // suggestions follow, for the same reason — this is the one command a
@@ -1514,11 +1521,7 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
             if visible.len() == 1 { "" } else { "s" }
         ))
     );
-    for line in budget_wait_lines(&budget_waits) {
-        for l in wrap_indented(&line, 2, width) {
-            println!("{}", style::warn(&l));
-        }
-    }
+
     // (#1569 packet A) Resolved ONCE per board, not per row: on a hub/peer
     // this may spawn `tailscale serve status --json`, and doing that 82 times
     // for an 82-mission board would be absurd. It short-circuits to loopback
