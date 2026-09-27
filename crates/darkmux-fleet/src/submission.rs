@@ -1404,6 +1404,7 @@ mod tests {
         let bad = "{\"status\":\"completed\"}\n{\"status\":\"completed\"}\n";
         assert!(read_reply_lines("x", 200, bad.as_bytes(), &mut |_| {}).is_err());
         assert!(read_reply_lines("x", 200, "".as_bytes(), &mut |_| {}).is_err(), "an empty body is not an answer");
+        // drift-guard:allow darkmux fleet — noun use: the listener, not the retired verb
         assert!(read_reply_lines("x", 200, "<html>".as_bytes(), &mut |_| {}).unwrap_err().to_string().contains("not as a darkmux fleet listener"));
         // (#2916 stage 2 review C6) A status this darkmux does not know is a
         // newer listener's answer, not a stranger's: the job may be running.
