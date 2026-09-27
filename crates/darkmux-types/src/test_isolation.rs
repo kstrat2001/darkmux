@@ -58,8 +58,8 @@
 //! resolver reads `env > config.json > default`, and a crate whose test
 //! build does not enable `darkmux-types/test-support` gets a `config()`
 //! that reads the operator's real `~/.darkmux/config.json`. So a
-//! destination the operator has relocated in config — this machine has
-//! `dirs.notebook` set, and `hooks.outbox_dir` has no env var at all —
+//! destination the operator has relocated in config — `dirs.lab` set to a
+//! shared path, say, while `hooks.outbox_dir` has no env var at all —
 //! can still escape a root-only pin. That is precisely why
 //! [`PINNED_STATE_VARS`] pins the env tier for every destination that HAS
 //! an env var: the env tier outranks config, so pinning it closes the
@@ -125,7 +125,6 @@ pub const PINNED_STATE_VARS: &[(&str, &str)] = &[
     ("DARKMUX_FINDINGS_DIR", "findings"),
     ("DARKMUX_MODS_DIR", "mods"),
     ("DARKMUX_LAB_DIR", "runs"),
-    ("DARKMUX_NOTEBOOK_DIR", "notebook"),
     ("DARKMUX_ACK_DIR", "acks"),
     ("DARKMUX_FLEET_FILE", "fleet.json"),
     // `.md`, not `.json`: `crew::dispatch::identity_path()`'s default is

@@ -347,7 +347,6 @@ pub struct DarkmuxConfig {
 pub struct DirsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub flows: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub audit: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub notebook: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub skills: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub crew: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub templates: Option<String>,

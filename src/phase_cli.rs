@@ -965,45 +965,6 @@ mod tests {
         assert_eq!(actions, vec!["phase review begin", "phase review aborted"]);
     }
 
-    /// `dispatch_compiler`'s `mission.compile.start`/`.error` pair used to
-    /// be plain paired writes (#1413): a panic between them orphaned the
-    /// start record. Drives the same guard shape mission_propose.rs wires
-    /// up and confirms a panic mid-guarded-region still fires the abort
-    /// record on Drop.
-    #[test]
-    fn mission_compile_bookend_fires_abort_record_on_panic() {
-        let mut actions: Vec<String> = Vec::new();
-        let prev_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut sink = |r: crate::flow::FlowRecord| actions.push(r.action);
-            let on_abort =
-                move |_id: &str, _kind: &str| crate::mission_propose::mission_compile_abort_record("mission-compile-1");
-            let mut guard = crate::flow::BookendGuard::new(&mut sink, on_abort);
-            guard.open(
-                "mission.compile",
-                "mission.compile",
-                crate::crew::dispatch::build_dispatch_record_with_payload(
-                    crate::flow::Level::Info,
-                    "mission.compile.start",
-                    "mission-compiler",
-                    "mission-compile-1",
-                    None,
-                    None,
-                    None,
-                    None,
-                ),
-            );
-            panic!("simulated mid-compile panic");
-        }));
-        std::panic::set_hook(prev_hook);
-        assert!(result.is_err());
-        assert_eq!(
-            actions,
-            vec!["mission.compile.start", "mission.compile.error"]
-        );
-    }
-
     /// Happy-path action-name pin: the empty-diff `phase review` path
     /// still emits exactly `"phase review begin"` then `"verdict: clean"`.
     /// The bookend-guard refactor (#1413) must not rename the vocabulary

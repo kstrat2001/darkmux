@@ -155,7 +155,7 @@ A rejected citation (a wrong line number, an unresolvable path, a budget already
 | `DARKMUX_MACHINE_ID` | `machine_id` |
 | `DARKMUX_FLEET_MODE` | `fleet.mode` |
 | `DARKMUX_LMS_BIN` / `DARKMUX_LMSTUDIO_URL` | `lms_bin` / `lmstudio_url` (base URL; callers append `/v1/...`) |
-| `DARKMUX_FLOWS_DIR` / `DARKMUX_NOTEBOOK_DIR` / `DARKMUX_CREW_DIR` / … | `dirs.flows` / `dirs.notebook` / `dirs.crew` / … |
+| `DARKMUX_FLOWS_DIR` / `DARKMUX_CREW_DIR` / … | `dirs.flows` / `dirs.crew` / … |
 | `DARKMUX_FINDINGS_DIR` | `dirs.findings` |
 | `DARKMUX_MODS_DIR` | `dirs.mods` |
 | `DARKMUX_AUDIT_DIR` | `audit.dir` (gated by `audit.enabled`) |
@@ -198,5 +198,7 @@ A rejected citation (a wrong line number, an unresolvable path, a budget already
 | `DARKMUX_EXPECT_TIGHT_HOST_BUDGET` (#2631 — test-only; gates which ceiling the live `host_probe` cost-budget assertion enforces) | — (not read by any runtime code path; test-only) |
 
 The internal runtime is the only dispatch path and needs no external binary. (Historical: a `DARKMUX_RUNTIME_CMD` env var, then a per-dispatch `--runtime-cmd <path>` flag, once let operators point `dispatch` / `lab run` at an external openclaw/Aider/Cline shell-out. That whole path — the flag, the openclaw runtime, and the `crew sync` verb — was removed on the 2.0 track; see [#1405](https://github.com/kstrat2001/darkmux/issues/1405).)
+
+(Historical: `DARKMUX_NOTEBOOK_DIR` and `dirs.notebook` were removed in 4.0 along with the `lab notebook` verbs (#2913); the bundled `darkmux-lab-notebook` skill writes entries wherever your own instructions say, so no darkmux setting names the location any more. `darkmux doctor` warns if either is still set and names the change to make.)
 
 (Historical: a `DARKMUX_ORCHESTRATOR` env var + `config.orchestrator` field once stamped flow records with the name of the frontier harness driving the session. Removed in #1758 — it was stamped from MACHINE-scoped config to describe an INVOCATION-scoped fact, so every record on a machine carried the same value regardless of what actually drove that invocation, and nothing ever read it. The cultivation discipline tracked in [#130](https://github.com/kstrat2001/darkmux/issues/130) continues without it.)

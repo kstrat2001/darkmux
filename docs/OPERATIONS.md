@@ -163,8 +163,8 @@ darkmux lab characterize              # one-command "QA my Mac": dispatch a smok
 darkmux lab run quick-q               # the smoke workload directly
 darkmux lab run list --limit 5         # see your recent runs
 darkmux lab run inspect <run-id>      # full per-run breakdown
-darkmux lab notebook draft <run-id>   # ask the active role to author a lab-style notebook entry
-darkmux mission propose --from-stdin   # AI-built-in: vague intent → a structured mission config
+darkmux lab run stats <run-id> --json # derived metrics; the darkmux-lab-notebook skill drafts an entry from this
+darkmux mission config list            # the mission configs you can launch
 darkmux mission launch <id>            # mint + start a running mission instance from a config
 ```
 
@@ -215,7 +215,7 @@ Bigger context wins long tasks. Slim config wins bounded tasks. **No static conf
 
 darkmux is a CLI binary, not an HTTP proxy. Your frontier session (Claude Code) invokes `darkmux` verbs directly to operate four substrates:
 
-1. **Mission + phase orchestration.** `darkmux dispatch <role>` invokes a per-role-pinned agent (coder, code-reviewer, scribe, …) via the in-house container-bounded runtime. `darkmux mission propose` is a utility-AI verb that turns vague intent into a structured mission config without the operator authoring it by hand; `darkmux mission launch <config>` mints the running mission instance and drives it as a task graph, gated on operator sign-off, finalizing into a typed envelope. Each dispatch emits a flow record carrying provenance: `machine_id`, role, model, mission, phase.
+1. **Mission + phase orchestration.** `darkmux dispatch <role>` invokes a per-role-pinned agent (coder, code-reviewer, crawler, …) via the in-house container-bounded runtime. `darkmux mission launch <config>` mints the running mission instance and drives it as a task graph, gated on operator sign-off, finalizing into a typed envelope. Each dispatch emits a flow record carrying provenance: `machine_id`, role, model, mission, phase.
 
 2. **Model residency (internal).** A dispatch loads the models a named profile in `~/.darkmux/profiles.json` declares, under the resident RAM budget, and unloads to make room when the budget requires it. This is the old profile multiplexer, now an internal capability: you declare profiles, darkmux loads them at dispatch time. The `swap` verb that used to drive it by hand is retired. `~10s` wall to load.
 
@@ -232,7 +232,7 @@ Both `dispatch` and `lab run` use the internal Docker-bounded runtime. The front
 
 OSS-published under personal GitHub: `github.com/kstrat2001/darkmux`. Darkly Energized is the brand context but darkmux is intentionally independent (no commercial coupling).
 
-The name comes from the multiplexer core: task-class-aware routing of LMStudio loadouts. That routing is still there, but it runs internally now; the project has grown into an AI-first local-AI orchestrator whose headline is the mission-and-lab pair, with small CLI primitives plus AI-built-in verbs (`mission propose`, `lab notebook draft`) that compose those primitives with utility-agent dispatch so the operator gets structured output without writing JSON by hand. Earlier framings of darkmux as *"infrastructure, not an agent framework"* or as *"a profile multiplexer"* were honest at the time, but the binary today embeds AI dispatch logic internally and leads with missions, so calling it an AI-first orchestrator out loud is the honest move.
+The name comes from the multiplexer core: task-class-aware routing of LMStudio loadouts. That routing is still there, but it runs internally now; the project has grown into an AI-first local-AI orchestrator whose headline is the mission-and-lab pair, with small CLI primitives plus a few jobs the local model does internally (context compaction, routing `darkmux radio` requests). The AI-built-in verbs that used to sit here (`mission propose`, `lab notebook draft`) were removed in 4.0 (#2912/#2913): the frontier orchestrator writes a mission config or a notebook entry better than a small local model did. Earlier framings of darkmux as *"infrastructure, not an agent framework"* or as *"a profile multiplexer"* were honest at the time, but the binary today embeds AI dispatch logic internally and leads with missions, so calling it an AI-first orchestrator out loud is the honest move.
 
 ## Design principles
 
@@ -295,34 +295,17 @@ The internal runtime watches each dispatch for the failure modes that waste loca
 
 Roles can override the nudge wording per signal via a `feedback_templates` block on the role manifest; operators can disable injection entirely with `DARKMUX_FEEDBACK_INJECTION=0`. The trajectory event reference lives in the `darkmux-analyze-run` skill.
 
-### Cross-machine notebook (multi-environment lab notes)
+### Lab notebook entries
 
-If you run darkmux on more than one machine and want a single notebook that collates entries from all of them (for example, comparing wall-clock distributions across hardware tiers), point the notebook directory at an iCloud-synced (or otherwise shared) path:
-
-```bash
-export DARKMUX_NOTEBOOK_DIR="$HOME/Library/Mobile Documents/com~apple~CloudDocs/darkmux-notebook"
-export DARKMUX_MACHINE_ID="m5-max-128gb-home"  # naming is yours; appears in entry headers
-darkmux lab notebook draft <run-id>
-```
-
-Set the same `DARKMUX_NOTEBOOK_DIR` on each machine; give each a distinct `DARKMUX_MACHINE_ID`. Entries get tagged with their machine of origin in the header comment, so cross-machine readouts are unambiguous.
-
-If `DARKMUX_MACHINE_ID` is unset, darkmux falls back to an auto-derived fingerprint (e.g. `apple-silicon-128gb`); fine for casual use, but a named id is recommended when more than one machine of the same tier exists.
-
-You can also override the machine id for a single draft via `--machine`:
+darkmux does not write notebook prose itself. The bundled `darkmux-lab-notebook` skill (installed by `darkmux init` into your agent's skills directory) tells the frontier orchestrator how to draft an entry from a run's derived numbers:
 
 ```bash
-darkmux lab notebook draft <run-id> --machine my-work-mac
+darkmux lab run stats <run-id> --json   # what the skill reads; the manifest when it needs more
 ```
 
-To list all entries in the notebook directory (optionally filtered by machine):
+The entry goes wherever your own instructions say your notebook lives; the skill asks when they say nothing. If you collate entries across machines, set a distinct `DARKMUX_MACHINE_ID` on each (`darkmux doctor --verbose` shows the resolved id) and the skill stamps it into the entry header, so cross-machine readouts stay unambiguous.
 
-```bash
-darkmux lab notebook list           # all entries
-darkmux lab notebook list --machine m5-home  # only this machine's entries
-```
-
-`lab notebook list` outputs columns: **date | machine | run | path** (aligned, newest first). The `--machine` flag filters to only entries matching that machine id.
+(The `lab notebook draft`/`list` verbs, the `scribe` role, and the `DARKMUX_NOTEBOOK_DIR` / `dirs.notebook` setting were removed in 4.0, #2913. `darkmux doctor` names either setting if it is still set.)
 
 ## Instrumentation
 
@@ -348,9 +331,9 @@ The case for darkmux: **once you accept that static configs leave performance on
 - ✅ Profile registry + `profile list`/`profile scan`/`profile draft` CLI, with `machine status` for the loaded-state read (the founding `swap` verb retired in 2.0; gestalt manages residency)
 - ✅ Lab subcommands (`run` + `run inspect`/`run compare`/`run list`, `characterize`/`tune`), `WorkloadProvider` trait, embedded smoke workloads, always-on cross-layer flow telemetry (#557)
 - ✅ Lab reproducibility (#487): per-run copy-on-write sandbox isolation (source never mutated), `baseline_hash` + `final_hash` content hashing in the run manifest, a fixture registry with `lab fixture register`/`unregister`/`list` + `lab doctor` verbs, workload `requires_fixture` resolution, and `scripts/lab-init.sh` + the built-in `demo-tiny-py` fixture
-- ✅ Lab notebook (`lab notebook draft`/`list`), cross-machine via `DARKMUX_NOTEBOOK_DIR`
+- ✅ Lab run stats (`lab run stats`, derived metrics + reconciliation checks) feeding the `darkmux-lab-notebook` skill
 - ✅ Agent-invocable skills bundle (12 skills including `/darkmux-bootstrap`)
-- ✅ Crew + Role + Mission + Phase schema with SQLite-backed index; `mission propose` utility-AI verb; mission configs + `mission launch` as the config-launched instance-creation path
+- ✅ Crew + Role + Mission + Phase schema with SQLite-backed index; mission configs + `mission launch` as the config-launched instance-creation path
 - ✅ Flow substrate: `LocalFileSink` (always) + `AuditFileSink` (BLAKE3 hash chain, verifiable via `flow integrity-check`; opt-in) + `RedisSink` (coordination; opt-in), composed via `TeeSink`
 - ✅ `darkmux flow status` + `darkmux flow integrity-check` diagnostic verbs
 - ✅ Observability daemon (`darkmux serve`) + `/flow` + `/lab` web viewers

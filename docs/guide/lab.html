@@ -245,9 +245,9 @@ scripts/lab-init.sh --force  <span class="comment"># re-register, accepting upst
 <section>
   <div class="wrap">
     <h2>Notebook entries from runs</h2>
-    <p><code>darkmux lab notebook draft &lt;run-id&gt;</code> dispatches the active role to author a lab-style notebook entry from the run's manifest + trajectory.</p>
-    <pre><code>darkmux lab notebook draft quick-q-deep-1778302418-1</code></pre>
-    <p>The output is markdown: Action/Why/Result/Next blocks suitable for pasting into your lab notebook. If you have <code>DARKMUX_NOTEBOOK_DIR</code> set (typically to an iCloud-synced path), <code>darkmux lab notebook list</code> enumerates entries across machines.</p>
+    <p>darkmux does not write the prose. The bundled <code>darkmux-lab-notebook</code> skill (installed by <code>darkmux init</code>) tells your orchestrator how to draft a lab-style entry from a run's derived numbers, observation first, with the verify outcome stated exactly as recorded:</p>
+    <pre><code>darkmux lab run stats quick-q-deep-1778302418-1 --json</code></pre>
+    <p>The entry is written wherever your own instructions say your notebook lives; the skill asks when they say nothing. Set a distinct <code>DARKMUX_MACHINE_ID</code> per machine if you collate entries across several, and the header records which machine each came from; <code>darkmux doctor --verbose</code> shows the resolved id. <code>lab run stats</code> takes a run id (resolved under <code>~/.darkmux/runs/</code>, or <code>$DARKMUX_LAB_DIR</code> / <code>dirs.lab</code> when set) or the run directory's path.</p>
   </div>
 </section>
 

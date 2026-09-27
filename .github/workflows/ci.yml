@@ -608,6 +608,12 @@ jobs:
           # on the full spelling so the surviving `mission launch`/`finalize`/
           # `abort`/`add-phase` family does NOT trip (`add-phase` is `darkmux
           # mission`, never `darkmux phase`).
+          # 4.0 (#2912/#2913): `darkmux mission propose` and `darkmux lab
+          # notebook ...` retired outright (no compat alias). The verb-anchored
+          # scan here catches the `darkmux <verb>` form; the bare-phrase scan
+          # further down catches `mission propose` / `notebook draft` /
+          # `notebook list` / `mission-compiler` spelled without the anchor,
+          # which is how CLAUDE.md's prose usually names a verb.
           # Decision 17: `darkmux lessons ...` -> `darkmux memory lesson ...`
           # (the family retired into `memory`, whose second kind is
           # `memory correction`). `lessons` is plural + darkmux-specific, so the
@@ -638,7 +644,7 @@ jobs:
           # exit status, not cmd1's — a path error in cmd1 (exit 2) was
           # doubly invisible. Capture cmd1's status directly, then filter
           # its captured output as a second, exit-code-free step.
-          VERBPAT='darkmux (profiles|scan|notebook|pr-review|external|skills|crew|status|swap|model|fleet|recommendations|lessons|phase|mission run|mission ship|mission close|lab runs|lab workloads|lab fixtures|lab inspect|lab compare|lab register|lab unregister|lab review-bench)\b'
+          VERBPAT='darkmux (profiles|scan|notebook|pr-review|external|skills|crew|status|swap|model|fleet|recommendations|lessons|phase|mission run|mission ship|mission close|mission propose|lab runs|lab workloads|lab fixtures|lab inspect|lab compare|lab register|lab unregister|lab review-bench|lab notebook)\b'
           set +e
           raw=$(grep -rniE $EXCL "$VERBPAT" $SCAN 2>"$VERB_ERRF")
           STATUS=$?
@@ -654,7 +660,37 @@ jobs:
           # emptiness test below; the FIRST grep's status is what gates, above.
           bad=$(printf '%s\n' "$raw" | grep -v '\*\*v[0-9]*\.' || true)
           if [ -n "$bad" ]; then
-            echo "::error::Retired verb spelling in user-facing docs (#1426/#1463/#1465) — use machine status / machine resources / machine list / machine add / profile list / profile scan / lab notebook / mission launch review / dispatch (not crew dispatch; the crew family retired entirely) / init (not skills) / mission launch coder-phase (not mission run) / memory lesson (not lessons) / mission finalize (not mission close/ship — the frontier does git/gh by hand) / mission abort or mission finalize (not the retired phase family) / lab run list|inspect|compare (not lab runs/inspect/compare) / lab workload list (not lab workloads) / lab fixture list|register|unregister (not lab fixtures/register/unregister) / lab eval (not lab review-bench); swap + recommendations retired:"
+            echo "::error::Retired verb spelling in user-facing docs (#1426/#1463/#1465/#2912/#2913) — use machine status / machine resources / machine list / machine add / profile list / profile scan / the darkmux-lab-notebook skill (not notebook or lab notebook) / mission launch review / dispatch (not crew dispatch; the crew family retired entirely) / init (not skills) / mission launch coder-phase (not mission run) / memory lesson (not lessons) / mission finalize (not mission close/ship — the frontier does git/gh by hand) / mission abort or mission finalize (not the retired phase family) / lab run list|inspect|compare (not lab runs/inspect/compare) / lab workload list (not lab workloads) / lab fixture list|register|unregister (not lab fixtures/register/unregister) / lab eval (not lab review-bench); swap + recommendations retired; mission propose + lab notebook removed in 4.0 (write the config by hand / the darkmux-lab-notebook skill):"
+            echo "$bad"
+            exit 1
+          fi
+          # (#2912/#2913) 4.0 removals, spelled WITHOUT the `darkmux ` anchor:
+          # prose names a verb as `mission propose` far more often than as
+          # `darkmux mission propose`, and the retired `mission-compiler` role
+          # is not a verb at all. Each phrase is specific enough to carry no
+          # false positives ("lab notebook" alone is NOT here — it is a
+          # legitimate noun in DESIGN.md's methodology prose). A line that
+          # narrates the removal itself legitimately names the term; those
+          # lines carry the issue number, so `#2912`/`#2913` lines are
+          # excluded, same shape as the release-notes exclusion above.
+          # The source-file and skill spellings (`mission_propose`,
+          # `notebook.rs`, `mission-compiling`) are here too: a doc that cites
+          # a deleted file or the deleted skill descriptor is the same drift.
+          RETIREDPAT='mission propose|notebook draft|notebook list|mission-compiler|mission-compiling|mission_propose|notebook\.rs'
+          RETIRED_ERRF=$(mktemp)
+          trap 'rm -f "$PAT_ERRF" "$VERB_ERRF" "$IDENTITY_ERRF" "$RETIRED_ERRF"' EXIT
+          set +e
+          raw=$(grep -rniE $EXCL "$RETIREDPAT" $SCAN 2>"$RETIRED_ERRF")
+          STATUS=$?
+          set -e
+          if [ "$STATUS" -eq 2 ]; then
+            echo "::error::Scan failed (grep exit 2) — a path in \$SCAN may have moved or been renamed:"
+            cat "$RETIRED_ERRF"
+            exit 1
+          fi
+          bad=$(printf '%s\n' "$raw" | grep -v '\*\*v[0-9]*\.' | grep -v -E '#291[23]' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::Removed-in-4.0 term in user-facing docs (#2912/#2913) — mission propose and the mission-compiler role are gone (write the mission config by hand, then mission launch); lab notebook draft/list are gone (the darkmux-lab-notebook skill drafts from lab run stats --json). A line that narrates the removal must cite #2912/#2913:"
             echo "$bad"
             exit 1
           fi

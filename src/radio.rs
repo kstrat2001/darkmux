@@ -524,7 +524,7 @@ fn validate_router_output(raw: &str, catalog: &[CatalogEntry]) -> RouteDecision 
 
 /// Extract a JSON value from a routing-seat response: prefer a fenced
 /// ```json block (matching `templates/builtin/roles/radio-router.md`'s own
-/// instructed output shape and `src/mission_propose.rs::extract_json_block`'s
+/// instructed output shape and the retired `mission propose` verb's `extract_json_block`'s
 /// established convention in this codebase), falling back to parsing the
 /// WHOLE trimmed response as bare JSON for a model that skips the fence.
 /// `None` when neither yields valid JSON — the caller turns that into a
@@ -542,7 +542,7 @@ fn extract_json(raw: &str) -> Option<serde_json::Value> {
 /// back to the first bare ``` fence when no tagged opener exists anywhere),
 /// or `None` when no CLOSED fence is found at all, OR (see the strictness
 /// note below) a SECOND fence opener follows the first block's close.
-/// Deliberately simpler than `mission_propose.rs::extract_json_block` (no
+/// Deliberately simpler than the retired `mission propose` extractor (no
 /// "unterminated" distinction — this module's caller only needs "did we
 /// get JSON or not," and an unterminated block naturally fails the JSON
 /// parse in [`extract_json`]'s bare-parse fallback too).

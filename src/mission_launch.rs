@@ -1667,7 +1667,7 @@ pub fn launch(
                 .map(|t| t.phase_id.as_str())
                 .unwrap_or_default();
             // (#1632) Without this the GENERIC launcher — every non-review
-            // config, including coder-phase and anything from `mission propose`
+            // config, including coder-phase and any hand-written config
             // — started phases and never closed them, so its board row read
             // `0/N` for the whole run and then jumped to `N/N`. Exactly the
             // #1620 defect, fixed there for the review launcher only.
@@ -2712,7 +2712,7 @@ pub(crate) fn ensure_mission_and_phases_with_provenance_and_start_payload(
         finalized_ts: None,
         paused_ts: None,
         // (must-fix 2) Hydrate from the config's extras overflow — where
-        // `mission propose` preserves the operator's verbatim words (#815)
+        // a config's `source_input` preserves the operator's verbatim words (#815)
         // and ticket id (#816). Absent keys stay None, same as before.
         source_input: config
             .extras
@@ -4574,7 +4574,7 @@ fn print_run_summary(mission_id: &str, steps: &BTreeMap<String, crew::types::Ste
 ///
 /// Hydrates `Mission.source_input`/`Mission.ticket` from the config's
 /// `extras` (#1284 review round 1, must-fix 2) — that's where `mission
-/// propose` preserves the operator's verbatim words (#815) and ticket id
+/// `source_input`/`ticket` keys preserve the operator's verbatim words (#815) and ticket id
 /// (#816), and dropping them silently broke `coder_brief`'s source-input
 /// injection plus the conventions' `{ticket}` templates.
 ///
@@ -7674,7 +7674,7 @@ mod tests {
     /// Phases are strictly linear (#1341), so at most ONE may be Running at any
     /// instant. #1620 fixed that for the review launcher and left the generic
     /// one — every non-review config, including coder-phase and anything from
-    /// `mission propose` — starting phases it never closed. The board then read
+    /// the retired `mission propose` verb — starting phases it never closed. The board then read
     /// `0/N` for the whole run and jumped to `N/N`, indistinguishable from a
     /// mission that never started.
     ///

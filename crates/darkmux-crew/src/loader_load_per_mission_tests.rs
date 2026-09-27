@@ -502,23 +502,6 @@
 
     #[serial]
     #[test]
-    fn mission_compiler_manifest_declares_role_family_utility() {
-        // A canonical utility role (#590 also tags scribe, and will add
-        // the compactor). Pins the manifest's role_family value so a
-        // future edit that accidentally removed it would fail loudly.
-        let _guard = TestCrewRoot::new();
-        let roles = load_roles().expect("load_roles must succeed against embedded defaults");
-        let mc = roles.iter()
-            .find(|r| r.id == "mission-compiler")
-            .expect("mission-compiler must be in the embedded role registry");
-        assert_eq!(mc.role_family.as_deref(), Some("utility"),
-            "mission-compiler must be tagged role_family: utility — it's the canonical bounded-I/O role; \
-             retagging requires explicit operator decision since it changes preamble behavior");
-        assert!(!mc.is_specialist());
-    }
-
-    #[serial]
-    #[test]
     fn embedded_roles_declare_expected_families() {
         // Pin the specialist/utility split across the built-in roster (#590):
         // utility = supports the runtime outside mission scope; specialist =
@@ -528,7 +511,7 @@
         let _guard = TestCrewRoot::new();
         let roles = load_roles().expect("load_roles must succeed against embedded defaults");
         let utility: std::collections::BTreeSet<&str> =
-            ["mission-compiler", "scribe", "radio-router"].into_iter().collect();
+            ["radio-router"].into_iter().collect();
         for r in &roles {
             assert!(
                 r.role_family.is_some(),

@@ -172,18 +172,15 @@ fn evaluate(p: &power_posture::PowerPosture, force: bool) -> Result<()> {
             return Ok(());
         }
         // (#2112 review CONSIDER 4) Named as the actual command, not just
-        // "pass --force" — `mission propose --start` reaches this same
-        // refusal by calling `mission_launch::launch` with an EMPTY params
-        // slice (see `src/mission_propose.rs::persist_and_maybe_start`),
-        // so there is no `--force` for that command to accept. Naming
-        // `mission launch <id>`/`mission crawl` explicitly means the
-        // recovery instruction is always real, regardless of which
-        // surface hit this refusal.
+        // "pass --force" — every surface that reaches this refusal calls
+        // `mission_launch::launch`, and naming `mission launch <id>`/
+        // `mission launch crawl` explicitly means the recovery instruction
+        // is always real, regardless of which surface hit it.
         bail!(
             "refusing to start: thermal state is \"{state_name}\" — this machine is already thermally \
              stressed and a sustained mission would make it worse. Run `darkmux mission launch <config-id> \
-             --force` (or `darkmux mission launch crawl --force`) to start anyway — `mission propose \
-             --start` does not itself accept `--force` — or let the machine cool first."
+             --force` (or `darkmux mission launch crawl --force`) to start anyway, or let the machine \
+             cool first."
         );
     }
 
@@ -270,16 +267,13 @@ mod tests {
 
     #[test]
     fn the_refusal_message_names_the_real_recovery_commands() {
-        // (#2112 review CONSIDER 4) `mission propose --start` calls
-        // `mission_launch::launch` with an empty params slice, so it can
-        // never satisfy `force_requested` — the message must name the
-        // commands that actually accept `--force`, not just say "pass
-        // --force" as if the current invocation could.
+        // (#2112 review CONSIDER 4) The message must name the commands
+        // that actually accept `--force`, not just say "pass --force" as
+        // if every invocation could.
         let err = evaluate(&posture_at(Some("critical")), false).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("mission launch <config-id> --force"), "{msg}");
         assert!(msg.contains("mission launch crawl --force"), "{msg}");
-        assert!(msg.contains("mission propose --start"), "{msg}");
     }
 
     // ── #2706: the battery-charge gate, every case the issue names.

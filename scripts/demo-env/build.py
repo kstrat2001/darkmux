@@ -290,7 +290,7 @@ REPLAYS = [
     dict(slug="crawl-error-discard",  machine="m5-ultra-256gb",     model="qwen3.6-35b-a3b-turboquant-mlx", role="crawler",  ends_ago_min=14,  scale=1.00),
     dict(slug="review-flow-sinks",    machine="m5-ultra-256gb",     model="qwen3.5-122b-a10b",              role="reviewer", ends_ago_min=52,  scale=1.60),
     dict(slug="crawl-unwrap-paths",   machine="m5-ultra-256gb",     model="qwen3.6-35b-a3b-turboquant-mlx", role="crawler",  ends_ago_min=97,  scale=0.72),
-    dict(slug="doc-drift-sweep",      machine="m1-max-32gb-studio", model="qwen3-4b-instruct-2507",         role="scribe",   ends_ago_min=133, scale=0.28),
+    dict(slug="doc-drift-sweep",      machine="m1-max-32gb-studio", model="qwen3-4b-instruct-2507",         role="reviewer", ends_ago_min=133, scale=0.28),
     dict(slug="review-serve-routes",  machine="m5-ultra-256gb",     model="qwen3-coder-next-mlx",           role="reviewer", ends_ago_min=181, scale=1.20),
     dict(slug="crawl-lock-ordering",  machine="m5-ultra-256gb",     model="qwen3.5-122b-a10b",              role="analyst",  ends_ago_min=244, scale=1.85),
     dict(slug="estimate-backlog",     machine="mac-mini-m4-16gb",   model="qwen3-4b-instruct-2507",         role="estimator",ends_ago_min=298, scale=0.18),

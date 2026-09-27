@@ -19,7 +19,7 @@ The CLI is the *engine*; the empirical findings in the Genesis series on Darkly 
 
 The user-facing **"What darkmux is for"** section in `README.md` is the canonical version of the project's north-star. Below is how the same five claims translate into operational doctrine for an AI agent (Antigravity, Claude Code, etc.) working on darkmux or driving it on behalf of an operator.
 
-1. **Optimization, not replacement.** When the operator asks you to pick a model from `lms ls` or propose a profile, prefer *complement* over *duplicate*. A team where every model is a 35B reasoner is not a team; it's a stack of identical instruments. The same logic applies *within* each role family (see **Project posture → Role families** below): a profile with three different 35B specialists and no 4B utility agent is missing its compactor, scribe, and estimator; conversely, a profile of nothing but utility agents has no specialist to do the actual judgment-dependent work. Read the existing profile registry first; propose additions that fill gaps in the right family (utility: compactor / scribe / estimator / mission-compiler; specialist: coder / reviewer / analyst) rather than swapping like for like.
+1. **Optimization, not replacement.** When the operator asks you to pick a model from `lms ls` or propose a profile, prefer *complement* over *duplicate*. A team where every model is a 35B reasoner is not a team; it's a stack of identical instruments. The same logic applies *within* each role family (see **Project posture → Role families** below): a profile with three different 35B specialists and no 4B utility agent is missing its compactor; conversely, a profile of nothing but utility agents has no specialist to do the actual judgment-dependent work. Read the existing profile registry first; propose additions that fill gaps in the right family (utility: compactor / radio router; specialist: coder / reviewer / analyst) rather than swapping like for like.
 
 2. **Harness, then model.** When the operator reports slow or wrong outputs, **check the harness before the model**. Compaction config, context-window mismatches, loaded-state drift, profile-vs-loaded model: all of these can produce large wall-clock regressions that look like model problems but are actually harness problems. Default action: run `darkmux doctor`, read the eureka findings, surface those *before* suggesting the operator change models.
 
@@ -180,7 +180,7 @@ An engagement is operator-defined, never system-defined. The system doesn't impo
 
 ### Role families
 
-- **Utility agents**: small model (4B-class), bounded I/O, high throughput, structured output (compactor, scribe, estimator, mission-compiler).
+- **Utility agents**: small model (4B-class), bounded I/O, high throughput, structured output (the compactor, the radio router).
 - **Specialist agents**: larger model (35B-class+), judgment-dependent, lower throughput, free-form output (coder, code-reviewer, analyst).
 
 <!-- darkmux:integration:agents:start -->

@@ -19,7 +19,7 @@ The CLI is the *engine*; the empirical findings in the Genesis series on Darkly 
 
 The user-facing **"What darkmux is for"** section in `README.md` is the canonical version of the project's north-star. Below is how the same five claims translate into operational doctrine for an AI agent (Claude Code, OpenClaw, Cursor, etc.) working on darkmux or driving it on behalf of an operator.
 
-1. **Optimization, not replacement.** When the operator asks you to pick a model from `lms ls` or propose a profile, prefer *complement* over *duplicate*. A team where every model is a 35B reasoner is not a team — it's a stack of identical instruments. The same logic applies *within* each role family (see **Project posture → Role families** below): a profile with three different 35B specialists and no 4B utility agent is missing its compactor, scribe, and estimator; conversely, a profile of nothing but utility agents has no specialist to do the actual judgment-dependent work. Read the existing profile registry first; propose additions that fill gaps in the right family (utility: compactor / scribe / estimator / mission-compiler; specialist: coder / reviewer / analyst) rather than swapping like for like.
+1. **Optimization, not replacement.** When the operator asks you to pick a model from `lms ls` or propose a profile, prefer *complement* over *duplicate*. A team where every model is a 35B reasoner is not a team — it's a stack of identical instruments. The same logic applies *within* each role family (see **Project posture → Role families** below): a profile with three different 35B specialists and no 4B utility agent is missing its compactor; conversely, a profile of nothing but utility agents has no specialist to do the actual judgment-dependent work. Read the existing profile registry first; propose additions that fill gaps in the right family (utility: compactor / radio router; specialist: coder / reviewer / analyst) rather than swapping like for like.
 
 2. **Harness, then model.** When the operator reports slow or wrong outputs, **check the harness before the model**. Compaction config, context-window mismatches, loaded-state drift, profile-vs-loaded model — all of these can produce large wall-clock regressions that look like model problems but are actually harness problems. Default action: run `darkmux doctor`, read the eureka findings, surface those *before* suggesting the operator change models.
 
@@ -313,7 +313,7 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
      OWN role and model, never blended into the primary's metrics. What counts as utility has
      ONE definition, `darkmux_crew::usage::call_purpose` (compaction and the radio router —
      darkmux's own jobs, run on the machine's one utility model, #2914; the scribe and
-     mission-compiler roles this entry used to list are retiring under #2912/#2913), and every
+     mission-compiler roles this entry used to list were retired in #2912/#2913), and every
      consumer that splits work from utility reads it rather than keeping its own list. Naming the unit for the role is what makes this compose rather than needing a
      special case: a sub-execution is the same kind of thing as its parent, one level in. The compactor's per-call usage record
      (`telemetry.tokens`, `call_kind: "compaction"`) conforms since #2902 step 1b: its `handle` is `compactor`
@@ -341,8 +341,8 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    modules. Two host-side entry points bookend per execution and are correct:
    `crew::dispatch::dispatch` and `dispatch_local_single_shot`. Everything model-bearing
    routes through one of them: all three lab providers (`providers/prompt.rs:209`,
-   `coding_task.rs:835`, `tool_bench.rs:1037`), `mission propose`, `lab notebook draft`,
-   coder-phase, and radio (`src/radio.rs:539`). Two things do not:
+   `coding_task.rs:835`, `tool_bench.rs:1037`), coder-phase, and radio (`src/radio.rs:539`).
+   Two things do not:
 
    - **Compaction is a sub-execution.** `runtime/src/compaction.rs` calls the endpoint with
      its own `compactor_model` (a 4B utility agent) inside the specialist's role execution,
@@ -499,9 +499,8 @@ src/                          CLI command layer (clap)
   acp_panel.rs                Registry-advertised ACP panel commands (#1684 Packet 1); `synthesize_diff_launch_inputs` derives diff/head_sha/workspace params for a no-argument `/review`-style panel launch from the cwd's own git state
   crawl_launch.rs             The crawl launcher (#1959) — `mission launch crawl`'s Task/Step graph is computed at run time from a resolved crawl plan (darkmux-lab's `crawl::plan`), never declared in a mission-config document; routed by literal config id, BEFORE `mission_config::load` runs
   coder_phase.rs              coder-phase pipeline StepKinds (worktree/coder/verify): Tier-3 bespoke, launch-owned (`mission run` retired #1426 ship-4)
-  mission_propose.rs          `mission propose`: utility-agent intent → mission config (stdin/file)
   mission_status.rs           `mission status`: the read-only mission board
-  lab_cli.rs                  `lab` family — kind-family shape (#1465): `run {<dispatch>·list·inspect·compare}` · `workload list` · `fixture {list·register·unregister}` · `notebook {draft·list}` · `eval <role>` · `loop`/`characterize`/`tune`/`doctor`
+  lab_cli.rs                  `lab` family — kind-family shape (#1465): `run {<dispatch>·list·inspect·compare}` · `workload list` · `fixture {list·register·unregister}` · `eval <role>` · `loop`/`characterize`/`tune`/`doctor`
   phase_cli.rs                Code-review output rendering (`phase_review_output_at`) for the coder-phase QA gate; the `phase` verb family retired (#1463)
   mod_cli.rs                  `mod` family (create/list/show over the write-once mod store)
   role_cli.rs                 `role` family (list/show from the SQLite index)
@@ -511,7 +510,6 @@ src/                          CLI command layer (clap)
   config_cmd.rs               `config` get/set/list
   init.rs / skills.rs         `darkmux init` (idempotent setup + bundled-skill refresh) + skill installer
   conventions.rs              Shared CLI helpers
-  notebook.rs                 Notebook draft generator (surfaced as `lab notebook`)
   migrate.rs                  Storage-layout migrations
 crates/
   darkmux-types/              Profile / ProfileRegistry / config / flow record schemas + config_access
@@ -635,8 +633,7 @@ If a user asks you to:
 | "add a lab fixture" | Create a dir with a `.fixture.json` manifest (`name` required; `satisfies`, `verify_command`, `required_files` optional), then `darkmux lab fixture register <path>`. A workload binds to it via `requires_fixture: "<name>@<version>"`. Built-ins live under `templates/builtin/lab-fixtures/` and register via `scripts/lab-init.sh`. |
 | "check fixtures are healthy" | `darkmux lab doctor` — offline check that registered paths exist, manifests load, required files are present, and content hashes haven't drifted. |
 | "run the smoke test" | `cargo install --path . && darkmux lab run quick-q`. Should complete in ~6-10s if a model is loaded. |
-| "list notebook entries" | `darkmux lab notebook list` (optionally `--machine <id>` to filter). Enumerates `.md` files, parses headers. (#1426 — the notebook family folded into `lab`.) |
-| "draft a notebook entry" | `darkmux lab notebook draft <run-id>` (optionally `--machine <id>` to override). |
+| "draft a notebook entry" | Invoke the bundled `darkmux-lab-notebook` skill (installed by `darkmux init`): it reads `darkmux lab run stats <run-id> --json` (and the run's `manifest.json` when needed) and drafts the entry, observation first, with the verify outcome stated as recorded, then writes it wherever the operator's own instructions say. The `lab notebook draft`/`list` verbs and the `scribe` role were removed in 4.0 (#2913). |
 | "make the build self-contained" | Already is — `include_str!` for embedded workloads, no external assets needed at runtime. |
 | "review the diff before commit" | Run the AREA you touched (`cargo t-review`, `cargo t-flow`, … — see "Testing — run the area, not the world"; `t-all` only for a cross-cutting change or a release), eyeball `git diff`, propose a commit message — but **do not commit unless explicitly asked**. |
 | "check the mission board / housekeeping" | `darkmux mission status` (#829) — the global mission-control read: every mission grouped by status with phase progress + the drift that needs attention (an open mission whose phases are all done; a stalled Active mission; a phase permanently blocked by an earlier abandoned one) + copy-pasteable reconcile commands. READ-ONLY — surfaces + suggests, never mutates; the operator/you run the suggested `mission finalize`/`mission abort` (#1463 — those two whole-mission terminals reconcile phases now, so a "Finalized mission with a non-terminal phase" is no longer a reachable drift). `--json` for programmatic consumption. **Run it as session-start housekeeping** (and before opening PRs / wrapping a work arc) so mission↔phase drift gets caught structurally rather than by memory — and so gh/jira stay reconciled off the same cue. The CLI twin of the viewer's missions lens (#827). |
@@ -720,7 +717,7 @@ Without the namespace, darkmux's operations have to fall back on heuristics or p
 
 When darkmux loads a model under `darkmux:<id>`, the underlying LMStudio model key is unchanged — `lms ps` shows `identifier=darkmux:foo, modelKey=foo`. Earlier revisions of this section said the namespace was "invisible at dispatch time" because a bare `model: "foo"` in the chat-completions call still resolved via the `modelKey` match. That was true only in the single-resident world, and it stopped being safe the moment the planner started deliberately creating co-residency (`darkmux:foo` loaded *alongside* a foreign, user-loaded `foo` — a sanctioned outcome, not an edge case): LMStudio's own bug tracker documents bare-key resolution across multiple same-key residents as undocumented/ambiguous, so which instance answers a bare `foo` under co-residency is not a contract darkmux can rely on. Dispatching against the wrong one is exactly the #1135 ghost — a user-loaded copy of the right model has unknown load configuration (context window, TTL, quant), and a confidently-wrong response from it looks identical to a correct one until something silently truncates.
 
-**So a dispatch against a LOCAL LMStudio instance puts the namespaced identifier on the wire, not the bare key.** `resolve_dispatch_model_internal`'s internal dispatch path (CLI `dispatch`, radio, acp, `mission propose`, notebook draft, crawl, the lab providers — everything riding it) puts `darkmux:<id>` (or the profile's explicit `identifier` opt-out) on the HTTP `model` field and the container's `--model` flag, the SAME identifier the residency preflight just loaded (or reused) it under (#2240; `dispatch_wire_model_id`). This is the mechanism LMStudio itself documents for addressing one of several resident copies of a base model.
+**So a dispatch against a LOCAL LMStudio instance puts the namespaced identifier on the wire, not the bare key.** `resolve_dispatch_model_internal`'s internal dispatch path (CLI `dispatch`, radio, acp, crawl, the lab providers — everything riding it) puts `darkmux:<id>` (or the profile's explicit `identifier` opt-out) on the HTTP `model` field and the container's `--model` flag, the SAME identifier the residency preflight just loaded (or reused) it under (#2240; `dispatch_wire_model_id`). This is the mechanism LMStudio itself documents for addressing one of several resident copies of a base model.
 
 **Two paths are deliberately exempt and stay bare, so the claim above is scoped, not global.** A REMOTE endpoint-staffed dispatch never routes through that function at all — its `model` is the provider's own deployment name, and there is no LMStudio residency to namespace against. And a dispatch pointed at a non-LMStudio base URL (the mock-model harness, `skip_lmstudio_residency`) stays bare for the same reason: darkmux loaded nothing there, so there is no instance to address. Reading the bolded sentence as "every wire `model` in darkmux is namespaced" would be wrong in both directions. The generic `dispatch.single_shot` / `dispatch.map` StepKinds sit on the same split from the other side — their `config.model` is *already* the namespaced wire identifier and `config.model_key` carries the bare loadable key the wave loader's `lms load` needs (`crates/darkmux-crew/src/step_kinds/builtins.rs`, #1442 ship-2b) — so those kinds pass `config.model` through untouched by design rather than re-deriving it. Existing dispatcher configs need no migration — the identifier is a load-time detail this layer now carries through, not a new operator-facing field.
 
@@ -803,7 +800,7 @@ Three reasons, and the third is the load-bearing one:
   string-token. *"This is my marriage time, not a work trip — relaxation, no
   aggressive sightseeing"* threaded through the intent text carries what the
   flag cannot.
-- **Utility agents are the wrong layer to interpret it.** A 4B mission-compiler
+- **Utility agents are the wrong layer to interpret it.** A 4B utility agent
   asked to interpret the operator's relationship to an engagement is the exact
   capability mismatch the utility/specialist split exists to prevent.
 - **Vision dies in translation, and a 4B agent cannot hold a contradiction — it
@@ -818,15 +815,15 @@ For a verb that would benefit from "context-aware" output, the operator carries
 that context in the verb's primary input, where a utility agent reads it as part
 of its bounded structuring job.
 
-Surfaced 2026-05-14: `--engagement` was added to `mission propose` and caught
-pre-merge as a doctrine violation. The full reasoning — every engagement shape,
+Surfaced 2026-05-14: `--engagement` was added to the mission-proposal verb
+(since retired, #2912) and caught pre-merge as a doctrine violation. The full reasoning — every engagement shape,
 the bridging role in detail, the complete lost-in-translation argument — is in
 [`docs/ENGAGEMENTS.md`](docs/ENGAGEMENTS.md). Tracked as #49.
 
 
 ## Project posture
 
-**darkmux is an AI-first local-AI orchestrator.** It uses local-AI internally to manage your local-AI workflows. The CLI binary embeds dispatch logic to call into LMStudio-loaded utility agents for structuring, planning, and routine bounded reasoning tasks (compaction, phase estimation, mission proposal, notebook draft). The frontier-AI orchestrator (your Claude Code, Cursor, or OpenClaw session) remains the strategic reasoner; darkmux operates the local tier as a self-contained capability.
+**darkmux is an AI-first local-AI orchestrator.** It uses local-AI internally to manage your local-AI workflows. The CLI binary embeds dispatch logic to call into LMStudio-loaded utility agents for its own routine bounded jobs: compaction inside every role execution, and routing for `darkmux radio`. The frontier-AI orchestrator (your Claude Code, Cursor, or OpenClaw session) remains the strategic reasoner; darkmux operates the local tier as a self-contained capability.
 
 The recursive shape is the point: **darkmux uses local-AI to manage your local-AI.** Operators running darkmux are running local-AI dispatches whose orchestration is itself done by local-AI. That's the AI-first move — not "AI bolted on," but AI as the obvious built-in capability of a tool whose reason for existing is local-AI orchestration. Earlier framings of darkmux as *"infrastructure, not an agent framework"* were honest at the time (one-thing-only swap tool, saturated agent-X namespace) but are now aspirational. The current posture matches what the binary does.
 
@@ -834,10 +831,10 @@ The recursive shape is the point: **darkmux uses local-AI to manage your local-A
 
 Two role families compose to make this work, and the distinction matters when picking models or proposing additions to a profile:
 
-- **Utility agents** — small model (4B-class), bounded I/O, high throughput, structured output. darkmux's own jobs on the machine's one utility model (#2914): today compaction and the radio router, and the one definition of which calls those are is `darkmux_crew::usage::call_purpose` (the scribe and mission-compiler roles that used to sit here are retiring under #2912/#2913). Each capability is asymmetric to its compute cost — one small model fills every utility job. darkmux dispatches utility agents internally for its own operations; the operator rarely invokes them directly. Defined by: bounded inputs + structured outputs + low per-call failure cost + throughput matters + bounded reasoning rather than strategy.
+- **Utility agents** — small model (4B-class), bounded I/O, high throughput, structured output. darkmux's own jobs on the machine's one utility model (#2914): today compaction and the radio router, and the one definition of which calls those are is `darkmux_crew::usage::call_purpose` (the scribe and mission-compiler roles that used to sit here were retired in #2912/#2913). Each capability is asymmetric to its compute cost — one small model fills every utility job. darkmux dispatches utility agents internally for its own operations; the operator rarely invokes them directly. Defined by: bounded inputs + structured outputs + low per-call failure cost + throughput matters + bounded reasoning rather than strategy.
 - **Specialist agents** — larger model (35B-class+), judgment-dependent, lower throughput, free-form output. Coder, code-reviewer, analyst. Operator's call: which specialist for which phase, with what tilt. darkmux makes them addressable via `dispatch <role>` but doesn't substitute its judgment for the operator's.
 
-CLI primitives stay small and composable; the AI-built-in verbs (`mission propose`, `notebook draft`) compose those primitives with utility-agent dispatches so the operator gets structured output without authoring JSON by hand. Both surfaces are part of the same project — the dual posture (small primitives + AI-built-in verbs) is deliberate.
+CLI primitives stay small and composable; the local model's built-in jobs are compaction (inside every role execution) and radio routing (`darkmux radio`), both utility-agent dispatches darkmux makes on its own behalf. Structuring work the operator used to get from built-in verbs (proposing a mission config, drafting a notebook entry) is the frontier orchestrator's job now, through bundled skills such as `darkmux-lab-notebook` (#2912/#2913). Both surfaces are part of the same project — the dual posture (small primitives + AI-first internals) is deliberate.
 
 `darkmux dispatch` and `darkmux lab run` both use the internal Docker-bounded runtime — the only dispatch path (#1405 removed the legacy openclaw shell-out alternative).
 

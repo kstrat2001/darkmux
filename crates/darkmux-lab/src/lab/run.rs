@@ -34,7 +34,7 @@ pub struct RunOpts {
 }
 
 /// `run_dir` is the canonical path to the run's output directory.
-/// Public-API surface — downstream tools (notebook drafting, viewer
+/// Public-API surface — downstream tools (the lab-notebook skill, viewer
 /// loading) read it after `lab run` completes. The CLI itself prints
 /// `run_id` and not the full path, hence the dead-code lint.
 #[allow(dead_code)]

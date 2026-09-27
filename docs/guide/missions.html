@@ -32,7 +32,7 @@
   <div class="wrap">
     <div class="label">04 <span class="dot">·</span> advanced</div>
     <h1>Missions, phases, and dispatch</h1>
-    <p class="lede">The advanced agentic surface. Use darkmux's <em>crew</em> abstraction to dispatch local-AI roles (coder, code-reviewer, scribe), track multi-step work as <em>missions</em> made of <em>phases</em>, and run structured QA via the review mission (<code>mission launch review</code>). Optional: everything in earlier sections works without these concepts.</p>
+    <p class="lede">The advanced agentic surface. Use darkmux's <em>crew</em> abstraction to dispatch local-AI roles (coder, code-reviewer, crawler), track multi-step work as <em>missions</em> made of <em>phases</em>, and run structured QA via the review mission (<code>mission launch review</code>). Optional: everything in earlier sections works without these concepts.</p>
   </div>
 </header>
 
@@ -42,7 +42,7 @@
     <p>If you're driving darkmux as a CLI for personal model loadout management, you don't need this. The mission/phase/crew layer is for operators using darkmux as the local-AI tier of an agentic workflow, where a frontier orchestrator (Claude, GPT, etc.) is delegating routine implementation work to local models.</p>
     <p>Specifically, this section is useful if you want:</p>
     <ul>
-      <li><strong>Named local-AI roles</strong> with specific tool palettes and system prompts (a "coder" that can edit files; a "code-reviewer" that can only read; a "scribe" that drafts prose).</li>
+      <li><strong>Named local-AI roles</strong> with specific tool palettes and system prompts (a "coder" that can edit files; a "code-reviewer" that can only read; a "crawler" that reads a tree and records findings).</li>
       <li><strong>Multi-step plans with structure</strong>: missions that contain phases, dependencies, lifecycle state (planned/running/complete/abandoned).</li>
       <li><strong>QA-by-default discipline</strong>: every implementation phase should pass through the review mission (<code>mission launch review</code>), which dispatches a reviewer crew against the diff.</li>
       <li><strong>Visible orchestration in the viewer</strong>: mission start, phase transitions, dispatch start/complete, verdict, all rendered as a timeline in <code>/flow</code>.</li>
@@ -97,42 +97,12 @@ darkmux role show coder          <span class="comment"># full details for one ro
 
     <p class="muted"><em>Note for operators with existing state:</em> earlier versions of darkmux nested everything under <code>~/.darkmux/crew/</code> (<code>roles/</code>, <code>missions/</code>, <code>phases/</code>). The loader transparently falls back to that layout. Separately, a mission whose phase JSONs still live under a legacy <code>sprints/</code> subdirectory (pre-rename) instead of <code>phases/</code> also reads and writes there transparently. Run <code>darkmux doctor</code> for a copy-pasteable <code>mv</code> script to flatten onto the current layout when you're ready. One older layout is <em>not</em> transparent: the original flat <code>~/.darkmux/missions/&lt;id&gt;.json</code> + <code>~/.darkmux/phases/&lt;id&gt;.json</code> shape (pre-mission-scoped-directories) needs an explicit one-time <code>darkmux mission migrate</code> to move into the nested layout above before it'll load. That same verb also synthesizes a <code>config-snapshot.json</code> for any nested-layout mission that predates <code>mission launch</code> and doesn't have one yet: a trivial, task-less config built from the mission's own JSON, so an old hand-authored instance reads honestly as the freeform/manual mission it always was. <code>darkmux mission migrate</code> (dry run) then <code>--apply</code> covers both.</p>
 
-    <h3>Authoring a mission (recommended)</h3>
-    <p>The preferred path is two verbs: <code>darkmux mission propose</code>, which takes unstructured input (pasted text, a Jira ticket via <code>acli</code>, a GitHub issue via <code>gh</code>) and dispatches the mission-compiler utility agent to emit a structured proposal you approve before anything lands; then <code>darkmux mission launch &lt;id&gt;</code>, which mints a running mission instance from what got persisted. Config-launched is the only instance-creation path (see the next section): <code>propose</code> writes the CONFIG, <code>launch</code> mints the INSTANCE.</p>
+    <h3>Authoring a mission</h3>
+    <p>A mission starts from a mission <strong>config</strong>: the built-in ones (<code>darkmux mission config list</code> shows them, <code>darkmux mission config show &lt;id&gt;</code> renders one's graph and the model each role resolves to), or one you write at <code>~/.darkmux/mission-configs/&lt;id&gt;.json</code>. Then <code>darkmux mission launch &lt;id&gt;</code> mints a running mission instance from it and drives it as a task graph, gated on your sign-off.</p>
+    <p>Turning unstructured intent (a pasted issue, a page, some notes) into a config is your frontier orchestrator's job, not darkmux's: hand it the text and the config schema below, and review what it writes before launching. (The <code>mission propose</code> verb that used to dispatch a local utility model for this was removed in 4.0, #2912: it emitted the pre-graph mission shape, which nothing could launch.)</p>
 
-    <h4>Worked example: proposing a mission from stdin</h4>
-    <p>The input is any text on stdin. The pipe is the interface, so the tools you already have are the source adapters. Pull an issue with <code>gh</code>, a web page with <code>curl</code>, a local file with <code>cat</code>, or the clipboard with <code>pbpaste</code>:</p>
-    <pre><code><span class="comment"># Pipe operator intent into the compiler</span>
-pbpaste            | darkmux mission propose --from-stdin
-gh issue view 42   | darkmux mission propose --from-stdin
-curl -s &lt;url&gt;      | darkmux mission propose --from-stdin
-cat notes.md       | darkmux mission propose --from-stdin
-<span class="comment"># or use a file:  darkmux mission propose --from-file intent.txt</span></code></pre>
-
-    <p>The compiler returns a proposal summary:</p>
-    <pre><code>┌─ Proposal ──────────────────────────────
-  Mission: draft-blog-post
-  Description:
-    Draft a blog post on local-AI bounded-task patterns.
-
-  Phases (2):
-    1. draft-blog-post-s1-outline (depends_on: none)
-       Write a one-page outline: thesis, three supporting sections.
-    2. draft-blog-post-s2-draft (depends_on: draft-blog-post-s1-outline)
-       Flesh out the outline into a full first draft.
-└─────────────────────────────────────────
-
-Approve [y] · Edit/regenerate with hint [e] · Reject [n]: y
-mission propose: persisted mission config `draft-blog-post` (2 phase(s))
-wrote mission config: ~/.darkmux/mission-configs/draft-blog-post.json
-next: <code>darkmux mission launch draft-blog-post</code> to begin (or pass <code>--start</code> next time)</code></pre>
-
-    <p>The approved proposal is persisted as a mission CONFIG at <code>~/.darkmux/mission-configs/draft-blog-post.json</code>, not a running instance. Pass <code>--start</code> to launch it immediately instead of stopping after persist:</p>
-    <pre><code>darkmux mission propose --from-stdin --start
-<span class="comment"># ... proposal approved, config written, then launched (mission → Active)</span></code></pre>
-
-    <h3>Authoring a mission config by hand (low-level alternative)</h3>
-    <p>If you prefer to skip the propose step or are building automation, you can write the config JSON directly at <code>~/.darkmux/mission-configs/&lt;id&gt;.json</code>, then run <code>darkmux mission launch &lt;id&gt;</code>. This is the escape hatch: recommended for operators who want full control or are scripting workflows. See <a href="#config-authoring">config authoring</a> below for the shape.</p>
+    <h3>Authoring a mission config by hand</h3>
+    <p>You write the config JSON directly at <code>~/.darkmux/mission-configs/&lt;id&gt;.json</code>, then run <code>darkmux mission launch &lt;id&gt;</code>. This is how every custom mission is authored; your orchestrator can write the file for you from a plain-language description of the work. See <a href="#config-authoring">config authoring</a> below for the shape.</p>
     <p>Hand-authoring the running <strong>instance</strong> JSON directly (writing <code>mission.json</code>/<code>phases/&lt;id&gt;.json</code> yourself under <code>~/.darkmux/missions/</code>) is <strong>not a documented path any more</strong>. Those files still exist on disk exactly as before, and they're still plain, human-readable JSON you can open and inspect; but they're now system-managed state that <code>mission launch</code> writes for you, the same way a database's on-disk pages are real files you could technically hand-edit but aren't meant to. Write a config; launch it.</p>
 
     <h3>When to use missions vs. not</h3>
@@ -249,7 +219,7 @@ darkmux mission config show review --param reviewer=review-mid</code></pre>
 <span class="comment"># mission `draft-blog-post` minted, Active, phase `draft-blog-post-s1-outline` Planned</span></code></pre>
 
     <h4>4. Do the work, then finalize</h4>
-    <pre><code><span class="comment"># …do the work, by hand or via `darkmux dispatch scribe ...`…</span>
+    <pre><code><span class="comment"># …do the work, by hand or via `darkmux dispatch coder ...`…</span>
 
 darkmux mission finalize draft-blog-post
 <span class="comment"># mission `draft-blog-post` → Finalized   duration=&lt;wall-clock seconds&gt;</span></code></pre>

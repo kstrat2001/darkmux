@@ -1582,7 +1582,7 @@ mod tests {
         // the other two serialized tests that mutate DARKMUX_ACK_DIR.
         require_licensed_adjacent_ack("coder").unwrap();
         require_licensed_adjacent_ack("analyst").unwrap();
-        require_licensed_adjacent_ack("scribe").unwrap();
+        require_licensed_adjacent_ack("crawler").unwrap();
     }
 
     #[test]
@@ -1991,10 +1991,10 @@ mod tests {
     fn fresh_session_id_differs_across_roles() {
         // Same call instant, different roles → different ids.
         let a = fresh_session_id("coder");
-        let b = fresh_session_id("scribe");
+        let b = fresh_session_id("crawler");
         assert_ne!(a, b);
         assert!(a.contains("-coder-"));
-        assert!(b.contains("-scribe-"));
+        assert!(b.contains("-crawler-"));
     }
 
     #[test]

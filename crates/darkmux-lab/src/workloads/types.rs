@@ -245,7 +245,7 @@ pub(crate) struct VerifyOutcome {
 }
 
 /// `payload_text` and `trajectory_path` are public-API surface for
-/// downstream consumers (notebook drafting reads them); the CLI's run
+/// downstream consumers (the lab-notebook skill reads them); the CLI's run
 /// summary doesn't, hence the dead-code lint.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
