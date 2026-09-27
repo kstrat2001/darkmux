@@ -1696,27 +1696,36 @@ mod tests {
         assert!(error_lines > 1, "{block:?}");
     }
 
+    /// The text of the first `<pre><code>` block after `after` in `html`,
+    /// with the handful of entities the guide uses decoded.
+    fn guide_block<'a>(html: &'a str, after: &str) -> String {
+        let from = html.find(after).unwrap_or_else(|| panic!("the guide has no {after:?}"));
+        let open = from + html[from..].find("<pre><code>").unwrap() + "<pre><code>".len();
+        let close = open + html[open..].find("</code></pre>").unwrap();
+        html[open..close].replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&amp;", "&")
+    }
+
     /// The guide's `darkmux doctor` example is the row doctor prints for the
-    /// guide's own Jira rule, flags included — only the adapter hash is a
-    /// placeholder. Reads the published page, so the example cannot drift
-    /// from the renderer unnoticed.
+    /// guide's own Jira rule — the rule is parsed from the page, not rebuilt
+    /// here, and only the adapter hash is a placeholder. The example cannot
+    /// drift from either the rule above it or the renderer.
     #[test]
     #[serial_test::serial]
     fn the_guide_shows_the_row_doctor_prints_for_its_jira_rule() {
+        let guide = include_str!("../../../docs/guide/crawl-and-hooks.html");
+        let rule: darkmux_types::config::HookRule =
+            serde_json::from_str(&guide_block(guide, "<h3>Transforms: reshaping a record")).expect("the Jira rule parses");
+        let example = guide_block(guide, "<h4><code>darkmux doctor</code></h4>");
+
         let state = darkmux_types::test_isolation::IsolatedState::new();
         let adapters = darkmux_types::config_access::hooks_adapters_dir();
         std::fs::create_dir_all(&adapters).unwrap();
-        std::fs::write(adapters.join("jira-issue.jq"), ".").unwrap();
-        let hash = darkmux_flow::hook_transform::load_adapter(&adapters, "jira-issue.jq").unwrap().short_hash;
-        let mut m = darkmux_types::config::HookMatch { action: Some("dispatch.tool".into()), ..Default::default() };
-        m.extras.insert("payload.tool_name".into(), serde_json::json!("create_finding"));
-        let mut rule = hook_rule(None, Some("http://100.64.1.2:8080/rest/api/3/issue"));
-        rule.r#match = Some(m);
-        rule.transform = Some("jira-issue.jq".into());
+        let adapter = rule.transform.clone().expect("the guide's rule names a transform");
+        std::fs::write(adapters.join(&adapter), ".").unwrap();
+        let hash = darkmux_flow::hook_transform::load_adapter(&adapters, &adapter).unwrap().short_hash;
         let checks = checks_for(&[rule], state.path());
         let row = named(&checks, "hooks.rule.0").message.replace(&hash, "a1b2c3d4e5f6a7b8");
-        let guide = include_str!("../../../docs/guide/crawl-and-hooks.html");
-        assert!(guide.contains(&format!("<pre><code>#0: {row}</code></pre>")), "the guide must show: #0: {row}");
+        assert_eq!(example, format!("#0: {row}"));
     }
 
     /// A clean last delivery after earlier give-ups clears the flag: the
