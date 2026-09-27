@@ -1105,6 +1105,7 @@ mod tests {
             ("Issue", "what the user-file key gate found at one key, not a setting"),
             ("Problem", "what the unknown-key gate found wrong with a file, not a setting"),
             ("Others", "how a schema treats keys it does not name, internal to the gate"),
+            ("Depth", "how strictly the user-file gate judges a value, internal to the gate"),
         ];
         const PROFILE_ENUMS: &[&str] = &["ManagedBackend", "Dialect", "BudgetPolicy"];
         const LITERAL_ARMS_ALLOWED: &[(&str, &str)] = &[(

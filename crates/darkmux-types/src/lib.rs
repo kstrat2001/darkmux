@@ -95,6 +95,31 @@ pub enum Capability {
 /// capped by the `Capability` variant count).
 pub type CapabilityProfile = BTreeMap<Capability, f32>;
 
+/// The schema of a [`CapabilityProfile`] field, for the unknown-key gate
+/// (`user_files`). Derived schemas lose a map's key type when the key enum
+/// documents its variants, which would let a misspelled capability pass the
+/// gate and then fail the load; this names each [`Capability`] token (read
+/// from that enum's own schema, never listed here) as the only valid key.
+/// Used only as `#[schemars(with)]`.
+pub struct CapabilityProfileSchema;
+
+impl schemars::JsonSchema for CapabilityProfileSchema {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "CapabilityProfile".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let enum_schema = schemars::schema_for!(Capability).to_value();
+        let tokens = user_files::enum_tokens(&enum_schema);
+        // A map (so `_comment` is an entry here, not a note) whose keys must
+        // be a capability token.
+        schemars::json_schema!({
+            "type": "object",
+            "additionalProperties": {"type": "number"},
+            "propertyNames": {"enum": tokens},
+        })
+    }
+}
+
 // (#2310 P1) `PartialEq` added so `ProfileModel` can compose into
 // `ResolvedSeatStaffing`/`ResolvedReviewRoles` (darkmux-crew's
 // resourcing.rs) and, through those, into `darkmux-lab`'s `ReviewContext`
@@ -136,6 +161,7 @@ pub struct ProfileModel {
     /// against it," which read as an inert field and made a live selection
     /// knob look safe to populate blindly.)
     #[serde(default)]
+    #[schemars(with = "CapabilityProfileSchema")]
     pub capabilities: CapabilityProfile,
     /// The endpoint this model is served from. Absent ⇒ the managed LM
     /// Studio default. (#2902 step 4) Written as an id naming an entry of the

@@ -169,7 +169,7 @@ fn a_syntax_error_is_reported_not_skipped() {
 /// mission config and rule, as an operator's copy of it would be read.
 #[test]
 fn every_shipped_document_has_no_unknown_keys() {
-    fn check<T: schemars::JsonSchema>(table: &[(&str, &str)]) {
+    fn check<T: schemars::JsonSchema + 'static>(table: &[(&str, &str)]) {
         for (id, text) in table {
             let doc: Value = serde_json::from_str(text).unwrap();
             assert_eq!(key_issues::<T>(&doc, &no_retired), vec![], "builtin {id}");
@@ -224,4 +224,14 @@ fn a_mistyped_value_is_refused_where_the_loader_would_fall_back_to_the_builtin()
         let refusal = preflight(scope).expect_err("refused").to_string();
         assert!(refusal.contains("`skills` must be a list, got \"code-reviewing\""), "{scope:?}: {refusal}");
     }
+}
+
+/// A user rule is a partial override: leaving out a required key is how it
+/// keeps the embedded value, so the gate does not report it.
+#[test]
+#[serial_test::serial]
+fn a_partial_rule_override_is_not_missing_keys() {
+    let state = IsolatedState::new();
+    write(&state, "rules", &json!({"id": "existing-solution", "window": 40}));
+    assert_eq!(problems(UserFileKind::Rule), vec![]);
 }

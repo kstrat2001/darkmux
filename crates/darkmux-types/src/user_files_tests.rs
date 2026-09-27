@@ -49,7 +49,7 @@ fn paths(keys: &[KeyIssue]) -> Vec<&str> {
 fn closest_of(k: &KeyIssue) -> Option<&str> {
     match &k.issue {
         Issue::Unknown { closest, .. } => closest.as_deref(),
-        Issue::Retired(_) | Issue::WrongType { .. } => None,
+        Issue::Retired(_) | Issue::WrongType { .. } | Issue::Missing { .. } => None,
     }
 }
 
@@ -100,9 +100,12 @@ fn keys_inside_arrays_maps_and_enum_variants_are_checked() {
         "shape": {"kind": "square", "sid": 2.0},
     });
     let keys = key_issues::<Probe>(&doc, &no_retired);
-    assert_eq!(paths(&keys), ["by_name.a.hst", "list[1].prot", "shape.sid"]);
+    // The `kind` tag picks the `square` variant, so its missing `side` is
+    // named too, before the typo that was meant for it.
+    assert_eq!(paths(&keys), ["by_name.a.hst", "list[1].prot", "shape.side", "shape.sid"]);
     assert_eq!(closest_of(&keys[1]), Some("list[1].port"));
-    assert_eq!(closest_of(&keys[2]), Some("shape.side"));
+    assert!(matches!(keys[2].issue, Issue::Missing { .. }), "{keys:?}");
+    assert_eq!(closest_of(&keys[3]), Some("shape.side"));
 }
 
 #[test]
@@ -368,4 +371,30 @@ fn a_long_wrong_value_is_shortened() {
 fn the_init_written_config_has_no_wrong_types() {
     let init = serde_json::to_value(crate::config::DarkmuxConfig::with_defaults()).unwrap();
     assert_eq!(key_issues::<crate::config::DarkmuxConfig>(&init, &no_retired), vec![]);
+}
+
+/// (review C1) `_comment` is a note only where the schema names its keys.
+/// Inside a map it is an ENTRY: `accept_work` would read it as a peer named
+/// `_comment` and serde fails the whole load (every setting back to its
+/// default), so the gate must walk it like any other entry.
+#[test]
+fn a_comment_key_inside_a_map_is_an_entry_not_a_note() {
+    let text = r#"{"fleet": {"accept_work": {"_comment": "why", "peer": {}}}, "redis": {"enabled": true}}"#;
+    assert!(serde_json::from_str::<crate::config::DarkmuxConfig>(text).is_err(), "precondition: serde refuses it");
+    let keys = config_keys(serde_json::from_str(text).unwrap());
+    assert_eq!(paths(&keys), ["fleet.accept_work._comment"]);
+    assert!(matches!(keys[0].issue, Issue::WrongType { .. }), "{keys:?}");
+    // In a free map (`role_profiles` is string -> string) it is a checked entry too.
+    let keys = config_keys(json!({"role_profiles": {"_comment": 5}}));
+    assert_eq!(paths(&keys), ["role_profiles._comment"]);
+}
+
+
+/// (review C1) A capability vector's keys are the `Capability` tokens: a
+/// misspelled one fails the load, so the gate names it.
+#[test]
+fn a_misspelled_capability_is_an_unknown_key() {
+    let keys = key_issues::<crate::ProfileModel>(&json!({"id": "m", "capabilities": {"code": 1, "reasonin": 1}}), &no_retired);
+    assert_eq!(paths(&keys), ["capabilities.reasonin"]);
+    assert_eq!(closest_of(&keys[0]), Some("capabilities.reasoning"));
 }

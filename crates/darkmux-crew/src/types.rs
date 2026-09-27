@@ -39,6 +39,7 @@ pub struct Skill {
     /// dispatch routing falls back to `default` regardless, so absence
     /// is harmless until phase 2 activates scoring.
     #[serde(default)]
+    #[schemars(with = "darkmux_types::CapabilityProfileSchema")]
     pub capabilities: CapabilityProfile,
 }
 

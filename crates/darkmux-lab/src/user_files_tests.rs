@@ -208,3 +208,97 @@ fn a_mistyped_workload_value_is_refused() {
     let refusal = preflight_with(Scope::LabRun, None).unwrap_err().to_string();
     assert!(refusal.contains("`workload.verify.must_contain` must be a list, got \"four\""), "{refusal}");
 }
+
+// ── (review C1) the gate and the loader never disagree ──
+
+/// Every JSON pointer into `v` (the root is `""`).
+fn pointers(v: &Value, at: String, out: &mut Vec<String>) {
+    match v {
+        Value::Object(m) => m.iter().for_each(|(k, c)| pointers(c, format!("{at}/{}", k.replace('~', "~0").replace('/', "~1")), out)),
+        Value::Array(a) => a.iter().enumerate().for_each(|(i, c)| pointers(c, format!("{at}/{i}"), out)),
+        _ => {}
+    }
+    out.push(at);
+}
+
+/// `base` and its variants: `_comment` and an unknown key inserted into
+/// every object, and every value replaced by each sample of every JSON type.
+fn variants(base: &Value) -> Vec<Value> {
+    let samples = [json!("x"), json!(1), json!(-1), json!(1.5), json!(300), json!(70000), json!(true), json!(null), json!([]), json!({}), json!(["x"]), json!({"_comment": "c"})];
+    let mut ptrs = Vec::new();
+    pointers(base, String::new(), &mut ptrs);
+    let mut out = vec![base.clone()];
+    for p in &ptrs {
+        if base.pointer(p).is_some_and(Value::is_object) {
+            for (k, v) in [("_comment", json!("c")), ("zz_probe", json!(1))] {
+                let mut d = base.clone();
+                d.pointer_mut(p).unwrap().as_object_mut().unwrap().insert(k.into(), v);
+                out.push(d);
+            }
+        }
+        if !p.is_empty() {
+            for s in &samples {
+                let mut d = base.clone();
+                *d.pointer_mut(p).unwrap() = s.clone();
+                out.push(d);
+            }
+        }
+    }
+    out
+}
+
+/// Every variant the gate passes, the typed load must accept: if the two
+/// ever disagree in that direction, a file the gate calls clean is dropped
+/// or reset to defaults at load time, silently.
+fn gate_agrees_with_loader<T>(name: &str, base: &Value, failures: &mut Vec<String>)
+where
+    T: schemars::JsonSchema + serde::de::DeserializeOwned + 'static,
+{
+    for doc in variants(base) {
+        if key_issues::<T>(&doc, &no_retired).is_empty() {
+            if let Err(e) = serde_json::from_value::<T>(doc.clone()) {
+                failures.push(format!("{name}: the gate passed it, serde refused it ({e}): {doc}"));
+            }
+        }
+    }
+}
+
+fn json_files(dir: &std::path::Path) -> Vec<(String, Value)> {
+    let mut out: Vec<(String, Value)> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .map(|p| (p.display().to_string(), serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap()))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+#[test]
+fn whatever_the_gate_passes_the_typed_load_accepts() {
+    use darkmux_crew::mission_config::MissionConfig;
+    use darkmux_crew::rules::Rule;
+    use darkmux_crew::types::{Crew, Role, Skill};
+    use darkmux_crew::workspace_spec::WorkspaceSpec;
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let t = repo.join("templates/builtin");
+    let read = |p: std::path::PathBuf| -> Value { serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap() };
+    let mut failures = Vec::new();
+    gate_agrees_with_loader::<darkmux_types::config::DarkmuxConfig>("config.example.json", &read(repo.join("config.example.json")), &mut failures);
+    let defaults = serde_json::to_value(darkmux_types::config::DarkmuxConfig::with_defaults()).unwrap();
+    gate_agrees_with_loader::<darkmux_types::config::DarkmuxConfig>("with_defaults", &defaults, &mut failures);
+    gate_agrees_with_loader::<darkmux_types::ProfileRegistry>("profiles.example.json", &read(repo.join("profiles.example.json")), &mut failures);
+    for (n, d) in json_files(&t.join("roles")) { gate_agrees_with_loader::<Role>(&n, &d, &mut failures); }
+    for (n, d) in json_files(&t.join("skills")) { gate_agrees_with_loader::<Skill>(&n, &d, &mut failures); }
+    for (n, d) in json_files(&t.join("mission-configs")) { gate_agrees_with_loader::<MissionConfig>(&n, &d, &mut failures); }
+    for (n, d) in json_files(&t.join("rules")) { gate_agrees_with_loader::<Rule>(&n, &d, &mut failures); }
+    for (n, d) in json_files(&t.join("workloads")) { gate_agrees_with_loader::<WorkloadManifest>(&n, &d, &mut failures); }
+    gate_agrees_with_loader::<FixtureManifest>("demo-tiny-py", &tiny_fixture(), &mut failures);
+    let crew = json!({"id": "c", "description": "d", "members": [{"role_id": "r", "position": "lead"}]});
+    gate_agrees_with_loader::<Crew>("crew", &crew, &mut failures);
+    let spec = json!({"name": "w", "sources": [{"id": "a", "path": "/x", "include": ["**"]}], "edges": [{"consumer": "a", "library": "a", "package": "p"}]});
+    gate_agrees_with_loader::<WorkspaceSpec>("workspace spec", &spec, &mut failures);
+    failures.truncate(20);
+    assert!(failures.is_empty(), "{failures:#?}");
+}

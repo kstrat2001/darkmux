@@ -198,6 +198,10 @@ mod wrong_type_tests {
         assert_eq!(loaded.registry.quarantined.len(), 1, "the bad entry is quarantined by name");
         assert!(loaded.registry.profiles.contains_key("good"));
         assert_eq!(crate::profiles::user_file_problem(&path), None);
+        // A missing required key is quarantined the same way.
+        std::fs::write(&path, r#"{"profiles": {"good": {"models": [{"id": "m", "n_ctx": 1}]}, "bad": {}}}"#).unwrap();
+        assert_eq!(crate::profiles::load_registry_quiet(Some(path.to_str().unwrap())).unwrap().registry.quarantined.len(), 1);
+        assert_eq!(crate::profiles::user_file_problem(&path), None);
         let with_typo = r#"{"profiles": {"bad": {"models": [{"id": "m", "n_ctx": "big", "n_ctxx": 1}]}}}"#;
         std::fs::write(&path, with_typo).unwrap();
         let msg = crate::profiles::user_file_problem(&path).unwrap().to_string();

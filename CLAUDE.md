@@ -270,7 +270,7 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    at preflight, before minting anything, and doctor reports it as Fail, one row per file.
    Both name the file, the key's dotted path and the closest valid key (the same shape as
    contract 9's enum refusal); a retired key names what replaced it instead of a guess.
-   **A value of the wrong type is refused the same way**, naming the path, the expected
+   **A value of the wrong type, or a missing required key, is refused the same way**, naming the path, the expected
    type and what it got: one such value fails the whole typed load, which for `config.json`
    means every setting falls back to its default (Redis and audit silently off) and for a
    user role, skill or rule means the builtin of the same id silently stands in. The
@@ -289,7 +289,11 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    against the schema's type, integer range, enum tokens and variant tags. The `extras` overflow is
    `#[schemars(skip)]` (it catches keys, it does not validate them); a flattened map that IS
    the schema (a hook rule's `match`) stays open, and each kind's `open_objects` test pins
-   that set. `_comment` is valid anywhere, as a note for the reader. `closest` is the only
+   that set. `_comment` is valid in any struct-shaped object, as a note for the reader; inside
+   a map it is an entry and is checked as one. A missing required key is refused too. The
+   structural guard is `whatever_the_gate_passes_the_typed_load_accepts`: for every shipped
+   template and example, and variants inserting `_comment`, an unknown key, or a value of
+   each JSON type at every level, a document the gate passes must load with serde. `closest` is the only
    "did you mean" in darkmux. The preflight chain is `config_enum::preflight` (config.json)
    inside `darkmux_profiles::preflight_with` (the registry) inside
    `darkmux_crew::user_files::preflight_with` (roles, skills, mission configs, rules), which

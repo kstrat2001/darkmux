@@ -23,13 +23,30 @@ pub fn problems(kind: UserFileKind) -> Vec<FileProblem> {
             .iter()
             .flat_map(|d| check_dir::<MissionConfig>(kind, d, &crate::mission_config::retired_key))
             .collect(),
-        UserFileKind::Rule => check_dir::<Rule>(kind, &crate::rules::user_rules_dir(), &no_retired),
+        UserFileKind::Rule => check_dir::<Rule>(kind, &crate::rules::user_rules_dir(), &no_retired)
+            .into_iter()
+            .filter_map(without_missing_keys)
+            .collect(),
         UserFileKind::Config
         | UserFileKind::Profiles
         | UserFileKind::Workload
         | UserFileKind::LabFixture
         | UserFileKind::WorkspaceSpec => Vec::new(),
     }
+}
+
+/// A user rule file is an OVERRIDE merged over the embedded rule of the same
+/// id (`rules::load_all`), so it names only the keys it changes: a required
+/// key it leaves out is not a problem.
+fn without_missing_keys(mut found: FileProblem) -> Option<FileProblem> {
+    use darkmux_types::user_files::{Issue, Problem};
+    if let Problem::Keys(keys) = &mut found.problem {
+        keys.retain(|k| !matches!(k.issue, Issue::Missing { .. }));
+        if keys.is_empty() {
+            return None;
+        }
+    }
+    Some(found)
 }
 
 /// THE preflight for an entry point that starts work: every bad
