@@ -2624,7 +2624,7 @@ pub(crate) fn admit_remote_execution(budget: u64) -> Result<()> {
             "remote token budget exhausted: the per-execution allowance \
              (config.remote.max_tokens_per_execution / \
              DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION) is 0 — this hosted dispatch is \
-             refused rather than run off the meter. Raise the allowance above 0 to dispatch \
+             refused because it has no allowance left. Raise the allowance above 0 to dispatch \
              to a remote endpoint."
         );
     }
