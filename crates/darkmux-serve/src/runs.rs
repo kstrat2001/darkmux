@@ -3921,67 +3921,59 @@ mod tests {
 
     // ── local_dispatch_status (#2682 fix-pass MUST FIX 1/2/3) ──────────────
 
-    /// (#2682 fix-pass MUST FIX 2, review Probe E2) An ambiguous session —
-    /// shared with another mission, and carrying FRESH activity — must
-    /// never be read as "this mission's dispatch went stale without a
-    /// terminal record" (`StaleNoTerminal`). Once `is_ambiguous()` refuses
-    /// it, the pool this mission can legitimately draw from is EMPTY, so
-    /// the verdict has to fall back to the mission's own age — proving
-    /// MUST FIX 1's fix (the `sessions.is_empty()` branch) is what actually
-    /// closes MUST FIX 2, exactly as the review predicted.
-    #[test]
-    #[serial_test::serial]
-    fn local_dispatch_status_reads_a_shared_session_by_the_missions_own_attempts() {
-        let _g = CrewGuard::new();
-        // (MUST FIX 2) 60s knob → a 120s budget. Without this pin the
-        // 90-minute distance below is measured against whatever
-        // `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` the environment exports, and
-        // this test fails outright under the documented `7200`.
-        let _budget = InactivityBudgetGuard::seconds(60);
+    /// A session `m` shares with another mission (#1918): `m` reads its OWN
+    /// attempt on it (`mission_status_sessions`), never the other mission's
+    /// activity, in `local_dispatch_status` (radio's busy check) and on its
+    /// `/runs` row alike. `m_ago`/`other_ago`: how long ago each mission's
+    /// `step start` landed. Returns both verdicts.
+    fn shared_session_verdicts(m_ago: u64, other_ago: u64) -> (RunStatus, Option<DispatchSessionEvidence>, RunStatus) {
         let flows = TempDir::new().unwrap();
-
         let mut m = minimal_mission("m-ambiguous-e2e", vec![], None);
-        // 90 minutes old — well past the pinned 120-second staleness
-        // budget, so the age branch genuinely fires once the session pool
-        // is empty (mirrors the review's Probe E2 fixture exactly).
         m.started_ts = Some(now_unix().saturating_sub(90 * 60));
         darkmux_crew::lifecycle::save_mission(&m).unwrap();
-
-        // Two DIFFERENT missions' records under the SAME session_id, both
-        // fresh (the review's "emitted AT THE CURRENT SECOND"). The session
-        // is ambiguous, but its attempts are per mission, so `m` reads its
-        // OWN attempt on it: live work, never "no attributable session".
-        let now_iso = darkmux_flow::ts_utc_now();
+        let at = |ago: u64| darkmux_flow::ts_utc_at(now_unix().saturating_sub(ago) as i64);
         write_day_file(
             flows.path(),
             &today(),
             &[
-                serde_json::json!({
-                    "ts": now_iso,
-                    "action": "step start",
-                    "session_id": "task-shared",
-                    "mission_id": "m-ambiguous-e2e",
-                    "source": "scheduler",
-                }),
-                serde_json::json!({
-                    "ts": now_iso,
-                    "action": "step start",
-                    "session_id": "task-shared",
-                    "mission_id": "some-other-mission",
-                    "source": "scheduler",
-                }),
+                serde_json::json!({ "ts": at(m_ago), "action": "step start", "session_id": "task-shared", "mission_id": "m-ambiguous-e2e", "source": "scheduler" }),
+                serde_json::json!({ "ts": at(other_ago), "action": "step start", "session_id": "task-shared", "mission_id": "some-other-mission", "source": "scheduler" }),
             ],
         );
-
         let status = local_dispatch_status(std::slice::from_ref(&m), flows.path(), &[]);
-        let (verdict, evidence) =
-            status.get(&m.id).copied().unwrap_or_else(|| panic!("no entry for {}", m.id));
-        assert_eq!(verdict, RunStatus::Running, "m's own step started this second on the shared session");
-        assert_eq!(evidence, None, "a live mission names no abandonment evidence");
-        // `/runs` and radio's busy check read the same mission the same way.
+        let (verdict, evidence) = status.get(&m.id).copied().unwrap_or_else(|| panic!("no entry for {}", m.id));
         let runs = build_runs(flows.path(), None, &[]);
         let row = runs.iter().find(|r| r.id == m.id).unwrap_or_else(|| panic!("no row for {}: {runs:?}", m.id));
-        assert_eq!(row.status, verdict, "/runs disagreed with local_dispatch_status: {row:?}");
+        (verdict, evidence, row.status)
+    }
+
+    /// `m`'s own step started this second; the other mission went quiet an
+    /// hour and a half ago. `m` is running.
+    #[test]
+    #[serial_test::serial]
+    fn local_dispatch_status_reads_a_shared_session_by_the_missions_own_attempts() {
+        let _g = CrewGuard::new();
+        // A 60s knob is a 120s staleness budget, whatever the environment
+        // exports.
+        let _budget = InactivityBudgetGuard::seconds(60);
+        let (verdict, evidence, row) = shared_session_verdicts(0, 90 * 60);
+        assert_eq!(verdict, RunStatus::Running, "m's own step started this second on the shared session");
+        assert_eq!(evidence, None, "a live mission names no abandonment evidence");
+        assert_eq!(row, verdict, "/runs disagreed with local_dispatch_status");
+    }
+
+    /// The borrowed case: `m`'s step went quiet an hour and a half ago while
+    /// the other mission's started this second. The other mission's activity
+    /// is not `m`'s: it reads Abandoned, on both surfaces.
+    #[test]
+    #[serial_test::serial]
+    fn a_shared_session_never_lends_another_missions_activity() {
+        let _g = CrewGuard::new();
+        let _budget = InactivityBudgetGuard::seconds(60);
+        let (verdict, evidence, row) = shared_session_verdicts(90 * 60, 0);
+        assert_eq!(verdict, RunStatus::Abandoned, "m went quiet; the other mission's fresh step is not its activity");
+        assert_eq!(evidence, Some(DispatchSessionEvidence::StaleNoTerminal));
+        assert_eq!(row, RunStatus::Abandoned, "/runs must not borrow the other mission's activity either");
     }
 
     /// A session shared by two missions the mission store does not know
