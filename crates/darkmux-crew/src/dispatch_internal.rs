@@ -9906,6 +9906,11 @@ impl TailerState {
                     if let Some(ms) = seq.and_then(|s| self.generation_ms_by_seq.remove(&s)) {
                         payload["generation_ms"] = serde_json::json!(ms);
                     }
+                    // (#2963, FLOW 1.64.0) Each call's file, so the viewer
+                    // names the file of the call running now.
+                    if let Some(paths) = turn_tool_paths(&event) {
+                        payload["tool_paths"] = paths;
+                    }
                     self.emit("dispatch.turn", darkmux_flow::Level::Info, payload);
                 }
                 // (#795) Per-turn token telemetry — the live "tokens
@@ -11692,6 +11697,25 @@ fn cap_json_result(value: Option<&serde_json::Value>, max: usize) -> serde_json:
         return v.clone();
     }
     serde_json::Value::String(cap_result_middle(s, max))
+}
+
+/// (#2963) `dispatch.turn`'s `tool_paths`: the runtime's per-call `path`
+/// (`model.completed.tool_calls[i].path`, the path argument only, never the
+/// content), aligned by index with the turn's calls, `null` for a call
+/// without one. A path over `MAX_TRAJ_FIELD_BYTES` is `null`, not clipped,
+/// since a clipped path names a different file. `None` (the key is left
+/// out) when no call has a path. The viewer names `tool_paths[k]` while the
+/// turn's k-th call runs.
+fn turn_tool_paths(event: &serde_json::Value) -> Option<serde_json::Value> {
+    let calls = event.get("tool_calls")?.as_array()?;
+    let paths: Vec<serde_json::Value> = calls
+        .iter()
+        .map(|c| match c.get("path").and_then(|p| p.as_str()) {
+            Some(p) if !p.is_empty() && p.len() <= MAX_TRAJ_FIELD_BYTES => serde_json::json!(p),
+            _ => serde_json::Value::Null,
+        })
+        .collect();
+    paths.iter().any(|p| !p.is_null()).then(|| serde_json::Value::Array(paths))
 }
 
 fn cap_json_str(value: Option<&serde_json::Value>, max: usize) -> serde_json::Value {

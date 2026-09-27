@@ -11637,6 +11637,74 @@
     /// one-off `darkmux dispatch` path) emits the SAME records WITHOUT a
     /// `step_id` payload key, so the field is purely additive and those records
     /// attribute via `session_id` exactly as before the emit half landed.
+    /// (#2963) `dispatch.turn` forwards the runtime's per-call `path`s as
+    /// `tool_paths`, aligned by index with the turn's calls, `null` for a
+    /// call without one; the key is absent when no call has a path. A path
+    /// over the field bound is `null`, never clipped (a clipped path names a
+    /// different file).
+    #[test]
+    fn turn_tool_paths_aligns_with_the_calls_and_is_absent_when_none_has_one() {
+        let ev = serde_json::json!({ "tool_calls": [
+            { "id": "a", "name": "read", "arguments_chars": 40, "path": "/workspace/src/a.rs" },
+            { "id": "b", "name": "bash", "arguments_chars": 12 },
+            { "id": "c", "name": "write", "arguments_chars": 90, "path": "src/b.rs" },
+            { "id": "d", "name": "read", "arguments_chars": 90, "path": 7 },
+            { "id": "e", "name": "read", "arguments_chars": 90, "path": "x".repeat(MAX_TRAJ_FIELD_BYTES + 1) },
+        ]});
+        assert_eq!(
+            turn_tool_paths(&ev),
+            Some(serde_json::json!(["/workspace/src/a.rs", null, "src/b.rs", null, null]))
+        );
+        let none = serde_json::json!({ "tool_calls": [{ "id": "b", "name": "bash", "arguments_chars": 12 }] });
+        assert_eq!(turn_tool_paths(&none), None);
+        assert_eq!(turn_tool_paths(&serde_json::json!({ "tool_calls": [] })), None);
+        assert_eq!(turn_tool_paths(&serde_json::json!({ "tool_calls": null })), None);
+        assert_eq!(turn_tool_paths(&serde_json::json!({})), None);
+    }
+
+    /// (#2963) End to end through the tailer: the turn record carries the
+    /// list, and a turn whose calls name no path carries no key.
+    #[test]
+    #[serial]
+    fn handle_event_turn_record_carries_tool_paths() {
+        let tmp = TempDir::new().unwrap();
+        // SAFETY: serialized via `#[serial]`; no concurrent env reader.
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            "sess-paths".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        state.handle_event(
+            r#"{"type":"model.completed","seq":1,"finish_reason":"tool_calls","tool_calls":[{"id":"a","name":"read","arguments_chars":40,"path":"src/a.rs"},{"id":"b","name":"bash","arguments_chars":9}]}"#,
+        );
+        state.handle_event(
+            r#"{"type":"model.completed","seq":2,"finish_reason":"tool_calls","tool_calls":[{"id":"c","name":"bash","arguments_chars":9}]}"#,
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+        let records = drain_flow_records_for_session(tmp.path(), "sess-paths");
+        let turns: Vec<_> = records.iter().filter(|v| v["action"] == "dispatch.turn").collect();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0]["payload"]["tool_paths"], serde_json::json!(["src/a.rs", null]));
+        assert_eq!(turns[0]["payload"]["tool_calls_count"], 2);
+        assert!(turns[1]["payload"].get("tool_paths").is_none(), "no key when no call names a path: {:?}", turns[1]);
+    }
+
     #[test]
     #[serial]
     fn handle_event_omits_step_id_when_not_a_graph_step() {

@@ -102,6 +102,18 @@ tools! {
 }
 
 impl Tool {
+    /// (#2963) Whether this tool's arguments carry a `path` naming the file
+    /// or directory it works on. The trajectory records that argument, and
+    /// only that one, on each `model.completed` tool call so the viewer can
+    /// name the file of the call running now. Exhaustive, so a new tool
+    /// decides.
+    pub fn takes_path(self) -> bool {
+        match self {
+            Tool::Read | Tool::Write | Tool::Edit | Tool::Search => true,
+            Tool::Echo | Tool::Bash | Tool::CreateFinding | Tool::CreateMod => false,
+        }
+    }
+
     pub fn description(self) -> &'static str {
         match self {
             Tool::Echo => {

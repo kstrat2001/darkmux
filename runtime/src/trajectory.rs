@@ -52,6 +52,29 @@ pub const WRITING_TOOL_CALL_PHASE: &str = "writing_tool_call";
 /// exceeds it, and a truncated head is enough to recall what was attempted.
 const MAX_TOOL_ARGS_CHARS: usize = 512;
 
+/// (#2963) Bound on a `tool_calls[]` entry's `path`, in bytes: the host's
+/// `MAX_TRAJ_FIELD_BYTES` for a short flow field. A longer path is left out
+/// rather than clipped, since a clipped path names a different file.
+const MAX_TOOL_PATH_BYTES: usize = 4 * 1024;
+
+/// (#2963) The `path` argument of one tool call, for a tool that takes one
+/// (`Tool::takes_path`). `None` for any other tool or an unknown name, when
+/// the arguments are not a JSON object, when `path` is missing, empty, or
+/// not a string, and when it is longer than `MAX_TOOL_PATH_BYTES`. Reads
+/// that one key; no other argument leaves this function.
+fn tool_call_path(name: &str, arguments: &str) -> Option<String> {
+    let tool = crate::tools::Tool::from_name(name)?;
+    if !tool.takes_path() {
+        return None;
+    }
+    let args: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let path = args.as_object()?.get("path")?.as_str()?;
+    if path.is_empty() || path.len() > MAX_TOOL_PATH_BYTES {
+        return None;
+    }
+    Some(path.to_string())
+}
+
 /// Truncate to at most `max` chars on a char boundary, appending an ellipsis
 /// marker when truncation happened. Never splits a multi-byte char.
 fn cap_chars(s: &str, max: usize) -> String {
@@ -252,11 +275,16 @@ impl Trajectory {
             calls
                 .iter()
                 .map(|c| {
-                    serde_json::json!({
+                    let mut entry = serde_json::json!({
                         "id": c.id,
                         "name": c.function.name,
                         "arguments_chars": c.function.arguments.len(),
-                    })
+                    });
+                    // (#2963) The path argument only, never the content.
+                    if let Some(path) = tool_call_path(&c.function.name, &c.function.arguments) {
+                        entry["path"] = serde_json::json!(path);
+                    }
+                    entry
                 })
                 .collect::<Vec<_>>()
         });
@@ -1581,6 +1609,55 @@ mod tests {
             assert!(parsed["type"].is_string());
             assert!(parsed["ts"].is_number());
         }
+    }
+
+    /// (#2963) Each `tool_calls[]` entry of `model.completed` carries the
+    /// call's `path` argument, and only that: for a tool that takes a path,
+    /// when the arguments parse and name one within the bound. The host
+    /// forwards the list as `dispatch.turn`'s `tool_paths`, so the viewer can
+    /// name the file of the call running NOW. Never any other argument (the
+    /// write's content must not appear anywhere in the event).
+    #[test]
+    fn model_completed_tool_calls_carry_the_path_argument_only() {
+        use crate::lmstudio::FunctionCall;
+        let call = |id: &str, name: &str, args: &str| ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: FunctionCall { name: name.into(), arguments: args.into() },
+            extra_content: None,
+        };
+        let long = format!("src/{}.rs", "d/".repeat(MAX_TOOL_PATH_BYTES));
+        let calls = vec![
+            call("c1", "read", r#"{"path":"/workspace/src/a.rs","offset":1,"limit":20}"#),
+            call("c2", "bash", r#"{"command":"cat /workspace/src/a.rs","path":"src/a.rs"}"#),
+            call("c3", "write", r#"{"path":"src/b.rs","content":"SECRET-CONTENT"}"#),
+            call("c4", "edit", r#"{"path":"src/c.rs","edits":[{"old_string":"x""#),
+            call("c5", "search", r#"{"pattern":"p","path":"src"}"#),
+            call("c6", "write", r#"{"path":"","content":"x"}"#),
+            call("c7", "edit", r#"{"path":7,"edits":[]}"#),
+            call("c8", "read", &serde_json::json!({ "path": long, "offset": 1, "limit": 1 }).to_string()),
+            call("c9", "not_a_tool", r#"{"path":"src/z.rs"}"#),
+        ];
+        let ws = tempfile::Builder::new().prefix("traj-paths").tempdir().unwrap();
+        let mut t = Trajectory::open(ws.path());
+        t.append_model_completed(1, "tool_calls", None, Some(&calls), None);
+        drop(t);
+
+        let body = fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
+        assert!(!body.contains("SECRET-CONTENT"), "no argument but the path is recorded: {body}");
+        let ev: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        let paths: Vec<Option<&str>> = ev["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.get("path").map(|p| p.as_str().expect("a path is a string")))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![Some("/workspace/src/a.rs"), None, Some("src/b.rs"), None, Some("src"), None, None, None, None],
+            "read/write/edit/search name their path; bash, unparsable args, an empty or \
+             non-string path, an over-bound path, and an unknown tool name none"
+        );
     }
 
     /// (#1444 review) Pins `append_model_completed`'s reasoning/cached
