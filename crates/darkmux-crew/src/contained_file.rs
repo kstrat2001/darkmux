@@ -600,8 +600,12 @@ mod tree {
     /// exclusively relative to the destination directory's fd.
     fn copy_file(from: File, dst_dir: &OwnedFd, name: &OsStr, mode: u32) -> io::Result<()> {
         let mode = mode & 0o7777;
+        #[cfg(all(test, target_os = "macos"))]
+        let force_byte_copy = super::FORCE_BYTE_COPY.with(|f| f.get());
+        #[cfg(all(not(test), target_os = "macos"))]
+        let force_byte_copy = false;
         #[cfg(target_os = "macos")]
-        {
+        if !force_byte_copy {
             let c = cstr(name)?;
             // `CLONE_NOFOLLOW` from <sys/clonefile.h>; the libc crate does
             // not export it. fclonefileat never overwrites (EEXIST).
@@ -746,6 +750,12 @@ pub(crate) type AfterListHook = Box<dyn FnMut(&Path)>;
 thread_local! {
     static AFTER_LIST_HOOK: std::cell::RefCell<Option<AfterListHook>> =
         const { std::cell::RefCell::new(None) };
+}
+
+// Test-only: skip the macOS clone so the byte-copy path is exercised.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FORCE_BYTE_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 // Test-only: files `copy_tree_nofollow` cloned (macOS `fclonefileat`)
@@ -929,6 +939,9 @@ mod tests {
         // resolves the Normal first, and it may itself be a recreated link.
         assert!(!relative_link_stays_inside(Path::new(""), Path::new("x/..")));
         assert!(!relative_link_stays_inside(Path::new(""), Path::new("sub/up/../s")));
+        // Refused even where the link is deep enough that counting the `..`
+        // against its depth alone would admit it.
+        assert!(!relative_link_stays_inside(Path::new("x"), Path::new("sub/up/../s")));
         assert!(relative_link_stays_inside(Path::new("node_modules/.bin"), Path::new("../pkg/bin.js")));
     }
 
@@ -953,6 +966,24 @@ mod tests {
         );
         assert!(report.skipped.iter().any(|(p, _)| p == Path::new("esc")), "{:?}", report.skipped);
         assert_eq!(fs::read_link(dst.join("sub/up")).unwrap(), Path::new(".."), "the plain in-tree link stays");
+    }
+
+    /// The same climb from a link one level down, where the target's single
+    /// `..` is within the link's own depth: `x/sub/up -> ../..` is the root,
+    /// so `x/esc -> sub/up/../HOST-SECRET` is the directory above the copy.
+    #[test]
+    fn copy_tree_nofollow_does_not_recreate_a_deeper_link_that_climbs_through_another_link() {
+        let (t, root, _s) = setup();
+        fs::create_dir_all(root.join("x/sub")).unwrap();
+        symlink("../..", root.join("x/sub/up")).unwrap();
+        symlink("sub/up/../HOST-SECRET", root.join("x/esc")).unwrap();
+        fs::write(t.path().join("HOST-SECRET"), "HOST").unwrap();
+        let dst = t.path().join("dst");
+
+        copy_tree_nofollow(&root, &dst).unwrap();
+
+        assert!(fs::read_to_string(dst.join("x/esc")).is_err(), "dst/x/esc resolves outside the copy");
+        assert_eq!(fs::read_link(dst.join("x/sub/up")).unwrap(), Path::new("../.."));
     }
 
     /// (#2869 C3) One fd is held per directory level; a tree deeper than
@@ -1000,6 +1031,14 @@ mod tests {
         symlink(&host_file, dst.join("f.txt")).unwrap();
         let _ = copy_tree_nofollow(&root, &dst);
         assert_eq!(fs::read_to_string(&host_file).unwrap(), "ORIGINAL", "wrote through a dst file link");
+        // Again on the byte-copy path (other volumes; every non-macOS host).
+        fs::remove_file(dst.join("f.txt")).ok();
+        fs::remove_dir_all(dst.join("sub")).ok();
+        symlink(&host_file, dst.join("f.txt")).unwrap();
+        FORCE_BYTE_COPY.with(|f| f.set(true));
+        let _ = copy_tree_nofollow(&root, &dst);
+        FORCE_BYTE_COPY.with(|f| f.set(false));
+        assert_eq!(fs::read_to_string(&host_file).unwrap(), "ORIGINAL", "byte copy wrote through a dst link");
 
         let dst2 = t.path().join("dst2");
         fs::create_dir_all(&dst2).unwrap();
