@@ -6860,6 +6860,51 @@ fn resolved_runtime_bounds_json(
     }))
 }
 
+/// (#2947) One `warn`-policy degeneracy finding: the stderr line and the
+/// `dispatch.degeneracy.warning` record payload.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DegeneracyWarning {
+    pub line: String,
+    pub payload: serde_json::Value,
+}
+
+/// (#2947) Pure: the warning a runtime trajectory event calls for, or
+/// `None`. Only under the `warn` policy (read off the event, which the
+/// RUNTIME stamps with the policy it actually ran under, never the host's
+/// current env), and only for a finding: a checkpoint whose judge
+/// `would_conclude`, or a stream-gate observation judged `degenerate`.
+/// `record` and `cut` produce none here: `record` is silent by design, and
+/// `cut` already surfaces the cut itself.
+pub(crate) fn degeneracy_warning(event_type: &str, event: &serde_json::Value) -> Option<DegeneracyWarning> {
+    if event.get("policy").and_then(|v| v.as_str()) != Some("warn") {
+        return None;
+    }
+    let (found, source) = match event_type {
+        "dispatch.checkpoint" => (event.get("would_conclude").and_then(|v| v.as_bool()) == Some(true), "checkpoint"),
+        "dispatch.gate.observation" => (event.get("degenerate").and_then(|v| v.as_bool()) == Some(true), "stream_gate"),
+        _ => return None,
+    };
+    if !found {
+        return None;
+    }
+    let turn = event.get("seq").cloned().unwrap_or(serde_json::Value::Null);
+    let ratio = event.get("tail_ratio").and_then(|v| v.as_f64());
+    let ratio_text = ratio.map(|r| format!(" (tail_ratio={r:.3})")).unwrap_or_default();
+    Some(DegeneracyWarning {
+        line: format!(
+            "darkmux dispatch: warning: turn {turn}: the output is repeating{ratio_text}; not cut \
+             (runtime.detection.degeneracy.policy = warn). Set it to `cut` to end repeating output."
+        ),
+        payload: serde_json::json!({
+            "turn_seq": turn,
+            "source": source,
+            "tail_ratio": ratio,
+            "policy": "warn",
+            "acted": false,
+        }),
+    })
+}
+
 /// (#1955) Add the observed summary to a JSON envelope.
 ///
 /// The orchestrator's ONLY surface is this envelope, and it carried none of
@@ -7003,6 +7048,9 @@ fn enrich_envelope_with_summary(
     // block can.
     if let Some(f) = read_findings_summary(out_dir) {
         obj.insert("findings".into(), f);
+    }
+    if summary.degeneracy_warnings > 0 {
+        obj.insert("degeneracy_warnings".into(), serde_json::json!(summary.degeneracy_warnings));
     }
     if summary.checkpoints > 0 {
         obj.insert(
@@ -7151,6 +7199,9 @@ struct TrajectorySummary {
     // and aggregate it by hand to learn otherwise.
     checkpoints: u32,
     checkpoints_concluded: u32,
+    /// (#2947) Findings the degeneracy detector surfaced as warnings under
+    /// the `warn` policy (it measured, found repetition, and did not cut).
+    degeneracy_warnings: u32,
     /// (#1959) The WORST and the MEAN novelty ratio across the run's
     /// checkpoints, replacing the LAST one.
     ///
@@ -10219,7 +10270,8 @@ impl TailerState {
                     // trajectory.jsonl — without this, the #2165 fix never
                     // reached the surface the miss actually happened on.
                     "bound": event.get("bound"),
-                    // (#2887) `policy` (enforce/observe/off) and
+                    // (#2887) `policy` (off/record/warn/cut; `enforce` /
+                    // `observe` in runs recorded before 4.0) and
                     // `would_conclude` (the judge's verdict BEFORE policy is
                     // applied) already ride the runtime's own trajectory
                     // event (`trajectory::append_checkpoint`) but were
@@ -10237,6 +10289,9 @@ impl TailerState {
                     event.get("verdict").and_then(|v| v.as_str()) == Some("conclude"),
                 );
                 self.emit("dispatch.checkpoint", darkmux_flow::Level::Info, payload);
+                if let Some(w) = degeneracy_warning(event_type, &event) {
+                    self.surface_degeneracy_warning(w);
+                }
             }
             "model.reasoning" => {
                 // The runtime emits these when it parses <think>...</think>
@@ -10444,6 +10499,11 @@ impl TailerState {
                     self.summary.detections.push(payload.clone());
                     self.emit_telemetry("detector", "telemetry.detector", payload);
                 }
+                if event_type == "dispatch.gate.observation" {
+                    if let Some(w) = degeneracy_warning(event_type, &event) {
+                        self.surface_degeneracy_warning(w);
+                    }
+                }
             }
             // (#557 slice 3) Per-turn context-window occupancy sawtooth.
             // The runtime emits one `dispatch.context` trajectory event per
@@ -10515,6 +10575,17 @@ impl TailerState {
                 // with no flow-stream consumer yet.
             }
         }
+    }
+
+    /// (#2947) The `warn` detection policy's surfaces, all three: a line on
+    /// this process's stderr (the dispatch's CLI), a Warn-level
+    /// `dispatch.degeneracy.warning` flow record the viewer shows, and the
+    /// envelope's `degeneracy_warnings` count. Nothing is cut: the runtime
+    /// never acts under `warn`.
+    fn surface_degeneracy_warning(&mut self, w: DegeneracyWarning) {
+        eprintln!("{}", darkmux_types::style::warn(&w.line));
+        self.summary.degeneracy_warnings = self.summary.degeneracy_warnings.saturating_add(1);
+        self.emit("dispatch.degeneracy.warning", darkmux_flow::Level::Warn, w.payload);
     }
 
     fn emit(&self, action: &str, level: darkmux_flow::Level, mut payload: serde_json::Value) {
@@ -11232,10 +11303,14 @@ fn detector_telemetry_payload(
                 "observation {observation}: tail_ratio={ratio} over {slice_chars} \
                  characters — the degeneracy gate judged this repeating (#2836)"
             );
+            // (#2947) `observe` is the retired spelling of `record`, still
+            // read here because archived trajectories carry it.
             let detail = if acted {
                 format!("{base} and ended the call")
-            } else if policy == Some("observe") {
-                format!("{base} — flagged (observed), not enforced")
+            } else if matches!(policy, Some("record") | Some("observe")) {
+                format!("{base} — recorded, not cut")
+            } else if policy == Some("warn") {
+                format!("{base} — warned, not cut")
             } else {
                 base
             };

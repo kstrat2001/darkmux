@@ -820,22 +820,65 @@ mod tests {
         check::<crate::endpoint::Dialect>();
     }
 
-    /// Every enum declared in the config schema must be registered here,
-    /// or be listed in `NOT_SETTINGS` with the reason it is not a setting
-    /// value. A new enum setting that skips the registry fails this test.
+    /// The production half of a source file: everything before its test
+    /// module, so an enum or a match arm written in a TEST (a review probe,
+    /// a fixture) never counts.
+    fn production(src: &str) -> &str {
+        src.find("#[cfg(test)]\nmod tests").map_or(src, |i| &src[..i])
+    }
+
+    fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if p.is_dir() {
+                if !matches!(name, "target" | ".git" | "node_modules" | "ui" | ".darkmux" | "tests") {
+                    rs_files(&p, out);
+                }
+            } else if p.extension().is_some_and(|x| x == "rs") && !name.ends_with("_tests.rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    /// The name declared by an `enum` line of any visibility (`enum X`,
+    /// `pub enum X`, `pub(crate) enum X`), or `None`.
+    fn enum_decl(line: &str) -> Option<String> {
+        let t = line.trim_start();
+        let rest = ["pub enum ", "pub(crate) enum ", "pub(super) enum ", "enum "]
+            .iter()
+            .find_map(|p| t.strip_prefix(p))?;
+        let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// (#2947, widened in review C2) An enum-valued setting must be in the
+    /// registry. Three structural scans, each failing on a new unregistered
+    /// shape:
     ///
-    /// **What it detects:** an `enum` declaration in `config.rs` or
-    /// `endpoint.rs` (the `config.json` schema and the `profiles.json`
-    /// endpoint schema). **What it cannot detect:** a setting that is
-    /// enum-like in meaning but typed as a plain `String` with no Rust enum
-    /// behind it (`runtime.log_level` is one: its only reader compares
-    /// against `"debug"`). A string compared against literals has no
-    /// declaration to find; the drift guard for that shape would have to
-    /// be a review question, and this doc is where that is said.
+    /// 1. **Every `enum` in darkmux-types' production source, of ANY
+    ///    visibility** (the crate that owns the config schema and its
+    ///    accessors) is registered, is a per-endpoint `profiles.json` enum,
+    ///    or is on `NOT_SETTINGS` with the reason it is not a setting value.
+    ///    Review probes `pub enum ZzProbeBudgetPolicy` in `config_access.rs`
+    ///    and `pub(crate) enum ZzProbeMode` in `config.rs` both fail here.
+    /// 2. **Every `config_enum!` invocation in the WHOLE workspace** is
+    ///    used by a registry entry (or is a profile enum): a ConfigEnum
+    ///    declared in another crate cannot skip the registry.
+    /// 3. **No hand-rolled token parse at an accessor**: a string-literal
+    ///    match arm (`"hub" =>`) in `config_access.rs` / `config.rs`
+    ///    production code must be on `LITERAL_ARMS_ALLOWED` with a reason.
+    ///    That is the shape the three drifted settings had before #2947.
+    ///
+    /// **Limits, stated plainly.** A setting whose value is compared with
+    /// `==` against a literal OUTSIDE those two files (`runtime.log_level`'s
+    /// reader checks `== "debug"`), or an enum declared outside
+    /// darkmux-types that is matched on a config string without
+    /// `config_enum!`, is not seen: text scans find declarations and match
+    /// arms, not meaning. Those remain a review question.
     #[test]
     fn every_enum_in_the_config_schema_is_registered() {
-        /// Enums in the schema files that are not the value of one
-        /// setting, with the reason.
+        /// Enums in darkmux-types that are not the value of one setting.
         const NOT_SETTINGS: &[(&str, &str)] = &[
             ("HeaderValue", "a hook header's value shape (literal string or Keychain item), not a token set"),
             ("EndpointKind", "derived from `managed` + `url`, never written"),
@@ -847,46 +890,111 @@ mod tests {
                 "profiles.json `auth.type`, strictly deserialized: an unknown value fails the \
                  registry load loudly, never a fallback",
             ),
+            (
+                "Capability",
+                "profiles.json capability names, strictly deserialized (an unknown one fails the load)",
+            ),
+            (
+                "CompactionStrategy",
+                "profiles.json `compaction.strategy`, strictly deserialized (an unknown one fails the load)",
+            ),
+            ("UtilityBinding", "the `internal.utility` value's shape (id or object), not a token set"),
+            ("QuarantinedEntryKind", "a registry-load diagnostic, never written"),
+            ("IssueSeverity", "a registry-load diagnostic, never written"),
+            ("GitdirPointerKind", "a workspace probe result, never written"),
+            ("Scope", "`paths::Scope` / `config_enum::Scope`: code-side enums, not setting values"),
+            ("ResolveScope", "a path-resolution mode chosen by code, not a setting"),
+            ("Source", "provenance of a resolved value, not a setting"),
+            ("Read", "how the registry reads a value, not a setting"),
+            ("SetIn", "where a bad value was set, not a setting"),
         ];
-        /// Per-endpoint `profiles.json` enums. They are ConfigEnums (one
-        /// value table), but not `config.json` settings: each endpoint
-        /// carries its own, read through `Lenient<T>` and refused by name
-        /// at use (`ModelEndpoint::kind` / `resolved_dialect`) and by
-        /// `darkmux doctor`'s endpoints check.
         const PROFILE_ENUMS: &[&str] = &["ManagedBackend", "Dialect"];
+        const LITERAL_ARMS_ALLOWED: &[(&str, &str)] = &[(
+            "parse_bool_token",
+            "the one boolean-token vocabulary (1/true/yes/on, 0/false/no/off), not an enum setting",
+        )];
 
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let crate_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rs_files(&crate_src, &mut files);
+        assert!(files.len() >= 10, "the darkmux-types scan found {} files", files.len());
+        let registered = |n: &str| ENUM_SETTINGS.iter().any(|s| s.rust_name == n) || PROFILE_ENUMS.contains(&n);
+
+        // 1. Enums of any visibility in darkmux-types.
         let mut declared = Vec::new();
-        for file in ["config.rs", "endpoint.rs"] {
-            let src = std::fs::read_to_string(root.join(file)).unwrap();
-            for line in src.lines() {
-                let Some(rest) = line.trim_start().strip_prefix("pub enum ") else { continue };
-                let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
-                declared.push(name);
+        for f in &files {
+            let src = std::fs::read_to_string(f).unwrap();
+            for line in production(&src).lines() {
+                if let Some(name) = enum_decl(line) {
+                    declared.push((f.file_name().unwrap().to_string_lossy().to_string(), name));
+                }
             }
         }
-        assert!(declared.len() >= 8, "the scan found too few enums ({declared:?}); is it still reading the schema?");
-        for name in &declared {
-            let registered = ENUM_SETTINGS.iter().any(|s| s.rust_name == name);
-            let excused = NOT_SETTINGS.iter().any(|(n, _)| n == name) || PROFILE_ENUMS.contains(&name.as_str());
+        assert!(declared.len() >= 15, "the scan found too few enums ({declared:?})");
+        for (file, name) in &declared {
             assert!(
-                registered || excused,
-                "`{name}` is declared in the config schema but is not in config_enum::ENUM_SETTINGS. \
-                 Implement ConfigEnum with config_enum! and register it, or add it to NOT_SETTINGS \
-                 with the reason it is not a setting value (#2947)"
+                registered(name) || NOT_SETTINGS.iter().any(|(n, _)| n == name),
+                "`{name}` ({file}) is an enum in the config crate but is not in \
+                 config_enum::ENUM_SETTINGS. Implement ConfigEnum with config_enum! and register it, \
+                 or add it to NOT_SETTINGS with the reason it is not a setting value (#2947)"
             );
         }
-        // And every ConfigEnum implementation in the schema is either
-        // registered or a declared profile enum.
-        for file in ["config.rs", "endpoint.rs"] {
-            let src = std::fs::read_to_string(root.join(file)).unwrap();
-            for line in src.lines() {
-                let Some(rest) = line.trim_start().strip_prefix("config_enum!(") else { continue };
+
+        // 2. Every `config_enum!` in the workspace is registered.
+        let root = crate_src.join("../../..");
+        let mut all = Vec::new();
+        for d in ["src", "crates", "runtime/src"] {
+            rs_files(&root.join(d), &mut all);
+        }
+        assert!(all.len() >= 100, "the workspace scan found only {} files", all.len());
+        let mut invocations = 0;
+        for f in &all {
+            let src = std::fs::read_to_string(f).unwrap();
+            for line in production(&src).lines() {
+                let t = line.trim_start();
+                let Some(rest) = t.strip_prefix("crate::config_enum!(").or_else(|| t.strip_prefix("darkmux_types::config_enum!(")) else {
+                    continue;
+                };
                 let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
-                assert!(
-                    ENUM_SETTINGS.iter().any(|s| s.rust_name == name) || PROFILE_ENUMS.contains(&name.as_str()),
-                    "`{name}` implements ConfigEnum but no registry entry uses it (#2947)"
-                );
+                invocations += 1;
+                assert!(registered(&name), "`{name}` ({}) implements ConfigEnum but no registry entry uses it (#2947)", f.display());
+            }
+        }
+        assert!(invocations >= 8, "found only {invocations} config_enum! invocations");
+
+        // 3. No hand-rolled token parse in the accessor / schema files.
+        for file in ["config_access.rs", "config.rs"] {
+            let src = std::fs::read_to_string(crate_src.join(file)).unwrap();
+            let mut current_fn = String::new();
+            let mut in_macro = false;
+            for line in production(&src).lines() {
+                let t = line.trim_start();
+                if let Some(rest) = t.strip_prefix("pub fn ").or_else(|| t.strip_prefix("fn ")) {
+                    current_fn = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                }
+                if t.starts_with("crate::config_enum!(") {
+                    in_macro = true;
+                }
+                if in_macro {
+                    if t.starts_with("]);") {
+                        in_macro = false;
+                    }
+                    continue;
+                }
+                let literal_arm = t.starts_with('"') && t.contains("=>") && !t.starts_with("\"") && {
+                    let lhs = t.split("=>").next().unwrap_or("");
+                    lhs.split('|').all(|p| {
+                        let p = p.trim();
+                        p.len() >= 2 && p.starts_with('"') && p.ends_with('"')
+                    })
+                };
+                if literal_arm {
+                    assert!(
+                        LITERAL_ARMS_ALLOWED.iter().any(|(f, _)| *f == current_fn),
+                        "{file}: `{current_fn}` matches a config string against literals (`{t}`): \
+                         register an enum setting instead of parsing tokens by hand (#2947)"
+                    );
+                }
             }
         }
     }

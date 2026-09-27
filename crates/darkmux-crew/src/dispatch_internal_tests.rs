@@ -7869,6 +7869,61 @@
         assert_eq!(records[1]["payload"]["rests"], 2);
     }
 
+    /// (#2947) The tailer turns a `warn`-policy finding into the flow
+    /// surface: one Warn-level `dispatch.degeneracy.warning` record per
+    /// finding (checkpoint AND stream gate), counted for the envelope; a
+    /// `record`-policy finding produces none.
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
+    fn a_warn_policy_finding_emits_a_warning_record_and_counts_it() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            "sess-warn".into(),
+            "coder".into(),
+            "darkmux:m".into(),
+        );
+        state.handle_event(r#"{"type":"dispatch.checkpoint","seq":3,"ts":1,"tail_ratio":0.1,"verdict":"continue","policy":"warn","would_conclude":true}"#);
+        state.handle_event(r#"{"type":"dispatch.gate.observation","seq":4,"ts":2,"tail_ratio":0.2,"degenerate":true,"acted":false,"policy":"warn","observation":1,"slice_chars":4000}"#);
+        state.handle_event(r#"{"type":"dispatch.checkpoint","seq":5,"ts":3,"tail_ratio":0.1,"verdict":"continue","policy":"record","would_conclude":true}"#);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+        assert_eq!(state.summary.degeneracy_warnings, 2);
+        let mut records = Vec::new();
+        for e in std::fs::read_dir(tmp.path()).unwrap().flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            {
+                for l in std::fs::read_to_string(&p).unwrap().lines() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
+                        if v["session_id"] == "sess-warn" && v["action"] == "dispatch.degeneracy.warning" {
+                            records.push(v);
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert!(records.iter().all(|r| r["level"] == "warn"), "{records:?}");
+        assert_eq!(records[0]["payload"]["source"], "checkpoint");
+        assert_eq!(records[1]["payload"]["source"], "stream_gate");
+    }
+
     /// (2026-08-30 fleet-observability finding) A manual pace pause (a
     /// paced `runtime.rest` event carrying `reason`/`state`) and a plain
     /// turn-delay rest were indistinguishable on the flow stream except by
@@ -13664,6 +13719,63 @@ fn summary_with(detections: Vec<serde_json::Value>) -> super::TrajectorySummary 
         detections,
         ..Default::default()
     }
+}
+
+/// (#2947) The pure mapping behind the `warn` policy: a finding under
+/// `warn` warns, the same finding under `record` / `cut` / an archived
+/// `observe` does not, and a non-finding never does.
+#[test]
+fn only_a_warn_policy_finding_produces_a_degeneracy_warning() {
+    use super::degeneracy_warning;
+    let cp = |policy: &str, would: bool| {
+        serde_json::json!({"type":"dispatch.checkpoint","seq":4,"tail_ratio":0.12,"policy":policy,"would_conclude":would})
+    };
+    let gate = |policy: &str, degenerate: bool| {
+        serde_json::json!({"type":"dispatch.gate.observation","seq":5,"tail_ratio":0.2,"policy":policy,"degenerate":degenerate})
+    };
+    let w = degeneracy_warning("dispatch.checkpoint", &cp("warn", true)).expect("a warn finding warns");
+    assert!(w.line.contains("turn 4") && w.line.contains("not cut") && w.line.contains("policy = warn"), "{}", w.line);
+    assert_eq!(w.payload["source"], "checkpoint");
+    assert_eq!(w.payload["acted"], false);
+    let g = degeneracy_warning("dispatch.gate.observation", &gate("warn", true)).expect("a warn gate finding warns");
+    assert_eq!(g.payload["source"], "stream_gate");
+    for policy in ["record", "cut", "observe", "enforce", "off"] {
+        assert!(degeneracy_warning("dispatch.checkpoint", &cp(policy, true)).is_none(), "{policy}");
+        assert!(degeneracy_warning("dispatch.gate.observation", &gate(policy, true)).is_none(), "{policy}");
+    }
+    assert!(degeneracy_warning("dispatch.checkpoint", &cp("warn", false)).is_none(), "no finding, no warning");
+    assert!(degeneracy_warning("dispatch.gate.observation", &gate("warn", false)).is_none());
+    assert!(degeneracy_warning("dispatch.turn", &cp("warn", true)).is_none());
+}
+
+/// (#2947) The `warn` policy's envelope surface: the count reaches the
+/// caller, and a run with none carries no field.
+#[test]
+fn degeneracy_warnings_reach_the_envelope() {
+    let mut summary = summary_with(vec![]);
+    summary.degeneracy_warnings = 2;
+    let out = super::enrich_envelope_with_summary(
+        r#"{"result":"stop"}"#.to_string(),
+        &summary,
+        &super::HostStats::default(),
+        &no_extras(),
+        no_findings_dir(),
+        serde_json::json!({}),
+        None,
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["degeneracy_warnings"], 2, "{out}");
+    let out = super::enrich_envelope_with_summary(
+        r#"{"result":"stop"}"#.to_string(),
+        &summary_with(vec![]),
+        &super::HostStats::default(),
+        &no_extras(),
+        no_findings_dir(),
+        serde_json::json!({}),
+        None,
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(v.get("degeneracy_warnings").is_none(), "{out}");
 }
 
 #[test]

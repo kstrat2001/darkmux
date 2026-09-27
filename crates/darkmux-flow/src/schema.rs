@@ -77,8 +77,26 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.62.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.63.0";
 // Version history:
+//   1.63.0 (#2947): the degeneracy detector's policy vocabulary names the
+//           action, and one additive action.
+//
+//           VALUES: the `policy` string on `dispatch.checkpoint`,
+//           `dispatch.gate.observation` / `.abort` records and on
+//           `dispatch.start`'s `bounds.detection_degeneracy_policy.value` is
+//           now `off` / `record` / `warn` / `cut`. `enforce` is now `cut`
+//           and `observe` is now `record`; records written before this
+//           version carry the old spellings, and consumers read BOTH (the
+//           archive is append-only and is never rewritten). The bounds
+//           `source` is `env` / `config` / `built-in`; the `*-invalid`
+//           sources are gone (an invalid value refuses at preflight now).
+//
+//           ACTION: `dispatch.degeneracy.warning` (level `warn`), one per
+//           finding the detector surfaced under the `warn` policy. Payload:
+//           `turn_seq`, `source` (`checkpoint` | `stream_gate`),
+//           `tail_ratio`, `policy` (`warn`), `acted` (`false`). Additive:
+//           an older reader ignores the action.
 //   1.62.0 (#2928, the live channel): additive, one payload block.
 //           `dispatch complete.payload.live`: the live channel's own cost for
 //           the execution — `enabled` (false for a dispatch that did not
