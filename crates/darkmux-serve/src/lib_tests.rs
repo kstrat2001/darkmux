@@ -5835,37 +5835,46 @@
     }
 
     /// Slice out just the `STATUS_ACTIONS` map body from `graph.ts`'s source
-    /// (#1868 QA finding). The three step-lifecycle literals this map holds
-    /// ("step start"/"step complete"/"step error") ALSO appear, independently,
-    /// in this same file's `applyRecordToMetrics` hedges (`isStart`/
-    /// `isComplete`, around the `"dispatch start" || ... || "step start"`
-    /// checks) — so a whole-file `contains()` scan can't actually prove the
-    /// STATUS_ACTIONS entry exists; deleting the map's own three step lines
-    /// while leaving the metrics hedges intact still passes. Scoping the scan
-    /// to the map's own body (between its `{` and the matching `};`) closes
-    /// that gap; the `expect` turns "someone renamed/restructured the map"
-    /// into a loud failure instead of a silently-vacuous pass.
+    /// (#1868 QA finding). The step-lifecycle actions this map holds ALSO
+    /// appear, independently, in this same file's `applyRecordToMetrics`
+    /// (`isStart`/`isTerminal`) — so a whole-file `contains()` scan can't
+    /// actually prove the STATUS_ACTIONS entry exists; deleting the map's own
+    /// step lines while leaving the metrics checks intact still passes.
+    /// Scoping the scan to the map's own body (up to its closing `]);`)
+    /// closes that gap; the `expect` turns "someone renamed/restructured the
+    /// map" into a loud failure instead of a silently-vacuous pass.
     fn graph_ts_status_actions_map() -> &'static str {
         let graph_ts = include_str!("../../../ui/src/lenses/mission/graph.ts");
         let (_, after) = graph_ts
             .split_once("const STATUS_ACTIONS")
             .expect("STATUS_ACTIONS map not found in ui/src/lenses/mission/graph.ts — the pin lost its subject");
         let (body, _) = after
-            .split_once("};")
-            .expect("STATUS_ACTIONS map has no closing `};` in ui/src/lenses/mission/graph.ts — the pin lost its subject");
+            .split_once("]);")
+            .expect("STATUS_ACTIONS map has no closing `]);` in ui/src/lenses/mission/graph.ts — the pin lost its subject");
         body
     }
 
-    /// (review-gate C2) Pin the SSE action-string contract: the lens's
-    /// STATUS_ACTIONS map must contain every action string the emitting
-    /// side actually writes (`scheduler::step_lifecycle_record`'s
-    /// "step start"/"step complete"/"step error";
-    /// `lifecycle::emit_phase_transition_record`'s "phase start"/
-    /// "phase complete"/"phase abandon"; the mission transition verbs).
-    /// A rename on either side must fail a test, not silently kill the
-    /// live animation. The emit side is pinned by darkmux-crew's own
+    /// How the viewer names `action` in code: `ACTION.<Variant>`, the
+    /// `ui/src/lib/ingest.ts` constant spelled with the Rust variant's own
+    /// name, so a Rust rename breaks the pin rather than drifting past it.
+    fn ts_action_key(action: &darkmux_flow::FlowAction) -> String {
+        let wire = action.as_str();
+        let k = darkmux_flow::FlowAction::KNOWN_WIRE
+            .iter()
+            .position(|w| *w == wire)
+            .unwrap_or_else(|| panic!("`{wire}` is not a current FlowAction"));
+        format!("ACTION.{}", darkmux_flow::FlowAction::VARIANT_NAMES[k])
+    }
+
+    /// (review-gate C2) Pin the SSE action contract: the lens's
+    /// STATUS_ACTIONS map must hold every action the emitting side actually
+    /// writes (`scheduler::step_lifecycle_record`'s step start/complete/
+    /// error; `lifecycle::emit_phase_transition_record`'s phase start/
+    /// complete/abandon; the mission transition verbs). A rename on either
+    /// side must fail a test, not silently kill the live animation. The emit
+    /// side is pinned by darkmux-crew's own
     /// `run_step_graph_emits_step_start_and_step_complete_records`; this
-    /// pins the lens side against the same literals.
+    /// pins the lens side against the same `FlowAction` variants.
     ///
     /// Retargeted at `ui/src/lenses/mission/graph.ts`'s own `STATUS_ACTIONS`
     /// map (#1868) — the standalone `mission-graph.html` page this test
@@ -5880,22 +5889,24 @@
     /// run was provably vacuous for the three step-lifecycle literals.
     #[test]
     fn mission_graph_lens_pins_flow_action_strings() {
+        use darkmux_flow::FlowAction;
         let map = graph_ts_status_actions_map();
         for action in [
-            "step start",
-            "step complete",
-            "step error",
-            "phase start",
-            "phase complete",
-            "phase abandon",
-            "mission start",
-            "mission close",
-            "mission pause",
-            "mission resume",
+            FlowAction::StepStart,
+            FlowAction::StepComplete,
+            FlowAction::StepError,
+            FlowAction::PhaseStart,
+            FlowAction::PhaseComplete,
+            FlowAction::PhaseAbandon,
+            FlowAction::MissionStart,
+            FlowAction::MissionClose,
+            FlowAction::MissionPause,
+            FlowAction::MissionResume,
         ] {
+            let key = ts_action_key(&action);
             assert!(
-                map.contains(&format!("\"{action}\"")),
-                "ui/src/lenses/mission/graph.ts lost the \"{action}\" entry from its \
+                map.contains(&format!("[{key},")),
+                "ui/src/lenses/mission/graph.ts lost the {key} entry from its \
                  STATUS_ACTIONS map — the SSE delta layer silently stops animating that transition"
             );
         }
@@ -5903,10 +5914,11 @@
 
     /// (F3, #1397/#1399 gate remediation) The MECHANICAL tie between the
     /// emit-side vocabulary constant and the lens-side consumer: iterates
-    /// `darkmux_crew::scheduler::STEP_LIFECYCLE_ACTIONS` itself (not
-    /// re-typed literals) and asserts each string appears in the lens's own
-    /// source. The test above pins the lens against literals (covering the
-    /// phase/mission verbs too, which have no shared Rust constant yet);
+    /// `darkmux_crew::scheduler::STEP_LIFECYCLE_ACTIONS` itself (not a
+    /// re-typed list) and asserts each action appears in the lens's own
+    /// map. The test above pins the lens against a hand-written variant list
+    /// (covering the phase/mission verbs too, which have no shared Rust
+    /// constant yet);
     /// this one guarantees that if the SCHEDULER's canonical step vocabulary
     /// ever changes, this crate fails to build/pass until the lens's
     /// STATUS_ACTIONS map catches up — the two hand-maintained lists (Rust
@@ -5916,18 +5928,17 @@
     /// retirement as the test above. Scans
     /// [`graph_ts_status_actions_map`]'s SLICE, not the whole file — see
     /// that helper's own doc; the naive whole-file scan cannot fail for any
-    /// of these three actions, because the same three literals also appear,
-    /// independently, in this file's `applyRecordToMetrics` hedges.
+    /// of these three actions, because the same three also appear,
+    /// independently, in this file's `applyRecordToMetrics`.
     #[test]
-    #[ignore = "4.0 dotted step actions: graph.ts's STATUS_ACTIONS map moves to them in the \
-                sibling viewer PR (refactor/4.0 dm-ingest), which owns every viewer-side copy"]
     fn mission_graph_lens_contains_every_scheduler_step_lifecycle_action() {
         let map = graph_ts_status_actions_map();
         for action in darkmux_crew::scheduler::STEP_LIFECYCLE_ACTIONS {
+            let key = ts_action_key(&action);
             assert!(
-                map.contains(&format!("\"{action}\"")),
+                map.contains(&format!("[{key},")),
                 "ui/src/lenses/mission/graph.ts's STATUS_ACTIONS map is missing scheduler \
-                 STEP_LIFECYCLE_ACTIONS entry \"{action}\" — the graph lens would silently \
+                 STEP_LIFECYCLE_ACTIONS entry {key} — the graph lens would silently \
                  stop animating that step transition"
             );
         }
