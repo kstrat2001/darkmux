@@ -528,14 +528,15 @@ Two rules worth carrying without looking anything up:
   (or `calls: 0`) is REFUSED ("0 is not a budget; set policy off to turn it
   off"), because read either way it would be an eternal wait.
 - **Two concurrency caps, and they are not interchangeable (#2394).**
-  `DARKMUX_REMOTE_CONCURRENT_CAP` → `remote.concurrent_cap` bounds HOSTED
-  endpoint dispatches; `DARKMUX_DISPATCH_FREE_CONCURRENCY` →
+  `DARKMUX_REMOTE_CONCURRENT_CAP` → `remote.concurrent_cap` (default `1`,
+  `0` = unbounded) bounds HOSTED endpoint dispatches, and on a fleet
+  receiver the hosted jobs other machines send; `DARKMUX_DISPATCH_FREE_CONCURRENCY` →
   `runtime.dispatch_free_concurrency` (default `8`) bounds steps that speak to
   no model at all (`procedural.shell`, `mods.gate`, `records.gather`,
   `deliver.github_review`). They were one cap only because a dispatch-free step
-  had no way to say what it consumed; a mission launch sets the remote cap to
-  1, so six independent shell waits ran strictly one at a time. See "Seat
-  classes" in `DESIGN.md`.
+  had no way to say what it consumed; a mission launch reads the remote cap
+  from config (default `1`, since #2681), so at the default six independent
+  shell waits ran strictly one at a time. See "Seat classes" in `DESIGN.md`.
 
 
 ## Where things live

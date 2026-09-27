@@ -139,17 +139,24 @@ darkmux release.
   on that seat (...)` at once, naming what runs; `queue` holds the job
   (first come, first served per seat; at most 4 queued per sending
   machine) and tells the sender it is waiting, with a `queued` line every
-  20 seconds until it runs. A queued job is checked again when its seat
-  frees (the allow-list entry, the scope with its profile resolved afresh,
-  the config preflight), so `untrust` also stops jobs already waiting; a
-  sender that hangs up gives its place back and its job never runs; a
-  waited-on job waits no longer than its connection allows, and one queued
-  without `--wait` at most 30 minutes (then it is answered busy and never
-  runs). Only jobs from other machines count: this machine's own
+  20 seconds until it runs. A queued job passes every admission check
+  again when its seat frees (the fleet token in force against the one it
+  was admitted with, the sender's network identity, its allow-list entry,
+  the config preflight, the scope with its profile resolved afresh), so
+  rotating the token, `untrust`, or removing the sender from the network
+  also stops jobs already waiting. A sender that closes its connection
+  gives its place back and its job never runs; one that vanishes without
+  closing it (a laptop that sleeps) keeps its place until TCP gives up on
+  the connection. A waited-on job waits no longer than its connection
+  allows (worked out from its timeout, which a container-agentic run does
+  not enforce), and one queued without `--wait` at most 30 minutes (then
+  it is answered busy and never runs). A reply with a status this darkmux
+  does not know (a newer receiver) is reported as such, with the job
+  possibly still running. Only jobs from other machines count: this machine's own
   dispatches are not seen by the listener. When a connection drops after
   the receiver may have taken the job, the sender says the job may still be
-  running there and names the session to follow. The sender prints the receiver's words
-  verbatim. A bad value is refused at the listener's start and reported
+  running there and names the session to follow. The sender prints the
+  receiver's words verbatim. A bad value is refused at the listener's start and reported
   Fail by `darkmux doctor` (#2947). The work-submission wire moves to
   schema `6` (a reply body is newline-delimited: `queued` lines, then the
   answer), so both machines must run the same darkmux; a mismatch is
