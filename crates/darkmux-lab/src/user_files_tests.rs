@@ -227,7 +227,8 @@ fn pointers(v: &Value, at: String, out: &mut Vec<String>) {
 }
 
 /// `base` and its variants: `_comment` and an unknown key inserted into
-/// every object, and every value replaced by each sample of every JSON type.
+/// every object, every key removed (a required one included, root level
+/// too), and every value replaced by each sample of every JSON type.
 fn variants(base: &Value) -> Vec<Value> {
     let samples = [json!("x"), json!(1), json!(-1), json!(1.5), json!(300), json!(70000), json!(true), json!(null), json!([]), json!({}), json!(["x"]), json!({"_comment": "c"})];
     let mut ptrs = Vec::new();
@@ -238,6 +239,14 @@ fn variants(base: &Value) -> Vec<Value> {
             for (k, v) in [("_comment", json!("c")), ("zz_probe", json!(1))] {
                 let mut d = base.clone();
                 d.pointer_mut(p).unwrap().as_object_mut().unwrap().insert(k.into(), v);
+                out.push(d);
+            }
+        }
+        if let Some((parent, key)) = p.rsplit_once('/') {
+            if base.pointer(parent).is_some_and(Value::is_object) {
+                let mut d = base.clone();
+                let key = key.replace("~1", "/").replace("~0", "~");
+                d.pointer_mut(parent).unwrap().as_object_mut().unwrap().remove(&key);
                 out.push(d);
             }
         }
@@ -259,12 +268,24 @@ fn gate_agrees_with_loader<T>(name: &str, base: &Value, failures: &mut Vec<Strin
 where
     T: schemars::JsonSchema + serde::de::DeserializeOwned + 'static,
 {
+    // The base must be clean: a refused base leaves only the variants that
+    // happen to repair it (a removed key), so most of the input tests
+    // nothing, silently.
+    let base_issues = key_issues::<T>(base, &no_retired);
+    if !base_issues.is_empty() {
+        failures.push(format!("{name}: the gate refuses the base itself, nothing exercised: {base_issues:?}"));
+    }
+    let mut passed = 0;
     for doc in variants(base) {
         if key_issues::<T>(&doc, &no_retired).is_empty() {
+            passed += 1;
             if let Err(e) = serde_json::from_value::<T>(doc.clone()) {
                 failures.push(format!("{name}: the gate passed it, serde refused it ({e}): {doc}"));
             }
         }
+    }
+    if passed <= 1 {
+        failures.push(format!("{name}: the gate passed {passed} variant(s); the base is refused, nothing exercised"));
     }
 }
 
@@ -302,7 +323,7 @@ fn whatever_the_gate_passes_the_typed_load_accepts() {
     gate_agrees_with_loader::<FixtureManifest>("demo-tiny-py", &tiny_fixture(), &mut failures);
     let crew = json!({"id": "c", "description": "d", "members": [{"role_id": "r", "position": "lead"}]});
     gate_agrees_with_loader::<Crew>("crew", &crew, &mut failures);
-    let spec = json!({"name": "w", "sources": [{"id": "a", "path": "/x", "include": ["**"]}], "edges": [{"consumer": "a", "library": "a", "package": "p"}]});
+    let spec = json!({"name": "w", "include": ["**"], "sources": [{"id": "a", "path": "/x"}], "edges": [{"consumer": "a", "library": "a", "package": "p"}]});
     gate_agrees_with_loader::<WorkspaceSpec>("workspace spec", &spec, &mut failures);
     failures.truncate(20);
     assert!(failures.is_empty(), "{failures:#?}");
