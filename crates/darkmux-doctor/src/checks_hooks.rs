@@ -50,13 +50,16 @@ fn action_from_match_desc(match_desc: &str) -> Option<&str> {
 /// (#2093 merge-gate finding 17) True when a rule's match risks the
 /// observer joining the observed (this project's own doctrine,
 /// CLAUDE.md's "The observer must not join the observed") — matching
-/// `telemetry.*` / category `telemetry`, or a bare `*` action that
-/// (among everything else) would also catch every telemetry record.
-/// String-matching against `describe_match`'s rendered form since
-/// `HookRuleSummary` carries only the description, not the structured
-/// `HookMatch` — good enough for a doctor Warn, not a security boundary.
-fn hooks_match_risks_observing_the_observer(match_desc: &str) -> bool {
-    match_desc.contains("category=telemetry") || match_desc.contains("action=telemetry.") || match_desc == "action=*"
+/// `telemetry.*` / category `telemetry`, or a bare `*` action with no other
+/// predicate, which (among everything else) catches every telemetry record.
+/// Reads the typed match, so a payload value that merely spells one of
+/// these is not mistaken for it.
+fn hooks_match_risks_observing_the_observer(m: &darkmux_types::config::HookMatch) -> bool {
+    let bare_star =
+        m.action.as_deref() == Some("*") && darkmux_types::config::HookMatch { action: None, ..m.clone() }.is_empty();
+    m.category.as_deref() == Some("telemetry")
+        || m.action.as_deref().is_some_and(|a| a.starts_with("telemetry."))
+        || bare_star
 }
 
 /// (#2093 merge-gate finding 15) `*.outbox.jsonl` files in `outbox_dir`
@@ -160,7 +163,8 @@ fn build_hooks_check(
     let mut overview_lines = Vec::with_capacity(summaries.len());
     let mut rule_checks = Vec::with_capacity(summaries.len());
 
-    for s in &summaries {
+    for (s, rule) in summaries.iter().zip(rules) {
+        let rule_match = rule.r#match.clone().unwrap_or_default();
         let mut flags = Vec::new();
         // (#2196 fix-round 4, MUST FIX G at the doctor surface) The
         // receiver's own reason text NEVER joins `message`. It rides
@@ -311,7 +315,7 @@ fn build_hooks_check(
                 rule_status = Status::Warn;
             }
         }
-        if hooks_match_risks_observing_the_observer(&s.match_desc) {
+        if hooks_match_risks_observing_the_observer(&rule_match) {
             flags.push(
                 "matches telemetry / a bare `*` action — the observer must not join the observed".to_string(),
             );
@@ -1407,6 +1411,21 @@ mod tests {
         let row = named(&checks, "hooks.rule.0");
         assert_eq!(row.status, Status::Warn);
         assert!(row.message.contains("observer must not join the observed"), "{}", row.message);
+    }
+
+    /// The observer check reads the rule's typed match, not its rendered
+    /// description: a payload VALUE that happens to spell
+    /// `category=telemetry` is not a telemetry match.
+    #[test]
+    fn a_payload_value_spelling_the_telemetry_category_is_not_the_observer_warning() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut m = darkmux_types::config::HookMatch { action: Some("crawl.finding".into()), ..Default::default() };
+        m.extras.insert("payload.note".into(), serde_json::json!("category=telemetry"));
+        let mut rule = hook_rule(None, Some(LOOPBACK));
+        rule.r#match = Some(m);
+        let checks = checks_for(&[rule], tmp.path());
+        let row = named(&checks, "hooks.rule.0");
+        assert_eq!(row.status, Status::Pass, "{}", row.message);
     }
 
     #[test]
