@@ -264,6 +264,7 @@ fn run_mock_dispatch(
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
         remote_origin: None,
+        live_channel: true,
         brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,
@@ -757,6 +758,7 @@ fn run_mock_dispatch_with_timeout_override(
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
         remote_origin: None,
+        live_channel: true,
         brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,

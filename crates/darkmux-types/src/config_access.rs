@@ -1450,6 +1450,53 @@ pub fn host_sampler_interval_ms() -> u64 {
     pick_parsed("DARKMUX_HOST_SAMPLER_INTERVAL_MS", cfg, Some(5000)).unwrap()
 }
 
+/// (#2928) The live channel's resolved cadence, from
+/// `env(DARKMUX_LIVE_SAMPLE_MS) > config.runtime.live_sample_ms > 250`. `0` is OFF (the zero-means-off
+/// convention `host_sampler_interval_ms` uses). A non-zero value is clamped
+/// to `LIVE_SAMPLE_MS_MIN..=LIVE_SAMPLE_MS_MAX`, and the clamp is REPORTED
+/// (`configured_ms` beside `effective_ms`) rather than applied silently:
+/// cadence is a recorded knob, never adaptive-silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveCadence {
+    /// What the winning tier said.
+    pub configured_ms: u64,
+    /// What is used: `0` (off) or the clamped value.
+    pub effective_ms: u64,
+    pub source: Source,
+}
+
+impl LiveCadence {
+    pub fn enabled(&self) -> bool {
+        self.effective_ms > 0
+    }
+    pub fn clamped(&self) -> bool {
+        self.configured_ms != self.effective_ms
+    }
+}
+
+/// (#2928) The fastest live cadence. Below it the host's 250 ms trajectory
+/// poll, not the knob, is what bounds latency, and every extra sample is
+/// forwarding cost for no visible change.
+pub const LIVE_SAMPLE_MS_MIN: u64 = 100;
+/// (#2928) The slowest live cadence: the runtime's silence tick follows the
+/// knob, and its pre-#2928 value (1 s) is what the host's 2 s heartbeat
+/// coalescing was designed under, so the knob may never slow it further.
+pub const LIVE_SAMPLE_MS_MAX: u64 = 1000;
+const LIVE_SAMPLE_MS_DEFAULT: u64 = 250;
+
+pub fn live_cadence() -> LiveCadence {
+    let cfg = config().runtime.as_ref().and_then(|r| r.live_sample_ms);
+    let (v, source) = pick_parsed_with_source("DARKMUX_LIVE_SAMPLE_MS", cfg, Some(LIVE_SAMPLE_MS_DEFAULT));
+    let configured_ms = v.unwrap_or(LIVE_SAMPLE_MS_DEFAULT);
+    let effective_ms = if configured_ms == 0 { 0 } else { configured_ms.clamp(LIVE_SAMPLE_MS_MIN, LIVE_SAMPLE_MS_MAX) };
+    LiveCadence { configured_ms, effective_ms, source }
+}
+
+/// (#2928) [`live_cadence`]'s effective value: `0` when the channel is off.
+pub fn live_sample_ms() -> u64 {
+    live_cadence().effective_ms
+}
+
 // ── Host sampler singleton lock (#2413) ──
 // The one machine-scoped host sampler (the daemon, or a dispatch process
 // when no daemon runs) coordinates via a single lock file. No env/config
@@ -3110,6 +3157,42 @@ mod tests {
         // An unparseable env value falls through (here, to the default).
         unsafe { std::env::set_var(k, "not-a-number") };
         assert_eq!(host_sampler_interval_ms(), 5000);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    // ── live_sample_ms (#2928): env > config > 250, 0 = off, clamped ──
+    #[serial_test::serial]
+    #[test]
+    fn live_cadence_resolves_clamps_and_reports_the_clamp() {
+        let k = "DARKMUX_LIVE_SAMPLE_MS";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k) };
+        let c = live_cadence();
+        assert_eq!((c.configured_ms, c.effective_ms, c.source), (250, 250, Source::BuiltIn));
+        assert!(c.enabled() && !c.clamped());
+        unsafe { std::env::set_var(k, "500") };
+        assert_eq!(live_cadence().effective_ms, 500, "env wins live");
+        assert_eq!(live_cadence().source, Source::Env);
+        unsafe { std::env::set_var(k, "0") };
+        let off = live_cadence();
+        assert_eq!(off.effective_ms, 0, "0 turns the live channel off");
+        assert!(!off.enabled() && !off.clamped(), "off is not a clamp");
+        unsafe { std::env::set_var(k, "10") };
+        let fast = live_cadence();
+        assert_eq!((fast.configured_ms, fast.effective_ms), (10, LIVE_SAMPLE_MS_MIN));
+        assert!(fast.clamped() && fast.enabled());
+        unsafe { std::env::set_var(k, "5000") };
+        let slow = live_cadence();
+        assert_eq!(slow.effective_ms, LIVE_SAMPLE_MS_MAX, "never slower than the runtime's 1 s tick");
+        assert!(slow.clamped());
+        assert_eq!(live_sample_ms(), LIVE_SAMPLE_MS_MAX);
+        unsafe { std::env::set_var(k, "not-a-number") };
+        assert_eq!(live_cadence().effective_ms, 250);
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),

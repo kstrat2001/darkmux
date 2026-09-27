@@ -113,6 +113,25 @@ describe("useCountUp (#2878)", () => {
     expect(result.current).toBe("—");
   });
 
+  // (#2928 re-review, C-1) A value that changes again soon after its last
+  // change (the live channel's cadence) is shown as it is: no tween that is
+  // always running; a change after a longer quiet still tweens.
+  it("snapWithinMs: a change soon after the last one snaps; a change after a quiet still tweens", () => {
+    stubReducedMotion(false);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "requestAnimationFrame", "cancelAnimationFrame", "performance"] });
+    const { result, rerender } = renderHook(({ v }) => useCountUp(v, fmt, 700, { snapWithinMs: 1_000 }), { initialProps: { v: 0 } });
+    act(() => vi.advanceTimersByTime(5_000));
+    rerender({ v: 100 });
+    act(() => vi.advanceTimersByTime(16));
+    const first = Number(result.current);
+    expect(first).toBeGreaterThan(0);
+    expect(first, "after a quiet, the change tweens").toBeLessThan(100);
+    act(() => vi.advanceTimersByTime(250));
+    rerender({ v: 200 });
+    act(() => vi.advanceTimersByTime(16));
+    expect(result.current, "250 ms after the last change: shown as it is").toBe("200");
+  });
+
   it("applies the caller's own formatter, never its own", () => {
     stubReducedMotion(false);
     const asDollars = (n: number | null) => (n === null ? "" : `$${n}`);

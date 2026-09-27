@@ -173,6 +173,8 @@ const KEYS: &[(&str, Ty)] = &[
     // (#2107, #1833) Cadence of `darkmux serve`'s daemon-side continuous
     // host sampler feeding the machine stats drawer. `0` disables it.
     ("runtime.host_sampler_interval_ms", Ty::Uint),
+    // (#2928) The live channel's cadence; `0` is off, clamped 100..=1000.
+    ("runtime.live_sample_ms", Ty::Uint),
     // (#2653) Retention window, in hours, for
     // `<darkmux-home>/liveness/<pid>.log` per-dispatch heartbeat files
     // (`darkmux_types::dispatch_liveness`). `0` disables pruning entirely

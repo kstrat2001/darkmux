@@ -2733,6 +2733,7 @@
             // (#2914) Work never runs on the utility model.
             allow_utility_model: false,
             remote_origin: None,
+            live_channel: true,
             brief_refs: Vec::new(),
             workspace_read_only: false,
             record_context: None,
@@ -5893,6 +5894,25 @@
         );
     }
 
+    /// (#2928 review, MF1) The live cadence is a HOST-side knob: it never
+    /// reaches the container, so the runtime's trajectory (a kept artifact)
+    /// is the same whatever the cadence is.
+    #[test]
+    #[serial]
+    fn build_docker_run_argv_never_forwards_the_live_cadence() {
+        let k = "DARKMUX_LIVE_SAMPLE_MS";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::set_var(k, "100") };
+        let argv = build_docker_run_argv(&base_argv_config());
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        assert!(!argv.iter().any(|a| a.contains("LIVE_SAMPLE")), "{argv:?}");
+    }
+
     // ─── N6 (final #2110/#2109 re-check): stale pace.json cleanup ───
 
     #[test]
@@ -7445,6 +7465,7 @@
                 None,
                 None, // (#2902) endpoint
                 None, // (#2902 step 1b) compactor endpoint
+                None, // (#2928) live sender
             )
         });
 
@@ -10550,6 +10571,234 @@
             original_deadline,
             "a writing tick must not reset the inactivity deadline"
         );
+    }
+
+    /// (#2928 review, lab decision) A dispatch that opts out of the live
+    /// channel gets no sender at all (so no sampling either), whatever the
+    /// cadence knob says; one that opts in gets one while the knob is on.
+    #[test]
+    #[serial]
+    fn live_sender_for_honors_the_dispatch_opt_out_and_the_knob() {
+        let k = "DARKMUX_LIVE_SAMPLE_MS";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::set_var(k, "250") };
+        assert!(live_sender_for(false).is_none(), "an opted-out (lab) dispatch has no sender");
+        assert!(live_sender_for(true).is_some());
+        unsafe { std::env::set_var(k, "0") };
+        assert!(live_sender_for(true).is_none(), "the knob still turns it off for everyone");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    /// (#2928 review, lab decision) The one production tailer spawn passes
+    /// the dispatch's own opt-out through. Checked on the source: exercising
+    /// the call site needs a real container, which a unit test does not run.
+    #[test]
+    fn the_production_tailer_spawn_honors_the_dispatch_opt_out() {
+        let src = include_str!("dispatch_internal.rs");
+        let spawn = src.find("let (_tailer_stop_guard, tailer_handle) = spawn_guarded_tailer(").expect("the spawn site");
+        let call = &src[spawn..spawn + src[spawn..].find(");").unwrap()];
+        assert!(call.contains("live_sender_for(opts.live_channel)"), "the spawn must pass the dispatch's own live_channel");
+        assert_eq!(src.matches("spawn_guarded_tailer(").count(), 2, "one definition, one production call");
+    }
+
+    /// (#2928) A simulated execution's trajectory: an opener, 1 s of steady
+    /// visible text, a 60 ms think burst, more text, then one compaction
+    /// start and its call. Event times are fixed, so the live sampler's
+    /// output is deterministic.
+    fn live_fixture_lines() -> Vec<String> {
+        let mut lines = vec![
+            r#"{"type":"model.streaming.start","seq":1,"ts":1758700000000,"system_chars":4000,"prompt_chars":9000}"#.to_string(),
+        ];
+        let (mut gen, mut vis) = (0u64, 0u64);
+        for i in 1..=60u64 {
+            gen += 12;
+            // chunks 20..=22 are reasoning only: the visible count holds.
+            if !(20..=22).contains(&i) {
+                vis += 12;
+            }
+            lines.push(format!(
+                r#"{{"type":"model.partial","seq":1,"partial_index":{i},"delta_chars":12,"cumulative_chars":{vis},"generated_chars":{gen},"ts":{}}}"#,
+                1_758_700_000_000u64 + i * 20
+            ));
+        }
+        lines.push(r#"{"type":"model.streaming.end","seq":1,"partial_count":60,"total_content_chars":684,"tool_calls_count":0,"observations":0,"idle_ticks":7,"idle_tick_us":91,"ts":1758700001300}"#.to_string());
+        lines.push(r#"{"type":"compaction.start","generation":1,"requested_model":"util-4b","ts":1758700001400}"#.to_string());
+        lines.push(r#"{"type":"compaction.call","generation":1,"requested_model":"util-4b","usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120},"ts":1758700001700}"#.to_string());
+        lines
+    }
+
+    /// (#2928) Every record the tailer wrote into the isolated flows dir,
+    /// reduced to its action (never a full record: those carry the host's
+    /// `machine_uid`).
+    fn record_actions_in(flows: &std::path::Path) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(flows) {
+            for e in entries.flatten() {
+                for line in std::fs::read_to_string(e.path()).unwrap_or_default().lines() {
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                    if let Some(a) = v.get("action").and_then(|a| a.as_str()) {
+                        out.push(a.to_string());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn run_live_fixture(live: Option<darkmux_flow::live::LiveSender>) -> (Vec<String>, TrajectorySummary) {
+        let isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let shared = Arc::new(Mutex::new(Instant::now()));
+        let mut state = TailerState::new(traj_path.clone(), "live-sess".into(), "coder".into(), "work-35b".into(), shared, 600)
+            .with_compactor_model(Some("util-4b".into()))
+            .with_live(live, 250);
+        let mut f = std::fs::File::create(&traj_path).unwrap();
+        for l in live_fixture_lines() {
+            writeln!(f, "{l}").unwrap();
+        }
+        drop(f);
+        state.poll_and_emit();
+        state.live_flush_final();
+        state.finish_live();
+        (record_actions_in(&isolated.path().join("flows")), state.summary)
+    }
+
+    /// (#2928) The live channel forwards samples to the daemon's socket and
+    /// adds NOTHING to the flow log: the same trajectory with and without it
+    /// writes the identical record sequence (same actions, same count).
+    #[test]
+    #[serial]
+    fn tailer_live_channel_forwards_samples_and_writes_no_record() {
+        let (without, _) = run_live_fixture(None);
+        let sock_dir = TempDir::new().unwrap();
+        let sock = sock_dir.path().join("live.sock");
+        let rx = darkmux_flow::live::bind_ingest(&sock).unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let (with, summary) = run_live_fixture(Some(darkmux_flow::live::LiveSender::to_path(sock)));
+        assert!(!without.is_empty(), "the fixture writes durable records");
+        assert_eq!(with, without, "the live channel added or changed flow records");
+
+        let mut samples = Vec::new();
+        let mut buf = [0u8; darkmux_flow::live::MAX_LIVE_DATAGRAM];
+        while let Ok(n) = rx.recv(&mut buf) {
+            samples.push(darkmux_flow::live::LiveSample::from_datagram(&buf[..n]).expect("a well-formed sample"));
+        }
+        let model: Vec<_> = samples.iter().filter(|s| s.kind == darkmux_flow::live::LiveKind::Model).collect();
+        let utility: Vec<_> = samples.iter().filter(|s| s.kind == darkmux_flow::live::LiveKind::Utility).collect();
+        // 1.2 s of chunks at a 250 ms cadence is ~5 steady samples, plus the
+        // opener and the four edges of the think burst; far below the 61
+        // events the runtime wrote.
+        assert!((7..=14).contains(&model.len()), "{} model samples", model.len());
+        assert!(model[0].fields.contains_key("prompt_chars"), "the opener goes first");
+        assert!(model.iter().all(|s| s.session_id.as_deref() == Some("live-sess") && s.cadence_ms == 250));
+        let gens: Vec<u64> = model.iter().filter_map(|s| s.fields["generated_chars"].as_u64()).collect();
+        // Both edges of the burst: the last visible chunk (19) and the first
+        // reasoning one (20), then the burst's last (22) and the first
+        // visible chunk after it (23).
+        for edge in [19 * 12, 20 * 12, 22 * 12, 23 * 12] {
+            assert!(gens.contains(&edge), "burst edge {edge} missing from {gens:?}");
+        }
+        // The stream's last state goes out when its window closes (the
+        // post-poll flush), not only when a newer chunk pushes it.
+        assert_eq!(gens.last(), Some(&(60 * 12)), "the final chunk was stranded: {gens:?}");
+        assert_eq!(utility.len(), 2, "the compaction's start and end");
+        assert_eq!(utility[0].fields["event"], "start");
+        assert_eq!(utility[1].fields["event"], "end");
+        assert_eq!(utility[0].fields["job_id"], utility[1].fields["job_id"]);
+        assert_eq!(utility[1].fields["duration_ms"], 300);
+        assert_eq!(utility[0].model.as_deref(), Some("util-4b"));
+
+        let live = &summary.live;
+        assert_eq!(live.samples_sent as usize, samples.len(), "the summary counts what was sent");
+        assert_eq!((live.dropped_no_receiver, live.dropped_full), (0, 0));
+        assert_eq!((live.enabled, live.cadence_ms), (true, 250));
+        assert!(live.bytes > 0);
+        // (#2928 review, C7) The stamped cost covers the sampler's work on
+        // every chunk, not only the sends.
+        assert!(live.sampler_us >= live.forward_us, "{live:?}");
+    }
+
+    /// (#2928 review, MF1) Through a silent tool-call write the HOST keeps
+    /// the live view fresh: each post-poll flush past the cadence re-sends
+    /// the writing state stamped with the host's clock, and it stops at the
+    /// stream's end. The runtime wrote one writing line; nothing else.
+    #[test]
+    #[serial]
+    fn tailer_refreshes_a_silent_tool_call_write_on_the_host_clock() {
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let tmp = TempDir::new().unwrap();
+        let traj = tmp.path().join("trajectory.jsonl");
+        let sock_dir = TempDir::new().unwrap();
+        let sock = sock_dir.path().join("live.sock");
+        let rx = darkmux_flow::live::bind_ingest(&sock).unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let mut st = TailerState::new(traj.clone(), "w-sess".into(), "coder".into(), "m".into(), Arc::new(Mutex::new(Instant::now())), 600)
+            .with_live(Some(darkmux_flow::live::LiveSender::to_path(sock)), 250);
+        let t = 1_758_700_000_000u64;
+        std::fs::write(
+            &traj,
+            format!(
+                "{}\n{}\n",
+                format_args!(r#"{{"type":"model.streaming.start","seq":1,"ts":{t},"system_chars":10,"prompt_chars":10}}"#),
+                format_args!(r#"{{"type":"model.partial","seq":1,"partial_index":1,"cumulative_chars":0,"generated_chars":40,"phase":"writing_tool_call","tool_name":"write","ts":{}}}"#, t + 50),
+            ),
+        )
+        .unwrap();
+        st.poll_and_emit();
+        for dt in [100u64, 300, 400, 600, 900, 1_200] {
+            st.live_flush(t + dt);
+        }
+        let mut refreshed = Vec::new();
+        let mut buf = [0u8; darkmux_flow::live::MAX_LIVE_DATAGRAM];
+        while let Ok(n) = rx.recv(&mut buf) {
+            let s = darkmux_flow::live::LiveSample::from_datagram(&buf[..n]).unwrap();
+            if let Some(r) = s.fields.get("refreshed_at_ms").and_then(|v| v.as_u64()) {
+                assert_eq!(s.fields["sampled_at_ms"], t + 50, "a refresh keeps the state's own time");
+                refreshed.push(r - t);
+            }
+            // (#2928 re-review, C-6) Every sample is stamped with the host's
+            // clock at send time, whatever the runtime's clock said.
+            assert!(s.at_ms > t + 10_000_000, "a host send time, not the fixture's runtime time");
+        }
+        assert_eq!(refreshed, vec![300, 600, 900, 1_200], "one refresh per cadence, stamped with the host's clock");
+        // (#2928 re-review, MF-A) The final flush never refreshes (it once
+        // emitted a u64::MAX-stamped sample).
+        st.live_flush_final();
+        assert!(rx.recv(&mut buf).is_err(), "no refresh from the final flush");
+        // The stream ends: no more refreshes.
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&traj).unwrap();
+        writeln!(f, r#"{{"type":"model.streaming.end","seq":1,"partial_count":1,"total_content_chars":0,"tool_calls_count":1,"observations":0,"ts":{}}}"#, t + 1_300).unwrap();
+        drop(f);
+        st.poll_and_emit();
+        st.live_flush(t + 5_000);
+        assert!(rx.recv(&mut buf).is_err(), "nothing after the stream ended");
+    }
+
+    /// (#2928) No daemon listening: the tailer carries on, every sample is a
+    /// counted drop, and the flow log is still untouched.
+    #[test]
+    #[serial]
+    fn tailer_live_channel_with_no_daemon_drops_and_carries_on() {
+        let (without, _) = run_live_fixture(None);
+        let dir = TempDir::new().unwrap();
+        let (off, off_summary) = run_live_fixture(None);
+        // (#2928 re-review, C-5) A dispatch with no channel (the lab) says so,
+        // rather than a cadence it never sampled at.
+        assert_eq!((off_summary.live.enabled, off_summary.live.cadence_ms, off_summary.live.samples_sent), (false, 0, 0));
+        assert_eq!(off_summary.live.to_json()["enabled"], false);
+        assert_eq!(off, without);
+        let (with, summary) = run_live_fixture(Some(darkmux_flow::live::LiveSender::to_path(dir.path().join("absent.sock"))));
+        assert_eq!(with, without);
+        assert_eq!(summary.live.samples_sent, 0);
+        assert!(summary.live.dropped_no_receiver > 0, "no daemon is a no-receiver drop");
+        assert_eq!(summary.live.dropped_full, 0);
     }
 
     /// (#2889 review, M2) Two-event helper: write `lines` as one trajectory
@@ -14051,6 +14300,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
             None, // (#2902) endpoint
             None, // (#2902 step 1b) compactor endpoint
+            None, // (#2928) live sender
         );
         let elapsed = started.elapsed();
 
@@ -14406,6 +14656,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 None,
                 None, // (#2902) endpoint
                 None, // (#2902 step 1b) compactor endpoint
+                None, // (#2928) live sender
             );
             *handle_holder_for_closure.lock().unwrap() = Some(handle);
             panic!("simulated panic between the tailer's spawn and dispatch()'s own stores");

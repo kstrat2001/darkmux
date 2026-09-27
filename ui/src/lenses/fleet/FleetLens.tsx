@@ -1,5 +1,5 @@
 import { encodeMachineKey } from "../../lib/machineKey";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { fitTubes } from "./tubeFit";
 import { scopeCenter } from "../../lib/scopeCenter";
 import { useQuery } from "@tanstack/react-query";
@@ -7,6 +7,7 @@ import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useNowMs } from "../../lib/clock";
+import { REPLAY_GRANULARITY_NOTE, useLiveOverlay } from "../../lib/liveChannel";
 import { useCountUp } from "../../hooks/useCountUp";
 import { useFleetRoster, useLiveMachines, useStaticFleetBeats } from "../../hooks/useLiveMachines";
 import { getSource, runsSrc, runsReachable } from "../../lib/source";
@@ -24,7 +25,7 @@ import { tokensOffMeter } from "./savings";
 import { hybridNote } from "./hybridNote";
 import { NotesDialog } from "../../components/NotesDialog";
 import { openModalEl } from "../../lib/dialogManager";
-import { buildFleetCard, busiestExecution, isStrictlyBusier, rosterOnlyEntries, rosterAliasFor, specUnknownLabel } from "./cards";
+import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, rosterOnlyEntries, rosterAliasFor, specUnknownLabel } from "./cards";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
 import type { MachineSpecs } from "../../types/handwritten";
 import { runsForMachine } from "../runs/format";
@@ -144,7 +145,7 @@ function Chip({ value, label, cls, loading, part }: { value?: string | number; l
  * parts add up — see `savings.ts`'s module doc for what was withdrawn and
  * why.
  */
-function SavingsHero({
+const SavingsHero = memo(function SavingsHero({
   tokens: t,
   note,
   liveMode,
@@ -289,7 +290,7 @@ function SavingsHero({
       <NotesDialog data={data} nowMs={nowMs} />
     </div>
   );
-}
+});
 
 /**
  * The fleet default view — `renderFleet()` (viewer.html:1667-1741): the
@@ -372,6 +373,78 @@ function RosterUnreadableNotice({ error }: { error: string | null }) {
     </div>
   );
 }
+
+/** (#2928 re-review, C-1) The activity lanes and axis, memoized on the
+ *  timeline object: live samples re-render the fleet lens several times a
+ *  second, and the timeline (rebuilt once per wall second or data change)
+ *  never reads them, so its hundreds of bars are not re-diffed per sample. */
+const NO_RUNS: import("../../types/generated/Run").Run[] = [];
+
+const TimelineLanes = memo(function TimelineLanes({ timeline }: { timeline: ReturnType<typeof buildActivityTimeline> }) {
+  return (
+    <>
+      {timeline.lanes.map((lane) => (
+        <div className="lane" key={lane.uid}>
+          <div className="lname" title={lane.name}>
+            {lane.name}
+          </div>
+          <div className="tltrack">
+            {/* (#1639, drill-in packet) Session drill — click a bar, land
+                on `#dispatch=<sid>`. Legacy's OWN `.sbar` bars are inert
+                (no `data-act`, no click handler anywhere in
+                `viewer.html`'s timeline code); legacy's only session-drill
+                click was `recentRow()`'s "open →" link on the machine
+                page's per-run list, which #1809 removed outright when it
+                replaced that list with a link into the runs lens (see
+                `MachineLens.tsx`'s own doc, and `viewer-session-url.spec.js`'s
+                module doc for the full gap history). Since #1809 nothing
+                ANYWHERE in this port reaches `SessionReplay` by clicking,
+                even though the fetch + render it needs (`/flow-session/<id>`
+                → `runRegions`) has worked since Packet 4.
+                This is a deliberate WIDENING beyond legacy's own address-bar
+                behavior, same precedent as `machineDrillHash`'s machine key and
+                the `machine=` runs-lens pin above: the activity lane already
+                names every session on screen (`bar.sid`, carried into
+                `bar.title`), so it is the least-surprising place to attach
+                the click legacy never wired. A real `location.hash` write
+                (not `writeHash`/`replaceState`) — the same mechanism every
+                other cross-lens hop in this file uses — so `hashchange`
+                fires, back/forward/copy-paste all behave, and `useSyncHash`
+                never has to reconcile a route no navigation actually
+                happened for. */}
+            {lane.bars.map((bar) => (
+              <div
+                key={bar.key}
+                className={`sbar ${bar.cls}`}
+                style={{ left: `${bar.leftPct}%`, width: `${bar.widthPct}%` }}
+                title={bar.title}
+                data-act="session"
+                data-arg={bar.sid}
+                role="button"
+                tabIndex={0}
+                onClick={() => {
+                  location.hash = `dispatch=${encodeURIComponent(bar.sid)}`;
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    location.hash = `dispatch=${encodeURIComponent(bar.sid)}`;
+                  }
+                }}
+              />
+            ))}
+            <div className="ph" style={{ left: `${timeline.playheadPct}%` }} />
+          </div>
+        </div>
+      ))}
+      <div className="tlaxis">
+        <span>{timeline.axis[0]}</span>
+        <span>{timeline.axis[1]}</span>
+        <span>{timeline.axis[2]}</span>
+      </div>
+    </>
+  );
+});
 
 /** (#1800 P2) `records`/`tMax`/`tMin` OPTIONAL so playback can render this
  * same hero over a historical day. Omitted = the live rolling window, exactly
@@ -519,7 +592,17 @@ export function FleetLens({
   // after every render, since a rate or a pager changes the text, and on
   // every resize of the card grid.
   const fleetRef = useRef<HTMLDivElement | null>(null);
+  // (#2928 re-review, C-1) A tube's size reads only its card's width, so it
+  // is refitted when the set of scope-bearing cards (or their pagers)
+  // changes, and on resize below: not on every render, where each call
+  // forced a synchronous layout and a live sample re-renders several times
+  // a second. `fitSignature` is defined once the cards are (below); a ref
+  // carries it up to this effect, which runs after that render commits.
+  const fitSignatureRef = useRef("");
+  const lastFitRef = useRef<string | null>(null);
   useLayoutEffect(() => {
+    if (lastFitRef.current === fitSignatureRef.current) return;
+    lastFitRef.current = fitSignatureRef.current;
     fitTubes(fleetRef.current);
   });
   useEffect(() => {
@@ -632,7 +715,9 @@ export function FleetLens({
   // future API drift) the same way every OTHER field on this response is
   // already optional-safe — `fetchJson`'s `ok: true` only proves the body
   // parsed as JSON, not that it matches `RunsResponse`.
-  const runs = (runsQuery.data?.ok ? runsQuery.data.data.runs : []) ?? [];
+  // (#2928 re-review, C-1) One stable empty list: a fresh `[]` each render
+  // was a new input to the card bases, rebuilding them on every render.
+  const runs = (runsQuery.data?.ok ? runsQuery.data.data.runs : NO_RUNS) ?? NO_RUNS;
   // (#1923 review) …but an empty list from a FAILED read is not the same
   // claim as an empty list from a healthy daemon, and the cards cannot tell
   // them apart: both render "idle" / "0 running". That is the exact lie
@@ -691,13 +776,27 @@ export function FleetLens({
   const tokens = useMemo(() => tokensOffMeter(scopedData), [scopedData]);
   const note = useMemo(() => hybridNote(scopedData, tokens), [scopedData, tokens]);
 
+  // (#2928) The live channel's overlay: at the live edge of a live route
+  // only (`livePolling` is false on a static build, `playhead` is set on a
+  // replay), so playback and a scrubbed view derive from durable records
+  // alone. Subscribing re-renders this lens on each live sample.
+  const liveOverlay = useLiveOverlay(livePolling && playhead == null);
+  // (#2928) What moves at the 1 s clock's pace, not at the live channel's:
+  // live samples re-render this lens up to 4 times a second per execution,
+  // and only the cards read them. At the live edge the running set and the
+  // activity timeline are recomputed when the wall second changes (or their
+  // inputs do), exactly as often as before the live channel existed.
+  // Measured on the busy-day fixture, recomputing both on every sample was
+  // most of the feed's cost. A replay keys on the playhead itself.
+  const liveEdgeClock = playhead == null ? Math.floor(playheadT / 1000) : playheadT;
   const liveSet = useMemo(
     // The flow-derived liveness FALLBACK inside `liveSessionSet` is itself
     // live-only in legacy (viewer.html:3378). Without `liveMode` a replay
     // would route around the disabled presence hooks above and re-derive
     // "running" from the day's own records — presence-agnostic in name only.
     () => liveSessionSet(flowWindow.data, liveSessionIds, playheadT, liveMode),
-    [flowWindow.data, liveSessionIds, playheadT, liveMode],
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
+    [flowWindow.data, liveSessionIds, liveEdgeClock, liveMode],
   );
   // (#2814) SELF IS NEVER UNKNOWN — and before this, self could be ABSENT.
   //
@@ -739,10 +838,17 @@ export function FleetLens({
     [flowWindow.data, liveMachines, specs, roster],
   );
 
-  const cards = useMemo(
+  // (#2928 re-review, C-1) Two stages. The BASE of each card reads the whole
+  // window (activity, running sessions, names, hardware, counts): built once
+  // per data change and per wall second (`liveEdgeClock`), exactly as often
+  // as before the live channel existed. The live READINGS (scope rate and
+  // state, pages, utility strip) are then derived per render from the base,
+  // touching only the running sessions, so a live sample never rescans the
+  // window. A replay keys the base on the playhead itself.
+  const baseCards = useMemo(
     () => [
       ...uids.map((m) => {
-        const card = buildFleetCard(
+        const card = buildFleetCardBase(
           flowWindow.data,
           liveMachines,
           specs,
@@ -756,8 +862,6 @@ export function FleetLens({
           // carries only a display NAME (`runsForMachine`'s own doc), same
           // alias-set lookup `specOf`/`nameOf` already use for this uid.
           runsForMachine(runs, machineNames(flowWindow.data, liveMachines, m)),
-          connected,
-          lastContactMs,
           roster,
         );
         // (#2768, corrected by the #2802 regression fix) A roster entry
@@ -785,7 +889,7 @@ export function FleetLens({
       // reached a card title), so the operator's declared name is passed
       // explicitly rather than inherited from the fallback.
       ...rosterOnly.map((entry) => ({
-        ...buildFleetCard(
+        ...buildFleetCardBase(
           flowWindow.data,
           liveMachines,
           specs,
@@ -796,13 +900,16 @@ export function FleetLens({
           playheadT,
           specBeats,
           undefined,
-          connected,
-          lastContactMs,
         ),
         name: entry.id,
       })),
     ],
-    [uids, rosterOnly, flowWindow.data, playheadT, liveMachines, specs, liveSet, liveMode, specBeats, runs, roster, connected, lastContactMs],
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
+    [uids, rosterOnly, flowWindow.data, liveEdgeClock, liveMachines, specs, liveSet, liveMode, specBeats, runs, roster],
+  );
+  const cards = useMemo(
+    () => baseCards.map((b) => withLiveReadings(b, playheadT, connected, lastContactMs, liveOverlay)),
+    [baseCards, playheadT, connected, lastContactMs, liveOverlay],
   );
   // (#2911) The card ticks while an execution is live. Nothing above
   // re-rendered this lens between records: SSE contact is a ref, presence
@@ -816,6 +923,7 @@ export function FleetLens({
   // edge only (a replay's clock is the transport's), and only while a card
   // has a live execution, so an idle fleet page runs no timer at all
   // (`useNowMs` subscribes to nothing when inactive).
+  fitSignatureRef.current = cards.map((c) => `${c.uid}:${c.liveTokRate !== null ? 1 : 0}:${c.executions.length}:${c.active ? 1 : 0}`).join("|");
   const ticking = livePolling && playhead == null && cards.some((c) => c.liveTokRate !== null);
   useNowMs(ticking);
 
@@ -839,7 +947,8 @@ export function FleetLens({
         specs,
         roster,
       ),
-    [flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, windowMinutesNum, liveMode, tMin, playheadT, fixedRange?.[0], fixedRange?.[1], specs, roster],
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
+    [flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, windowMinutesNum, liveMode, tMin, liveEdgeClock, fixedRange?.[0], fixedRange?.[1], specs, roster],
   );
 
   return (
@@ -849,7 +958,10 @@ export function FleetLens({
         note={note}
         liveMode={liveMode}
         data={scopedData}
-        nowMs={playheadT}
+        // (#2928 re-review, C-1) The wall second at the live edge: the hero
+        // reads no live sample, and a precise clock re-rendered it per
+        // sample.
+        nowMs={playhead == null ? liveEdgeClock * 1000 : playheadT}
         settled={flowWindow.settled}
       />
       <RunsUnreadableNotice unreadable={runsUnreadable} message={runsErrorMessage} />
@@ -1193,7 +1305,12 @@ export function FleetLens({
                 );
               })()}
               {card.liveTokRate !== null && selectedExec && (
-                <div className="mach-scope" data-testid="fleet-token-scope">
+                <div
+                  className="mach-scope"
+                  data-testid="fleet-token-scope"
+                  // (#2928) Replay has only the 2 s heartbeats; said on hover.
+                  title={playhead != null || !livePolling ? REPLAY_GRANULARITY_NOTE : undefined}
+                >
                   <TokenScope
                     // Same rule as the run page's tile — a stale rate from
                     // the last generating stretch must not still drive the
@@ -1282,65 +1399,7 @@ export function FleetLens({
               ))}
             </span>
           </div>
-          {timeline.lanes.map((lane) => (
-            <div className="lane" key={lane.uid}>
-              <div className="lname" title={lane.name}>
-                {lane.name}
-              </div>
-              <div className="tltrack">
-                {/* (#1639, drill-in packet) Session drill — click a bar, land
-                    on `#dispatch=<sid>`. Legacy's OWN `.sbar` bars are inert
-                    (no `data-act`, no click handler anywhere in
-                    `viewer.html`'s timeline code); legacy's only session-drill
-                    click was `recentRow()`'s "open →" link on the machine
-                    page's per-run list, which #1809 removed outright when it
-                    replaced that list with a link into the runs lens (see
-                    `MachineLens.tsx`'s own doc, and `viewer-session-url.spec.js`'s
-                    module doc for the full gap history). Since #1809 nothing
-                    ANYWHERE in this port reaches `SessionReplay` by clicking,
-                    even though the fetch + render it needs (`/flow-session/<id>`
-                    → `runRegions`) has worked since Packet 4.
-                    This is a deliberate WIDENING beyond legacy's own address-bar
-                    behavior, same precedent as `machineDrillHash`'s machine key and
-                    the `machine=` runs-lens pin above: the activity lane already
-                    names every session on screen (`bar.sid`, carried into
-                    `bar.title`), so it is the least-surprising place to attach
-                    the click legacy never wired. A real `location.hash` write
-                    (not `writeHash`/`replaceState`) — the same mechanism every
-                    other cross-lens hop in this file uses — so `hashchange`
-                    fires, back/forward/copy-paste all behave, and `useSyncHash`
-                    never has to reconcile a route no navigation actually
-                    happened for. */}
-                {lane.bars.map((bar) => (
-                  <div
-                    key={bar.key}
-                    className={`sbar ${bar.cls}`}
-                    style={{ left: `${bar.leftPct}%`, width: `${bar.widthPct}%` }}
-                    title={bar.title}
-                    data-act="session"
-                    data-arg={bar.sid}
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => {
-                      location.hash = `dispatch=${encodeURIComponent(bar.sid)}`;
-                    }}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" || e.key === " ") {
-                        e.preventDefault();
-                        location.hash = `dispatch=${encodeURIComponent(bar.sid)}`;
-                      }
-                    }}
-                  />
-                ))}
-                <div className="ph" style={{ left: `${timeline.playheadPct}%` }} />
-              </div>
-            </div>
-          ))}
-          <div className="tlaxis">
-            <span>{timeline.axis[0]}</span>
-            <span>{timeline.axis[1]}</span>
-            <span>{timeline.axis[2]}</span>
-          </div>
+          <TimelineLanes timeline={timeline} />
         </div>
       ) : (
         <div className="fleettl">

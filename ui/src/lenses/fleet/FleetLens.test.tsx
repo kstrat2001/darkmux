@@ -29,6 +29,20 @@ vi.mock("../../components/TokenScope", () => ({
   TokenScope: (props: Record<string, unknown>) => <div data-testid="token-scope-probe" data-props={JSON.stringify(props)} />,
 }));
 
+// (#2928) A pass-through spy on the activity timeline's build, so a test can
+// pin that live samples re-render the cards without rebuilding it.
+vi.mock("./timeline", async (importOriginal) => {
+  const real = await importOriginal<typeof import("./timeline")>();
+  return { ...real, buildActivityTimeline: vi.fn(real.buildActivityTimeline) };
+});
+
+// (#2928 re-review, C-1) A pass-through spy on the card BASE builder: a live
+// sample must re-derive the cards' readings without rebuilding their bases.
+vi.mock("./cards", async (importOriginal) => {
+  const real = await importOriginal<typeof import("./cards")>();
+  return { ...real, buildFleetCardBase: vi.fn(real.buildFleetCardBase) };
+});
+
 // (#2911) A pass-through spy: every behavior is the real `tokensOffMeter`;
 // the tick tests read its call count to pin that a tick does not make the
 // hero recompute its token sums.
@@ -2460,5 +2474,76 @@ describe("(#2915) fleet card: utility work is visible", () => {
     const el = await strip();
     expect(el.textContent).toBe("");
     expect(el.getAttribute("title")).toContain("darkmux:util-4b");
+  });
+});
+
+// (#2928) The live channel reaches the fleet card at the live edge only.
+describe("(#2928) the live overlay on the rendered fleet card", () => {
+  const at = (s: string) => `${todayUTC()}T${s}Z`;
+  const records = (): FlowRecord[] => [
+    { ts: at("10:01:00.000"), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+    { ts: at("10:01:56.000"), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { turn_seq: 1, sampled_at_ms: Date.parse(at("10:01:56.000")), generated_chars: 40, cumulative_chars: 40 } },
+    { ts: at("10:01:58.000"), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { turn_seq: 1, sampled_at_ms: Date.parse(at("10:01:58.000")), generated_chars: 120, cumulative_chars: 120 } },
+  ];
+  const feedLive = async () => {
+    const { liveStore } = await import("../../lib/liveChannel");
+    liveStore.reset();
+    for (const [t, gen] of [["10:01:59.000", 220], ["10:01:59.250", 420]] as const) {
+      const ms = Date.parse(at(t));
+      liveStore.ingest(JSON.stringify({ v: 1, kind: "model", session_id: "s1", at_ms: ms, cadence_ms: 250, fields: { turn_seq: 1, sampled_at_ms: ms, generated_chars: gen, cumulative_chars: gen } }), ms);
+    }
+    return liveStore;
+  };
+
+  it("live: the card's rate comes from the live samples (200 tok/s), not the 2 s heartbeats (10 tok/s)", async () => {
+    const store = await feedLive();
+    mockFleetFetch({ flowToday: records() });
+    const { container } = renderFleetLens();
+    await waitFor(() => expect(container.querySelector(".mach")?.textContent ?? "").toContain("200 tok/s"));
+    expect(container.querySelector('[data-testid="fleet-token-scope"]')?.getAttribute("title")).toBeNull();
+    store.reset();
+  });
+
+  it("live samples re-render the cards without rebuilding the activity timeline within the second", async () => {
+    const { buildActivityTimeline } = await import("./timeline");
+    const { liveStore } = await import("../../lib/liveChannel");
+    liveStore.reset();
+    mockFleetFetch({ flowToday: records() });
+    const { container } = renderFleetLens();
+    await waitFor(() => expect(container.querySelector(".mach")?.textContent ?? "").toContain("10 tok/s"));
+    // Let every query the lens fires settle first (a late `/runs` answer is
+    // a real input change and rightly rebuilds).
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 100));
+    });
+    const builds = vi.mocked(buildActivityTimeline).mock.calls.length;
+    const { buildFleetCardBase } = await import("./cards");
+    const bases = vi.mocked(buildFleetCardBase).mock.calls.length;
+    // The wall clock moves on inside the same second, as it does between
+    // samples.
+    vi.setSystemTime(new Date(Date.parse(FROZEN_NOW) + 300));
+    act(() => {
+      for (const [t, gen] of [["10:01:59.000", 220], ["10:01:59.250", 420]] as const) {
+        const ms = Date.parse(at(t));
+        liveStore.ingest(JSON.stringify({ v: 1, kind: "model", session_id: "s1", at_ms: ms, cadence_ms: 250, fields: { turn_seq: 1, sampled_at_ms: ms, generated_chars: gen, cumulative_chars: gen } }), ms);
+      }
+    });
+    await waitFor(() => expect(container.querySelector(".mach")?.textContent ?? "").toContain("200 tok/s"));
+    // Still inside one wall second: the cards moved, the timeline did not rebuild.
+    expect(vi.mocked(buildActivityTimeline).mock.calls.length).toBe(builds);
+    expect(vi.mocked(buildFleetCardBase).mock.calls.length, "the card bases were not rebuilt for a live sample").toBe(bases);
+    liveStore.reset();
+  });
+
+  it("replay: the same samples in the store change nothing (the durable 10 tok/s)", async () => {
+    const store = await feedLive();
+    mockFleetFetch({});
+    const t = Date.parse(FROZEN_NOW);
+    const { container } = renderFleetLens({ records: records(), tMax: t, tMin: Date.parse(at("10:00:00.000")), playhead: t, historical: true });
+    await waitFor(() => expect(container.querySelector(".mach")?.textContent ?? "").toContain("tok/s"));
+    expect(container.querySelector(".mach")!.textContent).toContain("10 tok/s");
+    expect(container.querySelector(".mach")!.textContent).not.toContain("200 tok/s");
+    expect(container.querySelector('[data-testid="fleet-token-scope"]')?.getAttribute("title")).toContain("one every 2 s");
+    store.reset();
   });
 });

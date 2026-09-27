@@ -110,6 +110,8 @@ pub mod envelope;
 pub mod findings;
 pub mod index;
 pub mod lessons;
+// (#2928) The live channel's sampler (which per-chunk events become live samples).
+pub(crate) mod live_gate;
 pub mod lifecycle;
 pub mod loader;
 /// (#2265) The mod record — how something could change, stored write-once

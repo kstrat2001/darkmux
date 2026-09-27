@@ -10,6 +10,7 @@ pub mod daemon_probe;
 pub(crate) mod hmac_sha256;
 pub mod hook_transform;
 pub mod hooks;
+pub mod live;
 pub mod presence;
 pub mod presence_reconciler;
 pub mod session_presence;
@@ -3251,7 +3252,9 @@ mod tests {
         //   1.61.0 — (#2915) `utility.start` / `utility.error` markers and
         //            `job` on utility usage records: utility work is
         //            visible while it runs.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.61.0");
+        //   1.62.0 — (#2928) `dispatch complete.payload.live`: the live
+        //            channel's own cost. The samples are never records.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.62.0");
     }
 
     #[test]

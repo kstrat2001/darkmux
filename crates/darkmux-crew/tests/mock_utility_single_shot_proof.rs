@@ -357,3 +357,60 @@ fn the_residency_arm_puts_the_namespaced_binding_on_the_wire() {
     assert_eq!(records[1]["payload"]["requested_model"], "darkmux:mock-util", "the usage record names the wire id");
     assert_eq!(records[1]["model"], "darkmux:mock-util");
 }
+
+/// (#2928) The job's two edges also go out on the LIVE channel, at once and
+/// in order, carrying the same job id as its durable records, and the flow
+/// log is exactly what it was without the channel: a start and a usage
+/// record.
+#[test]
+#[serial_test::serial]
+fn a_utility_job_sends_its_start_and_end_on_the_live_channel() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST).path("/v1/chat/completions");
+        then.status(200).header("content-type", "application/json").json_body(serde_json::json!({
+            "id": "mock-1", "object": "chat.completion", "created": 0, "model": "mock-util",
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": "{\"command\": \"review\"}" }, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10 },
+        }));
+    });
+    let registry_dir = tempfile::tempdir().unwrap();
+    let profiles_path = write_registry(registry_dir.path());
+    let flows_dir = tempfile::tempdir().unwrap();
+    // The daemon's ingest socket, where this process's sender resolves it.
+    let sock = darkmux_flow::live::local_socket_path().expect("a socket path");
+    let rx = darkmux_flow::live::bind_ingest(&sock).expect("binding the ingest socket");
+    rx.set_nonblocking(true).unwrap();
+
+    with_isolated_flows(flows_dir.path(), || {
+        run_utility_single_shot(&UtilityJob {
+            role_id: darkmux_crew::loader::RADIO_ROUTER_ROLE_ID,
+            message: "review this",
+            timeout_seconds: 30,
+            max_tokens: 256,
+            config_path: Some(profiles_path.to_str().unwrap()),
+            base_url_override: Some(&server.base_url()),
+        })
+    })
+    .expect("the utility call round-trips");
+
+    let mut samples = Vec::new();
+    let mut buf = [0u8; darkmux_flow::live::MAX_LIVE_DATAGRAM];
+    while let Ok(n) = rx.recv(&mut buf) {
+        samples.push(darkmux_flow::live::LiveSample::from_datagram(&buf[..n]).expect("well-formed"));
+    }
+    let _ = std::fs::remove_file(&sock);
+    // (#2928 review, C-7) Leave no empty fallback directory behind.
+    if let Some(dir) = sock.parent().filter(|d| d.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("darkmux-live-"))) {
+        let _ = std::fs::remove_dir(dir);
+    }
+    assert_eq!(samples.len(), 2, "one start, one end: {samples:?}");
+    assert_eq!(samples[0].fields["event"], "start");
+    assert_eq!(samples[1].fields["event"], "end");
+    assert!(samples.iter().all(|s| s.kind == darkmux_flow::live::LiveKind::Utility && s.session_id.is_none()));
+    let records = all_flow_records(flows_dir.path());
+    assert_eq!(records.len(), 2, "the live channel added no flow record");
+    assert_eq!(samples[0].fields["job_id"], records[0]["payload"]["job_id"], "the live start names the durable job id");
+    assert_eq!(samples[1].fields["job_id"], records[0]["payload"]["job_id"]);
+    assert!(samples[1].at_ms >= samples[0].at_ms);
+}

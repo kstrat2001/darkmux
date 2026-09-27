@@ -278,7 +278,16 @@ use std::path::Path;
 //           unknown key; `dirs` has no overflow map), has no effect, and
 //           `darkmux doctor` names it with the fix, alongside
 //           `DARKMUX_NOTEBOOK_DIR`.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.29";
+//   1.30 (#2928, darkmux 4.0): additive `runtime.live_sample_ms` — the cadence of the
+//           LIVE channel: model state sampled from a running execution and
+//           pushed to the local daemon's viewers, never written to the flow
+//           log. Written VISIBLY by `init` at its default of 250. `0` turns
+//           the live channel off (the zero-means-off convention
+//           `host_sampler_interval_ms` uses); a non-zero value is clamped to
+//           100..=1000 at the accessor, which reports the clamp. `Option<u64>`,
+//           lenient-on-read: an older binary ignores it and has no live
+//           channel, exactly as before.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.30";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -647,6 +656,14 @@ pub struct RuntimeBehaviorConfig {
     /// (`sampler_cost_ms_mean`) and the measured (not nominal) sample
     /// interval into the payload.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub host_sampler_interval_ms: Option<u64>,
+    /// (#2928) Cadence, in milliseconds, of the LIVE channel: how often a
+    /// running execution's model state (and every utility job's start and
+    /// end) is sampled and pushed to the local `darkmux serve` daemon's
+    /// viewers. The samples never reach a flow record, the day file, Redis
+    /// or the audit chain; the durable `dispatch.turn.heartbeat` stays at
+    /// its own 2 s coalescing. `0` turns the channel off. Resolved (and
+    /// clamped to 100..=1000) by `config_access::live_cadence`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub live_sample_ms: Option<u64>,
     /// (#2110/#2109) The thermal governor + breaker's tuning block. See
     /// [`ThermalConfig`]'s own doc for the pause/resume/breaker semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub thermal: Option<ThermalConfig>,
@@ -1676,6 +1693,9 @@ impl DarkmuxConfig {
                 // drawer's daemon-side sampler cadence, discoverable and
                 // one edit from `0` (disabled) or a tighter/looser value.
                 host_sampler_interval_ms: Some(5000),
+                // (#2928) Visible `250` — the live channel's cadence,
+                // discoverable and one edit from `0` (off).
+                live_sample_ms: Some(250),
                 // (#2110/#2109) Visible on-by-default block — see
                 // `ThermalConfig`'s own doc for why this defaults to
                 // `enabled: true` rather than the redis/audit off-by-default

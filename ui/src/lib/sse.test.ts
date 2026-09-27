@@ -25,6 +25,37 @@ class MockEventSource {
   }
 }
 
+/** (#2928) A mock that also carries named events, as a real EventSource does. */
+class NamedEventSource extends MockEventSource {
+  listeners = new Map<string, ((e: Event) => void)[]>();
+  addEventListener(type: string, fn: (e: Event) => void) {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), fn]);
+  }
+  emitNamed(type: string, data: string) {
+    for (const fn of this.listeners.get(type) ?? []) fn({ data } as MessageEvent<string>);
+  }
+}
+
+describe("(#2928) live frames", () => {
+  beforeEach(() => {
+    MockEventSource.instances = [];
+  });
+
+  it("a `live` frame reaches onLive and never the flow-tail cache", () => {
+    const queryClient = new QueryClient();
+    const queryKey = ["flow", "2026-08-09", "tail"];
+    const got: string[] = [];
+    const handle = startFlowTail(queryClient, queryKey, "2026-08-09", (url) => new NamedEventSource(url) as unknown as EventSource, {
+      onLive: (d) => got.push(d),
+    });
+    const es = MockEventSource.instances[0] as NamedEventSource;
+    es.emitNamed("live", '{"v":1}');
+    expect(got).toEqual(['{"v":1}']);
+    expect(queryClient.getQueryData(queryKey)).toBeUndefined();
+    handle.close();
+  });
+});
+
 describe("startFlowTail", () => {
   beforeEach(() => {
     MockEventSource.instances = [];

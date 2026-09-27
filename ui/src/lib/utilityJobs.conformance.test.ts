@@ -17,7 +17,7 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
-import { UTILITY_ERROR_ACTION, UTILITY_JOB, UTILITY_START_ACTION } from "./utilityJobs";
+import { LIVE_UTILITY_END_ACTION, UTILITY_ERROR_ACTION, UTILITY_JOB, UTILITY_START_ACTION } from "./utilityJobs";
 
 const SRC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DEFINITION = path.join("lib", "utilityJobs.ts");
@@ -68,12 +68,12 @@ describe("(#2915) utility job kinds are spelled once", () => {
     expect(files.length).toBeGreaterThan(50);
     const def = files.find((f) => f.rel === DEFINITION);
     expect(def, "lib/utilityJobs.ts must be scanned").toBeTruthy();
-    for (const word of [...Object.values(UTILITY_JOB), UTILITY_START_ACTION, UTILITY_ERROR_ACTION]) {
+    for (const word of [...Object.values(UTILITY_JOB), UTILITY_START_ACTION, UTILITY_ERROR_ACTION, LIVE_UTILITY_END_ACTION]) {
       expect(literalCount(def!.text, word), `${word} is defined in ${DEFINITION}`).toBeGreaterThan(0);
     }
   });
 
-  for (const word of [...Object.values(UTILITY_JOB), UTILITY_START_ACTION, UTILITY_ERROR_ACTION]) {
+  for (const word of [...Object.values(UTILITY_JOB), UTILITY_START_ACTION, UTILITY_ERROR_ACTION, LIVE_UTILITY_END_ACTION]) {
     test(`no literal "${word}" outside ${DEFINITION}, beyond other vocabularies' pinned uses`, () => {
       const allowed = OTHER_VOCABULARY[word] ?? {};
       const found: string[] = [];

@@ -6070,6 +6070,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // hosted brain or not (the runtime never routes the compactor through
         // the hosted URL; `runtime/src/main.rs`, #1187).
         Some(crate::usage::lmstudio_endpoint(opts.model_base_url_override.as_deref())),
+        // (#2928) The live channel, unless this dispatch opted out (the lab).
+        live_sender_for(opts.live_channel),
     );
 
     // (#363, then #457) Inactivity watchdog. Phase B dogfood (Beat 39,
@@ -7154,6 +7156,8 @@ struct TrajectorySummary {
     /// `detector_telemetry_payload` the flow stream uses — one producer, so
     /// the two surfaces cannot drift.
     detections: Vec<serde_json::Value>,
+    /// (#2928) The live channel's own cost; see [`LiveSummary`].
+    live: LiveSummary,
 }
 
 impl TrajectorySummary {
@@ -7692,6 +7696,7 @@ fn spawn_guarded_tailer(
     record_context: Option<serde_json::Value>,
     endpoint: Option<String>,
     compactor_endpoint: Option<String>,
+    live: Option<darkmux_flow::live::LiveSender>,
 ) -> (StopFlagGuard, thread::JoinHandle<TrajectorySummary>) {
     // Armed the moment this function is called — see `StopFlagGuard`'s own
     // doc. The caller holds the returned guard to the natural end of its
@@ -7717,9 +7722,21 @@ fn spawn_guarded_tailer(
             record_context,
             endpoint,
             compactor_endpoint,
+            live,
         )
     });
     (guard, handle)
+}
+
+/// (#2928) This execution's sender to the local daemon: `None` when the
+/// dispatch opted out (`DispatchOpts::live_channel: false`, the lab) or the
+/// channel is off (`runtime.live_sample_ms: 0`). `None` also means no
+/// sampling at all: the tailer's live path returns before any work.
+fn live_sender_for(live_channel: bool) -> Option<darkmux_flow::live::LiveSender> {
+    if !live_channel {
+        return None;
+    }
+    darkmux_flow::live::LiveSender::for_local_daemon()
 }
 
 /// Run the live trajectory tailer to completion. Polls until `stop_flag`
@@ -7752,6 +7769,7 @@ fn run_tailer(
     record_context: Option<serde_json::Value>,
     endpoint: Option<String>,
     compactor_endpoint: Option<String>,
+    live: Option<darkmux_flow::live::LiveSender>,
 ) -> TrajectorySummary {
     let trajectory_path = out_dir
         .join(".darkmux-runtime")
@@ -7770,14 +7788,18 @@ fn run_tailer(
     .with_compactor_model(compactor_model)
     .with_endpoint(endpoint)
     .with_compactor_endpoint(compactor_endpoint)
-    .with_record_context(record_context);
+    .with_record_context(record_context)
+    // (#2928) The live channel, off when `runtime.live_sample_ms` is 0.
+    .with_live(live, darkmux_types::config_access::live_sample_ms());
 
     loop {
         state.poll_and_emit();
+        state.live_flush(crate::usage::unix_ms_now());
         if stop_flag.load(Ordering::SeqCst) {
             // Final flush — pick up anything written between the last
             // sleep tick and the container's exit signal.
             state.poll_and_emit();
+            state.live_flush_final();
             break;
         }
         // (#2131 review round 2, MUST-FIX 2) This is the ONE poll point
@@ -7811,6 +7833,7 @@ fn run_tailer(
         thread::sleep(TAILER_POLL_INTERVAL);
     }
 
+    state.finish_live();
     state.summary
 }
 
@@ -7972,6 +7995,11 @@ fn build_dispatch_complete_payload(
         "tool_calls_invalid_name": summary.tool_calls_invalid_name,
         "tool_calls_ungranted": summary.tool_calls_ungranted,
         "total_compactions": summary.compactions,
+        // (#2928, FLOW_SCHEMA_VERSION 1.62.0) The live channel's own cost for
+        // this execution: its cadence, samples sent and dropped, the time
+        // spent forwarding them and the runtime's silence ticks. The live
+        // samples themselves are never records.
+        "live": summary.live.to_json(),
         // (#2263, FLOW_SCHEMA_VERSION 1.46.0) THIS DISPATCH's own token
         // usage, summed live from the tailer's per-turn `model.completed`
         // events — the SAME source `total_turns`/`total_compactions`
@@ -9321,6 +9349,56 @@ struct TailerState {
     /// tailer emits. `None` for every caller that doesn't set
     /// `DispatchOpts::record_context` — a complete no-op.
     record_context: Option<serde_json::Value>,
+    /// (#2928) The live channel for this execution: the sampler and the
+    /// sender to the local daemon. `None` when the channel is off
+    /// (`runtime.live_sample_ms: 0`) and in every test that does not opt in.
+    /// Nothing it does writes a flow record.
+    live: Option<LiveChannel>,
+}
+
+/// (#2928) One execution's live channel. See `darkmux_flow::live` for the
+/// transport and `crate::live_gate` for which events become samples.
+struct LiveChannel {
+    sender: darkmux_flow::live::LiveSender,
+    gate: crate::live_gate::LiveGate,
+    cadence_ms: u64,
+}
+
+/// (#2928) The live channel's own cost for one execution, stamped on its
+/// `dispatch complete` record as `payload.live` so the observer's cost is a
+/// number in the artifact rather than an assumption. `sampler_us` is ALL the
+/// time the channel spent on this execution (building each chunk's sample,
+/// the sampler's decision, and the sends); `forward_us` is the sends' share.
+/// Drops are split by cause: `dropped_no_receiver` (no daemon, or a stale
+/// socket nobody reads) and `dropped_full` (a daemon too slow to drain).
+#[derive(Debug, Default, Clone, PartialEq)]
+struct LiveSummary {
+    /// (#2928 re-review, C-5) Whether this execution fed the channel at
+    /// all. `false` (the lab, or `runtime.live_sample_ms: 0`) reads cadence
+    /// 0 and zeros throughout.
+    enabled: bool,
+    cadence_ms: u64,
+    samples_sent: u64,
+    dropped_no_receiver: u64,
+    dropped_full: u64,
+    sampler_us: u64,
+    forward_us: u64,
+    bytes: u64,
+}
+
+impl LiveSummary {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "enabled": self.enabled,
+            "cadence_ms": self.cadence_ms,
+            "samples_sent": self.samples_sent,
+            "dropped_no_receiver": self.dropped_no_receiver,
+            "dropped_full": self.dropped_full,
+            "sampler_us": self.sampler_us,
+            "forward_us": self.forward_us,
+            "bytes": self.bytes,
+        })
+    }
 }
 
 /// (#2779) The `dispatch.rest` payload the `runtime.rest` tailer arm emits —
@@ -9403,6 +9481,7 @@ impl TailerState {
             endpoint: None,
             compactor_endpoint: None,
             record_context: None,
+            live: None,
         }
     }
 
@@ -9427,6 +9506,125 @@ impl TailerState {
     fn with_record_context(mut self, record_context: Option<serde_json::Value>) -> Self {
         self.record_context = record_context;
         self
+    }
+
+    /// (#2928) Open this execution's live channel: `sender` to the local
+    /// daemon, sampled at `cadence_ms`. `None` leaves it off.
+    fn with_live(mut self, sender: Option<darkmux_flow::live::LiveSender>, cadence_ms: u64) -> Self {
+        self.summary.live.enabled = sender.is_some();
+        self.summary.live.cadence_ms = if sender.is_some() { cadence_ms } else { 0 };
+        self.live = sender.map(|sender| LiveChannel {
+            sender,
+            gate: crate::live_gate::LiveGate::new(cadence_ms),
+            cadence_ms,
+        });
+        self
+    }
+
+    /// (#2928) Offer one heartbeat-shaped payload to the live sampler and
+    /// send whatever it releases. Never a flow record. `build` makes the
+    /// payload, so a dispatch with no channel pays nothing, and building it
+    /// is counted in `sampler_us` with everything else the channel does here.
+    fn live_model(&mut self, event: &serde_json::Value, build: fn(&serde_json::Value) -> serde_json::Value) {
+        if self.live.is_none() {
+            return;
+        }
+        let t0 = Instant::now();
+        let ts = event.get("ts").and_then(|v| v.as_u64()).unwrap_or_else(crate::usage::unix_ms_now);
+        let released = self.live.as_mut().map(|l| l.gate.offer(ts, build(event))).unwrap_or_default();
+        for p in released {
+            let sample = self.model_sample(p);
+            if let Some(live) = self.live.as_mut() {
+                live.sender.send(&sample);
+            }
+        }
+        self.add_sampler_time(t0);
+    }
+
+    fn add_sampler_time(&mut self, t0: Instant) {
+        let us = t0.elapsed().as_micros() as u64;
+        self.summary.live.sampler_us = self.summary.live.sampler_us.saturating_add(us);
+    }
+
+    /// (#2928) After a poll, on the host's clock `now_ms`: send the sampler's
+    /// held sample once its window has closed (a burst's last state is never
+    /// stranded), else, through a silence, refresh the current silent state
+    /// (see `LiveGate::refresh_due`).
+    fn live_flush(&mut self, now_ms: u64) {
+        if self.live.is_none() {
+            return;
+        }
+        let t0 = Instant::now();
+        let due = self.live.as_mut().and_then(|l| l.gate.flush_due(now_ms).or_else(|| l.gate.refresh_due(now_ms)));
+        if let Some(p) = due {
+            let sample = self.model_sample(p);
+            if let Some(live) = self.live.as_mut() {
+                live.sender.send(&sample);
+            }
+        }
+        self.add_sampler_time(t0);
+    }
+
+    /// (#2928 re-review, MF-A) The last flush, after the container exited:
+    /// the held sample only, never a refresh (a stream that is over has no
+    /// silence to keep fresh).
+    fn live_flush_final(&mut self) {
+        if self.live.is_none() {
+            return;
+        }
+        let t0 = Instant::now();
+        if let Some(p) = self.live.as_mut().and_then(|l| l.gate.flush_due(u64::MAX)) {
+            let sample = self.model_sample(p);
+            if let Some(live) = self.live.as_mut() {
+                live.sender.send(&sample);
+            }
+        }
+        self.add_sampler_time(t0);
+    }
+
+    /// (#2928 re-review, C-6) `at_ms` is the HOST's clock at send time: the
+    /// daemon's skew check and every ordering use one clock, even if the
+    /// container's drifts. The runtime's own time stays in the payload's
+    /// `sampled_at_ms`, which is what rates are measured on.
+    fn model_sample(&self, payload: serde_json::Value) -> darkmux_flow::live::LiveSample {
+        let cadence = self.live.as_ref().map(|l| l.cadence_ms).unwrap_or(0);
+        let mut s = darkmux_flow::live::LiveSample::new(darkmux_flow::live::LiveKind::Model, crate::usage::unix_ms_now(), cadence);
+        s.session_id = Some(self.session_id.clone());
+        s.role = Some(self.role_id.clone());
+        s.model = Some(self.model.clone());
+        if let serde_json::Value::Object(map) = payload {
+            s.fields = map;
+        }
+        s
+    }
+
+    /// (#2928) A utility job's start or end on the live channel, sent at
+    /// once (never gated: a job's two edges are the whole signal).
+    /// `at_ms` is the host's send time (C-6); the job's own times ride in
+    /// `started_at_ms` / `ended_at_ms`.
+    fn live_utility(&mut self, fields: serde_json::Value, model: Option<&str>) {
+        let Some(live) = self.live.as_mut() else { return };
+        let mut s = darkmux_flow::live::LiveSample::new(darkmux_flow::live::LiveKind::Utility, crate::usage::unix_ms_now(), live.cadence_ms);
+        s.session_id = Some(self.session_id.clone());
+        s.role = Some(COMPACTOR_ROLE.to_string());
+        s.model = model.filter(|m| !m.is_empty()).map(str::to_string);
+        if let serde_json::Value::Object(map) = fields {
+            s.fields = map;
+        }
+        live.sender.send(&s);
+    }
+
+    /// (#2928) Fold the sender's own counters into the summary. Called once,
+    /// after the final poll.
+    fn finish_live(&mut self) {
+        if let Some(live) = self.live.as_ref() {
+            let st = live.sender.stats();
+            self.summary.live.samples_sent = st.sent;
+            self.summary.live.dropped_no_receiver = st.dropped_no_receiver;
+            self.summary.live.dropped_full = st.dropped_full;
+            self.summary.live.forward_us = st.send_ns / 1_000;
+            self.summary.live.bytes = st.bytes;
+        }
     }
 
     /// (#714) Stamp the phase → mission this dispatch belongs to so the
@@ -9501,6 +9699,7 @@ impl TailerState {
             endpoint: None,
             compactor_endpoint: None,
             record_context: None,
+            live: None,
         }
     }
 
@@ -9849,6 +10048,13 @@ impl TailerState {
                     started_at_ms,
                 );
                 payload["generation"] = event.get("generation").cloned().unwrap_or(serde_json::Value::Null);
+                // (#2928) The same start on the live channel, at once: a
+                // compaction shorter than the durable stream's delivery
+                // window is otherwise never seen open.
+                let mut live = payload.clone();
+                live["event"] = serde_json::json!("start");
+                live["serves"] = serde_json::json!(self.session_id);
+                self.live_utility(live, Some(&model));
                 self.emit_telemetry_as(
                     COMPACTOR_ROLE,
                     Some(&model).filter(|m| !m.is_empty()).map(String::as_str),
@@ -9876,9 +10082,19 @@ impl TailerState {
                 // (#2915 review) The attempt this call served: its job id
                 // and ms times (an older runtime writes no start: no id).
                 let mut payload = payload;
-                if let Some((job_id, started_at_ms)) = &self.open_compaction {
+                if let Some((job_id, started_at_ms)) = self.open_compaction.clone() {
                     let ended_at_ms = event.get("ts").and_then(|v| v.as_u64()).unwrap_or_else(crate::usage::unix_ms_now);
-                    crate::usage::stamp_utility_end(&mut payload, job_id, *started_at_ms, ended_at_ms);
+                    crate::usage::stamp_utility_end(&mut payload, &job_id, started_at_ms, ended_at_ms);
+                    // (#2928) The job's end on the live channel, at once.
+                    let live = serde_json::json!({
+                        "event": "end",
+                        "job": crate::usage::UtilityJobKind::Compaction,
+                        "job_id": job_id,
+                        "ended_at_ms": ended_at_ms,
+                        "duration_ms": ended_at_ms.saturating_sub(started_at_ms),
+                    });
+                    let m = payload["requested_model"].as_str().map(str::to_string);
+                    self.live_utility(live, m.as_deref());
                 }
                 let model = payload["requested_model"].as_str().map(str::to_string);
                 self.emit_telemetry_as(
@@ -10055,8 +10271,14 @@ impl TailerState {
                     darkmux_flow::Level::Info,
                     opening_heartbeat_payload(&event),
                 );
+                // (#2928) The opener is a transition: it goes live at once.
+                self.live_model(&event, opening_heartbeat_payload);
             }
             "model.streaming.end" => {
+                // (#2928) The stream ended: the live sampler stops refreshing.
+                if let Some(live) = self.live.as_mut() {
+                    live.gate.end_stream();
+                }
                 let seq = event.get("seq").and_then(|v| v.as_u64());
                 let end = event.get("ts").and_then(|v| v.as_u64());
                 if let (Some((open_seq, start)), Some(end), Some(s)) = (self.open_stream.take(), end, seq) {
@@ -10072,6 +10294,10 @@ impl TailerState {
             // viewer sees is unchanged; it is NOT proof of work (see below).
             "model.partial" | "model.tool_call.writing" => {
                 let is_chunk = event_type == "model.partial";
+                // (#2928) The live channel samples every chunk and tick on
+                // its own cadence, independent of the durable 2 s gate
+                // below, and writes no flow record.
+                self.live_model(&event, heartbeat_payload);
                 // Per-SSE-chunk events coalesced into a coarser heartbeat
                 // (rate-limited via HEARTBEAT_MIN_INTERVAL). Keeps
                 // topology edges animated during long streaming turns

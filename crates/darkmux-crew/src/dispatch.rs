@@ -455,6 +455,15 @@ pub struct DispatchOpts {
     /// rather than corrupting the payload shape — see
     /// `dispatch_internal::merge_record_context`'s own doc).
     pub record_context: Option<serde_json::Value>,
+    /// (#2928) Whether this execution feeds the LIVE channel (sub-second
+    /// model state to the local daemon's viewers; never a flow record).
+    /// `false` turns off both the sampler and the sender for this dispatch,
+    /// so none of the channel's cost lands on it. The lab's benchmark
+    /// providers set `false`: a lab run is a measurement and stays per-run
+    /// local (the lab/fleet boundary, contract 3). Every other caller sets
+    /// `true`; `runtime.live_sample_ms: 0` still turns the channel off for
+    /// everyone.
+    pub live_channel: bool,
     /// (#2114 follow-up) A PRIOR dispatch's host out dir (the
     /// `/darkmux-out` mount, `$TMPDIR/darkmux-out-<role>-<unix_micros>`)
     /// to resume from. `Some(dir)` is the trigger `resume_checkpoint`

@@ -4,6 +4,7 @@ import { fetchJson } from "../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS, LIVE_CONTACT_TIMEOUT_MS } from "../lib/queryKeys";
 import { asRecordArray, mergeTailRecords, prevDateUTC, todayUTC, LIVE_WINDOW_MS } from "../lib/flow";
 import { startFlowTail, type FlowTailHandle } from "../lib/sse";
+import { liveStore } from "../lib/liveChannel";
 import type { FlowRecord } from "../types/handwritten";
 
 /**
@@ -84,6 +85,9 @@ export interface UseLiveTailDeps {
    * than `useState`, so a message every ~2s never forces a re-render on its
    * own; see `App.tsx`'s own doc. */
   onContact?: (ms: number) => void;
+  /** (#2928) Test seam: where live samples go. Production uses the page's
+   *  one `liveStore`. */
+  liveSink?: { ingest: (data: string) => unknown };
 }
 
 /** `nd!==LIVE_ES_DATE` viewer.html:3792's reload half —
@@ -152,7 +156,7 @@ export function useLiveTail(enabled: boolean, deps: UseLiveTailDeps = {}): LiveT
   // "live" on a real `onOpen` fixes both: a route where streaming is
   // impossible now correctly reports "reconnecting" for its whole life.
   const [status, setStatus] = useState<LiveTailStatus>("reconnecting");
-  const { eventSourceFactory, fetchImpl, tickMs, onContact } = deps;
+  const { eventSourceFactory, fetchImpl, tickMs, onContact, liveSink } = deps;
 
   useEffect(() => {
     if (!enabled) return;
@@ -217,6 +221,13 @@ export function useLiveTail(enabled: boolean, deps: UseLiveTailDeps = {}): LiveT
         onMessage: () => {
           if (cancelled) return;
           markContact();
+        },
+        // (#2928) A live sample proves contact too, and feeds the live
+        // overlay (`lib/liveChannel.ts`) — never the flow-tail cache.
+        onLive: (data) => {
+          if (cancelled) return;
+          markContact();
+          (liveSink ?? liveStore).ingest(data);
         },
       });
     };

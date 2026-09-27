@@ -902,6 +902,9 @@ fn dispatch_via_internal(
         // (#2914) The lab benchmarks candidate utility models.
         allow_utility_model: true,
         remote_origin: None,
+        // (#2928) A lab run is a measurement: no live samples, no
+        // sampling cost charged to the measured dispatch.
+        live_channel: false,
         brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,

@@ -218,6 +218,7 @@ fn captured_docker_argv_with(
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
         remote_origin: remote_origin.map(str::to_string),
+        live_channel: true,
         brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,

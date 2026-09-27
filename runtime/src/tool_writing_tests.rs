@@ -215,3 +215,50 @@ fn a_silence_after_the_arguments_arrived_writes_no_writing_events() {
         "a partial after the arguments landed names no writing phase"
     );
 }
+
+/// (#2928 review, MF1) The live channel's cadence never reaches the
+/// runtime's kept artifact: through the FULL loop (the production tick),
+/// the same stream writes the same trajectory, line for line, whatever
+/// `DARKMUX_LIVE_SAMPLE_MS` says (even if a host forwarded it). Live
+/// freshness through a silence is the HOST's job.
+#[test]
+#[serial_test::serial]
+fn the_trajectory_is_identical_with_the_live_channel_on_and_off() {
+    let script = || {
+        let args = r#"{"path":"a.txt","content":"hello"}"#;
+        vec![
+            (Duration::ZERO, chunk(serde_json::json!({"tool_calls": [{"index": 0, "id": "c", "type": "function", "function": {"name": "write", "arguments": ""}}]}), None)),
+            // A silence long enough for one production (1 s) tick.
+            (Duration::from_millis(1_500), chunk(serde_json::json!({"tool_calls": [{"index": 0, "function": {"arguments": args}}]}), None)),
+            (Duration::ZERO, chunk(serde_json::json!({}), Some("tool_calls"))),
+        ]
+    };
+    let shape = |cadence: Option<&str>| {
+        let prev = std::env::var("DARKMUX_LIVE_SAMPLE_MS").ok();
+        match cadence {
+            Some(v) => unsafe { std::env::set_var("DARKMUX_LIVE_SAMPLE_MS", v) },
+            None => unsafe { std::env::remove_var("DARKMUX_LIVE_SAMPLE_MS") },
+        }
+        let ws = tempfile::Builder::new().prefix("live-on-off").tempdir().unwrap();
+        let client = LmStudioClient::with_base_url_and_read_timeout(sse_server_scripted(script()), Duration::from_secs(10));
+        let mut trajectory = Trajectory::open(ws.path());
+        let cfg = crate::compaction::CompactionConfig::never_compact();
+        let _ = super::run(&client, &client, "m", vec![Message::user("write it")], &[], &mut trajectory, true, &cfg, Some(1), None, None, None, std::collections::BTreeMap::new(), None);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LIVE_SAMPLE_MS", v),
+                None => std::env::remove_var("DARKMUX_LIVE_SAMPLE_MS"),
+            }
+        }
+        events(ws.path())
+            .iter()
+            .map(|e| e["type"].as_str().unwrap_or("").to_string())
+            .filter(|t| t.starts_with("model."))
+            .collect::<Vec<_>>()
+    };
+    let off = shape(None);
+    let on = shape(Some("100"));
+    assert!(off.iter().any(|t| t == "model.tool_call.writing"), "the fixture ticks at least once: {off:?}");
+    assert_eq!(on.len(), off.len(), "line count: on {on:?} vs off {off:?}");
+    assert_eq!(on, off);
+}

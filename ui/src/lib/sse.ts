@@ -48,6 +48,11 @@ export interface FlowTailHandlers {
    * watchdog uses it as one of its two contact signals; nothing else does.
    * Optional and purely additive, same as the two above. */
   onMessage?: () => void;
+  /** (#2928) Fires with the data of every `event: live` frame — the live
+   *  channel's samples, which ride the same stream as named events so an
+   *  older viewer (listening only for `message`) ignores them. Never
+   *  appended to the flow-tail cache: a live sample is not a flow record. */
+  onLive?: (data: string) => void;
 }
 
 /**
@@ -89,6 +94,10 @@ export function startFlowTail(
     };
     source.onopen = () => handlers?.onOpen?.();
     source.onerror = () => handlers?.onError?.();
+    // (#2928) `addEventListener` is optional on a test double.
+    source.addEventListener?.("live", (event: Event) => {
+      handlers?.onLive?.(String((event as MessageEvent<string>).data));
+    });
   };
 
   const onVisibilityChange = () => {

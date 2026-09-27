@@ -77,8 +77,23 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.61.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.62.0";
 // Version history:
+//   1.62.0 (#2928, the live channel): additive, one payload block.
+//           `dispatch complete.payload.live`: the live channel's own cost for
+//           the execution — `enabled` (false for a dispatch that did not
+//           feed it: the lab, or the channel off), `cadence_ms` (0 then),
+//           `samples_sent`, `dropped_no_receiver` (no daemon, or a stale
+//           socket) and `dropped_full` (a daemon too slow to drain),
+//           `sampler_us` (all the channel's time on this execution: building
+//           each chunk's sample, the sampler, the sends), `forward_us` (the
+//           sends' share) and `bytes`. A dispatch that opted out
+//           (`DispatchOpts::live_channel: false`, the lab) reports zeros.
+//           The live SAMPLES are never flow records: they travel dispatch ->
+//           local daemon -> SSE `event: live` and are dropped, so no action
+//           is added and nothing new reaches a day file, Redis, the audit
+//           chain or the runtime's trajectory. Readers ignoring the key see
+//           1.61.0 unchanged.
 //   1.61.0 (#2915, utility work is lean but VISIBLE): additive, two
 //           actions and utility fields on the usage record.
 //

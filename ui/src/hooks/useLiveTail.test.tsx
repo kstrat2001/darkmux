@@ -73,6 +73,38 @@ describe("useLiveTail", () => {
     vi.restoreAllMocks();
   });
 
+  // (#2928) A `live` frame feeds the live overlay and counts as contact; it
+  // never lands in the flow-tail cache.
+  it("routes a live frame to the live sink, marks contact, and keeps it out of the tail", () => {
+    const queryClient = new QueryClient();
+    const got: string[] = [];
+    const contacts: number[] = [];
+    class Named extends MockEventSource {
+      listeners = new Map<string, ((e: Event) => void)[]>();
+      addEventListener(type: string, fn: (e: Event) => void) {
+        this.listeners.set(type, [...(this.listeners.get(type) ?? []), fn]);
+      }
+    }
+    const { unmount } = renderHook(
+      () =>
+        useLiveTail(true, {
+          eventSourceFactory: (url) => new Named(url) as unknown as EventSource,
+          tickMs: 5000,
+          liveSink: { ingest: (d) => got.push(d) },
+          onContact: (ms) => contacts.push(ms),
+        }),
+      { wrapper: wrapper(queryClient) },
+    );
+    const es = MockEventSource.instances[0] as Named;
+    act(() => {
+      for (const fn of es.listeners.get("live") ?? []) fn({ data: '{"v":1,"kind":"model"}' } as MessageEvent<string>);
+    });
+    expect(got).toEqual(['{"v":1,"kind":"model"}']);
+    expect(contacts.length).toBeGreaterThan(0);
+    expect(queryClient.getQueryData(queryKeys.flowTail("2026-08-09"))).toBeUndefined();
+    unmount();
+  });
+
   it("opens a stream against today's date and appends SSE records into the flowTail cache", () => {
     const queryClient = new QueryClient();
     const { unmount } = renderHook(() => useLiveTail(true, { eventSourceFactory: factory, tickMs: 5000 }), {
