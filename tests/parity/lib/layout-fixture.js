@@ -305,14 +305,19 @@ const MACHINE_SPECS = {
   generated_at_ms: 0,
 };
 
-async function installLayoutRoutes(page, { blockStream = false, machineSpecs = false, holdRuns = false } = {}) {
+async function installLayoutRoutes(page, { blockStream = false, machineSpecs = false, holdRuns = false, roster = false, holdPresence = false } = {}) {
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
     const p = url.pathname;
+    const json = (body) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
     // (#2958) A daemon slow to answer `/runs` (the operator measured 3.3 s):
     // never answered, so a fleet card stays in its before-first-data state.
     if (holdRuns && p === "/runs") return new Promise(() => {});
-    const json = (body) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+    // (#2958 review M1) `holdPresence`: `/fleet/machines/live` never
+    // answers, so "offline" cannot be claimed yet. `roster`: one declared
+    // machine that is never seen, which renders as an offline card.
+    if (holdPresence && p === "/fleet/machines/live") return new Promise(() => {});
+    if (roster && p === "/fleet/roster") return json({ machines: [{ id: "layout-offline", address: "100.64.0.9:8765", added_unix_ms: 1 }], error: null });
     if (/^\/flow\/\d{4}-\d{2}-\d{2}\/stream$/.test(p)) {
       if (blockStream) return route.fulfill({ status: 503, contentType: "text/plain", body: "layout harness: stream refused\n" });
       return route.continue();
