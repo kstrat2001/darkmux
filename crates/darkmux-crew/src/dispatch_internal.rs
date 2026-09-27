@@ -2942,8 +2942,9 @@ pub struct ProbeReport {
     /// routes by deployment name, so this names what actually answered
     /// (the #1135 "healthy while broken" class of check).
     pub served_model: Option<String>,
-    /// What the probe itself cost (`usage.total_tokens`) — tokens only,
-    /// never a currency figure; surfaced so the opt-in cost is visible.
+    /// What the probe itself cost (the reply's total, by the one total
+    /// rule): tokens only, never a currency figure; surfaced so the opt-in
+    /// cost is visible.
     pub total_tokens: Option<u64>,
 }
 
@@ -2988,7 +2989,7 @@ pub fn probe_remote_endpoint(
             .get("model")
             .and_then(|m| m.as_str())
             .map(str::to_string),
-        total_tokens: resp.pointer("/usage/total_tokens").and_then(|v| v.as_u64()),
+        total_tokens: darkmux_trajectory::UsageCounts::of_reply(&resp).total_tokens(),
     })
 }
 

@@ -35,18 +35,73 @@ impl Usage {
     }
 }
 
+impl From<&UsageCounts> for Usage {
+    /// The usage block the runtime records for a call: exactly the counts
+    /// the provider reported, each unreported one as `null`.
+    fn from(c: &UsageCounts) -> Self {
+        Self {
+            prompt_tokens: c.prompt,
+            completion_tokens: c.completion,
+            total_tokens: c.total,
+            reasoning_tokens: c.reasoning,
+            cached_tokens: c.cached,
+        }
+    }
+}
+
 /// The token counts one model call reported. Every field is tri-state:
 /// `None` means the provider did not say, never zero.
+///
+/// Deserializes from a provider's `usage` object (the OpenAI-compatible
+/// reply shape) through [`UsageCounts::from_provider`], the one parse the
+/// runtime client and the host's direct calls share.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UsageCounts {
     pub prompt: Option<u64>,
     pub completion: Option<u64>,
+    /// The provider's own total. Recorded replies from some OpenAI-compatible
+    /// layers (Gemini's and xAI's) report a total GREATER than prompt +
+    /// completion: a token class outside `completion_tokens`. So a total is
+    /// never reconstructed when the provider sent one ([`Self::total_tokens`]).
     pub total: Option<u64>,
+    /// `completion_tokens_details.reasoning_tokens`. OpenAI and Azure document
+    /// it as a breakdown INSIDE `completion_tokens`; that is provider-scoped,
+    /// not a universal rule, so nothing adds it to or subtracts it from the
+    /// completion count. LMStudio never sends it.
     pub reasoning: Option<u64>,
+    /// `prompt_tokens_details.cached_tokens`: prompt tokens served from the
+    /// provider's cache.
     pub cached: Option<u64>,
 }
 
+impl<'de> Deserialize<'de> for UsageCounts {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(Self::from_provider(&serde_json::Value::deserialize(d)?))
+    }
+}
+
 impl UsageCounts {
+    /// THE parse of a provider's `usage` object. Lenient per field: a count
+    /// that is absent, null, negative, fractional or not a number reads as
+    /// unreported, and never sinks the rest of the block (or the reply it
+    /// arrived in).
+    pub fn from_provider(usage: &serde_json::Value) -> Self {
+        let count = |path: &str| usage.pointer(path).and_then(serde_json::Value::as_u64);
+        Self {
+            prompt: count("/prompt_tokens"),
+            completion: count("/completion_tokens"),
+            total: count("/total_tokens"),
+            reasoning: count("/completion_tokens_details/reasoning_tokens"),
+            cached: count("/prompt_tokens_details/cached_tokens"),
+        }
+    }
+
+    /// The counts of a whole chat-completion reply: its `usage` object, or
+    /// nothing reported when it has none.
+    pub fn of_reply(reply: &serde_json::Value) -> Self {
+        reply.get("usage").map(Self::from_provider).unwrap_or_default()
+    }
+
     /// The counts of an optional usage block: no block is nothing reported.
     pub fn of(usage: Option<&Usage>) -> Self {
         usage.map(Usage::counts).unwrap_or_default()
@@ -110,6 +165,73 @@ mod tests {
         assert_eq!(half.total_tokens(), Some(12));
         assert_eq!(UsageCounts::default().total_tokens(), None, "nothing reported is no total, not 0");
         assert!(!UsageCounts::default().reported());
+    }
+
+    /// The one parse of a provider's `usage` object: the runtime client and
+    /// the host's direct calls both read replies through it.
+    #[test]
+    fn a_provider_usage_block_reads_its_counts_and_details() {
+        let v = serde_json::json!({
+            "prompt_tokens": 75, "completion_tokens": 1186, "total_tokens": 1261,
+            "completion_tokens_details": {"reasoning_tokens": 1024},
+            "prompt_tokens_details": {"cached_tokens": 64},
+        });
+        let c = UsageCounts::from_provider(&v);
+        assert_eq!(
+            c,
+            UsageCounts { prompt: Some(75), completion: Some(1186), total: Some(1261), reasoning: Some(1024), cached: Some(64) }
+        );
+        let via_serde: UsageCounts = serde_json::from_value(v).unwrap();
+        assert_eq!(via_serde, c, "serde and the direct read are the same parse");
+    }
+
+    /// (#1444) Details absent, present but empty, and a true zero are three
+    /// different answers: the first two are "the provider did not say".
+    #[test]
+    fn provider_details_distinguish_unsaid_from_zero() {
+        let base = serde_json::json!({"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150});
+        let absent = UsageCounts::from_provider(&base);
+        assert_eq!((absent.reasoning, absent.cached), (None, None));
+        let mut empty = base.clone();
+        empty["completion_tokens_details"] = serde_json::json!({});
+        empty["prompt_tokens_details"] = serde_json::json!({});
+        let empty = UsageCounts::from_provider(&empty);
+        assert_eq!((empty.reasoning, empty.cached), (None, None), "an empty object names no zero");
+        let mut zero = base;
+        zero["completion_tokens_details"] = serde_json::json!({"reasoning_tokens": 0});
+        zero["prompt_tokens_details"] = serde_json::json!({"cached_tokens": 0});
+        let zero = UsageCounts::from_provider(&zero);
+        assert_eq!((zero.reasoning, zero.cached), (Some(0), Some(0)));
+    }
+
+    /// (#1444 review) A recorded gemini-2.5-flash reply: the provider's total
+    /// exceeds prompt + completion by 1500 and must survive the parse as sent.
+    #[test]
+    fn a_provider_total_above_the_split_survives_the_parse() {
+        let c = UsageCounts::from_provider(&serde_json::json!({"prompt_tokens": 9970, "completion_tokens": 128, "total_tokens": 11598}));
+        assert_eq!(c.total_tokens(), Some(11598));
+    }
+
+    #[test]
+    fn a_provider_count_that_is_not_a_whole_number_reads_as_unreported() {
+        for bad in [serde_json::json!(42.5), serde_json::json!("42"), serde_json::json!(-1), serde_json::Value::Null] {
+            let c = UsageCounts::from_provider(&serde_json::json!({"total_tokens": bad, "completion_tokens": 3}));
+            assert_eq!(c.total, None, "{bad}");
+            assert_eq!(c.completion, Some(3), "one bad field does not sink the block");
+        }
+        let odd_details = serde_json::json!({"prompt_tokens": 1, "completion_tokens_details": "n/a"});
+        assert_eq!(UsageCounts::from_provider(&odd_details).reasoning, None);
+        let reply = serde_json::json!({"choices": [], "usage": {"prompt_tokens": 9}});
+        assert_eq!(UsageCounts::of_reply(&reply).prompt, Some(9));
+        assert_eq!(UsageCounts::of_reply(&serde_json::json!({"choices": []})), UsageCounts::default());
+    }
+
+    #[test]
+    fn a_recorded_usage_block_carries_exactly_the_reported_counts() {
+        let c = UsageCounts { prompt: Some(10), total: Some(12), cached: Some(4), ..Default::default() };
+        let u = Usage::from(&c);
+        assert_eq!(u.counts(), c, "recording and reading back are inverse");
+        assert_eq!(u.completion_tokens, None, "an unreported count is recorded as unreported");
     }
 
     #[test]

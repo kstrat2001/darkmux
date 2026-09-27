@@ -593,6 +593,11 @@ fn resolve_turn_delay_ms(configured_ms: u64, budget_secs: u64) -> (u64, Option<S
 /// cost) and never left untouched (that would let the rest silently
 /// consume inactivity budget as if the dispatch had gone quiet). Pure +
 /// testable; mirrors `resolve_turn_delay_ms`'s shape.
+/// A reported token count as the loop's `u32` counters hold it.
+fn saturating_u32(n: u64) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
 fn extend_deadline_by_rest(deadline: std::time::Instant, rest_ms: u64) -> std::time::Instant {
     deadline + std::time::Duration::from_millis(rest_ms)
 }
@@ -1745,15 +1750,6 @@ fn run_with_sleeper(
     let mut total_prompt_tokens: u32 = resume_seed.as_ref().map(|c| c.total_prompt_tokens).unwrap_or(0);
     let mut total_completion_tokens: u32 =
         resume_seed.as_ref().map(|c| c.total_completion_tokens).unwrap_or(0);
-    // (#1444) NOT carried across a checkpoint resume — `RunCheckpoint`
-    // doesn't persist these (a deliberate scope cut, same shape as the
-    // detector-state/`checkpoints_used` reset `RunCheckpoint::
-    // pending_tool_calls`'s own doc already names: a resumed dispatch gets
-    // a clean slate here too). A resumed dispatch's reasoning/cached totals
-    // therefore cover only the turns AFTER the resume, not the whole
-    // dispatch. Always starts fresh regardless of `resume_seed`.
-    let mut total_reasoning_tokens: Option<u32> = None;
-    let mut total_cached_tokens: Option<u32> = None;
     let mut compactions: u32 = resume_seed.as_ref().map(|c| c.compactions).unwrap_or(0);
     // (#2094) Sum + count of the inter-turn rests taken this dispatch.
     let mut rest_ms: u64 = resume_seed.as_ref().map(|c| c.rest_ms).unwrap_or(0);
@@ -2949,37 +2945,28 @@ fn run_with_sleeper(
         // purpose is to discriminate per-call-cap stalls (count ≈
         // MAX_TOKENS_PER_CALL) from context-overflow stalls, so the
         // distinction matters.
-        let this_turn_completion_tokens: Option<u32> =
-            response.usage.as_ref().map(|u| u.completion_tokens);
-        if let Some(usage) = &response.usage {
-            total_prompt_tokens = total_prompt_tokens.saturating_add(usage.prompt_tokens);
+        let usage = response.usage.as_ref();
+        let this_turn_completion_tokens: Option<u32> = usage.and_then(|u| u.completion).map(saturating_u32);
+        if let Some(usage) = usage {
+            total_prompt_tokens = total_prompt_tokens.saturating_add(saturating_u32(usage.prompt.unwrap_or(0)));
             total_completion_tokens =
-                total_completion_tokens.saturating_add(usage.completion_tokens);
-            // (#1444) Tri-state accumulation: a turn that DOES report the
-            // field promotes the running total from `None` to `Some` (or
-            // adds to an already-`Some` total); a turn that omits it leaves
-            // the running total untouched — it never resets an already-seen
-            // total back to `None`, and it never promotes `None` to
-            // `Some(0)` on its own. So the FINAL total is `None` only if
-            // NO turn in the whole dispatch ever reported the field.
-            if let Some(rt) = usage.reasoning_tokens() {
-                total_reasoning_tokens = Some(total_reasoning_tokens.unwrap_or(0).saturating_add(rt));
-            }
-            if let Some(ct) = usage.cached_tokens() {
-                total_cached_tokens = Some(total_cached_tokens.unwrap_or(0).saturating_add(ct));
-            }
+                total_completion_tokens.saturating_add(this_turn_completion_tokens.unwrap_or(0));
+        }
+        // The prompt count is the ground truth everything below calibrates
+        // against, so all of it needs one the endpoint actually reported.
+        if let Some(prompt_tokens) = usage.and_then(|u| u.prompt).map(saturating_u32) {
             // (#854) Track endpoint staleness BEFORE overwriting the running
             // value: a count identical to last turn (while the thread grew)
-            // means the endpoint froze it. Deliberately inside the `Some(usage)`
+            // means the endpoint froze it. Deliberately inside the reported-prompt
             // arm: a usage-less turn (e.g. streaming without include_usage) is
             // BRIDGED — it neither increments nor resets the counter, so it
             // can't corrupt the run of identical reports. Don't "fix" this into
             // an unconditional reset; that would zero the counter on every
             // usage-less turn and defeat the detector.
             frozen_prompt_turns =
-                update_frozen_prompt_turns(prev_prompt_tokens, usage.prompt_tokens, frozen_prompt_turns);
-            prev_prompt_tokens = Some(usage.prompt_tokens);
-            latest_prompt_tokens = usage.prompt_tokens;
+                update_frozen_prompt_turns(prev_prompt_tokens, prompt_tokens, frozen_prompt_turns);
+            prev_prompt_tokens = Some(prompt_tokens);
+            latest_prompt_tokens = prompt_tokens;
             // (#2792 round-4) Ground truth for the request that just went
             // out, paired with the characters it carried. Everything the
             // local ruler cannot see — the chat template's per-message
@@ -2988,7 +2975,7 @@ fn run_with_sleeper(
             // adds on top.
             prompt_anchor = Some(PromptAnchor {
                 chars: request_message_chars,
-                tokens: usage.prompt_tokens,
+                tokens: prompt_tokens,
             });
             // (#557 Slice-3) Per-turn context-window occupancy sawtooth.
             // Emitted ONCE per turn, only when a real `usage` was seen
@@ -5233,8 +5220,9 @@ fn run_streaming_turn(
     let chars_per_token = response
         .usage
         .as_ref()
-        .filter(|u| u.completion_tokens > 0 && tool_calls_count == 0)
-        .map(|u| gate.generated_chars() as f32 / u.completion_tokens as f32);
+        .and_then(|u| u.completion)
+        .filter(|c| *c > 0 && tool_calls_count == 0)
+        .map(|c| gate.generated_chars() as f32 / c as f32);
     trajectory.append_model_streaming_end(
         seq,
         partial_count,
@@ -7664,6 +7652,51 @@ mod tests {
         assert_eq!(recorded.compactions(), 0);
         assert_eq!(recorded.tokens.prompt, 220, "100 (turn 1) + 120 (turn 2)");
         assert_eq!(recorded.tokens.completion, 25, "20 (turn 1) + 5 (turn 2)");
+    }
+
+    /// A reply whose `usage` reports a completion count but no prompt count
+    /// (the shared provider parse keeps what was sent) still finishes its
+    /// turn, counts the completion it reported, and calibrates nothing on a
+    /// prompt count it never received: no context-window event, no zero.
+    #[test]
+    #[serial_test::serial]
+    fn a_reply_without_a_prompt_count_counts_what_it_reported_and_calibrates_nothing() {
+        use crate::lmstudio::{LmStudioClient, Message};
+        use crate::trajectory::Trajectory;
+
+        std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        std::env::remove_var("DARKMUX_TURN_DELAY_MS");
+
+        let server = crate::test_support::GuardedMockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(serde_json::json!({
+                "id": "chatcmpl-1",
+                "choices": [{ "index": 0, "message": { "role": "assistant", "content": "done" }, "finish_reason": "stop" }],
+                "usage": { "completion_tokens": 5 },
+            }));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("usage-no-prompt").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("hi")];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &[], &mut traj, false, &cfg,
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None,
+            tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("a short usage block does not fail the turn");
+        drop(traj);
+
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+        let recorded = crate::trajectory::recorded(tmp.path());
+        assert_eq!(recorded.tokens.completion, 5);
+        assert_eq!(recorded.tokens.prompt, 0);
+        let raw = std::fs::read_to_string(darkmux_trajectory::trajectory_path(tmp.path())).unwrap();
+        assert!(!raw.contains("\"dispatch.context\""), "no prompt count, no context-window event: {raw}");
     }
 
     #[test]

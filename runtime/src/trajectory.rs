@@ -20,7 +20,8 @@ use std::io::Write;
 use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::lmstudio::{ToolCall, Usage};
+use crate::lmstudio::ToolCall;
+use darkmux_trajectory::UsageCounts;
 
 /// Container mount point for darkmux's OWN bookkeeping — SEPARATE from
 /// /workspace so the runtime never writes its logs into the tree it's
@@ -177,7 +178,7 @@ impl Trajectory {
         &mut self,
         seq: u32,
         finish_reason: &str,
-        usage: Option<&Usage>,
+        usage: Option<&UsageCounts>,
         tool_calls: Option<&[ToolCall]>,
         // (#2963) Aligned with `tool_calls`: whether each call will run
         // (`loop_runner::plan_tool_calls`). A call that will not is marked
@@ -204,7 +205,7 @@ impl Trajectory {
             seq: u64::from(seq),
             ts: unix_ms(),
             finish_reason: finish_reason.to_string(),
-            usage: usage.map(usage_of),
+            usage: usage.map(dt::Usage::from),
             tool_calls,
             // (#2902 step 1b) The model the server says answered this turn,
             // so the host's per-turn usage record can carry
@@ -252,7 +253,7 @@ impl Trajectory {
             generation: u64::from(call.generation),
             ts: unix_ms(),
             requested_model: call.requested_model.clone(),
-            usage: call.usage.as_ref().map(usage_of),
+            usage: call.usage.as_ref().map(dt::Usage::from),
             reported_model: call.reported_model.clone(),
         }));
     }
@@ -1366,22 +1367,6 @@ pub(crate) fn unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// The `usage` object a model-call event carries (`model.completed`,
-/// `compaction.call`): one shape, so the host reads both with one mapper.
-/// (#1444) `reasoning_tokens`/`cached_tokens` are `null`, not a fabricated
-/// `0`, when the provider reported no such field; whether reasoning sits
-/// INSIDE `completion_tokens` is provider-specific (see
-/// `Usage::reasoning_tokens`), so nothing derives one from the other.
-fn usage_of(u: &Usage) -> dt::Usage {
-    dt::Usage {
-        prompt_tokens: Some(u64::from(u.prompt_tokens)),
-        completion_tokens: Some(u64::from(u.completion_tokens)),
-        total_tokens: Some(u64::from(u.total_tokens)),
-        reasoning_tokens: u.reasoning_tokens().map(u64::from),
-        cached_tokens: u.cached_tokens().map(u64::from),
-    }
-}
-
 /// The bound a record names, as the opaque value the host forwards.
 fn bound_value(bound: crate::bounds::BoundRef) -> serde_json::Value {
     serde_json::to_value(bound).unwrap_or_default()
@@ -1554,23 +1539,20 @@ mod tests {
     /// the emission site.
     #[test]
     fn model_completed_usage_carries_reasoning_and_cached_tokens() {
-        use crate::lmstudio::{CompletionTokensDetails, PromptTokensDetails};
         let ws = tempfile::Builder::new().prefix("traj-reasoning").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
-        let usage = Usage {
-            prompt_tokens: 100,
-            completion_tokens: 600,
-            total_tokens: 700,
-            completion_tokens_details: Some(CompletionTokensDetails {
-                reasoning_tokens: Some(500),
-            }),
-            prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: Some(20) }),
+        let usage = UsageCounts {
+            prompt: Some(100),
+            completion: Some(600),
+            total: Some(700),
+            reasoning: Some(500),
+            cached: Some(20),
         };
         t.append_model_completed(1, "stop", Some(&usage), None, None, None);
 
         // A second turn whose provider reported NO details object at all —
         // both keys must be JSON `null`, never a fabricated `0`.
-        let bare = Usage { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12, ..Default::default() };
+        let bare = UsageCounts { prompt: Some(10), completion: Some(2), total: Some(12), ..Default::default() };
         t.append_model_completed(2, "stop", Some(&bare), None, None, None);
         drop(t);
 
@@ -1904,7 +1886,7 @@ mod tests {
     fn compaction_call_event_records_one_compactor_call() {
         let ws = tempfile::Builder::new().prefix("traj-compaction-call").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
-        let usage = Usage { prompt_tokens: 500, completion_tokens: 80, total_tokens: 580, ..Default::default() };
+        let usage = UsageCounts { prompt: Some(500), completion: Some(80), total: Some(580), ..Default::default() };
         t.append_compaction_call(&crate::compaction::CompactorCall {
             generation: 3,
             requested_model: "darkmux:compactor-4b".into(),

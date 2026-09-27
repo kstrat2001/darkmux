@@ -741,8 +741,8 @@ pub struct DispatchSingleShotStepKind;
 /// The token fields are the call's usage counts, the ones its usage record
 /// carries: `null` for a field the endpoint never reported, never a
 /// fabricated `0`, and `total_tokens` by the one total rule. Whether
-/// reasoning sits inside `completion_tokens` is provider-scoped (see the
-/// runtime crate's `lmstudio::CompletionTokensDetails::reasoning_tokens`).
+/// reasoning sits inside `completion_tokens` is provider-scoped (see
+/// `darkmux_trajectory::UsageCounts::reasoning`).
 fn hosted_single_shot_step_payload(
     step_id: &str,
     budget: Option<u64>,

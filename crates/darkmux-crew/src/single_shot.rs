@@ -342,17 +342,7 @@ pub(crate) fn extract_reply(resp: &serde_json::Value) -> SingleShotReply {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    // (#1444) `.pointer()` returns `None` for a missing intermediate object
-    // (no `completion_tokens_details` at all) exactly as for a missing leaf:
-    // both mean "the endpoint didn't say".
-    let count = |path: &str| resp.pointer(path).and_then(|v| v.as_u64());
-    let counts = darkmux_trajectory::UsageCounts {
-        prompt: count("/usage/prompt_tokens"),
-        completion: count("/usage/completion_tokens"),
-        total: count("/usage/total_tokens"),
-        reasoning: count("/usage/completion_tokens_details/reasoning_tokens"),
-        cached: count("/usage/prompt_tokens_details/cached_tokens"),
-    };
+    let counts = darkmux_trajectory::UsageCounts::of_reply(resp);
     let model = resp
         .get("model")
         .and_then(|m| m.as_str())
