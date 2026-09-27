@@ -399,7 +399,7 @@ darkmux mission finalize deploy-rewrite    <span class="comment"># close out dar
     </div>
 
     <h3>Fleet fan-out: <code>mission dispatch</code></h3>
-    <p>Everything above runs on this machine. If you're coordinating a fleet (multiple darkmux machines sharing a work queue), <code>darkmux mission dispatch &lt;mission&gt; --role &lt;role&gt;</code> fans every phase with no unmet dependencies out across the fleet in parallel instead of running one phase locally and synchronously: each phase becomes a work job the first available runner claims. This is the multi-machine sibling of the local coder-phase launch, not a replacement for it; a single-machine setup has no reason to reach for it.</p>
+    <p>Everything above runs on this machine. If you're coordinating a fleet, <code>darkmux mission dispatch &lt;mission&gt; --role &lt;role&gt; --machine &lt;id&gt;</code> sends the mission's next ready phase to that machine, which runs it if it trusts this one (see <a href="fleet.html#part-2">the fleet guide</a>). This is the multi-machine sibling of the local coder-phase launch, not a replacement for it; a single-machine setup has no reason to reach for it.</p>
   </div>
 </section>
 

@@ -54,6 +54,11 @@ enum Ty {
     Float,
     /// A string constrained to the `FleetMode` token set (#933).
     FleetMode,
+    /// (#2916) A string constrained to the identity providers this darkmux
+    /// knows (`darkmux_fleet::KNOWN_IDENTITY_PROVIDERS`). An unknown value
+    /// would load fine and then refuse every submission, so the write
+    /// surface refuses it up front.
+    IdentityProvider,
     /// (#2846) A string constrained to the `DetectionPolicy` token set
     /// (`enforce`/`observe`/`off`). Validated here rather than left as
     /// `Ty::Str` for the reason `ThermalState` is: the runtime's own parse
@@ -191,6 +196,14 @@ const KEYS: &[(&str, Ty)] = &[
     ("runtime.thermal.episode_threshold", Ty::Uint),
     ("runtime.thermal.tier4_enabled", Ty::Bool),
     ("fleet.mode", Ty::FleetMode),
+    // (#2916) Fleet work submission. `fleet.accept_work.*` is deliberately
+    // NOT here: an allow-list entry's `node_id` is resolved through the
+    // identity provider by `darkmux machine trust`, never typed, so the map
+    // has no `config set` form at all.
+    ("fleet.identity.provider", Ty::IdentityProvider),
+    ("fleet.identity.bin", Ty::Str),
+    ("fleet.listener.enabled", Ty::Bool),
+    ("fleet.listener.port", Ty::Uint),
     // (#1260) The per-execution remote token allowance for endpoint-staffed
     // crew seats (one pipeline stage = one execution). Tokens, never currency.
     ("remote.max_tokens_per_execution", Ty::Uint),
@@ -479,7 +492,7 @@ fn redact_secret_keys(root: &mut Value) {
 /// `set` can create it), a malformed file is a hard error here (unlike the
 /// lenient load path — `config set` must not silently clobber a file it can't
 /// understand).
-fn load_object(path: &Path) -> Result<Value> {
+pub(crate) fn load_object(path: &Path) -> Result<Value> {
     match std::fs::read_to_string(path) {
         Ok(raw) if raw.trim().is_empty() => Ok(Value::Object(Default::default())),
         Ok(raw) => {
@@ -529,6 +542,16 @@ fn parse_value(ty: Ty, raw: &str) -> Result<Value> {
                 .ok_or_else(|| anyhow!("invalid fleet.mode `{raw}` — valid: standalone, hub, peer"))?;
             // Store the canonical lowercase token regardless of the input casing.
             Value::String(mode.as_str().to_string())
+        }
+        Ty::IdentityProvider => {
+            let lower = raw.trim().to_ascii_lowercase();
+            if !darkmux_fleet::KNOWN_IDENTITY_PROVIDERS.contains(&lower.as_str()) {
+                bail!(
+                    "unknown identity provider `{raw}` — valid: {}",
+                    darkmux_fleet::KNOWN_IDENTITY_PROVIDERS.join(", ")
+                );
+            }
+            Value::String(lower)
         }
         Ty::DetectionPolicy => {
             let lower = raw.trim().to_ascii_lowercase();
@@ -1099,6 +1122,7 @@ mod tests {
                 Ty::Float => serde_json::json!(0.5),
                 // a valid FleetMode token doubles as the generic string sentinel
                 Ty::Str | Ty::FleetMode => Value::String("standalone".into()),
+                Ty::IdentityProvider => Value::String("tailscale".into()),
                 // a valid THERMAL_STATES token, same reasoning as FleetMode above
                 Ty::DetectionPolicy => Value::String("enforce".into()),
                 Ty::ThermalState => Value::String("nominal".into()),
@@ -1128,7 +1152,11 @@ mod tests {
             + c.redis.as_ref().map_or(0, |x| x.extras.len())
             + c.audit.as_ref().map_or(0, |x| x.extras.len())
             + c.runtime.as_ref().map_or(0, |x| x.extras.len())
-            + c.fleet.as_ref().map_or(0, |x| x.extras.len())
+            + c.fleet.as_ref().map_or(0, |x| {
+                x.extras.len()
+                    + x.identity.as_ref().map_or(0, |i| i.extras.len())
+                    + x.listener.as_ref().map_or(0, |l| l.extras.len())
+            })
             + c.cmd.as_ref().map_or(0, |x| x.extras.len())
             + c.hooks.as_ref().map_or(0, |x| x.extras.len())
     }

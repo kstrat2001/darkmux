@@ -51,10 +51,10 @@
     <p>A peer can play two roles, and they're a progression. Start with the first; move to the second when you want it.</p>
     <ul>
       <li><strong>Observability peer (Part 1):</strong> the machine joins the fleet's shared record stream and shows up in the hub's live viewer, and you run dispatches <em>directly on it</em>, sized to its hardware. It doesn't pull work off the fleet queue. The right starting posture for any machine, and the natural home for a small one.</li>
-      <li><strong>Fleet worker (Part 2):</strong> the machine runs the always-on daemon and <em>claims jobs off the global work queue</em>, so a dispatch from anywhere in the fleet can run on it.</li>
+      <li><strong>Fleet worker (Part 2):</strong> the machine runs the always-on daemon with its <em>fleet listener</em> on, and takes work that the machines you trust send it, for the profiles you let them use.</li>
     </ul>
     <div class="callout">
-      <strong>How the queue works.</strong> darkmux's work queue is a single global stream: the first available worker claims each job. It doesn't size-match jobs to machines, so a worker takes whatever comes next. That's why a fleet worker (Part 2) wants enough RAM for the kind of jobs you send the fleet, while an observability peer (Part 1) stays out of the queue and only runs what you start on it directly.
+      <strong>How fleet work travels (4.0).</strong> A dispatch sent with <code>--machine studio</code> goes straight to the studio's fleet listener, carrying the fleet token. The studio runs it only if the network itself says the request came from a machine on its allow-list, and only on a profile that machine is allowed to use. Anything else is refused at once, with the reason. Nothing is taken off a shared queue: the Redis work queue of earlier releases is retired, and Redis is only the shared record stream now.
     </div>
   </div>
 </section>
@@ -92,12 +92,10 @@ darkmux doctor</code></pre>
 <section id="dispatch-to-peer">
   <div class="wrap">
     <h2>Can I dispatch to this peer from another machine?</h2>
-    <p>Short answer for Part 1: <strong>no, and it's worth understanding why before you reach for it.</strong></p>
-    <p>A <code>darkmux dispatch &lt;role&gt; --machine mini-1 …</code> from another machine publishes the job to the global work queue. But a job only <em>runs</em> when some machine's <strong>claiming worker</strong> picks it up, and that worker only exists inside a running <code>darkmux serve</code> daemon with Redis configured. In Part 1 the peer isn't running that daemon, so it never claims. And because <code>--machine</code> is an <em>advisory hint</em>, not a pin, the hub's own worker (which IS running) would claim your <code>--machine mini-1</code> job and run it <strong>on the hub</strong>.</p>
-    <p>So:</p>
+    <p>Short answer for Part 1: <strong>no.</strong> A <code>darkmux dispatch &lt;role&gt; --machine mini-1 …</code> from another machine is sent to mini-1's fleet listener, which only exists inside a running <code>darkmux serve</code> with <code>fleet.listener.enabled</code> on. A Part 1 peer runs neither, so the dispatch fails at once with "no answer from mini-1". It never runs somewhere else instead: <code>--machine</code> names the one machine that runs the job.</p>
     <ul>
-      <li><strong>To run work on the peer in Part 1:</strong> run the dispatch <em>locally on the peer itself</em> (see below). No queue, no surprises about where it lands.</li>
-      <li><strong>To make remote dispatch reach the peer at all:</strong> the peer has to run a claiming worker, which is <a href="#part-2">Part 2</a>. Even then, the queue is first-available, so a job isn't guaranteed to land on the peer specifically rather than on another free worker.</li>
+      <li><strong>To run work on the peer in Part 1:</strong> run the dispatch <em>locally on the peer itself</em> (see below).</li>
+      <li><strong>To send it work from other machines:</strong> make it a fleet worker, <a href="#part-2">Part 2</a>.</li>
     </ul>
 
     <h3>Run work on the peer (locally)</h3>
@@ -111,15 +109,38 @@ darkmux dispatch coder "implement the X feature"</code></pre>
 <section id="part-2">
   <div class="wrap">
     <h2>Part 2: Run it as a fleet worker</h2>
-    <p>To have a machine pull work off the fleet queue, so a dispatch from anywhere in the fleet can run on it, run the always-on daemon. The daemon spawns a worker that claims jobs from the global <code>darkmux:work</code> stream. The Part 1 config already points at the hub's Redis, so this is just starting the daemon:</p>
-    <pre><code><span class="comment"># On the peer (Part 1 config already set):</span>
-brew services start darkmux                         <span class="comment"># daemon + claiming worker</span>
+    <p>A fleet worker takes work from other machines over its <strong>fleet listener</strong>: a second port the daemon opens on the machine's own tailnet address (never <code>0.0.0.0</code>, never loopback, and not behind Tailscale Serve, which would make every caller look like the machine itself). A request is run only when <strong>both</strong> checks pass:</p>
+    <ul>
+      <li><strong>The fleet token.</strong> It is the serve token (Keychain item <code>darkmux-serve-token</code>, or <code>DARKMUX_SERVE_TOKEN</code>), one value shared by every machine in the fleet. The check is that the caller holds that shared token. That keeps out something on an allowed machine that cannot read it (an agent container can reach tailnet addresses, but not the Keychain). It is not proof the caller is darkmux: any process running as your user can read the Keychain item, and <code>machine list --deep</code> sends the same token to every machine in the roster.</li>
+      <li><strong>The sending machine, as the network reports it.</strong> The worker asks Tailscale which node is on the other end of the connection (<code>tailscale whois</code>), and accepts only a node on its own allow-list, <code>fleet.accept_work</code>. Deny by default: a node that is not listed runs nothing, token or not.</li>
+    </ul>
+    <p>Each allow-list entry also has a <strong>scope</strong>: the profiles (on the worker) that machine may run. A profile outside it is refused, and so is a profile that runs on the worker's utility model: utility work (compaction, radio routing) always stays on the machine it serves.</p>
+    <pre><code><span class="comment"># On the worker (say the studio). The fleet token first, if it has none:</span>
+security add-generic-password -U -a "$USER" -s darkmux-serve-token -w   <span class="comment"># same value on every machine</span>
+darkmux config set runtime.daemon_auth_enabled true
 
-<span class="comment"># Confirm it's serving + claiming:</span>
-darkmux doctor 2>&amp;1 | grep -i "daemon reachable"   <span class="comment"># ✓</span></code></pre>
-    <p>The worker enables itself because Redis is configured, and shares a consumer group with every other worker on the fleet, so each job goes to exactly one of them. To take the machine back out of the pool, <code>brew services stop darkmux</code>: it reverts to a Part 1 observability peer (records still flow, it just stops claiming).</p>
-    <p>Because the queue is first-available, any worker can claim any job. Match a worker to the work you send the fleet: a small box is great for light dispatches, but a big-model job that lands on it will run out of memory. If you want a machine to take only the work you hand it, keep it a Part 1 peer and dispatch on it directly.</p>
-    <p>Register it in the hub's roster so it shows in <code>machine list</code>, and add the hub to the peer's roster. Use each machine's tailnet <strong>DNS name</strong>, not its IP — a peer that later sits behind <a href="always-on-hub.html#viewer">Tailscale Serve</a> routes by Host header, so a bare IP gets Tailscale's own 404 even though the daemon is healthy:</p>
+<span class="comment"># Trust the laptop for two profiles and two roles. The node is looked up on the tailnet by name</span>
+<span class="comment"># (the laptop's roster address, or --node &lt;its tailnet name&gt;); you never type its id.</span>
+darkmux machine trust laptop --profiles host,coder-studio --roles radio-host,coder
+
+<span class="comment"># Open the listener (port 8766 by default; use the same port on every machine).</span>
+darkmux config set fleet.listener.enabled true
+brew services restart darkmux
+
+darkmux doctor 2&gt;&amp;1 | grep -i fleet   <span class="comment"># fleet token / identity / listener / trust rows</span></code></pre>
+    <p>Then, from the laptop (the fleet token in its Keychain too, and the studio in its roster, below):</p>
+    <pre><code>darkmux dispatch radio-host "summarize today's runs" --machine studio --profile host</code></pre>
+    <p>With <code>--wait</code> (the default) the command returns when the studio's dispatch finishes, with its exit code and output. <code>--no-wait</code> returns as soon as the studio accepts the job. A refusal comes back immediately, naming the reason: <code>studio does not accept work from macbook-pro</code>, <code>not in the allow-list scope: profile coder-big</code>, or <code>studio is busy running &lt;session&gt;</code> (a worker runs one submitted job at a time). <code>darkmux machine untrust laptop</code> takes the laptop back off the list; both verbs take effect on the next request, with no restart. Removing a machine from the tailnet revokes it everywhere, and rotating the fleet token is one secret to redistribute.</p>
+    <p>What an entry grants, exactly. <strong>Roles:</strong> only the roles listed (a role is a tool palette; there is no "any role", and utility roles are refused). <strong>Images:</strong> the job runs on darkmux's own runtime image unless it names one the entry lists with <code>--images</code>. <strong>Workspace:</strong> <code>--workspace true</code> lets the peer mount any directory under this machine's darkmux worktrees base read-write as the job's workspace, including live worktrees your own git and test commands later run in. In effect that lets the peer run code on this machine, so grant it only to a machine you would give a shell; the default is none. (darkmux does not yet exclude worktrees that local missions are using.) A submitted job never mounts this machine's shared toolchain cache, so nothing it writes is run by your own later dispatches. <strong>One job at a time:</strong> a trusted peer that keeps resubmitting can keep the slot busy; that is accepted in a model where every trusted peer is yours.</p>
+    <div class="callout warn">
+      <strong>Upgrade every machine.</strong> A 3.x daemon still claims work off the old Redis queue (<code>darkmux:work</code>) and re-creates it when it starts, so the unauthenticated queue stays open until no machine runs 3.x. <code>darkmux doctor</code> names any daemon still consuming it. Mixed versions also do not talk: a 4.0 machine sending to a 3.x one gets "no answer" (3.x has no fleet listener), and a 3.x machine's <code>--machine</code> dispatch waits on a queue no 4.0 machine reads, until its timeout.
+    </div>
+    <p>The sender checks the receiver too. Every request that carries the fleet token (a <code>--machine</code> dispatch, <code>machine status</code>/<code>resources &lt;id&gt;</code>, <code>machine list --deep</code>, and the daemon's peer mission-graph proxy) first resolves the roster address, asks Tailscale which node is there, and refuses unless it is a tailnet node; the first contact pins that node in the roster (as <code>machine add</code> does), every later request checks it is the same node, and the connection goes to that verified address. Only this machine's own daemon and loopback (same-host) entries skip the check, and those never receive the token: whatever listens on a loopback port gets nothing (your own daemon does not ask for it from this machine), so reaching a peer through an ssh tunnel with the token is not supported. Anything a peer sends back has its control characters, bidirectional overrides and zero-width characters removed before it is printed; a field shown in a table or on one line also loses its newlines and tabs and is cut to its column, so a peer cannot print a line of its own.</p>
+    <p>The listener protects itself too: at most 32 connections at once and 3 per peer address, 3 seconds to send the request headers, at most 4 requests in flight per trusted machine once it is identified, and refusals logged at most 5 per peer per minute (the rest are counted and reported each minute). A node that routes a subnet can spread connections over many addresses, so the per-address cap bounds a single address, not a single node; the per-machine cap applies only after the token and identity checks. A job from another machine is never attributed to one of this machine's missions (its phase id is dropped).</p>
+    <div class="callout">
+      <strong>Fail closed.</strong> If Tailscale cannot say who is calling (it is stopped, logged out, or the connection came over the office LAN rather than the tailnet), the request is refused. A hardware id is never used to decide: every flow record carries one, so any machine could repeat it.
+    </div>
+    <p>Register each machine in the others' rosters: a sender finds a worker's address there (the host of the roster address, on <code>fleet.listener.port</code>), and <code>machine list</code> shows it. Use each machine's tailnet <strong>DNS name</strong>, not its IP — a peer that later sits behind <a href="always-on-hub.html#viewer">Tailscale Serve</a> routes by Host header, so a bare IP gets Tailscale's own 404 even though the daemon is healthy:</p>
     <pre><code><span class="comment"># On the hub:</span>
 darkmux machine add mini-1 --address &lt;peer-tailnet-dns-name&gt;:8765
 <span class="comment"># On the peer:</span>
@@ -141,8 +162,9 @@ darkmux machine list</code></pre>
 </figure>
 
     <ul>
-      <li><strong>Identity:</strong> each machine declares a logical fleet name (<code>machine_id</code>). That's what flow records carry and what <code>--machine</code> hints reference.</li>
-      <li><strong>Coordination:</strong> the hub's Redis carries two stream classes: <code>darkmux:work</code> (the global job queue; workers claim via a shared consumer group) and <code>darkmux:flow</code> (the fleet-wide event log; every machine writes, any daemon's <code>/flow</code> endpoint reads).</li>
+      <li><strong>Identity:</strong> each machine declares a fleet name (<code>machine_id</code>). That's what flow records carry, what <code>--machine</code> names, and what a worker's allow-list is keyed by. Who a caller actually IS comes from the network, not from that name.</li>
+      <li><strong>Work:</strong> machine to machine, over each worker's fleet listener, gated by the fleet token and the worker's allow-list.</li>
+      <li><strong>Records:</strong> the hub's Redis carries <code>darkmux:flow</code>, the fleet-wide event log; every machine writes, any daemon's <code>/flow</code> endpoint reads. (Before 4.0 it also carried <code>darkmux:work</code>, a job queue any node that could write Redis could fill. That queue is retired; <code>darkmux doctor</code> names it if it is still there, with the command that deletes it.)</li>
       <li><strong>Observability:</strong> any daemon hosts the live viewer at <code>http://localhost:8765/</code>; with Redis configured it aggregates events from every machine on the shared stream. The <a href="../demo/">demo at darkmux.com/demo</a> shows the bundled showcase. <code>darkmux machine list --deep</code> is the same per-machine view from the terminal.</li>
     </ul>
     <pre><code>darkmux machine list --deep</code></pre>
@@ -153,7 +175,7 @@ studio         studio:8765            ✓ 45ms     12 GB       macos aarch64   1
 
     <div class="callout warn">
       <strong>Scope: single operator, multiple machines.</strong>
-      <p style="margin: 6px 0 0;">The trust boundary is your tailnet (Tailscale / WireGuard / ZeroTier), not enforcement in darkmux's code. The fleet's Redis connection carries no auth beyond what your mesh VPN + Redis bind already provide; provenance fields are operator-asserted. This works because everyone on the substrate is you. Multi-tenant deployment is explicitly out of scope; see <a href="https://github.com/kstrat2001/darkmux/blob/main/DESIGN.md">DESIGN.md</a>.</p>
+      <p style="margin: 6px 0 0;">Work submission checks two things itself: the fleet token, and the sending node as Tailscale reports it against the worker's allow-list. Everything else leans on your tailnet as the boundary: the fleet's Redis record stream carries no auth beyond what your tailnet and the Redis bind provide, and provenance fields in records are operator-asserted. This works because everyone on the substrate is you. Multi-tenant deployment is explicitly out of scope; see <a href="https://github.com/kstrat2001/darkmux/blob/main/DESIGN.md">DESIGN.md</a>.</p>
     </div>
   </div>
 </section>
@@ -164,10 +186,12 @@ studio         studio:8765            ✓ 45ms     12 GB       macos aarch64   1
     <p>The substrate degrades gracefully. Knowing the modes saves you confused debugging.</p>
 
     <h3>Hub drops off the network</h3>
-    <p>The most common failure. Peers' flow writes fall back to local-file-only (records still land on disk per-machine; the Redis sink errors are logged + skipped). Cross-machine dispatch from a Part 2 worker bails loud. <code>darkmux doctor</code> reports the Redis sink unreachable. An open viewer tab's live tail retries for a bounded budget (~5s), emits a synthetic <code>stream.error</code>, and closes cleanly rather than spinning forever. Recovery: bring the hub back; the substrate self-heals on the next operation, no manual intervention.</p>
+    <p>The most common failure. Peers' flow writes fall back to local-file-only (records still land on disk per-machine; the Redis sink errors are logged + skipped). Work submission does not go through the hub, so a dispatch between two other machines keeps working. <code>darkmux doctor</code> reports the Redis sink unreachable. An open viewer tab's live tail retries for a bounded budget (~5s), emits a synthetic <code>stream.error</code>, and closes cleanly rather than spinning forever. Recovery: bring the hub back; the substrate self-heals on the next operation, no manual intervention.</p>
 
-    <h3>"Why didn't my dispatch land where I expected?"</h3>
-    <p>Because <code>--machine</code> is advisory, not a pin (see <a href="#dispatch-to-peer">above</a>). A routed dispatch emits a <code>dispatch route</code> flow record; filter the viewer for <code>action: dispatch route</code>. The payload shows <code>target_machine</code> and <code>decision</code> (<code>pinned</code> for an explicit <code>--machine</code> hint, <code>local</code> for a local fall-through). The substrate's reasoning is in the record, not hidden.</p>
+    <h3>"My dispatch to another machine was refused"</h3>
+    <p>The refusal names the reason, and each has one fix. <strong>The fleet token is missing or does not match:</strong> both machines need the same serve token. <strong>does not accept work from &lt;node&gt;:</strong> on the worker, <code>darkmux machine trust &lt;name&gt; --profiles …</code>. <strong>not in the allow-list scope:</strong> add the profile to that entry, or send <code>--profile</code> with one in scope. <strong>cannot tell which machine sent this request:</strong> Tailscale is not answering on the worker. <strong>did not come from a node on the tailscale network:</strong> the sender reached the worker some other way (the LAN); use the tailnet DNS name in the roster. <strong>this is &lt;x&gt;, not &lt;y&gt;:</strong> the sender's roster points at the wrong host. A routed dispatch also emits a <code>dispatch route</code> flow record on the sender (<code>target_machine</code>, <code>decision</code>).</p>
+    <h3>No answer at all</h3>
+    <p>"no answer from http://…:8766" means nothing is listening there: the worker's listener is off, its daemon is not running, or the two machines use different <code>fleet.listener.port</code> values. <code>darkmux doctor</code> on the worker has a <code>fleet listener</code> row.</p>
 
     <h3>Two operators on the same machine</h3>
     <p>Out of scope. <code>machine_id</code> is per-machine, not per-user. If you need per-user provenance on a shared Mac, darkmux has outgrown its target: fork it.</p>

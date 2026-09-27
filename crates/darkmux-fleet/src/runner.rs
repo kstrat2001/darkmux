@@ -1,65 +1,37 @@
-//! Fleet runner loop — claims jobs off the global work-stream and dispatches them.
+//! Running a submitted job on this machine (#2916).
+//!
+//! The work-submission listener (`darkmux-serve`'s `fleet_listener.rs`)
+//! admits a request, checks its scope, and hands the job here. Until 4.0 the
+//! same code sat behind a Redis claim loop (`darkmux:work`, consumer group
+//! `darkmux-runners`); that loop is gone, because the queue could not say
+//! who wrote an entry. What survived is the execution: the shape check, the
+//! workdir containment guard, and `dispatch_reconciled`, unchanged.
 
-use crate::{ack_job, claim_job, init_consumer_group, ClaimOutcome, ClaimedJob, WorkJob, WORK_STREAM};
+use crate::WorkJob;
+use anyhow::{Context, Result};
+use darkmux_crew::dispatch::DispatchResult;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
-// ─── Daemon runner loop (PR-C.2) ──────────────────────────────────────
-//
-// Runs on a dedicated `std::thread` (not a tokio task) inside the
-// `darkmux serve` daemon. Polls the single global `darkmux:work` stream
-// (#590) via XREADGROUP with a short BLOCK budget; on claim, invokes the
-// existing synchronous `crew::dispatch::dispatch(opts)` and acks on
-// completion. The dispatch path is unchanged — whether work arrives via
-// local CLI invocation OR queue claim, it lands at the same entry point.
-//
-// **Why a dedicated thread, not a tokio task:** the redis crate (sync)
-// + `crew::dispatch::dispatch` (spawns a Docker container, blocks 5+
-// minutes) would saturate the tokio executor. The thread runs
-// independently of the axum server's runtime.
-
-/// Consumer group name used by all darkmux runners. Combined with the
-/// single global stream name, every runner shares the group →
-/// exactly-one-consumer-per-job delivery.
-pub(crate) const RUNNER_CONSUMER_GROUP: &str = "darkmux-runners";
-
-/// XREADGROUP BLOCK budget per poll. 2 seconds is short enough that
-/// shutdown latency is bounded (the runner rechecks the shutdown flag
-/// every BLOCK round) and long enough that a quiet queue doesn't
-/// hot-spin Redis. (#246 PR-C.2)
-const RUNNER_BLOCK_MS: u64 = 2_000;
-
-/// (#2476 review round 2, MUST FIX 3) True while this thread is inside
-/// its one synchronous `crew::dispatch::dispatch()` call — the span that
-/// covers `dispatch_internal.rs`'s own post-wait interrupt check
-/// (`is_set() && !status.success()`, the thing that actually issues
-/// `docker kill <container>`; `kill_all` alone only kills the `docker
-/// run` CLIENT process, never the container — see
-/// `darkmux_serve::reap_dispatch_children_on_shutdown`'s own doc). The
-/// daemon's shutdown path polls [`dispatch_in_flight`], bounded, after
-/// signaling the interrupt, so that post-wait check gets a real window
-/// to run before the process exits, rather than the process exiting the
-/// instant its own (unrelated) HTTP connection drain completes — which
-/// can be near-instant on an idle daemon and has nothing to do with
-/// whether this SEPARATE, unjoined `std::thread` has reacted to the
-/// interrupt yet. Only one dispatch runs on this thread at a time (the
-/// claim/dispatch/ack loop is strictly sequential), so a bare
-/// `AtomicBool` is sufficient — no counter needed.
+/// (#2476 review round 2, MUST FIX 3) True while a submitted job is inside
+/// its one synchronous `dispatch_reconciled` call — the span that covers
+/// `dispatch_internal.rs`'s own post-wait interrupt check (the thing that
+/// actually issues `docker kill <container>`). The daemon's shutdown path
+/// polls [`dispatch_in_flight`], bounded, after signaling the interrupt, so
+/// that check gets a real window to run before the process exits. The
+/// listener runs at most one submitted job at a time, so a bare
+/// `AtomicBool` is sufficient.
 static RUNNER_DISPATCH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
-/// True while the runner thread is inside `dispatch()` — see
-/// [`RUNNER_DISPATCH_IN_FLIGHT`]'s own doc. Read-only from any other
-/// thread or crate (`darkmux-serve`'s shutdown path is the one caller
-/// today).
+/// True while a submitted job is inside `dispatch()` — see
+/// [`RUNNER_DISPATCH_IN_FLIGHT`]'s own doc. `darkmux-serve`'s shutdown path
+/// is the one caller.
 pub fn dispatch_in_flight() -> bool {
     RUNNER_DISPATCH_IN_FLIGHT.load(Ordering::SeqCst)
 }
 
 /// RAII guard scoping [`RUNNER_DISPATCH_IN_FLIGHT`] to exactly the
-/// `dispatch()` call — set true on construction, false on drop,
-/// regardless of how the call returns (`Ok`, `Err`, or a panic the
-/// caller's own `catch_unwind` converts back into a normal return).
+/// `dispatch()` call, on every exit path including a panic.
 struct DispatchInFlightGuard;
 
 impl DispatchInFlightGuard {
@@ -75,317 +47,77 @@ impl Drop for DispatchInFlightGuard {
     }
 }
 
-/// Spawn the daemon runner thread. Returns the JoinHandle so callers
-/// can monitor (typically the daemon never joins — the runner runs
-/// for the daemon's lifetime and dies when the process exits).
+/// Run one admitted, in-scope job on THIS machine, on `profile` (the
+/// profile the scope check resolved and approved; never re-resolved here, so
+/// what runs is what was checked), for the peer `origin`.
 ///
-/// Reads two env vars at spawn time:
-/// - `DARKMUX_REDIS_URL` — required; absent → runner doesn't start
-///   (Redis presence is the participation gate, #590)
-/// - `DARKMUX_MACHINE_ID` — used as consumer name (per-machine identity)
+/// The shape is re-validated, and a `workdir` must resolve (symlinks and
+/// all) under this machine's darkmux worktrees base (#840): a sender can
+/// never bind-mount an arbitrary directory of this machine as `/workspace`.
+/// The validated CANONICAL path is what gets mounted, closing the TOCTOU
+/// window a re-resolution would reopen. The dispatch is marked
+/// remote-origin, so it never mounts this machine's shared toolchain cache.
 ///
-/// When prerequisites are missing, logs to stderr and returns a thread
-/// that exits immediately (caller still gets a JoinHandle). This keeps
-/// the daemon usable as an observability node even without queue
-/// participation — same posture as the existing single-machine-fleet
-/// default in `fleet status`.
-pub fn spawn_runner_thread() -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("darkmux-runner".to_string())
-        .spawn(runner_main)
-        .expect("spawn darkmux-runner thread")
+/// A dispatch that panics is caught and returned as an error, so one bad
+/// job cannot take the listener's worker down.
+pub fn execute_job(job: WorkJob, profile: String, origin: String) -> Result<DispatchResult> {
+    // (#2628) `dispatch_reconciled`, not the raw primitive: the listener runs
+    // one submitted job at a time, the single-writer shape its lease-write
+    // contract requires, so a submitted job gets the same Exclusive-reconcile
+    // + #1487 residency-lease protection a `darkmux dispatch` gets.
+    execute_job_with(job, profile, origin, darkmux_crew::dispatch_reconciled::dispatch_reconciled)
 }
 
-/// Run one claimed-job handler with panic isolation.
-///
-/// The dispatch path (`dispatch()` → Docker container spawn + downstream
-/// libs) can PANIC, not just return `Err`. Without a guard the panic unwinds
-/// this spawned thread and kills it: the daemon keeps serving every endpoint
-/// (and the presence heartbeat keeps emitting, so it looks healthy) while the
-/// machine silently stops claiming work forever. Catch the unwind so a single
-/// bad dispatch can't take the runner down.
-///
-/// Returns `true` if the handler completed (normally or with a handled `Err`),
-/// `false` if it panicked — the caller then XACKs to release the queue lease,
-/// since a panic aborts before the handler's own ack.
-fn run_with_panic_guard<F: FnOnce()>(work_id: &str, f: F) -> bool {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
-        Ok(()) => true,
-        Err(_) => {
-            eprintln!(
-                "{}",
-                darkmux_types::style::error(&format!(
-                    "darkmux-runner: dispatch PANICKED for work_id={work_id}; runner surviving. \
-                     XACK-ing to release the queue lease (the panic aborted before the normal ack)."
-                ))
-            );
-            false
-        }
-    }
-}
-
-/// Entry point for the runner thread. Reads env config, opens Redis,
-/// initializes the consumer group, then loops on claim/dispatch/ack.
-fn runner_main() {
-    // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
-    let Some(url) = darkmux_flow::redis_url() else {
-        eprintln!(
-            "darkmux-runner: Redis not configured (DARKMUX_REDIS_URL or \
-             config.redis.enabled) — fleet work queue disabled. \
-             Daemon continues as observability/serve node only."
-        );
-        return;
-    };
-
-    let machine_id = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
-
-    let client = match redis::Client::open(url.expose_for_probe()) {
-        Ok(c) => c,
-        Err(e) => {
-            // `{e:#}` walks the anyhow context chain — single-level
-            // `{e}` would hide the underlying redis-rs cause behind
-            // our `.with_context` wrapper. Operator needs the full
-            // chain to diagnose. (PR-C.2 review carry-over)
-            eprintln!(
-                "{}",
-                darkmux_types::style::warn(&format!(
-                    "darkmux-runner: failed to open Redis client ({url}): {e:#}. \
-                     Queue runner disabled."
-                ))
-            );
-            return;
-        }
-    };
-
-    if let Err(e) = init_consumer_group(&client, RUNNER_CONSUMER_GROUP) {
-        eprintln!(
-            "{}",
-            darkmux_types::style::warn(&format!(
-                "darkmux-runner: init_consumer_group on {WORK_STREAM} failed: {e:#}. \
-                 Queue runner disabled."
-            ))
-        );
-        return;
-    }
-
-    eprintln!(
-        "darkmux-runner: started — consumer={machine_id} \
-         stream={WORK_STREAM} group={RUNNER_CONSUMER_GROUP}"
-    );
-
-    loop {
-        match claim_job(&client, RUNNER_CONSUMER_GROUP, &machine_id, RUNNER_BLOCK_MS) {
-            Ok(ClaimOutcome::Empty) => {
-                // BLOCK timeout — no work. Loop and re-block.
-                continue;
-            }
-            Ok(ClaimOutcome::Job(claimed)) => {
-                // Isolate the dispatch: a panic here would otherwise unwind
-                // and kill this thread, silently ending queue participation.
-                let work_id = claimed.work_id.clone();
-                if !run_with_panic_guard(&work_id, || handle_claimed_job(&client, *claimed)) {
-                    // The handler panicked before its own ack — release the
-                    // lease so the entry doesn't sit pending forever. A second
-                    // XACK on an already-acked id is a harmless no-op. Log on
-                    // failure to match the normal-path ack's discipline.
-                    if let Err(e) = ack_job(&client, RUNNER_CONSUMER_GROUP, &work_id) {
-                        eprintln!(
-                            "{}",
-                            darkmux_types::style::warn(&format!(
-                                "darkmux-runner: fallback XACK after panic failed for {work_id}: {e:#}"
-                            ))
-                        );
-                    }
-                }
-            }
-            Ok(ClaimOutcome::Malformed { work_id, reason }) => {
-                // (#903) A poison entry: claimed into this consumer's PEL but
-                // unparseable, so it can NEVER be dispatched. ACK it to drop it
-                // from the pending-entries list — otherwise it sits pending
-                // forever (the `>` cursor never redelivers it) and the loop
-                // keeps going to the next entry. Log loudly: a malformed entry
-                // means a buggy or hostile peer published it, or, most likely,
-                // plain schema-version skew (#1426 ship-3: a pre-4 peer's job
-                // fails the version-first gate and lands here with a reason that
-                // NAMES the version and the fix).
-                eprintln!(
-                    "{}",
-                    darkmux_types::style::warn(&format!(
-                        "darkmux-runner: dropping work entry {work_id} ({reason}) — malformed \
-                         or from an incompatible darkmux schema version; XACK to clear it \
-                         from the pending-entries list and continue the claim loop"
-                    ))
-                );
-                let _ = ack_job(&client, RUNNER_CONSUMER_GROUP, &work_id);
-            }
-            Err(e) => {
-                // Genuine connection/protocol error — back off and retry.
-                eprintln!(
-                    "{}",
-                    darkmux_types::style::warn(&format!(
-                        "darkmux-runner: claim_job failed ({e}); backing off 1s"
-                    ))
-                );
-                std::thread::sleep(Duration::from_secs(1));
-            }
-        }
-    }
-}
-
-/// Validate, dispatch, and ack one claimed job. Errors are logged and
-/// the job is acked anyway — the `dispatch.complete` flow record (or
-/// its absence) is the operator-visible signal; the ack just releases
-/// the queue lease.
-fn handle_claimed_job(client: &redis::Client, claimed: ClaimedJob) {
-    let ClaimedJob { work_id, mut job } = claimed;
-    let session_id = job.session_id.clone();
-    let role_id = job.role_id.clone();
-    eprintln!(
-        "darkmux-runner: claimed work_id={work_id} role={role_id} \
-         session={session_id} target_machine={:?} attempt={}",
-        job.target_machine, job.attempt
-    );
-
-    // Boundary validation — reject malformed jobs at the consumer too,
-    // even though `publish_job` validated. Belt-and-braces against a
-    // hostile publisher who bypassed our publish path.
-    if let Err(e) = job.validate() {
-        eprintln!(
-            "{}",
-            darkmux_types::style::warn(&format!(
-                "darkmux-runner: REJECTED claimed job {work_id}: {e:#}. \
-                 Acking to release queue lease; dispatch NOT invoked."
-            ))
-        );
-        let _ = ack_job(client, RUNNER_CONSUMER_GROUP, &work_id);
-        return;
-    }
-
-    // Workdir symlink-escape guard via the shared validator (Wave-E.2 /
-    // #255) + base-containment check (#840). Queue-originated jobs
-    // must have workdir under the per-machine darkmux worktrees base;
-    // this prevents a tailnet publisher from bind-mounting an arbitrary
-    // runner directory as /workspace.
-    //
-    // On success we OVERWRITE job.workdir with the validated CANONICAL
-    // path so the dispatch path mounts exactly the inode we blessed —
-    // not a re-resolution of the original string. Re-resolving downstream
-    // would reopen a TOCTOU window (a base-internal component swapped
-    // between this check and mount time); pinning the canonical result
-    // here closes it and matches the validator's documented contract
-    // ("use the returned canonical path for any subsequent fs operation").
+/// [`execute_job`] with the dispatch primitive injected, so what reaches
+/// dispatch (the resolved profile, the remote origin, the validated
+/// workdir) is testable without a container.
+pub fn execute_job_with(
+    mut job: WorkJob,
+    profile: String,
+    origin: String,
+    dispatch: impl FnOnce(darkmux_crew::dispatch::DispatchOpts) -> Result<DispatchResult>,
+) -> Result<DispatchResult> {
+    job.validate().context("the job failed its shape check")?;
     if let Some(workdir_str) = &job.workdir {
-        let path = std::path::Path::new(workdir_str);
-        match darkmux_types::workdir::validate_remote_workdir(path) {
-            Ok(canonical) => {
-                job.workdir = Some(canonical.to_string_lossy().into_owned());
-            }
-            Err(e) => {
-                eprintln!(
-                    "{}",
-                    darkmux_types::style::warn(&format!(
-                        "darkmux-runner: REJECTED claimed job {work_id}: workdir validation failed: {e:#}. \
-                         Acking to release queue lease; dispatch NOT invoked."
-                    ))
-                );
-                let _ = ack_job(client, RUNNER_CONSUMER_GROUP, &work_id);
-                return;
-            }
-        }
+        let canonical = darkmux_types::workdir::validate_remote_workdir(std::path::Path::new(workdir_str))
+            .context("workdir validation failed")?;
+        job.workdir = Some(canonical.to_string_lossy().into_owned());
     }
-
-    // Optional target_machine pre-claim hint: when set, the publisher
-    // asserted this specific machine should handle the job. If it
-    // doesn't match the local machine_id, log a warning but proceed —
-    // the queue already gave us the claim, refusing would orphan the
-    // job (PR-E will handle this properly via lease re-publish).
-    let local_machine = darkmux_flow::resolve_machine_id();
-    if let Some(target) = &job.target_machine {
-        if local_machine.as_deref() != Some(target.as_str()) {
-            eprintln!(
-                "{}",
-                darkmux_types::style::warn(&format!(
-                    "darkmux-runner: target_machine={target:?} doesn't match \
-                     local machine_id={local_machine:?}; proceeding (queue \
-                     already claimed; PR-E will add lease re-publish)."
-                ))
-            );
-        }
-    }
-
-    // Convert + dispatch. The dispatch function is synchronous and may
-    // block several minutes for long-agentic dispatches.
-    let opts = job.into_dispatch_opts();
-    // (#2476 review round 2, MUST FIX 3) Scoped tightly to the dispatch
-    // call itself — see `DispatchInFlightGuard`'s and
-    // `RUNNER_DISPATCH_IN_FLIGHT`'s own docs. The flag goes false the
-    // instant `dispatch()` returns, not when this whole function (ack
-    // included) finishes.
-    //
-    // (#2628) `dispatch_reconciled`, not the raw `crew::dispatch::dispatch`
-    // primitive: `runner_main`'s claim/dispatch/ack loop (above) is
-    // strictly serial — one claimed job dispatched at a time, never
-    // concurrently with another job in this same process — so this is
-    // exactly the single-writer shape `dispatch_reconciled`'s lease-write
-    // contract requires. Gives a queue-claimed job the same Exclusive-
-    // reconcile + #1487 residency-lease protection a `darkmux dispatch`
-    // CLI verb or mission step gets, closing the gap #1509's own doc
-    // named as a follow-up for this runner.
-    let dispatch_result = {
+    let mut opts = job.into_dispatch_opts();
+    opts.profile_name = Some(profile);
+    opts.remote_origin = Some(origin);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _in_flight = DispatchInFlightGuard::new();
-        darkmux_crew::dispatch_reconciled::dispatch_reconciled(opts)
-    };
-
-    match dispatch_result {
-        Ok(outcome) => {
-            eprintln!(
-                "darkmux-runner: dispatched work_id={work_id} → exit_code={} \
-                 stdout_bytes={} stderr_bytes={}",
-                outcome.exit_code,
-                outcome.stdout.len(),
-                outcome.stderr.len(),
-            );
-        }
-        Err(e) => {
-            eprintln!(
-                "{}",
-                darkmux_types::style::error(&format!(
-                    "darkmux-runner: dispatch ERROR work_id={work_id}: {e:#}. \
-                     Acking to release queue lease; dispatch.complete flow \
-                     record carries the failure detail."
-                ))
-            );
-        }
-    }
-
-    if let Err(e) = ack_job(client, RUNNER_CONSUMER_GROUP, &work_id) {
-        eprintln!("{}", darkmux_types::style::warn(&format!("darkmux-runner: XACK failed for {work_id}: {e:#}")));
+        dispatch(opts)
+    }));
+    match result {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::anyhow!("the dispatch panicked; the listener survived it")),
     }
 }
 
 impl WorkJob {
-    /// Convert a claimed `WorkJob` into the `DispatchOpts` shape the
-    /// `crew::dispatch::dispatch` entry point consumes. Centralizes the
-    /// queue → in-process boundary so PR-C.3's client path can be checked
-    /// against this shape for round-trip parity.
+    /// Convert a received `WorkJob` into the `DispatchOpts` shape the
+    /// dispatch entry point consumes: the one wire → in-process boundary.
     pub fn into_dispatch_opts(self) -> darkmux_crew::dispatch::DispatchOpts {
         use darkmux_crew::dispatch::DispatchOpts;
         DispatchOpts {
             // (#2914) Work never runs on the utility model.
             allow_utility_model: false,
+            remote_origin: None,
             // (#2265) A cross-machine job carries its brief as TEXT, so a
             // `--finding`-briefed dispatch still reaches the runner with the
             // finding's record inside `message`; only the keys field — this
             // machine's provenance note about where that text came from — does
-            // not cross the queue, because `WorkJob` does not carry it.
+            // not cross the wire, because `WorkJob` does not carry it.
             brief_refs: Vec::new(),
             workspace_read_only: false,
             record_context: None,
             resume_from: None,
             host_out: None,
             max_turns_override: None,
-            // (#2480 review, finding 7) `--timeout` does NOT cross the fleet
-            // queue: `WorkJob` carries no field for it (adding one is a real
+            // (#2480 review, finding 7) `--timeout` does NOT cross to the
+            // other machine: `WorkJob` carries no field for it (adding one is a real
             // wire break — the struct is `deny_unknown_fields` under a
             // versioned `WORK_JOB_SCHEMA_VERSION`), so a cross-machine
             // dispatch runs on the RUNNER's own
@@ -410,8 +142,8 @@ impl WorkJob {
             json: false,
             workdir: self.workdir.map(PathBuf::from),
             phase_id: self.phase_id,
-            // Runner-side opts: never recurse into the queue (would
-            // ping-pong jobs back to redis); always run local synchronous.
+            // A received job runs HERE: never forwarded to another machine
+            // (that would bounce jobs between machines); always synchronous.
             machine: None,
             wait: true,
             // Fleet-deserialized dispatch jobs: producer didn't
@@ -420,12 +152,9 @@ impl WorkJob {
             // the job payload if cross-machine compaction tuning
             // becomes a real requirement.
             compaction: darkmux_crew::dispatch::CompactionDispatchArgs::default(),
-            // (#549) Fleet-deserialized jobs don't carry a `--profile`
-            // override (pre-#549 wire shape) — the runner resolves against
-            // its local `default_profile`. Future iteration could propagate
-            // via the job payload if cross-machine profile selection becomes
-            // a requirement.
-            profile_name: None,
+            // (#2916) The job's own `profile` request; `execute_job`
+            // replaces it with the profile the scope check resolved.
+            profile_name: self.profile,
             // (#984) Fleet-deserialized jobs don't carry a profiles-file
             // either — the runner resolves against its local registry.
             config_path: None,
@@ -448,24 +177,75 @@ impl WorkJob {
 
 #[cfg(test)]
 mod tests {
-    use super::run_with_panic_guard;
+    use super::*;
 
-    #[test]
-    fn panic_guard_catches_panic_and_reports_false() {
-        // A panicking dispatch must be CAUGHT (returns false), not propagated:
-        // propagation unwinds the runner thread and permanently ends queue
-        // participation. (The default panic hook prints the simulated panic
-        // below; that stderr line is expected test noise.)
-        let completed = run_with_panic_guard("w-panic", || panic!("simulated dispatch panic"));
-        assert!(!completed, "a panicking dispatch must be caught, not propagated");
+    fn job() -> WorkJob {
+        WorkJob {
+            target_machine: "studio".into(),
+            role_id: "coder".into(),
+            message: "m".into(),
+            session_id: "s".into(),
+            profile: Some("host".into()),
+            workdir: None,
+            phase_id: Some("p".into()),
+            image: Some("rust:slim".into()),
+            timeout_seconds: 60,
+            published_at_unix_ms: 1,
+            published_by_machine: None,
+        }
     }
 
+    /// The conversion carries what crosses and never recurses to another
+    /// machine.
     #[test]
-    fn panic_guard_runs_and_reports_normal_completion() {
-        let mut ran = false;
-        let completed = run_with_panic_guard("w-ok", || ran = true);
-        assert!(completed, "a normal handler reports completion");
-        assert!(ran, "the handler closure must actually run");
+    fn into_dispatch_opts_carries_the_job_and_never_reroutes() {
+        let o = job().into_dispatch_opts();
+        assert_eq!(o.role_id, "coder");
+        assert_eq!(o.profile_name.as_deref(), Some("host"));
+        assert_eq!(o.session_id.as_deref(), Some("s"));
+        assert_eq!(o.phase_id.as_deref(), Some("p"));
+        assert_eq!(o.image.as_deref(), Some("rust:slim"));
+        assert!(o.machine.is_none(), "a received job runs here; it is never forwarded");
+        assert!(!o.allow_utility_model);
+    }
+
+    /// A job that fails its shape check never reaches dispatch.
+    #[test]
+    fn execute_job_refuses_a_malformed_job_before_dispatch() {
+        let mut j = job();
+        j.role_id = "../x".into();
+        let err = execute_job_with(j, "host".into(), "laptop".into(), |_| panic!("never dispatched")).unwrap_err();
+        assert!(format!("{err:#}").contains("shape check"), "{err:#}");
+        assert!(!dispatch_in_flight());
+    }
+
+    /// A workdir outside the worktrees base is refused before dispatch.
+    #[test]
+    fn execute_job_refuses_a_workdir_outside_the_worktrees_base() {
+        let mut j = job();
+        j.workdir = Some("/etc".into());
+        let err = execute_job_with(j, "host".into(), "laptop".into(), |_| panic!("never dispatched")).unwrap_err();
+        assert!(format!("{err:#}").contains("workdir"), "{err:#}");
+    }
+
+    /// (#2916 review C3/M2) What reaches dispatch: the RESOLVED profile
+    /// (not the job's own request), the remote origin, never a forward.
+    #[test]
+    fn execute_job_hands_dispatch_the_resolved_profile_and_the_origin() {
+        let mut seen = None;
+        let r = execute_job_with(job(), "resolved-host".into(), "laptop".into(), |o| {
+            seen = Some((o.profile_name.clone(), o.remote_origin.clone(), o.machine.clone()));
+            Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: "s".into(), out_dir: None })
+        });
+        assert!(r.is_ok());
+        assert_eq!(seen, Some((Some("resolved-host".into()), Some("laptop".into()), None)));
+    }
+
+    /// A panicking dispatch is caught, reported, and the in-flight flag clears.
+    #[test]
+    fn execute_job_survives_a_panicking_dispatch() {
+        let err = execute_job_with(job(), "host".into(), "laptop".into(), |_| panic!("boom")).unwrap_err();
+        assert!(format!("{err:#}").contains("panicked"));
+        assert!(!dispatch_in_flight());
     }
 }
-

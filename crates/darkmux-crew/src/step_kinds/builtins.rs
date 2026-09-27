@@ -483,6 +483,7 @@ pub(crate) fn dispatch_opts_for(
     let opts = DispatchOpts {
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
+        remote_origin: None,
         brief_refs,
         workspace_read_only: false,
         record_context: None,

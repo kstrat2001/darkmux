@@ -173,6 +173,7 @@ fn oversize_phase_aborts_publish_with_no_orphans() {
         .args([
             "mission", "dispatch", "m-oversize-test",
             "--role", "tdd-coder",
+            "--machine", "node-b",
             "--no-wait",
         ])
         .output()
@@ -190,9 +191,8 @@ fn oversize_phase_aborts_publish_with_no_orphans() {
         "expected validation error message; stderr={stderr}"
     );
 
-    // Critical assertion: NO phases published. The all-or-nothing
-    // invariant means even the well-formed `phase-normal` did not
-    // land on Redis. Net XADD count for our stream after the failed
+    // Critical assertion: NO phases published, and (#2916) nothing lands
+    // on the retired queue either. Net XADD count for our stream after the failed
     // dispatch must equal the pre-dispatch count (typically 0).
     let post_xlen = xlen(harness.redis_url(), "darkmux:work");
     assert_eq!(
@@ -202,10 +202,10 @@ fn oversize_phase_aborts_publish_with_no_orphans() {
          A future refactor must NOT publish ANY phase when ANY phase trips validation."
     );
 
-    // Bonus: ORPHAN-list message must NOT appear (we never had orphans
-    // to report; if it does appear, the test fixture / fix is inconsistent).
+    // (#2916) Nor was anything submitted: a submission to `node-b` (not in
+    // this node's roster) would have reported the phase as "not run".
     assert!(
-        !stderr.contains("ORPHAN"),
-        "no ORPHAN message expected when validation prevents any publish; stderr={stderr}"
+        !stderr.contains("not run:"),
+        "no submission may be attempted when validation fails; stderr={stderr}"
     );
 }

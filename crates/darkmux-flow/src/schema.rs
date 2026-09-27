@@ -2108,11 +2108,10 @@ pub struct FlowRecord {
     /// FlowRecord fields, just not the event-specific extras.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
-    /// Work-queue claim id when this record was produced by a job that
-    /// flowed through the global `darkmux:work` stream. Absent on direct
-    /// local dispatches (the operator ran `darkmux dispatch <role>`
-    /// with no `--machine`). Populated by the dispatch path when it claims
-    /// work from the queue. Schema 1.8 addition (#246).
+    /// Work-queue claim id, from when a job could flow through the global
+    /// `darkmux:work` stream. That queue is retired (#2916), so no current
+    /// producer sets it; kept so archived records still parse. Schema 1.8
+    /// addition (#246).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub work_id: Option<String>,
     /// Retry counter for queued work — 1 on first attempt, 2+ on retries

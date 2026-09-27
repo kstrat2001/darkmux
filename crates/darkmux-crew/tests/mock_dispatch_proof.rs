@@ -263,6 +263,7 @@ fn run_mock_dispatch(
     let opts = DispatchOpts {
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
+        remote_origin: None,
         brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,
@@ -755,6 +756,7 @@ fn run_mock_dispatch_with_timeout_override(
     let opts = DispatchOpts {
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
+        remote_origin: None,
         brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,

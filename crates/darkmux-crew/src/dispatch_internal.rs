@@ -1124,6 +1124,19 @@ pub(crate) fn apply_runtime_injection(args: &mut Vec<String>, binary: &Path) {
     args.push("/darkmux-runtime".to_string());
 }
 
+/// (#2916) The shared toolchain cache a dispatch mounts: this machine's
+/// cache for work started here, NONE for work another machine submitted.
+/// The cache is writable and every later local dispatch (with a real
+/// worktree) runs whatever it holds (`CARGO_HOME` binaries, build scripts'
+/// inputs), so a peer that may not touch this machine's workspaces must
+/// not be able to write it either.
+pub(crate) fn shared_cache_dir_for(remote_origin: Option<&str>) -> Option<std::path::PathBuf> {
+    match remote_origin {
+        Some(_) => None,
+        None => Some(darkmux_types::config_access::cache_dir()),
+    }
+}
+
 /// (#703 Slice 3) Mount the shared toolchain cache at `/darkmux-cache` and
 /// point the language package managers at it, so the inner verify loop doesn't
 /// re-download deps on every dispatch. The registry/download caches are
@@ -1802,8 +1815,10 @@ pub struct DockerRunConfig {
     pub feedback_templates: serde_json::Value,
     /// Host path bind-mounted at `/darkmux-cache` (the shared toolchain
     /// cache). Resolved + created at the call site so the inner verify loop
-    /// reuses downloaded deps across dispatches (#703 Slice 3).
-    pub cache_dir: std::path::PathBuf,
+    /// reuses downloaded deps across dispatches (#703 Slice 3). `None` (#2916)
+    /// for a job another machine submitted: no shared cache is mounted, so
+    /// nothing it writes outlives its own container.
+    pub cache_dir: Option<std::path::PathBuf>,
     /// (#1548) The resolved `feedback_injection` setting
     /// (`darkmux_types::config_access::feedback_injection()`), forwarded into
     /// the container as `-e DARKMUX_FEEDBACK_INJECTION=<true|false>`. Before
@@ -2001,7 +2016,9 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     // per-dispatch `--rm` container (#703 Slice 3). A bare `/darkmux-cache`
     // (no host:container colon) would be an anonymous volume discarded on
     // --rm — i.e. no caching at all.
-    apply_cache_mount(&mut args, &config.cache_dir);
+    if let Some(cache) = &config.cache_dir {
+        apply_cache_mount(&mut args, cache);
+    }
 
     // (#1548) Forward the resolved `feedback_injection` setting into the
     // container — the piece that was missing pre-#1548: the config accessor
@@ -4104,10 +4121,9 @@ impl Drop for PidRegistration {
 /// stores skips every one of them. The flag stays false, and the thread
 /// it gates — a SEPARATE OS thread that does NOT die with a caught panic
 /// — keeps running forever in any process that survives the panic, which
-/// is the common case, not the rare one: the fleet runner's
-/// `run_with_panic_guard` (`darkmux-fleet::runner`, spawned by the serve
-/// daemon via `darkmux_fleet::spawn_runner_thread()` — ONE `catch_unwind`,
-/// not two independent ones) wraps a dispatch in `catch_unwind` for
+/// is the common case, not the rare one: `darkmux_fleet::execute_job` (the
+/// serve daemon's fleet listener runs every submitted job through it — ONE
+/// `catch_unwind`, not two independent ones) wraps a dispatch in `catch_unwind` for
 /// exactly this reason, so one bad dispatch doesn't take the whole
 /// long-lived process down. Catching the panic kills only the panicking
 /// thread; each of these three threads is separate and survives it. Left
@@ -5766,8 +5782,10 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // Shared toolchain cache: resolve the host dir + best-effort create so
     // the bind-mount target exists (#703 Slice 3). If create fails the mount
     // still works (docker creates the source) — just uncached.
-    let cache_dir = darkmux_types::config_access::cache_dir();
-    let _ = fs::create_dir_all(&cache_dir);
+    let cache_dir = shared_cache_dir_for(opts.remote_origin.as_deref());
+    if let Some(c) = &cache_dir {
+        let _ = fs::create_dir_all(c);
+    }
 
     // (#2480) Resolved ONCE here, and reused by all three consumers — the
     // container-forwarded `DARKMUX_INACTIVITY_TIMEOUT_SECONDS*` env vars

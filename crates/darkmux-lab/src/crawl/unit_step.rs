@@ -1486,6 +1486,7 @@ impl StepKind for CrawlUnitStepKind {
             let opts = DispatchOpts {
                 // (#2914) Work never runs on the utility model.
                 allow_utility_model: false,
+                remote_origin: None,
                 brief_refs: Vec::new(),
                 role_id: role_id.clone(),
                 message: message.clone(),

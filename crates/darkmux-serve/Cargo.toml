@@ -49,6 +49,13 @@ tempfile = "3.10"
 # `default-features = false` matches both existing usages: plain HTTP/1.1 +
 # timeouts, no TLS/gzip surface needed to reach a peer over the tailnet.
 ureq = { version = "2.10", default-features = false }
+# (#2916 review M1) The fleet listener serves each connection itself so it
+# can cap connections and bound header reads (`axum::serve` has neither).
+# Both are already in the tree under axum; named directly for the API.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "http1", "service"] }
+# (#2916 review M1) Raise RLIMIT_NOFILE's soft limit at daemon start.
+libc = "0.2"
 
 [dev-dependencies]
 serial_test = "3.1"
@@ -69,3 +76,5 @@ darkmux-types = { path = "../darkmux-types", features = ["test-support"] }
 # only, so the release binary never pulls `ts-rs` through these crates.
 darkmux-crew = { path = "../darkmux-crew", features = ["ts-export", "test-support"] }
 darkmux-lab = { path = "../darkmux-lab", features = ["ts-export"] }
+# (#2916) The fake identity provider the fleet listener's HTTP tests use.
+darkmux-fleet = { path = "../darkmux-fleet", features = ["test-support"] }

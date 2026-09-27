@@ -709,6 +709,7 @@ dependencies = [
  "darkmux-types",
  "dirs",
  "futures",
+ "libc",
  "predicates",
  "redis",
  "rusqlite",
@@ -784,12 +785,13 @@ dependencies = [
  "anyhow",
  "darkmux-crew",
  "darkmux-flow",
+ "darkmux-profiles",
  "darkmux-types",
- "redis",
  "serde",
  "serde_json",
  "serial_test",
  "tempfile",
+ "ureq",
 ]
 
 [[package]]
@@ -892,6 +894,9 @@ dependencies = [
  "darkmux-profiles",
  "darkmux-types",
  "futures",
+ "hyper 1.9.0",
+ "hyper-util",
+ "libc",
  "redis",
  "serde",
  "serde_json",

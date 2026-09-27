@@ -21,7 +21,7 @@ Before walking through join, confirm the operator's mental model lines up with w
 
 - **Per-machine roster.** Each machine has its OWN `~/.darkmux/fleet.json`. Adding this new machine to the fleet means: (a) configure this machine's env vars + roster to know about its peers, AND (b) run `darkmux machine add <this-machine-id>` on EACH of the operator's other existing machines so they see it too. Cross-machine roster replication is filed as [#280](https://github.com/kstrat2001/darkmux/issues/280) but not yet shipped — for now, the per-machine roster is the operator's hand-managed reality.
 - **Tailnet trust boundary.** darkmux assumes everyone reachable on the same `DARKMUX_REDIS_URL` is the same operator. No per-machine auth beyond the mesh VPN (Tailscale, etc.). See [README — "Who darkmux is for"](https://github.com/kstrat2001/darkmux#who-darkmux-is-for).
-- **Single global work stream (#590).** All fleet work routes onto one stream (`darkmux:work`); the first available runner claims any job. There's no machine-capacity tier to declare — a `--machine <id>` hint is advisory only.
+- **Work goes machine to machine, and only to machines that trust the sender (#2916).** `darkmux dispatch <role> --machine <id>` is sent straight to that machine's fleet listener with the fleet token (the serve token, one value on every machine). The receiver runs it only if its own allow-list (`darkmux machine trust <sender> --profiles ... --roles ...`, run ON the receiver) names the sending node as the tailnet reports it, and only for a profile in that entry's scope. There is no shared work queue any more; Redis carries flow records only.
 
 Tell the operator these points up-front, then continue.
 
@@ -177,6 +177,19 @@ For machines that should run `darkmux serve` (the daemon) continuously — typic
 
 The skill does NOT auto-create the launchd plist — operator-sovereignty; system services are the operator's territory.
 
+## Step 10 — Optional: let other machines send this one work (#2916)
+
+Only if the operator wants this machine to RUN work other machines send it. Propose, operator runs, on THIS machine:
+
+```bash
+darkmux machine trust <sender-machine-id> --profiles <profile>[,...] --roles <role>[,...]   # node resolved via tailscale, never typed
+darkmux config set fleet.listener.enabled true                             # port 8766 unless fleet.listener.port says otherwise
+brew services restart darkmux
+darkmux doctor 2>&1 | grep -i fleet
+```
+
+Needs the fleet token (Keychain item `darkmux-serve-token`, the same value as on the sender). The `fleet` doctor rows should read: token resolves, identity names this machine, listener listening on its tailnet address, and the sender listed with its scope. Never propose a profile that runs on the utility model: it is refused anyway, since utility work never crosses machines.
+
 ## Idempotency note
 
 If the operator re-runs this skill on an already-joined machine, the early checks (`darkmux doctor` showing `machine_id ✓`, `flow sink health ✓`, etc.) will surface the existing state. The skill should recognize this and ask:
@@ -197,4 +210,4 @@ If re-configuring, continue from the step the operator names. If a different mac
 - `darkmux-bootstrap` — first-time setup; use that on the operator's FIRST machine; this skill on every subsequent one
 - `darkmux-enable-audit` — opt-in hash-chained audit sink (after this skill completes)
 - [#280](https://github.com/kstrat2001/darkmux/issues/280) — cross-machine roster replication (will eliminate step 7's manual fanout)
-- [#590](https://github.com/kstrat2001/darkmux/issues/590) — single-stream fleet dispatch + the capability-routing successor (replaces the retired tier-aware routing)
+- [#2916](https://github.com/kstrat2001/darkmux/issues/2916) — secure machine-to-machine work submission (replaced the #590 Redis work queue); `profile@machine` addresses are its next stage

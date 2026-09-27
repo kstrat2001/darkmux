@@ -2732,6 +2732,7 @@
         crate::dispatch::DispatchOpts {
             // (#2914) Work never runs on the utility model.
             allow_utility_model: false,
+            remote_origin: None,
             brief_refs: Vec::new(),
             workspace_read_only: false,
             record_context: None,
@@ -4401,7 +4402,7 @@
             feedback_templates: serde_json::json!({
                 "error": "An error occurred."
             }),
-            cache_dir: PathBuf::from("/home/op/.darkmux/cache"),
+            cache_dir: Some(PathBuf::from("/home/op/.darkmux/cache")),
             // (#1548) true here (vs the other assertion test's false) so the
             // two tests together pin BOTH string forms the container's
             // falsy-set reader must distinguish.
@@ -4647,7 +4648,7 @@
             allowed_tools: None,
             compaction: crate::dispatch::CompactionDispatchArgs::default(),
             feedback_templates: serde_json::Value::Null,
-            cache_dir: PathBuf::from("/tmp/cache"),
+            cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: false,
             turn_delay_ms: 0,
             inactivity_timeout_seconds: 600,
@@ -4662,6 +4663,20 @@
             workspace_read_only: false,
             resume_checkpoint: false,
         }
+    }
+
+    /// (#2916 review M2) A job another machine submitted never mounts this
+    /// machine's shared, writable toolchain cache; local work still does.
+    #[test]
+    fn a_remote_origin_dispatch_mounts_no_shared_cache() {
+        assert!(crate::dispatch_internal::shared_cache_dir_for(Some("laptop")).is_none());
+        assert!(crate::dispatch_internal::shared_cache_dir_for(None).is_some());
+        let mut cfg = argv_config_with_base_url(None);
+        let local = build_docker_run_argv(&cfg).join(" ");
+        assert!(local.contains(":/darkmux-cache") && local.contains("CARGO_HOME=/darkmux-cache/cargo"), "{local}");
+        cfg.cache_dir = crate::dispatch_internal::shared_cache_dir_for(Some("laptop"));
+        let remote = build_docker_run_argv(&cfg).join(" ");
+        assert!(!remote.contains("darkmux-cache"), "{remote}");
     }
 
     /// The value following `--base-url` in `argv`, if the flag is present.
@@ -4847,7 +4862,7 @@
             allowed_tools: None,
             compaction: crate::dispatch::CompactionDispatchArgs::default(),
             feedback_templates: serde_json::Value::Null,
-            cache_dir: PathBuf::from("/tmp/cache"),
+            cache_dir: Some(PathBuf::from("/tmp/cache")),
             // (#1548 QA finding) FALSE here, deliberately. The sibling
             // full-argv test uses `true`, and its comment claimed the two
             // "together pin BOTH string forms" — which was not true: nothing
@@ -4987,7 +5002,7 @@
             allowed_tools: None,
             compaction: crate::dispatch::CompactionDispatchArgs::default(),
             feedback_templates: serde_json::Value::Null,
-            cache_dir: PathBuf::from("/tmp/cache"),
+            cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: true,
             turn_delay_ms: 0,
             inactivity_timeout_seconds: 600,
@@ -5045,7 +5060,7 @@
             allowed_tools: None,
             compaction: crate::dispatch::CompactionDispatchArgs::default(),
             feedback_templates: serde_json::Value::Null,
-            cache_dir: PathBuf::from("/tmp/cache"),
+            cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: true,
             turn_delay_ms: 0,
             inactivity_timeout_seconds: 600,
@@ -6251,7 +6266,7 @@
             allowed_tools: None,
             compaction: crate::dispatch::CompactionDispatchArgs::default(),
             feedback_templates: serde_json::Value::Null,
-            cache_dir: PathBuf::from("/tmp/cache"),
+            cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: true,
             turn_delay_ms: 0,
             inactivity_timeout_seconds: 600,
@@ -12413,7 +12428,7 @@
             allowed_tools: None,
             compaction,
             feedback_templates: serde_json::Value::Null,
-            cache_dir: PathBuf::from("/tmp/cache"),
+            cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: false,
             turn_delay_ms: 0,
             inactivity_timeout_seconds: 600,
@@ -14306,10 +14321,9 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         // `dispatch()`. A panic unwinding through the lines between a
         // flag's creation and those stores skips all of them, and the
         // thread each flag gates — a SEPARATE OS thread — survives the
-        // panic in any process that catches it (the fleet runner's
-        // `run_with_panic_guard`, which the serve daemon spawns via
-        // `darkmux_fleet::spawn_runner_thread()`, does exactly this on
-        // purpose, so one bad dispatch can't take the whole long-lived
+        // panic in any process that catches it (`darkmux_fleet::execute_job`,
+        // which the serve daemon's fleet listener runs every submitted job
+        // through, does exactly this on purpose, so one bad dispatch can't take the whole long-lived
         // process down). Left unguarded, the tailer polls `trajectory.jsonl`
         // every 250ms forever, the sampler keeps sampling + governing
         // thermals every 2s forever, and the watchdog polls to its full

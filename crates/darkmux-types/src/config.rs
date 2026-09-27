@@ -257,7 +257,28 @@ use std::path::Path;
 //           guarantee as 1.8's `orchestrator` and 1.22's `review`), has no
 //           effect, and `darkmux doctor` names it with the fix.
 //           `radio.answerer_profile` stays: answering the user is work.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.28";
+//   1.29 (#2916, darkmux 4.0): three additive keys under `fleet{}`, the
+//           secure work-submission surface. `fleet.identity.provider` names
+//           the overlay network that verifies which machine is on the other
+//           end of a connection (a VALUE, `"tailscale"` today; no vendor name
+//           appears in any field). `fleet.listener{}` (`enabled` / `port`) is
+//           the dedicated submission listener, bound to the address that
+//           provider reports for this machine and nowhere else. `fleet.
+//           accept_work{}` is the receiver's allow-list, keyed by machine
+//           name, each entry carrying the `node_id` `darkmux machine trust`
+//           resolved (never typed), the `profiles` that machine may run here,
+//           and `workspace` (reserved for the workspace handoff, #755).
+//           `init` writes `identity` and `listener` visibly (`enabled:
+//           false`) and `accept_work` empty. Lenient-on-read as always: an
+//           older binary ignores all three into `fleet.extras`.
+//           Also recorded here, since it shipped in the same 4.0 cycle with
+//           no bump of its own: REMOVED `dirs.notebook` (#2913, with the
+//           `lab notebook` verb and the `scribe` role). `config set` rejects
+//           the key; a config still carrying it loads fine (serde drops the
+//           unknown key; `dirs` has no overflow map), has no effect, and
+//           `darkmux doctor` names it with the fix, alongside
+//           `DARKMUX_NOTEBOOK_DIR`.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.29";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -952,6 +973,78 @@ pub struct PowerConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FleetConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub mode: Option<String>,
+    /// (#2916) Which overlay network verifies a connecting machine. See
+    /// [`FleetIdentityConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub identity: Option<FleetIdentityConfig>,
+    /// (#2916) The work-submission listener. See [`FleetListenerConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub listener: Option<FleetListenerConfig>,
+    /// (#2916) The receiver's allow-list, keyed by machine name (the peer's
+    /// `machine_id`). Written by `darkmux machine trust` / `untrust`, never
+    /// by `config set`: its `node_id` is resolved through the identity
+    /// provider, never typed. An absent or empty map accepts no work.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub accept_work: Option<BTreeMap<String, AcceptWorkEntry>>,
+    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// (#2916) The identity source for fleet work submission: the overlay
+/// network whose own daemon answers "which node is on the other end of this
+/// connection". `provider` is a VALUE (`"tailscale"` is the one this darkmux
+/// knows); an unknown value resolves to no provider, and no provider means
+/// every submission is refused (fail closed). Stored as a string, like
+/// `fleet.mode`, so a typo never fails the whole-config parse.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FleetIdentityConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub provider: Option<String>,
+    /// Path to the provider's command-line tool, when it is not on `PATH`
+    /// under its usual name (a daemon started by launchd may have a short
+    /// `PATH`). Absent = the provider's usual command name. Not written by
+    /// `init`: a literal would be wrong on most machines.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub bin: Option<String>,
+    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// (#2916) The dedicated work-submission listener `darkmux serve` opens
+/// beside its viewer port. It binds only to the address the identity
+/// provider reports for this machine (never `0.0.0.0`, never a LAN address),
+/// so every connection it accepts can be asked "which node is this".
+/// An `enabled`-gated feature block: `init` writes `enabled: false` with the
+/// default port visible.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FleetListenerConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub enabled: Option<bool>,
+    /// TCP port on the overlay address. Built-in default `8766`. The fleet
+    /// uses ONE port: a sender dials the roster host of the target on its
+    /// own resolved port, so set the same value on every machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub port: Option<u16>,
+    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// (#2916) One allow-list entry: a machine this machine takes work from.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcceptWorkEntry {
+    /// The overlay network's stable id for the peer's node, resolved by
+    /// `darkmux machine trust`. An entry without one never matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub node_id: Option<String>,
+    /// The work-class profiles (this machine's own profile names) the peer
+    /// may run here. A profile outside this list is refused, and so is a
+    /// profile that resolves only to the machine's utility model.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub profiles: Option<Vec<String>>,
+    /// The roles (this machine's role ids) the peer may dispatch here. An
+    /// explicit list, and absent or empty means NONE: a role is a tool
+    /// palette and a system prompt, so granting "any role" would grant every
+    /// tool palette this machine has.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub roles: Option<Vec<String>>,
+    /// Docker images the peer may name with `--image`, matched exactly. A
+    /// job naming no image runs on darkmux's own pinned runtime image and is
+    /// always allowed; any other image (a custom one, or a pull from an
+    /// arbitrary registry) must be listed. Absent = none.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub images: Option<Vec<String>>,
+    /// Whether the peer may name a working directory on this machine.
+    /// `true` lets a job mount any directory under this machine's darkmux
+    /// worktrees base READ-WRITE as its workspace (symlinks resolved; nothing
+    /// outside the base). `false` or absent: a job carrying a `workdir` is
+    /// refused. The workspace handoff (#755) builds on this.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub workspace: Option<bool>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -1619,6 +1712,19 @@ impl DarkmuxConfig {
             }),
             fleet: Some(FleetConfig {
                 mode: Some("standalone".to_string()),
+                // (#2916) Visible, so the submission surface is discoverable:
+                // the provider value, and the listener one flip from on.
+                identity: Some(FleetIdentityConfig {
+                    provider: Some(crate::config_access::FLEET_IDENTITY_PROVIDER_DEFAULT.to_string()),
+                    bin: None,
+                    extras: Default::default(),
+                }),
+                listener: Some(FleetListenerConfig {
+                    enabled: Some(false),
+                    port: Some(crate::config_access::FLEET_LISTENER_PORT_DEFAULT),
+                    extras: Default::default(),
+                }),
+                accept_work: Some(BTreeMap::new()),
                 extras: Default::default(),
             }),
             remote: Some(RemoteConfig {

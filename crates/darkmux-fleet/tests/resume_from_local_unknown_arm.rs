@@ -42,6 +42,7 @@ fn opts_for(role_id: &str) -> DispatchOpts {
     DispatchOpts {
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
+        remote_origin: None,
         brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,
@@ -71,7 +72,7 @@ fn opts_for(role_id: &str) -> DispatchOpts {
     }
 }
 
-/// Bare TCP listener recording every accepted connection — the fleet-queue
+/// Bare TCP listener recording every accepted connection — the peer fleet-listener
 /// stand-in. Copied in shape from `routing.rs`'s
 /// `spawn_connection_counting_peer` (that one is `#[cfg(test)]`-private to
 /// the unit-test binary, unreachable from here).
@@ -95,7 +96,7 @@ fn spawn_connection_counting_peer() -> (u16, std::sync::mpsc::Receiver<()>) {
 /// Harmless today (this is the only test in this binary, about to exit
 /// either way), but nothing said so, and a second test added to this file
 /// would silently inherit an emptied `PATH` / unset `DARKMUX_MACHINE_ID`
-/// from any panic here and race on the leftover `DARKMUX_REDIS_URL` /
+/// from any panic here and race on the leftover `DARKMUX_FLEET_FILE` /
 /// `DARKMUX_FLOWS_DIR`. Captures the ORIGINAL values at construction time
 /// (before the caller mutates anything), then restores them all when
 /// dropped — including during unwind, since `Drop::drop` runs on the
@@ -130,7 +131,7 @@ impl Drop for EnvRestore {
 }
 
 #[test]
-fn dispatch_routed_via_refuses_resume_from_on_the_local_unknown_arm_before_the_queue_is_touched()
+fn dispatch_routed_via_refuses_resume_from_on_the_local_unknown_arm_before_anything_is_sent()
 {
     // Captured BEFORE any mutation below, so this always restores the
     // real pre-test values regardless of how (or whether) the test below
@@ -138,7 +139,9 @@ fn dispatch_routed_via_refuses_resume_from_on_the_local_unknown_arm_before_the_q
     let _restore_env = EnvRestore::capture(&[
         "DARKMUX_MACHINE_ID",
         "PATH",
-        "DARKMUX_REDIS_URL",
+        "DARKMUX_FLEET_FILE",
+        "DARKMUX_FLEET_LISTENER_PORT",
+        "DARKMUX_SERVE_TOKEN",
         "DARKMUX_FLOWS_DIR",
     ]);
 
@@ -156,8 +159,20 @@ fn dispatch_routed_via_refuses_resume_from_on_the_local_unknown_arm_before_the_q
 
     let (port, rx) = spawn_connection_counting_peer();
     let flows_dir = tempfile::TempDir::new().unwrap();
+    // (#2916) A roster naming `peer-b` at 127.0.0.1, the fleet port on the
+    // counting peer, and a fleet token: without the refusal, the submission
+    // would dial exactly this listener.
+    let roster_dir = tempfile::TempDir::new().unwrap();
+    let roster = roster_dir.path().join("fleet.json");
+    std::fs::write(
+        &roster,
+        r#"{"version":"2","machines":{"peer-b":{"id":"peer-b","address":"127.0.0.1","added_unix_ms":1}}}"#,
+    )
+    .unwrap();
     unsafe {
-        std::env::set_var("DARKMUX_REDIS_URL", format!("redis://127.0.0.1:{port}"));
+        std::env::set_var("DARKMUX_FLEET_FILE", &roster);
+        std::env::set_var("DARKMUX_FLEET_LISTENER_PORT", port.to_string());
+        std::env::set_var("DARKMUX_SERVE_TOKEN", "test-fleet-token");
         std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
     }
 
@@ -185,8 +200,7 @@ fn dispatch_routed_via_refuses_resume_from_on_the_local_unknown_arm_before_the_q
              local_unknown arm either"
         );
     })
-    .expect_err("--resume-from with --machine=<peer> must refuse on this arm too, not route \
-                 to the queue");
+    .expect_err("--resume-from with --machine=<peer> must refuse on this arm too, not submit");
     let msg = format!("{err:#}");
 
     // Env restoration now happens unconditionally when `_restore_env` drops
@@ -209,8 +223,8 @@ fn dispatch_routed_via_refuses_resume_from_on_the_local_unknown_arm_before_the_q
     match rx.recv_timeout(Duration::from_millis(300)) {
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         Ok(()) => panic!(
-            "dispatch_via_queue must never run for a refused resume, but the mock \
-             fleet-queue peer accepted a connection"
+            "dispatch_via_submission must never run for a refused resume, but the mock \
+             peer listener accepted a connection"
         ),
         Err(e) => panic!("unexpected mock channel state: {e:?}"),
     }

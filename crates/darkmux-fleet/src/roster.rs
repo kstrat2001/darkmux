@@ -28,9 +28,8 @@ const REACHABILITY_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 /// the port in the address when it differs (`machine add studio --address
 /// 100.64.0.2:9000`), which is explicit input rather than a guess.
 ///
-/// The same reasoning covers `fleet_cli::normalize_daemon_base` /
-/// `fetch_machine_specs` and `darkmux_serve::peer_graph::
-/// normalize_daemon_base`, which build peer base URLs from the same
+/// The same reasoning covers `peer::split_address` (every CLI peer read
+/// and submission, #2916), which builds peer base URLs from the same
 /// portless form.
 ///
 /// (#2782 C10, superseded by #2924) The one case this reasoning used not to
@@ -118,6 +117,18 @@ pub struct MachineEntry {
     /// (false) on every entry written before #2924.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub loopback_intended: bool,
+
+    /// (#2916 review C1) The overlay network's stable id for the node this
+    /// entry's address reached, pinned by `machine add` or by the first
+    /// token-bearing request from the CLI (a work submission, `machine
+    /// status`/`resources <id>`, `machine list --deep`). EVERY token-bearing
+    /// request (`darkmux_fleet::peer`) checks the node at the address is
+    /// this one before anything is sent, and an entry with no pin must at
+    /// least resolve to a tailnet node. The daemon's peer-graph proxy checks
+    /// but never writes a pin. Cleared when `machine add` changes the
+    /// address. Never printed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
 
     /// Fields this binary does not know, preserved verbatim on rewrite.
     #[serde(flatten)]
@@ -404,6 +415,8 @@ pub fn add_machine(
     let existing_added_at = existing.map(|m| m.added_unix_ms);
     let existing_uid = existing.and_then(|m| m.machine_uid.clone());
     let existing_extras = existing.map(|m| m.extras.clone()).unwrap_or_default();
+    // A pin belongs to the address it was made for.
+    let existing_node = existing.filter(|m| m.address == address).and_then(|m| m.node_id.clone());
     let entry = MachineEntry {
         id: id.to_string(),
         address: address.to_string(),
@@ -411,10 +424,57 @@ pub fn add_machine(
         added_unix_ms: existing_added_at.unwrap_or(now),
         machine_uid: uid.map(String::from).or(existing_uid),
         loopback_intended: false,
+        node_id: existing_node,
         extras: existing_extras,
     };
     roster.machines.insert(id.to_string(), entry);
     Ok(())
+}
+
+/// (#2916) The roster KEY naming `name`: machine names are ASCII
+/// case-insensitive, so an exact key wins, else the one key equal ignoring
+/// case. Two keys differing only in case (a roster written before this
+/// rule) are ambiguous: an error naming both, never a pick by map order.
+pub fn find_machine_key(roster: &FleetRoster, name: &str) -> Result<Option<String>> {
+    if roster.machines.contains_key(name) {
+        return Ok(Some(name.to_string()));
+    }
+    let hits: Vec<&String> = roster.machines.keys().filter(|k| k.eq_ignore_ascii_case(name)).collect();
+    match hits.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some((*one).clone())),
+        many => Err(anyhow!(
+            "the roster has several entries for `{name}` differing only in case ({}); machine names \
+             are case-insensitive, so remove all but one with `darkmux machine remove <exact name>`",
+            many.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
+/// (#2916) The roster entry for `name`, case-insensitively (see
+/// [`find_machine_key`]).
+pub fn find_machine<'a>(roster: &'a FleetRoster, name: &str) -> Result<Option<&'a MachineEntry>> {
+    Ok(find_machine_key(roster, name)?.and_then(|k| roster.machines.get(&k)))
+}
+
+/// (#2916 review C1) Resolve a roster address's host to its IP addresses,
+/// bounded like every roster lookup. Empty when it does not resolve.
+pub fn resolve_host_addrs(address: &str) -> Vec<std::net::IpAddr> {
+    let Some(host) = address_host(address) else { return Vec::new() };
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return vec![ip.to_canonical()];
+    }
+    use std::net::ToSocketAddrs;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let q = format!("{host}:0");
+    let _ = std::thread::Builder::new().name("darkmux-dns-resolve".into()).spawn(move || {
+        let r: Vec<std::net::IpAddr> =
+            q.to_socket_addrs().map(|it| it.map(|a| a.ip().to_canonical()).collect()).unwrap_or_default();
+        let _ = tx.send(r);
+    });
+    let mut ips = rx.recv_timeout(DNS_RESOLUTION_TIMEOUT).unwrap_or_default();
+    ips.dedup();
+    ips
 }
 
 /// Remove a machine from the roster. Returns the removed entry (so the
@@ -597,6 +657,28 @@ fn short_ipv4_reaches_only_reader(host: &str) -> bool {
         return false;
     };
     (nums.len() >= 2 && nums[0] == 127) || nums.iter().all(|n| *n == 0)
+}
+
+/// (#2916) The HOST a roster address names, without scheme, port, brackets,
+/// path or trailing dot. This is what a roster address MEANS to fleet work
+/// submission: the machine's name on the network (#2924: its tailnet DNS
+/// name). The viewer daemon's port (or the `https://` a `tailscale serve`
+/// front puts on it) is not part of it; the work-submission listener is that
+/// host on `fleet.listener.port`. `None` for an empty address.
+pub fn address_host(address: &str) -> Option<String> {
+    let trimmed = address.trim();
+    let rest = trimmed.split_once("://").map(|(_, r)| r).unwrap_or(trimmed);
+    let rest = rest.split('/').next().unwrap_or(rest);
+    let host = if let Some(inner) = rest.strip_prefix('[') {
+        inner.split(']').next().unwrap_or(inner)
+    } else if rest.parse::<std::net::IpAddr>().is_ok() {
+        // A bare v6 literal contains colons that are not a port separator.
+        rest
+    } else {
+        rest.rsplit_once(':').map(|(h, _)| h).unwrap_or(rest)
+    };
+    let host = host.trim_end_matches('.');
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 /// Parse an `address` string into a `SocketAddr`. Accepts:

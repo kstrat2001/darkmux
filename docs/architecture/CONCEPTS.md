@@ -153,9 +153,9 @@ A crew is a **static manifest**: `id`, `description`, and
 indexed and queryable.
 
 **Crews are not dynamically composed per mission today.** A mission has no
-`crew_id` field; `darkmux mission dispatch` takes an explicit `role` and fans the
-mission's ready phases onto the single global work stream, where the first
-available runner claims each one (#590). The operator names the role per
+`crew_id` field; `darkmux mission dispatch` takes an explicit `role` and
+submits the mission's next ready phase to the machine named by `--machine`,
+which runs it if its allow-list trusts the sender (#2916). The operator names the role per
 dispatch; dynamic per-mission crew assembly is
 [planned](#8-planned-not-yet-shipped), not shipped.
 
@@ -198,7 +198,7 @@ All of the following are **shipped**:
 |---|---|---|
 | `darkmux mission launch <config>` | Mints a running mission instance from a mission CONFIG (built-in, or one written at `~/.darkmux/mission-configs/<id>.json`) and drives it as a task graph, every dispatch gated on operator sign-off (#1284 Packet 4a). The `mission propose` verb that used to draft a config from unstructured intent was removed in 4.0 (#2912); the frontier orchestrator writes the config. | `src/mission_launch.rs` |
 | `darkmux mission launch review` | The code-review mission (#2310 P4d): one diff-scoped `plan.sites` task per rule, one reviewer dispatch per planned unit, an optional gated mod, then a rendered GitHub review payload. A config on the crawl's shared blocks — no launcher of its own (the bespoke funnel and its ten `review.*` step kinds were deleted). The coder-phase pipeline still runs its own in-gate `code-reviewer` QA pass (`src/coder_phase.rs`). | `templates/builtin/mission-configs/review.json`; `crates/darkmux-lab/src/crawl/` |
-| `darkmux mission dispatch` | Loads a mission, validates status, confirms the role exists, fans out its ready phases (`depends_on == []`) as work jobs onto the single global fleet work queue (`darkmux:work`); waits or returns session ids. | `src/main.rs` |
+| `darkmux mission dispatch` | Loads a mission, validates status, confirms the role exists, submits its next ready phase to the `--machine` it names over that machine's fleet listener (#2916); waits for the result or returns the session id. | `src/main.rs` |
 | `darkmux dispatch <role>` | Single-turn dispatch to a named role through the internal runtime. | see `CLAUDE.md` → operator-facing commands |
 
 The **operator sign-off on every `mission launch` dispatch** is the sovereignty

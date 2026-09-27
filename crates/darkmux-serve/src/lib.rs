@@ -47,6 +47,7 @@ pub mod mission_graph;
 /// rendering needs it too, not just the wire response.
 /// (#2107, #1833) The daemon-side continuous host sampler feeding the
 /// machine stats drawer's live `load` block — see the module's own doc.
+mod fleet_listener;
 mod host_sampler;
 mod panel;
 /// (#1466) Best-effort peer-mission-graph fetch — see the module's own doc
@@ -1238,6 +1239,8 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
     // would return the mtime of the new binary and report a stale daemon as
     // fresh — the exact false negative this check exists to prevent.
     let _ = STARTUP_EXE_MTIME.set(current_exe_mtime());
+    // (#2916 review M1) 10240 is macOS's per-process ceiling (OPEN_MAX).
+    let _ = raise_open_file_limit(10_240);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1317,16 +1320,11 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
             println!("{line}");
         }
 
-        // Spawn the fleet work-queue runner thread (#246 PR-C.2, renamed #595).
-        // Runs on a dedicated std::thread (not a tokio task) so the sync
-        // redis client + sync crew::dispatch::dispatch don't saturate
-        // the tokio executor. The runner self-disables when its prerequisite
-        // (DARKMUX_REDIS_URL) isn't declared — single-machine fleets
-        // continue to work unchanged (#590: Redis presence is the
-        // participation gate; tier declaration is no longer required).
-        // The thread runs for the daemon's lifetime; the process
-        // force-exit in the SHUTDOWN_GRACE_SECS path kills it cleanly.
-        let _runner_handle = darkmux_fleet::spawn_runner_thread();
+        // (#2916) The Redis work-queue runner that used to start here is
+        // retired: `darkmux:work` could not say who wrote an entry, so any
+        // node that could write Redis could make this machine run work.
+        // Work now arrives on the fleet listener (below), which checks the
+        // fleet token and the connecting node first.
 
         // (#638) Spawn the fleet-presence heartbeat emitter. Same dedicated-
         // std::thread shape + DARKMUX_REDIS_URL self-disable as the runner
@@ -1369,6 +1367,11 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
         // `watch::channel` is the right shape — both consumers wait_for
         // the same latch flip.
         let (shutdown_tx, mut shutdown_rx_axum) = tokio::sync::watch::channel(false);
+
+        // (#2916) The work-submission listener, when `fleet.listener.enabled`:
+        // its own socket on this machine's overlay address, gated by the
+        // fleet token + the network-verified allow-list.
+        fleet_listener::spawn_if_enabled(shutdown_rx_axum.clone());
 
         tokio::spawn(async move {
             shutdown_signal().await;
@@ -1485,13 +1488,58 @@ fn current_exe_mtime() -> Option<u64> {
 /// The mtime is deliberately reported as a bare integer rather than the exe
 /// PATH: `/health` is auth-exempt even for non-loopback peers, and a path would
 /// disclose the operator's home directory to anything that can reach the port.
-async fn health() -> axum::Json<serde_json::Value> {
+async fn health(peer: Option<ConnectInfo<SocketAddr>>) -> axum::Json<serde_json::Value> {
+    // (#2916 re-review C9) A peer sees only the listener's coarse state.
+    let loopback_caller = peer.is_some_and(|c| c.0.ip().is_loopback());
     axum::Json(serde_json::json!({
         "darkmux_version": env!("CARGO_PKG_VERSION"),
         "build": darkmux_types::build_version(),
         "binary_mtime": STARTUP_EXE_MTIME.get().copied().flatten(),
         "flow_schema_version": darkmux_flow::FLOW_SCHEMA_VERSION,
+        // (#2916 review C8) What the fleet listener is doing (`null` when it
+        // is off), so `darkmux doctor` reads the DAEMON's view rather than
+        // re-deriving it from a shell whose PATH may differ.
+        "fleet_listener": fleet_listener::listener_state(loopback_caller),
+        // (#2916 re-review C3) The open-file soft limit this daemon runs
+        // with (raised at start), for this machine only.
+        "open_file_limit": if loopback_caller { current_open_file_limit() } else { None },
     }))
+}
+
+/// The current soft open-file limit.
+#[allow(clippy::unnecessary_cast)]
+pub fn current_open_file_limit() -> Option<u64> {
+    // SAFETY: plain getrlimit on a stack struct.
+    unsafe {
+        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        (libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0).then_some(lim.rlim_cur as u64)
+    }
+}
+
+/// (#2916 review M1) Raise the soft open-file limit toward the hard one at
+/// daemon start. launchd starts a daemon at 256, and every open connection,
+/// flow file and child pipe costs one; running out is what let a flood of
+/// half-open fleet connections take the viewer down. Returns the (old, new)
+/// soft limits. Never lowers anything, never exceeds the hard limit.
+#[allow(clippy::unnecessary_cast)] // `rlim_t` is not u64 on every target
+pub fn raise_open_file_limit(target: u64) -> Option<(u64, u64)> {
+    // SAFETY: plain getrlimit/setrlimit on a stack struct.
+    unsafe {
+        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return None;
+        }
+        let old = lim.rlim_cur as u64;
+        let want = target.min(lim.rlim_max as u64);
+        if want <= old {
+            return Some((old, old));
+        }
+        lim.rlim_cur = want as libc::rlim_t;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+            return Some((old, old));
+        }
+        Some((old, want))
+    }
 }
 
 /// Validate a base ref string: must match `^[A-Za-z0-9][A-Za-z0-9_/.-]*$`.
