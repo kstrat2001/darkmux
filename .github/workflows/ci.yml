@@ -384,6 +384,80 @@ jobs:
         if: steps.filter.outputs.runtime != 'true'
         run: echo "No runtime/ changes detected; test+lint skipped (reports green)."
 
+  # (#1793) Every `rust-version` in a manifest is a published claim: "this
+  # compiles on that toolchain". Before this job nothing checked it, and when
+  # it was first run two of the three claims were false (the member crates and
+  # runtime/ said 1.80; their locked dependencies need 1.86).
+  #
+  # The toolchains come from the manifests, never from this file: the script
+  # reads each package's `rust-version` through `cargo metadata` and runs
+  # `cargo +<that version> check` per group, asserting the requested toolchain
+  # is the one that ran (rust-toolchain.toml would otherwise make the check
+  # vacuous; see that file's comment). Changing a `rust-version` changes what
+  # is checked in the same edit.
+  #
+  # Light gate, not `full-ci`: `check` only, measured at about 85s cold for
+  # both manifests on an M5 Max (a hosted runner is slower), and it runs in
+  # parallel with the heavier jobs rather than adding to their wall clock. macOS, not
+  # ubuntu, because 23 source files carry `target_os = "macos"` code that a
+  # Linux check would never compile.
+  msrv:
+    name: MSRV — check each package on its declared rust-version (macos-latest)
+    runs-on: macos-latest
+    timeout-minutes: 15
+    env:
+      # The claim is "compiles", not "compiles without warnings on an old
+      # compiler". Warning hygiene is clippy's job on the pinned toolchain.
+      RUSTFLAGS: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Source edits can break the floor too (a std API newer than the
+      # MSRV), so any Rust change in either manifest's tree runs this.
+      - name: Detect Rust-relevant changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+              - 'templates/**'
+              - 'scripts/ci-msrv-check.sh'
+              - '.github/workflows/ci.yml'
+
+      # The pinned DEV toolchain, only so `cargo metadata` can run under
+      # rust-toolchain.toml. The MSRV toolchains are installed by the script.
+      - name: Install Rust stable toolchain
+        if: steps.filter.outputs.rust == 'true'
+        uses: dtolnay/rust-toolchain@1.97.1
+
+      - name: Cache cargo registry + build artifacts
+        if: steps.filter.outputs.rust == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+          workspaces: |
+            . -> target
+            runtime -> target
+
+      - name: MSRV check (workspace)
+        if: steps.filter.outputs.rust == 'true'
+        run: scripts/ci-msrv-check.sh Cargo.toml
+
+      # runtime/ is its own workspace root with its own Cargo.lock (#463), so
+      # `--workspace` at the repo root never reaches it.
+      - name: MSRV check (runtime crate)
+        if: steps.filter.outputs.rust == 'true'
+        run: scripts/ci-msrv-check.sh runtime/Cargo.toml
+
+      - name: No Rust-relevant changes — MSRV check skipped
+        if: steps.filter.outputs.rust != 'true'
+        run: echo "No Rust-relevant changes; MSRV check skipped (reports green)."
+
   # A `mock-dispatch-proof` nightly job was written here and withdrawn before
   # merge (#2486, #2600): `tests/mock_dispatch_proof.rs` is the only test in
   # the tree that constructs and runs a real `docker run`, but a frontier

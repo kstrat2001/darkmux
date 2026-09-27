@@ -7,7 +7,7 @@ license = "MIT"
 homepage = "https://darkmux.com"
 repository = "https://github.com/kstrat2001/darkmux"
 authors = ["Kain Osterholt"]
-rust-version = "1.80"
+rust-version = "1.86"
 
 [features]
 # (#811) Clean-by-construction test isolation. When enabled (only ever via a
