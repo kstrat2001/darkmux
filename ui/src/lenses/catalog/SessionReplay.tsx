@@ -1,7 +1,7 @@
 import { scopeCenter } from "../../lib/scopeCenter";
 import { WorkStatus } from "../../components/WorkStatus";
 import { Shimmer } from "../../components/Placeholder";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useCountUp } from "../../hooks/useCountUp";
 import { parseNumericLike } from "../../lib/numericLike";
 import { useQuery } from "@tanstack/react-query";
@@ -26,6 +26,7 @@ import { TokenScope } from "../../components/TokenScope";
 import { usePlaybackClock } from "../../lib/pageClockRate";
 import { WALL_CLOCK } from "../../lib/restHand";
 import { liveStateLabel, toolReadout, type LiveStateReading } from "../../lib/tokenRate";
+import { leftTrimWidth } from "../../lib/leftTrim";
 import { REPLAY_GRANULARITY_NOTE, useLiveOverlay } from "../../lib/liveChannel";
 import { scopeStateOf, type ScopeState } from "../../lib/scopeMorph";
 import { CLEAN_DETECTORS, runRegions } from "../session/sessionRun";
@@ -159,10 +160,45 @@ export function ScopeNote({ note, tool }: { note: string | null; tool?: { action
   return (
     <div className="modelbox__note modelbox__note--tool" title={note}>
       <span className="modelbox__note-act">{`${tool.action} · `}</span>
-      <span className="modelbox__note-path">
-        <bdi>{tool.path}</bdi>
-      </span>
+      <TrimmedPath path={tool.path} />
     </div>
+  );
+}
+
+/** (#2963) The file box of a tool's readout line, trimmed from the left.
+ *  When the path overflows, the box is narrowed to the "…" plus whole
+ *  characters (`leftTrimWidth`), so the "…" sits right after "write · "
+ *  with the same spacing an untrimmed path has. Re-fit when the line's slot
+ *  changes size. The width only ever shrinks inside the one-line slot, so
+ *  nothing around it moves. */
+function TrimmedPath({ path }: { path: string }) {
+  const box = useRef<HTMLSpanElement>(null);
+  useLayoutEffect(() => {
+    const el = box.current;
+    const slot = el?.parentElement;
+    if (!el || !slot) return;
+    const fit = () => {
+      el.style.maxWidth = "";
+      const text = el.firstElementChild as HTMLElement | null;
+      if (!text) return;
+      const probe = document.createElement("span");
+      probe.textContent = "…";
+      el.appendChild(probe);
+      const ellipsis = probe.getBoundingClientRect().width;
+      probe.remove();
+      const width = leftTrimWidth({ available: el.clientWidth, full: text.getBoundingClientRect().width, chars: [...(text.textContent ?? "")].length, ellipsis });
+      if (width !== null) el.style.maxWidth = `${width}px`;
+    };
+    fit();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(fit);
+    ro.observe(slot);
+    return () => ro.disconnect();
+  }, [path]);
+  return (
+    <span className="modelbox__note-path" ref={box}>
+      <bdi>{path}</bdi>
+    </span>
   );
 }
 

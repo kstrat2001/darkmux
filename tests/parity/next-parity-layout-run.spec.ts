@@ -100,6 +100,32 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
             return { inside: r.left >= b.left + ell - 0.5 && r.right <= b.right + 0.5 && r.width > 0, trimmed };
           }, state.fileName);
           expect(shown.inside, `${state.id}: the file name must be on screen (${vpName}, ${mode})`).toBe(true);
+          // (#2963) The "…" of a trimmed path sits where an untrimmed path's
+          // first character does: right after "write · ", with no extra gap.
+          // The ellipsis is drawn just before the first whole character
+          // that clears it, so that character's position says where it is.
+          const gap = await page.locator(NOTE).evaluate((note) => {
+            const act = note.querySelector(".modelbox__note-act").getBoundingClientRect();
+            const box = note.querySelector(".modelbox__note-path");
+            const b = box.getBoundingClientRect();
+            const text = box.querySelector("bdi").firstChild;
+            const probe = document.createElement("span");
+            probe.textContent = "…";
+            box.appendChild(probe);
+            const ell = probe.getBoundingClientRect().width;
+            probe.remove();
+            const trimmed = box.scrollWidth > box.clientWidth;
+            const range = document.createRange();
+            for (let i = 0; i < text.textContent.length; i++) {
+              range.setStart(text, i);
+              range.setEnd(text, i + 1);
+              const r = range.getBoundingClientRect();
+              if (!trimmed) return r.left - act.right;
+              if (r.left >= b.left + ell - 0.5) return r.left - ell - act.right;
+            }
+            return null;
+          });
+          expect(Math.abs(gap), `${state.id}: the gap between "·" and the path (${vpName}, ${mode}) is ${gap}px`).toBeLessThanOrEqual(1);
           if (state.id === "tool-file-long" && vpName === "phone") expect(shown.trimmed, `${state.id}: the long path is trimmed on a phone`).toBe(true);
           if (state.id === "tool-file") expect(shown.trimmed, `${state.id}: a short path is shown whole (${vpName}, ${mode})`).toBe(false);
         }
@@ -126,12 +152,12 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
       // The readout under the lamps is present in the tool-gen states and
       // absent elsewhere; that is the case the layout must absorb.
       expect(rows.map((r) => r.state)).toEqual(
-        expect.arrayContaining(["toolgen-named", "finished", "compacting", "radio-routing", "rest", "rest-turn-delay", "rest-thermal", "rest-pacing", "rest-battery", "rest-episode-limit", "rest-unknown", "armed-generating", "armed-toolgen", "tool-file", "tool-file-long"]),
+        expect.arrayContaining(["toolgen-named", "finished", "compacting", "radio-routing", "rest", "rest-turn-delay", "rest-thermal", "rest-pacing", "rest-battery", "rest-episode-limit", "rest-unknown", "armed-generating", "armed-toolgen", "tool-file", "tool-file-long", "tool-file-unlisted"]),
       );
       // (#2963) The line's own box, only in states that show it: a tool's
       // two-part line (action, then a left-trimming file box) is the same
       // one line, across the same slot, as TOOL GEN's and REST's.
-      expect(noteRows.map((r) => r.state)).toEqual(expect.arrayContaining(["toolgen-named", "tool-file", "tool-file-long", "rest-thermal"]));
+      expect(noteRows.map((r) => r.state)).toEqual(expect.arrayContaining(["toolgen-named", "tool-file", "tool-file-long", "tool-file-unlisted", "rest-thermal"]));
       expect(sizeGroups(noteRows, "note"), `the readout line changed height (${vpName}, ${mode})`).toHaveLength(1);
     });
 
