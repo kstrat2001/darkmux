@@ -176,7 +176,13 @@ fn build_hooks_check(
         // tailnet policy is what `HookSink::new` refuses the whole sink
         // over — a valid tailnet rule (`is_tailnet: true`) is NOT this
         // case and must not read as broken.
-        if s.is_refused {
+        //
+        // A rule with both or neither of `http`/`file` is refused for its
+        // destination FIELDS, not its URL, and says so.
+        if let Some(problem) = s.destination_problem {
+            flags.push(format!("DESTINATION REFUSED — {}; refused at load", problem.describe()));
+            rule_status = Status::Fail;
+        } else if s.is_refused {
             flags.push("URL REFUSED — neither loopback nor a Tailscale address; refused at load".to_string());
             rule_status = Status::Fail;
         }
@@ -372,7 +378,9 @@ fn build_hooks_check(
         // what makes it legible. (#2183) `file` names the no-network
         // testing-tier transport instead — there's no URL policy or
         // signature to report for it.
-        let target_kind = if s.is_file {
+        let target_kind = if s.destination_problem.is_some() {
+            "refused"
+        } else if s.is_file {
             "file"
         } else if s.is_loopback {
             "loopback"
@@ -1477,6 +1485,14 @@ mod tests {
         let checks = checks_for(&[rule], tmp.path());
         let row = named(&checks, "hooks.rule.0");
         assert_eq!(row.status, Status::Fail, "{}", row.message);
+        assert_eq!(
+            row.message,
+            format!(
+                "action=crawl.* -> {LOOPBACK} [refused, unsigned] (undelivered: 0) [DESTINATION REFUSED — names \
+                 BOTH `http` and `file` — a rule needs exactly one destination; refused at load]"
+            ),
+            "the URL itself is fine; what is refused is naming two destinations"
+        );
     }
 
     #[test]
@@ -1485,6 +1501,12 @@ mod tests {
         let checks = checks_for(&[hook_rule(Some("crawl.*"), None)], tmp.path());
         let row = named(&checks, "hooks.rule.0");
         assert_eq!(row.status, Status::Fail, "{}", row.message);
+        assert_eq!(
+            row.message,
+            "action=crawl.* ->  [refused, unsigned] (undelivered: 0) [DESTINATION REFUSED — has no \
+             destination — set exactly one of `http` or `file`; refused at load]",
+            "there is no URL to refuse; what is missing is a destination"
+        );
     }
 
     #[test]
