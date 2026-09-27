@@ -12121,6 +12121,27 @@ mod tests {
         }
     }
 
+    /// (#2947) A bad `fleet.mode` is not read as `standalone` silently:
+    /// link rendering starts no work, so it keeps the direct address (the
+    /// one link true whatever the position) and says what is wrong on
+    /// stderr. Pinned here so a regression to a tailnet spawn on a typo, or
+    /// a panic, is red.
+    #[test]
+    #[serial_test::serial]
+    fn viewer_link_base_on_a_bad_fleet_mode_uses_the_direct_link() {
+        let prev = std::env::var("DARKMUX_FLEET_MODE").ok();
+        unsafe { std::env::set_var("DARKMUX_FLEET_MODE", "hubb") };
+        darkmux_types::style::set_colorize_override(Some(true));
+        assert_eq!(viewer_link_base(8765), "http://127.0.0.1:8765/");
+        darkmux_types::style::set_colorize_override(None);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLEET_MODE", v),
+                None => std::env::remove_var("DARKMUX_FLEET_MODE"),
+            }
+        }
+    }
+
     /// (#2782 C4) The link's HOST follows `serve.bind`, the same as its
     /// port follows `serve.port`.
     ///
