@@ -181,7 +181,7 @@ test.describe('(U1-3) fleet activity session bars', () => {
         host.innerHTML =
           '<div class="lane"><div class="lname">probe</div><div class="tltrack">' +
           widths
-            .map((w, i) => `<div class="sbar done" data-act="session" data-arg="s${i}" role="button" style="left:${i * 22}%;width:${w}%"></div>`)
+            .map((w, i) => `<div class="sbar complete" data-act="session" data-arg="s${i}" role="button" style="left:${i * 22}%;width:${w}%"></div>`)
             .join('') +
           '</div></div>';
         document.body.appendChild(host);
