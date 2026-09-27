@@ -5,7 +5,7 @@
 [![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/kstrat2001/darkmux/badges/coverage.json)](https://github.com/kstrat2001/darkmux/actions/workflows/quality.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Own your AI workforce.** Run real engineering work on models you already have, on machines you already own. Off the meter.
+**Own your AI workforce.** Run real engineering work on models you already have, on machines you already own.
 
 darkmux turns a Mac (or a few of them on a tailnet) into a working local-AI fleet: config-defined **missions** run as live task graphs by a crew of role-staffed models. Every consequential step gates on your sign-off. Every dispatch leaves a record: which machine, which model, and why. Underneath it, a **lab** that measures what your hardware actually does, so your configuration rests on numbers, not vibes.
 
