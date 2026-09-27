@@ -569,26 +569,32 @@ fn resolve_single_source_dir(tree_root: &Path) -> Result<PathBuf, String> {
 /// copy-on-write clone, which answers the cost note above.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<crate::contained_file::TreeCopyReport> {
     let report = crate::contained_file::copy_tree_nofollow(src, dst)?;
-    if !report.skipped.is_empty() {
-        let listed: Vec<String> = report
-            .skipped
-            .iter()
-            .take(10)
-            .map(|(p, why)| format!("{} ({why})", p.display()))
-            .collect();
-        eprintln!(
-            "{}",
-            darkmux_types::style::warn(&format!(
-                "mods.gate: {} entr{} of {} not copied into the scratch checkout: {}{}",
-                report.skipped.len(),
-                if report.skipped.len() == 1 { "y" } else { "ies" },
-                src.display(),
-                listed.join("; "),
-                if report.skipped.len() > 10 { "; …" } else { "" }
-            ))
-        );
+    if let Some(w) = skipped_entries_warning(src, &report) {
+        eprintln!("{}", darkmux_types::style::warn(&w));
     }
     Ok(report)
+}
+
+/// The one warning naming what the scratch copy left out, or `None` when
+/// it left nothing out.
+fn skipped_entries_warning(src: &Path, report: &crate::contained_file::TreeCopyReport) -> Option<String> {
+    if report.skipped.is_empty() {
+        return None;
+    }
+    let listed: Vec<String> = report
+        .skipped
+        .iter()
+        .take(10)
+        .map(|(p, why)| format!("{} ({why})", p.display()))
+        .collect();
+    Some(format!(
+        "mods.gate: {} entr{} of {} not copied into the scratch checkout: {}{}",
+        report.skipped.len(),
+        if report.skipped.len() == 1 { "y" } else { "ies" },
+        src.display(),
+        listed.join("; "),
+        if report.skipped.len() > 10 { "; …" } else { "" }
+    ))
 }
 
 /// A content fingerprint of a directory tree — every regular file's
@@ -1508,5 +1514,23 @@ mod tests {
         assert_eq!(std::fs::read_link(dst.join("lib-alias")).unwrap(), Path::new("lib"));
         assert!(std::fs::symlink_metadata(dst.join("abs")).is_err(), "absolute link recreated");
         assert!(std::fs::symlink_metadata(dst.join("bin/escape")).is_err(), "escaping link recreated");
+    }
+
+    #[test]
+    fn skipped_entries_warning_names_every_skipped_link() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("ok.txt"), "ok").unwrap();
+        let dst = tmp.path().join("dst");
+        let clean = copy_dir_recursive(&src, &dst).unwrap();
+        assert_eq!(skipped_entries_warning(&src, &clean), None, "nothing skipped, no warning");
+
+        std::os::unix::fs::symlink("/etc/hosts", src.join("abs")).unwrap();
+        std::os::unix::fs::symlink("../../outside", src.join("escape")).unwrap();
+        let dst2 = tmp.path().join("dst2");
+        let report = copy_dir_recursive(&src, &dst2).unwrap();
+        let w = skipped_entries_warning(&src, &report).expect("skips must be warned");
+        assert!(w.contains("2 entries") && w.contains("abs") && w.contains("escape"), "{w}");
     }
 }

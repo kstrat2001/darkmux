@@ -542,6 +542,8 @@ mod tree {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e),
             };
+            #[cfg(test)]
+            super::run_before_open_hook(&src_dir.join(&name));
             match st.st_mode & libc::S_IFMT {
                 libc::S_IFDIR => {
                     let sub = match openat(dir, &name, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW) {
@@ -618,6 +620,29 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn set_after_list_hook(f: Option<AfterListHook>) {
     AFTER_LIST_HOOK.with(|h| *h.borrow_mut() = f);
+}
+
+// Test-only seam: called by the tree walk after it has read an entry's
+// type (`fstatat`) and before it opens that entry, with the entry's source
+// path. Lets a test swap the entry between the type check and the open.
+#[cfg(test)]
+thread_local! {
+    static BEFORE_OPEN_HOOK: std::cell::RefCell<Option<AfterListHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_open_hook(f: Option<AfterListHook>) {
+    BEFORE_OPEN_HOOK.with(|h| *h.borrow_mut() = f);
+}
+
+#[cfg(test)]
+pub(crate) fn run_before_open_hook(entry: &Path) {
+    BEFORE_OPEN_HOOK.with(|h| {
+        if let Some(f) = h.borrow_mut().as_mut() {
+            f(entry);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -761,5 +786,69 @@ mod tests {
         assert!(!relative_link_stays_inside(Path::new(""), Path::new("..")));
         assert!(!relative_link_stays_inside(Path::new("a"), Path::new("/etc/hosts")));
         assert!(relative_link_stays_inside(Path::new("a/b"), Path::new("./../../c")));
+    }
+
+    /// Swap `src/<name>` for `with` between the walk's type check and its
+    /// open, run the copy, and return the report.
+    fn copy_with_swap_before_open(
+        root: &Path,
+        name: &'static str,
+        swap: impl Fn(&Path) + 'static,
+        dst: &Path,
+    ) -> TreeCopyReport {
+        let target = root.join(name);
+        set_before_open_hook(Some(Box::new(move |p: &Path| {
+            if p == target.as_path() {
+                swap(p);
+            }
+        })));
+        let r = copy_tree_nofollow(root, dst);
+        set_before_open_hook(None);
+        r.unwrap()
+    }
+
+    #[test]
+    fn copy_tree_nofollow_refuses_a_dir_swapped_for_a_link_between_stat_and_open() {
+        let (t, root, _s) = setup();
+        fs::create_dir_all(root.join("d")).unwrap();
+        let host = t.path().join("host");
+        fs::create_dir_all(&host).unwrap();
+        fs::write(host.join("f.txt"), "HOST").unwrap();
+        let h = host.clone();
+        let dst = t.path().join("dst");
+        let report = copy_with_swap_before_open(&root, "d", move |p| {
+            fs::remove_dir(p).unwrap();
+            symlink(&h, p).unwrap();
+        }, &dst);
+        assert!(!dst.join("d/f.txt").exists(), "followed a directory swapped for a link");
+        assert!(report.skipped.iter().any(|(p, _)| p == Path::new("d")), "{:?}", report.skipped);
+    }
+
+    #[test]
+    fn copy_tree_nofollow_refuses_a_file_swapped_for_a_link_between_stat_and_open() {
+        let (t, root, secret) = setup();
+        fs::write(root.join("f.txt"), "REAL").unwrap();
+        let dst = t.path().join("dst");
+        let report = copy_with_swap_before_open(&root, "f.txt", move |p| {
+            fs::remove_file(p).unwrap();
+            symlink(&secret, p).unwrap();
+        }, &dst);
+        assert!(!dst.join("f.txt").exists(), "followed a file swapped for a link");
+        assert_eq!(report.skipped.len(), 1, "{:?}", report.skipped);
+    }
+
+    #[test]
+    fn copy_tree_nofollow_refuses_a_file_swapped_for_a_fifo_between_stat_and_open() {
+        let (t, root, _s) = setup();
+        fs::write(root.join("f.txt"), "REAL").unwrap();
+        let dst = t.path().join("dst");
+        let report = copy_with_swap_before_open(&root, "f.txt", |p| {
+            fs::remove_file(p).unwrap();
+            let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+            // SAFETY: valid NUL-terminated path.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        }, &dst);
+        assert!(!dst.join("f.txt").exists(), "a FIFO was copied as a file");
+        assert_eq!(report.skipped.len(), 1, "{:?}", report.skipped);
     }
 }

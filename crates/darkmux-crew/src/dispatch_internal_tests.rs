@@ -18307,5 +18307,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
             polls += 1;
         }
         assert_eq!(state.summary.compactions, 1, "only the legitimate trailing event counts");
-        assert_eq!(lines.lock().unwrap().len(), 1, "{:?}", lines.lock().unwrap());
+        // Bind first: locking twice in one `assert_eq!` deadlocks on failure.
+        let lines = lines.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "{lines:?}");
     }
