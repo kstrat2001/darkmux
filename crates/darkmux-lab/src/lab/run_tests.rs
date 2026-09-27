@@ -12,17 +12,17 @@ use tempfile::TempDir;
 /// What the scripted provider does on its next run. One process-global
 /// script, so every test using it holds `#[serial_test::serial]`.
 #[derive(Clone, Default)]
-struct Script {
-    setup_err: bool,
-    run_err: bool,
-    ok: bool,
-    verify: Option<bool>,
-    write_manifest: bool,
+pub(crate) struct Script {
+    pub(crate) setup_err: bool,
+    pub(crate) run_err: bool,
+    pub(crate) ok: bool,
+    pub(crate) verify: Option<bool>,
+    pub(crate) write_manifest: bool,
 }
 
 static SCRIPT: Mutex<Option<Script>> = Mutex::new(None);
 
-fn script(s: Script) {
+pub(crate) fn script(s: Script) {
     *SCRIPT.lock().unwrap() = Some(s);
 }
 
@@ -83,10 +83,23 @@ impl WorkloadProvider for ScriptedProvider {
 
 /// An isolated darkmux root holding one profile registry and the named
 /// workload documents.
-struct Lab {
+pub(crate) struct Lab {
     _tmp: TempDir,
     _home: HomeGuard,
-    profiles: String,
+    prev_lms_bin: Option<std::ffi::OsString>,
+    pub(crate) profiles: String,
+}
+
+impl Drop for Lab {
+    fn drop(&mut self) {
+        // SAFETY: every caller holds `#[serial_test::serial]`.
+        unsafe {
+            match &self.prev_lms_bin {
+                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            }
+        }
+    }
 }
 
 impl Lab {
@@ -109,10 +122,14 @@ impl Lab {
             .unwrap();
         }
         let guard = HomeGuard::set(&home);
-        Self { _tmp: tmp, _home: guard, profiles: profiles.to_str().unwrap().to_string() }
+        // A non-quiet run lists the loaded models; never reach a real `lms`.
+        let prev_lms_bin = std::env::var_os("DARKMUX_LMS_BIN");
+        // SAFETY: every caller holds `#[serial_test::serial]`.
+        unsafe { std::env::set_var("DARKMUX_LMS_BIN", "/usr/bin/true") };
+        Self { _tmp: tmp, _home: guard, prev_lms_bin, profiles: profiles.to_str().unwrap().to_string() }
     }
 
-    fn scripted(workloads: &[&str]) -> Self {
+    pub(crate) fn scripted(workloads: &[&str]) -> Self {
         let docs: Vec<_> = workloads
             .iter()
             .map(|id| serde_json::json!({ "id": id, "provider": SCRIPTED, "prompt": "hi" }))
@@ -271,4 +288,25 @@ fn a_prompt_workload_reports_verify_none_without_a_spec_and_the_verdict_with_one
         assert!(o.ok, "{id}: the stub dispatch must succeed: {:?}", o.notes);
         assert_eq!(o.verify_passed, want, "{id}: {:?}", o.notes);
     }
+}
+/// (#2982b, #2494) ONE exit gate for every lab verb that runs a workload:
+/// a failed dispatch or a failed verify exits 1; a verify nothing declared
+/// does not.
+#[test]
+fn the_exit_gate_fails_on_a_failed_dispatch_or_a_failed_verify_only() {
+    let o = |ok: bool, verify_passed: Option<bool>| RunOutcome {
+        run_id: String::new(),
+        run_dir: std::path::PathBuf::new(),
+        ok,
+        verify_passed,
+        duration_ms: 0,
+        notes: vec![],
+    };
+    assert_eq!(exit_code(&[]), 0);
+    assert_eq!(exit_code(&[o(true, None)]), 0);
+    assert_eq!(exit_code(&[o(true, Some(true))]), 0);
+    assert_eq!(exit_code(&[o(true, Some(false))]), 1);
+    assert_eq!(exit_code(&[o(false, None)]), 1);
+    assert_eq!(exit_code(&[o(false, Some(true))]), 1);
+    assert_eq!(exit_code(&[o(true, None), o(true, Some(false))]), 1);
 }

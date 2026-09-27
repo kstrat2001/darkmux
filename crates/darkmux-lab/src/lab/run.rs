@@ -52,6 +52,31 @@ pub struct RunOutcome {
     pub notes: Vec<String>,
 }
 
+impl RunOutcome {
+    /// The workload's verify ran and failed. A verify nothing declared
+    /// (`None`) is not a failure.
+    pub fn verify_failed(&self) -> bool {
+        self.verify_passed == Some(false)
+    }
+
+    /// (#2494) The run passed: the dispatch completed AND no declared verify
+    /// failed. `ok` alone lets a run whose tests failed read green.
+    pub fn passed(&self) -> bool {
+        self.ok && !self.verify_failed()
+    }
+}
+
+/// (#2494, #2982) The process exit code for every lab verb that runs
+/// workloads (`lab run`, `lab characterize`, `lab tune`): 0 when every run
+/// passed, 1 otherwise.
+pub fn exit_code(outcomes: &[RunOutcome]) -> i32 {
+    if outcomes.iter().all(RunOutcome::passed) {
+        0
+    } else {
+        1
+    }
+}
+
 /// (#1004) Loop-lab A/B "with-context" arm: splice the caller-built
 /// engagement-context blocks in FRONT of the workload's own prompt, so the
 /// dispatch carries the same context a real coder brief would. Resolves the
@@ -2168,4 +2193,4 @@ mod tests {
 
 #[cfg(test)]
 #[path = "run_tests.rs"]
-mod run_tests;
+pub(crate) mod run_tests;
