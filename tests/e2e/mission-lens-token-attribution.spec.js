@@ -39,14 +39,14 @@ const GRAPH = {
 const rec = (over) => ({ ts: `${TODAY}T10:00:00Z`, level: 'info', category: 'work', tier: 'local', stage: 'dispatch', handle: 'h', ...over });
 
 const RECORDS = [
-  rec({ action: 'dispatch.start', session_id: 'step-judge-1', payload: {} }),
-  rec({ action: 'dispatch.start', session_id: 'step-judge-2', payload: {} }),
-  rec({ action: 'dispatch.start', session_id: 'step-local-1', payload: {} }),
-  rec({ action: 'telemetry.tokens', category: 'telemetry', source: 'tokens', session_id: 'step-judge-1', payload: { total_tokens: 5000 } }),
-  rec({ action: 'telemetry.tokens', category: 'telemetry', source: 'tokens', session_id: 'step-judge-2', payload: { total_tokens: 7000 } }),
-  rec({ action: 'dispatch.error', session_id: 'step-judge-2', payload: {} }),
-  rec({ action: 'telemetry.tokens', category: 'telemetry', source: 'tokens', session_id: 'step-local-1', payload: { total_tokens: 3000 } }),
-  rec({ action: 'dispatch.complete', session_id: 'step-local-1', payload: {} }),
+  rec({ action: 'dispatch.start', session_id: 'step-judge-1', payload: { step_id: 'judge-1' } }),
+  rec({ action: 'dispatch.start', session_id: 'step-judge-2', payload: { step_id: 'judge-2' } }),
+  rec({ action: 'dispatch.start', session_id: 'step-local-1', payload: { step_id: 'local-1' } }),
+  rec({ action: 'telemetry.tokens', category: 'telemetry', source: 'tokens', session_id: 'step-judge-1', payload: { step_id: 'judge-1', total_tokens: 5000 } }),
+  rec({ action: 'telemetry.tokens', category: 'telemetry', source: 'tokens', session_id: 'step-judge-2', payload: { step_id: 'judge-2', total_tokens: 7000 } }),
+  rec({ action: 'dispatch.error', session_id: 'step-judge-2', payload: { step_id: 'judge-2' } }),
+  rec({ action: 'telemetry.tokens', category: 'telemetry', source: 'tokens', session_id: 'step-local-1', payload: { step_id: 'local-1', total_tokens: 3000 } }),
+  rec({ action: 'dispatch.complete', session_id: 'step-local-1', payload: { step_id: 'local-1' } }),
 ];
 
 async function open(page, records) {

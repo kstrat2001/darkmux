@@ -2382,8 +2382,7 @@ pub(crate) struct LabRunSummary {
     /// used — read from `manifest.json` when it exists (a completed run),
     /// falling back to `lifecycle.json`'s own `session_id` (#2511) when it
     /// doesn't (a LIVE run). Exists so `runs::build_runs` can claim this
-    /// session the same way `collect_mission_step_sessions` claims a
-    /// mission's own step sessions — an absent value claims nothing and the
+    /// session for the lab run — an absent value claims nothing and the
     /// ghost persists, which is the honest degradation.
     ///
     /// SCOPE, stated exactly, because the field is easy to over-read as "a
@@ -3859,6 +3858,9 @@ async fn catalog_records_response(
             // response goes out, so the run-detail SYSTEM pane (which reads
             // this same session-scoped record set) doesn't have to learn a
             // second fetch.
+            if field == "mission_id" {
+                mission_graph::stamp_session_steps(&mut records, &id);
+            }
             let mut days_scanned = 0usize;
             if field == "session_id" {
                 let join_stats =

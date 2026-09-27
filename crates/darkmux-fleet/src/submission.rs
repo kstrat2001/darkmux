@@ -35,6 +35,7 @@ use crate::job::{WorkJob, WORK_JOB_SCHEMA_VERSION};
 use crate::identity::NodeIdentity;
 use anyhow::{anyhow, Context, Result};
 use darkmux_types::config::AcceptWorkEntry;
+use darkmux_types::session_id::SessionId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -109,8 +110,12 @@ pub struct SubmissionReply {
     /// The machine that answered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
+    /// The receiver's relay session for the job. (#2916 re-review C6) The
+    /// echoed id is printed and stored, so only a well-formed one is kept:
+    /// one outside the session grammar reads as none, and the reply itself
+    /// still reads.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "well_formed_session")]
+    pub session_id: Option<SessionId>,
     /// The profile the job ran on (after the receiver resolved it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
@@ -123,6 +128,12 @@ pub struct SubmissionReply {
     /// Why, for `refused` and `error` (and what a `queued` job waits for).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// A reply's `session_id`, kept only when it parses in the session grammar.
+fn well_formed_session<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<SessionId>, D::Error> {
+    let raw = Option::<String>::deserialize(d)?;
+    Ok(raw.and_then(|wire| SessionId::parse(&wire).ok()))
 }
 
 impl SubmissionReply {
@@ -423,14 +434,6 @@ pub fn read_allow_list(path: &std::path::Path) -> std::result::Result<BTreeMap<S
 /// [`read_allow_list`] at this machine's user-scope config.json.
 pub fn read_user_allow_list() -> std::result::Result<BTreeMap<String, AcceptWorkEntry>, String> {
     read_allow_list(&darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config)
-}
-
-/// (#2916 review C2) The session id the RECEIVER runs a submitted job
-/// under: the sender's id with the peer's name appended, so a peer can
-/// never reuse (and so write into the records of) one of this machine's own
-/// sessions. The reply carries it back to the sender.
-pub fn receiver_session_id(sender_session: &str, peer: &str) -> String {
-    format!("{sender_session}-from-{peer}")
 }
 
 /// What the receiver's profile resolution made of a job's (role, profile).
@@ -951,13 +954,13 @@ pub fn submit_work(job: WorkJob, wait: bool) -> Result<SubmissionReply> {
             }
         }
     };
-    let (code, mut reply) =
+    let (code, reply) =
         send_submission(&peer, &submission, read_timeout, &mut on_progress).map_err(|e| match e.downcast::<AnswerLost>() {
             Ok(lost) => {
                 // The receiver names the run after the allow-list entry it
                 // trusts this machine under, normally this machine_id.
                 let me = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "<this machine>".into());
-                let theirs = receiver_session_id(&session_id, &me);
+                let theirs = SessionId::relay(session_id.clone(), me);
                 anyhow!(
                     "{lost}. The job may still be running on {target} (session {theirs}); follow it \
                      there with `darkmux flow tail --session {theirs}` or in its viewer"
@@ -965,13 +968,6 @@ pub fn submit_work(job: WorkJob, wait: bool) -> Result<SubmissionReply> {
             }
             Err(other) => other,
         })?;
-    // (#2916 re-review C6) The echoed session id is printed and stored:
-    // only a well-formed one is kept.
-    if let Some(sid) = &reply.session_id {
-        if crate::job::validate_reply_session_id(sid).is_err() {
-            reply.session_id = None;
-        }
-    }
     match reply.status {
         ReplyStatus::Completed | ReplyStatus::Accepted | ReplyStatus::Queued => Ok(reply),
         ReplyStatus::Error => Err(anyhow!(
@@ -1018,7 +1014,7 @@ mod tests {
             target_machine: "studio".into(),
             role_id: "radio-host".into(),
             message: "hi".into(),
-            session_id: "s-1".into(),
+            session_id: crate::test_session("s-1"),
             profile: profile.map(str::to_string),
             workdir: None,
             phase_id: None,
@@ -1167,7 +1163,6 @@ mod tests {
         let mut j = job(None);
         j.target_machine = "Studio".into();
         assert_eq!(check_scope("studio", &admitted, &j, work()).unwrap().profile, "host", "case-insensitive");
-        assert_eq!(receiver_session_id("s-1", "laptop"), "s-1-from-laptop");
     }
 
     #[test]
@@ -1225,6 +1220,21 @@ mod tests {
         assert_eq!(read_allow_list(&p).unwrap()["laptop"].node_id.as_deref(), Some("n1"));
         std::fs::write(&p, "{ not json").unwrap();
         assert!(read_allow_list(&p).is_err());
+    }
+
+    /// A 3.x sender speaks v6, whose `session_id` is a free-form string.
+    /// Its job must get the version remedy, never a field error from the
+    /// 4.0 session grammar it could not have known.
+    #[test]
+    fn a_v6_job_with_a_pre_4_0_session_gets_the_version_remedy() {
+        let good = serde_json::to_vec(&WorkSubmission::new(job(Some("host")), true)).unwrap();
+        let mut v: serde_json::Value = serde_json::from_slice(&good).unwrap();
+        v["schema"] = "6".into();
+        v["job"]["session_id"] = "crew-dispatch-coder-1788254029192466-0".into();
+        assert_eq!(
+            WorkSubmission::parse(&serde_json::to_vec(&v).unwrap()).unwrap_err(),
+            Refusal::SchemaMismatch { got: "6".into() }
+        );
     }
 
     #[test]

@@ -37,7 +37,7 @@ function graphSnapshot() {
 const CODER_SESS = 'mission-run-agentic-turns-build-abc';
 const coderTurn = { ts: `${TODAY}T10:00:00Z`, action: 'dispatch.turn', category: 'work', session_id: CODER_SESS, level: 'info', handle: 'coder', payload: { step_id: 'coder-1', turns_so_far: 3, turn_seq: 3 } };
 const coderTool = { ts: `${TODAY}T10:00:01Z`, action: 'dispatch.tool', category: 'work', session_id: CODER_SESS, level: 'info', handle: 'coder', payload: { step_id: 'coder-1', tool_calls_so_far: 2, tool_name: 'edit' } };
-const probeTok = { ts: `${TODAY}T10:00:02Z`, action: 'telemetry.tokens', category: 'telemetry', source: 'tokens', session_id: 'step-probe-1', level: 'info', payload: { total_tokens: 4000 } };
+const probeTok = { ts: `${TODAY}T10:00:02Z`, action: 'telemetry.tokens', category: 'telemetry', source: 'tokens', session_id: 'step-probe-1', level: 'info', payload: { step_id: 'probe-1', total_tokens: 4000 } };
 const verifyPhantomTurn = { ts: `${TODAY}T10:00:03Z`, action: 'dispatch.turn', category: 'work', session_id: CODER_SESS, level: 'info', handle: 'coder', payload: { step_id: 'verify-1', turns_so_far: 5, turn_seq: 5 } };
 
 async function routeAll(page, streamRecords) {

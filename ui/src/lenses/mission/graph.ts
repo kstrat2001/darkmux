@@ -315,8 +315,6 @@ export interface GraphIndex {
   stepIds: Set<string>;
   taskIds: Set<string>;
   phaseIds: Set<string>;
-  sessionToStep: Record<string, string>;
-  sessions: Set<string>;
 }
 
 export function indexGraph(g: { nodes: GraphNode[] }): GraphIndex {
@@ -325,23 +323,16 @@ export function indexGraph(g: { nodes: GraphNode[] }): GraphIndex {
   const stepIds = new Set<string>();
   const taskIds = new Set<string>();
   const phaseIds = new Set<string>();
-  const sessionToStep: Record<string, string> = {};
-  const sessions = new Set<string>();
   for (const n of g.nodes) {
     nodeIds.add(n.id);
     if (n.kind === "phase") phaseIds.add(n.id);
-    if (n.kind === "task") {
-      taskIds.add(n.id);
-      sessions.add("task-" + n.id);
-    }
+    if (n.kind === "task") taskIds.add(n.id);
     for (const s of n.steps || []) {
       stepToTask[s.id] = n.id;
       stepIds.add(s.id);
-      sessionToStep["step-" + s.id] = s.id;
-      sessions.add("step-" + s.id);
     }
   }
-  return { nodeIds, stepToTask, stepIds, taskIds, phaseIds, sessionToStep, sessions };
+  return { nodeIds, stepToTask, stepIds, taskIds, phaseIds };
 }
 
 // ─── work metrics (mission-graph.html: isAiKind, stepForRecord,
@@ -417,45 +408,19 @@ export function tsToMs(stamp: string | number | null | undefined): number {
   return isNaN(t) ? 0 : t;
 }
 
-/** `stepForRecord` — mission-graph.html. Three correlation keys, in order:
- * `payload.step_id`, `session_id` (the `step-<id>` default, in either its
- * bare pre-FLOW-1.43.0 spelling or the `step-<id>-<missionId>` run-scoped
- * spelling #1918 introduced), `handle`.
- * `mission_id`, when present, is authoritative and never falls through.
- *
- * (#1918) `mission_id` does NOT make the session key redundant: it gates
- * ADMISSION (which mission owns the record) and says nothing about WHICH
- * STEP the record belongs to. The `dispatch complete` record the token/turn
- * meters read carries no `payload.step_id` (only the tailer's per-event
- * records are step-stamped) and its `handle` is the ROLE id, so the session
- * key is the only one that can attribute it. Mirrors
- * `crates/darkmux-serve/src/mission_graph.rs`'s `step_for_record` exactly —
- * the two must stay in lock-step. */
+/** `stepForRecord` — mission-graph.html. Two correlation keys, in order:
+ * `payload.step_id` (every record of a step's own session names its step,
+ * and a dispatch run as a graph step stamps it on its per-event records),
+ * then `handle` (the scheduler's step lifecycle records). The session id is
+ * never parsed: it is an opaque join key. `mission_id`, when present, is
+ * authoritative and never falls through. */
 export function stepForRecord(rec: NormRecord, idx: GraphIndex, missionId: string): string | null {
   if (rec.mission_id && rec.mission_id !== missionId) return null;
   const p = rec.payload || {};
   const stepId = typeof p.step_id === "string" ? p.step_id : undefined;
   if (stepId && idx.stepIds.has(stepId)) return stepId;
-  if (rec.session_id) {
-    if (idx.sessionToStep[rec.session_id]) return idx.sessionToStep[rec.session_id];
-    const unscoped = unscopeSession(rec.session_id, missionId);
-    if (unscoped && idx.sessionToStep[unscoped]) return idx.sessionToStep[unscoped];
-  }
   if (rec.handle && idx.stepIds.has(rec.handle)) return rec.handle;
   return null;
-}
-
-/** (#1918) Peel the run-scope `-<missionId>` suffix
- * `darkmux_types::session_id::scope_to_run` appends to the config-derived
- * `task-`/`step-` session defaults, so a mixed day file — pre-1.43.0
- * unscoped records beside post-1.43.0 scoped ones, the state every
- * upgrading operator actually has — resolves identically under both
- * spellings. Returns "" when the id carries no such suffix. */
-function unscopeSession(sessionId: string, missionId: string): string {
-  if (!missionId) return "";
-  const suffix = "-" + missionId;
-  if (!sessionId.endsWith(suffix)) return "";
-  return sessionId.slice(0, sessionId.length - suffix.length);
 }
 
 /** `stepDispatchSessions` (#2223) -- the INVERSE of {@link stepForRecord}:
@@ -463,32 +428,19 @@ function unscopeSession(sessionId: string, missionId: string): string {
  * records, which is what lets the step drill-in reach the dispatch detail
  * view (`#dispatch=<id>`) instead of only scoping the events column.
  *
- * The discriminator is EVIDENCE OF DISPATCH, not the shape of the session
- * id: a session counts only through records whose action is a
- * `dispatch.*` bookend/turn (`isDispatchFamily`). This matters
- * because the emitter's DEFAULT session id for a `dispatch.internal` step
- * with no configured session is literally `step-<id>`
- * (`session_id::step`, see `crates/darkmux-serve/src/runs.rs`'s
- * "join by session_id" doc) -- the id LOOKS graph-minted and is
- * simultaneously the real dispatch session for every generic
- * `mission launch <config>` step. An earlier version of this function
- * filtered those by prefix and was therefore inert on exactly that
- * flagship path (caught in adversarial review). Steps that never
- * dispatched (procedural steps, bookkeeping-only sessions) still produce
- * no entry, and the caller keeps #2189's scoping -- the honest fallback.
+ * The discriminator is EVIDENCE OF DISPATCH, never the shape of the
+ * session id (an opaque join key): a session counts only through records
+ * whose action is a `dispatch.*` bookend/turn (`isDispatchFamily`). Steps
+ * that never dispatched (procedural steps, bookkeeping-only sessions)
+ * produce no entry, and the caller keeps #2189's scoping -- the honest
+ * fallback.
  *
  * Selection, when a step's records name more than one dispatch session:
  * 1. A session whose dispatch records carry THIS mission's `mission_id`
- *    beats any session that doesn't -- generic-launch dispatch records
- *    carry `mission_id: null` (the serve doc's gap 1/2), so null-mission
- *    records are admitted, but a concurrent mission's records leaking in
- *    through the day-file merge (they pass `recordInMission`'s last-resort
- *    step-id match only when THEY are null-mission too) can never outrank
- *    records positively tagged as ours.
- * 2. Within a tier, the step's own emitter-default session
- *    (`step-<stepId>`) wins -- it is deterministic and cannot belong to a
- *    colliding foreign step.
- * 3. Otherwise the session with the LATEST dispatch-action timestamp wins,
+ *    beats any session that doesn't -- a pre-4.0 archive's records may
+ *    carry none, so null-mission records are admitted, but they can never
+ *    outrank records positively tagged as ours.
+ * 2. Otherwise the session with the LATEST dispatch-action timestamp wins,
  *    not the most records: a looped-then-killed attempt emits hundreds of
  *    turn records while the successful retry emits a dozen, so frequency
  *    selects the failure; recency selects the attempt that represents the
@@ -515,14 +467,6 @@ export function stepDispatchSessions(records: NormRecord[], missionId: string): 
   }
   const out: Record<string, string> = {};
   for (const [stepId, seen] of Object.entries(tally)) {
-    // (#1918) The emitter default now carries the run scope
-    // (`step-<id>-<missionId>`) whenever the step's phase resolves, so
-    // this deterministic tiebreak accepts BOTH spellings — otherwise the
-    // rule silently stopped applying on exactly the flagship generic
-    // `mission launch <config>` path it was written for.
-    const emitterDefault = "step-" + stepId;
-    const emitterDefaultScoped = emitterDefault + "-" + missionId;
-    const isEmitterDefault = (sid: string) => sid === emitterDefault || sid === emitterDefaultScoped;
     let best = "";
     let bestT: Tally | null = null;
     for (const [sid, t] of Object.entries(seen)) {
@@ -533,12 +477,6 @@ export function stepDispatchSessions(records: NormRecord[], missionId: string): 
       }
       if (t.ours !== bestT.ours) {
         if (t.ours) { best = sid; bestT = t; }
-        continue;
-      }
-      const aDefault = isEmitterDefault(sid);
-      const bDefault = isEmitterDefault(best);
-      if (aDefault !== bDefault) {
-        if (aDefault) { best = sid; bestT = t; }
         continue;
       }
       if (t.lastTs !== bestT.lastTs) {
@@ -841,12 +779,12 @@ export function mergeGraphs(prevGraph: MissionGraph | null, fresh: MissionGraph)
 
 /** `recordInMission` — mission-graph.html. Does this record belong to THIS
  * mission (the events panel filter)? `mission_id`, when present, is
- * authoritative; absent, falls back to proxy matching on handle/session. */
+ * authoritative; absent, falls back to proxy matching on phase, handle and
+ * `payload.step_id`. */
 export function recordInMission(rec: NormRecord, idx: GraphIndex, missionId: string): boolean {
   if (rec.mission_id) return rec.mission_id === missionId;
   if (rec.phase_id && idx.phaseIds.has(rec.phase_id)) return true;
   if (rec.handle && (idx.nodeIds.has(rec.handle) || idx.stepIds.has(rec.handle))) return true;
-  if (rec.session_id && idx.sessions.has(rec.session_id)) return true;
   const stepId = rec.payload && typeof rec.payload.step_id === "string" ? rec.payload.step_id : undefined;
   if (stepId && idx.stepIds.has(stepId)) return true;
   return false;

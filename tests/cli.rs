@@ -4163,7 +4163,11 @@ fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
         "cli-test-serve-node".to_string(),
         "dialectic-judge".to_string(),
         "hang please".to_string(),
-        "cli-test-serve-sigterm-session".to_string(),
+        darkmux_types::session_id::SessionId::adhoc(
+            darkmux_types::session_id::RunId::mission("cli-test").unwrap(),
+            "dialectic-judge",
+            "cli-test-serve-sigterm-session",
+        ),
         None,
         None,
         None,

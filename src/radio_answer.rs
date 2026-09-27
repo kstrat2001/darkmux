@@ -1599,7 +1599,7 @@ pub fn dispatch_answerer_call_with(
         timeout_override_seconds: None, // (#2480)
         role_id: "radio-host".to_string(),
         message: user_message.to_string(),
-        session_id: None,
+        session: crate::radio::radio_session("radio-host"),
         timeout_seconds: 300,
         skip_preflight: false,
         json: false,

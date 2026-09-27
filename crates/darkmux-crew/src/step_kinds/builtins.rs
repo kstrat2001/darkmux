@@ -21,6 +21,7 @@ use super::types::{
 };
 use crate::remote_budget::RemoteBudget;
 use crate::types::{Step, Task};
+use darkmux_types::session_id::{SessionId, SessionScope};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -355,7 +356,7 @@ pub struct RawDispatchOutcome {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
-    pub session_id: String,
+    pub session_id: SessionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub out_dir: Option<std::path::PathBuf>,
 }
@@ -384,6 +385,7 @@ pub(crate) fn dispatch_opts_for(
     step: &Step,
     task: &Task,
     input: &BTreeMap<String, String>,
+    ctx: &StepRunCtx,
 ) -> Result<crate::dispatch::DispatchOpts> {
     use crate::dispatch::{CompactionDispatchArgs, DispatchOpts};
 
@@ -417,9 +419,16 @@ pub(crate) fn dispatch_opts_for(
     let phase_id = config_str(step, "phase_id")
         .map(str::to_string)
         .or_else(|| (!task.phase_id.is_empty()).then(|| task.phase_id.clone()));
-    let session_id = config_str(step, "session_id")
-        .map(str::to_string)
-        .unwrap_or_else(|| darkmux_types::session_id::step(&step.id));
+    // A producer that names the session (the crew-of-one names its ad-hoc
+    // dispatch) writes its wire string here; read back strictly. Otherwise
+    // the step's own session in this run.
+    let session = match step.config.get("session_id") {
+        Some(v) => serde_json::from_value::<SessionId>(v.clone())
+            .with_context(|| format!("step `{}`: config.session_id", step.id))?,
+        None => ctx
+            .session(&DispatchInternalStepKind, step)
+            .ok_or_else(|| anyhow!("step `{}`: `dispatch.internal` declares no session", step.id))?,
+    };
     // (#1509) Additive, default-preserving config passthroughs — see
     // `DispatchInternalStepKind`'s doc. Every existing caller (mission
     // launch, coder-phase, review) never sets these keys, so each falls
@@ -472,7 +481,7 @@ pub(crate) fn dispatch_opts_for(
         record_context: None,
         role_id,
         message,
-        session_id: Some(session_id),
+        session,
         timeout_seconds,
         skip_preflight,
         json,
@@ -488,8 +497,8 @@ pub(crate) fn dispatch_opts_for(
         image,
         model_base_url_override: None,
         // (#1483) Stamp the step id so the tailer's live turn/tool/token
-        // records attribute to this seat even if `session_id` was
-        // config-overridden off the `step-<id>` default the viewer maps.
+        // records attribute to this seat even when the session is not the
+        // step's own (a producer named it).
         step_id: Some(step.id.clone()),
         system_prompt_override: None,
         resume_from,
@@ -522,7 +531,7 @@ impl StepKind for DispatchInternalStepKind {
         "Dispatch"
     }
 
-    fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+    fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>, ctx: &StepRunCtx) -> Result<StepOutcome> {
         use crate::dispatch::dispatch;
 
         let parse_verifiers = step
@@ -540,7 +549,7 @@ impl StepKind for DispatchInternalStepKind {
         // free function a unit test can call without Docker or a model —
         // so a field can no longer be dropped on this hop while the suite
         // stays green. Everything below is post-dispatch handling.
-        let opts = dispatch_opts_for(step, task, input)?;
+        let opts = dispatch_opts_for(step, task, input, ctx)?;
         let result =
             dispatch(opts).with_context(|| format!("step `{}` dispatch.internal", step.id))?;
 
@@ -577,31 +586,21 @@ impl StepKind for DispatchInternalStepKind {
             let failed = parse_failed_verifiers(&result.stdout);
             if !failed.is_empty() {
                 flow_records.push(darkmux_flow::FlowRecord {
-                    ts: darkmux_flow::ts_utc_now(),
-                    level: darkmux_flow::Level::Warn,
-                    category: darkmux_flow::Category::Work,
-                    tier: darkmux_flow::Tier::Local,
-                    stage: darkmux_flow::Stage::Dispatch,
-                    action: darkmux_flow::FlowAction::StepResult,
-                    handle: step.id.clone(),
-                    phase_id: None,
-                    session_id: Some(darkmux_types::session_id::task(&step.task_id)),
                     source: Some("scheduler".to_string()),
-                    model: None,
-                    reasoning: None,
-                    mission_id: None,
-                    machine_id: None,
-                    machine_uid: None,
-                    prev_hash: None,
-                    hash: None,
                     payload: Some(serde_json::json!({
                         "step_id": step.id,
                         "kind": "dispatch.internal",
                         "failed_verifiers": failed,
                         "count": failed.len(),
                     })),
-                    work_id: None,
-                    attempt: None,
+                    ..darkmux_flow::FlowRecord::for_session(
+                        &SessionId::task(ctx.run_id().clone(), &step.task_id),
+                        darkmux_flow::Level::Warn,
+                        darkmux_flow::Category::Work,
+                        darkmux_flow::Stage::Dispatch,
+                        darkmux_flow::FlowAction::StepResult,
+                        step.id.clone(),
+                    )
                 });
             }
         }
@@ -684,12 +683,12 @@ impl StepKind for DispatchInternalStepKind {
         step: &Step,
         task: &Task,
         input: &std::collections::BTreeMap<String, String>,
-        _ctx: &StepRunCtx,
+        ctx: &StepRunCtx,
     ) -> Result<()> {
         if config_str(step, "resume_from").is_none() {
             return Ok(());
         }
-        let opts = dispatch_opts_for(step, task, input)
+        let opts = dispatch_opts_for(step, task, input, ctx)
             .with_context(|| format!("step `{}` dispatch.internal", step.id))?;
         let Some(resume_from) = opts.resume_from.clone() else {
             return Ok(());
@@ -766,9 +765,10 @@ fn hosted_single_shot_step_payload(
 impl DispatchSingleShotStepKind {
     /// (#2344) This kind's contract-#2 bookend records — the same shape
     /// `DispatchMapStepKind::bookend_record` builds for its own kind, and
-    /// keyed on the SAME `session_id::task` this kind's `step result` record
+    /// keyed on the SAME task session this kind's `step result` record
     /// already uses, so a consumer joins the pair to the tokens.
     fn bookend_record(
+        session: &SessionId,
         step: &Step,
         model: &str,
         action: darkmux_flow::FlowAction,
@@ -788,26 +788,10 @@ impl DispatchSingleShotStepKind {
         }
         darkmux_flow::stamp_remote_classification(&mut payload, endpoint_label, None);
         darkmux_flow::FlowRecord {
-            ts: darkmux_flow::ts_utc_now(),
-            level,
-            category: darkmux_flow::Category::Work,
-            tier: darkmux_flow::Tier::Local,
-            stage: darkmux_flow::Stage::Dispatch,
-            action,
-            handle: step.id.clone(),
-            phase_id: None,
-            session_id: Some(darkmux_types::session_id::task(&step.task_id)),
             source: Some("scheduler".to_string()),
             model: Some(model.to_string()),
-            reasoning: None,
-            mission_id: None,
-            machine_id: None,
-            machine_uid: None,
-            prev_hash: None,
-            hash: None,
             payload: Some(payload),
-            work_id: None,
-            attempt: None,
+            ..darkmux_flow::FlowRecord::for_session(session, level, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, action, step.id.clone())
         }
     }
 }
@@ -824,17 +808,11 @@ impl StepKind for DispatchSingleShotStepKind {
     /// (#1979) Task-scoped, NOT the trait default's step scope. Deliberate:
     /// sibling seats fanned out within one task share this key so a
     /// consumer can join a seat's tokens to its endpoint (see the record
-    /// built in this kind's own dispatch path, and `session_id::task`'s
-    /// doc). The step remains individually attributable through
+    /// built in this kind's own dispatch path). The step remains individually attributable through
     /// `payload.step_id` and `handle` — grouping and identity are different
     /// jobs, and this field is the grouping one.
-    fn dispatch_session_id(&self, step: &Step) -> Option<String> {
-        if let Some(sid) = step.config.get("session_id").and_then(|v| v.as_str()) {
-            if !sid.is_empty() {
-                return Some(sid.to_string());
-            }
-        }
-        Some(darkmux_types::session_id::task(&step.task_id))
+    fn session_scope(&self) -> SessionScope {
+        SessionScope::Task
     }
 
 
@@ -900,25 +878,8 @@ impl StepKind for DispatchSingleShotStepKind {
         None
     }
 
-    /// The ctx-free entry point unit tests drive directly. Production takes
-    /// [`Self::run_streaming`] below; both funnel into `run_single_shot`, so
-    /// the presence beat and the liveness bookends are on ONE path, not two.
-    fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
-        self.run_single_shot(step, task, input, None)
-    }
-
-    /// (#2344) The scheduler's real entry point. Overridden for the same
-    /// reason `dispatch.map` overrides it: the liveness bookends ride the
-    /// STREAMING seam (see [`StepBookend`]), so a kind that only implements
-    /// `run` can emit a start but never a live terminal.
-    fn run_streaming(
-        &self,
-        step: &Step,
-        task: &Task,
-        input: &BTreeMap<String, String>,
-        ctx: &StepRunCtx,
-    ) -> Result<StepOutcome> {
-        self.run_single_shot(step, task, input, Some(ctx))
+    fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>, ctx: &StepRunCtx) -> Result<StepOutcome> {
+        self.run_single_shot(step, task, input, ctx)
     }
 }
 
@@ -928,12 +889,18 @@ impl DispatchSingleShotStepKind {
         step: &Step,
         task: &Task,
         input: &BTreeMap<String, String>,
-        ctx: Option<&StepRunCtx>,
+        run_ctx: &StepRunCtx,
     ) -> Result<StepOutcome> {
         use crate::single_shot::{
             single_shot_chat, single_shot_chat_hosted, HostedSingleShotRequest,
             SingleShotRequest,
         };
+        // Records go out live through the scheduler's emitter when there is
+        // one, else batch into the outcome (see `StepBookend`).
+        let ctx = run_ctx.live();
+        let session = &run_ctx
+            .session(self, step)
+            .ok_or_else(|| anyhow!("step `{}`: `dispatch.single_shot` declares no session", step.id))?;
 
         let model = require_config_str(step, self.id(), "model")?;
         // (#2570) The identifier this step actually ADDRESSES: the bare
@@ -980,6 +947,7 @@ impl DispatchSingleShotStepKind {
         let mut bookend = StepBookend::new(
             ctx,
             Self::bookend_record(
+                session,
                 step,
                 wire_model.as_ref(),
                 darkmux_flow::FlowAction::DispatchStart,
@@ -988,6 +956,7 @@ impl DispatchSingleShotStepKind {
                 serde_json::json!({}),
             ),
             Self::bookend_record(
+                session,
                 step,
                 wire_model.as_ref(),
                 darkmux_flow::FlowAction::DispatchError,
@@ -1002,8 +971,8 @@ impl DispatchSingleShotStepKind {
 
         // (#2344) Session-liveness heartbeat — the same in-process twin of
         // the container path's emitter (#638) `dispatch.map` grew, opened at
-        // the same point the bookends open and keyed on the SAME
-        // `session_id::task` every record on this path uses. One hosted
+        // the same point the bookends open and keyed on the SAME task session
+        // every record on this path uses. One hosted
         // single-shot against a reasoning model is minutes of real
         // wall-clock; without a beat none of it was visible on the live
         // fleet view, because bookends are terminal-only records. Stopped
@@ -1015,13 +984,8 @@ impl DispatchSingleShotStepKind {
         //
         // See `DispatchMapStepKind::run_map`'s own spawn site for why the
         // key is TASK-scoped here rather than step-scoped.
-        let mut session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
-            darkmux_types::session_id::task(&step.task_id),
-            None,
-            Some(wire_model.to_string()),
-            // A mission's run page is live while any beat names its mission.
-            crate::dispatch::resolve_mission_for_phase(Some(&task.phase_id)),
-        );
+        let mut session_emitter =
+            darkmux_flow::session_presence::spawn_session_emitter(session, None, Some(wire_model.to_string()));
 
         let mut flow_records = Vec::new();
 
@@ -1031,13 +995,10 @@ impl DispatchSingleShotStepKind {
             // the endpoint's window, then this step's per-step cap. A breach
             // warns; an endpoint `wait` holds the call (the step stays live,
             // its heartbeat beating) until there is room. Nothing is clamped.
-            let caller_session = darkmux_types::session_id::task(&step.task_id);
-            let caller_mission = crate::dispatch::resolve_mission_for_phase(Some(&task.phase_id));
             let budget_caller = crate::budget::BudgetCaller {
+                session,
                 role_id: None,
-                session_id: Some(&caller_session),
                 model: Some(wire_model.as_ref()),
-                mission_id: caller_mission.as_deref(),
                 phase_id: Some(&task.phase_id),
                 profiles_file: config_str(step, "config_path"),
             };
@@ -1072,23 +1033,8 @@ impl DispatchSingleShotStepKind {
             // single-shot step's token usage is visible even without the
             // full per-step bucket regime.
             flow_records.push(darkmux_flow::FlowRecord {
-                ts: darkmux_flow::ts_utc_now(),
-                level: darkmux_flow::Level::Info,
-                category: darkmux_flow::Category::Work,
-                tier: darkmux_flow::Tier::Local,
-                stage: darkmux_flow::Stage::Dispatch,
-                action: darkmux_flow::FlowAction::StepResult,
-                handle: step.id.clone(),
-                phase_id: None,
-                session_id: Some(darkmux_types::session_id::task(&step.task_id)),
                 source: Some("scheduler".to_string()),
                 model: Some(wire_model.to_string()),
-                reasoning: None,
-                mission_id: None,
-                machine_id: None,
-                machine_uid: None,
-                prev_hash: None,
-                hash: None,
                 payload: Some(hosted_single_shot_step_payload(
                     &step.id,
                     budget,
@@ -1096,8 +1042,7 @@ impl DispatchSingleShotStepKind {
                     max_tokens,
                     &reply,
                 )),
-                work_id: None,
-                attempt: None,
+                ..darkmux_flow::FlowRecord::for_session(session, darkmux_flow::Level::Info, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, darkmux_flow::FlowAction::StepResult, step.id.clone())
             });
 
             reply
@@ -1133,9 +1078,8 @@ impl DispatchSingleShotStepKind {
             darkmux_flow::FlowAction::TelemetryTokens,
             crate::usage::USAGE_SOURCE,
             &step.id,
-            &darkmux_types::session_id::task(&step.task_id),
+            session,
             Some(wire_model.as_ref()),
-            None,
             None,
             // A step runs no role (#2914: `None` → the call's `purpose` is decided
             // by its kind alone).
@@ -1159,6 +1103,7 @@ impl DispatchSingleShotStepKind {
             em.stop();
         }
         bookend.close(Self::bookend_record(
+            session,
             step,
             wire_model.as_ref(),
             darkmux_flow::FlowAction::DispatchComplete,
@@ -1551,25 +1496,10 @@ impl DispatchMapStepKind {
     /// [`DispatchSingleShotStepKind`]'s hosted "step result" record so a
     /// graph/parity consumer reads a map's per-item records the same way it
     /// reads a single-shot's.
-    fn item_record(step: &Step, model: &str, remote: bool, res: &MapItemResult) -> darkmux_flow::FlowRecord {
+    fn item_record(session: &SessionId, step: &Step, model: &str, remote: bool, res: &MapItemResult) -> darkmux_flow::FlowRecord {
         darkmux_flow::FlowRecord {
-            ts: darkmux_flow::ts_utc_now(),
-            level: if res.ok { darkmux_flow::Level::Info } else { darkmux_flow::Level::Warn },
-            category: darkmux_flow::Category::Work,
-            tier: darkmux_flow::Tier::Local,
-            stage: darkmux_flow::Stage::Dispatch,
-            action: darkmux_flow::FlowAction::StepResult,
-            handle: step.id.clone(),
-            phase_id: None,
-            session_id: Some(darkmux_types::session_id::task(&step.task_id)),
             source: Some("scheduler".to_string()),
             model: Some(model.to_string()),
-            reasoning: None,
-            mission_id: None,
-            machine_id: None,
-            machine_uid: None,
-            prev_hash: None,
-            hash: None,
             payload: Some(serde_json::json!({
                 "step_id": step.id,
                 "kind": "dispatch.map",
@@ -1585,8 +1515,7 @@ impl DispatchMapStepKind {
                 "wall_ms": res.wall_ms,
                 "error": res.error,
             })),
-            work_id: None,
-            attempt: None,
+            ..darkmux_flow::FlowRecord::for_session(session, if res.ok { darkmux_flow::Level::Info } else { darkmux_flow::Level::Warn }, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, darkmux_flow::FlowAction::StepResult, step.id.clone())
         }
     }
 
@@ -1611,6 +1540,7 @@ impl DispatchMapStepKind {
     /// byte-identical to a purely-local dispatch's — the same no-op-when-None
     /// discipline `stamp_remote_classification` keeps.
     fn bookend_record(
+        session: &SessionId,
         step: &Step,
         model: &str,
         action: darkmux_flow::FlowAction,
@@ -1630,32 +1560,15 @@ impl DispatchMapStepKind {
         }
         darkmux_flow::stamp_remote_classification(&mut payload, endpoint_label, None);
         darkmux_flow::FlowRecord {
-            ts: darkmux_flow::ts_utc_now(),
-            level,
-            category: darkmux_flow::Category::Work,
-            tier: darkmux_flow::Tier::Local,
-            stage: darkmux_flow::Stage::Dispatch,
-            action,
-            handle: step.id.clone(),
-            phase_id: None,
-            // The SAME session id the item/aggregate records use — that is
-            // what lets a consumer join a seat's tokens to its endpoint.
-            session_id: Some(darkmux_types::session_id::task(&step.task_id)),
             source: Some("scheduler".to_string()),
             model: Some(model.to_string()),
-            reasoning: None,
-            mission_id: None,
-            machine_id: None,
-            machine_uid: None,
-            prev_hash: None,
-            hash: None,
             payload: Some(payload),
-            work_id: None,
-            attempt: None,
+            ..darkmux_flow::FlowRecord::for_session(session, level, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, action, step.id.clone())
         }
     }
 
     fn aggregate_record(
+        session: &SessionId,
         step: &Step,
         model: &str,
         remote: bool,
@@ -1670,23 +1583,8 @@ impl DispatchMapStepKind {
         // re-folding the per-item records.
         let total_wall_ms: u64 = results.iter().map(|r| r.wall_ms).sum();
         darkmux_flow::FlowRecord {
-            ts: darkmux_flow::ts_utc_now(),
-            level: if failed_count == 0 { darkmux_flow::Level::Info } else { darkmux_flow::Level::Warn },
-            category: darkmux_flow::Category::Work,
-            tier: darkmux_flow::Tier::Local,
-            stage: darkmux_flow::Stage::Dispatch,
-            action: darkmux_flow::FlowAction::StepResult,
-            handle: step.id.clone(),
-            phase_id: None,
-            session_id: Some(darkmux_types::session_id::task(&step.task_id)),
             source: Some("scheduler".to_string()),
             model: Some(model.to_string()),
-            reasoning: None,
-            mission_id: None,
-            machine_id: None,
-            machine_uid: None,
-            prev_hash: None,
-            hash: None,
             payload: Some(serde_json::json!({
                 "step_id": step.id,
                 "kind": "dispatch.map",
@@ -1697,32 +1595,16 @@ impl DispatchMapStepKind {
                 "total_tokens": total_tokens,
                 "total_wall_ms": total_wall_ms,
             })),
-            work_id: None,
-            attempt: None,
+            ..darkmux_flow::FlowRecord::for_session(session, if failed_count == 0 { darkmux_flow::Level::Info } else { darkmux_flow::Level::Warn }, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, darkmux_flow::FlowAction::StepResult, step.id.clone())
         }
     }
 
     /// The empty-collection short-circuit record (#1442): a NAMED reason so
     /// observability answers "why did this map not dispatch" directly.
-    fn short_circuit_record(step: &Step) -> darkmux_flow::FlowRecord {
+    fn short_circuit_record(session: &SessionId, step: &Step) -> darkmux_flow::FlowRecord {
         darkmux_flow::FlowRecord {
-            ts: darkmux_flow::ts_utc_now(),
-            level: darkmux_flow::Level::Info,
-            category: darkmux_flow::Category::Work,
-            tier: darkmux_flow::Tier::Local,
-            stage: darkmux_flow::Stage::Dispatch,
-            action: darkmux_flow::FlowAction::StepResult,
-            handle: step.id.clone(),
-            phase_id: None,
-            session_id: Some(darkmux_types::session_id::task(&step.task_id)),
             source: Some("scheduler".to_string()),
             model: config_str(step, "model").map(str::to_string),
-            reasoning: None,
-            mission_id: None,
-            machine_id: None,
-            machine_uid: None,
-            prev_hash: None,
-            hash: None,
             payload: Some(serde_json::json!({
                 "step_id": step.id,
                 "kind": "dispatch.map",
@@ -1730,8 +1612,7 @@ impl DispatchMapStepKind {
                 "items_out": 0,
                 "short_circuit": "empty collection — dispatch.map skipped before any model load",
             })),
-            work_id: None,
-            attempt: None,
+            ..darkmux_flow::FlowRecord::for_session(session, darkmux_flow::Level::Info, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, darkmux_flow::FlowAction::StepResult, step.id.clone())
         }
     }
 
@@ -1771,8 +1652,12 @@ impl DispatchMapStepKind {
         step: &Step,
         task: &Task,
         input: &BTreeMap<String, String>,
-        ctx: Option<&StepRunCtx>,
+        run_ctx: &StepRunCtx,
     ) -> Result<StepOutcome> {
+        let ctx = run_ctx.live();
+        let session = &run_ctx
+            .session(self, step)
+            .ok_or_else(|| anyhow!("step `{}`: `dispatch.map` declares no session", step.id))?;
         let items = resolve_map_collection(step, task, input)?;
         let mut batched: Vec<darkmux_flow::FlowRecord> = Vec::new();
         // Emit LIVE through the scheduler's seam when a ctx is present
@@ -1792,7 +1677,7 @@ impl DispatchMapStepKind {
             // no-op, not a config error (mirrors the review verify seat's
             // empty-docket short-circuit). `residency` already returned
             // `None` for this input, so no model was loaded.
-            push(Self::short_circuit_record(step), &mut batched);
+            push(Self::short_circuit_record(session, step), &mut batched);
             return Ok(StepOutcome { output: "[]".to_string(), flow_records: batched });
         }
 
@@ -1854,6 +1739,7 @@ impl DispatchMapStepKind {
         let mut bookend = StepBookend::new(
             ctx,
             Self::bookend_record(
+                session,
                 step,
                 wire_model.as_ref(),
                 darkmux_flow::FlowAction::DispatchStart,
@@ -1862,6 +1748,7 @@ impl DispatchMapStepKind {
                 serde_json::json!({ "items_in": items.len() }),
             ),
             Self::bookend_record(
+                session,
                 step,
                 wire_model.as_ref(),
                 darkmux_flow::FlowAction::DispatchError,
@@ -1917,11 +1804,9 @@ impl DispatchMapStepKind {
         // the fix is at the session convention (rekey the WHOLE vocabulary
         // together), never at the beat alone.
         let session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
-            darkmux_types::session_id::task(&step.task_id),
+            session,
             task.role_id.clone(),
             Some(wire_model.to_string()),
-            // A mission's run page is live while any beat names its mission.
-            crate::dispatch::resolve_mission_for_phase(Some(&task.phase_id)),
         );
 
         // The per-step cap. When the step named a `bucket_group`, the
@@ -1933,26 +1818,23 @@ impl DispatchMapStepKind {
         // absent, `remote.max_tokens_per_step` applies, and (#2902 step
         // 5) with neither there is no cap at all. Local items never
         // draw from it.
-        let bucket: Arc<Mutex<RemoteBudget>> = match ctx.and_then(|c| c.remote_bucket()) {
+        let bucket: Arc<Mutex<RemoteBudget>> = match run_ctx.remote_bucket() {
             Some(shared) => shared.clone(),
             None => Arc::new(Mutex::new(
                 RemoteBudget::from_config(step.config.get("bucket_budget").and_then(|v| v.as_u64()))
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?,
             )),
         };
-        let budget_session = darkmux_types::session_id::task(&step.task_id);
-        let budget_mission = crate::dispatch::resolve_mission_for_phase(Some(&task.phase_id));
         let budget_caller = crate::budget::BudgetCaller {
+            session,
             role_id: task.role_id.as_deref(),
-            session_id: Some(&budget_session),
             model: Some(wire_model.as_ref()),
-            mission_id: budget_mission.as_deref(),
             phase_id: Some(&task.phase_id),
             profiles_file: config_str(step, "config_path"),
         };
         // (#1442 ship-2b) The scheduler-supplied dispatch override, if any —
         // threaded into every item's arm; `None` on all production paths.
-        let ovr = ctx.and_then(|c| c.dispatch_override());
+        let ovr = run_ctx.dispatch_override();
 
         let temperature =
             step.config.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.7) as f32;
@@ -1978,7 +1860,7 @@ impl DispatchMapStepKind {
                 ),
             };
             // (#1442 gate C3) LIVE per-item emission when streaming.
-            push(Self::item_record(step, wire_model.as_ref(), endpoint.is_some(), &res), &mut batched);
+            push(Self::item_record(session, step, wire_model.as_ref(), endpoint.is_some(), &res), &mut batched);
             // (#1442 ship-2b, #1361 continuity) `telemetry.tokens` records
             // for this item's calls (see #2902 below), so the fleet
             // dashboard's off-meter token sum (`category: telemetry,
@@ -2009,9 +1891,8 @@ impl DispatchMapStepKind {
                         darkmux_flow::FlowAction::TelemetryTokens,
                         crate::usage::USAGE_SOURCE,
                         &step.id,
-                        &darkmux_types::session_id::task(&step.task_id),
+                        session,
                         Some(wire_model.as_ref()),
-                        None,
                         None,
                         map_call_token_payload(
                             call,
@@ -2048,7 +1929,7 @@ impl DispatchMapStepKind {
         // would render as the LARGEST single item, not the step's spend. The
         // aggregate's SUMMED total_tokens is >= every per-item value, so the
         // existing max-fold reads the true spend with zero viewer changes.
-        push(Self::aggregate_record(step, wire_model.as_ref(), endpoint.is_some(), &results), &mut batched);
+        push(Self::aggregate_record(session, step, wire_model.as_ref(), endpoint.is_some(), &results), &mut batched);
 
         // (#1607) The clean terminal. `remote_tokens` is stamped only for a
         // hosted seat, and only the SUM the seat actually spent — the same
@@ -2056,6 +1937,7 @@ impl DispatchMapStepKind {
         let ok_count = results.iter().filter(|r| r.ok).count();
         let spent: u64 = results.iter().filter_map(|r| r.total_tokens).sum();
         let mut done = Self::bookend_record(
+            session,
             step,
             wire_model.as_ref(),
             darkmux_flow::FlowAction::DispatchComplete,
@@ -2675,42 +2557,22 @@ impl StepKind for DispatchMapStepKind {
     /// (#1979) Task-scoped, NOT the trait default's step scope. Deliberate:
     /// sibling seats fanned out within one task share this key so a
     /// consumer can join a seat's tokens to its endpoint (see the record
-    /// built in this kind's own dispatch path, and `session_id::task`'s
-    /// doc). The step remains individually attributable through
+    /// built in this kind's own dispatch path). The step remains individually attributable through
     /// `payload.step_id` and `handle` — grouping and identity are different
     /// jobs, and this field is the grouping one.
-    fn dispatch_session_id(&self, step: &Step) -> Option<String> {
-        if let Some(sid) = step.config.get("session_id").and_then(|v| v.as_str()) {
-            if !sid.is_empty() {
-                return Some(sid.to_string());
-            }
-        }
-        Some(darkmux_types::session_id::task(&step.task_id))
+    fn session_scope(&self) -> SessionScope {
+        SessionScope::Task
     }
 
 
-    fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
-        // Ctx-free path (unit tests / callers with no scheduler seam): every
-        // record batches into `StepOutcome.flow_records`, and the remote
-        // bucket is step-scoped (no `bucket_group` sharing without a
-        // scheduler to own the group map).
-        self.run_map(step, task, input, None)
-    }
-
-    /// (#1442 gate C3) The scheduler entry point — LIVE per-item emission
-    /// through the [`StepRunCtx`] channel (so a 30-item map lands items on
-    /// the graph page as they finish, never batched at wave-drain) and the
-    /// scheduler-supplied shared `bucket_group` bucket when the step names
-    /// one. Delegates to the same [`Self::run_map`] body the ctx-free `run`
-    /// uses, differing ONLY in where records go and which bucket meters.
-    fn run_streaming(
-        &self,
-        step: &Step,
-        task: &Task,
-        input: &BTreeMap<String, String>,
-        ctx: &StepRunCtx,
-    ) -> Result<StepOutcome> {
-        self.run_map(step, task, input, Some(ctx))
+    /// (#1442 gate C3) LIVE per-item emission through the [`StepRunCtx`]
+    /// channel when the scheduler supplies one (so a 30-item map lands items
+    /// on the graph page as they finish, never batched at wave-drain), and
+    /// the scheduler-supplied shared `bucket_group` bucket when the step
+    /// names one. A context with no emitter (a step run on its own) batches
+    /// every record into `StepOutcome.flow_records`.
+    fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>, ctx: &StepRunCtx) -> Result<StepOutcome> {
+        self.run_map(step, task, input, ctx)
     }
 
     /// (#1442, restated as a seat claim by #2394) Four genuinely different
@@ -2986,8 +2848,8 @@ impl StepKind for ProceduralShellStepKind {
     /// which every kind gets and which a consumer adds once. Named on the
     /// no-dispatch list in `step_kinds::registry`'s conformance test, so
     /// this stays a stated choice rather than an unimplemented default.
-    fn dispatch_session_id(&self, _step: &Step) -> Option<String> {
-        None
+    fn session_scope(&self) -> SessionScope {
+        SessionScope::None
     }
 
     /// (#2577) The one kind that legitimately does — see
@@ -2998,7 +2860,7 @@ impl StepKind for ProceduralShellStepKind {
         CwdPolicy::AmbientWithRefusal
     }
 
-    fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+    fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
         let command = require_config_str(step, self.id(), "command")?;
         let cwd = resolve_shell_cwd(step, task)?;
 
@@ -3156,12 +3018,12 @@ impl StepKind for ProceduralNoopStepKind {
     /// which every kind gets and which a consumer adds once. Named on the
     /// no-dispatch list in `step_kinds::registry`'s conformance test, so
     /// this stays a stated choice rather than an unimplemented default.
-    fn dispatch_session_id(&self, _step: &Step) -> Option<String> {
-        None
+    fn session_scope(&self) -> SessionScope {
+        SessionScope::None
     }
 
 
-    fn run(&self, step: &Step, _task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+    fn run(&self, step: &Step, _task: &Task, _input: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
         let output = config_str(step, "output").unwrap_or(&step.id).to_string();
         Ok(StepOutcome {
             output,
@@ -3212,13 +3074,19 @@ mod tests {
         }
     }
 
+    /// Task `t1`'s session in the test run: what a task-scoped seat's
+    /// records land under.
+    fn task_session() -> darkmux_types::session_id::SessionId {
+        darkmux_types::session_id::SessionId::task(crate::test_run(), "t1")
+    }
+
     /// (#1530 Packet 3a) A bare `StepRunCtx` — no emitter/bucket/override,
     /// an empty `ArtifactBus` — for tests that call `seat()` directly
     /// (bypassing the scheduler, which is the only production caller that
     /// materializes a real bus). None of `seat()`'s Tier 1 builtin
     /// implementations read the bus, so an empty one is sufficient here.
     fn bare_ctx() -> StepRunCtx {
-        StepRunCtx::new(None, None, None, std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()))
+        StepRunCtx::new(crate::test_run(), None, None, None, std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()))
     }
 
     // ── #2614 review: resume_precheck / message ordering ────────────────
@@ -3473,7 +3341,7 @@ mod tests {
         }
 
         let s = step("s1", "dispatch.single_shot", json!({ "model": "qwen3-4b", "user": "hi" }));
-        let out = DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new());
+        let out = DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test());
 
         unsafe {
             match prev {
@@ -3527,7 +3395,7 @@ mod tests {
             "user_template": "check {item}",
             "collection": ["a", "b"],
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new());
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test());
 
         unsafe {
             match prev {
@@ -3642,13 +3510,13 @@ mod tests {
 
         let s = step("s1", "dispatch.single_shot", json!({ "model": "qwen3-4b", "user": "hi" }));
         let (tx, rx) = std::sync::mpsc::channel();
-        let ctx = StepRunCtx::new(
+        let ctx = StepRunCtx::new(crate::test_run(), 
             Some(tx),
             None,
             None,
             std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
         );
-        let result = DispatchSingleShotStepKind.run_streaming(&s, &empty_task(), &BTreeMap::new(), &ctx);
+        let result = DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &ctx);
         drop(ctx);
 
         unsafe {
@@ -3715,7 +3583,7 @@ mod tests {
         }
 
         let s = step("s1", "dispatch.single_shot", json!({ "model": "qwen3-4b", "user": "hi" }));
-        let out = DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new());
+        let out = DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test());
 
         unsafe {
             match prev {
@@ -3759,7 +3627,7 @@ mod tests {
             "user_template": "check {item}",
             "collection": ["a"],
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new());
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test());
 
         unsafe {
             match prev {
@@ -3823,13 +3691,13 @@ mod tests {
 
         let s = step("s1", "dispatch.single_shot", json!({ "model": "qwen3-4b", "user": "hi" }));
         let (tx, rx) = std::sync::mpsc::channel();
-        let ctx = StepRunCtx::new(
+        let ctx = StepRunCtx::new(crate::test_run(), 
             Some(tx),
             None,
             None,
             std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
         );
-        let result = DispatchSingleShotStepKind.run_streaming(&s, &empty_task(), &BTreeMap::new(), &ctx);
+        let result = DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &ctx);
         drop(ctx);
 
         unsafe {
@@ -3908,7 +3776,7 @@ mod tests {
             "collection": ["a"],
         }));
         let (tx, rx) = std::sync::mpsc::channel();
-        let ctx = StepRunCtx::new(
+        let ctx = StepRunCtx::new(crate::test_run(), 
             Some(tx),
             None,
             Some(ovr),
@@ -3916,7 +3784,7 @@ mod tests {
         );
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            DispatchMapStepKind.run_streaming(&s, &empty_task(), &BTreeMap::new(), &ctx)
+            DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &ctx)
         }));
         drop(ctx);
 
@@ -4001,7 +3869,7 @@ mod tests {
             exit_code: 2,
             stdout: "some output".to_string(),
             stderr: "some warning".to_string(),
-            session_id: "crew-dispatch-coder-123-0".to_string(),
+            session_id: crate::test_session("123-0"),
             out_dir: Some(std::path::PathBuf::from("/tmp/darkmux-out")),
         };
         let json = serde_json::to_string(&original).unwrap();
@@ -4009,7 +3877,7 @@ mod tests {
         assert_eq!(back.exit_code, 2);
         assert_eq!(back.stdout, "some output");
         assert_eq!(back.stderr, "some warning");
-        assert_eq!(back.session_id, "crew-dispatch-coder-123-0");
+        assert_eq!(back.session_id, crate::test_session("123-0"));
         assert_eq!(back.out_dir, Some(std::path::PathBuf::from("/tmp/darkmux-out")));
     }
 
@@ -4019,7 +3887,7 @@ mod tests {
             exit_code: 0,
             stdout: String::new(),
             stderr: String::new(),
-            session_id: "s".to_string(),
+            session_id: crate::test_session("s"),
             out_dir: None,
         };
         let json = serde_json::to_string(&original).unwrap();
@@ -4040,21 +3908,21 @@ mod tests {
     #[test]
     fn dispatch_internal_requires_role_id() {
         let s = step("s1", "dispatch.internal", json!({"message": "hi"}));
-        let err = DispatchInternalStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        let err = DispatchInternalStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err();
         assert!(err.to_string().contains("config.role_id"), "{err}");
     }
 
     #[test]
     fn dispatch_single_shot_requires_model() {
         let s = step("s1", "dispatch.single_shot", json!({"user": "hi"}));
-        let err = DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        let err = DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err();
         assert!(err.to_string().contains("config.model"), "{err}");
     }
 
     #[test]
     fn procedural_shell_requires_command() {
         let s = step("s1", "procedural.shell", json!({}));
-        let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err();
         assert!(err.to_string().contains("config.command"), "{err}");
     }
 
@@ -4065,7 +3933,7 @@ mod tests {
     #[serial_test::serial]
     fn procedural_shell_runs_and_captures_stdout() {
         let s = step("s1", "procedural.shell", json!({"command": "echo hello-shell"}));
-        let out = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let out = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         assert!(out.output.contains("hello-shell"));
     }
 
@@ -4076,7 +3944,7 @@ mod tests {
     #[serial_test::serial]
     fn procedural_shell_nonzero_exit_is_an_error() {
         let s = step("s1", "procedural.shell", json!({"command": "exit 3"}));
-        let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err();
         assert!(err.to_string().contains("exited with"), "{err}");
     }
 
@@ -4098,7 +3966,7 @@ mod tests {
         unsafe { std::env::set_var(k, "2") };
         let s = step("s1", "procedural.shell", json!({"command": "sleep 300"}));
         let started = std::time::Instant::now();
-        let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err();
         let elapsed = started.elapsed();
         unsafe {
             match prev {
@@ -4123,7 +3991,7 @@ mod tests {
             "procedural.shell",
             json!({"command": "echo $DARKMUX_STEP_INPUT_UPSTREAM_STEP"}),
         );
-        let out = ProceduralShellStepKind.run(&s, &empty_task(), &input).unwrap();
+        let out = ProceduralShellStepKind.run(&s, &empty_task(), &input, &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         assert!(out.output.contains("value-from-upstream"), "got: {}", out.output);
     }
 
@@ -4138,7 +4006,7 @@ mod tests {
     #[serial_test::serial]
     fn procedural_shell_exports_the_running_darkmux_binarys_path() {
         let s = step("s1", "procedural.shell", json!({"command": "printf %s \"${DARKMUX_BIN:-}\""}));
-        let out = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let out = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let seen = std::path::PathBuf::from(out.output.trim());
         assert!(
             seen.is_absolute() && seen.exists(),
@@ -4233,7 +4101,7 @@ mod tests {
         // getcwd() now fails (ENOENT) even though nothing has chdir'd away.
 
         let s = step("s1", "procedural.shell", json!({"command": "echo should-not-run"}));
-        let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err();
         assert!(
             err.to_string().contains("no longer exists"),
             "expected a refusal naming the missing directory, got: {err}"
@@ -4250,7 +4118,7 @@ mod tests {
     #[serial_test::serial]
     fn procedural_shell_valid_ambient_cwd_still_works_with_no_config() {
         let s = step("s1", "procedural.shell", json!({"command": "echo still-fine"}));
-        let out = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let out = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         assert!(out.output.contains("still-fine"));
     }
 
@@ -4280,7 +4148,7 @@ mod tests {
             "procedural.shell",
             json!({"command": "pwd", "workdir": dir.path().to_str().unwrap()}),
         );
-        let out = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let out = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         assert_eq!(
             std::fs::canonicalize(out.output.trim()).unwrap(),
             std::fs::canonicalize(dir.path()).unwrap()
@@ -4298,7 +4166,7 @@ mod tests {
         let mut task = empty_task();
         task.workdir = Some(dir.path().to_path_buf());
         let s = step("s1", "procedural.shell", json!({"command": "pwd"}));
-        let out = ProceduralShellStepKind.run(&s, &task, &BTreeMap::new()).unwrap();
+        let out = ProceduralShellStepKind.run(&s, &task, &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         assert_eq!(
             std::fs::canonicalize(out.output.trim()).unwrap(),
             std::fs::canonicalize(dir.path()).unwrap()
@@ -4326,7 +4194,7 @@ mod tests {
             "procedural.shell",
             json!({"command": "pwd", "workdir": step_dir.path().to_str().unwrap()}),
         );
-        let out = ProceduralShellStepKind.run(&s, &task, &BTreeMap::new()).unwrap();
+        let out = ProceduralShellStepKind.run(&s, &task, &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         assert_eq!(
             std::fs::canonicalize(out.output.trim()).unwrap(),
             std::fs::canonicalize(task_dir.path()).unwrap(),
@@ -4352,7 +4220,7 @@ mod tests {
             "procedural.shell",
             json!({"command": "pwd", "cwd": step_dir.path().to_str().unwrap()}),
         );
-        let out = ProceduralShellStepKind.run(&s, &task, &BTreeMap::new()).unwrap();
+        let out = ProceduralShellStepKind.run(&s, &task, &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         assert_eq!(
             std::fs::canonicalize(out.output.trim()).unwrap(),
             std::fs::canonicalize(step_dir.path()).unwrap()
@@ -4370,7 +4238,7 @@ mod tests {
             "procedural.shell",
             json!({"command": "echo hi", "cwd": "/definitely/not/a/real/darkmux/path/2532"}),
         );
-        let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err();
         let rendered = format!("{err:#}");
         assert!(rendered.contains("does not exist"), "{rendered}");
         assert!(rendered.contains("step config `cwd`"), "the refusal must name WHICH tier: {rendered}");
@@ -4392,7 +4260,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
         let s = step("s1", "procedural.shell", json!({"command": "pwd", "cwd": link.to_str().unwrap()}));
-        let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err();
         let rendered = format!("{err:#}");
         assert!(
             rendered.contains("symlink"),
@@ -4408,7 +4276,7 @@ mod tests {
     #[test]
     fn procedural_shell_empty_cwd_says_the_key_is_empty() {
         let s = step("s1", "procedural.shell", json!({"command": "echo hi", "cwd": ""}));
-        let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err();
         let rendered = format!("{err:#}");
         assert!(rendered.contains("is set but empty"), "{rendered}");
     }
@@ -4416,14 +4284,14 @@ mod tests {
     #[test]
     fn procedural_noop_defaults_output_to_step_id() {
         let s = step("marker-step", "procedural.noop", json!(null));
-        let out = ProceduralNoopStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let out = ProceduralNoopStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         assert_eq!(out.output, "marker-step");
     }
 
     #[test]
     fn procedural_noop_honors_config_output_override() {
         let s = step("s1", "procedural.noop", json!({"output": "custom"}));
-        let out = ProceduralNoopStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let out = ProceduralNoopStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         assert_eq!(out.output, "custom");
     }
 
@@ -4449,14 +4317,14 @@ mod tests {
         // A non-empty collection reaches the model check; an empty one
         // short-circuits BEFORE it (tested separately), so give one item.
         let s = map_step(json!({ "user_template": "check {item}", "collection": ["a"] }));
-        let err = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        let err = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err();
         assert!(err.to_string().contains("config.model"), "{err}");
     }
 
     #[test]
     fn dispatch_map_requires_user_template_once_the_collection_is_non_empty() {
         let s = map_step(json!({ "model": "m", "collection": ["a"] }));
-        let err = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        let err = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err();
         assert!(err.to_string().contains("config.user_template"), "{err}");
     }
 
@@ -4681,7 +4549,7 @@ mod tests {
         // reaches the model/user_template requirements or any dispatch — so a
         // config missing `model` still succeeds here (nothing to dispatch).
         let s = map_step(json!({ "collection": [] }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         assert_eq!(out.output, "[]");
         assert_eq!(out.flow_records.len(), 1, "one short-circuit record");
         let payload = out.flow_records[0].payload.as_ref().unwrap();
@@ -4793,7 +4661,7 @@ mod tests {
         });
         let out = map_hosted_item(
             0, &bucket, &map_ep(), "gpt-5.1", "sys", "user", 4_096, 1, 0, 0, Some(&ovr),
-            &mut Vec::new(), "s1", &crate::budget::BudgetCaller::default(),
+            &mut Vec::new(), "s1", &crate::budget::tests::solo_caller(),
         );
         assert!(out.ok, "{out:?}");
         assert_eq!(out.content, "answer");
@@ -4819,7 +4687,7 @@ mod tests {
         let mut calls = Vec::new();
         let out = map_hosted_item(
             0, &bucket, &map_ep(), "gpt-5.1", "sys", "user", 4_096, 0, 0, 0, Some(&ovr),
-            &mut calls, "s1", &crate::budget::BudgetCaller::default(),
+            &mut calls, "s1", &crate::budget::tests::solo_caller(),
         );
         let record = map_call_token_payload(&calls[0], 0, true, "gpt-5.1", "ep", None);
         assert_eq!(record["total_tokens"], 42);
@@ -4844,7 +4712,7 @@ mod tests {
         let mut calls = Vec::new();
         let out = map_hosted_item(
             0, &bucket, &map_ep(), "gpt-5.1", "sys", "user", 4_096, 0, 0, 0, Some(&ovr),
-            &mut calls, "s1", &crate::budget::BudgetCaller::default(),
+            &mut calls, "s1", &crate::budget::tests::solo_caller(),
         );
         let record = map_call_token_payload(&calls[0], 0, true, "gpt-5.1", "ep", None);
         assert!(record.get("total_tokens").is_none_or(|t| t.is_null()), "{record}");
@@ -4892,7 +4760,7 @@ mod tests {
         });
         let out = map_hosted_item(
             0, &bucket, &map_ep(), "gpt-5.1", "sys", "user", 1_000, 1, 0, 1, Some(&ovr),
-            &mut Vec::new(), "s1", &crate::budget::BudgetCaller::default(),
+            &mut Vec::new(), "s1", &crate::budget::tests::solo_caller(),
         );
         assert!(!out.ok, "{out:?}");
         assert!(out.error.as_deref().unwrap_or_default().contains("endpoint refused the draw"), "{out:?}");
@@ -4931,7 +4799,7 @@ mod tests {
             anyhow::bail!("must not be called")
         });
         let bucket = Arc::new(Mutex::new(RemoteBudget::new(None, darkmux_types::config::StepBudgetPolicy::Warn)));
-        let caller = crate::budget::BudgetCaller { mission_id: Some("m-aborted"), ..Default::default() };
+        let caller = crate::budget::tests::mission_caller("m-aborted");
         let out = crate::budget::with_test_env(env.clone(), || {
             map_hosted_item(
                 0, &bucket, &budgeted_ep("wait"), "gpt-5.1", "sys", "user", 1_000, 1, 0, 0, Some(&ovr),
@@ -4968,7 +4836,7 @@ mod tests {
         let out = crate::budget::with_test_env(env.clone(), || {
             map_hosted_item(
                 0, &bucket, &ep, "gpt-5.1", "sys", "user", 5, 1, 0, 0, Some(&ovr),
-                &mut Vec::new(), "s1", &crate::budget::BudgetCaller::default(),
+                &mut Vec::new(), "s1", &crate::budget::tests::solo_caller(),
             )
         });
         assert!(out.ok, "{out:?}");
@@ -4993,7 +4861,7 @@ mod tests {
         let out = crate::budget::with_test_env(env.clone(), || {
             map_hosted_item(
                 0, &bucket, &budgeted_ep("warn"), "gpt-5.1", "sys", "user", 1_000, 1, 0, 0, Some(&ovr),
-                &mut Vec::new(), "s1", &crate::budget::BudgetCaller::default(),
+                &mut Vec::new(), "s1", &crate::budget::tests::solo_caller(),
             )
         });
         assert!(out.ok, "{out:?}");
@@ -5022,7 +4890,7 @@ mod tests {
         );
         let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::full_window().stopped_after(1, "mission `x` is aborted"));
         let msg = crate::budget::with_test_env(env.clone(), || {
-            format!("{:#}", DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err())
+            format!("{:#}", DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err())
         });
         assert!(msg.contains("stopped waiting on endpoint `azure`'s budget"), "{msg}");
         assert!(!msg.contains("dispatch.single_shot (hosted)"), "nothing was sent: {msg}");
@@ -5031,6 +4899,67 @@ mod tests {
             vec![darkmux_flow::FlowAction::BudgetWait, darkmux_flow::FlowAction::BudgetStop],
             "the ended wait is recorded as a stop"
         );
+    }
+
+    /// Two concurrent launches of ONE config: the same step `s1` in the same
+    /// task `t1`, each launch its own run. Both wait on a full budgeted
+    /// endpoint. Launch A's wait is stopped (its abort), and A is aborted on
+    /// disk (what `darkmux mission abort` writes); launch B's window frees
+    /// after 90 s. A's abort ends A's wait and only A's: B still waits, then
+    /// resumes, and A's `budget.stop` names a session B never used, so no
+    /// surface closes B's wait on it.
+    #[test]
+    #[serial_test::serial]
+    fn an_abort_in_one_launch_never_ends_another_launchs_wait() {
+        let crew = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        unsafe { std::env::set_var("DARKMUX_CREW_DIR", crew.path()) };
+        for (mid, status) in [("launch-a", "aborted"), ("launch-b", "active")] {
+            let mpath = crate::lifecycle::mission_path(mid);
+            std::fs::create_dir_all(mpath.parent().unwrap()).unwrap();
+            std::fs::write(&mpath, format!(r#"{{"id":"{mid}","status":"{status}"}}"#)).unwrap();
+        }
+        let reg = tempfile::TempDir::new().unwrap();
+        let pf = reg.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":1}]}},
+                "endpoints":{"azure":{"url":"http://127.0.0.1:1",
+                    "limits":{"policy":"wait","window":{"period":"1d","tokens":1000}}}}}"#,
+        )
+        .unwrap();
+        let s = step(
+            "s1",
+            "dispatch.single_shot",
+            json!({ "model": "gpt-5.1", "user": "hi", "endpoint": "azure", "config_path": pf.to_str().unwrap(), "timeout_seconds": 1 }),
+        );
+        // One launch of the config, as its launcher runs the step.
+        let launch = |run: &str, env: std::rc::Rc<crate::budget::tests::FakeEnv>| {
+            let ctx = StepRunCtx::solo(darkmux_types::session_id::RunId::mission(run).unwrap());
+            let _ = crate::budget::with_test_env(env, || DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &ctx));
+        };
+        let env_a = std::rc::Rc::new(
+            crate::budget::tests::FakeEnv::full_window().stopped_after(1, "mission `launch-a` is aborted"),
+        );
+        let env_b = std::rc::Rc::new(
+            crate::budget::tests::FakeEnv::new(vec![(1_790_000_000 - 86_400 + 90, 1_000)]).reading_disk_for_stops(),
+        );
+        launch("launch-a", env_a.clone());
+        launch("launch-b", env_b.clone());
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
+        use darkmux_flow::FlowAction::{BudgetResume, BudgetStop, BudgetWait};
+        assert_eq!(env_a.actions(), vec![BudgetWait, BudgetStop], "A waits, then its abort ends the wait");
+        assert_eq!(env_b.actions(), vec![BudgetWait, BudgetResume], "B reads only its own run: A's abort on disk does not end B's wait");
+        let a_stop = env_a.record(BudgetStop).unwrap();
+        let b_wait = env_b.record(BudgetWait).unwrap();
+        assert_ne!(a_stop.session_id, b_wait.session_id, "A's stop must not close B's wait");
+        assert_eq!(a_stop.mission_id.as_deref(), Some("launch-a"));
+        assert_eq!(b_wait.mission_id.as_deref(), Some("launch-b"));
     }
 
     /// A registry naming endpoint `azure` at `url` (no limits), returning
@@ -5071,7 +5000,7 @@ mod tests {
         let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
         let out = with_env(&[("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "10")], || {
             crate::budget::with_test_env(env.clone(), || {
-                DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new())
+                DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
             })
         })
         .expect("mock answers");
@@ -5103,7 +5032,7 @@ mod tests {
         let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
         let out = with_env(&[("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "0")], || {
             crate::budget::with_test_env(env.clone(), || {
-                DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new())
+                DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
             })
         })
         .expect("mock answers");
@@ -5130,7 +5059,7 @@ mod tests {
         }));
         let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
         let out = crate::budget::with_test_env(env.clone(), || {
-            DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new())
+            DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
         })
         .expect("mock answers");
         mock.assert_hits(1);
@@ -5173,17 +5102,17 @@ mod tests {
     /// path. The sibling `dispatch.single_shot` emitter already used the
     /// helper; these four sites had drifted to an inline `format!`.
     ///
-    /// Asserting the SHAPE rather than a literal: the point is that the id
-    /// comes from `session_id::task`, so a future rename moves both producer
-    /// and consumer together instead of silently re-breaking the meters.
+    /// The id comes from `SessionId::task`, so a future grammar change moves
+    /// both producer and consumer together instead of silently re-breaking
+    /// the meters.
     #[test]
     fn map_emits_canonical_task_session_ids_not_colon_form() {
-        let expected = darkmux_types::session_id::task("t1");
+        let expected = darkmux_types::session_id::SessionId::task(crate::test_run(), "t1").wire();
         assert!(
             !expected.contains(':'),
             "canonical form must not be colon-delimited, got {expected}"
         );
-        assert_eq!(expected, "task-t1", "the hyphen form mission_graph folds on");
+        assert_eq!(expected, "m-test.task.t1", "the task session in its run");
 
         // The aggregate record is the one a reader can build without a live
         // dispatch; the per-item emits use the identical expression.
@@ -5202,7 +5131,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         }];
-        let rec = DispatchMapStepKind::aggregate_record(&s, "m", false, &results);
+        let rec = DispatchMapStepKind::aggregate_record(&task_session(), &s, "m", false, &results);
         assert_eq!(
             rec.session_id.as_deref(),
             Some(expected.as_str()),
@@ -5369,7 +5298,7 @@ mod tests {
         };
         for remote in [false, true] {
             let tok = map_item_token_payload(&res, remote, "m", "ep").expect("emits");
-            let item = DispatchMapStepKind::item_record(&step, "m", remote, &res);
+            let item = DispatchMapStepKind::item_record(&task_session(), &step, "m", remote, &res);
             let item_payload = item.payload.as_ref().expect("payload");
             assert_eq!(tok["remote"], item_payload["remote"], "one seat, one verdict");
             assert_eq!(tok["index"], item_payload["index"], "and one item position");
@@ -5571,7 +5500,7 @@ mod tests {
             MapItemResult { index: 2, ok: true, content: "c".to_string(), error: None, total_tokens: Some(250), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0 },
         ];
         let s = map_step(json!({}));
-        let rec = DispatchMapStepKind::aggregate_record(&s, "m", true, &results);
+        let rec = DispatchMapStepKind::aggregate_record(&task_session(), &s, "m", true, &results);
         let p = rec.payload.as_ref().unwrap();
         assert_eq!(p["kind"], "dispatch.map");
         assert_eq!(p["items_in"], 3);
@@ -5585,7 +5514,7 @@ mod tests {
         );
 
         let clean = vec![MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(5), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0 }];
-        let rec = DispatchMapStepKind::aggregate_record(&s, "m", false, &clean);
+        let rec = DispatchMapStepKind::aggregate_record(&task_session(), &s, "m", false, &clean);
         assert!(matches!(rec.level, darkmux_flow::Level::Info));
         assert_eq!(rec.payload.as_ref().unwrap()["remote"], false);
     }
@@ -5610,7 +5539,7 @@ mod tests {
             "collection": ["a", "b", "c"],
             "timeout_seconds": 1,
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
         assert_eq!(results.len(), 3, "every item produced a result despite each failing");
         assert!(results.iter().all(|r| !r.ok), "each item's dispatch failed and was isolated");
@@ -5647,7 +5576,7 @@ mod tests {
             "collection": ["only"],
             "timeout_seconds": 1,
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].index, 0);
@@ -5679,7 +5608,7 @@ mod tests {
             "endpoint": { "url": "https://example.com" },
         }));
         let out = with_env(&[("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "0")], || {
-            DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap()
+            DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap()
         });
         clear_hosted_override();
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
@@ -5727,7 +5656,7 @@ mod tests {
             "endpoint": { "url": "https://example.com" },
         }));
         let out = with_env(&[("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "100")], || {
-            DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap()
+            DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap()
         });
         clear_hosted_override();
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
@@ -5759,7 +5688,7 @@ mod tests {
             "collection": ["a", "b"],
             "endpoint": { "url": "https://example.com" },
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         clear_hosted_override();
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
         assert_eq!(results.len(), 2);
@@ -5816,7 +5745,7 @@ mod tests {
             "endpoint": { "url": "https://example.com" },
             "retry_on_empty": 1,
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         clear_hosted_override();
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
         assert_eq!(results.len(), 1);
@@ -5851,7 +5780,7 @@ mod tests {
             "endpoint": { "url": "https://example.com" },
             "retry_on_empty": 1,
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         clear_hosted_override();
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
         assert_eq!(results.len(), 1);
@@ -5886,7 +5815,7 @@ mod tests {
             "collection": ["a"],
             "endpoint": { "url": "https://example.com" },
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         clear_hosted_override();
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
         assert_eq!(results.len(), 1);
@@ -5961,7 +5890,7 @@ mod tests {
             "endpoint": { "url": "https://example.com" },
             "retry_on_error": 1,
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         clear_hosted_override();
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
         assert_eq!(results.len(), 1);
@@ -6001,7 +5930,7 @@ mod tests {
             "endpoint": { "url": "https://example.com" },
             "retry_on_error": 1,
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         clear_hosted_override();
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
         assert_eq!(results.len(), 1);
@@ -6044,7 +5973,7 @@ mod tests {
             "collection": ["a"],
             "endpoint": { "url": "https://example.com" },
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         clear_hosted_override();
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
         assert_eq!(results.len(), 1);
@@ -6067,7 +5996,7 @@ mod tests {
             "collection": ["a"],
             "retry_on_error": u64::from(u32::MAX) + 1,
         }));
-        let err = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        let err = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err();
         assert!(err.to_string().contains("retry_on_error"), "{err}");
     }
 
@@ -6082,7 +6011,7 @@ mod tests {
             "collection": ["a"],
             "retry_on_empty": u64::from(u32::MAX) + 1,
         }));
-        let err = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        let err = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("retry_on_empty"), "{msg}");
         assert!(msg.contains("exceeds the maximum"), "{msg}");
@@ -6099,7 +6028,7 @@ mod tests {
             "collection": ["a"],
             "retry_on_empty": "lots",
         }));
-        let err = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err();
+        let err = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("retry_on_empty"), "{msg}");
         assert!(msg.contains("non-negative integer"), "{msg}");
@@ -6149,7 +6078,7 @@ mod tests {
             "collection": ["a", "b"],
             "endpoint": { "url": "https://example.cognitiveservices.azure.com" },
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new());
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test());
         clear_hosted_override();
         unsafe {
             match prev {
@@ -6206,7 +6135,7 @@ mod tests {
             "user_template": "check {item}",
             "collection": ["a", "b"],
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new());
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test());
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(url_key, v),
@@ -6263,14 +6192,14 @@ mod tests {
         // live emitter — the same shape the scheduler supplies in production.
         // The batched `run()` path deliberately emits none (see StepBookend).
         let (tx, rx) = std::sync::mpsc::channel();
-        let ctx = StepRunCtx::new(
+        let ctx = StepRunCtx::new(crate::test_run(), 
             Some(tx),
             None,
             None,
             std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
         );
         DispatchMapStepKind
-            .run_streaming(&s, &empty_task(), &BTreeMap::new(), &ctx)
+            .run(&s, &empty_task(), &BTreeMap::new(), &ctx)
             .unwrap();
         drop(ctx);
         clear_hosted_override();
@@ -6326,7 +6255,7 @@ mod tests {
         );
         assert_eq!(
             terminal.session_id.as_deref(),
-            Some(darkmux_types::session_id::task("t1").as_str()),
+            Some(darkmux_types::session_id::SessionId::task(crate::test_run(), "t1").wire().as_str()),
             "SAME session as the seat's token records — that join is the whole point"
         );
     }
@@ -6375,13 +6304,13 @@ mod tests {
             "collection": ["a"],
         }));
         let (tx, rx) = std::sync::mpsc::channel();
-        let ctx = StepRunCtx::new(
+        let ctx = StepRunCtx::new(crate::test_run(), 
             Some(tx),
             None,
             None,
             std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
         );
-        let result = DispatchMapStepKind.run_streaming(&s, &empty_task(), &BTreeMap::new(), &ctx);
+        let result = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &ctx);
         drop(ctx);
 
         unsafe {
@@ -6537,8 +6466,8 @@ mod tests {
             "user_template": "check {item}",
             "collection": ["a"],
         }));
-        let ctx = StepRunCtx::new(None, None, Some(ovr), Arc::new(crate::step_kinds::ArtifactBus::new()));
-        DispatchMapStepKind.run_streaming(&s, &empty_task(), &BTreeMap::new(), &ctx).unwrap();
+        let ctx = StepRunCtx::new(crate::test_run(), None, None, Some(ovr), Arc::new(crate::step_kinds::ArtifactBus::new()));
+        DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &ctx).unwrap();
 
         // (2) — see doc above: past one full beat interval, a still-ticking
         // thread would have fired a second SET by now.
@@ -6553,12 +6482,12 @@ mod tests {
 
         let expected_key = format!(
             "darkmux:session-presence:{}",
-            darkmux_types::session_id::task("t1")
+            darkmux_types::session_id::SessionId::task(crate::test_run(), "t1").wire()
         );
         let entries = log.lock().unwrap().clone();
         let set_count =
             entries.iter().filter(|e| e.contains("SET") && e.contains(&expected_key)).count();
-        let saw_claim_edge = entries.iter().any(|e| e.contains("edge-claim:session-end:task-t1"));
+        let saw_claim_edge = entries.iter().any(|e| e.contains(&format!("edge-claim:session-end:{}", darkmux_types::session_id::SessionId::task(crate::test_run(), "t1"))));
         assert_eq!(
             set_count, 1,
             "expected exactly ONE session-presence SET beat for {expected_key} (fired once \
@@ -6623,7 +6552,7 @@ mod tests {
             "user_template": "check {item}",
             "collection": ["a"],
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new());
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test());
 
         unsafe {
             match prev_lms {
@@ -6702,14 +6631,14 @@ mod tests {
             }),
         );
         let (tx, rx) = std::sync::mpsc::channel();
-        let ctx = StepRunCtx::new(
+        let ctx = StepRunCtx::new(crate::test_run(), 
             Some(tx),
             None,
             None,
             std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
         );
         let out = DispatchSingleShotStepKind
-            .run_streaming(&s, &empty_task(), &BTreeMap::new(), &ctx)
+            .run(&s, &empty_task(), &BTreeMap::new(), &ctx)
             .expect("the mock endpoint answers, so the step completes");
         drop(ctx);
 
@@ -6726,7 +6655,7 @@ mod tests {
         // first thing it does after joining the beat thread).
         let expected_key = format!(
             "darkmux:session-presence:{}",
-            darkmux_types::session_id::task("t1")
+            darkmux_types::session_id::SessionId::task(crate::test_run(), "t1").wire()
         );
         let entries = log.lock().unwrap().clone();
         assert!(
@@ -6735,7 +6664,7 @@ mod tests {
              session-presence SET for {expected_key}; saw {entries:?}"
         );
         assert!(
-            entries.iter().any(|e| e.contains("edge-claim:session-end:task-t1")),
+            entries.iter().any(|e| e.contains(&format!("edge-claim:session-end:{}", darkmux_types::session_id::SessionId::task(crate::test_run(), "t1")))),
             "expected `stop()`'s session-end edge claim, proving the beat was released rather \
              than left to TTL out; saw {entries:?}"
         );
@@ -6817,7 +6746,7 @@ mod tests {
         }
 
         let s = step("s1", "dispatch.single_shot", json!({ "model": "qwen3-4b", "user": "hi" }));
-        let out = DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new());
+        let out = DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test());
 
         unsafe {
             match prev_lms {
@@ -6857,7 +6786,7 @@ mod tests {
             "user_template": "check {item}",
             "collection": [],
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         for r in &out.flow_records {
             if let Some(p) = r.payload.as_ref() {
                 assert!(
@@ -6888,7 +6817,7 @@ mod tests {
             "collection": ["a"],
             "endpoint": { "url": "https://example.com" },
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         clear_hosted_override();
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
         assert_eq!(results.len(), 1);
@@ -6940,7 +6869,7 @@ mod tests {
             "collection": ["a"],
             "endpoint": { "url": "https://example.com" },
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         clear_hosted_override();
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
         assert_eq!(results.len(), 1);
@@ -6981,7 +6910,7 @@ mod tests {
             "collection": ["a", "b"],
             "timeout_seconds": 1,
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
         assert_eq!(results.len(), 2);
         assert!(
@@ -7035,7 +6964,7 @@ mod tests {
             "endpoint": { "url": "https://example.com" },
             "retry_on_empty": 1,
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         clear_hosted_override();
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
         assert_eq!(results.len(), 1);
@@ -7088,7 +7017,7 @@ mod tests {
             json!({ "model": "gpt-5.1", "user": "hi", "endpoint": { "url": "http://127.0.0.1:1" }, "timeout_seconds": 1 }),
         );
         let msg = with_env(&[("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "0")], || {
-            format!("{:#}", DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err())
+            format!("{:#}", DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err())
         });
         assert!(msg.contains("dispatch.single_shot (hosted)"), "the call was attempted: {msg}");
         assert!(!msg.contains("budget"), "no budget refusal: {msg}");
@@ -7107,7 +7036,7 @@ mod tests {
         );
         let msg = with_env(
             &[("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "0"), ("DARKMUX_REMOTE_STEP_BUDGET_POLICY", "wait")],
-            || format!("{:#}", DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err()),
+            || format!("{:#}", DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err()),
         );
         assert!(msg.contains("`wait`") && msg.contains("remote.step_budget_policy"), "{msg}");
         assert!(msg.contains("off") && msg.contains("warn"), "{msg}");
@@ -7134,7 +7063,7 @@ mod tests {
             json!({ "model": "some-local-model", "user": "hi", "timeout_seconds": 1 }),
         );
         let err = DispatchSingleShotStepKind
-            .run(&s, &empty_task(), &BTreeMap::new())
+            .run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
             .unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -7356,7 +7285,7 @@ mod tests {
         let mock = usage_mock(&server, true);
         let s = step("s1", "dispatch.single_shot", json!({ "model": "qwen3-4b", "user": "hi" }));
         let out = with_lmstudio_url(&server.base_url(), || {
-            DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new())
+            DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
         })
         .expect("mock answers");
         mock.assert_hits(1);
@@ -7368,7 +7297,7 @@ mod tests {
         assert_eq!(p["endpoint"], format!("{}/v1", server.base_url()));
         assert_eq!(p["token_source"], "provider");
         assert_eq!(p["total_tokens"], 12, "provider total wins over 7+3");
-        assert_eq!(rec["session_id"], darkmux_types::session_id::task(&s.task_id));
+        assert_eq!(rec["session_id"], darkmux_types::session_id::SessionId::task(crate::test_run(), &s.task_id).wire());
         assert_eq!(rec["handle"], "s1");
     }
 
@@ -7381,7 +7310,7 @@ mod tests {
             "dispatch.single_shot",
             json!({ "model": "gpt-5.1", "user": "hi", "endpoint": { "url": format!("{}/v1", server.base_url()) } }),
         );
-        let out = DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new()).expect("mock answers");
+        let out = DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).expect("mock answers");
         mock.assert_hits(1);
         let recs = as_values(&out.flow_records);
         let rec = crate::usage::assert_one_usage_record(&recs, crate::usage::CallKind::SingleShot, "dispatch.single_shot (hosted)");
@@ -7404,7 +7333,7 @@ mod tests {
         let _mock = usage_mock(&server, false);
         let s = step("s1", "dispatch.single_shot", json!({ "model": "qwen3-4b", "user": "hi" }));
         let out = with_lmstudio_url(&server.base_url(), || {
-            DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new())
+            DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
         })
         .expect("mock answers");
         let recs = as_values(&out.flow_records);
@@ -7420,7 +7349,7 @@ mod tests {
         let mock = usage_mock(&server, true);
         let s = map_step(json!({ "model": "qwen3-4b", "user_template": "check {item}", "collection": ["a"] }));
         let out = with_lmstudio_url(&server.base_url(), || {
-            DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new())
+            DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
         })
         .expect("mock answers");
         mock.assert_hits(1);
@@ -7445,8 +7374,8 @@ mod tests {
     ) -> (usize, Vec<serde_json::Value>) {
         let s = map_step(config);
         let (tx, rx) = std::sync::mpsc::channel();
-        let ctx = StepRunCtx::new(Some(tx), None, Some(ovr), Arc::new(crate::step_kinds::ArtifactBus::new()));
-        let _ = DispatchMapStepKind.run_streaming(&s, &empty_task(), &BTreeMap::new(), &ctx);
+        let ctx = StepRunCtx::new(crate::test_run(), Some(tx), None, Some(ovr), Arc::new(crate::step_kinds::ArtifactBus::new()));
+        let _ = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &ctx);
         drop(ctx);
         let recs: Vec<serde_json::Value> = rx
             .into_iter()
@@ -7547,7 +7476,7 @@ mod tests {
         let s = map_step(json!({
             "model": "gpt-5.1", "user_template": "check {item}", "collection": ["a"], "endpoint": ep_json,
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).expect("mock answers");
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).expect("mock answers");
         mock.assert_hits(1);
         let recs = as_values(&out.flow_records);
         let rec = crate::usage::assert_one_usage_record(&recs, crate::usage::CallKind::MapItem, "dispatch.map item (hosted)");
@@ -7566,7 +7495,7 @@ mod tests {
         let _mock = usage_mock(&server, false);
         let s = map_step(json!({ "model": "qwen3-4b", "user_template": "check {item}", "collection": ["a"] }));
         let out = with_lmstudio_url(&server.base_url(), || {
-            DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new())
+            DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
         })
         .expect("mock answers");
         let recs = as_values(&out.flow_records);

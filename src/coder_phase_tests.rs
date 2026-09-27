@@ -51,7 +51,7 @@
             exit_code: 0,
             stdout: String::new(),
             stderr: String::new(),
-            session_id: "s".into(),
+            session_id: crate::test_session("s"),
             out_dir: Some(tmp.path().to_path_buf()),
             trajectory: Some(darkmux_trajectory::TrajectoryFold::from_lines(&completed(120, 10))),
         };
@@ -441,17 +441,13 @@ edit loop detected on src/widget.rs in an earlier dispatch
         // SAFETY: serialized via #[serial]; restored below.
         unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
 
-        let auth_ids: std::collections::HashSet<String> =
-            ["mission-run-auth-s1", "mission-run-auth-s2"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let auth_ids = crew::corrections::PhaseSessions::new("auth", ["s1", "s2"].map(String::from));
         // Empty intent + a root with no matching files: no file-in-play boost
         // and (no code_hash on these records) no staleness reorder, so this
         // exercises the severity-then-recency fallthrough unchanged.
         let no_intent = std::collections::HashSet::new();
         let cautions = mission_cautions(&auth_ids, &no_intent, tmp.path());
-        let unknown = mission_cautions(&std::collections::HashSet::new(), &no_intent, tmp.path());
+        let unknown = mission_cautions(&crew::corrections::PhaseSessions::new("auth", []), &no_intent, tmp.path());
 
         unsafe {
             match prev {
@@ -504,8 +500,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
         // SAFETY: serialized via #[serial]; restored below.
         unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
 
-        let ids: std::collections::HashSet<String> =
-            ["mission-run-rep-s1"].iter().map(|s| s.to_string()).collect();
+        let ids = crew::corrections::PhaseSessions::new("rep", ["s1".to_string()]);
         let no_intent = std::collections::HashSet::new();
         let cautions = mission_cautions(&ids, &no_intent, tmp.path());
 
@@ -566,8 +561,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
         let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
         unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
 
-        let ids: std::collections::HashSet<String> =
-            ["mission-run-m-s1"].iter().map(|s| s.to_string()).collect();
+        let ids = crew::corrections::PhaseSessions::new("m", ["s1".to_string()]);
         let intent: std::collections::HashSet<String> =
             ["src/target.rs"].iter().map(|s| s.to_string()).collect();
         // workspace_root has no such files → no code_hash on records anyway → no
@@ -619,8 +613,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
         let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
         unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", flows.path()) };
 
-        let ids: std::collections::HashSet<String> =
-            ["mission-run-m-s1"].iter().map(|s| s.to_string()).collect();
+        let ids = crew::corrections::PhaseSessions::new("m", ["s1".to_string()]);
         // No intent match for either (neither file is in play) so the only
         // discriminator is freshness.
         let cautions = mission_cautions(&ids, &std::collections::HashSet::new(), ws.path());
@@ -744,13 +737,9 @@ edit loop detected on src/widget.rs in an earlier dispatch
 
         // `auth`'s EXACT dispatch session ids — as run() builds them from the
         // mission's phases. Note `auth-v2`'s session id is deliberately absent.
-        let auth_ids: std::collections::HashSet<String> =
-            ["mission-run-auth-s1", "mission-run-auth-s2"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let auth_ids = crew::corrections::PhaseSessions::new("auth", ["s1", "s2"].map(String::from));
         let notes = mission_adjudication_notes(&auth_ids);
-        let unknown = mission_adjudication_notes(&std::collections::HashSet::new());
+        let unknown = mission_adjudication_notes(&crew::corrections::PhaseSessions::new("auth", []));
 
         unsafe {
             match prev {
@@ -1089,14 +1078,12 @@ edit loop detected on src/widget.rs in an earlier dispatch
                     && r.get("mission_id").and_then(|v| v.as_str()) == Some("m-x")
                 {
                     found = true;
-                    // (#1436) The prompt joins the mission's lifecycle session
-                    // bucket under the canonical HYPHEN form — the colon form
-                    // (`mission:m-x`) is retired; a regression to it splits the
-                    // viewer's session grouping between close and debrief.
+                    // The prompt joins the mission's own run session, the one
+                    // its close record lands under.
                     assert_eq!(
                         r.get("session_id").and_then(|v| v.as_str()),
-                        Some("mission-m-x"),
-                        "debrief prompt must carry the canonical hyphen session id"
+                        Some("m-x.run"),
+                        "debrief prompt must land under the mission's run session"
                     );
                 }
             }
@@ -1506,12 +1493,11 @@ edit loop detected on src/widget.rs in an earlier dispatch
             base: "HEAD".to_string(),
             mission_id: "m1".to_string(),
             phase_id: "s1".to_string(),
-            session_id: "mission-run-m1-s1".to_string(),
             role: "coder".to_string(),
         });
         let mut bus = crew::step_kinds::ArtifactBus::new();
         bus.seed(CODER_CONTEXT_ARTIFACT, ctx as Arc<dyn std::any::Any + Send + Sync>);
-        let run_ctx = crew::step_kinds::StepRunCtx::new(None, None, None, Arc::new(bus));
+        let run_ctx = crew::step_kinds::StepRunCtx::new(crate::test_run(), None, None, None, Arc::new(bus));
         let step = crew::types::Step {
             id: "s1-worktree-step".to_string(),
             task_id: "s1-worktree".to_string(),
@@ -1526,7 +1512,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
         let task = test_task("s1-worktree");
 
         let outcome = kind
-            .run_streaming(&step, &task, &std::collections::BTreeMap::new(), &run_ctx)
+            .run(&step, &task, &std::collections::BTreeMap::new(), &run_ctx)
             .unwrap();
         assert!(wt_path.is_dir(), "worktree dir must exist after a clean run");
         assert_eq!(outcome.output, wt_path.display().to_string());
@@ -1535,7 +1521,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
         // fail loud, not silently clobber — same contract `add_worktree`
         // always had.
         let err = kind
-            .run_streaming(&step, &task, &std::collections::BTreeMap::new(), &run_ctx)
+            .run(&step, &task, &std::collections::BTreeMap::new(), &run_ctx)
             .unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
     }
@@ -1586,7 +1572,6 @@ edit loop detected on src/widget.rs in an earlier dispatch
             base: "main".to_string(),
             mission_id: "m1".to_string(),
             phase_id: "s1".to_string(),
-            session_id: "mission-run-m1-s1".to_string(),
             role: "coder".to_string(),
         });
         let mut bus = crew::step_kinds::ArtifactBus::new();
@@ -1595,7 +1580,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
             slot.clone() as Arc<dyn std::any::Any + Send + Sync>,
         );
         bus.seed(CODER_CONTEXT_ARTIFACT, ctx as Arc<dyn std::any::Any + Send + Sync>);
-        let run_ctx = crew::step_kinds::StepRunCtx::new(None, None, None, Arc::new(bus));
+        let run_ctx = crew::step_kinds::StepRunCtx::new(crate::test_run(), None, None, None, Arc::new(bus));
         let kind = MissionVerifyStepKind;
         let step = crew::types::Step {
             id: "s1-verify-step".to_string(),
@@ -1609,7 +1594,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
             output: None,
         };
         let task = test_task("s1-verify");
-        let outcome = kind.run_streaming(&step, &task, &std::collections::BTreeMap::new(), &run_ctx);
+        let outcome = kind.run(&step, &task, &std::collections::BTreeMap::new(), &run_ctx);
 
         unsafe {
             match prev {
@@ -1680,7 +1665,11 @@ edit loop detected on src/widget.rs in an earlier dispatch
 
         let mission_id = "m-brief-1546";
         let phase_id = "s1";
-        let session_id = darkmux_types::session_id::mission_run(mission_id, phase_id);
+        let session_id = darkmux_types::session_id::SessionId::phase(
+            darkmux_types::session_id::RunId::mission(mission_id).unwrap(),
+            phase_id,
+        )
+        .wire();
 
         // One recorded adjudication correction (#849) + one detector
         // caution (#994), scoped to this mission's exact session id — the
@@ -1719,8 +1708,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
 
         // REFERENCE: the retired pre-#1546 call site's own inline
         // computation, invoked directly against the SAME inputs.
-        let mission_session_ids: std::collections::HashSet<String> =
-            m.phase_ids.iter().map(|pid| darkmux_types::session_id::mission_run(mission_id, pid)).collect();
+        let mission_session_ids = crew::corrections::PhaseSessions::new(mission_id, m.phase_ids.iter().cloned());
         let intent = intent_files(&p.description);
         let corrections = mission_adjudication_notes(&mission_session_ids);
         let cautions = mission_cautions(&mission_session_ids, &intent, &wt_path);
@@ -1729,7 +1717,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
             allocate_injected_context(corrections, cautions, authored, budget);
         let expected = coder_brief(&p, &m, &lessons, &prior_corrections, &detected_cautions);
 
-        // RUN-TIME PATH: the exact call `MissionCoderStepKind::run_streaming`
+        // RUN-TIME PATH: the exact call `MissionCoderStepKind::run`
         // now makes — mission id / phase id / worktree path / a
         // pre-resolved budget only (the SPEC #1546 stamps).
         let actual = coder_brief_with_injected_context(mission_id, phase_id, &wt_path, budget).unwrap();

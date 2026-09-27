@@ -378,7 +378,7 @@
         }
         let mut opts = dispatch_preflight_probe_opts();
         opts.role_id = "pr-reviewer".to_string();
-        opts.session_id = Some(format!("budget-gate-remote-{}", std::process::id()));
+        opts.session = crate::test_session(&format!("budget-gate-remote-{}", std::process::id()));
         opts.phase_id = None;
         let mut pm: darkmux_types::ProfileModel = serde_json::from_str(&format!(
             r#"{{"id":"gpt-remote","endpoint":{{"url":"{base_url}","limits":{{"policy":"wait","window":{{"period":"1d","tokens":1}}}}}}}}"#
@@ -438,7 +438,7 @@
         opts.role_id = "code-reviewer".to_string();
         opts.profile_name = Some("p".to_string());
         opts.config_path = Some(pf.to_string_lossy().to_string());
-        opts.session_id = Some(format!("budget-gate-agentic-{}", std::process::id()));
+        opts.session = crate::test_session(&format!("budget-gate-agentic-{}", std::process::id()));
         let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::full_window().stopped_after(1, "mission `m` is aborted"));
         let result = crate::budget::with_test_env(env.clone(), || dispatch(opts));
         unsafe {
@@ -491,11 +491,10 @@
             run_telemetry_sampler(
                 stop,
                 "coder".into(),
-                "s-pacer".into(),
+                crate::test_session("s-pacer"),
                 "gpt-remote".into(),
                 None,
                 None,
-                Some("m".into()),
                 None,
                 out.path().to_path_buf(),
                 None,
@@ -2583,7 +2582,7 @@
             timeout_override_seconds: None,
             role_id: "no-such-role-2294-preflight-probe".to_string(),
             message: "probe".to_string(),
-            session_id: None,
+            session: crate::test_session("n"),
             timeout_seconds: 5,
             skip_preflight: true,
             json: true,
@@ -2755,10 +2754,14 @@
             std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
         }
 
-        let session_id = format!("mock-dispatch-remote-mission-proof-{}", std::process::id());
+        let session = crate::mission_test_session(
+            MISSION_ID,
+            &format!("mock-dispatch-remote-mission-proof-{}", std::process::id()),
+        );
+        let session_id = session.wire();
         let mut opts = dispatch_preflight_probe_opts();
         opts.role_id = "pr-reviewer".to_string();
-        opts.session_id = Some(session_id.clone());
+        opts.session = session.clone();
         opts.phase_id = Some(PHASE_ID.to_string());
         opts.json = false;
 
@@ -2807,7 +2810,7 @@
             assert_eq!(
                 rec.get("mission_id").and_then(|v| v.as_str()),
                 Some(MISSION_ID),
-                "every dispatch_remote record must carry the phase-resolved mission_id, got: {rec:?}"
+                "every dispatch_remote record must carry its session's mission, got: {rec:?}"
             );
         }
         let actions: Vec<&str> = records.iter().filter_map(|r| r["action"].as_str()).collect();
@@ -2815,19 +2818,9 @@
         assert!(actions.contains(&"dispatch.complete"), "must have emitted dispatch complete: {actions:?}");
     }
 
-    /// (#1645 fix-pass CONSIDER 3) `dispatch_opts_for` (the `dispatch.
-    /// internal` StepKind's own opts builder, `step_kinds/builtins.rs`)
-    /// hands every unconfigured step the SAME config-derived
-    /// `session_id::step(&step.id)` default, byte-identical across every
-    /// launch of the same mission config — regardless of whether the
-    /// resolved profile routes to the container path or to
-    /// `dispatch_remote`. `dispatch_internal::dispatch` (the container
-    /// path) already composes the resolved mission id into that default
-    /// via `scope_to_run` (#1918); this proves `dispatch_remote` now does
-    /// the identical composition, so two DIFFERENT missions launching the
-    /// same config's hosted step diverge instead of colliding on one
-    /// session_id — now carrying DIFFERENT `mission_id`s too, which would
-    /// otherwise be a worse collision than before this fix existed at all.
+    /// Two missions launching the SAME config run the same step `s1-1645`
+    /// under two sessions, one per run: `dispatch_remote` runs under its
+    /// caller's session, whichever arm the resolved profile routes to.
     #[test]
     #[serial]
     fn dispatch_remote_scopes_a_config_derived_session_id_by_mission_so_two_missions_diverge() {
@@ -2859,7 +2852,6 @@
         // The SAME config-derived default `dispatch_opts_for` hands an
         // unconfigured `dispatch.internal` step — literal out of the
         // mission config document, identical whichever mission launches it.
-        let raw_session_id = darkmux_types::session_id::step("s1-1645");
         let role = quarantine_test_role();
 
         let mut seen_session_ids = std::collections::HashSet::new();
@@ -2869,7 +2861,11 @@
             );
             let mut opts = dispatch_preflight_probe_opts();
             opts.role_id = "pr-reviewer".to_string();
-            opts.session_id = Some(raw_session_id.clone());
+            let step_session = darkmux_types::session_id::SessionId::step(
+                darkmux_types::session_id::RunId::mission(mission_id).unwrap(),
+                "s1-1645",
+            );
+            opts.session = step_session.clone();
             opts.phase_id = Some(phase_id.to_string());
             opts.json = false;
             let pm: darkmux_types::ProfileModel = serde_json::from_str(&format!(
@@ -2878,11 +2874,7 @@
             .unwrap();
             let result =
                 dispatch_remote(&opts, &role, "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap()).expect("dispatch_remote must succeed");
-            assert_eq!(
-                result.session_id,
-                darkmux_types::session_id::scope_to_run(&raw_session_id, mission_id),
-                "dispatch_remote's returned session_id must be scoped to its own mission"
-            );
+            assert_eq!(result.session_id, step_session, "dispatch_remote runs under its caller's session");
             seen_session_ids.insert(result.session_id);
         }
 
@@ -4218,7 +4210,7 @@
             )),
             image: "rust:slim".to_string(),
             role_id: "test-role".to_string(),
-            session_id: "sess-test".to_string(),
+            session_id: crate::test_session("sess-test"),
             model: "llama3-8b".to_string(),
             system_prompt: "You are a coding assistant.".to_string(),
             message: "Fix the bug in main.rs".to_string(),
@@ -4406,7 +4398,7 @@
         // (#2386) Unconditional too — the runtime needs its finding-key
         // namespace on every dispatch. See `DockerRunConfig::session_id`.
         assert_eq!(argv[43], "--session-id");
-        assert_eq!(argv[44], "sess-test");
+        assert_eq!(argv[44], &*crate::test_session("sess-test").wire());
         assert_eq!(argv[45], "--system");
         assert_eq!(argv[46], "You are a coding assistant.");
         // (#386) The message goes via the out-dir mount, not argv — argv carries
@@ -4481,7 +4473,7 @@
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
-            session_id: "sess-test".to_string(),
+            session_id: crate::test_session("sess-test"),
             model: "default-model".to_string(),
             system_prompt: "Basic role.".to_string(),
             message: "Hello world".to_string(),
@@ -4696,7 +4688,7 @@
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
-            session_id: "sess-test".to_string(),
+            session_id: crate::test_session("sess-test"),
             model: "default-model".to_string(),
             system_prompt: "Basic role.".to_string(),
             message: "Hello world".to_string(),
@@ -4837,7 +4829,7 @@
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
-            session_id: "sess-test".to_string(),
+            session_id: crate::test_session("sess-test"),
             model: "default-model".to_string(),
             system_prompt: "Tool-less reviewer.".to_string(),
             message: "Review this.".to_string(),
@@ -4896,7 +4888,7 @@
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
-            session_id: "sess-test".to_string(),
+            session_id: crate::test_session("sess-test"),
             model: "m".to_string(),
             system_prompt: "role".to_string(),
             message: "msg".to_string(),
@@ -6122,7 +6114,7 @@
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
-            session_id: "sess-test".to_string(),
+            session_id: crate::test_session("sess-test"),
             model: "default-model".to_string(),
             system_prompt: "Basic role.".to_string(),
             message: "Hello world".to_string(),
@@ -6956,7 +6948,7 @@
 
         let mut state = TailerState::new(
             traj_path.clone(),
-            "test-session".into(),
+            crate::test_session("test-session"),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -7019,7 +7011,7 @@
         let shared = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(3600)));
         let mut state = TailerState::new(
             traj_path.clone(),
-            "test-session".into(),
+            crate::test_session("test-session"),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -7063,7 +7055,7 @@
 
         let mut state = TailerState::new(
             traj_path.clone(),
-            "test-session".into(),
+            crate::test_session("test-session"),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -7138,7 +7130,7 @@
 
         let mut state = TailerState::new(
             traj_path.clone(),
-            "test-session".into(),
+            crate::test_session("test-session"),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -7203,7 +7195,7 @@
 
         let mut state = TailerState::new(
             traj_path.clone(),
-            "test-session".into(),
+            crate::test_session("test-session"),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -7296,10 +7288,9 @@
         let handle = crate::concurrent_dispatch::spawn_detached_named(move || {
             run_tailer(
                 out_dir,
-                "sess-real-watchdog".into(),
+                crate::test_session("sess-real-watchdog"),
                 "coder".into(),
                 "darkmux:qwen3.6".into(),
-                None,
                 None,
                 None,
                 tailer_stop,
@@ -7411,7 +7402,7 @@
 
         let mut state = TailerState::new(
             traj_path.clone(),
-            "test-session".into(),
+            crate::test_session("test-session"),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -7461,7 +7452,7 @@
 
         let mut state = TailerState::new(
             traj_path.clone(),
-            "test-session".into(),
+            crate::test_session("test-session"),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -7521,7 +7512,7 @@
 
         let mut state = TailerState::new(
             traj_path.clone(),
-            "test-session".into(),
+            crate::test_session("test-session"),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -7578,7 +7569,7 @@
 
         let mut state = TailerState::new(
             traj_path.clone(),
-            "test-session".into(),
+            crate::test_session("test-session"),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -7625,7 +7616,7 @@
         let traj_path = tmp.path().join("trajectory.jsonl");
         let mut state = TailerState::new_for_test(
             traj_path,
-            "sess-rest".into(),
+            crate::test_session("sess-rest"),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         );
@@ -7656,7 +7647,7 @@
         let records: Vec<serde_json::Value> = contents
             .lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .filter(|v| v["session_id"] == "sess-rest" && v["action"] == "dispatch.rest")
+            .filter(|v| v["session_id"] == crate::test_session("sess-rest").wire() && v["action"] == "dispatch.rest")
             .collect();
 
         assert_eq!(records.len(), 2, "one dispatch.rest record per runtime.rest event");
@@ -7694,7 +7685,7 @@
         let lines_c = lines.clone();
         let mut state = TailerState::new_for_test(
             tmp.path().join("trajectory.jsonl"),
-            "sess-warn-once".into(),
+            crate::test_session("sess-warn-once"),
             "coder".into(),
             "darkmux:m".into(),
         );
@@ -7736,7 +7727,7 @@
             {
                 for l in std::fs::read_to_string(&p).unwrap().lines() {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
-                        if v["session_id"] == "sess-warn-once" && v["action"] == "dispatch.degeneracy.warning" {
+                        if v["session_id"] == crate::test_session("sess-warn-once").wire() && v["action"] == "dispatch.degeneracy.warning" {
                             records.push(v);
                         }
                     }
@@ -7764,7 +7755,7 @@
         }
         let mut state = TailerState::new_for_test(
             tmp.path().join("trajectory.jsonl"),
-            "sess-warn".into(),
+            crate::test_session("sess-warn"),
             "coder".into(),
             "darkmux:m".into(),
         );
@@ -7790,7 +7781,7 @@
             {
                 for l in std::fs::read_to_string(&p).unwrap().lines() {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
-                        if v["session_id"] == "sess-warn" && v["action"] == "dispatch.degeneracy.warning" {
+                        if v["session_id"] == crate::test_session("sess-warn").wire() && v["action"] == "dispatch.degeneracy.warning" {
                             records.push(v);
                         }
                     }
@@ -7824,7 +7815,7 @@
         let traj_path = tmp.path().join("trajectory.jsonl");
         let mut state = TailerState::new_for_test(
             traj_path,
-            "sess-paced-rest".into(),
+            crate::test_session("sess-paced-rest"),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         );
@@ -7869,7 +7860,7 @@
         let records: Vec<serde_json::Value> = contents
             .lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .filter(|v| v["session_id"] == "sess-paced-rest" && v["action"] == "dispatch.rest")
+            .filter(|v| v["session_id"] == crate::test_session("sess-paced-rest").wire() && v["action"] == "dispatch.rest")
             .collect();
         assert_eq!(records.len(), 4);
 
@@ -7907,7 +7898,7 @@
         let traj_path = tmp.path().join("trajectory.jsonl");
         let mut state = TailerState::new_for_test(
             traj_path,
-            "sess-context".into(),
+            crate::test_session("sess-context"),
             "crawler".into(),
             "darkmux:qwen3.6".into(),
         )
@@ -7945,7 +7936,7 @@
         let record = contents
             .lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .find(|v| v["session_id"] == "sess-context" && v["action"] == "dispatch.tool")
+            .find(|v| v["session_id"] == crate::test_session("sess-context").wire() && v["action"] == "dispatch.tool")
             .expect("a dispatch.tool record for the create_finding call");
 
         assert_eq!(record["payload"]["context"]["workspace"], "acme");
@@ -7985,7 +7976,7 @@
         let traj_path = tmp.path().join("trajectory.jsonl");
         let mut state = TailerState::new_for_test(
             traj_path,
-            "sess-emit".into(),
+            crate::test_session("sess-emit"),
             "crawler".into(),
             "darkmux:qwen3.6".into(),
         );
@@ -8032,7 +8023,7 @@
             .unwrap()
             .lines()
             .filter_map(|l| serde_json::from_str(l).ok())
-            .filter(|v: &serde_json::Value| v["session_id"] == "sess-emit" && v["action"] == "dispatch.tool")
+            .filter(|v: &serde_json::Value| v["session_id"] == crate::test_session("sess-emit").wire() && v["action"] == "dispatch.tool")
             .collect();
         assert_eq!(records.len(), 2, "one dispatch.tool record per tool.completed event");
 
@@ -8075,10 +8066,11 @@
 
         let mut state = TailerState::new_for_test(
             tmp.path().join("trajectory.jsonl"),
-            "sess-finding".into(),
+            crate::mission_test_session("crawl-1788402801", "sess-finding"),
             "crawler".into(),
             "darkmux:qwen3.6".into(),
         );
+        let dispatch = crate::mission_test_session("crawl-1788402801", "sess-finding").wire();
         // A crawl's `context` is the LAUNCHER's blob: workspace / source / sha /
         // rule / unit. The mission is NOT in it — on the flow record
         // `mission_id`, `phase_id` and `step_id` are TOP-LEVEL fields, which is
@@ -8087,7 +8079,6 @@
             "unit": "u7", "rule": "unnamed-predicate",
             "source": "acme", "sha": "deadbeef",
         }));
-        state.mission_id = Some("crawl-1788402801".into());
         state.phase_id = Some("crawl-1788402801-crawl".into());
         state.step_id = Some("step-7".into());
 
@@ -8103,11 +8094,11 @@
         });
         state.handle_event(&accepted.to_string());
 
-        let path = store.join("sess-finding").join("4").join("finding.json");
+        let path = store.join(&dispatch).join("4").join("finding.json");
         let rec: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("record written")).unwrap();
-        assert_eq!(rec["key"], "sess-finding/4");
-        assert_eq!(rec["dispatch"], "sess-finding");
+        assert_eq!(rec["key"], format!("{dispatch}/4"));
+        assert_eq!(rec["dispatch"], dispatch.as_str());
         assert_eq!(rec["seq"], 4);
         assert_eq!(rec["tool_name"], "create_finding");
         assert_eq!(rec["schema_version"], "1");
@@ -8167,7 +8158,7 @@
             .to_string(),
         );
         assert!(
-            store.join("sess-finding").join("5").join("finding.json").exists(),
+            store.join(&dispatch).join("5").join("finding.json").exists(),
             "report_finding (the old name) must materialize the same record"
         );
 
@@ -8179,7 +8170,7 @@
             r#"{"type":"tool.completed","seq":1,"tool_seq":8,"tool_name":"create_finding","args":"{}","result":"REJECTED: line 9999 does not exist","ok":false,"emitted":{"file":"r.ts"},"emit_seq":8}"#,
         );
         assert!(
-            !store.join("sess-finding").join("8").exists(),
+            !store.join(&dispatch).join("8").exists(),
             "a rejected (ok:false) finding call must NOT become a record"
         );
 
@@ -8190,15 +8181,15 @@
         state.handle_event(
             r#"{"type":"tool.completed","seq":1,"tool_seq":3,"tool_name":"read","args":"{}","result":"r","ok":true,"emitted":{"file":"z"},"emit_seq":7}"#,
         );
-        assert!(!store.join("sess-finding").join("6").exists(), "emitted:null → no record");
-        assert!(!store.join("sess-finding").join("7").exists(), "a read is not a finding");
+        assert!(!store.join(&dispatch).join("6").exists(), "emitted:null → no record");
+        assert!(!store.join(&dispatch).join("7").exists(), "a read is not a finding");
 
         // A plain `darkmux dispatch` runs under no mission at all. The fields
         // must be explicitly null rather than absent, so "no mission" and "an
         // older writer that did not know the field" stay distinguishable.
         let mut solo = TailerState::new_for_test(
             tmp.path().join("trajectory.jsonl"),
-            "sess-solo".into(),
+            crate::test_session("sess-solo"),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         );
@@ -8206,7 +8197,7 @@
             r#"{"type":"tool.completed","seq":1,"tool_seq":0,"tool_name":"create_finding","args":"{}","result":"r","ok":true,"emitted":{"file":"s.ts"},"emit_seq":1}"#,
         );
         let solo_rec: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(store.join("sess-solo").join("1").join("finding.json")).unwrap(),
+            &std::fs::read_to_string(store.join(&*crate::test_session("sess-solo").wire()).join("1").join("finding.json")).unwrap(),
         )
         .unwrap();
         assert!(solo_rec["mission_id"].is_null(), "no mission → explicit null: {solo_rec}");
@@ -8320,7 +8311,7 @@
 
         let mut state = TailerState::new_for_test(
             tmp.path().join("trajectory.jsonl"),
-            "sess-wire".into(),
+            crate::test_session("sess-wire"),
             "coder".into(),
             "m".into(),
         );
@@ -8388,7 +8379,7 @@
 
         let mut state = TailerState::new_for_test(
             tmp.path().join("trajectory.jsonl"),
-            "sess-partial".into(),
+            crate::test_session("sess-partial"),
             "coder".into(),
             "m".into(),
         );
@@ -8583,7 +8574,7 @@
 
     /// (#2386 review, item 6) The argv's `--session-id` value and the id the
     /// finding tailer stamps into a stored key must be ONE string. Pinning
-    /// only the literal `"sess-test"` would stay green if the two drifted to
+    /// only the literal `&*crate::test_session("sess-test").wire()` would stay green if the two drifted to
     /// different fields, and the model would then be handed a key the store
     /// files elsewhere — worse than handing it no key at all.
     #[test]
@@ -8593,11 +8584,12 @@
         let findings_store = tmp.path().join("findings");
         let prev = mod_test_env(tmp.path(), &tmp.path().join("mods"), &findings_store);
 
-        let session_id = "step-review-unit-0007";
+        let session = crate::test_session("step-review-unit-0007");
+        let session_id = session.wire();
 
         // 1. What the container is TOLD, off the real argv builder.
         let mut config = base_argv_config();
-        config.session_id = session_id.to_string();
+        config.session_id = session.clone();
         let argv = build_docker_run_argv(&config);
         let at = argv.iter().position(|a| a == "--session-id").expect("--session-id is passed");
         let told = argv[at + 1].clone();
@@ -8605,7 +8597,7 @@
         // 2. What the tailer STAMPS, off a real create_finding event.
         let mut state = TailerState::new_for_test(
             tmp.path().join("trajectory.jsonl"),
-            session_id.into(),
+            session,
             "crawler".into(),
             "m".into(),
         );
@@ -8737,11 +8729,10 @@
 
         let mut state = TailerState::new_for_test(
             tmp.path().join("trajectory.jsonl"),
-            "sess-mod".into(),
+            crate::mission_test_session("crawl-1", "sess-mod"),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         );
-        state.mission_id = Some("crawl-1".into());
         state.phase_id = Some("crawl-1-fix".into());
         state.step_id = Some("step-2".into());
 
@@ -8850,7 +8841,7 @@
 
         let mut state = TailerState::new_for_test(
             tmp.path().join("trajectory.jsonl"),
-            "sess-parity".into(),
+            crate::test_session("sess-parity"),
             "crawler".into(),
             "darkmux:qwen3.6".into(),
         );
@@ -8897,7 +8888,7 @@
             .find(|v| v["action"] == "dispatch.tool")
             .expect("a dispatch.tool record");
         let rec: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(store.join("sess-parity").join("1").join("finding.json"))
+            &std::fs::read_to_string(store.join(&*crate::test_session("sess-parity").wire()).join("1").join("finding.json"))
                 .expect("record written"),
         )
         .unwrap();
@@ -8959,7 +8950,7 @@
         // No `.with_record_context(...)` — the default `None`.
         let mut state = TailerState::new_for_test(
             traj_path,
-            "sess-no-context".into(),
+            crate::test_session("sess-no-context"),
             "crawler".into(),
             "darkmux:qwen3.6".into(),
         );
@@ -8990,7 +8981,7 @@
         let record = contents
             .lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .find(|v| v["session_id"] == "sess-no-context" && v["action"] == "dispatch.tool")
+            .find(|v| v["session_id"] == crate::test_session("sess-no-context").wire() && v["action"] == "dispatch.tool")
             .expect("a dispatch.tool record");
 
         assert!(
@@ -9176,7 +9167,7 @@
         let traj_path = tmp.path().join("trajectory.jsonl");
         let mut state = TailerState::new_for_test(
             traj_path,
-            "sess-discard".into(),
+            crate::test_session("sess-discard"),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         );
@@ -9212,7 +9203,7 @@
             .lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .filter(|v| {
-                v["session_id"] == "sess-discard"
+                v["session_id"] == crate::test_session("sess-discard").wire()
                     && v["payload"]["kind"] == "discarded_tool_call"
             })
             .collect();
@@ -9684,7 +9675,7 @@
         let traj_path = tmp.path().join("trajectory.jsonl");
         let mut state = TailerState::new_for_test(
             traj_path,
-            "sess-bound-detections".into(),
+            crate::test_session("sess-bound-detections"),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         );
@@ -9729,7 +9720,7 @@
         let traj_path = tmp.path().join("trajectory.jsonl");
         let mut state = TailerState::new_for_test(
             traj_path,
-            "sess-checkpoint-bound".into(),
+            crate::test_session("sess-checkpoint-bound"),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         );
@@ -9761,7 +9752,7 @@
         let record = contents
             .lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .find(|v| v["session_id"] == "sess-checkpoint-bound" && v["action"] == "dispatch.checkpoint")
+            .find(|v| v["session_id"] == crate::test_session("sess-checkpoint-bound").wire() && v["action"] == "dispatch.checkpoint")
             .expect("dispatch.checkpoint record must exist");
         assert_eq!(
             record["payload"]["bound"],
@@ -9790,7 +9781,7 @@
         let traj_path = tmp.path().join("trajectory.jsonl");
         let mut state = TailerState::new_for_test(
             traj_path,
-            "sess-checkpoint-policy".into(),
+            crate::test_session("sess-checkpoint-policy"),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         );
@@ -9824,7 +9815,7 @@
         let record = contents
             .lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .find(|v| v["session_id"] == "sess-checkpoint-policy" && v["action"] == "dispatch.checkpoint")
+            .find(|v| v["session_id"] == crate::test_session("sess-checkpoint-policy").wire() && v["action"] == "dispatch.checkpoint")
             .expect("dispatch.checkpoint record must exist");
         assert_eq!(record["payload"]["policy"], "observe");
         assert_eq!(record["payload"]["would_conclude"], true);
@@ -9857,7 +9848,7 @@
         let traj_path = tmp.path().join("trajectory.jsonl");
         let mut state = TailerState::new_for_test(
             traj_path,
-            "sess-gate-observe".into(),
+            crate::test_session("sess-gate-observe"),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         );
@@ -9890,7 +9881,7 @@
         let record = contents
             .lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .find(|v| v["session_id"] == "sess-gate-observe" && v["action"] == "telemetry.detector")
+            .find(|v| v["session_id"] == crate::test_session("sess-gate-observe").wire() && v["action"] == "telemetry.detector")
             .expect("a telemetry.detector record must exist for the degenerate observation");
         assert_eq!(record["payload"]["kind"], "repetition");
         assert_eq!(record["payload"]["turn_seq"], 2);
@@ -9919,7 +9910,7 @@
         let traj_path = tmp.path().join("trajectory.jsonl");
         let mut state = TailerState::new_for_test(
             traj_path,
-            "sess-gate-abort".into(),
+            crate::test_session("sess-gate-abort"),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         );
@@ -9952,7 +9943,7 @@
         let record = contents
             .lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .find(|v| v["session_id"] == "sess-gate-abort" && v["action"] == "telemetry.detector")
+            .find(|v| v["session_id"] == crate::test_session("sess-gate-abort").wire() && v["action"] == "telemetry.detector")
             .expect("a telemetry.detector record must exist for the abort");
         assert_eq!(record["payload"]["kind"], "repetition");
         assert_eq!(record["payload"]["turn_seq"], 2);
@@ -9980,7 +9971,7 @@
         let traj_path = tmp.path().join("trajectory.jsonl");
         let mut state = TailerState::new_for_test(
             traj_path,
-            "sess-gate-legacy".into(),
+            crate::test_session("sess-gate-legacy"),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         );
@@ -10014,7 +10005,7 @@
         let record = contents
             .lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .find(|v| v["session_id"] == "sess-gate-legacy" && v["action"] == "telemetry.detector")
+            .find(|v| v["session_id"] == crate::test_session("sess-gate-legacy").wire() && v["action"] == "telemetry.detector")
             .expect("a telemetry.detector record must exist for the degenerate observation");
         assert!(record["payload"]["policy"].is_null(), "got {}", record["payload"]);
         assert!(record["payload"]["acted"].is_null(), "got {}", record["payload"]);
@@ -10140,9 +10131,8 @@
     fn build_remote_record_threads_mission_id_through() {
         let rec = build_remote_record(
             "coder",
-            "sess-1",
+            &crate::mission_test_session("m1", "sess-1"),
             "gpt-remote",
-            Some("m1"),
             Some("p1"),
             darkmux_flow::FlowAction::DispatchStart,
             serde_json::json!({}),
@@ -10158,9 +10148,8 @@
         // mission resolved ⇒ no fabricated mission_id.
         let bare = build_remote_record(
             "coder",
-            "sess-2",
+            &crate::test_session("sess-2"),
             "gpt-remote",
-            None,
             None,
             darkmux_flow::FlowAction::DispatchStart,
             serde_json::json!({}),
@@ -10335,7 +10324,7 @@
         let shared = Arc::new(Mutex::new(original_deadline));
         let mut state = TailerState::new(
             traj_path.clone(),
-            "test-session".into(),
+            crate::test_session("test-session"),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -10378,7 +10367,7 @@
         let shared = Arc::new(Mutex::new(original_deadline));
         let mut state = TailerState::new(
             traj_path.clone(),
-            "test-session".into(),
+            crate::test_session("test-session"),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -10489,7 +10478,7 @@
         let tmp = TempDir::new().unwrap();
         let traj_path = tmp.path().join("trajectory.jsonl");
         let shared = Arc::new(Mutex::new(Instant::now()));
-        let mut state = TailerState::new(traj_path.clone(), "live-sess".into(), "coder".into(), "work-35b".into(), shared, 600)
+        let mut state = TailerState::new(traj_path.clone(), crate::test_session("live-sess"), "coder".into(), "work-35b".into(), shared, 600)
             .with_compactor_model(Some("util-4b".into()))
             .with_live(live, 250);
         let mut f = std::fs::File::create(&traj_path).unwrap();
@@ -10530,7 +10519,7 @@
         // events the runtime wrote.
         assert!((7..=14).contains(&model.len()), "{} model samples", model.len());
         assert!(model[0].fields.contains_key("prompt_chars"), "the opener goes first");
-        assert!(model.iter().all(|s| s.session_id.as_deref() == Some("live-sess") && s.cadence_ms == 250));
+        assert!(model.iter().all(|s| s.session_id.as_deref() == Some(&*crate::test_session("live-sess").wire()) && s.cadence_ms == 250));
         let gens: Vec<u64> = model.iter().filter_map(|s| s.fields["generated_chars"].as_u64()).collect();
         // Both edges of the burst: the last visible chunk (19) and the first
         // reasoning one (20), then the burst's last (22) and the first
@@ -10572,7 +10561,7 @@
         let sock = sock_dir.path().join("live.sock");
         let rx = darkmux_flow::live::bind_ingest(&sock).unwrap();
         rx.set_nonblocking(true).unwrap();
-        let mut st = TailerState::new(traj.clone(), "w-sess".into(), "coder".into(), "m".into(), Arc::new(Mutex::new(Instant::now())), 600)
+        let mut st = TailerState::new(traj.clone(), crate::test_session("w-sess"), "coder".into(), "m".into(), Arc::new(Mutex::new(Instant::now())), 600)
             .with_live(Some(darkmux_flow::live::LiveSender::to_path(sock)), 250);
         let t = 1_758_700_000_000u64;
         std::fs::write(
@@ -10647,7 +10636,7 @@
         let shared = Arc::new(Mutex::new(original_deadline));
         let mut state = TailerState::new(
             traj_path.clone(),
-            "test-session".into(),
+            crate::test_session("test-session"),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -10766,11 +10755,12 @@
     /// time — a real refactor, tracked on #1544.
     fn drain_flow_records_for_session(
         dir: &std::path::Path,
-        session: &str,
+        session: &darkmux_types::session_id::SessionId,
     ) -> Vec<serde_json::Value> {
+        let wire = session.wire();
         drain_flow_records(dir)
             .into_iter()
-            .filter(|v| v["session_id"] == session)
+            .filter(|v| v["session_id"] == wire.as_str())
             .collect()
     }
 
@@ -10810,9 +10800,8 @@
             let mut guard = DispatchBookendGuard::new(
                 &mut sink,
                 "coder".into(),
-                "sess-orphan".into(),
+                crate::mission_test_session("pre-1.0-compat-sweep", "sess-orphan"),
                 "darkmux:qwen3.6".into(),
-                Some("pre-1.0-compat-sweep".into()),
                 Some("s694".into()),
                 None,
             );
@@ -10820,9 +10809,8 @@
                 darkmux_flow::Level::Info,
                 darkmux_flow::FlowAction::DispatchStart,
                 "coder",
-                "sess-orphan",
+                &crate::mission_test_session("pre-1.0-compat-sweep", "sess-orphan"),
                 Some("darkmux:qwen3.6"),
-                Some("pre-1.0-compat-sweep"),
                 Some("s694"),
                 None,
             ));
@@ -10840,11 +10828,11 @@
             }
         }
 
-        let rec = drain_flow_records_for_session(tmp.path(), "sess-orphan")
+        let rec = drain_flow_records_for_session(tmp.path(), &crate::mission_test_session("pre-1.0-compat-sweep", "sess-orphan"))
             .into_iter()
             .find(|v| v["action"] == "dispatch.error")
             .expect("armed guard should emit a dispatch.error terminal on drop");
-        assert_eq!(rec["session_id"], "sess-orphan");
+        assert_eq!(rec["session_id"], crate::mission_test_session("pre-1.0-compat-sweep", "sess-orphan").wire());
         assert_eq!(rec["mission_id"], "pre-1.0-compat-sweep");
         assert_eq!(rec["phase_id"], "s694");
         assert_eq!(rec["payload"]["result_class"], "error");
@@ -10871,9 +10859,8 @@
             let mut guard = DispatchBookendGuard::new(
                 &mut sink,
                 "coder".into(),
-                "sess-clean".into(),
+                crate::test_session("sess-clean"),
                 "darkmux:qwen3.6".into(),
-                None,
                 None,
                 None,
             );
@@ -10881,9 +10868,8 @@
                 darkmux_flow::Level::Info,
                 darkmux_flow::FlowAction::DispatchStart,
                 "coder",
-                "sess-clean",
+                &crate::test_session("sess-clean"),
                 Some("darkmux:qwen3.6"),
-                None,
                 None,
                 None,
             ));
@@ -10901,7 +10887,7 @@
             }
         }
 
-        let emitted = drain_flow_records_for_session(tmp.path(), "sess-clean")
+        let emitted = drain_flow_records_for_session(tmp.path(), &crate::test_session("sess-clean"))
             .into_iter()
             .any(|v| v["action"] == "dispatch.error");
         assert!(!emitted, "disarmed guard must not emit any terminal record");
@@ -10931,9 +10917,8 @@
             let mut guard = DispatchBookendGuard::new(
                 &mut sink,
                 "coder".into(),
-                "sess-panic".into(),
+                crate::mission_test_session("pre-1.0-compat-sweep", "sess-panic"),
                 "darkmux:qwen3.6".into(),
-                Some("pre-1.0-compat-sweep".into()),
                 None,
                 None,
             );
@@ -10941,9 +10926,8 @@
                 darkmux_flow::Level::Info,
                 darkmux_flow::FlowAction::DispatchStart,
                 "coder",
-                "sess-panic",
+                &crate::mission_test_session("pre-1.0-compat-sweep", "sess-panic"),
                 Some("darkmux:qwen3.6"),
-                Some("pre-1.0-compat-sweep"),
                 None,
                 None,
             ));
@@ -10963,11 +10947,11 @@
             }
         }
 
-        let rec = drain_flow_records_for_session(tmp.path(), "sess-panic")
+        let rec = drain_flow_records_for_session(tmp.path(), &crate::mission_test_session("pre-1.0-compat-sweep", "sess-panic"))
             .into_iter()
             .find(|v| v["action"] == "dispatch.error")
             .expect("guard should emit a dispatch.error terminal on panic unwind");
-        assert_eq!(rec["session_id"], "sess-panic");
+        assert_eq!(rec["session_id"], crate::mission_test_session("pre-1.0-compat-sweep", "sess-panic").wire());
         assert_eq!(rec["mission_id"], "pre-1.0-compat-sweep");
     }
 
@@ -10996,7 +10980,7 @@
         let traj_path = tmp.path().join("trajectory.jsonl");
         let mut state = TailerState::new_for_test(
             traj_path,
-            "sess-ckpt".into(),
+            crate::test_session("sess-ckpt"),
             "pr-reviewer".into(),
             "darkmux:qwen3.8".into(),
         );
@@ -11050,7 +11034,7 @@
         let traj_path = tmp.path().join("trajectory.jsonl");
         let mut state = TailerState::new_for_test(
             traj_path,
-            "sess-cycle".into(),
+            crate::test_session("sess-cycle"),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         );
@@ -11122,7 +11106,7 @@
         let traj_path = tmp.path().join("trajectory.jsonl");
         let mut state = TailerState::new_for_test(
             traj_path,
-            "sess-tokens".into(),
+            crate::test_session("sess-tokens"),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         );
@@ -11144,7 +11128,7 @@
             }
         }
 
-        let records = drain_flow_records_for_session(tmp.path(), "sess-tokens");
+        let records = drain_flow_records_for_session(tmp.path(), &crate::test_session("sess-tokens"));
         let tokens: Vec<&serde_json::Value> = records
             .iter()
             .filter(|v| v["category"] == "telemetry" && v["source"] == "tokens")
@@ -11156,7 +11140,7 @@
         let rec = tokens[0];
         assert_eq!(rec["action"], "telemetry.tokens");
         assert_eq!(rec["handle"], "coder");
-        assert_eq!(rec["session_id"], "sess-tokens");
+        assert_eq!(rec["session_id"], &*crate::test_session("sess-tokens").wire());
         assert_eq!(rec["payload"]["turn_seq"], 5);
         assert_eq!(rec["payload"]["prompt_tokens"], 31000);
         assert_eq!(rec["payload"]["completion_tokens"], 1200);
@@ -11184,7 +11168,7 @@
         let traj_path = tmp.path().join("trajectory.jsonl");
         let mut state = TailerState::new_for_test(
             traj_path,
-            "sess-sat".into(),
+            crate::test_session("sess-sat"),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         );
@@ -11224,7 +11208,7 @@
         // the stamped `step_id`, these records would be unattributable.
         let mut state = TailerState::new_for_test(
             traj_path,
-            "mission-run-m1-build-abc".into(),
+            crate::test_session("mission-run-m1-build-abc"),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         )
@@ -11392,7 +11376,7 @@
         }
         let mut state = TailerState::new_for_test(
             tmp.path().join("trajectory.jsonl"),
-            "sess-paths".into(),
+            crate::test_session("sess-paths"),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         );
@@ -11412,7 +11396,7 @@
                 None => std::env::remove_var("DARKMUX_REDIS_URL"),
             }
         }
-        let records = drain_flow_records_for_session(tmp.path(), "sess-paths");
+        let records = drain_flow_records_for_session(tmp.path(), &crate::test_session("sess-paths"));
         let turns: Vec<_> = records.iter().filter(|v| v["action"] == "dispatch.turn").collect();
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0]["payload"]["tool_paths"], serde_json::json!(["src/a.rs", null]));
@@ -11442,7 +11426,7 @@
         let traj_path = tmp.path().join("trajectory.jsonl");
         let mut state = TailerState::new_for_test(
             traj_path,
-            "sess-oneoff".into(),
+            crate::test_session("sess-oneoff"),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         );
@@ -11462,7 +11446,7 @@
             }
         }
 
-        let records = drain_flow_records_for_session(tmp.path(), "sess-oneoff");
+        let records = drain_flow_records_for_session(tmp.path(), &crate::test_session("sess-oneoff"));
         let turn = records
             .iter()
             .find(|v| v["action"] == "dispatch.turn")
@@ -11495,7 +11479,7 @@
         let traj_path = tmp.path().join("trajectory.jsonl");
         let mut state = TailerState::new_for_test(
             traj_path,
-            "sess-context".into(),
+            crate::test_session("sess-context"),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         );
@@ -11534,7 +11518,7 @@
             .find(|v| {
                 v["category"] == "telemetry"
                     && v["source"] == "context"
-                    && v["session_id"] == "sess-context"
+                    && v["session_id"] == crate::test_session("sess-context").wire()
             })
             .expect("a telemetry record should have been emitted");
 
@@ -11564,7 +11548,7 @@
         let traj_path = tmp.path().join("trajectory.jsonl");
         let mut state = TailerState::new_for_test(
             traj_path,
-            "sess-compaction".into(),
+            crate::test_session("sess-compaction"),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         );
@@ -11604,7 +11588,7 @@
             .iter()
             .find(|v| {
                 v["action"] == "dispatch.compaction"
-                    && v["session_id"] == "sess-compaction"
+                    && v["session_id"] == crate::test_session("sess-compaction").wire()
             })
             .expect("the dispatch.compaction work record should still be emitted");
         assert_eq!(work["payload"]["generation"], 1);
@@ -11623,7 +11607,7 @@
             .find(|v| {
                 v["category"] == "telemetry"
                     && v["source"] == "compaction"
-                    && v["session_id"] == "sess-compaction"
+                    && v["session_id"] == crate::test_session("sess-compaction").wire()
             })
             .expect("a source=compaction telemetry record should have been emitted");
         assert_eq!(telemetry["action"], "telemetry.compaction");
@@ -12132,27 +12116,21 @@
     fn fixture_state(trajectory_path: PathBuf) -> TailerState {
         TailerState::new_for_test(
             trajectory_path,
-            "test-session".into(),
+            crate::test_session("test-session"),
             "test-role".into(),
             "test-model".into(),
         )
     }
 
     #[test]
-    fn tailer_state_with_mission_stamps_fields() {
-        // (#714) The production tailer chains `.with_mission(...)` so every
-        // per-event flow record it emits carries the dispatch's mission/phase
-        // and groups under the mission in the observability view. Default
-        // (test/one-off) is None.
+    fn tailer_state_with_phase_stamps_the_phase() {
+        // (#714) The production tailer chains `.with_phase(...)` so every
+        // per-event flow record it emits carries the dispatch's phase; its
+        // mission comes from its session. Default (test/one-off) is None.
         let tmp = TempDir::new().unwrap();
         let bare = fixture_state(tmp.path().join("t.jsonl"));
-        assert!(bare.mission_id.is_none() && bare.phase_id.is_none());
-
-        let stamped = fixture_state(tmp.path().join("t.jsonl")).with_mission(
-            Some("pre-1.0-compat-sweep".into()),
-            Some("s694-profiles-schema".into()),
-        );
-        assert_eq!(stamped.mission_id.as_deref(), Some("pre-1.0-compat-sweep"));
+        assert!(bare.phase_id.is_none());
+        let stamped = fixture_state(tmp.path().join("t.jsonl")).with_phase(Some("s694-profiles-schema".into()));
         assert_eq!(stamped.phase_id.as_deref(), Some("s694-profiles-schema"));
     }
 
@@ -12601,7 +12579,7 @@
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
-            session_id: "sess-test".to_string(),
+            session_id: crate::test_session("sess-test"),
             model: "primary-model".to_string(),
             system_prompt: "Basic role.".to_string(),
             message: "Hello world".to_string(),
@@ -14331,10 +14309,9 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let started = Instant::now();
         let _summary = run_tailer(
             out_dir.path().to_path_buf(),
-            "test-session".to_string(),
+            crate::test_session("test-session"),
             "coder".to_string(),
             "test-model".to_string(),
-            None,
             None,
             None,
             // stop_flag — deliberately never set. Only the interrupt
@@ -14700,10 +14677,9 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             let (_guard, handle) = spawn_guarded_tailer(
                 &stop_flag_for_closure,
                 out_dir,
-                "test-session".to_string(),
+                crate::test_session("test-session"),
                 "test-role".to_string(),
                 "test-model".to_string(),
-                None,
                 None,
                 None,
                 inactivity_deadline_for_closure,
@@ -14794,9 +14770,8 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             let (_guard, handle) = spawn_guarded_sampler(
                 &sampler_stop_for_closure,
                 "test-role".to_string(),
-                "test-session".to_string(),
+                crate::test_session("test-session"),
                 "test-model".to_string(),
-                None,
                 None,
                 None,
                 None,
@@ -16340,7 +16315,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let tmp = TempDir::new().unwrap();
         let mut state = super::TailerState::new_for_test(
             tmp.path().join("trajectory.jsonl"),
-            session.into(),
+            crate::test_session(session),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         );
@@ -16805,7 +16780,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let shared = Arc::new(Mutex::new(Instant::now()));
         let mut state = TailerState::new(
             traj_path.clone(),
-            "test-session".into(),
+            crate::test_session("test-session"),
             "coder".into(),
             "darkmux:qwen3.6-35b-a3b".into(),
             Arc::clone(&shared),
@@ -16886,7 +16861,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         }
         let mut state = TailerState::new_for_test(
             tmp.path().join("trajectory.jsonl"),
-            "sess-gen".into(),
+            crate::test_session("sess-gen"),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         );
@@ -16914,7 +16889,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
                 None => std::env::remove_var("DARKMUX_REDIS_URL"),
             }
         }
-        let records = drain_flow_records_for_session(tmp.path(), "sess-gen");
+        let records = drain_flow_records_for_session(tmp.path(), &crate::test_session("sess-gen"));
         let turns: Vec<&serde_json::Value> =
             records.iter().filter(|v| v["action"] == "dispatch.turn").collect();
         assert_eq!(turns.len(), 3, "one record per logical turn; got {turns:?}");
@@ -16947,7 +16922,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         }
         let mut state = TailerState::new_for_test(
             tmp.path().join("trajectory.jsonl"),
-            "sess-leak".into(),
+            crate::test_session("sess-leak"),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         );
@@ -16970,7 +16945,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
                 None => std::env::remove_var("DARKMUX_REDIS_URL"),
             }
         }
-        let records = drain_flow_records_for_session(tmp.path(), "sess-leak");
+        let records = drain_flow_records_for_session(tmp.path(), &crate::test_session("sess-leak"));
         let times: Vec<(serde_json::Value, Option<serde_json::Value>)> = records
             .iter()
             .filter(|v| v["action"] == "dispatch.turn")
@@ -17004,7 +16979,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         }
         let mut state = TailerState::new_for_test(
             tmp.path().join("trajectory.jsonl"),
-            "sess-usage-turn".into(),
+            crate::test_session("sess-usage-turn"),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         )
@@ -17022,7 +16997,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
                 None => std::env::remove_var("DARKMUX_REDIS_URL"),
             }
         }
-        let records = drain_flow_records_for_session(tmp.path(), "sess-usage-turn");
+        let records = drain_flow_records_for_session(tmp.path(), &crate::test_session("sess-usage-turn"));
         let rec = crate::usage::assert_one_usage_record(&records, crate::usage::CallKind::Turn, "container turn");
         let p = &rec["payload"];
         assert_eq!(p["requested_model"], "darkmux:qwen3.6");
@@ -17048,7 +17023,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         }
         let mut state = TailerState::new_for_test(
             tmp.path().join("trajectory.jsonl"),
-            "sess-usage-epid".into(),
+            crate::test_session("sess-usage-epid"),
             "coder".into(),
             "gpt-hosted".into(),
         )
@@ -17067,7 +17042,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
                 None => std::env::remove_var("DARKMUX_REDIS_URL"),
             }
         }
-        let records = drain_flow_records_for_session(tmp.path(), "sess-usage-epid");
+        let records = drain_flow_records_for_session(tmp.path(), &crate::test_session("sess-usage-epid"));
         let rec = crate::usage::assert_one_usage_record(&records, crate::usage::CallKind::Turn, "container turn (named)");
         assert_eq!(rec["payload"]["endpoint_id"], "azure", "{rec}");
     }
@@ -17165,7 +17140,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let session = format!("budget-epid-remote-{}", std::process::id());
         let mut opts = dispatch_preflight_probe_opts();
         opts.role_id = "pr-reviewer".to_string();
-        opts.session_id = Some(session.clone());
+        opts.session = crate::test_session(&session);
         opts.phase_id = None;
         let mut pm: darkmux_types::ProfileModel =
             serde_json::from_str(&format!(r#"{{"id":"gpt-remote","endpoint":{{"url":"{base_url}"}}}}"#)).unwrap();
@@ -17179,7 +17154,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
                 &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap(),
             )
         });
-        let records = drain_flow_records_for_session(flows_dir.path(), &session);
+        let records = drain_flow_records_for_session(flows_dir.path(), &crate::test_session(&session));
         unsafe {
             for (k, v) in keys.iter().zip(prev) {
                 match v {
@@ -17219,7 +17194,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let session = format!("budget-unmetered-remote-{}", std::process::id());
         let mut opts = dispatch_preflight_probe_opts();
         opts.role_id = "pr-reviewer".to_string();
-        opts.session_id = Some(session.clone());
+        opts.session = crate::test_session(&session);
         opts.phase_id = None;
         let mut pm: darkmux_types::ProfileModel =
             serde_json::from_str(&format!(r#"{{"id":"gpt-remote","endpoint":{{"url":"{base_url}"}}}}"#)).unwrap();
@@ -17233,7 +17208,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
                 &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap(),
             )
         });
-        let records = drain_flow_records_for_session(flows_dir.path(), &session);
+        let records = drain_flow_records_for_session(flows_dir.path(), &crate::test_session(&session));
         unsafe {
             for (k, v) in keys.iter().zip(prev) {
                 match v {
@@ -17272,7 +17247,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         }
         let mut state = TailerState::new_for_test(
             tmp.path().join("trajectory.jsonl"),
-            session.into(),
+            crate::test_session(session),
             "coder".into(),
             "darkmux:qwen3.6".into(),
         )
@@ -17294,7 +17269,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
                 None => std::env::remove_var("DARKMUX_REDIS_URL"),
             }
         }
-        (drain_flow_records_for_session(tmp.path(), session), state.summary.clone())
+        (drain_flow_records_for_session(tmp.path(), &crate::test_session(session)), state.summary.clone())
     }
 
     /// (#2902 step 1b) One compactor call → exactly one `telemetry.tokens`
@@ -17369,12 +17344,12 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let st = starts[0];
         assert_eq!(st["handle"], "compactor", "{st}");
         assert_eq!(st["model"], "darkmux:compactor-4b", "{st}");
-        assert_eq!(st["session_id"], "sess-utility-start", "a compaction serves its execution: {st}");
+        assert_eq!(st["session_id"], crate::test_session("sess-utility-start").wire(), "a compaction serves its execution: {st}");
         assert_eq!(st["source"], crate::usage::UTILITY_SOURCE, "{st}");
         let p = &st["payload"];
         assert_eq!(p["job"], "compaction", "{p}");
         assert_eq!(p["model"], "darkmux:compactor-4b", "{p}");
-        assert_eq!(p["serves"], "sess-utility-start", "{p}");
+        assert_eq!(p["serves"], crate::test_session("sess-utility-start").wire(), "{p}");
         assert_eq!(p["stall_after_seconds"], 600, "the dispatch's inactivity window: {p}");
         assert_eq!(p["generation"], 3, "{p}");
         let start_at = records.iter().position(|r| r["action"] == "utility.start").unwrap();
@@ -17383,7 +17358,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(records[usage_at]["payload"]["job"], "compaction", "the end names the same job");
         // (#2915 review, MUST 1 / C4) One job id across the start and its
         // call's usage record, and ms-precision times from the runtime events.
-        assert_eq!(p["job_id"], "sess-utility-start:compaction:1", "{p}");
+        assert_eq!(p["job_id"], format!("{}:compaction:1", crate::test_session("sess-utility-start")), "{p}");
         assert_eq!(records[usage_at]["payload"]["job_id"], p["job_id"]);
         assert_eq!(p["started_at_ms"], 1_790_000_000_100u64, "{p}");
         assert_eq!(records[usage_at]["payload"]["ended_at_ms"], 1_790_000_004_600u64);
@@ -17409,12 +17384,15 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let ids: Vec<String> = records.iter().map(|r| r["payload"]["job_id"].as_str().unwrap_or("").to_string()).collect();
         assert_eq!(
             ids,
-            vec![
-                "sess-two-attempts:compaction:1",
-                "sess-two-attempts:compaction:1",
-                "sess-two-attempts:compaction:2",
-                "sess-two-attempts:compaction:2"
-            ],
+            {
+                let sid = crate::test_session("sess-two-attempts");
+                vec![
+                    format!("{sid}:compaction:1"),
+                    format!("{sid}:compaction:1"),
+                    format!("{sid}:compaction:2"),
+                    format!("{sid}:compaction:2"),
+                ]
+            },
             "{records:#?}"
         );
     }
@@ -17509,7 +17487,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         }
         let mut opts = dispatch_preflight_probe_opts();
         opts.role_id = "pr-reviewer".to_string();
-        opts.session_id = Some(format!("dialect-2902-{}", std::process::id()));
+        opts.session = crate::test_session(&format!("dialect-2902-{}", std::process::id()));
         opts.phase_id = None;
         opts.json = false;
         opts.max_completion_tokens = Some(55);
@@ -17556,7 +17534,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let session_id = format!("usage-conformance-remote-{}", std::process::id());
         let mut opts = dispatch_preflight_probe_opts();
         opts.role_id = "pr-reviewer".to_string();
-        opts.session_id = Some(session_id.clone());
+        opts.session = crate::test_session(&session_id);
         opts.phase_id = None;
         opts.json = false;
         let pm: darkmux_types::ProfileModel = serde_json::from_str(&format!(
@@ -17575,7 +17553,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
             }
         }
         result.expect("dispatch_remote must succeed against the mock server");
-        let records = drain_flow_records_for_session(flows_dir.path(), &session_id);
+        let records = drain_flow_records_for_session(flows_dir.path(), &crate::test_session(&session_id));
         let rec = crate::usage::assert_one_usage_record(&records, crate::usage::CallKind::SingleShot, "dispatch_remote");
         let p = &rec["payload"];
         assert_eq!(p["requested_model"], "gpt-remote");
@@ -17640,7 +17618,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let lines_c = lines.clone();
         let mut state = TailerState::new_for_test(
             tmp.path().join("out/.darkmux-runtime/trajectory.jsonl"),
-            "sess-2869".into(),
+            crate::test_session("sess-2869"),
             "coder".into(),
             "darkmux:m".into(),
         );
@@ -17670,7 +17648,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let swap_c = swap_lines.clone();
         let mut swapped = TailerState::new_for_test(
             out.join(".darkmux-runtime/trajectory.jsonl"),
-            "sess-2869-swap".into(),
+            crate::test_session("sess-2869-swap"),
             "coder".into(),
             "darkmux:m".into(),
         );
@@ -17744,7 +17722,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let lines_c = lines.clone();
         let mut state = TailerState::new_for_test(
             rt.join("trajectory.jsonl"),
-            "sess-2869-sparse".into(),
+            crate::test_session("sess-2869-sparse"),
             "coder".into(),
             "darkmux:m".into(),
         );
@@ -17776,7 +17754,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         fs::write(rt.join("trajectory.jsonl"), &body).unwrap();
         let mut state = TailerState::new_for_test(
             rt.join("trajectory.jsonl"),
-            "sess-2869-long".into(),
+            crate::test_session("sess-2869-long"),
             "coder".into(),
             "darkmux:m".into(),
         );
@@ -17839,7 +17817,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let lines_c = lines.clone();
         let mut state = TailerState::new_for_test(
             rt.join("trajectory.jsonl"),
-            "sess-2869-oversize".into(),
+            crate::test_session("sess-2869-oversize"),
             "coder".into(),
             "darkmux:m".into(),
         );
@@ -17877,10 +17855,9 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let stop = Arc::new(AtomicBool::new(true));
         let summary = run_tailer(
             tmp.path().to_path_buf(),
-            "sess-2869-drain".into(),
+            crate::test_session("sess-2869-drain"),
             "coder".into(),
             "darkmux:m".into(),
-            None,
             None,
             None,
             stop,
@@ -17909,7 +17886,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         fs::create_dir_all(&rt).unwrap();
         let path = rt.join("trajectory.jsonl");
         fs::write(&path, "Z".repeat(400)).unwrap();
-        let mut state = TailerState::new_for_test(path.clone(), "sess-2869-trunc".into(), "coder".into(), "darkmux:m".into());
+        let mut state = TailerState::new_for_test(path.clone(), crate::test_session("sess-2869-trunc"), "coder".into(), "darkmux:m".into());
         state.warning_sink = Arc::new(|_: &str| {});
         state.max_poll_bytes = 64;
         state.max_pending_bytes = 128;

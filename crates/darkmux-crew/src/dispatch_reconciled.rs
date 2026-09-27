@@ -323,7 +323,7 @@ mod tests {
             timeout_override_seconds: None,
             role_id: role.to_string(),
             message: "hi".to_string(),
-            session_id: None,
+            session: crate::test_session("n"),
             timeout_seconds: 3600,
             skip_preflight: false,
             json: true,
@@ -479,7 +479,7 @@ mod tests {
                     exit_code: 0,
                     stdout: format!("dispatched {}", opts.role_id),
                     stderr: String::new(),
-                    session_id: String::new(),
+                    session_id: crate::test_session("n"),
                     out_dir: None,
                     trajectory: None,
                 })
@@ -561,7 +561,7 @@ mod tests {
                     exit_code: 0,
                     stdout: format!("dispatched {}", opts.role_id),
                     stderr: String::new(),
-                    session_id: String::new(),
+                    session_id: crate::test_session("n"),
                     out_dir: None,
                     trajectory: None,
                 })
@@ -613,7 +613,7 @@ mod tests {
                     exit_code: 0,
                     stdout: "remote ok".to_string(),
                     stderr: String::new(),
-                    session_id: String::new(),
+                    session_id: crate::test_session("n"),
                     out_dir: None,
                     trajectory: None,
                 })
@@ -642,7 +642,7 @@ mod tests {
                     exit_code: 0,
                     stdout: "ran anyway".to_string(),
                     stderr: String::new(),
-                    session_id: String::new(),
+                    session_id: crate::test_session("n"),
                     out_dir: None,
                     trajectory: None,
                 })
@@ -747,7 +747,7 @@ mod tests {
                     exit_code: 0,
                     stdout: format!("dispatched {}", opts.role_id),
                     stderr: String::new(),
-                    session_id: String::new(),
+                    session_id: crate::test_session("n"),
                     out_dir: None,
                     trajectory: None,
                 })
@@ -821,7 +821,7 @@ mod tests {
                     exit_code: 0,
                     stdout: format!("dispatched {}", opts.role_id),
                     stderr: String::new(),
-                    session_id: String::new(),
+                    session_id: crate::test_session("n"),
                     out_dir: None,
                     trajectory: None,
                 })

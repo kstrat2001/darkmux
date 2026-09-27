@@ -2,10 +2,9 @@
 // hosted step's task id. Mission A waits on its endpoint's budget and is
 // stopped; later mission B's same step waits. B must read REST
 // "budget · <endpoint>" on the fleet card, its mission's run page and its
-// step's run page. The producer scopes every budget record to its run
-// (`budget.rs::record` -> `scope_to_run`, the id `mission_launch` stamps on
-// the run's other records): with the bare `task-judge` both missions wrote
-// before, A's `budget.stop` closed B's wait on every surface.
+// step's run page. A budget record carries its caller's session, which
+// names its run (`<mission>.task.<task>`): with the bare `task-judge` both
+// missions wrote before, A's `budget.stop` closed B's wait on every surface.
 process.env.TZ = "UTC";
 import { describe, it, expect } from "vitest";
 import { shapeRecords, flowToRenderModel } from "./flow";
@@ -18,7 +17,7 @@ const iso = (ms: number) => new Date(ms).toISOString();
 const A = "mission-A";
 const B = "mission-B";
 // The session a budget record carries: its run's (what the producer writes).
-const taskOf = (m: string) => `task-judge-${m}`;
+const taskOf = (m: string) => `${m}.task.judge`;
 const rec = (at: number, action: string, sid: string, extra: Record<string, unknown> = {}) =>
   ({ ts: iso(at), action, session_id: sid, machine_uid: "M", machine_id: "M", payload: {}, ...extra });
 const wait = (at: number, m: string) =>

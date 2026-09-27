@@ -58,6 +58,7 @@
 //! the honest answer, not a fabricated representative id.
 
 use anyhow::{Context, Result};
+use darkmux_types::session_id::SessionId;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -237,28 +238,15 @@ impl RunLifecycle {
     /// `manifest.json` is written at the run's end) rather than failing the
     /// dispatch — this is observability, not correctness.
     ///
-    /// (#2511 review CONSIDER 5) Enforces both halves of the trait's own
+    /// (#2511 review CONSIDER 5) The first call wins, per the trait's own
     /// doc (`WorkloadProvider::run`'s `on_session_id` param: "Called AT
-    /// MOST ONCE"), rather than trusting every current and future caller to
-    /// honor it unchecked:
-    ///
-    /// - **An empty string is never a session id.** Assigning one would
-    ///   still satisfy every downstream `Option::is_some()` read (this
-    ///   struct's own `read`/scan consumers included) while joining to
-    ///   nothing — the same non-empty guard `runs.rs`'s session-id readers
-    ///   already apply is applied here at the write, so the empty case
-    ///   never reaches disk in the first place.
-    /// - **The first call wins.** A second call — a provider bug, or a
-    ///   future caller that doesn't honor "at most once" — is a debug-time
-    ///   assertion (loud in tests/dev, where the mistake belongs) and a
-    ///   silent no-op in release (keeping the first, already-claimed
-    ///   session rather than letting a later value overwrite something a
-    ///   flow session may already be joined to).
-    pub fn set_session_id(&mut self, session_id: impl Into<String>) {
-        let session_id = session_id.into();
-        if session_id.is_empty() {
-            return;
-        }
+    /// MOST ONCE"). A second call — a provider bug — is a debug-time
+    /// assertion (loud in tests/dev, where the mistake belongs) and a
+    /// silent no-op in release, keeping the first, already-claimed session
+    /// rather than letting a later value overwrite something a flow session
+    /// may already be joined to.
+    pub fn set_session_id(&mut self, session: &SessionId) {
+        let session_id = session.wire();
         debug_assert!(
             self.record.session_id.is_none(),
             "set_session_id called more than once on {} (already {:?}, now attempting {session_id:?}) \

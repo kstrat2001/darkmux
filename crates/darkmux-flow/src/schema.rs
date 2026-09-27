@@ -44,6 +44,23 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           darkmux reads the dotted spellings; darkmux's own readers
 //           upgrade old archives.
 //
+//           Also (4.0): the session grammar. `session_id` is the wire
+//           string of a typed `darkmux_types::session_id::SessionId`, one
+//           session within one run, `.`-separated and begun by its run:
+//           `<run>[.lab|.solo].<kind>[.<field>...]`, kind one of `run`,
+//           `phase.<p>`, `task.<t>`, `step.<s>`, `adhoc.<role>.<nonce>`,
+//           `relay.<peer>.<sender>`, every component escaped (`[A-Za-z0-9-]`
+//           kept, any other byte `_XX`). Replaces the free-form ids
+//           (`mission-<m>`, bare `<m>`, `mission-run-<m>-<p>`,
+//           `task-<t>[-<m>]`, `step-<s>[-<m>]`, `crew-dispatch-...`,
+//           `crawl-...`, `radio-...`, `phase-review-...`, the lab forms and
+//           the fleet `<sender>-from-<peer>`). `session_id` and
+//           `mission_id` are stamped from the one session
+//           (`FlowRecord::for_session`): `mission_id` is the run when it is
+//           a mission, absent for a lab, standalone or relay run. A reader
+//           of an archive reads an old id through
+//           `SessionId::parse_legacy` only.
+//
 //           Also removed (4.0, one token truth): `dispatch.complete`'s
 //           `cumulative_prompt_tokens` / `cumulative_completion_tokens`.
 //           Their only source was the runtime's `metrics.json`, which 4.0
@@ -2221,6 +2238,45 @@ pub struct FlowRecord {
     pub attempt: Option<u32>,
 }
 
+impl FlowRecord {
+    /// A record under `session`, at the current time and `Tier::Local`, with
+    /// every optional field empty. `session_id` and `mission_id` are both
+    /// stamped from the one `session` here, so they can never disagree: the
+    /// wire string names the run, and `mission_id` is that run when it is a
+    /// mission. The only place a session is put on a record.
+    pub fn for_session(
+        session: &darkmux_types::session_id::SessionId,
+        level: Level,
+        category: Category,
+        stage: Stage,
+        action: crate::FlowAction,
+        handle: impl Into<String>,
+    ) -> Self {
+        FlowRecord {
+            ts: crate::ts_utc_now(),
+            level,
+            category,
+            tier: Tier::Local,
+            stage,
+            action,
+            handle: handle.into(),
+            phase_id: None,
+            session_id: Some(session.wire()),
+            source: None,
+            model: None,
+            reasoning: None,
+            mission_id: session.mission_id().map(str::to_string),
+            machine_id: None,
+            machine_uid: None,
+            prev_hash: None,
+            hash: None,
+            payload: None,
+            work_id: None,
+            attempt: None,
+        }
+    }
+}
+
 /// Resolve the flows directory. Precedence (#661 Slice 3):
 /// `env(DARKMUX_FLOWS_DIR) > config.dirs.flows > <darkmux root>/flows`, where the
 /// root is what `paths::resolve(Auto)` selects (`DARKMUX_HOME`, else a project-local
@@ -2351,6 +2407,23 @@ pub fn resolve_machine_id_with_source() -> Option<(String, MachineIdSource)> {
         .map(|h| (h, MachineIdSource::Hostname))
 }
 
+
+#[cfg(test)]
+mod for_session_tests {
+    use super::*;
+    use darkmux_types::session_id::{RunId, SessionId};
+
+    /// `session_id` and `mission_id` come from the one session: a mission
+    /// run's records carry its id as `mission_id`, a lab run's carry none.
+    #[test]
+    fn a_record_carries_its_sessions_run_and_nothing_else() {
+        let rec = |s: &SessionId| FlowRecord::for_session(s, Level::Info, Category::Work, Stage::Dispatch, crate::FlowAction::StepStart, "h");
+        let m = rec(&SessionId::task(RunId::mission("m-1").unwrap(), "t1"));
+        assert_eq!((m.session_id.as_deref(), m.mission_id.as_deref()), (Some("m-1.task.t1"), Some("m-1")));
+        let lab = rec(&SessionId::adhoc(RunId::lab("l-1").unwrap(), "coder", "n"));
+        assert_eq!((lab.session_id.as_deref(), lab.mission_id), (Some("l-1.lab.adhoc.coder.n"), None));
+    }
+}
 
 #[cfg(test)]
 mod forward_compat_tests {

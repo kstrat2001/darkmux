@@ -104,6 +104,11 @@ fn explicit_interrupted_records_the_reason() {
 
 // ── session-id join (#2511) ───────────────────────────────────────────────
 
+/// A dispatch session `nonce` in lab run `r`.
+fn lab_session(nonce: &str) -> darkmux_types::session_id::SessionId {
+    darkmux_types::session_id::SessionId::adhoc(darkmux_types::session_id::RunId::lab("r").unwrap(), "coder", nonce)
+}
+
 /// A provider that has minted its dispatch session id reports it back
 /// mid-run, WHILE the record is still `Running` — this is the whole point:
 /// a live row must be joinable to its own flow session before it finishes,
@@ -112,11 +117,11 @@ fn explicit_interrupted_records_the_reason() {
 fn set_session_id_attaches_it_while_still_running() {
     let tmp = TempDir::new().unwrap();
     let mut lc = RunLifecycle::start(tmp.path(), "r", "w", "p").unwrap();
-    lc.set_session_id("darkmux-coding-demo-123");
+    lc.set_session_id(&lab_session("darkmux-coding-demo-123"));
 
     let rec = read(tmp.path()).expect("record must exist");
     assert_eq!(rec.status, LifecycleStatus::Running, "attaching the id must not terminate the run");
-    assert_eq!(rec.session_id.as_deref(), Some("darkmux-coding-demo-123"));
+    assert_eq!(rec.session_id.as_deref(), Some(lab_session("darkmux-coding-demo-123").wire().as_str()));
     std::mem::forget(lc); // this test is about the mid-run write only
 }
 
@@ -128,14 +133,14 @@ fn set_session_id_attaches_it_while_still_running() {
 fn set_session_id_survives_the_terminal_write() {
     let tmp = TempDir::new().unwrap();
     let mut lc = RunLifecycle::start(tmp.path(), "r", "w", "p").unwrap();
-    lc.set_session_id("darkmux-prompt-demo-456");
+    lc.set_session_id(&lab_session("darkmux-prompt-demo-456"));
     lc.finish_complete();
 
     let rec = read(tmp.path()).unwrap();
     assert_eq!(rec.status, LifecycleStatus::Complete);
     assert_eq!(
         rec.session_id.as_deref(),
-        Some("darkmux-prompt-demo-456"),
+        Some(lab_session("darkmux-prompt-demo-456").wire().as_str()),
         "the terminal write must not erase a session id set earlier in the run"
     );
 }
@@ -158,27 +163,6 @@ fn a_run_that_never_mints_a_session_id_never_gains_one() {
     );
 }
 
-/// (#2511 review CONSIDER 5) An empty string is not a session id — assigning
-/// one would still satisfy every downstream `Option::is_some()` read while
-/// joining to nothing. Must never reach disk, in either direction: not as
-/// the first value, and not as an attempted overwrite of a real one.
-#[test]
-fn set_session_id_ignores_an_empty_string() {
-    let tmp = TempDir::new().unwrap();
-    let mut lc = RunLifecycle::start(tmp.path(), "r", "w", "p").unwrap();
-    lc.set_session_id("");
-    assert_eq!(read(tmp.path()).unwrap().session_id, None, "an empty string must never be claimed");
-
-    lc.set_session_id("darkmux-coding-real-1");
-    lc.set_session_id("");
-    assert_eq!(
-        read(tmp.path()).unwrap().session_id.as_deref(),
-        Some("darkmux-coding-real-1"),
-        "an empty string offered AFTER a real id must not clobber it"
-    );
-    std::mem::forget(lc);
-}
-
 /// (#2511 review CONSIDER 5) The trait's own doc says `on_session_id` is
 /// "Called AT MOST ONCE" — this is the loud, debug-time half of enforcing
 /// that, so a provider bug (or a future caller that doesn't honor the
@@ -195,8 +179,8 @@ fn set_session_id_ignores_an_empty_string() {
 fn set_session_id_called_twice_panics_in_a_debug_build() {
     let tmp = TempDir::new().unwrap();
     let mut lc = RunLifecycle::start(tmp.path(), "r", "w", "p").unwrap();
-    lc.set_session_id("darkmux-coding-first-1");
-    lc.set_session_id("darkmux-coding-second-1");
+    lc.set_session_id(&lab_session("darkmux-coding-first-1"));
+    lc.set_session_id(&lab_session("darkmux-coding-second-1"));
     std::mem::forget(lc);
 }
 
@@ -211,9 +195,9 @@ fn set_session_id_called_twice_panics_in_a_debug_build() {
 fn set_session_id_called_twice_keeps_the_first_value_past_the_assertion() {
     let tmp = TempDir::new().unwrap();
     let mut lc = RunLifecycle::start(tmp.path(), "r", "w", "p").unwrap();
-    lc.set_session_id("darkmux-coding-first-2");
+    lc.set_session_id(&lab_session("darkmux-coding-first-2"));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        lc.set_session_id("darkmux-coding-second-2");
+        lc.set_session_id(&lab_session("darkmux-coding-second-2"));
     }));
     // The PANIC is profile-dependent; the INVARIANT below is not. Asserting
     // `is_err()` unconditionally is what made this test fail under
@@ -228,7 +212,7 @@ fn set_session_id_called_twice_keeps_the_first_value_past_the_assertion() {
     }
     assert_eq!(
         read(tmp.path()).unwrap().session_id.as_deref(),
-        Some("darkmux-coding-first-2"),
+        Some(lab_session("darkmux-coding-first-2").wire().as_str()),
         "the record on disk must still hold the FIRST claimed session, not the second"
     );
     std::mem::forget(lc);

@@ -4280,6 +4280,7 @@ mod tests {
                 "ts": "2024-01-01T09:00:00Z",
                 "action": "dispatch.start",
                 "session_id": "crew-dispatch-coder-2682",
+                "mission_id": "dispatch-crashed-2682",
                 "handle": "coder",
             })
         )

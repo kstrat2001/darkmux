@@ -211,28 +211,51 @@ fn should_emit_edges(first_tick: bool, recovered_this_tick: bool) -> bool {
 /// So in practice `session.end` marks only the process-level-abandonment
 /// interval-close that playback would otherwise have no bracket for at all
 /// — not merely "this dispatch errored".
+///
+/// A 4.0 session is stamped through [`FlowRecord::for_session`], so the
+/// edge's `mission_id` is the run its session names. A beat whose session
+/// does not parse (an emitter from before 4.0, still beating across an
+/// upgrade) keeps its string and names no mission.
 fn build_session_end_record(beat: &SessionBeat) -> FlowRecord {
+    let handle = beat.role.clone().unwrap_or_else(|| beat.session_id.clone());
+    let base = match darkmux_types::session_id::SessionId::parse(&beat.session_id) {
+        Ok(session) => FlowRecord::for_session(
+            &session,
+            crate::Level::Info,
+            crate::Category::Machinery,
+            crate::Stage::Dispatch,
+            crate::FlowAction::SessionEnd,
+            handle,
+        ),
+        Err(_) => FlowRecord {
+            ts: crate::ts_utc_now(),
+            level: crate::Level::Info,
+            category: crate::Category::Machinery,
+            tier: crate::Tier::Local,
+            stage: crate::Stage::Dispatch,
+            action: crate::FlowAction::SessionEnd,
+            handle,
+            phase_id: None,
+            session_id: Some(beat.session_id.clone()),
+            source: None,
+            model: None,
+            reasoning: None,
+            mission_id: None,
+            machine_id: None,
+            machine_uid: None,
+            prev_hash: None,
+            hash: None,
+            payload: None,
+            work_id: None,
+            attempt: None,
+        },
+    };
     FlowRecord {
-        ts: crate::ts_utc_now(),
-        level: crate::Level::Info,
-        category: crate::Category::Machinery,
-        tier: crate::Tier::Local,
-        stage: crate::Stage::Dispatch,
-        action: crate::FlowAction::SessionEnd,
-        handle: beat.role.clone().unwrap_or_else(|| beat.session_id.clone()),
-        phase_id: None,
-        session_id: Some(beat.session_id.clone()),
         source: Some(EDGE_SOURCE.to_string()),
         model: beat.model.clone(),
-        reasoning: None,
-        mission_id: None,
         machine_id: Some(beat.display_name.clone()),
         machine_uid: beat.machine_uid.clone(),
-        prev_hash: None,
-        hash: None,
-        payload: None,
-        work_id: None,
-        attempt: None,
+        ..base
     }
 }
 
@@ -621,6 +644,27 @@ mod tests {
         assert_eq!(rec.machine_id.as_deref(), Some("laptop"));
         assert_eq!(rec.handle, "coder");
         assert_eq!(rec.source.as_deref(), Some(EDGE_SOURCE));
+    }
+
+    /// A 4.0 session's close-edge is stamped from the one session value, so
+    /// its `mission_id` agrees with the run its wire names; a beat whose
+    /// session does not parse (a pre-4.0 emitter) keeps its string and no
+    /// mission.
+    #[test]
+    fn session_end_edge_names_the_mission_its_session_names() {
+        let run = darkmux_types::session_id::RunId::mission("review-1").unwrap();
+        let session = darkmux_types::session_id::SessionId::task(run, "probe");
+        let rec = build_session_end_record(&sbeat(&session.wire(), "coder"));
+        assert_eq!(rec.session_id, Some(session.wire()));
+        assert_eq!(rec.mission_id.as_deref(), Some("review-1"));
+        assert_eq!(rec.machine_uid.as_deref(), Some("UID-1"));
+        assert_eq!(rec.machine_id.as_deref(), Some("laptop"));
+        assert_eq!(rec.handle, "coder");
+        assert_eq!(rec.source.as_deref(), Some(EDGE_SOURCE));
+
+        let legacy = build_session_end_record(&sbeat("crew-dispatch-coder-1-internal", "coder"));
+        assert_eq!(legacy.session_id.as_deref(), Some("crew-dispatch-coder-1-internal"));
+        assert_eq!(legacy.mission_id, None);
     }
 
     #[test]

@@ -39,17 +39,17 @@
 //! caller (`cmd_dispatch`) sees an outcome indistinguishable from the
 //! pre-#1509 raw `dispatch()` call.
 //!
-//! The frozen `crew-dispatch-<role>-<micros>-<counter>` session-id scheme
-//! (see [`crate::dispatch::fresh_session_id`]'s doc — presence tests key on
-//! the prefix) is preserved explicitly: when the caller's `opts.session_id`
-//! is `None`, this module mints one via `fresh_session_id` itself and pins
-//! it into the Step's `config.session_id`, rather than letting
-//! `DispatchInternalStepKind`'s own default (`session_id::step(&step.id)`)
-//! apply — that default is right for a mission-graph step, wrong for a
-//! standalone dispatch whose session id is part of the CLI's own frozen
-//! vocabulary.
+//! The run is the caller's: [`dispatch_session`] mints a crew-of-one
+//! mission id and an ad-hoc session in it BEFORE routing, so the route
+//! record, a fleet submission and the local run all carry one run. This
+//! module mints its mission under that id and pins the session into the
+//! Step's `config.session_id`, rather than letting
+//! `DispatchInternalStepKind`'s own default (the step's session) apply —
+//! that default is right for a mission-graph step, wrong for a top-level
+//! dispatch, whose session the operator can name (`--session-id`).
 
 use crate::dispatch::{DispatchOpts, DispatchResult};
+use darkmux_types::session_id::{RunId, SessionId};
 use crate::envelope::{MissionEnvelope, MissionOutcomeStatus};
 use crate::lifecycle;
 use crate::step_kinds::{Facts, FixedEstimator, RawDispatchOutcome, StepKindRegistry};
@@ -154,12 +154,11 @@ pub(crate) fn dispatch_as_crew_of_one_with(
         darkmux_types::workdir::validate_workdir(workdir)?;
     }
 
-    let session_id = opts
-        .session_id
-        .clone()
-        .unwrap_or_else(|| crate::dispatch::fresh_session_id(&opts.role_id));
-
-    let mission_id = mint_dispatch_run_id(&opts.role_id);
+    let mission_id = opts
+        .session
+        .mission_id()
+        .ok_or_else(|| anyhow!("dispatch: a crew-of-one dispatch runs in a mission's own run, not in `{}`", opts.session))?
+        .to_string();
     let mission_path = lifecycle::mission_path(&mission_id);
     if mission_path.exists() {
         bail!(
@@ -170,7 +169,7 @@ pub(crate) fn dispatch_as_crew_of_one_with(
         );
     }
 
-    let (mission, phase, task, step) = build_graph(&opts, &mission_id, &session_id);
+    let (mission, phase, task, step) = build_graph(&opts, &mission_id);
     let phase_id = phase.id.clone();
     let task_id = task.id.clone();
     let step_id = step.id.clone();
@@ -209,6 +208,7 @@ pub(crate) fn dispatch_as_crew_of_one_with(
     let est = FixedEstimator::default();
 
     let graph_result = crate::scheduler::run_step_graph(
+        opts.session.run_id(),
         &mut steps,
         &tasks,
         registry,
@@ -328,9 +328,9 @@ fn reconcile_on_error(mission_id: &str, phase_id: &str, reason: &str) {
 
 /// Build the (unsaved) Mission/Phase/Task/Step quadruple for one crew-of-one
 /// dispatch run. Pure — no I/O — so the shape is independently unit-testable.
-/// `mission_id`/`session_id` are minted by the caller (uniqueness/frozen-
-/// session-id-scheme concerns live there, not here).
-fn build_graph(opts: &DispatchOpts, mission_id: &str, session_id: &str) -> (Mission, Phase, Task, Step) {
+/// `mission_id` is the run of `opts.session`, minted by the caller
+/// ([`dispatch_session`]).
+fn build_graph(opts: &DispatchOpts, mission_id: &str) -> (Mission, Phase, Task, Step) {
     let now = now_unix();
     let phase_id = format!("{mission_id}-phase");
     let task_id = format!("{mission_id}-task");
@@ -393,7 +393,7 @@ fn build_graph(opts: &DispatchOpts, mission_id: &str, session_id: &str) -> (Miss
     let mut config = serde_json::json!({
         "message": opts.message,
         "timeout_seconds": opts.timeout_seconds,
-        "session_id": session_id,
+        "session_id": opts.session,
         "skip_preflight": opts.skip_preflight,
         "json": opts.json,
         "preserve_dispatch_result": true,
@@ -477,6 +477,15 @@ fn spec_fingerprint(opts: &DispatchOpts) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// The session a top-level `darkmux dispatch <role>` runs under: an ad-hoc
+/// dispatch of `role_id` in a freshly minted crew-of-one run. `nonce` names
+/// it (the CLI's `--session-id`); `None` mints a fresh one
+/// ([`crate::dispatch::fresh_nonce`]).
+pub fn dispatch_session(role_id: &str, nonce: Option<String>) -> SessionId {
+    let run = RunId::mission(mint_dispatch_run_id(role_id)).expect("a minted run id is never empty");
+    SessionId::adhoc(run, role_id, nonce.unwrap_or_else(crate::dispatch::fresh_nonce))
+}
+
 /// Mint a fresh, unique run id for one crew-of-one dispatch — never derived
 /// from the message (dispatches are non-deterministic AI work; two
 /// dispatches of the same role with the same message are two DIFFERENT
@@ -545,9 +554,9 @@ mod tests {
             host_out: None,
             max_turns_override: None,
             timeout_override_seconds: None, // (#2480)
+            session: dispatch_session(role, None),
             role_id: role.to_string(),
             message: message.to_string(),
-            session_id: None,
             timeout_seconds: 3600,
             skip_preflight: false,
             json: true,
@@ -710,6 +719,7 @@ mod tests {
             step: &crate::types::Step,
             task: &crate::types::Task,
             _input: &BTreeMap<String, String>,
+            _ctx: &crate::step_kinds::StepRunCtx,
         ) -> Result<StepOutcome> {
             let session_id =
                 step.config.get("session_id").and_then(|v| v.as_str()).map(String::from);
@@ -756,7 +766,7 @@ mod tests {
                 exit_code: self.exit_code,
                 stdout: self.stdout.clone(),
                 stderr: self.stderr.clone(),
-                session_id: session_id.unwrap_or_default(),
+                session_id: SessionId::parse(&session_id.unwrap_or_default())?,
                 out_dir: None,
             };
             let output = serde_json::to_string(&payload).unwrap();
@@ -837,7 +847,7 @@ mod tests {
     #[test]
     fn build_graph_is_one_phase_one_task_one_step() {
         let opts = test_opts("coder", "do the thing");
-        let (mission, phase, task, step) = build_graph(&opts, "dispatch-coder-1-abc", "sess-1");
+        let (mission, phase, task, step) = build_graph(&opts, "dispatch-coder-1-abc");
 
         assert_eq!(mission.phase_ids, vec![phase.id.clone()]);
         assert_eq!(phase.task_ids, vec![task.id.clone()]);
@@ -856,7 +866,7 @@ mod tests {
         opts.profile_name = Some("balanced".to_string());
         opts.workdir = Some(std::path::PathBuf::from("/tmp/wt"));
         opts.image = Some("rust:slim".to_string());
-        let (_, _, task, _) = build_graph(&opts, "dispatch-coder-1-abc", "sess-1");
+        let (_, _, task, _) = build_graph(&opts, "dispatch-coder-1-abc");
 
         assert_eq!(task.role_id.as_deref(), Some("coder"));
         assert_eq!(task.profile_name.as_deref(), Some("balanced"));
@@ -870,7 +880,7 @@ mod tests {
     /// config. Needs no Docker and no model — everything after this function
     /// is what needs a container.
     fn rebuilt_opts(task: &crate::types::Task, step: &crate::types::Step) -> DispatchOpts {
-        crate::step_kinds::builtins::dispatch_opts_for(step, task, &BTreeMap::new())
+        crate::step_kinds::builtins::dispatch_opts_for(step, task, &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
             .expect("reconstructing DispatchOpts from the crew-of-one step")
     }
 
@@ -889,11 +899,11 @@ mod tests {
         opts.skip_preflight = true;
         opts.json = false;
         opts.max_completion_tokens = Some(2048);
-        let (_, _, task, step) = build_graph(&opts, "dispatch-coder-1-abc", "sess-frozen-1");
+        let (_, _, task, step) = build_graph(&opts, "dispatch-coder-1-abc");
 
         assert_eq!(step.config["message"], "hello there");
         assert_eq!(step.config["timeout_seconds"], 120);
-        assert_eq!(step.config["session_id"], "sess-frozen-1");
+        assert_eq!(step.config["session_id"], opts.session.wire(), "the dispatch's own session, pinned");
         assert_eq!(step.config["skip_preflight"], true);
         assert_eq!(step.config["json"], false);
         assert_eq!(step.config["max_completion_tokens"], 2048);
@@ -925,7 +935,7 @@ mod tests {
              an omitted flag must not become a 600s clamp"
         );
         opts.timeout_override_seconds = Some(45);
-        let (_, _, task, step) = build_graph(&opts, "dispatch-coder-1-abc", "sess-frozen-1");
+        let (_, _, task, step) = build_graph(&opts, "dispatch-coder-1-abc");
         assert_eq!(step.config["timeout_override_seconds"], 45);
         // The READER half, asserted against the writer half rather than
         // separately, and through the SAME function the step kind runs
@@ -955,7 +965,7 @@ mod tests {
             crate::brief_refs::BriefRef::finding("sess-a/1"),
             crate::brief_refs::BriefRef::mod_("mod-1-aaa"),
         ];
-        let (_, _, _, step) = build_graph(&opts, "dispatch-coder-1-abc", "sess-frozen-1");
+        let (_, _, _, step) = build_graph(&opts, "dispatch-coder-1-abc");
         assert_eq!(
             step.config["brief_refs"],
             serde_json::json!([
@@ -976,7 +986,7 @@ mod tests {
     #[test]
     fn build_graph_omits_resume_from_by_default() {
         let opts = test_opts("coder", "hi");
-        let (_, _, _, step) = build_graph(&opts, "dispatch-coder-1-abc", "sess-1");
+        let (_, _, _, step) = build_graph(&opts, "dispatch-coder-1-abc");
         assert!(
             step.config.get("resume_from").is_none(),
             "no key at all, not a null, when `--resume-from` wasn't given: {:?}",
@@ -994,7 +1004,7 @@ mod tests {
         // raw `DispatchOpts` handoff (see this fn's own doc).
         let mut opts = test_opts("coder", "hi");
         opts.resume_from = Some(std::path::PathBuf::from("/tmp/darkmux-out-coder-123456"));
-        let (_, _, _, step) = build_graph(&opts, "dispatch-coder-1-abc", "sess-1");
+        let (_, _, _, step) = build_graph(&opts, "dispatch-coder-1-abc");
 
         assert_eq!(step.config["resume_from"], "/tmp/darkmux-out-coder-123456");
     }
@@ -1038,11 +1048,12 @@ mod tests {
         let resume_from = tempfile::TempDir::new().unwrap(); // no checkpoint.json written
         let mut opts = test_opts("coder", "resume please");
         opts.resume_from = Some(resume_from.path().to_path_buf());
-        let (_, _, task, step) = build_graph(&opts, "dispatch-coder-2-abc", "sess-2");
+        let (_, _, task, step) = build_graph(&opts, "dispatch-coder-2-abc");
 
         let registry = StepKindRegistry::with_builtins();
         let kind = registry.get("dispatch.internal").expect("dispatch.internal is a Tier 1 builtin");
         let ctx = crate::step_kinds::StepRunCtx::new(
+            crate::test_run(),
             None,
             None,
             None,
@@ -1065,7 +1076,7 @@ mod tests {
         // string from this graph's OWN minted phase id (`task.phase_id`).
         let mut opts = test_opts("coder", "hi");
         opts.phase_id = Some("some-other-mission-phase".to_string());
-        let (_, phase, task, step) = build_graph(&opts, "dispatch-coder-1-abc", "sess-1");
+        let (_, phase, task, step) = build_graph(&opts, "dispatch-coder-1-abc");
 
         assert_eq!(step.config["phase_id"], "some-other-mission-phase");
         assert_eq!(task.phase_id, phase.id);
@@ -1078,7 +1089,7 @@ mod tests {
         // Matches the pre-#1509 `DispatchOpts.phase_id: None` default —
         // `config_str(step, "phase_id")` must read `None`, not `Some("")`.
         let opts = test_opts("coder", "hi");
-        let (_, _, _, step) = build_graph(&opts, "dispatch-coder-1-abc", "sess-1");
+        let (_, _, _, step) = build_graph(&opts, "dispatch-coder-1-abc");
         assert!(step.config.get("phase_id").is_none());
     }
 
@@ -1219,7 +1230,6 @@ mod tests {
 
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, r#"{"result":"stop"}"#);
-        assert!(result.session_id.starts_with("crew-dispatch-coder-"), "{}", result.session_id);
 
         // A first-class Run: exactly one mission dir with one phase, one
         // task, one step persisted on disk.
@@ -1227,6 +1237,7 @@ mod tests {
         let entries: Vec<_> = std::fs::read_dir(&missions_dir).unwrap().collect();
         assert_eq!(entries.len(), 1, "exactly one mission dir minted");
         let mission_id = entries[0].as_ref().unwrap().file_name().to_string_lossy().to_string();
+        assert_eq!(result.session_id.mission_id(), Some(mission_id.as_str()), "the session names the crew-of-one run");
 
         let mission = crate::lifecycle::load_mission_by_id(&mission_id).unwrap();
         assert_eq!(mission.phase_ids.len(), 1);
@@ -1448,9 +1459,10 @@ mod tests {
         };
 
         let mut opts = test_opts("coder", "build the thing");
-        opts.session_id = Some("operator-pinned-session".to_string());
+        opts.session = dispatch_session("coder", Some("operator-pinned-session".to_string()));
+        let pinned = opts.session.clone();
         let result = dispatch_as_crew_of_one_with(opts, &registry, &host_factory).unwrap();
-        assert_eq!(result.session_id, "operator-pinned-session");
+        assert_eq!(result.session_id, pinned);
     }
 
     // ── #2585: the checkpoint gate must precede the residency wave ─────

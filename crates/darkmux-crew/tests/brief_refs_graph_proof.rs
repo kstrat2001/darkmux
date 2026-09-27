@@ -181,7 +181,12 @@ fn a_step_config_that_names_records_gets_their_blocks_in_the_brief() {
         ("DARKMUX_MODS_DIR", mods.path()),
     ]);
 
-    let session_id = format!("brief-refs-graph-{}", std::process::id());
+    let session_id = darkmux_types::session_id::SessionId::adhoc(
+        darkmux_types::session_id::RunId::mission("m-test").unwrap(),
+        "dialectic-judge",
+        format!("brief-refs-graph-{}", std::process::id()),
+    )
+    .wire();
     let step = step_with(serde_json::json!({
         "role_id": "dialectic-judge",
         "message": "the graph's own message",
@@ -199,7 +204,7 @@ fn a_step_config_that_names_records_gets_their_blocks_in_the_brief() {
     }));
 
     DispatchInternalStepKind
-        .run(&step, &empty_task(), &BTreeMap::new())
+        .run(&step, &empty_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission("m-test").unwrap()))
         .expect("the step must run against the mock endpoint");
     mock.assert();
 
@@ -262,13 +267,18 @@ fn a_step_config_naming_a_missing_record_fails_the_step_before_any_container_wor
     let step = step_with(serde_json::json!({
         "role_id": "dialectic-judge",
         "message": "hi",
-        "session_id": "brief-refs-graph-missing",
+        "session_id": darkmux_types::session_id::SessionId::adhoc(
+            darkmux_types::session_id::RunId::mission("m-test").unwrap(),
+            "dialectic-judge",
+            "brief-refs-graph-missing",
+        )
+        .wire(),
         "skip_preflight": true,
         "brief_refs": [{"kind": "mod", "key": "mod-nope-1"}],
     }));
 
     let err = DispatchInternalStepKind
-        .run(&step, &empty_task(), &BTreeMap::new())
+        .run(&step, &empty_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission("m-test").unwrap()))
         .expect_err("a step naming a record that is not stored must fail");
     let text = format!("{err:#}");
     assert!(text.contains("no mod mod-nope-1"), "{text}");
@@ -314,7 +324,12 @@ fn a_step_whose_task_names_the_phase_stamps_it_on_the_dispatch_record() {
     let flows = tempfile::tempdir().unwrap();
     let profiles = write_endpoint_profiles(registry.path(), &server.base_url());
     let _env = EnvGuard::set(&[("DARKMUX_FLOWS_DIR", flows.path())]);
-    let session_id = format!("phase-stamp-graph-{}", std::process::id());
+    let session_id = darkmux_types::session_id::SessionId::adhoc(
+        darkmux_types::session_id::RunId::mission("m-test").unwrap(),
+        "dialectic-judge",
+        format!("phase-stamp-graph-{}", std::process::id()),
+    )
+    .wire();
     let step = step_with(serde_json::json!({
         "role_id": "dialectic-judge",
         "message": "phase stamp",
@@ -325,7 +340,7 @@ fn a_step_whose_task_names_the_phase_stamps_it_on_the_dispatch_record() {
         "config_path": profiles.to_string_lossy(),
     }));
     // No `phase_id` in the step config: the task is the only source.
-    DispatchInternalStepKind.run(&step, &empty_task(), &BTreeMap::new()).expect("runs against the mock");
+    DispatchInternalStepKind.run(&step, &empty_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission("m-test").unwrap())).expect("runs against the mock");
     mock.assert();
     let mut start: Option<Value> = None;
     let mut seen: Vec<String> = Vec::new();

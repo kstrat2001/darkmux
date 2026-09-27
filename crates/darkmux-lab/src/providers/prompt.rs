@@ -8,11 +8,11 @@ use crate::workloads::types::{
     InspectionReport, LoadedWorkload, RunResult, VerifyOutcome, WorkloadProvider,
 };
 use anyhow::{anyhow, Context, Result};
+use darkmux_types::session_id::{RunId, SessionId};
 #[cfg(test)]
 use std::env;
 use std::fs;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) struct PromptProvider;
 
@@ -47,20 +47,12 @@ impl WorkloadProvider for PromptProvider {
         // no compaction config to override — the loop lab targets coding-task
         // workloads. Accepted to satisfy the trait; intentionally unused.
         _loop_override: Option<&crate::lab::loop_report::LoopCompactionOverride>,
-        on_session_id: &mut dyn FnMut(&str),
+        run: &RunId,
+        on_session_id: &mut dyn FnMut(&SessionId),
     ) -> Result<RunResult> {
         let prompt = resolve_prompt(loaded)?;
         let role = pick_role(loaded);
-        // (#1436) Through the canonical session-id helper; byte-identical shape.
-        let session_id = darkmux_types::session_id::session_id(
-            "darkmux-prompt",
-            &loaded.manifest.workload.id,
-            &SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0)
-                .to_string(),
-        );
+        let session_id = SessionId::adhoc(run.clone(), &role, &loaded.manifest.workload.id);
         // (#2511) Report the id back to the lab harness BEFORE dispatching —
         // this is the ONE mint for this run, so it is the run's own
         // governing dispatch session.
@@ -185,7 +177,7 @@ impl WorkloadProvider for PromptProvider {
 fn dispatch_via_internal(
     role_id: &str,
     prompt: &str,
-    session_id: &str,
+    session_id: &SessionId,
     image: Option<&str>,
     config_path: Option<&str>,
     profile_name: &str,
@@ -207,7 +199,7 @@ fn dispatch_via_internal(
         timeout_override_seconds: None, // (#2480)
         role_id: role_id.to_string(),
         message: prompt.to_string(),
-        session_id: Some(session_id.to_string()),
+        session: session_id.clone(),
         timeout_seconds: 3600,
         skip_preflight: false,
         json: true,

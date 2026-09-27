@@ -147,11 +147,12 @@ pub(crate) enum Cmd {
         /// the profile here.
         #[arg(long, value_name = "PROFILE[@MACHINE]")]
         profile: Option<String>,
-        /// Override the dispatch session id. Default: a fresh
-        /// `crew-dispatch-<role>-<unix-micros>-<process-counter>` is
-        /// generated per call, so consecutive dispatches don't share
-        /// session state (which would otherwise pollute one task with
-        /// another's context).
+        /// Name this dispatch within its run. The recorded session is
+        /// `<run>.adhoc.<role>.<name>`, where the run is the crew-of-one
+        /// mission this dispatch mints. Default: a fresh
+        /// `<unix-micros>-<process-counter>`, so consecutive dispatches never
+        /// share session state (which would pollute one task with another's
+        /// context).
         #[arg(long)]
         session_id: Option<String>,
         /// (#2480) Per-invocation timeout override, in seconds — what it
@@ -1706,7 +1707,7 @@ pub(crate) enum LabCmd {
         #[arg(long)]
         ab: bool,
         /// Scope the injected cautions + corrections to this mission's
-        /// dispatches (its `mission-run-<id>-<phase>` sessions). Without it,
+        /// phases' coder runs (each phase's own session). Without it,
         /// only the repo's authored lessons inject. Requires `--ab` (clap
         /// errors otherwise, so the flag is never a silent no-op).
         #[arg(long = "inject-from-mission", requires = "ab")]

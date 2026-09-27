@@ -70,6 +70,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use darkmux_types::session_id::SessionId;
 use darkmux_types::{BudgetPolicy, ModelEndpoint, WindowBudget};
 
 /// The flow-record telemetry `source` every budget record carries. The
@@ -86,14 +87,15 @@ pub const WAIT_POLL_MAX: Duration = Duration::from_secs(30);
 const WAIT_SLICE: Duration = Duration::from_millis(500);
 
 /// Who a gated call is for, so a budget record lands on the right run, and
-/// so a wait can tell that its run was stopped. Every field is optional: a
-/// `dispatch.map` step runs no role.
-#[derive(Clone, Copy, Debug, Default)]
+/// so a wait can tell that its run was stopped. The session is required: it
+/// names the run, so two launches of one config never share a budget
+/// record, and a wait reads only its own run's stop. The rest is optional
+/// (a `dispatch.map` step runs no role).
+#[derive(Clone, Copy, Debug)]
 pub struct BudgetCaller<'a> {
+    pub session: &'a SessionId,
     pub role_id: Option<&'a str>,
-    pub session_id: Option<&'a str>,
     pub model: Option<&'a str>,
-    pub mission_id: Option<&'a str>,
     pub phase_id: Option<&'a str>,
     /// The profile registry the command resolved its endpoint from (its
     /// `--profiles-file`), re-read while a call waits. `None`: the default
@@ -648,7 +650,7 @@ impl BudgetEnv for LiveEnv {
         if darkmux_types::interrupt::is_set() {
             return Some("the run was interrupted".to_string());
         }
-        run_stop_reason(caller.mission_id, caller.phase_id)
+        run_stop_reason(caller.session.mission_id(), caller.phase_id)
     }
     fn reload(&self, endpoint_id: &str, profiles_file: Option<&str>) -> Option<Option<EndpointBudget>> {
         // Quiet: a quarantine warning every 30 s of a wait is noise; the
@@ -877,30 +879,16 @@ fn record(
     caller: &BudgetCaller<'_>,
     payload: serde_json::Value,
 ) -> darkmux_flow::FlowRecord {
-    let mut rec = crate::dispatch::build_telemetry_record(
+    crate::dispatch::build_telemetry_record(
         level,
         action,
         BUDGET_SOURCE,
         caller.role_id.unwrap_or("budget"),
-        caller.session_id.unwrap_or(""),
+        caller.session,
         caller.model,
-        caller.mission_id,
         caller.phase_id,
         payload,
-    );
-    if caller.session_id.is_none() {
-        rec.session_id = None;
-    }
-    // (6th review MF) On the RUN's session: a hosted step's caller carries
-    // the bare `task-<id>` every mission from one config shares, and these
-    // records go straight to the flow sink, around `mission_launch`'s
-    // `scope_to_run`. Unscoped, mission A's `budget.stop` closed mission B's
-    // later wait on every surface. Idempotent: an already-scoped id, or one
-    // that is not a task/step form, is left alone.
-    if let (Some(sid), Some(mid)) = (rec.session_id.as_deref(), caller.mission_id) {
-        rec.session_id = Some(darkmux_types::session_id::scope_to_run(sid, mid));
-    }
-    rec
+    )
 }
 
 fn warn(b: &EndpointBudget, br: &Breach, caller: &BudgetCaller<'_>, env: &dyn BudgetEnv) {
@@ -969,7 +957,7 @@ fn announce_wait(
         ),
         None => "until its window has room".to_string(),
     };
-    let how_to_stop = match caller.mission_id {
+    let how_to_stop = match caller.session.mission_id() {
         Some(mid) => format!("`darkmux mission abort {mid}` ends the wait without sending"),
         None => "Ctrl-C ends the wait without sending".to_string(),
     };

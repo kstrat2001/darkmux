@@ -70,6 +70,47 @@ mod tests {
         );
     }
 
+    /// (4.0) A pre-4.0 mission archive, as `/flow-mission/<id>` serves it.
+    ///
+    /// The day file holds raw 3.x records: step sessions spelled
+    /// `step-<id>` and, from FLOW 1.43.0, `step-<id>-<mission>`, with no
+    /// `payload.step_id` on the records that carry a step's tokens and turns.
+    /// The viewer never parses a session id, so the daemon names each step as
+    /// `payload.step_id` on the way out. `mission-lens-legacy-archive.spec.js`
+    /// feeds this served body to the lens and asserts the steps still show
+    /// their tokens and turns, so the pair pins the archive end to end.
+    #[tokio::test]
+    async fn flow_mission_legacy_archive_wire_shape() {
+        use tower::ServiceExt;
+        let m = "review-1785400940-legacy";
+        let day = [
+            serde_json::json!({ "ts": "2026-08-20T09:00:00Z", "level": "info", "category": "work", "tier": "local", "stage": "dispatch", "action": "dispatch.start", "handle": "judge", "session_id": "step-judge-1", "mission_id": m, "source": "crew_dispatch", "payload": {} }),
+            serde_json::json!({ "ts": "2026-08-20T09:00:05Z", "level": "info", "category": "work", "tier": "local", "stage": "dispatch", "action": "dispatch.turn", "handle": "judge", "session_id": "step-judge-1", "mission_id": m, "source": "crew_dispatch", "payload": { "turn_seq": 4, "turns_so_far": 4 } }),
+            serde_json::json!({ "ts": "2026-08-20T09:00:06Z", "level": "info", "category": "telemetry", "tier": "local", "stage": "dispatch", "action": "telemetry.tokens", "handle": "judge", "session_id": "step-judge-1", "mission_id": m, "source": "tokens", "payload": { "total_tokens": 5000 } }),
+            serde_json::json!({ "ts": "2026-08-20T09:00:07Z", "level": "info", "category": "work", "tier": "local", "stage": "dispatch", "action": "dispatch.complete", "handle": "judge", "session_id": "step-judge-1", "mission_id": m, "source": "crew_dispatch" }),
+            serde_json::json!({ "ts": "2026-08-20T09:01:00Z", "level": "info", "category": "work", "tier": "local", "stage": "dispatch", "action": "dispatch.start", "handle": "verifier", "session_id": format!("step-verify-1-{m}"), "mission_id": m, "source": "crew_dispatch", "payload": {} }),
+            serde_json::json!({ "ts": "2026-08-20T09:01:04Z", "level": "info", "category": "work", "tier": "local", "stage": "dispatch", "action": "dispatch.turn", "handle": "verifier", "session_id": format!("step-verify-1-{m}"), "mission_id": m, "source": "crew_dispatch", "payload": { "turn_seq": 2, "turns_so_far": 2 } }),
+            serde_json::json!({ "ts": "2026-08-20T09:01:05Z", "level": "info", "category": "telemetry", "tier": "local", "stage": "dispatch", "action": "telemetry.tokens", "handle": "verifier", "session_id": format!("step-verify-1-{m}"), "mission_id": m, "source": "tokens", "payload": { "total_tokens": 18000 } }),
+            serde_json::json!({ "ts": "2026-08-20T09:01:06Z", "level": "info", "category": "work", "tier": "local", "stage": "dispatch", "action": "dispatch.complete", "handle": "verifier", "session_id": format!("step-verify-1-{m}"), "mission_id": m, "source": "crew_dispatch" }),
+        ];
+        let flows = tempfile::TempDir::new().unwrap();
+        let body: String = day.iter().map(|r| format!("{r}\n")).collect();
+        std::fs::write(flows.path().join("2026-08-20.jsonl"), body).unwrap();
+        let response = crate::build_router_local(flows.path().to_path_buf())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/flow-mission/{m}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let served: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+        golden("flow-mission-legacy-archive.json", &served["records"]);
+    }
+
     /// A `/runs` row with every optional field POPULATED.
     ///
     /// Populated rather than minimal on purpose: a spec author copying this

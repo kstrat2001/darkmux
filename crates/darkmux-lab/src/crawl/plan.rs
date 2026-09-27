@@ -3938,7 +3938,7 @@ line two
             run_on: darkmux_crew::types::default_run_on(),
         };
         let gather_out =
-            darkmux_crew::step_kinds::RecordsGatherStepKind.run(&gather_step, &task, &std::collections::BTreeMap::new()).unwrap();
+            darkmux_crew::step_kinds::RecordsGatherStepKind.run(&gather_step, &task, &std::collections::BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission("m-test").unwrap())).unwrap();
         let mut input = std::collections::BTreeMap::new();
         input.insert("records-gather-step".to_string(), gather_out.output);
 
@@ -3957,7 +3957,7 @@ line two
             completed_ts: None,
             output: None,
         };
-        darkmux_crew::step_kinds::DeliverGithubReviewStepKind.run(&deliver_step, &task, &input).unwrap();
+        darkmux_crew::step_kinds::DeliverGithubReviewStepKind.run(&deliver_step, &task, &input, &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission("m-test").unwrap())).unwrap();
         let payload: darkmux_crew::step_kinds::DeliverOutcome =
             serde_json::from_str(&fs::read_to_string(&emit_path).unwrap()).unwrap();
         assert_eq!(payload.mode, "review");
