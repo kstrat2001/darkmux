@@ -1254,4 +1254,284 @@ mod tests {
         assert!(checks.iter().all(|c| c.name != "hooks.stray"), "no stray files → no stray check emitted");
     }
 
+
+    // ─── characterization: every branch of `build_hooks_check`, pinned ──────
+
+    const LOOPBACK: &str = "http://127.0.0.1:8790/events";
+    const REMEDY: &str = "Fix this rule in ~/.darkmux/config.json (or `darkmux config set hooks.rules ...`).";
+
+    fn hook_rule(action: Option<&str>, http: Option<&str>) -> darkmux_types::config::HookRule {
+        darkmux_types::config::HookRule {
+            r#match: action.map(|a| darkmux_types::config::HookMatch { action: Some(a.to_string()), ..Default::default() }),
+            http: http.map(str::to_string),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }
+    }
+
+    /// The per-rule sidecar key a rule's files are named by.
+    fn key_of(r: &darkmux_types::config::HookRule) -> String {
+        darkmux_flow::hooks::summarize_configured_rules(std::slice::from_ref(r), std::path::Path::new("/nonexistent"))
+            .remove(0)
+            .key
+    }
+
+    fn checks_for(rules: &[darkmux_types::config::HookRule], dir: &std::path::Path) -> Vec<Check> {
+        build_hooks_check(true, "config.json", rules, dir, &std::collections::HashSet::new())
+    }
+
+    fn named<'a>(checks: &'a [Check], name: &str) -> &'a Check {
+        checks.iter().find(|c| c.name == name).unwrap_or_else(|| panic!("no `{name}` check in {checks:?}"))
+    }
+
+    #[test]
+    fn disabled_is_one_pass_row_even_with_rules_configured() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rules = vec![hook_rule(None, Some("http://10.0.0.5/x"))];
+        let checks = build_hooks_check(false, "env", &rules, tmp.path(), &std::collections::HashSet::new());
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert_eq!(checks[0].name, "hooks");
+        assert_eq!(checks[0].status, Status::Pass);
+        assert_eq!(checks[0].message, "disabled (env)");
+        assert!(checks[0].hint.is_none());
+    }
+
+    #[test]
+    fn enabled_with_no_rules_names_the_outbox_dir_and_an_example_rule() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let checks = build_hooks_check(true, "config.json", &[], tmp.path(), &std::collections::HashSet::new());
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert_eq!(checks[0].status, Status::Warn);
+        assert_eq!(
+            checks[0].message,
+            format!("enabled (config.json) but no rules configured — outbox_dir={}", tmp.path().display())
+        );
+        let hint = checks[0].hint.as_deref().unwrap();
+        assert!(hint.starts_with("Add a rule to config.json's `hooks.rules`"), "{hint}");
+        assert!(hint.contains("darkmux config set hooks.rules"), "{hint}");
+    }
+
+    #[test]
+    fn a_healthy_loopback_rule_is_one_clean_row_and_a_clean_overview() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let checks = checks_for(&[hook_rule(Some("crawl.*"), Some(LOOPBACK))], tmp.path());
+        assert_eq!(checks.len(), 2, "{checks:?}");
+        let row = named(&checks, "hooks.rule.0");
+        assert_eq!(row.status, Status::Pass);
+        assert_eq!(row.message, format!("action=crawl.* -> {LOOPBACK} [loopback, unsigned] (undelivered: 0)"));
+        assert!(row.hint.is_none(), "a clean rule carries no remedy");
+        let overview = named(&checks, "hooks");
+        assert_eq!(overview.status, Status::Pass);
+        assert_eq!(
+            overview.message,
+            format!(
+                "enabled (config.json) — 1 rule(s), outbox_dir={}\n  #0: {}",
+                tmp.path().display(),
+                row.message
+            )
+        );
+        assert!(overview.hint.is_none());
+    }
+
+    #[test]
+    fn dropped_writes_warn_with_their_count() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rule = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        std::fs::write(tmp.path().join(format!("{}.dropped", key_of(&rule))), "2").unwrap();
+        let checks = checks_for(&[rule], tmp.path());
+        let row = named(&checks, "hooks.rule.0");
+        assert_eq!(row.status, Status::Warn);
+        assert!(
+            row.message.ends_with("[2 write(s) dropped so far (over the outbox cap, or an append failure)]"),
+            "{}",
+            row.message
+        );
+        assert_eq!(row.hint.as_deref(), Some(REMEDY));
+        let overview = named(&checks, "hooks");
+        assert_eq!(overview.status, Status::Warn);
+        assert_eq!(overview.hint.as_deref(), Some("See the individual `hooks.rule.*` checks below for which rule(s)."));
+    }
+
+    #[test]
+    fn a_stalled_rule_warns_with_its_failure_count() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rule = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        std::fs::write(
+            tmp.path().join(format!("{}.last", key_of(&rule))),
+            r#"{"ts":"2026-01-01T00:00:00Z","ok":false,"cursor_write_failures":3,"stalled":true}"#,
+        )
+        .unwrap();
+        let checks = checks_for(&[rule], tmp.path());
+        let row = named(&checks, "hooks.rule.0");
+        assert_eq!(row.status, Status::Warn);
+        assert!(row.message.contains("[STALLED — 3 consecutive cursor-write failure(s);"), "{}", row.message);
+    }
+
+    #[test]
+    fn quarantined_lines_warn_with_their_count() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rule = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        std::fs::write(tmp.path().join(format!("{}.outbox.jsonl.quarantine", key_of(&rule))), "x\ny\n").unwrap();
+        let checks = checks_for(&[rule], tmp.path());
+        let row = named(&checks, "hooks.rule.0");
+        assert_eq!(row.status, Status::Warn);
+        assert!(row.message.contains("[2 line(s) quarantined (invalid JSON — never redelivered)]"), "{}", row.message);
+    }
+
+    #[test]
+    fn a_telemetry_category_match_warns_about_the_observer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut rule = hook_rule(None, Some(LOOPBACK));
+        rule.r#match =
+            Some(darkmux_types::config::HookMatch { category: Some("telemetry".into()), ..Default::default() });
+        let checks = checks_for(&[rule], tmp.path());
+        let row = named(&checks, "hooks.rule.0");
+        assert_eq!(row.status, Status::Warn);
+        assert!(row.message.contains("observer must not join the observed"), "{}", row.message);
+    }
+
+    #[test]
+    fn a_bare_star_narrowed_by_another_predicate_is_not_the_observer_warning() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut rule = hook_rule(None, Some(LOOPBACK));
+        rule.r#match = Some(darkmux_types::config::HookMatch {
+            action: Some("*".into()),
+            level: Some("warn".into()),
+            ..Default::default()
+        });
+        let checks = checks_for(&[rule], tmp.path());
+        assert_eq!(named(&checks, "hooks.rule.0").status, Status::Pass);
+    }
+
+    #[test]
+    fn a_file_rule_reports_its_path_and_no_url_policy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut rule = hook_rule(Some("crawl.*"), None);
+        rule.file = Some("/tmp/darkmux-hook-sink.jsonl".into());
+        let checks = checks_for(&[rule], tmp.path());
+        let row = named(&checks, "hooks.rule.0");
+        assert_eq!(row.status, Status::Pass, "{}", row.message);
+        assert_eq!(row.message, "action=crawl.* -> file:///tmp/darkmux-hook-sink.jsonl [file, n/a] (undelivered: 0)");
+    }
+
+    #[test]
+    fn a_failed_transform_fails_only_its_own_rule_row() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut broken = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        broken.transform = Some("no-such-adapter-for-this-test.jq".into());
+        let checks = checks_for(&[broken, hook_rule(Some("dispatch.*"), Some(LOOPBACK))], tmp.path());
+        let row = named(&checks, "hooks.rule.0");
+        assert_eq!(row.status, Status::Fail);
+        assert!(row.message.contains(", transform: no-such-adapter-for-this-test.jq [FAILED]"), "{}", row.message);
+        assert!(row.message.contains("[TRANSFORM `no-such-adapter-for-this-test.jq` FAILED TO LOAD — "), "{}", row.message);
+        assert_eq!(named(&checks, "hooks.rule.1").status, Status::Pass);
+        assert_eq!(named(&checks, "hooks").status, Status::Fail);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_loaded_transform_names_its_content_hash() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let adapters = darkmux_types::config_access::hooks_adapters_dir();
+        assert!(adapters.starts_with(state.path()), "the adapters dir must be the isolated one");
+        std::fs::create_dir_all(&adapters).unwrap();
+        std::fs::write(adapters.join("ok.jq"), ".").unwrap();
+        let hash = darkmux_flow::hook_transform::load_adapter(&adapters, "ok.jq").unwrap().short_hash;
+        let mut rule = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        rule.transform = Some("ok.jq".into());
+        let checks = checks_for(&[rule], state.path());
+        let row = named(&checks, "hooks.rule.0");
+        assert_eq!(row.status, Status::Pass, "{}", row.message);
+        assert!(row.message.contains(&format!(", transform: ok.jq (sha256:{hash})")), "{}", row.message);
+    }
+
+    #[test]
+    fn a_later_warn_rule_never_downgrades_an_earlier_fail() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rules = [hook_rule(Some("crawl.*"), Some("http://10.0.0.5/x")), hook_rule(None, Some(LOOPBACK))];
+        let checks = checks_for(&rules, tmp.path());
+        assert_eq!(named(&checks, "hooks.rule.0").status, Status::Fail);
+        assert_eq!(named(&checks, "hooks.rule.1").status, Status::Warn);
+        assert_eq!(named(&checks, "hooks").status, Status::Fail);
+    }
+
+    #[test]
+    fn a_refused_url_with_an_empty_match_stays_fail_and_names_both() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let checks = checks_for(&[hook_rule(None, Some("http://10.0.0.5/x"))], tmp.path());
+        let row = named(&checks, "hooks.rule.0");
+        assert_eq!(row.status, Status::Fail);
+        assert!(row.message.contains("[EMPTY MATCH — matches nothing; URL REFUSED —"), "{}", row.message);
+        assert!(row.message.contains("[refused, unsigned]"), "{}", row.message);
+    }
+
+    #[test]
+    fn a_rule_with_both_http_and_file_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut rule = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        rule.file = Some("/tmp/x.jsonl".into());
+        let checks = checks_for(&[rule], tmp.path());
+        let row = named(&checks, "hooks.rule.0");
+        assert_eq!(row.status, Status::Fail, "{}", row.message);
+    }
+
+    #[test]
+    fn a_rule_with_no_destination_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let checks = checks_for(&[hook_rule(Some("crawl.*"), None)], tmp.path());
+        let row = named(&checks, "hooks.rule.0");
+        assert_eq!(row.status, Status::Fail, "{}", row.message);
+    }
+
+    #[test]
+    fn receiver_reasons_lead_the_hint_and_the_remedy_closes_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rule = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        let key = key_of(&rule);
+        std::fs::write(
+            tmp.path().join(format!("{key}.last")),
+            r#"{"ts":"2026-01-01T00:00:00Z","ok":true,"last_receiver_rejected":1,"last_receiver_rejected_reasons":["bad"]}"#,
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join(format!("{key}.rejected")), "1").unwrap();
+        let checks = checks_for(&[rule], tmp.path());
+        let hint = named(&checks, "hooks.rule.0").hint.clone().unwrap();
+        let lines: Vec<&str> = hint.lines().collect();
+        assert_eq!(lines.first().copied(), Some("the receiver's stated reason(s) for the last rejection:"));
+        assert!(lines[1..lines.len() - 1].iter().any(|l| l.contains("\"bad\"")), "{hint}");
+        assert_eq!(lines.last().copied(), Some(REMEDY));
+    }
+
+    #[test]
+    fn a_stray_outbox_counts_undelivered_lines_from_its_own_cursor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stray = "127.0.0.1-9999-0123456789abcdef";
+        std::fs::write(tmp.path().join(format!("{stray}.outbox.jsonl")), "{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n").unwrap();
+        std::fs::write(tmp.path().join(format!("{stray}.cursor")), "8").unwrap();
+        let checks = checks_for(&[hook_rule(Some("crawl.*"), Some(LOOPBACK))], tmp.path());
+        let row = named(&checks, "hooks.stray");
+        assert_eq!(row.status, Status::Warn);
+        assert_eq!(
+            row.message,
+            format!(
+                "1 outbox file(s) belong to no currently-configured rule: {stray}.outbox.jsonl (2 undelivered \
+                 line(s); siblings: {stray}.cursor)"
+            )
+        );
+        assert!(row.hint.as_deref().unwrap().starts_with("A rule was removed or edited since these were written."));
+    }
+
+    #[test]
+    fn a_configured_rules_own_outbox_is_never_stray() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rule = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        std::fs::write(tmp.path().join(format!("{}.outbox.jsonl", key_of(&rule))), "{\"a\":1}\n").unwrap();
+        let checks = checks_for(&[rule], tmp.path());
+        assert!(checks.iter().all(|c| c.name != "hooks.stray"), "{checks:?}");
+        assert!(named(&checks, "hooks.rule.0").message.contains("(undelivered: 1)"));
+    }
 }
