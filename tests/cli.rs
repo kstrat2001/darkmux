@@ -3828,6 +3828,15 @@ struct RespondingStubServer {
 
 impl RespondingStubServer {
     fn start() -> Self {
+        Self::start_with(std::time::Duration::ZERO, |_| "ack".to_string())
+    }
+
+    /// The same stub, replying after `delay` with the content `reply` picks
+    /// from the full request text (head and body). `lab loop --ab` uses
+    /// both: a delay so its two arms land in different second-stamped run
+    /// dirs, and a request-dependent reply so the injected context can move
+    /// the verdict.
+    fn start_with(delay: std::time::Duration, reply: fn(&str) -> String) -> Self {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("binding the stub listener");
         let port = listener.local_addr().unwrap().port();
@@ -3835,14 +3844,11 @@ impl RespondingStubServer {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 std::thread::spawn(move || {
-                    use std::io::{Read, Write};
-                    // Read the request head (and whatever body arrives with
-                    // it); curl waits for the response, so a bounded read is
-                    // enough — this is a stub, not an HTTP server.
-                    let mut buf = [0u8; 8192];
-                    let _ = stream.read(&mut buf);
+                    use std::io::Write;
+                    let request = read_http_request(&mut stream);
+                    std::thread::sleep(delay);
                     let body = serde_json::json!({
-                        "choices": [{ "message": { "content": "ack" } }],
+                        "choices": [{ "message": { "content": reply(&request) } }],
                         "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
                     })
                     .to_string();
@@ -3859,6 +3865,39 @@ impl RespondingStubServer {
             }
         });
         Self { port }
+    }
+}
+
+/// Read one HTTP request: the head, then as many body bytes as its
+/// `Content-Length` names (curl waits for the response, so this terminates).
+/// Answers an `Expect: 100-continue` so a large body is sent at once.
+fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+    use std::io::{Read, Write};
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut continued = false;
+    loop {
+        let text = String::from_utf8_lossy(&buf).to_string();
+        if let Some(head_end) = text.find("\r\n\r\n") {
+            let head = text[..head_end].to_ascii_lowercase();
+            if !continued && head.contains("expect: 100-continue") {
+                let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+                continued = true;
+            }
+            let want = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if buf.len() >= head_end + 4 + want {
+                return text;
+            }
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return String::from_utf8_lossy(&buf).to_string(),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
     }
 }
 
@@ -12332,4 +12371,567 @@ fn radio_refuses_bad_enum_config_before_routing() {
     assert!(!out.status.success(), "{stderr}");
     assert!(stderr.contains("radio: dispatch: refusing to start: bad config"), "{stderr}");
     assert!(!stdout.contains("falling back") && !stderr.contains("falling back"), "{stdout}{stderr}");
+}
+
+// ─── `darkmux lab` characterization (lab_cli split) ────────────────────
+//
+// These pin what `darkmux lab …` prints and exits with, end to end, for the
+// paths that need a dispatch: `lab loop` (every override flag, the A/B
+// arms), `lab run` and its recorded-run sub-verbs, `characterize`, `tune`.
+// No model and no Docker: each workload is a `prompt` workload bound to the
+// tool-less `dialectic-judge` role, staffed by a `RespondingStubServer`
+// endpoint, so the dispatch is a host `curl` to the stub.
+
+/// Marker a recorded lesson carries into the `--ab` treatment arm's prompt.
+const LAB_LESSON_MARKER: &str = "LABCHAR-LESSON-MARKER";
+
+/// One isolated lab root: a stub endpoint, a profiles registry staffing it,
+/// and three user-tier `prompt` workloads (no verify, a verify the stub's
+/// "ack" passes, a verify it fails).
+struct LabStub {
+    home: TempDir,
+    flows: TempDir,
+    profiles: std::path::PathBuf,
+}
+
+impl LabStub {
+    fn new(stub: &RespondingStubServer) -> Self {
+        let home = TempDir::new().unwrap();
+        let flows = TempDir::new().unwrap();
+        let profiles = home.path().join("profiles.json");
+        fs::write(&profiles, responding_endpoint_profiles_json(stub.port)).unwrap();
+        let workloads = home.path().join("workloads");
+        fs::create_dir_all(&workloads).unwrap();
+        for (id, verify) in [
+            ("labchar", serde_json::Value::Null),
+            ("labchar-pass", serde_json::json!({ "must_contain": ["ack"] })),
+            ("labchar-fail", serde_json::json!({ "must_contain": ["zzz-never"] })),
+        ] {
+            let mut w = serde_json::json!({
+                "id": id,
+                "provider": "prompt",
+                "description": "lab_cli characterization fixture",
+                "role": "dialectic-judge",
+                "prompt": "say ack"
+            });
+            if !verify.is_null() {
+                w["verify"] = verify;
+            }
+            fs::write(
+                workloads.join(format!("{id}.json")),
+                serde_json::json!({ "workload": w }).to_string(),
+            )
+            .unwrap();
+        }
+        Self { home, flows, profiles }
+    }
+
+    fn cmd(&self) -> Command {
+        let mut cmd = darkmux_cmd();
+        cmd.current_dir(self.home.path())
+            .env("DARKMUX_HOME", self.home.path())
+            .env("DARKMUX_FLOWS_DIR", self.flows.path())
+            .env("DARKMUX_REDIS_URL", "");
+        cmd
+    }
+
+    fn profiles(&self) -> &str {
+        self.profiles.to_str().unwrap()
+    }
+
+    fn run_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = fs::read_dir(self.home.path().join("runs"))
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    }
+
+    fn record_lesson(&self) {
+        self.cmd()
+            .args(["memory", "lesson", "add", "--title", "labchar rule", "--body"])
+            .arg(format!("{LAB_LESSON_MARKER} because it is characterized"))
+            .assert()
+            .success();
+    }
+}
+
+fn out_text(out: &std::process::Output) -> (String, String) {
+    (
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// Every `lab loop` override flag reaches the report's `loop_config`, in
+/// the documented order, with its own spelling and unit.
+#[test]
+fn lab_loop_every_flag_reaches_the_loop_config_in_order() {
+    let stub = RespondingStubServer::start();
+    let lab = LabStub::new(&stub);
+    let out = lab
+        .cmd()
+        .args(["lab", "loop", "labchar", "--profile", "stub", "--profiles-file", lab.profiles()])
+        .args(["--max-turns", "7", "--max-tokens", "900", "--timeout", "33"])
+        .args(["--compact-threshold-tokens", "4000", "--compact-threshold-ratio", "0.5"])
+        .args(["--compact-strategy", "narrative", "--bail-after-compactions", "2"])
+        .args(["--context-window", "16000", "--json"])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = out_text(&out);
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout} / {stderr}"));
+    assert_eq!(
+        report["loop_config"],
+        serde_json::json!([
+            "profile=stub",
+            format!("profiles-file={}", lab.profiles()),
+            "max-turns=7",
+            "max-tokens=900",
+            "timeout=33s",
+            "compact-threshold-tokens=4000",
+            "compact-threshold-ratio=0.5",
+            "compact-strategy=narrative",
+            "bail-after-compactions=2",
+            "context-window=16000",
+        ])
+    );
+    // A prompt workload with no verify spec still reports `verify_passed:
+    // true` to the loop classifier, so zero tool calls read as a false pass.
+    assert_eq!(report["verdict"], "inert-false-pass", "{stdout}");
+    assert_eq!(report["verify_passed"], true, "{stdout}");
+    assert!(report["run_id"].as_str().unwrap().starts_with("labchar-stub-"), "{stdout}");
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+}
+
+/// No override at all reads as "profile defaults"; the profile then comes
+/// from the registry's default, not a flag.
+#[test]
+fn lab_loop_without_overrides_reports_profile_defaults() {
+    let stub = RespondingStubServer::start();
+    let lab = LabStub::new(&stub);
+    let out = lab
+        .cmd()
+        .env("DARKMUX_PROFILES", &lab.profiles)
+        .args(["lab", "loop", "labchar-pass", "--json"])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = out_text(&out);
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout} / {stderr}"));
+    assert_eq!(report["loop_config"], serde_json::json!(["profile defaults (no overrides)"]));
+    assert_eq!(report["verdict"], "inert-false-pass", "{stdout}");
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+}
+
+/// The human report prints the verdict line and the joined loop config.
+#[test]
+fn lab_loop_human_report_renders_the_loop_config_line() {
+    let stub = RespondingStubServer::start();
+    let lab = LabStub::new(&stub);
+    let out = lab
+        .cmd()
+        .args(["lab", "loop", "labchar-pass", "--profile", "stub", "--profiles-file", lab.profiles()])
+        .args(["--max-turns", "3", "--compact-strategy", "Structured_Slot"])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = out_text(&out);
+    assert!(stdout.contains("loop verdict: INERT-FALSE-PASS"), "{stdout}");
+    let want = format!(
+        "  loop config:  profile=stub, profiles-file={}, max-turns=3, compact-strategy=Structured_Slot\n",
+        lab.profiles()
+    );
+    assert!(stdout.contains(&want), "{stdout}");
+    assert!(!stderr.contains("… A/B"), "{stderr}");
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+}
+
+/// `--compact-strategy` is parsed before any dispatch; an unknown value is
+/// refused by name. The adaptive ratio is range-checked at both ends.
+#[test]
+fn lab_loop_refuses_bad_compaction_values_before_dispatch() {
+    let lab = LabStub::new(&RespondingStubServer::start());
+    let base = ["lab", "loop", "labchar", "--profile", "stub"];
+    lab.cmd()
+        .args(base)
+        .args(["--profiles-file", lab.profiles(), "--compact-strategy", "bogus"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "unknown --compact-strategy `bogus` (expected `narrative` or `structured-slot`)",
+        ));
+    for bad in ["0.09", "0.95"] {
+        lab.cmd()
+            .args(base)
+            .args(["--profiles-file", lab.profiles(), "--compact-threshold-ratio", bad])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(format!(
+                "--compact-threshold-ratio {bad} is out of range (expected 0.1–0.9)"
+            )));
+    }
+    assert!(lab.run_ids().is_empty(), "a refused value dispatches nothing: {:?}", lab.run_ids());
+    for ok in ["0.1", "0.9"] {
+        let out = lab
+            .cmd()
+            .args(base)
+            .args(["--profiles-file", lab.profiles(), "--compact-threshold-ratio", ok, "--json"])
+            .output()
+            .unwrap();
+        let (stdout, stderr) = out_text(&out);
+        assert!(stdout.contains(&format!("compact-threshold-ratio={ok}")), "{stdout} / {stderr}");
+    }
+}
+
+/// `--ab` with nothing to inject refuses before dispatching, and names the
+/// remedy that fits whether a mission was given.
+#[test]
+fn lab_loop_ab_with_nothing_to_inject_names_the_remedy() {
+    let lab = LabStub::new(&RespondingStubServer::start());
+    lab.cmd()
+        .args(["lab", "loop", "labchar", "--profile", "stub", "--profiles-file", lab.profiles(), "--ab"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--ab: nothing to inject — no authored lessons for this repo. Record a lesson \
+             (`darkmux memory lesson add`) or pass --inject-from-mission <id> to add a \
+             mission's cautions, then retry.",
+        ));
+    lab.cmd()
+        .args(["lab", "loop", "labchar", "--profile", "stub", "--profiles-file", lab.profiles()])
+        .args(["--ab", "--inject-from-mission", "m-char"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--ab: nothing to inject — no authored lessons for this repo and no detected \
+             cautions for mission `m-char`. Record a lesson (`darkmux memory lesson add`), \
+             then retry.",
+        ));
+    assert!(lab.run_ids().is_empty(), "{:?}", lab.run_ids());
+}
+
+/// Replies "ack" only when the request carries the recorded lesson, so the
+/// WITH arm passes verify and the WITHOUT arm does not.
+fn ack_only_with_lesson(request: &str) -> String {
+    if request.contains(LAB_LESSON_MARKER) { "ack" } else { "nope" }.to_string()
+}
+
+/// The inverse: the lesson makes the reply fail verify.
+fn ack_only_without_lesson(request: &str) -> String {
+    if request.contains(LAB_LESSON_MARKER) { "nope" } else { "ack" }.to_string()
+}
+
+fn run_ab(reply: fn(&str) -> String, json: bool) -> (std::process::Output, LabStub) {
+    // Over a second per reply, so the two sequential arms land in different
+    // second-stamped run dirs.
+    let stub = RespondingStubServer::start_with(std::time::Duration::from_millis(1100), reply);
+    let lab = LabStub::new(&stub);
+    lab.record_lesson();
+    let mut cmd = lab.cmd();
+    cmd.args(["lab", "loop", "labchar-pass", "--profile", "stub", "--profiles-file", lab.profiles()])
+        .args(["--max-turns", "4", "--ab"]);
+    if json {
+        cmd.arg("--json");
+    }
+    (cmd.output().unwrap(), lab)
+}
+
+/// `--ab --json`: one object with both arms, the injected size, and the
+/// verdict shift; the exit code follows the WITH arm; no progress lines.
+#[test]
+fn lab_loop_ab_json_reports_both_arms_and_an_improvement() {
+    let (out, lab) = run_ab(ack_only_with_lesson, true);
+    let (stdout, stderr) = out_text(&out);
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout} / {stderr}"));
+    assert_eq!(v["ab"], true);
+    assert_eq!(v["verdict_shift"], "improved", "{stdout}");
+    assert_eq!(v["without"]["verdict"], "failed");
+    assert_eq!(v["with"]["verdict"], "inert-false-pass");
+    assert!(v["injected_context_chars"].as_u64().unwrap() > LAB_LESSON_MARKER.len() as u64);
+    for arm in ["with", "without"] {
+        assert_eq!(v[arm]["loop_config"], serde_json::json!([
+            "profile=stub",
+            format!("profiles-file={}", lab.profiles()),
+            "max-turns=4",
+        ]));
+    }
+    assert_ne!(v["with"]["run_id"], v["without"]["run_id"]);
+    assert_eq!(lab.run_ids().len(), 2);
+    assert!(!stderr.contains("… A/B"), "{stderr}");
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+}
+
+/// `--ab` human render: both progress lines on stderr, then the A/B block.
+#[test]
+fn lab_loop_ab_human_render_shows_a_regression() {
+    let (out, _lab) = run_ab(ack_only_without_lesson, false);
+    let (stdout, stderr) = out_text(&out);
+    assert!(stderr.contains("… A/B: baseline run (WITHOUT engagement-context)\n"), "{stderr}");
+    let chars: String = stderr
+        .split("… A/B: treatment run (WITH ")
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .unwrap_or_else(|| panic!("{stderr}"))
+        .to_string();
+    assert!(stderr.contains(&format!("(WITH {chars} chars of engagement-context)\n")), "{stderr}");
+    let block = format!(
+        "\n── engagement-context A/B (#1004) ──\n  without context: inert-false-pass\n  \
+         with context:    failed ({chars} chars injected)\n  verdict shift:   regressed\n"
+    );
+    assert!(stdout.ends_with(&block), "{stdout}");
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+}
+
+/// `lab run <w>`: the summary block, the exit code gated on verify, and
+/// `--quiet` suppressing the summary. No workload and no sub-verb refuses.
+#[test]
+fn lab_run_dispatch_summary_and_exit_code() {
+    let lab = LabStub::new(&RespondingStubServer::start());
+    let out = lab
+        .cmd()
+        .args(["lab", "run", "labchar-pass", "--profile", "stub", "--profiles-file", lab.profiles()])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = out_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{stdout} / {stderr}");
+    let id = lab.run_ids().pop().unwrap();
+    assert!(stdout.contains(&format!("\n1 run(s) complete:\n  {id} — ")), "{stdout}");
+
+    let out = lab
+        .cmd()
+        .args(["lab", "run", "labchar-fail", "--profile", "stub", "--profiles-file", lab.profiles(), "-q"])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = out_text(&out);
+    assert_eq!(out.status.code(), Some(1), "a failed verify exits 1: {stderr}");
+    assert!(!stdout.contains("run(s) complete"), "{stdout}");
+
+    lab.cmd().args(["lab", "run"]).assert().failure().stderr(predicate::str::contains(
+        "specify a workload to dispatch (`lab run <workload>`) or a run sub-verb \
+         (`lab run list` / `lab run inspect <id>` / `lab run compare <a> <b>`)",
+    ));
+}
+
+/// `lab run inspect`/`list`/`compare` over runs this test recorded.
+#[test]
+fn lab_run_inspect_list_and_compare_render_recorded_runs() {
+    let lab = LabStub::new(&RespondingStubServer::start());
+    for w in ["labchar", "labchar-pass", "labchar-fail"] {
+        lab.cmd()
+            .args(["lab", "run", w, "--profile", "stub", "--profiles-file", lab.profiles(), "-q"])
+            .output()
+            .unwrap();
+    }
+    let ids = lab.run_ids();
+    assert_eq!(ids.len(), 3, "{ids:?}");
+    let id_of = |w: &str| ids.iter().find(|i| i.starts_with(&format!("{w}-stub-"))).unwrap().clone();
+
+    for (w, verify) in [
+        ("labchar", "verify:      not checked\n"),
+        ("labchar-pass", "verify:      ok\n"),
+        ("labchar-fail", "verify:      FAILED — "),
+    ] {
+        let id = id_of(w);
+        let out = lab.cmd().args(["lab", "run", "inspect", &id]).output().unwrap();
+        let (stdout, stderr) = out_text(&out);
+        assert_eq!(out.status.code(), Some(0), "{stderr}");
+        let head = format!("run:         {id}\nworkload:    {w}\nwall:        ");
+        assert!(stdout.starts_with(&head), "{stdout}");
+        assert!(stdout.contains("\nturns:       1\ncompactions: 0\nverify:      "), "{stdout}");
+        assert!(stdout.contains(verify), "{w}: {stdout}");
+        assert!(!stdout.contains("rest:"), "{stdout}");
+        assert!(!stdout.contains("tokensBefore:"), "{stdout}");
+        assert!(!stdout.contains("mode:"), "{stdout}");
+        assert!(stdout.contains("\nnotes:\n  - "), "{stdout}");
+        assert!(!stdout.contains("compaction summaries"), "{stdout}");
+    }
+    let out = lab.cmd().args(["lab", "run", "inspect", &id_of("labchar"), "--summary"]).output().unwrap();
+    let (stdout, _) = out_text(&out);
+    assert!(
+        stdout.ends_with("\n\ncompaction summaries: (none — no trajectory.jsonl recorded)\n"),
+        "{stdout}"
+    );
+    lab.cmd().args(["lab", "run", "inspect", "no-such-run"]).assert().failure();
+
+    let out = lab.cmd().args(["lab", "run", "list", "--all"]).output().unwrap();
+    let (stdout, _) = out_text(&out);
+    for id in &ids {
+        assert!(stdout.contains(id.as_str()), "{stdout}");
+    }
+    let out = lab.cmd().args(["lab", "run", "list", "-l", "1"]).output().unwrap();
+    let (stdout, _) = out_text(&out);
+    assert_eq!(ids.iter().filter(|i| stdout.contains(i.as_str())).count(), 1, "{stdout}");
+
+    let out = lab
+        .cmd()
+        .args(["lab", "run", "compare", &id_of("labchar-pass"), &id_of("labchar-fail")])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = out_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(!stdout.is_empty());
+}
+
+/// `lab characterize` and `lab tune` print their reports and exit on the
+/// dispatch outcome.
+#[test]
+fn lab_characterize_and_tune_run_and_report() {
+    let lab = LabStub::new(&RespondingStubServer::start());
+    let out = lab
+        .cmd()
+        .args(["lab", "characterize", "labchar", "--profile", "stub", "--profiles-file", lab.profiles()])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = out_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{stdout} / {stderr}");
+    assert!(stdout.starts_with("darkmux characterize — workload `labchar`\n"), "{stdout}");
+    let out = lab
+        .cmd()
+        .args(["lab", "tune", "labchar", "--profile", "stub", "-n", "2", "--profiles-file", lab.profiles()])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = out_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{stdout} / {stderr}");
+    assert!(stdout.contains("│  total:  ") && stdout.contains("across 2 run(s)\n"), "{stdout}");
+    // Run ids are second-stamped, so the characterize run and tune's first
+    // run can share a dir; only "something was recorded" is stable here.
+    assert!(!lab.run_ids().is_empty());
+}
+
+/// `lab workload list` prints one id per line, built-ins and user-tier.
+#[test]
+fn lab_workload_list_prints_ids_one_per_line() {
+    let lab = LabStub::new(&RespondingStubServer::start());
+    let out = lab.cmd().args(["lab", "workload", "list"]).output().unwrap();
+    let (stdout, _) = out_text(&out);
+    assert_eq!(out.status.code(), Some(0));
+    let lines: Vec<&str> = stdout.lines().collect();
+    for id in ["quick-q", "labchar", "labchar-pass", "labchar-fail"] {
+        assert!(lines.contains(&id), "{stdout}");
+    }
+}
+
+/// `lab eval` resolves its `--cases-dir` before any dispatch: an empty dir
+/// and a missing one are each refused by name.
+#[test]
+fn lab_eval_refuses_an_empty_or_missing_cases_dir() {
+    let lab = LabStub::new(&RespondingStubServer::start());
+    let cases = lab.home.path().join("cases");
+    fs::create_dir_all(&cases).unwrap();
+    lab.cmd()
+        .args(["lab", "eval", "--profiles-file", lab.profiles(), "--cases-dir"])
+        .arg(&cases)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(format!(
+            "no cases (*.label.json + sibling *.diff) found in {}",
+            cases.display()
+        )));
+    let missing = lab.home.path().join("nope");
+    lab.cmd()
+        .args(["lab", "eval", "--dialectic", "--cases-dir"])
+        .arg(&missing)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(format!("reading cases dir {}", missing.display())));
+}
+
+/// (#2463) SIGTERM mid-dispatch for a lab verb other than `lab run`: the
+/// verb must have armed the signal handlers, so the blocked `curl` is reaped,
+/// the process exits non-zero, and the run's `lifecycle.json` is finalized
+/// `interrupted` rather than left `running` (which is what an unarmed
+/// process, killed by the default disposition, leaves behind).
+fn assert_lab_verb_sigterm_finalizes_interrupted(verb_args: &[&str], label: &str) {
+    let stub = HangingStubServer::start();
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let os_home = TempDir::new().unwrap();
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(&profiles_path, hanging_endpoint_profiles_json(stub.port)).unwrap();
+    let workloads_dir = home.path().join("workloads");
+    fs::create_dir_all(&workloads_dir).unwrap();
+    fs::write(
+        workloads_dir.join("sigterm-lab-verb.json"),
+        r#"{"workload": {"id": "sigterm-lab-verb", "provider": "prompt",
+            "description": "SIGTERM lab-verb fixture (#2463)",
+            "role": "dialectic-judge", "prompt": "hang please"}}"#,
+    )
+    .unwrap();
+
+    let stderr_path = home.path().join("stderr.log");
+    let mut child = darkmux_std_cmd()
+        .env("HOME", os_home.path())
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_REDIS_URL", "")
+        .args(verb_args)
+        .args(["sigterm-lab-verb", "--profile", "hang", "--profiles-file"])
+        .arg(&profiles_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(fs::File::create(&stderr_path).unwrap()))
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawning darkmux {label}: {e}"));
+    let pid = child.id();
+
+    assert!(
+        stub.wait_for_a_connection(std::time::Duration::from_secs(20)),
+        "{label} never reached a dispatch call to the stub server within 20s"
+    );
+    assert!(child.try_wait().unwrap().is_none(), "{label} must still be blocked before SIGTERM");
+    let kill = std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status().unwrap();
+    assert!(kill.success());
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        assert!(std::time::Instant::now() < deadline, "{label} did not exit within 5s of SIGTERM");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(!status.success(), "a signal-interrupted {label} must not exit 0");
+    assert!(
+        stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(3)),
+        "{label}: the blocked curl was never torn down"
+    );
+    assert_no_surviving_remote_curl(pid, label);
+
+    let runs_dir = home.path().join("runs");
+    let run_id = fs::read_dir(&runs_dir)
+        .unwrap_or_else(|e| panic!("{label}: reading {}: {e}", runs_dir.display()))
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .next()
+        .unwrap_or_else(|| panic!("{label}: no run dir was minted"));
+    let lifecycle: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(runs_dir.join(&run_id).join("lifecycle.json"))
+            .unwrap_or_else(|e| panic!("{label}: reading lifecycle.json: {e}")),
+    )
+    .unwrap();
+    assert_eq!(
+        lifecycle["status"], "interrupted",
+        "{label}: a signal-ended run must be archived `interrupted`: {lifecycle} / stderr: {}",
+        fs::read_to_string(&stderr_path).unwrap_or_default()
+    );
+}
+
+#[test]
+fn lab_loop_sigterm_mid_dispatch_finalizes_lifecycle_interrupted() {
+    assert_lab_verb_sigterm_finalizes_interrupted(&["lab", "loop"], "lab loop");
+}
+
+#[test]
+fn lab_characterize_sigterm_mid_dispatch_finalizes_lifecycle_interrupted() {
+    assert_lab_verb_sigterm_finalizes_interrupted(&["lab", "characterize"], "lab characterize");
+}
+
+#[test]
+fn lab_tune_sigterm_mid_dispatch_finalizes_lifecycle_interrupted() {
+    assert_lab_verb_sigterm_finalizes_interrupted(&["lab", "tune"], "lab tune");
 }
