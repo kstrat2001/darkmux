@@ -157,12 +157,17 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let run_id = format!("{}-{}-{}-{}", opts.workload_id, profile_name, stamp, i);
         // Through `lab_dir()`, not `paths.runs`: the lab READER scans that
         // root, it honors DARKMUX_LAB_DIR / config.dirs.lab, and it is
         // cfg-isolated in test builds (#994). Resolving the write root
         // independently is how a run lands somewhere the reader never looks.
-        let run_dir = darkmux_types::config_access::lab_dir().join(&run_id);
+        let (run_id, run_dir) = claim_run_dir(
+            &darkmux_types::config_access::lab_dir(),
+            &opts.workload_id,
+            &profile_name,
+            stamp,
+            i,
+        )?;
         // (#488 Phase 1 / #490 Phase 3) The workload's *source* sandbox
         // is what gets COW-cloned per run. Phase 3 resolution shape:
         //   1. If workload declares `requires_fixture: <name@version>`,
@@ -216,8 +221,6 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
                 prev_envelope_warns = Some(warns);
             }
         }
-
-        fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
 
         // The lifecycle bookend goes here — directly after the directory
         // exists and BEFORE the first fallible step, so every `?` below is
@@ -450,6 +453,41 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
     }
 
     Ok(outcomes)
+}
+
+/// A run id: `<workload>-<profile>-<epoch_secs>-<n>`. `stats` reads the
+/// stamp back as the second-to-last dash-separated segment, so `n` never
+/// contains a dash.
+fn run_id(workload: &str, profile: &str, stamp: u64, n: &str) -> String {
+    format!("{workload}-{profile}-{stamp}-{n}")
+}
+
+/// Claim a run directory of this run's own under `root`, created
+/// EXCLUSIVELY, and return its id with it (#2981). The first candidate's
+/// last segment is the run's ordinal `i`; when that directory already exists
+/// (an earlier run of the same workload and profile in the same second, from
+/// this process or another), the next candidates are `i.2`, `i.3`, and so
+/// on. A run id therefore names exactly one run, and a run never writes into
+/// a directory it did not create.
+fn claim_run_dir(
+    root: &Path,
+    workload: &str,
+    profile: &str,
+    stamp: u64,
+    i: u32,
+) -> Result<(String, std::path::PathBuf)> {
+    fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
+    let mut claim = 1u32;
+    loop {
+        let n = if claim == 1 { i.to_string() } else { format!("{i}.{claim}") };
+        let id = run_id(workload, profile, stamp, &n);
+        let dir = root.join(&id);
+        match fs::create_dir(&dir) {
+            Ok(()) => return Ok((id, dir)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => claim += 1,
+            Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
+        }
+    }
 }
 
 pub fn lab_workloads() -> Vec<String> {

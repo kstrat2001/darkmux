@@ -136,6 +136,77 @@ impl Lab {
     }
 }
 
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+}
+
+// ─── #2981: a run never reuses a run dir ─────────────────────────────
+
+/// (#2981) A run dir that already exists is never written into. Plants a
+/// dir under every id a run could mint in the next few seconds, each with a
+/// sentinel; the run must land in a dir of its own, and every planted dir
+/// must hold exactly what it held before.
+#[test]
+#[serial_test::serial]
+fn a_run_never_writes_into_an_existing_run_dir() {
+    let lab = Lab::scripted(&["w2981"]);
+    script(Script { ok: true, write_manifest: true, ..Default::default() });
+    let root = darkmux_types::config_access::lab_dir();
+    let now = now_secs();
+    let planted: Vec<_> = (now..now + 5).map(|s| root.join(format!("w2981-fast-{s}-1"))).collect();
+    for d in &planted {
+        fs::create_dir_all(d).unwrap();
+        fs::write(d.join("sentinel"), "earlier run").unwrap();
+    }
+
+    let out = lab.run("w2981", 1).unwrap();
+
+    assert!(!planted.contains(&out[0].run_dir), "reused {}", out[0].run_dir.display());
+    for d in &planted {
+        let names: Vec<_> = fs::read_dir(d).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("sentinel")], "{} was written into", d.display());
+    }
+    assert!(out[0].run_dir.join("marker").is_file());
+}
+
+/// (#2981) The reported case: back-to-back runs of one workload, well
+/// inside one second, each keep their own artifacts.
+#[test]
+#[serial_test::serial]
+fn back_to_back_runs_keep_their_own_artifacts() {
+    let lab = Lab::scripted(&["w2981b"]);
+    script(Script { ok: true, ..Default::default() });
+    let a = lab.run("w2981b", 1).unwrap().remove(0);
+    let b = lab.run("w2981b", 1).unwrap().remove(0);
+    assert_ne!(a.run_id, b.run_id);
+    let marker = |o: &RunOutcome| fs::read_to_string(o.run_dir.join("marker")).unwrap();
+    assert_ne!(marker(&a), marker(&b), "the second run overwrote the first run's artifacts");
+}
+
+/// (#2981) The claim itself: the ordinal first, then `.2`, `.3` past each
+/// directory that already exists, and a real I/O error surfaces instead of
+/// being retried.
+#[test]
+fn a_claim_skips_every_existing_dir_and_surfaces_other_errors() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("runs");
+    let claim = || claim_run_dir(&root, "w", "p", 100, 3).unwrap();
+    assert_eq!(claim().0, "w-p-100-3");
+    let second = claim().0;
+    assert_eq!(second, "w-p-100-3.2");
+    // The stamp still reads back from a later claim's id.
+    assert_eq!(crate::lab::stats::run_id_epoch_ms(&second), Some(100_000));
+    let (id, dir) = claim();
+    assert_eq!(id, "w-p-100-3.3");
+    assert_eq!(dir, root.join("w-p-100-3.3"));
+    assert!(dir.is_dir());
+
+    let file_root = tmp.path().join("a-file");
+    fs::write(&file_root, "").unwrap();
+    let err = claim_run_dir(&file_root, "w", "p", 100, 1).unwrap_err();
+    assert!(format!("{err:#}").contains("creating"), "{err:#}");
+}
+
 // ─── #2982: verify tri-state and the exit gate ───────────────────────
 
 /// A chat-completions stub that answers every request with `ack`.
