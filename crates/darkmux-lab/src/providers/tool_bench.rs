@@ -2451,6 +2451,7 @@ not json — tolerated
             // `None` (see its own `if let Some(out) = out_dir.as_deref()`),
             // so a mocked dispatch needs no `.darkmux-runtime/` fixture.
             out_dir: None,
+            trajectory: None,
         })
     }
 
@@ -2588,6 +2589,7 @@ not json — tolerated
                 stderr: "container exited".into(),
                 session_id: "s".into(),
                 out_dir: None,
+                trajectory: None,
             })
         }));
         provider

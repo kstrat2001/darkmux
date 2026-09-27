@@ -248,6 +248,8 @@ pub(crate) fn dispatch_as_crew_of_one_with(
                 stderr: raw.stderr,
                 session_id: raw.session_id,
                 out_dir: raw.out_dir,
+                // The packed step output carries the envelope, not the fold.
+                trajectory: None,
             };
             // A non-zero dispatch exit is real, postable output (the dispatch
             // RAN, it just didn't finish cleanly) — `Degraded`, which

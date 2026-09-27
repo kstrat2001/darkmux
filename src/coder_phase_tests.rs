@@ -31,6 +31,37 @@
         }
     }
 
+    /// The coder's tokens are the dispatch result's fold, never a second read
+    /// of the model-writable out-dir: here the out-dir holds a trajectory
+    /// reporting 999 tokens and the fold 130. With no fold the count is zero,
+    /// whatever the out-dir holds.
+    #[test]
+    fn coder_tokens_come_from_the_dispatch_fold_not_the_out_dir() {
+        let completed = |prompt: u64, completion: u64| {
+            format!(
+                r#"{{"type":"model.completed","seq":1,"finish_reason":"stop","usage":{{"prompt_tokens":{prompt},"completion_tokens":{completion},"total_tokens":{}}}}}"#,
+                prompt + completion
+            )
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rt = tmp.path().join(".darkmux-runtime");
+        std::fs::create_dir_all(&rt).unwrap();
+        std::fs::write(rt.join("trajectory.jsonl"), completed(900, 99) + "\n").unwrap();
+        let mut result = crew::dispatch::DispatchResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            session_id: "s".into(),
+            out_dir: Some(tmp.path().to_path_buf()),
+            trajectory: Some(darkmux_trajectory::TrajectoryFold::from_lines(&completed(120, 10))),
+        };
+        let tokens = coder_tokens(&result);
+        assert_eq!((tokens.prompt, tokens.completion, tokens.total), (120, 10, 130));
+
+        result.trajectory = None;
+        assert_eq!(coder_tokens(&result).total, 0, "no fold: the out-dir is never read");
+    }
+
     /// (#816) conventions_branch: template + ticket → conventioned ref;
     /// ticketless mission or invalid expansion → darkmux default (soft
     /// fallback, never an error).

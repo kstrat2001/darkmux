@@ -14,6 +14,7 @@
 
 use super::*;
 use darkmux_crew::types::{NodeStatus, Phase, PhaseStatus};
+use darkmux_trajectory::TrajectoryFold;
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
@@ -151,9 +152,8 @@ fn unit_task() -> Task {
     }
 }
 
-/// A dispatch out dir seeded with `findings` accepted findings and,
-/// optionally, a trajectory whose turns all made no progress.
-fn seeded_out_dir(dir: &Path, findings: usize, idle_turns: usize) -> PathBuf {
+/// A dispatch out dir seeded with `findings` accepted findings.
+fn seeded_out_dir(dir: &Path, findings: usize) -> PathBuf {
     let out = dir.join("out");
     let rt = out.join(".darkmux-runtime");
     fs::create_dir_all(&rt).unwrap();
@@ -167,16 +167,25 @@ fn seeded_out_dir(dir: &Path, findings: usize, idle_turns: usize) -> PathBuf {
     if findings > 0 {
         fs::write(rt.join("findings.jsonl"), body).unwrap();
     }
-    if idle_turns > 0 {
-        let mut traj = String::new();
-        for seq in 0..idle_turns {
-            traj.push_str(&format!(
-                "{{\"type\":\"tool.completed\",\"seq\":{seq},\"tool_name\":\"bash\",\"ok\":true}}\n"
-            ));
-        }
-        fs::write(rt.join("trajectory.jsonl"), traj).unwrap();
-    }
     out
+}
+
+/// A trajectory fold of `lines`, as the dispatch's live tailer hands it back
+/// on `DispatchResult::trajectory`.
+fn fold_of(lines: &[String]) -> TrajectoryFold {
+    TrajectoryFold::from_lines(&lines.join("\n"))
+}
+
+/// `n` turns that each ran one `bash` call: no finding attempt, no new read.
+fn idle_turns(n: u64) -> Vec<String> {
+    (0..n).map(|seq| format!(r#"{{"type":"tool.completed","seq":{seq},"tool_name":"bash","ok":true}}"#)).collect()
+}
+
+/// `n` `create_finding` calls the runtime rejected, one per turn.
+fn rejected_findings(n: u64) -> Vec<String> {
+    (0..n)
+        .map(|seq| format!(r#"{{"type":"tool.completed","seq":{seq},"tool_name":"create_finding","ok":false}}"#))
+        .collect()
 }
 
 fn envelope(result: &str, prompt: u64, completion: u64, wall_ms: u64) -> String {
@@ -189,7 +198,18 @@ fn envelope(result: &str, prompt: u64, completion: u64, wall_ms: u64) -> String 
 }
 
 fn ok_result(stdout: String, out: PathBuf) -> Result<DispatchResult> {
-    Ok(DispatchResult { exit_code: 0, stdout, stderr: String::new(), session_id: "s".into(), out_dir: Some(out) })
+    ok_result_with(stdout, out, TrajectoryFold::default())
+}
+
+fn ok_result_with(stdout: String, out: PathBuf, trajectory: TrajectoryFold) -> Result<DispatchResult> {
+    Ok(DispatchResult {
+        exit_code: 0,
+        stdout,
+        stderr: String::new(),
+        session_id: "s".into(),
+        out_dir: Some(out),
+        trajectory: Some(trajectory),
+    })
 }
 
 /// The envelope's `metrics` block is the host's fold of THIS dispatch's
@@ -202,6 +222,7 @@ fn interpret_dispatch_result_reads_the_envelope_metrics() {
         stderr: String::new(),
         session_id: "s".into(),
         out_dir: None,
+        trajectory: None,
     };
     let (result, wall_ms, prompt_tokens, completion_tokens, model, _, _, _) =
         interpret_dispatch_result("u-0001", &res);
@@ -222,7 +243,7 @@ fn a_clean_unit_dispatch_produces_a_typed_outcome_and_counts_its_findings() {
     save_phase(PHASE, MISSION);
     let ws = TempDir::new().unwrap();
     let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
-    let out = seeded_out_dir(ws.path(), 2, 0);
+    let out = seeded_out_dir(ws.path(), 2);
 
     let seen: Arc<std::sync::Mutex<Option<DispatchOpts>>> = Arc::new(std::sync::Mutex::new(None));
     let captured = seen.clone();
@@ -300,7 +321,7 @@ fn config_timeout_seconds_routes_into_the_container_paths_override_field() {
     save_phase(PHASE, MISSION);
     let ws = TempDir::new().unwrap();
     let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
-    let out = seeded_out_dir(ws.path(), 0, 0);
+    let out = seeded_out_dir(ws.path(), 0);
 
     let seen: Arc<std::sync::Mutex<Option<DispatchOpts>>> = Arc::new(std::sync::Mutex::new(None));
     let captured = seen.clone();
@@ -340,7 +361,7 @@ fn omitted_config_timeout_seconds_leaves_the_override_field_absent() {
     save_phase(PHASE, MISSION);
     let ws = TempDir::new().unwrap();
     let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
-    let out = seeded_out_dir(ws.path(), 0, 0);
+    let out = seeded_out_dir(ws.path(), 0);
 
     let seen: Arc<std::sync::Mutex<Option<DispatchOpts>>> = Arc::new(std::sync::Mutex::new(None));
     let captured = seen.clone();
@@ -381,7 +402,7 @@ fn config_timeout_seconds_string_form_routes_into_the_container_paths_override_f
     save_phase(PHASE, MISSION);
     let ws = TempDir::new().unwrap();
     let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
-    let out = seeded_out_dir(ws.path(), 0, 0);
+    let out = seeded_out_dir(ws.path(), 0);
 
     let seen: Arc<std::sync::Mutex<Option<DispatchOpts>>> = Arc::new(std::sync::Mutex::new(None));
     let captured = seen.clone();
@@ -625,7 +646,7 @@ fn a_stop_file_from_a_previous_mission_does_not_block_this_one() {
     save_phase(PHASE, MISSION);
     let ws = TempDir::new().unwrap();
     let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
-    let out = seeded_out_dir(ws.path(), 1, 0);
+    let out = seeded_out_dir(ws.path(), 1);
 
     let stop_dir = home.path().join("crawl").join("fixture-ws");
     fs::create_dir_all(&stop_dir).unwrap();
@@ -706,7 +727,7 @@ fn no_thermal_stop_file_dispatches_normally() {
     save_phase(PHASE, MISSION);
     let ws = TempDir::new().unwrap();
     let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
-    let out = seeded_out_dir(ws.path(), 1, 0);
+    let out = seeded_out_dir(ws.path(), 1);
 
     let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = called.clone();
@@ -797,6 +818,7 @@ fn two_rules_growing_unit_u_0001_do_not_collide_on_disk() {
             stderr: String::new(),
             session_id: opts.session_id.unwrap_or_default(),
             out_dir: Some(dir),
+            trajectory: Some(TrajectoryFold::default()),
         })
     }));
 
@@ -883,8 +905,8 @@ fn draws_dispatches_the_unit_n_times_and_dedups_matching_finding_refs() {
     // same real issue would produce.
     let draw1_dir = TempDir::new().unwrap();
     let draw2_dir = TempDir::new().unwrap();
-    let out1 = seeded_out_dir(draw1_dir.path(), 1, 0);
-    let out2 = seeded_out_dir(draw2_dir.path(), 1, 0);
+    let out1 = seeded_out_dir(draw1_dir.path(), 1);
+    let out2 = seeded_out_dir(draw2_dir.path(), 1);
 
     let calls: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let captured = calls.clone();
@@ -951,7 +973,7 @@ fn draws_defaults_to_exactly_one_dispatch() {
     save_phase(PHASE, MISSION);
     let ws = TempDir::new().unwrap();
     let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
-    let out = seeded_out_dir(ws.path(), 1, 0);
+    let out = seeded_out_dir(ws.path(), 1);
 
     let calls: Arc<std::sync::Mutex<usize>> = Arc::new(std::sync::Mutex::new(0));
     let captured = calls.clone();
@@ -984,7 +1006,7 @@ fn a_task_naming_a_different_role_dispatches_as_that_role_and_stamps_its_confirm
     save_phase(PHASE, MISSION);
     let ws = TempDir::new().unwrap();
     let plan = write_plan(ws.path(), "swallowed-error", "u-0001", &"b".repeat(40));
-    let out = seeded_out_dir(ws.path(), 1, 0);
+    let out = seeded_out_dir(ws.path(), 1);
 
     let seen: Arc<std::sync::Mutex<Option<DispatchOpts>>> = Arc::new(std::sync::Mutex::new(None));
     let captured = seen.clone();
@@ -1027,7 +1049,7 @@ fn an_intent_file_in_config_lands_in_the_dispatched_message() {
     save_phase(PHASE, MISSION);
     let ws = TempDir::new().unwrap();
     let plan = write_plan(ws.path(), "intent-vs-diff", "u-0001", &"c".repeat(40));
-    let out = seeded_out_dir(ws.path(), 0, 0);
+    let out = seeded_out_dir(ws.path(), 0);
     let intent_file = ws.path().join("intent.txt");
     const INTENT_MARKER: &str = "PR-INTENT-MARKER: fix the off-by-one in the pagination cursor";
     fs::write(&intent_file, INTENT_MARKER).unwrap();
@@ -1062,7 +1084,7 @@ fn max_turns_is_a_bound_not_a_failure_and_the_step_still_completes() {
     save_phase(PHASE, MISSION);
     let ws = TempDir::new().unwrap();
     let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"b".repeat(40));
-    let out = seeded_out_dir(ws.path(), 0, 0);
+    let out = seeded_out_dir(ws.path(), 0);
     let kind =
         CrawlUnitStepKind::with_dispatch(Arc::new(move |_| ok_result(envelope("max_turns", 10, 5, 900), out.clone())));
     let step = unit_step(serde_json::json!({ "plan": plan.to_string_lossy(), "unit": "u-0001" }));
@@ -1081,8 +1103,10 @@ fn a_no_progress_tail_ends_a_clean_stop_as_budget_exhausted() {
     save_phase(PHASE, MISSION);
     let ws = TempDir::new().unwrap();
     let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"c".repeat(40));
-    let out = seeded_out_dir(ws.path(), 0, 4);
-    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |_| ok_result(envelope("stop", 1, 1, 10), out.clone())));
+    let out = seeded_out_dir(ws.path(), 0);
+    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |_| {
+        ok_result_with(envelope("stop", 1, 1, 10), out.clone(), fold_of(&idle_turns(4)))
+    }));
     // The bound only fires once there IS a full trailing window: 4 idle
     // turns clear a window of 3 and do not clear a window of 5.
     for (n, want) in [(3u64, "unit_budget_exhausted"), (5, "stop")] {
@@ -2154,7 +2178,7 @@ fn two_units_and_a_summary_run_through_the_real_scheduler() {
     save_phase(PHASE, MISSION);
     let ws = TempDir::new().unwrap();
     let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
-    let out = seeded_out_dir(ws.path(), 1, 0);
+    let out = seeded_out_dir(ws.path(), 1);
 
     // The dispatch converges for u-0001 and refuses for the second unit,
     // keyed on what the step actually asked for.
@@ -2466,7 +2490,7 @@ fn a_units_outcome_names_every_finding_it_recorded_by_store_key() {
     save_phase(PHASE, MISSION);
     let ws = TempDir::new().unwrap();
     let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
-    let out = seeded_out_dir(ws.path(), 2, 0);
+    let out = seeded_out_dir(ws.path(), 2);
     let kind =
         CrawlUnitStepKind::with_dispatch(Arc::new(move |_| ok_result(envelope("stop", 1, 1, 10), out.clone())));
 
@@ -2645,7 +2669,7 @@ fn an_unaddressable_session_id_yields_no_refs_but_still_counts_the_findings() {
     // The session id is `crawl-<mission>-<unit id>`, so a unit id holding a
     // separator is the one input that can make it unaddressable.
     let plan = write_plan(ws.path(), "unnamed-predicate", "u/0001", &"a".repeat(40));
-    let out = seeded_out_dir(ws.path(), 2, 0);
+    let out = seeded_out_dir(ws.path(), 2);
     let kind =
         CrawlUnitStepKind::with_dispatch(Arc::new(move |_| ok_result(envelope("stop", 1, 1, 10), out.clone())));
     let step = unit_step(serde_json::json!({ "plan": plan.to_string_lossy(), "unit": "u/0001" }));
@@ -3261,7 +3285,7 @@ fn two_rules_first_units_never_share_a_dispatch_session_id() {
     let plan_a = write_plan(ws_a.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
     let plan_b = write_plan(ws_b.path(), "swallowed-error", "u-0001", &"b".repeat(40));
     let out_dir = TempDir::new().unwrap();
-    let out = seeded_out_dir(out_dir.path(), 0, 0);
+    let out = seeded_out_dir(out_dir.path(), 0);
 
     let calls: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let captured = calls.clone();
@@ -3315,26 +3339,57 @@ fn the_crawler_seat_stamp_names_the_selected_model() {
     assert_eq!(seat.profile_name.as_deref(), Some("mixed"));
 }
 
-// ── (#2869) out-dir reads refuse what the model could have planted ─────
+// ── one trajectory read per dispatch ───────────────────────────────────
 
-/// An out-dir whose `.darkmux-runtime/trajectory.jsonl` is a symlink to a
-/// host file holding one rejected `create_finding` line. Followed, the
-/// count would read 1.
+/// An out-dir whose `.darkmux-runtime/trajectory.jsonl` holds `lines`: a
+/// trajectory that disagrees with the dispatch's fold, so a re-read of the
+/// out-dir shows in the reported count.
+fn out_dir_with_trajectory(dir: &Path, lines: &[String]) -> PathBuf {
+    let out = seeded_out_dir(dir, 0);
+    fs::write(out.join(".darkmux-runtime/trajectory.jsonl"), lines.join("\n") + "\n").unwrap();
+    out
+}
+
+fn run_unit(kind: &CrawlUnitStepKind, plan: &Path, extra: Value) -> UnitOutcome {
+    let mut config = serde_json::json!({ "plan": plan.to_string_lossy(), "unit": "u-0001" });
+    config.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+    let outcome = kind.run(&unit_step(config), &unit_task(), &BTreeMap::new()).unwrap();
+    darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome.output, UNIT_OUTCOME_KIND).unwrap().body
+}
+
+/// The rejected-finding count is the dispatch result's fold, never a second
+/// read of the out-dir: the out-dir here holds a trajectory with five
+/// rejections, the fold two.
 #[test]
-fn count_rejected_create_findings_refuses_a_symlinked_trajectory() {
-    let tmp = TempDir::new().unwrap();
-    let out = tmp.path().join("out");
-    fs::create_dir_all(out.join(".darkmux-runtime")).unwrap();
-    let host = tmp.path().join("host-trajectory.jsonl");
-    let line = r#"{"type":"tool.completed","tool_name":"create_finding","ok":false,"seq":1}"#;
-    fs::write(&host, format!("{line}\n")).unwrap();
-    std::os::unix::fs::symlink(&host, out.join(".darkmux-runtime/trajectory.jsonl")).unwrap();
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn rejected_findings_come_from_the_dispatch_fold_not_the_out_dir() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"e".repeat(40));
+    let out = out_dir_with_trajectory(ws.path(), &rejected_findings(5));
+    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |_| {
+        ok_result_with(envelope("stop", 1, 1, 10), out.clone(), fold_of(&rejected_findings(2)))
+    }));
+    assert_eq!(run_unit(&kind, &plan, serde_json::json!({})).findings_rejected, 2);
+}
 
-    assert_eq!(count_rejected_create_findings(&out), 0, "the symlink was followed");
-    assert!(darkmux_crew::dispatch_internal::read_out_dir_text(&out, ".darkmux-runtime/trajectory.jsonl").is_none());
-
-    // The same bytes as a regular file are read.
-    fs::remove_file(out.join(".darkmux-runtime/trajectory.jsonl")).unwrap();
-    fs::copy(&host, out.join(".darkmux-runtime/trajectory.jsonl")).unwrap();
-    assert_eq!(count_rejected_create_findings(&out), 1);
+/// The no-progress bound judges the dispatch result's fold, never a second
+/// read of the out-dir: the out-dir here holds a trajectory of four
+/// idle turns, the fold four turns that each attempted a finding.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn the_no_progress_bound_judges_the_dispatch_fold_not_the_out_dir() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"f".repeat(40));
+    let out = out_dir_with_trajectory(ws.path(), &idle_turns(4));
+    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |_| {
+        ok_result_with(envelope("stop", 1, 1, 10), out.clone(), fold_of(&rejected_findings(4)))
+    }));
+    let unit = run_unit(&kind, &plan, serde_json::json!({ "no_progress_turns": 3 }));
+    assert_eq!(unit.result, "stop", "a finding attempt every turn is progress");
 }

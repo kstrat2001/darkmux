@@ -481,6 +481,7 @@ mod tests {
                     stderr: String::new(),
                     session_id: String::new(),
                     out_dir: None,
+                    trajectory: None,
                 })
             },
             factory.as_ref(),
@@ -562,6 +563,7 @@ mod tests {
                     stderr: String::new(),
                     session_id: String::new(),
                     out_dir: None,
+                    trajectory: None,
                 })
             },
             factory.as_ref(),
@@ -613,6 +615,7 @@ mod tests {
                     stderr: String::new(),
                     session_id: String::new(),
                     out_dir: None,
+                    trajectory: None,
                 })
             },
             factory.as_ref(),
@@ -641,6 +644,7 @@ mod tests {
                     stderr: String::new(),
                     session_id: String::new(),
                     out_dir: None,
+                    trajectory: None,
                 })
             },
             factory.as_ref(),
@@ -745,6 +749,7 @@ mod tests {
                     stderr: String::new(),
                     session_id: String::new(),
                     out_dir: None,
+                    trajectory: None,
                 })
             },
             factory.as_ref(),
@@ -818,6 +823,7 @@ mod tests {
                     stderr: String::new(),
                     session_id: String::new(),
                     out_dir: None,
+                    trajectory: None,
                 })
             },
             factory.as_ref(),

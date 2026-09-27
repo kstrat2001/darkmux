@@ -942,14 +942,7 @@ impl StepKind for MissionCoderStepKind {
             style::dim(&format!("darkmux coder-phase: session id `{}`", ctx.session_id))
         );
 
-        // The coder's tokens: the fold of its own trajectory, the one
-        // reading every other surface quotes, read with the contained
-        // out-dir reader (the out-dir is model-writable).
-        let tokens = result
-            .out_dir
-            .as_deref()
-            .map(|out| crew::dispatch_internal::out_dir_trajectory(out).tokens)
-            .unwrap_or_default();
+        let tokens = coder_tokens(&result);
 
         if result.exit_code != 0 {
             let exit_code = result.exit_code;
@@ -3022,6 +3015,13 @@ fn worktree_branch(wt_path: &Path) -> Option<String> {
     }
     let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if b.is_empty() || b == "HEAD" { None } else { Some(b) }
+}
+
+/// The coder's tokens: the dispatch's own fold of its trajectory, the one
+/// reading every other surface quotes. Never re-read from the out-dir, which
+/// the model can write to.
+fn coder_tokens(result: &crew::dispatch::DispatchResult) -> darkmux_trajectory::TokenSum {
+    result.trajectory.as_ref().map(|fold| fold.tokens).unwrap_or_default()
 }
 
 /// One-line tokens-off-meter readout. Tokens only — the operator multiplies
