@@ -1222,6 +1222,21 @@ mod tests {
         assert!(read_allow_list(&p).is_err());
     }
 
+    /// A 3.x sender speaks v6, whose `session_id` is a free-form string.
+    /// Its job must get the version remedy, never a field error from the
+    /// 4.0 session grammar it could not have known.
+    #[test]
+    fn a_v6_job_with_a_pre_4_0_session_gets_the_version_remedy() {
+        let good = serde_json::to_vec(&WorkSubmission::new(job(Some("host")), true)).unwrap();
+        let mut v: serde_json::Value = serde_json::from_slice(&good).unwrap();
+        v["schema"] = "6".into();
+        v["job"]["session_id"] = "crew-dispatch-coder-1788254029192466-0".into();
+        assert_eq!(
+            WorkSubmission::parse(&serde_json::to_vec(&v).unwrap()).unwrap_err(),
+            Refusal::SchemaMismatch { got: "6".into() }
+        );
+    }
+
     #[test]
     fn the_version_is_checked_before_the_shape() {
         let good = serde_json::to_vec(&WorkSubmission::new(job(Some("host")), true)).unwrap();

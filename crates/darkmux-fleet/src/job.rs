@@ -90,12 +90,14 @@ pub struct WorkJob {
 /// `attempt` / `published_by_orchestrator` fields were removed. The receiver
 /// reads the envelope's `schema` BEFORE parsing the job, so a sender on
 /// another version gets a reply naming the version, not a field error.
-/// "6" (#2916 stage 2, 4.0): the reply body became newline-delimited (a
-/// queued job's `queued` lines before its answer), `profile` never carries
-/// a `profile@machine` address (the sender splits it off), and
-/// `session_id` (the job's and the reply's) is a session in the 4.0 grammar
-/// (`darkmux_types::session_id`), read back strictly.
-pub const WORK_JOB_SCHEMA_VERSION: &str = "6";
+/// "6" (#2916 stage 2): the reply body became newline-delimited (a queued
+/// job's `queued` lines before its answer) and `profile` never carries a
+/// `profile@machine` address (the sender splits it off). 3.x senders speak
+/// it. "7" (4.0): `session_id` (the job's and the reply's) is a session in
+/// the 4.0 grammar (`darkmux_types::session_id`), read back strictly, so a
+/// v6 sender's free-form session gets the version remedy, not a field
+/// error.
+pub const WORK_JOB_SCHEMA_VERSION: &str = "7";
 
 /// Max byte size of a `WorkJob.message`. 256 KiB matches the
 /// reasoning-text cap in `dispatch_internal.rs` (#231 / S6). (#246 PR-C.2)

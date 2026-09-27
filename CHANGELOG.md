@@ -161,7 +161,7 @@ darkmux release.
   and `mission_id` always agrees with the session. `mission-<m>` and the
   bare `<m>` of the whole-run bookend are one session, `<m>.run`. A fleet
   receiver runs a submitted job under a relay of the sender's session in a
-  standalone run (WORK_JOB 6), never one of its own missions, so the
+  standalone run (WORK_JOB 7), never one of its own missions, so the
   `-from-` rule on machine names is gone. `darkmux dispatch --session-id
   <name>` now names the dispatch within its crew-of-one run
   (`<run>.adhoc.<role>.<name>`). Archives are never rewritten: an old id
