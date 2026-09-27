@@ -3157,11 +3157,58 @@ fn run_with_sleeper(
             .first()
             .and_then(|c| c.message.tool_calls.as_ref())
             .cloned();
+
+        // (#2836) Who ended this call. Two predicates below — the #479
+        // salvage and the #1221 cap-cliff — used to answer that by comparing
+        // `completion_tokens` against `per_call_cap` inline, resolving an
+        // absent `usage` in OPPOSITE directions four hundred lines apart with
+        // no name on the distinction. `CutSource` carries the reading once.
+        //
+        // The comparison stays against `per_call_cap` — what THIS request
+        // actually sent — deliberately. An earlier attempt keyed it to
+        // `answer_max_tokens`, which stops recognizing a check-in cut as ours
+        // and drops well-formed tool calls that should have dispatched.
+        //
+        // (#2963) Read here, before `model.completed`, because the record
+        // says which calls will run and that depends on it.
+        let cut = match runtime_cut {
+            CutSource::RuntimeAbort(_) => runtime_cut,
+            _ => CutSource::classify(&trajectory_finish_reason, this_turn_completion_tokens, wire_max_tokens),
+        };
+        // (#479) Per-turn-cap salvage — see the block that acts on it below
+        // for the full reasoning. (#2836) `is_ours_confirmed`: an absent
+        // `usage` answers NO here, because salvaging DISPATCHES the tool
+        // calls that were in flight.
+        let salvaged_per_turn_cap = trajectory_finish_reason == "length"
+            && cut.is_ours_confirmed()
+            && response
+                .choices
+                .first()
+                .is_some_and(|c| assistant_message_has_well_formed_tool_calls(&c.message));
+        // (#2963) Which of this turn's calls will RUN, decided ONCE, here,
+        // and followed by the dispatch below (`partition_by_plan`): the
+        // record and the loop cannot disagree. A call that will not run —
+        // ungranted, not a tool, cut off mid-arguments, or on a turn that
+        // dispatches nothing — is marked `runs: false` on `model.completed`,
+        // so the viewer never names it as the call running now.
+        let dispatches_tool_calls = resolve_finish_reason(
+            &trajectory_finish_reason,
+            trajectory_tool_calls.as_ref().is_some_and(|t| !t.is_empty()),
+            salvaged_per_turn_cap,
+        ) == "tool_calls";
+        let call_plan = plan_tool_calls(
+            trajectory_tool_calls.as_deref().unwrap_or(&[]),
+            dispatches_tool_calls,
+            salvaged_per_turn_cap,
+            &allowed_tool_names,
+        );
+        let call_runs: Vec<bool> = call_plan.iter().map(|f| *f == CallFate::Runs).collect();
         trajectory.append_model_completed(
             turns,
             &trajectory_finish_reason,
             response.usage.as_ref(),
             trajectory_tool_calls.as_deref(),
+            Some(&call_runs),
             response.served_model(),
         );
 
@@ -3177,20 +3224,9 @@ fn run_with_sleeper(
         let mut assistant_message = choice.message;
         let finish_reason = choice.finish_reason;
 
-        // (#2836) Who ended this call. Two predicates below — the #479
-        // salvage and the #1221 cap-cliff — used to answer that by comparing
-        // `completion_tokens` against `per_call_cap` inline, resolving an
-        // absent `usage` in OPPOSITE directions four hundred lines apart with
-        // no name on the distinction. `CutSource` carries the reading once.
-        //
-        // The comparison stays against `per_call_cap` — what THIS request
-        // actually sent — deliberately. An earlier attempt keyed it to
-        // `answer_max_tokens`, which stops recognizing a check-in cut as ours
-        // and drops well-formed tool calls that should have dispatched.
-        let cut = match runtime_cut {
-            CutSource::RuntimeAbort(_) => runtime_cut,
-            _ => CutSource::classify(&finish_reason, this_turn_completion_tokens, wire_max_tokens),
-        };
+        // (#2836, #2963) `cut` and `salvaged_per_turn_cap` were read above,
+        // before `model.completed`; `finish_reason` is that record's.
+        debug_assert_eq!(finish_reason, trajectory_finish_reason);
 
         // Extract reasoning content from `<think>...</think>` blocks in
         // the assistant message content (#204). Thinking-mode models
@@ -3315,9 +3351,8 @@ fn run_with_sleeper(
         // unproven "our cap cut it" costs a truncated call reaching a real
         // tool. The cap-cliff below asks the other question of the same
         // uncertainty and gets the opposite answer, on purpose.
-        let salvaged_per_turn_cap = finish_reason == "length"
-            && cut.is_ours_confirmed()
-            && assistant_message_has_well_formed_tool_calls(&assistant_message);
+        // (#2963) `salvaged_per_turn_cap` is read above, before
+        // `model.completed`, from this same message.
         if salvaged_per_turn_cap {
             // (#2169 merge-gate CONSIDER 6) `salvaged_count` measures ONLY
             // JSON well-formedness (#479's own filter) — it is computed
@@ -3646,7 +3681,7 @@ fn run_with_sleeper(
                 // or a real tool this dispatch wasn't GRANTED — is never
                 // executed, never checkpointed as pending, and never
                 // reaches the cycle/failure-rate detectors. See
-                // `partition_tool_calls_by_name`'s doc for why this has to
+                // `partition_by_plan`'s doc for why this has to
                 // happen here (before `calls_snapshot`) rather than inside
                 // the dispatch loop below, for how this composes with
                 // #479's per-turn-cap salvage, and for why the two invalid
@@ -3654,8 +3689,24 @@ fn run_with_sleeper(
                 // to be one bucket, which both mislabeled a real-tool
                 // permission refusal as "looks like quoted code" and mixed
                 // it into the Devstral-pattern metric).
+                // (#2963) By the plan made before `model.completed`, so the
+                // calls that run are exactly the ones that record left
+                // unmarked. `calls` above (the message's, after the #479
+                // salvage dropped the malformed ones) is the plan's
+                // `Runs`/`NotGranted`/`NotATool` calls in the same order.
+                debug_assert_eq!(
+                    calls.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+                    trajectory_tool_calls
+                        .iter()
+                        .flatten()
+                        .zip(&call_plan)
+                        .filter(|(_, f)| **f != CallFate::Discarded)
+                        .map(|(c, _)| c.id.as_str())
+                        .collect::<Vec<_>>(),
+                    "the plan must cover exactly the calls this arm sees"
+                );
                 let (calls, ungranted_calls, not_a_tool_calls) =
-                    partition_tool_calls_by_name(calls, &allowed_tool_names);
+                    partition_by_plan(trajectory_tool_calls.clone().unwrap_or_default(), &call_plan);
                 handle_invalid_tool_calls(
                     &ungranted_calls,
                     InvalidToolCallReason::RealToolNotGranted,
@@ -5581,9 +5632,15 @@ fn assistant_message_has_well_formed_tool_calls(msg: &Message) -> bool {
 /// existed. Applied ONLY on the salvage path: everywhere else a malformed
 /// tool call is the model's own output and belongs in the transcript, where
 /// the failure-rate detector can see it. Here it is an artifact of OUR cut.
+/// (#479, #2963) Whether a tool call's arguments parse: the one predicate
+/// the salvage's `retain_well_formed_tool_calls` and `plan_tool_calls` share.
+fn tool_call_is_well_formed(tc: &ToolCall) -> bool {
+    serde_json::from_str::<serde_json::Value>(&tc.function.arguments).is_ok()
+}
+
 fn retain_well_formed_tool_calls(msg: &mut Message) {
     if let Some(tcs) = msg.tool_calls.as_mut() {
-        tcs.retain(|tc| serde_json::from_str::<serde_json::Value>(&tc.function.arguments).is_ok());
+        tcs.retain(tool_call_is_well_formed);
         // An empty vector is not the same as no tool calls: `resolve_finish_reason`
         // asks whether any remain, and a `Some([])` would answer "yes".
         if tcs.is_empty() {
@@ -5749,41 +5806,71 @@ fn classify_invalid_tool_call(name: &str) -> InvalidToolCallReason {
 /// `generation_bound_salvage_and_malformed_names_compose_on_the_same_turn`
 /// in this module's tests for a probe through `run_with_sleeper` that
 /// exercises both on one turn.
-fn partition_tool_calls_by_name(
+fn partition_by_plan(
     calls: Vec<ToolCall>,
-    allowed_tool_names: &HashSet<String>,
+    plan: &[CallFate],
 ) -> (Vec<ToolCall>, Vec<ToolCall>, Vec<ToolCall>) {
     let mut granted = Vec::new();
     let mut ungranted = Vec::new();
     let mut not_a_tool = Vec::new();
-    for call in calls {
-        if allowed_tool_names.contains(&call.function.name) {
-            granted.push(call);
-        } else {
-            match classify_invalid_tool_call(&call.function.name) {
-                InvalidToolCallReason::RealToolNotGranted => ungranted.push(call),
-                InvalidToolCallReason::NotATool => not_a_tool.push(call),
-            }
+    for (call, fate) in calls.into_iter().zip(plan) {
+        match fate {
+            CallFate::Runs => granted.push(call),
+            CallFate::NotGranted => ungranted.push(call),
+            CallFate::NotATool => not_a_tool.push(call),
+            CallFate::Discarded => {}
         }
     }
     (granted, ungranted, not_a_tool)
 }
 
-/// Handle ONE reason-bucket of a turn's non-dispatchable tool calls
-/// (#2169): never dispatch them, coalesce into ONE feedback message worded
-/// SPECIFICALLY for `reason` (see [`InvalidToolCallReason`]'s doc — the two
-/// reasons need different wording, not just a different counter), emit ONE
-/// `dispatch.tool.malformed_names` trajectory event carrying `reason` +
-/// this bucket's own count + a sample name, and satisfy the OpenAI
-/// tool-message-per-`tool_call_id` protocol with
-/// `MALFORMED_TOOL_CALL_RESULT_BODY`'s short constant body (same body for
-/// both reasons — the reason-specific explanation lives in the ONE
-/// feedback message, not repeated per call). No-op when `calls` is empty.
-///
-/// Called once per bucket at the call site — a turn carrying BOTH an
-/// ungranted-real-tool call and a not-a-tool call gets TWO events, TWO
-/// feedback messages, correctly separated telemetry, rather than one
-/// muddled bucket.
+/// (#2963) What becomes of one tool call a model returned. Decided once per
+/// turn, before `model.completed` is written (`plan_tool_calls`), and then
+/// followed by the dispatch (`partition_by_plan`), so the record's
+/// `runs: false` marks and what actually runs cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallFate {
+    /// Dispatched to its tool.
+    Runs,
+    /// A real tool this dispatch was not granted (#2169).
+    NotGranted,
+    /// Not a tool at all (#2169).
+    NotATool,
+    /// Never reaches the partition: cut off mid-arguments and dropped by the
+    /// #479 salvage, or on a turn that dispatches nothing (the #2836 discard,
+    /// a `length` finish, a context overflow).
+    Discarded,
+}
+
+/// (#2963) The fate of each of a turn's tool calls, in their order. A turn
+/// that does not dispatch its calls (`dispatches` false) discards them all;
+/// a #479 salvage discards the ones whose arguments do not parse
+/// (`tool_call_is_well_formed`, the predicate `retain_well_formed_tool_calls`
+/// uses); the rest are sorted by name, as #2169's partition always did: a
+/// granted call runs, a real ungranted tool and a non-tool do not.
+fn plan_tool_calls(
+    calls: &[ToolCall],
+    dispatches: bool,
+    salvaged: bool,
+    allowed_tool_names: &HashSet<String>,
+) -> Vec<CallFate> {
+    calls
+        .iter()
+        .map(|call| {
+            if !dispatches || (salvaged && !tool_call_is_well_formed(call)) {
+                CallFate::Discarded
+            } else if allowed_tool_names.contains(&call.function.name) {
+                CallFate::Runs
+            } else {
+                match classify_invalid_tool_call(&call.function.name) {
+                    InvalidToolCallReason::RealToolNotGranted => CallFate::NotGranted,
+                    InvalidToolCallReason::NotATool => CallFate::NotATool,
+                }
+            }
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_invalid_tool_calls(
     calls: &[ToolCall],
@@ -9378,6 +9465,128 @@ mod tests {
             rec["cut"], "server_length",
             "and who cut it — the seam Stage 1 changes to a runtime abort"
         );
+        // (#2963) The call never runs, and the turn's own record says so, so
+        // the viewer never names it as the call running now.
+        let completed: Vec<serde_json::Value> = traj_text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["type"] == "model.completed" && v["tool_calls"].is_array())
+            .collect();
+        assert_eq!(completed[0]["tool_calls"][0]["name"], "edit");
+        assert_eq!(completed[0]["tool_calls"][0]["runs"], false, "a discarded call is marked not to run: {}", completed[0]);
+        assert!(!traj_text.contains("\"type\":\"tool.completed\""), "and nothing ran");
+    }
+
+    /// (#2963) Each `model.completed` tool call says whether it RUNS, decided
+    /// by the same plan the dispatch then follows (`plan_tool_calls`): an
+    /// ungranted call (first) and a call to no tool at all (last) are marked
+    /// `runs: false`, the granted one is not marked, and the only
+    /// `tool.completed` that follows is the granted call's. The host builds
+    /// `tool_names` / `tool_paths` from the running calls alone, so the
+    /// viewer never names a call the runtime refused.
+    #[test]
+    #[serial_test::serial]
+    fn model_completed_marks_the_calls_that_will_not_run() {
+        let server = crate::test_support::GuardedMockServer::start();
+        let calls = serde_json::json!([
+            { "id": "c1", "type": "function", "function": { "name": "write", "arguments": "{\"path\":\"/workspace/src/x.rs\",\"content\":\"x\"}" } },
+            { "id": "c2", "type": "function", "function": { "name": "read", "arguments": "{\"path\":\"/workspace/src/y.rs\",\"offset\":1,\"limit\":1}" } },
+            { "id": "c3", "type": "function", "function": { "name": "frobnicate", "arguments": "{}" } },
+        ]);
+        let _turn1 = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 0
+            });
+            then.status(200).json_body(chat_response_json(None, Some(calls.clone()), "tool_calls", 100, 20));
+        });
+        let _turn2 = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() > 0
+            });
+            then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 150, 10));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("runs-marks").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("read-only task")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+        let outcome = run(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(5), None, None, None, std::collections::BTreeMap::new(), None,
+        )
+        .expect("refused calls must not error the dispatch");
+        assert!(matches!(outcome.terminal_reason, TerminalReason::Stop));
+
+        let raw = std::fs::read_to_string(tmp.path().join(".darkmux-runtime/trajectory.jsonl")).unwrap();
+        let events: Vec<serde_json::Value> = raw.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        let completed = events.iter().find(|v| v["type"] == "model.completed" && v["tool_calls"].is_array()).expect("turn 1's record");
+        let marks: Vec<(String, Option<bool>)> = completed["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c["name"].as_str().unwrap().to_string(), c.get("runs").map(|r| r.as_bool().unwrap())))
+            .collect();
+        assert_eq!(
+            marks,
+            vec![("write".into(), Some(false)), ("read".into(), None), ("frobnicate".into(), Some(false))],
+            "only the granted call is left unmarked: {completed}"
+        );
+        let ran: Vec<&str> = events.iter().filter(|v| v["type"] == "tool.completed").map(|v| v["tool_name"].as_str().unwrap()).collect();
+        assert_eq!(ran, vec!["read"], "the calls that run are exactly the unmarked ones");
+    }
+
+    /// (#2963) The #479 salvage keeps the well-formed calls of a turn the
+    /// cap cut, and drops the one cut mid-arguments (#2836). The record
+    /// marks the dropped call `runs: false` and the kept one not at all, and
+    /// only the kept call completes.
+    #[test]
+    #[serial_test::serial]
+    fn model_completed_marks_a_call_the_cut_left_malformed() {
+        let server = crate::test_support::GuardedMockServer::start();
+        let calls = serde_json::json!([
+            { "id": "c1", "type": "function", "function": { "name": "read", "arguments": "{\"path\":\"/workspace/src/y.rs\",\"offset\":1,\"limit\":1}" } },
+            { "id": "c2", "type": "function", "function": { "name": "edit", "arguments": "{\"path\":\"/workspace/te" } },
+        ]);
+        server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 0
+            });
+            // cap-1 of the generation check-in: OUR cut, so #479 salvages.
+            then.status(200).json_body(chat_response_json(None, Some(calls.clone()), "length", 100, 3999));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() > 0
+            });
+            then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 150, 10));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("runs-salvage").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("edit it")];
+        let tools = [Tool::Read, Tool::Edit];
+        let cfg = compaction::CompactionConfig::never_compact();
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(3), None, None, None, None,
+            None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("the salvage must drive the loop");
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+
+        let raw = std::fs::read_to_string(tmp.path().join(".darkmux-runtime/trajectory.jsonl")).unwrap();
+        let events: Vec<serde_json::Value> = raw.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        assert!(events.iter().any(|v| v["type"] == "dispatch.per_turn_cap_salvaged" || v["type"].as_str().is_some_and(|t| t.contains("salvage"))), "the salvage fired: {raw}");
+        let completed = events.iter().find(|v| v["type"] == "model.completed" && v["tool_calls"].is_array()).expect("the cut call's record");
+        assert!(completed["tool_calls"][0].get("runs").is_none(), "the well-formed call runs: {completed}");
+        assert_eq!(completed["tool_calls"][1]["runs"], false, "the call the cut left malformed does not: {completed}");
+        let ran: Vec<&str> = events.iter().filter(|v| v["type"] == "tool.completed").map(|v| v["tool_name"].as_str().unwrap()).collect();
+        assert_eq!(ran, vec!["read"]);
     }
 
     /// (#2171 test c) #2166's own invariant must survive this change: once a

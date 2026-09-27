@@ -268,13 +268,19 @@ impl Trajectory {
         finish_reason: &str,
         usage: Option<&Usage>,
         tool_calls: Option<&[ToolCall]>,
+        // (#2963) Aligned with `tool_calls`: whether each call will run
+        // (`loop_runner::plan_tool_calls`). A call that will not is marked
+        // `runs: false`; one that will carries no key. `None`: unknown, no
+        // marks (a caller with no plan).
+        runs: Option<&[bool]>,
         reported_model: Option<&str>,
     ) {
         let usage_json = usage_event_json(usage);
         let tool_calls_json = tool_calls.map(|calls| {
             calls
                 .iter()
-                .map(|c| {
+                .enumerate()
+                .map(|(i, c)| {
                     let mut entry = serde_json::json!({
                         "id": c.id,
                         "name": c.function.name,
@@ -283,6 +289,9 @@ impl Trajectory {
                     // (#2963) The path argument only, never the content.
                     if let Some(path) = tool_call_path(&c.function.name, &c.function.arguments) {
                         entry["path"] = serde_json::json!(path);
+                    }
+                    if runs.and_then(|r| r.get(i)) == Some(&false) {
+                        entry["runs"] = serde_json::json!(false);
                     }
                     entry
                 })
@@ -1592,7 +1601,7 @@ mod tests {
         let ws = tempfile::Builder::new().prefix("traj-test-2").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
         t.append_dispatch_start("test-model", 100, 50, &["read", "search"]);
-        t.append_model_completed(1, "stop", None, None, None);
+        t.append_model_completed(1, "stop", None, None, None, None);
         drop(t);
 
         let traj_file = ws
@@ -1640,7 +1649,7 @@ mod tests {
         ];
         let ws = tempfile::Builder::new().prefix("traj-paths").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
-        t.append_model_completed(1, "tool_calls", None, Some(&calls), None);
+        t.append_model_completed(1, "tool_calls", None, Some(&calls), None, None);
         drop(t);
 
         let body = fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
@@ -1684,12 +1693,12 @@ mod tests {
             }),
             prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: Some(20) }),
         };
-        t.append_model_completed(1, "stop", Some(&usage), None, None);
+        t.append_model_completed(1, "stop", Some(&usage), None, None, None);
 
         // A second turn whose provider reported NO details object at all —
         // both keys must be JSON `null`, never a fabricated `0`.
         let bare = Usage { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12, ..Default::default() };
-        t.append_model_completed(2, "stop", Some(&bare), None, None);
+        t.append_model_completed(2, "stop", Some(&bare), None, None, None);
         drop(t);
 
         let body =
@@ -2031,8 +2040,8 @@ mod tests {
     fn model_completed_carries_the_reported_model_only_when_known() {
         let ws = tempfile::Builder::new().prefix("traj-reported").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
-        t.append_model_completed(1, "stop", None, None, Some("served-a"));
-        t.append_model_completed(2, "stop", None, None, None);
+        t.append_model_completed(1, "stop", None, None, None, Some("served-a"));
+        t.append_model_completed(2, "stop", None, None, None, None);
         drop(t);
         let body =
             fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
