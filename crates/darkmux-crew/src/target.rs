@@ -78,7 +78,7 @@ pub fn endpoint_route_label(ep: &ModelEndpoint, model_id: &str) -> String {
 pub enum Resolution {
     Target(Box<Target>),
     /// No `--profile` match, no `role_profiles` binding and no usable
-    /// `default_profile`: the container path's `probe_loaded_model` fallback.
+    /// `default_profile`. The container path refuses to dispatch.
     NoProfile,
     /// A profile resolved but `select_model` returned no model.
     NoModel { profile_name: String, profile: Box<Profile>, error: String },

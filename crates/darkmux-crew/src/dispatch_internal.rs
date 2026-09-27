@@ -2504,9 +2504,8 @@ fn write_remote_auth_header_stdin(
 //
 // When a dispatch's resolved model names a REMOTE OpenAI-compatible endpoint
 // (Azure OpenAI, OpenAI, a LiteLLM proxy), darkmux does NOT start the container
-// runtime. It makes ONE OpenAI chat-completions call — via `curl`, the same
-// convention `probe_loaded_model` uses, so no Rust HTTP-client dep is dragged
-// in — and emits the same flow records the container path does, so the run
+// runtime. It makes ONE OpenAI chat-completions call — via `curl`, so no Rust
+// HTTP-client dep is dragged in — and emits the same flow records the container path does, so the run
 // lands in the fleet viewer identically, distinguished only by its `endpoint`
 // (and by having no host-load, since the model computes off-fleet). The tier is
 // NOT inferred from remoteness: a dispatched model is a worker wherever it runs,
@@ -2524,8 +2523,8 @@ use crate::target::{resolve_role_aware_profile_with, role_profile_binding};
 /// Resolve the dispatch's [`crate::target::Target`] (the selected model with
 /// its own endpoint) WITHOUT loading anything in LMStudio — so `dispatch` can
 /// branch to the hosted path before the container/load machinery. `Ok(None)`
-/// ⇒ no profile model resolves (the local path's `probe_loaded_model`
-/// fallback + container path). `Err` ⇒ the requested (or default) profile is
+/// ⇒ no profile model resolves (the local path, whose own resolution then
+/// fails with the named error). `Err` ⇒ the requested (or default) profile is
 /// QUARANTINED (#1282), a `role_profiles` binding names an undefined profile,
 /// or the selected model names an undefined endpoint (#2902) — a hard stop:
 /// falling through here would re-resolve against a DIFFERENT profile
@@ -5253,10 +5252,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //    the profile's candidate models; with no offer vectors it falls back
     //    to the profile's default model (ModelRole removed in #601).
     //    The profile is the `--profile` override when set (#549), else the
-    //    registry's `default_profile`. If no profile is configured (or has
-    //    no model), falls back to `probe_loaded_model()` with a deprecation
-    //    warning — back-compat for operators on the pre-refactor-1b config
-    //    shape; the warning surfaces the gap so they migrate.
+    //    registry's `default_profile`. If no profile is configured (or it
+    //    selects no model), the dispatch fails with an error naming the fix.
     //
     //    NOT the long-form probe-then-pin path documented in #408 —
     //    that's phase 2+ scope when the recommendation registry
@@ -11960,28 +11957,21 @@ fn preflight_result_for(status: DockerRuntimeStatus) -> Result<()> {
 ///    `registry.default_profile`. An override that ISN'T defined on this
 ///    machine falls back to `default_profile` (logged) rather than failing —
 ///    a machine-agnostic caller names the profile it wants and each machine
-///    maps it to a lab-validated model. When nothing resolves, fall back to
-///    `probe_loaded_model()`.
+///    maps it to a lab-validated model. When nothing resolves, a hard error
+///    naming the fix.
 /// 2. Look up the profile + call `select_model(role, profile, skill_lookup)`,
 ///    which capability-scores the role against the profile's models (#590),
 ///    falling back to the profile's default model when no vectors
 ///    are populated (ModelRole removed in #601).
 /// 3. On no-default / no-model failures (a registry that LOADED fine but has
-///    nothing usable), log a deprecation warning + fall back to
-///    `probe_loaded_model()`. Back-compat for pre-refactor-1b
-///    configurations; the warning points the operator at the migration.
-///
-/// The fallback is intentional but loud for those two cases. Per memory
-/// note `feedback_model_unload_load_authority`, silent reliance on
-/// "whatever LMStudio happens to have loaded" is the contaminating-dispatch
-/// anti-pattern. The deprecation warning makes the misconfiguration
-/// operator-visible while keeping pre-refactor-1b setups working.
+///    nothing usable), a hard error naming the profile and the fix. (4.0)
+///    There is no fallback to "whatever LMStudio happens to have loaded":
+///    that is the contaminating-dispatch anti-pattern (a user-loaded model
+///    has unknown load configuration, the #1135 ghost).
 ///
 /// (#1269) A registry-LOAD failure (step 1 itself erroring — malformed
-/// JSON, a bad profile) is a DIFFERENT failure class and does NOT fall
-/// through to `probe_loaded_model()`: routing a broken config file into an
-/// unrelated LMStudio probe just produces a second, more confusing error on
-/// top of the first. One config mistake gets ONE clear, named error.
+/// JSON, a bad profile) gets its own named error too: one config mistake,
+/// ONE clear error.
 ///
 /// `skip_lmstudio_residency`: mock-model harness escape hatch (real Docker
 /// dispatch, fake "model" — see `crates/darkmux-crew/tests/mock_dispatch_proof.rs`
@@ -12168,25 +12158,37 @@ fn resolve_dispatch_model_with_hosts(
     // names a profile NOT defined on this machine falls back to
     // `default_profile` (the machine-agnostic-caller contract — a workflow
     // names the profile it wants; each machine maps it to a lab-validated
-    // model or degrades to its default). When nothing resolves, probe.
+    // model or degrades to its default). When nothing resolves, a hard error.
     // (#1547) Role-aware: when no `--profile` override is given, this now
     // honors the `role_profiles.<role.id>` map before falling to
     // `default_profile` — the same precedence the review launcher already
     // applies to this map, now honored on the container dispatch path too.
-    let active_name = match &resolution {
-        crate::target::Resolution::Target(t) => t.profile_name.clone(),
-        crate::target::Resolution::NoModel { profile_name, .. } => profile_name.clone(),
+    let target = match resolution {
+        crate::target::Resolution::Target(t) => t,
+        crate::target::Resolution::NoModel { profile_name, error, .. } => bail!(
+            "darkmux dispatch: profile `{profile_name}` selects no model for role `{}` ({error}). \
+             Add a model for it to profile `{profile_name}` in {}.",
+            role.id,
+            loaded.path.display()
+        ),
         crate::target::Resolution::NoProfile => {
             // (#1282) A quarantined `default_profile` already hard-stopped in
-            // `resolve_in`, so this is genuinely "nothing configured".
-            eprintln!(
-                "darkmux dispatch: no usable profile (no --profile match and no \
-                 default_profile set/defined); falling back to probe_loaded_model() — \
-                 deprecated, set default_profile in ~/.darkmux/profiles.json. (#450 refactor 1b)"
+            // `resolve_in`, so this is genuinely "nothing configured". (4.0)
+            // No fallback to whatever LMStudio has loaded: that model has
+            // unknown load configuration (the #1135 ghost).
+            bail!(
+                "darkmux dispatch: no profile resolves for role `{}` (no --profile, no \
+                 `role_profiles.{}` binding, and no default_profile in {}). Set one: \
+                 `\"default_profile\": \"<name>\"` in profiles.json, or `darkmux config set \
+                 role_profiles.{} <profile>`.",
+                role.id,
+                role.id,
+                loaded.path.display(),
+                role.id
             );
-            return probe_loaded_model();
         }
     };
+    let active_name = target.profile_name.clone();
     // Surface the fallback so the operator isn't surprised which model ran:
     // an explicit `--profile X` that resolved to a different name means X
     // wasn't defined here.
@@ -12201,129 +12203,109 @@ fn resolve_dispatch_model_with_hosts(
         }
     }
 
-    match resolution {
-        crate::target::Resolution::Target(target) => {
-            let id = target.model.id.clone();
-            // (#2038) Before anything else: a placeholder id would reach
-            // LM Studio and come back as "model not found", which reads as
-            // an LM Studio problem. It is an unfilled blank from
-            // `darkmux init`, and the message has to say so. Unconditional,
-            // so a residency-skipping path cannot carry the placeholder on.
-            if is_placeholder_model_id(&id) {
-                bail!(placeholder_model_error(&active_name, &id, &loaded.path));
-            }
-            // (#1135) Load the selected model at the profile's DECLARED n_ctx
-            // before dispatch — and before the #408 cross-check below, which
-            // then finds it resident. Pre-#1135 the dispatch only resolved the
-            // model *id* and let LMStudio JIT-load it at the MODEL default
-            // (e.g. 4096 on devstral), silently truncating large inputs (a
-            // pr-review diff overflows 4096 → garbage review, no error). The
-            // profile *declares* the context; honor it.
-            //
-            // (#2240) `wire_id` starts as the bare selection and is upgraded
-            // below, only for a real LMStudio dispatch, to the SAME
-            // darkmux-namespaced identifier the JIT-load just created (or
-            // reused). Putting the bare key on the wire let a dispatch aimed
-            // at "foo" resolve to a co-resident user-loaded "foo" instead of
-            // darkmux's own instance — the namespace convention's registry
-            // item 4 is ABSOLUTE for model lifecycle (#1274): darkmux
-            // dispatches only TO `darkmux:*` instances, because a
-            // user-loaded copy of the right model has unknown load
-            // configuration (the #1135 ghost — a model silently JIT-loaded
-            // at LMStudio's 4096 default instead of the profile's n_ctx).
-            // This mirrors the identifier `ensure_model_resident` itself
-            // derives for the `lms load`/`lms ps` calls — see that
-            // function's `model_key`/`identifier` derivation — so the id
-            // this function hands back to the wire is byte-identical to the
-            // one that now answers for it.
-            let mut wire_id = id.clone();
-            if !skip_lmstudio_residency {
-                ensure_resident(&target.model)?;
-                wire_id = target.wire_model();
-            }
-            // (#450 review note / #408) Cross-check against actual
-            // LMStudio loaded models. Residents loaded for one profile (a
-            // prior dispatch, or a hand `lms load`) don't update
-            // `default_profile` in the registry — so this path could select
-            // `balanced`'s default model while LMStudio holds `fast`'s
-            // models. The dispatch would then fail at the LMStudio call
-            // (or worse, silently route to a different model if the id
-            // collides). Surfacing the mismatch here makes the
-            // misconfiguration operator-visible at dispatch time, not at
-            // LMStudio's cryptic "model not loaded" error.
-            if !skip_lmstudio_residency {
-                if let Ok(loaded_ids) = list_loaded() {
-                if !loaded_ids.is_empty() && !loaded_ids.iter().any(|m| m == &id) {
-                    let loaded = loaded_ids.join(", ");
-                    if strict_selection_enabled() {
-                        // (#408) Strict mode: a selected-vs-loaded
-                        // mismatch is the dispatch-contamination case from
-                        // the `feedback_model_unload_load_authority` memory
-                        // note — proceeding risks measuring or attributing
-                        // the wrong model, inheriting class-wide errors
-                        // into every downstream claim. In a methodology /
-                        // CI run the operator opts into hard-fail rather
-                        // than a silent route to whatever LMStudio has
-                        // loaded.
-                        bail!(
-                            "darkmux dispatch: profile `{active_name}` selects \
-                             `{id}`, but LMStudio has loaded [{loaded}] and \
-                             DARKMUX_STRICT_SELECTION is set — refusing to dispatch \
-                             against an unselected model. Fix: `lms load {id}` to load \
-                             the selected model, update `default_profile` to match \
-                             what's loaded, or unset DARKMUX_STRICT_SELECTION to \
-                             proceed anyway. (#408)"
-                        );
-                    }
-                    eprintln!(
-                        "darkmux dispatch: WARNING — profile `{active_name}` \
-                         selects `{id}`, but LMStudio has loaded [{loaded}]. \
-                         Residents loaded for another profile don't update \
-                         `default_profile` in the registry; your loaded model \
-                         won't match the selection. To fix: either `lms load {id}` \
-                         to align LMStudio with the registry's default, or update \
-                         `default_profile` to match what's loaded. Set \
-                         DARKMUX_STRICT_SELECTION=1 to make this mismatch fatal \
-                         instead of a warning. (#450 review note, #408)"
+        let id = target.model.id.clone();
+        // (#2038) Before anything else: a placeholder id would reach
+        // LM Studio and come back as "model not found", which reads as
+        // an LM Studio problem. It is an unfilled blank from
+        // `darkmux init`, and the message has to say so. Unconditional,
+        // so a residency-skipping path cannot carry the placeholder on.
+        if is_placeholder_model_id(&id) {
+            bail!(placeholder_model_error(&active_name, &id, &loaded.path));
+        }
+        // (#1135) Load the selected model at the profile's DECLARED n_ctx
+        // before dispatch — and before the #408 cross-check below, which
+        // then finds it resident. Pre-#1135 the dispatch only resolved the
+        // model *id* and let LMStudio JIT-load it at the MODEL default
+        // (e.g. 4096 on devstral), silently truncating large inputs (a
+        // pr-review diff overflows 4096 → garbage review, no error). The
+        // profile *declares* the context; honor it.
+        //
+        // (#2240) `wire_id` starts as the bare selection and is upgraded
+        // below, only for a real LMStudio dispatch, to the SAME
+        // darkmux-namespaced identifier the JIT-load just created (or
+        // reused). Putting the bare key on the wire let a dispatch aimed
+        // at "foo" resolve to a co-resident user-loaded "foo" instead of
+        // darkmux's own instance — the namespace convention's registry
+        // item 4 is ABSOLUTE for model lifecycle (#1274): darkmux
+        // dispatches only TO `darkmux:*` instances, because a
+        // user-loaded copy of the right model has unknown load
+        // configuration (the #1135 ghost — a model silently JIT-loaded
+        // at LMStudio's 4096 default instead of the profile's n_ctx).
+        // This mirrors the identifier `ensure_model_resident` itself
+        // derives for the `lms load`/`lms ps` calls — see that
+        // function's `model_key`/`identifier` derivation — so the id
+        // this function hands back to the wire is byte-identical to the
+        // one that now answers for it.
+        let mut wire_id = id.clone();
+        if !skip_lmstudio_residency {
+            ensure_resident(&target.model)?;
+            wire_id = target.wire_model();
+        }
+        // (#450 review note / #408) Cross-check against actual
+        // LMStudio loaded models. Residents loaded for one profile (a
+        // prior dispatch, or a hand `lms load`) don't update
+        // `default_profile` in the registry — so this path could select
+        // `balanced`'s default model while LMStudio holds `fast`'s
+        // models. The dispatch would then fail at the LMStudio call
+        // (or worse, silently route to a different model if the id
+        // collides). Surfacing the mismatch here makes the
+        // misconfiguration operator-visible at dispatch time, not at
+        // LMStudio's cryptic "model not loaded" error.
+        if !skip_lmstudio_residency {
+            if let Ok(loaded_ids) = list_loaded() {
+            if !loaded_ids.is_empty() && !loaded_ids.iter().any(|m| m == &id) {
+                let loaded = loaded_ids.join(", ");
+                if strict_selection_enabled() {
+                    // (#408) Strict mode: a selected-vs-loaded
+                    // mismatch is the dispatch-contamination case from
+                    // the `feedback_model_unload_load_authority` memory
+                    // note — proceeding risks measuring or attributing
+                    // the wrong model, inheriting class-wide errors
+                    // into every downstream claim. In a methodology /
+                    // CI run the operator opts into hard-fail rather
+                    // than a silent route to whatever LMStudio has
+                    // loaded.
+                    bail!(
+                        "darkmux dispatch: profile `{active_name}` selects \
+                         `{id}`, but LMStudio has loaded [{loaded}] and \
+                         DARKMUX_STRICT_SELECTION is set — refusing to dispatch \
+                         against an unselected model. Fix: `lms load {id}` to load \
+                         the selected model, update `default_profile` to match \
+                         what's loaded, or unset DARKMUX_STRICT_SELECTION to \
+                         proceed anyway. (#408)"
                     );
                 }
-                }
-            }
-            // (#2240 review) The #408 mismatch warning ~30 lines above names
-            // this model by its KEY (``selects `{id}` ``) and advises
-            // ``lms load {id}`` — `lms load` takes a KEY, never an
-            // identifier, so THAT remedy has to stay bare. Both lines can
-            // fire in one dispatch, so this one names the same key and then
-            // discloses the instance actually being dispatched against,
-            // rather than silently printing a second spelling of one model
-            // and leaving the operator to work out they are the same thing.
-            if wire_id == id {
-                eprintln!("darkmux dispatch: selected model `{id}` via profile `{active_name}`");
-            } else {
                 eprintln!(
-                    "darkmux dispatch: selected model `{id}` via profile `{active_name}`; \
-                     dispatching against darkmux's own resident instance `{wire_id}` (#2240)"
+                    "darkmux dispatch: WARNING — profile `{active_name}` \
+                     selects `{id}`, but LMStudio has loaded [{loaded}]. \
+                     Residents loaded for another profile don't update \
+                     `default_profile` in the registry; your loaded model \
+                     won't match the selection. To fix: either `lms load {id}` \
+                     to align LMStudio with the registry's default, or update \
+                     `default_profile` to match what's loaded. Set \
+                     DARKMUX_STRICT_SELECTION=1 to make this mismatch fatal \
+                     instead of a warning. (#450 review note, #408)"
                 );
             }
-            Ok(wire_id)
+            }
         }
-        // `NoProfile` returned above; kept exhaustive rather than panicking.
-        crate::target::Resolution::NoProfile => probe_loaded_model(),
-        crate::target::Resolution::NoModel { error: e, .. } => {
+        // (#2240 review) The #408 mismatch warning ~30 lines above names
+        // this model by its KEY (``selects `{id}` ``) and advises
+        // ``lms load {id}`` — `lms load` takes a KEY, never an
+        // identifier, so THAT remedy has to stay bare. Both lines can
+        // fire in one dispatch, so this one names the same key and then
+        // discloses the instance actually being dispatched against,
+        // rather than silently printing a second spelling of one model
+        // and leaving the operator to work out they are the same thing.
+        if wire_id == id {
+            eprintln!("darkmux dispatch: selected model `{id}` via profile `{active_name}`");
+        } else {
             eprintln!(
-                "darkmux dispatch: select_model error ({e}); falling back \
-                 to probe_loaded_model() — deprecated. Add a default \
-                 model to profile `{active_name}` to migrate. (#450 refactor 1b)"
+                "darkmux dispatch: selected model `{id}` via profile `{active_name}`; \
+                 dispatching against darkmux's own resident instance `{wire_id}` (#2240)"
             );
-            // TODO(#450 phase-1c): the selected-vs-loaded MISMATCH case
-            // now honors `DARKMUX_STRICT_SELECTION` (see the Ok branch
-            // above). This Err branch — no model configured at all —
-            // still warn-and-probes for back-compat with pre-refactor-1b
-            // configs. When phase-1c lands the two-instances-per-purpose
-            // policy, fold this fallback under strict mode too.
-            probe_loaded_model()
         }
-    }
+        Ok(wire_id)
 }
 
 /// (#590) Best-effort: the machine's registered utility model
@@ -12402,7 +12384,7 @@ fn resolve_dispatch_compaction(
 /// Delegates the derivation to `CompactionDispatchArgs::from_profile` so the
 /// default-model → `n_ctx` rule has a single source of truth. Returns
 /// `Ok(None)` when the registry/profile can't be resolved — the same edge
-/// cases that send model selection to `probe_loaded_model()` — and `Err`
+/// cases where model selection fails — and `Err`
 /// when the requested (or default) profile is QUARANTINED (#1282): the
 /// window must never silently come from a DIFFERENT profile than the one
 /// the dispatch names.
@@ -12541,9 +12523,8 @@ fn profile_context_window(profile: &darkmux_types::Profile) -> Option<u32> {
 /// came from a `role_profiles` mapping (#2905). Takes the binding explicitly
 /// (`mapped`) so a test can drive the mapped arm.
 ///
-/// When a profile resolves but no model is selectable (the dispatch then
-/// falls back to `probe_loaded_model`), the profile's default model's window
-/// is kept, as before. A registry that does not load is `Ok(None)`.
+/// When a profile resolves but no model is selectable (the dispatch itself
+/// then fails), the profile's default model's window is kept. A registry that does not load is `Ok(None)`.
 fn resolve_dispatch_windows_with(
     role: &crate::types::Role,
     profile_override: Option<&str>,
@@ -13236,33 +13217,6 @@ fn probe_loaded_model_list() -> Result<Vec<String>> {
         }
     }
     Ok(ids)
-}
-
-/// return the first model id. Uses curl so we don't drag a Rust HTTP
-/// client dep into darkmux's main crate for one probe call.
-fn probe_loaded_model() -> Result<String> {
-    // env(DARKMUX_LMSTUDIO_URL) > config.lmstudio_url > http://localhost:1234,
-    // + the /v1/models path (#661 Slice 4 — the probe is now config-aware and
-    // shares the base URL with the phase chat narrator).
-    let url = format!("{}/v1/models", darkmux_types::config_access::lmstudio_url());
-    let output = Command::new("curl")
-        .args(["-sf", "-m", "5", &url])
-        .output()
-        .context("running curl to probe LMStudio")?;
-
-    if !output.status.success() {
-        bail!("LMStudio /v1/models probe failed (curl exit {})", output.status.code().unwrap_or(-1));
-    }
-
-    let body: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .context("parsing LMStudio /v1/models response as JSON")?;
-
-    body["data"]
-        .as_array()
-        .and_then(|arr| arr.first())
-        .and_then(|m| m["id"].as_str())
-        .map(String::from)
-        .ok_or_else(|| anyhow!("LMStudio /v1/models returned no models"))
 }
 
 // `first_user_symlink_in` and `is_macos_firmlink` moved to

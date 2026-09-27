@@ -78,6 +78,12 @@ darkmux release.
   fallback read.** User state resolves under `<root>/<subdir>/` only;
   `darkmux doctor` now FAILS on a leftover `crew/` subdir and prints the
   move script. **Migration:** run the script `darkmux doctor` prints.
+- **Dispatching with no resolvable profile no longer probes LMStudio's
+  first loaded model.** With no `--profile`, no `role_profiles.<role>`
+  binding and no `default_profile` (or a profile that selects no model for
+  the role), the dispatch now fails with an error naming the fix, where 3.x
+  printed a deprecation warning and ran against whatever was loaded.
+  **Migration:** set `"default_profile"` in `profiles.json`.
 
 ### Changed (breaking, 4.0)
 
