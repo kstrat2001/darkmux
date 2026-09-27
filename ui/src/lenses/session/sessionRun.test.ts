@@ -1158,6 +1158,17 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(runRegions(flowToRenderModel(data), "s1").hasModelWork).toBe(true);
   });
 
+  it("(#2902 step 5) a hosted wait stopped before its call closes the run; a later start reopens it", () => {
+    const wait = { ts: BASE_TS, session_id: "s1", action: "budget.wait", payload: { endpoint_id: "azure", wait_seconds: 86000 } } as unknown as FlowRecord;
+    const stop = { ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "budget.stop", payload: { endpoint_id: "azure", reason: "mission `m` is aborted" } } as unknown as FlowRecord;
+    const stopped = runRegions(flowToRenderModel([wait, stop]), "s1", Date.parse("2026-01-01T05:00:00Z"));
+    expect(stopped.live).toBe(false);
+    // Closed, but never a clean completion: the call was never sent.
+    expect(JSON.stringify(stopped.header)).not.toMatch(/complete/i);
+    const start = { ts: "2026-01-01T00:02:00Z", session_id: "s1", action: "dispatch.start", payload: {} } as unknown as FlowRecord;
+    expect(runRegions(flowToRenderModel([wait, stop, start]), "s1", Date.parse("2026-01-01T00:03:00Z")).live).toBe(true);
+  });
+
   it("(#1973) a dispatch that has STARTED but reported nothing keeps its model pane", () => {
     // The discriminator is EVIDENCE of model work, not the absence of
     // numbers. A live dispatch whose first turn has not landed would

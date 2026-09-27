@@ -217,10 +217,12 @@ const STATES = [
     { id: "rest-budget-hosted", date: "2026-07-20", endpoint: "azure", secs: 20, rest: "\\d+s", words: "budget · azure" },
     // (5th review C7) A day window and a long endpoint id: the countdown is
     // "23h 53m", and the id is trimmed so the line fits.
-    { id: "rest-budget-hosted-long", date: "2026-07-18", endpoint: "azure-openai-eastus2-prod", secs: 86_000, rest: "23h 53m", words: "budget · azure-opena…", tube: "23h 53m" },
-  ].map(({ id, date, endpoint, secs, rest, words, tube }) => ({
+    // Minutes round up (never under-report): 85996 s left is "23h 54m". The
+    // lamp status keeps the full id; the one-line slots trim it.
+    { id: "rest-budget-hosted-long", date: "2026-07-18", endpoint: "azure-openai-eastus2-prod", secs: 86_000, rest: "23h 54m", words: "budget · azure-opena…", full: "budget · azure-openai-eastus2-prod", tube: "23h 54m" },
+  ].map(({ id, date, endpoint, secs, rest, words, full, tube }) => ({
     id, date, now: "12:00:12", tubeText: tube,
-    runText: new RegExp(`run state: rest ${rest} · ${words}$`), noteText: new RegExp(`^${words}$`), rateText: new RegExp(`^${words}$`), rateTextPhone: /^budget$/,
+    runText: new RegExp(`run state: rest ${rest} · ${full ?? words}$`), noteText: new RegExp(`^${words}$`), rateText: new RegExp(`^${words}$`), rateTextPhone: /^budget$/,
     recs: (b, d) => [budgetWait(b, d, endpoint, secs), tick(d, "12:00:12")],
   })),
   // A mission's hosted `dispatch.map` step held by its budget: the wait is on

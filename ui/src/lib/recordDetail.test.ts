@@ -444,7 +444,7 @@ describe("budget records (#2902 step 5)", () => {
 
   it("a wait says what it waits on and for how long, in words, never clock-shaped", () => {
     expect(recordDetail(rec("budget.wait", { scope: "endpoint", endpoint_id: "azure", wait_seconds: 843 }))).toBe(
-      "azure: waiting 14m",
+      "azure: waiting 15m",
     );
     expect(recordDetail(rec("budget.wait", { scope: "endpoint", endpoint_id: "azure", wait_seconds: 3840 }))).toBe(
       "azure: waiting 1h 4m",

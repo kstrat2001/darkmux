@@ -53,7 +53,8 @@ describe("(#2915) compacting", () => {
 describe("scopeCenter: a long rest (5th review C7)", () => {
   it("shows a day window's rest as a compact duration, not raw seconds", () => {
     expect(scopeCenter({ state: "rest", restSecondsLeft: 23 * 3600 + 53 * 60 } as never).centerLabel).toBe("23h 53m");
-    expect(scopeCenter({ state: "rest", restSecondsLeft: 12 * 60 + 5 } as never).centerLabel).toBe("12m");
+    expect(scopeCenter({ state: "rest", restSecondsLeft: 12 * 60 + 5 } as never).centerLabel).toBe("13m");
+    expect(scopeCenter({ state: "rest", restSecondsLeft: 12 * 60 } as never).centerLabel).toBe("12m");
     expect(scopeCenter({ state: "rest", restSecondsLeft: 45 } as never).centerLabel).toBe("45s");
   });
 });

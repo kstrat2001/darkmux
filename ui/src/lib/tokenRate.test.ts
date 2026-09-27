@@ -24,6 +24,7 @@ import {
   lastHeartbeatMs,
   toolReadout,
   liveExecutions,
+  reasonForLine,
 } from "./tokenRate";
 
 const SID = "darkmux-coder-1790125784225";
@@ -521,8 +522,14 @@ describe("deriveLiveState", () => {
     const secs = 23 * 3600 + 53 * 60;
     const wait = { ts: at(0), action: "budget.wait", session_id: SID, payload: { endpoint_id: "azure-openai-eastus2-prod", wait_seconds: secs } } as unknown as FlowRecord;
     const r = deriveLiveState([wait], 0);
-    expect(r.restReason).toBe("budget · azure-opena…");
-    expect(liveStateLabel(r)).toBe("rest 23h 53m · budget · azure-opena…");
+    // (6th review) The full id where there is room (the lamp status, the
+    // hover title): two endpoints sharing a prefix stay distinct. Trimmed
+    // only for the one-line slots (the note line, the card's status line).
+    expect(r.restReason).toBe("budget · azure-openai-eastus2-prod");
+    expect(liveStateLabel(r)).toBe("rest 23h 53m · budget · azure-openai-eastus2-prod");
+    expect(reasonForLine(r.restReason ?? "")).toBe("budget · azure-opena…");
+    expect(reasonForLine("thermal · serious")).toBe("thermal · serious");
+    expect(reasonForLine("battery")).toBe("battery");
     expect(liveStateLabel(deriveLiveState([wait], (secs - 12 * 60) * 1000))).toMatch(/^rest 12m · /);
     expect(liveStateLabel(deriveLiveState([wait], (secs - 45) * 1000))).toMatch(/^rest 45s · /);
     expect(restReasonLabel("thermal", "serious")).toBe("thermal · serious");

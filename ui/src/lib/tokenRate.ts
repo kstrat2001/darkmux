@@ -949,14 +949,23 @@ export function restReasonLabel(reason: unknown, state: unknown): string | null 
   const word = restReasonWord(reason);
   if (word === null) return null;
   const s = typeof state === "string" ? state.trim() : "";
-  return s ? `${word} · ${trimState(s)}` : word;
+  return s ? `${word} · ${s}` : word;
 }
 
-/** (#2902 step 5, 5th review C7) The longest state a readout line holds
- *  whole. A budget's state is the endpoint id, which the operator names and
- *  can make any length ("azure-openai-eastus2-prod"); past this it is cut
- *  with an ellipsis so "budget · <id>" fits its one-line slot. */
+/** (#2902 step 5, 5th review C7) The longest state a one-line readout slot
+ *  holds whole. A budget's state is the endpoint id, which the operator names
+ *  and can make any length ("azure-openai-eastus2-prod"); past this it is cut
+ *  with an ellipsis so "budget · <id>" fits the slot. */
 const STATE_MAX_CHARS = 12;
+
+/** (6th review) A rest reason for a ONE-LINE slot (the run page's note line,
+ *  a fleet card's status line): the state trimmed to fit. Everywhere with
+ *  room (the lamp status, a hover title) keeps [`restReasonLabel`]'s full
+ *  form, so two endpoints sharing a prefix can be told apart. */
+export function reasonForLine(reason: string): string {
+  const at = reason.indexOf(" · ");
+  return at < 0 ? reason : `${reason.slice(0, at)} · ${trimState(reason.slice(at + 3))}`;
+}
 
 function trimState(s: string): string {
   const chars = [...s];

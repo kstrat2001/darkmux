@@ -518,7 +518,8 @@ describe("(#2961) REST's seconds hand", () => {
       <TokenScope tokensPerSec={0} size="tile" state="rest" centerLabel="23h 53m" centerUnit="resting" restEndMs={END} clock={{ kind: "playback", tMs: END - left, wallMs: 0, rate: 1 }} />,
     );
     for (const t of [100, 200, 300]) h.step(t);
-    expect(num(container)?.textContent).toBe("23h 53m");
+    // 23h 53m 1s left: minutes round up, never under-reporting (6th review).
+    expect(num(container)?.textContent).toBe("23h 54m");
   });
 
   it("during a countdown there is no breathing ring: only the drawn circle, from 12 to the dot, dimmer by age", () => {

@@ -283,12 +283,15 @@ export function reclaimableNote(availableBytes: number | null | undefined, freeB
 
 /** (#2902 step 5) A span of seconds in words a line can hold: "23h 53m",
  *  then "12m", then "45s" under a minute. A day-long budget wait counts
- *  down in this form, in the tube and on the line, never as raw seconds. */
+ *  down in this form, in the tube and on the line, never as raw seconds.
+ *  Minutes round UP (119 s is "2m", 23h 53m 59s is "23h 54m"): a
+ *  countdown must never say less time is left than is. Under a minute the
+ *  seconds are exact, so a rest's hand still ticks every second. */
 export function compactDuration(secs: number): string {
   const s = Math.max(0, Math.round(secs));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  if (h > 0) return `${h}h ${m}m`;
-  if (m > 0) return `${m}m`;
-  return `${s}s`;
+  if (s < 60) return `${s}s`;
+  const mins = Math.ceil(s / 60);
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
