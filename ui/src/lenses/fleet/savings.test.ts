@@ -15,6 +15,13 @@ import { hybridNote } from "./hybridNote";
 import { isDispatchComplete, T } from "../../lib/flow";
 import type { FlowRecord } from "../../types/handwritten";
 
+/** (#2919) Vocabulary. `local` / `cloud` / `unknown` (and their `*Runs`
+ * twins) name what `tokensOffMeter` can tell from a record's own bookends —
+ * endpoint-less, endpoint-bearing, or no bookend either way. They are NOT a
+ * cost tier: the hero withdrew that reading in #2834 (an endpoint's URL does
+ * not say whether it is metered) and sums all three into one figure; the run
+ * twins still feed `hybridNote`. Test names below use the field names for
+ * what a record classifies as, never "free" or "off the meter". */
 function rec(overrides: Partial<FlowRecord>): FlowRecord {
   return { ts: "2026-08-08T00:00:00.000Z", ...overrides };
 }
@@ -82,7 +89,7 @@ describe("tokensOffMeter", () => {
     expect(t.total).toBe(240);
   });
 
-  it("excludes a session with NO dispatch bookend at all from the local claim — unknown, not free (#1607)", () => {
+  it("a session with NO dispatch bookend at all classifies as unknown — never as the endpoint-less local bucket (#1607)", () => {
     // Token telemetry with no dispatch.start/complete anywhere for the
     // session — darkmux has no evidence of where this ran.
     const data: FlowRecord[] = [tokenRec("s3", 1, 500, 10)];

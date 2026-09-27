@@ -24,7 +24,7 @@
  * step reducers work the same way).
  */
 import type { FlowRecord } from "../../types/handwritten";
-import { fmtElapsed } from "../../lib/format";
+import { compactThousands, fmtElapsed, type CompactStyle } from "../../lib/format";
 import { PURPOSE, stepTokensWithLegacyFallback, usageContribution } from "../../lib/usageRecords";
 import { isDispatchStart, isDispatchComplete, isDispatchTerminal } from "../../lib/flow";
 
@@ -860,12 +860,24 @@ export function recordInMission(rec: FlowRecord, idx: GraphIndex, missionId: str
 // (U3-7/U5-2) `fmtElapsed` moved to `lib/format.ts` — one duration
 // formatter for the whole app; see its own doc.
 
+/** The graph's compact token count (`1.5k` / `15k` / `2.5M`) — step rows,
+ * node labels, the totals line. Its decimals are deliberately NOT `fmtC`'s:
+ * a step row is a one-line meter beside a duration and a seat, where
+ * `15.00k` spends two characters on a precision nobody reads there, so the
+ * thousands arm keeps one decimal only below 10k and none above.
+ *
+ * (#2919) The arms themselves hand over through `compactThousands`, the one
+ * shared rule: this used to switch at 1,000,000 with no regard to rounding,
+ * so 999,500–999,999 printed `1000k`. It also printed a lowercase `m`, an
+ * inheritance from `mission-graph.html` that no golden pins; `M` now, the
+ * same letter as every other count in the app. */
 export function fmtTok(n: number | null | undefined): string {
   if (n == null) return "0";
   if (n < 1000) return String(n);
-  if (n < 1000000) return (n / 1000).toFixed(n < 10000 ? 1 : 0) + "k";
-  return (n / 1000000).toFixed(1) + "m";
+  return compactThousands(n, GRAPH_TOK_STYLE);
 }
+
+const GRAPH_TOK_STYLE: CompactStyle = { k: (n) => (n < 10_000 ? 1 : 0), m: 1 };
 
 export function fmtModel(m: string | undefined): string {
   if (!m) return "";

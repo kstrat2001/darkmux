@@ -614,7 +614,21 @@ describe("formatting helpers", () => {
     expect(fmtTok(999)).toBe("999");
     expect(fmtTok(1500)).toBe("1.5k");
     expect(fmtTok(15000)).toBe("15k");
-    expect(fmtTok(2_500_000)).toBe("2.5m");
+    // (#2919) Uppercase, the same letter as every other count in the app;
+    // the lowercase `m` was a mission-graph.html inheritance no golden pins.
+    expect(fmtTok(2_500_000)).toBe("2.5M");
+  });
+
+  it("(#2919) fmtTok hands the thousands arm over where its zero decimals would round to 1000k", () => {
+    expect(fmtTok(999_499)).toBe("999k");
+    expect(fmtTok(999_500)).toBe("1.0M"); // never "1000k"
+    expect(fmtTok(999_999)).toBe("1.0M");
+    expect(fmtTok(1_000_000)).toBe("1.0M");
+    // The one-decimal step at 10k is a width edge, not a unit change:
+    // 9,999 prints "10.0k", 10,000 prints "10k".
+    expect(fmtTok(9_949)).toBe("9.9k");
+    expect(fmtTok(9_999)).toBe("10.0k");
+    expect(fmtTok(10_000)).toBe("10k");
   });
 
   it("fmtModel strips the darkmux namespace and any leading vendor path", () => {

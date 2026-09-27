@@ -1069,6 +1069,17 @@ describe("(#2889) the prompt size on the opening heartbeat", () => {
     expect(promptTokensLabel(0, 4)).toBeNull();
   });
 
+  it("(#2919) each arm of the label hands over where the arm below would round to its unit", () => {
+    // charsPerToken = 1, so the char count IS the token estimate.
+    expect(promptTokensLabel(999.49, 1)).toBe("~999");
+    expect(promptTokensLabel(999.5, 1)).toBe("~1k"); // never "~1000"
+    expect(promptTokensLabel(1_000, 1)).toBe("~1k");
+    expect(promptTokensLabel(999_499, 1)).toBe("~999k");
+    expect(promptTokensLabel(999_500, 1)).toBe("~1.0M"); // never "~1000k"
+    expect(promptTokensLabel(1_000_000, 1)).toBe("~1.0M");
+    expect(promptTokensLabel(1_234_567, 1)).toBe("~1.2M");
+  });
+
   // (#2889 review, M3) The wire as it really lands: record `ts` is
   // WHOLE-SECOND, and the heartbeat's own `sampled_at_ms` is ms-precise. In
   // 9 of 12 real openers the marker (`dispatch.start`, or the turn's last

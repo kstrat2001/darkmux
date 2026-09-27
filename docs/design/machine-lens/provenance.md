@@ -81,7 +81,11 @@ rendering the hand-written strings at all. The `darkmux/utility` card — whose
 hardcoded in the TypeScript, with no capability list on `/machine/specs` to
 read (`utility_model` carries only `{id, loaded}`) — was deleted outright as
 config rather than machine state. Its gloss survives as a `title` on the
-badge at ②. Where live and static values do sit together in future, the
+badge at ② (the list itself is shorter now: 4.0 retired `mission-compiler`
+and `scribe`, #2912/#2913, the `estimate` job it named never had an
+implementation, and the title reads "compaction · radio routing", the two
+jobs the utility model runs, #2914). Where live and static values do sit
+together in future, the
 mechanism is brightness: a live value is `--fg`, hand-written copy stays
 `--dim`.
 

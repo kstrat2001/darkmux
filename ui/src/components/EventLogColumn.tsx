@@ -5,7 +5,7 @@ import { recKey } from "../lib/flow";
 import { useThrottledValue } from "../hooks/useThrottledValue";
 import { useArrivalKeys } from "../hooks/useArrivalKeys";
 import { LIVE_WINDOW_MS } from "../lib/flow";
-import { clk } from "../lib/format";
+import { clk, compactThousands, type CompactStyle } from "../lib/format";
 import { RecordView } from "./RecordView";
 import { Shimmer } from "./Placeholder";
 import {
@@ -55,11 +55,15 @@ export function compactCountLabel(text: string): string {
   return text
     .replace(/ events\b/g, "")
     .replace(/ of /g, "/")
-    .replace(/\d{4,}/g, (digits) => {
-      const n = Number(digits);
-      return `${(n / 1000).toFixed(1)}k`;
-    });
+    .replace(/\d{4,}/g, (digits) => compactThousands(Number(digits), COUNT_STYLE));
 }
+
+/** One decimal in either arm — the event log's counts (`12.9k hidden`,
+ * `in 18.9k`) sit in running prose, not a grid, so nothing needs to align.
+ * (#2919) Both printers below used to stop at the thousands arm, so a count
+ * from 999,950 read `1000.0k`; `compactThousands` hands over to `M` where
+ * the rounding would carry the unit. */
+const COUNT_STYLE: CompactStyle = { k: 1, m: 1 };
 /** (#2068) How long the followed record holds in the detail card before the
  * next one may replace it. Two updates a second is still "live"; faster is
  * unreadable on a phone and reads as flicker. */
@@ -108,7 +112,7 @@ export function ctxTitle(inTok: number, window: number, threshold: number | null
 }
 
 export function fmtTok(n: number): string {
-  return n < 1000 ? n.toLocaleString() : `${(n / 1000).toFixed(1)}k`;
+  return n < 1000 ? n.toLocaleString() : compactThousands(n, COUNT_STYLE);
 }
 const COLLAPSE_SLACK_PX = 80;
 const PAGE_MIN_PX = 420;
