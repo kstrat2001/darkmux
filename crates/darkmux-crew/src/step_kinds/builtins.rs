@@ -2704,7 +2704,8 @@ fn map_hosted_item(
                     conservative_hosted_spend(reply.total_tokens, clamped),
                     1,
                     step_label,
-                    caller);
+                    caller,
+                );
                 if let Some(t) = reply.total_tokens {
                     sum += t;
                     any_usage = true;
@@ -5022,6 +5023,32 @@ mod tests {
         let err = out.error.unwrap_or_default();
         assert!(err.contains("mission `m-aborted` is aborted") && err.contains("nothing was sent"), "{err}");
         assert_eq!(*calls.lock().unwrap(), 0, "the transport is never called");
+    }
+
+    /// (5th review C2) A hosted map item settles its REPLY's spend into
+    /// the step bucket: a 10-token cap and a 12-token reply warn with
+    /// `spent: 12` (settling 0 would leave the cap silent).
+    #[test]
+    fn a_hosted_map_item_settles_its_reply_into_the_step_cap() {
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
+        let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
+            Ok(crate::single_shot::SingleShotReply {
+                content: "ok".into(), total_tokens: Some(12), prompt_tokens: None, completion_tokens: None,
+                reasoning_tokens: None, cached_tokens: None, model: None,
+            })
+        });
+        let bucket = Arc::new(Mutex::new(RemoteBudget::new(Some(10), darkmux_types::config::StepBudgetPolicy::Warn)));
+        let ep: darkmux_types::ModelEndpoint = serde_json::from_value(json!({ "url": "https://h.example/v1" })).unwrap();
+        let out = crate::budget::with_test_env(env.clone(), || {
+            map_hosted_item(
+                0, &bucket, &ep, "gpt-5.1", "sys", "user", 5, 1, 0, 0, Some(&ovr),
+                &mut Vec::new(), "s1", &crate::budget::BudgetCaller::default(),
+            )
+        });
+        assert!(out.ok, "{out:?}");
+        assert_eq!(env.actions(), vec![crate::budget::BUDGET_WARN_ACTION.to_string()]);
+        let w = env.payload(crate::budget::BUDGET_WARN_ACTION);
+        assert_eq!((w["scope"].as_str(), w["spent"].as_u64(), w["limit"].as_u64()), (Some("step"), Some(12), Some(10)), "{w}");
     }
 
     /// (#2902 step 5 review C1) The endpoint gate fires on the map path: a

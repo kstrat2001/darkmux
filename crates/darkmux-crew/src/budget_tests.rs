@@ -155,6 +155,12 @@ fn nothing_is_enforced_unless_a_window_budget_is_set_and_not_off() {
     assert_eq!(EndpointBudget::of(&inline), Ok(None), "inline: no id to sum by");
     let off = named(serde_json::json!({"policy": "off", "window": {"period": "1d", "tokens": 10}}));
     assert_eq!(EndpointBudget::of(&off), Ok(None), "policy off counts nothing");
+    // (5th review MF2) `off` with a 0 is still off: the gate admits, never
+    // refusing every hosted call over an inert number.
+    let off_zero = named(serde_json::json!({"policy": "off", "window": {"period": "1d", "tokens": 0, "calls": 0}}));
+    assert_eq!(EndpointBudget::of(&off_zero), Ok(None), "policy off + 0 counts nothing and refuses nothing");
+    let warn_zero = named(serde_json::json!({"policy": "warn", "window": {"period": "1d", "tokens": 0}}));
+    assert!(EndpointBudget::of(&warn_zero).unwrap_err().contains("0 is not a budget"), "warn + 0 is refused");
     let shipped = named(serde_json::json!({"policy": null, "warn_at": null, "window": {"period": null, "tokens": null, "calls": null}}));
     assert_eq!(EndpointBudget::of(&shipped), Ok(None), "the shipped all-null shape is no budget");
     let mut managed = named(serde_json::json!({"window": {"period": "1d", "tokens": 10}}));
@@ -510,6 +516,32 @@ fn live_reload_releases_a_removed_endpoint_and_keeps_on_an_unreadable_registry()
     assert_eq!(LiveEnv.reload("azure", Some("/no/such/profiles.json")), None, "unreadable: kept");
 }
 
+/// (5th review C5) An edit the budget cannot take (a 0 written in while a
+/// call waits) keeps the budget in hand, and says so ONCE, naming the
+/// reason, instead of being dropped without a word.
+#[test]
+fn a_refused_edit_during_a_wait_keeps_the_budget_and_says_why_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let pf = dir.path().join("profiles.json");
+    std::fs::write(
+        &pf,
+        r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":1}]}},
+            "endpoints":{"refused-edit":{"url":"https://h.example/v1","limits":{"policy":"wait","window":{"period":"1d","tokens":0}}}}}"#,
+    )
+    .unwrap();
+    let loaded = darkmux_profiles::profiles::load_registry_quiet(Some(pf.to_str().unwrap())).unwrap();
+    let err = reloaded_budget(&loaded.registry, "refused-edit").unwrap_err();
+    assert!(err.contains("0 is not a budget"), "{err}");
+    let line = refused_edit_line("refused-edit", &err);
+    assert!(
+        line.contains("endpoint `refused-edit`") && line.contains("0 is not a budget") && line.contains("keeps the budget it had"),
+        "{line}"
+    );
+    assert!(first_refusal(&line), "said the first time");
+    assert!(!first_refusal(&line), "and only once");
+    assert_eq!(LiveEnv.reload("refused-edit", Some(pf.to_str().unwrap())), None, "kept, not released");
+}
+
 /// A budget switched off (or raised) while waiting releases the wait.
 #[test]
 fn a_budget_switched_off_while_waiting_releases_it() {
@@ -530,7 +562,8 @@ fn a_zero_budget_built_directly_waits_until_raised() {
     *env.reload_to.borrow_mut() = Some(Some(budget(BudgetPolicy::Wait, Some(5), None, None)));
     admit_with(budget(BudgetPolicy::Wait, Some(0), None, None), &BudgetCaller::default(), &env).unwrap();
     assert!(env.payload(BUDGET_WAIT_ACTION)["resume_at"].is_null());
-    assert!(env.said.borrow()[0].contains("waits until it is raised"));
+    let said = env.said.borrow()[0].clone();
+    assert!(said.contains("until its window has room") && !said.contains("budget is 0"), "{said}");
 }
 
 // ── The per-step cap ─────────────────────────────────────────────────────
@@ -650,6 +683,11 @@ fn a_stopped_run_with_a_full_window_is_held_and_stopped() {
     let ev = p.on_tick(0, dir.path(), &OtherPacing::default(), &BudgetCaller::default(), &env);
     assert!(matches!(ev, Some(PacerEvent::Stopped { .. })), "{ev:?}");
     assert_eq!(pace(dir.path())["pause"], true);
+    // (5th review C6) No wait was announced, so no `budget.stop` either
+    // (the gate's rule): a stop record always follows its wait. The CLI
+    // still says why the run ended.
+    assert!(env.actions().is_empty(), "{:?}", env.actions());
+    assert!(env.said.borrow().iter().any(|l| l.contains("the run was interrupted")), "{:?}", env.said.borrow());
 }
 
 /// Under `warn` the pacer never touches the pace file.

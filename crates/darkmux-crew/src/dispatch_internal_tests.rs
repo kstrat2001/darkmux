@@ -310,7 +310,8 @@
         let from = src.find("if let Some(t) = &agentic_pm {").expect("the pre-start gate block");
         let block = &src[from..];
         let gate = block.find("crate::budget::admit_endpoint(").expect("the gate");
-        let beat = block.find("let _gate_beat = darkmux_flow::session_presence::spawn_session_emitter(").expect("heartbeat");
+        let beat = block.find("let _gate_beat = matches!(crate::budget::EndpointBudget::of(&t.endpoint), Ok(Some(_))).then(|| {")
+            .expect("a heartbeat, spawned only for an endpoint with a budget (5th review C3)");
         assert!(beat < gate, "the heartbeat is held across the gate");
     }
 
@@ -461,7 +462,9 @@
         let interrupted = darkmux_types::interrupt::is_set();
         darkmux_types::interrupt::reset_for_test();
         assert!(interrupted, "the stopped run is ended the way an interrupt ends it");
-        assert!(env.actions().contains(&crate::budget::BUDGET_STOP_ACTION.to_string()), "{:?}", env.actions());
+        // (5th review C6) Stopped before any wait was announced: no orphan
+        // `budget.stop` (a stop record always follows its wait).
+        assert!(!env.actions().contains(&crate::budget::BUDGET_STOP_ACTION.to_string()), "{:?}", env.actions());
         let pace: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(crate::pace_file::path(out.path())).unwrap()).unwrap();
         assert_eq!((pace["pause"].as_bool(), pace["reason"].as_str()), (Some(true), Some("budget")), "{pace}");
@@ -17589,6 +17592,61 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let named = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
         assert_eq!(tailer_endpoint_id(Some(&named)).as_deref(), Some("azure"));
         assert_eq!(tailer_endpoint_id(None), None, "a local brain");
+    }
+
+    /// Top-level comma-separated arguments of the call that starts at
+    /// `open` (the index of its `(`), comments already stripped.
+    fn call_args(src: &str, open: usize) -> Vec<String> {
+        let (mut depth, mut cur, mut out) = (0i32, String::new(), Vec::new());
+        for ch in src[open..].chars() {
+            match ch {
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    if depth == 1 {
+                        continue;
+                    }
+                }
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if !cur.trim().is_empty() {
+                            out.push(cur.trim().to_string());
+                        }
+                        return out;
+                    }
+                }
+                ',' if depth == 1 => {
+                    out.push(cur.trim().to_string());
+                    cur.clear();
+                    continue;
+                }
+                _ => {}
+            }
+            cur.push(ch);
+        }
+        out
+    }
+
+    /// (5th review C2) The CALL SITE hands the tailer the hosted brain's
+    /// endpoint id, in the `endpoint_id` position: the helper is pinned by
+    /// `the_tailer_endpoint_id_is_the_hosted_brains_registry_id`, this pins
+    /// that `dispatch()` passes it (a `None` there stamps nothing, and the
+    /// endpoint's window never sums a container run's turns).
+    #[test]
+    fn dispatch_passes_the_endpoint_id_to_the_tailer() {
+        let src: String = include_str!("dispatch_internal.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let sig = src.find("fn spawn_guarded_tailer(").expect("signature") + "fn spawn_guarded_tailer".len();
+        let params: Vec<String> =
+            call_args(&src, sig).iter().map(|p| p.split(':').next().unwrap().trim().to_string()).collect();
+        let at = params.iter().position(|p| p == "endpoint_id").expect("an endpoint_id parameter");
+        let call = src.find("spawn_guarded_tailer(\n        &stop_flag,").expect("dispatch()'s call") + "spawn_guarded_tailer".len();
+        let args = call_args(&src, call);
+        assert_eq!(args.len(), params.len(), "{args:#?}");
+        assert_eq!(args[at], "tailer_endpoint_id(agentic_pm.as_ref())", "{args:#?}");
     }
 
     /// (#2902 step 5 review, 3rd pass MUST FIX 1) `dispatch_remote` against

@@ -3541,19 +3541,6 @@ fn dispatch_remote(
         ),
     );
 
-    // (#2344) Session-liveness heartbeat — the in-process twin of the
-    // container path's emitter (#638), opened at the same point the bookends
-    // open (before any model work) and keyed on the SAME `session_id` those
-    // bookends use. A hosted single-shot is not instantaneous — a reasoning
-    // model on a long brief runs for minutes — and until this, none of that
-    // wall-clock was live: the bookends are terminal-only records, so the
-    // whole hosted arm of `darkmux dispatch` and of every fleet-queue job
-    // read as "not running" on the live fleet view the entire time it WAS.
-    // Self-disables when Redis is unset. Stopped explicitly before each
-    // terminal record below; for a `?`/panic in between, `SessionEmitter::drop`
-    // (#2344) now removes the presence key itself (pre-claim + DEL), the same
-    // teardown `stop()` runs, instead of only halting the beat thread and
-    // leaving the TTL to age the key out.
     let req_body = single_shot_body(
         target.dialect,
         &pm.id,
@@ -5008,14 +4995,18 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         let session_id = internal_session_id(&opts, unix_micros, mission_id.as_deref());
         // (#2902 step 5 review) A held start is live work: a heartbeat while
         // the gate may wait (no bookend: contract 2 keeps those around model
-        // work). Dropped when the gate returns; the container path's own
-        // emitter takes over from there.
-        let _gate_beat = darkmux_flow::session_presence::spawn_session_emitter(
-            session_id.clone(),
-            Some(opts.role_id.clone()),
-            Some(t.model.id.clone()),
-            mission_id.clone(),
-        );
+        // work). Only for an endpoint that HAS a budget, the one case the
+        // gate can hold (a heartbeat costs a spawn and a Redis round trip,
+        // ~250 ms, on every hosted start). Dropped when the gate returns;
+        // the container path's own emitter takes over from there.
+        let _gate_beat = matches!(crate::budget::EndpointBudget::of(&t.endpoint), Ok(Some(_))).then(|| {
+            darkmux_flow::session_presence::spawn_session_emitter(
+                session_id.clone(),
+                Some(opts.role_id.clone()),
+                Some(t.model.id.clone()),
+                mission_id.clone(),
+            )
+        });
         crate::budget::admit_endpoint(
             &t.endpoint,
             &crate::budget::BudgetCaller {

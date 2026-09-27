@@ -300,9 +300,12 @@ impl UsageLimits {
         if let Some(w) = &self.window {
             // (zero doctrine) A `0` on a darkmux bound means unbounded,
             // never "instantly"; a zero budget would be an eternal wait, so
-            // it is refused rather than read either way.
+            // it is refused rather than read either way. Under `off` the
+            // number is inert (nothing is counted), so it is left alone:
+            // `off` is exactly what the refusal tells the operator to set.
+            let off = matches!(&self.policy, Some(Lenient::Known(p)) if !p.counts());
             for (field, n) in [("tokens", w.tokens), ("calls", w.calls)] {
-                if n == Some(0) {
+                if !off && n == Some(0) {
                     return Err(format!(
                         "limits.window.{field} is 0: 0 is not a budget; set policy off to turn it off"
                     ));
@@ -998,10 +1001,11 @@ mod tests {
     /// off. Unset stays fine, and so does `policy: off` with a real number.
     #[test]
     fn a_zero_window_is_refused_and_names_policy_off() {
-        let with = |tokens: Option<u64>, calls: Option<u64>| ModelEndpoint {
+        let with_policy = |policy: Option<BudgetPolicy>, tokens: Option<u64>, calls: Option<u64>| ModelEndpoint {
             url: Some("https://h/v1".into()),
             limits: Some(
                 UsageLimits {
+                    policy: policy.map(Lenient::Known),
                     window: Some(UsageWindow { period: Some("1d".into()), tokens, calls, ..Default::default() }),
                     ..Default::default()
                 }
@@ -1009,11 +1013,18 @@ mod tests {
             ),
             ..Default::default()
         };
+        let with = |tokens: Option<u64>, calls: Option<u64>| with_policy(None, tokens, calls);
         let t = with(Some(0), None).validate().unwrap_err();
         assert!(t.contains("limits.window.tokens is 0") && t.contains("set policy off"), "{t}");
         let c = with(None, Some(0)).validate().unwrap_err();
         assert!(c.contains("limits.window.calls is 0") && c.contains("set policy off"), "{c}");
         assert_eq!(with(Some(1), Some(1)).validate(), Ok(()));
+        // (5th review MF2) Under `off` the number is inert: the operator did
+        // what the refusal asks, so it is not refused. `warn` and `wait` are.
+        assert_eq!(with_policy(Some(BudgetPolicy::Off), Some(0), Some(0)).validate(), Ok(()), "off + 0 is fine");
+        for p in [BudgetPolicy::Warn, BudgetPolicy::Wait] {
+            assert!(with_policy(Some(p), Some(0), None).validate().unwrap_err().contains("is 0"), "{p:?} + 0");
+        }
     }
 
     #[test]

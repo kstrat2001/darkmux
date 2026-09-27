@@ -490,6 +490,37 @@ fn warned_levels() -> &'static Mutex<HashMap<String, BreachLevel>> {
     LEVELS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// An endpoint's budget as a freshly loaded registry says it: `Ok(None)`
+/// when the endpoint was removed, switched `off` or left without a window
+/// (review C-i: the operator took the budget away, which releases a wait);
+/// `Err` when its limits cannot be used as written (a 0 edited in, a typo).
+pub(crate) fn reloaded_budget(
+    reg: &darkmux_types::ProfileRegistry,
+    endpoint_id: &str,
+) -> Result<Option<EndpointBudget>, String> {
+    let Some(ep) = reg.endpoints.get(endpoint_id) else { return Ok(None) };
+    let mut named = ep.clone();
+    named.source = darkmux_types::EndpointSource::Named(endpoint_id.to_string());
+    EndpointBudget::of(&named)
+}
+
+/// The line a refused mid-wait edit prints.
+pub(crate) fn refused_edit_line(endpoint_id: &str, why: &str) -> String {
+    format!(
+        "darkmux: ⚠ endpoint `{endpoint_id}`'s edited limits were refused ({why}); the wait keeps the budget it had"
+    )
+}
+
+/// True the first time `line` is seen in this process: a refused edit is
+/// re-read every poll of a wait, and said once.
+pub(crate) fn first_refusal(line: &str) -> bool {
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(line.to_string())
+}
+
 /// The lowercase `status` of the JSON document at `path`, when it has one.
 fn status_at(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
@@ -537,13 +568,18 @@ impl BudgetEnv for LiveEnv {
         // Quiet: a quarantine warning every 30 s of a wait is noise; the
         // command's own load already printed it once.
         let loaded = darkmux_profiles::profiles::load_registry_quiet(profiles_file).ok()?;
-        // (review C-i) The endpoint removed from a registry that DID load:
-        // the operator took the budget away, which releases the wait. A
-        // registry that failed to load keeps the budget in hand.
-        let Some(ep) = loaded.registry.endpoints.get(endpoint_id) else { return Some(None) };
-        let mut named = ep.clone();
-        named.source = darkmux_types::EndpointSource::Named(endpoint_id.to_string());
-        EndpointBudget::of(&named).ok()
+        match reloaded_budget(&loaded.registry, endpoint_id) {
+            Ok(b) => Some(b),
+            // (5th review C5) An edit the budget cannot take keeps the one in
+            // hand, said once, never dropped without a word.
+            Err(e) => {
+                let line = refused_edit_line(endpoint_id, &e);
+                if first_refusal(&line) {
+                    eprintln!("{line}");
+                }
+                None
+            }
+        }
     }
     fn emit(&self, rec: darkmux_flow::FlowRecord) {
         let _ = darkmux_flow::record(rec);
@@ -825,7 +861,7 @@ fn announce_wait(
             human_duration((r - now).max(0) as u64),
             darkmux_flow::ts_utc_at(r)
         ),
-        None => "the budget is 0, so it waits until it is raised in profiles.json".to_string(),
+        None => "until its window has room".to_string(),
     };
     let how_to_stop = match caller.mission_id {
         Some(mid) => format!("`darkmux mission abort {mid}` ends the wait without sending"),
@@ -1108,8 +1144,9 @@ impl BudgetPacer {
 }
 
 impl BudgetPacer {
-    /// Report the stop once: a CLI line and a `budget.stop` record. The
-    /// caller (the sampler) ends the run.
+    /// Report the stop once: a CLI line, and a `budget.stop` record when a
+    /// wait was announced (the gate's rule: a stop record always follows its
+    /// `budget.wait`). The caller (the sampler) ends the run.
     fn stop(&mut self, reason: String, caller: &BudgetCaller<'_>, env: &dyn BudgetEnv) -> PacerEvent {
         self.stopped = true;
         let message = format!(
@@ -1117,7 +1154,9 @@ impl BudgetPacer {
             self.budget.endpoint_id
         );
         env.say(&message);
-        stop_record(&self.budget.endpoint_id, &reason, self.waited_ms, &message, caller, env);
+        if self.announced.is_some() {
+            stop_record(&self.budget.endpoint_id, &reason, self.waited_ms, &message, caller, env);
+        }
         PacerEvent::Stopped { reason }
     }
 }

@@ -128,9 +128,10 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.64.0";
 //           - `budget.wait` (level `warn`, endpoint scope only): calls are
 //             held under the `wait` policy. Adds `policy` (`wait`), `metric`,
 //             `spent`, `limit`, `period`, `resume_at` (a record-`ts`-shaped
-//             string, or null for a budget of 0, which waits on the
-//             operator) and `wait_seconds` (or null), and `pid` (the waiting
-//             process, so a reader can tell a live wait from a dead one).
+//             string) and `wait_seconds`, and `pid` (the waiting process,
+//             so a reader can tell a live wait from a dead one). A wait
+//             still waiting at `resume_at` is announced again with its new
+//             resume time.
 //           - `budget.resume` (level `info`): a held call went ahead. Adds
 //             `waited_ms` and `pid`.
 //           `dispatch.rest` gains the reason `budget` (the pace-file pause
@@ -145,10 +146,10 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.64.0";
 //           call is clamped). An older reader ignores all of it.
 //           `budget.stop` (level `warn`, endpoint scope): a budget wait
 //           ended because its run was stopped (Ctrl-C, `mission abort`, an
-//           abandoned phase), closing its `budget.wait`. Written by a
-//           hosted call's gate (the call is never sent) and by the pacer
-//           holding an agentic-remote container (the run is ended). Adds
-//           `reason`, `waited_ms`, `pid`.
+//           abandoned phase), closing its `budget.wait`. Written only
+//           after a `budget.wait` was: by a hosted call's gate (the call is
+//           never sent) and by the pacer holding an agentic-remote
+//           container (the run is ended). Adds `reason`, `waited_ms`, `pid`.
 //   1.63.0 (#2947): the degeneracy detector's policy vocabulary names the
 //           action, and one additive action.
 //

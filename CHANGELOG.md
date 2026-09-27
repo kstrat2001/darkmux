@@ -254,7 +254,9 @@ darkmux release.
   last 24 hours from now, counted from this machine's usage records, with
   no calendar reset (`tokens`, `calls`, or both; the period is `<n>m`,
   `<n>h` or `<n>d`; `0` is not a budget and is refused: set `policy` to
-  `off` to turn one off). `limits.policy` says what reaching it does: `warn`
+  `off` to turn one off, and under `off` the number is left alone; a 0
+  edited in while a call waits is refused the same way, said once on the
+  CLI, and the wait keeps the budget it had). `limits.policy` says what reaching it does: `warn`
   (the default once a budget is set: a warning on the CLI, a Warn-level
   `budget.warn` flow record, and the work keeps going), `wait` (calls to
   that endpoint pause until enough of the window has expired to have room,
@@ -271,8 +273,8 @@ darkmux release.
   policy and the spend in its window. `darkmux mission abort` (or Ctrl-C)
   ends a wait without sending: the wait checks its mission's status on disk
   every half second, and an agentic-remote run the budget holds between
-  turns is ended rather than released; either way the ended wait is a
-  `budget.stop` record. The viewer reads a hosted call's wait as
+  turns is ended rather than released; either way an announced wait that
+  ends this way is closed by a `budget.stop` record. The viewer reads a hosted call's wait as
   `REST budget · <endpoint>` until it resumes. A misspelled
   key in `limits` (`windw`, `polcy`, `tokns`) is refused the same way,
   naming the nearest valid key. Budgets apply to
