@@ -3599,7 +3599,7 @@ fn dispatch_refuses_an_explicit_unlabeled_darkmux_runtime_tag_before_running() {
                 .and(predicate::str::contains("`darkmux-runtime:4.0-rc`"))
                 .and(predicate::str::contains("no version label"))
                 .and(predicate::str::contains(format!(
-                    "docker build --build-arg DARKMUX_VERSION={version} -t darkmux-runtime:4.0-rc runtime/"
+                    "docker build --build-arg DARKMUX_VERSION={version} -f runtime/Dockerfile -t darkmux-runtime:4.0-rc ."
                 ))),
         );
     assert_no_container_ran(&log);

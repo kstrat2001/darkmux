@@ -37,8 +37,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const INACTIVITY_TIMEOUT_MARKER: &str = "darkmux dispatch: INACTIVITY TIMEOUT";
 
 /// Local Docker image tag for the internal runtime, built from
-/// `runtime/Dockerfile` by a source checkout (`docker build --build-arg
-/// DARKMUX_VERSION=<version> -t darkmux-runtime:latest runtime/`). Preferred
+/// `runtime/Dockerfile` at the root of a source checkout
+/// ([`crate::runtime_image::rebuild_command`] spells the command). Preferred
 /// when present AND its version label matches this darkmux (#2923); an
 /// unlabeled or mismatched one is skipped for the version-pinned GHCR image.
 /// Resolution lives in [`crate::runtime_image`].
@@ -12052,9 +12052,10 @@ fn preflight_result_for(status: DockerRuntimeStatus) -> Result<()> {
         DockerRuntimeStatus::ImageMissing => bail!(
             "no darkmux runtime image for darkmux {version} found locally. darkmux pulls the \
              version-pinned image `{}` from GHCR on demand; if that pull \
-             can't run, build it once from a darkmux {version} source checkout:\n  \
-             docker build --build-arg DARKMUX_VERSION={version} -t {RUNTIME_IMAGE} runtime/",
+             can't run, build it once from the root of a darkmux {version} source checkout:\n  \
+             {}",
             ghcr_runtime_image(),
+            crate::runtime_image::rebuild_command(RUNTIME_IMAGE, env!("CARGO_PKG_VERSION")),
             version = env!("CARGO_PKG_VERSION"),
         ),
         DockerRuntimeStatus::ProbeError(e) => {

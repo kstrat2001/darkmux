@@ -518,8 +518,8 @@ darkmux release.
   reports an image dispatch would refuse as refused, not "will pull".
   **Behavior change for
   source builds:** a local runtime image must now be built with
-  `docker build --build-arg DARKMUX_VERSION=<version> -t darkmux-runtime:latest runtime/`
-  to be used. `--image darkmux-runtime:<any tag>` (e.g. `:4.0-rc`) is now
+  `docker build --build-arg DARKMUX_VERSION=<version> -f runtime/Dockerfile -t darkmux-runtime:latest .`
+  (from the repo root) to be used. `--image darkmux-runtime:<any tag>` (e.g. `:4.0-rc`) is now
   treated as darkmux's own image: version checked, run directly, never
   injected. A BYO `--image` (#703) now extracts its injected runtime from
   the matching image too. `darkmux doctor`'s `runtime image freshness`

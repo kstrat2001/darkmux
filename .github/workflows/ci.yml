@@ -341,10 +341,10 @@ jobs:
 
       # The runtime crate is EXCLUDED from the parent cargo workspace (#463 —
       # it builds against musl in the darkmux-runtime Docker image) and is its
-      # own workspace root with its own Cargo.lock. Its `include_str!`s only
-      # ever resolve within `runtime/` (confirmed 2026-07-13) — zero
-      # dependency on the parent workspace's sources — so this job's filter
-      # is scoped to `runtime/**` alone, letting it run IN PARALLEL with
+      # own workspace root with its own Cargo.lock. Its one dependency on the
+      # parent tree is the path dependency crates/darkmux-trajectory (the
+      # trajectory event types it shares with the host), so this job's filter
+      # is `runtime/**` plus that crate, letting it run IN PARALLEL with
       # `build-test-lint` above instead of appending to that job's sequential
       # steps (the change that fixed this job's chronic near-timeout).
       - name: Detect runtime-relevant changes
@@ -354,6 +354,7 @@ jobs:
           filters: |
             runtime:
               - 'runtime/**'
+              - 'crates/darkmux-trajectory/**'
               - '.github/workflows/ci.yml'
 
       - name: Install Rust stable toolchain

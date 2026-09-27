@@ -25,7 +25,7 @@ A container-bounded in-house runtime replaces both layers:
 | `src/tools/` | Tool implementations: `search`, `read`, `edit`, `write`, `bash` (+ `echo` for unit tests only) |
 | `src/tools/workspace.rs` | Path validators — canonicalize + `starts_with` check against the workspace root; symlink escapes rejected |
 | `src/compaction.rs` | Token-count-aware middle-replace compaction via a companion 4B model |
-| `src/trajectory.rs` | Per-dispatch JSONL trajectory + final metrics, written under `<workspace>/.darkmux-runtime/` |
+| `src/trajectory.rs` | Per-dispatch JSONL trajectory, written under `/darkmux-out/.darkmux-runtime/` as events happen; every event is a `darkmux-trajectory` type (`crates/darkmux-trajectory`), the definition the host reads back |
 
 ## Tool catalog
 
@@ -43,13 +43,15 @@ The shape converged through an empirical-evaluation arc against the canonical Ar
 
 ## Build + run
 
-From this directory:
+From the repo root (the build context is the root: the runtime depends on
+`crates/darkmux-trajectory`, and `Dockerfile.dockerignore` here limits the
+context to the two crates):
 
 ```
 # build the image, stamped with the darkmux version it is for; dispatch
 # skips (or, when named with --image, refuses) an image whose
 # org.opencontainers.image.version label does not match the host (#2923)
-docker build --build-arg DARKMUX_VERSION=<version> -t darkmux-runtime .
+docker build --build-arg DARKMUX_VERSION=<version> -f runtime/Dockerfile -t darkmux-runtime .
 
 # default CMD runs the container environment check
 docker run --rm darkmux-runtime

@@ -7062,10 +7062,11 @@ fn docker_status_to_check(status: darkmux_crew::dispatch_internal::DockerRuntime
             ),
             hint: Some(format!(
                 "darkmux pulls `{}` from GHCR on demand (#759). Pre-pull now with \
-                 `docker pull {}`, or build locally from a darkmux {version} source checkout: \
-                 `docker build --build-arg DARKMUX_VERSION={version} -t {RUNTIME_IMAGE} runtime/`.",
+                 `docker pull {}`, or build locally from the root of a darkmux {version} \
+                 source checkout: `{}`.",
                 ghcr_runtime_image(),
                 ghcr_runtime_image(),
+                darkmux_crew::runtime_image::rebuild_command(RUNTIME_IMAGE, env!("CARGO_PKG_VERSION")),
                 version = env!("CARGO_PKG_VERSION"),
             )),
         },
@@ -12713,7 +12714,7 @@ mod tests {
         let hint = c.hint.as_deref().unwrap();
         assert!(
             hint.contains(
-                "docker build --build-arg DARKMUX_VERSION=3.13.0 -t darkmux-runtime:latest runtime/"
+                "docker build --build-arg DARKMUX_VERSION=3.13.0 -f runtime/Dockerfile -t darkmux-runtime:latest ."
             ),
             "{hint}"
         );
@@ -13026,7 +13027,7 @@ mod tests {
         assert_eq!(c.status, Status::Warn);
         // (#2923) The build fix stamps the label, or dispatch skips the image.
         assert!(c.hint.unwrap().contains(&format!(
-            "docker build --build-arg DARKMUX_VERSION={} -t darkmux-runtime:latest runtime/",
+            "docker build --build-arg DARKMUX_VERSION={} -f runtime/Dockerfile -t darkmux-runtime:latest .",
             env!("CARGO_PKG_VERSION")
         )));
     }

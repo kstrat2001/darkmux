@@ -695,15 +695,20 @@ pub struct ToolCallDiscarded {
     pub cut: String,
 }
 
-/// Why a batch of structured tool calls never dispatched.
+/// (#2169) Why a structured tool call is not dispatchable. Two different
+/// causes, never one bucket: telling a model it called a fictional tool
+/// when it named `bash` correctly without the grant misleads it, and a
+/// permission refusal mixed into the "garbage tool-call names" count would
+/// corrupt the signal that count exists to surface.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MalformedReason {
-    /// No darkmux tool is named this. The reading of a record older than
-    /// the field.
+    /// No darkmux tool is named this (e.g. model content sliced around a
+    /// `[TOOL_CALLS]` marker became the name). The reading of a record
+    /// older than the field.
     #[default]
     NotATool,
-    /// A real darkmux tool the role was not granted.
+    /// A real darkmux tool this execution's role was not granted.
     RealToolNotGranted,
 }
 

@@ -750,7 +750,7 @@
         // skip the image it just told the operator to build.
         assert!(
             msg.contains(&format!(
-                "docker build --build-arg DARKMUX_VERSION={} -t darkmux-runtime:latest runtime/",
+                "docker build --build-arg DARKMUX_VERSION={} -f runtime/Dockerfile -t darkmux-runtime:latest .",
                 env!("CARGO_PKG_VERSION")
             )),
             "{msg}"

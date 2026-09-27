@@ -34,6 +34,12 @@ serde_json = "1"
 # workspace dependency (darkmux-lab / darkmux-flow), so no new license surface.
 blake3 = "1.5"
 
+# (4.0) The trajectory event definitions and their one fold, shared with the
+# host. A path dependency outside this workspace: the Docker image build
+# therefore runs from the repo root (see Dockerfile and
+# Dockerfile.dockerignore beside it).
+darkmux-trajectory = { path = "../crates/darkmux-trajectory" }
+
 # HTTP client. ureq is blocking + tokio-free → smaller binary + simpler
 # call sites. The agent loop is inherently sequential per dispatch, so
 # async buys us nothing here.

@@ -72,7 +72,9 @@ jobs:
       - name: Build + push runtime image
         uses: docker/build-push-action@v6
         with:
-          context: runtime
+          # The repo root: the runtime depends on crates/darkmux-trajectory by
+          # path. runtime/Dockerfile.dockerignore limits what is sent.
+          context: .
           file: runtime/Dockerfile
           platforms: linux/arm64
           push: true

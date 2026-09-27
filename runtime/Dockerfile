@@ -5,8 +5,8 @@
 #   2. Run it in a small Alpine image with the Unix toolkit agents need.
 #
 # The runtime hosts a per-dispatch agent loop: receives a model + system
-# prompt + user message, runs the tool-call loop until stop, records
-# trajectory + metrics, exits. The container is the kernel-enforced
+# prompt + user message, runs the tool-call loop until stop, records its
+# trajectory, exits. The container is the kernel-enforced
 # workspace boundary — workspace mounts at /workspace, and the binary's
 # path validators reject anything that resolves outside it.
 
@@ -26,15 +26,19 @@ RUN apk add --no-cache musl-dev pkgconfig openssl-dev
 
 WORKDIR /build
 
-# Copy manifest + lockfile first so the cargo dep cache is reused when
-# only src changes. Cargo.lock ensures reproducibility — the docker
-# build uses the same dep versions as the local build.
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+# The build context is the REPO ROOT, not runtime/: the runtime depends by
+# path on crates/darkmux-trajectory, the trajectory event types it shares
+# with the host. `runtime/Dockerfile.dockerignore` restricts the context
+# to exactly the files copied here. Build it with:
+#   docker build --build-arg DARKMUX_VERSION=<version> -f runtime/Dockerfile -t darkmux-runtime:latest .
+# Cargo.lock ensures reproducibility — the docker build uses the same dep
+# versions as the local build.
+COPY crates/darkmux-trajectory ./crates/darkmux-trajectory
+COPY runtime/Cargo.toml runtime/Cargo.lock ./runtime/
+COPY runtime/src ./runtime/src
+WORKDIR /build/runtime
 
-# Build the release binary. Cargo does real work on first build
-# (~30s on cache miss, <2s on cache hit thanks to the manifest-first
-# COPY above keeping the dep cache hot when only src changes).
+# Build the release binary.
 RUN cargo build --release --locked || cargo build --release
 
 # ─── runtime ──────────────────────────────────────────────────────────────
@@ -81,7 +85,7 @@ RUN apk add --no-cache \
 RUN adduser -D -u 1000 -h /home/darkmux -s /bin/bash darkmux
 
 # Copy the runtime binary from the builder stage.
-COPY --from=builder /build/target/release/darkmux-runtime /usr/local/bin/darkmux-runtime
+COPY --from=builder /build/runtime/target/release/darkmux-runtime /usr/local/bin/darkmux-runtime
 
 # Dispatch mounts the operator's per-dispatch workspace at /workspace.
 # Pre-creating the dir means the sanity check (`--check`) has something
@@ -98,8 +102,8 @@ RUN mkdir -p /workspace && chown -R darkmux:darkmux /workspace
 # run. Declared AFTER the last RUN on purpose: a build-arg is part of the
 # cache key for every RUN that follows it, so declaring it early would make a
 # rebuild at a new version re-run `apk add` and the rest. Here, a new version
-# only changes the label layer. Nothing below uses the arg. Build it with:
-#   docker build --build-arg DARKMUX_VERSION=<version> -t darkmux-runtime:latest runtime/
+# only changes the label layer. Nothing below uses the arg. The build
+# command is at the top of the builder stage.
 ARG DARKMUX_VERSION=""
 LABEL org.opencontainers.image.version=$DARKMUX_VERSION
 

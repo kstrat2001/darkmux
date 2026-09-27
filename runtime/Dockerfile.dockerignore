@@ -1,0 +1,11 @@
+# The context for runtime/Dockerfile is the REPO ROOT (the runtime depends
+# by path on crates/darkmux-trajectory). BuildKit reads this file, named for
+# the Dockerfile beside it, instead of a root .dockerignore. Everything is
+# excluded except what the Dockerfile copies, so the multi-GB target/ trees
+# and the rest of the workspace never reach the daemon.
+*
+!runtime/Cargo.toml
+!runtime/Cargo.lock
+!runtime/src
+!crates/darkmux-trajectory/Cargo.toml
+!crates/darkmux-trajectory/src

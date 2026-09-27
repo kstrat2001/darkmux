@@ -300,8 +300,9 @@ darkmux --version             # must equal NEW
 
 **Make a runtime image available first.** The versioned GHCR image publishes
 *at* release, so a pre-release dogfood cannot pull it. Build one from the
-release commit, stamped with NEW: `docker build --build-arg DARKMUX_VERSION=NEW
--t darkmux-runtime:latest runtime/`, and drop the tag afterwards. Retagging the
+release commit's root, stamped with NEW: `docker build --build-arg
+DARKMUX_VERSION=NEW -f runtime/Dockerfile -t darkmux-runtime:latest .`, and drop
+the tag afterwards. Retagging the
 prior release's image no longer works even when `runtime/` did not change: its
 version label names the prior release, and dispatch skips a local image whose
 label does not match the binary (#2923). The rebuild is cheap when `runtime/`
