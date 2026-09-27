@@ -379,7 +379,7 @@ const HEROES = [
   { id: "hero-cached", date: "2026-08-25", cached: true, util: false },
   { id: "hero-util", date: "2026-08-27", cached: false, util: true },
   { id: "hero-both", date: "2026-08-29", cached: true, util: true },
-  { id: "hero-notes", date: "2026-07-26", cached: false, util: false, notes: true },
+  { id: "hero-notes", date: "2026-07-16", cached: false, util: false, notes: true },
 ].map((h) => ({
   ...h,
   now: "12:00:30",
