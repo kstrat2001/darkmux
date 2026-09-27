@@ -881,7 +881,7 @@
       "status": "running"
     },
     {
-      "name": "a later mission's start supersedes an earlier mission's silent run on the same session",
+      "name": "an earlier mission's run silent past the window reads stopped beside a later mission on its session",
       "as_of": "2026-09-27T12:00:10Z",
       "records": [
         {
@@ -917,7 +917,42 @@
       "server_skip_reason": "/runs judges a session by its current attempt; an earlier mission of a session several missions share has no row of its own there (#1918: such a session is no mission's drill target)"
     },
     {
-      "name": "presence holds open only the session's current run, not a superseded mission's",
+      "name": "a later mission starting on a shared session does not stop an earlier mission's run still in flight",
+      "as_of": "2026-09-27T10:00:30Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "A"
+        },
+        {
+          "ts": "2026-09-27T10:00:10Z",
+          "action": "dispatch.start",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "B"
+        },
+        {
+          "ts": "2026-09-27T10:00:20Z",
+          "action": "dispatch.turn",
+          "session_id": "task-probe",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "A"
+        }
+      ],
+      "run": {
+        "session_id": "task-probe",
+        "mission_id": "A"
+      },
+      "phase": "open",
+      "status": "running",
+      "server": false,
+      "server_skip_reason": "/runs judges a session by its current attempt; an earlier mission of a session several missions share has no row of its own there (#1918: such a session is no mission's drill target)"
+    },
+    {
+      "name": "presence holds open only the session's current run, not an earlier mission's",
       "as_of": "2026-09-27T12:00:10Z",
       "records": [
         {

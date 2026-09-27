@@ -40,7 +40,9 @@
  *    `budgetWaitGraceMs`; past that the staleness clock runs from there.
  * 5. Stale. An open attempt whose last record is more than `staleAfterMs`
  *    before t has stopped with no ending recorded. So has an attempt a later
- *    one of its session superseded, whichever mission that one is.
+ *    one of its mission superseded. Another mission's later attempt on the
+ *    same session does not: missions launched from one config share a task
+ *    session and run at once (#2125).
  * 6. A mission's whole-run bookend (`runRef.ts`'s `run` grain) never beats
  *    itself; its steps do. Its activity and its waits are its mission's
  *    other runs' too, so it is in flight while any of them is.
@@ -324,10 +326,12 @@ function activityOf(run: RunRecords, recs: readonly NormRecord[], asOf: number):
   return sets;
 }
 
+const openedBy = (a: Attempt | null, asOf: number): boolean => a !== null && isAsOf(a.opening, asOf);
+
 /** The phase of an attempt that has opened and not closed (rules 4-6). */
 function openPhase(run: RunRecords, recs: readonly NormRecord[], asOf: number, policy: LifecyclePolicy, presence: Presence): Pick<Lifecycle, "phase" | "waitUntilMs"> {
-  if (run.next && isAsOf(run.next.opening, asOf)) return { phase: "stale", waitUntilMs: null };
-  if (presence.has(run.ref.sessionId)) return { phase: "open", waitUntilMs: null };
+  if (openedBy(run.next, asOf)) return { phase: "stale", waitUntilMs: null };
+  if (presence.has(run.ref.sessionId) && !openedBy(run.sessionNext, asOf)) return { phase: "open", waitUntilMs: null };
   const sets = activityOf(run, recs, asOf);
   const until = maxOf(sets.map((set) => openWaitUntil(set, policy)));
   if (until !== null && asOf <= until) return { phase: "waiting", waitUntilMs: until };

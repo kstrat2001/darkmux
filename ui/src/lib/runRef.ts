@@ -40,9 +40,10 @@ export interface RunGroup {
   readonly records: readonly NormRecord[];
   /** This mission's attempts, time order. */
   readonly attempts: readonly Attempt[];
-  /** Every attempt of the session, every mission's, time order: a later
-   *  one supersedes this group's current attempt, and presence speaks for
-   *  the latest only. */
+  /** Every attempt of the session, every mission's, time order: presence
+   *  speaks for the latest only. Missions launched from one config share a
+   *  task session and run at once (#2125), so another mission's later
+   *  attempt never supersedes this group's. */
   readonly sessionAttempts: readonly Attempt[];
   readonly grain: Grain;
   /** A run-grain group's mission's OTHER runs, whose activity is this run's
@@ -57,8 +58,11 @@ export interface RunRecords {
   readonly group: RunGroup;
   /** The named attempt; `null` when the group has none (nothing opened). */
   readonly attempt: Attempt | null;
-  /** The attempt after it, whose opening supersedes this one. */
+  /** Its mission's attempt after it, whose opening supersedes this one. */
   readonly next: Attempt | null;
+  /** The session's attempt after it, any mission's: once that opened,
+   *  presence on the session speaks for it, not for this one. */
+  readonly sessionNext: Attempt | null;
 }
 
 /** What kind of unit a group is (contract 8's grains):
@@ -224,7 +228,13 @@ export function refAt(group: RunGroup, asOf: number): RunRef {
 /** The records of `ref` as a `RunRecords`, from `group` (already in hand). */
 export function recordsOfGroup(group: RunGroup, ref: RunRef): RunRecords {
   const attempt = group.attempts[ref.attempt] ?? null;
-  return { ref, group, attempt, next: attempt ? (group.sessionAttempts[attempt.index + 1] ?? null) : null };
+  return {
+    ref,
+    group,
+    attempt,
+    next: group.attempts[ref.attempt + 1] ?? null,
+    sessionNext: attempt ? (group.sessionAttempts[attempt.index + 1] ?? null) : null,
+  };
 }
 
 /** The records of `ref` in window `data`; `null` when the window holds no
