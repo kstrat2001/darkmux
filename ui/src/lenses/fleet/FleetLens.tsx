@@ -1183,8 +1183,18 @@ export function FleetLens({
                           // ("thermal · serious"), in place of "rest Ns": the
                           // tube's center already counts the seconds down,
                           // and the card's line has room for one of the two.
+                          // (Operator, 2026-09-27) At phone width the state
+                          // is dropped ("thermal"): both are in the DOM and
+                          // CSS shows one by the viewport's width, so the
+                          // line keeps its one-line height either way. The
+                          // hover title keeps the state.
                           selectedExec.state === "rest" && selectedExec.restReason
-                          ? selectedExec.restReason
+                          ? (
+                              <>
+                                <span className="mach-scope__why mach-scope__why--full">{selectedExec.restReason}</span>
+                                <span className="mach-scope__why mach-scope__why--word">{selectedExec.restReasonWord ?? selectedExec.restReason}</span>
+                              </>
+                            )
                           : liveStateLabel({
                             state: selectedExec.state,
                             restSecondsLeft: selectedExec.restSecondsLeft,

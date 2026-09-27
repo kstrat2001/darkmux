@@ -95,7 +95,12 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
       for (const state of states) {
         const { ctx, page } = await openState(browser, viewport, state, { mode, surface: "fleet" });
         await expect(page.locator(CARD.card).first()).toBeVisible();
-        if (state.rateText) {
+        if (state.rateTextPhone) {
+          // (#2950) The words the card SHOWS (`innerText` skips the hidden
+          // form): with the state on a desktop card, without it on a phone.
+          const want = vpName === "phone" ? state.rateTextPhone : state.rateText;
+          await expect(page.locator(CARD.rateLine).first(), `${state.id}: the card's visible reason`).toHaveText(want, { useInnerText: true });
+        } else if (state.rateText) {
           await expect(page.locator(CARD.rateLine).first(), `${state.id}: the card must reach this state`).toHaveText(state.rateText instanceof RegExp ? state.rateText : new RegExp(state.rateText));
         } else {
           await expect(page.locator(CARD.rateLine)).toHaveCount(0);

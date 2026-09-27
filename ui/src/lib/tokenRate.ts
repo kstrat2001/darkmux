@@ -473,6 +473,9 @@ export interface LiveStateReading {
    *  words `restReasonLabel` makes of them ("thermal · serious", "battery ·
    *  18%", "turn delay (config)"). Absent when the record names no reason. */
   restReason?: string;
+  /** (#2950) Alongside `restReason`: the reason without its state
+   *  (`restReasonWord`), for the phone-width fleet card. */
+  restReasonWord?: string;
   /** (#2890) Present only when `state === "tools"` and a tool of the CURRENT
    *  turn has completed: the latest completed call's `tool_name`, which the
    *  scope's TOOLS center draws as an icon. `dispatch.tool` is emitted on
@@ -517,8 +520,10 @@ interface StateMarker {
   atMs: number;
   kind: "prompt" | "tools" | "rest" | "compacting";
   restMs?: number;
-  /** (#2950) `rest` only: `restReasonLabel` of the record's own fields. */
+  /** (#2950) `rest` only: `restReasonLabel` / `restReasonWord` of the
+   *  record's own fields. */
   restReason?: string;
+  restReasonWord?: string;
   /** (#2915) `compacting` only: the job's own bound. */
   stallAfterMs?: number;
 }
@@ -636,7 +641,10 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
       if (ms !== null && ms > 0) {
         m = { atMs, kind: "rest", restMs: ms };
         const why = restReasonLabel(f.reason, f.state);
-        if (why !== null) m.restReason = why;
+        if (why !== null) {
+          m.restReason = why;
+          m.restReasonWord = restReasonWord(f.reason) ?? why;
+        }
       }
     }
     if (m && (!marker || m.atMs >= marker.atMs)) marker = m;
@@ -674,7 +682,10 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
       const remaining = found.restMs - (nowMs - found.atMs);
       if (remaining > 0) {
         const reading: LiveStateReading = { state: "rest", restSecondsLeft: Math.ceil(remaining / 1000) };
-        if (found.restReason !== undefined) reading.restReason = found.restReason;
+        if (found.restReason !== undefined) {
+          reading.restReason = found.restReason;
+          reading.restReasonWord = found.restReasonWord ?? found.restReason;
+        }
         return reading;
       }
       return prompt();
@@ -840,11 +851,20 @@ const REST_REASON_WORDS: Record<string, string> = {
 };
 
 export function restReasonLabel(reason: unknown, state: unknown): string | null {
+  const word = restReasonWord(reason);
+  if (word === null) return null;
+  const s = typeof state === "string" ? state.trim() : "";
+  return s ? `${word} · ${s}` : word;
+}
+
+/** (#2950, operator 2026-09-27) The reason's words WITHOUT its state
+ *  ("thermal pacing", "battery"): what a phone-width fleet card shows, where
+ *  the state no longer fits on the line. `null` exactly when
+ *  `restReasonLabel` is. */
+export function restReasonWord(reason: unknown): string | null {
   const r = typeof reason === "string" ? reason.trim() : "";
   if (!r) return null;
-  const s = typeof state === "string" ? state.trim() : "";
-  const word = Object.prototype.hasOwnProperty.call(REST_REASON_WORDS, r) ? REST_REASON_WORDS[r] : r;
-  return s ? `${word} · ${s}` : word;
+  return Object.prototype.hasOwnProperty.call(REST_REASON_WORDS, r) ? REST_REASON_WORDS[r] : r;
 }
 
 /** The short word (or `"rest Ns"`) a caller renders for every state except
@@ -1043,6 +1063,9 @@ export interface ExecutionTokenReading {
   /** (#2950) Present only when `state === "rest"` and the rest's record says
    *  why. See `LiveStateReading.restReason`. */
   restReason?: string;
+  /** (#2950) Alongside `restReason`: without its state. See
+   *  `LiveStateReading.restReasonWord`. */
+  restReasonWord?: string;
   /** This execution's own current reading. `null` outside `"generating"`
    *  (the caller renders the state word instead) or while generating with
    *  no same-turn heartbeat pair yet — mirrors `FleetCard.liveTokRate`'s
@@ -1098,7 +1121,9 @@ export function executionTokenReading(
     role: executionRole(records),
     state,
     restSecondsLeft: state === "rest" ? liveState?.restSecondsLeft : undefined,
-    ...(state === "rest" && liveState?.restReason !== undefined ? { restReason: liveState.restReason } : {}),
+    ...(state === "rest" && liveState?.restReason !== undefined
+      ? { restReason: liveState.restReason, restReasonWord: liveState.restReasonWord ?? liveState.restReason }
+      : {}),
     tokensPerSec: reading?.tokensPerSec ?? null,
     carried: reading?.carried ?? false,
     toolName: state === "tools" ? liveState?.toolName : undefined,

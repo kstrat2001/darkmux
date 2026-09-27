@@ -127,19 +127,23 @@ const STATES = [
   // the readout slot TOOL GEN uses (`noteText`: the run page's line under
   // the lamps; `null` where the record names no reason, so no line). One
   // state per reason a producer writes, and one this build does not know.
+  // (Operator, 2026-09-27) A phone-width fleet card drops the state
+  // (`rateTextPhone`, the line's VISIBLE text); the run page and a desktop
+  // card keep it.
   ...[
-    ["rest-turn-delay", "2026-09-10", { reason: "turn_delay" }, "turn delay \\(config\\)"],
-    ["rest-thermal", "2026-09-12", { reason: "thermal", state: "serious" }, "thermal · serious"],
-    ["rest-pacing", "2026-09-14", { reason: "thermal-duty-cycle", state: "fair" }, "thermal pacing · fair"],
-    ["rest-battery", "2026-09-16", { reason: "battery", state: "18%" }, "battery · 18%"],
-    ["rest-episode-limit", "2026-09-18", { reason: "thermal-episode-limit", state: "serious" }, "thermal hold · serious"],
-    ["rest-unknown", "2026-09-20", { reason: "solar-flare" }, "solar-flare"],
-  ].map(([id, date, why, words]) => ({
+    ["rest-turn-delay", "2026-09-10", { reason: "turn_delay" }, "turn delay \\(config\\)", "turn delay \\(config\\)"],
+    ["rest-thermal", "2026-09-12", { reason: "thermal", state: "serious" }, "thermal · serious", "thermal"],
+    ["rest-pacing", "2026-09-14", { reason: "thermal-duty-cycle", state: "fair" }, "thermal pacing · fair", "thermal pacing"],
+    ["rest-battery", "2026-09-16", { reason: "battery", state: "18%" }, "battery · 18%", "battery"],
+    ["rest-episode-limit", "2026-09-18", { reason: "thermal-episode-limit", state: "serious" }, "thermal hold · serious", "thermal hold"],
+    ["rest-unknown", "2026-09-20", { reason: "solar-flare" }, "solar-flare", "solar-flare"],
+  ].map(([id, date, why, words, phoneWords]) => ({
     id, date, now: "12:00:12",
     runText: new RegExp(`run state: rest \\d+s · ${words}$`),
     // The readout lines carry the words alone; the tube counts down.
     noteText: new RegExp(`^${words}$`),
     rateText: new RegExp(`^${words}$`),
+    rateTextPhone: new RegExp(`^${phoneWords}$`),
     // A thermal rest exists only on a run whose thermal governor is armed.
     armed: why.reason.startsWith("thermal"),
     recs: (b, d) => [...b.prefix(d, {}, true, why.reason.startsWith("thermal")), b.rec(at(d, "12:00:08"), "dispatch.rest", { ms: 20000, turn: 1, ...why }), tick(d, "12:00:12")],

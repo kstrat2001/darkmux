@@ -3875,6 +3875,24 @@ body {
   color: var(--scope-phosphor);
   font-variant-numeric: tabular-nums;
 }
+/* (#2950, operator 2026-09-27) A resting card's line says why. Both forms
+   are always in the line; the viewport's width picks one, the same 561px
+   boundary the card's own layout switches on (above). The phone card's text
+   column fits about 20 characters, so there the state is dropped
+   ("thermal pacing", not "thermal pacing · fair"); the desktop card and the
+   hover title keep it. Either way the line stays one line, so the card does
+   not change size. */
+.mach-scope__why--word {
+  display: none;
+}
+@media (max-width: 560px) {
+  .mach-scope__why--full {
+    display: none;
+  }
+  .mach-scope__why--word {
+    display: inline;
+  }
+}
 /* (#2881) The pager: a small row under the rate line, sized by its own
    text/tap-targets rather than any fixed constant — see `.mach-scope`'s own
    doc for the ONE thing that must not grow the card (the tube), which this

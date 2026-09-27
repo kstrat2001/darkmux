@@ -10,6 +10,7 @@ import {
   currentTokenRate,
   deriveLiveState,
   restReasonLabel,
+  restReasonWord,
   executionRole,
   executionTokenReading,
   promptTokensLabel,
@@ -478,7 +479,7 @@ describe("deriveLiveState", () => {
   it("is rest with a countdown while inside a reported rest's ms window, then falls to prompt once it elapses", () => {
     const recs = [tool(0), rest(1_000, 15_000)];
     // 1s into the 15s window → 14s left (ceil).
-    expect(deriveLiveState(recs, 2_000)).toEqual({ state: "rest", restSecondsLeft: 14, restReason: "thermal pacing" });
+    expect(deriveLiveState(recs, 2_000)).toEqual({ state: "rest", restSecondsLeft: 14, restReason: "thermal pacing", restReasonWord: "thermal pacing" });
     // Right at the boundary the window has fully elapsed.
     expect(deriveLiveState(recs, 1_000 + 15_000)).toEqual({ state: "prompt" });
     // Comfortably past it too.
@@ -528,7 +529,7 @@ describe("aggregateLiveState", () => {
   it("surfaces rest over tools/prompt when nothing is generating", () => {
     const toolsOnly = [tool(0)];
     const resting = [tool(0), rest(1_000, 15_000)];
-    expect(aggregateLiveState([toolsOnly, resting], 2_000)).toEqual({ state: "rest", restSecondsLeft: 14, restReason: "thermal pacing" });
+    expect(aggregateLiveState([toolsOnly, resting], 2_000)).toEqual({ state: "rest", restSecondsLeft: 14, restReason: "thermal pacing", restReasonWord: "thermal pacing" });
   });
 
   it("falls back to stalled only when every execution is stalled", () => {
@@ -649,12 +650,16 @@ describe("restReasonLabel", () => {
     ["toString", undefined, "toString"],
   ])("%s / %s -> %s", (reason, state, want) => {
     expect(restReasonLabel(reason, state)).toBe(want);
+    // (#2950, phone card) The same words without the state.
+    expect(restReasonWord(reason)).toBe(want.split(" · ")[0]);
   });
   it("says nothing when the record names no reason, whatever its state", () => {
     expect(restReasonLabel(undefined, undefined)).toBeNull();
     expect(restReasonLabel("", "serious")).toBeNull();
     expect(restReasonLabel(null, "serious")).toBeNull();
     expect(restReasonLabel(42, undefined)).toBeNull();
+    expect(restReasonWord(undefined)).toBeNull();
+    expect(restReasonWord("")).toBeNull();
   });
 });
 
@@ -663,22 +668,22 @@ describe("the rest reading carries the rest record's own reason", () => {
     ({ ts: new Date(atMs).toISOString(), action: "dispatch.rest", session_id: SID, payload }) as unknown as FlowRecord;
   it("a thermal pause names its state", () => {
     const r = deriveLiveState([tool(0), restWith(1_000, { ms: 2_000, reason: "thermal", state: "serious", turn: 3 })], 1_500);
-    expect(r).toEqual({ state: "rest", restSecondsLeft: 2, restReason: "thermal · serious" });
+    expect(r).toEqual({ state: "rest", restSecondsLeft: 2, restReason: "thermal · serious", restReasonWord: "thermal" });
   });
   it("the latest rest wins: a turn delay after a thermal pause reads as the turn delay", () => {
     const recs = [tool(0), restWith(1_000, { ms: 2_000, reason: "thermal", state: "serious" }), restWith(3_000, { ms: 5_000, reason: "turn_delay" })];
-    expect(deriveLiveState(recs, 3_500)).toEqual({ state: "rest", restSecondsLeft: 5, restReason: "turn delay (config)" });
+    expect(deriveLiveState(recs, 3_500)).toEqual({ state: "rest", restSecondsLeft: 5, restReason: "turn delay (config)", restReasonWord: "turn delay (config)" });
   });
   it("a rest record with no reason carries none", () => {
     expect(deriveLiveState([tool(0), restWith(1_000, { ms: 15_000 })], 2_000)).toEqual({ state: "rest", restSecondsLeft: 14 });
   });
   it("a pacing announcement (no ms) never lends its reason to the rest", () => {
     const recs = [tool(0), restWith(1_000, { ms: 15_000, reason: "turn_delay" }), restWith(1_500, { reason: "thermal-duty-cycle", state: "fair", pause: false, delay_ms: 15_000 })];
-    expect(deriveLiveState(recs, 2_000)).toEqual({ state: "rest", restSecondsLeft: 14, restReason: "turn delay (config)" });
+    expect(deriveLiveState(recs, 2_000)).toEqual({ state: "rest", restSecondsLeft: 14, restReason: "turn delay (config)", restReasonWord: "turn delay (config)" });
   });
   it("the per-execution reading passes it on, and only while resting", () => {
     const recs = [tool(0), restWith(1_000, { ms: 15_000, reason: "battery", state: "18%" })];
-    expect(executionTokenReading(recs, 2_000).restReason).toBe("battery · 18%");
+    expect(executionTokenReading(recs, 2_000)).toMatchObject({ restReason: "battery · 18%", restReasonWord: "battery" });
     expect(executionTokenReading(recs, 20_000).restReason).toBeUndefined();
   });
 });

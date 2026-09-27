@@ -7,7 +7,9 @@ import type { ScopeState } from "./scopeMorph";
  *
  *  - GEN: the rounded rate ("—" when not yet measured) over "tok/s"
  *    (also while thinking; the shimmer and the rate line say that);
- *  - REST: the countdown ("12s") over "resting";
+ *  - REST: the countdown ("12s") over "resting" (operator, 2026-09-27: an
+ *    accepted exception to "no timer in the tube center"; the readout line
+ *    under it says why it rests, #2950);
  *  - TOOLS: the tool's icon (drawn by `TokenScope`), with "tool gen" under
  *    it while the model generates the call (LM Studio's "tool call
  *    generation"; not "writing", which read as the edit/write tools' own

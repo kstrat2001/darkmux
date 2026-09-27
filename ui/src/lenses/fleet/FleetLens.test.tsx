@@ -1178,7 +1178,12 @@ describe("FleetLens pager (#2881)", () => {
       </QueryClientProvider>,
     );
     await waitFor(() => expect(document.querySelector(".mach-scope__rate")).not.toBeNull());
-    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("thermal · serious");
+    // (Operator, 2026-09-27) Both forms are in the line; CSS shows the full
+    // one at desktop width and the one without the state on a phone
+    // (`.mach-scope__why--*` in styles.css; the parity layout suite checks
+    // which one is visible at each width).
+    expect(document.querySelector(".mach-scope__why--full")!.textContent).toBe("thermal · serious");
+    expect(document.querySelector(".mach-scope__why--word")!.textContent).toBe("thermal");
     expect(document.querySelector(".mach-scope__rate")!.getAttribute("title")).toBe("resting: thermal · serious");
   });
 
