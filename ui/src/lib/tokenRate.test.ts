@@ -647,6 +647,7 @@ describe("restReasonLabel", () => {
     ["thermal-critical", "critical", "thermal breaker · critical"],
     ["thermal-episode-limit", "serious", "thermal hold · serious"],
     ["battery", "18%", "battery · 18%"],
+    ["budget", "azure", "budget · azure"],
     ["paused", undefined, "paused"],
     ["solar-flare", "x9", "solar-flare · x9"],
     ["toString", undefined, "toString"],

@@ -211,6 +211,37 @@ fn a_typo_in_limits_is_an_error_never_no_budget() {
     }
 }
 
+/// (review MF2) The reviewer's four misspelled-KEY probes, committed. Each
+/// used to disarm the budget silently (no window, the default policy, a
+/// dropped token budget); each is now an error naming the key and the
+/// nearest valid one, at the gate and in preflight's registry pass.
+#[test]
+fn a_misspelled_key_in_limits_is_an_error_naming_it() {
+    let probes = [
+        (serde_json::json!({"windw": {"period": "1d", "tokens": 10}, "policy": "wait"}), "windw", "window"),
+        (serde_json::json!({"polcy": "wait", "window": {"period": "1d", "tokens": 10}}), "polcy", "policy"),
+        (serde_json::json!({"policy": "wait", "window": {"period": "1d", "tokns": 10, "calls": 400}}), "tokns", "tokens"),
+        (serde_json::json!({"policy": "wait", "window": {"tokns": 10}}), "tokns", "tokens"),
+    ];
+    for (limits, key, nearest) in probes {
+        let err = EndpointBudget::of(&named(limits.clone())).expect_err(&format!("{limits} must not be Ok"));
+        assert!(err.contains(&format!("unknown key `{key}`")) && err.contains(&format!("did you mean `{nearest}`")), "{limits}: {err}");
+        let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
+            "profiles": {"p": {"models": [{"id": "m", "endpoint": "azure"}]}},
+            "endpoints": {"azure": {"url": "https://h.example/v1", "limits": limits}},
+        }))
+        .unwrap();
+        reg.materialize_endpoints();
+        let invalid = darkmux_types::config_enum::invalid_endpoint_limits(&reg);
+        assert_eq!(invalid.len(), 1, "{limits}: {invalid:?}");
+        assert!(invalid[0].problem.contains(key), "{:?}", invalid[0]);
+    }
+    // A policy that governs nothing is named too.
+    let err = EndpointBudget::of(&named(serde_json::json!({"policy": "wait"}))).unwrap_err();
+    assert!(err.contains("governs nothing"), "{err}");
+    assert!(EndpointBudget::of(&named(serde_json::json!({"policy": "off"}))).unwrap().is_none(), "`off` with no window is fine");
+}
+
 /// The shape checks `darkmux doctor` and the registry validation report.
 #[test]
 fn limits_validate_warn_at_and_policy() {
@@ -400,6 +431,28 @@ fn an_aborted_mission_on_disk_stops_its_waiter_without_sending() {
     assert_eq!(live.as_deref(), Some("mission `m1` is aborted"), "LiveEnv reads the same disk");
 }
 
+/// (review C-b, the reviewer's probe) The window frees at +12 s and the run
+/// is stopped at +11.8 s, in the wait's last slice: the call is NOT sent.
+#[test]
+fn an_abort_in_the_last_slice_of_a_wait_still_sends_nothing() {
+    let env = FakeEnv::new(vec![(T0 - DAY + 12, 1_000)]).stopped_after(11_800, "mission `m` is aborted");
+    let err = admit_with(budget(BudgetPolicy::Wait, Some(1_000), None, None), &BudgetCaller::default(), &env)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("mission `m` is aborted") && err.contains("nothing was sent"), "{err}");
+    assert!(!env.actions().contains(&BUDGET_RESUME_ACTION.to_string()), "{:?}", env.actions());
+}
+
+/// (review C-i) An endpoint removed from the registry while a call waits
+/// releases the wait (the operator took the budget away).
+#[test]
+fn an_endpoint_removed_while_waiting_releases_it() {
+    let env = FakeEnv::new(vec![(T0 - 10, 1_000)]);
+    *env.reload_to.borrow_mut() = Some(None);
+    admit_with(budget(BudgetPolicy::Wait, Some(1_000), None, None), &BudgetCaller::default(), &env).unwrap();
+    assert_eq!(env.actions(), vec![BUDGET_WAIT_ACTION, BUDGET_RESUME_ACTION]);
+}
+
 /// A budget switched off (or raised) while waiting releases the wait.
 #[test]
 fn a_budget_switched_off_while_waiting_releases_it() {
@@ -504,6 +557,40 @@ fn the_pacer_release_keeps_a_thermal_duty_cycle() {
     let v = pace(dir.path());
     assert_eq!((v["pause"].as_bool(), v["turn_delay_ms"].as_u64()), (Some(false), Some(15_000)), "{v}");
     assert_eq!(v["reason"], "thermal-duty-cycle");
+}
+
+/// (review MF1, the reviewer's probe) A run stopped while the pacer holds
+/// it is never released: no `pause: false`, no `budget.resume`; one
+/// `Stopped` and a `budget.stop` record, and it keeps holding after.
+#[test]
+fn the_pacer_never_releases_a_stopped_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = FakeEnv::new(vec![(T0 - DAY + 10, 1_000)]);
+    let mut p = BudgetPacer::new(budget(BudgetPolicy::Wait, Some(1_000), None, None), None);
+    let c = BudgetCaller { mission_id: Some("m1"), ..Default::default() };
+    let free = OtherPacing::default();
+    assert!(matches!(p.on_tick(0, dir.path(), &free, &c, &env), Some(PacerEvent::Paused { .. })));
+    *env.stop.borrow_mut() = Some((0, "mission `m1` is aborted".into()));
+    // The window frees: an unstopped pacer would release here.
+    env.now.set(T0 + 11);
+    let ev = p.on_tick(2_000, dir.path(), &free, &c, &env);
+    assert_eq!(ev, Some(PacerEvent::Stopped { reason: "mission `m1` is aborted".into() }));
+    assert_eq!(pace(dir.path())["pause"], true, "still held");
+    assert_eq!(p.on_tick(2_000, dir.path(), &free, &c, &env), None, "reported once");
+    assert_eq!(pace(dir.path())["pause"], true, "never released");
+    assert_eq!(env.actions(), vec![BUDGET_WAIT_ACTION, BUDGET_STOP_ACTION]);
+}
+
+/// (review MF1) A stopped run whose window is full is never paused into a
+/// wait that could later release: it is held and stopped at once.
+#[test]
+fn a_stopped_run_with_a_full_window_is_held_and_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = FakeEnv::new(vec![(T0 - 10, 1_000)]).stopped("the run was interrupted");
+    let mut p = BudgetPacer::new(budget(BudgetPolicy::Wait, Some(1_000), None, None), None);
+    let ev = p.on_tick(0, dir.path(), &OtherPacing::default(), &BudgetCaller::default(), &env);
+    assert!(matches!(ev, Some(PacerEvent::Stopped { .. })), "{ev:?}");
+    assert_eq!(pace(dir.path())["pause"], true);
 }
 
 /// Under `warn` the pacer never touches the pace file.
@@ -620,6 +707,15 @@ fn budget_messages_have_no_double_spaces() {
     let bucket = Mutex::new(crate::remote_budget::RemoteBudget::new(Some(1), StepBudgetPolicy::Warn));
     admit_step(&bucket, 1);
     settle_step(&bucket, 1, 5, 1, "s1", &caller, &env);
+    let dir = tempfile::tempdir().unwrap();
+    let stop_env = FakeEnv::new(vec![(T0 - 10, 1_000)]).stopped("x");
+    let mut pacer = BudgetPacer::new(budget(BudgetPolicy::Wait, Some(1_000), None, None), None);
+    pacer.on_tick(0, dir.path(), &OtherPacing::default(), &caller, &stop_env);
+    env.said.borrow_mut().extend(stop_env.said.borrow().iter().cloned());
+    for e in ["2M", "windw"] {
+        let limits = if e == "2M" { serde_json::json!({"window": {"period": "1d", "tokens": "2M"}}) } else { serde_json::json!({"windw": {}}) };
+        env.said.borrow_mut().push(EndpointBudget::of(&named(limits)).unwrap_err());
+    }
     let mut messages: Vec<String> = env.said.borrow().clone();
     messages.extend(env.emitted.borrow().iter().filter_map(|r| r.payload.as_ref()?.get("message")?.as_str().map(str::to_string)));
     let err = EndpointBudget::of(&named(serde_json::json!({"window": {"period": "1d", "tokens": "2M"}}))).unwrap_err();

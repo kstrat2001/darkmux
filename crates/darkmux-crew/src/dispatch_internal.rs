@@ -4884,6 +4884,22 @@ pub(crate) fn resume_from_bare_hosted_refusal(role_id: &str) -> String {
     )
 }
 
+/// The container path's session id: the caller's own, else
+/// `crew-dispatch-<role>-<unix_micros>-internal`, scoped to its mission run
+/// (#1918, see `dispatch`'s own comment at its use). One function so the
+/// early agentic-remote budget gate (#2902 step 5) and the records the
+/// dispatch emits later name the same session.
+fn internal_session_id(opts: &DispatchOpts, unix_micros: u128, mission_id: Option<&str>) -> String {
+    let session_id = opts
+        .session_id
+        .clone()
+        .unwrap_or_else(|| format!("crew-dispatch-{}-{unix_micros}-internal", opts.role_id));
+    match mission_id {
+        Some(mid) => darkmux_types::session_id::scope_to_run(&session_id, mid),
+        None => session_id,
+    }
+}
+
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // (#2947) Bad enum config refuses FIRST: before the daemon nudge, the
     // ack gate, any session id or flow record. Every host-side dispatch
@@ -4919,6 +4935,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //     endpoint's URL + auth threaded into the container as its "brain"
     //     instead of local LMStudio (#1187 — agentic-remote). `agentic_pm`
     //     carries the resolved remote model forward past this point.
+    // (#2162) A pure `SystemTime::now()` read with no dependency on anything
+    // computed after it. Needed by the resume-checkpoint hoist below (to name
+    // the intended no-`--workdir` workspace path) and (#2902 step 5) by the
+    // agentic-remote budget gate just below, which names the session id.
+    let unix_micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0);
     let remote_target = try_resolve_remote_target(&opts)?;
     let mut agentic_pm: Option<crate::target::Target> = None;
     if let Some((role, system_prompt, pm)) = remote_target {
@@ -4955,6 +4979,29 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             }
             return dispatch_remote(&opts, &role, &system_prompt, &pm);
         }
+    }
+
+    // (#2902 step 5) An agentic-remote brain calls its endpoint from inside
+    // the container, turn after turn. Its budget is checked HERE, before the
+    // container (or its image) is touched: a `wait` holds the start,
+    // reported, and a stopped run (Ctrl-C, `mission abort`) returns before
+    // anything was sent. Between turns the host sampler's budget pacer takes
+    // over, pausing the runtime through the pace file the way the thermal
+    // governor does.
+    if let Some(t) = &agentic_pm {
+        let mission_id = crate::dispatch::resolve_mission_for_phase(opts.phase_id.as_deref());
+        let session_id = internal_session_id(&opts, unix_micros, mission_id.as_deref());
+        crate::budget::admit_endpoint(
+            &t.endpoint,
+            &crate::budget::BudgetCaller {
+                role_id: Some(&opts.role_id),
+                session_id: Some(&session_id),
+                model: Some(&t.model.id),
+                mission_id: mission_id.as_deref(),
+                phase_id: opts.phase_id.as_deref(),
+                profiles_file: opts.config_path.as_deref(),
+            },
+        )?;
     }
 
     // (#2294) PREFLIGHT: does this workdir's git directory live outside
@@ -5173,15 +5220,10 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         None => None,
     };
 
-    // (#2162) Moved up from what used to be "3. Resolve session id" below —
-    // this timestamp is a pure `SystemTime::now()` read with no dependency
-    // on anything computed after it, and the resume-checkpoint hoist just
-    // below needs it (to name the intended no-`--workdir` workspace path)
-    // before model selection runs.
-    let unix_micros = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros())
-        .unwrap_or(0);
+    // (#2162) `unix_micros` (the pure `SystemTime::now()` read the
+    // resume-checkpoint hoist just below needs) is taken further up, before
+    // the remote-target resolution: (#2902 step 5) the agentic-remote budget
+    // gate names this dispatch's session id before any Docker work.
 
     // (#2162) `--resume-from` validation, hoisted ahead of model selection
     // and workspace/host_out materialization. #2162 found `stage_resume_
@@ -5288,13 +5330,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
 
     // 3. Resolve session id. (`unix_micros` computed earlier, above — see
     // the #2162 comment on the resume-checkpoint hoist for why.)
-    let session_id = opts.session_id.clone().unwrap_or_else(|| {
-        format!(
-            "crew-dispatch-{}-{unix_micros}-internal",
-            opts.role_id
-        )
-    });
-
     // (#714) Resolve the phase → mission once so every flow record this
     // dispatch emits (start / turn / tool / compaction / complete / telemetry)
     // carries `mission_id`/`phase_id` and groups under its mission in the
@@ -5324,10 +5359,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // no-op for crew-of-one's `{mission_id}-task`-embedded ids and
     // coder-phase/review's explicit `mission-run-<…>` session — both
     // already carry their own run identity.
-    let session_id = match &mission_id {
-        Some(mid) => darkmux_types::session_id::scope_to_run(&session_id, mid),
-        None => session_id,
-    };
+    let session_id = internal_session_id(&opts, unix_micros, mission_id.as_deref());
     let phase_id = opts.phase_id.clone();
 
     // (#2294) Consumer 3 of the preflight detection: a durable record.
@@ -5523,26 +5555,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         remote_auth = remote_auth_header(&t.endpoint)?;
     }
     let remote_needs_auth = remote_auth.is_some();
-
-    // (#2902 step 5) An agentic-remote brain calls its endpoint from inside
-    // the container, turn after turn. Its budget is checked here, before
-    // the container starts (a `wait` holds the start, reported and never
-    // stopping the run), and then between turns by the host sampler's
-    // budget pacer, which pauses the runtime through the pace file the way
-    // the thermal governor does.
-    if let Some(t) = &agentic_pm {
-        crate::budget::admit_endpoint(
-            &t.endpoint,
-            &crate::budget::BudgetCaller {
-                role_id: Some(&opts.role_id),
-                session_id: Some(&session_id),
-                model: Some(&model),
-                mission_id: mission_id.as_deref(),
-                phase_id: phase_id.as_deref(),
-                profiles_file: opts.config_path.as_deref(),
-            },
-        )?;
-    }
 
     // 5. Emit dispatch.start flow record with runtime metadata in payload
     //    (#204). Pairs with dispatch.complete below via session_id.
@@ -9187,12 +9199,23 @@ fn run_telemetry_sampler(
                 phase_id: phase_id.as_deref(),
                 profiles_file: None,
             };
-            match pacer.on_tick(thermal_elapsed_ms, &host_out, &others, &caller, &crate::budget::LiveEnv) {
+            let event =
+                crate::budget::with_env(|env| pacer.on_tick(thermal_elapsed_ms, &host_out, &others, &caller, env));
+            match event {
                 Some(crate::budget::PacerEvent::Paused { state }) => {
                     emit_rest(crate::budget::PACE_REASON, &state, true)
                 }
                 Some(crate::budget::PacerEvent::Resumed { state }) => {
                     emit_rest(crate::budget::PACE_REASON, &state, false)
+                }
+                Some(crate::budget::PacerEvent::Stopped { .. }) => {
+                    // (#2902 step 5 review MF1) The run was stopped while the
+                    // pacer held it (`mission abort` writes only terminal state;
+                    // this is where it reaches a paused container). End it
+                    // the way an interrupt does: the tailer kills the child on
+                    // the flag, and the launcher takes its abort path. The
+                    // pace file still says pause, so no turn goes out first.
+                    darkmux_types::interrupt::mark_interrupted();
                 }
                 None => {}
             }

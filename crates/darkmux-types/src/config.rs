@@ -337,25 +337,75 @@ use std::path::Path;
 //           keys and falls back to its own 500000 default.
 pub const CONFIG_SCHEMA_VERSION: &str = "1.32";
 
-/// (#2902 step 5) Settings RENAMED in 4.0, with no alias:
-/// `(old dotted key, old env var, new dotted key, new env var)`. `config set`
-/// refuses an old key naming the new one; `darkmux doctor` names a leftover
-/// old key in `config.json` or the env with the exact rename. Nothing reads
-/// an old key.
-pub const RENAMED_SETTINGS: &[(&str, &str, &str, &str)] = &[
-    (
-        "remote.max_tokens_per_execution",
-        "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION",
-        "remote.max_tokens_per_step",
-        "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP",
-    ),
-    (
-        "remote.stage_budget_policy",
-        "DARKMUX_REMOTE_STAGE_BUDGET_POLICY",
-        "remote.step_budget_policy",
-        "DARKMUX_REMOTE_STEP_BUDGET_POLICY",
-    ),
+/// (#2902 step 5) A setting RENAMED in 4.0, with no alias. `config set`
+/// refuses the old key naming the new one; `darkmux doctor` (Warn) and every
+/// dispatch / launch / lab-run preflight (a one-line warning) name a leftover
+/// old key in `config.json` or the env, which nothing reads.
+#[derive(Debug, Clone, Copy)]
+pub struct RenamedSetting {
+    pub old_key: &'static str,
+    pub old_env: &'static str,
+    pub new_key: &'static str,
+    pub new_env: &'static str,
+    /// What to do about a leftover (the old key never silently does nothing).
+    pub advice: &'static str,
+}
+
+/// Every setting renamed in 4.0.
+pub const RENAMED_SETTINGS: &[RenamedSetting] = &[
+    RenamedSetting {
+        old_key: "remote.max_tokens_per_execution",
+        old_env: "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION",
+        new_key: "remote.max_tokens_per_step",
+        new_env: "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP",
+        advice: "delete it unless you chose that number (500000 was darkmux's old default); the 4.0 per-step \
+                 cap is unset by default, set remote.max_tokens_per_step only if you want one",
+    },
+    RenamedSetting {
+        old_key: "remote.stage_budget_policy",
+        old_env: "DARKMUX_REMOTE_STAGE_BUDGET_POLICY",
+        new_key: "remote.step_budget_policy",
+        new_env: "DARKMUX_REMOTE_STEP_BUDGET_POLICY",
+        advice: "rename it to remote.step_budget_policy (`off` or `warn`)",
+    },
 ];
+
+/// A leftover old key found in the config or the env.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenamedLeftover {
+    pub setting_old_key: &'static str,
+    /// `config.json key `...`` or `env var ...`.
+    pub found_in: String,
+    /// The operator line: what is ignored, its new name, and the advice.
+    pub line: String,
+}
+
+/// Every leftover renamed setting in `cfg` (a key landed in `remote.extras`)
+/// or `env`.
+pub fn renamed_leftovers(cfg: &DarkmuxConfig, env: &dyn Fn(&str) -> Option<String>) -> Vec<RenamedLeftover> {
+    let mut out = Vec::new();
+    for r in RENAMED_SETTINGS {
+        let leaf = r.old_key.rsplit('.').next().unwrap_or(r.old_key);
+        let mut found: Vec<String> = Vec::new();
+        if let Some(v) = cfg.remote.as_ref().and_then(|x| x.extras.get(leaf)) {
+            found.push(format!("config.json key `{}` ({v})", r.old_key));
+        }
+        if let Some(v) = env(r.old_env).filter(|v| !v.trim().is_empty()) {
+            found.push(format!("env var {} ({v})", r.old_env));
+        }
+        for f in found {
+            out.push(RenamedLeftover {
+                setting_old_key: r.old_key,
+                line: format!(
+                    "{f} is ignored: renamed to `{}` (env {}) in 4.0 (#2902); {}",
+                    r.new_key, r.new_env, r.advice
+                ),
+                found_in: f,
+            });
+        }
+    }
+    out
+}
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -2170,6 +2220,25 @@ mod tests {
     /// on the machine's utility model. `with_defaults()` no longer writes it,
     /// and an older config still carrying it loads leniently into
     /// `radio.extras`, where `darkmux doctor` names it.
+    /// (#2902 step 5) A leftover renamed key, in config.json (it lands in
+    /// `remote.extras`) or the env, is found and named with its new name
+    /// and the advice; the new keys are not leftovers.
+    #[test]
+    fn renamed_leftovers_are_found_in_config_and_env() {
+        let old: DarkmuxConfig = serde_json::from_str(r#"{"remote":{"max_tokens_per_execution":500000}}"#).unwrap();
+        let found = renamed_leftovers(&old, &|_| None);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].line.contains("config.json key `remote.max_tokens_per_execution` (500000) is ignored"), "{}", found[0].line);
+        assert!(found[0].line.contains("renamed to `remote.max_tokens_per_step`") && found[0].line.contains("500000 was darkmux's old default"));
+        let env = |k: &str| (k == "DARKMUX_REMOTE_STAGE_BUDGET_POLICY").then(|| "warn".to_string());
+        let found = renamed_leftovers(&DarkmuxConfig::default(), &env);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].line.contains("env var DARKMUX_REMOTE_STAGE_BUDGET_POLICY (warn) is ignored"));
+        let new: DarkmuxConfig = serde_json::from_str(r#"{"remote":{"max_tokens_per_step":5}}"#).unwrap();
+        assert!(renamed_leftovers(&new, &|_| None).is_empty());
+        assert!(renamed_leftovers(&DarkmuxConfig::with_defaults(), &|_| None).is_empty());
+    }
+
     #[test]
     fn radio_router_profile_is_removed_and_a_leftover_lands_in_extras() {
         let cfg = DarkmuxConfig::with_defaults();

@@ -3880,11 +3880,12 @@ mod tests {
                 Some(b) => {
                     let mut g = b.lock().expect("bucket poisoned");
                     // (#2902 step 5) "Admitted" = the shared bucket still had
-                    // room when this step arrived. Then reserve far past the
-                    // budget and never settle it down, so the next grouped
-                    // sibling finds the SAME bucket spent.
+                    // room when this step arrived. Then settle a spend far
+                    // past the cap, so the next grouped sibling finds the
+                    // SAME bucket spent.
                     let admitted = !g.exhausted();
-                    g.admit_reserve(u32::MAX);
+                    g.admit_reserve(0);
+                    g.settle(0, 1 << 40, 1);
                     (step.id.clone(), true, admitted)
                 }
                 None => (step.id.clone(), false, false),

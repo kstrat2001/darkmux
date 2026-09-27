@@ -466,8 +466,9 @@ pub trait BudgetEnv {
     fn stop_reason(&self, caller: &BudgetCaller<'_>) -> Option<String>;
     /// The endpoint's budget as the registry (`profiles_file`, else the
     /// default search) says NOW, re-read while a call waits, so raising or
-    /// switching off a budget releases the wait. `None`: keep the one in
-    /// hand.
+    /// switching off a budget, or removing the endpoint, releases the wait
+    /// (`Some(None)`). `None`: keep the one in hand (the registry could not
+    /// be read).
     fn reload(&self, endpoint_id: &str, profiles_file: Option<&str>) -> Option<Option<EndpointBudget>>;
     /// Write a flow record.
     fn emit(&self, rec: darkmux_flow::FlowRecord);
@@ -536,7 +537,10 @@ impl BudgetEnv for LiveEnv {
         // Quiet: a quarantine warning every 30 s of a wait is noise; the
         // command's own load already printed it once.
         let loaded = darkmux_profiles::profiles::load_registry_quiet(profiles_file).ok()?;
-        let ep = loaded.registry.endpoints.get(endpoint_id)?;
+        // (review C-i) The endpoint removed from a registry that DID load:
+        // the operator took the budget away, which releases the wait. A
+        // registry that failed to load keeps the budget in hand.
+        let Some(ep) = loaded.registry.endpoints.get(endpoint_id) else { return Some(None) };
         let mut named = ep.clone();
         named.source = darkmux_types::EndpointSource::Named(endpoint_id.to_string());
         EndpointBudget::of(&named).ok()
@@ -585,6 +589,17 @@ pub(crate) fn with_test_env<T>(env: std::rc::Rc<dyn BudgetEnv>, f: impl FnOnce()
     out
 }
 
+/// Run `f` with the environment the budget code uses on this thread: the
+/// live one, or a test's stand-in ([`with_test_env`]). The sampler's pacer
+/// tick goes through this, so a test drives it on the real sampler.
+pub fn with_env<T>(f: impl FnOnce(&dyn BudgetEnv) -> T) -> T {
+    #[cfg(test)]
+    if let Some(env) = TEST_ENV.with(|e| e.borrow().clone()) {
+        return f(&*env);
+    }
+    f(&LiveEnv)
+}
+
 /// THE gate every hosted call to an endpoint passes through, before the
 /// call. `Ok` means go ahead (after warning, or after waiting); `Err` for
 /// limits that cannot be used as written, or a run stopped during a wait
@@ -592,11 +607,7 @@ pub(crate) fn with_test_env<T>(env: std::rc::Rc<dyn BudgetEnv>, f: impl FnOnce()
 /// reading anything.
 pub fn admit_endpoint(ep: &ModelEndpoint, caller: &BudgetCaller<'_>) -> anyhow::Result<()> {
     let Some(budget) = EndpointBudget::of(ep).map_err(|e| anyhow::anyhow!(e))? else { return Ok(()) };
-    #[cfg(test)]
-    if let Some(env) = TEST_ENV.with(|e| e.borrow().clone()) {
-        return admit_with(budget, caller, &*env);
-    }
-    admit_with(budget, caller, &LiveEnv)
+    with_env(|env| admit_with(budget, caller, env))
 }
 
 /// [`admit_endpoint`] against an explicit environment.
@@ -608,6 +619,16 @@ pub fn admit_with(mut b: EndpointBudget, caller: &BudgetCaller<'_>, env: &dyn Bu
         let now = env.now();
         let entries = env.window(&b, now);
         match evaluate(&b, &entries, now) {
+            Verdict::Proceed | Verdict::Warn(_) if waited_ms > 0 && env.stop_reason(caller).is_some() => {
+                // (review C-b) Room returned, but the run was stopped while
+                // it waited (an abort in the wait's last slice): never send.
+                let why = env.stop_reason(caller).unwrap_or_default();
+                anyhow::bail!(
+                    "darkmux: stopped waiting on endpoint `{}`'s budget ({}): {why}; nothing was sent",
+                    b.endpoint_id,
+                    b.describe()
+                );
+            }
             Verdict::Proceed => {
                 env.set_last_level(&key, None);
                 resume_if_waited(&b, caller, env, waited_ms);
@@ -645,7 +666,17 @@ pub fn admit_with(mut b: EndpointBudget, caller: &BudgetCaller<'_>, env: &dyn Bu
                 match env.reload(&b.endpoint_id, caller.profiles_file) {
                     Some(Some(fresh)) => b = fresh,
                     Some(None) => {
-                        // Switched off (or removed) while waiting: go ahead.
+                        // Switched off, or the endpoint removed from the
+                        // registry, while waiting: the operator took the
+                        // budget away, so go ahead (unless the run was
+                        // stopped meanwhile: re-checked at the top of the
+                        // loop, which evaluates nothing against no budget).
+                        if let Some(why) = env.stop_reason(caller) {
+                            anyhow::bail!(
+                                "darkmux: stopped waiting on endpoint `{}`'s budget: {why}; nothing was sent",
+                                b.endpoint_id
+                            );
+                        }
                         resume_if_waited(&b, caller, env, waited_ms);
                         return Ok(());
                     }
@@ -839,7 +870,16 @@ pub const PACER_RELOAD_MS: u64 = 30_000;
 pub enum PacerEvent {
     Paused { state: String },
     Resumed { state: String },
+    /// (review MF1) The run was stopped (Ctrl-C, `mission abort`, an
+    /// abandoned phase) while the pacer held it: the pacer never releases a
+    /// stopped run, and the sampler ends it the way an interrupt does, so
+    /// nothing more is sent. Reported once.
+    Stopped { reason: String },
 }
+
+/// (review MF1) The flow-record action when a budget wait ends because its
+/// run was stopped. Level Warn. Nothing was sent after it.
+pub const BUDGET_STOP_ACTION: &str = "budget.stop";
 
 /// What the other governors hold on the pace file this tick, so the pacer
 /// neither overwrites nor drops them.
@@ -885,6 +925,8 @@ pub struct BudgetPacer {
     pausing: bool,
     waited_ms: u64,
     announced: Option<Option<i64>>,
+    /// The run was stopped and `Stopped` was reported: hold, never release.
+    stopped: bool,
 }
 
 impl BudgetPacer {
@@ -898,6 +940,7 @@ impl BudgetPacer {
             pausing: false,
             waited_ms: 0,
             announced: None,
+            stopped: false,
         }
     }
 
@@ -906,11 +949,10 @@ impl BudgetPacer {
         self.pausing
     }
 
-    fn state(&self, resume_at: Option<i64>) -> String {
-        match resume_at {
-            Some(r) => format!("{} until {}", self.budget.endpoint_id, darkmux_flow::ts_utc_at(r)),
-            None => format!("{} (budget 0)", self.budget.endpoint_id),
-        }
+    /// The pace-file `state`: the endpoint id. When the wait resumes lives
+    /// on the `budget.wait` record; the rest reason reads "budget · <id>".
+    fn state(&self) -> String {
+        self.budget.endpoint_id.clone()
     }
 
     /// One sampler tick. `elapsed_ms` is the real gap since the last tick,
@@ -924,7 +966,19 @@ impl BudgetPacer {
         env: &dyn BudgetEnv,
     ) -> Option<PacerEvent> {
         self.since_check_ms = self.since_check_ms.saturating_add(elapsed_ms);
+        if self.stopped {
+            // Reported already; keep holding (the sampler is ending the run).
+            if self.pausing && !others.pausing {
+                crate::pace_file::write(host_out, true, PACE_REASON, &self.state());
+            }
+            return None;
+        }
         if self.pausing {
+            // (review MF1) Every tick while holding: a stopped run is never
+            // released, and ends here.
+            if let Some(reason) = env.stop_reason(caller) {
+                return Some(self.stop(reason, caller, env));
+            }
             self.waited_ms = self.waited_ms.saturating_add(elapsed_ms);
             env.paused(elapsed_ms);
             self.since_reload_ms = self.since_reload_ms.saturating_add(elapsed_ms);
@@ -947,12 +1001,21 @@ impl BudgetPacer {
         let key = format!("endpoint:{}", self.budget.endpoint_id);
         match evaluate(&self.budget, &entries, now) {
             Verdict::Wait { breach, resume_at } => {
+                if let Some(reason) = env.stop_reason(caller) {
+                    // A stopped run whose window is full: hold it (never let
+                    // another turn go out) and end it.
+                    if !others.pausing {
+                        crate::pace_file::write(host_out, true, PACE_REASON, &self.state());
+                    }
+                    self.pausing = true;
+                    return Some(self.stop(reason, caller, env));
+                }
                 if self.announced != Some(resume_at) {
                     announce_wait(&self.budget, &breach, resume_at, now, caller, env);
                     self.announced = Some(resume_at);
                 }
                 env.set_last_level(&key, Some(BreachLevel::AtLimit));
-                let state = self.state(resume_at);
+                let state = self.state();
                 if !others.pausing {
                     crate::pace_file::write(host_out, true, PACE_REASON, &state);
                 }
@@ -986,9 +1049,13 @@ impl BudgetPacer {
         if !self.pausing {
             return None;
         }
+        // (review MF1) Never release a stopped run.
+        if let Some(reason) = env.stop_reason(caller) {
+            return Some(self.stop(reason, caller, env));
+        }
         self.pausing = false;
         self.announced = None;
-        let state = self.budget.endpoint_id.clone();
+        let state = self.state();
         if !others.pausing {
             match &others.duty_cycle {
                 Some((delay, thermal_state)) => crate::pace_file::write_with_turn_delay(
@@ -1004,6 +1071,33 @@ impl BudgetPacer {
         resume_if_waited(&self.budget, caller, env, self.waited_ms.max(1));
         self.waited_ms = 0;
         Some(PacerEvent::Resumed { state })
+    }
+}
+
+impl BudgetPacer {
+    /// Report the stop once: a CLI line and a `budget.stop` record. The
+    /// caller (the sampler) ends the run.
+    fn stop(&mut self, reason: String, caller: &BudgetCaller<'_>, env: &dyn BudgetEnv) -> PacerEvent {
+        self.stopped = true;
+        let message = format!(
+            "darkmux: stopped waiting on endpoint `{}`'s budget: {reason}; ending the run, nothing more is sent",
+            self.budget.endpoint_id
+        );
+        env.say(&message);
+        env.emit(record(
+            darkmux_flow::Level::Warn,
+            BUDGET_STOP_ACTION,
+            caller,
+            serde_json::json!({
+                "scope": "endpoint",
+                "endpoint_id": self.budget.endpoint_id,
+                "reason": reason,
+                "waited_ms": self.waited_ms,
+                "pid": std::process::id(),
+                "message": message,
+            }),
+        ));
+        PacerEvent::Stopped { reason }
     }
 }
 
@@ -1108,7 +1202,7 @@ pub fn active_waits(dir: &Path, now: i64, lookback_secs: u64, alive: &dyn Fn(u32
             let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("");
             let waiting = match action {
                 BUDGET_WAIT_ACTION => true,
-                BUDGET_RESUME_ACTION => false,
+                BUDGET_RESUME_ACTION | BUDGET_STOP_ACTION => false,
                 _ => continue,
             };
             let p = crate::usage::payload_of(&v);

@@ -12252,6 +12252,28 @@ fn config_set_refuses_the_renamed_per_execution_key() {
     );
 }
 
+/// (#2902 step 5) A leftover pre-4.0 per-execution cap in the env is read
+/// by nothing: a dispatch says so on stderr (once), naming the new key and
+/// the advice, and is NOT refused for it.
+#[test]
+fn a_leftover_renamed_cap_is_named_at_preflight_and_not_refused() {
+    let empty_path = TempDir::new().unwrap();
+    let out = darkmux_std_cmd()
+        .env("PATH", empty_path.path())
+        .env("DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION", "500000")
+        .args(["dispatch", "code-reviewer", "hello"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("env var DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION (500000) is ignored: renamed to `remote.max_tokens_per_step`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("500000 was darkmux's old default"), "{stderr}");
+    assert!(!stderr.contains("refusing to start: bad config"), "a leftover is never refused: {stderr}");
+    assert_eq!(stderr.matches("is ignored: renamed to").count(), 1, "once per process: {stderr}");
+}
+
 fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for e in entries.flatten() {

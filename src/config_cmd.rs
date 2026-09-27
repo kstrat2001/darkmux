@@ -402,7 +402,7 @@ fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
         );
     }
     // (#2902 step 5) Renamed in 4.0, no alias: name the new key.
-    if let Some((_, _, new_key, _)) = darkmux_types::config::RENAMED_SETTINGS.iter().find(|(old, ..)| *old == key) {
+    if let Some(new_key) = darkmux_types::config::RENAMED_SETTINGS.iter().find(|r| r.old_key == key).map(|r| r.new_key) {
         bail!(
             "`{key}` was renamed to `{new_key}` in 4.0 (#2902): darkmux config set {new_key} {value}"
         );
@@ -1290,7 +1290,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("config.json");
         std::fs::write(&path, "{}").unwrap();
-        for (old, _, new, _) in darkmux_types::config::RENAMED_SETTINGS {
+        for r in darkmux_types::config::RENAMED_SETTINGS {
+            let (old, new) = (r.old_key, r.new_key);
             let err = set_at(&path, old, "warn").unwrap_err().to_string();
             assert!(err.contains(&format!("`{old}` was renamed to `{new}` in 4.0")), "{err}");
         }

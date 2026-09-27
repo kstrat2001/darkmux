@@ -158,8 +158,9 @@ pub enum VerifyRuling {
     Uncertain,
     /// No recognizable fenced JSON ruling (after one retry).
     Unparsed,
-    /// The dispatch itself failed (or the stage's remote token budget was
-    /// exhausted — the note names which).
+    /// The dispatch itself failed (or, in an envelope recorded before 4.0,
+    /// the stage's remote token budget was exhausted: the note names which;
+    /// since #2902 step 5 no call is skipped for budget).
     Error,
 }
 
@@ -312,14 +313,17 @@ pub struct ReviewEnvelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staffing: Option<StaffingSnapshot>,
     /// (#1260) Non-fatal run findings the operator should read — e.g. a
-    /// remote probe seat failing after bounded retries (reduced coverage)
-    /// or the probe stage's remote token budget exhausting. Empty on a
+    /// remote probe seat failing after bounded retries (reduced coverage),
+    /// or (in an envelope recorded before 4.0) the probe stage's remote token
+    /// budget exhausting, which no longer happens (#2902 step 5). Empty on a
     /// clean run (and then not serialized — older envelopes are unchanged).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
-    /// (#1260/#1177 — operator decision) Per-stage remote token-bucket
-    /// accounting: one record per pipeline stage that made (or skipped) at
-    /// least one REMOTE call. Empty (and unserialized) on local-only runs.
+    /// (#1260/#1177 — operator decision) Remote token-bucket accounting: one
+    /// record per labeled bucket that made (or, before 4.0, skipped) at least
+    /// one REMOTE call. Empty (and unserialized) on local-only runs. Since
+    /// #2902 step 5 a bucket is a per-step cap that never skips a call, so a
+    /// new row's `skipped_calls` is 0; old envelopes still read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remote_budgets: Vec<RemoteBudgetRecord>,
     /// (#1299) The `needs_check` tier clustered by `(file, mechanism-family)`
@@ -420,7 +424,9 @@ fn usize_is_zero(n: &usize) -> bool {
 ///   SAME condition that has always meant "produced no signal."
 /// - [`RunOutcome::Partial`] — `env.degenerate` is `None` but at least one
 ///   `remote_budgets` row for a JUDGE stage (`"judge-pass1"`/`"judge-pass2"`)
-///   carries `skipped_calls > 0`. This is the #1876 fix's own case: the
+///   carries `skipped_calls > 0`. Only an envelope recorded before 4.0 can
+///   (#2902 step 5: no call is skipped for budget any more); it is kept so
+///   those still read as they did. This is the #1876 fix's own case: the
 ///   judge stage's remote token bucket ran out before the whole docket was
 ///   judged, but usable rulings exist. Scoped to judge stages ONLY —
 ///   probe-stage exhaustion already renders as a "reduced coverage" warning

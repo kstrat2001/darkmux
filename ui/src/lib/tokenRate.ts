@@ -910,6 +910,9 @@ const REST_REASON_WORDS: Record<string, string> = {
   // The governor's tier-4 OperatorHold: a pause that waits for the operator.
   "thermal-episode-limit": "thermal hold",
   battery: "battery",
+  // (#2902 step 5) An endpoint budget's `wait` pausing an agentic-remote run
+  // (the pacer's `state` is the endpoint id): "budget · azure".
+  budget: "budget",
   paused: "paused",
 };
 

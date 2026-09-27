@@ -268,7 +268,10 @@ darkmux release.
   shape, and is a Fail in `darkmux doctor`, which also shows each budget's
   policy and the spend in its window. `darkmux mission abort` (or Ctrl-C)
   ends a wait without sending: the wait checks its mission's status on disk
-  every half second. Budgets apply to
+  every half second, and an agentic-remote run the budget holds between
+  turns is ended rather than released (a `budget.stop` record). A misspelled
+  key in `limits` (`windw`, `polcy`, `tokns`) is refused the same way,
+  naming the nearest valid key. Budgets apply to
   calls darkmux sends to an endpoint it does not manage; `tokens_per_dispatch`
   and `concurrent_calls` are still shown and not enforced, and
   `remote.concurrent_cap` still applies. FLOW 1.64.0 (`endpoint_id` on usage

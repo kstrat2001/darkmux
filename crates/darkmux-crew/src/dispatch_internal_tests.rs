@@ -339,6 +339,106 @@
         assert!(rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(), "the endpoint received no request");
     }
 
+    /// (#2902 step 5 review C-a) The agentic-remote container path's
+    /// PRE-START gate, driven through the real `dispatch()`: a tool-granting
+    /// role on a budgeted endpoint whose window is full under `wait`, on a
+    /// run that was stopped, returns the gate's error before any Docker work
+    /// (none is available here, so reaching it would fail differently).
+    #[test]
+    #[serial]
+    fn the_agentic_remote_prestart_gate_fires_before_the_container() {
+        let reg = TempDir::new().unwrap();
+        let pf = reg.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"p":{"models":[{"id":"gpt-remote","endpoint":"azure"}]}},"default_profile":"p",
+                "endpoints":{"azure":{"url":"http://127.0.0.1:1",
+                    "limits":{"policy":"wait","window":{"period":"1d","tokens":1}}}}}"#,
+        )
+        .unwrap();
+        let home = TempDir::new().unwrap();
+        let flows_dir = TempDir::new().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+        }
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "code-reviewer".to_string();
+        opts.profile_name = Some("p".to_string());
+        opts.config_path = Some(pf.to_string_lossy().to_string());
+        opts.session_id = Some(format!("budget-gate-agentic-{}", std::process::id()));
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::full_window().stopped_after(1, "mission `m` is aborted"));
+        let result = crate::budget::with_test_env(env.clone(), || dispatch(opts));
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+        let err = format!("{:#}", result.expect_err("a stopped wait must not start the container"));
+        assert!(err.contains("stopped waiting on endpoint `azure`'s budget") && err.contains("nothing was sent"), "{err}");
+        assert_eq!(env.actions(), vec![crate::budget::BUDGET_WAIT_ACTION.to_string()]);
+    }
+
+    /// (#2902 step 5 review C-a, MF1) The sampler's pacer call, driven on
+    /// the real `run_telemetry_sampler`: a held run that was stopped is
+    /// never released; the pace file keeps `pause`, a `budget.stop` is
+    /// recorded, and the run is ended the way an interrupt ends it.
+    #[test]
+    #[serial]
+    fn the_sampler_pacer_ends_a_stopped_run_it_holds() {
+        darkmux_types::interrupt::reset_for_test();
+        let out = TempDir::new().unwrap();
+        let mut ep: darkmux_types::ModelEndpoint = serde_json::from_str(
+            r#"{"url":"http://127.0.0.1:1","limits":{"policy":"wait","window":{"period":"1d","tokens":1}}}"#,
+        )
+        .unwrap();
+        ep.source = darkmux_types::EndpointSource::Named("azure".into());
+        let pacer = crate::budget::BudgetPacer::new(crate::budget::EndpointBudget::of(&ep).unwrap().unwrap(), None);
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::full_window().stopped("mission `m` is aborted"));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopper = Arc::clone(&stop);
+        // End the sampler once the interrupt was raised (or after a bound),
+        // never on a fixed guess at how long its first tick takes.
+        let t = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !darkmux_types::interrupt::is_set() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(50));
+            }
+            stopper.store(true, Ordering::SeqCst);
+        });
+        crate::budget::with_test_env(env.clone(), || {
+            run_telemetry_sampler(
+                stop,
+                "coder".into(),
+                "s-pacer".into(),
+                "gpt-remote".into(),
+                None,
+                None,
+                Some("m".into()),
+                None,
+                out.path().to_path_buf(),
+                None,
+                crate::thermal_governor::ThermalGovernorConfig::from_env().unwrap(),
+                Some(pacer),
+            )
+        });
+        t.join().unwrap();
+        let interrupted = darkmux_types::interrupt::is_set();
+        darkmux_types::interrupt::reset_for_test();
+        assert!(interrupted, "the stopped run is ended the way an interrupt ends it");
+        assert!(env.actions().contains(&crate::budget::BUDGET_STOP_ACTION.to_string()), "{:?}", env.actions());
+        let pace: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(crate::pace_file::path(out.path())).unwrap()).unwrap();
+        assert_eq!((pace["pause"].as_bool(), pace["reason"].as_str()), (Some(true), Some("budget")), "{pace}");
+    }
+
     /// Hosted-response classification (pure): the happy path passes through;
     /// object-shaped errors (Azure/OpenAI) and ARRAY-shaped errors (Google's
     /// OpenAI-compat layer, observed live 2026-07-05) both surface their

@@ -280,6 +280,23 @@ impl UsageLimits {
     /// Shape checks: the window's period, `warn_at`'s range, and the
     /// policy's value.
     pub fn validate(&self) -> Result<(), String> {
+        // (#2902 step 5 review MF2) A misspelled KEY lands in `extras` and
+        // would silently disarm the budget (`windw` is no window, `polcy` is
+        // the default policy, `tokns` drops the token budget). Read
+        // leniently, refused here, naming the key and the nearest valid one.
+        unknown_key("limits", &self.extras, LIMITS_KEYS)?;
+        if let Some(w) = &self.window {
+            unknown_key("limits.window", &w.extras, WINDOW_KEYS)?;
+        }
+        if let Some(Lenient::Known(p)) = &self.policy {
+            if p.counts() && !self.window.as_ref().is_some_and(UsageWindow::is_set) {
+                return Err(format!(
+                    "limits.policy `{}` is set but no `window` budget is: a policy with no budget governs \
+                     nothing. Set `window` (`period` and `tokens` or `calls`), or drop `policy`",
+                    crate::config_enum::ConfigEnum::token(*p)
+                ));
+            }
+        }
         if let Some(w) = &self.window {
             if !w.is_set() && w.period.is_some() {
                 return Err("limits.window sets neither `tokens` nor `calls`".to_string());
@@ -311,6 +328,36 @@ impl UsageLimits {
         }
         Ok(())
     }
+}
+
+/// The keys `limits` knows.
+const LIMITS_KEYS: &[&str] = &["window", "policy", "warn_at", "tokens_per_dispatch", "concurrent_calls"];
+/// The keys `limits.window` knows.
+const WINDOW_KEYS: &[&str] = &["period", "tokens", "calls"];
+
+/// An error naming the first unknown key in `extras` and the nearest known
+/// one, or `Ok` when there is none.
+fn unknown_key(at: &str, extras: &serde_json::Map<String, serde_json::Value>, known: &[&str]) -> Result<(), String> {
+    let Some(key) = extras.keys().next() else { return Ok(()) };
+    let nearest = known.iter().min_by_key(|k| edit_distance(key, k)).copied().unwrap_or("");
+    Err(format!(
+        "{at} has an unknown key `{key}` (did you mean `{nearest}`?); valid keys: {}",
+        known.join(", ")
+    ))
+}
+
+/// Levenshtein distance, for a "did you mean" suggestion.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            cur.push((prev[j] + usize::from(ca != *cb)).min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
 }
 
 /// `<n>m`, `<n>h` or `<n>d` in seconds, `n >= 1`.

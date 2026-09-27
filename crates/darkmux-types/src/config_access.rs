@@ -1101,6 +1101,13 @@ pub fn remote_step_budget_policy() -> Result<crate::config::StepBudgetPolicy, cr
     resolve_enum("remote.step_budget_policy").map(|(v, _)| v)
 }
 
+/// (#2902 step 5) Every leftover RENAMED setting (`config::RENAMED_SETTINGS`)
+/// in the live config or env: read by nothing, so named loudly (doctor Warn,
+/// a preflight warning line). Never refused.
+pub fn renamed_setting_leftovers() -> Vec<crate::config::RenamedLeftover> {
+    crate::config::renamed_leftovers(config(), &env_str)
+}
+
 /// (#1230 Packet 1) Max CONCURRENT remote dispatches
 /// `darkmux_crew::concurrent_dispatch::run_bounded` runs at once. Resolves
 /// `env(DARKMUX_REMOTE_CONCURRENT_CAP) > config.remote.concurrent_cap > 1`
@@ -3693,10 +3700,10 @@ mod tests {
         }
     }
 
-    // ── remote_max_tokens_per_step (#1260): env > config > 500000 ──
+    // ── remote_max_tokens_per_step (#1260, #2902 step 5): env > config > none ──
     #[serial_test::serial]
     #[test]
-    fn remote_max_tokens_per_step_env_then_default() {
+    fn remote_max_tokens_per_step_env_then_config_then_none() {
         let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
         let prev = std::env::var(k).ok();
         unsafe { std::env::remove_var(k); }

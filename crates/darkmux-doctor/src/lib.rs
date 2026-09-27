@@ -2730,20 +2730,6 @@ fn check_removed_telemetry_record_every_samples() -> Check {
     }
 }
 
-/// (#2913, 4.0) `dirs.notebook` and `DARKMUX_NOTEBOOK_DIR` are removed —
-/// `lab notebook draft`/`list` retired outright in 4.0 (no deprecation
-/// release, no compatibility read), replaced by the bundled
-/// `darkmux-lab-notebook` skill, which writes the entry wherever the
-/// operator's own instructions say. Because the `DirsConfig` field is gone,
-/// a `config.json` still carrying `dirs.notebook` is read leniently (serde
-/// ignores the unknown key) and has no effect; the env var is read by
-/// nothing at all. Both are silent by construction, so this is the ONE
-/// place an operator learns the setting is dead and what to change.
-///
-/// `Pass` when neither tier is set (including a fresh `with_defaults()`
-/// config); `Warn` naming exactly the tier(s) that are set, with the exact
-/// removal step for each. An empty env value reads as unset, matching every
-/// other env-tier accessor.
 /// (#2902 step 5) Settings RENAMED in 4.0 with no alias
 /// (`darkmux_types::config::RENAMED_SETTINGS`: the per-step cap's
 /// `remote.max_tokens_per_execution` -> `remote.max_tokens_per_step`, and its
@@ -2762,34 +2748,35 @@ fn renamed_settings_status(
     config_path: &std::path::Path,
 ) -> Check {
     let name = "renamed settings (4.0)";
-    let mut found: Vec<String> = Vec::new();
-    let mut steps: Vec<String> = Vec::new();
-    for (old_key, old_env, new_key, new_env) in darkmux_types::config::RENAMED_SETTINGS {
-        let leaf = old_key.rsplit('.').next().unwrap_or(old_key);
-        if cfg.remote.as_ref().is_some_and(|r| r.extras.contains_key(leaf)) {
-            found.push(format!("config.json sets `{old_key}`"));
-            steps.push(format!("rename `{old_key}` to `{new_key}` in {}", config_path.display()));
-        }
-        if env(old_env).is_some_and(|v| !v.trim().is_empty()) {
-            found.push(format!("`{old_env}` is exported"));
-            steps.push(format!("export {new_env} instead of {old_env}"));
-        }
-    }
-    if found.is_empty() {
+    let leftovers = darkmux_types::config::renamed_leftovers(cfg, env);
+    if leftovers.is_empty() {
         return Check { name: name.into(), status: Status::Pass, message: "none present".into(), hint: None };
     }
     Check {
         name: name.into(),
         status: Status::Warn,
-        message: format!("{}: renamed in 4.0 (#2902); nothing reads the old name", found.join("; ")),
+        message: leftovers.iter().map(|l| l.line.clone()).collect::<Vec<_>>().join("; "),
         hint: Some(format!(
-            "{}. The per-step cap on hosted tokens is `remote.max_tokens_per_step` (no default: unset is no cap) \
-             with `remote.step_budget_policy` (`off` or `warn`)",
-            steps.join("; ")
+            "Nothing reads the old names. config.json is {}; an old env var is removed from your shell rc.",
+            config_path.display()
         )),
     }
 }
 
+/// (#2913, 4.0) `dirs.notebook` and `DARKMUX_NOTEBOOK_DIR` are removed —
+/// `lab notebook draft`/`list` retired outright in 4.0 (no deprecation
+/// release, no compatibility read), replaced by the bundled
+/// `darkmux-lab-notebook` skill, which writes the entry wherever the
+/// operator's own instructions say. Because the `DirsConfig` field is gone,
+/// a `config.json` still carrying `dirs.notebook` is read leniently (serde
+/// ignores the unknown key) and has no effect; the env var is read by
+/// nothing at all. Both are silent by construction, so this is the ONE
+/// place an operator learns the setting is dead and what to change.
+///
+/// `Pass` when neither tier is set (including a fresh `with_defaults()`
+/// config); `Warn` naming exactly the tier(s) that are set, with the exact
+/// removal step for each. An empty env value reads as unset, matching every
+/// other env-tier accessor.
 fn check_removed_notebook_settings() -> Check {
     let name = "dirs.notebook / DARKMUX_NOTEBOOK_DIR (removed)";
     let cfg = darkmux_types::config::DarkmuxConfig::load_resolved();
@@ -13318,10 +13305,16 @@ mod tests {
             serde_json::from_str(r#"{"remote":{"max_tokens_per_execution":500000}}"#).unwrap();
         let c = renamed_settings_status(&old, &|_| None, path);
         assert_eq!(c.status, Status::Warn, "{}", c.message);
-        assert!(c.hint.unwrap().contains("rename `remote.max_tokens_per_execution` to `remote.max_tokens_per_step`"));
+        assert!(c.message.contains("config.json key `remote.max_tokens_per_execution` (500000) is ignored"), "{}", c.message);
+        assert!(
+            c.message.contains("delete it unless you chose that number (500000 was darkmux's old default)"),
+            "{}",
+            c.message
+        );
+        assert!(c.message.contains("set remote.max_tokens_per_step only if you want one"), "{}", c.message);
         let env = |k: &str| (k == "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION").then(|| "5".to_string());
         let c = renamed_settings_status(&darkmux_types::config::DarkmuxConfig::default(), &env, path);
-        assert!(c.hint.unwrap().contains("export DARKMUX_REMOTE_MAX_TOKENS_PER_STEP instead of DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION"));
+        assert!(c.message.contains("env var DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION (5) is ignored"), "{}", c.message);
         let new: darkmux_types::config::DarkmuxConfig =
             serde_json::from_str(r#"{"remote":{"max_tokens_per_step":5,"step_budget_policy":"warn"}}"#).unwrap();
         assert_eq!(renamed_settings_status(&new, &|_| None, path).status, Status::Pass);

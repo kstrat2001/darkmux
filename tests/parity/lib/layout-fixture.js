@@ -177,6 +177,9 @@ const STATES = [
     ["rest-battery", "2026-09-16", { reason: "battery", state: "18%" }, "battery · 18%", "battery"],
     ["rest-episode-limit", "2026-09-18", { reason: "thermal-episode-limit", state: "serious" }, "thermal hold · serious", "thermal hold"],
     ["rest-unknown", "2026-09-20", { reason: "solar-flare" }, "solar-flare", "solar-flare"],
+    // (#2902 step 5) A budget pause on an agentic-remote run: the budget
+    // pacer writes `state` as the endpoint id.
+    ["rest-budget", "2026-09-26", { reason: "budget", state: "azure" }, "budget · azure", "budget"],
   ].map(([id, date, why, words, phoneWords]) => ({
     id, date, now: "12:00:12",
     runText: new RegExp(`run state: rest \\d+s · ${words}$`),

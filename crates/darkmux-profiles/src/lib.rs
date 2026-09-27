@@ -54,6 +54,7 @@ pub fn preflight_with(
     };
     let mut invalid = Vec::new();
     if matches!(scope, Scope::Dispatch | Scope::MissionLaunch | Scope::LabRun) {
+        warn_renamed_leftovers_once();
         if let Ok(loaded) = profiles::load_registry_quiet(profiles_file) {
             bad.extend(config_enum::bad_endpoint_budget_policies(&loaded.registry));
             invalid.extend(config_enum::invalid_endpoint_limits(&loaded.registry));
@@ -63,5 +64,20 @@ pub fn preflight_with(
         Ok(())
     } else {
         Err(PreflightRefusal { scope, bad, invalid })
+    }
+}
+
+/// (#2902 step 5) A leftover RENAMED setting (the pre-4.0
+/// `remote.max_tokens_per_execution`, in config.json or the env) is read by
+/// nothing. It is never refused, but it must not silently do nothing: every
+/// entry point that dispatches says so, once per process, on stderr.
+fn warn_renamed_leftovers_once() {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let leftovers = darkmux_types::config_access::renamed_setting_leftovers();
+    if leftovers.is_empty() || WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    for l in leftovers {
+        eprintln!("darkmux: ⚠ {}", l.line);
     }
 }

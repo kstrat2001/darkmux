@@ -25,11 +25,11 @@
 //! operator never asked to stop, and with no clamp there is no starved grant
 //! for a floor to deny.
 //!
-//! **The ceiling is SOFT, by construction.** A call's cost is settled AFTER
-//! it, so a step can overshoot by whatever the calls in flight at the
-//! crossing spend. Each call's cap is reserved when it is admitted and
-//! replaced by its real spend when it settles, so concurrent siblings of one
-//! `bucket_group` (#1442) see each other's calls in flight.
+//! **The ceiling is SOFT, by construction.** A call's cost is known only
+//! AFTER it, so a step can overshoot by whatever the calls in flight at the
+//! crossing spend. A breach is decided, and reported, on SETTLED spend only
+//! (review C-c): a sibling's call still in flight has spent nothing yet. The
+//! in-flight reservations are tracked beside it ([`RemoteBudget::used`]).
 
 use darkmux_types::config::StepBudgetPolicy;
 use serde::{Deserialize, Serialize};
@@ -38,7 +38,10 @@ use serde::{Deserialize, Serialize};
 /// (e.g. `darkmux-lab`'s `ReviewEnvelope::remote_budgets`). Its `stage`
 /// field is the envelope's wire name for the bucket's label (the retired
 /// review pipeline labeled its buckets `probe`, `judge-pass1`, ...), kept
-/// so recorded envelopes still read; the bucket is a per-step cap.
+/// so recorded envelopes still read; the bucket is a per-step cap. The same
+/// rule (CLAUDE.md contract 8: the wire keeps its historical spelling, the
+/// vocabulary says "step") keeps the hosted `dispatch.single_shot` step
+/// result's `remote_max_tokens_per_execution` key.
 // (#2310 P2) `PartialEq` is new — every field is a plain String/u64/bool/
 // u32, so this rides inside a typed `Output<T>` body (which derives
 // `PartialEq` throughout — see `darkmux_crew::step_output`'s module doc).
@@ -47,9 +50,12 @@ pub struct RemoteBudgetRecord {
     /// The bucket's label (wire name kept), e.g. a step id.
     pub stage: String,
     pub max_tokens: u64,
+    /// What the bucket's settled calls spent.
     pub used_tokens: u64,
     pub exhausted: bool,
-    /// Remote calls NOT made because the bucket had already exhausted.
+    /// Remote calls NOT made because the bucket had already exhausted. A
+    /// pre-4.0 envelope can carry a non-zero count; since #2902 step 5 no
+    /// call is ever skipped, so a new row always says 0. Kept for the shape.
     pub skipped_calls: u32,
 }
 
@@ -67,6 +73,8 @@ pub struct RemoteBudget {
     budget: Option<u64>,
     policy: StepBudgetPolicy,
     used: u64,
+    /// What settled calls actually spent (no reservations).
+    settled: u64,
     calls: u32,
     /// The breach has been handed out ([`Self::take_breach`] fires once).
     surfaced: bool,
@@ -75,7 +83,7 @@ pub struct RemoteBudget {
 impl RemoteBudget {
     /// A bucket with no label ([`Self::record`] returns `None`).
     pub fn new(budget: Option<u64>, policy: StepBudgetPolicy) -> Self {
-        Self { label: None, budget, policy, used: 0, calls: 0, surfaced: false }
+        Self { label: None, budget, policy, used: 0, settled: 0, calls: 0, surfaced: false }
     }
 
     /// A bucket that reports its label on [`Self::record`].
@@ -108,14 +116,19 @@ impl RemoteBudget {
         self.policy
     }
 
-    /// Tokens spent (and reserved for calls in flight).
+    /// Tokens spent AND reserved for calls in flight.
     pub fn used(&self) -> u64 {
         self.used
     }
 
-    /// True when a counting bucket's spend has reached its budget.
+    /// Tokens settled calls actually spent.
+    pub fn settled(&self) -> u64 {
+        self.settled
+    }
+
+    /// True when a counting bucket's SETTLED spend has reached its cap.
     pub fn exhausted(&self) -> bool {
-        self.counts() && self.budget.is_some_and(|b| self.used >= b)
+        self.counts() && self.budget.is_some_and(|b| self.settled >= b)
     }
 
     /// Admit one call and reserve `requested` (the call's completion cap).
@@ -130,6 +143,7 @@ impl RemoteBudget {
     /// represents.
     pub fn settle(&mut self, reserved: u32, actual: u64, calls: u32) {
         self.used = self.used.saturating_sub(u64::from(reserved)).saturating_add(actual);
+        self.settled = self.settled.saturating_add(actual);
         self.calls += calls;
     }
 
@@ -140,12 +154,12 @@ impl RemoteBudget {
             return None;
         }
         self.surfaced = true;
-        Some(StepBreach { used: self.used, budget: self.budget.unwrap_or(0) })
+        Some(StepBreach { used: self.settled, budget: self.budget.unwrap_or(0) })
     }
 
     /// This bucket's outcome row: `None` without a label, without a cap, or
-    /// when no call was made. `skipped_calls` is always 0 now (a step never
-    /// skips a call); the field stays for the row's shape.
+    /// when no call was made. `used_tokens` is the SETTLED spend;
+    /// `skipped_calls` is always 0 now (a step never skips a call).
     pub fn record(&self) -> Option<RemoteBudgetRecord> {
         let label = self.label?;
         let budget = self.budget?;
@@ -155,8 +169,8 @@ impl RemoteBudget {
         Some(RemoteBudgetRecord {
             stage: label.to_string(),
             max_tokens: budget,
-            used_tokens: self.used,
-            exhausted: self.used >= budget,
+            used_tokens: self.settled,
+            exhausted: self.settled >= budget,
             skipped_calls: 0,
         })
     }
@@ -209,13 +223,30 @@ mod tests {
         assert_eq!((rec.max_tokens, rec.used_tokens, rec.exhausted, rec.skipped_calls), (1_000, 1_230, true, 0));
     }
 
+    /// (review C-c) A breach is decided on SETTLED spend: siblings' calls
+    /// in flight (reserved, not settled) never count, so the message never
+    /// reports "12788 of 10000" when only 500 was spent.
+    #[test]
+    fn a_breach_counts_settled_spend_not_siblings_in_flight() {
+        let mut b = RemoteBudget::new(Some(10_000), StepBudgetPolicy::Warn);
+        for _ in 0..3 {
+            b.admit_reserve(4_096); // three siblings in flight: 12288 reserved
+        }
+        b.settle(4_096, 500, 1);
+        assert_eq!(b.take_breach(), None, "500 settled of 10000: no breach");
+        assert_eq!((b.settled(), b.used()), (500, 8_692));
+        b.settle(4_096, 9_600, 1);
+        assert_eq!(b.take_breach(), Some(StepBreach { used: 10_100, budget: 10_000 }));
+    }
+
     /// A zero budget under `warn` surfaces the breach at once. (Pre-4.0, 0
     /// was a hard refusal.)
     #[test]
     fn a_zero_budget_warns_and_never_refuses() {
         let mut n = RemoteBudget::new(Some(0), StepBudgetPolicy::Warn);
         n.admit_reserve(10);
-        assert!(n.take_breach().is_some());
+        n.settle(10, 0, 1);
+        assert!(n.take_breach().is_some(), "0 settled reaches a cap of 0");
     }
 
     /// Concurrent siblings on one shared bucket: every call's reservation

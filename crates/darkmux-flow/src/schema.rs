@@ -136,13 +136,17 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.64.0";
 //           `dispatch.rest` gains the reason `budget` (the pace-file pause
 //           an agentic-remote dispatch takes while its endpoint's window is
 //           full); its payload shape is unchanged.
-//           `step result.payload` (hosted `dispatch.single_shot`): the key
-//           `remote_max_tokens_per_execution` is renamed
-//           `remote_max_tokens_per_step` with the config key it echoes, and
-//           is null when no per-step cap is set (no default since 4.0);
+//           `step result.payload.remote_max_tokens_per_execution` (hosted
+//           `dispatch.single_shot`) keeps its shipped spelling (CLAUDE.md
+//           contract 8: the wire keeps its historical spelling) though the
+//           config key it echoes is now `remote.max_tokens_per_step`; it is
+//           null when no per-step cap is set (no default since 4.0), and
 //           `max_tokens_sent` now always equals `max_tokens_requested` (no
-//           call is clamped). A reader of the old key finds it absent.
-//           Otherwise an older reader ignores all of it.
+//           call is clamped). An older reader ignores all of it.
+//           `budget.stop` (level `warn`, endpoint scope): a budget wait's
+//           run was stopped (Ctrl-C, `mission abort`, an abandoned phase)
+//           while a container was held; the run is ended and nothing more
+//           is sent. Adds `reason`, `waited_ms`, `pid`.
 //   1.63.0 (#2947): the degeneracy detector's policy vocabulary names the
 //           action, and one additive action.
 //

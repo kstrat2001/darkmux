@@ -753,7 +753,9 @@ fn hosted_single_shot_step_payload(
         "step_id": step_id,
         "kind": "dispatch.single_shot",
         "runtime": "direct",
-        "remote_max_tokens_per_step": budget,
+        // (#2902 step 5, CLAUDE.md contract 8: the wire keeps its historical
+        // spelling) The per-step cap, under the key v3.13.0 shipped.
+        "remote_max_tokens_per_execution": budget,
         "max_tokens_requested": max_tokens_requested,
         "max_tokens_sent": max_tokens_sent,
         "prompt_tokens": reply.prompt_tokens,
