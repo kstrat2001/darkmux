@@ -73,8 +73,10 @@ pub type Pools = BTreeMap<PoolId, PoolFact>;
 /// Global AI RAM budget (#1243). Counts ONLY darkmux-owned residents — user
 /// loads never count against the cap (cross-checking total physical pressure
 /// is a doctor/observability concern layered on top, never a core decision
-/// input). The config source (`runtime.max_model_ram_gb`) is resolved by the
-/// caller; the core sees bytes. `None` = no budget configured.
+/// input). The core sees bytes; the caller resolves them. No caller sets a
+/// budget today: there is no config key for it yet, and every production
+/// path passes `None` (no budget configured), so the budget arms only run
+/// in tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Budget {
     pub max_darkmux_bytes: Option<u64>,

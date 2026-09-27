@@ -437,7 +437,15 @@ impl<'a> Acquisition<'a> {
     /// #1243 budget arm, fit half. Base = darkmux-owned residents that
     /// remain after pass 1 + surviving reconcile stales. User loads NEVER
     /// count (#1243) — physical pressure cross-checks are doctor scope.
+    ///
+    /// The arm exists to make room for pending loads, so it runs only when
+    /// a load survived the flat refusals: a base already over budget with
+    /// nothing to load (nothing desired, everything reused, or every load
+    /// refused) evicts nothing and claims no override.
     fn budget_fit(&mut self, budget: u64, intent: CallerIntent) {
+        if !self.has_surviving_load() {
+            return;
+        }
         let base = resident_base(self.facts, &self.removed);
         let need = self.pending_sum();
         if base + need <= budget {
@@ -603,6 +611,10 @@ impl<'a> Acquisition<'a> {
 
     fn pending_sum(&self) -> u64 {
         pending_sum(&self.decisions, &self.pendings)
+    }
+
+    fn has_surviving_load(&self) -> bool {
+        self.pendings.iter().any(|p| is_load_like(&self.decisions[p.decision_idx].action))
     }
 
     /// Assembly: refusals, then the free phase, then the rest.
@@ -1889,6 +1901,45 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    #[test]
+    fn budget_arm_never_evicts_without_a_surviving_load() {
+        // The darkmux base alone already exceeds the budget. With nothing
+        // left to load, whether nothing was desired, everything is reused,
+        // or the only load was refused flat, there is no pending load to
+        // make room for: nothing is evicted, and no override is claimed.
+        let f = Facts {
+            residents: vec![
+                resident("darkmux:idle", "idle", 8_000, Some(20 * GB)),
+                resident("darkmux:kept", "kept", 32_000, Some(GB)),
+            ],
+            budget: Budget { max_darkmux_bytes: Some(15 * GB) },
+            ..Default::default()
+        };
+        let est = est_map(&[("huge", 16 * GB)]);
+        let cases: [(&str, Vec<Placement>); 3] = [
+            ("nothing desired", vec![]),
+            ("reuse only", vec![placement("kept", 8_000)]),
+            ("only load refused flat", vec![placement("huge", 8_000)]),
+        ];
+        for (label, desired) in cases {
+            for intent in [CallerIntent::Auto, CallerIntent::OperatorExplicit] {
+                let plan = plan_acquire(&desired, &f, opts(intent, AcquireScope::Additive), &est);
+                assert!(
+                    !plan.actions.iter().any(|a| matches!(a.action, Action::Unload { .. })),
+                    "{label}/{intent:?}: evicted toward no pending load: {plan:?}"
+                );
+                assert!(
+                    !plan.warnings.iter().any(|w| matches!(w, Warning::BudgetExceededOperatorOverride { .. })),
+                    "{label}/{intent:?}: override warning with nothing loading: {plan:?}"
+                );
+            }
+        }
+        // Recovery: the same over-budget base with a real pending load still
+        // evicts to make room for it.
+        let plan = plan_acquire(&[placement("m", 8_000)], &f, additive_auto(), &est_map(&[("m", 5 * GB)]));
+        assert!(plan.actions.iter().any(|a| matches!(a.action, Action::Unload { .. })), "{plan:?}");
     }
 
     #[test]
