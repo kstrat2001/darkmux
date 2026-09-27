@@ -418,7 +418,7 @@ const TimelineLanes = memo(function TimelineLanes({ timeline }: { timeline: Retu
             {lane.bars.map((bar) => (
               <div
                 key={bar.key}
-                className={`sbar ${bar.cls}`}
+                className={`sbar ${bar.status}`}
                 style={{ left: `${bar.leftPct}%`, width: `${bar.widthPct}%` }}
                 title={bar.title}
                 data-act="session"

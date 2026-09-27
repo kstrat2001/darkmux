@@ -36,9 +36,6 @@ export const LIVE_WINDOW_MS = 24 * 60 * 60 * 1000;
  * presence — see `flowLiveSessions` below. */
 export const FLOW_LIVE_TTL_MS = 300 * 1000;
 
-/** `RECENT_CAP` — viewer.html:1052. Default cap on the recent-runs list. */
-export const RECENT_CAP = 20;
-
 export const T = (s: string): number => Date.parse(s);
 
 /** `todayUTC()` — viewer.html:3369. */
@@ -1118,93 +1115,6 @@ export function liveSessionSet(
   if (!liveSessionIds.size) return flowDerived;
   if (!flowDerived.size) return liveSessionIds;
   return new Set([...liveSessionIds, ...flowDerived]);
-}
-
-/** One row of the machine lens's runs list — the fields `recentRow()`
- * (viewer.html:1745) actually renders into its COLLAPSED `<summary>` (the
- * only state the parity harness's `innerText` extraction ever observes;
- * `<details>` boots closed and this lens never opens one — see
- * `tests/parity/lib/extract-lens.js`'s module doc). */
-export interface MachineRunNode {
-  lbl: string;
-  closeTs: number | null;
-  startTs: number | null;
-  sid: string;
-  handle: string;
-  model: string;
-  mission: string | null;
-  donePayload: Record<string, unknown> | null;
-}
-
-/** The `sessionsOn(m).map(...)` body inside `renderMachine()` —
- * viewer.html:1914-1957, sorted the same way (closeTs, falling back to
- * startTs, descending — most-recent-first). */
-export function buildMachineRuns(
-  data: FlowRecord[],
-  liveMachines: Map<string, PresenceBeat>,
-  liveSessionIds: Set<string>,
-  tMax: number,
-  nowMs: number,
-  m: string,
-): MachineRunNode[] {
-  const machAbsent = machPresent(data, liveMachines, tMax, m) === false;
-  const liveSet = liveSessionSet(data, liveSessionIds, nowMs);
-  const sids = sessionsOn(data, m);
-
-  const nodes: MachineRunNode[] = sids.map((sid) => {
-    const s = dispatchRec(data, sid, "start");
-    const c = dispatchEnd(data, sid);
-    const e = sessEnd(data, sid);
-    const closeCands = [c ? T(c.ts) : null, e ? T(e.ts) : null].filter((x): x is number => x != null);
-    const closeTs = closeCands.length ? Math.min(...closeCands) : null;
-    const closedBy = closeTs != null && closeTs <= tMax;
-    const cleanClose = !!c && T(c.ts) === closeTs && !dispatchErrored(c);
-    const errClose = !!c && T(c.ts) === closeTs && dispatchErrored(c);
-    const liveNow = liveSet.has(sid);
-    const killed = dispatchKilled(c);
-    const lbl = statusLabel(
-      runStateFrom({
-        open: !closedBy && !machAbsent && (liveNow || closeTs != null),
-        errored: closedBy && errClose,
-        killed,
-        clean: closedBy && cleanClose,
-      }),
-    );
-    const startTs = s ? T(s.ts) : null;
-    const donePayload = c?.payload ?? null;
-
-    if (s) {
-      return {
-        lbl,
-        closeTs,
-        startTs,
-        sid,
-        handle: s.handle || sid,
-        model: s.model || "?",
-        mission: s.mission_id ?? null,
-        donePayload,
-      };
-    }
-    // Fallback: no dispatch.start — pull handle/model/mission from the
-    // first record on this session; "no start" says the lifecycle wasn't
-    // captured here (viewer.html:1944-1953).
-    const first = data.find((r) => r.session_id === sid);
-    const handle = first?.handle || `session ${sid}`;
-    const model = first?.model || "?";
-    const fbTs = closeTs ?? (first?.ts ? T(first.ts) : null);
-    return {
-      lbl: "no start",
-      closeTs,
-      startTs: fbTs,
-      sid,
-      handle,
-      model,
-      mission: first?.mission_id ?? null,
-      donePayload,
-    };
-  });
-
-  return nodes.sort((a, b) => (b.closeTs ?? b.startTs ?? 0) - (a.closeTs ?? a.startTs ?? 0));
 }
 
 /** `lastTs()` — viewer.html:1187. A session's last recorded activity —

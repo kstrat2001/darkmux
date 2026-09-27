@@ -62,23 +62,12 @@ import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";
 import { PURPOSE, sumUsage, type UsageRecordLike } from "../../lib/usageRecords";
 import type { FlowRecord, DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
 import { toolOutcome } from "../../lib/recordDetail";
+import type { RunStatus } from "../../types/generated/RunStatus";
 
 /** The run-time figure's long hover text, shared by SYSTEM's WALL CLOCK and
  *  (#2890) the MODEL section's ACTIVE TIME, which show the same number. */
 const WALL_HINT_TITLE =
   "run time — the runtime's own measure of this execution, INCLUDING any thermal rest. A mission step's badge covers a WIDER span (setup and gate included) and reads longer.";
-
-export type PillCls = "run" | "err" | "done" | "canceled";
-
-/** `statusVisual()`'s `cls` half (viewer.html:1151-1155) — `statusLabel`
- * (already ported in `lib/flow.ts`) gives the SAME vocabulary's `lbl` half;
- * this maps back to the class the two vocabularies share. */
-function pillClsFor(label: string): PillCls {
-  if (label === "running") return "run";
-  if (label === "errored" || label === "killed") return "err";
-  if (label === "complete") return "done";
-  return "canceled";
-}
 
 /** (#2863) The detectors a clean run passed, in the order the old sentence
  * named them (`cycle, tool-failure, reasoning-loop, edit-drift`). One list,
@@ -102,7 +91,8 @@ export interface SessionHeader {
    * "uppercase the STRING directly" discipline, rather than depending on a
    * stylesheet rule this port is free to change). */
   pillLabel: string;
-  pillCls: PillCls;
+  /** (#2813) The canonical run status; the pill's look reads it. */
+  status: RunStatus;
   /** Pre-uppercased, same reason. */
   role: string;
   sid: string;
@@ -783,14 +773,13 @@ export function runRegions(
   const wallSub = wallOutcome;
 
   const role = String(handle || "").replace(/^darkmux\//, "").toUpperCase();
-  const svLabel = statusLabel(
-    runStateFrom({
-      open: !done,
-      errored: !!c && dispatchErrored(c),
-      killed: !!c && dispatchKilled(c),
-      clean: done && !!c && !dispatchErrored(c),
-    }),
-  );
+  const svState = runStateFrom({
+    open: !done,
+    errored: !!c && dispatchErrored(c),
+    killed: !!c && dispatchKilled(c),
+    clean: done && !!c && !dispatchErrored(c),
+  });
+  const svLabel = statusLabel(svState);
 
   const sp = (d?.payload ?? {}) as DispatchStartPayload;
   const dp = (c?.payload ?? {}) as DispatchCompletePayload;
@@ -1827,7 +1816,7 @@ export function runRegions(
     // record has scrolled out of the window still names its machine.
     header: {
       pillLabel: svLabel.toUpperCase(),
-      pillCls: pillClsFor(svLabel),
+      status: svState.status,
       role,
       sid,
       machineName: String(d?.machine_id || firstSessRec?.machine_id || ""),

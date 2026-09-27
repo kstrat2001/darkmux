@@ -25,7 +25,7 @@
  *              operator/budget kill) and must stay distinguishable by the
  *              raw status word even though they share a color family.
  *   stopped  — an operator or budget terminal: aborted / abandoned /
- *              canceled / interrupted / paused
+ *              interrupted / paused
  *   idle     — not started, or a word this map does not know: planned /
  *              unparseable / undefined / anything new (loud in the DOM via
  *              `s-<raw>`, quiet on screen)
@@ -71,7 +71,6 @@ const KIND: Record<string, WorkStatusKind> = {
   degraded: "degraded",
   aborted: "stopped",
   abandoned: "stopped",
-  canceled: "stopped",
   interrupted: "stopped",
   paused: "stopped",
   planned: "idle",

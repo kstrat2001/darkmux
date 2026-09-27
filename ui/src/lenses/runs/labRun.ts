@@ -161,7 +161,7 @@ export function labFeedLines(events: LabRunEvent[]): string[] {
  * 900-event run says "newest 500 of 900", not "900 records" above a list
  * holding 500. A truncation presented as a bare total is the one thing
  * CLAUDE.md's no-silent-caps rule forbids; every other cap in this codebase
- * (RUNS_CAP, RECENT_CAP, CATALOG_MISSION_CAP, the unfiltered-log 50)
+ * (RUNS_CAP, CATALOG_MISSION_CAP, the unfiltered-log 50)
  * already discloses this way. `totalEvents` is the FULL accumulated event
  * count (`events.length` in the caller), not the capped feed-line count. */
 export function labFeedCountText(totalEvents: number): string {

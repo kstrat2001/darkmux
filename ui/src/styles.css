@@ -133,7 +133,7 @@
   /* (U2-3) IN-FLIGHT, and deliberately not `--warn`. There were three
      ambers outside this block: `#ffd166` (a session bar that is RUNNING,
      plus the mission lens's own `--ml-run`), `#ffb86b` (stale panels,
-     canceled bars, lab warnings) and `--warn` itself. The last two are the
+     abandoned bars, lab warnings) and `--warn` itself. The last two are the
      same concept and are now one; the first is not — a run in progress is
      not a warning, and collapsing it would say so on every fleet screen. */
   --run: #ffd166;
@@ -4223,17 +4223,17 @@ body {
     min-width: 24px;
   }
 }
-.sbar.run {
+.sbar.running {
   background-color: var(--run);
   box-shadow: 0 0 6px var(--run);
 }
-.sbar.done {
+.sbar.complete {
   background-color: var(--good);
 }
-.sbar.canceled {
+.sbar.abandoned {
   background-color: var(--warn);
 }
-.sbar.err {
+.sbar.error {
   background-color: var(--error);
 }
 .tltrack .ph {
