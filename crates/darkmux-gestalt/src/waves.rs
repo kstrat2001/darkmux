@@ -491,7 +491,7 @@ mod tests {
     use super::*;
     use crate::estimator::{ArchEstimator, ArchFacts, FixedEstimator};
     use crate::facts::{Budget, CatalogFact, Facts, PoolFact, PoolId, Pools, ResidentFact};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     const GB: u64 = 1_000_000_000;
     // The #1286 probed potentials (weights + KV at profile ctx + margin).
@@ -551,6 +551,116 @@ mod tests {
             PoolId("unified".into()),
             PoolFact { capacity_bytes: 128 * GB, available_bytes: available },
         )])
+    }
+
+    // ── characterization sweep ───────────────────────────────────────────
+
+    /// Every combination of a small resident universe (undersized /
+    /// sufficient owned copy, foreign duplicate, alias resident, idle and
+    /// unknown-size owned residents), placement set, budget, pool and mode.
+    type SweptSchedule = (Vec<Placement>, Facts, WaveMode, Result<WaveSchedule, ForceParallelRefused>);
+
+    fn wave_sweep() -> Vec<SweptSchedule> {
+        let placement_sets: Vec<Vec<Placement>> = vec![
+            vec![],
+            vec![placement("a", 32_000)],
+            vec![placement("a", 32_000), aliased("b", 32_000, "alias-b"), placement("c", 8_000)],
+            vec![placement("big", 8_000), placement("b", 8_000), placement("a", 32_000), placement("c", 8_000)],
+        ];
+        // "c" is deliberately unpriced: the unknown-estimate path.
+        let est = est_map(&[("a", 10 * GB), ("b", 6 * GB), ("big", 30 * GB)]);
+        let mut out = Vec::new();
+        for own in [None, Some(4_096u64), Some(64_000)] {
+            for bits in 0u8..8 {
+                let mut residents = Vec::new();
+                if let Some(ctx) = own {
+                    residents.push(resident("darkmux:a", "a", ctx, Some(10 * GB)));
+                }
+                if bits & 1 != 0 {
+                    residents.push(resident("a-user", "a", 64_000, Some(12 * GB)));
+                }
+                if bits & 2 != 0 {
+                    residents.push(resident("alias-b", "b", 4_096, Some(6 * GB)));
+                }
+                if bits & 4 != 0 {
+                    residents.push(resident("darkmux:idle", "idle", 8_000, Some(8 * GB)));
+                    residents.push(resident("darkmux:nosize", "nosize", 8_000, None));
+                }
+                for placements in &placement_sets {
+                    for budget in [None, Some(15 * GB), Some(25 * GB)] {
+                        for pools in [Pools::new(), single_pool(9 * GB), single_pool(20 * GB)] {
+                            for mode in [WaveMode::Auto, WaveMode::ForceParallel, WaveMode::ForceSequential] {
+                                let facts = Facts {
+                                    residents: residents.clone(),
+                                    pools: pools.clone(),
+                                    budget: Budget { max_darkmux_bytes: budget },
+                                    ..Default::default()
+                                };
+                                let r = plan_waves(placements, &facts, &est, mode);
+                                out.push((placements.clone(), facts, mode, r));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_placement_is_scheduled_exactly_once_across_a_sweep() {
+        let mut seen_refusal_kinds: BTreeSet<&str> = BTreeSet::new();
+        let mut seen_multi_wave = false;
+        let mut seen_force_parallel_refused = false;
+        for (placements, facts, mode, result) in wave_sweep() {
+            let ctx = format!("placements={placements:?}\nfacts={facts:?}\nmode={mode:?}\nresult={result:?}");
+            let schedule = match (mode, result) {
+                (WaveMode::ForceParallel, Err(refused)) => {
+                    assert!(refused.need_bytes > refused.limit_bytes, "{ctx}");
+                    seen_force_parallel_refused = true;
+                    continue;
+                }
+                (WaveMode::ForceParallel, Ok(s)) => {
+                    assert!(s.waves.len() <= 1 && s.refusals.is_empty(), "{ctx}");
+                    s
+                }
+                (WaveMode::Auto | WaveMode::ForceSequential, Err(_)) => panic!("only ForceParallel errs\n{ctx}"),
+                (WaveMode::Auto | WaveMode::ForceSequential, Ok(s)) => s,
+            };
+            assert_eq!(schedule.mode, mode, "{ctx}");
+            // Every placement appears exactly once, and input order holds
+            // within each wave and among the refusals.
+            let mut scheduled: Vec<&Placement> = schedule.waves.iter().flatten().collect();
+            scheduled.extend(schedule.refusals.iter().map(|r| &r.placement));
+            assert_eq!(scheduled.len(), placements.len(), "{ctx}");
+            for p in &placements {
+                assert!(scheduled.contains(&p), "{p:?} lost\n{ctx}");
+            }
+            let position = |p: &Placement| placements.iter().position(|q| q == p).unwrap();
+            for w in &schedule.waves {
+                assert!(!w.is_empty(), "empty wave\n{ctx}");
+                assert!(w.windows(2).all(|x| position(&x[0]) < position(&x[1])), "{ctx}");
+            }
+            if mode == WaveMode::ForceSequential {
+                assert!(schedule.waves.iter().all(|w| w.len() == 1), "{ctx}");
+            }
+            seen_multi_wave |= schedule.waves.len() > 1;
+            for r in &schedule.refusals {
+                match &r.reason {
+                    Reason::BudgetRefuse { budget_bytes, .. } => {
+                        assert_eq!(Some(*budget_bytes), facts.budget.max_darkmux_bytes, "names the configured budget\n{ctx}");
+                        seen_refusal_kinds.insert("budget");
+                    }
+                    Reason::ForeignDuplicateNoCapacity { foreign_identifier, .. } => {
+                        assert!(!foreign_identifier.starts_with("darkmux:"), "{ctx}");
+                        seen_refusal_kinds.insert("foreign");
+                    }
+                    other => panic!("unexpected refusal reason {other:?}\n{ctx}"),
+                }
+            }
+        }
+        assert_eq!(seen_refusal_kinds.len(), 2, "{seen_refusal_kinds:?}");
+        assert!(seen_multi_wave && seen_force_parallel_refused);
     }
 
     // ── #1877: wave_schedule_to_exec_mode's own table ────────────────────
