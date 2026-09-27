@@ -1646,6 +1646,9 @@ mod tests {
         let body = fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
         assert!(!body.contains("SECRET-CONTENT"), "no argument but the path is recorded: {body}");
         let ev: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        // (#2963) The host forwards each entry's `name` as `tool_names`.
+        let names: Vec<&str> = ev["tool_calls"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["read", "bash", "write", "edit", "search", "write", "edit", "read", "not_a_tool"]);
         let paths: Vec<Option<&str>> = ev["tool_calls"]
             .as_array()
             .unwrap()

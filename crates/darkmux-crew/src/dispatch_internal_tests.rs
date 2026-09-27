@@ -11662,6 +11662,26 @@
         assert_eq!(turn_tool_paths(&serde_json::json!({})), None);
     }
 
+    /// (#2963) `dispatch.turn` forwards each call's tool name as
+    /// `tool_names`, aligned by index with `tool_paths`; unlike the paths
+    /// the key is present whenever the turn made any calls. A name that is
+    /// not a string is `null`; an over-bound name is `null`, never clipped.
+    #[test]
+    fn turn_tool_names_aligns_with_the_calls_and_is_present_whenever_there_are_calls() {
+        let ev = serde_json::json!({ "tool_calls": [
+            { "id": "a", "name": "write", "arguments_chars": 40, "path": "src/a.rs" },
+            { "id": "b", "name": "read", "arguments_chars": 12, "path": "src/b.rs" },
+            { "id": "c", "name": 7, "arguments_chars": 1 },
+            { "id": "d", "name": "x".repeat(MAX_TRAJ_FIELD_BYTES + 1), "arguments_chars": 1 },
+        ]});
+        assert_eq!(turn_tool_names(&ev), Some(serde_json::json!(["write", "read", null, null])));
+        let bash = serde_json::json!({ "tool_calls": [{ "id": "b", "name": "bash", "arguments_chars": 12 }] });
+        assert_eq!(turn_tool_names(&bash), Some(serde_json::json!(["bash"])));
+        assert_eq!(turn_tool_names(&serde_json::json!({ "tool_calls": [] })), None);
+        assert_eq!(turn_tool_names(&serde_json::json!({ "tool_calls": null })), None);
+        assert_eq!(turn_tool_names(&serde_json::json!({})), None);
+    }
+
     /// (#2963) End to end through the tailer: the turn record carries the
     /// list, and a turn whose calls name no path carries no key.
     #[test]
@@ -11701,8 +11721,11 @@
         let turns: Vec<_> = records.iter().filter(|v| v["action"] == "dispatch.turn").collect();
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0]["payload"]["tool_paths"], serde_json::json!(["src/a.rs", null]));
+        assert_eq!(turns[0]["payload"]["tool_names"], serde_json::json!(["read", "bash"]));
         assert_eq!(turns[0]["payload"]["tool_calls_count"], 2);
         assert!(turns[1]["payload"].get("tool_paths").is_none(), "no key when no call names a path: {:?}", turns[1]);
+        // The names ride whenever the turn made calls, paths or not.
+        assert_eq!(turns[1]["payload"]["tool_names"], serde_json::json!(["bash"]));
     }
 
     #[test]

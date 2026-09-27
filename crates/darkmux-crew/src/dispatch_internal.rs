@@ -9911,6 +9911,11 @@ impl TailerState {
                     if let Some(paths) = turn_tool_paths(&event) {
                         payload["tool_paths"] = paths;
                     }
+                    // (#2963, FLOW 1.64.0) Each call's tool name, same order,
+                    // so the word and the icon name the call running now.
+                    if let Some(names) = turn_tool_names(&event) {
+                        payload["tool_names"] = names;
+                    }
                     self.emit("dispatch.turn", darkmux_flow::Level::Info, payload);
                 }
                 // (#795) Per-turn token telemetry — the live "tokens
@@ -11706,6 +11711,28 @@ fn cap_json_result(value: Option<&serde_json::Value>, max: usize) -> serde_json:
 /// since a clipped path names a different file. `None` (the key is left
 /// out) when no call has a path. The viewer names `tool_paths[k]` while the
 /// turn's k-th call runs.
+/// (#2963) `dispatch.turn`'s `tool_names`: each of the turn's tool calls'
+/// name (`model.completed.tool_calls[i].name`), aligned by index with
+/// `tool_paths`, `null` for a name that is not a string or is over
+/// `MAX_TRAJ_FIELD_BYTES` (never clipped). Unlike the paths, present
+/// whenever the turn made any calls. The viewer names `tool_names[k]` (the
+/// word and the icon) while the turn's k-th call runs.
+fn turn_tool_names(event: &serde_json::Value) -> Option<serde_json::Value> {
+    let calls = event.get("tool_calls")?.as_array()?;
+    if calls.is_empty() {
+        return None;
+    }
+    Some(serde_json::Value::Array(
+        calls
+            .iter()
+            .map(|c| match c.get("name").and_then(|n| n.as_str()) {
+                Some(n) if !n.is_empty() && n.len() <= MAX_TRAJ_FIELD_BYTES => serde_json::json!(n),
+                _ => serde_json::Value::Null,
+            })
+            .collect(),
+    ))
+}
+
 fn turn_tool_paths(event: &serde_json::Value) -> Option<serde_json::Value> {
     let calls = event.get("tool_calls")?.as_array()?;
     let paths: Vec<serde_json::Value> = calls
