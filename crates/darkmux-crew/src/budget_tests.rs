@@ -453,6 +453,26 @@ fn an_endpoint_removed_while_waiting_releases_it() {
     assert_eq!(env.actions(), vec![BUDGET_WAIT_ACTION, BUDGET_RESUME_ACTION]);
 }
 
+/// (review C-i, C4) `LiveEnv::reload` reads the command's own registry: an
+/// endpoint removed from it releases (`Some(None)`), a present one reloads,
+/// and a registry that cannot be read keeps the budget in hand (`None`).
+#[test]
+fn live_reload_releases_a_removed_endpoint_and_keeps_on_an_unreadable_registry() {
+    let dir = tempfile::tempdir().unwrap();
+    let pf = dir.path().join("profiles.json");
+    std::fs::write(
+        &pf,
+        r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":1}]}},
+            "endpoints":{"azure":{"url":"https://h.example/v1","limits":{"policy":"wait","window":{"period":"1d","tokens":5}}}}}"#,
+    )
+    .unwrap();
+    let path = pf.to_str().unwrap();
+    let present = LiveEnv.reload("azure", Some(path));
+    assert!(matches!(present, Some(Some(ref b)) if b.window.tokens == Some(5)), "{present:?}");
+    assert_eq!(LiveEnv.reload("gone", Some(path)), Some(None), "removed: released");
+    assert_eq!(LiveEnv.reload("azure", Some("/no/such/profiles.json")), None, "unreadable: kept");
+}
+
 /// A budget switched off (or raised) while waiting releases the wait.
 #[test]
 fn a_budget_switched_off_while_waiting_releases_it() {
