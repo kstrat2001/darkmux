@@ -103,13 +103,13 @@ mod role_cli;
 pub use darkmux_serve as serve;
 mod skills;
 mod phase_cli;
-// #463 workspace split (PR2) — profiles/swap/lms extracted to the
-// darkmux-profiles crate. These re-exports keep every existing
-// crate::{profiles,swap,lms}::* path resolving unchanged. (2.0, #1405: the
+// #463 workspace split (PR2) — profiles/ownership/lms extracted to the
+// darkmux-profiles crate. These re-exports keep crate::{profiles,
+// ownership,lms}::* paths resolving. (2.0, #1405: the
 // `runtime` module — the legacy openclaw config-file patcher — was removed.)
 pub use darkmux_profiles::lms;
 pub use darkmux_profiles::profiles;
-pub use darkmux_profiles::swap;
+pub use darkmux_profiles::ownership;
 // #463 workspace split — types extracted to the darkmux-types crate. The
 // re-export keeps all existing `crate::types::*` paths resolving unchanged.
 pub use darkmux_types as types;
@@ -1630,7 +1630,7 @@ fn render_residents(
 ) -> Result<i32> {
     let (managed, user): (Vec<_>, Vec<_>) = loaded
         .iter()
-        .partition(|m| swap::is_darkmux_owned(&m.identifier));
+        .partition(|m| ownership::is_darkmux_owned(&m.identifier));
     if json {
         // (#907) machine-readable parity, grouped by ownership.
         let mut out = serde_json::json!({
@@ -1707,13 +1707,13 @@ fn render_residents(
 }
 
 fn cmd_model_eject(dry_run: bool) -> Result<i32> {
-    // (#2774 tier 5) `swap::eject_all_managed` is the one unloader now —
+    // (#2774 tier 5) `ownership::eject_all_managed` is the one unloader now —
     // the thermal breaker's tier-5 hard-stop calls the SAME function
     // rather than a second copy of this filter+unload loop. One
     // `lms::list_loaded()` call total: `summary.user_loaded_count` already
     // carries what the old "nothing to eject" message needed, so there is
     // no separate peek to keep in sync with it.
-    let summary = swap::eject_all_managed(dry_run)?;
+    let summary = ownership::eject_all_managed(dry_run)?;
     // (#2774 review C1) A stuck resident no longer aborts the sweep, so
     // report what did NOT come out alongside what did — and exit non-zero,
     // since "eject" did not fully happen.
@@ -2017,14 +2017,13 @@ fn cmd_init(
 fn profile_matches(profile: &types::Profile, loaded: &[types::LoadedModel]) -> bool {
     // (#1282) Endpoint-bearing (remote) models are served by their provider —
     // they never appear in `lms ps` — so the comparison covers LOCAL models
-    // only, mirroring `swap::desired_loads`' skip. A hybrid profile (local +
-    // endpoint) that swap just loaded therefore matches on its local half.
+    // only. A hybrid profile (local + endpoint) therefore matches on its
+    // local half.
     //
     // Pure-endpoint semantics: zero local models required ⇒ the profile
-    // matches exactly when NOTHING is loaded locally. That's what a swap to
-    // it produces (everything darkmux-owned unloaded), so `darkmux machine status`
-    // reports that state as the profile it is rather than "matches no
-    // registered profile". Any local load means the state isn't this
+    // matches exactly when NOTHING is loaded locally, so `darkmux machine
+    // status` reports that state as the profile it is rather than "matches
+    // no registered profile". Any local load means the state isn't this
     // profile's.
     let local: Vec<&types::ProfileModel> =
         profile.models.iter().filter(|m| m.is_managed()).collect();

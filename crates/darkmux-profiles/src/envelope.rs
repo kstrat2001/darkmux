@@ -10,7 +10,7 @@
 //! load). These two functions are the single source of truth so the three
 //! surfaces always agree about the same loaded state.
 
-use crate::swap::namespaced_identifier;
+use crate::ownership::namespaced_identifier;
 use darkmux_types::{LoadedModel, ProfileModel};
 
 /// Does this loaded model correspond to the profile's declared model?

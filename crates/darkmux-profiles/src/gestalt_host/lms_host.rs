@@ -1,8 +1,7 @@
 //! [`LmsHost`] — the [`ModelHost`] port over the `lms` CLI (#1274 packet 2b).
 //!
-//! Sibling to (not a replacement for) `crate::lms`: the existing wrappers
-//! keep serving `swap.rs` untouched until the packet-3 cutover. This adapter
-//! differs from them in exactly the ways the gestalt ports require:
+//! Sibling to (not a replacement for) `crate::lms`. This adapter differs
+//! from those wrappers in exactly the ways the gestalt ports require:
 //!
 //! - **Enforced deadline on EVERY call (#1276).** The current
 //!   `lms::load_with_identifier` blocks indefinitely via `Command::status()`

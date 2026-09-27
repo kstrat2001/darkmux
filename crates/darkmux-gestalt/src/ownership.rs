@@ -1,13 +1,8 @@
 //! The darkmux ownership boundary, as pure string predicates.
 //!
-//! Canonical home going forward for the namespace helpers that today also
-//! live in `darkmux_profiles::swap` (the #52 namespace convention). Packet 3
-//! re-points swap.rs at this module (a thin delegating wrapper for the
-//! `&ProfileModel` form, `pub use` for the rest) so the review's `LmsCycler`
-//! and the dispatch path keep exactly ONE definition — the #1271
-//! discipline. Until that cutover lands, the root-crate
-//! `tests/gestalt_parity.rs` asserts these functions agree with swap's over
-//! swap's own test vectors, so the duplication window cannot fork.
+//! The ONE definition of the #52 namespace helpers (the #1271 discipline).
+//! `darkmux_profiles::ownership` re-exports [`is_darkmux_owned`] and adds
+//! the `&ProfileModel` form of [`namespaced_identifier`].
 
 /// Prefix attached to identifiers darkmux uses for its own host loads.
 /// Anything visible in host residency starting with this prefix is owned by
@@ -22,13 +17,12 @@ pub const DARKMUX_NAMESPACE: &str = "darkmux:";
 /// namespace opt-out for operators with special cases. Otherwise the model
 /// key is wrapped under the `darkmux:` namespace so ownership filtering can
 /// distinguish darkmux's loads from user-managed ones. Same semantics as
-/// `darkmux_profiles::swap::namespaced_identifier(&ProfileModel)`, with the
+/// `darkmux_profiles::ownership::namespaced_identifier(&ProfileModel)`, with the
 /// two inputs that function reads off the model made explicit parameters.
 ///
 /// Normalize guard: a `model_key` ALREADY carrying the `darkmux:` prefix is
-/// returned as-is, never double-prefixed — the same dual-form tolerance
-/// swap.rs applies one layer up in `utility_load_target` (operators store
-/// either the bare LMStudio key or the namespaced identifier; a
+/// returned as-is, never double-prefixed (operators store either the bare
+/// LMStudio key or the namespaced identifier; a
 /// `darkmux:darkmux:…` identifier would escape every ownership filter's
 /// unload scope while still matching `is_darkmux_owned`).
 pub fn namespaced_identifier(model_key: &str, explicit: Option<&str>) -> String {
@@ -66,9 +60,8 @@ pub fn ctx_sufficient(loaded_ctx: u64, wanted_n_ctx: u32) -> bool {
 mod tests {
     use super::*;
 
-    // Golden vectors mirroring `darkmux_profiles::swap`'s own tests — the
-    // in-crate half of the anti-fork guard (the cross-crate half lives in
-    // the root crate's tests/gestalt_parity.rs).
+    // Golden vectors, mirrored by `darkmux_profiles::ownership`'s own tests
+    // for the `&ProfileModel` form.
 
     #[test]
     fn namespaced_identifier_wraps_bare_key() {
@@ -90,7 +83,7 @@ mod tests {
     #[test]
     fn namespaced_identifier_never_double_prefixes() {
         // The double-prefix hazard: a pre-namespaced key (operators store
-        // either form — swap.rs's utility_load_target dual-form tolerance)
+        // either form: the bare LMStudio key or the namespaced identifier)
         // must come back unchanged. `darkmux:darkmux:…` would pass
         // is_darkmux_owned yet match no resident any consumer ever loaded.
         assert_eq!(

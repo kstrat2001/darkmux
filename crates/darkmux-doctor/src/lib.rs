@@ -1487,7 +1487,7 @@ fn unpriceable_residents_status(models: &[darkmux_profiles::model_ledger::ModelR
 /// the issue's operator made by hand.
 ///
 /// "Addressable" means the resident's namespaced identifier
-/// (`darkmux_profiles::swap::namespaced_identifier`) matches either (a) some
+/// (`darkmux_profiles::ownership::namespaced_identifier`) matches either (a) some
 /// model entry in some profile in the registry, or (b) the machine's
 /// `internal.utility` binding (#590) — the ONE darkmux-owned identifier that
 /// is legitimately never listed in any profile's `models[]`. A non-namespaced
@@ -1541,7 +1541,7 @@ fn unreachable_residents_status(
     let mut addressable: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for profile in registry.profiles.values() {
         for m in &profile.models {
-            addressable.insert(darkmux_profiles::swap::namespaced_identifier(m));
+            addressable.insert(darkmux_profiles::ownership::namespaced_identifier(m));
         }
     }
     if let Some(util_id) = registry.utility_model_id() {
@@ -1552,12 +1552,12 @@ fn unreachable_residents_status(
         // profile loop above uses rather than adding a `darkmux-gestalt`
         // dependency just for its two-arg twin.
         let util_pm = darkmux_types::ProfileModel { id: util_id.to_string(), ..Default::default() };
-        addressable.insert(darkmux_profiles::swap::namespaced_identifier(&util_pm));
+        addressable.insert(darkmux_profiles::ownership::namespaced_identifier(&util_pm));
     }
 
     let unreachable: Vec<&str> = loaded
         .iter()
-        .filter(|l| darkmux_profiles::swap::is_darkmux_owned(&l.identifier))
+        .filter(|l| darkmux_profiles::ownership::is_darkmux_owned(&l.identifier))
         .filter(|l| !addressable.contains(&l.identifier))
         .map(|l| l.identifier.as_str())
         .collect();
@@ -6986,7 +6986,7 @@ fn check_ram_headroom_load_projection() -> Check {
         .models
         .iter()
         .filter(|pm| {
-            let ns = darkmux_profiles::swap::namespaced_identifier(pm);
+            let ns = darkmux_profiles::ownership::namespaced_identifier(pm);
             !loaded
                 .iter()
                 .any(|l| l.identifier == pm.id || l.model == pm.id || l.identifier == ns)
@@ -7107,7 +7107,7 @@ fn pick_active_profile<'a>(
                 .iter()
                 .filter(|m| Some(m.id.as_str()) == default_id)
                 .any(|pm| {
-                    let ns = darkmux_profiles::swap::namespaced_identifier(pm);
+                    let ns = darkmux_profiles::ownership::namespaced_identifier(pm);
                     loaded
                         .iter()
                         .any(|l| l.identifier == pm.id || l.model == pm.id || l.identifier == ns)

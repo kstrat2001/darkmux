@@ -214,8 +214,8 @@ vocabulary without the dispatch-liveness bookends (violated: running work is vis
 
 The contract registry (extend this list when a new cross-cutting invariant is born):
 
-1. **Profile uniformity** — a profile means the same thing to every consumer (swap, dispatch,
-   crews, benches). A consumer may not legislate which profiles are legal; it routes on what
+1. **Profile uniformity** — a profile means the same thing to every consumer (dispatch,
+   missions, benches). A consumer may not legislate which profiles are legal; it routes on what
    the profile declares (local vs endpoint → dialect, cycling, token accounting).
 2. **Dispatch liveness** — any production code path that performs a WORK execution emits
    `dispatch.start` and a terminal `dispatch.complete`/`dispatch.error` (RAII-guarded on all
@@ -479,7 +479,7 @@ When proposing a config change to an operator, write the visible field; don't re
 
 **Schema is minor-bump + lenient on read** (all-`Option` + `#[serde(flatten)] extras` overflow): an older binary tolerates a newer config, and a partial/hand-edited/malformed config never bricks the CLI — loud validation belongs to `darkmux doctor`, not the hot load path. `CONFIG_SCHEMA_VERSION` lives in `darkmux-types/src/config.rs`.
 
-**Don't confuse `config.json` with the profiles registry.** `~/.darkmux/profiles.json` (the swap profiles) is a SEPARATE file, overridden by `--profiles-file` / `DARKMUX_PROFILES` — **renamed in #661 from the misleading `--config` / `DARKMUX_CONFIG`** (those names are retired, not reused, because a real `config.json` now exists).
+**Don't confuse `config.json` with the profiles registry.** `~/.darkmux/profiles.json` (the model profiles) is a SEPARATE file, overridden by `--profiles-file` / `DARKMUX_PROFILES` — **renamed in #661 from the misleading `--config` / `DARKMUX_CONFIG`** (those names are retired, not reused, because a real `config.json` now exists).
 
 ## Environment variables
 
@@ -770,8 +770,8 @@ When darkmux loads a model under `darkmux:<id>`, the underlying LMStudio model k
 
 When writing a new feature that mutates LMStudio state on the operator's behalf:
 
-1. **Generate the namespaced form** at the point of write. See `swap::namespaced_identifier`.
-2. **Filter on the namespace** at the point of read/cleanup. See `swap::is_darkmux_owned`.
+1. **Generate the namespaced form** at the point of write. See `darkmux_profiles::ownership::namespaced_identifier`.
+2. **Filter on the namespace** at the point of read/cleanup. See `darkmux_profiles::ownership::is_darkmux_owned`.
 3. **Pass-through explicit overrides** — if the operator sets an explicit identifier in their profile, don't override it. The namespace is the *default*; the operator can opt out.
 
 ### Operator-facing commands

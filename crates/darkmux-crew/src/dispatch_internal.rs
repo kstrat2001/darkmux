@@ -8294,7 +8294,7 @@ fn stamping_emitter<'a>(
 /// doc names: the breaker pauses the DISPATCH but "never kills the
 /// container," so the resident model that produced the heat keeps holding
 /// the GPU. This unloads every `darkmux:`-namespaced resident on this host
-/// (via [`darkmux_profiles::swap::eject_all_managed`] — the SAME mechanism
+/// (via [`darkmux_profiles::ownership::eject_all_managed`] — the SAME mechanism
 /// `darkmux machine eject` uses, not a second unloader) so the machine can
 /// actually cool.
 ///
@@ -8333,7 +8333,7 @@ fn tier5_eject_on_critical(host_out: &Path, trip_wall: SystemTime, emit: &dyn Fn
         }
         thread::sleep(POLL_INTERVAL);
     };
-    match darkmux_profiles::swap::eject_all_managed(false) {
+    match darkmux_profiles::ownership::eject_all_managed(false) {
         Ok(summary) => {
             let ejected: Vec<serde_json::Value> = summary
                 .ejected

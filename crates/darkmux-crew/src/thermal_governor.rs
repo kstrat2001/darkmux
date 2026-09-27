@@ -69,7 +69,7 @@
 //! | 2 | `fair` sustained (`resume_at`, held `resume_hold_ms`) | duty-cycle: pace file `pause: false, turn_delay_ms: Some(_)` |
 //! | 3 | `serious` (`pause_at`) | full pause until back to `resume_at`, THEN resume with the duty-cycle delay DOUBLED (`ratchet_factor`) for the rest of the run |
 //! | 4 | the Nth `serious` EPISODE (`episode_threshold`, default 2; `0` = unbounded) | indefinite pause (`reason: "thermal-episode-limit"`) — resumes only on operator intervention, never automatically |
-//! | 5 | `critical` | the pre-existing breaker (unchanged) — PLUS, in `dispatch_internal.rs`, `swap::eject_all_managed` once a turn boundary is reached or a short bound elapses |
+//! | 5 | `critical` | the pre-existing breaker (unchanged) — PLUS, in `dispatch_internal.rs`, `ownership::eject_all_managed` once a turn boundary is reached or a short bound elapses |
 //!
 //! **Tier 2 (`DutyCycle`).** Entering and leaving both require a SUSTAINED
 //! hold at the boundary (reusing `resume_hold_ms` for both directions,

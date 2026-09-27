@@ -32,10 +32,9 @@
 //!
 //! Absorption lineage: [`residency::decide_residency`] is a fact-typed port
 //! of the review's validated miniature (`darkmux-lab` review.rs,
-//! PR #1275); [`ownership`] duplicates `darkmux_profiles::swap`'s canonical
-//! ownership helpers under golden parity tests (the root-crate
-//! `tests/gestalt_parity.rs` guards the duplication window until packet 3
-//! re-points swap.rs at this crate — the #1271 one-definition discipline).
+//! PR #1275); [`ownership`] is the one definition of the ownership helpers
+//! (`darkmux_profiles::ownership` builds on it — the #1271 one-definition
+//! discipline).
 //!
 //! Namespace ownership is ABSOLUTE (operator decision, 2026-07-10, #1274):
 //! every planned load/unload/reconcile targets only `darkmux:*` instances

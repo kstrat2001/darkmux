@@ -6,7 +6,7 @@
 //! #1140 pool-headroom pass, then orders actions per the [`Plan`] ordering
 //! contract: a two-phase free-then-load shape — EVERY Unload (Exclusive
 //! pass-1, reconcile unload-halves, budget/headroom evictions) precedes
-//! EVERY Load, the `swap::swap` RAM-headroom discipline. Every placement —
+//! EVERY Load, the free-then-load RAM-headroom discipline. Every placement —
 //! primary, utility, probe, judge — goes through the SAME path (#1280: no
 //! seat is exempt).
 //!
@@ -114,7 +114,7 @@ impl AcquireOpts {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcquireScope {
-    /// The `swap::swap` shape: darkmux-owned residents NOT in the desired
+    /// The exclusive shape: darkmux-owned residents NOT in the desired
     /// set get `Unload(NoLongerDesired)` — pass 1, before loads (the
     /// RAM-headroom two-pass order).
     Exclusive,
@@ -2061,7 +2061,7 @@ mod tests {
         // The review's concrete regression, as a table row: desired = a
         // fresh Load A (est 20GB) + a reconcile of B (stale 30GB resident
         // at the wrong ctx). B's free MUST precede A's load — the
-        // free-then-load RAM-headroom shape of swap::swap. The pre-fix
+        // free-then-load RAM-headroom shape. The pre-fix
         // draft emitted [Load A, Reconcile B], loading 20GB before the
         // 30GB free.
         let pools: Pools = BTreeMap::from([(

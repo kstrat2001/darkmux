@@ -30,8 +30,7 @@
 //!   a real `config.json`, when one exists, is read directly rather than
 //!   reconstructed from the weights file.
 //!
-//! These adapters are NEW surface: `swap.rs` / `lms.rs` call paths are
-//! untouched (cutover is packet 3). Nothing here mutates host state except
+//! Nothing here mutates host state except
 //! through the port methods, and unload targets are claim-checked
 //! [`darkmux_gestalt::OwnedTarget`]s — the namespace contract stays
 //! structural at the adapter layer too.

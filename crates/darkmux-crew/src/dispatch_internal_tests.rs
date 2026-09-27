@@ -12834,7 +12834,7 @@
     #[test]
     fn utility_residency_pm_namespaces_like_the_dispatch_model() {
         let pm = super::utility_residency_pm("util-4b", 68_000);
-        assert_eq!(darkmux_profiles::swap::namespaced_identifier(&pm), "darkmux:util-4b");
+        assert_eq!(darkmux_profiles::ownership::namespaced_identifier(&pm), "darkmux:util-4b");
     }
 
     /// Warn, don't abort HERE: a failed utility load yields a warning naming
@@ -13861,7 +13861,7 @@ fn normalizing_the_key_does_not_change_the_minted_identifier() {
         darkmux_gestalt::namespaced_identifier(super::bare_model_key("darkmux:qwen3-4b"), None);
     assert_eq!(from_bare, "darkmux:qwen3-4b");
     assert_eq!(from_bare, from_namespaced);
-    assert!(darkmux_profiles::swap::is_darkmux_owned(&from_namespaced));
+    assert!(darkmux_profiles::ownership::is_darkmux_owned(&from_namespaced));
 }
 
 // ---------------------------------------------------------------
