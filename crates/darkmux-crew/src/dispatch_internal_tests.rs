@@ -18341,12 +18341,13 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
             stop,
             Arc::new(Mutex::new(Instant::now() + Duration::from_secs(600))),
             600,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None, // compaction threshold
+            None, // compactor model
+            None, // record context
+            None, // endpoint
+            None, // endpoint id
+            None, // compactor endpoint
+            None, // live sender
         );
         assert_eq!(summary.compactions, 1, "the event at the end of a 20 MiB backlog was dropped");
     }
