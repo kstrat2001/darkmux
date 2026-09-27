@@ -811,12 +811,29 @@ pub fn check_text<T: JsonSchema + 'static>(
     Some(FileProblem { kind, path: path.to_path_buf(), problem, note: None })
 }
 
+/// The largest user file the gate reads (and the crew loader parses): 1 MiB,
+/// far past any real manifest or config. A larger one is reported, never
+/// buffered.
+pub const MAX_USER_FILE_BYTES: u64 = 1024 * 1024;
+
+/// `path`'s text, bounded by [`MAX_USER_FILE_BYTES`].
+fn read_bounded(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let mut text = String::new();
+    file.take(MAX_USER_FILE_BYTES + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_USER_FILE_BYTES {
+        return Err(std::io::Error::other(format!("larger than the {MAX_USER_FILE_BYTES}-byte cap")));
+    }
+    Ok(text)
+}
+
 /// Check the file at `path` against `T`. `None` when it is clean or absent.
 pub fn check_path<T: JsonSchema + 'static>(kind: UserFileKind, path: &Path, retired: RetiredLookup<'_>) -> Option<FileProblem> {
     if is_operator_state(path) {
         return None;
     }
-    match std::fs::read_to_string(path) {
+    match read_bounded(path) {
         Ok(text) => check_text::<T>(kind, path, &text, retired),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => Some(FileProblem { kind, path: path.to_path_buf(), problem: Problem::Unreadable(e.to_string()), note: None }),

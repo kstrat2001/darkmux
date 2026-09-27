@@ -464,3 +464,15 @@ fn every_historical_config_key_is_named_as_retired() {
         assert!(msg.contains(says), "{says}: {msg}");
     }
 }
+
+/// (review minor) A file larger than the cap is not read into memory: it is
+/// reported, the same cap the crew loader holds manifests to.
+#[test]
+fn an_oversized_file_is_reported_not_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.json");
+    let f = std::fs::File::create(&path).unwrap();
+    f.set_len(MAX_USER_FILE_BYTES + 1).unwrap();
+    let found = check_path::<Probe>(UserFileKind::Role, &path, &no_retired).unwrap();
+    assert!(matches!(&found.problem, Problem::Unreadable(e) if e.contains("cap")), "{found:?}");
+}

@@ -794,6 +794,19 @@ mod tests {
         }
     }
 
+    /// (review minor) Round trip: what `profile draft` prints, pasted into a
+    /// profiles.json, passes the registry's own gate.
+    #[test]
+    fn a_drafted_profile_passes_the_registry_gate() {
+        let m = meta("qwen3.6-35b-a3b", Some("35B"), Some("qwen3_5_moe"), 262_144, 0);
+        let s = suggest_profile_for(&m, TaskClass::Long, &apple_silicon_128gb());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let doc = serde_json::json!({ "profiles": suggestion_to_profile_json("p", &m.model_key, &s) });
+        std::fs::write(&path, doc.to_string()).unwrap();
+        assert_eq!(darkmux_profiles::profiles::user_file_problem(&path), None);
+    }
+
     #[test]
     fn suggestion_to_profile_json_omits_compaction_when_no_compactor() {
         let m = meta("phi", Some("4B"), Some("phi"), 32_000, 0);

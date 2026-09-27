@@ -1952,6 +1952,31 @@ fn user_file_problems(kind: darkmux_types::user_files::UserFileKind) -> Vec<dark
     }
 }
 
+/// What to do about one bad user file, and what it does meanwhile: an
+/// unknown key does nothing, but broken JSON, a wrong-type value or a
+/// missing required key makes the whole file fail to load.
+fn user_file_hint(p: &darkmux_types::user_files::FileProblem) -> String {
+    use darkmux_types::user_files::{Issue, Problem, UserFileKind};
+    let unloaded = match p.kind {
+        UserFileKind::Config => "the whole file fails to load, so every setting falls back to its default",
+        UserFileKind::Profiles => "the entry is quarantined, or the whole registry fails to load",
+        UserFileKind::Role | UserFileKind::Skill | UserFileKind::Crew | UserFileKind::Rule => {
+            "the file fails to load and is skipped, so a builtin of the same id runs in its place"
+        }
+        UserFileKind::MissionConfig | UserFileKind::Workload | UserFileKind::LabFixture | UserFileKind::WorkspaceSpec => {
+            "the file fails to load"
+        }
+    };
+    match &p.problem {
+        Problem::Unreadable(_) => format!("make it readable (and under the size cap); until then {unloaded}"),
+        Problem::NotJson(_) => format!("fix the JSON syntax; until then {unloaded}"),
+        Problem::Keys(keys) if keys.iter().any(|k| matches!(k.issue, Issue::WrongType { .. } | Issue::Missing { .. })) => {
+            format!("fix each value named and add each missing key; until then {unloaded}")
+        }
+        Problem::Keys(_) => "rename each key to the valid one named, or delete it; until then it does nothing".to_string(),
+    }
+}
+
 /// Pure row builder for [`check_user_file_keys`].
 fn user_file_key_rows(problems: &[darkmux_types::user_files::FileProblem]) -> Vec<Check> {
     if problems.is_empty() {
@@ -1982,7 +2007,7 @@ fn user_file_key_rows(problems: &[darkmux_types::user_files::FileProblem]) -> Ve
                 ),
                 status: Status::Fail,
                 message: format!("{p}{consequence}"),
-                hint: Some("rename each key to the valid one named, or delete it; loading ignores it".into()),
+                hint: Some(user_file_hint(p)),
             }
         })
         .collect()
@@ -16199,5 +16224,33 @@ mod user_file_key_tests {
         assert!(text.contains("broken.json: not valid JSON"), "{text}");
         assert!(text.contains("unknown key `membrs`: did you mean `members`?"), "{text}");
         assert!(text.contains("Nothing that starts work reads this file"), "a crew manifest refuses nothing: {text}");
+    }
+}
+
+#[cfg(test)]
+mod user_file_hint_tests {
+    use super::*;
+
+    fn row_for(text: &str) -> Check {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, text).unwrap();
+        let problem = darkmux_types::user_files::config_json_problem_at(&path).unwrap();
+        user_file_key_rows(&[problem]).remove(0)
+    }
+
+    /// (review minor) Each kind of problem says its own consequence: an
+    /// unknown key does nothing, but a wrong value or broken JSON makes the
+    /// whole file fail to load; "loading ignores it" is only true of the
+    /// first.
+    #[test]
+    fn each_problem_kind_names_its_own_consequence() {
+        let unknown = row_for(r#"{"redis": {"hots": "h"}}"#).hint.unwrap();
+        assert!(unknown.contains("does nothing"), "{unknown}");
+        for text in [r#"{"redis": {"port": "x"}}"#, r#"{"redis": "#] {
+            let hint = row_for(text).hint.unwrap();
+            assert!(!hint.contains("ignores") && !hint.contains("does nothing"), "{text}: {hint}");
+            assert!(hint.contains("every setting falls back to its default"), "{text}: {hint}");
+        }
     }
 }

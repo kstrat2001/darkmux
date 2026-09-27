@@ -382,9 +382,9 @@ pub fn role_prompt(role_id: &str) -> Option<String> {
 /// (#906) Defense-in-depth cap on a single manifest file. Role / mission /
 /// phase / crew manifests are small (a few KB); a multi-MB file is either
 /// corrupt or hostile, and an unbounded `read_to_string` + `from_str` is a
-/// needless memory-amplification surface. 1 MiB is far above any real
-/// manifest while still bounding the blast radius.
-const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+/// needless memory-amplification surface. The same cap the unknown-key gate
+/// reads user files under.
+const MAX_MANIFEST_BYTES: u64 = darkmux_types::user_files::MAX_USER_FILE_BYTES;
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T> {
     if let Ok(meta) = fs::metadata(path) {

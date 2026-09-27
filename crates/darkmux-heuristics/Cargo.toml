@@ -18,3 +18,4 @@ serde_json = "1.0"
 [dev-dependencies]
 # `a_drafted_profile_has_no_unknown_keys` runs the unknown-key gate.
 darkmux-types = { path = "../darkmux-types" }
+tempfile = "3.10"
