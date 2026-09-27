@@ -255,7 +255,7 @@ darkmux release.
   undefined name is refused by name, never replaced by its
   `default_profile`. On a path that runs only on this machine (the lab, a
   mission step, until mission steps route), an address is refused naming
-  it, never read as an undefined local name. The sender's `dispatch route`
+  it, never read as an undefined local name. The sender's `dispatch.route`
   record carries `profile_address`; tokens are counted once, by the machine
   that runs the model, never on the sender's records. A profile name that
   contains `@` cannot be addressed. **Migration:** `darkmux dispatch <role>
