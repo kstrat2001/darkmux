@@ -45,6 +45,20 @@ rust-version = "1.88"
 name = "darkmux"
 path = "src/main.rs"
 
+[features]
+# (#2916 stage 2) Test-only. A binary built with it lets the fleet listener
+# bind loopback, so two daemons on one machine can exercise the real
+# sender -> listener path (`tests/fleet_profile_address_two_daemons.rs`, the one
+# target that requires it). Never enabled by a release build.
+e2e-fleet-loopback = ["darkmux-serve/e2e-fleet-loopback"]
+
+# (#2916 stage 2) Two daemons, one sending `--profile <p>@<machine>` to the
+# other's fleet listener. Runs only with `--features e2e-fleet-loopback`.
+[[test]]
+name = "fleet_profile_address_two_daemons"
+path = "tests/fleet_profile_address_two_daemons.rs"
+required-features = ["e2e-fleet-loopback"]
+
 [dependencies]
 # #463 workspace split — foundation crates extracted from this binary.
 darkmux-types = { path = "crates/darkmux-types" }

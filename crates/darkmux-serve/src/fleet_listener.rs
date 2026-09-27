@@ -552,11 +552,21 @@ pub(crate) fn listen_addr(local: &darkmux_fleet::NodeIdentity, port: u16) -> Res
         .or_else(|| local.addresses.first())
         .copied()
         .ok_or_else(|| "the identity provider reports no overlay address for this machine".to_string())?;
-    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+    if ip.is_unspecified() || (ip.is_loopback() && !LOOPBACK_FOR_E2E) || ip.is_multicast() {
         return Err(format!("refusing to bind the fleet listener to {ip}: not a specific overlay address"));
     }
     Ok(SocketAddr::new(ip, port))
 }
+
+/// (#2916 stage 2) True only in a binary built with the
+/// `e2e-fleet-loopback` cargo feature, which exists for ONE test target
+/// (`tests/fleet_profile_address_two_daemons.rs`: two daemons on one machine, each
+/// with a fake identity tool that places the other at 127.0.0.1). It lets
+/// the listener bind the loopback address its fake provider reports. It is
+/// a compile-time switch, not a runtime knob: no config value or env var
+/// reaches it, and a release build (`cargo build --release`, brew) never
+/// enables the feature, so production still refuses loopback.
+pub(crate) const LOOPBACK_FOR_E2E: bool = cfg!(feature = "e2e-fleet-loopback");
 
 /// What the listener is doing, for `/health` and so for `darkmux doctor`
 /// (#2916 review C8): a daemon started by launchd can fail where a shell
@@ -761,6 +771,15 @@ async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<(), Str
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| format!("binding {addr}: {e} (another process on `fleet.listener.port`?)"))?;
+    if LOOPBACK_FOR_E2E {
+        eprintln!(
+            "{}",
+            darkmux_types::style::warn(
+                "darkmux serve: fleet listener: this binary was built with the test-only \
+                 `e2e-fleet-loopback` feature and may bind loopback; never run it as a real fleet member"
+            )
+        );
+    }
     set_state("listening", format!("listening on {addr}"));
     println!("  fleet listener: {addr} (work submission; identity: {})", provider.provider_name());
     let state = FleetListenerState::production(receiver, provider, Some(local_id), busy_policy);
@@ -1550,6 +1569,9 @@ mod tests {
     }
 
     #[test]
+    // Without the test-only `e2e-fleet-loopback` feature, which is how every
+    // release binary is built: loopback is refused.
+    #[cfg(not(feature = "e2e-fleet-loopback"))]
     fn the_listener_binds_only_a_specific_overlay_address() {
         let local = test_node("n", "studio", "100.64.0.2");
         assert_eq!(listen_addr(&local, 8766).unwrap().to_string(), "100.64.0.2:8766");

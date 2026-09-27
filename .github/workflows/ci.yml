@@ -326,6 +326,18 @@ jobs:
         run: |
           cargo test --workspace --test 'e2e_*'
 
+      # (#2916 stage 2) Two daemons on one runner: `dispatch --profile
+      # <p>@<machine>` from one node through the other's fleet listener.
+      # Needs the test-only `e2e-fleet-loopback` feature (the target's
+      # `required-features`), so it is not in the `e2e_*` glob above; the
+      # test builds its own feature binary in `target/e2e-fleet-loopback`.
+      # No redis, no Docker, no model: the receiver's profile is a hosted
+      # endpoint on a mock chat server inside the test.
+      - name: Fleet two-daemon profile addresses (#2916)
+        if: steps.filter.outputs.rust == 'true'
+        run: |
+          cargo test -p darkmux --features e2e-fleet-loopback --test fleet_profile_address_two_daemons
+
       - name: No Rust-relevant changes — fleet e2e skipped
         if: steps.filter.outputs.rust != 'true'
         run: echo "No Rust-relevant changes; fleet e2e skipped (reports green)."
