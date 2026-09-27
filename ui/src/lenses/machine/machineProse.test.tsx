@@ -128,7 +128,8 @@ describe("machine lens — at-rest prose budget", () => {
   it("the demo fixture's healthy machine renders under the at-rest word ceiling", async () => {
     const { container } = mount(DEMO_MACHINE);
     await waitFor(() => expect(document.querySelector(".machine-lens__health")).toHaveAttribute("data-state", "loaded"));
-    await waitFor(() => expect(screen.getByText(/darkmux:qwen3-4b-instruct-2507/)).toBeInTheDocument());
+    // (#2915) The model's id is on its residency row AND in the Utility section.
+    await waitFor(() => expect(screen.getAllByText(/darkmux:qwen3-4b-instruct-2507/)[0]).toBeInTheDocument());
 
     const words = visibleWords(container.querySelector(".machine-lens") as HTMLElement);
     // Measured 293 before the trim, 256 after. The ceiling sits just above
@@ -161,8 +162,12 @@ describe("machine lens — at-rest prose budget", () => {
     // Measured 423 before the #1854-era trim, 338 after #1819, 317 after
     // #2440 (the per-row estimated hint, the machine-level duplicate shrink
     // hint, and the always-open info-message paragraph are all gone from
-    // the at-rest surface now). The ceiling only ever moves down.
-    expect(words).toBeLessThanOrEqual(322);
+    // the at-rest surface now). The ceiling only ever moves down, with ONE
+    // recorded exception: (#2915) the Utility section the operator asked for
+    // (2026-09-26) adds its model, facts, live and per-job lines (a fixed
+    // row per known job plus one "other"), measured at 339 here. That is a
+    // new section, not prose regrowing on an old one.
+    expect(words).toBeLessThanOrEqual(339);
   });
 
   // (#2440 cut 4 supersedes fix-loop 4's finding above) The operator's own

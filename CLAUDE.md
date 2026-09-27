@@ -222,16 +222,22 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    exit paths), regardless of what richer vocabulary it also emits. Liveness surfaces key on
    these bookends plus presence (#857); new vocabularies supplement, never replace.
    **Amended by #2914 (4.0): darkmux's own UTILITY jobs are exempt, and run lean.** The
-   utility jobs are defined once, by `darkmux_crew::usage::call_purpose` (every runtime
-   compactor call, and every call by the radio routing role); they run on the machine's one
-   utility model (`internal.utility`), and each emits its `telemetry.tokens` usage record
-   (`purpose: utility`) and nothing else: no session, no bookends, no presence, no run. They
-   are ACCOUNTED (the fleet hero sums them under their own chip) but not LISTED (the runs
-   board, the fleet card's activity and the status line's last dispatch key on bookends and
-   therefore show work only, which is the intent). Their visibility is #2915's utility state,
-   emitted at the one chokepoint each half passes through (`darkmux_crew::utility::
-   run_utility_single_shot` on the host; the runtime's `compaction.*` trajectory events,
-   through the tailer), never a bookend. Radio's ANSWERING seat (`radio-host`) is work and
+   utility jobs are defined once, by `darkmux_crew::usage::utility_job` (every runtime
+   compactor call, and every call by the radio routing role; `call_purpose` and the
+   `UtilityJobKind` enum both read it); they run on the machine's one utility model
+   (`internal.utility`). Each emits a lean `utility.start` when it starts and its
+   `telemetry.tokens` usage record (`purpose: utility`, `job`) when it ends (a failed routing
+   call ends with `utility.error` instead; a compaction whose calls all failed is ended by
+   its execution's next record), and nothing else: no session of its own, no bookends,
+   no presence, no run. They are ACCOUNTED (the fleet hero sums them under their own chip)
+   and VISIBLE (#2915: the fleet card's utility strip and the "compacting" scope reading key
+   on `utility.start`), but not LISTED (the runs board, the fleet card's activity and the
+   status line's last dispatch key on bookends and therefore show work only, which is the
+   intent). The markers are emitted at the one chokepoint each half passes through
+   (`darkmux_crew::utility::run_utility_single_shot` on the host; the runtime's
+   `compaction.start` trajectory event, through the tailer), never as a bookend; a
+   compaction's markers carry the session of the execution it serves, a routing job's carry
+   none. Radio's ANSWERING seat (`radio-host`) is work and
    keeps its bookends and its run.
 3. **Lab/fleet sink boundary** — lab runs write per-run-local artifacts; the fleet flow
    stream carries engagement work only. No crossings in either direction.

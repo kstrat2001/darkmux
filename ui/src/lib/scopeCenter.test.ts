@@ -35,3 +35,17 @@ describe("(#2911) a run in flight with no model working", () => {
     expect(scopeCenter({ state: "idle", tokensPerSec: 0, inFlight: false })).toEqual({ centerLabel: null, centerUnit: "idle", centerCarried: false });
   });
 });
+
+describe("(#2915) compacting", () => {
+  it("the tube's center reads 'compacting' on its own, with the utility treatment, and no timer", () => {
+    expect(scopeCenter({ state: "prompt", tokensPerSec: 0, compacting: true })).toEqual({ centerLabel: null, centerUnit: "compacting", centerCarried: false, utility: true });
+  });
+  it("plain PROMPT keeps its brain: no word, no utility treatment", () => {
+    const c = scopeCenter({ state: "prompt", tokensPerSec: 0 });
+    expect(c.centerUnit).toBeNull();
+    expect(c.utility).toBeUndefined();
+  });
+  it("compacting never leaks into another state", () => {
+    expect(scopeCenter({ state: "stalled", tokensPerSec: 0, compacting: true })).toEqual({ centerLabel: null, centerUnit: null, centerCarried: false });
+  });
+});

@@ -801,6 +801,7 @@ describe("activitySectionOf / groupActivitiesBySections (#2450-ish, filter panel
       "machine online": "MACHINE",
       "machine offline": "MACHINE",
       "host telemetry": "MACHINE",
+      utility: "MACHINE",
       telemetry: "DISPATCH",
       other: "OTHER",
     };
@@ -927,5 +928,19 @@ describe("PERIODIC_SAMPLE_ACTIVITIES — the fallback shows lifecycle noise, nev
     // event-triggered, not periodic — must stay OFF this list.
     expect(PERIODIC_SAMPLE_ACTIVITIES.has("detector")).toBe(false);
     expect(PERIODIC_SAMPLE_ACTIVITIES.has("dispatch start")).toBe(false);
+  });
+});
+
+// (#2915 review, C8) Utility job markers get their own facet, filed with the
+// machine (a utility job is machine-level), not lumped into "telemetry".
+describe("(#2915) utility facet", () => {
+  it("utility.start and utility.error read as 'utility', under MACHINE", async () => {
+    const { activityOf, activitySectionOf, ACT_ORDER } = await import("./eventFilters");
+    const { UTILITY_START_ACTION, UTILITY_ERROR_ACTION } = await import("./utilityJobs");
+    for (const action of [UTILITY_START_ACTION, UTILITY_ERROR_ACTION]) {
+      expect(activityOf({ ts: "2026-09-27T00:00:00Z", action, category: "telemetry", source: "utility" } as never)).toBe("utility");
+    }
+    expect(activitySectionOf("utility")).toBe("MACHINE");
+    expect(ACT_ORDER).toContain("utility");
   });
 });

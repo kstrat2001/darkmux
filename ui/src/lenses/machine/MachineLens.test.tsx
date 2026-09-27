@@ -468,24 +468,28 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
     expect(container.textContent).not.toContain("mission-compile");
   });
 
-  it("badges the configured tier's row instead — the seam that replaced the card", async () => {
-    mockMachineFetch(withUtility);
+  it("(#2915) the Utility section names the model, its window and residency with the row's footprint; no row badge", async () => {
+    mockMachineFetch({ ...withUtility, specs: { ...withUtility.specs, utility_model: { id: "darkmux:qwen3-4b", loaded: true, n_ctx: 120000 } } });
     const { container } = renderMachine(null);
     await waitFor(() => expect(screen.getByText(/limit source/i)).toBeInTheDocument());
-    const row = [...container.querySelectorAll(".mm-row")].find((r) => r.textContent?.includes("darkmux:qwen3-4b"))!;
-    expect(row).toBeTruthy();
-    const chip = [...row.querySelectorAll(".mm-row-chip")].find((c) => c.textContent === "utility")!;
-    expect(chip).toBeTruthy();
-    // Identity, never a health verdict — no severity class.
-    // Identity, never a health verdict: it carries the identity treatment
-    // (filled + achromatic) and NONE of the severity classes.
-    expect(chip.className).toBe("mm-row-chip is-identity");
-    expect(chip.className).not.toMatch(/is-(green|amber|red|state|warn|new)\b/);
-    // The gloss the card used to spend a line on survives as the title.
-    expect(chip.getAttribute("title")).toContain("small-model tier");
+    const section = await waitFor(() => {
+      const el = container.querySelector('[data-testid="machine-utility"]');
+      expect(el).toBeTruthy();
+      return el as HTMLElement;
+    });
+    expect(section.querySelector(".mm-utility__id")?.textContent).toBe("darkmux:qwen3-4b");
+    expect(section.querySelector(".mm-utility__facts")?.textContent).toMatch(/^window 120,000 · resident · [\d.]+ (B|KiB|MiB|GiB)$/);
+    expect(section.querySelector(".mm-utility__live")?.textContent).toBe("idle");
+    // Every known job is listed, at zero with no usage in the window.
+    expect([...section.querySelectorAll(".mm-utility__job")].map((r) => r.textContent)).toEqual([
+      "compacting0 calls0 tokens",
+      "radio routing0 calls0 tokens",
+      "other0 calls0 tokens",
+    ]);
+    expect([...container.querySelectorAll(".mm-row-chip")].some((c) => c.textContent === "utility")).toBe(false);
   });
 
-  it("the inverted case: a machine with no utility tier configured badges nothing", async () => {
+  it("the inverted case: a machine with no utility tier configured says so", async () => {
     mockMachineFetch({
       specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max", ram_total_bytes: 137438953472, utility_model: null },
       resources: RESIDENT_UTILITY, // the row is THERE; only the binding is absent
@@ -493,7 +497,7 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
     const { container } = renderMachine(null);
     await waitFor(() => expect(screen.getByText(/limit source/i)).toBeInTheDocument());
     expect([...container.querySelectorAll(".mm-row-chip")].some((c) => c.textContent === "utility")).toBe(false);
-    expect(container.querySelector(".machine-lens__util")).toBeNull();
+    expect(container.querySelector(".mm-utility__facts")?.textContent).toBe("window — · no utility model registered");
   });
 });
 

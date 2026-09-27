@@ -1577,3 +1577,55 @@ describe("(#2926) run page: THINK opener and TOOL GEN, from the real run", () =>
     expect(document.querySelector(".modelbox__note")).toBeNull();
   });
 });
+
+// (#2915) The run page while its execution compacts, over the real run with a
+// compaction inserted between turn 9's tool (10:52:09) and turn 10's opener
+// (10:52:22): PROMPT stays lit (no sixth lamp), the tube reads "compacting"
+// with the utility treatment and no timer, and the readout slot under the
+// lamps counts ("compacting · 5s").
+describe("(#2915) run page: compacting", () => {
+  async function renderAt(records: unknown[], playhead: number) {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <SessionReplay sessionId={PEPPER_SID} playhead={playhead} />
+      </QueryClientProvider>,
+    );
+    await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
+  }
+  const lit = () => document.querySelector('.scope-lamp[data-on="true"]');
+  const compactStart = {
+    ts: "2026-09-26T10:52:10Z",
+    action: "utility.start",
+    category: "telemetry",
+    source: "utility",
+    session_id: PEPPER_SID,
+    handle: "compactor",
+    payload: { job: "compaction", model: "darkmux:util-4b", serves: PEPPER_SID, stall_after_seconds: 600 },
+  };
+  const compactEnd = {
+    ts: "2026-09-26T10:52:20Z",
+    action: "telemetry.tokens",
+    category: "telemetry",
+    source: "tokens",
+    session_id: PEPPER_SID,
+    handle: "compactor",
+    payload: { purpose: "utility", call_kind: "compaction", job: "compaction", total_tokens: 900 },
+  };
+
+  it("PROMPT lit, the tube reads 'compacting' (utility treatment, no timer), the readout counts", async () => {
+    await renderAt([...pepperRecords(), compactStart], pepperAt("10:52:15"));
+    expect(lit()?.getAttribute("data-state")).toBe("prompt");
+    expect(document.querySelectorAll(".scope-lamp")).toHaveLength(5);
+    expect(latestTokenScopeProps()).toMatchObject({ state: "prompt", centerLabel: null, centerUnit: "compacting", utility: true });
+    expect(document.querySelector(".modelbox__note")?.textContent).toBe("compacting · 5s");
+    expect(document.querySelector(".scope-lamps")?.getAttribute("aria-label")).toBe("run state: compacting · 5s");
+  });
+
+  it("ended by its usage record: the ordinary PROMPT, no readout, no utility treatment", async () => {
+    await renderAt([...pepperRecords(), compactStart, compactEnd], pepperAt("10:52:21"));
+    expect(lit()?.getAttribute("data-state")).toBe("prompt");
+    expect(latestTokenScopeProps().utility).toBe(false);
+    expect(document.querySelector(".modelbox__note")).toBeNull();
+  });
+});

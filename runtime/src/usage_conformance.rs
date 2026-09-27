@@ -500,3 +500,19 @@ fn each_loop_compaction_site_drains_its_own_calls() {
         "one `compaction.call` drain per compaction site (#2902)"
     );
 }
+
+/// (#2915) Each compaction site marks its START before it calls the
+/// compactor: the host maps `compaction.start` to the `utility.start` flow
+/// record the viewer reads as "compacting". One start per site, placed
+/// before that site's compactor call (`compaction::compact(`), so a site
+/// that drops or moves its marker below the call fails here.
+#[test]
+fn each_loop_compaction_site_marks_its_start_before_the_call() {
+    let body = fn_body("src/loop_runner.rs", "run_with_sleeper");
+    let starts: Vec<usize> = body.match_indices("trajectory.append_compaction_start(").map(|(i, _)| i).collect();
+    let calls: Vec<usize> = body.match_indices("compaction::compact(").map(|(i, _)| i).collect();
+    assert_eq!(starts.len(), calls.len(), "one `compaction.start` per compaction site (#2915)");
+    for (s, c) in starts.iter().zip(&calls) {
+        assert!(s < c, "a site's start marker must precede its compactor call (#2915)");
+    }
+}

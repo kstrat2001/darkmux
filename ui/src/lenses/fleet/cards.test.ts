@@ -1151,3 +1151,52 @@ describe("buildFleetCard: executions and defaultExecutionSessionId (#2881)", () 
     expect(card.defaultExecutionSessionId).toBe("s1");
   });
 });
+
+// (#2915) The fleet card's utility strip: the machine's utility model, whether
+// it is resident, and its live utility job (quiet when none). A radio routing
+// job has no session, so it reaches the card only through the machine.
+describe("(#2915) buildFleetCard's utility strip", () => {
+  const at = (s: number) => new Date(Date.parse("2026-08-08T00:00:00.000Z") + s * 1000).toISOString();
+  const tAt = (s: number) => Date.parse(at(s));
+  const routeStart = (s: number, uid = "u1") =>
+    rec({ ts: at(s), machine_uid: uid, action: "utility.start", category: "telemetry", source: "utility", handle: "radio-router", model: "util-4b", payload: { job: "radio_routing", model: "util-4b", stall_after_seconds: 30 } } as Partial<FlowRecord>);
+  const routeEnd = (s: number) =>
+    rec({ ts: at(s), machine_uid: "u1", action: "telemetry.tokens", category: "telemetry", source: "tokens", handle: "radio-router", payload: { purpose: "utility", call_kind: "single_shot", job: "radio_routing", requested_model: "util-4b", total_tokens: 9 } } as Partial<FlowRecord>);
+  const card = (data: FlowRecord[], t: number, specs: MachineSpecs | null = null) => buildFleetCard(data, new Map(), specs, new Set(), false, "u1", true, t);
+
+  it("shows the routing job while it runs, and is quiet once its usage record lands", () => {
+    expect(card([routeStart(0)], tAt(2)).utility.job).toMatchObject({ job: "radio_routing", visual: "radio", stalled: false });
+    expect(card([routeStart(0), routeEnd(1)], tAt(2)).utility.job).toBeNull();
+  });
+
+  it("another machine's job is not this card's", () => {
+    expect(card([routeStart(0, "u2")], tAt(2)).utility.job).toBeNull();
+  });
+
+  it("a routing job with no end past its bound reads stalled", () => {
+    expect(card([routeStart(0)], tAt(31)).utility.job?.stalled).toBe(true);
+  });
+
+  it("a job this build does not know gets the generic visual, never none", () => {
+    const r = routeStart(0);
+    (r as unknown as { payload: Record<string, unknown> }).payload.job = "dream_job";
+    expect(card([r], tAt(1)).utility.job).toMatchObject({ job: "dream_job", visual: "generic" });
+  });
+
+  it("the model and residency come from this machine's own /machine/specs", () => {
+    const specs = machineSpecs({ machine_id: "studio", machine_uid: "u1", utility_model: { id: "util-4b", loaded: true } });
+    expect(card([], T_MAX, specs).utility).toMatchObject({ model: "util-4b", resident: true, job: null });
+  });
+
+  it("a peer's model comes from its own utility records; its residency is unknown", () => {
+    expect(card([routeStart(0), routeEnd(1)], tAt(2)).utility).toMatchObject({ model: "util-4b", resident: null });
+    expect(card([], T_MAX).utility).toMatchObject({ model: null, resident: null, job: null });
+  });
+
+  it("a compaction on this machine shows as compacting, ended by its usage record", () => {
+    const start = rec({ ts: at(0), machine_uid: "u1", session_id: "s1", action: "utility.start", payload: { job: "compaction", model: "util-4b", serves: "s1", stall_after_seconds: 600 } } as Partial<FlowRecord>);
+    const end = rec({ ts: at(4), machine_uid: "u1", session_id: "s1", action: "telemetry.tokens", category: "telemetry", source: "tokens", payload: { purpose: "utility", call_kind: "compaction", job: "compaction", total_tokens: 3 } } as Partial<FlowRecord>);
+    expect(card([start], tAt(2)).utility.job).toMatchObject({ job: "compaction", visual: "compacting" });
+    expect(card([start, end], tAt(5)).utility.job).toBeNull();
+  });
+});

@@ -12,7 +12,9 @@ import { relAgoFrom } from "../../lib/format";
 import { specOf } from "../fleet/cards";
 import { utilityModelId } from "./memoryLedgerLines";
 import { MachineHealthRegion } from "./MachineHealthRegion";
-import { advanceResidency, residencyChangedThisPoll, type ResidencyRowView, type ResidencyState } from "./machineGauge";
+import { advanceResidency, isUtilityTierRow, residencyChangedThisPoll, type ResidencyRowView, type ResidencyState } from "./machineGauge";
+import { UtilitySection } from "./UtilitySection";
+import { utilitySectionView } from "./utilitySectionView";
 import { getSource } from "../../lib/source";
 import {
   Meter,
@@ -467,9 +469,23 @@ export function MachineLens({
           residencyRows={residencyRows}
           residencyChanged={residencyChanged}
           nowMs={nowMs}
-          utilityModelId={utilityModelId(specs, isLocalSpecs)}
         />
       </div>
+
+      {/* (#2915) darkmux's own jobs on this machine's utility model: the
+          model, its residency, the live job, each job's recent usage. */}
+      {targetUid != null && (
+        <UtilitySection
+          view={utilitySectionView({
+            data: flowWindow.data,
+            uid: targetUid,
+            nowMs,
+            specs,
+            isLocal: isLocalMach,
+            residentRow: residencyRows.find((r) => r.status !== "ghost" && isUtilityTierRow(r.model.identifier, r.model.model_key, utilityModelId(specs, isLocalSpecs)))?.model ?? null,
+          })}
+        />
+      )}
 
       {/* (#2108, operator design rule — the lens is a strict SUPERSET of
           the sheet) The LOCAL machine renders the SAME shared block the

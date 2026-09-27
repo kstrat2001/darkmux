@@ -47,7 +47,6 @@ COMPRESSOR
 limit source physical pool · available 45.98 GiB (38.38 GiB reclaimable) · unpriced 0 models
 DARKMUX-MANAGED · 2 RESIDENT
 darkmux:qwen3-4b-instruct-2507
-utility
 14.6
 ctx 120000 · weights 2.01 GiB · kv@ctx 16.48 GiB · potential 19.18 GiB · current 14.61 GiB
 darkmux:qwen3.6-35b-a3b-turboquant-mlx
@@ -55,6 +54,19 @@ darkmux:qwen3.6-35b-a3b-turboquant-mlx
 ctx 262144 · weights 17.18 GiB · kv@ctx 5.00 GiB · potential 22.88 GiB · current 21.92 GiB
 snapshot just now
 how this was measured
+UTILITY · LAST 24H
+darkmux:qwen3-4b-instruct-2507
+window — · resident · 14.61 GiB
+idle
+compacting
+0 calls
+0 tokens
+radio routing
+0 calls
+0 tokens
+other
+0 calls
+0 tokens
 LIVE LOAD · LAST 10 MIN
 CPU
 15%
