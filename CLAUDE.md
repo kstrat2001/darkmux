@@ -414,18 +414,26 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    `config set --help`) lists the valid values with their meanings. `--skip-preflight` does not
    waive it: that flag skips a Docker probe, and a bad config value is not a probe result.
 
+   Retired spellings are refused too, naming the replacement ("`enforce` was renamed to `cut`
+   in 4.0"): a rename never reads the old word as the new one. Policy values name the action
+   (`off` / `record` / `warn` / the rule's own verb, e.g. `cut`), never `enforce`/`observe`.
+
    The mechanism is two declarations in `darkmux-types/src/config_enum.rs`, and everything else
    derives from them with no per-setting code: a `ConfigEnum` (implemented with `config_enum!`,
-   one row per value, its token and one-line meaning, with an exhaustive `match` so the value
-   list cannot drift from the Rust enum) and an entry in `ENUM_SETTINGS` (key, env var, shipped
-   value, and the consuming `Scope`s: dispatch, mission launch, lab run, fleet submission).
+   one row per value, its token and one-line meaning, plus any retired spellings, with an
+   exhaustive `match` so the value list cannot drift from the Rust enum) and an entry in
+   `ENUM_SETTINGS` (key, env var, shipped value, and the consuming `Scope`s: dispatch, mission
+   launch, lab run, fleet submission; or a per-item entry such as `hooks.rules[].match.level`,
+   checked where the list is loaded).
    Storage stays a string parsed at the accessor, so contract 7's lenient read holds. A new enum
    setting is those two declarations plus a one-line accessor over `config_access::resolve_enum`.
    Conformance: `config_cmd::every_enum_setting_obeys_the_rule_on_every_surface` iterates the
    registry across preflight, doctor, `config set` and help; `tests/cli.rs`'s
    `every_enum_setting_is_refused_by_every_cli_entry_point_that_consumes_it` spawns each entry
-   point; and `config_enum::every_enum_in_the_config_schema_is_registered` fails on an enum in the
-   config schema that is not registered. `docs/ENVIRONMENT.md`'s value lists are drift-tested
+   point; and `config_enum::every_enum_in_the_config_schema_is_registered` fails on an unregistered
+   enum of any visibility in darkmux-types, an unregistered `config_enum!` anywhere, or a
+   hand-rolled string-literal token match at a config accessor. Its limit: a string compared
+   with `==` against a literal outside those files is not seen, and stays a review question. `docs/ENVIRONMENT.md`'s value lists are drift-tested
    against the registry. Per-endpoint `profiles.json` enums (`managed`, `dialect`) share the
    `ConfigEnum` value tables but keep their own refuse-at-use path through `Lenient<T>`.
 

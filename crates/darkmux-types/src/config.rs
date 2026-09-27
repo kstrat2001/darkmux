@@ -236,7 +236,8 @@ use std::path::Path;
 //   1.27 (#2846): one additive block under `runtime`.
 //           `detection{}` — per-detector policy. `degeneracy.policy` is
 //           `enforce` (act) / `observe` (measure, never act) / `off` (do
-//           not measure). Written visibly by `init` at `enforce`, so an
+//           not measure); renamed in 1.31 (#2947). Written visibly by
+//           `init` at `enforce`, so an
 //           older binary ignoring the block behaves exactly as the
 //           default does.
 //           The value is stored as a STRING, not a derived enum: this
@@ -288,7 +289,26 @@ use std::path::Path;
 //           100..=1000 at the accessor, which reports the clamp. `Option<u64>`,
 //           lenient-on-read: an older binary ignores it and has no live
 //           channel, exactly as before.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.30";
+//   1.31 (#2947, darkmux 4.0): VALUE change, no field change.
+//           `runtime.detection.degeneracy.policy` values now name the
+//           action: `off` / `record` / `warn` / `cut` (was `off` / `observe`
+//           / `enforce`). `init` writes `cut`. Bumped although no field
+//           changed, because a config written by `init` at 1.30 or earlier
+//           carries `"policy": "enforce"`, which this binary REFUSES (the
+//           retired spelling is refused with its replacement named, never
+//           read as `cut`): the file still loads (lenient read), but every
+//           dispatch, mission launch and lab run refuses until the value is
+//           changed, and `darkmux doctor` prints the exact `config set`.
+//           Also added under the same rule: `hooks.rules[].match.level` /
+//           `.category` are validated against the flow vocabulary (a typo
+//           used to match nothing); no shape change there either.
+//           The same release makes every enum-valued key (the policy,
+//           `runtime.thermal.pause_at` / `resume_at`, `fleet.mode`,
+//           `fleet.identity.provider`, the hook `match` fields) follow one
+//           rule (`config_enum`): still read leniently as strings, but an
+//           unregistered value is refused where it is consumed and reported
+//           as Fail by `darkmux doctor`, never resolved to a fallback.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.31";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent

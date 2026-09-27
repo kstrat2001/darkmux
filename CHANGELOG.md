@@ -72,6 +72,18 @@ darkmux release.
 
 ### Changed (breaking, 4.0)
 
+- **The degeneracy detector's policy values name the action: `off`,
+  `record`, `warn`, `cut`** (#2947). `enforce` is now `cut` (still the
+  default, behavior unchanged) and `observe` is now `record`. New: `warn`
+  measures and, on each finding, prints a warning for the dispatch, writes
+  a Warn-level `dispatch.degeneracy.warning` flow record and counts
+  `degeneracy_warnings` in the run envelope, without cutting anything. The
+  old spellings are refused with the new word ("`enforce` was renamed to
+  `cut` in 4.0"). CONFIG 1.30, FLOW 1.62.0. **Migration:** a `config.json`
+  written by an earlier `darkmux init` carries `"policy": "enforce"`, so
+  every dispatch refuses until you run
+  `darkmux config set runtime.detection.degeneracy.policy cut` (or `record`
+  where you had `observe`); `darkmux doctor` prints the exact command.
 - **An unrecognized value in an enum-valued setting is refused, not
   guessed** (#2947). `runtime.detection.degeneracy.policy` used to run as
   `enforce`, `fleet.mode` used to read as `standalone`, and a typo in
@@ -81,9 +93,14 @@ darkmux release.
   starting anything, naming the value, where it was set (env var or
   `config.json` key) and the valid values; fleet work submission does the
   same for `fleet.identity.provider`; `darkmux doctor` reports each as Fail.
-  `--skip-preflight` does not waive it. `darkmux config set <key>` with no
-  value, `config list` and `config set --help` list every valid value with
-  its meaning. Nothing on disk changed (no CONFIG bump): a config file with
+  `--skip-preflight` does not waive it. So do `mission dispatch`,
+  `machine add` (before writing the roster), `radio` and the ACP panel
+  (before the routing call), and a fleet receiver, which refuses a
+  submission synchronously (503) before accepting it. A hook rule's
+  `match.level` / `match.category` is checked the same way: a typo refuses
+  the hooks sink instead of matching nothing. `darkmux config set <key>`
+  with no value (exit 2), `config list` (at a terminal) and
+  `config set --help` list every valid value with its meaning. Nothing on disk changed (no CONFIG bump): a config file with
   a typo in one of these keys still loads, and now says what is wrong
   instead of running on a value nobody wrote. **Migration:** run `darkmux
   doctor`; fix any Fail row it names with the `darkmux config set` it

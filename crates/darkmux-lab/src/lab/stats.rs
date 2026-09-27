@@ -155,7 +155,8 @@ fn mean(xs: impl Iterator<Item = f64>) -> Option<f64> {
 ///
 /// `degenerate_turns` comes from each record's OWN `degenerate` flag, which
 /// is the gate's judgment and is recorded regardless of whether the policy
-/// let it act. Under `observe` a degenerate finding therefore appears here
+/// let it act. Under `record` or `warn` (`observe` before 4.0, #2947) a
+/// degenerate finding therefore appears here
 /// with `aborts: 0`, which is exactly the shape that proves the policy was
 /// in effect.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -178,8 +179,8 @@ pub struct CheckpointGate {
     /// Turns the runtime JUDGED degenerate (`would_conclude`), whatever the
     /// policy then did about it.
     pub degenerate_turns: Vec<u64>,
-    /// Turns the runtime actually CUT (`verdict: conclude`). Under `observe`
-    /// this is empty while `degenerate_turns` is not; that difference is the
+    /// Turns the runtime actually CUT (`verdict: conclude`). Under `record`
+    /// or `warn` (`observe` before 4.0) this is empty while `degenerate_turns` is not; that difference is the
     /// whole point of the policy and must not be collapsed.
     pub concluded_turns: Vec<u64>,
     /// Re-derived from [`DEGENERATE_TAIL_RATIO`], for the cross-check only.
@@ -188,7 +189,9 @@ pub struct CheckpointGate {
     /// The detection policy in force: what the checkpoint records say ran,
     /// or, when the run made none (a clean run, or any run under `off`), what
     /// `dispatch start.bounds` says the host resolved. Without the fallback a
-    /// healthy `enforce` run and an `off` run read identically.
+    /// healthy `cut` run and an `off` run read identically. The string is
+    /// passed through as recorded: `off`/`record`/`warn`/`cut`, or
+    /// `enforce`/`observe` in a run recorded before 4.0 (#2947).
     pub policy: Option<String>,
 }
 
@@ -636,7 +639,7 @@ pub(crate) fn parse_trajectory(raw: &str) -> Trajectory {
                 t.checkpoints.entry(seq.unwrap_or(0)).or_default().push(Checkpoint {
                     tail_ratio: as_f64(body.get("tail_ratio")),
                     concluded,
-                    // Under `observe` the runtime records a degenerate
+                    // Under `record`/`warn` (`observe` before 4.0) the runtime records a degenerate
                     // finding as `would_conclude` while the verdict stays
                     // `continue`. Reading the VERDICT as the judgment makes
                     // every observing run look clean; reading
