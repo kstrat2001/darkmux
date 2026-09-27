@@ -142,7 +142,7 @@ struct ReconcileFree {
 /// THE pure acquisition planner. See module docs; the per-arm behavior is
 /// specified by the table tests below, one row per #1278-family bug class.
 ///
-/// The passes run in a fixed order, each a method on [`Acquisition`]:
+/// The passes run in a fixed order, each a method on `Acquisition`:
 /// per-desired decisions, Exclusive pass 1, estimation, the #1243 budget
 /// arm's flat refusals, the surviving reconciles' stale credits, the budget
 /// arm's fit half, the #1140 pool-headroom arm, then assembly.

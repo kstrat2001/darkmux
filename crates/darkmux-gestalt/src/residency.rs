@@ -8,10 +8,10 @@
 //! 2026-07-10, #1274): a foreign resident sharing the weights is now a
 //! [`ResidencyDecision::ForeignDuplicate`] fact — respected as pool
 //! consumption, never a reuse candidate — and the planner decides
-//! load-alongside vs Block-on-capacity. The root-crate
-//! `tests/gestalt_parity.rs` proves arm-for-arm agreement against the
-//! review's own test fixtures for the arms that still match, and annotates
-//! the diverged vectors as named behavior changes.
+//! load-alongside vs Block-on-capacity. The review's own copy is gone. One
+//! residency decision still lives outside the planner: the dispatch
+//! preflight in `darkmux_crew::dispatch_internal`
+//! (`ensure_model_resident_from`) makes its own reuse/reload call.
 
 use crate::desired::Placement;
 use crate::facts::ResidentFact;
@@ -95,8 +95,7 @@ pub fn decide_residency(residents: &[ResidentFact], p: &Placement) -> ResidencyD
 mod tests {
     //! Golden arm-for-arm fixtures lifted from the review's own residency
     //! tests (the #1271 `LmsCycler` suite) — same residents, same wanted
-    //! ctx, same expected arm. The cross-crate copy of these vectors lives
-    //! in the root crate's tests/gestalt_parity.rs.
+    //! ctx, same expected arm.
 
     use super::*;
 

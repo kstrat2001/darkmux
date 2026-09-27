@@ -1,13 +1,9 @@
 //! The darkmux ownership boundary, as pure string predicates.
 //!
-//! Canonical home going forward for the namespace helpers that today also
-//! live in `darkmux_profiles::swap` (the #52 namespace convention). Packet 3
-//! re-points swap.rs at this module (a thin delegating wrapper for the
-//! `&ProfileModel` form, `pub use` for the rest) so the review's `LmsCycler`
-//! and the dispatch path keep exactly ONE definition — the #1271
-//! discipline. Until that cutover lands, the root-crate
-//! `tests/gestalt_parity.rs` asserts these functions agree with swap's over
-//! swap's own test vectors, so the duplication window cannot fork.
+//! The one definition of the #52 namespace convention: `darkmux_profiles::
+//! swap` delegates to these helpers (its `&ProfileModel` wrapper and
+//! `DARKMUX_LMS_NAMESPACE` re-export) rather than carrying its own copy —
+//! the #1271 one-definition discipline.
 
 /// Prefix attached to identifiers darkmux uses for its own host loads.
 /// Anything visible in host residency starting with this prefix is owned by
@@ -66,9 +62,7 @@ pub fn ctx_sufficient(loaded_ctx: u64, wanted_n_ctx: u32) -> bool {
 mod tests {
     use super::*;
 
-    // Golden vectors mirroring `darkmux_profiles::swap`'s own tests — the
-    // in-crate half of the anti-fork guard (the cross-crate half lives in
-    // the root crate's tests/gestalt_parity.rs).
+    // Golden vectors mirroring `darkmux_profiles::swap`'s own tests.
 
     #[test]
     fn namespaced_identifier_wraps_bare_key() {
