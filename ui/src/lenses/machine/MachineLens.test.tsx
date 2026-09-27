@@ -84,6 +84,8 @@ function mockMachineFetch(opts: {
   /** (#2019) The committed `{specs, resources}` a daemon-less build reads
    * from `darkmux-machine-src`, served here at that same path. */
   staticMachine?: unknown;
+  /** (#2921 follow-up) `GET /fleet/roster` entries. */
+  roster?: unknown[];
 } = {}) {
   const today = todayUTC();
   const yesterday = prevDateUTC(today);
@@ -118,6 +120,9 @@ function mockMachineFetch(opts: {
       if (path === "/fleet/sessions/live") {
         return Promise.resolve(new Response(JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
       }
+      if (path === "/fleet/roster" && opts.roster) {
+        return Promise.resolve(new Response(JSON.stringify({ machines: opts.roster, error: null }), { status: 200 }));
+      }
       return Promise.resolve(new Response("not recorded\n", { status: 404 }));
     }),
   );
@@ -125,6 +130,25 @@ function mockMachineFetch(opts: {
 }
 
 describe("MachineLens", () => {
+  // (#2921 follow-up) A remote machine known only by its hardware uid: the
+  // placeholder names it from the roster when it can, and otherwise says how
+  // to name it; it never prints the uid.
+  const FAKE_UID = "0A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
+  const uidOnly = () => [{ ts: new Date(Date.now() - 60_000).toISOString(), action: "dispatch.turn", machine_uid: FAKE_UID }];
+  const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+  it("(#2921) a uid-only remote machine with a roster entry is named by it", async () => {
+    mockMachineFetch({ specs: { machine_id: "MacBook-Pro" }, flowToday: uidOnly(), roster: [{ id: "studio", address: "a:1", added_unix_ms: 1, machine_uid: FAKE_UID }] });
+    renderMachine(FAKE_UID);
+    await waitFor(() => expect(screen.getByText(/View the machine page on studio directly/i)).toBeInTheDocument());
+    expect(UUID_RE.test(document.body.textContent ?? "")).toBe(false);
+  });
+  it("(#2921) a uid-only remote machine with no name says how to name it", async () => {
+    mockMachineFetch({ specs: { machine_id: "MacBook-Pro" }, flowToday: uidOnly() });
+    renderMachine(FAKE_UID);
+    await waitFor(() => expect(screen.getByText(/darkmux config set machine_id <name>/)).toBeInTheDocument());
+    expect(UUID_RE.test(document.body.textContent ?? "")).toBe(false);
+  });
+
   it("uid: null (nav-tab/deep-link) is always the local machine — resources loads with real figures", async () => {
     const resourcesCalled = mockMachineFetch({ specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max", ram_total_bytes: 137438953472 } });
     renderMachine(null);

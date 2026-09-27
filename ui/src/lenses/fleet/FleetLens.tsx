@@ -748,6 +748,7 @@ export function FleetLens({
           runsForMachine(runs, machineNames(flowWindow.data, liveMachines, m)),
           connected,
           lastContactMs,
+          roster,
         );
         // (#2768, corrected by the #2802 regression fix) A roster entry
         // whose declared hardware identity matches this uid still prevents a
@@ -768,10 +769,13 @@ export function FleetLens({
       // rather than a new vocabulary for "silent". `entry.id` doubles as
       // the card's `uid`: a roster entry carries no hardware uid (it is
       // declared before the machine has ever proven one), and `id` is
-      // already the identity `nameOf`/`specOf` fall back to for an unknown
-      // `m` — see those functions' own docs.
-      ...rosterOnly.map((entry) =>
-        buildFleetCard(
+      // already the identity `specOf` falls back to for an unknown `m`.
+      // (#2921) Its TITLE is the roster id, set here: `nameOf` no longer
+      // echoes an unknown `m` back (that echo was how a raw hardware uid
+      // reached a card title), so the operator's declared name is passed
+      // explicitly rather than inherited from the fallback.
+      ...rosterOnly.map((entry) => ({
+        ...buildFleetCard(
           flowWindow.data,
           liveMachines,
           specs,
@@ -785,7 +789,8 @@ export function FleetLens({
           connected,
           lastContactMs,
         ),
-      ),
+        name: entry.id,
+      })),
     ],
     [uids, rosterOnly, flowWindow.data, playheadT, liveMachines, specs, liveSet, liveMode, specBeats, runs, roster, connected, lastContactMs],
   );
@@ -821,8 +826,10 @@ export function FleetLens({
         tMin ?? 0,
         playheadT,
         fixedRange,
+        specs,
+        roster,
       ),
-    [flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, windowMinutesNum, liveMode, tMin, playheadT, fixedRange?.[0], fixedRange?.[1]],
+    [flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, windowMinutesNum, liveMode, tMin, playheadT, fixedRange?.[0], fixedRange?.[1], specs, roster],
   );
 
   return (

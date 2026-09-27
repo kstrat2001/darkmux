@@ -356,7 +356,17 @@ export function computeTMin(data: FlowRecord[]): number {
 /** `uidOf()` — viewer.html:1107. */
 export const uidOf = (r: FlowRecord): string => r.machine_uid || "unknown";
 
-/** `nameOf()` — viewer.html:1112. */
+/** (#2921) The label for a machine nothing has named. Never the hardware uid:
+ * a uid lands in screenshots and identifies the physical machine. */
+export const UNNAMED_MACHINE = "unnamed machine";
+
+/** Whether a label is `UNNAMED_MACHINE`, with or without its ordinal. */
+export const isUnnamedMachineLabel = (name: string): boolean =>
+  name === UNNAMED_MACHINE || /^unnamed machine \d+$/.test(name);
+
+/** `nameOf()` — viewer.html:1112. The newest `machine_id` a record carried
+ * for this uid, then the presence beat's `display_name`, then
+ * `UNNAMED_MACHINE` — never the uid itself (#2921; legacy fell back to it). */
 export function nameOf(data: FlowRecord[], liveMachines: Map<string, PresenceBeat>, m: string): string {
   if (m === "unknown") return "unknown";
   // (#2030) The MOST RECENT name this uid carried, not the first one found.
@@ -392,7 +402,7 @@ export function nameOf(data: FlowRecord[], liveMachines: Map<string, PresenceBea
   }
   if (best) return best.machine_id as string;
   const b = liveMachines.get(m);
-  return b?.display_name || m;
+  return b?.display_name || UNNAMED_MACHINE;
 }
 
 /** `machines()` — viewer.html:1123. */
@@ -484,10 +494,14 @@ export interface SelfIdentity {
 /** (#2814) `nameOf` with the self-identity FLOOR applied — what to TITLE a
  * machine with, as opposed to `nameOf`'s "what has this uid been called".
  *
- * `nameOf` answers with the raw uid when the window holds no record naming
- * the machine. That is honest for a uid nothing is known about, and wrong
- * for the one uid the daemon can name out of its own config — a page titled
- * with a 36-character UUID is the display half of "self is unknown".
+ * `nameOf` answers `UNNAMED_MACHINE` when the window holds no record naming
+ * the machine (it answered with the raw uid until #2921). That is honest for
+ * a uid nothing is known about, and wrong for the one uid the daemon can
+ * name out of its own config.
+ *
+ * (#2921) This is THE machine-label helper: every surface that titles a
+ * machine (fleet card, activity lane, machine page, app title, runs pin,
+ * stats panel) goes through it, so none can render the uid.
  *
  * This became REQUIRED, not merely nicer, the moment self-identity resolved
  * by uid: before that, `localMachineUid` fell through to `?? machineId` on
@@ -498,8 +512,8 @@ export interface SelfIdentity {
  * regression.
  *
  * A FLOOR, not an override, and the shape of the condition is what makes it
- * one: it fires only where `nameOf` returned the uid itself, i.e. where it
- * had nothing. Any observed name — including an alias older than the one
+ * one: it fires only where `nameOf` returned `UNNAMED_MACHINE`, i.e. where
+ * it had nothing. Any observed name — including an alias older than the one
  * specs reports — still wins, because #2030's lesson is that a value which
  * cannot be outvoted is the defect rather than the fix. */
 export function displayNameOf(
@@ -507,11 +521,103 @@ export function displayNameOf(
   liveMachines: Map<string, PresenceBeat>,
   specs: SelfIdentity | null,
   m: string,
+  /** (#2921 follow-up) The operator's declared roster. An entry whose
+   *  `machine_uid` is `m` names a machine nothing else does. Empty (a replay,
+   *  a static build, a caller with no roster) skips that step. */
+  roster: readonly RosterName[] = NO_ROSTER,
 ): string {
+  const own = ownName(data, liveMachines, specs, roster, m);
+  return own ?? unnamedLabel(data, liveMachines, specs, roster, m);
+}
+
+/** A stable empty roster, so the default never defeats `unnamedLabel`'s cache. */
+const NO_ROSTER: readonly RosterName[] = [];
+
+/** The structural slice of a roster entry `displayNameOf` reads. */
+export interface RosterName {
+  id: string;
+  machine_uid?: string | null;
+}
+
+/** A name `m` has of its own, in precedence order: an observed one
+ *  (`nameOf`), this daemon's specs name when `m` is this daemon, the roster
+ *  id declared for `m`. `null` when it has none. */
+function ownName(
+  data: FlowRecord[],
+  liveMachines: Map<string, PresenceBeat>,
+  specs: SelfIdentity | null,
+  roster: readonly RosterName[],
+  m: string,
+): string | null {
   const derived = nameOf(data, liveMachines, m);
-  if (derived !== m) return derived;
-  if (!specs?.machine_id) return derived;
-  return isSelfMachine(data, liveMachines, specs, m) ? specs.machine_id : derived;
+  if (derived !== UNNAMED_MACHINE) return derived;
+  if (specs?.machine_id && isSelfMachine(data, liveMachines, specs, m)) return specs.machine_id;
+  const declared = roster.find((e) => e.machine_uid === m)?.id;
+  return declared || null;
+}
+
+/** (#2921 follow-up) `UNNAMED_MACHINE`, with an ordinal from the second one
+ *  on ("unnamed machine 2"), so two nameless machines never read alike.
+ *
+ *  The order is FIRST-SEEN in `data` (earliest record `ts`; a uid known only
+ *  from a presence beat comes after every recorded one; ties by uid), not
+ *  render order, so every surface handed the same window — the machine's
+ *  card and its activity lane — gives the same machine the same ordinal,
+ *  and a machine appearing later takes a higher number rather than
+ *  renumbering the ones already shown. Only machines with no name of their
+ *  own (see `ownName`) take a number, and the number says nothing about the
+ *  hardware. */
+function unnamedLabel(
+  data: FlowRecord[],
+  liveMachines: Map<string, PresenceBeat>,
+  specs: SelfIdentity | null,
+  roster: readonly RosterName[],
+  m: string,
+): string {
+  if (m === "unknown") return "unknown";
+  // One ordering per (window, beats, specs, roster), shared by every label
+  // asked of it: a fleet page names each machine twice (card and lane) plus
+  // the lane-width pass, and each ordering costs a scan per machine.
+  const cached = unnamedOrderCache.get(data);
+  let order =
+    cached && cached.liveMachines === liveMachines && cached.specs === specs && cached.roster === roster ? cached.order : null;
+  if (!order) {
+    order = unnamedOrder(data, liveMachines, specs, roster);
+    unnamedOrderCache.set(data, { liveMachines, specs, roster, order });
+  }
+  const i = order.indexOf(m);
+  // A uid outside the window and the beats (a roster-only card's id) sorts
+  // after every one in it.
+  const at = i >= 0 ? i : order.length;
+  return at === 0 ? UNNAMED_MACHINE : `${UNNAMED_MACHINE} ${at + 1}`;
+}
+
+const unnamedOrderCache = new WeakMap<
+  FlowRecord[],
+  { liveMachines: Map<string, PresenceBeat>; specs: SelfIdentity | null; roster: readonly RosterName[]; order: string[] }
+>();
+
+/** The uids with no name of their own, in first-seen order. */
+function unnamedOrder(
+  data: FlowRecord[],
+  liveMachines: Map<string, PresenceBeat>,
+  specs: SelfIdentity | null,
+  roster: readonly RosterName[],
+): string[] {
+  const firstSeen = new Map<string, number>();
+  for (const r of data) {
+    const uid = r.machine_uid;
+    if (!uid) continue;
+    const t = T(r.ts);
+    const at = Number.isFinite(t) ? t : Infinity;
+    const prev = firstSeen.get(uid);
+    if (prev === undefined || at < prev) firstSeen.set(uid, at);
+  }
+  for (const uid of liveMachines.keys()) if (!firstSeen.has(uid)) firstSeen.set(uid, Infinity);
+  return [...firstSeen.entries()]
+    .filter(([uid]) => ownName(data, liveMachines, specs, roster, uid) === null)
+    .sort(([ua, ta], [ub, tb]) => (ta !== tb ? (ta < tb ? -1 : 1) : ua < ub ? -1 : ua > ub ? 1 : 0))
+    .map(([uid]) => uid);
 }
 
 /** `localMachineUid()` — viewer.html:2642-2644. Which uid IS this daemon,
@@ -742,9 +848,14 @@ export function recordsAsOf(data: FlowRecord[], now: number): FlowRecord[] {
  * for why a bare `session_id` match is unsafe for a review-shaped session.
  * `undefined` (every pre-existing caller) preserves the exact prior
  * session_id-only behavior. */
-export function dispatchRec(data: FlowRecord[], sid: string, act: string, missionId?: string): FlowRecord | undefined {
+export function dispatchRec(data: FlowRecord[], sid: string, act: "start" | "complete" | "error", missionId?: string): FlowRecord | undefined {
+  // (#2927) Either producer spelling. Every app ingest path dots the action
+  // first (`normalizeRecords`/`buildFlowWindow`), so this is defense in depth
+  // for a consumer handed raw records (unit fixtures, the mission graph's
+  // stream), per the #1852 contract.
+  const is = DISPATCH_ACT[act];
   return sessionRecords(data, sid).find(
-    (r) => r.session_id === sid && r.action === "dispatch." + act && (missionId === undefined || !r.mission_id || r.mission_id === missionId),
+    (r) => r.session_id === sid && is(r.action) && (missionId === undefined || !r.mission_id || r.mission_id === missionId),
   );
 }
 
@@ -753,8 +864,10 @@ export function dispatchEnd(data: FlowRecord[], sid: string, missionId?: string)
   return dispatchRec(data, sid, "complete", missionId) ?? dispatchRec(data, sid, "error", missionId);
 }
 
+const DISPATCH_ACT = { start: isDispatchStart, complete: isDispatchComplete, error: isDispatchError } as const;
+
 /** `dispatchErrored()` — viewer.html:1132. */
-export const dispatchErrored = (rec: FlowRecord | undefined): boolean => !!rec && rec.action === "dispatch.error";
+export const dispatchErrored = (rec: FlowRecord | undefined): boolean => !!rec && isDispatchError(rec.action);
 
 /** `dispatchKilled()` — viewer.html:1133. Watchdog kill = exit 137. */
 export const dispatchKilled = (rec: FlowRecord | undefined): boolean =>
@@ -952,7 +1065,7 @@ export function flowLiveSessions(data: FlowRecord[], nowMs: number, liveMode = t
     const t = T(r.ts);
     const prev = lastBySid.get(r.session_id);
     if (prev === undefined || t > prev) lastBySid.set(r.session_id, t);
-    if (r.action === "dispatch.start") started.add(r.session_id);
+    if (isDispatchStart(r.action)) started.add(r.session_id);
   }
   const out = new Set<string>();
   for (const sid of started) {

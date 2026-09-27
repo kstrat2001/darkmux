@@ -53,7 +53,7 @@
  * golden moves — asserted directly in `lib/format.test.ts`.
  */
 
-import { T, dispatchErrored, dispatchKilled, statusLabel, runStateFrom, computeTMax } from "../../lib/flow";
+import { T, dispatchErrored, dispatchKilled, statusLabel, runStateFrom, computeTMax, isDispatchStart, isDispatchTerminal } from "../../lib/flow";
 import { fmtElapsed, clk, fmtC } from "../../lib/format";
 import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
 import { aggregateLiveState, aggregateTokenRate, averageGenerationRate, lastHeartbeatMs, liveStateWhileConnected } from "../../lib/tokenRate";
@@ -581,7 +581,7 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     const t = T(r.ts);
     return Number.isFinite(t) ? t : null;
   };
-  const allSidStarts = data.filter((r) => r.session_id === sid && r.action === "dispatch.start");
+  const allSidStarts = data.filter((r) => r.session_id === sid && isDispatchStart(r.action));
   const sidStarts = allSidStarts
     .filter((r) => {
       const t = finiteTs(r);
@@ -619,7 +619,7 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // arithmetic against skew while leaving the terminal SELECTION exposed to
   // it was the inconsistency.
   const isTerminal = (r: FlowRecord) =>
-    r.action === "dispatch.complete" || r.action === "dispatch.error" || r.action === "session.end";
+    isDispatchTerminal(r.action) || r.action === "session.end";
   const sessionTerminals = data.filter((r) => r.session_id === sid && isTerminal(r)).sort((a, b) => T(a.ts) - T(b.ts));
   const inAttemptCloses = sessionTerminals.filter(inAttempt);
   // Prefer terminals inside the attempt window; fall back to any terminal on

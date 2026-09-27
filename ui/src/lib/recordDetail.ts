@@ -1,4 +1,5 @@
 import type { FlowRecord } from "../types/handwritten";
+import { isDispatchStart } from "./flow";
 
 /**
  * The event-log row's trailing preview (`renderLog()`'s `detail`,
@@ -103,7 +104,7 @@ function recordDetailRaw(r: FlowRecord): string {
   if (a === "tier-decision" && typeof reasoning === "string") {
     return `"${firstLine(reasoning, 60)}..."`;
   }
-  if (a === "dispatch.start" || a === "dispatch start") {
+  if (isDispatchStart(a)) {
     return `start (prompt: ${f?.prompt_chars ?? 0}ch)`;
   }
   return "";

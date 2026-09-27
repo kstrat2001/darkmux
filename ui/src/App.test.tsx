@@ -1796,3 +1796,41 @@ describe("App — presence coverage on the masthead", () => {
     expect(container.querySelector(".fleetcov")).toBeNull();
   });
 });
+
+// (#2921 follow-up) A drilled machine known only by its hardware uid is named
+// in the route chrome (`#logscope`) the way its fleet card is — here by its
+// roster id — and the uid never reaches the page text.
+describe("(#2921) machine route chrome names a uid-only machine", () => {
+  const FAKE_UID = "0A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
+  const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+  function mount(roster: unknown[]) {
+    window.location.hash = `#lens=machine&uid=${FAKE_UID}`;
+    const today = new Date().toISOString().slice(0, 10);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        const path = String(url);
+        if (path === `/flow/${today}`) {
+          return Promise.resolve(new Response(JSON.stringify([{ ts: new Date(Date.now() - 60_000).toISOString(), action: "dispatch.turn", machine_uid: FAKE_UID }]), { status: 200 }));
+        }
+        if (path === "/fleet/roster") return Promise.resolve(new Response(JSON.stringify({ machines: roster, error: null }), { status: 200 }));
+        return Promise.resolve(new Response("[]", { status: 200 }));
+      }),
+    );
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <App />
+      </QueryClientProvider>,
+    );
+  }
+  it("rostered: #logscope reads the roster id", async () => {
+    mount([{ id: "studio", address: "a:1", added_unix_ms: 1, machine_uid: FAKE_UID }]);
+    await waitFor(() => expect(document.getElementById("logscope")?.textContent).toBe("studio"));
+    expect(UUID_RE.test(document.body.textContent ?? "")).toBe(false);
+  });
+  it("unrostered: #logscope reads 'unnamed machine', never the uid", async () => {
+    mount([]);
+    await waitFor(() => expect(document.getElementById("logscope")?.textContent).toBe("unnamed machine"));
+    expect(UUID_RE.test(document.body.textContent ?? "")).toBe(false);
+  });
+});

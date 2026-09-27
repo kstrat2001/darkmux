@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, MACHINE_MEM_POLL_MS } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
-import { useLiveMachines } from "../../hooks/useLiveMachines";
+import { useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
 import { localMachineUid, displayNameOf } from "../../lib/flow";
 import { relAgoFrom } from "../../lib/format";
 import { specOf } from "../fleet/cards";
@@ -216,6 +216,9 @@ export function MachineLens({
   // fleet-card drill, local or remote) or, absent one, the local machine
   // (the nav-tab/deep-link entry — legacy's `goMachine`).
   const targetUid = routeUid ?? localUid;
+  // (#2921 follow-up) The roster names a drilled machine nothing else does,
+  // as it names that machine's fleet card. Read once, no poller.
+  const { machines: roster } = useFleetRoster(daemonBacked && routeUid != null, false);
   // (#1833) The live CPU/GPU/MEM section's own reduction — SAME window
   // function + aggregation the global machine drawer uses
   // (`lib/machineDrawerScope.ts`, `lib/hostStats.ts`), scoped to
@@ -365,7 +368,7 @@ export function MachineLens({
   // cross-lens link this used to label — "runs on <machine> →" — was
   // removed 2026-09-23; `label` still feeds `MachineHealthRegion`'s
   // `machineName` prop below, used for the remote-machine placeholder.)
-  const label = targetUid != null ? displayNameOf(flowWindow.data, liveMachines, specs, targetUid) : "this machine";
+  const label = targetUid != null ? displayNameOf(flowWindow.data, liveMachines, specs, targetUid, roster) : "this machine";
   // `specOf()` (viewer.html:1124-1129, ported in `lenses/fleet/cards.ts` —
   // reused rather than re-derived here) — the local daemon's own
   // `/machine/specs` probe (cpu + RAM) when this page IS that machine;

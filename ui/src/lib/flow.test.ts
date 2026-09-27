@@ -6,6 +6,7 @@ import {
   machineNames,
   localMachineUid,
   nameOf,
+  UNNAMED_MACHINE,
   displayNameOf,
   buildFlowWindow,
   liveSessionSet,
@@ -274,7 +275,7 @@ describe("machineNames / localMachineUid — identity is the uid, not the label"
   // start printing a 36-character UUID on an empty window. These two ship
   // together; the first without the second is a regression.
   it("(#2814) displayNameOf names THIS machine from specs when the window knows nothing", () => {
-    expect(nameOf([], new Map(), UID)).toBe(UID); // the gap, stated
+    expect(nameOf([], new Map(), UID)).toBe(UNNAMED_MACHINE); // the gap, stated (#2921: never the uid)
     expect(displayNameOf([], new Map(), { machine_id: "MacBook-Pro", machine_uid: UID }, UID)).toBe("MacBook-Pro");
   });
 
@@ -284,13 +285,13 @@ describe("machineNames / localMachineUid — identity is the uid, not the label"
   });
 
   it("(#2814) displayNameOf does not lend this machine's name to a DIFFERENT uid", () => {
-    expect(displayNameOf([], new Map(), { machine_id: "MacBook-Pro", machine_uid: UID }, OTHER)).toBe(OTHER);
+    expect(displayNameOf([], new Map(), { machine_id: "MacBook-Pro", machine_uid: UID }, OTHER)).toBe(UNNAMED_MACHINE);
   });
 
   it("(#2814) displayNameOf with no specs is exactly nameOf", () => {
     const data = [rec(UID, "MacBook-Pro")];
     expect(displayNameOf(data, new Map(), null, UID)).toBe(nameOf(data, new Map(), UID));
-    expect(displayNameOf([], new Map(), null, UID)).toBe(UID);
+    expect(displayNameOf([], new Map(), null, UID)).toBe(UNNAMED_MACHINE);
   });
 
   it("(#2814) keeps the name path when specs reports no uid (non-macOS, or an older build)", () => {
@@ -332,9 +333,10 @@ describe("nameOf recency", () => {
     expect(nameOf([newer, older], new Map(), UID)).toBe("MacBook-Pro");
   });
 
-  it("falls back to the presence beat, then the uid, when no record names it", () => {
+  it("falls back to the presence beat, then UNNAMED_MACHINE (never the uid), when no record names it", () => {
     expect(nameOf([], new Map([[UID, { display_name: "studio" } as never]]), UID)).toBe("studio");
-    expect(nameOf([], new Map(), UID)).toBe(UID);
+    expect(nameOf([], new Map(), UID)).toBe(UNNAMED_MACHINE);
+    expect(nameOf([], new Map(), UID)).toBe("unnamed machine");
   });
 
   it("keeps the first match when timestamps are unusable, rather than picking arbitrarily", () => {
@@ -586,5 +588,54 @@ describe("(#2911) recordsAsOf: the window as of now, without a filter per tick",
     // than serving a result that still holds it.
     expect(recordsAsOf(win, t("2026-09-26T10:00:04Z")).map((r) => r.handle)).toEqual(["a"]);
     expect(__asOfFilterRuns()).toBe(runs + 3);
+  });
+});
+
+// (#2921 follow-up) The fallbacks after an observed name: this daemon's own
+// specs name, then the roster id declared for the uid, then an ordinal that
+// tells two unnamed machines apart without identifying either.
+describe("displayNameOf: roster and unnamed ordinals", () => {
+  // Fixture uids, not any real machine's.
+  const A = "0A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
+  const B = "1B2C3D4E-5F60-4182-93A4-B5C6D7E8F9A0";
+  const C = "2C3D4E5F-6071-4293-A4B5-C6D7E8F9A0B1";
+  const uidOnly = (uid: string, ts: string) => ({ ts, action: "dispatch.turn", machine_uid: uid }) as unknown as FlowRecord;
+  const none = new Map();
+
+  it("a roster entry declared for the uid names a uid-only machine", () => {
+    const data = [uidOnly(A, "2026-09-26T10:00:00Z")];
+    expect(displayNameOf(data, none, null, A, [{ id: "studio", machine_uid: A }])).toBe("studio");
+    // An entry for a different uid lends nothing.
+    expect(displayNameOf(data, none, null, A, [{ id: "studio", machine_uid: B }])).toBe(UNNAMED_MACHINE);
+  });
+
+  it("an observed name and this daemon's own name both outrank the roster id", () => {
+    const named = [{ ts: "2026-09-26T10:00:00Z", machine_uid: A, machine_id: "box" } as unknown as FlowRecord];
+    expect(displayNameOf(named, none, null, A, [{ id: "studio", machine_uid: A }])).toBe("box");
+    const self = { machine_id: "laptop", machine_uid: A };
+    expect(displayNameOf([uidOnly(A, "2026-09-26T10:00:00Z")], none, self, A, [{ id: "studio", machine_uid: A }])).toBe("laptop");
+  });
+
+  it("two unnamed machines get distinct ordinals by first-seen order, whatever the array order", () => {
+    const data = [uidOnly(B, "2026-09-26T10:05:00Z"), uidOnly(A, "2026-09-26T10:00:00Z"), uidOnly(B, "2026-09-26T09:59:00Z")];
+    // B was seen first (09:59), A second.
+    expect(displayNameOf(data, none, null, B)).toBe("unnamed machine");
+    expect(displayNameOf(data, none, null, A)).toBe("unnamed machine 2");
+    const reversed = [...data].reverse();
+    expect(displayNameOf(reversed, none, null, B)).toBe("unnamed machine");
+    expect(displayNameOf(reversed, none, null, A)).toBe("unnamed machine 2");
+  });
+
+  it("named, self and rostered machines take no ordinal; a presence-only uid comes after every recorded one", () => {
+    const data = [
+      { ts: "2026-09-26T09:00:00Z", machine_uid: C, machine_id: "box" } as unknown as FlowRecord,
+      uidOnly(A, "2026-09-26T09:10:00Z"),
+      uidOnly(B, "2026-09-26T09:20:00Z"),
+    ];
+    const roster = [{ id: "studio", machine_uid: A }];
+    expect(displayNameOf(data, none, null, B, roster)).toBe("unnamed machine");
+    const live = new Map([["D0000000-0000-4000-8000-000000000000", {} as never]]);
+    expect(displayNameOf(data, live, null, B)).toBe("unnamed machine 2");
+    expect(displayNameOf(data, live, null, "D0000000-0000-4000-8000-000000000000")).toBe("unnamed machine 3");
   });
 });

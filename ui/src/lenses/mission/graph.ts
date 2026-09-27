@@ -26,6 +26,7 @@
 import type { FlowRecord } from "../../types/handwritten";
 import { fmtElapsed } from "../../lib/format";
 import { PURPOSE, stepTokensWithLegacyFallback, usageContribution } from "../../lib/usageRecords";
+import { isDispatchStart, isDispatchComplete, isDispatchTerminal } from "../../lib/flow";
 
 // ─── wire types (crates/darkmux-serve/src/mission_graph.rs) ────────────────
 
@@ -576,16 +577,13 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: FlowRecord, idx: 
   const isUsage = (rec.category === "telemetry" && rec.source === "tokens") || action === "telemetry.tokens";
   const isTurn = action === "dispatch.turn";
   const isTool = action === "dispatch.tool";
-  const isComplete = action === "dispatch complete" || action === "dispatch.complete";
+  const isComplete = isDispatchComplete(action);
   const isStepResult = action === "step result";
-  const isStart = action === "dispatch start" || action === "dispatch.start" || action === "step start";
+  const isStart = isDispatchStart(action) || action === "step start";
   const isTerminal =
     action === "step complete" ||
     action === "step error" ||
-    action === "dispatch complete" ||
-    action === "dispatch.complete" ||
-    action === "dispatch error" ||
-    action === "dispatch.error";
+    isDispatchTerminal(action);
 
   if (isStart && recMs) next.startTs = next.startTs ? Math.min(next.startTs, recMs) : recMs;
   if (isTerminal && recMs) next.endTs = Math.max(next.endTs, recMs);

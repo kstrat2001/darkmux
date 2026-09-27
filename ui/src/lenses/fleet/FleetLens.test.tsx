@@ -2183,14 +2183,13 @@ describe("(#2926) fleet card: THINK opener and TOOL GEN, from the real run", () 
       return el as HTMLElement;
     });
   const extra = { machine_uid: "u1" };
-  // The real crew dispatch opens with `dispatch start` (spaced), and the
-  // card's `machActive` (`cards.ts`) only recognizes `dispatch.start`, so the
-  // real records alone leave the card idle in playback (a separate defect,
-  // reported with #2926, not fixed here). Dotted here so the card is active.
-  const dotted = (rs: FlowRecord[]) => rs.map((r) => (r.action === "dispatch start" ? { ...r, action: "dispatch.start" } : r));
+  // The real crew dispatch opens with `dispatch start` (spaced); these feed
+  // it verbatim. The app normalizes it to dotted on ingest, but this fixture
+  // hands the lens raw records, and the card reads either spelling (#2927,
+  // defense in depth).
 
   it("turn 7's stream-open chunk: the previous turn's rate, dimmed, never ~1 think tok/s", async () => {
-    renderAt(dotted(pepperRecords({ extra })), pepperAt("10:51:33"));
+    renderAt(pepperRecords({ extra }), pepperAt("10:51:33"));
     const rate = await rateLine();
     expect(rate.getAttribute("data-thinking")).toBe("true");
     expect(rate.getAttribute("data-carried")).toBe("true");
@@ -2199,16 +2198,114 @@ describe("(#2926) fleet card: THINK opener and TOOL GEN, from the real run", () 
   });
 
   it("the same opener on a session's first turn: '— think tok/s', no figure", async () => {
-    renderAt(dotted(pepperRecords({ minTurn: 7, extra })), pepperAt("10:51:33"));
+    renderAt(pepperRecords({ minTurn: 7, extra }), pepperAt("10:51:33"));
     const rate = await rateLine();
     expect(rate.textContent).toBe("— think tok/s");
     expect(latestTokenScopeProps()).toMatchObject({ state: "generating", centerLabel: "—" });
   });
 
   it("turn 10 writing a `write` call: 'tool gen · write · 18s' on the rate line, the tube keeps just 'tool gen'", async () => {
-    renderAt(dotted(pepperRecords({ extra })), pepperAt("10:52:48.500"));
+    renderAt(pepperRecords({ extra }), pepperAt("10:52:48.500"));
     const rate = await rateLine();
     expect(rate.textContent).toBe("tool gen · write · 18s");
     expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolName: "write", toolWriting: true, centerLabel: null, centerUnit: "tool gen" });
+  });
+});
+
+// (#2921) A machine the window only knows by its hardware uid must never be
+// labeled with that uid: it lands in screenshots and identifies the machine.
+describe("(#2921) fleet page: no hardware uid is ever rendered as a label", () => {
+  // Fixture uid, uppercase like the real ones; not any real machine's.
+  const FAKE_UID = "0A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
+  const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+  function renderFleet(records: FlowRecord[]) {
+    const playhead = pepperAt("10:51:33");
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={records} tMax={playhead} tMin={pepperAt("10:51:00")} playhead={playhead} historical />
+      </QueryClientProvider>,
+    );
+  }
+  const uidShapedText = () => {
+    const found: string[] = [];
+    if (UUID_RE.test(document.body.textContent ?? "")) found.push("text");
+    for (const attr of ["title", "aria-label"]) {
+      for (const el of document.querySelectorAll(`[${attr}]`)) {
+        if (UUID_RE.test(el.getAttribute(attr) ?? "")) found.push(`${attr} on .${el.className}`);
+      }
+    }
+    return found;
+  };
+
+  it("records carrying only machine_uid: card and lane read 'unnamed machine', no uid text or title", async () => {
+    renderFleet(pepperRecords({ extra: { machine_uid: FAKE_UID, machine_id: undefined } }));
+    await waitFor(() => expect(document.querySelector(".lane .lname")).toBeTruthy());
+    expect(document.querySelector(".lane .lname")?.textContent).toBe("unnamed machine");
+    expect(document.querySelector(".mach-name")?.textContent).toContain("unnamed machine");
+    expect(uidShapedText()).toEqual([]);
+  });
+
+  // The reported scenario: a live daemon with an empty DARKMUX_HOME (no
+  // roster), whose records carry only the uid.
+  const liveUidOnly = () => [
+    { ts: new Date(Date.now() - 60_000).toISOString(), action: "dispatch start", session_id: "s-live", machine_uid: FAKE_UID, handle: "coder" },
+  ];
+  it("live, no roster, no specs: the lane and card read 'unnamed machine'", async () => {
+    mockFleetFetch({ flowToday: liveUidOnly() });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".lane .lname")).toBeTruthy());
+    expect(document.querySelector(".lane .lname")?.textContent).toBe("unnamed machine");
+    expect(uidShapedText()).toEqual([]);
+  });
+
+  it("live, this daemon's own uid: its specs name titles the lane like the card", async () => {
+    mockFleetFetch({ flowToday: liveUidOnly(), specs: { machine_id: "scratch-box", machine_uid: FAKE_UID } });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".lane .lname")?.textContent).toBe("scratch-box"));
+    expect(document.querySelector(".mach-name")?.textContent).toContain("scratch-box");
+    expect(uidShapedText()).toEqual([]);
+  });
+
+  it("the record's machine_id names the machine when present", async () => {
+    renderFleet(pepperRecords({ extra: { machine_uid: FAKE_UID } }));
+    await waitFor(() => expect(document.querySelector(".lane .lname")).toBeTruthy());
+    expect(document.querySelector(".lane .lname")?.textContent).toBe("MacBook-Pro");
+    expect(uidShapedText()).toEqual([]);
+  });
+});
+
+describe("(#2921 follow-up) fleet page: roster names and unnamed ordinals", () => {
+  const A = "0A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
+  const B = "1B2C3D4E-5F60-4182-93A4-B5C6D7E8F9A0";
+  const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+  const start = (uid: string, sid: string, agoMs: number) => ({
+    ts: new Date(Date.now() - agoMs).toISOString(),
+    action: "dispatch start",
+    session_id: sid,
+    machine_uid: uid,
+    handle: "coder",
+  });
+  const names = (sel: string) => [...document.querySelectorAll(sel)].map((el) => el.textContent ?? "");
+
+  it("a uid-only machine with a roster entry reads its roster id on card and lane", async () => {
+    mockFleetFetch({ flowToday: [start(A, "s-a", 60_000)], roster: [{ id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000, machine_uid: A }] });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".lane .lname")?.textContent).toBe("studio"));
+    expect(names(".mach-name").join(" ")).toContain("studio");
+    expect(UUID_RE.test(document.body.textContent ?? "")).toBe(false);
+  });
+
+  it("two unnamed machines: distinct ordinals, and each machine's card and lane agree", async () => {
+    mockFleetFetch({ flowToday: [start(B, "s-b", 120_000), start(A, "s-a", 60_000)] });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".lane .lname")).toHaveLength(2));
+    const lanes = names(".lane .lname");
+    expect(new Set(lanes)).toEqual(new Set(["unnamed machine", "unnamed machine 2"]));
+    const cards = [...document.querySelectorAll<HTMLElement>(".mach[data-arg]")];
+    const cardName = (uid: string) => cards.find((c) => c.getAttribute("data-arg") === uid)?.querySelector(".mach-name")?.textContent;
+    // B was seen first.
+    expect(cardName(B)).toBe("unnamed machine");
+    expect(cardName(A)).toBe("unnamed machine 2");
+    expect(new Set(names(".mach-name"))).toEqual(new Set(lanes));
   });
 });

@@ -69,6 +69,23 @@ describe("RecordView", () => {
     expect(screen.getByText(/"machine_uid"/)).toBeInTheDocument();
   });
 
+  // (#2921 follow-up) The hardware uid identifies the physical machine and
+  // lands in screenshots, so the inspector masks it everywhere it renders:
+  // the unchanging-fields rows, a nested payload, and the raw JSON dump.
+  it("never shows a full machine_uid, in the rows or the raw JSON", () => {
+    const FAKE_UID = "0A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
+    const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+    const { container } = render(<RecordView record={{ ...REC, machine_uid: FAKE_UID, payload: { ...REC.payload, peer: { machine_uid: FAKE_UID.toLowerCase() } } }} />);
+    fireEvent.click(screen.getByText(/unchanging fields/));
+    fireEvent.click(screen.getByText("raw JSON"));
+    const text = container.textContent ?? "";
+    expect(text).not.toMatch(UUID_RE);
+    expect(text).toContain('"machine_uid": "hidden"');
+    // The field is still listed, so the record's shape stays readable.
+    const rows = container.querySelector(".rv__constants")?.textContent ?? "";
+    expect(rows).toContain("machine uidhidden");
+  });
+
   it("truncates a huge string rather than flooding the column", () => {
     // The median record is 463B and the largest is 46KB — that outlier is a
     // single long string, and it is exactly when the panel matters most.

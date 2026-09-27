@@ -51,7 +51,7 @@ import { COMPACT_METER_WIDTH, COMPACT_METER_HEIGHT } from "./Meter";
 import { aggregateHostSamples, type HostAggregate } from "../lib/hostStats";
 import { resolveDrawerScope } from "../lib/machineDrawerScope";
 import { injectedMeta } from "../lib/injectedMeta";
-import { firstRecordDate, nameOf, todayUTC } from "../lib/flow";
+import { displayNameOf, firstRecordDate, todayUTC } from "../lib/flow";
 import { relAgoFrom } from "../lib/format";
 import { replayPlaybackKvValue } from "../lib/replayMeta";
 import { isLiveRoute, type Route } from "../lib/route";
@@ -794,7 +794,7 @@ export function useMachineStatsContent({
     : scope.samples.length === 0 && daemonLoad == null;
 
   const machineName =
-    localUid != null ? nameOf(flowWindow, liveMachines, localUid) : null;
+    localUid != null ? displayNameOf(flowWindow, liveMachines, specs, localUid) : null;
   const verMeta = injectedMeta("darkmux-version");
   const schemaMeta = injectedMeta("darkmux-flow-schema");
 

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { attributionLine, limitDescription, overPriceHint, perModelScale, stampLine, utilityModelId } from "./memoryLedgerLines";
+import { attributionLine, limitDescription, notLocalMessage, overPriceHint, perModelScale, stampLine, utilityModelId } from "./memoryLedgerLines";
 import type { MachineResources, MachineResourcesModel, MachineSpecs } from "../../types/handwritten";
 
 // #1806 Stage 1 refactored the health region's text builders from one flat
@@ -166,3 +166,20 @@ describe("overPriceHint", () => {
   });
 });
 
+
+// (#2921 follow-up) "View the machine page on unnamed machine directly"
+// names nothing the user can find. For a machine with no name the sentence
+// says how to give it one instead; a named machine's sentence is unchanged.
+describe("notLocalMessage", () => {
+  it("a named machine: go to its own machine page", () => {
+    expect(notLocalMessage("studio")).toBe(
+      "residency / RAM not reported from here — local-probe only. View the machine page on studio directly for live figures.",
+    );
+  });
+  it.each(["unnamed machine", "unnamed machine 2"])("%s: says how to name it, not where to go", (name) => {
+    const msg = notLocalMessage(name);
+    expect(msg).toContain("residency / RAM not reported from here — local-probe only.");
+    expect(msg).toContain("darkmux config set machine_id <name>");
+    expect(msg).not.toContain(`on ${name} directly`);
+  });
+});

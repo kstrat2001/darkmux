@@ -17,18 +17,26 @@
  * not per-lens.
  */
 
-import { T} from "./flow";
+import { T, isDispatchStart } from "./flow";
 import { relAgoFrom } from "./format";
 import type { FlowRecord, PresenceBeat } from "../types/handwritten";
+
+/** How long ago the newest dispatch STARTED, as of `nowMs` ("" when none
+ *  has, or the newest lies after `nowMs`). The idle headline and the ready
+ *  parts both read it, so the two can never date "last dispatch" differently.
+ *  Either bookend spelling counts (#2927). */
+function lastDispatchAgo(data: FlowRecord[], nowMs: number): string {
+  const starts = data.filter((r) => isDispatchStart(r.action));
+  const last = starts.length ? Math.max(...starts.map((r) => T(r.ts))) : null;
+  const known = last != null && nowMs - last >= 0;
+  return known ? relAgoFrom(nowMs, last as number) : "";
+}
 
 /** `idleStatus()` — viewer.html:1258-1276. */
 function idleHeadline(data: FlowRecord[], liveMachines: Map<string, PresenceBeat>, nowMs: number): string {
   const n = liveMachines.size;
   if (!n) return "○ waiting for a machine";
-  const starts = data.filter((r) => r.action === "dispatch.start");
-  const last = starts.length ? Math.max(...starts.map((r) => T(r.ts))) : null;
-  const known = last != null && nowMs - last >= 0;
-  const ago = known ? relAgoFrom(nowMs, last as number) : "";
+  const ago = lastDispatchAgo(data, nowMs);
   // Trailing space after `n` and the leading space on the `ago` suffix are
   // BOTH literal — legacy's template concatenates `${n} ${ICON}` (icon
   // renders no text, leaving the space) with `${ago?' · last run '+ago:''}`,
@@ -56,10 +64,7 @@ export function readyParts(data: FlowRecord[], liveMachines: Map<string, Presenc
   // heartbeats stream continuously and it would read "just now" forever.
   // A dispatch START is the honest activity signal: it says when work last
   // BEGAN, counts in-flight work, and cannot be kept warm by telemetry.
-  const starts = data.filter((r) => r.action === "dispatch.start");
-  const last = starts.length ? Math.max(...starts.map((r) => T(r.ts))) : null;
-  const known = last != null && nowMs - last >= 0;
-  return { kind: "ready", n, ago: known ? relAgoFrom(nowMs, last as number) : "" };
+  return { kind: "ready", n, ago: lastDispatchAgo(data, nowMs) };
 }
 
 /** The two `#meta` lines (joined by `<br>` in legacy — two lines here). */

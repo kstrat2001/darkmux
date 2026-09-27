@@ -1,5 +1,5 @@
 import type { FlowRecord } from "../types/handwritten";
-import { isDispatchTerminal } from "./flow";
+import { isDispatchStart, isDispatchTerminal } from "./flow";
 
 /** (#2863) A run's event list, grouped by the turn each event belongs to.
  *
@@ -115,7 +115,7 @@ export function turnItems(visible: FlowRecord[], all: FlowRecord[]): TurnItem[] 
   const terminalForExec = new Map<number, boolean>();
   for (const r of byTime) {
     const f = fields(r);
-    if (r.action === "dispatch start" || r.action === "dispatch.start") {
+    if (isDispatchStart(r.action)) {
       exec++;
       current = null;
       currentSeqNum = null;

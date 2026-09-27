@@ -1,5 +1,6 @@
 import type { FlowRecord } from "../types/handwritten";
 import { isTurnUsage } from "./usageRecords";
+import { isDispatchStart, isDispatchTerminal } from "./flow";
 
 /** (#2877) Live token-rate scope — pure derivation from flow records
  * already fetched for a session; zero model work, matches CLAUDE.md's "the
@@ -540,7 +541,7 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
     if (r.action === "dispatch.turn.heartbeat") {
       const f = fields(r);
       if (f.phase === WRITING_TOOL_CALL_PHASE && typeof f.tool_name === "string" && f.tool_name) writtenTool = f.tool_name;
-    } else if (r.action === "dispatch.start") {
+    } else if (isDispatchStart(r.action)) {
       pendingTools = null;
       turnToolName = null;
       writtenTool = null;
@@ -656,7 +657,7 @@ function isThinking(beats: HeartbeatSample[]): boolean {
 }
 
 const isCloseEdge = (a: string | undefined): boolean =>
-  a === "dispatch.complete" || a === "dispatch complete" || a === "dispatch.error" || a === "dispatch error" || a === "session.end";
+  isDispatchTerminal(a) || a === "session.end";
 
 /** The executions a live reading may come from, as of `nowMs`: not one that
  *  has already closed (its last rate and its last marker are history, and a
@@ -681,7 +682,7 @@ export function liveExecutions(perExecutionRecords: FlowRecord[][], nowMs: numbe
     for (const r of recs) {
       if (Date.parse(r.ts) > nowMs) continue;
       if (isCloseEdge(r.action)) return false;
-      if (r.action === "dispatch.start" || r.action === "dispatch start") {
+      if (isDispatchStart(r.action)) {
         evidence = true;
         if (r.source === "mission" || r.source === RETIRED_REVIEW_RUN_SOURCE) runGrain = true;
       } else if (
@@ -879,7 +880,7 @@ export function executionRole(records: FlowRecord[]): string {
   let fallback: string | undefined;
   for (const r of records) {
     if (fallback === undefined && r.handle) fallback = r.handle;
-    if (r.action !== "dispatch.start" && r.action !== "dispatch start") continue;
+    if (!isDispatchStart(r.action)) continue;
     if (!r.handle) continue;
     const atMs = Date.parse(r.ts);
     const rank = Number.isFinite(atMs) ? atMs : -Infinity;
