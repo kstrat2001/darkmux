@@ -1454,7 +1454,15 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
     // this machine's flow log (`budget.wait` with no later `budget.resume`,
     // from a process still alive). Shown above the board: a wait is the
     // one state on it that is the operator's own limit at work.
-    let budget_waits = crew::budget::active_waits(&flows_dir, now as i64, &crew::host_sampler_lock::pid_alive);
+    let widest = darkmux_profiles::profiles::load_registry_quiet(None)
+        .ok()
+        .and_then(|l| crew::budget::widest_window_secs(&l.registry));
+    let budget_waits = crew::budget::active_waits(
+        &flows_dir,
+        now as i64,
+        crew::budget::waits_lookback_secs(widest),
+        &crew::host_sampler_lock::pid_alive,
+    );
 
     if json {
         return run_json(&views, &peer, &fleet.state, &budget_waits);
@@ -2021,10 +2029,7 @@ fn budget_wait_lines(waits: &[crew::budget::ActiveWait]) -> Vec<String> {
     waits
         .iter()
         .map(|w| {
-            let what = match w.scope.as_str() {
-                "stage" => format!("stage `{}`", w.subject),
-                _ => format!("endpoint `{}`", w.subject),
-            };
+            let what = format!("endpoint `{}`", w.subject);
             let whose = w
                 .mission_id
                 .as_deref()
@@ -2366,12 +2371,12 @@ mod tests {
             resumes_in_secs: secs,
             message: String::new(),
         };
-        let lines = budget_wait_lines(&[w("endpoint", "azure", Some(843)), w("stage", "probe", None)]);
+        let lines = budget_wait_lines(&[w("endpoint", "azure", Some(843)), w("endpoint", "zero", None)]);
         assert_eq!(
             lines,
             vec![
                 "⏸ waiting on a budget: endpoint `azure` (mission a1b2c3), resumes in about 14m 3s (at 2026-09-27T12:14:09Z)".to_string(),
-                "⏸ waiting on a budget: stage `probe` (mission a1b2c3), until the budget is raised".to_string(),
+                "⏸ waiting on a budget: endpoint `zero` (mission a1b2c3), until the budget is raised".to_string(),
             ]
         );
         assert!(budget_wait_lines(&[]).is_empty(), "no wait, no line: the board is unchanged");

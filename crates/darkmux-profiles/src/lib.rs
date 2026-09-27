@@ -24,8 +24,10 @@ pub mod swap;
 /// (#2902 step 5) THE preflight for an entry point that starts work: every
 /// registered `config.json` enum setting its scope consumes
 /// (`darkmux_types::config_enum::preflight`), plus, for a scope that
-/// dispatches, every endpoint budget `policy` in the profile registry
-/// (`config_enum::bad_endpoint_budget_policies`). A per-endpoint enum lives
+/// dispatches, every endpoint budget in the profile registry: an
+/// unregistered `policy` (`config_enum::bad_endpoint_budget_policies`) and
+/// `limits` that cannot be used as written
+/// (`config_enum::invalid_endpoint_limits`). A per-endpoint enum lives
 /// in `profiles.json`, which `darkmux-types` cannot locate on its own, so
 /// this crate (the registry's loader) adds that pass. Every endpoint is
 /// checked, not only the ones this run would call: bad config is bad config
@@ -34,19 +36,32 @@ pub mod swap;
 pub fn preflight(
     scope: darkmux_types::config_enum::Scope,
 ) -> Result<(), darkmux_types::config_enum::PreflightRefusal> {
+    preflight_with(scope, None)
+}
+
+/// [`preflight`] against the registry the command itself uses:
+/// `profiles_file` is its `--profiles-file` (or equivalent), `None` for the
+/// default search (`DARKMUX_PROFILES`, then the default locations). A
+/// registry that cannot be loaded adds nothing here.
+pub fn preflight_with(
+    scope: darkmux_types::config_enum::Scope,
+    profiles_file: Option<&str>,
+) -> Result<(), darkmux_types::config_enum::PreflightRefusal> {
     use darkmux_types::config_enum::{self, PreflightRefusal, Scope};
     let mut bad = match config_enum::preflight(scope) {
         Ok(()) => Vec::new(),
         Err(r) => r.bad,
     };
+    let mut invalid = Vec::new();
     if matches!(scope, Scope::Dispatch | Scope::MissionLaunch | Scope::LabRun) {
-        if let Ok(loaded) = profiles::load_registry_quiet(None) {
+        if let Ok(loaded) = profiles::load_registry_quiet(profiles_file) {
             bad.extend(config_enum::bad_endpoint_budget_policies(&loaded.registry));
+            invalid.extend(config_enum::invalid_endpoint_limits(&loaded.registry));
         }
     }
-    if bad.is_empty() {
+    if bad.is_empty() && invalid.is_empty() {
         Ok(())
     } else {
-        Err(PreflightRefusal { scope, bad })
+        Err(PreflightRefusal { scope, bad, invalid })
     }
 }

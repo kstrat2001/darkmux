@@ -312,21 +312,50 @@ use std::path::Path;
 //           branch and renamed to `conclude` before anything shipped, so
 //           `cut` is not a retired spelling.)
 //   1.32 (#2902 step 5, darkmux 4.0): budgets are the operator's, never
-//           darkmux's. Two changes to `remote{}`:
-//           - `remote.max_tokens_per_execution` (the STAGE budget) loses its
-//             built-in 500000. Unset means no stage budget. `init` writes it
-//             visibly as `null`, never a number. A config written by an
-//             earlier `init` still carries `500000`, which now reads as a
-//             budget the operator set, under the new policy below (it warns;
-//             it no longer stops the stage).
-//           - additive `remote.stage_budget_policy` (`off` / `warn` /
-//             `wait`, a registered `ConfigEnum`): what a stage that reaches
-//             its budget does. Absent: `warn`. There is no stopping value; a
-//             stage used to STOP at its budget and now never does. `init`
-//             writes it visibly as `null`.
-//           Minor bump: both are `Option`s, lenient on read; an older binary
-//           ignores the new key and keeps its own 500000 default.
+//           darkmux's, and the per-step cap speaks darkmux's step vocabulary
+//           (CLAUDE.md contract 8). Changes to `remote{}`:
+//           - RENAMED `remote.max_tokens_per_execution` ->
+//             `remote.max_tokens_per_step` (env
+//             `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` ->
+//             `DARKMUX_REMOTE_MAX_TOKENS_PER_STEP`): a per-step cap on hosted
+//             tokens. Clean break, no alias: `config set` refuses the old key
+//             naming the new one, and `darkmux doctor` names a leftover old
+//             key (in config.json, where it now lands in `remote.extras` and
+//             is read by nothing, or in the env). It also LOSES its built-in
+//             500000: unset means no per-step cap, and `init` writes it
+//             visibly as `null`, never a number.
+//           - additive `remote.step_budget_policy` (env
+//             `DARKMUX_REMOTE_STEP_BUDGET_POLICY`; `off` / `warn`, a
+//             registered `ConfigEnum`, absent = `warn`; `wait` is an
+//             endpoint budget's value only and is refused here): what a step
+//             that reaches its cap does. A step used to STOP its hosted
+//             calls at the cap; nothing stops a step now. `init` writes it
+//             visibly as `null`.
+//           Folded into this minor bump by operator decision (the rename
+//           would be a major by the rule above; 4.0 is the clean-break
+//           release). An older binary reading this file ignores both new
+//           keys and falls back to its own 500000 default.
 pub const CONFIG_SCHEMA_VERSION: &str = "1.32";
+
+/// (#2902 step 5) Settings RENAMED in 4.0, with no alias:
+/// `(old dotted key, old env var, new dotted key, new env var)`. `config set`
+/// refuses an old key naming the new one; `darkmux doctor` names a leftover
+/// old key in `config.json` or the env with the exact rename. Nothing reads
+/// an old key.
+pub const RENAMED_SETTINGS: &[(&str, &str, &str, &str)] = &[
+    (
+        "remote.max_tokens_per_execution",
+        "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION",
+        "remote.max_tokens_per_step",
+        "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP",
+    ),
+    (
+        "remote.stage_budget_policy",
+        "DARKMUX_REMOTE_STAGE_BUDGET_POLICY",
+        "remote.step_budget_policy",
+        "DARKMUX_REMOTE_STEP_BUDGET_POLICY",
+    ),
+];
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -687,7 +716,7 @@ pub struct RuntimeBehaviorConfig {
     /// desktop modal) has live numbers between dispatches
     /// instead of reading "idle · no samples" until one starts. `0`
     /// disables the sampler entirely (an explicit opt-out, mirroring
-    /// `remote.max_tokens_per_execution`'s `0`-means-hard-off convention).
+    /// the pre-4.0 per-execution remote budget's `0`-means-hard-off convention).
     /// The sampler writes NO flow records (CLAUDE.md "the observer must not
     /// join the observed" — zero model dispatches, and this must not double
     /// the fleet stream's size); it only feeds the `/machine/resources`
@@ -853,6 +882,22 @@ impl DetectionPolicy {
         crate::config_enum::ConfigEnum::token(self)
     }
 }
+
+/// (#2902 step 5, operator 2026-09-27) What a STEP that reaches
+/// `remote.max_tokens_per_step` does. Only `off` and `warn`: a step has no
+/// rolling window, so there is nothing to wait for (`wait` is an ENDPOINT
+/// budget's value only, `endpoint::BudgetPolicy`), and nothing stops a step
+/// (a hard stop is `darkmux mission abort`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepBudgetPolicy {
+    Off,
+    Warn,
+}
+
+crate::config_enum!(StepBudgetPolicy, "step budget policy", [
+    Off = "off" => "nothing is counted",
+    Warn = "warn" => "reaching the per-step cap is surfaced (a CLI line and a budget.warn record) and the step keeps going (the default)",
+]);
 
 // (#2947) The value table: tokens, meanings, retired spellings, and
 // (through the macro's exhaustive match) the parser. An unknown or retired
@@ -1158,42 +1203,41 @@ pub struct AcceptWorkEntry {
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
-/// (#1260/#1177) Remote (hosted-endpoint) dispatch knobs: the STAGE budget
-/// and the concurrency cap. Unlike `redis{}`/`audit{}` there is NO `enabled`
-/// gate: remote staffing is enabled by the profile itself (endpoint present
-/// on the staffing's model, contract 1).
+/// (#1260/#1177) Remote (hosted-endpoint) dispatch knobs: the per-step cap
+/// on hosted tokens and the concurrency cap. Unlike `redis{}`/`audit{}`
+/// there is NO `enabled` gate: remote staffing is enabled by the profile
+/// itself (endpoint present on the staffing's model, contract 1).
 ///
-/// **What an "execution" is (operator decision, 2026-07-10 design chat):**
-/// one pipeline stage; a bare `dispatch` is one execution. Each stage's
-/// REMOTE calls draw from their own allowance. Tokens only, never currency.
+/// **(#2902 step 5) The cap is the operator's.** darkmux ships no number:
+/// `max_tokens_per_step` unset means no per-step cap, and `init` writes it
+/// visibly as `null`. When set, `step_budget_policy` decides what reaching
+/// it does (`off` / `warn`; `wait` is an endpoint budget's value only: a
+/// step has no rolling window to wait on). Nothing stops a step any more.
 ///
-/// **(#2902 step 5) The stage budget is the operator's.** darkmux ships no
-/// number: `max_tokens_per_execution` unset means no stage budget, and
-/// `init` writes it visibly as `null`. When set, `stage_budget_policy`
-/// decides what reaching it does (`off` / `warn` / `wait`, the same words
-/// an endpoint budget uses); nothing stops a stage any more.
-///
-/// **Which paths the stage budget meters:** a hosted `dispatch.map`
-/// (sibling steps naming one `bucket_group` share one allowance, #1442), a
-/// hosted `dispatch.single_shot` step, and the tool-less hosted `dispatch`
-/// (`dispatch_remote`). The AGENTIC-remote container loop (#1187) is not
-/// metered by the STAGE budget; an ENDPOINT window budget
-/// (`endpoints.<id>.limits`) does cover it.
+/// **Which steps it meters:** a hosted `dispatch.map` step (`dispatch.map`
+/// steps naming the same `bucket_group` share one allowance, #1442), a
+/// hosted `dispatch.single_shot` step, and a tool-less hosted `dispatch`
+/// (`dispatch_remote`, one step). The AGENTIC-remote container loop (#1187)
+/// is not metered by this cap; an ENDPOINT window budget
+/// (`endpoints.<id>.limits` in `profiles.json`) does cover it. Tokens only,
+/// never currency.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RemoteConfig {
-    /// The STAGE budget: remote `total_tokens` one pipeline stage may spend
-    /// before `stage_budget_policy` applies. No default (#2902 step 5):
-    /// `None` is no stage budget. Serialized even when `None` (as `null`) so
-    /// the knob `init` writes stays visible without carrying a number. A
-    /// group of `dispatch.map` steps that name the same `bucket_group`
-    /// share ONE allowance between them (#1442).
-    #[serde(default)] pub max_tokens_per_execution: Option<u64>,
-    /// (#2902 step 5) What a stage that reaches `max_tokens_per_execution`
-    /// does: `off` / `warn` / `wait` (a registered `ConfigEnum`, stored as a
-    /// string and parsed at the accessor; an unregistered value is refused
-    /// at preflight). Absent: `warn`. Serialized even when `None`, like the
-    /// budget beside it.
-    #[serde(default)] pub stage_budget_policy: Option<String>,
+    /// A per-step cap on hosted tokens: remote `total_tokens` one step may
+    /// spend before `step_budget_policy` applies. No default (#2902 step
+    /// 5): `None` is no cap. Serialized even when `None` (as `null`) so the
+    /// knob `init` writes stays visible without carrying a number.
+    /// `dispatch.map` steps naming the same `bucket_group` share ONE
+    /// allowance (#1442). Renamed from `max_tokens_per_execution` in 4.0; the
+    /// old key lands in `extras` and is read by nothing (`darkmux doctor`
+    /// names it).
+    #[serde(default)] pub max_tokens_per_step: Option<u64>,
+    /// (#2902 step 5) What a step that reaches `max_tokens_per_step` does:
+    /// `off` / `warn` (a registered `ConfigEnum`, stored as a string and
+    /// parsed at the accessor; an unregistered value, `wait` included, is
+    /// refused at preflight). Absent: `warn`. Serialized even when `None`,
+    /// like the cap beside it.
+    #[serde(default)] pub step_budget_policy: Option<String>,
     /// (#1230 Packet 1) Max CONCURRENT remote (hosted-endpoint) dispatches
     /// `darkmux_crew::concurrent_dispatch::run_bounded` runs at once — remote
     /// jobs aren't RAM-bound (gestalt's wave scheduler only governs LOCAL
@@ -1875,8 +1919,8 @@ impl DarkmuxConfig {
             }),
             remote: Some(RemoteConfig {
                 // (#2902 step 5) Visible and unset: darkmux ships no budget.
-                max_tokens_per_execution: None,
-                stage_budget_policy: None,
+                max_tokens_per_step: None,
+                step_budget_policy: None,
                 // (#1665 review CONSIDER 5) Visible `1`, matching the
                 // resolved accessor default — see `RemoteConfig::
                 // concurrent_cap`'s own doc for why this moved down from
@@ -2098,15 +2142,15 @@ mod tests {
         // (#933) The fleet block is written visible at the standalone default,
         // so the fleet surface is discoverable + one edit from hub/peer.
         assert_eq!(cfg.fleet.as_ref().unwrap().mode.as_deref(), Some("standalone"));
-        // (#2902 step 5) The remote block is written visible, and its stage
+        // (#2902 step 5) The remote block is written visible, and its per-step
         // budget and budget policy visible AND unset: `null` in the file,
         // never a number darkmux picked.
-        assert_eq!(cfg.remote.as_ref().unwrap().max_tokens_per_execution, None);
-        assert_eq!(cfg.remote.as_ref().unwrap().stage_budget_policy, None);
+        assert_eq!(cfg.remote.as_ref().unwrap().max_tokens_per_step, None);
+        assert_eq!(cfg.remote.as_ref().unwrap().step_budget_policy, None);
         let remote_json = serde_json::to_value(cfg.remote.as_ref().unwrap()).unwrap();
-        assert!(remote_json["max_tokens_per_execution"].is_null(), "{remote_json}");
-        assert!(remote_json.as_object().unwrap().contains_key("max_tokens_per_execution"), "visible: {remote_json}");
-        assert!(remote_json.as_object().unwrap().contains_key("stage_budget_policy"), "visible: {remote_json}");
+        assert!(remote_json["max_tokens_per_step"].is_null(), "{remote_json}");
+        assert!(remote_json.as_object().unwrap().contains_key("max_tokens_per_step"), "visible: {remote_json}");
+        assert!(remote_json.as_object().unwrap().contains_key("step_budget_policy"), "visible: {remote_json}");
         // (#1230 Packet 1) The concurrent-dispatch remote cap, same
         // visible-default treatment as its token-allowance sibling.
         // (#1665 review CONSIDER 5) `1`, not the old placeholder `4` —
@@ -2118,7 +2162,7 @@ mod tests {
         assert_eq!(back.redis.as_ref().unwrap().enabled, Some(false));
         assert_eq!(back.audit.as_ref().unwrap().dir.as_deref(), Some("~/.darkmux/audit"));
         assert_eq!(back.fleet.as_ref().unwrap().mode.as_deref(), Some("standalone"));
-        assert_eq!(back.remote.as_ref().unwrap().max_tokens_per_execution, None);
+        assert_eq!(back.remote.as_ref().unwrap().max_tokens_per_step, None);
         assert_eq!(back.remote.as_ref().unwrap().concurrent_cap, Some(1));
     }
 

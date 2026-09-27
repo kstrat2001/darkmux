@@ -12179,6 +12179,25 @@ fn an_unregistered_endpoint_budget_policy_is_refused_by_every_dispatching_entry_
             assert!(stderr.contains(v), "{args:?}: valid value `{v}` missing: {stderr}");
         }
     }
+    // (review M2) A typo elsewhere in `limits` (here a quoted number) makes
+    // the whole value unreadable; it is refused by path, never run as no
+    // budget.
+    std::fs::write(
+        &profiles,
+        r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":4096}]}},
+            "endpoints":{"azure":{"url":"https://h.example/v1",
+                "limits":{"window":{"period":"1d","tokens":"2M"}}}}}"#,
+    )
+    .unwrap();
+    let out = darkmux_std_cmd()
+        .env("PATH", empty_path.path())
+        .env("DARKMUX_PROFILES", &profiles)
+        .args(["dispatch", "code-reviewer", "hello"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("dispatch: refusing to start: bad config"), "{stderr}");
+    assert!(stderr.contains("endpoints.azure.limits") && stderr.contains("2M"), "{stderr}");
     // A registered policy passes the preflight (the command then fails for
     // its own reasons, never with the bad-config refusal).
     std::fs::write(
@@ -12195,6 +12214,42 @@ fn an_unregistered_endpoint_budget_policy_is_refused_by_every_dispatching_entry_
         .output()
         .unwrap();
     assert!(!String::from_utf8_lossy(&out.stderr).contains("refusing to start: bad config"));
+}
+
+/// (#2902 step 5, operator 2026-09-27) The per-step cap has `off` and
+/// `warn` only: `wait` is refused at preflight by every dispatching entry
+/// point, naming the valid values.
+#[test]
+fn a_step_budget_policy_of_wait_is_refused_at_preflight() {
+    let empty_path = TempDir::new().unwrap();
+    for args in [&["dispatch", "code-reviewer", "hello"][..], &["mission", "launch", "review", "--dry-run"][..]] {
+        let out = darkmux_std_cmd()
+            .env("PATH", empty_path.path())
+            .env("DARKMUX_REMOTE_STEP_BUDGET_POLICY", "wait")
+            .args(args)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{args:?}: {stderr}");
+        assert!(stderr.contains("refusing to start: bad config") && stderr.contains("`wait`"), "{args:?}: {stderr}");
+        assert!(stderr.contains("off") && stderr.contains("warn"), "{args:?}: {stderr}");
+    }
+}
+
+/// (#2902 step 5) The renamed per-step cap key is refused by `config set`,
+/// naming the new key, through the real binary.
+#[test]
+fn config_set_refuses_the_renamed_per_execution_key() {
+    let out = darkmux_cmd()
+        .args(["config", "set", "remote.max_tokens_per_execution", "5000"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("`remote.max_tokens_per_execution` was renamed to `remote.max_tokens_per_step` in 4.0"),
+        "{stderr}"
+    );
 }
 
 fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {

@@ -111,7 +111,7 @@ function recordDetailRaw(r: FlowRecord): string {
   // and, for a wait, how long: the run page is one of the three places a
   // wait must say so (with the CLI and `mission status`).
   if (a.startsWith("budget.") && f) {
-    const subject = String(f.endpoint_id ?? f.stage ?? "budget");
+    const subject = String(f.endpoint_id ?? f.step ?? "budget");
     if (a === "budget.wait") {
       return typeof f.wait_seconds === "number"
         ? `${subject}: waiting ${spanWords(f.wait_seconds)}`

@@ -6,7 +6,7 @@
 //! `MissionEnvelope::records_emitted` (`MISSION_ENVELOPE_SCHEMA` 1.2 -> 1.3,
 //! additive) so a run is self-describing about its own stream cost the same
 //! way it already carries its staffing snapshot (`FunnelEnvelope::staffing`,
-//! CLAUDE.md's `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` doctrine — a
+//! CLAUDE.md's `DARKMUX_REMOTE_MAX_TOKENS_PER_STEP` doctrine — a
 //! resolved run-shape snapshot lives ON the envelope rather than requiring a
 //! reader to re-derive it). `darkmux mission debrief` renders the persisted
 //! block.

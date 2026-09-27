@@ -185,9 +185,11 @@ const KEYS: &[(&str, Ty)] = &[
     ("fleet.identity.bin", Ty::Str),
     ("fleet.listener.enabled", Ty::Bool),
     ("fleet.listener.port", Ty::Uint),
-    // (#1260) The per-execution remote token allowance for endpoint-staffed
-    // crew seats (one pipeline stage = one execution). Tokens, never currency.
-    ("remote.max_tokens_per_execution", Ty::Uint),
+    // (#1260, #2902 step 5) A per-step cap on hosted tokens; `dispatch.map`
+    // steps naming the same `bucket_group` share one allowance. Tokens,
+    // never currency. (Renamed from `remote.max_tokens_per_execution` in
+    // 4.0; `set_at` refuses the old key naming this one.)
+    ("remote.max_tokens_per_step", Ty::Uint),
     // (#1230 Packet 1) Max concurrent remote dispatches
     // `darkmux_crew::concurrent_dispatch::run_bounded` runs at once.
     ("remote.concurrent_cap", Ty::Uint),
@@ -397,6 +399,12 @@ fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
         bail!(
             "`{key}` is a secret and never lives in config.json — store it in the macOS Keychain:\n  \
              security add-generic-password -U -a \"$USER\" -s {item} -w <value>"
+        );
+    }
+    // (#2902 step 5) Renamed in 4.0, no alias: name the new key.
+    if let Some((_, _, new_key, _)) = darkmux_types::config::RENAMED_SETTINGS.iter().find(|(old, ..)| *old == key) {
+        bail!(
+            "`{key}` was renamed to `{new_key}` in 4.0 (#2902): darkmux config set {new_key} {value}"
         );
     }
     // (#2914) The one role id the dynamic map refuses: radio routing runs on
@@ -1273,6 +1281,23 @@ mod tests {
                 assert!(preflight(scope).is_ok(), "{}: {scope:?} still refusing after cleanup", s.key);
             }
         }
+    }
+
+    /// (#2902 step 5) `config set` refuses a renamed budget key, naming the
+    /// new key, and writes nothing.
+    #[test]
+    fn config_set_refuses_a_renamed_budget_key_naming_the_new_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        for (old, _, new, _) in darkmux_types::config::RENAMED_SETTINGS {
+            let err = set_at(&path, old, "warn").unwrap_err().to_string();
+            assert!(err.contains(&format!("`{old}` was renamed to `{new}` in 4.0")), "{err}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}", "nothing was written");
+        assert!(set_at(&path, "remote.max_tokens_per_step", "1000").is_ok());
+        let err = set_at(&path, "remote.step_budget_policy", "wait").unwrap_err().to_string();
+        assert!(err.contains("`wait`") && err.contains("off") && err.contains("warn"), "{err}");
     }
 
     /// (#2947 rename) `config set` refuses every retired spelling of every

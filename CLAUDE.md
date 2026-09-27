@@ -464,7 +464,7 @@ darkmux's canonical config surface is **`~/.darkmux/config.json`** (#661), writt
   "redis":   { "enabled": false, "host": "127.0.0.1", "port": 6379, "stream": "darkmux:flow", "maxlen": 10000 },
   "audit":   { "enabled": false, "dir": "~/.darkmux/audit" },
   "runtime": { "inactivity_timeout_seconds": 600, "strict_selection": false, "feedback_injection": true, "check_updates": true },
-  "remote":  { "max_tokens_per_execution": null, "stage_budget_policy": null, "concurrent_cap": 1 },
+  "remote":  { "max_tokens_per_step": null, "step_budget_policy": null, "concurrent_cap": 1 },
   "power":   { "min_battery_pct": 50, "refuse_start_below_min": true, "pause_running_below_min": true },
   "fleet":   { "mode": "standalone" }
 }

@@ -27,40 +27,63 @@ fn named(limits: serde_json::Value) -> ModelEndpoint {
     ep
 }
 
-struct FakeEnv {
+/// The frozen-clock environment every budget test drives. `pub(crate)` so a
+/// step kind's own test can stand it in for the live one
+/// (`budget::with_test_env`) and see the gate fire on its path.
+pub(crate) struct FakeEnv {
     now: Cell<i64>,
     records: RefCell<Vec<(i64, u64)>>,
     slept_ms: Cell<u64>,
     paused_ms: Cell<u64>,
-    interrupted: Cell<bool>,
-    /// Interrupt once this much has been slept.
-    interrupt_after_ms: Option<u64>,
+    /// Why the run was stopped, from this many ms slept on (a test's
+    /// stand-in for an interrupt or a `mission abort`).
+    stop: RefCell<Option<(u64, String)>>,
+    /// Read stops from disk the way `LiveEnv` does (`run_stop_reason`).
+    disk_stops: bool,
     /// What `reload` returns (`None` = keep the budget in hand).
     reload_to: RefCell<Option<Option<EndpointBudget>>>,
+    /// The registry path each `reload` was asked for.
+    reloaded_from: RefCell<Vec<Option<String>>>,
     emitted: RefCell<Vec<darkmux_flow::FlowRecord>>,
     said: RefCell<Vec<String>>,
     levels: RefCell<HashMap<String, BreachLevel>>,
-    /// The stage budget `stage_budget_fresh` reports.
-    stage: RefCell<(Option<u64>, BudgetPolicy)>,
 }
 
 impl FakeEnv {
-    fn new(records: Vec<(i64, u64)>) -> Self {
+    pub(crate) fn new(records: Vec<(i64, u64)>) -> Self {
         FakeEnv {
             now: Cell::new(T0),
             records: RefCell::new(records),
             slept_ms: Cell::new(0),
             paused_ms: Cell::new(0),
-            interrupted: Cell::new(false),
-            interrupt_after_ms: None,
+            stop: RefCell::new(None),
+            disk_stops: false,
             reload_to: RefCell::new(None),
+            reloaded_from: RefCell::new(Vec::new()),
             emitted: RefCell::new(Vec::new()),
             said: RefCell::new(Vec::new()),
             levels: RefCell::new(HashMap::new()),
-            stage: RefCell::new((None, BudgetPolicy::Warn)),
         }
     }
-    fn actions(&self) -> Vec<String> {
+    /// A window already over any small budget.
+    pub(crate) fn full_window() -> Self {
+        Self::new(vec![(T0 - 10, 1_000_000)])
+    }
+    /// Stopped from the start, for `reason`.
+    pub(crate) fn stopped(self, reason: &str) -> Self {
+        *self.stop.borrow_mut() = Some((0, reason.to_string()));
+        self
+    }
+    /// Stopped once `ms` has been slept: the wait is announced first.
+    pub(crate) fn stopped_after(self, ms: u64, reason: &str) -> Self {
+        *self.stop.borrow_mut() = Some((ms, reason.to_string()));
+        self
+    }
+    pub(crate) fn reading_disk_for_stops(mut self) -> Self {
+        self.disk_stops = true;
+        self
+    }
+    pub(crate) fn actions(&self) -> Vec<String> {
         self.emitted.borrow().iter().map(|r| r.action.clone()).collect()
     }
     fn payload(&self, action: &str) -> serde_json::Value {
@@ -80,16 +103,20 @@ impl BudgetEnv for FakeEnv {
         self.slept_ms.set(self.slept_ms.get() + d.as_millis() as u64);
         // The frozen clock moves only when the gate sleeps.
         self.now.set(T0 + (self.slept_ms.get() / 1000) as i64);
-        if let Some(after) = self.interrupt_after_ms {
-            if self.slept_ms.get() >= after {
-                self.interrupted.set(true);
+    }
+    fn stop_reason(&self, caller: &BudgetCaller<'_>) -> Option<String> {
+        if self.disk_stops {
+            if let Some(r) = run_stop_reason(caller.mission_id, caller.phase_id) {
+                return Some(r);
             }
         }
+        match &*self.stop.borrow() {
+            Some((after, why)) if self.slept_ms.get() >= *after => Some(why.clone()),
+            _ => None,
+        }
     }
-    fn interrupted(&self) -> bool {
-        self.interrupted.get()
-    }
-    fn reload(&self, _id: &str) -> Option<Option<EndpointBudget>> {
+    fn reload(&self, _id: &str, profiles_file: Option<&str>) -> Option<Option<EndpointBudget>> {
+        self.reloaded_from.borrow_mut().push(profiles_file.map(str::to_string));
         self.reload_to.borrow().clone()
     }
     fn emit(&self, rec: darkmux_flow::FlowRecord) {
@@ -113,10 +140,6 @@ impl BudgetEnv for FakeEnv {
                 self.levels.borrow_mut().remove(key);
             }
         }
-    }
-    fn stage_budget_fresh(&self) -> (Option<u64>, Result<BudgetPolicy, darkmux_types::config_enum::BadEnumValue>) {
-        let (b, p) = *self.stage.borrow();
-        (b, Ok(p))
     }
 }
 
@@ -155,6 +178,36 @@ fn an_absent_policy_is_warn_and_an_unknown_one_is_refused() {
         let bad = named(serde_json::json!({"policy": raw, "window": {"period": "1d", "tokens": 10}}));
         let err = EndpointBudget::of(&bad).unwrap_err();
         assert!(err.contains(&format!("`{raw}`")) && err.contains("off, warn, wait"), "{err}");
+    }
+}
+
+/// (review M2) The reviewer's five probes, committed. Each typo used to
+/// make `limits` unreadable (or leave an unparseable period), which read as
+/// NO budget: it passed preflight and ran unmetered. Now each is an error
+/// at the gate (and refused at preflight: `invalid_endpoint_limits`).
+#[test]
+fn a_typo_in_limits_is_an_error_never_no_budget() {
+    let probes = [
+        (serde_json::json!({"warn_at": "80%", "window": {"period": "1d", "tokens": 10}}), "80%"),
+        (serde_json::json!({"window": {"period": "1d", "tokens": "2M"}}), "2M"),
+        (serde_json::json!({"window": {"period": "24H", "tokens": 10}}), "24H"),
+        (serde_json::json!({"window": {"period": "1w", "tokens": 10}}), "1w"),
+        (serde_json::json!({"policy": "wiat", "warn_at": "80%", "window": {"period": "1d", "tokens": 10}}), "80%"),
+    ];
+    for (limits, needle) in probes {
+        let err = EndpointBudget::of(&named(limits.clone())).expect_err(&format!("{limits} must not be Ok"));
+        assert!(err.contains(needle) && err.contains("azure"), "{limits}: {err}");
+        // And preflight's registry pass names it by path.
+        let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
+            "profiles": {"p": {"models": [{"id": "m", "endpoint": "azure"}]}},
+            "endpoints": {"azure": {"url": "https://h.example/v1", "limits": limits}},
+        }))
+        .unwrap();
+        reg.materialize_endpoints();
+        let invalid = darkmux_types::config_enum::invalid_endpoint_limits(&reg);
+        assert_eq!(invalid.len(), 1, "{limits}: {invalid:?}");
+        let line = invalid[0].to_string();
+        assert!(line.contains("endpoints.azure.limits") && line.contains("period"), "{line}");
     }
 }
 
@@ -296,15 +349,55 @@ fn wait_holds_until_the_window_has_room_then_resumes() {
     assert!(env.payload(BUDGET_RESUME_ACTION)["waited_ms"].as_u64().unwrap() >= 90_000);
 }
 
-/// An abort ends a wait before anything is sent; the gate says so.
+/// A stopped run (an interrupt, or a `mission abort`) ends a wait before
+/// anything is sent; the gate says why.
 #[test]
-fn an_interrupt_ends_a_wait_and_nothing_is_sent() {
-    let mut env = FakeEnv::new(vec![(T0 - 10, 1_000)]);
-    env.interrupt_after_ms = Some(2_000);
+fn a_stopped_run_ends_a_wait_and_nothing_is_sent() {
+    let env = FakeEnv::new(vec![(T0 - 10, 1_000)]).stopped_after(2_000, "mission `m` is aborted");
     let b = budget(BudgetPolicy::Wait, Some(1_000), None, None);
     let err = admit_with(b, &BudgetCaller::default(), &env).unwrap_err().to_string();
-    assert!(err.contains("interrupted") && err.contains("nothing was sent"), "{err}");
-    assert!(env.slept_ms.get() <= 30_000, "stopped within one poll: {}", env.slept_ms.get());
+    assert!(err.contains("mission `m` is aborted") && err.contains("nothing was sent"), "{err}");
+    assert!(env.slept_ms.get() <= 2_500, "stopped within one slice: {}", env.slept_ms.get());
+}
+
+/// (review M1) The stop is read from DISK, where `darkmux mission abort`
+/// (another process) writes it: an aborted or finalized mission, or an
+/// abandoned phase, stops the wait; an active one does not.
+#[test]
+#[serial_test::serial]
+fn an_aborted_mission_on_disk_stops_its_waiter_without_sending() {
+    let crew = tempfile::tempdir().unwrap();
+    let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+    unsafe { std::env::set_var("DARKMUX_CREW_DIR", crew.path()) };
+    let write = |path: std::path::PathBuf, status: &str| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!(r#"{{"status":"{status}"}}"#)).unwrap();
+    };
+    write(crate::lifecycle::mission_path("m1"), "active");
+    write(crate::lifecycle::phase_path("m1", "p1"), "running");
+    let active = run_stop_reason(Some("m1"), Some("p1"));
+    write(crate::lifecycle::phase_path("m1", "p1"), "abandoned");
+    let abandoned = run_stop_reason(Some("m1"), Some("p1"));
+    write(crate::lifecycle::mission_path("m1"), "aborted");
+    let aborted = run_stop_reason(Some("m1"), None);
+    // The waiter itself, end to end on the real disk read.
+    let env = FakeEnv::new(vec![(T0 - 10, 1_000)]).reading_disk_for_stops();
+    let caller = BudgetCaller { mission_id: Some("m1"), ..Default::default() };
+    let res = admit_with(budget(BudgetPolicy::Wait, Some(1_000), None, None), &caller, &env);
+    let live = LiveEnv.stop_reason(&caller);
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+            None => std::env::remove_var("DARKMUX_CREW_DIR"),
+        }
+    }
+    assert_eq!(active, None);
+    assert_eq!(abandoned.as_deref(), Some("phase `p1` of mission `m1` is abandoned"));
+    assert_eq!(aborted.as_deref(), Some("mission `m1` is aborted"));
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("mission `m1` is aborted") && err.contains("nothing was sent"), "{err}");
+    assert_eq!(env.slept_ms.get(), 0, "already aborted: it never sleeps");
+    assert_eq!(live.as_deref(), Some("mission `m1` is aborted"), "LiveEnv reads the same disk");
 }
 
 /// A budget switched off (or raised) while waiting releases the wait.
@@ -328,45 +421,33 @@ fn a_zero_budget_waits_until_raised() {
     assert!(env.said.borrow()[0].contains("waits until it is raised"));
 }
 
-// ── The stage budget ─────────────────────────────────────────────────────
+// ── The per-step cap ─────────────────────────────────────────────────────
 
 #[test]
-fn a_stage_under_warn_never_holds_and_warns_once_on_crossing() {
+fn a_step_under_warn_never_holds_and_warns_once_on_crossing() {
+    use darkmux_types::config::StepBudgetPolicy;
     let env = FakeEnv::new(vec![]);
-    let bucket = Mutex::new(crate::remote_budget::RemoteBudget::new(Some(1_000), BudgetPolicy::Warn));
+    let bucket = Mutex::new(crate::remote_budget::RemoteBudget::new(Some(1_000), StepBudgetPolicy::Warn));
     for _ in 0..3 {
-        admit_stage(&bucket, 4_096, "probe", &BudgetCaller::default(), &env).unwrap();
-        settle_stage(&bucket, 4_096, 600, 1, "probe", &BudgetCaller::default(), &env);
+        admit_step(&bucket, 4_096);
+        settle_step(&bucket, 4_096, 600, 1, "probe", &BudgetCaller::default(), &env);
     }
     assert_eq!(env.slept_ms.get(), 0);
     assert_eq!(env.actions(), vec![BUDGET_WARN_ACTION], "one warning, at the crossing");
     let p = env.payload(BUDGET_WARN_ACTION);
-    assert_eq!((p["scope"].as_str(), p["stage"].as_str()), (Some("stage"), Some("probe")));
+    assert_eq!((p["scope"].as_str(), p["step"].as_str()), (Some("step"), Some("probe")));
 }
 
-/// A stage under `wait` holds its next call until the budget is raised
-/// (read fresh from the config while it waits), then resumes.
+/// (operator, 2026-09-27) The per-step cap has `off` and `warn` only:
+/// `wait` is refused by the registry (preflight, doctor, `config set`,
+/// help all read it).
 #[test]
-fn a_stage_under_wait_holds_until_the_budget_is_raised() {
-    let env = FakeEnv::new(vec![]);
-    let bucket = Mutex::new(crate::remote_budget::RemoteBudget::new(Some(1_000), BudgetPolicy::Wait));
-    admit_stage(&bucket, 100, "s1", &BudgetCaller::default(), &env).unwrap();
-    settle_stage(&bucket, 100, 1_000, 1, "s1", &BudgetCaller::default(), &env);
-    *env.stage.borrow_mut() = (Some(10_000), BudgetPolicy::Wait);
-    admit_stage(&bucket, 100, "s1", &BudgetCaller::default(), &env).unwrap();
-    assert!(env.slept_ms.get() > 0, "it waited");
-    assert_eq!(env.paused_ms.get(), env.slept_ms.get());
-    assert_eq!(env.actions(), vec![BUDGET_WARN_ACTION, BUDGET_WAIT_ACTION, BUDGET_RESUME_ACTION]);
-}
-
-#[test]
-fn a_waiting_stage_ends_only_on_an_interrupt() {
-    let mut env = FakeEnv::new(vec![]);
-    env.interrupt_after_ms = Some(45_000);
-    *env.stage.borrow_mut() = (Some(0), BudgetPolicy::Wait);
-    let bucket = Mutex::new(crate::remote_budget::RemoteBudget::new(Some(0), BudgetPolicy::Wait));
-    let err = admit_stage(&bucket, 100, "s1", &BudgetCaller::default(), &env).unwrap_err().to_string();
-    assert!(err.contains("interrupted while stage `s1` waited"), "{err}");
+fn the_step_policy_refuses_wait() {
+    use darkmux_types::config_enum::{ConfigEnum, ENUM_SETTINGS};
+    assert_eq!(darkmux_types::config::StepBudgetPolicy::TOKENS, &["off", "warn"]);
+    let s = ENUM_SETTINGS.iter().find(|s| s.key == "remote.step_budget_policy").unwrap();
+    assert_eq!(s.canonical("wait"), None);
+    assert_eq!(s.canonical("warn"), Some("warn"));
 }
 
 // ── The in-run pacer ─────────────────────────────────────────────────────
@@ -382,27 +463,47 @@ fn pace(dir: &Path) -> serde_json::Value {
 fn the_pacer_pauses_through_the_pace_file_and_releases() {
     let dir = tempfile::tempdir().unwrap();
     let env = FakeEnv::new(vec![(T0 - DAY + 10, 1_000)]);
-    let mut p = BudgetPacer::new(budget(BudgetPolicy::Wait, Some(1_000), None, None));
+    let mut p = BudgetPacer::new(budget(BudgetPolicy::Wait, Some(1_000), None, None), None);
     let c = BudgetCaller::default();
-    let ev = p.on_tick(0, dir.path(), false, &c, &env);
+    let free = OtherPacing::default();
+    let held = OtherPacing { pausing: true, duty_cycle: None };
+    let ev = p.on_tick(0, dir.path(), &free, &c, &env);
     assert!(matches!(ev, Some(PacerEvent::Paused { .. })), "{ev:?}");
     assert_eq!(pace(dir.path())["pause"], true);
     assert_eq!(pace(dir.path())["reason"], PACE_REASON);
     // Another governor pauses: the pacer writes nothing over it.
     crate::pace_file::write(dir.path(), true, "thermal", "serious");
-    assert_eq!(p.on_tick(2_000, dir.path(), true, &c, &env), None);
+    assert_eq!(p.on_tick(2_000, dir.path(), &held, &c, &env), None);
     assert_eq!(pace(dir.path())["reason"], "thermal");
     // Thermal lets go: the pacer re-asserts its own hold.
-    assert_eq!(p.on_tick(2_000, dir.path(), false, &c, &env), None);
+    assert_eq!(p.on_tick(2_000, dir.path(), &free, &c, &env), None);
     assert_eq!(pace(dir.path())["reason"], PACE_REASON);
     assert_eq!(env.paused_ms.get(), 4_000, "time held counts as pause");
     // The record leaves the window.
     env.now.set(T0 + 11);
-    let ev = p.on_tick(2_000, dir.path(), false, &c, &env);
+    let ev = p.on_tick(2_000, dir.path(), &free, &c, &env);
     assert!(matches!(ev, Some(PacerEvent::Resumed { .. })), "{ev:?}");
     assert_eq!(pace(dir.path())["pause"], false);
     assert!(!p.is_pausing());
     assert_eq!(env.actions(), vec![BUDGET_WAIT_ACTION, BUDGET_RESUME_ACTION]);
+}
+
+/// (review C6) Releasing during a thermal duty cycle writes the duty
+/// cycle's instruction back (its `turn_delay_ms`), never a bare
+/// `pause: false` that would drop it.
+#[test]
+fn the_pacer_release_keeps_a_thermal_duty_cycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = FakeEnv::new(vec![(T0 - DAY + 10, 1_000)]);
+    let mut p = BudgetPacer::new(budget(BudgetPolicy::Wait, Some(1_000), None, None), None);
+    let c = BudgetCaller::default();
+    let duty = OtherPacing { pausing: false, duty_cycle: Some((15_000, "fair".into())) };
+    assert!(matches!(p.on_tick(0, dir.path(), &duty, &c, &env), Some(PacerEvent::Paused { .. })));
+    env.now.set(T0 + 11);
+    assert!(matches!(p.on_tick(2_000, dir.path(), &duty, &c, &env), Some(PacerEvent::Resumed { .. })));
+    let v = pace(dir.path());
+    assert_eq!((v["pause"].as_bool(), v["turn_delay_ms"].as_u64()), (Some(false), Some(15_000)), "{v}");
+    assert_eq!(v["reason"], "thermal-duty-cycle");
 }
 
 /// Under `warn` the pacer never touches the pace file.
@@ -410,10 +511,23 @@ fn the_pacer_pauses_through_the_pace_file_and_releases() {
 fn the_pacer_under_warn_never_pauses() {
     let dir = tempfile::tempdir().unwrap();
     let env = FakeEnv::new(vec![(T0 - 10, 5_000)]);
-    let mut p = BudgetPacer::new(budget(BudgetPolicy::Warn, Some(1_000), None, None));
-    assert_eq!(p.on_tick(0, dir.path(), false, &BudgetCaller::default(), &env), None);
+    let mut p = BudgetPacer::new(budget(BudgetPolicy::Warn, Some(1_000), None, None), None);
+    assert_eq!(p.on_tick(0, dir.path(), &OtherPacing::default(), &BudgetCaller::default(), &env), None);
     assert!(!crate::pace_file::path(dir.path()).exists());
     assert_eq!(env.actions(), vec![BUDGET_WARN_ACTION]);
+}
+
+/// (review C4) A waiting pacer re-reads the endpoint from the command's own
+/// registry file, not the default search.
+#[test]
+fn the_pacer_reloads_from_the_commands_registry() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = FakeEnv::new(vec![(T0 - DAY + 100, 1_000)]);
+    let mut p = BudgetPacer::new(budget(BudgetPolicy::Wait, Some(1_000), None, None), Some("/x/profiles.json".into()));
+    let c = BudgetCaller::default();
+    p.on_tick(0, dir.path(), &OtherPacing::default(), &c, &env);
+    p.on_tick(PACER_RELOAD_MS, dir.path(), &OtherPacing::default(), &c, &env);
+    assert_eq!(*env.reloaded_from.borrow(), vec![Some("/x/profiles.json".to_string())]);
 }
 
 // ── The ledger ───────────────────────────────────────────────────────────
@@ -468,6 +582,52 @@ fn a_partial_last_line_is_read_once_complete() {
     assert!(l.window("azure", T0, DAY as u64).is_empty());
     append(dir.path(), T0, b);
     assert_eq!(l.window("azure", T0, DAY as u64), vec![(T0 - 5, 42)]);
+}
+
+/// (review C7) A day file rewritten in place, larger than before, is read
+/// again from the start: the old entries go and every new one is counted.
+/// (The probe: `[1000]` then five `1`s read back as `[1000, 1, 1, 1]`.)
+#[test]
+fn a_day_file_rewritten_larger_is_read_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(format!("{}.jsonl", darkmux_flow::day_utc_at(T0)));
+    std::fs::write(&path, usage_line(T0 - 50, Some("azure"), 1_000)).unwrap();
+    let mut l = Ledger::new(dir.path());
+    assert_eq!(l.window("azure", T0, DAY as u64), vec![(T0 - 50, 1_000)]);
+    let rewritten: String = (1..=5).map(|i| usage_line(T0 - 50 + i, Some("azure"), 1)).collect();
+    std::fs::write(&path, rewritten).unwrap();
+    let w = l.window("azure", T0, DAY as u64);
+    assert_eq!(w.iter().map(|(_, n)| *n).collect::<Vec<_>>(), vec![1, 1, 1, 1, 1], "{w:?}");
+    // An ordinary append still reads only the new bytes.
+    let before = l.bytes_read();
+    let one = usage_line(T0 - 1, Some("azure"), 7);
+    append(dir.path(), T0, &one);
+    assert_eq!(l.window("azure", T0, DAY as u64).len(), 6);
+    assert_eq!(l.bytes_read() - before, one.len() as u64);
+}
+
+/// (review C8) No operator-facing budget message carries a run of spaces
+/// (a lost line continuation in the source).
+#[test]
+fn budget_messages_have_no_double_spaces() {
+    use darkmux_types::config::StepBudgetPolicy;
+    let env = FakeEnv::new(vec![(T0 - DAY + 90, 1_000)]);
+    let caller = BudgetCaller { mission_id: Some("m1"), ..Default::default() };
+    admit_with(budget(BudgetPolicy::Wait, Some(1_000), None, None), &caller, &env).unwrap();
+    admit_with(budget(BudgetPolicy::Warn, Some(10), None, None), &caller, &env).unwrap();
+    admit_with(budget(BudgetPolicy::Wait, Some(0), None, None), &BudgetCaller::default(), &FakeEnv::new(vec![]).stopped("x"))
+        .unwrap_err();
+    let bucket = Mutex::new(crate::remote_budget::RemoteBudget::new(Some(1), StepBudgetPolicy::Warn));
+    admit_step(&bucket, 1);
+    settle_step(&bucket, 1, 5, 1, "s1", &caller, &env);
+    let mut messages: Vec<String> = env.said.borrow().clone();
+    messages.extend(env.emitted.borrow().iter().filter_map(|r| r.payload.as_ref()?.get("message")?.as_str().map(str::to_string)));
+    let err = EndpointBudget::of(&named(serde_json::json!({"window": {"period": "1d", "tokens": "2M"}}))).unwrap_err();
+    messages.push(err);
+    assert!(messages.len() >= 5, "{messages:?}");
+    for m in &messages {
+        assert!(!m.contains("  "), "a message carries a run of spaces: {m:?}");
+    }
 }
 
 /// (Cost check) The first read of a window pays for the day files it
@@ -533,12 +693,35 @@ fn active_waits_lists_open_waits_from_live_processes_only() {
     text += &rec(BUDGET_WAIT_ACTION, "long-past", 1, Some(T0 - 100));
     text += &rec(BUDGET_WAIT_ACTION, "indefinite", 1, None);
     append(dir.path(), T0, &text);
-    let waits = active_waits(dir.path(), T0, &|pid| pid == 1);
+    let waits = active_waits(dir.path(), T0, 86_400, &|pid| pid == 1);
     let sessions: Vec<&str> = waits.iter().filter_map(|w| w.session_id.as_deref()).collect();
     assert_eq!(sessions, vec!["indefinite", "open"]);
     let open = waits.iter().find(|w| w.session_id.as_deref() == Some("open")).unwrap();
     assert_eq!(open.resumes_in_secs, Some(600));
     assert_eq!(open.mission_id.as_deref(), Some("m-1"));
+}
+
+/// (review C2) A long window's wait was announced up to a window ago: it
+/// stays listed while the lookback reaches its announcement, and the
+/// lookback is the widest configured period (never under a day).
+#[test]
+fn active_waits_reach_back_to_the_widest_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let wait = serde_json::json!({
+        "ts": darkmux_flow::ts_utc_at(T0 - 3 * DAY), "action": BUDGET_WAIT_ACTION, "session_id": "s",
+        "payload": {"scope": "endpoint", "endpoint_id": "azure", "pid": 1,
+            "resume_at": darkmux_flow::ts_utc_at(T0 + 3_600), "message": "m"}
+    })
+    .to_string()
+        + "\n";
+    append(dir.path(), T0 - 3 * DAY, &wait);
+    assert!(active_waits(dir.path(), T0, waits_lookback_secs(None), &|_| true).is_empty(), "a day back misses it");
+    let week = waits_lookback_secs(Some(7 * DAY as u64));
+    assert_eq!(week, 7 * DAY as u64);
+    assert_eq!(waits_lookback_secs(Some(60)), DAY as u64, "never under a day");
+    let waits = active_waits(dir.path(), T0, week, &|_| true);
+    assert_eq!(waits.len(), 1, "{waits:?}");
+    assert_eq!(waits[0].resumes_in_secs, Some(3_600));
 }
 
 #[test]

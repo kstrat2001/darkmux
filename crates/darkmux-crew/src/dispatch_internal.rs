@@ -3447,23 +3447,25 @@ fn dispatch_remote(
     };
 
     // (#2902 step 5) The budgets, BEFORE any bookend is emitted: the
-    // endpoint's rolling-window budget, then this execution's stage budget
-    // (a bare hosted dispatch is one execution). Neither ever refuses: a
-    // breach warns, or under `wait` this blocks until there is room (the
-    // wait is reported and extends the run's wall-clock bound). A wait
-    // interrupted by an abort returns before anything was sent.
+    // endpoint's rolling-window budget, then this dispatch's per-step cap (a
+    // bare hosted dispatch is one step). Neither refuses a valid config: a
+    // breach warns, or under an endpoint `wait` this blocks until there is
+    // room (the wait is reported and extends the run's wall-clock bound). A
+    // wait whose run is stopped (Ctrl-C, `mission abort`) returns before
+    // anything was sent.
     let budget_caller = crate::budget::BudgetCaller {
         role_id: Some(&opts.role_id),
         session_id: Some(&session_id),
         model: Some(&pm.id),
         mission_id: mission_id.as_deref(),
         phase_id: phase,
+        profiles_file: opts.config_path.as_deref(),
     };
     crate::budget::admit_endpoint(ep, &budget_caller)?;
-    let stage_bucket = std::sync::Mutex::new(
+    let step_bucket = std::sync::Mutex::new(
         crate::remote_budget::RemoteBudget::from_config(None).map_err(|e| anyhow!(e.to_string()))?,
     );
-    crate::budget::admit_stage(&stage_bucket, 0, "dispatch", &budget_caller, &crate::budget::LiveEnv)?;
+    crate::budget::admit_step(&step_bucket, 0);
 
     // (#1230 Packet 0) `dispatch_remote` previously had NO bookend guard at
     // all — a panic mid-hosted-call (or any future early return added
@@ -3617,7 +3619,7 @@ fn dispatch_remote(
             ep.named_id(),
         ),
     );
-    crate::budget::settle_stage(&stage_bucket, 0, ttok, 1, "dispatch", &budget_caller, &crate::budget::LiveEnv);
+    crate::budget::settle_step(&step_bucket, 0, ttok, 1, "dispatch", &budget_caller, &crate::budget::LiveEnv);
 
 
     let mut complete_payload = serde_json::json!({
@@ -3751,7 +3753,7 @@ fn dispatch_remote(
 /// than adding speculative shape for a consumer that doesn't exist yet.
 pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> {
     // (#2947) Bad enum config refuses before anything, same as `dispatch`.
-    darkmux_profiles::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
+    darkmux_profiles::preflight_with(darkmux_types::config_enum::Scope::Dispatch, opts.config_path.as_deref())?;
     darkmux_flow::daemon_probe::nudge_if_daemon_unreachable("dispatch");
     crate::dispatch::require_licensed_adjacent_ack(&opts.role_id)
         .context("licensed-adjacent role dispatch requires acknowledgment")?;
@@ -4890,7 +4892,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // is the one place that covers them all. Deliberately NOT gated on
     // `opts.skip_preflight`: that flag skips the Docker/daemon probe, and a
     // bad config value is not a probe result that could be stale.
-    darkmux_profiles::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
+    darkmux_profiles::preflight_with(darkmux_types::config_enum::Scope::Dispatch, opts.config_path.as_deref())?;
     // 0. Pre-flight: nudge the operator if the daemon isn't up. The
     //    dispatch will still write flow records to disk, but they
     //    won't be observable in the viewer until the daemon comes up.
@@ -5537,6 +5539,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 model: Some(&model),
                 mission_id: mission_id.as_deref(),
                 phase_id: phase_id.as_deref(),
+                profiles_file: opts.config_path.as_deref(),
             },
         )?;
     }
@@ -5865,7 +5868,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // endpoint, not local LMStudio). The rest exists for GPU thermal /
         // power relief between LOCAL inference bursts; an endpoint has no
         // GPU on this host to rest, and the per-execution remote allowance
-        // (`DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`) should not pay
+        // (`DARKMUX_REMOTE_MAX_TOKENS_PER_STEP`) should not pay
         // latency for a knob that does nothing for it. Forced to `0`
         // regardless of the operator's configured `turn_delay_ms` — see
         // the matching `dispatch_start_payload["turn_delay_ms"]` stamp
@@ -6212,7 +6215,9 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // (#2902 step 5) The in-run half of an agentic-remote brain's
         // endpoint budget (the pre-start half ran before `dispatch start`).
         match &agentic_pm {
-            Some(t) => crate::budget::EndpointBudget::of(&t.endpoint).map_err(|e| anyhow!(e))?,
+            Some(t) => crate::budget::EndpointBudget::of(&t.endpoint)
+                .map_err(|e| anyhow!(e))?
+                .map(|b| crate::budget::BudgetPacer::new(b, opts.config_path.clone())),
             None => None,
         },
     );
@@ -8592,7 +8597,7 @@ fn spawn_guarded_sampler(
     host_out: PathBuf,
     record_context: Option<serde_json::Value>,
     thermal_config: crate::thermal_governor::ThermalGovernorConfig,
-    budget: Option<crate::budget::EndpointBudget>,
+    budget_pacer: Option<crate::budget::BudgetPacer>,
 ) -> (StopFlagGuard, thread::JoinHandle<(HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary)>) {
     let guard = StopFlagGuard(Arc::clone(sampler_stop));
     let stop = Arc::clone(sampler_stop);
@@ -8610,7 +8615,7 @@ fn spawn_guarded_sampler(
             host_out,
             record_context,
             thermal_config,
-            budget,
+            budget_pacer,
         )
     });
     (guard, handle)
@@ -8639,9 +8644,8 @@ fn run_telemetry_sampler(
     thermal_config: crate::thermal_governor::ThermalGovernorConfig,
     // (#2902 step 5) An agentic-remote brain's endpoint budget, when it
     // counts (see `crate::budget::BudgetPacer`). `None` for a local brain.
-    budget: Option<crate::budget::EndpointBudget>,
+    mut budget_pacer: Option<crate::budget::BudgetPacer>,
 ) -> (HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary) {
-    let mut budget_pacer = budget.map(crate::budget::BudgetPacer::new);
     // (#2107) Relative to THIS sampler's own start, not wall-clock — the
     // reduction only needs the gaps BETWEEN samples, and a relative clock
     // makes `reduce_host_stats` testable with plain integers instead of
@@ -9171,15 +9175,19 @@ fn run_telemetry_sampler(
         // that already holds it. Decided AFTER both governors, so it reads
         // their post-decision state; reported as `dispatch.rest` like theirs.
         if let Some(pacer) = budget_pacer.as_mut() {
-            let others_pausing = governors.thermal.is_pausing() || governors.battery.is_pacing();
+            let others = crate::budget::OtherPacing {
+                pausing: governors.thermal.is_pausing() || governors.battery.is_pacing(),
+                duty_cycle: governors.thermal.duty_cycle(),
+            };
             let caller = crate::budget::BudgetCaller {
                 role_id: Some(&role_id),
                 session_id: Some(&session_id),
                 model: Some(&model),
                 mission_id: mission_id.as_deref(),
                 phase_id: phase_id.as_deref(),
+                profiles_file: None,
             };
-            match pacer.on_tick(thermal_elapsed_ms, &host_out, others_pausing, &caller, &crate::budget::LiveEnv) {
+            match pacer.on_tick(thermal_elapsed_ms, &host_out, &others, &caller, &crate::budget::LiveEnv) {
                 Some(crate::budget::PacerEvent::Paused { state }) => {
                     emit_rest(crate::budget::PACE_REASON, &state, true)
                 }

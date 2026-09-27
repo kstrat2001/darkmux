@@ -29,7 +29,7 @@
 //! [`MissionOutcomeStatus`] has four values. A mission driver's OWN
 //! conversion logic decides which one applies (this module does not
 //! prescribe the mission-type-specific thresholds — see `CLAUDE.md`'s
-//! `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` budget-policy text for the
+//! `DARKMUX_REMOTE_MAX_TOKENS_PER_STEP` budget-policy text for the
 //! review pipeline's own rules), but the SHAPE of the decision is uniform:
 //!
 //! - **Clean** — the mission produced its full intended output with no

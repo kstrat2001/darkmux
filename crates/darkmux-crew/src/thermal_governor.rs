@@ -1371,6 +1371,14 @@ impl ThermalGovernor {
         matches!(self.state, State::Paused | State::OperatorHold | State::Broken)
     }
 
+    /// (#2902 step 5 review C6) While tier 2 duty-cycles, the instruction
+    /// it wrote (`turn_delay_ms`, the thermal state), so another pace-file
+    /// writer letting go of the file (the budget pacer) writes it back
+    /// instead of a bare `pause: false`. `None` in every other state.
+    pub fn duty_cycle(&self) -> Option<(u64, String)> {
+        (self.state == State::DutyCycle).then(|| (self.current_duty_delay_ms, self.last_known_state.clone()))
+    }
+
     /// (#2456) See the field's own doc.
     pub fn last_stop_write_error(&self) -> Option<&str> {
         self.last_stop_write_error.as_deref()

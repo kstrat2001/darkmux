@@ -62,8 +62,8 @@
     "accept_work": {}
   },
   "remote": {
-    "max_tokens_per_execution": null,
-    "stage_budget_policy": null,
+    "max_tokens_per_step": null,
+    "step_budget_policy": null,
     "concurrent_cap": 1
   },
   "power": {

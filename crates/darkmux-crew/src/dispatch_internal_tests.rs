@@ -269,24 +269,74 @@
         assert_eq!(both["max_completion_tokens"], 8000, "an explicit cap wins");
     }
 
-    /// (#2902 step 5) A bare hosted `dispatch` passes BOTH budgets (the
-    /// endpoint's window, then its own stage) before its first record, so a
-    /// `wait` holds it with no orphaned in-flight session, and settles the
-    /// stage after the call. Checked on the source: running the arm needs a
-    /// real endpoint. The behavior of each gate is pinned in `budget_tests`.
+    /// (#2902 step 5) A bare hosted `dispatch` passes the endpoint budget
+    /// gate and reserves against the per-step cap before its first record,
+    /// and settles the cap after the call. Checked on the source with
+    /// comments stripped (the full ordering rule is
+    /// `usage_conformance::every_hosted_call_site_passes_the_budget_gates`);
+    /// the gate firing is `the_endpoint_gate_fires_on_dispatch_remote`.
     #[test]
     fn dispatch_remote_passes_both_budget_gates_before_any_record() {
-        let src = include_str!("dispatch_internal.rs");
+        let src: String = include_str!("dispatch_internal.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let body = &src[src.find("fn dispatch_remote(").expect("dispatch_remote")..];
         let body = &body[..body.find("\n}\n").expect("fn end")];
         let open = body.find("bookend.open(").expect("bookend opens");
         let endpoint_gate = body.find("crate::budget::admit_endpoint(ep,").expect("endpoint gate");
-        let stage_gate = body.find("crate::budget::admit_stage(").expect("stage gate");
+        let step_gate = body.find("crate::budget::admit_step(").expect("per-step reservation");
         let call = body.find("remote_chat_completion(").expect("the call");
-        let settle = body.find("crate::budget::settle_stage(").expect("stage settle");
-        assert!(endpoint_gate < open && stage_gate < open, "both gates run before the first record");
-        assert!(settle > call, "the stage is settled with the call's real spend");
+        let settle = body.find("crate::budget::settle_step(").expect("per-step settle");
+        assert!(endpoint_gate < open && step_gate < open, "both run before the first record");
+        assert!(settle > call, "the per-step cap is settled with the call's real spend");
         assert!(!src.contains("fn admit_remote_execution("), "the pre-4.0 zero-refusal gate is gone");
+    }
+
+    /// (#2902 step 5 review C1, M1) The endpoint gate FIRES on
+    /// `dispatch_remote`: an endpoint whose window is full under `wait`, on a
+    /// run that was stopped, returns the gate's error, and the endpoint
+    /// never receives a request.
+    #[test]
+    #[serial]
+    fn the_endpoint_gate_fires_on_dispatch_remote() {
+        let (base_url, rx) = one_shot_http_mock(r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+        let home = TempDir::new().unwrap();
+        let flows_dir = TempDir::new().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+        }
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "pr-reviewer".to_string();
+        opts.session_id = Some(format!("budget-gate-remote-{}", std::process::id()));
+        opts.phase_id = None;
+        let mut pm: darkmux_types::ProfileModel = serde_json::from_str(&format!(
+            r#"{{"id":"gpt-remote","endpoint":{{"url":"{base_url}","limits":{{"policy":"wait","window":{{"period":"1d","tokens":1}}}}}}}}"#
+        ))
+        .unwrap();
+        pm.endpoint.as_mut().unwrap().source = darkmux_types::EndpointSource::Named("azure".into());
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::full_window().stopped_after(1, "mission `m` is aborted"));
+        let result = crate::budget::with_test_env(env.clone(), || {
+            dispatch_remote(&opts, &quarantine_test_role(), "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap())
+        });
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+        let err = format!("{:#}", result.expect_err("a stopped wait must not dispatch"));
+        assert!(err.contains("stopped waiting on endpoint `azure`'s budget") && err.contains("nothing was sent"), "{err}");
+        assert_eq!(env.actions(), vec![crate::budget::BUDGET_WAIT_ACTION.to_string()]);
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(), "the endpoint received no request");
     }
 
     /// Hosted-response classification (pure): the happy path passes through;

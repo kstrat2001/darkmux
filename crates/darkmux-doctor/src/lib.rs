@@ -173,6 +173,7 @@ pub fn run() -> DoctorReport {
         check_removed_telemetry_record_every_samples(),
         check_removed_radio_router_staffing(),
         check_removed_notebook_settings(),
+        check_renamed_budget_settings(),
         check_retired_role_leftovers(),
         check_role_skill_references(),
         check_step_command_timeout(),
@@ -2743,6 +2744,52 @@ fn check_removed_telemetry_record_every_samples() -> Check {
 /// config); `Warn` naming exactly the tier(s) that are set, with the exact
 /// removal step for each. An empty env value reads as unset, matching every
 /// other env-tier accessor.
+/// (#2902 step 5) Settings RENAMED in 4.0 with no alias
+/// (`darkmux_types::config::RENAMED_SETTINGS`: the per-step cap's
+/// `remote.max_tokens_per_execution` -> `remote.max_tokens_per_step`, and its
+/// policy key). A leftover old key in `config.json` lands in `remote.extras`
+/// and is read by nothing; a leftover old env var is read by nothing. Either
+/// is named with the exact rename. Warn, not Fail: nothing refuses to run.
+fn check_renamed_budget_settings() -> Check {
+    let cfg = darkmux_types::config::DarkmuxConfig::load_resolved();
+    renamed_settings_status(&cfg, &|k| std::env::var(k).ok(), &resolved_config_path())
+}
+
+/// Pure decision for [`check_renamed_budget_settings`].
+fn renamed_settings_status(
+    cfg: &darkmux_types::config::DarkmuxConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+    config_path: &std::path::Path,
+) -> Check {
+    let name = "renamed settings (4.0)";
+    let mut found: Vec<String> = Vec::new();
+    let mut steps: Vec<String> = Vec::new();
+    for (old_key, old_env, new_key, new_env) in darkmux_types::config::RENAMED_SETTINGS {
+        let leaf = old_key.rsplit('.').next().unwrap_or(old_key);
+        if cfg.remote.as_ref().is_some_and(|r| r.extras.contains_key(leaf)) {
+            found.push(format!("config.json sets `{old_key}`"));
+            steps.push(format!("rename `{old_key}` to `{new_key}` in {}", config_path.display()));
+        }
+        if env(old_env).is_some_and(|v| !v.trim().is_empty()) {
+            found.push(format!("`{old_env}` is exported"));
+            steps.push(format!("export {new_env} instead of {old_env}"));
+        }
+    }
+    if found.is_empty() {
+        return Check { name: name.into(), status: Status::Pass, message: "none present".into(), hint: None };
+    }
+    Check {
+        name: name.into(),
+        status: Status::Warn,
+        message: format!("{}: renamed in 4.0 (#2902); nothing reads the old name", found.join("; ")),
+        hint: Some(format!(
+            "{}. The per-step cap on hosted tokens is `remote.max_tokens_per_step` (no default: unset is no cap) \
+             with `remote.step_budget_policy` (`off` or `warn`)",
+            steps.join("; ")
+        )),
+    }
+}
+
 fn check_removed_notebook_settings() -> Check {
     let name = "dirs.notebook / DARKMUX_NOTEBOOK_DIR (removed)";
     let cfg = darkmux_types::config::DarkmuxConfig::load_resolved();
@@ -4554,18 +4601,21 @@ fn endpoints_status(
 ) -> Check {
     let name = "endpoints".to_string();
     let bad = darkmux_types::config_enum::bad_endpoint_budget_policies(registry);
-    if !bad.is_empty() {
-        let fix = bad.iter().map(|b| b.fix()).collect::<Vec<_>>().join("; ");
+    let invalid = darkmux_types::config_enum::invalid_endpoint_limits(registry);
+    if !bad.is_empty() || !invalid.is_empty() {
+        let mut problems: Vec<String> = bad.iter().map(|b| format!("{}; {}", b.summary(), b.valid_line())).collect();
+        problems.extend(invalid.iter().map(|v| format!("{}: {}", v.set_in, v.problem)));
+        let mut fixes: Vec<String> = bad.iter().map(|b| b.fix()).collect();
+        if let Some(v) = invalid.first() {
+            fixes.push(format!("write `limits` in the valid shape, {}", v.valid));
+        }
         return Check {
             name,
             status: Status::Fail,
-            message: format!(
-                "{}; {}",
-                bad.iter().map(|b| b.summary()).collect::<Vec<_>>().join("; "),
-                bad[0].valid_line()
-            ),
+            message: problems.join("; "),
             hint: Some(format!(
-                "Every dispatch, mission launch and lab run refuses to start until this is fixed: {fix}. (#2902)"
+                "Every dispatch, mission launch and lab run refuses to start until this is fixed: {}. (#2902)",
+                fixes.join("; ")
             )),
         };
     }
@@ -13259,6 +13309,26 @@ mod tests {
         r
     }
 
+    /// (#2902 step 5) A leftover old budget key, in config.json or the env,
+    /// is named with its exact rename; the new keys pass.
+    #[test]
+    fn renamed_budget_settings_are_named_with_the_exact_rename() {
+        let path = std::path::Path::new("/h/config.json");
+        let old: darkmux_types::config::DarkmuxConfig =
+            serde_json::from_str(r#"{"remote":{"max_tokens_per_execution":500000}}"#).unwrap();
+        let c = renamed_settings_status(&old, &|_| None, path);
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
+        assert!(c.hint.unwrap().contains("rename `remote.max_tokens_per_execution` to `remote.max_tokens_per_step`"));
+        let env = |k: &str| (k == "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION").then(|| "5".to_string());
+        let c = renamed_settings_status(&darkmux_types::config::DarkmuxConfig::default(), &env, path);
+        assert!(c.hint.unwrap().contains("export DARKMUX_REMOTE_MAX_TOKENS_PER_STEP instead of DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION"));
+        let new: darkmux_types::config::DarkmuxConfig =
+            serde_json::from_str(r#"{"remote":{"max_tokens_per_step":5,"step_budget_policy":"warn"}}"#).unwrap();
+        assert_eq!(renamed_settings_status(&new, &|_| None, path).status, Status::Pass);
+        let defaults = darkmux_types::config::DarkmuxConfig::with_defaults();
+        assert_eq!(renamed_settings_status(&defaults, &|_| None, path).status, Status::Pass);
+    }
+
     fn no_spend(_: &darkmux_crew::budget::EndpointBudget) -> darkmux_crew::budget::WindowEntries {
         Vec::new()
     }
@@ -13317,6 +13387,14 @@ mod tests {
         );
         let c = endpoints_status(&off, &mut |_| panic!("an `off` budget must not read the window"));
         assert!(c.message.contains("budget off (nothing is counted)"), "{}", c.message);
+        // (review M2) Unreadable limits are Fail too, by path, never "no budget".
+        let typo = materialized(
+            r#"{"profiles":{"p":{"models":[{"id":"m","endpoint":"e"}]}},
+                "endpoints":{"e":{"url":"https://h.example/v1","limits":{"window":{"period":"1d","tokens":"2M"}}}}}"#,
+        );
+        let c = endpoints_status(&typo, &mut no_spend);
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("endpoints.e.limits") && c.message.contains("2M"), "{}", c.message);
     }
 
     /// (#2902 step 4) An inline endpoint still works; doctor names the move.
@@ -13430,8 +13508,9 @@ mod tests {
         // `check_detection_policy` left the array for the generic
         // `check_enum_settings`, which contributes one row per registered
         // enum setting.
+        // (#2902 step 5) 68: `check_renamed_budget_settings` joined.
         let expected =
-            67 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            68 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

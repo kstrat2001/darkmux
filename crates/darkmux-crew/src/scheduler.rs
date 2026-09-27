@@ -627,7 +627,7 @@ pub fn run_step_graph(
     // comes from a Step's own `config.bucket_group` (resolved per-step,
     // inline in the wave loop below, because a group can first appear in
     // ANY wave) and its budget is a runtime value read from that same
-    // config or `config_access::remote_max_tokens_per_execution()`. An
+    // config or `config_access::remote_max_tokens_per_step()`. An
     // `ArtifactBus` entry's factory is a plain `fn() -> Arc<dyn Any + Send
     // + Sync>` chosen specifically for `Port` to stay `const`-constructible
     // (see `Port`'s doc) — it cannot capture a runtime budget value, so
@@ -1183,8 +1183,8 @@ pub fn run_step_graph(
                     // expected to declare the SAME value; the first step to
                     // create the group's bucket wins (the bucket lives for
                     // the whole graph run). Absent, `remote.max_tokens_per_
-                    // execution` applies, and (#2902 step 5) with neither
-                    // there is no stage budget.
+                    // step` applies, and (#2902 step 5) with neither there
+                    // is no per-step cap.
                     let explicit = step_snapshot.config.get("bucket_budget").and_then(|v| v.as_u64());
                     let bucket = match bucket_groups.get(group) {
                         Some(b) => b.clone(),
@@ -3879,12 +3879,12 @@ mod tests {
             let entry = match ctx.remote_bucket() {
                 Some(b) => {
                     let mut g = b.lock().expect("bucket poisoned");
-                    // (#2902 step 5) "Admitted" = the shared stage still had
+                    // (#2902 step 5) "Admitted" = the shared bucket still had
                     // room when this step arrived. Then reserve far past the
                     // budget and never settle it down, so the next grouped
                     // sibling finds the SAME bucket spent.
                     let admitted = !g.exhausted();
-                    let _ = g.admit_reserve(u32::MAX);
+                    g.admit_reserve(u32::MAX);
                     (step.id.clone(), true, admitted)
                 }
                 None => (step.id.clone(), false, false),
@@ -3930,7 +3930,7 @@ mod tests {
         // draw, so step A admits + exhausts and step B is refused — proving
         // the scheduler handed both the SAME shared bucket, not a fresh
         // per-step allowance each.
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
         let prev = std::env::var(k).ok();
         unsafe {
             std::env::set_var(k, "100");

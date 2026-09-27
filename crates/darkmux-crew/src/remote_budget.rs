@@ -1,59 +1,50 @@
-//! `RemoteBudget`: one pipeline stage's hosted-token bucket, metering the
-//! STAGE budget (`remote.max_tokens_per_execution`, where one execution =
-//! one pipeline stage; a bare hosted `dispatch` is one). Local calls never
-//! touch it.
+//! `RemoteBudget`: one step's hosted-token bucket, metering the per-step
+//! cap on hosted tokens (`remote.max_tokens_per_step`; `dispatch.map` steps
+//! naming the same `bucket_group` share one bucket, and a bare hosted
+//! `dispatch` is one step). Local calls never touch it.
 //!
-//! **(#2902 step 5) The budget is the operator's, and reaching it never
-//! stops the stage.** There is no built-in number: `None` is no stage
-//! budget, and nothing is counted. When the operator sets one, the stage
-//! policy (`remote.stage_budget_policy`, the same `off` / `warn` / `wait`
-//! words an endpoint budget uses, [`BudgetPolicy`]) decides what reaching it
-//! does:
+//! **(#2902 step 5) The cap is the operator's, and reaching it never stops
+//! the step.** There is no built-in number: `None` is no cap, and nothing is
+//! counted. When the operator sets one, `remote.step_budget_policy` decides
+//! what reaching it does, and it has two values (operator, 2026-09-27):
 //!
 //! - `off`: nothing is counted.
 //! - `warn` (absent = `warn`): every call is admitted, and the first time
-//!   the stage's spend reaches its budget [`RemoteBudget::take_breach`]
-//!   hands the caller one breach to surface (`crate::budget` prints and
-//!   records it).
-//! - `wait`: once the budget is spent, [`RemoteBudget::admit_reserve`]
-//!   answers [`StageAdmit::Wait`] and the caller waits
-//!   (`crate::budget::admit_stage`) until the operator raises the budget or
-//!   switches the policy (re-read from disk while it waits), or aborts the
-//!   run. A stage has no rolling window, so nothing frees room on its own.
+//!   the step's spend reaches its cap [`RemoteBudget::take_breach`] hands
+//!   the caller one breach to surface (`crate::budget::settle_step` prints
+//!   and records it).
+//!
+//! There is no `wait` for a step: a step has no rolling window, so nothing
+//! would ever free room. `wait` is an ENDPOINT budget's value only, and
+//! `remote.step_budget_policy: wait` is refused at preflight.
 //!
 //! Before 4.0 this bucket had a 500000 default, SKIPPED the calls a spent
-//! stage would have made (a named envelope reason), and clamped each call's
+//! step would have made (a named envelope reason), and clamped each call's
 //! `max_tokens` to what was left, denying a grant below a per-caller floor
 //! (#1610). All three are gone: skipping and clamping both stopped work the
 //! operator never asked to stop, and with no clamp there is no starved grant
 //! for a floor to deny.
 //!
-//! **The ceiling is SOFT, by construction.** Admission is checked BEFORE a
-//! call and the call's cost is settled AFTER it, so a stage can overshoot by
-//! whatever the calls in flight at the crossing spend.
-//!
-//! **Concurrent siblings.** [`RemoteBudget::admit_reserve`] reserves the
-//! requested cap in the same locked operation it admits in, and
-//! [`RemoteBudget::settle`] replaces the reservation with the real spend, so
-//! sibling `dispatch.map` steps sharing one `bucket_group` (#1442) see each
-//! other's in-flight calls rather than all admitting against the same
-//! untouched balance.
+//! **The ceiling is SOFT, by construction.** A call's cost is settled AFTER
+//! it, so a step can overshoot by whatever the calls in flight at the
+//! crossing spend. Each call's cap is reserved when it is admitted and
+//! replaced by its real spend when it settles, so concurrent siblings of one
+//! `bucket_group` (#1442) see each other's calls in flight.
 
-use darkmux_types::BudgetPolicy;
+use darkmux_types::config::StepBudgetPolicy;
 use serde::{Deserialize, Serialize};
 
-/// (#1260) One pipeline stage's remote token-bucket outcome — the row that
-/// lands in a mission's envelope (e.g. `darkmux-lab`'s
-/// `ReviewEnvelope::remote_budgets`). An "execution" is one stage (the
-/// probe pass, each judge pass, the verify pass), each drawing from its own
-/// `remote.max_tokens_per_execution` allowance so a runaway stage is caught
-/// at the cap without starving later stages.
+/// (#1260) One bucket's outcome row, as it lands in a mission's envelope
+/// (e.g. `darkmux-lab`'s `ReviewEnvelope::remote_budgets`). Its `stage`
+/// field is the envelope's wire name for the bucket's label (the retired
+/// review pipeline labeled its buckets `probe`, `judge-pass1`, ...), kept
+/// so recorded envelopes still read; the bucket is a per-step cap.
 // (#2310 P2) `PartialEq` is new — every field is a plain String/u64/bool/
 // u32, so this rides inside a typed `Output<T>` body (which derives
 // `PartialEq` throughout — see `darkmux_crew::step_output`'s module doc).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RemoteBudgetRecord {
-    /// e.g. `probe` | `judge-pass1` | `judge-pass2` | `verify`.
+    /// The bucket's label (wire name kept), e.g. a step id.
     pub stage: String,
     pub max_tokens: u64,
     pub used_tokens: u64,
@@ -62,28 +53,19 @@ pub struct RemoteBudgetRecord {
     pub skipped_calls: u32,
 }
 
-/// A stage whose spend has reached its budget.
+/// A step whose spend has reached its cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StageBreach {
+pub struct StepBreach {
     pub used: u64,
     pub budget: u64,
 }
 
-/// What [`RemoteBudget::admit_reserve`] says about one call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StageAdmit {
-    /// Make the call. The requested cap is reserved; settle it after.
-    Proceed,
-    /// `wait` policy and the budget is spent: hold the call.
-    Wait(StageBreach),
-}
-
-/// One stage's bucket. See the module doc.
+/// One step's bucket. See the module doc.
 #[derive(Debug)]
 pub struct RemoteBudget {
-    stage: Option<&'static str>,
+    label: Option<&'static str>,
     budget: Option<u64>,
-    policy: BudgetPolicy,
+    policy: StepBudgetPolicy,
     used: u64,
     calls: u32,
     /// The breach has been handed out ([`Self::take_breach`] fires once).
@@ -91,38 +73,38 @@ pub struct RemoteBudget {
 }
 
 impl RemoteBudget {
-    /// A bucket with no stage label ([`Self::record`] returns `None`).
-    pub fn new(budget: Option<u64>, policy: BudgetPolicy) -> Self {
-        Self { stage: None, budget, policy, used: 0, calls: 0, surfaced: false }
+    /// A bucket with no label ([`Self::record`] returns `None`).
+    pub fn new(budget: Option<u64>, policy: StepBudgetPolicy) -> Self {
+        Self { label: None, budget, policy, used: 0, calls: 0, surfaced: false }
     }
 
-    /// A bucket that reports its stage on [`Self::record`].
-    pub fn with_stage(stage: &'static str, budget: Option<u64>, policy: BudgetPolicy) -> Self {
-        Self { stage: Some(stage), ..Self::new(budget, policy) }
+    /// A bucket that reports its label on [`Self::record`].
+    pub fn labeled(label: &'static str, budget: Option<u64>, policy: StepBudgetPolicy) -> Self {
+        Self { label: Some(label), ..Self::new(budget, policy) }
     }
 
     /// The bucket the configuration describes: `explicit` (a launcher's
     /// `bucket_budget` stamped into the step's own config) else
-    /// `remote.max_tokens_per_execution` (no default), under
-    /// `remote.stage_budget_policy`. An unregistered policy is an error,
+    /// `remote.max_tokens_per_step` (no default), under
+    /// `remote.step_budget_policy`. An unregistered policy is an error,
     /// never a fallback (preflight refuses it before any run starts).
     pub fn from_config(explicit: Option<u64>) -> Result<Self, darkmux_types::config_enum::BadEnumValue> {
-        let policy = darkmux_types::config_access::remote_stage_budget_policy()?;
-        Ok(Self::new(explicit.or_else(darkmux_types::config_access::remote_max_tokens_per_execution), policy))
+        let policy = darkmux_types::config_access::remote_step_budget_policy()?;
+        Ok(Self::new(explicit.or_else(darkmux_types::config_access::remote_max_tokens_per_step), policy))
     }
 
     /// True when this bucket counts anything: a budget is set and the
     /// policy is not `off`.
     pub fn counts(&self) -> bool {
-        self.budget.is_some() && self.policy.counts()
+        self.budget.is_some() && self.policy == StepBudgetPolicy::Warn
     }
 
-    /// The stage budget, when one is set.
+    /// The per-step cap, when one is set.
     pub fn budget(&self) -> Option<u64> {
         self.budget
     }
 
-    pub fn policy(&self) -> BudgetPolicy {
+    pub fn policy(&self) -> StepBudgetPolicy {
         self.policy
     }
 
@@ -136,20 +118,10 @@ impl RemoteBudget {
         self.counts() && self.budget.is_some_and(|b| self.used >= b)
     }
 
-    fn breach(&self) -> StageBreach {
-        StageBreach { used: self.used, budget: self.budget.unwrap_or(0) }
-    }
-
-    /// Admit one call and reserve `requested` (the call's completion cap)
-    /// against the bucket, or, under `wait` with the budget spent, say to
-    /// wait. Never clamps and never refuses: under `off`, `warn` or no
-    /// budget the call always proceeds.
-    pub fn admit_reserve(&mut self, requested: u32) -> StageAdmit {
-        if self.policy == BudgetPolicy::Wait && self.exhausted() {
-            return StageAdmit::Wait(self.breach());
-        }
+    /// Admit one call and reserve `requested` (the call's completion cap).
+    /// Never clamps, never refuses, never holds.
+    pub fn admit_reserve(&mut self, requested: u32) {
         self.used = self.used.saturating_add(u64::from(requested));
-        StageAdmit::Proceed
     }
 
     /// Replace a reservation made by [`Self::admit_reserve`] with the call's
@@ -162,36 +134,26 @@ impl RemoteBudget {
     }
 
     /// The breach to surface, ONCE per bucket: the first time a counting
-    /// bucket's spend has reached its budget. `None` otherwise.
-    pub fn take_breach(&mut self) -> Option<StageBreach> {
+    /// bucket's spend has reached its cap. `None` otherwise.
+    pub fn take_breach(&mut self) -> Option<StepBreach> {
         if self.surfaced || !self.exhausted() {
             return None;
         }
         self.surfaced = true;
-        Some(self.breach())
+        Some(StepBreach { used: self.used, budget: self.budget.unwrap_or(0) })
     }
 
-    /// Adopt a budget and policy re-read while waiting (the operator raised
-    /// the budget, or changed the policy).
-    pub fn reconfigure(&mut self, budget: Option<u64>, policy: BudgetPolicy) {
-        if budget != self.budget {
-            self.surfaced = false;
-        }
-        self.budget = budget;
-        self.policy = policy;
-    }
-
-    /// This stage's outcome row: `None` without a stage label, without a
-    /// budget, or when no call was made. `skipped_calls` is always 0 now
-    /// (a stage never skips a call); the field stays for the row's shape.
+    /// This bucket's outcome row: `None` without a label, without a cap, or
+    /// when no call was made. `skipped_calls` is always 0 now (a step never
+    /// skips a call); the field stays for the row's shape.
     pub fn record(&self) -> Option<RemoteBudgetRecord> {
-        let stage = self.stage?;
+        let label = self.label?;
         let budget = self.budget?;
         if self.calls == 0 {
             return None;
         }
         Some(RemoteBudgetRecord {
-            stage: stage.to_string(),
+            stage: label.to_string(),
             max_tokens: budget,
             used_tokens: self.used,
             exhausted: self.used >= budget,
@@ -204,14 +166,14 @@ impl RemoteBudget {
 mod tests {
     use super::*;
 
-    /// No budget: nothing counts, every call proceeds, nothing is surfaced,
-    /// and no row is emitted, however much is spent.
+    /// No budget: nothing counts, nothing is surfaced, and no row is
+    /// emitted, however much is spent.
     #[test]
     fn no_budget_counts_nothing() {
-        for policy in [BudgetPolicy::Off, BudgetPolicy::Warn, BudgetPolicy::Wait] {
-            let mut b = RemoteBudget::with_stage("s", None, policy);
+        for policy in [StepBudgetPolicy::Off, StepBudgetPolicy::Warn] {
+            let mut b = RemoteBudget::labeled("s", None, policy);
             for _ in 0..5 {
-                assert_eq!(b.admit_reserve(1_000_000), StageAdmit::Proceed);
+                b.admit_reserve(1_000_000);
                 b.settle(1_000_000, 9_000_000, 1);
             }
             assert!(!b.counts() && !b.exhausted());
@@ -223,99 +185,62 @@ mod tests {
     /// `off` with a budget set: still nothing counts.
     #[test]
     fn off_never_breaches_even_past_the_budget() {
-        let mut b = RemoteBudget::new(Some(100), BudgetPolicy::Off);
-        assert_eq!(b.admit_reserve(500), StageAdmit::Proceed);
+        let mut b = RemoteBudget::new(Some(100), StepBudgetPolicy::Off);
+        b.admit_reserve(500);
         b.settle(500, 1_000, 1);
-        assert_eq!(b.admit_reserve(500), StageAdmit::Proceed);
         assert_eq!(b.take_breach(), None);
     }
 
-    /// `warn`: every call proceeds, the breach is surfaced exactly once, and
-    /// no call is ever clamped (the reservation is the full request).
+    /// `warn`: the breach is surfaced exactly once, and no call is ever
+    /// clamped (the reservation is the full request).
     #[test]
-    fn warn_admits_every_call_and_surfaces_the_breach_once() {
-        let mut b = RemoteBudget::with_stage("probe", Some(1_000), BudgetPolicy::Warn);
-        assert_eq!(b.admit_reserve(4_096), StageAdmit::Proceed);
+    fn warn_surfaces_the_breach_once_and_never_clamps() {
+        let mut b = RemoteBudget::labeled("probe", Some(1_000), StepBudgetPolicy::Warn);
+        b.admit_reserve(4_096);
         assert_eq!(b.used(), 4_096, "reserved in full: never clamped to the budget");
         b.settle(4_096, 1_200, 1);
-        assert_eq!(b.take_breach(), Some(StageBreach { used: 1_200, budget: 1_000 }));
+        assert_eq!(b.take_breach(), Some(StepBreach { used: 1_200, budget: 1_000 }));
         assert_eq!(b.take_breach(), None, "surfaced once");
         for _ in 0..3 {
-            assert_eq!(b.admit_reserve(4_096), StageAdmit::Proceed, "warn never holds a call");
+            b.admit_reserve(4_096);
             b.settle(4_096, 10, 1);
         }
         let rec = b.record().unwrap();
         assert_eq!((rec.max_tokens, rec.used_tokens, rec.exhausted, rec.skipped_calls), (1_000, 1_230, true, 0));
     }
 
-    /// `wait`: calls proceed while there is room; once spent, the next call
-    /// waits (and is not reserved); a raised budget lets it proceed.
+    /// A zero budget under `warn` surfaces the breach at once. (Pre-4.0, 0
+    /// was a hard refusal.)
     #[test]
-    fn wait_holds_only_once_spent_and_a_raised_budget_releases_it() {
-        let mut b = RemoteBudget::new(Some(1_000), BudgetPolicy::Wait);
-        assert_eq!(b.admit_reserve(600), StageAdmit::Proceed);
-        b.settle(600, 900, 1);
-        assert_eq!(b.admit_reserve(600), StageAdmit::Proceed, "900 < 1000: room");
-        b.settle(600, 300, 1);
-        assert_eq!(b.admit_reserve(600), StageAdmit::Wait(StageBreach { used: 1_200, budget: 1_000 }));
-        assert_eq!(b.used(), 1_200, "a waiting call reserves nothing");
-        b.reconfigure(Some(5_000), BudgetPolicy::Wait);
-        assert_eq!(b.admit_reserve(600), StageAdmit::Proceed);
-        b.reconfigure(Some(10), BudgetPolicy::Warn);
-        assert_eq!(b.admit_reserve(600), StageAdmit::Proceed, "switched to warn: never holds");
-    }
-
-    /// A zero budget under `wait` holds the first call; under `warn` it
-    /// proceeds and surfaces the breach. (Pre-4.0, 0 was a hard refusal.)
-    #[test]
-    fn a_zero_budget_waits_or_warns_and_never_refuses() {
-        let mut w = RemoteBudget::new(Some(0), BudgetPolicy::Wait);
-        assert!(matches!(w.admit_reserve(10), StageAdmit::Wait(_)));
-        let mut n = RemoteBudget::new(Some(0), BudgetPolicy::Warn);
-        assert_eq!(n.admit_reserve(10), StageAdmit::Proceed);
+    fn a_zero_budget_warns_and_never_refuses() {
+        let mut n = RemoteBudget::new(Some(0), StepBudgetPolicy::Warn);
+        n.admit_reserve(10);
         assert!(n.take_breach().is_some());
     }
 
-    /// Concurrent siblings on one shared bucket: every attempt is admitted
-    /// or told to wait (never lost), and the reservations keep a `wait`
-    /// bucket's admitted spend within the budget plus one call per thread in
-    /// flight at the crossing.
+    /// Concurrent siblings on one shared bucket: every call's reservation
+    /// and settlement is accounted.
     #[test]
-    fn concurrent_admit_reserve_settle_accounts_every_attempt() {
+    fn concurrent_admit_reserve_settle_accounts_every_call() {
         use std::sync::{Arc, Mutex};
-        const BUDGET: u64 = 20_000;
         const REQ: u32 = 100;
-        const THREADS: u32 = 32;
+        const THREADS: u32 = 16;
         const ITERS: u32 = 20;
-        let bucket = Arc::new(Mutex::new(RemoteBudget::with_stage("stress", Some(BUDGET), BudgetPolicy::Wait)));
+        let bucket = Arc::new(Mutex::new(RemoteBudget::labeled("stress", Some(1_000), StepBudgetPolicy::Warn)));
         let handles: Vec<_> = (0..THREADS)
             .map(|_| {
                 let bucket = Arc::clone(&bucket);
                 std::thread::spawn(move || {
-                    let (mut admitted, mut held) = (0u32, 0u32);
                     for _ in 0..ITERS {
-                        let a = bucket.lock().unwrap().admit_reserve(REQ);
-                        match a {
-                            StageAdmit::Proceed => {
-                                admitted += 1;
-                                bucket.lock().unwrap().settle(REQ, u64::from(REQ), 1);
-                            }
-                            StageAdmit::Wait(_) => held += 1,
-                        }
+                        bucket.lock().unwrap().admit_reserve(REQ);
+                        bucket.lock().unwrap().settle(REQ, 7, 1);
                     }
-                    (admitted, held)
                 })
             })
             .collect();
-        let (mut admitted, mut held) = (0, 0);
         for h in handles {
-            let (a, w) = h.join().unwrap();
-            admitted += a;
-            held += w;
+            h.join().unwrap();
         }
-        assert_eq!(admitted + held, THREADS * ITERS);
-        let b = bucket.lock().unwrap();
-        assert!(b.used() <= BUDGET, "reservations keep admitted spend inside the budget: {}", b.used());
-        assert_eq!(u64::from(admitted) * u64::from(REQ), b.used());
+        assert_eq!(bucket.lock().unwrap().used(), u64::from(THREADS * ITERS) * 7);
     }
 }

@@ -118,9 +118,10 @@ crate::config_enum!(Dialect, "endpoint dialect", [
 ]);
 
 /// (#2902 step 5) What darkmux does when an endpoint's budget is reached.
-/// The same three words every budget uses (`remote.stage_budget_policy`
-/// too), registered on the #2947 `ConfigEnum` rule: an unregistered value is
-/// refused at preflight, never resolved to a fallback.
+/// Registered on the #2947 `ConfigEnum` rule: an unregistered value is
+/// refused at preflight, never resolved to a fallback. (`wait` is an
+/// endpoint budget's value only: the per-step cap, `remote.step_budget_policy`,
+/// has `off` and `warn`, `config::StepBudgetPolicy`.)
 ///
 /// There is deliberately no action that stops a run: a hard stop is the
 /// operator's own `darkmux mission abort`.
@@ -163,7 +164,7 @@ impl BudgetPolicy {
 ///
 /// **What is not.** `tokens_per_dispatch` and `concurrent_calls` are parsed,
 /// validated and shown by `darkmux doctor`, and change nothing:
-/// `remote.max_tokens_per_execution` (the stage budget) and
+/// `remote.max_tokens_per_step` (the per-step cap) and
 /// `remote.concurrent_cap` still apply. Whether the per-endpoint pair
 /// replaces those two is not decided (#2902).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

@@ -1,13 +1,16 @@
 //! (#2902 step 5) Budgets: the operator's own limits on what darkmux spends
-//! at an endpoint, and what reaching one does.
+//! at an endpoint, and on what one step spends, and what reaching one does.
 //!
 //! **Nothing here runs unless the operator sets a budget.** darkmux ships no
 //! number: an endpoint with no `limits.window` budget, or with `policy:
 //! "off"`, is returned from [`EndpointBudget::of`] as `None` before any file
-//! is opened, so the gate costs a struct read.
+//! is opened, so the gate costs a struct read. A `limits` that cannot be
+//! used as written (unreadable, or a window period that does not parse) is
+//! an ERROR, never "no budget": a typo must not silently disarm a budget
+//! (preflight refuses it first, `darkmux_profiles::preflight`).
 //!
-//! **Once set, a breach never stops the run.** The policy is one of
-//! [`BudgetPolicy`]'s three values:
+//! **Once set, a breach never stops the run.** An endpoint budget's policy
+//! is one of [`BudgetPolicy`]'s three values:
 //!
 //! - `off`: nothing is counted.
 //! - `warn` (the default once a budget is set): the breach is printed on the
@@ -18,8 +21,22 @@
 //!   run page and `darkmux mission status` read), then goes ahead and writes
 //!   `budget.resume`. The wait is recorded in [`darkmux_types::run_pause`],
 //!   which extends the run's wall-clock bound, the host-side twin of the
-//!   thermal governor's pause. A hard stop is the operator's own
-//!   `darkmux mission abort` (the wait polls the interrupt flag).
+//!   thermal governor's pause.
+//!
+//! **Ending a wait.** Every half second the wait checks whether its run was
+//! stopped: the process was interrupted (Ctrl-C, a signal), or its mission
+//! is aborted or finalized, or its phase abandoned, on disk
+//! ([`BudgetEnv::stop_reason`]). `darkmux mission abort` runs in another
+//! process and only writes that terminal state, so the waiter reads it
+//! rather than being signalled: a pid is not the operator's handle on a run
+//! (a mission can outlive, and be aborted apart from, the process that
+//! launched it), and the terminal state on disk is the one authority the
+//! board and every other consumer already read. A stopped wait returns an
+//! error and the call is never sent.
+//!
+//! **The per-step cap** (`remote.max_tokens_per_step`, [`admit_step`] /
+//! [`settle_step`]) has only `off` and `warn` (operator, 2026-09-27): a step
+//! has no rolling window, so there is nothing to wait for.
 //!
 //! **The window.** "The last `period` from now": a rolling window with no
 //! calendar reset. Its spend is the sum of this machine's usage records
@@ -34,16 +51,18 @@
 //!
 //! **"Room"** is `spent < budget`, for tokens and calls alike. The next
 //! call's own cost is unknowable until it returns, so a call admitted with
-//! room can overshoot by itself (a soft ceiling, the same reading the stage
-//! bucket has always had), and the next one then waits.
+//! room can overshoot by itself (a soft ceiling), and the next one then
+//! waits.
 //!
 //! **Cost.** The window is read before every hosted call to a budgeted
 //! endpoint, so it must not re-scan the flow history each time (the #2891
 //! trap). [`Ledger`] opens only the day files the window can touch and
 //! remembers, per file, the byte offset it has read to: a later call reads
 //! only the bytes appended since, and keeps only the (endpoint id, second,
-//! tokens) triples of records that carry an id. Measured in
-//! `ledger_cost_is_incremental_after_the_first_read` below.
+//! tokens) triples of records that carry an id. The FIRST read in a process
+//! pays for every day file the window spans (measured on release builds:
+//! about 5 ms for a 1d window, 45 ms for 7d, 180 ms for 30d on a busy
+//! machine); every later read about 0.1 to 0.7 ms.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek, SeekFrom};
@@ -56,7 +75,7 @@ use darkmux_types::{BudgetPolicy, ModelEndpoint, WindowBudget};
 /// The flow-record telemetry `source` every budget record carries.
 pub const BUDGET_SOURCE: &str = "budget";
 /// A budget was reached (or its `warn_at` fraction was) under `warn`, or a
-/// stage budget was crossed. Level Warn. The call went ahead.
+/// per-step cap was crossed. Level Warn. The call went ahead.
 pub const BUDGET_WARN_ACTION: &str = "budget.warn";
 /// A call is waiting on a budget (`wait`). Level Warn. Carries when it will
 /// resume, when that is known.
@@ -71,8 +90,9 @@ pub const WAIT_POLL_MAX: Duration = Duration::from_secs(30);
 /// How often an interrupt is noticed while a wait sleeps.
 const WAIT_SLICE: Duration = Duration::from_millis(500);
 
-/// Who a gated call is for, so a budget record lands on the right run. Every
-/// field is optional: a `dispatch.map` step runs no role.
+/// Who a gated call is for, so a budget record lands on the right run, and
+/// so a wait can tell that its run was stopped. Every field is optional: a
+/// `dispatch.map` step runs no role.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BudgetCaller<'a> {
     pub role_id: Option<&'a str>,
@@ -80,6 +100,10 @@ pub struct BudgetCaller<'a> {
     pub model: Option<&'a str>,
     pub mission_id: Option<&'a str>,
     pub phase_id: Option<&'a str>,
+    /// The profile registry the command resolved its endpoint from (its
+    /// `--profiles-file`), re-read while a call waits. `None`: the default
+    /// search.
+    pub profiles_file: Option<&'a str>,
 }
 
 /// An endpoint budget ready to enforce.
@@ -95,16 +119,41 @@ pub struct EndpointBudget {
 
 impl EndpointBudget {
     /// The budget `ep` carries, or `None` when there is nothing to enforce:
-    /// no `endpoints` id (an inline endpoint: its usage records carry no id
-    /// to sum by, which `darkmux doctor` names), a MANAGED endpoint (darkmux
-    /// budgets the calls it SENDS to an endpoint it does not manage; local
-    /// calls carry no `endpoint_id`), no window budget, or policy `off`. `Err` names an unregistered policy (preflight refuses it first;
-    /// this keeps a caller that skipped preflight from guessing one).
+    /// no `limits`, no window budget, policy `off`, no `endpoints` id (an
+    /// inline endpoint: its usage records carry no id to sum by, which
+    /// `darkmux doctor` names), or a MANAGED endpoint (darkmux budgets the
+    /// calls it SENDS to an endpoint it does not manage).
+    ///
+    /// `Err` (review M2), never `Ok(None)`, when the limits cannot be used as
+    /// written: unreadable (one mistyped field makes the whole value
+    /// unreadable), an unregistered `policy`, a set window whose `period`
+    /// does not parse, or `warn_at` outside (0, 1). Preflight refuses all of
+    /// them first; this keeps a caller that skipped preflight from running a
+    /// typo'd budget as no budget.
     pub fn of(ep: &ModelEndpoint) -> Result<Option<Self>, String> {
-        let Some(limits) = ep.known_limits() else { return Ok(None) };
+        let at = match ep.named_id() {
+            Some(id) => format!("endpoint `{id}`"),
+            None => "an inline endpoint".to_string(),
+        };
+        let limits = match ep.limits.as_ref() {
+            None => return Ok(None),
+            Some(darkmux_types::Lenient::Known(l)) => l,
+            Some(darkmux_types::Lenient::Unrecognized(raw)) => {
+                let why = serde_json::from_value::<darkmux_types::UsageLimits>(raw.clone())
+                    .err()
+                    .map(|e| format!(" ({e})"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "darkmux: {at}'s `limits` could not be read{why}; a budget that cannot be read is refused, \
+                     never run as no budget. valid: {} (#2902)",
+                    darkmux_types::config_enum::LIMITS_SHAPE
+                ));
+            }
+        };
+        limits.validate().map_err(|e| format!("darkmux: {at}: {e} (#2902)"))?;
         let policy = limits.resolved_policy().map_err(|raw| {
             format!(
-                "darkmux: endpoint budget policy `{raw}` is not one of {} (#2902)",
+                "darkmux: {at}'s budget policy `{raw}` is not one of {} (#2902)",
                 <BudgetPolicy as darkmux_types::config_enum::ConfigEnum>::TOKENS.join(", ")
             )
         })?;
@@ -254,10 +303,22 @@ fn resume_at_for(inside: &[(i64, u64)], br: &Breach, period: i64) -> Option<i64>
 struct DayFile {
     /// Bytes read so far (always at a line boundary).
     offset: u64,
+    /// (review C7) What the bytes already read looked like: the file's
+    /// inode, its first bytes, and the bytes just before `offset`. An append
+    /// changes none of them; a file replaced (new inode) or rewritten in
+    /// place (different head or tail bytes) resets the file and it is read
+    /// again from the start. Not mtime: every append changes that.
+    inode: u64,
+    head: Vec<u8>,
+    tail: Vec<u8>,
     /// `(endpoint id, epoch second, tokens)` for every usage record in the
     /// bytes read that carries an `endpoint_id`.
     entries: Vec<(String, i64, u64)>,
 }
+
+/// How many bytes of a day file's start, and of the bytes just before the
+/// read offset, identify what was already read.
+const FINGERPRINT_BYTES: u64 = 64;
 
 /// An incremental reader of the flow day files (`<flows_dir>/YYYY-MM-DD.jsonl`,
 /// one per UTC day) for the usage records a window budget sums. See the
@@ -318,22 +379,29 @@ impl Ledger {
     fn refresh(&mut self, stem: &str) {
         let path = self.dir.join(format!("{stem}.jsonl"));
         let Ok(mut file) = std::fs::File::open(&path) else { return };
-        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let Ok(meta) = file.metadata() else { return };
+        let len = meta.len();
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(&meta);
+        #[cfg(not(unix))]
+        let inode = 0u64;
         let entry = self.days.entry(stem.to_string()).or_default();
-        if len < entry.offset {
-            // Truncated or replaced: start the file over.
-            *entry = DayFile::default();
+        if entry.offset > 0 {
+            let same = entry.inode == inode
+                && len >= entry.offset
+                && read_at(&mut file, 0, entry.head.len() as u64).as_deref() == Some(entry.head.as_slice())
+                && read_at(&mut file, entry.offset - entry.tail.len() as u64, entry.tail.len() as u64).as_deref()
+                    == Some(entry.tail.as_slice());
+            if !same {
+                // Replaced, truncated or rewritten: start the file over.
+                *entry = DayFile::default();
+            }
         }
+        entry.inode = inode;
         if len == entry.offset {
             return;
         }
-        if file.seek(SeekFrom::Start(entry.offset)).is_err() {
-            return;
-        }
-        let mut buf = Vec::with_capacity((len - entry.offset) as usize);
-        if file.take(len - entry.offset).read_to_end(&mut buf).is_err() {
-            return;
-        }
+        let Some(buf) = read_at(&mut file, entry.offset, len - entry.offset) else { return };
         self.bytes_read += buf.len() as u64;
         // Only COMPLETE lines: a record still being appended is read next
         // time, from the start of its line.
@@ -344,7 +412,19 @@ impl Ledger {
             }
         }
         entry.offset += (last_nl + 1) as u64;
+        let head_len = entry.offset.min(FINGERPRINT_BYTES);
+        entry.head = read_at(&mut file, 0, head_len).unwrap_or_default();
+        let tail_len = entry.offset.min(FINGERPRINT_BYTES);
+        entry.tail = read_at(&mut file, entry.offset - tail_len, tail_len).unwrap_or_default();
     }
+}
+
+/// `len` bytes of `file` from `at`, or `None` when they cannot be read.
+fn read_at(file: &mut std::fs::File, at: u64, len: u64) -> Option<Vec<u8>> {
+    file.seek(SeekFrom::Start(at)).ok()?;
+    let mut buf = Vec::with_capacity(len as usize);
+    std::io::Read::by_ref(file).take(len).read_to_end(&mut buf).ok()?;
+    (buf.len() as u64 == len).then_some(buf)
 }
 
 /// One line to a ledger entry: a usage record that carries an
@@ -379,12 +459,16 @@ pub trait BudgetEnv {
     fn window(&self, b: &EndpointBudget, now: i64) -> WindowEntries;
     /// Sleep `d` (a test advances its clock instead).
     fn sleep(&self, d: Duration);
-    /// True once the process was asked to stop (`mission abort`, Ctrl-C).
-    fn interrupted(&self) -> bool;
-    /// The endpoint's budget as the registry says NOW, re-read while a call
-    /// waits, so raising or switching off a budget releases the wait.
-    /// `None`: keep the one in hand.
-    fn reload(&self, endpoint_id: &str) -> Option<Option<EndpointBudget>>;
+    /// Why the caller's run was stopped, when it was: the process was
+    /// interrupted, or its mission is aborted or finalized, or its phase
+    /// abandoned (read from disk: `darkmux mission abort` runs in another
+    /// process). `None`: keep waiting.
+    fn stop_reason(&self, caller: &BudgetCaller<'_>) -> Option<String>;
+    /// The endpoint's budget as the registry (`profiles_file`, else the
+    /// default search) says NOW, re-read while a call waits, so raising or
+    /// switching off a budget releases the wait. `None`: keep the one in
+    /// hand.
+    fn reload(&self, endpoint_id: &str, profiles_file: Option<&str>) -> Option<Option<EndpointBudget>>;
     /// Write a flow record.
     fn emit(&self, rec: darkmux_flow::FlowRecord);
     /// Print an operator line.
@@ -394,20 +478,38 @@ pub trait BudgetEnv {
     /// The highest breach level already surfaced for `key` in this process.
     fn last_level(&self, key: &str) -> Option<BreachLevel>;
     fn set_last_level(&self, key: &str, level: Option<BreachLevel>);
-    /// The stage budget and policy as the config says NOW (re-read from
-    /// disk while a stage waits, so `darkmux config set` releases it).
-    fn stage_budget_fresh(
-        &self,
-    ) -> (Option<u64>, Result<BudgetPolicy, darkmux_types::config_enum::BadEnumValue>);
 }
 
 /// The production environment: the system clock, the configured flows dir,
-/// the live profile registry, the process-wide flow sink.
+/// the live profile registry, the mission store, the process-wide flow sink.
 pub struct LiveEnv;
 
 fn warned_levels() -> &'static Mutex<HashMap<String, BreachLevel>> {
     static LEVELS: std::sync::OnceLock<Mutex<HashMap<String, BreachLevel>>> = std::sync::OnceLock::new();
     LEVELS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The lowercase `status` of the JSON document at `path`, when it has one.
+fn status_at(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    Some(v.get("status")?.as_str()?.to_ascii_lowercase())
+}
+
+/// (review M1) Why a run was stopped, read from what `darkmux mission
+/// abort` / `finalize` write: the mission's own status, and its phase's.
+pub fn run_stop_reason(mission_id: Option<&str>, phase_id: Option<&str>) -> Option<String> {
+    let mid = mission_id?;
+    if let Some(status) = status_at(&crate::lifecycle::mission_path(mid)) {
+        if matches!(status.as_str(), "aborted" | "finalized" | "closed") {
+            return Some(format!("mission `{mid}` is {status}"));
+        }
+    }
+    let pid = phase_id?;
+    match status_at(&crate::lifecycle::phase_path(mid, pid)).as_deref() {
+        Some("abandoned") => Some(format!("phase `{pid}` of mission `{mid}` is abandoned")),
+        _ => None,
+    }
 }
 
 impl BudgetEnv for LiveEnv {
@@ -424,11 +526,16 @@ impl BudgetEnv for LiveEnv {
     fn sleep(&self, d: Duration) {
         std::thread::sleep(d)
     }
-    fn interrupted(&self) -> bool {
-        darkmux_types::interrupt::is_set()
+    fn stop_reason(&self, caller: &BudgetCaller<'_>) -> Option<String> {
+        if darkmux_types::interrupt::is_set() {
+            return Some("the run was interrupted".to_string());
+        }
+        run_stop_reason(caller.mission_id, caller.phase_id)
     }
-    fn reload(&self, endpoint_id: &str) -> Option<Option<EndpointBudget>> {
-        let loaded = darkmux_profiles::profiles::load_registry(None).ok()?;
+    fn reload(&self, endpoint_id: &str, profiles_file: Option<&str>) -> Option<Option<EndpointBudget>> {
+        // Quiet: a quarantine warning every 30 s of a wait is noise; the
+        // command's own load already printed it once.
+        let loaded = darkmux_profiles::profiles::load_registry_quiet(profiles_file).ok()?;
         let ep = loaded.registry.endpoints.get(endpoint_id)?;
         let mut named = ep.clone();
         named.source = darkmux_types::EndpointSource::Named(endpoint_id.to_string());
@@ -446,11 +553,6 @@ impl BudgetEnv for LiveEnv {
     fn last_level(&self, key: &str) -> Option<BreachLevel> {
         warned_levels().lock().unwrap_or_else(|p| p.into_inner()).get(key).copied()
     }
-    fn stage_budget_fresh(
-        &self,
-    ) -> (Option<u64>, Result<BudgetPolicy, darkmux_types::config_enum::BadEnumValue>) {
-        darkmux_types::config_access::remote_stage_budget_fresh()
-    }
     fn set_last_level(&self, key: &str, level: Option<BreachLevel>) {
         let mut m = warned_levels().lock().unwrap_or_else(|p| p.into_inner());
         match level {
@@ -464,12 +566,36 @@ impl BudgetEnv for LiveEnv {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// (review C1) A test's stand-in environment for [`admit_endpoint`], so
+    /// a behavioral test drives a real production path (the step kinds,
+    /// `dispatch_remote`) and sees the gate fire. Thread-local: the paths
+    /// under test gate on the thread that runs them.
+    static TEST_ENV: std::cell::RefCell<Option<std::rc::Rc<dyn BudgetEnv>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with `env` standing in for [`LiveEnv`] in [`admit_endpoint`] on
+/// this thread.
+#[cfg(test)]
+pub(crate) fn with_test_env<T>(env: std::rc::Rc<dyn BudgetEnv>, f: impl FnOnce() -> T) -> T {
+    TEST_ENV.with(|e| *e.borrow_mut() = Some(env));
+    let out = f();
+    TEST_ENV.with(|e| *e.borrow_mut() = None);
+    out
+}
+
 /// THE gate every hosted call to an endpoint passes through, before the
-/// call. `Ok` means go ahead (after warning, or after waiting); `Err` only
-/// for an unregistered policy or an interrupt during a wait. An endpoint
-/// with no budget returns at once, without reading anything.
+/// call. `Ok` means go ahead (after warning, or after waiting); `Err` for
+/// limits that cannot be used as written, or a run stopped during a wait
+/// (nothing was sent). An endpoint with no budget returns at once, without
+/// reading anything.
 pub fn admit_endpoint(ep: &ModelEndpoint, caller: &BudgetCaller<'_>) -> anyhow::Result<()> {
     let Some(budget) = EndpointBudget::of(ep).map_err(|e| anyhow::anyhow!(e))? else { return Ok(()) };
+    #[cfg(test)]
+    if let Some(env) = TEST_ENV.with(|e| e.borrow().clone()) {
+        return admit_with(budget, caller, &*env);
+    }
     admit_with(budget, caller, &LiveEnv)
 }
 
@@ -496,9 +622,9 @@ pub fn admit_with(mut b: EndpointBudget, caller: &BudgetCaller<'_>, env: &dyn Bu
                 return Ok(());
             }
             Verdict::Wait { breach, resume_at } => {
-                if env.interrupted() {
+                if let Some(why) = env.stop_reason(caller) {
                     anyhow::bail!(
-                        "darkmux: interrupted while waiting on endpoint `{}`'s budget ({}); nothing was sent",
+                        "darkmux: stopped waiting on endpoint `{}`'s budget ({}): {why}; nothing was sent",
                         b.endpoint_id,
                         b.describe()
                     );
@@ -509,14 +635,14 @@ pub fn admit_with(mut b: EndpointBudget, caller: &BudgetCaller<'_>, env: &dyn Bu
                 }
                 env.set_last_level(&key, Some(BreachLevel::AtLimit));
                 // Sleep to the resume second (+1: a record leaves the window
-                // AT `t + period`), in bounded slices so an interrupt is seen
-                // and a raised budget is noticed.
+                // AT `t + period`), in bounded slices so a stopped run is
+                // seen and a raised budget is noticed.
                 let until = resume_at.map(|r| r + 1).unwrap_or(now + WAIT_POLL_MAX.as_secs() as i64);
                 let span = Duration::from_secs((until - now).clamp(1, WAIT_POLL_MAX.as_secs() as i64) as u64);
-                let slept = sleep_sliced(env, span);
+                let slept = sleep_sliced(env, span, caller);
                 waited_ms = waited_ms.saturating_add(slept);
                 env.paused(slept);
-                match env.reload(&b.endpoint_id) {
+                match env.reload(&b.endpoint_id, caller.profiles_file) {
                     Some(Some(fresh)) => b = fresh,
                     Some(None) => {
                         // Switched off (or removed) while waiting: go ahead.
@@ -530,13 +656,13 @@ pub fn admit_with(mut b: EndpointBudget, caller: &BudgetCaller<'_>, env: &dyn Bu
     }
 }
 
-/// Sleep `span` in [`WAIT_SLICE`]s, stopping early on an interrupt.
-/// Returns the milliseconds slept.
-fn sleep_sliced(env: &dyn BudgetEnv, span: Duration) -> u64 {
+/// Sleep `span` in [`WAIT_SLICE`]s, stopping early once the caller's run
+/// was stopped. Returns the milliseconds slept.
+fn sleep_sliced(env: &dyn BudgetEnv, span: Duration, caller: &BudgetCaller<'_>) -> u64 {
     let mut left = span;
     let mut slept = 0u64;
     while !left.is_zero() {
-        if env.interrupted() {
+        if env.stop_reason(caller).is_some() {
             break;
         }
         let step = left.min(WAIT_SLICE);
@@ -636,9 +762,13 @@ fn announce_wait(
         ),
         None => "the budget is 0, so it waits until it is raised in profiles.json".to_string(),
     };
+    let how_to_stop = match caller.mission_id {
+        Some(mid) => format!("`darkmux mission abort {mid}` ends the wait without sending"),
+        None => "Ctrl-C ends the wait without sending".to_string(),
+    };
     let message = format!(
-        "darkmux: endpoint `{}` has reached its budget ({} of {} {} in the last {}); \
-         calls to it are waiting, {when}. `darkmux mission abort <id>` stops the run.",
+        "darkmux: endpoint `{}` has reached its budget ({} of {} {} in the last {}); calls to it are \
+         waiting, {when}. {how_to_stop}.",
         b.endpoint_id,
         br.spent,
         br.limit,
@@ -697,7 +827,8 @@ fn resume_if_waited(b: &EndpointBudget, caller: &BudgetCaller<'_>, env: &dyn Bud
 /// with this reason, so a budget rest reads as its own state, not thermal.
 pub const PACE_REASON: &str = "budget";
 
-/// How often the pacer re-reads the window while NOT waiting.
+/// How often the pacer re-reads the window while NOT waiting. While it
+/// waits it re-reads on every sampler tick (~2 s).
 pub const PACER_CHECK_MS: u64 = 5_000;
 /// How often a waiting pacer re-reads the endpoint's limits from the
 /// registry (a raised or switched-off budget releases the wait).
@@ -710,6 +841,22 @@ pub enum PacerEvent {
     Resumed { state: String },
 }
 
+/// What the other governors hold on the pace file this tick, so the pacer
+/// neither overwrites nor drops them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OtherPacing {
+    /// Thermal or battery holds a genuine pause: the pacer writes nothing.
+    pub pausing: bool,
+    /// Thermal is duty-cycling (`pause: false` with a turn delay):
+    /// `(turn_delay_ms, state)`. A pacer releasing its own pause writes this
+    /// instruction back rather than a bare `pause: false` (review C6).
+    pub duty_cycle: Option<(u64, String)>,
+}
+
+/// The duty-cycle `reason` the thermal governor writes, restored verbatim
+/// when the pacer lets go of the file during a duty-cycle episode.
+const THERMAL_DUTY_REASON: &str = "thermal-duty-cycle";
+
 /// The budget gate for a dispatch whose calls are made INSIDE the runtime
 /// container (an agentic-remote brain, #1187): the host cannot stand in
 /// front of each call, so it rides the dispatch's host sampler (a ~2 s
@@ -720,13 +867,18 @@ pub enum PacerEvent {
 /// it waits; the wait is also recorded in [`darkmux_types::run_pause`] for
 /// the run's wall-clock bound. `warn` surfaces the breach and never pauses.
 ///
+/// While NOT waiting it re-reads the window every [`PACER_CHECK_MS`] (5 s),
+/// so the runtime can start up to that many seconds of turns after a window
+/// fills and before the pacer notices; while waiting, every tick.
+///
 /// Sharing the pace file: when another governor (thermal, battery) is
 /// pausing, the pacer writes nothing (theirs is the stronger reason to
-/// hold) and re-asserts its own pause on the next tick they are not. A tick
-/// of latency is the bound: the runtime can start one more turn in the
-/// ~2 s between a window filling and the pacer noticing.
+/// hold) and re-asserts its own pause on the next tick they are not. When
+/// it releases during a thermal duty cycle, it writes the duty cycle's
+/// instruction back.
 pub struct BudgetPacer {
     budget: EndpointBudget,
+    profiles_file: Option<String>,
     since_check_ms: u64,
     since_reload_ms: u64,
     checked_once: bool,
@@ -736,9 +888,10 @@ pub struct BudgetPacer {
 }
 
 impl BudgetPacer {
-    pub fn new(budget: EndpointBudget) -> Self {
+    pub fn new(budget: EndpointBudget, profiles_file: Option<String>) -> Self {
         BudgetPacer {
             budget,
+            profiles_file,
             since_check_ms: 0,
             since_reload_ms: 0,
             checked_once: false,
@@ -761,12 +914,12 @@ impl BudgetPacer {
     }
 
     /// One sampler tick. `elapsed_ms` is the real gap since the last tick,
-    /// `others_pausing` whether thermal or battery holds the pace file now.
+    /// `others` what thermal and battery hold on the pace file now.
     pub fn on_tick(
         &mut self,
         elapsed_ms: u64,
         host_out: &Path,
-        others_pausing: bool,
+        others: &OtherPacing,
         caller: &BudgetCaller<'_>,
         env: &dyn BudgetEnv,
     ) -> Option<PacerEvent> {
@@ -777,9 +930,9 @@ impl BudgetPacer {
             self.since_reload_ms = self.since_reload_ms.saturating_add(elapsed_ms);
             if self.since_reload_ms >= PACER_RELOAD_MS {
                 self.since_reload_ms = 0;
-                match env.reload(&self.budget.endpoint_id) {
+                match env.reload(&self.budget.endpoint_id, self.profiles_file.as_deref()) {
                     Some(Some(fresh)) => self.budget = fresh,
-                    Some(None) => return self.release(host_out, others_pausing, caller, env),
+                    Some(None) => return self.release(host_out, others, caller, env),
                     None => {}
                 }
             }
@@ -800,7 +953,7 @@ impl BudgetPacer {
                 }
                 env.set_last_level(&key, Some(BreachLevel::AtLimit));
                 let state = self.state(resume_at);
-                if !others_pausing {
+                if !others.pausing {
                     crate::pace_file::write(host_out, true, PACE_REASON, &state);
                 }
                 if !self.pausing {
@@ -814,11 +967,11 @@ impl BudgetPacer {
                     warn(&self.budget, &br, caller, env);
                 }
                 env.set_last_level(&key, Some(br.level));
-                self.release(host_out, others_pausing, caller, env)
+                self.release(host_out, others, caller, env)
             }
             Verdict::Proceed => {
                 env.set_last_level(&key, None);
-                self.release(host_out, others_pausing, caller, env)
+                self.release(host_out, others, caller, env)
             }
         }
     }
@@ -826,7 +979,7 @@ impl BudgetPacer {
     fn release(
         &mut self,
         host_out: &Path,
-        others_pausing: bool,
+        others: &OtherPacing,
         caller: &BudgetCaller<'_>,
         env: &dyn BudgetEnv,
     ) -> Option<PacerEvent> {
@@ -836,8 +989,17 @@ impl BudgetPacer {
         self.pausing = false;
         self.announced = None;
         let state = self.budget.endpoint_id.clone();
-        if !others_pausing {
-            crate::pace_file::write(host_out, false, PACE_REASON, &state);
+        if !others.pausing {
+            match &others.duty_cycle {
+                Some((delay, thermal_state)) => crate::pace_file::write_with_turn_delay(
+                    host_out,
+                    false,
+                    THERMAL_DUTY_REASON,
+                    thermal_state,
+                    Some(*delay),
+                ),
+                None => crate::pace_file::write(host_out, false, PACE_REASON, &state),
+            }
         }
         resume_if_waited(&self.budget, caller, env, self.waited_ms.max(1));
         self.waited_ms = 0;
@@ -845,109 +1007,36 @@ impl BudgetPacer {
     }
 }
 
-// ── The stage budget ────────────────────────────────────────────────────
+// ── The per-step cap ────────────────────────────────────────────────────
 
-/// Admit one hosted call against a STAGE bucket (`remote.max_tokens_per_
-/// execution`), reserving `requested`. Under `warn` (or no budget, or `off`)
-/// this never holds. Under `wait` with the budget spent it waits, re-reading
-/// the budget and policy from disk every [`WAIT_POLL_MAX`], until the
-/// operator raises the budget or changes the policy, and reports the wait
-/// like an endpoint's. `Err` only on an interrupt during the wait, or a
-/// policy that became unregistered while waiting.
-pub fn admit_stage(
-    bucket: &Mutex<crate::remote_budget::RemoteBudget>,
-    requested: u32,
-    stage: &str,
-    caller: &BudgetCaller<'_>,
-    env: &dyn BudgetEnv,
-) -> anyhow::Result<()> {
-    use crate::remote_budget::StageAdmit;
-    let mut waited_ms = 0u64;
-    let mut announced = false;
-    loop {
-        let admit = bucket.lock().unwrap_or_else(|p| p.into_inner()).admit_reserve(requested);
-        match admit {
-            StageAdmit::Proceed => {
-                if waited_ms > 0 {
-                    let message = format!(
-                        "darkmux: stage `{stage}` has room again after waiting {}; resuming",
-                        human_duration(waited_ms / 1000)
-                    );
-                    env.say(&message);
-                    env.emit(record(
-                        darkmux_flow::Level::Info,
-                        BUDGET_RESUME_ACTION,
-                        caller,
-                        serde_json::json!({
-                            "scope": "stage", "stage": stage, "waited_ms": waited_ms,
-                            "pid": std::process::id(), "message": message,
-                        }),
-                    ));
-                }
-                return Ok(());
-            }
-            StageAdmit::Wait(br) => {
-                if env.interrupted() {
-                    anyhow::bail!(
-                        "darkmux: interrupted while stage `{stage}` waited on its budget ({} of {} tokens); nothing was sent",
-                        br.used,
-                        br.budget
-                    );
-                }
-                if !announced {
-                    announced = true;
-                    let message = format!(
-                        "darkmux: stage `{stage}` has spent its stage budget ({} of {} tokens,                          remote.max_tokens_per_execution); its hosted calls are waiting until the budget                          is raised (`darkmux config set remote.max_tokens_per_execution <n>`) or                          remote.stage_budget_policy is changed. `darkmux mission abort <id>` stops the run.",
-                        br.used, br.budget
-                    );
-                    env.say(&message);
-                    env.emit(record(
-                        darkmux_flow::Level::Warn,
-                        BUDGET_WAIT_ACTION,
-                        caller,
-                        serde_json::json!({
-                            "scope": "stage", "stage": stage, "policy": "wait",
-                            "metric": Metric::Tokens, "spent": br.used, "limit": br.budget,
-                            "resume_at": null, "wait_seconds": null,
-                            "pid": std::process::id(), "message": message,
-                        }),
-                    ));
-                }
-                let slept = sleep_sliced(env, WAIT_POLL_MAX);
-                waited_ms = waited_ms.saturating_add(slept);
-                env.paused(slept);
-                let (budget, policy) = env.stage_budget_fresh();
-                let policy = policy.map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                bucket.lock().unwrap_or_else(|p| p.into_inner()).reconfigure(budget, policy);
-            }
-        }
-    }
+/// Admit one hosted call against a STEP bucket (`remote.max_tokens_per_step`),
+/// reserving `requested` (the call's completion cap) so concurrent siblings
+/// of one `bucket_group` see it in flight. Never holds, never refuses: the
+/// per-step cap has only `off` and `warn`.
+pub fn admit_step(bucket: &Mutex<crate::remote_budget::RemoteBudget>, requested: u32) {
+    bucket.lock().unwrap_or_else(|p| p.into_inner()).admit_reserve(requested);
 }
 
-/// Settle one call against a STAGE bucket and surface the breach, once, if
-/// this call's spend reached the budget (`warn`, or `wait` whose NEXT call
-/// will hold).
-pub fn settle_stage(
+/// Settle one call against a STEP bucket and surface the breach, once, if
+/// this call's spend reached the cap (`warn`).
+pub fn settle_step(
     bucket: &Mutex<crate::remote_budget::RemoteBudget>,
     reserved: u32,
     actual: u64,
     calls: u32,
-    stage: &str,
+    step: &str,
     caller: &BudgetCaller<'_>,
     env: &dyn BudgetEnv,
 ) {
-    let (breach, policy) = {
+    let breach = {
         let mut b = bucket.lock().unwrap_or_else(|p| p.into_inner());
         b.settle(reserved, actual, calls);
-        (b.take_breach(), b.policy())
+        b.take_breach()
     };
     let Some(br) = breach else { return };
-    let then = match policy {
-        BudgetPolicy::Wait => "policy wait: its next hosted call waits",
-        _ => "policy warn: continuing",
-    };
     let message = format!(
-        "darkmux: ⚠ stage `{stage}` has reached its stage budget: {} of {} tokens          (remote.max_tokens_per_execution); {then}",
+        "darkmux: ⚠ step `{step}` has reached its per-step cap: {} of {} hosted tokens \
+         (remote.max_tokens_per_step); policy warn: continuing",
         br.used, br.budget
     );
     env.say(&message);
@@ -956,8 +1045,7 @@ pub fn settle_stage(
         BUDGET_WARN_ACTION,
         caller,
         serde_json::json!({
-            "scope": "stage", "stage": stage,
-            "policy": darkmux_types::config_enum::ConfigEnum::token(policy),
+            "scope": "step", "step": step, "policy": "warn",
             "level": BreachLevel::AtLimit, "metric": Metric::Tokens,
             "spent": br.used, "limit": br.budget, "message": message,
         }),
@@ -969,9 +1057,9 @@ pub fn settle_stage(
 /// A wait still in progress, read back from the flow log.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct ActiveWait {
-    /// `endpoint` or `stage`.
+    /// `endpoint` (the one budget that waits).
     pub scope: String,
-    /// The endpoint id (endpoint scope) or the stage label (stage scope).
+    /// The endpoint id.
     pub subject: String,
     pub mission_id: Option<String>,
     pub session_id: Option<String>,
@@ -982,14 +1070,36 @@ pub struct ActiveWait {
     pub message: String,
 }
 
-/// Every budget wait still open in `dir`'s last two day files at `now`: the
-/// newest `budget.wait` per (scope, subject, session, pid) with no later
-/// `budget.resume`, whose process is alive and whose resume time has not
-/// passed. For `darkmux mission status`.
-pub fn active_waits(dir: &Path, now: i64, alive: &dyn Fn(u32) -> bool) -> Vec<ActiveWait> {
+/// The oldest a wait's announcement can be: a wait is announced once, when
+/// it starts, and lasts at most the widest window it waits on. Callers pass
+/// the widest `period` configured (`widest_window_secs`); never less than a
+/// day.
+pub fn waits_lookback_secs(widest_window_secs: Option<u64>) -> u64 {
+    widest_window_secs.unwrap_or(0).max(86_400)
+}
+
+/// The widest window period among a registry's endpoint budgets.
+pub fn widest_window_secs(reg: &darkmux_types::ProfileRegistry) -> Option<u64> {
+    reg.endpoints
+        .values()
+        .filter_map(|ep| ep.known_limits()?.window_budget().map(|w| w.period_secs))
+        .max()
+}
+
+/// Every budget wait still open at `now`, from the day files covering the
+/// last `lookback_secs` (review C2: a long window's wait was announced up to
+/// a whole window ago): the newest `budget.wait` per (scope, subject,
+/// session, pid) with no later `budget.resume`, whose process is alive,
+/// whose run was not stopped, and whose resume time has not passed. For
+/// `darkmux mission status`.
+pub fn active_waits(dir: &Path, now: i64, lookback_secs: u64, alive: &dyn Fn(u32) -> bool) -> Vec<ActiveWait> {
     let mut latest: BTreeMap<(String, String, String, u64), (bool, serde_json::Value)> = BTreeMap::new();
-    for day in [darkmux_flow::day_utc_at(now - 86_400), darkmux_flow::day_utc_at(now)] {
-        let Ok(text) = std::fs::read_to_string(dir.join(format!("{day}.jsonl"))) else { continue };
+    let mut day = (now - lookback_secs as i64).div_euclid(86_400) * 86_400;
+    let last = darkmux_flow::day_utc_at(now);
+    while darkmux_flow::day_utc_at(day) <= last {
+        let stem = darkmux_flow::day_utc_at(day);
+        day += 86_400;
+        let Ok(text) = std::fs::read_to_string(dir.join(format!("{stem}.jsonl"))) else { continue };
         for line in text.lines() {
             if !line.contains("\"budget.") {
                 continue;
@@ -1003,12 +1113,7 @@ pub fn active_waits(dir: &Path, now: i64, alive: &dyn Fn(u32) -> bool) -> Vec<Ac
             };
             let p = crate::usage::payload_of(&v);
             let scope = p.get("scope").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let subject = p
-                .get("endpoint_id")
-                .or_else(|| p.get("stage"))
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string();
+            let subject = p.get("endpoint_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let session = v.get("session_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let pid = p.get("pid").and_then(|x| x.as_u64()).unwrap_or(0);
             latest.insert((scope, subject, session, pid), (waiting, v));
@@ -1020,6 +1125,10 @@ pub fn active_waits(dir: &Path, now: i64, alive: &dyn Fn(u32) -> bool) -> Vec<Ac
             if !waiting || !alive(pid as u32) {
                 return None;
             }
+            let s = |k: &str| v.get(k).and_then(|x| x.as_str());
+            if run_stop_reason(s("mission_id"), s("phase_id")).is_some() {
+                return None;
+            }
             let p = crate::usage::payload_of(&v);
             let resume_at = p.get("resume_at").and_then(|x| x.as_str()).map(str::to_string);
             let resume_secs = resume_at.as_deref().and_then(crate::records_emitted::parse_ts_secs);
@@ -1029,7 +1138,7 @@ pub fn active_waits(dir: &Path, now: i64, alive: &dyn Fn(u32) -> bool) -> Vec<Ac
             Some(ActiveWait {
                 scope,
                 subject,
-                mission_id: v.get("mission_id").and_then(|x| x.as_str()).map(str::to_string),
+                mission_id: s("mission_id").map(str::to_string),
                 session_id: (!session.is_empty()).then_some(session),
                 resume_at,
                 resumes_in_secs: resume_secs.map(|r| (r - now).max(0) as u64),
@@ -1041,4 +1150,4 @@ pub fn active_waits(dir: &Path, now: i64, alive: &dyn Fn(u32) -> bool) -> Vec<Ac
 
 #[cfg(test)]
 #[path = "budget_tests.rs"]
-mod tests;
+pub(crate) mod tests;

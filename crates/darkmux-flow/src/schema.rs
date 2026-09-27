@@ -117,30 +117,32 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.64.0";
 //           records without it are never counted against a budget.
 //
 //           ACTIONS (category `telemetry`, source `budget`), each with
-//           `scope` (`endpoint` | `stage`), `endpoint_id` (endpoint scope)
-//           or `stage` (stage scope, the step id or `dispatch`), and a
-//           human `message`:
+//           `scope` (`endpoint` | `step`), `endpoint_id` (endpoint scope)
+//           or `step` (step scope: the step id, or `dispatch` for a bare
+//           hosted dispatch), and a human `message`:
 //           - `budget.warn` (level `warn`): a budget was reached, or its
 //             `warn_at` fraction was, and the call went ahead. Adds
 //             `policy`, `level` (`early` | `at_limit`), `metric` (`tokens` |
 //             `calls`), `spent`, `limit`, and for an endpoint `period` and
 //             `warn_at`.
-//           - `budget.wait` (level `warn`): calls are held under the `wait`
-//             policy. Adds `policy` (`wait`), `metric`, `spent`, `limit`,
-//             `period`, `resume_at` (a record-`ts`-shaped string, or null
-//             when it waits on the operator: a budget of 0, or a stage
-//             budget) and `wait_seconds` (or null), and `pid` (the waiting
+//           - `budget.wait` (level `warn`, endpoint scope only): calls are
+//             held under the `wait` policy. Adds `policy` (`wait`), `metric`,
+//             `spent`, `limit`, `period`, `resume_at` (a record-`ts`-shaped
+//             string, or null for a budget of 0, which waits on the
+//             operator) and `wait_seconds` (or null), and `pid` (the waiting
 //             process, so a reader can tell a live wait from a dead one).
 //           - `budget.resume` (level `info`): a held call went ahead. Adds
 //             `waited_ms` and `pid`.
 //           `dispatch.rest` gains the reason `budget` (the pace-file pause
 //           an agentic-remote dispatch takes while its endpoint's window is
 //           full); its payload shape is unchanged.
-//           `step result.payload.remote_max_tokens_per_execution` (hosted
-//           `dispatch.single_shot`) is null when no stage budget is set; the
-//           stage budget has no default since 4.0, and `max_tokens_sent`
-//           now always equals `max_tokens_requested` (no call is clamped).
-//           An older reader ignores all of it.
+//           `step result.payload` (hosted `dispatch.single_shot`): the key
+//           `remote_max_tokens_per_execution` is renamed
+//           `remote_max_tokens_per_step` with the config key it echoes, and
+//           is null when no per-step cap is set (no default since 4.0);
+//           `max_tokens_sent` now always equals `max_tokens_requested` (no
+//           call is clamped). A reader of the old key finds it absent.
+//           Otherwise an older reader ignores all of it.
 //   1.63.0 (#2947): the degeneracy detector's policy vocabulary names the
 //           action, and one additive action.
 //
