@@ -7869,6 +7869,82 @@
         assert_eq!(records[1]["payload"]["rests"], 2);
     }
 
+    /// (#2947 review M-A, C-a) `warn` warns ONCE per turn, where `conclude`
+    /// would have acted. Under `warn` the turn keeps streaming, so the same
+    /// turn produces more degenerate gate observations and a continuation's
+    /// `would_conclude` checkpoint; the reviewer found two warn-eligible
+    /// events in turn 1 of the runtime's own warn fixture. Fed that real
+    /// sequence (two gate observations then a checkpoint, all `seq` 1): one
+    /// warning line through the sink, one record, count 1. A second turn
+    /// warns again.
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
+    fn a_warn_policy_turn_warns_once_however_many_findings_it_has() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let lines_c = lines.clone();
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            "sess-warn-once".into(),
+            "coder".into(),
+            "darkmux:m".into(),
+        );
+        state.warning_sink = Arc::new(move |l: &str| lines_c.lock().unwrap().push(l.to_string()));
+        let gate = |seq: u64, obs: u64| {
+            format!(
+                r#"{{"type":"dispatch.gate.observation","seq":{seq},"ts":{obs},"tail_ratio":0.01,"degenerate":true,"acted":false,"policy":"warn","observation":{obs},"slice_chars":4002,"interval_tokens":1000}}"#
+            )
+        };
+        state.handle_event(&gate(1, 1));
+        state.handle_event(&gate(1, 2));
+        state.handle_event(r#"{"type":"dispatch.checkpoint","seq":1,"ts":3,"tail_ratio":0.01,"verdict":"continue","policy":"warn","would_conclude":true}"#);
+        let after_turn_1 = (state.summary.degeneracy_warnings, lines.lock().unwrap().clone());
+        state.handle_event(&gate(2, 1));
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+        assert_eq!(after_turn_1.0, 1, "one warning for turn 1, however many findings");
+        assert_eq!(after_turn_1.1.len(), 1, "{:?}", after_turn_1.1);
+        assert!(
+            after_turn_1.1[0].contains("turn 1") && after_turn_1.1[0].contains("policy = warn"),
+            "{}",
+            after_turn_1.1[0]
+        );
+        assert_eq!(state.summary.degeneracy_warnings, 2, "turn 2 warns again");
+        assert_eq!(lines.lock().unwrap().len(), 2);
+        let mut records = Vec::new();
+        for e in std::fs::read_dir(tmp.path()).unwrap().flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            {
+                for l in std::fs::read_to_string(&p).unwrap().lines() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
+                        if v["session_id"] == "sess-warn-once" && v["action"] == "dispatch.degeneracy.warning" {
+                            records.push(v);
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(records.len(), 2, "one record per turn: {records:?}");
+        assert_eq!(records[0]["payload"]["turn_seq"], 1);
+        assert_eq!(records[1]["payload"]["turn_seq"], 2);
+    }
+
     /// (#2947) The tailer turns a `warn`-policy finding into the flow
     /// surface: one Warn-level `dispatch.degeneracy.warning` record per
     /// finding (checkpoint AND stream gate), counted for the envelope; a

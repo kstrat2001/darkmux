@@ -6866,6 +6866,14 @@ fn resolved_runtime_bounds_json(
 pub(crate) struct DegeneracyWarning {
     pub line: String,
     pub payload: serde_json::Value,
+    /// The turn the finding is in (the event's `seq`), the dedupe key.
+    pub turn_seq: Option<u64>,
+}
+
+/// (#2947 review C-a) The production warning sink: one line on this
+/// process's stderr, styled as a warning.
+fn stderr_warning_sink(line: &str) {
+    eprintln!("{}", darkmux_types::style::warn(line));
 }
 
 /// (#2947) Pure: the warning a runtime trajectory event calls for, or
@@ -6891,6 +6899,7 @@ pub(crate) fn degeneracy_warning(event_type: &str, event: &serde_json::Value) ->
     let ratio = event.get("tail_ratio").and_then(|v| v.as_f64());
     let ratio_text = ratio.map(|r| format!(" (tail_ratio={r:.3})")).unwrap_or_default();
     Some(DegeneracyWarning {
+        turn_seq: event.get("seq").and_then(|v| v.as_u64()),
         line: format!(
             "darkmux dispatch: warning: turn {turn}: the output is repeating{ratio_text}; not concluded \
              (runtime.detection.degeneracy.policy = warn). Set it to `conclude` to close a repeating thought."
@@ -9389,6 +9398,17 @@ struct TailerState {
     /// the inactivity deadline) regardless of the 2 s coalescing window.
     chunk_owed: bool,
     summary: TrajectorySummary,
+    /// (#2947 review M-A) Turn seqs the `warn` policy already warned on.
+    /// Under `conclude` the first degenerate finding in a turn acts and the
+    /// turn ends; under `warn` the turn keeps streaming, so every later
+    /// gate observation and every continuation's `would_conclude`
+    /// checkpoint in the SAME turn is the same finding again. One warning
+    /// per turn is what "warn where `conclude` would have acted" means.
+    warned_turns: std::collections::HashSet<u64>,
+    /// (#2947 review C-a) Where a `warn`-policy warning line goes. The
+    /// production default prints it on stderr (`style::warn`); a test
+    /// captures it.
+    warning_sink: Arc<dyn Fn(&str) + Send + Sync>,
     /// (#457) Shared with the watchdog thread. Tailer writes a new
     /// deadline (`now + inactivity_secs`) when a `compaction` event
     /// fires; watchdog reads each tick to decide whether to kill the
@@ -9553,6 +9573,8 @@ impl TailerState {
             last_heartbeat_at: None,
             chunk_owed: false,
             summary: TrajectorySummary::default(),
+            warned_turns: std::collections::HashSet::new(),
+            warning_sink: Arc::new(stderr_warning_sink),
             inactivity_deadline: Some(inactivity_deadline),
             inactivity_secs,
             compaction_threshold: None,
@@ -9771,6 +9793,8 @@ impl TailerState {
             last_heartbeat_at: None,
             chunk_owed: false,
             summary: TrajectorySummary::default(),
+            warned_turns: std::collections::HashSet::new(),
+            warning_sink: Arc::new(stderr_warning_sink),
             inactivity_deadline: None,
             inactivity_secs: 600,
             compaction_threshold: None,
@@ -10583,7 +10607,14 @@ impl TailerState {
     /// envelope's `degeneracy_warnings` count. Nothing is cut: the runtime
     /// never acts under `warn`.
     fn surface_degeneracy_warning(&mut self, w: DegeneracyWarning) {
-        eprintln!("{}", darkmux_types::style::warn(&w.line));
+        // (#2947 review M-A) Once per turn: the first finding is where
+        // `conclude` would have acted; the rest of that turn repeats it.
+        if let Some(turn) = w.turn_seq {
+            if !self.warned_turns.insert(turn) {
+                return;
+            }
+        }
+        (self.warning_sink)(&w.line);
         self.summary.degeneracy_warnings = self.summary.degeneracy_warnings.saturating_add(1);
         self.emit("dispatch.degeneracy.warning", darkmux_flow::Level::Warn, w.payload);
     }
