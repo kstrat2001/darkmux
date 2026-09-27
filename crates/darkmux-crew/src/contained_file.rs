@@ -307,11 +307,12 @@ pub fn read_contained_to_string(
         .map_err(|e| ContainedFileError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))
 }
 
-/// Copy `root/rel` to `dst` (created or truncated), bounded by `max_bytes`.
-/// `dst` is host-owned and is written normally. Streams rather than
-/// buffering the whole file. Nothing is left at `dst` when the source is
-/// refused, missing, or turns out larger than the cap mid-copy. Returns the
-/// number of bytes copied.
+/// Copy `root/rel` to a NEW file `dst`, bounded by `max_bytes`. `dst` is
+/// created exclusively (`O_CREAT|O_EXCL`): an existing file there is
+/// refused and left untouched, never truncated. Streams rather than
+/// buffering the whole file. When the source is refused, missing, or turns
+/// out larger than the cap mid-copy, nothing this call created is left at
+/// `dst`. Returns the number of bytes copied.
 pub fn copy_contained(
     root: &Path,
     rel: &Path,
@@ -325,7 +326,11 @@ pub fn copy_contained(
     if file.metadata()?.len() > max_bytes {
         return Err(too_big());
     }
-    let mut out = File::create(dst).map_err(ContainedFileError::Io)?;
+    let mut out = File::options()
+        .write(true)
+        .create_new(true)
+        .open(dst)
+        .map_err(ContainedFileError::Io)?;
     let copied = io::copy(&mut (&mut file).take(max_bytes + 1), &mut out);
     let fail = |e: ContainedFileError| {
         drop(std::fs::remove_file(dst));
@@ -1075,6 +1080,22 @@ mod tests {
         assert!(!dst.exists(), "a partial copy was left behind");
         assert_eq!(copy_contained(&root, Path::new("sub/big"), &dst, 64).unwrap(), 64);
         assert_eq!(fs::read(&dst).unwrap().len(), 64);
+    }
+
+    /// (#2869 review 3) `dst` is created exclusively: an existing file is
+    /// refused, never truncated, so an over-cap source cannot delete it.
+    #[test]
+    fn copy_contained_refuses_an_existing_destination_and_leaves_it_intact() {
+        let (t, root, _s) = setup();
+        fs::write(root.join("sub/big"), vec![b'x'; 64]).unwrap();
+        fs::write(root.join("sub/small"), "new").unwrap();
+        let dst = t.path().join("existing");
+        fs::write(&dst, "KEEP").unwrap();
+
+        assert!(copy_contained(&root, Path::new("sub/small"), &dst, 64).is_err(), "overwrote an existing dst");
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "KEEP");
+        assert!(copy_contained(&root, Path::new("sub/big"), &dst, 10).is_err());
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "KEEP", "an over-cap copy removed the existing dst");
     }
 
     /// Timing: the fd-walk copy against the pre-#2869 std walk. Not a

@@ -564,9 +564,12 @@ fn resolve_single_source_dir(tree_root: &Path) -> Result<PathBuf, String> {
 /// file, keeping permission bits (a test script's executable bit is
 /// load-bearing for `test_command`). Relative symlinks that stay inside the
 /// checkout are recreated, since real repos commit them and `test_command`
-/// should see them; absolute or escaping links, FIFOs, sockets and devices
-/// are skipped and named in one warning. On macOS the file bytes are a
-/// copy-on-write clone, which answers the cost note above.
+/// should see them; links that could resolve outside the checkout
+/// (absolute, climbing above it, or with any `..` after a name), FIFOs,
+/// sockets and devices are skipped and named in one warning. A copy that
+/// fails partway leaves nothing behind: the scratch directory is a
+/// `TempDir` that `gate_one_mod` drops on its early return. On macOS the
+/// file bytes are a copy-on-write clone, which answers the cost note above.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<crate::contained_file::TreeCopyReport> {
     let report = crate::contained_file::copy_tree_nofollow(src, dst)?;
     if let Some(w) = skipped_entries_warning(src, &report) {
@@ -1532,5 +1535,30 @@ mod tests {
         let report = copy_dir_recursive(&src, &dst2).unwrap();
         let w = skipped_entries_warning(&src, &report).expect("skips must be warned");
         assert!(w.contains("2 entries") && w.contains("abs") && w.contains("escape"), "{w}");
+    }
+
+    /// (#2869 review 3) A scratch copy that fails partway (here, a source
+    /// nested past the tree-copy depth cap) leaves no partial tree behind:
+    /// the gate reports an infra skip and its scratch directory is gone.
+    #[test]
+    fn a_scratch_copy_that_fails_partway_leaves_nothing_behind() {
+        let base = TempDir::new().unwrap();
+        let _scratch_base_guard = ScratchBaseGuard::set(base.path());
+        let (_fixture, tree_root) = fixture_tree("wrong\n");
+        let mut deep = tree_root.join("app");
+        for _ in 0..(crate::contained_file::MAX_TREE_DEPTH + 2) {
+            deep.push("d");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("f.txt"), "x").unwrap();
+        let m = a_mod_kit("mod-deep", "sess-a/1", &one_line_kit("wrong", "right"), Some("unified-diff"));
+
+        let (outcome, reason) = gate_one_mod(&m, "true", Some(&tree_root.to_string_lossy()));
+
+        assert!(outcome.is_none(), "{outcome:?}");
+        let reason = reason.expect("an infra skip reason");
+        assert!(reason.contains("could not copy the source checkout"), "{reason}");
+        let left: Vec<_> = std::fs::read_dir(base.path()).unwrap().collect();
+        assert!(left.is_empty(), "a partial scratch copy was left behind: {left:?}");
     }
 }
