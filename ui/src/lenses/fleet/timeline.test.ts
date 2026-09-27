@@ -46,13 +46,13 @@ describe("buildActivityTimeline — lanes and bars", () => {
   const data: FlowRecord[] = [
     // s1: still running (∈ liveSet) — open-ended bar.
     rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start", ts: iso(-30), handle: "coder" }),
-    // s2: cleanly completed, not live — "done".
+    // s2: cleanly completed, not live — "complete".
     rec({ machine_uid: "m1", session_id: "s2", action: "dispatch.start", ts: iso(-50) }),
     rec({ machine_uid: "m1", session_id: "s2", action: "dispatch.complete", ts: iso(-40) }),
-    // s3: watchdog-killed, not live — "err".
+    // s3: watchdog-killed, not live — "error".
     rec({ machine_uid: "m1", session_id: "s3", action: "dispatch.start", ts: iso(-45) }),
     rec({ machine_uid: "m1", session_id: "s3", action: "dispatch.error", ts: iso(-35), payload: { exit_code: 137 } }),
-    // s4: abandoned (only a session.end close-edge, no dispatch terminal), not live — "canceled".
+    // s4: abandoned (only a session.end close-edge, no dispatch terminal), not live — "abandoned".
     rec({ machine_uid: "m1", session_id: "s4", action: "dispatch.start", ts: iso(-25) }),
     rec({ machine_uid: "m1", session_id: "s4", action: "session.end", ts: iso(-20) }),
     // s5: entirely before the 1h window — dropped, not a bar at all.
@@ -71,31 +71,31 @@ describe("buildActivityTimeline — lanes and bars", () => {
     expect(self.lanes[0].name).toBe("studio");
   });
 
-  it("classifies a still-live session as 'run', open-ended to the window's right edge", () => {
+  it("classifies a still-live session as 'running', open-ended to the window's right edge", () => {
     const tl = buildActivityTimeline(data, new Map(), uids, liveSet, TMAX, TMAX, 60);
     const bar = tl.lanes[0].bars.find((b) => b.sid === "s1")!;
-    expect(bar.cls).toBe("run");
+    expect(bar.status).toBe("running");
     expect(bar.title).toContain("running");
   });
 
-  it("classifies a clean dispatch.complete as 'done'", () => {
+  it("classifies a clean dispatch.complete as 'complete'", () => {
     const tl = buildActivityTimeline(data, new Map(), uids, liveSet, TMAX, TMAX, 60);
     const bar = tl.lanes[0].bars.find((b) => b.sid === "s2")!;
-    expect(bar.cls).toBe("done");
+    expect(bar.status).toBe("complete");
     expect(bar.title).toContain("complete");
   });
 
-  it("classifies a watchdog-killed dispatch.error (exit 137) as 'err'/killed", () => {
+  it("classifies a watchdog-killed dispatch.error (exit 137) as 'error'/killed", () => {
     const tl = buildActivityTimeline(data, new Map(), uids, liveSet, TMAX, TMAX, 60);
     const bar = tl.lanes[0].bars.find((b) => b.sid === "s3")!;
-    expect(bar.cls).toBe("err");
+    expect(bar.status).toBe("error");
     expect(bar.title).toContain("killed");
   });
 
-  it("classifies an abandoned session (session.end, no dispatch terminal) as 'canceled'", () => {
+  it("classifies an abandoned session (session.end, no dispatch terminal) as the canonical 'abandoned'", () => {
     const tl = buildActivityTimeline(data, new Map(), uids, liveSet, TMAX, TMAX, 60);
     const bar = tl.lanes[0].bars.find((b) => b.sid === "s4")!;
-    expect(bar.cls).toBe("canceled");
+    expect(bar.status).toBe("abandoned");
   });
 
   it("drops a session that ended entirely before the window — no bar at all", () => {
@@ -154,24 +154,24 @@ describe("buildActivityTimeline — parity: liveMode no longer changes the windo
     expect(replay.lanes[0].bars.map((b) => b.sid)).toEqual(["s1"]);
   });
 
-  it("a closed session reads 'done', not 'run', regardless of the liveMode flag", () => {
+  it("a closed session reads 'complete', not 'running', regardless of the liveMode flag", () => {
     const tl = buildActivityTimeline(day, new Map(), uids, new Set(), TMAX, TMAX, 1440, false, TMIN);
-    expect(tl.lanes[0].bars[0].cls).toBe("done");
+    expect(tl.lanes[0].bars[0].status).toBe("complete");
   });
 
-  it("an UNCLOSED session, fresh as of the playhead, reads 'run' regardless of the liveMode flag", () => {
+  it("an UNCLOSED session, fresh as of the playhead, reads 'running' regardless of the liveMode flag", () => {
     const open: FlowRecord[] = [
       rec({ machine_uid: "m1", session_id: "s9", action: "dispatch.start", ts: new Date(TMIN).toISOString() }),
       rec({ machine_uid: "m1", session_id: "s9", action: "dispatch.turn", ts: new Date(TMAX).toISOString() }),
     ];
     const replay = buildActivityTimeline(open, new Map(), uids, new Set(), TMAX, TMAX, 1440, false, TMIN);
-    expect(replay.lanes[0].bars[0].cls).toBe("run");
+    expect(replay.lanes[0].bars[0].status).toBe("running");
     // Same data, same empty presence set, the OTHER value of the now-inert
     // `liveMode` flag: the SAME verdict, which is the parity fix (this used
     // to be the one test proving `liveMode` was "genuinely load-bearing" —
     // it no longer is, by design).
     const live = buildActivityTimeline(open, new Map(), uids, new Set(), TMAX, TMAX, 1440, true, TMIN);
-    expect(live.lanes[0].bars[0].cls).toBe("run");
+    expect(live.lanes[0].bars[0].status).toBe("running");
   });
 
   // (#1869) Omitting the 10th argument (`playheadT`) defaults it to `tMax`
@@ -276,11 +276,11 @@ describe("buildActivityTimeline — reused step session ids across missions (#21
     expect(new Set(bars.map((b) => b.key)).size).toBe(2);
   });
 
-  it("the older mission's bar reads 'done' (clean complete), the newer's reads 'err' (aborted) — not both 'canceled' off a blended close-edge", () => {
+  it("the older mission's bar reads 'complete', the newer's reads 'error' (aborted) — not both 'abandoned' off a blended close-edge", () => {
     const tl = buildActivityTimeline(data, new Map(), uids, new Set(), TMAX, TMAX, 1440);
     const bars = tl.lanes[0].bars.filter((b) => b.sid === REUSED_SID);
-    const classes = bars.map((b) => b.cls).sort();
-    expect(classes).toEqual(["done", "err"]);
+    const classes = bars.map((b) => b.status).sort();
+    expect(classes).toEqual(["complete", "error"]);
   });
 
   it("a session with NO mission_id at all keeps its exact prior (unscoped) behavior", () => {

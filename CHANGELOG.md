@@ -69,6 +69,38 @@ darkmux release.
   is still set with the exact change to make. `darkmux config set
   dirs.notebook ...` now rejects the key. Existing entries on disk are
   untouched.
+- **`darkmux mission migrate` and the pre-#148 flat mission layout.**
+  Flat `<root>/missions/<id>.json` / `<root>/phases/<id>.json` files are
+  not read; `darkmux doctor` FAILS naming each one still present.
+  **Migration:** run `darkmux mission migrate --apply` on 3.x before
+  upgrading.
+- **The pre-Beat-33 `<root>/crew/{roles,missions,phases,crews,skills}`
+  fallback read.** User state resolves under `<root>/<subdir>/` only;
+  `darkmux doctor` now FAILS on a leftover `crew/` subdir and prints the
+  move script. **Migration:** run the script `darkmux doctor` prints.
+- **Dispatching with no resolvable profile no longer probes LMStudio's
+  first loaded model.** With no `--profile`, no `role_profiles.<role>`
+  binding and no `default_profile` (or a profile that selects no model for
+  the role), the dispatch now fails with an error naming the fix, where 3.x
+  printed a deprecation warning and ran against whatever was loaded.
+  **Migration:** set `"default_profile"` in `profiles.json`.
+- **`darkmux lab eval --k`, `--roster-profile`, `--exec-mode` and
+  `--bundler`.** They configured the funnel mode deleted in #2310 P4d and
+  were accepted and silently ignored since; `--k` claimed a value above 1
+  was a loud error, and it was not. **Migration:** drop the flags; they
+  never changed a run.
+- **Doctor's "legacy compaction extras" check.** The openclaw-shape keys
+  it warned about (`mode`, `maxHistoryShare`, `recentTurnsPreserve`,
+  `customInstructions` under `runtime.compaction`) now ride as ordinary
+  unrecognized extras: kept on round-trip, read by nothing. **Migration:**
+  none required; delete the keys if you like (`custom_instructions` is the
+  typed field).
+- **Doctor's residue checks for pre-3.x removals:** the `crews` map in
+  `profiles.json`, the `review{}` config block,
+  `runtime.telemetry_record_every_samples`, and the "daemon predates the
+  build field" verdict. Each key is still read leniently and ignored.
+  **Migration:** delete any of those keys still present (3.x's `darkmux
+  doctor` names them).
 
 ### Changed (breaking, 4.0)
 

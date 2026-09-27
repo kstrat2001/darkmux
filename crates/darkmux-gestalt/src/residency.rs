@@ -1,17 +1,16 @@
 //! The four-way residency split — the validated miniature the gestalt core
 //! generalizes (#1274).
 //!
-//! Absorbed from the review's `decide_residency` (darkmux-lab
-//! review.rs, PR #1275). The Reuse / Reconcile / LoadFresh arms are
-//! byte-semantic ports; the review's Blocked-on-foreign arm is DELIBERATELY
-//! DIVERGED under the absolute-ownership decision (operator-approved
-//! 2026-07-10, #1274): a foreign resident sharing the weights is now a
+//! Ported from the PR-review pipeline's `decide_residency` (PR #1275; that
+//! pipeline and its copy are gone since #2310 P4d, so this is the only
+//! one). The Reuse / Reconcile / LoadFresh arms were byte-semantic ports;
+//! the Blocked-on-foreign arm DELIBERATELY DIVERGED under the
+//! absolute-ownership decision (operator-approved 2026-07-10, #1274): a
+//! foreign resident sharing the weights is a
 //! [`ResidencyDecision::ForeignDuplicate`] fact — respected as pool
 //! consumption, never a reuse candidate — and the planner decides
-//! load-alongside vs Block-on-capacity. The root-crate
-//! `tests/gestalt_parity.rs` proves arm-for-arm agreement against the
-//! review's own test fixtures for the arms that still match, and annotates
-//! the diverged vectors as named behavior changes.
+//! load-alongside vs Block-on-capacity. The tests below carry the ported
+//! fixtures.
 
 use crate::desired::Placement;
 use crate::facts::ResidentFact;
@@ -93,10 +92,9 @@ pub fn decide_residency(residents: &[ResidentFact], p: &Placement) -> ResidencyD
 
 #[cfg(test)]
 mod tests {
-    //! Golden arm-for-arm fixtures lifted from the review's own residency
-    //! tests (the #1271 `LmsCycler` suite) — same residents, same wanted
-    //! ctx, same expected arm. The cross-crate copy of these vectors lives
-    //! in the root crate's tests/gestalt_parity.rs.
+    //! Golden arm-for-arm fixtures lifted from the PR-review pipeline's
+    //! residency tests (the #1271 `LmsCycler` suite, since deleted) — same
+    //! residents, same wanted ctx, same expected arm.
 
     use super::*;
 

@@ -75,7 +75,7 @@ pub fn pin_cwd(cmd: &mut Command) {
 /// each produced `Ok(vec![])`.
 ///
 /// The consumer that makes this a safety defect rather than a cosmetic one
-/// is tier 5. The thermal breaker calls `swap::eject_all_managed` on a real
+/// is tier 5. The thermal breaker calls `ownership::eject_all_managed` on a real
 /// `critical` trip, unattended, and that function's only `Err` path is this
 /// listing. A silent empty made it emit
 /// `thermal.tier5_eject { ejected: [], user_loaded_count: 0 }` —
@@ -397,7 +397,7 @@ pub fn unload(identifier: &str) -> Result<()> {
 
 /// Load a model into LMStudio under an explicit identifier. The caller is
 /// responsible for deciding whether the identifier should be darkmux-namespaced
-/// (see `swap::namespaced_identifier`) or pass-through for an operator-set
+/// (see `ownership::namespaced_identifier`) or pass-through for an operator-set
 /// custom name.
 pub fn load_with_identifier(
     model_id: &str,

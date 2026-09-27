@@ -271,15 +271,11 @@ pub struct MissionConfig {
     /// `darkmux_types::config_access::cmd_allowed(verb)` returns true
     /// (`config.cmd.enabled == true` AND `verb` is named in
     /// `config.cmd.allowed`) — checked ONCE, before `validate`/`interpret`
-    /// ever runs, by [`check_cmd`]. All three call sites that can
-    /// execute a config's graph call it: `darkmux acp`'s ephemeral panel
-    /// route (`run_ephemeral` in the `darkmux` binary crate), a direct
-    /// `darkmux mission launch <id>` (same crate, `mission_launch::launch`),
-    /// and `darkmux-lab`'s `review_bench::resolve_funnel_ctx` (the
-    /// `--funnel` path, which resolves the SAME user-tier-overridable
-    /// `review.json` and runs it through a `StepKindRegistry::
-    /// with_builtins()`-backed graph) — so the gate holds regardless of
-    /// which surface invoked the config. Named independently of the
+    /// ever runs, by [`check_cmd`]. Both call sites that can execute a
+    /// config's graph call it: `darkmux acp`'s ephemeral panel route
+    /// (`run_ephemeral` in the `darkmux` binary crate) and a direct
+    /// `darkmux mission launch <id>` (same crate, `mission_launch::launch`)
+    /// — so the gate holds regardless of which surface invoked the config. Named independently of the
     /// document's own `id` (conventionally the same string, e.g. a
     /// `pr-merge.json` config declaring `"cmd": "pr-merge"`, but not
     /// required to match) so the registry-key concern and the allowlist-name

@@ -463,7 +463,7 @@ pub fn review_outcome(env: &ReviewEnvelope) -> RunOutcome {
 /// excluded from `usable`, per `judge_gate_outcome`'s own filter) — the
 /// flag is genuinely unjudged. A pass-2 skip means the flag's pass-1
 /// ALREADY ruled it `Confirmed`; only the CONFIRMATION pass was skipped,
-/// which `multi_pass_confirm`'s `PassClass::Reject` arm demotes to
+/// which the (since-deleted) funnel's confirmation stage demoted to
 /// `Tier::NeedsCheck` (`demoted_by_pass2 = true`) — that flag WAS judged
 /// and DOES render, just at a lower tier than a from-scratch double-confirm
 /// would have given it. Reporting a pass-2 skip as "N flags went unjudged"

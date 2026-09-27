@@ -230,7 +230,7 @@ export function LabRunDetail({
   // run that just completed doesn't wait for a full remount to say so).
   const isFinished = !!env || scores != null || finished;
   const pipelineLines = labPipelineLines(pipe, env);
-  const cliHint = labCliHint(env, scores);
+  const cliHint = labCliHint(scores);
   const feedLines = labFeedLines(events);
 
   return (

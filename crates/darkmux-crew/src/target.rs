@@ -78,13 +78,38 @@ pub fn endpoint_route_label(ep: &ModelEndpoint, model_id: &str) -> String {
 pub enum Resolution {
     Target(Box<Target>),
     /// No `--profile` match, no `role_profiles` binding and no usable
-    /// `default_profile`: the container path's `probe_loaded_model` fallback.
+    /// `default_profile`. The container path refuses to dispatch.
     NoProfile,
     /// A profile resolved but `select_model` returned no model.
     NoModel { profile_name: String, profile: Box<Profile>, error: String },
 }
 
 impl Resolution {
+    /// The target, or THE error for a resolution that selects nothing:
+    /// [`darkmux_profiles::profiles::no_profile_message`] for no profile, the
+    /// profile and `select_model`'s reason for no model. (4.0) Both are
+    /// fatal for a dispatch; there is no fallback model.
+    pub fn require(
+        self,
+        role_id: &str,
+        requested: Option<&str>,
+        registry_path: &std::path::Path,
+    ) -> Result<Target> {
+        match self {
+            Resolution::Target(t) => Ok(*t),
+            Resolution::NoProfile => bail!(darkmux_profiles::profiles::no_profile_message(
+                Some(role_id),
+                requested,
+                Some(registry_path),
+            )),
+            Resolution::NoModel { profile_name, error, .. } => bail!(
+                "profile `{profile_name}` selects no model for role `{role_id}` ({error}). Add a model \
+                 for it to profile `{profile_name}` in {}.",
+                registry_path.display()
+            ),
+        }
+    }
+
     pub fn target(self) -> Option<Target> {
         match self {
             Resolution::Target(t) => Some(*t),

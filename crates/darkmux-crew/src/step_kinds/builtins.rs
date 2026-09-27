@@ -209,15 +209,9 @@ fn resolve_local_placement_inner_with(
     // `default_profile`, a dangling binding loud), the same `select_model`
     // with the utility set-aside (#2914: a step never runs on the machine's
     // utility model), and the same endpoint classification.
-    let target = match crate::target::resolve_in(&loaded.registry, role, profile_name, mapped, false)
-        .map_err(|e| ResolutionFailed(format!("{e:#}")))?
-    {
-        crate::target::Resolution::Target(t) => t,
-        crate::target::Resolution::NoProfile => return Err(ResolutionFailed("no active profile".to_string())),
-        crate::target::Resolution::NoModel { error, .. } => {
-            return Err(ResolutionFailed(format!("select_model: {error}")))
-        }
-    };
+    let target = crate::target::resolve_in(&loaded.registry, role, profile_name, mapped, false)
+        .and_then(|r| r.require(role_id, profile_name, &loaded.path))
+        .map_err(|e| ResolutionFailed(format!("{e:#}")))?;
     // (#2902 review C4) Exhaustive on the kind, so a new kind is a compile
     // error at the placement decision.
     match target.kind {

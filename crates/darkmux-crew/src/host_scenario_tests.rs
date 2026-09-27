@@ -475,7 +475,7 @@ fn a_critical_breaker_event_is_what_tier_five_s_eject_keys_on() {
     //
     // 1. **The sweep's own semantics** — every managed model attempted, a
     //    failed unload recorded and the loop CONTINUED, user state never
-    //    touched — are pinned by `darkmux_profiles::swap::eject_each`'s
+    //    touched — are pinned by `darkmux_profiles::ownership::eject_each`'s
     //    injected-unloader tests (#2774 review C1).
     // 2. **The trigger** is a `Breaker` event whose state string is
     //    literally `critical` — deliberately NOT the speed-limit trigger,

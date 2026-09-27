@@ -2,24 +2,22 @@
 //!
 //! `darkmux lab run` stamps each run's `manifest.json` with the
 //! *requested* profile name (either `--profile` or the registry's
-//! `default_profile`). But the dispatch goes through LMStudio's
-//! OpenAI-compatible API by model id, so LMStudio answers with whatever
-//! is actually loaded — regardless of which profile the lab thinks it's
-//! using. If a prior dispatch (or a hand `lms load`) left `balanced`'s
-//! models resident and the operator then runs `darkmux lab run
-//! medium-coding` (no `--profile`), the manifest says `profile=deep`
-//! while the real runtime envelope is `balanced`'s.
+//! `default_profile`). The dispatch itself loads darkmux's own instance of
+//! the selected model at the profile's declared `n_ctx` (#1135) and
+//! addresses that `darkmux:` identifier on the wire (#2240), so the model
+//! and window the run measures are the profile's, whatever else is
+//! resident.
 //!
-//! That silent provenance drift poisons reproducibility: a notebook
-//! entry citing "measured against profile deep" is wrong, and a future
-//! operator re-running at `deep` gets a different context envelope.
+//! What this check still reports is whether that load happens INSIDE the
+//! run: when the declared model is not resident, or is resident at a
+//! different window, the run's wall-clock includes a model load and is not
+//! comparable to a warm run. That matters to reproducibility (a notebook
+//! comparing two runs should know one of them paid for a load).
 //!
-//! Per the operator-sovereignty doctrine, the fix is the *least*
-//! intrusive of the issue's three options: **warn, don't block**. We
-//! compare the requested profile's declared model envelope against
-//! `lms ps` and emit operator-facing warnings on divergence; the
-//! dispatch proceeds either way (the operator may have swapped
-//! deliberately — A/B, defensive escalation, candidate eval).
+//! Per the operator-sovereignty doctrine: **warn, don't block**. We compare
+//! the requested profile's declared model envelope against `lms ps` before
+//! the dispatch and emit operator-facing notes; the dispatch proceeds
+//! either way.
 
 use darkmux_profiles::envelope::{ctx_diverges, loaded_matches};
 use darkmux_types::{LoadedModel, Profile};
@@ -30,10 +28,8 @@ use darkmux_types::{LoadedModel, Profile};
 /// can't tell). Pure: the caller owns the best-effort `lms ps` query and
 /// the printing.
 ///
-/// Two findings, both pointing at the same risk — the manifest's
-/// `profile=` tag may not reflect the real runtime envelope:
-///   1. The profile's **default** model isn't in the loaded set at
-///      all, so the dispatch will use whatever LMStudio has loaded.
+/// Two findings, both meaning "this run starts with a model load":
+///   1. The profile's **default** model isn't in the loaded set at all.
 ///   2. A declared model **is** loaded but at a materially different
 ///      context window than the profile declares.
 pub(crate) fn envelope_warnings(
@@ -67,10 +63,9 @@ pub(crate) fn envelope_warnings(
                         .unwrap_or_else(|| "unset".to_string());
                     out.push(format!(
                         "requested profile `{profile_name}` declares default model `{}` (ctx {declared}) \
-                         but it is not among the currently loaded models — the dispatch will use \
-                         whatever LMStudio has loaded, so this run's `profile={profile_name}` tag \
-                         may not reflect the real runtime envelope. Pass `--profile <loaded-profile>` \
-                         to align them (a dispatch on `{profile_name}` loads its declared models).",
+                         but it is not among the currently loaded models — the dispatch loads it \
+                         first, so this run's wall-clock includes a model load and is not comparable \
+                         to a warm run.",
                         pm.id,
                     ));
                 }
@@ -83,8 +78,8 @@ pub(crate) fn envelope_warnings(
                     if ctx_diverges(declared as u64, lm.context) {
                         out.push(format!(
                             "requested profile `{profile_name}` declares model `{}` at {} ctx but the \
-                             loaded instance is at {} ctx — proceeding, but this run's `profile={profile_name}` \
-                             tag may not reflect the real runtime envelope (loaded != requested).",
+                             loaded instance is at {} ctx — the dispatch loads darkmux's own instance at \
+                             the declared window, so this run's wall-clock includes a model load.",
                             pm.id, declared, lm.context,
                         ));
                     }

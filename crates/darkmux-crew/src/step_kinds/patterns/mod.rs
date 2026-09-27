@@ -10,7 +10,7 @@
 //!   there first, always, before reaching for anything in this module.
 //! - `step_kinds::patterns` (here, Tier 2) — the procedure's *shape* is new
 //!   and reusable, but the algorithm inside it is supplied per caller.
-//!   Neither submodule here depends on any mission's own types (this crate
+//!   Nothing here depends on any mission's own types (this crate
 //!   has no `darkmux-lab` dependency, and never will — see the workspace's
 //!   crate-dependency direction) — that's what keeps a Tier 2 pattern
 //!   actually reusable rather than one mission's code with extra ceremony.
@@ -19,22 +19,17 @@
 //!   genuinely bespoke, stays physically co-located with the mission that
 //!   owns it, never migrates here "just in case."
 //!
-//! Three patterns live here today:
+//! One pattern lives here today:
 //!
-//! - [`multi_pass_confirm::multi_pass_confirm`] — the "run a pass,
-//!   conditionally run more confirmation passes, demote on the first
-//!   disagreement" control-flow shape, generalized from the PR-review
-//!   pipeline's judge stage.
-//! - [`dedup::dedup`] — the "scan a data set for the first survivor a
-//!   candidate collapses into, per a pluggable match/merge strategy"
-//!   procedure, generalized from the PR-review pipeline's probe-flag dedup
-//!   stage.
 //! - [`plan_sites::plan_site_units`] — the "prefilter hits over a source,
 //!   window each hit, pack windows into sizing-bounded units" procedure
 //!   (#2310 P4b), generalized from the crawl planner so a diff-scoped
-//!   planner (a future review config) can plug in a different SOURCE
-//!   without duplicating the windowing/packing math.
+//!   planner (the `review` config's `plan.sites` step) plugs in a different
+//!   SOURCE without duplicating the windowing/packing math.
+//!
+//! (4.0) Two earlier patterns, `multi_pass_confirm` and `dedup`, were
+//! generalized from the PR-review funnel's judge and dedup stages. Their
+//! only consumer was that funnel, deleted in #2310 P4d, so they were
+//! deleted too.
 
-pub mod dedup;
-pub mod multi_pass_confirm;
 pub mod plan_sites;

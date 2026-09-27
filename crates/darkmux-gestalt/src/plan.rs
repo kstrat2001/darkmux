@@ -93,7 +93,7 @@ pub enum Precondition {
 /// batch-level Unload. A reconcile is TWO actions — its Unload half rides
 /// the free phase and its Load half the load phase (both carrying
 /// [`Reason::InsufficientCtx`]) — so ALL frees precede ALL loads, the
-/// `swap::swap` RAM-headroom shape (see the [`Plan`] ordering contract).
+/// free-then-load RAM-headroom shape (see the [`Plan`] ordering contract).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum Action {
     Load { model_key: String, identifier: String, min_ctx: u32 },
@@ -366,8 +366,8 @@ pub enum ExecHint {
 /// 2. LOAD phase: the surviving per-desired decisions (Load/Reuse), in
 ///    desired-input order
 ///
-/// ALL frees precede ALL loads — the RAM-headroom two-pass shape of
-/// `swap::swap` (free-then-load). An earlier draft claimed this parity while
+/// ALL frees precede ALL loads — the RAM-headroom two-pass shape
+/// (free-then-load). An earlier draft claimed this shape while
 /// carrying each reconcile's unload inside the load phase, interleaving a
 /// free after other loads; the reconcile split into a free-phase Unload +
 /// load-phase Load is the review MUST_FIX that restored the shape. Same

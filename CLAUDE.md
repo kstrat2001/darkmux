@@ -214,8 +214,8 @@ vocabulary without the dispatch-liveness bookends (violated: running work is vis
 
 The contract registry (extend this list when a new cross-cutting invariant is born):
 
-1. **Profile uniformity** — a profile means the same thing to every consumer (swap, dispatch,
-   crews, benches). A consumer may not legislate which profiles are legal; it routes on what
+1. **Profile uniformity** — a profile means the same thing to every consumer (dispatch,
+   missions, benches). A consumer may not legislate which profiles are legal; it routes on what
    the profile declares (local vs endpoint → dialect, cycling, token accounting).
 2. **Dispatch liveness** — any production code path that performs a WORK execution emits
    `dispatch.start` and a terminal `dispatch.complete`/`dispatch.error` (RAII-guarded on all
@@ -457,7 +457,7 @@ darkmux's canonical config surface is **`~/.darkmux/config.json`** (#661), writt
 
 ```json
 {
-  "schema_version": "1.2",
+  "schema_version": "1.31",
   "machine_id": "studio",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
@@ -479,7 +479,7 @@ When proposing a config change to an operator, write the visible field; don't re
 
 **Schema is minor-bump + lenient on read** (all-`Option` + `#[serde(flatten)] extras` overflow): an older binary tolerates a newer config, and a partial/hand-edited/malformed config never bricks the CLI — loud validation belongs to `darkmux doctor`, not the hot load path. `CONFIG_SCHEMA_VERSION` lives in `darkmux-types/src/config.rs`.
 
-**Don't confuse `config.json` with the profiles registry.** `~/.darkmux/profiles.json` (the swap profiles) is a SEPARATE file, overridden by `--profiles-file` / `DARKMUX_PROFILES` — **renamed in #661 from the misleading `--config` / `DARKMUX_CONFIG`** (those names are retired, not reused, because a real `config.json` now exists).
+**Don't confuse `config.json` with the profiles registry.** `~/.darkmux/profiles.json` (the model profiles) is a SEPARATE file, overridden by `--profiles-file` / `DARKMUX_PROFILES` — **renamed in #661 from the misleading `--config` / `DARKMUX_CONFIG`** (those names are retired, not reused, because a real `config.json` now exists).
 
 ## Environment variables
 
@@ -562,7 +562,6 @@ src/                          CLI command layer (clap)
   config_cmd.rs               `config` get/set/list
   init.rs / skills.rs         `darkmux init` (idempotent setup + bundled-skill refresh) + skill installer
   conventions.rs              Shared CLI helpers
-  migrate.rs                  Storage-layout migrations
 crates/
   darkmux-types/              Profile / ProfileRegistry / config / flow record schemas + config_access
   darkmux-profiles/           Registry loader + lookup
@@ -629,21 +628,16 @@ crates/darkmux-crew/src/step_kinds/
     patterns/     — Tier 2: a genuinely new, reusable control-flow SHAPE,
                     with the domain-specific ALGORITHM plugged in as a
                     caller-supplied strategy (deliberately NO runtime
-                    name-keyed strategy registry yet; dedup.rs's module
-                    doc names the upgrade path for when a second strategy
-                    needs runtime selection). multi_pass_confirm.rs (the
-                    pass-1 → conditional confirmation passes → demote-on-
-                    disagreement shape, generalized from the PR-review
-                    judge; pass count + confirm rule are parameterized,
-                    the demotion rule is currently fixed — a known,
-                    documented narrowing of #1352's spec, widen when a
-                    consumer needs a different demotion). dedup.rs (the
-                    "scan for the first survivor a candidate collapses
-                    into, per a pluggable match/merge strategy" procedure,
-                    generalized from the PR-review dedup stage). Neither
-                    submodule depends on any mission's own types, which is
-                    what keeps a Tier 2 pattern actually reusable rather
-                    than one mission's code with extra ceremony.
+                    name-keyed strategy registry). plan_sites.rs (the
+                    "prefilter hits over a source, window each hit, pack
+                    windows into sizing-bounded units" procedure, shared
+                    by the crawl planner and the diff-scoped `plan.sites`
+                    step). Nothing here depends on any mission's own
+                    types, which is what keeps a Tier 2 pattern actually
+                    reusable rather than one mission's code with extra
+                    ceremony. (The funnel-era multi_pass_confirm.rs and
+                    dedup.rs were deleted in 4.0: their only consumer was
+                    the funnel #2310 P4d removed.)
     types.rs      — the StepKind trait itself.
     registry.rs   — StepKindRegistry.
 ```
@@ -779,8 +773,8 @@ When darkmux loads a model under `darkmux:<id>`, the underlying LMStudio model k
 
 When writing a new feature that mutates LMStudio state on the operator's behalf:
 
-1. **Generate the namespaced form** at the point of write. See `swap::namespaced_identifier`.
-2. **Filter on the namespace** at the point of read/cleanup. See `swap::is_darkmux_owned`.
+1. **Generate the namespaced form** at the point of write. See `darkmux_profiles::ownership::namespaced_identifier`.
+2. **Filter on the namespace** at the point of read/cleanup. See `darkmux_profiles::ownership::is_darkmux_owned`.
 3. **Pass-through explicit overrides** — if the operator sets an explicit identifier in their profile, don't override it. The namespace is the *default*; the operator can opt out.
 
 ### Operator-facing commands

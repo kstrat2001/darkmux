@@ -37,10 +37,6 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
             prosecutor_profile,
             defender_profile,
             judge_profile,
-            roster_profile,
-            exec_mode,
-            k,
-            bundler,
         } => cmd_lab_eval(lab::review_bench::ReviewBenchOpts {
             role,
             cases_dir: std::path::PathBuf::from(cases_dir),
@@ -53,10 +49,6 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
             prosecutor_profile,
             defender_profile,
             judge_profile,
-            roster_profile,
-            exec_mode,
-            k_override: k,
-            bundler_cmd: bundler,
         }),
         LabCmd::Loop {
             workload,

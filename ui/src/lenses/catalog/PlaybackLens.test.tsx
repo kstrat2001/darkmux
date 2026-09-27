@@ -241,12 +241,12 @@ describe("PlaybackLens — the playback transport (#1869)", () => {
     const { rerender } = render(<PlaybackLens date="2026-08-07" playhead={null} />, { wrapper: wrapper() });
     await waitFor(() => expect(document.querySelector(".fleet-lens")).toBeTruthy());
     await waitFor(() => expect(document.querySelector(".savings .savnum")?.textContent).toBe("600"));
-    expect(document.querySelector(".sbar")).toHaveClass("done");
+    expect(document.querySelector(".sbar")).toHaveClass("complete");
     // (#2834) One figure now; there is no separate unattributed tile to be
     // zero. The scrubbing property this test guards is unchanged.
 
     rerender(<PlaybackLens date="2026-08-07" playhead={Date.parse("2026-08-07T00:30:00.000Z")} />);
-    await waitFor(() => expect(document.querySelector(".sbar")).toHaveClass("run"));
+    await waitFor(() => expect(document.querySelector(".sbar")).toHaveClass("running"));
     // (#2834) The tokens STAY counted at 600. Before the consolidation they
     // moved from "local" to "unattributed" here — an in-flight session has
     // no dispatch.complete, so nothing named its endpoint, and the local
