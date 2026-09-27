@@ -1,0 +1,641 @@
+{
+  "$comment": "One lifecycle spec, two executors: ui/src/lib/lifecycle.corpus.test.ts (the viewer's lifecycleAt) and crates/darkmux-serve/src/runs.rs's lifecycle_corpus test (the daemon's session fold and session_is_live). Each case is one run's records, an as-of instant and the phase and status every surface must state for it. A case the daemon cannot judge says why in server_skip_reason.",
+  "policy": {
+    "stale_after_ms": 1200000,
+    "budget_wait_grace_ms": 60000
+  },
+  "cases": [
+    {
+      "name": "a started run is open",
+      "as_of": "2026-09-27T10:01:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-27T10:00:30Z",
+          "action": "dispatch.turn.heartbeat",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "open",
+      "status": "running"
+    },
+    {
+      "name": "a run silent for exactly the window is still open",
+      "as_of": "2026-09-27T10:20:30Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-27T10:00:30Z",
+          "action": "dispatch.turn.heartbeat",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "open",
+      "status": "running"
+    },
+    {
+      "name": "a run silent past the window has stopped with no ending recorded",
+      "as_of": "2026-09-27T10:20:31Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-27T10:00:30Z",
+          "action": "dispatch.turn.heartbeat",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "stale",
+      "status": "abandoned",
+      "abandoned_reason": "noterminal"
+    },
+    {
+      "name": "a completed run is closed",
+      "as_of": "2026-09-27T10:02:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "dispatch.complete",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "wall_ms": 60000
+          }
+        }
+      ],
+      "phase": "closed",
+      "status": "complete"
+    },
+    {
+      "name": "a watchdog kill is an error",
+      "as_of": "2026-09-27T10:02:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "dispatch.error",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "exit_code": 137
+          }
+        }
+      ],
+      "phase": "closed",
+      "status": "error"
+    },
+    {
+      "name": "a presence reconciler close ends the run with no ending recorded",
+      "as_of": "2026-09-27T10:02:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "session.end",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "closed",
+      "status": "abandoned",
+      "abandoned_reason": "noterminal"
+    },
+    {
+      "name": "a terminal whose timestamp does not parse still closes the run",
+      "as_of": "2026-09-27T10:02:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "not-a-time",
+          "action": "dispatch.complete",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "closed",
+      "status": "complete"
+    },
+    {
+      "name": "a terminal timestamped before its own start (clock skew) closes the run",
+      "as_of": "2026-09-27T10:02:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:10Z",
+          "action": "dispatch.start",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-27T10:00:05Z",
+          "action": "dispatch.complete",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "closed",
+      "status": "complete"
+    },
+    {
+      "name": "before its start a run has not started",
+      "as_of": "2026-09-27T10:00:05Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:10Z",
+          "action": "dispatch.start",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        }
+      ],
+      "phase": "not_started",
+      "status": "planned",
+      "server": false,
+      "server_skip_reason": "the server judges a session as of now; it has no as-of cut"
+    },
+    {
+      "name": "a close after the as-of instant does not close it yet",
+      "as_of": "2026-09-27T10:00:30Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "dispatch.complete",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "open",
+      "status": "running",
+      "server": false,
+      "server_skip_reason": "the server judges a session as of now; it has no as-of cut"
+    },
+    {
+      "name": "a budget wait before any start is waiting until its resume time",
+      "as_of": "2026-09-27T11:00:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "budget.wait",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "scope": "endpoint",
+            "endpoint_id": "azure",
+            "wait_seconds": 86000
+          }
+        }
+      ],
+      "phase": "waiting",
+      "status": "running"
+    },
+    {
+      "name": "a budget wait is never stale before its resume time plus the grace",
+      "as_of": "2026-09-27T10:11:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "budget.wait",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "endpoint_id": "azure",
+            "wait_seconds": 600
+          }
+        }
+      ],
+      "phase": "waiting",
+      "status": "running"
+    },
+    {
+      "name": "past its resume time plus the grace a lapsed wait is open, its staleness clock running from there",
+      "as_of": "2026-09-27T10:31:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "budget.wait",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "endpoint_id": "azure",
+            "wait_seconds": 600
+          }
+        }
+      ],
+      "phase": "open",
+      "status": "running"
+    },
+    {
+      "name": "a lapsed wait silent past the window has stopped",
+      "as_of": "2026-09-27T10:31:01Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "budget.wait",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "endpoint_id": "azure",
+            "wait_seconds": 600
+          }
+        }
+      ],
+      "phase": "stale",
+      "status": "abandoned",
+      "abandoned_reason": "noterminal"
+    },
+    {
+      "name": "a resumed wait is an ordinary open run",
+      "as_of": "2026-09-27T10:02:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "budget.wait",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "endpoint_id": "azure",
+            "wait_seconds": 600
+          }
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "budget.resume",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "endpoint_id": "azure",
+            "waited_ms": 60000
+          }
+        },
+        {
+          "ts": "2026-09-27T10:01:01Z",
+          "action": "dispatch.start",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        }
+      ],
+      "phase": "open",
+      "status": "running"
+    },
+    {
+      "name": "a wait the operator stopped closes the run as aborted",
+      "as_of": "2026-09-27T10:02:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "budget.wait",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "endpoint_id": "azure",
+            "wait_seconds": 86000
+          }
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "budget.stop",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "endpoint_id": "azure",
+            "reason": "mission `m` is aborted"
+          }
+        }
+      ],
+      "phase": "closed",
+      "status": "abandoned",
+      "abandoned_reason": "aborted"
+    },
+    {
+      "name": "a stopped wait that names no reason ends with no ending recorded",
+      "as_of": "2026-09-27T10:02:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "budget.wait",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "endpoint_id": "azure",
+            "wait_seconds": 86000
+          }
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "budget.stop",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "endpoint_id": "azure"
+          }
+        }
+      ],
+      "phase": "closed",
+      "status": "abandoned",
+      "abandoned_reason": "noterminal"
+    },
+    {
+      "name": "a running dispatch the pacer held, then stopped, is closed",
+      "as_of": "2026-09-27T10:02:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-27T10:00:30Z",
+          "action": "budget.wait",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "endpoint_id": "azure",
+            "wait_seconds": 86000
+          }
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "budget.stop",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "endpoint_id": "azure",
+            "reason": "the run was interrupted"
+          }
+        }
+      ],
+      "phase": "closed",
+      "status": "abandoned",
+      "abandoned_reason": "aborted"
+    },
+    {
+      "name": "a start after a stopped wait opens the run again",
+      "as_of": "2026-09-27T10:03:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "budget.wait",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "endpoint_id": "azure",
+            "wait_seconds": 86000
+          }
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "budget.stop",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "endpoint_id": "azure",
+            "reason": "mission `m` is aborted"
+          }
+        },
+        {
+          "ts": "2026-09-27T10:02:00Z",
+          "action": "dispatch.start",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        }
+      ],
+      "phase": "open",
+      "status": "running",
+      "server": false,
+      "server_skip_reason": "the server folds a session's first terminal and has no attempts"
+    },
+    {
+      "name": "a relaunch under the same session id after a clean finish is open",
+      "as_of": "2026-09-27T10:06:40Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "dispatch.complete",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        },
+        {
+          "ts": "2026-09-27T10:05:00Z",
+          "action": "dispatch.start",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        }
+      ],
+      "phase": "open",
+      "status": "running",
+      "server": false,
+      "server_skip_reason": "the server folds a session's first terminal and has no attempts"
+    },
+    {
+      "name": "a relaunch supersedes an attempt that never closed; the new attempt closes on its own terminal",
+      "as_of": "2026-09-27T10:06:40Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-27T10:05:00Z",
+          "action": "dispatch.start",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-27T10:06:00Z",
+          "action": "dispatch.complete",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "closed",
+      "status": "complete",
+      "server": false,
+      "server_skip_reason": "the server folds a session's first terminal and has no attempts"
+    },
+    {
+      "name": "presence holds a silent run open",
+      "as_of": "2026-09-27T10:30:30Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-27T10:00:30Z",
+          "action": "dispatch.turn.heartbeat",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "open",
+      "status": "running",
+      "presence": [
+        "crew-dispatch-coder-1"
+      ],
+      "server": false,
+      "server_skip_reason": "/runs does not read session presence"
+    },
+    {
+      "name": "presence does not reopen a closed run",
+      "as_of": "2026-09-27T10:02:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "dispatch.complete",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "closed",
+      "status": "complete",
+      "presence": [
+        "crew-dispatch-coder-1"
+      ],
+      "server": false,
+      "server_skip_reason": "/runs does not read session presence"
+    },
+    {
+      "name": "records with no opening are not a run",
+      "as_of": "2026-09-27T10:01:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "telemetry.lms",
+          "session_id": "crew-dispatch-coder-1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "category": "telemetry",
+          "source": "lms"
+        }
+      ],
+      "phase": "not_started",
+      "status": "planned"
+    },
+    {
+      "name": "a mission's lifecycle session closes on mission.close",
+      "as_of": "2026-09-27T10:02:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "mission.start",
+          "session_id": "mission-m1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "m1"
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "mission.close",
+          "session_id": "mission-m1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "m1"
+        }
+      ],
+      "phase": "closed",
+      "status": "complete",
+      "server": false,
+      "server_skip_reason": "the server reads a mission's status from its mission record, not its lifecycle session"
+    },
+    {
+      "name": "a mission aborted by the operator is abandoned as aborted",
+      "as_of": "2026-09-27T10:02:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "mission.start",
+          "session_id": "mission-m1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "m1"
+        },
+        {
+          "ts": "2026-09-27T10:01:00Z",
+          "action": "mission.abort",
+          "session_id": "mission-m1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "mission_id": "m1"
+        }
+      ],
+      "phase": "closed",
+      "status": "abandoned",
+      "abandoned_reason": "aborted",
+      "server": false,
+      "server_skip_reason": "the server reads a mission's status from its mission record, not its lifecycle session"
+    }
+  ]
+}
