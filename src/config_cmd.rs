@@ -1314,7 +1314,11 @@ mod tests {
         // (#2947 review C-f) A stored retired spelling names its replacement.
         std::fs::write(f.path(), r#"{"runtime":{"detection":{"degeneracy":{"policy":"enforce"}}}}"#).unwrap();
         let out = describe_key_at(f.path(), "runtime.detection.degeneracy.policy").unwrap();
-        assert!(out.contains("`enforce` was renamed to `conclude` in 4.0"), "{out}");
+        // On the STORED line, not merely in the value list's retired note.
+        assert!(
+            out.contains("stored in config.json: \"enforce\" - not a valid value: `enforce` was renamed to `conclude` in 4.0"),
+            "{out}"
+        );
     }
 
     #[test]
