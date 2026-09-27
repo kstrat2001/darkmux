@@ -542,12 +542,9 @@ pub fn review_mission_outcome(env: &ReviewEnvelope) -> RunOutcome {
 
 // (#1877) `RemoteBudgetRecord`/`RemoteBucket` moved to
 // `darkmux_crew::remote_budget` (as `RemoteBudgetRecord`/`RemoteBudget`) —
-// the shared home for what used to be two hand-copied buckets, this one and
-// `step_kinds::MapRemoteBucket`. `MIN_VIABLE_JUDGE_GRANT` below stays here,
-// unmoved: it is THIS pipeline's own floor policy, passed to
-// `RemoteBudget::with_stage` at construction rather than baked into the
-// type, so darkmux-crew's own `MIN_VIABLE_MAP_GRANT` never has to reference
-// it (or vice versa) — see `remote_budget`'s module doc.
+// the shared home for what used to be two hand-copied buckets. (#2902 step
+// 5) The bucket no longer clamps or skips, so the per-caller grant floors
+// (`MIN_VIABLE_MAP_GRANT`, and this pipeline's judge floor) are gone.
 
 // (#1877 item 2) `seat_identifier`/`seat_endpoint_host`/`seat_endpoint`/
 // `SeatStaffingSnapshot`/`StaffingSnapshot`/`staffing_snapshot` moved to

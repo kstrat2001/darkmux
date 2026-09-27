@@ -2349,6 +2349,30 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (#2902 step 5) `mission status` says what a waiting call waits on,
+    /// whose mission, and how long, or that it waits on the operator.
+    #[test]
+    fn budget_wait_lines_say_what_whose_and_how_long() {
+        let w = |scope: &str, subject: &str, secs: Option<u64>| crew::budget::ActiveWait {
+            scope: scope.into(),
+            subject: subject.into(),
+            mission_id: Some("review-1790000000-a1b2c3".into()),
+            session_id: Some("s".into()),
+            resume_at: secs.map(|_| "2026-09-27T12:14:09Z".into()),
+            resumes_in_secs: secs,
+            message: String::new(),
+        };
+        let lines = budget_wait_lines(&[w("endpoint", "azure", Some(843)), w("stage", "probe", None)]);
+        assert_eq!(
+            lines,
+            vec![
+                "⏸ waiting on a budget: endpoint `azure` (mission a1b2c3), resumes in about 14m 3s (at 2026-09-27T12:14:09Z)".to_string(),
+                "⏸ waiting on a budget: stage `probe` (mission a1b2c3), until the budget is raised".to_string(),
+            ]
+        );
+        assert!(budget_wait_lines(&[]).is_empty(), "no wait, no line: the board is unchanged");
+    }
     use crate::crew::types::MissionSpec;
     use darkmux_serve::RunKind;
 

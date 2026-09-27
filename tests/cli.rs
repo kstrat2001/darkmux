@@ -12139,6 +12139,64 @@ fn every_enum_setting_is_refused_by_every_cli_entry_point_that_consumes_it() {
     assert!(exercised >= 12, "only {exercised} (setting, entry point) pairs exercised");
 }
 
+/// (#2902 step 5) An unregistered endpoint budget `policy` in
+/// `profiles.json` is refused at preflight by every CLI entry point that
+/// dispatches, naming the raw value, where it was set (the profiles.json
+/// path) and the valid values, before anything is minted. `PATH` is empty,
+/// so a missing preflight fails for some other reason and the text
+/// assertions turn red.
+#[test]
+fn an_unregistered_endpoint_budget_policy_is_refused_by_every_dispatching_entry_point() {
+    let empty_path = TempDir::new().unwrap();
+    let reg_dir = TempDir::new().unwrap();
+    let profiles = reg_dir.path().join("profiles.json");
+    std::fs::write(
+        &profiles,
+        r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":4096}]}},
+            "endpoints":{"azure":{"url":"https://h.example/v1",
+                "limits":{"policy":"stop","window":{"period":"1d","tokens":5}}}}}"#,
+    )
+    .unwrap();
+    let cases: &[(&str, &[&str])] = &[
+        ("dispatch", &["dispatch", "code-reviewer", "hello"]),
+        ("dispatch", &["dispatch", "--skip-preflight", "code-reviewer", "hello"]),
+        ("mission launch", &["mission", "launch", "review", "--dry-run"]),
+        ("lab run", &["lab", "run", "quick-q"]),
+    ];
+    for (label, args) in cases {
+        let out = darkmux_std_cmd()
+            .env("PATH", empty_path.path())
+            .env("DARKMUX_PROFILES", &profiles)
+            .args(*args)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{args:?} succeeded: {stderr}");
+        assert!(stderr.contains(&format!("{label}: refusing to start: bad config")), "{args:?}: {stderr}");
+        assert!(stderr.contains("`stop`"), "{args:?} names the raw value: {stderr}");
+        assert!(stderr.contains("endpoints.azure.limits.policy"), "{args:?} names where: {stderr}");
+        for v in ["off", "warn", "wait"] {
+            assert!(stderr.contains(v), "{args:?}: valid value `{v}` missing: {stderr}");
+        }
+    }
+    // A registered policy passes the preflight (the command then fails for
+    // its own reasons, never with the bad-config refusal).
+    std::fs::write(
+        &profiles,
+        r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":4096}]}},
+            "endpoints":{"azure":{"url":"https://h.example/v1",
+                "limits":{"policy":"wait","window":{"period":"1d","tokens":5}}}}}"#,
+    )
+    .unwrap();
+    let out = darkmux_std_cmd()
+        .env("PATH", empty_path.path())
+        .env("DARKMUX_PROFILES", &profiles)
+        .args(["dispatch", "code-reviewer", "hello"])
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("refusing to start: bad config"));
+}
+
 fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for e in entries.flatten() {

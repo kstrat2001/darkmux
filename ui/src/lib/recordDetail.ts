@@ -107,7 +107,36 @@ function recordDetailRaw(r: FlowRecord): string {
   if (isDispatchStart(a)) {
     return `start (prompt: ${f?.prompt_chars ?? 0}ch)`;
   }
+  // (#2902 step 5) A budget record says in the row itself what it is about
+  // and, for a wait, how long: the run page is one of the three places a
+  // wait must say so (with the CLI and `mission status`).
+  if (a.startsWith("budget.") && f) {
+    const subject = String(f.endpoint_id ?? f.stage ?? "budget");
+    if (a === "budget.wait") {
+      return typeof f.wait_seconds === "number"
+        ? `${subject}: waiting ${spanWords(f.wait_seconds)}`
+        : `${subject}: waiting until the budget is raised`;
+    }
+    if (a === "budget.resume" && typeof f.waited_ms === "number") {
+      return `${subject}: resumed after ${spanWords(f.waited_ms / 1000)}`;
+    }
+    if (a === "budget.warn" && typeof f.spent === "number" && typeof f.limit === "number") {
+      const per = typeof f.period === "string" ? ` per ${f.period}` : "";
+      return `${subject}: ${f.spent}/${f.limit} ${String(f.metric ?? "tokens")}${per}`;
+    }
+  }
   return "";
+}
+
+/** `45s`, `14m`, `1h 4m`: a span in words, never clock-shaped (a wait of
+ * `14:03` would read as a time of day). */
+function spanWords(secs: number): string {
+  const s = Math.max(0, Math.round(secs));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m`;
+  return `${s}s`;
 }
 
 /** (#2863) What one event row shows: a kind chip, the object the event was

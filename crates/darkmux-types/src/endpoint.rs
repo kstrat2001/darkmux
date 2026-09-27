@@ -157,8 +157,9 @@ impl BudgetPolicy {
 /// (`tokens`, `calls`, or both, over `period`), under `policy` (`off` /
 /// `warn` / `wait`, see [`BudgetPolicy`]), with an optional early warning
 /// at `warn_at` (a fraction of the budget). Enforcement applies to an
-/// endpoint declared in the `endpoints` map and named by id, because the
-/// usage records it sums are keyed by that id (`endpoint_id`).
+/// endpoint darkmux does not manage (the calls it SENDS), declared in the
+/// `endpoints` map and named by id, because the usage records it sums are
+/// keyed by that id (`endpoint_id`).
 ///
 /// **What is not.** `tokens_per_dispatch` and `concurrent_calls` are parsed,
 /// validated and shown by `darkmux doctor`, and change nothing:
@@ -1031,7 +1032,7 @@ mod tests {
 
         let limits = pm(r#"{"id":"m","endpoint":{"url":"https://h/v1","limits":{"tokens_per_dispatch":"500k"}}}"#);
         let ep = limits.endpoint.as_ref().unwrap();
-        assert_eq!(ep.kind().unwrap(), EndpointKind::Unmanaged, "limits are not enforced, so they never block a call");
+        assert_eq!(ep.kind().unwrap(), EndpointKind::Unmanaged, "unreadable limits never decide routing");
         assert!(ep.validate().unwrap_err().contains("limits"), "{:?}", ep.validate());
         assert_eq!(ep.limits_summary(), "(unreadable)");
     }

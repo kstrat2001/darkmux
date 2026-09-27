@@ -565,6 +565,13 @@ impl Profile {
 // than a 2.1 because no binary has shipped 2.0 yet, so there is no released
 // 2.x reader it could break. Inline endpoint objects still read unchanged,
 // and gained three optional fields (`managed`, `dialect`, `limits`).
+// Also in 2.0 (#2902 step 5, same unreleased major, so no bump of its own):
+// `limits` gained two optional fields, `policy` (`off` / `warn` / `wait`, a
+// registered `ConfigEnum`, read leniently and refused at preflight when
+// unregistered) and `warn_at` (a fraction in (0, 1)), and its rolling
+// `window` budget is now ENFORCED on an unmanaged endpoint named by id. A
+// `window` with neither `tokens` nor `calls` (the shipped all-null shape) is
+// no budget. Additive: every earlier 2.0 registry reads unchanged.
 pub const PROFILES_SCHEMA_VERSION: &str = "2.0";
 
 /// Scopes a review probe seat's draws to a subset of fact families, and

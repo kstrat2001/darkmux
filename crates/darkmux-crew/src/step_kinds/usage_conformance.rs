@@ -325,3 +325,75 @@ fn every_roster_path_calls_the_writer() {
         }
     }
 }
+
+/// (#2902 step 5) The budget half of the same roster: every HOSTED call
+/// site (a call darkmux sends to an endpoint it does not manage) passes the
+/// endpoint budget gate and the stage budget gate before its call, or is
+/// named here as exempt with the reason. Keyed off [`ROSTER`], whose own
+/// sweep already fails on any unrostered transport call, so a new hosted
+/// path cannot ship without deciding its budget too.
+///
+/// The entry points above these primitives need no row of their own: radio's
+/// answering seat, `darkmux acp`, `crawl.unit`, the lab providers, the fleet
+/// runner and every mission `dispatch.internal` step reach a hosted endpoint
+/// only through `dispatch::dispatch` (-> `dispatch_remote`, or the container
+/// path below) or through the `dispatch.single_shot` / `dispatch.map` kinds.
+#[test]
+fn every_hosted_call_site_passes_the_budget_gates() {
+    enum Budget {
+        /// `gate_in`'s body calls both gates.
+        Gated { gate_in: (&'static str, &'static str) },
+        /// The transport itself; its callers are rostered separately.
+        Transport,
+        Exempt(&'static str),
+    }
+    const BUDGETS: &[(&str, Budget)] = &[
+        ("single_shot_chat_hosted", Budget::Transport),
+        ("dispatch_remote", Budget::Gated { gate_in: ("src/dispatch_internal.rs", "dispatch_remote") }),
+        (
+            "probe_remote_endpoint",
+            Budget::Exempt(
+                "`darkmux doctor --probe`: an operator-run 64-token connectivity check, not work; \
+                 it is the tool for checking an endpoint that a budget may be holding",
+            ),
+        ),
+        ("run_single_shot", Budget::Gated { gate_in: ("src/step_kinds/builtins.rs", "run_single_shot") }),
+        ("map_hosted_dispatch", Budget::Gated { gate_in: ("src/step_kinds/builtins.rs", "map_hosted_item") }),
+    ];
+    let hosted = |c: &CallSite| {
+        c.transport == "single_shot_chat_hosted(" || (c.transport == "remote_chat_completion(" && c.caller != "single_shot_chat")
+    };
+    let mut checked = 0;
+    for c in ROSTER.iter().filter(|c| hosted(c)) {
+        let (_, duty) = BUDGETS
+            .iter()
+            .find(|(caller, _)| *caller == c.caller)
+            .unwrap_or_else(|| panic!("{}::{} sends a hosted call but has no budget duty here (#2902 step 5)", c.file, c.caller));
+        match duty {
+            Budget::Gated { gate_in } => {
+                let body = fn_body(&read_src(gate_in.0), gate_in.1);
+                for gate in ["crate::budget::admit_endpoint(", "crate::budget::admit_stage("] {
+                    assert!(body.contains(gate), "{}::{} must call `{gate}` before its call", gate_in.0, gate_in.1);
+                }
+                assert!(body.contains("crate::budget::settle_stage("), "{}::{} must settle the stage", gate_in.0, gate_in.1);
+                checked += 1;
+            }
+            Budget::Transport => {}
+            Budget::Exempt(why) => assert!(!why.trim().is_empty(), "{}: an exemption states its reason", c.caller),
+        }
+    }
+    assert!(checked >= 3, "only {checked} gated hosted paths seen");
+    // `map_hosted_dispatch` is reached only through the gated item loop.
+    let builtins = read_src("src/step_kinds/builtins.rs");
+    let map_calls = production_lines(&builtins).iter().map(|l| calls_on_line(l, "map_hosted_dispatch(")).sum::<usize>();
+    assert_eq!(map_calls, 1, "map_hosted_dispatch has one caller, the gated map_hosted_item");
+    assert!(fn_body(&builtins, "map_hosted_item").contains("map_hosted_dispatch("));
+    // The container path: the runtime calls a hosted brain INSIDE Docker, so
+    // the gate runs before the container starts and the pacer rides the
+    // host sampler between turns.
+    let di = read_src("src/dispatch_internal.rs");
+    let dispatch = fn_body(&di, "dispatch");
+    assert!(dispatch.contains("crate::budget::admit_endpoint(\n            &t.endpoint"), "pre-start gate");
+    assert!(dispatch.contains("crate::budget::EndpointBudget::of(&t.endpoint)"), "the pacer gets the budget");
+    assert!(fn_body(&di, "run_telemetry_sampler").contains("pacer.on_tick("), "the pacer ticks");
+}

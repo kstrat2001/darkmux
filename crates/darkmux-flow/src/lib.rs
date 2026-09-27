@@ -3260,6 +3260,8 @@ mod tests {
         //   1.64.0 — (#2963) `dispatch.turn.payload.tool_names` and
         //            `tool_paths`: each tool call's name and path argument,
         //            so the viewer names the running call and its file.
+        //   1.64.0 — (#2902 step 5) `endpoint_id` on usage records and the
+        //            `budget.warn` / `budget.wait` / `budget.resume` actions.
         assert_eq!(FLOW_SCHEMA_VERSION, "1.64.0");
     }
 

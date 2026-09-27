@@ -96,8 +96,9 @@ pub struct EndpointBudget {
 impl EndpointBudget {
     /// The budget `ep` carries, or `None` when there is nothing to enforce:
     /// no `endpoints` id (an inline endpoint: its usage records carry no id
-    /// to sum by, which `darkmux doctor` names), no window budget, or policy
-    /// `off`. `Err` names an unregistered policy (preflight refuses it first;
+    /// to sum by, which `darkmux doctor` names), a MANAGED endpoint (darkmux
+    /// budgets the calls it SENDS to an endpoint it does not manage; local
+    /// calls carry no `endpoint_id`), no window budget, or policy `off`. `Err` names an unregistered policy (preflight refuses it first;
     /// this keeps a caller that skipped preflight from guessing one).
     pub fn of(ep: &ModelEndpoint) -> Result<Option<Self>, String> {
         let Some(limits) = ep.known_limits() else { return Ok(None) };
@@ -108,6 +109,9 @@ impl EndpointBudget {
             )
         })?;
         let Some(id) = ep.named_id() else { return Ok(None) };
+        if !matches!(ep.kind(), Ok(darkmux_types::EndpointKind::Unmanaged)) {
+            return Ok(None);
+        }
         if !policy.counts() {
             return Ok(None);
         }
@@ -484,7 +488,7 @@ pub fn admit_with(mut b: EndpointBudget, caller: &BudgetCaller<'_>, env: &dyn Bu
                 return Ok(());
             }
             Verdict::Warn(br) => {
-                if env.last_level(&key).is_none_or(|l| l < br.level) {
+                if env.last_level(&key).map_or(true, |l| l < br.level) {
                     warn(&b, &br, caller, env);
                 }
                 env.set_last_level(&key, Some(br.level));
@@ -806,7 +810,7 @@ impl BudgetPacer {
                 None
             }
             Verdict::Warn(br) => {
-                if env.last_level(&key).is_none_or(|l| l < br.level) {
+                if env.last_level(&key).map_or(true, |l| l < br.level) {
                     warn(&self.budget, &br, caller, env);
                 }
                 env.set_last_level(&key, Some(br.level));

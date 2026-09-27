@@ -134,6 +134,10 @@ fn nothing_is_enforced_unless_a_window_budget_is_set_and_not_off() {
     assert_eq!(EndpointBudget::of(&off), Ok(None), "policy off counts nothing");
     let shipped = named(serde_json::json!({"policy": null, "warn_at": null, "window": {"period": null, "tokens": null, "calls": null}}));
     assert_eq!(EndpointBudget::of(&shipped), Ok(None), "the shipped all-null shape is no budget");
+    let mut managed = named(serde_json::json!({"window": {"period": "1d", "tokens": 10}}));
+    managed.url = None;
+    managed.managed = Some(darkmux_types::ManagedBackend::Lmstudio.into());
+    assert_eq!(EndpointBudget::of(&managed), Ok(None), "a managed endpoint's local calls are not budgeted");
     let per_dispatch_only = named(serde_json::json!({"tokens_per_dispatch": 5}));
     assert_eq!(EndpointBudget::of(&per_dispatch_only), Ok(None), "tokens_per_dispatch is not enforced");
 }

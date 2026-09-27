@@ -4521,6 +4521,9 @@ fn endpoint_budget_note(
     named.source = darkmux_types::EndpointSource::Named(id.to_string());
     match darkmux_crew::budget::EndpointBudget::of(&named) {
         Err(_) => String::new(), // the Fail row names it
+        Ok(None) if ep.kind().is_ok_and(|k| k.is_managed()) && limits.window.as_ref().is_some_and(|w| w.is_set()) => {
+            format!("; window budget not enforced on a managed endpoint (budgets apply to calls sent to an endpoint darkmux does not manage){unenforced}")
+        }
         Ok(None) => match limits.resolved_policy() {
             Ok(darkmux_types::BudgetPolicy::Off) if limits.window.as_ref().is_some_and(|w| w.is_set()) => {
                 format!("; budget off (nothing is counted){unenforced}")
