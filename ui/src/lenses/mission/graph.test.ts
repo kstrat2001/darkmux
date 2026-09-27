@@ -722,6 +722,21 @@ describe("stepMeterFor liveness", () => {
     expect(meterAt(records, T0 + 3_000).generating).toBe(false);
   });
 
+  it("stays generating while any of its concurrent items is still working, whatever another item's terminal says", () => {
+    // A step fanning out items (`dispatch.map`, review's seats and draws):
+    // each item's dispatch runs on its own session, all attributed to the
+    // step. Item 1 finishing is not the step finishing while item 2 works.
+    const s = (sec: number) => iso(T0 + sec * 1000);
+    const records = [
+      { action: "step.start", ts: s(0), session_id: "task-a" },
+      { action: "dispatch.start", ts: s(1), session_id: "item-1" },
+      { action: "dispatch.start", ts: s(2), session_id: "item-2" },
+      { action: "dispatch.complete", ts: s(10), session_id: "item-1" },
+      { action: "dispatch.turn", ts: s(20), session_id: "item-2" },
+    ];
+    expect(meterAt(records, T0 + 30_000).generating).toBe(true);
+  });
+
   it("is not generating with no records of its own", () => {
     expect(meterAt([], T0).generating).toBe(false);
   });
