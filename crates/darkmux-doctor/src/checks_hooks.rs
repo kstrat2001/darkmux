@@ -1573,6 +1573,17 @@ mod tests {
         assert!(row.hint.as_deref().unwrap().starts_with("A rule was removed or edited since these were written."));
     }
 
+    /// A fresh install has no outbox dir yet: that is not a problem, and not
+    /// a stray.
+    #[test]
+    fn a_missing_outbox_dir_is_not_a_stray_row() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("never-created");
+        let checks = checks_for(&[hook_rule(Some("crawl.*"), Some(LOOPBACK))], &missing);
+        assert_eq!(checks.len(), 2, "{checks:?}");
+        assert_eq!(named(&checks, "hooks").status, Status::Pass);
+    }
+
     #[test]
     fn a_configured_rules_own_outbox_is_never_stray() {
         let tmp = tempfile::TempDir::new().unwrap();
