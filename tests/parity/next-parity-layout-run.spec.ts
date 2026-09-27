@@ -89,7 +89,15 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
             range.setEnd(text, text.textContent.length);
             const r = range.getBoundingClientRect();
             const b = box.getBoundingClientRect();
-            return { inside: r.left >= b.left - 0.5 && r.right <= b.right + 0.5 && r.width > 0, trimmed: box.scrollWidth > box.clientWidth };
+            const trimmed = box.scrollWidth > box.clientWidth;
+            // A trimmed box draws its ellipsis over the start of the box, so
+            // the name must clear that too, not just the box's edge.
+            const probe = document.createElement("span");
+            probe.textContent = "…";
+            box.appendChild(probe);
+            const ell = trimmed ? probe.getBoundingClientRect().width : 0;
+            probe.remove();
+            return { inside: r.left >= b.left + ell - 0.5 && r.right <= b.right + 0.5 && r.width > 0, trimmed };
           }, state.fileName);
           expect(shown.inside, `${state.id}: the file name must be on screen (${vpName}, ${mode})`).toBe(true);
           if (state.id === "tool-file-long" && vpName === "phone") expect(shown.trimmed, `${state.id}: the long path is trimmed on a phone`).toBe(true);

@@ -123,12 +123,14 @@ const STATES = [
   // the slot TOOL GEN and REST use. A long path trims from the LEFT, so the
   // file name stays (`fileName`: the suite checks it is on screen).
   ...[
-    ["tool-file", "2026-09-26", "/workspace/src/lib/tokenRate.ts", "write · src/lib/tokenRate.ts"],
+    // Short enough to show whole in the desktop slot (240px there, the
+    // tube's column; wider on a phone).
+    ["tool-file", "2026-09-26", "/workspace/src/tokenRate.ts", "write · src/tokenRate.ts"],
     [
       "tool-file-long",
       "2026-09-28",
-      "/workspace/crates/darkmux-serve/assets/viewer/lenses/session/deeply/nested/folder/tree/tokenRateReadoutSpecimen.ts",
-      "write · crates/darkmux-serve/assets/viewer/lenses/session/deeply/nested/folder/tree/tokenRateReadoutSpecimen.ts",
+      "/workspace/crates/darkmux-serve/assets/viewer/lenses/session/deeply/nested/folder/tree/tokenReadout.ts",
+      "write · crates/darkmux-serve/assets/viewer/lenses/session/deeply/nested/folder/tree/tokenReadout.ts",
     ],
   ].map(([id, date, path, words]) => ({
     id, date, now: "12:00:15", runText: "run state: tools", rateText: "tools",
