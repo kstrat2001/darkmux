@@ -11,8 +11,38 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.65.0";
+pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 // Version history:
+//   2.0.0 (4.0): MAJOR, the action vocabulary is closed and has one spelling
+//           per event. Every action is a `FlowAction` variant (`action.rs`),
+//           spelled `<scope>.<event>[.<detail>]`: lowercase, two or three
+//           dot-separated segments. Dotted only on write; a spaced or
+//           otherwise retired spelling in an archive is upgraded on read by
+//           `darkmux_flow::reader` (the table is `legacy.rs`), and an
+//           archive is never rewritten. Renamed: `dispatch start` /
+//           `complete` / `error` / `route` -> `dispatch.*`; `step start` /
+//           `complete` / `error` / `result` / `timing` -> `step.*`,
+//           `step seat unresolved` -> `step.seat_unresolved`; `phase start`
+//           / `complete` / `abandon` / `added` (and the pre-rename `sprint
+//           start` / `complete` / `abandon` / `added` / `review begin`)
+//           -> `phase.*`,
+//           `ambiguous-phase-id` -> `phase.id_ambiguous`; `phase review
+//           begin` / `aborted` -> `phase.review.*`, `dispatch
+//           code-reviewer` -> `phase.review.dispatch`, `dispatch failed`
+//           -> `phase.review.failed`, `verdict: <v>` ->
+//           `phase.review.verdict` with the verdict in `payload.verdict`;
+//           `mission start` / `close` / `abort` / `pause` / `resume` ->
+//           `mission.*`; `note` -> `operator.note`, `catch` ->
+//           `operator.catch`, `tier-decision` -> `tier.decision`. An action
+//           darkmux retired with no current equivalent (`telemetry.process`,
+//           `funnel.*`, the old `mission.run.*` / `mission.compile.*` /
+//           `mission reopen`, the literal launcher's `crawl.*`) reads as
+//           `FlowAction::Retired`: known, never written, not counted as
+//           unknown. An action this build does not know reads as
+//           `FlowAction::Other`, is never written, and `darkmux doctor`
+//           names it. A consumer outside
+//           darkmux reads the dotted spellings; darkmux's own readers
+//           upgrade old archives.
 //   1.65.0 (#2902 step 5, budgets): additive, four actions and one usage
 //           field.
 //

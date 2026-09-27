@@ -98,6 +98,22 @@ darkmux release.
   it now, so it no longer caps anything. Delete it, or, to keep a cap, run
   `darkmux config set remote.max_tokens_per_step <n>` (and rename an
   exported `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`).
+- **Flow actions have one spelling per event** (FLOW 2.0.0). Every action
+  is `<scope>.<event>[.<detail>]`: `dispatch start` is now `dispatch.start`,
+  `step result` is `step.result`, `mission close` is `mission.close`,
+  `note` is `operator.note`, `tier-decision` is `tier.decision`, and
+  `verdict: <v>` is `phase.review.verdict` with the verdict in
+  `payload.verdict` (the full list is in `crates/darkmux-flow/src/schema.rs`).
+  darkmux's own readers, the daemon routes included, upgrade pre-4.0
+  archives on read and never rewrite them. An action retired with no
+  current equivalent (`telemetry.process`, `funnel.*`, the old
+  `mission.run.*`, `crawl.*` launcher records) still reads, as retired; an
+  action this build does not know still reads and `darkmux doctor` names it. `darkmux flow record
+  --action` accepts only known actions. **Migration:** a consumer of the
+  flow stream outside darkmux (a hook receiver, a script over the day files
+  or Redis) must read the dotted spellings. A hook rule whose `match.action`
+  names a retired spelling never matches again: `darkmux doctor` flags it
+  `CANNOT MATCH` and names the spelling to write instead.
 
 - **The degeneracy detector's policy values name the action: `off`,
   `record`, `warn`, `conclude`** (#2947). `enforce` is now `conclude` (still

@@ -3306,7 +3306,9 @@ mod tests {
         //            so the viewer names the running call and its file.
         //   1.65.0 — (#2902 step 5) `endpoint_id` on usage records and the
         //            `budget.warn` / `budget.wait` / `budget.resume` / `budget.stop` actions.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.65.0");
+        //   2.0.0 — (4.0) MAJOR: one wire spelling per action, dotted on
+        //            write; retired spellings upgrade on read.
+        assert_eq!(FLOW_SCHEMA_VERSION, "2.0.0");
     }
 
     #[test]
