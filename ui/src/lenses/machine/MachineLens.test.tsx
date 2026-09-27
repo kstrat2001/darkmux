@@ -86,8 +86,9 @@ function mockMachineFetch(opts: {
   staticMachine?: unknown;
   /** (#2921 follow-up) `GET /fleet/roster` entries. */
   roster?: unknown[];
-  /** (#2958) The flow window never answers. */
-  holdFlow?: boolean;
+  /** (#2958) The flow window never answers (`true`), or answers once the
+   *  promise resolves. */
+  holdFlow?: boolean | Promise<void>;
 } = {}) {
   const today = todayUTC();
   const yesterday = prevDateUTC(today);
@@ -103,7 +104,10 @@ function mockMachineFetch(opts: {
         resourcesCalled.value = true;
         return Promise.resolve(new Response(JSON.stringify(opts.resources ?? RESOURCES), { status: 200 }));
       }
-      if (opts.holdFlow && (path === `/flow/${today}` || path === `/flow/${yesterday}`)) return new Promise<Response>(() => {});
+      if (opts.holdFlow && (path === `/flow/${today}` || path === `/flow/${yesterday}`)) {
+        if (opts.holdFlow === true) return new Promise<Response>(() => {});
+        return opts.holdFlow.then(() => new Response(JSON.stringify(path === `/flow/${today}` ? (opts.flowToday ?? []) : (opts.flowYesterday ?? [])), { status: 200 }));
+      }
       if (path === `/flow/${today}`) return Promise.resolve(new Response(JSON.stringify(opts.flowToday ?? []), { status: 200 }));
       if (path === `/flow/${yesterday}`) return Promise.resolve(new Response(JSON.stringify(opts.flowYesterday ?? []), { status: 200 }));
       if (path === "/fleet/machines/live") {
@@ -492,8 +496,12 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
     expect([...container.querySelectorAll(".mm-row-chip")].some((c) => c.textContent === "utility")).toBe(false);
   });
 
-  it("(#2958) the Utility section's live line says no signal, not idle, while the flow window is unanswered", async () => {
-    mockMachineFetch({ ...withUtility, holdFlow: true });
+  it("(#2958) the Utility section says no signal and '—' counts while the flow window is unanswered, then its reading", async () => {
+    let open = () => {};
+    const flow = new Promise<void>((r) => {
+      open = r;
+    });
+    mockMachineFetch({ ...withUtility, holdFlow: flow });
     const { container } = renderMachine(null);
     const section = await waitFor(() => {
       const el = container.querySelector('[data-testid="machine-utility"]');
@@ -502,6 +510,39 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
     });
     expect(section.querySelector(".mm-utility__live")?.textContent).toBe("no signal");
     expect(section.querySelector(".mach-util")?.getAttribute("aria-label")).toMatch(/no signal$/);
+    // The model comes from /machine/specs, a reading: it shows at once.
+    expect(section.querySelector(".mm-utility__id")?.textContent).toBe("darkmux:qwen3-4b");
+    expect([...section.querySelectorAll(".mm-utility__job")].map((r) => r.textContent)).toEqual(["compacting——", "radio routing——", "other——"]);
+
+    open();
+    await waitFor(() => expect(section.querySelector(".mm-utility__live")?.textContent).toBe("idle"));
+    expect([...section.querySelectorAll(".mm-utility__job")].map((r) => r.textContent)).toEqual([
+      "compacting0 calls0 tokens",
+      "radio routing0 calls0 tokens",
+      "other0 calls0 tokens",
+    ]);
+  });
+
+  it("(#2958) a remote machine page says no signal, not idle, while the flow window is unanswered", async () => {
+    let open = () => {};
+    const flow = new Promise<void>((r) => {
+      open = r;
+    });
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" },
+      liveMachines: [{ machine_uid: "remote-uid", display_name: "studio", schema_version: "1", beat_ts_ms: 1, specs: "M1 Max · 32 GB" }],
+      holdFlow: flow,
+    });
+    const { container } = renderMachine("remote-uid");
+    await waitFor(() => expect(container.querySelector(".machine-drawer__idle-line")).not.toBeNull());
+    expect(container.querySelector(".machine-drawer__idle-line")!.textContent).toBe("no signal");
+    const section = container.querySelector('[data-testid="machine-utility"]')!;
+    expect(section.querySelector(".mm-utility__id")?.textContent).toBe("—");
+    expect(section.querySelector(".mm-utility__live")?.textContent).toBe("no signal");
+
+    open();
+    await waitFor(() => expect(container.querySelector(".machine-drawer__idle-line")!.textContent).toBe("idle · no samples in the last 10 min"));
+    expect(section.querySelector(".mm-utility__id")?.textContent).toBe("no utility model seen");
   });
 
   it("the inverted case: a machine with no utility tier configured says so", async () => {

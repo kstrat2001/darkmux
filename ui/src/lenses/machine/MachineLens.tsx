@@ -6,6 +6,7 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, MACHINE_MEM_POLL_MS } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
+import { useLatch } from "../../hooks/useLatch";
 import { useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
 import { localMachineUid, displayNameOf } from "../../lib/flow";
 import { relAgoFrom } from "../../lib/format";
@@ -197,6 +198,9 @@ export function MachineLens({
   const staticSettled = !daemonBacked && (machineSrc === null || !staticMachineQuery.isPending);
 
   const flowWindow = useFlowWindow(nowMs);
+  // (#2958) The window's FIRST answer: a new day's pending key at UTC
+  // midnight does not send the page back to "no signal".
+  const flowAnswered = useLatch(flowWindow.settled);
   const liveMachines = useLiveMachines(daemonBacked);
 
   const specsQuery = useQuery({
@@ -482,7 +486,7 @@ export function MachineLens({
             nowMs,
             specs,
             isLocal: isLocalMach,
-            settled: flowWindow.settled,
+            settled: flowAnswered,
             residentRow: residencyRows.find((r) => r.status !== "ghost" && isUtilityTierRow(r.model.identifier, r.model.model_key, utilityModelId(specs, isLocalSpecs)))?.model ?? null,
           })}
         />
@@ -505,7 +509,9 @@ export function MachineLens({
           liveBlock
         ) : liveSamples.length === 0 ? (
           <div className="machine-drawer__idle">
-            <div className="machine-drawer__idle-line">idle · no samples in the last 10 min</div>
+            {/* (#2958) Before the flow window answers, "idle" is a default:
+                the page has no samples because it has read nothing yet. */}
+            <div className="machine-drawer__idle-line">{flowAnswered ? "idle · no samples in the last 10 min" : "no signal"}</div>
             {liveLastKnown && (
               <div className="machine-drawer__lastknown">
                 {`last sample ${relAgoFrom(nowMs, liveLastKnown.ts)} — CPU ${fmtPct(liveLastKnown.point.cpu ?? null)} · GPU ${fmtPct(liveLastKnown.point.gpu ?? null)} · MEM ${fmtPct(liveLastKnown.point.mem ?? null)}`}

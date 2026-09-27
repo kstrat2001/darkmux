@@ -28,7 +28,7 @@ export interface UtilitySectionView {
   /** "idle", "radio routing · 3s", "compacting · 12s", "compacting · stalled". */
   liveLine: string;
   /** (#2958) The page's flow window has not answered yet: the live line
-   *  says "no signal" and the strip draws quiet, rather than "idle". */
+   *  says "no signal" rather than "idle", and every count reads "—". */
   noSignal: boolean;
   jobs: Array<{ word: string; calls: string; tokens: string; known: boolean }>;
 }
@@ -65,16 +65,20 @@ export function utilitySectionView(args: {
   // routing record from before 1.61.0), present even at zero.
   const usage = utilityUsageByJob(mine);
   const other = usage.filter((u) => !u.known).reduce((acc, u) => ({ calls: acc.calls + u.calls, tokens: acc.tokens + u.tokens }), { calls: 0, tokens: 0 });
+  // (#2958) "0 calls" before the records arrive is a default, not a count:
+  // "—" holds the cell until then.
   const row = (word: string, calls: number, tokens: number, known: boolean) => ({
     word,
-    calls: `${calls.toLocaleString("en-US")} ${calls === 1 ? "call" : "calls"}`,
-    tokens: `${fmtC(tokens)} tokens`,
+    calls: noSignal ? "—" : `${calls.toLocaleString("en-US")} ${calls === 1 ? "call" : "calls"}`,
+    tokens: noSignal ? "—" : `${fmtC(tokens)} tokens`,
     known,
   });
   const jobs = [...usage.filter((u) => u.known).map((u) => row(utilityJobWord(u.job), u.calls, u.tokens, true)), row("other", other.calls, other.tokens, false)];
   return {
     strip,
-    modelLine: strip.model ?? "no utility model seen",
+    // (#2958) "no utility model seen" is a claim about the records; a model
+    // named by `/machine/specs` is a reading and shows at once.
+    modelLine: strip.model ?? (noSignal ? "—" : "no utility model seen"),
     factsLine: `${win} · ${residency}`,
     liveLine,
     noSignal,

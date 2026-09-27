@@ -29,12 +29,13 @@ export function UtilityGlyph({
   noSignal = false,
 }: {
   strip: UtilityStrip;
-  /** (#2958) The card has not had its first data yet: the strip draws
-   *  quiet and its words say "no signal", not "idle", which would be a
-   *  default rather than a reading. The box is unchanged. */
+  /** (#2958) The source that would name a running job has not answered
+   *  yet: a QUIET strip's words say "no signal", not "idle", which would be
+   *  a default rather than a reading. A job already read still shows. The
+   *  box is unchanged. */
   noSignal?: boolean;
 }) {
-  const job = noSignal ? null : strip.job;
+  const job = strip.job;
   const visual = job ? job.visual : "quiet";
   const residency =
     strip.model == null
@@ -44,7 +45,7 @@ export function UtilityGlyph({
         : strip.resident === false
           ? "not loaded"
           : "residency unknown";
-  const doing = noSignal ? "no signal" : job ? (job.stalled ? `${job.word}, stalled` : job.word) : "idle";
+  const doing = job ? (job.stalled ? `${job.word}, stalled` : job.word) : noSignal ? "no signal" : "idle";
   const label = strip.model != null ? `utility model ${strip.model} · ${residency} · ${doing}` : `${residency} · ${doing}`;
   const dot = strip.resident === true ? "filled" : strip.resident === false ? "hollow" : "unknown";
   return (
