@@ -118,6 +118,31 @@ const STATES = [
       tick(d, "12:00:15"),
     ],
   },
+  // (#2963) darkmux running a turn's tools after a write completed: the
+  // readout line names the action and the file ("write · src/lib/…"), in
+  // the slot TOOL GEN and REST use. A long path trims from the LEFT, so the
+  // file name stays (`fileName`: the suite checks it is on screen).
+  ...[
+    ["tool-file", "2026-09-26", "/workspace/src/lib/tokenRate.ts", "write · src/lib/tokenRate.ts"],
+    [
+      "tool-file-long",
+      "2026-09-28",
+      "/workspace/crates/darkmux-serve/assets/viewer/lenses/session/deeply/nested/folder/tree/tokenRateReadoutSpecimen.ts",
+      "write · crates/darkmux-serve/assets/viewer/lenses/session/deeply/nested/folder/tree/tokenRateReadoutSpecimen.ts",
+    ],
+  ].map(([id, date, path, words]) => ({
+    id, date, now: "12:00:15", runText: "run state: tools", rateText: "tools",
+    noteText: words, fileName: path.split("/").pop(),
+    recs: (b, d) => [
+      ...b.prefix(d),
+      b.opener(d),
+      b.beat(d, "12:00:10", 2, 900, 900),
+      b.rec(at(d, "12:00:12"), "dispatch.turn", { turn_seq: 2, tool_calls_count: 2, generation_ms: 4000 }),
+      // The args the runtime forwards, capped: the path, then the content.
+      b.rec(at(d, "12:00:13"), "dispatch.tool", { tool_name: "write", args: JSON.stringify({ path, content: "export const x = 1;\n".repeat(40) }).slice(0, 512) }),
+      tick(d, "12:00:15"),
+    ],
+  })),
   {
     // A rest record with no `reason` (a host from before #2167): no line.
     id: "rest", date: "2026-08-15", now: "12:00:12", runText: /run state: rest \d+s$/, rateText: /^rest \d+s$/, noteText: null,

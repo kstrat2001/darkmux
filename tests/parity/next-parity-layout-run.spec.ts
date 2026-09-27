@@ -65,6 +65,7 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
     test(`run page MODEL section: one size in every state (${vpName}, ${mode})`, async ({ browser }) => {
       const states = STATES.filter((s) => mode === "live" || s.runPlayback !== false);
       const rows = [];
+      const noteRows = [];
       for (const state of states) {
         const { ctx, page } = await openState(browser, viewport, state, { mode, surface: "run" });
         const lamps = page.locator(RUN.lamps);
@@ -74,6 +75,29 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
         if (state.noteText === null) await expect(page.locator(NOTE), `${state.id}: no readout line`).toHaveCount(0);
         else if (state.noteText) await expect(page.locator(NOTE), `${state.id}: the readout line`).toHaveText(state.noteText);
         if (state.rateTextPhone) await expectFits(page.locator(NOTE), `${state.id}: run page readout (${vpName}, ${mode})`);
+        // (#2963) A tool's file: the line is one line inside its slot, and
+        // however long the path, the FILE NAME is on screen (the path trims
+        // from the left). On a phone the long path must actually be trimmed,
+        // so this state exercises the trim rather than a path that fit.
+        if (state.fileName) {
+          await expectFits(page.locator(NOTE), `${state.id}: run page readout (${vpName}, ${mode})`);
+          const shown = await page.locator(`${NOTE} .modelbox__note-path`).evaluate((box, name) => {
+            const bdi = box.querySelector("bdi");
+            const text = bdi.firstChild;
+            const range = document.createRange();
+            range.setStart(text, text.textContent.length - name.length);
+            range.setEnd(text, text.textContent.length);
+            const r = range.getBoundingClientRect();
+            const b = box.getBoundingClientRect();
+            return { inside: r.left >= b.left - 0.5 && r.right <= b.right + 0.5 && r.width > 0, trimmed: box.scrollWidth > box.clientWidth };
+          }, state.fileName);
+          expect(shown.inside, `${state.id}: the file name must be on screen (${vpName}, ${mode})`).toBe(true);
+          if (state.id === "tool-file-long" && vpName === "phone") expect(shown.trimmed, `${state.id}: the long path is trimmed on a phone`).toBe(true);
+          if (state.id === "tool-file") expect(shown.trimmed, `${state.id}: a short path is shown whole (${vpName}, ${mode})`).toBe(false);
+        }
+        // (#2963) The readout line itself is one line tall in every state
+        // that shows one, a tool's file included.
+        if ((await page.locator(NOTE).count()) > 0) noteRows.push({ state: state.id, ...(await measure(page, { note: NOTE })) });
         // Settle: the count-ups and the scope's morph run on timers, and a
         // size taken mid-frame would be a flake, not a finding.
         await page.waitForTimeout(400);
@@ -94,8 +118,13 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
       // The readout under the lamps is present in the tool-gen states and
       // absent elsewhere; that is the case the layout must absorb.
       expect(rows.map((r) => r.state)).toEqual(
-        expect.arrayContaining(["toolgen-named", "finished", "compacting", "radio-routing", "rest", "rest-turn-delay", "rest-thermal", "rest-pacing", "rest-battery", "rest-episode-limit", "rest-unknown", "armed-generating", "armed-toolgen"]),
+        expect.arrayContaining(["toolgen-named", "finished", "compacting", "radio-routing", "rest", "rest-turn-delay", "rest-thermal", "rest-pacing", "rest-battery", "rest-episode-limit", "rest-unknown", "armed-generating", "armed-toolgen", "tool-file", "tool-file-long"]),
       );
+      // (#2963) The line's own box, only in states that show it: a tool's
+      // two-part line (action, then a left-trimming file box) is the same
+      // one line, across the same slot, as TOOL GEN's and REST's.
+      expect(noteRows.map((r) => r.state)).toEqual(expect.arrayContaining(["toolgen-named", "tool-file", "tool-file-long", "rest-thermal"]));
+      expect(sizeGroups(noteRows, "note"), `the readout line changed height (${vpName}, ${mode})`).toHaveLength(1);
     });
 
     test(`fleet card: one size across its running states (${vpName}, ${mode})`, async ({ browser }) => {
