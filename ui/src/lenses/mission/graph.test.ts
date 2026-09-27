@@ -737,6 +737,30 @@ describe("stepMeterFor liveness", () => {
     expect(meterAt(records, T0 + 30_000).generating).toBe(true);
   });
 
+  it("is closed once its own step terminal lands, even while an item's session lacks its terminal", () => {
+    const s = (sec: number) => iso(T0 + sec * 1000);
+    const records = [
+      { action: "step.start", ts: s(0), session_id: "task-a" },
+      { action: "dispatch.start", ts: s(1), session_id: "item-1" },
+      { action: "dispatch.turn", ts: s(5), session_id: "item-1" },
+      { action: "step.complete", ts: s(10), session_id: "task-a" },
+    ];
+    expect(meterAt(records, T0 + 20_000).generating).toBe(false);
+    const byStep = recordsByStep(records.map((r) => rec({ handle: "a-step", ...r })), indexGraph(baseGraph()), "m1");
+    expect(stepPhasesAt(byStep, T0 + 20_000, DEFAULT_POLICY).get("a-step")).toBe("closed");
+  });
+
+  it("before its step terminal lands, an item in flight keeps it generating", () => {
+    const s = (sec: number) => iso(T0 + sec * 1000);
+    const records = [
+      { action: "step.start", ts: s(0), session_id: "task-a" },
+      { action: "dispatch.start", ts: s(1), session_id: "item-1" },
+      { action: "dispatch.turn", ts: s(5), session_id: "item-1" },
+      { action: "step.complete", ts: s(40), session_id: "task-a" },
+    ];
+    expect(meterAt(records, T0 + 20_000).generating).toBe(true);
+  });
+
   it("is not generating with no records of its own", () => {
     expect(meterAt([], T0).generating).toBe(false);
   });
