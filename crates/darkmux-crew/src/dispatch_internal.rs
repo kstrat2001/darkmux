@@ -10270,7 +10270,7 @@ impl TailerState {
                     // trajectory.jsonl — without this, the #2165 fix never
                     // reached the surface the miss actually happened on.
                     "bound": event.get("bound"),
-                    // (#2887) `policy` (off/record/warn/cut; `enforce` /
+                    // (#2887) `policy` (off/record/warn/conclude; `enforce` /
                     // `observe` in runs recorded before 4.0) and
                     // `would_conclude` (the judge's verdict BEFORE policy is
                     // applied) already ride the runtime's own trajectory
