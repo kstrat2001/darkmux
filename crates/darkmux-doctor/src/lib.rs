@@ -4571,10 +4571,10 @@ fn endpoint_budget_note(
         },
         Ok(Some(b)) => {
             let entries = spend(&b);
-            let tokens: u64 = entries.iter().filter_map(|(_, n)| *n).sum();
+            let tokens: u64 = entries.iter().map(|(_, s)| s.known).sum();
             // A call with an unknown spend is never read as small: the
             // figure becomes a floor, and says why.
-            let unmetered = entries.iter().filter(|(_, n)| n.is_none()).count();
+            let unmetered = entries.iter().filter(|(_, s)| !s.metered).count();
             let spent = match unmetered {
                 0 => format!("spent {tokens} tokens"),
                 n => format!("spent at least {tokens} tokens ({n} with an unknown spend)"),
@@ -13334,7 +13334,7 @@ mod tests {
         let mut asked = Vec::new();
         let c = endpoints_status(&r, &mut |b| {
             asked.push(b.endpoint_id.clone());
-            vec![(1, Some(1_200_000)), (2, Some(300_000))]
+            vec![(1, darkmux_crew::budget::Spend::full(1_200_000)), (2, darkmux_crew::budget::Spend::full(300_000))]
         });
         assert_eq!(c.status, Status::Pass, "{}", c.message);
         assert!(c.message.contains("`azure`: unmanaged, r.example"), "host only, userinfo stripped: {}", c.message);
@@ -13349,9 +13349,9 @@ mod tests {
         assert!(c.message.contains("shown, not enforced"), "{}", c.message);
         assert!(c.message.contains("`lms`: managed (lmstudio), chat-completions-max-tokens"), "{}", c.message);
         assert_eq!(asked, vec!["azure".to_string()], "only a counting budget reads the window");
-        let floor = endpoints_status(&r, &mut |_| vec![(1, Some(1_200_000)), (2, None)]);
+        let floor = endpoints_status(&r, &mut |_| vec![(1, darkmux_crew::budget::Spend::full(1_200_000)), (2, darkmux_crew::budget::Spend::partial(500))]);
         assert!(
-            floor.message.contains("spent at least 1200000 tokens (1 with an unknown spend) in 2 calls"),
+            floor.message.contains("spent at least 1200500 tokens (1 with an unknown spend) in 2 calls"),
             "an unknown spend is a floor, never a small number: {}",
             floor.message
         );

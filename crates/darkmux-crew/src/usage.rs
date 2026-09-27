@@ -383,8 +383,9 @@ pub(crate) fn assert_one_usage_record<'a>(
 /// One record's contribution: the twin of `usageContribution`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageAmount {
-    /// What the record's counts add up to, for display sums: its total, else
-    /// whatever halves it reported. A lower bound when a half is missing.
+    /// What the record's counts add up to: its total, else whatever halves
+    /// it reported. A lower bound when a half is missing; display sums show
+    /// it, and the endpoint budget counts it as the call's known spend.
     pub total: u64,
     pub prompt: u64,
     pub completion: u64,
@@ -394,8 +395,8 @@ pub struct UsageAmount {
     pub reported: bool,
     /// What the call SPENT, by the one total rule
     /// ([`darkmux_trajectory::UsageCounts::total_tokens`]): `None` when it is
-    /// unknown (no usage, or no prompt count). The endpoint budget reads
-    /// this, never `total`.
+    /// unknown (no usage, or no prompt count). The endpoint budget reads it
+    /// to know whether `total` is the full spend or only a floor.
     pub spend: Option<u64>,
 }
 

@@ -32,7 +32,7 @@ fn named(limits: serde_json::Value) -> ModelEndpoint {
 /// (`budget::with_test_env`) and see the gate fire on its path.
 pub(crate) struct FakeEnv {
     now: Cell<i64>,
-    records: RefCell<Vec<(i64, Option<u64>)>>,
+    records: RefCell<Vec<(i64, Spend)>>,
     slept_ms: Cell<u64>,
     paused_ms: Cell<u64>,
     /// Why the run was stopped, from this many ms slept on (a test's
@@ -46,14 +46,14 @@ pub(crate) struct FakeEnv {
     reloaded_from: RefCell<Vec<Option<String>>>,
     emitted: RefCell<Vec<darkmux_flow::FlowRecord>>,
     said: RefCell<Vec<String>>,
-    levels: RefCell<HashMap<String, BreachLevel>>,
+    levels: RefCell<HashMap<String, Surfaced>>,
 }
 
 impl FakeEnv {
     pub(crate) fn new(records: Vec<(i64, u64)>) -> Self {
         FakeEnv {
             now: Cell::new(T0),
-            records: RefCell::new(records.into_iter().map(|(t, n)| (t, Some(n))).collect()),
+            records: RefCell::new(records.into_iter().map(|(t, n)| (t, Spend::full(n))).collect()),
             slept_ms: Cell::new(0),
             paused_ms: Cell::new(0),
             stop: RefCell::new(None),
@@ -128,10 +128,10 @@ impl BudgetEnv for FakeEnv {
     fn paused(&self, ms: u64) {
         self.paused_ms.set(self.paused_ms.get() + ms);
     }
-    fn last_level(&self, key: &str) -> Option<BreachLevel> {
+    fn last_surfaced(&self, key: &str) -> Option<Surfaced> {
         self.levels.borrow().get(key).copied()
     }
-    fn set_last_level(&self, key: &str, level: Option<BreachLevel>) {
+    fn set_surfaced(&self, key: &str, level: Option<Surfaced>) {
         match level {
             Some(l) => {
                 self.levels.borrow_mut().insert(key.into(), l);
@@ -269,27 +269,63 @@ fn limits_validate_warn_at_and_policy() {
 
 /// Every entry's spend known: the shape all but the unmetered tests use.
 fn evaluate_known(b: &EndpointBudget, entries: &[(i64, u64)], now: i64) -> Verdict {
-    let known: Vec<(i64, Option<u64>)> = entries.iter().map(|(t, n)| (*t, Some(*n))).collect();
+    let known: Vec<(i64, Spend)> = entries.iter().map(|(t, n)| (*t, Spend::full(*n))).collect();
     evaluate(b, &known, now)
 }
 
-/// A call whose spend is unknown (no prompt count, or no usage at all) is
-/// never read as small: under a token budget the window cannot be
-/// metered, which is surfaced under `warn` and `wait` alike. A known spend
-/// already at the limit still waits.
+/// A call whose full spend is unknown (no prompt count, or no usage at
+/// all) is never read as small: its known halves still count toward the
+/// budget (a lower bound), and the window is flagged as not fully metered.
+/// The flag rides on the same warning; it never replaces the level.
 #[test]
-fn an_unmetered_call_is_surfaced_never_read_as_small() {
-    let entries = [(T0 - 10, Some(100)), (T0 - 5, None)];
+fn an_unmetered_call_counts_its_known_halves_and_is_flagged() {
+    let entries = [(T0 - 10, Spend::full(100)), (T0 - 5, Spend::partial(0))];
     for policy in [BudgetPolicy::Warn, BudgetPolicy::Wait] {
         let b = budget(policy, Some(1_000), None, None);
         let Verdict::Warn(br) = evaluate(&b, &entries, T0) else { panic!("{policy:?}: not surfaced") };
-        assert_eq!((br.level, br.metric, br.spent, br.limit, br.unmetered), (BreachLevel::Unmetered, Metric::Tokens, 100, 1_000, 1));
+        assert_eq!((br.level, br.metric, br.spent, br.limit, br.unmetered), (None, Metric::Tokens, 100, 1_000, 1));
     }
     let calls_only = budget(BudgetPolicy::Warn, None, Some(10), None);
     assert_eq!(evaluate(&calls_only, &entries, T0), Verdict::Proceed, "a calls budget counts the call either way");
-    let wait = budget(BudgetPolicy::Wait, Some(1_000), None, None);
-    let at = [(T0 - 10, Some(1_000)), (T0 - 5, None)];
-    assert!(matches!(evaluate(&wait, &at, T0), Verdict::Wait { .. }), "the known spend alone reached the budget");
+}
+
+/// (re-review N1, the probe) Five completion-only records of 400,000
+/// tokens against a 100,000-token `wait` budget: the known halves alone
+/// are 2,000,000, so the call WAITS. Throwing the halves away read the
+/// window as 0 spent and let the call through.
+#[test]
+fn completion_only_spend_still_fills_a_wait_budget() {
+    let entries: Vec<(i64, Spend)> = (1..=5).map(|i| (T0 - 100 + i, Spend::partial(400_000))).collect();
+    let b = budget(BudgetPolicy::Wait, Some(100_000), None, None);
+    let Verdict::Wait { breach, .. } = evaluate(&b, &entries, T0) else { panic!("an over-full window must wait") };
+    assert_eq!((breach.level, breach.spent, breach.unmetered), (Some(BreachLevel::AtLimit), 2_000_000, 5));
+}
+
+/// (re-review N4) The level (over the known spend) and the unmetered flag
+/// are independent: an early warning that arrives after an unmetered-only
+/// one is news and is said, and a newly unmetered window at the same level
+/// is said too.
+#[test]
+fn an_early_warning_after_an_unmetered_one_is_still_said() {
+    let env = FakeEnv::new(vec![]);
+    env.records.borrow_mut().push((T0 - 60, Spend::partial(10)));
+    let b = budget(BudgetPolicy::Warn, Some(1_000), None, Some(0.5));
+    let caller = BudgetCaller::default();
+    admit_with(b.clone(), &caller, &env).unwrap();
+    assert_eq!(env.actions().len(), 1, "unmetered, under every threshold: said once");
+    admit_with(b.clone(), &caller, &env).unwrap();
+    assert_eq!(env.actions().len(), 1, "nothing new: not repeated");
+    env.records.borrow_mut().push((T0 - 30, Spend::full(600)));
+    admit_with(b.clone(), &caller, &env).unwrap();
+    assert_eq!(env.actions().len(), 2, "crossing warn_at is news even after an unmetered warning");
+    let early = env.emitted.borrow()[1].payload.clone().unwrap();
+    assert_eq!((early["level"].as_str(), early["unmetered_calls"].as_u64()), (Some("early"), Some(1)));
+    // The other direction: a metered early warning, then an unmetered call.
+    let env = FakeEnv::new(vec![(T0 - 60, 600)]);
+    admit_with(b.clone(), &caller, &env).unwrap();
+    env.records.borrow_mut().push((T0 - 30, Spend::partial(0)));
+    admit_with(b, &caller, &env).unwrap();
+    assert_eq!(env.actions().len(), 2, "a window that became unmetered is news at the same level");
 }
 
 /// The window's reading of a usage record: a completion-only record's
@@ -304,11 +340,11 @@ fn a_usage_record_without_a_prompt_count_has_an_unknown_spend() {
         .to_string()
     };
     let partial = rec(serde_json::json!({"endpoint_id": "azure", "token_source": "provider", "completion_tokens": 12}));
-    assert_eq!(parse_entry(partial.as_bytes()).map(|e| e.2), Some(None));
+    assert_eq!(parse_entry(partial.as_bytes()).map(|e| e.2), Some(Spend::partial(12)), "the known half is kept as a lower bound");
     let absent = rec(serde_json::json!({"endpoint_id": "azure", "token_source": "absent"}));
-    assert_eq!(parse_entry(absent.as_bytes()).map(|e| e.2), Some(None), "no usage at all is unknown too");
+    assert_eq!(parse_entry(absent.as_bytes()).map(|e| e.2), Some(Spend::partial(0)), "no usage at all is unknown too");
     let whole = rec(serde_json::json!({"endpoint_id": "azure", "prompt_tokens": 90, "completion_tokens": 12}));
-    assert_eq!(parse_entry(whole.as_bytes()).map(|e| e.2), Some(Some(102)));
+    assert_eq!(parse_entry(whole.as_bytes()).map(|e| e.2), Some(Spend::full(102)));
 }
 
 #[test]
@@ -317,7 +353,7 @@ fn under_budget_proceeds_at_budget_warns_or_waits() {
     assert_eq!(evaluate_known(&warn, &[(T0 - 10, 999)], T0), Verdict::Proceed);
     let at = [(T0 - 10, 600), (T0 - 5, 400)];
     let Verdict::Warn(br) = evaluate_known(&warn, &at, T0) else { panic!() };
-    assert_eq!((br.level, br.metric, br.spent, br.limit), (BreachLevel::AtLimit, Metric::Tokens, 1_000, 1_000));
+    assert_eq!((br.level, br.metric, br.spent, br.limit), (Some(BreachLevel::AtLimit), Metric::Tokens, 1_000, 1_000));
     let wait = budget(BudgetPolicy::Wait, Some(1_000), None, None);
     // Room returns when the 600 at T0-10 leaves the window: T0-10 + 1d.
     assert_eq!(
@@ -373,7 +409,7 @@ fn a_zero_budget_waits_with_no_resume_time() {
 fn warn_at_warns_early_and_is_never_guessed() {
     let with = budget(BudgetPolicy::Warn, Some(1_000), None, Some(0.8));
     let Verdict::Warn(br) = evaluate_known(&with, &[(T0 - 1, 800)], T0) else { panic!() };
-    assert_eq!(br.level, BreachLevel::Early);
+    assert_eq!(br.level, Some(BreachLevel::Early));
     assert_eq!(evaluate_known(&with, &[(T0 - 1, 799)], T0), Verdict::Proceed);
     let without = budget(BudgetPolicy::Warn, Some(1_000), None, None);
     assert_eq!(evaluate_known(&without, &[(T0 - 1, 999)], T0), Verdict::Proceed, "no threshold picked by darkmux");
@@ -424,7 +460,7 @@ fn warn_surfaces_the_breach_once_and_never_holds_the_call() {
     // Spend leaves the window, then returns: a second crossing warns again.
     env.records.borrow_mut().clear();
     admit_with(b.clone(), &caller, &env).unwrap();
-    env.records.borrow_mut().push((T0, Some(5_000)));
+    env.records.borrow_mut().push((T0, Spend::full(5_000)));
     admit_with(b, &caller, &env).unwrap();
     assert_eq!(env.actions().len(), 2);
 }
@@ -815,7 +851,7 @@ fn the_ledger_sums_this_endpoints_records_in_the_window() {
     append(dir.path(), T0, "{\"not json\n");
     let mut l = Ledger::new(dir.path());
     let w = l.window("azure", T0, DAY as u64);
-    assert_eq!(w, vec![(T0 - DAY + 100, Some(10)), (T0 - 50, Some(20)), (T0 - 20, Some(3))]);
+    assert_eq!(w, vec![(T0 - DAY + 100, Spend::full(10)), (T0 - 50, Spend::full(20)), (T0 - 20, Spend::full(3))]);
 }
 
 /// A half-written last line is read on a later call, from its start.
@@ -828,7 +864,7 @@ fn a_partial_last_line_is_read_once_complete() {
     let mut l = Ledger::new(dir.path());
     assert!(l.window("azure", T0, DAY as u64).is_empty());
     append(dir.path(), T0, b);
-    assert_eq!(l.window("azure", T0, DAY as u64), vec![(T0 - 5, Some(42))]);
+    assert_eq!(l.window("azure", T0, DAY as u64), vec![(T0 - 5, Spend::full(42))]);
 }
 
 /// (review C7) A day file rewritten in place, larger than before, is read
@@ -840,11 +876,11 @@ fn a_day_file_rewritten_larger_is_read_again() {
     let path = dir.path().join(format!("{}.jsonl", darkmux_flow::day_utc_at(T0)));
     std::fs::write(&path, usage_line(T0 - 50, Some("azure"), 1_000)).unwrap();
     let mut l = Ledger::new(dir.path());
-    assert_eq!(l.window("azure", T0, DAY as u64), vec![(T0 - 50, Some(1_000))]);
+    assert_eq!(l.window("azure", T0, DAY as u64), vec![(T0 - 50, Spend::full(1_000))]);
     let rewritten: String = (1..=5).map(|i| usage_line(T0 - 50 + i, Some("azure"), 1)).collect();
     std::fs::write(&path, rewritten).unwrap();
     let w = l.window("azure", T0, DAY as u64);
-    assert_eq!(w.iter().map(|(_, n)| *n).collect::<Vec<_>>(), vec![Some(1); 5], "{w:?}");
+    assert_eq!(w.iter().map(|(_, n)| *n).collect::<Vec<_>>(), vec![Spend::full(1); 5], "{w:?}");
     // An ordinary append still reads only the new bytes.
     let before = l.bytes_read();
     let one = usage_line(T0 - 1, Some("azure"), 7);
