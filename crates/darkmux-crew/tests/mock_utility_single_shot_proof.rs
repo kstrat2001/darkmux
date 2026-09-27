@@ -15,6 +15,7 @@ use serde_json::Value;
 use std::path::Path;
 
 use darkmux_crew::utility::{run_utility_single_shot, UtilityJob};
+use darkmux_types::test_isolation::IsolatedState;
 
 /// A registry with ONE work profile and the machine utility binding in the
 /// object form. `mock-util` is the utility model; the work profile never
@@ -55,20 +56,20 @@ fn all_flow_records(flows_dir: &Path) -> Vec<Value> {
     records
 }
 
-fn with_isolated_flows<T>(flows_dir: &Path, f: impl FnOnce() -> T) -> T {
-    // SAFETY (matches `mock_single_shot_proof.rs`): each `tests/*.rs` file is
-    // its own process and every test here is `#[serial]`, so no other test
-    // races this env var.
-    let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
-    unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir) };
-    let out = f();
-    unsafe {
-        match prev {
-            Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
-            None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
-        }
-    }
-    out
+/// Pins every darkmux state destination under a root this test alone owns,
+/// for as long as the guard lives, with the flows dir created so a job that
+/// records nothing still leaves an empty, readable one. The pinned home is
+/// also what scopes the LIVE channel: its socket derives from the home, so
+/// this test's socket is its own. Pinning only the flows dir left the home
+/// ambient, and every test process sharing that home (a suite run with
+/// `DARKMUX_HOME` set) sent its utility edges into whichever test had bound
+/// the socket.
+fn isolated_state() -> IsolatedState {
+    // `#[serial]` on every test here keeps the env mutation single-threaded
+    // within this process; each `tests/*.rs` file is its own process.
+    let state = IsolatedState::new();
+    std::fs::create_dir_all(state.join("flows")).expect("creating the isolated flows dir");
+    state
 }
 
 #[test]
@@ -102,17 +103,16 @@ fn a_utility_job_runs_on_the_binding_and_leaves_only_its_usage_record() {
 
     let registry_dir = tempfile::tempdir().unwrap();
     let profiles_path = write_registry(registry_dir.path());
-    let flows_dir = tempfile::tempdir().unwrap();
+    let state = isolated_state();
+    let flows_dir = state.join("flows");
 
-    let reply = with_isolated_flows(flows_dir.path(), || {
-        run_utility_single_shot(&UtilityJob {
-            role_id: darkmux_crew::loader::RADIO_ROUTER_ROLE_ID,
-            message: "review this when you get a sec",
-            timeout_seconds: 30,
-            max_tokens: 256,
-            config_path: Some(profiles_path.to_str().unwrap()),
-            base_url_override: Some(&server.base_url()),
-        })
+    let reply = run_utility_single_shot(&UtilityJob {
+        role_id: darkmux_crew::loader::RADIO_ROUTER_ROLE_ID,
+        message: "review this when you get a sec",
+        timeout_seconds: 30,
+        max_tokens: 256,
+        config_path: Some(profiles_path.to_str().unwrap()),
+        base_url_override: Some(&server.base_url()),
     })
     .expect("the utility call round-trips through the mock server");
 
@@ -120,7 +120,7 @@ fn a_utility_job_runs_on_the_binding_and_leaves_only_its_usage_record() {
     mock.assert();
 
     // LEAN: exactly one record, the usage record; no bookends, no session.
-    let records = all_flow_records(flows_dir.path());
+    let records = all_flow_records(&flows_dir);
     let usage: Vec<&Value> = records
         .iter()
         .filter(|r| r["category"] == "telemetry" && r["source"] == "tokens")
@@ -184,19 +184,18 @@ fn a_utility_job_whose_call_fails_ends_with_utility_error() {
     });
     let registry_dir = tempfile::tempdir().unwrap();
     let profiles_path = write_registry(registry_dir.path());
-    let flows_dir = tempfile::tempdir().unwrap();
-    let res = with_isolated_flows(flows_dir.path(), || {
-        run_utility_single_shot(&UtilityJob {
-            role_id: darkmux_crew::loader::RADIO_ROUTER_ROLE_ID,
-            message: "anything",
-            timeout_seconds: 5,
-            max_tokens: 16,
-            config_path: Some(profiles_path.to_str().unwrap()),
-            base_url_override: Some(&server.base_url()),
-        })
+    let state = isolated_state();
+    let flows_dir = state.join("flows");
+    let res = run_utility_single_shot(&UtilityJob {
+        role_id: darkmux_crew::loader::RADIO_ROUTER_ROLE_ID,
+        message: "anything",
+        timeout_seconds: 5,
+        max_tokens: 16,
+        config_path: Some(profiles_path.to_str().unwrap()),
+        base_url_override: Some(&server.base_url()),
     });
     assert!(res.is_err(), "a 500 is an error");
-    let records = all_flow_records(flows_dir.path());
+    let records = all_flow_records(&flows_dir);
     let actions: Vec<&str> = records.iter().filter_map(|r| r["action"].as_str()).collect();
     assert_eq!(
         actions,
@@ -224,21 +223,20 @@ fn each_utility_job_mints_its_own_id() {
     });
     let registry_dir = tempfile::tempdir().unwrap();
     let profiles_path = write_registry(registry_dir.path());
-    let flows_dir = tempfile::tempdir().unwrap();
-    with_isolated_flows(flows_dir.path(), || {
-        for _ in 0..2 {
-            run_utility_single_shot(&UtilityJob {
-                role_id: darkmux_crew::loader::RADIO_ROUTER_ROLE_ID,
-                message: "x",
-                timeout_seconds: 5,
-                max_tokens: 8,
-                config_path: Some(profiles_path.to_str().unwrap()),
-                base_url_override: Some(&server.base_url()),
-            })
-            .unwrap();
-        }
-    });
-    let records = all_flow_records(flows_dir.path());
+    let state = isolated_state();
+    let flows_dir = state.join("flows");
+    for _ in 0..2 {
+        run_utility_single_shot(&UtilityJob {
+            role_id: darkmux_crew::loader::RADIO_ROUTER_ROLE_ID,
+            message: "x",
+            timeout_seconds: 5,
+            max_tokens: 8,
+            config_path: Some(profiles_path.to_str().unwrap()),
+            base_url_override: Some(&server.base_url()),
+        })
+        .unwrap();
+    }
+    let records = all_flow_records(&flows_dir);
     let ids: std::collections::BTreeSet<String> = records
         .iter()
         .filter(|r| r["action"] == "utility.start")
@@ -257,21 +255,20 @@ fn a_utility_job_with_no_binding_is_a_loud_error_naming_the_fix() {
         r#"{"schema_version":"2.0","default_profile":"work","profiles":{"work":{"models":[{"id":"mock-worker","n_ctx":8192}]}}}"#,
     )
     .unwrap();
-    let flows_dir = tempfile::tempdir().unwrap();
-    let err = with_isolated_flows(flows_dir.path(), || {
-        run_utility_single_shot(&UtilityJob {
-            role_id: darkmux_crew::loader::RADIO_ROUTER_ROLE_ID,
-            message: "anything",
-            timeout_seconds: 5,
-            max_tokens: 16,
-            config_path: Some(path.to_str().unwrap()),
-            base_url_override: Some("http://127.0.0.1:9"),
-        })
+    let state = isolated_state();
+    let flows_dir = state.join("flows");
+    let err = run_utility_single_shot(&UtilityJob {
+        role_id: darkmux_crew::loader::RADIO_ROUTER_ROLE_ID,
+        message: "anything",
+        timeout_seconds: 5,
+        max_tokens: 16,
+        config_path: Some(path.to_str().unwrap()),
+        base_url_override: Some("http://127.0.0.1:9"),
     })
     .expect_err("no utility model, no utility job");
     let msg = format!("{err:#}");
     assert!(msg.contains("internal.utility"), "names the fix: {msg}");
-    assert!(all_flow_records(flows_dir.path()).is_empty(), "nothing recorded for a job that never ran");
+    assert!(all_flow_records(&flows_dir).is_empty(), "nothing recorded for a job that never ran");
 }
 
 /// (#2914 review, C7) The REAL arm: no base-URL override, so the binding is
@@ -300,7 +297,8 @@ fn the_residency_arm_puts_the_namespaced_binding_on_the_wire() {
 
     let registry_dir = tempfile::tempdir().unwrap();
     let profiles_path = write_registry(registry_dir.path());
-    let flows_dir = tempfile::tempdir().unwrap();
+    let state = isolated_state();
+    let flows_dir = state.join("flows");
     // A fake `lms`: `ps --json` says the binding is resident under darkmux's
     // own namespaced identifier at its declared window; anything else is a
     // no-op. Reaching `load`/`unload` would mean the preflight did not
@@ -330,15 +328,13 @@ fn the_residency_arm_puts_the_namespaced_binding_on_the_wire() {
         std::env::set_var("DARKMUX_LMSTUDIO_URL", server.base_url());
         std::env::set_var("DARKMUX_LMS_BIN", &fake_lms);
     }
-    let reply = with_isolated_flows(flows_dir.path(), || {
-        run_utility_single_shot(&UtilityJob {
-            role_id: darkmux_crew::loader::RADIO_ROUTER_ROLE_ID,
-            message: "anything",
-            timeout_seconds: 30,
-            max_tokens: 64,
-            config_path: Some(profiles_path.to_str().unwrap()),
-            base_url_override: None,
-        })
+    let reply = run_utility_single_shot(&UtilityJob {
+        role_id: darkmux_crew::loader::RADIO_ROUTER_ROLE_ID,
+        message: "anything",
+        timeout_seconds: 30,
+        max_tokens: 64,
+        config_path: Some(profiles_path.to_str().unwrap()),
+        base_url_override: None,
     });
     unsafe {
         match prev_url {
@@ -355,7 +351,7 @@ fn the_residency_arm_puts_the_namespaced_binding_on_the_wire() {
     // The request carried `darkmux:mock-util`, or this never matched.
     mock.assert();
 
-    let records = all_flow_records(flows_dir.path());
+    let records = all_flow_records(&flows_dir);
     assert_eq!(records.len(), 2, "the start marker and the usage record: {records:#?}");
     assert_eq!(records[0]["action"], "utility.start");
     assert_eq!(records[0]["payload"]["model"], "darkmux:mock-util", "the start names the wire id too");
@@ -381,21 +377,29 @@ fn a_utility_job_sends_its_start_and_end_on_the_live_channel() {
     });
     let registry_dir = tempfile::tempdir().unwrap();
     let profiles_path = write_registry(registry_dir.path());
-    let flows_dir = tempfile::tempdir().unwrap();
+    // Stands in for the home this process inherits. A suite run with
+    // `DARKMUX_HOME` exported hands the SAME home to every test process, so
+    // a sibling test (or a real dispatch) sends to that home's socket.
+    let _inherited = IsolatedState::new();
+    let sibling_socket = darkmux_flow::live::local_socket_path().expect("a sibling's socket path");
+    let state = isolated_state();
+    let flows_dir = state.join("flows");
     // The daemon's ingest socket, where this process's sender resolves it.
     let sock = darkmux_flow::live::local_socket_path().expect("a socket path");
     let rx = darkmux_flow::live::bind_ingest(&sock).expect("binding the ingest socket");
     rx.set_nonblocking(true).unwrap();
+    // The sibling's own utility edge must never reach this test's socket.
+    let mut sibling_edge = darkmux_flow::live::LiveSample::new(darkmux_flow::live::LiveKind::Utility, 1, 250);
+    sibling_edge.fields.insert("event".into(), serde_json::json!("sibling"));
+    darkmux_flow::live::LiveSender::to_path(sibling_socket).send(&sibling_edge);
 
-    with_isolated_flows(flows_dir.path(), || {
-        run_utility_single_shot(&UtilityJob {
-            role_id: darkmux_crew::loader::RADIO_ROUTER_ROLE_ID,
-            message: "review this",
-            timeout_seconds: 30,
-            max_tokens: 256,
-            config_path: Some(profiles_path.to_str().unwrap()),
-            base_url_override: Some(&server.base_url()),
-        })
+    run_utility_single_shot(&UtilityJob {
+        role_id: darkmux_crew::loader::RADIO_ROUTER_ROLE_ID,
+        message: "review this",
+        timeout_seconds: 30,
+        max_tokens: 256,
+        config_path: Some(profiles_path.to_str().unwrap()),
+        base_url_override: Some(&server.base_url()),
     })
     .expect("the utility call round-trips");
 
@@ -413,7 +417,7 @@ fn a_utility_job_sends_its_start_and_end_on_the_live_channel() {
     assert_eq!(samples[0].fields["event"], "start");
     assert_eq!(samples[1].fields["event"], "end");
     assert!(samples.iter().all(|s| s.kind == darkmux_flow::live::LiveKind::Utility && s.session_id.is_none()));
-    let records = all_flow_records(flows_dir.path());
+    let records = all_flow_records(&flows_dir);
     assert_eq!(records.len(), 2, "the live channel added no flow record");
     assert_eq!(samples[0].fields["job_id"], records[0]["payload"]["job_id"], "the live start names the durable job id");
     assert_eq!(samples[1].fields["job_id"], records[0]["payload"]["job_id"]);
