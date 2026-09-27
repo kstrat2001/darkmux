@@ -355,13 +355,18 @@ fn resume_at_for(inside: &[(i64, Spend)], br: &Breach, period: i64) -> Option<i6
 
 /// (#1442 gate C4) What one hosted call SPENDS from a step's bucket: its
 /// total ([`darkmux_trajectory::UsageCounts::total_tokens`], the amount its
-/// usage record carries) when the spend is known, else, conservatively, the
-/// `max_tokens` the call was granted. The spend is unknown when the reply
-/// reported no usage, or a split without its prompt half; charging 0 (or
-/// the completion alone) would let such an endpoint run off the meter, and
-/// over-counting a capped grant is the safe direction.
-pub fn conservative_hosted_spend(total_tokens: Option<u64>, granted_max_tokens: u32) -> u64 {
-    total_tokens.unwrap_or(u64::from(granted_max_tokens))
+/// usage record carries) when the spend is known. When it is not (the reply
+/// reported no usage, or a split without its prompt half), the charge is
+/// the `max_tokens` the call was granted, which bounds its completion, PLUS
+/// the prompt it sent, estimated from `request` (the body actually posted)
+/// by the project's one estimate ([`darkmux_trajectory::estimate_tokens`]).
+/// Charging 0, the completion alone, or the cap alone would let such an
+/// endpoint run off the meter; over-counting is the safe direction.
+pub fn conservative_hosted_spend(total_tokens: Option<u64>, granted_max_tokens: u32, request: &serde_json::Value) -> u64 {
+    total_tokens.unwrap_or_else(|| {
+        let prompt = darkmux_trajectory::estimate_tokens(&request.to_string()) as u64;
+        u64::from(granted_max_tokens).saturating_add(prompt)
+    })
 }
 
 // ── The window ledger ───────────────────────────────────────────────────

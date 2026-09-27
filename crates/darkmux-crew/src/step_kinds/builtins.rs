@@ -1067,7 +1067,7 @@ impl DispatchSingleShotStepKind {
             crate::budget::settle_step_live(
                 &step_bucket,
                 max_tokens,
-                crate::budget::conservative_hosted_spend(reply.counts.total_tokens(), max_tokens),
+                crate::budget::conservative_hosted_spend(reply.counts.total_tokens(), max_tokens, &req.body()?),
                 1,
                 &step.id,
                 &budget_caller,
@@ -2531,6 +2531,33 @@ fn map_hosted_item(
     // of states that reach it without re-deriving that honesty.
     let mut last_error: Option<String> = None;
     let mut error_retries_used = 0u32;
+    let clamped = max_tokens;
+    let req = HostedSingleShotRequest {
+        endpoint,
+        model,
+        system,
+        user,
+        max_tokens: clamped,
+        timeout_seconds,
+    };
+    // The body every attempt posts: an unreported spend is charged against
+    // the prompt it carries. A dialect that cannot be resolved fails the
+    // item here, before any budget is touched, as the send itself would.
+    let body = match req.body() {
+        Ok(b) => b,
+        Err(e) => {
+            return MapItemResult {
+                index,
+                ok: false,
+                content: String::new(),
+                error: Some(format!("{e:#}")),
+                served_model,
+                wall_ms,
+                retried: 0,
+                ..MapItemResult::tokens_of(calls)
+            };
+        }
+    };
     loop {
         // (#2902 step 5) The endpoint's window, then the shared per-step cap
         // (which RESERVES this attempt's cap, so concurrent siblings of one
@@ -2553,15 +2580,6 @@ fn map_hosted_item(
                 ..MapItemResult::tokens_of(calls)
             };
         }
-        let clamped = max_tokens;
-        let req = HostedSingleShotRequest {
-            endpoint,
-            model,
-            system,
-            user,
-            max_tokens: clamped,
-            timeout_seconds,
-        };
         let t0 = std::time::Instant::now();
         // (#1442 ship-2b) Scheduler-supplied override replaces the TRANSPORT
         // only — the reserve/settle metering around it is identical.
@@ -2584,7 +2602,7 @@ fn map_hosted_item(
                 crate::budget::settle_step_live(
                     bucket,
                     clamped,
-                    crate::budget::conservative_hosted_spend(reply.counts.total_tokens(), clamped),
+                    crate::budget::conservative_hosted_spend(reply.counts.total_tokens(), clamped, &body),
                     1,
                     step_label,
                     caller,
@@ -4817,10 +4835,10 @@ mod tests {
 
     /// A reply that reports its completion but not its prompt has an
     /// UNKNOWN spend (the prompt is usually most of it), so the call settles
-    /// the whole granted cap, the same as a reply that reported nothing,
-    /// and its record carries no total.
+    /// the whole granted cap plus the prompt it sent, the same as a reply
+    /// that reported nothing, and its record carries no total.
     #[test]
-    fn a_map_call_with_no_prompt_count_settles_the_granted_cap() {
+    fn a_map_call_with_no_prompt_count_settles_the_cap_plus_its_prompt() {
         let bucket = Arc::new(Mutex::new(RemoteBudget::new(None, darkmux_types::config::StepBudgetPolicy::Warn)));
         let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
             Ok(crate::single_shot::SingleShotReply {
@@ -4837,8 +4855,25 @@ mod tests {
         let record = map_call_token_payload(&calls[0], 0, true, "gpt-5.1", "ep", None);
         assert!(record.get("total_tokens").is_none_or(|t| t.is_null()), "{record}");
         assert_eq!(record["completion_tokens"], 12, "the partial count is still recorded");
-        assert_eq!(bucket.lock().unwrap().used(), 4_096, "spend unknown: the granted cap, never 12");
+        // `max_tokens` bounds only the completion: the prompt the request
+        // carried is charged too, by its estimate, never 0.
+        let prompt = darkmux_trajectory::estimate_tokens("sys") + darkmux_trajectory::estimate_tokens("user");
+        let used = bucket.lock().unwrap().used();
+        assert!(used >= 4_096 + prompt as u64, "spend unknown: the cap plus the prompt estimate, got {used}");
         assert_eq!(out.total_tokens, None);
+    }
+
+    /// (re-review N2) The conservative charge for an unknown spend is the
+    /// granted completion cap PLUS the request's prompt, estimated from the
+    /// request actually sent: a 40,000-char prompt is ~10,000 tokens the
+    /// cap alone never bounded.
+    #[test]
+    fn an_unknown_spend_is_charged_the_cap_plus_the_prompt_it_sent() {
+        let big = serde_json::json!({ "messages": [{ "role": "user", "content": "x".repeat(40_000) }], "max_tokens": 4096 });
+        let charged = crate::budget::conservative_hosted_spend(None, 4096, &big);
+        assert!(charged >= 4096 + 10_000, "{charged}");
+        assert_eq!(charged, 4096 + darkmux_trajectory::estimate_tokens(&big.to_string()) as u64);
+        assert_eq!(crate::budget::conservative_hosted_spend(Some(1234), 4096, &big), 1234, "a known spend is charged as reported");
     }
 
     /// (#1605 QA finding, kept) An item whose first dispatch errored and
@@ -5116,9 +5151,11 @@ mod tests {
         // (#1442 gate C4) A reply that reports usage spends what it reports;
         // a reply that OMITS usage spends the clamped max_tokens it was
         // granted — an omitting endpoint must not mint an infinite allowance.
-        assert_eq!(crate::budget::conservative_hosted_spend(Some(1234), 4096), 1234);
-        assert_eq!(crate::budget::conservative_hosted_spend(None, 4096), 4096);
-        assert_eq!(crate::budget::conservative_hosted_spend(None, 0), 0);
+        let empty = serde_json::json!({});
+        let prompt = darkmux_trajectory::estimate_tokens(&empty.to_string()) as u64;
+        assert_eq!(crate::budget::conservative_hosted_spend(Some(1234), 4096, &empty), 1234);
+        assert_eq!(crate::budget::conservative_hosted_spend(None, 4096, &empty), 4096 + prompt);
+        assert_eq!(crate::budget::conservative_hosted_spend(None, 0, &empty), prompt);
     }
 
     /// (#1530 dogfood) A map item's `telemetry.tokens` record carries the

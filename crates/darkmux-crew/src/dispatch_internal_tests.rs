@@ -17137,10 +17137,11 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
     }
 
     /// A reply with no prompt count has an unknown spend: the step settles
-    /// the granted cap, and the usage record carries no total.
+    /// the granted cap plus the prompt it sent, and the usage record carries
+    /// no total.
     #[test]
     #[serial]
-    fn dispatch_remote_settles_the_granted_cap_when_the_prompt_count_is_unreported() {
+    fn dispatch_remote_settles_the_cap_plus_the_prompt_when_the_prompt_count_is_unreported() {
         let (base_url, rx) = one_shot_http_mock(
             r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"completion_tokens":3}}"#,
         );
@@ -17187,8 +17188,12 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWarn]);
         let w = env.payload(darkmux_flow::FlowAction::BudgetWarn);
         // No prompt count: the spend is unknown, so the step is charged the
-        // whole granted cap (4096 by default), never the 3 it reported.
-        assert_eq!((w["scope"].as_str(), w["spent"].as_u64(), w["limit"].as_u64()), (Some("step"), Some(4096), Some(5)), "{w}");
+        // whole granted cap (4096 by default) plus the prompt it sent, by
+        // estimate: never the 3 it reported, never the cap alone.
+        assert_eq!((w["scope"].as_str(), w["limit"].as_u64()), (Some("step"), Some(5)), "{w}");
+        let spent = w["spent"].as_u64().unwrap();
+        let sent_prompt = darkmux_trajectory::estimate_tokens("system prompt") as u64;
+        assert!(spent >= 4096 + sent_prompt, "the cap bounds only the completion; the prompt sent counts too: {w}");
     }
 
     /// (#2902 step 1b) Drive the tailer with `events` and return its session's

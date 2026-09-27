@@ -3,6 +3,17 @@
 
 use serde::{Deserialize, Serialize};
 
+/// `ceil(chars / 4)`: the one project-wide token ESTIMATE, for text no
+/// provider has counted (a crawl unit sized against a chunk budget, a
+/// prompt whose count a reply left out). Deliberately crude: real
+/// tokenization is model-specific.
+pub const CHARS_PER_TOKEN: usize = 4;
+
+/// The estimated token count of `text` ([`CHARS_PER_TOKEN`]).
+pub fn estimate_tokens(text: &str) -> usize {
+    text.chars().count().div_ceil(CHARS_PER_TOKEN)
+}
+
 /// The usage block of a `model.completed` or `compaction.call` event, as the
 /// runtime wrote it from the endpoint's reply. Read leniently per field: a
 /// count that is not a whole number reads as unreported and never costs the

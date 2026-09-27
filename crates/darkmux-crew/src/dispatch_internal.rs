@@ -3567,6 +3567,7 @@ fn dispatch_remote(
         crate::budget::conservative_hosted_spend(
             counts.total_tokens(),
             single_shot_cap(opts.max_completion_tokens, ep.reasoning_effort.as_deref()),
+            &req_body,
         ),
         1,
         "dispatch",

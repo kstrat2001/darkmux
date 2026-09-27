@@ -16,7 +16,7 @@ pub mod usage;
 
 pub use event::*;
 pub use fold::*;
-pub use usage::{TokenSum, Usage, UsageCounts};
+pub use usage::{estimate_tokens, TokenSum, Usage, UsageCounts, CHARS_PER_TOKEN};
 
 /// The runtime's bookkeeping directory, under its out-dir mount. The dot
 /// marks it as runtime metadata rather than agent content.

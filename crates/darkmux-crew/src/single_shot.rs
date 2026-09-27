@@ -289,6 +289,21 @@ pub struct HostedSingleShotRequest<'a> {
     pub timeout_seconds: u32,
 }
 
+impl HostedSingleShotRequest<'_> {
+    /// The request body this call posts: what [`single_shot_chat_hosted`]
+    /// sends, and what a budget settle estimates an unreported prompt from.
+    pub fn body(&self) -> Result<serde_json::Value> {
+        Ok(hosted_chat_body_in(
+            self.endpoint.resolved_dialect()?,
+            self.model,
+            self.system,
+            self.user,
+            self.max_tokens,
+            self.endpoint.reasoning_effort.as_deref(),
+        ))
+    }
+}
+
 /// (#1260) Container-free single-shot chat call against a REMOTE
 /// OpenAI-compatible endpoint — the hosted twin of [`single_shot_chat`],
 /// through the EXACT URL/auth/POST chain `dispatch_remote` and
@@ -303,14 +318,7 @@ pub struct HostedSingleShotRequest<'a> {
 pub fn single_shot_chat_hosted(req: &HostedSingleShotRequest) -> Result<SingleShotReply> {
     let url = req.endpoint.chat_url()?;
     let auth = remote_auth_header(req.endpoint)?;
-    let body = hosted_chat_body_in(
-        req.endpoint.resolved_dialect()?,
-        req.model,
-        req.system,
-        req.user,
-        req.max_tokens,
-        req.endpoint.reasoning_effort.as_deref(),
-    );
+    let body = req.body()?;
     let start = std::time::Instant::now();
     let resp = remote_chat_completion(&url, auth.as_ref(), &body, req.timeout_seconds)?;
     let reply = extract_reply(&resp);
