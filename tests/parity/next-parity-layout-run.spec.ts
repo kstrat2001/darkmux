@@ -152,12 +152,12 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
       // The readout under the lamps is present in the tool-gen states and
       // absent elsewhere; that is the case the layout must absorb.
       expect(rows.map((r) => r.state)).toEqual(
-        expect.arrayContaining(["toolgen-named", "finished", "compacting", "radio-routing", "rest", "rest-turn-delay", "rest-thermal", "rest-pacing", "rest-battery", "rest-episode-limit", "rest-unknown", "armed-generating", "armed-toolgen", "tool-file", "tool-file-long", "tool-file-unlisted"]),
+        expect.arrayContaining(["toolgen-named", "finished", "compacting", "radio-routing", "rest", "rest-turn-delay", "rest-thermal", "rest-pacing", "rest-battery", "rest-episode-limit", "rest-unknown", "armed-generating", "armed-toolgen", "tool-file", "tool-file-long", "tool-file-mixed", "tool-file-unlisted"]),
       );
       // (#2963) The line's own box, only in states that show it: a tool's
       // two-part line (action, then a left-trimming file box) is the same
       // one line, across the same slot, as TOOL GEN's and REST's.
-      expect(noteRows.map((r) => r.state)).toEqual(expect.arrayContaining(["toolgen-named", "tool-file", "tool-file-long", "tool-file-unlisted", "rest-thermal"]));
+      expect(noteRows.map((r) => r.state)).toEqual(expect.arrayContaining(["toolgen-named", "tool-file", "tool-file-long", "tool-file-mixed", "rest-thermal"]));
       expect(sizeGroups(noteRows, "note"), `the readout line changed height (${vpName}, ${mode})`).toHaveLength(1);
     });
 

@@ -118,26 +118,30 @@ const STATES = [
       tick(d, "12:00:15"),
     ],
   },
-  // (#2963) darkmux running the SECOND write of a turn: the readout names
-  // the action and that call's own file, from the turn record's
-  // `tool_paths` (FLOW 1.64.0), in the slot TOOL GEN and REST use. A long
-  // path trims from the LEFT, so the file name stays (`fileName`: the suite
-  // checks it is on screen). `tool-file-unlisted`: a turn record with no
-  // list (an older host): the action word alone, never the first write's
-  // file.
+  // (#2963) darkmux running the SECOND call of a turn whose first call, a
+  // write, has completed: the readout names that second call's own tool
+  // and file, from the turn record's `tool_names` / `tool_paths` (FLOW
+  // 1.64.0), in the slot TOOL GEN and REST use. A long path trims from the
+  // LEFT, so the file name stays (`fileName`: the suite checks it is on
+  // screen). `tool-file-mixed`: write, then read, reads "read · …" (the
+  // word is the running call's, never the completed write's).
+  // `tool-file-unlisted`: a turn record with no lists (an older host): the
+  // neutral TOOLS state, no line at all.
   ...[
     // Short enough to show whole in the desktop slot (240px there, the
     // tube's column; wider on a phone).
-    ["tool-file", "2026-09-26", "/workspace/src/tokenRate.ts", "write · src/tokenRate.ts", true],
+    ["tool-file", "2026-09-26", "write", "/workspace/src/tokenRate.ts", "write · src/tokenRate.ts", true],
     [
       "tool-file-long",
       "2026-09-28",
+      "write",
       "/workspace/crates/darkmux-serve/assets/viewer/lenses/session/deeply/nested/folder/tree/tokenReadout.ts",
       "write · crates/darkmux-serve/assets/viewer/lenses/session/deeply/nested/folder/tree/tokenReadout.ts",
       true,
     ],
-    ["tool-file-unlisted", "2026-09-30", "/workspace/src/tokenRate.ts", "write", false],
-  ].map(([id, date, path, words, listed]) => ({
+    ["tool-file-mixed", "2026-07-30", "read", "/workspace/src/b.ts", "read · src/b.ts", true],
+    ["tool-file-unlisted", "2026-07-28", "write", "/workspace/src/tokenRate.ts", null, false],
+  ].map(([id, date, tool, path, words, listed]) => ({
     id, date, now: "12:00:15", runText: "run state: tools", rateText: "tools",
     noteText: words, ...(listed ? { fileName: path.split("/").pop() } : {}),
     recs: (b, d) => {
@@ -146,9 +150,9 @@ const STATES = [
         ...b.prefix(d),
         b.opener(d),
         b.beat(d, "12:00:10", 2, 900, 900),
-        b.rec(at(d, "12:00:12"), "dispatch.turn", { turn_seq: 2, tool_calls_count: 2, generation_ms: 4000, ...(listed ? { tool_paths: [first, path] } : {}) }),
-        // The first write completed (its args as the runtime forwards them,
-        // capped); the second, `path`, is running.
+        b.rec(at(d, "12:00:12"), "dispatch.turn", { turn_seq: 2, tool_calls_count: 2, generation_ms: 4000, ...(listed ? { tool_names: ["write", tool], tool_paths: [first, path] } : {}) }),
+        // The first call, a write, completed (its args as the runtime
+        // forwards them, capped); the second, `tool` on `path`, is running.
         b.rec(at(d, "12:00:13"), "dispatch.tool", { tool_name: "write", args: JSON.stringify({ path: first, content: "export const x = 1;\n".repeat(40) }).slice(0, 512) }),
         tick(d, "12:00:15"),
       ];
