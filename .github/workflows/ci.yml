@@ -483,6 +483,57 @@ jobs:
   # beyond an artifact upload, so a red nightly would have gone unaddressed.
   # The gating work is tracked in #2600 — read it before re-adding this job.
 
+  # (4.0) The complexity ratchet: no new Rust function above cyclomatic
+  # complexity 15, no function's complexity above its recorded baseline, and
+  # no stale baseline entry (a gain is kept by `--prune`). See the script's
+  # header for the measure and the two files it reads. rust-code-analysis
+  # reads sources, not a build, so this is ubuntu and about half a minute;
+  # the tool is compiled once and cached by version. The TypeScript half runs
+  # in the ui job.
+  complexity:
+    name: complexity ratchet (Rust)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect Rust-relevant changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - '**/*.rs'
+              - 'scripts/complexity-ratchet.py'
+              - 'scripts/complexity-baseline.json'
+              - 'scripts/complexity-allowlist.json'
+              - 'scripts/rust_source.py'
+              - '.github/workflows/ci.yml'
+
+      - name: Ratchet self-test
+        run: python3 scripts/complexity-ratchet.py --self-test
+
+      - name: Cache rust-code-analysis
+        if: steps.filter.outputs.rust == 'true'
+        id: rca-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/rust-code-analysis-cli
+          key: rust-code-analysis-cli-0.0.25-${{ runner.os }}
+
+      - name: Install rust-code-analysis
+        if: steps.filter.outputs.rust == 'true' && steps.rca-cache.outputs.cache-hit != 'true'
+        run: cargo install rust-code-analysis-cli --version 0.0.25 --locked
+
+      - name: No Rust function above its complexity limit
+        if: steps.filter.outputs.rust == 'true'
+        run: python3 scripts/complexity-ratchet.py --lang rust
+
+      - name: No Rust-relevant changes — ratchet skipped
+        if: steps.filter.outputs.rust != 'true'
+        run: echo "No Rust changes; complexity ratchet skipped (reports green)."
+
   cargo-audit:
     name: cargo audit (RUSTSEC advisories)
     runs-on: ubuntu-latest
@@ -953,6 +1004,10 @@ jobs:
               # (#2212) the slop-chop survey/oracle scripts resolve
               # `typescript` from ui/node_modules, so they test in this job.
               - 'scripts/slop-chop/**'
+              # The TypeScript half of the complexity ratchet runs here.
+              - 'scripts/complexity-ratchet.py'
+              - 'scripts/complexity-baseline.json'
+              - 'scripts/complexity-allowlist.json'
 
       - name: Install bun
         if: steps.filter.outputs.ui == 'true'
@@ -1008,6 +1063,15 @@ jobs:
         if: steps.filter.outputs.ui == 'true'
         working-directory: ui
         run: bun run knip
+
+      # The TypeScript half of the complexity ratchet (the Rust half is the
+      # `complexity` job): ESLint's `complexity` rule at 15 over ui/src, each
+      # reported function held to its recorded baseline.
+      - name: UI complexity ratchet
+        if: steps.filter.outputs.ui == 'true'
+        run: |
+          python3 scripts/complexity-ratchet.py --self-test
+          python3 scripts/complexity-ratchet.py --lang ts
 
       # (#2212) slop-chop's mechanical stages: the AST survey and the
       # truth-table oracle. Plain `node --test` — no vitest, no bundler — and
