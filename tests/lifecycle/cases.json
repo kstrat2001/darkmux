@@ -1068,7 +1068,7 @@
       "status": "complete"
     },
     {
-      "name": "a close with nothing opened is not a run",
+      "name": "a close with nothing opened is not a run, but its session reads as ended",
       "as_of": "2026-09-27T10:00:10Z",
       "records": [
         {
@@ -1079,7 +1079,62 @@
         }
       ],
       "phase": "not_started",
-      "status": "planned"
+      "status": "abandoned",
+      "abandoned_reason": "noterminal"
+    },
+    {
+      "name": "a mission's session whose only record is its recorded end reads as ended for that mission",
+      "as_of": "2026-09-27T10:00:10Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "session.end",
+          "session_id": "e2e-crashed-session",
+          "mission_id": "M",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "run": {
+        "session_id": "e2e-crashed-session",
+        "mission_id": "M"
+      },
+      "phase": "not_started",
+      "status": "abandoned",
+      "abandoned_reason": "noterminal"
+    },
+    {
+      "name": "a dispatch terminal with nothing opened is not a run, but reads as its outcome",
+      "as_of": "2026-09-27T10:00:10Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.complete",
+          "session_id": "s1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "not_started",
+      "status": "complete"
+    },
+    {
+      "name": "with nothing opened, a dispatch terminal is the recorded outcome over an earlier session.end",
+      "as_of": "2026-09-27T10:00:10Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "session.end",
+          "session_id": "s1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        },
+        {
+          "ts": "2026-09-27T10:00:01Z",
+          "action": "dispatch.error",
+          "session_id": "s1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "not_started",
+      "status": "error"
     },
     {
       "name": "a budget.resume in the same second as its wait ends the wait",

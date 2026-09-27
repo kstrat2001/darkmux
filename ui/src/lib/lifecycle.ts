@@ -30,9 +30,11 @@
  *    step terminal, `session.end`, `budget.stop`, `mission.close` or
  *    `mission.abort`. A closing record timestamped before anything opened
  *    (clock skew across machines, #1988) closes the first attempt left with
- *    no close of its own, and is marked `skewed`. A record with an
- *    unparsable `ts` is inside every as-of cut, so an untimed terminal still
- *    closes its run.
+ *    no close of its own, and is marked `skewed`; with no attempt at all to
+ *    close, it is not a run (phase `not_started`), but its session recorded
+ *    its end, which the lifecycle carries as `close` and a status reads. A
+ *    record with an unparsable `ts` is inside every as-of cut, so an untimed
+ *    terminal still closes its run.
  * 3. Outcome. How it ended comes from the attempt's dispatch terminal when
  *    it has one (a `session.end` that lands first does not erase a clean
  *    `dispatch.complete`), else from the closing record itself.
@@ -107,6 +109,8 @@ export interface Lifecycle {
   readonly startMs: number | null;
   /** The attempt's latest timed record as of t. */
   readonly lastActivityMs: number | null;
+  /** How it ended once `closed`; for a group nothing of which opened
+   *  (`not_started`), how its session recorded its end, when it did. */
   readonly close: Close | null;
   /** While `waiting`: when the wait lapses. */
   readonly waitUntilMs: number | null;
@@ -303,6 +307,19 @@ export function segmentSession(records: readonly NormRecord[]): SessionSegments 
   return { attempts, strays: placeStrays(attempts, strays) };
 }
 
+/** How a group that never opened recorded its end (rule 2): nothing opened,
+ *  so it is not a run, but its session did record how it ended (the crash
+ *  shape: the presence reconciler's `session.end`, with the opening records
+ *  in an older day or never written). Its dispatch terminal when it has one
+ *  (rule 3), else its earliest closing record, as of `asOf`; `null` when it
+ *  has none, or when anything opened. */
+function recordedEndAsOf(group: RunGroup, asOf: number): Close | null {
+  if (group.attempts.length > 0) return null;
+  const closes = group.records.filter((r) => isClosing(r) && isAsOf(r, asOf)).sort(byTime);
+  const record = closes.find((r) => isDispatchTerminal(r.action)) ?? closes[0];
+  return record ? { edge: closeEdgeOf(record) ?? { kind: "session_end" }, atMs: record.tMs, skewed: false, record } : null;
+}
+
 /** The attempt's close as of `asOf` (rules 2 and 3), or `null`. */
 function closeAsOf(a: Attempt, asOf: number): Close | null {
   if (!a.close || !isAsOf(a.close, asOf)) return null;
@@ -372,7 +389,8 @@ function maxOf(xs: readonly (number | null)[]): number | null {
 export function lifecycleAt(run: RunRecords, asOf: number, policy: LifecyclePolicy, presence: Presence = NO_PRESENCE): Lifecycle {
   const a = run.attempt;
   if (!a || !isAsOf(a.opening, asOf)) {
-    return { phase: "not_started", startMs: null, lastActivityMs: latestTime(recordsAsOf(run.group.records, asOf)), close: null, waitUntilMs: null };
+    const close = a ? null : recordedEndAsOf(run.group, asOf);
+    return { phase: "not_started", startMs: null, lastActivityMs: latestTime(recordsAsOf(run.group.records, asOf)), close, waitUntilMs: null };
   }
   const recs = recordsAsOf(a.records, asOf);
   const base = { startMs: startOf(a), lastActivityMs: latestTime(recs) };
@@ -413,7 +431,7 @@ export function toRunState(l: Lifecycle): RunState {
     case "waiting":
       return { status: "running", killed: false };
     case "not_started":
-      return { status: "planned", killed: false };
+      return l.close ? closedState(l.close.edge) : { status: "planned", killed: false };
     case "stale":
       return { status: "abandoned", killed: false, abandonReason: "noterminal" };
     case "closed":
