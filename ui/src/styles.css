@@ -8897,6 +8897,32 @@ body {
   color: var(--lamp-rest);
   text-shadow: 0 0 10px color-mix(in srgb, var(--lamp-rest) 60%, transparent);
 }
+/* (#2961) The countdown flares on each tick, the moment REST's seconds hand
+   reaches 12 o'clock: brighter and whiter, then back over ~260 ms
+   (`REST_NUMBER_FLARE_MS`). Color and glow only, so nothing moves or resizes.
+   `TokenScope` sets `data-flare` on a fresh element per tick, which restarts
+   the animation. */
+.token-scope-center[data-state="rest"] .token-scope-n[data-flare="true"] {
+  animation: token-scope-rest-tick 260ms ease-out;
+}
+@keyframes token-scope-rest-tick {
+  0% {
+    color: color-mix(in srgb, var(--lamp-rest) 22%, white);
+    text-shadow:
+      0 0 6px color-mix(in srgb, var(--lamp-rest) 40%, white),
+      0 0 22px color-mix(in srgb, var(--lamp-rest) 85%, transparent),
+      0 0 40px color-mix(in srgb, var(--lamp-rest) 45%, transparent);
+  }
+  100% {
+    color: var(--lamp-rest);
+    text-shadow: 0 0 10px color-mix(in srgb, var(--lamp-rest) 60%, transparent);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .token-scope-center[data-state="rest"] .token-scope-n[data-flare="true"] {
+    animation: none;
+  }
+}
 /* (#2915) Compacting: the center's word takes the utility treatment's gray,
    not the PROMPT lamp's teal (the lamp stays lit; the tube shows the job). */
 .token-scope-bezel[data-utility="true"] .token-scope-center .token-scope-u {

@@ -223,6 +223,14 @@ export interface SessionRunView {
         /** Present only when `state === "rest"` — whole seconds left in the
          *  reported rest window. */
         restSecondsLeft?: number;
+        /** (#2961) Present only when `state === "rest"`: when the rest ends,
+         *  on the clock below. See `LiveStateReading.restEndMs`. */
+        restEndMs?: number;
+        /** (#2961) The page clock this reading was derived at (the playhead
+         *  in playback, the ticking wall clock live, the newest record's time
+         *  when frozen). The scope extrapolates from it between renders to
+         *  phase REST's seconds hand. */
+        clockMs?: number;
         /** (#2950) Present only when `state === "rest"` and the rest's own
          *  record says why. See `LiveStateReading.restReason`. */
         restReason?: string;
@@ -1836,6 +1844,10 @@ export function runRegions(
             // Every lamp is off; nothing claims a state.
             state: tokRateLiveState?.state ?? null,
             restSecondsLeft: tokRateLiveState?.restSecondsLeft,
+            ...(tokRateLiveState?.state === "rest" && tokRateLiveState.restEndMs !== undefined
+              ? { restEndMs: tokRateLiveState.restEndMs }
+              : {}),
+            clockMs: nowMs,
             ...(tokRateLiveState?.state === "rest" && tokRateLiveState.restReason !== undefined
               ? { restReason: tokRateLiveState.restReason }
               : {}),

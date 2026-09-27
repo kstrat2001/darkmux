@@ -23,6 +23,8 @@ import { injectedPlaybackDate } from "../../lib/injectedMeta";
 export const STALE_AFTER_MS = 600_000;
 import { livenessState } from "../../components/LivenessPulse";
 import { TokenScope } from "../../components/TokenScope";
+import { usePlaybackClock } from "../../lib/pageClockRate";
+import { WALL_CLOCK } from "../../lib/restHand";
 import { liveStateLabel, type LiveStateReading } from "../../lib/tokenRate";
 import { REPLAY_GRANULARITY_NOTE, useLiveOverlay } from "../../lib/liveChannel";
 import { scopeStateOf, type ScopeState } from "../../lib/scopeMorph";
@@ -163,6 +165,12 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
   centerCarried: boolean;
   /** (#2915) The tube shows a utility job (compacting), not the work model. */
   utility?: true;
+  /** (#2961) REST only: when the rest ends, on the page clock `clockMs` is
+   *  read on. The scope phases its seconds hand and counts its number from
+   *  it (`lib/restHand.ts`). */
+  restEndMs?: number;
+  /** (#2961) The page clock this reading was derived at. */
+  clockMs?: number;
   lamps: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; restReason?: string; toolName?: string; writing?: true; writingSeconds?: number; thinking?: boolean; compacting?: true; compactingSeconds?: number };
   note: string | null;
 } | null {
@@ -182,6 +190,7 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
       toolName: state === "tools" ? live.toolName : undefined,
       toolWriting: state === "tools" ? writing : undefined,
       thinking: generating && live.thinking === true,
+      ...(state === "rest" && live.restEndMs !== undefined ? { restEndMs: live.restEndMs, clockMs: live.clockMs } : {}),
       // (#2890) The center is the SAME for every scope in the app: see
       // `lib/scopeCenter.ts`.
       ...scopeCenter({
@@ -633,6 +642,8 @@ export function SessionReplay({
   // reading only advanced when a new record happened to arrive.
   const ticking = plausiblyRunning && source.kind !== "static" && injectedPlaybackDate() == null && playhead === null;
   const nowMs = useNowMs(ticking);
+  // (#2961) The playhead's clock, for REST's seconds hand.
+  const playbackClock = usePlaybackClock();
   // (#2928) The live channel, on the same gate as the clock: the live edge
   // of a live route only, so a scrubbed or played-back run shows its
   // durable 2 s heartbeats and nothing else.
@@ -840,6 +851,18 @@ export function SessionReplay({
                       // an earlier turn rather than the current one's own two
                       // most recent heartbeats.
                       centerCarried={scopeHero.centerCarried}
+                      // (#2961) REST's seconds hand follows the page clock:
+                      // the playhead in playback (at the transport's speed
+                      // while it plays, still while paused), the wall clock
+                      // at a live edge, still when the view is frozen.
+                      restEndMs={scopeHero.restEndMs}
+                      clock={
+                        playhead !== null
+                          ? (playbackClock ?? { kind: "frozen", tMs: playhead })
+                          : ticking
+                            ? WALL_CLOCK
+                            : { kind: "frozen", tMs: scopeHero.clockMs ?? clockNow }
+                      }
                     />
                     {/* The lamps and, under them, a quiet readout line: "no
                         signal" when the page lost its connection (distinct

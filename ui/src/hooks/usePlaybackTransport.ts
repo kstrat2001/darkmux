@@ -142,6 +142,11 @@ export interface PlaybackTransport {
    * is true. */
   scrubbed: boolean;
   t: number;
+  /** (#2961) The monotonic time (`performance.now()`) `t` was computed at:
+   *  the play tick that last advanced it, or the seek/start that set it. An
+   *  animation that extrapolates the playhead between ticks anchors here,
+   *  never at whenever its own render happened to land. */
+  tickWallMs: number;
   tMin: number;
   tMax: number;
   playing: boolean;
@@ -194,6 +199,7 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null, focus: Pla
 
   const [t, setT] = useState<number | null>(null);
   const [playing, setPlaying] = useState(false);
+  const [tickWallMs, setTickWallMs] = useState(() => performance.now());
   const [speed, setSpeed] = useState<Speed>(DEFAULT_SPEED);
   useEffect(() => {
     setT(null);
@@ -288,13 +294,17 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null, focus: Pla
       lastTick.current = null;
       return;
     }
-    if (lastTick.current === null) lastTick.current = performance.now();
+    if (lastTick.current === null) {
+      lastTick.current = performance.now();
+      setTickWallMs(lastTick.current);
+    }
     const id = setInterval(() => {
       const now = performance.now();
       const dt = now - (lastTick.current ?? now);
       lastTick.current = now;
       const step = dt * speed; // recorded ms this tick
       setT((prev) => Math.min((prev ?? tMax) + step, tMax));
+      setTickWallMs(now);
     }, PLAY_TICK_MS);
     return () => clearInterval(id);
   }, [playing, dayIdentity, tMin, tMax, speed]);
@@ -317,16 +327,30 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null, focus: Pla
   const scrub = useCallback(
     (next: number) => {
       bumpSeek();
+      setTickWallMs(performance.now());
       setT(Math.min(tMax, Math.max(tMin, next)));
     },
     [tMin, tMax, bumpSeek],
   );
   const rewind = useCallback(() => {
     bumpSeek();
+    setTickWallMs(performance.now());
     setT(tMin);
   }, [tMin, bumpSeek]);
   const togglePlay = useCallback(() => {
+    // (#2961) Both branches stamp `tickWallMs` in the same batch as the
+    // change of `playing`, so no committed render pairs the new rate with a
+    // stale stamp (an animation extrapolating the playhead would jump by the
+    // pause length times the speed).
+    const now = performance.now();
     if (playing) {
+      // Pausing lands the partial tick in flight (the time since the last
+      // tick, at the current speed) in `t`, so the paused playhead is what
+      // an animation had already extrapolated to, not up to a tick behind it.
+      const since = lastTick.current !== null ? Math.max(0, now - lastTick.current) : 0;
+      if (since > 0) setT((prev) => Math.min((prev ?? tMax) + since * speed, tMax));
+      lastTick.current = null;
+      setTickWallMs(now);
       setPlaying(false);
       return;
     }
@@ -338,8 +362,10 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null, focus: Pla
       bumpSeek();
       setT(tMin);
     }
+    lastTick.current = now;
+    setTickWallMs(now);
     setPlaying(true);
-  }, [playing, playheadT, tMin, tMax, bumpSeek]);
+  }, [playing, playheadT, tMin, tMax, speed, bumpSeek]);
   const cycleSpeed = useCallback(() => setSpeed((s) => SPEEDS[(SPEEDS.indexOf(s) + 1) % SPEEDS.length]), []);
 
   const visibleCount = useMemo(() => (records ? records.filter((r) => !(T(r.ts) > playheadT)).length : 0), [records, playheadT]);
@@ -348,6 +374,7 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null, focus: Pla
     active: records !== null,
     scrubbed: t !== null,
     t: playheadT,
+    tickWallMs,
     tMin,
     tMax,
     playing,

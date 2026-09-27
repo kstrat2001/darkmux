@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { flushSync } from "react-dom";
 import { PHOSPHOR_FALLBACK, toneRgb, type Rgb, type ScopeTone } from "../lib/scopeTone";
 import {
   advanceMorph,
@@ -14,6 +15,8 @@ import { useCountUp } from "../hooks/useCountUp";
 import { usePrefersReducedMotion } from "../hooks/usePrefersReducedMotion";
 import { SWEEP_PER_PHASE, stepLobes, wavePhaseStep, type LobeBlend } from "../lib/scopeWave";
 import { ToolIcon } from "./ToolIcon";
+import { REST_HAND_TOP, REST_STILL_FRAME, WALL_CLOCK, pageClockRate, pageNowOf, restStrokeSegments, stepRestHand, type PageClock, type RestHandFrame, type RestHandState } from "../lib/restHand";
+import { useSeekGeneration } from "../lib/seekSignal";
 import { BrainGlyph } from "./ActivityIcon";
 
 /**
@@ -116,6 +119,17 @@ export interface TokenScopeProps {
    *  state when `state` is omitted; the trace's color always follows the
    *  state (`stateTone`). */
   tone?: ScopeTone;
+  /** (#2961) While `state` is `"rest"`: when the rest ends, on the page
+   *  clock (`clock`). REST's dot becomes a seconds hand that loops once a
+   *  second and reaches 12 o'clock exactly when the countdown drops; the
+   *  scope then counts the center's number itself, from the same clock, so
+   *  the two can never disagree (`lib/restHand.ts`). Absent: the older
+   *  drifting dot and the caller's `centerLabel`. */
+  restEndMs?: number;
+  /** (#2961) Where the page's "now" comes from (`lib/restHand.ts`'s
+   *  `PageClock`): the wall clock live (the default), the playback
+   *  transport's clock, or a frozen instant. */
+  clock?: PageClock;
 }
 
 /** The older props to a state, for a caller that does not pass `state`. */
@@ -139,6 +153,9 @@ interface ScopeClocks {
   /** (#2890) The wave's WHOLE lobe count now, the one it is leaving, and how
    *  far the crossfade between them has run; stepped by `lib/scopeWave.ts`. */
   lobes: LobeBlend;
+  /** (#2961) How far REST's seconds hand has replaced the breathing ring,
+   *  0..1, eased so the ring leaves (and comes back) without a pop. */
+  handMix: number;
 }
 
 /** Mix a channel toward white by `k`, the hot core of a dot. */
@@ -213,6 +230,35 @@ export function waveAt(t: number, from: number, to: number, mix: number, phase: 
   return (1 - mix) * one(from) + mix * one(to);
 }
 
+/** (#2961) REST's drawn circle: from 12 o'clock to `progress` of a turn,
+ *  each segment as bright as its age says (`restStrokeSegments`), scaled by
+ *  `k`. The TOOLS comet's cheap technique: ONE soft blurred stroke under the
+ *  newest quarter turn, then the segments unblurred (canvas blur is paid per
+ *  stroke; a blur per segment cost ~16 ms a frame). */
+function drawRestStroke(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number, p: ScopeParams, progress: number, k: number) {
+  if (progress <= 0.002 || k <= 0) return;
+  const { r: cr, g: cg, b: cb } = p;
+  const turn = Math.PI * 2;
+  const head = REST_HAND_TOP + turn * progress;
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, r * p.sx, r * p.sy, 0, Math.max(REST_HAND_TOP, head - Math.PI * 0.5), head);
+  ctx.strokeStyle = rgba(cr, cg, cb, 0.35 * k);
+  ctx.lineWidth = 4;
+  ctx.shadowColor = rgba(cr, cg, cb, 0.8);
+  ctx.shadowBlur = 9 * k;
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+  for (const seg of restStrokeSegments(progress)) {
+    const b = seg.brightness * k;
+    ctx.beginPath();
+    // The small overlap closes hairline gaps between segments.
+    ctx.ellipse(cx, cy, r * p.sx, r * p.sy, 0, REST_HAND_TOP + turn * seg.from, REST_HAND_TOP + turn * seg.to + 0.004);
+    ctx.strokeStyle = rgba(cr, cg, cb, 0.95 * b);
+    ctx.lineWidth = 1.2 + 1.8 * b;
+    ctx.stroke();
+  }
+}
+
 /** One frame of the scope, from the current morph parameters `p`. Ported
  *  from the prototype's `draw()`: an afterglow fill (a low-alpha fill rather
  *  than a hard clear, so the previous frame bleeds through), then, each
@@ -222,7 +268,7 @@ export function waveAt(t: number, from: number, to: number, mix: number, phase: 
  *  every layer, which is what squashes the tube to a line and a dot when it
  *  stalls. `clock` is the scope's own running time (seconds), for the
  *  ember's pulse. Additive blending ("lighter") for the glow. */
-function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: ScopeParams, c: ScopeClocks, clock: number, dt: number) {
+function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: ScopeParams, c: ScopeClocks, clock: number, dt: number, hand: RestHandFrame | null = null) {
   const cx = w / 2;
   const cy = h / 2;
   // (#2890, operator: "nowhere near the edge") 40% of the screen, not 34%:
@@ -258,9 +304,16 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
   const rBase = R * p.rscale * (1 + 0.06 * p.breath * (breathe - 0.5));
   const amp = R * (0.03 + 0.16 * active) * (1 - 0.8 * p.breath);
 
+  // (#2961) While a REST countdown runs the seconds hand draws the circle
+  // itself, so the breathing ring steps aside: `handMix` eases toward 1 while
+  // there is a hand and back to 0 without one (at once on a still frame).
+  const handTarget = hand ? 1 : 0;
+  c.handMix = dt > 0 ? c.handMix + (handTarget - c.handMix) * (1 - Math.exp(-10 * dt)) : handTarget;
+  const ringVis = p.ring * (1 - c.handMix);
+
   // The main trace.
-  if (p.ring > 0.01) {
-    const bright = Math.min(1, p.ring * (1 - 0.3 * p.breath * (1 - breathe)));
+  if (ringVis > 0.01) {
+    const bright = Math.min(1, ringVis * (1 - 0.3 * p.breath * (1 - breathe)));
     for (const [lw, a] of TRACE_PASSES) {
       ctx.beginPath();
       for (let i = 0; i <= 240; i++) {
@@ -371,9 +424,45 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
     }
     ctx.shadowBlur = 0;
   }
-  // REST: a slow drifting dot on the breathing circle (idle breathes without
-  // it, #2890).
-  if (p.breath > 0.05 && p.drift > 0.05) {
+  // REST (idle breathes without a dot, #2890).
+  if (hand) {
+    // (#2961, design B) A REST countdown: no breathing ring; the dot DRAWS
+    // the circle over each second, from 12 o'clock clockwise to itself,
+    // dimmer along its length by age, and reaches 12 exactly when the number
+    // drops (`lib/restHand.ts`). There the finished circle fades out fast
+    // while the next one starts. Radius without the breath: the circle is
+    // drawn, not breathed.
+    const vis = c.handMix;
+    if (vis > 0.01) {
+      const rs = R * p.rscale;
+      if (hand.closedFade > 0.01) drawRestStroke(ctx, cx, cy, rs, p, 1, hand.closedFade * vis);
+      if (hand.stroke) drawRestStroke(ctx, cx, cy, rs, p, hand.progress, vis);
+      const head = hand.angle;
+      ctx.beginPath();
+      ctx.arc(cx + Math.cos(head) * rs * p.sx, cy + Math.sin(head) * rs * p.sy, Math.max(1.6, R * 0.045), 0, Math.PI * 2);
+      ctx.fillStyle = rgba(lift(cr, 0.6), lift(cg, 0.6), lift(cb, 0.6), 0.95 * vis);
+      ctx.shadowColor = rgba(cr, cg, cb, 0.9);
+      ctx.shadowBlur = 12 * vis;
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      // The tick: a short amber flash at 12 o'clock (~180 ms, `hand.glow`).
+      if (hand.glow > 0.01) {
+        const k = hand.glow * vis;
+        const tx = cx + Math.cos(REST_HAND_TOP) * rs * p.sx;
+        const ty = cy + Math.sin(REST_HAND_TOP) * rs * p.sy;
+        const gr = R * 0.22;
+        const g = ctx.createRadialGradient(tx, ty, 0, tx, ty, gr);
+        g.addColorStop(0, rgba(lift(cr, 0.7), lift(cg, 0.7), lift(cb, 0.7), 0.8 * k));
+        g.addColorStop(1, rgba(cr, cg, cb, 0));
+        ctx.fillStyle = g;
+        ctx.beginPath();
+        ctx.arc(tx, ty, gr, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  } else if (p.breath > 0.05 && p.drift > 0.05) {
+    // No end time to phase from (older records): the breathing ring with its
+    // slow drifting dot, as before.
     const a = c.breathT * 0.32;
     ctx.beginPath();
     ctx.arc(cx + Math.cos(a) * rBase * p.sx, cy + Math.sin(a) * rBase * p.sy, Math.max(1.2, R * 0.03), 0, Math.PI * 2);
@@ -430,11 +519,13 @@ export function TokenScope({
   centerCarried = false,
   className,
   tone = "generating",
+  restEndMs,
+  clock = WALL_CLOCK,
 }: TokenScopeProps) {
   const state: ScopeState = stateProp ?? legacyState(stalled, resting, tone);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const morphRef = useRef<ScopeMorph>(createMorph());
-  const clocksRef = useRef<ScopeClocks>({ phase: Math.random() * 6, breathT: Math.random() * 6, sweep: Math.random() * 6, inwardT: Math.random(), lobes: { cur: 3, prev: 3, mix: 1 } });
+  const clocksRef = useRef<ScopeClocks>({ phase: Math.random() * 6, breathT: Math.random() * 6, sweep: Math.random() * 6, inwardT: Math.random(), lobes: { cur: 3, prev: 3, mix: 1 }, handMix: 0 });
   // GEN's live rate, or a finished run's average for its echo (#2890).
   const rate = state === "generating" || state === "finished" ? Math.max(0, tokensPerSec ?? 0) : 0;
   // The trace takes the state's color, read once per state change from the
@@ -447,8 +538,21 @@ export function TokenScope({
   // rebuild the canvas/observer/listener on that same cadence).
   const writing = state === "tools" && toolWriting;
   const thinking = state === "generating" && thinkingProp;
-  const targetRef = useRef<{ state: ScopeState; rate: number; rgb: Rgb; writing: boolean; thinking: boolean }>({ state, rate, rgb: PHOSPHOR_FALLBACK, writing, thinking });
-  targetRef.current = { state, rate, rgb, writing, thinking };
+  // (#2961) REST's seconds hand: the rest's end on the page clock, or null.
+  const restEnd = state === "rest" && restEndMs !== undefined && Number.isFinite(restEndMs) ? restEndMs : null;
+  const targetRef = useRef<{ state: ScopeState; rate: number; rgb: Rgb; writing: boolean; thinking: boolean; restEnd: number | null }>({ state, rate, rgb: PHOSPHOR_FALLBACK, writing, thinking, restEnd });
+  targetRef.current = { state, rate, rgb, writing, thinking, restEnd };
+  // (#2961) The page clock and the page's seek generation, read by the
+  // loop every frame (`lib/restHand.ts`: the clock carries the moment it was
+  // READ, so the loop never anchors on when a render landed).
+  const seekGen = useSeekGeneration();
+  const clockRef = useRef<{ clock: PageClock; seekGen: number }>({ clock, seekGen });
+  clockRef.current = { clock, seekGen };
+  // (#2961) What the hand carries from frame to frame (monotonic page time,
+  // the last tick it saw), and the number it counts itself, with the rest it
+  // belongs to, how many ticks it has flared on, and the flare's length.
+  const handStateRef = useRef<RestHandState | null>(null);
+  const [restNum, setRestNum] = useState<{ end: number; n: number; flares: number; flareMs: number } | null>(null);
   // Set by the effect: redraws one settled frame when motion is reduced.
   const staticRedrawRef = useRef<(() => void) | null>(null);
   // (#2911) Reactive, not read once at mount: a runtime change of the
@@ -467,7 +571,10 @@ export function TokenScope({
       const h = canvas!.clientHeight;
       const t = targetRef.current;
       const p = settleMorph(morphRef.current, t.state, t.rate, t.rgb, t.writing, t.thinking);
-      if (w && h) drawFrame(ctx!, w, h, p, clocksRef.current, morphRef.current.clock, 0);
+      // (#2961) Reduced motion: the dot still at 12, no stroke, glow or fade;
+      // the number is the caller's own countdown.
+      const hand = t.restEnd !== null ? REST_STILL_FRAME : null;
+      if (w && h) drawFrame(ctx!, w, h, p, clocksRef.current, morphRef.current.clock, 0, hand);
     }
 
     // `redraw`: a resize repaints the static readout (a resized canvas is
@@ -506,7 +613,30 @@ export function TokenScope({
       last = now;
       const t = targetRef.current;
       const p = advanceMorph(morphRef.current, t.state, t.rate, t.rgb, dt, t.writing, t.thinking);
-      if (w && h) drawFrame(ctx!, w, h, p, clocksRef.current, morphRef.current.clock, dt);
+      let hand: RestHandFrame | null = null;
+      if (t.restEnd !== null) {
+        const { clock: pc, seekGen: sg } = clockRef.current;
+        const stepped = stepRestHand(handStateRef.current, {
+          end: t.restEnd,
+          pageMs: pageNowOf(pc, now, Date.now()),
+          wallMs: now,
+          rate: pageClockRate(pc),
+          seekGen: sg,
+        });
+        const prev = handStateRef.current;
+        handStateRef.current = stepped.state;
+        hand = stepped.frame;
+        // (#2961) The number drops in the same frame the hand reaches 12:
+        // both come from `stepped`. `flushSync` commits it before this frame
+        // paints (a plain update would land a frame late).
+        if (!prev || prev.end !== stepped.state.end || prev.shown !== stepped.state.shown || prev.flares !== stepped.state.flares) {
+          const next = { end: stepped.state.end, n: stepped.state.shown, flares: stepped.state.flares, flareMs: hand.flareMs };
+          flushSync(() => setRestNum(next));
+        }
+      } else {
+        handStateRef.current = null;
+      }
+      if (w && h) drawFrame(ctx!, w, h, p, clocksRef.current, morphRef.current.clock, dt, hand);
       rafId = requestAnimationFrame(frame);
     }
     function start() {
@@ -540,13 +670,18 @@ export function TokenScope({
 
   useEffect(() => {
     staticRedrawRef.current?.();
-  }, [state, rate, rgb, writing, thinking]);
+  }, [state, rate, rgb, writing, thinking, restEnd]);
 
   const whole = parseWhole(centerLabel);
   // (#2928 re-review) Live readings arrive several times a second: those
   // snap; a reading changing at the durable 2 s cadence still tweens.
   const eased = useCountUp(whole, (n) => (n === null ? "" : String(Math.round(n))), undefined, { snapWithinMs: 1_000 });
-  const shownLabel = whole !== null ? eased : centerLabel;
+  // (#2961) While the hand runs, the scope's own count, from the same clock
+  // as the hand (the caller's label re-renders at most once a second and
+  // would drop up to a second off the tick). Until the first frame, and with
+  // reduced motion, the caller's label.
+  const handNum = !reduce && restEnd !== null && restNum !== null && restNum.end === restEnd ? restNum : null;
+  const shownLabel = handNum !== null ? `${handNum.n}s` : whole !== null ? eased : centerLabel;
   const showIcon = state === "tools";
   // (#2889, #2890) While the model generates the call: a wrench over the
   // "tool gen" caption. When darkmux runs the tool the icon becomes the
@@ -590,7 +725,15 @@ export function TokenScope({
     centerNode = (
       <div className="token-scope-center" data-state={state}>
         {centerLabel != null ? (
-          <span className="token-scope-n" data-carried={centerCarried ? "true" : "false"}>
+          <span
+            // (#2961) A new element per tick restarts the flare animation,
+            // shortened at fast playback so it ends before the next tick.
+            key={handNum !== null ? `flare-${handNum.flares}` : "n"}
+            className="token-scope-n"
+            data-carried={centerCarried ? "true" : "false"}
+            data-flare={handNum !== null && handNum.flares > 0 ? "true" : undefined}
+            style={handNum !== null && handNum.flares > 0 ? { animationDuration: `${Math.round(handNum.flareMs)}ms` } : undefined}
+          >
             {shownLabel}
           </span>
         ) : null}
