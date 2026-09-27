@@ -324,21 +324,13 @@ async fn gate(State(state): State<FleetListenerState>, mut req: Request, next: N
         TokenCheck::Mismatch => return refuse(&state, Some(peer), &Refusal::Token),
         TokenCheck::NotConfigured => return refuse(&state, Some(peer), &Refusal::NoTokenConfigured),
     }
-    let allow = match (state.allow_list)() {
-        Ok(a) => a,
-        Err(e) => {
-            return refuse(
-                &state,
-                Some(peer),
-                &Refusal::BadRequest(format!("this machine's allow-list cannot be read ({e}); refusing everything")),
-            )
-        }
-    };
     // The identity lookup is blocking (a subprocess) and runs only after the
-    // token matched: `admit` calls this closure after its token check.
+    // token matched: `admit` calls this closure after its token check, and
+    // reads the allow-list after the lookup.
     let provider = state.provider.clone();
     let provider_name = provider.provider_name().to_string();
     let local_id = state.local_node_id.clone();
+    let allow_list = state.allow_list.clone();
     let decision = tokio::task::spawn_blocking(move || {
         darkmux_fleet::admit(
             token,
@@ -346,7 +338,7 @@ async fn gate(State(state): State<FleetListenerState>, mut req: Request, next: N
             &provider_name,
             peer,
             local_id.as_deref(),
-            &allow,
+            || allow_list(),
         )
     })
     .await;
@@ -527,34 +519,38 @@ impl Worker {
         }
     }
 
-    /// (#2916 stage 2 review M1) A queued job is checked again when its seat
-    /// frees, against the state of THIS moment: the config preflight, the
-    /// allow-list entry for the sending node (`untrust` may have run), and
-    /// the scope with the profile resolved afresh. It still runs on the seat
-    /// it waited for, or not at all.
+    /// (#2916 stage 2 review M1, F1) A queued job is checked again when its
+    /// seat frees, against the state of THIS moment, and still runs on the
+    /// seat it waited for, or not at all.
     ///
     /// Every gate the request passed is passed again, in the gate's own
-    /// order: the fleet token (the one in force now, against the one the
-    /// request was admitted with), the allow-list (readable), the network
-    /// identity of the same peer address (still a node, still this node,
-    /// never this machine's own), the allow-list entry for it — all through
-    /// the one `darkmux_fleet::admit` — then the config preflight and the
-    /// scope. The per-node request cap is not a trust gate and is not
+    /// order, through the one `darkmux_fleet::admit`: the fleet token (the
+    /// one `state.token` gives now, against the one the request was
+    /// admitted with), the network identity of the same peer address (still
+    /// a node, still this node, never this machine's own), then the
+    /// allow-list (readable, read AFTER the lookup so an `untrust` during it
+    /// is seen) and the entry for that node; then the config preflight and
+    /// the scope. The per-node request cap is not a trust gate and is not
     /// re-applied. Returns the entry as it stands now and the profile.
+    ///
+    /// In production the daemon reads the fleet token once
+    /// (`serve_token`'s Keychain tier and `daemon_auth_enabled` are cached
+    /// for the process), so a rotated or removed token is seen only after a
+    /// restart, which drops the queue anyway; the token check here holds
+    /// for whatever `state.token` returns.
     fn recheck(&self) -> Result<(Admitted, String), Refusal> {
         let state = &self.state;
         let token = self.token.check_now((state.token)());
-        let allow = (state.allow_list)().map_err(|e| {
-            Refusal::BadRequest(format!("this machine's allow-list cannot be read ({e}); refusing everything"))
-        })?;
         let provider = &state.provider;
+        // `admit` reads the allow-list only after the identity lookup, so an
+        // `untrust` that lands while the provider answers is still seen.
         let admitted = darkmux_fleet::admit(
             token,
             || provider.identify(self.peer).map_err(|e| format!("{e:#}")),
             provider.provider_name(),
             self.peer,
             state.local_node_id.as_deref(),
-            &allow,
+            || (state.allow_list)(),
         )?;
         // The address now belongs to another node (one the allow-list also
         // trusts): not the machine that queued this job.
@@ -1115,9 +1111,14 @@ mod tests {
 
     /// An identity provider a test can change mid-run: a node leaving the
     /// network, the provider going down, another node taking the address.
-    struct Switchable(Mutex<StaticIdentityProvider>);
+    struct Switchable(Mutex<StaticIdentityProvider>, Mutex<Duration>);
 
     impl Switchable {
+        /// Make every later `identify` take `d` (a slow provider tool).
+        fn slow(&self, d: Duration) {
+            *self.1.lock().unwrap() = d;
+        }
+
         fn set(&self, peers: Vec<darkmux_fleet::NodeIdentity>, down: Option<&str>) {
             let mut g = self.0.lock().unwrap();
             g.peers = peers;
@@ -1130,6 +1131,8 @@ mod tests {
             "static"
         }
         fn identify(&self, peer: std::net::IpAddr) -> anyhow::Result<Option<darkmux_fleet::NodeIdentity>> {
+            let delay = *self.1.lock().unwrap();
+            std::thread::sleep(delay);
             self.0.lock().unwrap().identify(peer)
         }
         fn local_node(&self) -> anyhow::Result<darkmux_fleet::NodeIdentity> {
@@ -1187,11 +1190,14 @@ mod tests {
         let model_moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let moved = model_moved.clone();
         let local = test_node("nSTUDIO", "studio", "100.64.0.2");
-        let network = Arc::new(Switchable(Mutex::new(StaticIdentityProvider {
-            local,
-            peers: peer.into_iter().collect(),
-            down: down.then(|| "daemon not running".to_string()),
-        })));
+        let network = Arc::new(Switchable(
+            Mutex::new(StaticIdentityProvider {
+                local,
+                peers: peer.into_iter().collect(),
+                down: down.then(|| "daemon not running".to_string()),
+            }),
+            Mutex::new(Duration::ZERO),
+        ));
         let token_now = Arc::new(Mutex::new(Some(TOKEN.to_string())));
         let token_read = token_now.clone();
         let ran = Arc::new(Mutex::new(Vec::new()));
@@ -1505,6 +1511,8 @@ mod tests {
         let local = listener_busy(true).unwrap();
         assert_eq!((local["policy"].as_str(), local["hosted_cap"].as_u64()), (Some("queue"), Some(2)));
         assert!(listener_busy(false).is_none(), "a peer sees nothing");
+        // Process-global: leave it as the process started.
+        *LISTENER_BUSY.lock().unwrap() = None;
     }
 
     /// Wait until `ran` holds `n` jobs (or fail after 10 s).
@@ -1651,6 +1659,66 @@ mod tests {
             h.network.set(vec![test_node("nPHONE", "phone", "127.0.0.1")], None);
         });
         refused_because(&reply, "did not come from a node");
+    }
+
+    /// (#2916 stage 2 final review 2) The allow-list is read AFTER the
+    /// identity lookup when a queued job is checked again: an `untrust` that
+    /// lands while the provider is still answering is seen.
+    #[test]
+    fn an_untrust_during_the_rechecks_identity_lookup_is_seen() {
+        let h = start_full(Some(laptop()), false, 600, Arc::new(|| Ok(())), BusyPolicy::Queue, 1, WIDE);
+        assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
+        let waiting = post_in_background(&h, job("s-queued", None));
+        std::thread::sleep(Duration::from_millis(200));
+        // From now on the provider takes 800 ms to answer: the recheck's
+        // lookup starts when the first job ends, and the untrust lands
+        // inside it.
+        h.network.slow(Duration::from_millis(800));
+        wait_ran(&h, 1);
+        std::thread::sleep(Duration::from_millis(300));
+        h.allow.lock().unwrap().clear();
+        let (_, reply, _) = waiting.join().unwrap();
+        refused_because(&reply, "does not accept work from macbook-pro");
+        assert_eq!(h.ran.lock().unwrap().len(), 1, "the queued job ran");
+    }
+
+    /// (#2916 stage 2 final review 3) A sender that hangs up WHILE its job is
+    /// being checked again (the seat already taken, the provider still
+    /// answering) is caught by the check just before the job runs.
+    #[test]
+    fn a_sender_that_hangs_up_during_the_recheck_never_runs() {
+        use std::io::{Read, Write};
+        let h = start_full(Some(laptop()), false, 600, Arc::new(|| Ok(())), BusyPolicy::Queue, 1, WIDE);
+        assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
+        let body = serde_json::to_vec(&WorkSubmission::new(job("s-gone", None), true)).unwrap();
+        let addr = h.url.trim_start_matches("http://").split('/').next().unwrap().to_string();
+        let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+        write!(
+            sock,
+            "POST {} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            darkmux_fleet::SUBMISSION_PATH,
+            body.len()
+        )
+        .unwrap();
+        sock.write_all(&body).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut got = Vec::new();
+        let mut b = [0u8; 4096];
+        while !String::from_utf8_lossy(&got).contains("\"queued\"") {
+            let n = sock.read(&mut b).unwrap();
+            assert!(n > 0, "the listener closed before saying queued");
+            got.extend_from_slice(&b[..n]);
+        }
+        // The recheck's lookup will take 1.2 s; hang up inside it, after the
+        // waiter has already taken the freed seat.
+        h.network.slow(Duration::from_millis(1_200));
+        wait_ran(&h, 1);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!h.seats.running().is_empty(), "the waiter should hold the seat, mid-recheck");
+        drop(sock);
+        wait_idle(&h);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(h.ran.lock().unwrap().len(), 1, "a job whose sender hung up during its recheck ran");
     }
 
     /// (#2916 stage 2 review C3) The scope is checked again: an entry

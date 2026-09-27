@@ -638,12 +638,19 @@ async fn auth_mw(req: Request, next: Next) -> Response {
 /// peer's address) and `X-Forwarded-Host`; for a user-owned node it also
 /// sets `Tailscale-User-Login`, `Tailscale-User-Name` and
 /// `Tailscale-Headers-Info` (its `ipn/ipnlocal/serve.go`, and the serve
-/// docs' identity headers). `Forwarded` is the standard form other proxies
-/// use.
+/// docs' identity headers). `Forwarded`, `Via` and the rest are what other
+/// common proxies and CDNs add.
 const PROXY_HEADERS: &[&str] = &[
     "x-forwarded-for",
     "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-forwarded-server",
+    "x-real-ip",
     "forwarded",
+    "via",
+    "cf-connecting-ip",
+    "true-client-ip",
     "tailscale-user-login",
     "tailscale-user-name",
     "tailscale-headers-info",
@@ -657,6 +664,9 @@ const PROXY_HEADERS: &[&str] = &[
 /// alone would hand a peer what only this machine may read. A local process
 /// that adds such a header only makes itself look remote, which fails
 /// toward showing less. No address (no `ConnectInfo`) is not local.
+///
+/// The limit: a proxy that forwards to loopback and adds NONE of these
+/// headers looks exactly like a local request, and cannot be told apart.
 pub(crate) fn is_local_request(peer: Option<SocketAddr>, headers: &axum::http::HeaderMap) -> bool {
     peer.is_some_and(|p| p.ip().is_loopback()) && !PROXY_HEADERS.iter().any(|h| headers.contains_key(*h))
 }

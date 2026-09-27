@@ -143,8 +143,10 @@ darkmux release.
   again when its seat frees (the fleet token in force against the one it
   was admitted with, the sender's network identity, its allow-list entry,
   the config preflight, the scope with its profile resolved afresh), so
-  rotating the token, `untrust`, or removing the sender from the network
-  also stops jobs already waiting. A sender that closes its connection
+  `untrust` or removing the sender from the network also stops jobs
+  already waiting. Rotating or removing the fleet token takes effect when
+  the daemon restarts (it reads the token once), and a restart drops the
+  queue anyway. A sender that closes its connection
   gives its place back and its job never runs; one that vanishes without
   closing it (a laptop that sleeps) keeps its place until TCP gives up on
   the connection. A waited-on job waits no longer than its connection

@@ -341,13 +341,18 @@ pub struct Admitted {
 /// `Ok(Some)` a node, `Ok(None)` no node holds it, `Err(detail)` the
 /// provider could not answer. The last two refuse (fail closed). An entry
 /// without a `node_id` never matches.
+///
+/// `allow` reads the allow-list, and is called only AFTER the identity
+/// lookup (which runs the provider's tool, up to its 3 s bound), so an
+/// `untrust` that lands while the provider answers is still seen. An
+/// allow-list that cannot be read refuses everything.
 pub fn admit(
     token: TokenCheck,
     identity: impl FnOnce() -> std::result::Result<Option<NodeIdentity>, String>,
     provider: &str,
     peer_addr: IpAddr,
     local_node_id: Option<&str>,
-    allow: &BTreeMap<String, AcceptWorkEntry>,
+    allow: impl FnOnce() -> std::result::Result<BTreeMap<String, AcceptWorkEntry>, String>,
 ) -> std::result::Result<Admitted, Refusal> {
     match token {
         TokenCheck::Match => {}
@@ -367,7 +372,10 @@ pub fn admit(
     if local_node_id.is_some_and(|me| !me.is_empty() && me == node.node_id) {
         return Err(Refusal::FromSelf);
     }
-    match_entry(&node.node_id, &node.name, allow)
+    let allow = allow().map_err(|e| {
+        Refusal::BadRequest(format!("this machine's allow-list cannot be read ({e}); refusing everything"))
+    })?;
+    match_entry(&node.node_id, &node.name, &allow)
 }
 
 /// The allow-list entry for the node `node_id` (named `node_name` on the
@@ -1045,7 +1053,7 @@ mod tests {
             Node::NotOnOverlay => Ok(None),
             Node::Unresolvable => Err("daemon not running".to_string()),
         };
-        let admitted = admit(token, identity, "tailscale", peer, Some("nSTUDIO"), &allow())?;
+        let admitted = admit(token, identity, "tailscale", peer, Some("nSTUDIO"), || Ok(allow()))?;
         let resolution = match prof {
             Prof::InScope => work("host"),
             Prof::OutOfScope => work("coder-big"),
@@ -1097,7 +1105,7 @@ mod tests {
     fn the_identity_lookup_never_runs_without_the_token() {
         let peer: IpAddr = "100.64.0.7".parse().unwrap();
         for t in [TokenCheck::Mismatch, TokenCheck::NotConfigured] {
-            let r = admit(t, || panic!("identity looked up without a token"), "tailscale", peer, Some("nSTUDIO"), &allow());
+            let r = admit(t, || panic!("identity looked up without a token"), "tailscale", peer, Some("nSTUDIO"), || Ok(allow()));
             assert!(r.is_err());
         }
     }
@@ -1113,7 +1121,7 @@ mod tests {
         // A hand-edited entry with an EMPTY id must not match a node the
         // provider reports with an empty id either.
         a.insert("blank".into(), entry(Some(""), &["host"], false));
-        let r = admit(TokenCheck::Match, || Ok(Some(n)), "tailscale", peer, Some("nSTUDIO"), &a);
+        let r = admit(TokenCheck::Match, || Ok(Some(n)), "tailscale", peer, Some("nSTUDIO"), || Ok(a.clone()));
         assert!(matches!(r, Err(Refusal::NotAllowed { .. })), "{r:?}");
     }
 
@@ -1122,7 +1130,7 @@ mod tests {
         let mut a = allow();
         a.insert("laptop".into(), entry(Some("nLAPTOP"), &["host"], true));
         let peer: IpAddr = "100.64.0.7".parse().unwrap();
-        let r = admit(TokenCheck::Match, || Ok(Some(test_node("nLAPTOP", "macbook-pro", "100.64.0.7"))), "tailscale", peer, Some("nSTUDIO"), &a);
+        let r = admit(TokenCheck::Match, || Ok(Some(test_node("nLAPTOP", "macbook-pro", "100.64.0.7"))), "tailscale", peer, Some("nSTUDIO"), || Ok(a.clone()));
         assert!(matches!(r, Err(Refusal::AmbiguousEntry { ref names }) if names.len() == 2), "{r:?}");
     }
 
@@ -1134,7 +1142,7 @@ mod tests {
         let peer: IpAddr = "100.64.0.2".parse().unwrap();
         let mut a = allow();
         a.insert("studio".into(), entry(Some("nSTUDIO"), &["host"], false));
-        let r = admit(TokenCheck::Match, || Ok(Some(test_node("nSTUDIO", "studio", "100.64.0.2"))), "tailscale", peer, Some("nSTUDIO"), &a);
+        let r = admit(TokenCheck::Match, || Ok(Some(test_node("nSTUDIO", "studio", "100.64.0.2"))), "tailscale", peer, Some("nSTUDIO"), || Ok(a.clone()));
         assert_eq!(r, Err(Refusal::FromSelf));
 
         let admitted = Admitted {

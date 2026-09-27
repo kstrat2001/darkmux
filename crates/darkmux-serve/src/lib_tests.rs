@@ -1878,6 +1878,8 @@
             assert!(v["open_file_limit"].is_null(), "{proxied:?} is a peer, not this machine: {v}");
             assert!(v["fleet_busy"].is_null(), "{proxied:?}: {v}");
         }
+        // Process-global: leave it as the process started.
+        *crate::fleet_listener::LISTENER_BUSY.lock().unwrap() = None;
     }
 
     #[test]
