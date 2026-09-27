@@ -11,9 +11,11 @@ pub mod daemon_probe;
 pub(crate) mod hmac_sha256;
 pub mod hook_transform;
 pub mod hooks;
+pub mod legacy;
 pub mod live;
 pub mod presence;
 pub mod presence_reconciler;
+pub mod reader;
 pub mod session_presence;
 
 mod bookend;
@@ -278,17 +280,9 @@ fn audit_dir_default() -> PathBuf {
 /// file → 0 (nothing to report).
 pub fn count_audit_write_failures_today() -> usize {
     let path = flows_dir().join(format!("{}.jsonl", day_utc_now()));
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return 0;
-    };
-    content
-        .lines()
-        .filter(|l| {
-            serde_json::from_str::<serde_json::Value>(l)
-                .ok()
-                .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(|s| s == "audit.write_failed"))
-                .unwrap_or(false)
-        })
+    reader::day_file_records(&path)
+        .iter()
+        .filter(|v| reader::action_of(v) == Some(FlowAction::AuditWriteFailed))
         .count()
 }
 
@@ -1489,7 +1483,7 @@ impl TeeSink {
         let mut bc = dropped.clone();
         bc.level = crate::schema::Level::Error;
         bc.category = crate::schema::Category::Audit;
-        bc.action = "audit.write_failed".to_string();
+        bc.action = crate::FlowAction::AuditWriteFailed;
         // Never carry chain fields on the casual-sink breadcrumb.
         bc.prev_hash = None;
         bc.hash = None;
@@ -1728,7 +1722,24 @@ pub(crate) fn default_sink_info() -> SinkInfo {
 /// production code path uses `record()` which dispatches through the
 /// process-wide default sink.
 pub fn record_via(sink: &dyn FlowSink, record: &FlowRecord) -> Result<()> {
+    refuse_unknown_action(record)?;
     sink.write(record)
+}
+
+/// An action this build does not know, or one darkmux retired, is readable
+/// (lenient on read) and never writable: writing one would pass it off as
+/// current vocabulary. Only a record READ from an archive can carry one, so
+/// this refuses the re-write.
+fn refuse_unknown_action(record: &FlowRecord) -> Result<()> {
+    match &record.action {
+        FlowAction::Other(unknown) => {
+            anyhow::bail!("refusing to write a flow record whose action `{}` is not one darkmux knows", unknown.as_str())
+        }
+        FlowAction::Retired(retired) => {
+            anyhow::bail!("refusing to write a flow record with the retired action `{}`", retired.as_str())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Append `record` to today's per-day JSONL file. Creates the file with a
@@ -1758,6 +1769,7 @@ pub fn record(record: FlowRecord) -> Result<()> {
 /// default sink + live env. The provenance auto-populate is identical to
 /// the pre-split `record()`.
 pub(crate) fn record_to(sink: &dyn FlowSink, record: FlowRecord) -> Result<()> {
+    refuse_unknown_action(&record)?;
     let mut rec = record;
     if rec.machine_id.is_none() {
         rec.machine_id = resolve_machine_id();
@@ -1973,6 +1985,36 @@ mod tests {
 
     // ─── (#388) RedisSink graceful-disable-on-unreachable ────────────
 
+    /// An action read from an archive that this build does not know is never
+    /// written back: both write entry points refuse it before any sink sees
+    /// it, and a known action still goes through.
+    #[test]
+    fn an_unknown_action_is_refused_on_write_and_a_known_one_is_not() {
+        struct Counting(std::sync::atomic::AtomicUsize);
+        impl FlowSink for Counting {
+            fn write(&self, _record: &FlowRecord) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Counting".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        let sink = Counting(Default::default());
+        let mut unknown = minimal_record();
+        unknown.action = serde_json::from_str("\"future.thing\"").unwrap();
+        assert!(record_via(&sink, &unknown).is_err());
+        assert!(record_to(&sink, unknown).is_err());
+        let mut retired = minimal_record();
+        retired.action = serde_json::from_str("\"telemetry.process\"").unwrap();
+        assert!(matches!(retired.action, FlowAction::Retired(_)));
+        assert!(record_via(&sink, &retired).is_err());
+        assert!(record_to(&sink, retired).is_err());
+        assert_eq!(sink.0.load(std::sync::atomic::Ordering::Relaxed), 0, "no sink saw the unknown or retired action");
+        assert!(record_via(&sink, &minimal_record()).is_ok());
+        assert_eq!(sink.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
     fn minimal_record() -> FlowRecord {
         FlowRecord {
             ts: "2025-01-15T12:34:56Z".to_string(),
@@ -1980,7 +2022,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Dispatch,
-            action: "test".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "t".to_string(),
             phase_id: None,
             session_id: None,
@@ -2085,7 +2127,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Dispatch,
-            action: "ran".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "test-1".to_string(),
             phase_id: None,
             session_id: None,
@@ -2121,14 +2163,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("2025-01-15.jsonl");
 
-        let r = |action: &str| FlowRecord {
+        let r = |handle: &str| FlowRecord {
             ts: "2025-01-15T12:34:56Z".to_string(),
             level: Level::Info,
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Dispatch,
-            action: action.to_string(),
-            handle: "test".to_string(),
+            action: crate::FlowAction::OperatorNote,
+            handle: handle.to_string(),
             phase_id: None,
             session_id: None,
             source: None,
@@ -2191,7 +2233,7 @@ mod tests {
                 thread::spawn(move || {
                     for i in 0..per_thread {
                         let mut rec = minimal_record();
-                        rec.action = format!("thr{t}-rec{i}");
+                        rec.handle = format!("thr{t}-rec{i}");
                         record_at(&rec, &path).unwrap();
                     }
                 })
@@ -2207,7 +2249,7 @@ mod tests {
         for (n, line) in contents.lines().enumerate() {
             let v: Value = serde_json::from_str(line)
                 .unwrap_or_else(|e| panic!("torn line {n}: {e}: {line:?}"));
-            if let Some(a) = v["action"].as_str() {
+            if let Some(a) = v["handle"].as_str() {
                 markers.insert(a.to_string());
             }
         }
@@ -2230,7 +2272,7 @@ mod tests {
             category: Category::Audit,
             tier: Tier::Local,
             stage: Stage::Estimate,
-            action: "budget_check".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "handle-42".to_string(),
             phase_id: Some("sp-100".to_string()),
             session_id: Some("sess-abc".to_string()),
@@ -2262,7 +2304,7 @@ mod tests {
         assert_eq!(parsed["category"], "audit");
         assert_eq!(parsed["tier"], "local");
         assert_eq!(parsed["stage"], "estimate");
-        assert_eq!(parsed["action"], "budget_check");
+        assert_eq!(parsed["action"], "operator.note");
         assert_eq!(parsed["handle"], "handle-42");
 
         // Optional fields should be present (not omitted) when set.
@@ -2277,7 +2319,7 @@ mod tests {
 
         // Round-trip: parse back into FlowRecord.
         let roundtrip: FlowRecord = serde_json::from_str(rec_line).unwrap();
-        assert_eq!(roundtrip.action, "budget_check");
+        assert_eq!(roundtrip.action, crate::FlowAction::OperatorNote);
         assert_eq!(roundtrip.handle, "handle-42");
     }
 
@@ -2297,7 +2339,7 @@ mod tests {
                 category: Category::Review,
                 tier: Tier::Frontier,
                 stage: Stage::Scope,
-                action: "scope_review".to_string(),
+                action: crate::FlowAction::OperatorNote,
                 handle: "ex-path-1".to_string(),
                 phase_id: None,
                 session_id: None,
@@ -2328,7 +2370,7 @@ mod tests {
         assert_eq!(lines.len(), 2); // header + record
 
         let parsed: Value = serde_json::from_str(lines[1]).unwrap();
-        assert_eq!(parsed["action"], "scope_review");
+        assert_eq!(parsed["action"], "operator.note");
     }
 
     #[serial_test::serial]
@@ -2343,7 +2385,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Ship,
-            action: "deploy".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "ship-1".to_string(),
             phase_id: None,
             session_id: None,
@@ -2398,7 +2440,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Review,
-            action: "env_test".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "ev-1".to_string(),
             phase_id: None,
             session_id: None,
@@ -2448,7 +2490,7 @@ mod tests {
         );
 
         let contents = fs::read_to_string(found.unwrap()).unwrap();
-        assert!(contents.contains("env_test"));
+        assert!(contents.contains("ev-1"));
     }
 
     #[test]
@@ -2545,7 +2587,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "test".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
@@ -2571,7 +2613,7 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert!(lines[0].contains("\"_type\":\"schema\""), "line 1 = header");
-        assert!(lines[1].contains("\"action\":\"test\""), "line 2 = record");
+        assert!(lines[1].contains("\"action\":\"operator.note\""), "line 2 = record");
 
         unsafe {
             match prev {
@@ -2644,7 +2686,7 @@ mod tests {
         ]);
 
         let mut rec = minimal_record();
-        rec.action = "dispatch.complete".to_string();
+        rec.action = crate::FlowAction::DispatchComplete;
         rec.session_id = Some("sess-1".to_string());
 
         // TeeSink returns Err (the audit child failed), but the breadcrumb is
@@ -2657,8 +2699,8 @@ mod tests {
             2,
             "local sink should hold the original record + the audit-failure breadcrumb"
         );
-        assert_eq!(captured[0].action, "dispatch.complete", "original first");
-        assert_eq!(captured[1].action, "audit.write_failed", "breadcrumb second");
+        assert_eq!(captured[0].action, crate::FlowAction::DispatchComplete, "original first");
+        assert_eq!(captured[1].action, crate::FlowAction::AuditWriteFailed, "breadcrumb second");
         assert!(matches!(captured[1].level, Level::Error));
         assert!(matches!(captured[1].category, Category::Audit));
         assert!(captured[1].prev_hash.is_none() && captured[1].hash.is_none());
@@ -2721,7 +2763,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "explicit-sink".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
@@ -2762,7 +2804,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "tee-test".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
@@ -2817,7 +2859,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "tee-fail".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
@@ -2860,7 +2902,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "default-path".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
@@ -2882,7 +2924,7 @@ mod tests {
         let path = tmp.path().join(format!("{day}.jsonl"));
         assert!(path.exists(), "default sink should have written to {}", path.display());
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("\"action\":\"default-path\""));
+        assert!(content.contains("\"action\":\"operator.note\""));
 
         unsafe {
             match prev {
@@ -3312,7 +3354,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "test".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
@@ -3347,7 +3389,7 @@ mod tests {
                 category: Category::Work,
                 tier: Tier::Operator,
                 stage: Stage::Dispatch,
-                action: "init".to_string(),
+                action: crate::FlowAction::OperatorNote,
                 handle: "schema-check".to_string(),
                 phase_id: None,
                 session_id: None,
@@ -3530,7 +3572,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "x".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "y".to_string(),
             phase_id: None,
             session_id: None,
@@ -3558,7 +3600,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "x".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "y".to_string(),
             phase_id: None,
             session_id: None,
@@ -3601,7 +3643,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "auto-pop".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
@@ -3652,7 +3694,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "x".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "y".to_string(),
             phase_id: None,
             session_id: None,
@@ -3685,7 +3727,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "x".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "y".to_string(),
             phase_id: None,
             session_id: None,
@@ -3758,7 +3800,7 @@ mod tests {
                 category: Category::Work,
                 tier: Tier::Operator,
                 stage: Stage::Scope,
-                action: "pre-1.8-record".to_string(),
+                action: crate::FlowAction::OperatorNote,
                 handle: format!("h-{i}"),
                 phase_id: None,
                 session_id: None,
@@ -3823,7 +3865,7 @@ mod tests {
                 category: Category::Work,
                 tier: Tier::Operator,
                 stage: Stage::Scope,
-                action: format!("audit-{i}"),
+                action: crate::FlowAction::OperatorNote,
                 handle: format!("rec-{i}"),
                 phase_id: None,
                 session_id: None,
@@ -3872,7 +3914,7 @@ mod tests {
                 category: Category::Work,
                 tier: Tier::Operator,
                 stage: Stage::Scope,
-                action: format!("audit-{i}"),
+                action: crate::FlowAction::OperatorNote,
                 handle: format!("rec-{i}"),
                 phase_id: None,
                 session_id: None,
@@ -3943,7 +3985,7 @@ mod tests {
                 category: Category::Work,
                 tier: Tier::Operator,
                 stage: Stage::Scope,
-                action: format!("audit-{i}"),
+                action: crate::FlowAction::OperatorNote,
                 handle: format!("rec-{i}"),
                 phase_id: None,
                 session_id: None,
@@ -4050,7 +4092,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "post-recovery".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
@@ -4115,7 +4157,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "x".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: handle.to_string(),
             phase_id: None,
             session_id: None,
@@ -4520,7 +4562,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Local,
             stage: Stage::Dispatch,
-            action: "test-unresponsive-redis".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "test".to_string(),
             phase_id: None,
             session_id: None,
@@ -4731,7 +4773,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Local,
             stage: Stage::Dispatch,
-            action: "test-silent-redis-peer".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "test".to_string(),
             phase_id: None,
             session_id: None,
@@ -4897,7 +4939,7 @@ mod tests {
 
         for i in 0..5 {
             let mut rec = minimal_record();
-            rec.action = format!("action-{i}");
+            rec.handle = format!("action-{i}");
             rec.reasoning = Some(format!("reasoning {i}"));
             crate::integrity::audit_record_at(&rec, &path).unwrap();
         }
@@ -4918,7 +4960,6 @@ mod tests {
         fn fresh_chain(path: &std::path::Path, n: usize) {
             for i in 0..n {
                 let mut rec = minimal_record();
-                rec.action = format!("action-{i}");
                 rec.handle = format!("rec-{i}");
                 crate::integrity::audit_record_at(&rec, path).unwrap();
             }
@@ -4964,7 +5005,7 @@ mod tests {
             // record that follows it.
             let (rec0_hash, _) = lines[1].split_once(' ').unwrap();
             let mut forged = minimal_record();
-            forged.action = "forged".to_string();
+            forged.handle = "forged".to_string();
             forged.prev_hash = Some(rec0_hash.to_string());
             forged.hash = None;
             let forged_json = serde_json::to_string(&forged).unwrap();
@@ -5152,7 +5193,7 @@ mod tests {
             "an older/newer reader must still parse a mission.grow record — the payload is \
              free-form and every added field is optional",
         );
-        assert_eq!(rec.action, "mission.grow");
+        assert_eq!(rec.action, crate::FlowAction::MissionGrow);
         let payload = rec.payload.expect("the record carries its payload");
         assert_eq!(payload["producer_status"], serde_json::json!("error"));
         assert_eq!(payload["reason"], serde_json::json!("producer_errored"));

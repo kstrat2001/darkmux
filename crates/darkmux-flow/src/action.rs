@@ -11,6 +11,10 @@
 //! payload per action attaches there: each row gains its payload type, and the
 //! macro grows one `match` that maps a variant to it.
 //!
+//! [`FlowAction::Retired`] is an action darkmux once wrote and retired with
+//! no current equivalent (`telemetry.process`, the pre-graph `funnel.*` and
+//! `crawl.*` records, ...): known, readable, never written.
+//!
 //! [`FlowAction::Other`] exists only for READING: an archive may hold an
 //! action this binary does not know (a newer writer's record, or an
 //! old spelling [`crate::legacy`] has no mapping for). Its field is private,
@@ -46,7 +50,7 @@ macro_rules! flow_scopes {
 flow_scopes! {
     Audit => "audit";
     Battery => "battery";
-    Crawl => "crawl";
+    Budget => "budget";
     Dispatch => "dispatch";
     Gh => "gh";
     Hook => "hook";
@@ -60,6 +64,7 @@ flow_scopes! {
     Stream => "stream";
     Telemetry => "telemetry";
     Thermal => "thermal";
+    Tier => "tier";
     Utility => "utility";
 }
 
@@ -80,6 +85,10 @@ macro_rules! flow_actions {
         #[derive(Debug, Clone, PartialEq, Eq, Hash)]
         pub enum FlowAction {
             $( $(#[$meta])* $variant, )*
+            /// An action darkmux once wrote and no longer does, read from an
+            /// archive. Known, never written (see
+            /// [`crate::legacy::RetiredAction`]).
+            Retired(crate::legacy::RetiredAction),
             /// An action read from a record this binary has no variant for.
             Other(UnknownAction),
         }
@@ -88,10 +97,17 @@ macro_rules! flow_actions {
             /// Every known wire string, in declaration order.
             pub const KNOWN_WIRE: &'static [&'static str] = &[ $( $wire, )* ];
 
+            /// Every variant's Rust name, aligned with [`Self::KNOWN_WIRE`]:
+            /// for a source scanner that meets `FlowAction::<Name>` and needs
+            /// the wire string it writes.
+            #[doc(hidden)]
+            pub const VARIANT_NAMES: &'static [&'static str] = &[ $( stringify!($variant), )* ];
+
             /// The wire spelling.
             pub fn as_str(&self) -> &str {
                 match self {
                     $( FlowAction::$variant => $wire, )*
+                    FlowAction::Retired(r) => r.as_str(),
                     FlowAction::Other(u) => u.as_str(),
                 }
             }
@@ -100,14 +116,14 @@ macro_rules! flow_actions {
             pub fn scope(&self) -> Option<FlowScope> {
                 match self {
                     $( FlowAction::$variant => Some(FlowScope::$scope), )*
-                    FlowAction::Other(_) => None,
+                    FlowAction::Retired(_) | FlowAction::Other(_) => None,
                 }
             }
 
             /// Parse a CURRENT wire string. An unknown string becomes
-            /// [`FlowAction::Other`]; old spellings are
-            /// [`crate::legacy::upgrade_action`]'s job, not this one's.
-            pub fn from_wire(s: &str) -> FlowAction {
+            /// [`FlowAction::Other`]; a retired spelling is
+            /// [`crate::legacy::read_action`]'s job, not this one's.
+            pub(crate) fn from_wire(s: &str) -> FlowAction {
                 match s {
                     $( $wire => FlowAction::$variant, )*
                     other => FlowAction::Other(UnknownAction(other.to_string())),
@@ -132,7 +148,15 @@ macro_rules! flow_actions {
 flow_actions! {
     AuditWriteFailed => Audit, "audit.write_failed";
     BatteryPauseUnsupported => Battery, "battery.pause_unsupported";
-    CrawlFinding => Crawl, "crawl.finding";
+    /// A budget was reached (or its `warn_at` fraction was) under `warn`, or
+    /// a per-step cap was crossed; the call went ahead.
+    BudgetWarn => Budget, "budget.warn";
+    /// A call is waiting on a budget (`wait`).
+    BudgetWait => Budget, "budget.wait";
+    /// A waiting call went ahead.
+    BudgetResume => Budget, "budget.resume";
+    /// A budget wait ended because its run was stopped; nothing was sent.
+    BudgetStop => Budget, "budget.stop";
     DispatchStart => Dispatch, "dispatch.start";
     DispatchComplete => Dispatch, "dispatch.complete";
     DispatchError => Dispatch, "dispatch.error";
@@ -146,6 +170,7 @@ flow_actions! {
     DispatchRest => Dispatch, "dispatch.rest";
     DispatchDegeneracyWarning => Dispatch, "dispatch.degeneracy.warning";
     DispatchWorkdirGitUnavailable => Dispatch, "dispatch.workdir_git_unavailable";
+    DispatchRoute => Dispatch, "dispatch.route";
     GhVerbExecuted => Gh, "gh.verb.executed";
     HookFired => Hook, "hook.fired";
     HookFailed => Hook, "hook.failed";
@@ -164,6 +189,8 @@ flow_actions! {
     MissionResume => Mission, "mission.resume";
     MissionGrow => Mission, "mission.grow";
     MissionDebriefPrompt => Mission, "mission.debrief.prompt";
+    MissionRunFinalize => Mission, "mission.run.finalize";
+    MissionRunAbort => Mission, "mission.run.abort";
     OperatorNote => Operator, "operator.note";
     OperatorCatch => Operator, "operator.catch";
     PhaseStart => Phase, "phase.start";
@@ -175,6 +202,7 @@ flow_actions! {
     PhaseReviewAborted => Phase, "phase.review.aborted";
     PhaseReviewDispatch => Phase, "phase.review.dispatch";
     PhaseReviewFailed => Phase, "phase.review.failed";
+    PhaseReviewVerdict => Phase, "phase.review.verdict";
     RadioRoute => Radio, "radio.route";
     SessionEnd => Session, "session.end";
     StepStart => Step, "step.start";
@@ -189,7 +217,11 @@ flow_actions! {
     TelemetryContext => Telemetry, "telemetry.context";
     TelemetryCompaction => Telemetry, "telemetry.compaction";
     TelemetryRuntime => Telemetry, "telemetry.runtime";
+    TelemetryLms => Telemetry, "telemetry.lms";
+    TierDecision => Tier, "tier.decision";
     ThermalStopUnresolved => Thermal, "thermal.stop_unresolved";
+    ThermalTier5Eject => Thermal, "thermal.tier5_eject";
+    ThermalTier5EjectFailed => Thermal, "thermal.tier5_eject_failed";
     UtilityStart => Utility, "utility.start";
     UtilityError => Utility, "utility.error";
 }
@@ -209,7 +241,7 @@ impl Serialize for FlowAction {
 impl<'de> Deserialize<'de> for FlowAction {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
-        Ok(FlowAction::from_wire(&s))
+        Ok(crate::legacy::read_action(&s))
     }
 }
 
@@ -218,6 +250,7 @@ impl<'de> Deserialize<'de> for FlowAction {
 #[cfg(feature = "ts-export")]
 mod ts {
     use super::{FlowAction, FlowScope};
+    use crate::legacy::RetiredAction;
     use std::path::Path;
 
     fn union(wires: &[&str]) -> String {
@@ -261,6 +294,17 @@ mod ts {
         "FlowScope.ts",
         "/**\n * The first segment of a flow action: the subject the action is about.\n */\n"
     );
+
+    ts_union!(
+        RetiredAction,
+        "RetiredAction.ts",
+        "/**\n * An action darkmux wrote before 4.0 and retired with no current\n * equivalent. An archive may still hold it; nothing writes it.\n */\n"
+    );
+
+    #[test]
+    fn export_bindings_retiredaction() {
+        <RetiredAction as ts_rs::TS>::export_all().expect("could not export RetiredAction");
+    }
 
     #[test]
     fn export_bindings_flowaction() {

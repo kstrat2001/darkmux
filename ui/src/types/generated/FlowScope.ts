@@ -3,4 +3,4 @@
 /**
  * The first segment of a flow action: the subject the action is about.
  */
-export type FlowScope = "audit" | "battery" | "crawl" | "dispatch" | "gh" | "hook" | "machine" | "mission" | "operator" | "phase" | "radio" | "session" | "step" | "stream" | "telemetry" | "thermal" | "utility";
+export type FlowScope = "audit" | "battery" | "budget" | "dispatch" | "gh" | "hook" | "machine" | "mission" | "operator" | "phase" | "radio" | "session" | "step" | "stream" | "telemetry" | "thermal" | "tier" | "utility";
