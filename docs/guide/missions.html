@@ -318,7 +318,7 @@ darkmux mission add-phase &lt;mission-id&gt; \
       <tr>
         <td>2 · reusable patterns</td>
         <td><code>crates/darkmux-crew/src/step_kinds/patterns/</code></td>
-        <td>Reusable control-flow SHAPES (<code>dedup</code>, <code>multi_pass_confirm</code>) with the domain-specific algorithm plugged in per caller. Not directly nameable in a <code>kind</code> field; they're Rust-level building blocks a Tier 3 kind wraps (a bespoke dedup step's implementation calls the Tier 2 <code>dedup</code> pattern internally).</td>
+        <td>Reusable control-flow SHAPES with the domain-specific algorithm plugged in per caller. One today: <code>plan_sites</code> (prefilter hits over a source, window them, pack windows into sized units), shared by the crawl planner and the diff-scoped <code>plan.sites</code> step. Not directly nameable in a <code>kind</code> field; it's a Rust-level building block a kind wraps.</td>
       </tr>
       <tr>
         <td>3 · bespoke</td>

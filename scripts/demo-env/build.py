@@ -456,7 +456,7 @@ def materialize_mission(slug, plan, machine, home, now_ms):
     # `home / "crew"`, NOT `home / "missions"` directly: `panel_env`/`serve.py`
     # both pin `DARKMUX_CREW_DIR` at `<home>/crew` (the env var names the
     # directory CONTAINING `missions/`/`phases/`/`roles/`/…, no extra nesting
-    # — see `darkmux-crew::loader::resolve_user_subdir`), so that is where
+    # — see `darkmux-crew::loader::user_subdir`), so that is where
     # `load_missions()` actually walks. Missing this the first time round
     # made the graph route 404 with "no mission with id ... found" even
     # though the files existed, just one directory level off from where the

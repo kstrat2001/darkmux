@@ -558,7 +558,6 @@ src/                          CLI command layer (clap)
   config_cmd.rs               `config` get/set/list
   init.rs / skills.rs         `darkmux init` (idempotent setup + bundled-skill refresh) + skill installer
   conventions.rs              Shared CLI helpers
-  migrate.rs                  Storage-layout migrations
 crates/
   darkmux-types/              Profile / ProfileRegistry / config / flow record schemas + config_access
   darkmux-profiles/           Registry loader + lookup
