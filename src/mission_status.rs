@@ -1798,7 +1798,7 @@ fn footer_lines(b: &Board, visible: &[&MissionView], hidden: &[&MissionView], an
     let (clean, summary) = attention_rollup(
         visible_attention,
         hidden_attention,
-        any_drift_hidden || hidden_attention > 0,
+        HiddenBy::of(any_drift_hidden, hidden_attention > 0),
         b.all_link.is_some(),
         fleet_complete(b.fleet_state),
     );
@@ -1863,6 +1863,27 @@ fn hidden_run_summary(hidden_len: usize, hidden_attention: usize) -> Option<Stri
     ))
 }
 
+/// Why some missions needing attention are not printed as full rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HiddenBy {
+    /// A section limit cut them off; `--all` shows them.
+    Paginated,
+    /// `--missions` filtered them out; only dropping it shows them.
+    Filtered,
+    Both,
+}
+
+impl HiddenBy {
+    fn of(paginated: bool, filtered: bool) -> Option<Self> {
+        match (paginated, filtered) {
+            (false, false) => None,
+            (true, false) => Some(Self::Paginated),
+            (false, true) => Some(Self::Filtered),
+            (true, true) => Some(Self::Both),
+        }
+    }
+}
+
 /// (#1562) The final "N missions need attention" line (or the clean
 /// checkmark) — extracted so its three distinct cases are each directly
 /// testable without a real board:
@@ -1870,14 +1891,14 @@ fn hidden_run_summary(hidden_len: usize, hidden_attention: usize) -> Option<Stri
 ///   - something ONLY among hidden (collapsed) runs → the rollup must still
 ///     say so, since nothing about that is visible above it;
 ///   - something on-screen → "run the suggested commands above", with a
-///     tail naming where the hidden ones are when `any_drift_hidden`.
+///     tail naming where the hidden ones are, per [`HiddenBy`].
 ///
 /// Returns `(is_clean, message)`; the caller picks `style::success` /
 /// `style::warn` from `is_clean`.
 fn attention_rollup(
     visible_attention: usize,
     hidden_attention: usize,
-    any_drift_hidden: bool,
+    hidden_by: Option<HiddenBy>,
     all_link_present: bool,
     // (#1711) Whether the fleet-wide peer-mission read covered the whole
     // fleet (`SourceState::Ok`/`Off`) or came back degraded
@@ -1898,7 +1919,7 @@ fn attention_rollup(
         // fleet.
         (0, 0) => (false, format!("this machine's missions are reconciled{fleet_tail} (see note above)")),
         (0, hidden) => (false, filtered_out_attention(hidden, fleet_tail)),
-        (visible, _) => (false, visible_attention_line(visible, any_drift_hidden, all_link_present, fleet_tail)),
+        (visible, _) => (false, visible_attention_line(visible, hidden_by, all_link_present, fleet_tail)),
     }
 }
 
@@ -1921,12 +1942,16 @@ fn filtered_out_attention(hidden: usize, fleet_tail: &str) -> String {
 
 /// Some printed mission needs action. "above" is only true for the ones
 /// printed as full rows, so when a limit or the filter hid others, the line
-/// says where to see them.
-fn visible_attention_line(visible: usize, any_drift_hidden: bool, all_link_present: bool, fleet_tail: &str) -> String {
-    let tail = match (any_drift_hidden, all_link_present) {
-        (false, _) => "",
-        (true, true) => " (some are hidden — open the full board above)",
-        (true, false) => " (some are hidden — `--all` to see them)",
+/// names the cure for that cause: `--all` un-paginates, but only dropping
+/// `--missions` brings back a filtered-out run (#1709).
+fn visible_attention_line(visible: usize, hidden_by: Option<HiddenBy>, all_link_present: bool, fleet_tail: &str) -> String {
+    let tail = match (hidden_by, all_link_present) {
+        (None, _) => "",
+        (Some(HiddenBy::Paginated), true) => " (some are hidden — open the full board above)",
+        (Some(HiddenBy::Paginated), false) => " (some are hidden — `--all` to see them)",
+        (Some(HiddenBy::Filtered), _) => " (some are hidden — drop `--missions` to see them)",
+        (Some(HiddenBy::Both), true) => " (some are hidden — drop `--missions` and open the full board above)",
+        (Some(HiddenBy::Both), false) => " (some are hidden — drop `--missions` and add `--all`)",
     };
     format!(
         "{visible} mission{s} {verb} attention — run the suggested commands above to reconcile{tail}{fleet_tail}",
@@ -4670,7 +4695,7 @@ mod tests {
 
     #[test]
     fn attention_rollup_is_clean_only_when_both_counts_are_zero() {
-        let (clean, msg) = attention_rollup(0, 0, false, false, true);
+        let (clean, msg) = attention_rollup(0, 0, None, false, true);
         assert!(clean);
         assert_eq!(msg, "✓ board is clean — every mission's phases are reconciled");
     }
@@ -4681,12 +4706,12 @@ mod tests {
         // the board must not read as clean, and (#1709) must point at
         // DROPPING `--missions`, the only thing that could have hidden it,
         // matching the footer's advice rather than competing with it.
-        let (clean, msg) = attention_rollup(0, 1, true, false, true);
+        let (clean, msg) = attention_rollup(0, 1, Some(HiddenBy::Filtered), false, true);
         assert!(!clean, "a hidden actionable run must never look like a clean board");
         assert!(msg.contains("1 filtered-out run instance needs attention"), "{msg}");
         assert!(msg.contains("--missions"), "{msg}");
 
-        let (clean, msg) = attention_rollup(0, 2, true, false, true);
+        let (clean, msg) = attention_rollup(0, 2, Some(HiddenBy::Filtered), false, true);
         assert!(!clean);
         assert!(msg.contains("2 filtered-out run instances need attention"), "{msg}");
         assert!(msg.contains("--missions"), "{msg}");
@@ -4694,24 +4719,46 @@ mod tests {
 
     #[test]
     fn attention_rollup_uses_the_existing_wording_when_visible_missions_need_attention() {
-        let (clean, msg) = attention_rollup(3, 0, false, false, true);
+        let (clean, msg) = attention_rollup(3, 0, None, false, true);
         assert!(!clean);
         assert_eq!(msg, "3 missions need attention — run the suggested commands above to reconcile");
 
-        let (_, msg) = attention_rollup(1, 0, false, false, true);
+        let (_, msg) = attention_rollup(1, 0, None, false, true);
         assert_eq!(msg, "1 mission needs attention — run the suggested commands above to reconcile");
     }
 
     #[test]
     fn attention_rollup_tail_reflects_hidden_drift_and_panel_presence() {
-        let (_, msg) = attention_rollup(3, 2, true, false, true);
+        let (_, msg) = attention_rollup(3, 0, Some(HiddenBy::Paginated), false, true);
         assert!(msg.ends_with("(some are hidden — `--all` to see them)"), "{msg}");
 
-        let (_, msg) = attention_rollup(3, 2, true, true, true);
+        let (_, msg) = attention_rollup(3, 0, Some(HiddenBy::Paginated), true, true);
         assert!(msg.ends_with("(some are hidden — open the full board above)"), "{msg}");
 
-        let (_, msg) = attention_rollup(3, 0, false, false, true);
+        let (_, msg) = attention_rollup(3, 0, None, false, true);
         assert!(!msg.contains("hidden"), "{msg}");
+    }
+
+    /// The tail names the cure for WHY rows are hidden: `--all` un-paginates,
+    /// but only dropping `--missions` brings back a filtered-out run.
+    #[test]
+    fn attention_rollup_tail_names_the_cure_for_filtered_rows() {
+        for panel in [false, true] {
+            let (_, msg) = attention_rollup(3, 2, Some(HiddenBy::Filtered), panel, true);
+            assert!(msg.ends_with("(some are hidden — drop `--missions` to see them)"), "{msg}");
+        }
+        let (_, msg) = attention_rollup(3, 2, Some(HiddenBy::Both), false, true);
+        assert!(msg.ends_with("(some are hidden — drop `--missions` and add `--all`)"), "{msg}");
+        let (_, msg) = attention_rollup(3, 2, Some(HiddenBy::Both), true, true);
+        assert!(msg.ends_with("(some are hidden — drop `--missions` and open the full board above)"), "{msg}");
+    }
+
+    #[test]
+    fn hidden_by_is_none_only_when_nothing_is_hidden() {
+        assert_eq!(HiddenBy::of(false, false), None);
+        assert_eq!(HiddenBy::of(true, false), Some(HiddenBy::Paginated));
+        assert_eq!(HiddenBy::of(false, true), Some(HiddenBy::Filtered));
+        assert_eq!(HiddenBy::of(true, true), Some(HiddenBy::Both));
     }
 
     // ─── #1711: the clean-board claim must cover — or admit the scope of —
@@ -4723,7 +4770,7 @@ mod tests {
         // the fleet-wide read never completed — the summary line says
         // "board", and the board is supposed to include the fleet. The
         // green checkmark is a claim of full coverage this run cannot make.
-        let (clean, msg) = attention_rollup(0, 0, false, false, false);
+        let (clean, msg) = attention_rollup(0, 0, None, false, false);
         assert!(!clean, "an incomplete fleet read must never render as the clean checkmark");
         assert!(!msg.starts_with('✓'), "{msg}");
         assert!(
@@ -4737,7 +4784,7 @@ mod tests {
         // `Off` (no fleet substrate configured) and `Ok` (a complete read)
         // are both real "nothing is missing" answers — a standalone
         // install must see the EXACT pre-#1711 wording, unchanged.
-        let (clean, msg) = attention_rollup(0, 0, false, false, true);
+        let (clean, msg) = attention_rollup(0, 0, None, false, true);
         assert!(clean);
         assert_eq!(msg, "✓ board is clean — every mission's phases are reconciled");
     }
@@ -4748,7 +4795,7 @@ mod tests {
         // actually renders, not just the all-clean one — an operator
         // reconciling local drift should also know the fleet half of the
         // board could not be verified.
-        let (_, msg) = attention_rollup(3, 0, false, false, false);
+        let (_, msg) = attention_rollup(3, 0, None, false, false);
         assert!(msg.contains("3 missions need attention"), "{msg}");
         assert!(msg.contains("fleet"), "the local-attention branch must still name the fleet gap: {msg}");
     }
@@ -5347,9 +5394,9 @@ mod tests {
         let mut b = board(&vs);
         b.missions_only = true;
         let out = text(render_board(&b));
-        let rollup = out.rsplit("\n\n").next().unwrap();
+        let rollup = out.rsplit("\n\n").next().unwrap().replace('\n', " ");
         assert!(rollup.starts_with("1 mission needs attention"), "{rollup}");
-        assert!(rollup.contains("(some are "), "{rollup}");
+        assert!(rollup.ends_with("(some are hidden — drop `--missions` to see them)"), "{rollup}");
     }
 
     #[test]
