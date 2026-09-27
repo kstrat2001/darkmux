@@ -813,6 +813,29 @@ fn profile_list_lists_from_explicit_config() {
         .stdout(predicate::str::contains("(default)"));
 }
 
+// `mission dispatch` names an unknown mission and points at `mission
+// launch`, and rejects an id outside the identifier charset, both before
+// any fan-out. Runs without Redis or a model (the redis e2e twin of the
+// charset check skips on CI runners with no redis-server, #2938).
+#[test]
+fn mission_dispatch_names_an_unknown_mission_and_how_to_create_one() {
+    darkmux_cmd()
+        .args(["mission", "dispatch", "no-such-mission", "--role", "coder"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("mission `no-such-mission` not found"))
+        .stderr(predicate::str::contains("darkmux mission launch <config-id>"));
+}
+
+#[test]
+fn mission_dispatch_rejects_a_mission_id_outside_the_charset() {
+    darkmux_cmd()
+        .args(["mission", "dispatch", "../evil", "--role", "coder"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("mission_id contains invalid char"));
+}
+
 #[test]
 fn profile_list_errors_when_config_missing() {
     let mut cmd = darkmux_cmd();
