@@ -604,6 +604,8 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
     });
     await waitFor(() => expect(section.querySelector(".mm-utility__live")?.textContent).toBe("idle"));
     expect(container.textContent).not.toContain("another machine");
+    expect(container.textContent).not.toContain("not reported from here");
+    expect(container.querySelector(".machine-lens__health")?.getAttribute("data-state")).toBe("loading");
     expect(container.textContent).not.toContain("no samples in the last 10 min");
     expect(section.querySelector(".mm-utility__facts")?.textContent).toBe("window — · —");
     expect(container.querySelector(".machine-drawer__idle-line")?.textContent).toBe("no signal");
