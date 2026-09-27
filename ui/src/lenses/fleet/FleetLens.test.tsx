@@ -1856,47 +1856,47 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
     expect(cardScope(card)).toMatchObject({ state: "idle", centerUnit: "idle" });
   });
 
-  it("this machine's own card (from /machine/specs) says 'no signal' while the flow window and presence are unanswered", async () => {
-    const slow = gate();
-    const today = todayUTC();
-    mockFleetFetch({
-      specs: { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 },
-      runs: [],
-      hold: {
-        [`/flow/${today}`]: slow.promise,
-        [`/flow/${prevDateUTC(today)}`]: slow.promise,
-        "/fleet/machines/live": slow.promise,
-        "/fleet/sessions/live": slow.promise,
-      },
+  // Each source on its own: this machine's card (drawn from /machine/specs,
+  // which is fast) must wait on every source its status is derived from,
+  // so holding any ONE of them holds "no signal".
+  // The flow paths are named inside the test: `todayUTC()` reads the frozen
+  // clock, which `beforeEach` sets after this list is built.
+  const flowPaths = () => [`/flow/${todayUTC()}`, `/flow/${prevDateUTC(todayUTC())}`];
+  for (const [what, held] of [
+    ["the flow window", flowPaths],
+    ["live machines", () => ["/fleet/machines/live"]],
+    ["live sessions", () => ["/fleet/sessions/live"]],
+    ["/runs", () => ["/runs"]],
+  ] as const) {
+    it(`this machine's own card says 'no signal' while ${what} alone is unanswered, then 'idle'`, async () => {
+      const paths = held();
+      const slow = gate();
+      mockFleetFetch({
+        specs: { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 },
+        runs: [],
+        hold: Object.fromEntries(paths.map((p) => [p, slow.promise])),
+      });
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      renderFleetLens({}, queryClient);
+      await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+      // Every other source has answered before the card is read: the held
+      // one is the only thing standing between the card and its reading.
+      const others = { "/fleet/machines/live": queryKeys.fleetMachinesLive(), "/fleet/sessions/live": queryKeys.fleetSessionsLive(), "/runs": queryKeys.runs() };
+      await waitFor(() => {
+        for (const [path, key] of Object.entries(others)) {
+          if (!paths.includes(path)) expect(queryClient.getQueryState(key)?.status, path).toBe("success");
+        }
+        if (what !== "the flow window") expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull();
+      });
+      const card = document.querySelector(".mach")!;
+      expect(card.textContent).toContain("MacBook-Pro");
+      expect(stat(card)).toBe("no signal");
+      expect(card.textContent).not.toContain("idle");
+
+      slow.open();
+      await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("idle"));
     });
-    renderFleetLens();
-    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
-    const card = document.querySelector(".mach")!;
-    expect(card.textContent).toContain("MacBook-Pro");
-    expect(stat(card)).toBe("no signal");
-    expect(card.textContent).not.toContain("idle");
-
-    slow.open();
-    await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("idle"));
-  });
-
-  it("each source is waited on: presence alone unanswered still holds 'no signal'", async () => {
-    const presence = gate();
-    mockFleetFetch({
-      specs: { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 },
-      runs: [],
-      hold: { "/fleet/sessions/live": presence.promise },
-    });
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    renderFleetLens({}, queryClient);
-    await waitFor(() => expect(queryClient.getQueryState(queryKeys.runs())?.status).toBe("success"));
-    await waitFor(() => expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull());
-    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
-    expect(stat(document.querySelector(".mach")!)).toBe("no signal");
-
-    presence.open();
-    await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("idle"));
-  });
+  }
 
   it("a replay has its records in hand and never shows 'no signal'", async () => {
     const records = [
