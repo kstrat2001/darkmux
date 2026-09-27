@@ -203,6 +203,7 @@ pub fn run() -> DoctorReport {
         check_binary_split_brain(),
         check_audit_integrity(),
         check_audit_write_drops(),
+        check_unknown_flow_actions(),
         check_state_file_permissions(),
         check_daemon_auth(),
         check_utility_model_binding(),
@@ -847,6 +848,45 @@ fn summarize_audit_reports(reports: &[darkmux_flow::IntegrityReport]) -> Check {
             reports.len()
         ),
         hint: None,
+    }
+}
+
+/// How many of the newest day files [`check_unknown_flow_actions`] reads.
+const UNKNOWN_ACTION_SCAN_DAYS: usize = 7;
+
+/// Records in the recent flow archive whose action this darkmux does not
+/// know. They still read (lenient on read, contract 5), and they are never
+/// taken as vocabulary: a newer darkmux wrote them, or something outside
+/// darkmux did. Named here so neither case goes unseen.
+fn check_unknown_flow_actions() -> Check {
+    let dir = darkmux_types::config_access::flows_dir();
+    unknown_flow_actions_check(&darkmux_flow::reader::unknown_actions_in(&dir, UNKNOWN_ACTION_SCAN_DAYS))
+}
+
+fn unknown_flow_actions_check(tally: &darkmux_flow::reader::UnknownActions) -> Check {
+    let name = "flow action vocabulary".to_string();
+    if tally.total() == 0 {
+        return Check {
+            name,
+            status: Status::Pass,
+            message: format!("every action in the last {UNKNOWN_ACTION_SCAN_DAYS} day file(s) is one this darkmux knows"),
+            hint: None,
+        };
+    }
+    let names: Vec<String> = tally.by_name().iter().map(|(a, n)| format!("{a} ({n})")).collect();
+    Check {
+        name,
+        status: Status::Warn,
+        message: format!(
+            "{} record(s) in the last {UNKNOWN_ACTION_SCAN_DAYS} day file(s) carry an action this darkmux does not know: {}",
+            tally.total(),
+            names.join(", ")
+        ),
+        hint: Some(
+            "They read as-is and nothing acts on them. A newer darkmux on this machine or a peer \
+             writes actions this build does not know; upgrading this binary names them."
+                .into(),
+        ),
     }
 }
 
@@ -2171,49 +2211,24 @@ fn check_hooks() -> Vec<Check> {
     let enabled = darkmux_types::config_access::hooks_enabled();
     let rules = darkmux_types::config_access::hooks_rules();
     let outbox_dir = darkmux_types::config_access::hooks_outbox_dir();
-    let today_actions = today_flow_actions();
-    build_hooks_check(enabled, provenance, &rules, &outbox_dir, &today_actions)
+    build_hooks_check(enabled, provenance, &rules, &outbox_dir)
 }
 
-/// (silent-miss audit, 2026-09-06) Every DISTINCT `action` value present in
-/// today's flow day file — read once here so [`build_hooks_check`] can flag
-/// a rule that has NEVER matched anything because its `match.action` names
-/// the OTHER bookend spelling from what today's records actually carry
-/// (`darkmux_flow::is_dispatch_start`/`is_dispatch_complete`/
-/// `is_dispatch_error` tolerate both spellings; a hook rule's own
-/// `HookMatch::action` glob does not — see `build_hooks_check`'s own
-/// comment on the check this feeds). Not a general flow reader: reads
-/// exactly one file (today's), and returns an empty set on any
-/// read/parse failure or a line that isn't a JSON object with a string
-/// `action` — the same descriptive-not-refusing posture the rest of
-/// `darkmux doctor` takes when a file is missing, absent, or malformed.
-fn today_flow_actions() -> std::collections::HashSet<String> {
-    let dir = darkmux_types::config_access::flows_dir();
-    let path = dir.join(format!("{}.jsonl", darkmux_flow::day_utc_now()));
-    let Ok(text) = std::fs::read_to_string(&path) else { return std::collections::HashSet::new() };
-    text.lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter_map(|v| v.get("action").and_then(|a| a.as_str()).map(str::to_string))
-        .collect()
-}
-
-/// The "other" spelling of a known dispatch-bookend action — `None` for
-/// anything else. Scoped deliberately to the six literal spellings
-/// `darkmux_flow`'s shared matchers already know about (three bookends ×
-/// two spellings), not every action string: this is the ONE vocabulary
-/// where "configured for one spelling, records carry the other" is a
-/// known, structural drift risk (see `CLAUDE.md`'s "Dispatch liveness"
-/// contract) rather than an operator simply misspelling an arbitrary verb.
-fn other_bookend_spelling(action: &str) -> Option<&'static str> {
-    match action {
-        "dispatch.start" => Some("dispatch start"),
-        "dispatch start" => Some("dispatch.start"),
-        "dispatch.complete" => Some("dispatch complete"),
-        "dispatch complete" => Some("dispatch.complete"),
-        "dispatch.error" => Some("dispatch error"),
-        "dispatch error" => Some("dispatch.error"),
-        _ => None,
+/// The action a hook rule names when it names one no record can carry: a
+/// glob that matches none of the actions this darkmux writes. `None` for a
+/// rule whose glob matches at least one, and for the bare `*`.
+///
+/// When the configured string is a spelling 4.0 retired (`dispatch start`),
+/// the second element is the current one, so the warning can say what to
+/// write instead.
+fn unmatchable_action(configured: &str) -> Option<Option<darkmux_flow::FlowAction>> {
+    let matches_some = darkmux_flow::FlowAction::KNOWN_WIRE
+        .iter()
+        .any(|wire| darkmux_flow::hooks::action_glob_matches(configured, wire));
+    if matches_some {
+        return None;
     }
+    Some(darkmux_flow::legacy::upgrade_action(configured))
 }
 
 /// The literal `action=<value>` predicate from a `describe_match`
@@ -2315,7 +2330,6 @@ fn build_hooks_check(
     provenance: &str,
     rules: &[darkmux_types::config::HookRule],
     outbox_dir: &std::path::Path,
-    today_actions: &std::collections::HashSet<String>,
 ) -> Vec<Check> {
     let name = "hooks";
     if !enabled {
@@ -2493,30 +2507,20 @@ fn build_hooks_check(
                 rule_status = Status::Warn;
             }
         }
-        // (silent-miss audit, 2026-09-06) A rule with ZERO deliveries ever
-        // (nothing currently undelivered, and no terminal outcome has ever
-        // landed) reads as merely quiet — a healthy rule waiting for a
-        // matching record is indistinguishable from one that has NEVER
-        // matched a single record because it was written against the
-        // wrong bookend spelling (`HookMatch::action` is a literal glob;
-        // it does NOT tolerate both spellings the way `darkmux_flow`'s
-        // shared matchers do). If today's flow day file holds at least
-        // one record carrying the OTHER spelling of this rule's configured
-        // action, that silence has an explanation worth naming instead of
-        // leaving the operator to notice only when nothing ever arrives.
-        if s.undelivered == 0 && s.last_delivery_ts.is_none() {
-            if let Some(configured) = action_from_match_desc(&s.match_desc) {
-                if let Some(other) = other_bookend_spelling(configured) {
-                    if today_actions.contains(other) {
-                        flags.push(format!(
-                            "NEVER MATCHED (zero deliveries) — configured for action=\"{configured}\", but \
-                             today's flow records use \"{other}\" instead; this looks like a bookend-spelling \
-                             mismatch, not a quiet rule"
-                        ));
-                        if rule_status == Status::Pass {
-                            rule_status = Status::Warn;
-                        }
-                    }
+        // (#4.0) A rule whose `action` glob matches no action darkmux writes
+        // can never deliver anything, however quiet it looks. The usual
+        // cause is a spelling 4.0 retired (`dispatch start` is now
+        // `dispatch.start`), so when the configured string is one, say what
+        // to write instead.
+        if let Some(configured) = action_from_match_desc(&s.match_desc) {
+            if let Some(current) = unmatchable_action(configured) {
+                let instead = current.map(|a| format!("; write \"{a}\" instead")).unwrap_or_default();
+                flags.push(format!(
+                    "CANNOT MATCH — action=\"{configured}\" matches no action darkmux writes \
+                     (actions are spelled `<scope>.<event>`){instead}"
+                ));
+                if rule_status == Status::Pass {
+                    rule_status = Status::Warn;
                 }
             }
         }
@@ -8657,7 +8661,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let rules = vec![
             HookRule {
-                r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+                r#match: Some(HookMatch { action: Some("phase.*".to_string()), ..Default::default() }),
                 http: Some("http://127.0.0.1:8790/events".to_string()),
                 signing_secret_keychain_item: None,
                 file: None,
@@ -8687,7 +8691,7 @@ mod tests {
                 extras: Default::default(),
             },
         ];
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path());
         assert_eq!(checks.len(), 4, "1 overview + 3 per-rule checks");
 
         let overview = checks.iter().find(|c| c.name == "hooks").unwrap();
@@ -8695,7 +8699,7 @@ mod tests {
 
         let healthy = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(healthy.status, Status::Pass, "{}", healthy.message);
-        assert!(healthy.message.contains("crawl.*"), "{}", healthy.message);
+        assert!(healthy.message.contains("phase.*"), "{}", healthy.message);
         assert!(healthy.message.contains("undelivered"), "{}", healthy.message);
 
         let empty_match = checks.iter().find(|c| c.name == "hooks.rule.1").unwrap();
@@ -8720,7 +8724,7 @@ mod tests {
         use darkmux_types::config::{HookMatch, HookRule};
         let tmp = tempfile::TempDir::new().unwrap();
         let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some("phase.*".to_string()), ..Default::default() }),
             http: Some("http://100.64.1.2:8790/events".to_string()),
             signing_secret_keychain_item: None,
             file: None,
@@ -8729,7 +8733,7 @@ mod tests {
             attribution_headers: None,
             extras: Default::default(),
         }];
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path());
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.status, Status::Warn, "{}", rule.message);
         assert!(!rule.message.contains("URL REFUSED"), "a valid tailnet target is not refused: {}", rule.message);
@@ -8743,7 +8747,7 @@ mod tests {
         use darkmux_types::config::{HookMatch, HookRule};
         let tmp = tempfile::TempDir::new().unwrap();
         let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some("phase.*".to_string()), ..Default::default() }),
             http: Some("http://100.64.1.2:8790/events".to_string()),
             signing_secret_keychain_item: Some("darkmux-hook-0".to_string()),
             file: None,
@@ -8752,7 +8756,7 @@ mod tests {
             attribution_headers: None,
             extras: Default::default(),
         }];
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path());
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.status, Status::Pass, "{}", rule.message);
         assert!(rule.message.contains("[tailnet, signed]"), "{}", rule.message);
@@ -8788,7 +8792,7 @@ mod tests {
                 extras: Default::default(),
             },
         ];
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path());
         let telemetry = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(telemetry.status, Status::Warn, "{}", telemetry.message);
         assert!(telemetry.message.contains("observer must not join the observed"), "{}", telemetry.message);
@@ -8798,20 +8802,10 @@ mod tests {
         assert!(bare_star.message.contains("observer must not join the observed"), "{}", bare_star.message);
     }
 
-    /// (silent-miss audit, 2026-09-06) A rule configured for the DOTTED
-    /// spelling (`dispatch.complete`) that has NEVER delivered anything
-    /// (fresh outbox dir: `undelivered == 0`, `last_delivery_ts == None`)
-    /// reads as merely quiet — UNTIL today's flow day file is shown to
-    /// carry the SPACED spelling instead, which is exactly the
-    /// bookend-spelling mismatch `HookMatch::action`'s literal glob
-    /// cannot tolerate (unlike `darkmux_flow`'s shared matchers). Both
-    /// spellings must be named.
-    #[test]
-    fn hooks_check_warns_when_rule_never_matched_but_todays_records_use_the_other_spelling() {
+    fn one_rule_matching(action: &str) -> Vec<darkmux_types::config::HookRule> {
         use darkmux_types::config::{HookMatch, HookRule};
-        let tmp = tempfile::TempDir::new().unwrap();
-        let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("dispatch.complete".to_string()), ..Default::default() }),
+        vec![HookRule {
+            r#match: Some(HookMatch { action: Some(action.to_string()), ..Default::default() }),
             http: Some("http://127.0.0.1:8790/events".to_string()),
             signing_secret_keychain_item: None,
             file: None,
@@ -8819,88 +8813,62 @@ mod tests {
             headers: None,
             attribution_headers: None,
             extras: Default::default(),
-        }];
-        let mut today_actions = std::collections::HashSet::new();
-        today_actions.insert("dispatch complete".to_string());
+        }]
+    }
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &today_actions);
+    /// Unknown actions in the archive warn with their count and names; none
+    /// passes.
+    #[test]
+    fn unknown_flow_actions_warn_with_count_and_names_and_none_pass() {
+        let mut tally = darkmux_flow::reader::UnknownActions::default();
+        assert_eq!(unknown_flow_actions_check(&tally).status, Status::Pass);
+        for a in ["future.thing", "future.thing", "dispatch start", "other.x"] {
+            tally.observe(&serde_json::json!({ "action": a }));
+        }
+        let check = unknown_flow_actions_check(&tally);
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.starts_with("3 record(s)"), "{}", check.message);
+        assert!(check.message.contains("future.thing (2), other.x (1)"), "{}", check.message);
+    }
+
+    /// (#4.0) A rule written against a retired spelling can never deliver:
+    /// the warning names it and says what to write instead.
+    #[test]
+    fn hooks_check_warns_on_a_rule_written_against_a_retired_spelling() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let checks = build_hooks_check(true, "config.json", &one_rule_matching("dispatch complete"), tmp.path());
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.status, Status::Warn, "{}", rule.message);
-        assert!(rule.message.contains("NEVER MATCHED"), "{}", rule.message);
-        assert!(rule.message.contains("dispatch.complete"), "must name the CONFIGURED spelling: {}", rule.message);
-        assert!(rule.message.contains("dispatch complete"), "must name the OTHER spelling seen: {}", rule.message);
+        assert!(rule.message.contains("CANNOT MATCH"), "{}", rule.message);
+        assert!(rule.message.contains("\"dispatch complete\""), "names the configured spelling: {}", rule.message);
+        assert!(rule.message.contains("write \"dispatch.complete\" instead"), "names the current one: {}", rule.message);
     }
 
-    /// The negative space around the test above: with NOTHING in today's
-    /// flow day file naming the other spelling, the same never-delivered
-    /// rule stays Pass — a genuinely quiet, correctly-configured rule
-    /// (e.g. one waiting for its first matching dispatch of the day) must
-    /// not be flagged.
+    /// A glob that matches no action at all (a typo, an invented scope)
+    /// warns too, without a suggestion it does not have.
     #[test]
-    fn hooks_check_no_alias_warn_when_todays_actions_dont_carry_the_other_spelling() {
-        use darkmux_types::config::{HookMatch, HookRule};
+    fn hooks_check_warns_on_a_glob_that_matches_no_action() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("dispatch.complete".to_string()), ..Default::default() }),
-            http: Some("http://127.0.0.1:8790/events".to_string()),
-            signing_secret_keychain_item: None,
-            file: None,
-            transform: None,
-            headers: None,
-            attribution_headers: None,
-            extras: Default::default(),
-        }];
-        // Empty today_actions: no evidence of the alias, so no warn.
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &one_rule_matching("dispatchh.*"), tmp.path());
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
-        assert_eq!(rule.status, Status::Pass, "{}", rule.message);
-        assert!(!rule.message.contains("NEVER MATCHED"), "{}", rule.message);
+        assert_eq!(rule.status, Status::Warn, "{}", rule.message);
+        assert!(rule.message.contains("CANNOT MATCH"), "{}", rule.message);
+        assert!(!rule.message.contains("instead"), "{}", rule.message);
     }
 
-    /// (round-2 audit, 2026-09-06 — C4) The other half of the negative
-    /// space: a rule that HAS actually delivered (a real `.last` sidecar
-    /// from a genuine terminal outcome, the same shape the drainer
-    /// writes) must stay Pass even when today's flow day file ALSO
-    /// happens to carry the other spelling of its configured action —
-    /// the alias-drift Warn is specifically for a rule that has NEVER
-    /// matched anything; a rule that clearly HAS matched (and delivered)
-    /// is not that case, whatever else today's records contain. Red-proved
-    /// by replacing the `undelivered == 0 && last_delivery_ts.is_none()`
-    /// gate with `if true`: this test then fails because it would warn
-    /// regardless of the genuine prior delivery.
+    /// The inverse: a current action, and a glob that reaches some, stay
+    /// Pass. (A bare `*` warns for another reason, the observer check.)
     #[test]
-    fn hooks_check_no_alias_warn_when_the_rule_has_actually_delivered() {
-        use darkmux_types::config::{HookMatch, HookRule};
+    fn hooks_check_passes_a_rule_that_can_match() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let m = HookMatch { action: Some("dispatch.complete".to_string()), ..Default::default() };
-        let url = "http://127.0.0.1:8790/events".to_string();
-        let rules = vec![HookRule {
-            r#match: Some(m.clone()),
-            http: Some(url.clone()),
-            signing_secret_keychain_item: None,
-            file: None,
-            transform: None,
-            headers: None,
-            attribution_headers: None,
-            extras: Default::default(),
-        }];
-        // A genuine prior delivery: the `.last` sidecar the drainer
-        // itself writes on a terminal outcome (`write_last_status`).
-        let key = darkmux_flow::hooks::rule_key(&m, &url);
-        std::fs::write(tmp.path().join(format!("{key}.last")), r#"{"ts":"2026-01-01T00:00:00Z","ok":true}"#).unwrap();
-
-        let mut today_actions = std::collections::HashSet::new();
-        today_actions.insert("dispatch complete".to_string()); // the other spelling, ALSO present today
-
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &today_actions);
+        for action in ["dispatch.complete", "phase.*"] {
+            let checks = build_hooks_check(true, "config.json", &one_rule_matching(action), tmp.path());
+            let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
+            assert_eq!(rule.status, Status::Pass, "{action}: {}", rule.message);
+        }
+        let checks = build_hooks_check(true, "config.json", &one_rule_matching("*"), tmp.path());
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
-        assert_eq!(rule.status, Status::Pass, "{}", rule.message);
-        assert!(
-            !rule.message.contains("NEVER MATCHED"),
-            "a rule with an actual prior delivery must not be flagged, even with the other \
-             spelling also present today: {}",
-            rule.message
-        );
+        assert!(!rule.message.contains("CANNOT MATCH"), "{}", rule.message);
     }
 
     /// (#2196 fix-round 4) Every line `print_report` emits FLUSH LEFT
@@ -8984,7 +8952,7 @@ mod tests {
         .unwrap();
         std::fs::write(tmp.path().join(format!("{key}.rejected")), "1").unwrap();
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path());
         checks.into_iter().find(|c| c.name == "hooks.rule.0").unwrap()
     }
 
@@ -9143,7 +9111,7 @@ mod tests {
     /// tempdir standing in for the outbox dir.
     fn rejection_fixture_rule() -> (darkmux_types::config::HookRule, String) {
         use darkmux_types::config::{HookMatch, HookRule};
-        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let m = HookMatch { action: Some("phase.*".to_string()), ..Default::default() };
         let url = "http://127.0.0.1:8790/events".to_string();
         let key = darkmux_flow::hooks::rule_key(&m, &url);
         (
@@ -9179,7 +9147,7 @@ mod tests {
         .unwrap();
         std::fs::write(tmp.path().join(format!("{key}.rejected")), "3").unwrap();
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path());
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.status, Status::Warn, "{}", rule.message);
         assert!(rule.message.contains("3 record(s) reported rejected by the receiver"), "{}", rule.message);
@@ -9202,7 +9170,7 @@ mod tests {
         .unwrap();
         std::fs::write(tmp.path().join(format!("{key}.rejected")), "1").unwrap();
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path());
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.status, Status::Warn, "{}", rule.message);
         // (#2196 fix-round 2, MUST FIX C) The fixture's 47-column raw
@@ -9265,7 +9233,7 @@ mod tests {
         .unwrap();
         std::fs::write(tmp.path().join(format!("{key}.rejected")), "3").unwrap();
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path());
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.message.matches("3 on the last delivery").count(), 1, "{}", rule.message);
         assert!(!rule.message.contains("()"), "no empty parens when there's no reason: {}", rule.message);
@@ -9289,7 +9257,7 @@ mod tests {
         std::fs::write(tmp.path().join(format!("{key}.last")), r#"{"ts":"2026-01-01T00:00:00Z","ok":true}"#).unwrap();
         std::fs::write(tmp.path().join(format!("{key}.rejected")), "400").unwrap();
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path());
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(
             rule.status,
@@ -9319,7 +9287,7 @@ mod tests {
         let rules = vec![rule_cfg];
         std::fs::write(tmp.path().join(format!("{key}.last")), r#"{"ts":"2026-01-01T00:00:00Z","ok":true}"#).unwrap();
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path());
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.status, Status::Pass, "{}", rule.message);
         assert!(!rule.message.contains("rejected"), "{}", rule.message);
@@ -9334,7 +9302,7 @@ mod tests {
         use darkmux_types::config::{HookMatch, HookRule};
         let tmp = tempfile::TempDir::new().unwrap();
         let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some("phase.*".to_string()), ..Default::default() }),
             http: Some("http://127.0.0.1:8790/events".to_string()),
             signing_secret_keychain_item: None,
             file: None,
@@ -9353,7 +9321,7 @@ mod tests {
         // silently left behind by whoever acts on this listing.
         std::fs::write(tmp.path().join("127.0.0.1-9999-deadbeefdeadbeef.rejected"), "5").unwrap();
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path());
         let stray = checks.iter().find(|c| c.name == "hooks.stray").expect("a stray-file check must be present");
         assert_eq!(stray.status, Status::Warn, "{}", stray.message);
         assert!(stray.message.contains("127.0.0.1-9999-deadbeefdeadbeef"), "{}", stray.message);
@@ -9365,7 +9333,7 @@ mod tests {
         use darkmux_types::config::{HookMatch, HookRule};
         let tmp = tempfile::TempDir::new().unwrap();
         let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some("phase.*".to_string()), ..Default::default() }),
             http: Some("http://127.0.0.1:8790/events".to_string()),
             signing_secret_keychain_item: None,
             file: None,
@@ -9374,7 +9342,7 @@ mod tests {
             attribution_headers: None,
             extras: Default::default(),
         }];
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path());
         assert!(checks.iter().all(|c| c.name != "hooks.stray"), "no stray files → no stray check emitted");
     }
 
@@ -13510,8 +13478,9 @@ mod tests {
         // `check_enum_settings`, which contributes one row per registered
         // enum setting.
         // (#2902 step 5) 68: `check_renamed_budget_settings` joined.
+        // (4.0) 69: `check_unknown_flow_actions` joined.
         let expected =
-            68 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            69 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

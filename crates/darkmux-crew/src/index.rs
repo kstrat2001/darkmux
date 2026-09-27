@@ -902,9 +902,8 @@ fn derive_cautions(tx: &Connection) -> Result<()> {
             Err(_) => continue,
         };
         for line in content.lines() {
-            let rec = match serde_json::from_str::<darkmux_flow::FlowRecord>(line) {
-                Ok(r) => r,
-                Err(_) => continue,
+            let Some(rec) = darkmux_flow::reader::parse_record(line) else {
+                continue;
             };
             if !is_detector_caution(&rec) {
                 continue;
@@ -1269,7 +1268,7 @@ mod tests {
     fn detector_line(source: &str, payload: serde_json::Value) -> String {
         let rec = crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
-            "telemetry.detector",
+            darkmux_flow::FlowAction::TelemetryDetector,
             source,
             "coder",
             "sess-1",
@@ -1407,7 +1406,7 @@ mod tests {
     fn caution_fields_extracts_area_and_defaults() {
         let with_area = crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
-            "telemetry.detector",
+            darkmux_flow::FlowAction::TelemetryDetector,
             "detector",
             "coder",
             "s",
@@ -1426,7 +1425,7 @@ mod tests {
 
         let no_area = crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
-            "telemetry.detector",
+            darkmux_flow::FlowAction::TelemetryDetector,
             "detector",
             "coder",
             "s",
@@ -1442,7 +1441,7 @@ mod tests {
         // Malformed payload (no kind/severity/detail) → defaults, never panics.
         let malformed = crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
-            "telemetry.detector",
+            darkmux_flow::FlowAction::TelemetryDetector,
             "detector",
             "coder",
             "s",
@@ -1459,7 +1458,7 @@ mod tests {
     fn is_detector_caution_keys_on_category_and_source() {
         let detector = crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
-            "telemetry.detector",
+            darkmux_flow::FlowAction::TelemetryDetector,
             "detector",
             "coder",
             "s",
@@ -1472,7 +1471,7 @@ mod tests {
 
         let runtime = crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
-            "telemetry.runtime",
+            darkmux_flow::FlowAction::TelemetryRuntime,
             "runtime",
             "coder",
             "s",

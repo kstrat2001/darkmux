@@ -1064,14 +1064,10 @@ where
         let Some(sid) = step_for_record(&rec, step_ids, mission_id) else {
             continue;
         };
-        let action = rec.get("action").and_then(|a| a.as_str()).unwrap_or("");
+        let action = darkmux_flow::reader::action_of(&rec);
         let payload = rec.get("payload");
-        // (silent-miss audit, 2026-09-06) Was a hand-spelled literal pair —
-        // exactly the drift risk `darkmux_flow::is_dispatch_complete`
-        // exists to close off; see `runs.rs`'s `is_dispatch_lifecycle_
-        // action`/`terminal_status_for_action` for the sibling fix.
-        let is_complete = darkmux_flow::is_dispatch_complete(action);
-        let is_step_result = action == "step result";
+        let is_complete = action == Some(darkmux_flow::FlowAction::DispatchComplete);
+        let is_step_result = action == Some(darkmux_flow::FlowAction::StepResult);
         if !is_complete && !is_step_result {
             continue;
         }
@@ -1243,7 +1239,7 @@ fn backfill_step_finals_bounded(
             }
             // A malformed line is skipped, never fatal — pinned by
             // `backfill_skips_malformed_lines`.
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(v) = darkmux_flow::reader::parse_value(line) {
                 records.push(v);
                 if records.len() >= max_records {
                     break 'files;
@@ -1633,7 +1629,7 @@ mod tests {
     }
 
     /// (#1877, final wiring step, schema leniency) `darkmux-crew::
-    /// scheduler::STEP_TIMING_ACTION` ("step timing") is a NEW action this
+    /// scheduler::darkmux_flow::FlowAction::StepTiming` ("step timing") is a NEW action this
     /// fold predates. An older/unaware consumer must ignore an action it
     /// doesn't recognize entirely, never crash, and never fold it into a
     /// wrongly-zeroed entry (a step with NO entry reads as "nothing folded
@@ -2027,6 +2023,22 @@ mod tests {
         // The production cap folds all three.
         let out_full = backfill_step_finals(tmp.path(), &step_ids, "m-this", created_ts);
         assert_eq!(out_full["s1"].tokens, Some(950));
+    }
+
+    /// (4.0) `/mission/:id/graph.json` over a pre-4.0 day file folds the
+    /// same finals as its dotted twin.
+    #[test]
+    fn a_spaced_archive_folds_like_its_dotted_twin() {
+        let step_ids = ids(&["s1"]);
+        let created_ts = (days_from_civil(2026, 7, 17) * 86400) as u64;
+        let fold = |action: &str| {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let rec = serde_json::json!({ "action": action, "handle": "s1", "payload": { "total_tokens": 4200 } });
+            write_day_file(tmp.path(), "2026-07-17", &[rec]);
+            backfill_step_finals(tmp.path(), &step_ids, "m-this", created_ts)["s1"].tokens
+        };
+        assert_eq!(fold("dispatch complete"), Some(4200));
+        assert_eq!(fold("dispatch complete"), fold("dispatch.complete"));
     }
 
     #[test]

@@ -333,18 +333,24 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
      it never puts a second specialist role inside this one. Any predicate that infers a "model swap" from
      residency alone is wrong: a declared utility role going resident is not a swap (#1934).
 
-   **The WIRE keeps its historical spelling; only the vocabulary is fixed.** The flow-record
-   bookends `dispatch start`/`dispatch complete` are emitted at BOTH grains today — around a
-   whole run (contract 2's liveness requirement, phrased over "any production code path that
-   performs model work", which is granularity-agnostic) and around an inner role execution.
-   Those action strings are NOT being renamed: archives are append-only, four consumers key
-   on them at the session grain (`terminal_status_for_action`
-   `crates/darkmux-serve/src/runs.rs:1476-1478`, the runs board's representative-session
-   pick, `ui/src/lenses/fleet/cards.ts:59`, `ui/src/lib/metaLine.ts:28`), and renaming them
-   would buy a consumer migration for no behavioral gain. Grain is already recoverable from
-   `session_id`/`source`. What entry 8 fixes is the WORD used in code, docs and UI — where
-   `dispatch` had come to mean both ends of the ladder at once. Both contracts stand:
-   contract 2 says liveness must be visible, contract 8 says which noun means which grain.
+   **One wire spelling per event (operator, 2026-09-27; supersedes "the wire keeps its
+   historical spelling").** 4.0 breaks flow compatibility rather than carry two conventions
+   for the same event. Every action is a `darkmux_flow::FlowAction` variant, spelled
+   `<scope>.<event>[.<detail>]` (lowercase, two or three dot-separated segments), and the
+   wire string lives in exactly one place: `crates/darkmux-flow/src/action.rs`. Producers
+   build the enum; no constructor, builder or helper takes an action as a string. Consumers
+   match on the enum, never on a string. The pre-4.0 spellings (`dispatch start`,
+   `step result`, `mission close`, `note`, `verdict: <v>`, ...) live only in
+   `darkmux_flow::legacy`, and every reader goes through `darkmux_flow::reader`, which
+   upgrades them on read; archives are append-only and are never rewritten. An action this
+   build does not know reads as `FlowAction::Other`, is never treated as vocabulary, and is
+   counted by `darkmux doctor`. `scripts/flow-action-guard.py` (CI) fails on any flow
+   action written as a string literal outside the vocabulary. The bookends
+   `dispatch.start`/`dispatch.complete` are still emitted at BOTH grains today (the whole
+   run, and an inner role execution); separating the run grain is the migration below. What
+   entry 8 fixes is the WORD used in code, docs and UI, where `dispatch` had come to mean
+   both ends of the ladder at once. Both contracts stand: contract 2 says liveness must be
+   visible, contract 8 says which noun means which grain.
 
    Verified by enumerating every completion-endpoint (`chat/completions`) call site — five
    modules. Two host-side entry points bookend per execution and are correct:
@@ -373,12 +379,12 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
 
    **Retiring the run-grain use is a CONSUMER MIGRATION, not a free deletion.** An earlier
    draft of this entry claimed it "costs nothing in liveness" because the scheduler already
-   emits `step start`/`step complete`/`step error` per step
-   (`crates/darkmux-crew/src/scheduler.rs:715, 1032, 1040`) under a `mission start`. That is
+   emits `step.start`/`step.complete`/`step.error` per step (`scheduler.rs`'s
+   `step_lifecycle_record`) under a `mission.start`. That is
    true and irrelevant: four consumers key specifically on DISPATCH bookends at the session
    grain, and step bookends do not feed any of them —
-   `terminal_status_for_action` (`crates/darkmux-serve/src/runs.rs:1476-1478`, which matches
-   only `dispatch complete`/`dispatch error`), the runs board's representative-session pick
+   `terminal_status_for_action` (`crates/darkmux-serve/src/runs.rs`, which matches only
+   `dispatch.complete`/`dispatch.error`), the runs board's representative-session pick
    (`runs.rs:3307`'s regression test records that the whole-run bookend wins that pick, and
    that losing it already blanked role/model once), fleet card activity
    (`ui/src/lenses/fleet/cards.ts:59`, filtering `action === "dispatch.start"` with no
@@ -390,9 +396,9 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    dispatch bookend are PRESCRIBED here, not opt-in"). This entry supersedes that
    deliberately, and the supersession is the point: contract 8 wins on the NOUN, #1899 wins
    on the MECHANISM. The run grain keeps its bookend and gets its own action vocabulary
-   (`run start`/`run complete`/`run error`), so `dispatch *` can mean one specialist
-   execution. Consumers become bilingual FIRST and stay bilingual permanently — archives are
-   append-only and are never rewritten. That ordering is not optional.
+   (`run.start`/`run.complete`/`run.error`), so `dispatch.*` can mean one specialist
+   execution. Archives are append-only and are never rewritten, so the run-grain split
+   reaches old records through `darkmux_flow::legacy`, like every other retired spelling.
 
    **"step" is a known-imperfect name, deliberately not being changed (operator, 2026-08-26.)**
    It implies plurality, so it reads badly for a single-step dispatch — but a task genuinely

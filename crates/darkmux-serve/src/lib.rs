@@ -782,7 +782,7 @@ fn backfill_roster_machine_uids(
             continue;
         };
         for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            let Some(v) = darkmux_flow::reader::parse_value(&line) else {
                 continue;
             };
             let (Some(id), Some(uid)) = (
@@ -1675,11 +1675,10 @@ pub fn resolve_session(
             if line.is_empty() {
                 continue;
             }
-            let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            let Some(record) = darkmux_flow::reader::parse_value(line) else {
                 continue;
             };
-            let action = record.get("action").and_then(|a| a.as_str()).unwrap_or("");
-            if action != "step result" {
+            if darkmux_flow::reader::action_of(&record) != Some(darkmux_flow::FlowAction::StepResult) {
                 continue;
             }
             let payload = record.get("payload");
@@ -2861,7 +2860,7 @@ fn tail_lab_events(dir: &StdPath, offset: u64) -> LabRunEventsResponse {
         if line.is_empty() || line.len() > MAX_FLOW_LINE_BYTES {
             continue;
         }
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) {
+        if let Some(v) = std::str::from_utf8(line).ok().and_then(darkmux_flow::reader::parse_value) {
             lines.push(v);
         }
     }
@@ -3414,7 +3413,7 @@ fn scan_flow_days(flows_dir: &std::path::Path) -> Vec<serde_json::Value> {
             if line.is_empty() {
                 continue;
             }
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            let Some(v) = darkmux_flow::reader::parse_value(line) else {
                 continue;
             };
             if v.get("_type").and_then(|t| t.as_str()) == Some("schema") {
@@ -3424,10 +3423,8 @@ fn scan_flow_days(flows_dir: &std::path::Path) -> Vec<serde_json::Value> {
             if let Some(m) = v.get("mission_id").and_then(|m| m.as_str()) {
                 missions.insert(m.to_string());
             }
-            // A dispatch = a dispatch.start edge (tolerate the dotted + spaced
-            // action forms the flow stream carries).
-            let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("");
-            if darkmux_flow::is_dispatch_start(action) {
+            // A dispatch = a dispatch.start edge.
+            if darkmux_flow::reader::action_of(&v) == Some(darkmux_flow::FlowAction::DispatchStart) {
                 if let Some(s) = v.get("session_id").and_then(|s| s.as_str()) {
                     dispatches.insert(s.to_string());
                 }
@@ -3520,7 +3517,7 @@ pub(crate) fn for_each_flow_record_across_days(
             if line.is_empty() {
                 continue;
             }
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            let Some(v) = darkmux_flow::reader::parse_value(line) else {
                 continue;
             };
             if v.get("_type").and_then(|t| t.as_str()) == Some("schema") {
@@ -3588,7 +3585,7 @@ pub(crate) fn for_each_flow_record_in_day_range(
             if line.is_empty() {
                 continue;
             }
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            let Some(v) = darkmux_flow::reader::parse_value(line) else {
                 continue;
             };
             if v.get("_type").and_then(|t| t.as_str()) == Some("schema") {
@@ -3696,8 +3693,7 @@ fn scan_flow_missions(
         if date > e.last_date.as_str() {
             e.last_date = date.to_string();
         }
-        let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("");
-        if darkmux_flow::is_dispatch_start(action) {
+        if darkmux_flow::reader::action_of(v) == Some(darkmux_flow::FlowAction::DispatchStart) {
             if let Some(s) = v.get("session_id").and_then(|s| s.as_str()) {
                 e.dispatches.insert(s.to_string());
             }
@@ -3951,18 +3947,13 @@ fn join_host_samples_into_session_records(
     records: &mut Vec<serde_json::Value>,
     now_ms: u64,
 ) -> HostSampleJoinStats {
-    // Both spellings: the crew and the CLI emit `dispatch start`/`dispatch
-    // complete` (spaced); darkmux-lab and the runtime emit the dotted form.
-    // Matching only the dotted one here meant no real run ever got a host
-    // sample (found live, 2026-09-06). Same shared helpers `/flow/<date>`'s
-    // bookend keep-list uses (#2410), so the two cannot drift again.
-    fn action_of(r: &serde_json::Value) -> &str {
-        r.get("action").and_then(|a| a.as_str()).unwrap_or("")
-    }
-    let is_start = |r: &serde_json::Value| darkmux_flow::is_dispatch_start(action_of(r));
+    use darkmux_flow::FlowAction;
+    let is_start = |r: &serde_json::Value| darkmux_flow::reader::action_of(r) == Some(FlowAction::DispatchStart);
     let is_terminal = |r: &serde_json::Value| {
-        let a = action_of(r);
-        darkmux_flow::is_dispatch_complete(a) || darkmux_flow::is_dispatch_error(a) || a == "session.end"
+        matches!(
+            darkmux_flow::reader::action_of(r),
+            Some(FlowAction::DispatchComplete | FlowAction::DispatchError | FlowAction::SessionEnd)
+        )
     };
     // (live finding, 2026-09-06) `machine_uid` must come from the
     // dispatch-START record specifically, matching what the CLIENT gates
@@ -4607,7 +4598,7 @@ fn read_flow_records_from_redis(
                 continue;
             }
         }
-        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json) else {
+        let Some(parsed) = darkmux_flow::reader::parse_value(json) else {
             continue;
         };
         records.push(parsed);
@@ -4627,8 +4618,8 @@ fn read_flow_records_from_redis(
 /// snapshot path wasn't).
 ///
 /// (#2409) The cap applies to the supplementary-vocabulary ring only.
-/// `dispatch.start`/`dispatch.complete`/`dispatch.error` (both dotted and
-/// legacy spaced spellings — `darkmux_flow::is_dispatch_start` et al.) are
+/// `dispatch.start`/`dispatch.complete`/`dispatch.error` (a pre-4.0 spaced
+/// spelling reads as the same action through `darkmux_flow::reader`) are
 /// ALWAYS kept regardless of this count: cross-system contract 2 (dispatch
 /// liveness) requires that liveness surfaces key on these bookends, and
 /// that supplementary vocabularies (here, high-cadence `telemetry.process`
@@ -4662,8 +4653,7 @@ const MAX_FLOW_FILE_RECORDS: usize = darkmux_flow::FLOW_READ_CAP_RECORDS;
 /// so every `dispatch.start` sitting further back than that gets dropped and
 /// every activity bar built from it goes blank — cross-system contract 2
 /// (dispatch liveness) says a route serving liveness surfaces must never do
-/// that. This function now tracks bookends (`is_dispatch_start` /
-/// `is_dispatch_complete` / `is_dispatch_error`, both spellings) in a
+/// that. This function now tracks the dispatch bookends in a
 /// separate always-kept list alongside the capped ring, carries each kept
 /// record's file-order line index, and merges the two lists by index at the
 /// end — so the cap still bounds memory for the high-cadence vocabulary
@@ -4751,9 +4741,7 @@ async fn read_flow_records_from_file(
 /// tolerance the old `.lines()` loop had.
 ///
 /// (#2409) A `dispatch.start`/`dispatch.complete`/`dispatch.error` record
-/// (either spelling — `darkmux_flow::is_dispatch_start` et al. are the ONE
-/// Rust-side hedge for that, per that module's doc comment) goes to
-/// `bookends` and never touches the ring's cap. Everything else keeps the
+/// goes to `bookends` and never touches the ring's cap. Everything else keeps the
 /// prior newest-`MAX_FLOW_FILE_RECORDS` ring behavior. `next_index` is
 /// advanced only for lines that actually parse, so the index each kept
 /// record carries is a dense, monotonic file-order position the caller can
@@ -4771,7 +4759,7 @@ fn push_flow_line(
     if s.is_empty() {
         return;
     }
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else {
+    let Some(v) = darkmux_flow::reader::parse_value(s) else {
         return;
     };
     // (found live 2026-09-06) The day file's own `{"_type":"schema",…}`
@@ -4784,11 +4772,14 @@ fn push_flow_line(
     let index = *next_index;
     *next_index += 1;
 
-    let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("");
-    if darkmux_flow::is_dispatch_start(action)
-        || darkmux_flow::is_dispatch_complete(action)
-        || darkmux_flow::is_dispatch_error(action)
-    {
+    if matches!(
+        darkmux_flow::reader::action_of(&v),
+        Some(
+            darkmux_flow::FlowAction::DispatchStart
+                | darkmux_flow::FlowAction::DispatchComplete
+                | darkmux_flow::FlowAction::DispatchError
+        )
+    ) {
         if bookends.len() >= MAX_FLOW_FILE_RECORDS {
             bookends.pop_front();
         }
@@ -4885,7 +4876,7 @@ fn tail_lines(
                 let line: String = s.2.drain(..nl).collect();
                 s.2.drain(..1);
                 if !line.is_empty() {
-                    s.3.push_back(line);
+                    s.3.push_back(forwarded_line(line));
                 }
             }
             // s.2 now holds the incomplete trailing chunk (if any).
@@ -5226,19 +5217,31 @@ fn synthetic_stream_error_record(stream_name: &str, attempts: u32, reason: &str)
     // docs/topology/index.html doesn't currently render
     // `stage: scope` records as edges — separate follow-up to add
     // a stream-error pill / toast in the viewer surface.
-    serde_json::json!({
-        "ts": darkmux_flow::ts_utc_now(),
-        "level": "warn",
-        "category": "audit",
-        "tier": "local",
-        "stage": "scope",
-        "action": "stream.error",
-        "handle": "redis_tail_lines",
-        "reasoning": format!(
+    let record = darkmux_flow::FlowRecord {
+        ts: darkmux_flow::ts_utc_now(),
+        level: darkmux_flow::Level::Warn,
+        category: darkmux_flow::Category::Audit,
+        tier: darkmux_flow::Tier::Local,
+        stage: darkmux_flow::Stage::Scope,
+        action: darkmux_flow::FlowAction::StreamError,
+        handle: "redis_tail_lines".to_string(),
+        phase_id: None,
+        session_id: None,
+        source: None,
+        model: None,
+        reasoning: Some(format!(
             "redis tail exited after {attempts} consecutive failures on stream `{stream_name}`: {reason}"
-        ),
-    })
-    .to_string()
+        )),
+        mission_id: None,
+        machine_id: None,
+        machine_uid: None,
+        prev_hash: None,
+        hash: None,
+        payload: None,
+        work_id: None,
+        attempt: None,
+    };
+    serde_json::to_string(&record).unwrap_or_default()
 }
 
 /// Query `XINFO STREAM <stream>` for `last-generated-id`. Returns
@@ -5361,11 +5364,21 @@ fn xread_block_once(
                 continue;
             };
             if record_ts_matches_date(record_json, date_filter) {
-                records.push(record_json.to_string());
+                records.push(forwarded_line(record_json.to_string()));
             }
         }
     }
     Ok((records, new_last_id))
+}
+
+/// One raw record line as the live stream sends it: through the flow
+/// reader, so a pre-4.0 spelling goes out current. A line that is not a
+/// JSON object goes out as it came.
+fn forwarded_line(line: String) -> String {
+    match darkmux_flow::reader::upgrade_line(&line) {
+        Some(std::borrow::Cow::Owned(upgraded)) => upgraded,
+        Some(std::borrow::Cow::Borrowed(_)) | None => line,
+    }
 }
 
 /// Extract the `record` field's string value from an XADD/XREAD/XRANGE

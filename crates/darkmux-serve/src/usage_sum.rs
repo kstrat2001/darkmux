@@ -124,7 +124,7 @@ pub fn legacy_complete_counts<'a>(records: &[&'a serde_json::Value]) -> Vec<&'a 
 }
 
 fn is_dispatch_complete(v: &serde_json::Value) -> bool {
-    v.get("action").and_then(|a| a.as_str()).is_some_and(darkmux_flow::is_dispatch_complete)
+    darkmux_flow::reader::action_of(v) == Some(darkmux_flow::FlowAction::DispatchComplete)
 }
 
 fn is_legacy_fallback_complete(v: &serde_json::Value, with_usage: &HashSet<String>) -> bool {
@@ -815,5 +815,21 @@ mod tests {
             let err = parse_since(bad, NOW).unwrap_err();
             assert!(err.contains("24h") && err.contains("YYYY-MM-DD"), "{bad:?}: {err}");
         }
+    }
+
+    /// (4.0) The pre-4.0 archive golden sums exactly as its upgraded twin:
+    /// its one usage record counts once (its spaced `dispatch complete` is not
+    /// counted again), and a spaced legacy complete with no usage record for
+    /// its run counts by its own totals.
+    #[test]
+    fn the_archive_golden_sums_like_its_upgraded_twin() {
+        let read = |name: &str| -> Vec<serde_json::Value> {
+            let path = format!("{}/../../tests/flow-archive-golden/{name}", env!("CARGO_MANIFEST_DIR"));
+            std::fs::read_to_string(&path).unwrap().lines().filter_map(darkmux_flow::reader::parse_value).collect()
+        };
+        let archive = sum_usage(&read("2026-08-20.jsonl"));
+        let twin = sum_usage(&read("2026-08-20.upgraded.jsonl"));
+        assert_eq!(archive, twin);
+        assert_eq!(archive.total, 1_500, "1200 from the usage record + 300 from the legacy complete: {archive:?}");
     }
 }

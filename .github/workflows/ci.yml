@@ -814,6 +814,14 @@ jobs:
         # the allowlist mechanism (`// drift-guard:allow <verb> — <reason>`) live
         # in scripts/rs-drift-guard.py so both halves of the guard can't drift.
         run: python3 scripts/rs-drift-guard.py
+      - name: No flow action written as a string literal (4.0)
+        # Every flow action is a `darkmux_flow::FlowAction` variant; its wire
+        # string lives only in darkmux-flow's action.rs (retired spellings in
+        # legacy.rs). The guard reads its list from those two files, so it
+        # cannot drift from the vocabulary, and self-tests before it scans.
+        run: |
+          python3 scripts/flow-action-guard.py --self-test
+          python3 scripts/flow-action-guard.py
       - name: No engagement-private identifiers (this repo is PUBLIC)
         # darkmux is public OSS developed alongside private client work, so an
         # employer name, a private repo, a hosted endpoint or a tracker key can

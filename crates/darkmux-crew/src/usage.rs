@@ -415,12 +415,12 @@ pub struct UsageAmount {
     pub reported: bool,
 }
 
-/// True for a usage record (`telemetry.tokens`), in either spelling the
-/// stream carries it (category + source, or the action).
+/// True for a usage record (`telemetry.tokens`), by either mark it carries
+/// (category + source, or the action).
 pub fn is_usage_record(v: &serde_json::Value) -> bool {
     let s = |k: &str| v.get(k).and_then(|x| x.as_str());
     (s("category") == Some("telemetry") && s("source") == Some(USAGE_SOURCE))
-        || s("action") == Some(USAGE_ACTION)
+        || darkmux_flow::reader::action_of(v) == Some(darkmux_flow::FlowAction::TelemetryTokens)
 }
 
 pub fn payload_of(v: &serde_json::Value) -> &serde_json::Value {

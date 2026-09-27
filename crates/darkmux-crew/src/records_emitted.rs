@@ -32,7 +32,7 @@
 //! disk-free — unit-testable without touching a filesystem — with a thin
 //! disk-scanning wrapper ([`records_emitted_for_mission`]) around it.
 
-use darkmux_flow::{is_dispatch_start, is_dispatch_terminal, FlowRecord};
+use darkmux_flow::{FlowAction, FlowRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -203,10 +203,8 @@ const DAY_MARGIN_DAYS: i64 = 1;
 /// finalize-time clock, used to close an OPEN dispatch bookend (a `dispatch
 /// start` with no matching terminal) at "now" rather than dropping it.
 ///
-/// Bookends pair by `session_id` and recognize BOTH action spellings via
-/// [`darkmux_flow::is_dispatch_start`]/[`darkmux_flow::is_dispatch_terminal`]
-/// — never a literal `"dispatch start"` comparison (#2425: two producer
-/// lineages spell the bookends differently).
+/// Bookends pair by `session_id`, matched on [`darkmux_flow::FlowAction`];
+/// a pre-4.0 spaced spelling reads as the same action (#2425).
 ///
 /// **The launch's own wrapper bookend is excluded from pairing (#2426 round
 /// 2 MF1).** `mission_bookend_record` (`src/mission_launch.rs`) opens a
@@ -252,7 +250,7 @@ pub fn aggregate_records_emitted(lines: &[(FlowRecord, u64)], mission_id: &str, 
         }
         total_records += 1;
         total_bytes += line_bytes;
-        *by_action.entry(rec.action.clone()).or_insert(0) += 1;
+        *by_action.entry(rec.action.to_string()).or_insert(0) += 1;
 
         let ts = parse_ts_secs(&rec.ts);
         if let Some(ts) = ts {
@@ -270,7 +268,7 @@ pub fn aggregate_records_emitted(lines: &[(FlowRecord, u64)], mission_id: &str, 
             continue;
         }
 
-        if is_dispatch_start(&rec.action) {
+        if rec.action == FlowAction::DispatchStart {
             if let (Some(sid), Some(ts)) = (rec.session_id.clone(), ts) {
                 if let Some(prev_start) = open_starts.insert(sid, ts) {
                     // A repeat start for this session with no terminal in
@@ -280,7 +278,7 @@ pub fn aggregate_records_emitted(lines: &[(FlowRecord, u64)], mission_id: &str, 
                     open_dispatches += 1;
                 }
             }
-        } else if is_dispatch_terminal(&rec.action) {
+        } else if matches!(rec.action, FlowAction::DispatchComplete | FlowAction::DispatchError) {
             if let Some(sid) = &rec.session_id {
                 if let Some(start_ts) = open_starts.remove(sid) {
                     dispatch_pairs += 1;
@@ -307,7 +305,7 @@ pub fn aggregate_records_emitted(lines: &[(FlowRecord, u64)], mission_id: &str, 
     let mut host_samples_in_window: u64 = 0;
     if let (Some(mu), Some(f), Some(l)) = (machine_uid.as_deref(), first_ts, last_ts) {
         for (rec, _bytes) in lines {
-            if rec.action != "machine.telemetry" {
+            if rec.action != FlowAction::MachineTelemetry {
                 continue;
             }
             if rec.machine_uid.as_deref() != Some(mu) {
@@ -353,7 +351,7 @@ pub fn aggregate_records_emitted(lines: &[(FlowRecord, u64)], mission_id: &str, 
 /// the whole thing was measured at ~370ms on a 44 MB / 60k-line synthetic
 /// file (reviewer figure: ~380ms). This reads with a `BufReader` line by
 /// line and pre-filters on a cheap substring test — `line.contains(
-/// mission_id) || line.contains("machine.telemetry")` — BEFORE paying for
+/// mission_id) || line.contains(darkmux_flow::FlowAction::MachineTelemetry)` — BEFORE paying for
 /// `serde_json::from_str`; the substring test is only a pre-filter (a false
 /// positive just means one wasted parse, never a wrong answer — the exact
 /// field checks below and inside [`aggregate_records_emitted`] are the
@@ -406,11 +404,11 @@ pub fn records_emitted_for_mission(mission_id: &str, mission_created_ts: u64, fi
                 // Cheap pre-filter — see this function's doc. Neither
                 // substring needs to appear for this line to be
                 // structurally irrelevant to this call.
-                if !trimmed.contains(mission_id) && !trimmed.contains("machine.telemetry") {
+                if !trimmed.contains(mission_id) && !trimmed.contains(FlowAction::MachineTelemetry.as_str()) {
                     continue;
                 }
-                let Ok(rec) = serde_json::from_str::<FlowRecord>(trimmed) else { continue };
-                if rec.mission_id.as_deref() == Some(mission_id) || rec.action == "machine.telemetry" {
+                let Some(rec) = darkmux_flow::reader::parse_record(trimmed) else { continue };
+                if rec.mission_id.as_deref() == Some(mission_id) || rec.action == FlowAction::MachineTelemetry {
                     lines.push((rec, trimmed.len() as u64));
                 }
             }
@@ -432,7 +430,7 @@ mod tests {
     /// name the launch wrapper's `source == "mission"`.
     fn rec(
         ts: &str,
-        action: &str,
+        action: darkmux_flow::FlowAction,
         mission_id: Option<&str>,
         session_id: Option<&str>,
         machine_uid: Option<&str>,
@@ -444,7 +442,7 @@ mod tests {
     /// tests (#2426 round 2 MF1), which need `source == Some("mission")`.
     fn rec_src(
         ts: &str,
-        action: &str,
+        action: darkmux_flow::FlowAction,
         mission_id: Option<&str>,
         session_id: Option<&str>,
         machine_uid: Option<&str>,
@@ -456,7 +454,7 @@ mod tests {
             category: darkmux_flow::Category::Work,
             tier: darkmux_flow::Tier::Local,
             stage: darkmux_flow::Stage::Dispatch,
-            action: action.to_string(),
+            action,
             handle: "role".to_string(),
             phase_id: None,
             session_id: session_id.map(String::from),
@@ -484,31 +482,29 @@ mod tests {
     #[test]
     fn counts_only_the_target_missions_records_from_an_interleaved_file() {
         let lines = vec![
-            line(rec("2023-11-14T10:00:00Z", "dispatch start", Some("m1"), Some("s1"), None)),
-            line(rec("2023-11-14T10:00:00Z", "dispatch start", Some("m2"), Some("s2"), None)),
-            line(rec("2023-11-14T10:00:05Z", "dispatch complete", Some("m1"), Some("s1"), None)),
-            line(rec("2023-11-14T10:00:07Z", "dispatch complete", Some("m2"), Some("s2"), None)),
-            line(rec("2023-11-14T10:00:08Z", "dispatch.turn", Some("m1"), Some("s1"), None)),
+            line(rec("2023-11-14T10:00:00Z", darkmux_flow::FlowAction::DispatchStart, Some("m1"), Some("s1"), None)),
+            line(rec("2023-11-14T10:00:00Z", darkmux_flow::FlowAction::DispatchStart, Some("m2"), Some("s2"), None)),
+            line(rec("2023-11-14T10:00:05Z", darkmux_flow::FlowAction::DispatchComplete, Some("m1"), Some("s1"), None)),
+            line(rec("2023-11-14T10:00:07Z", darkmux_flow::FlowAction::DispatchComplete, Some("m2"), Some("s2"), None)),
+            line(rec("2023-11-14T10:00:08Z", darkmux_flow::FlowAction::DispatchTurn, Some("m1"), Some("s1"), None)),
         ];
         let got = aggregate_records_emitted(&lines, "m1", 0);
         assert_eq!(got.total_records, 3, "only m1's 3 records, not all 5");
-        assert_eq!(got.by_action.get("dispatch start"), Some(&1));
-        assert_eq!(got.by_action.get("dispatch complete"), Some(&1));
+        assert_eq!(got.by_action.get("dispatch.start"), Some(&1));
+        assert_eq!(got.by_action.get("dispatch.complete"), Some(&1));
         assert_eq!(got.by_action.get("dispatch.turn"), Some(&1));
         // m2's records must not leak into m1's counts at all.
         assert_eq!(got.by_action.values().sum::<u64>(), 3);
     }
 
     #[test]
-    fn bookends_pair_by_session_id_across_both_spellings() {
-        // Start uses the SPACED form, terminal uses the DOTTED form —
-        // #2425's exact "a literal is a bug" scenario.
+    fn bookends_pair_by_session_id() {
         let lines = vec![
-            line(rec("2023-11-14T10:00:00Z", "dispatch start", Some("m1"), Some("s1"), None)),
-            line(rec("2023-11-14T10:00:10Z", "dispatch.complete", Some("m1"), Some("s1"), None)),
-            // A second pair, spellings reversed the other way.
-            line(rec("2023-11-14T10:01:00Z", "dispatch.start", Some("m1"), Some("s2"), None)),
-            line(rec("2023-11-14T10:01:20Z", "dispatch error", Some("m1"), Some("s2"), None)),
+            line(rec("2023-11-14T10:00:00Z", darkmux_flow::FlowAction::DispatchStart, Some("m1"), Some("s1"), None)),
+            line(rec("2023-11-14T10:00:10Z", darkmux_flow::FlowAction::DispatchComplete, Some("m1"), Some("s1"), None)),
+            // A second pair, closed by an error.
+            line(rec("2023-11-14T10:01:00Z", darkmux_flow::FlowAction::DispatchStart, Some("m1"), Some("s2"), None)),
+            line(rec("2023-11-14T10:01:20Z", darkmux_flow::FlowAction::DispatchError, Some("m1"), Some("s2"), None)),
         ];
         let got = aggregate_records_emitted(&lines, "m1", 0);
         assert_eq!(got.dispatch_seconds, 10.0 + 20.0);
@@ -516,7 +512,7 @@ mod tests {
 
     #[test]
     fn an_open_dispatch_counts_to_the_finalize_time() {
-        let lines = vec![line(rec("2023-11-14T10:00:00Z", "dispatch start", Some("m1"), Some("s1"), None))];
+        let lines = vec![line(rec("2023-11-14T10:00:00Z", darkmux_flow::FlowAction::DispatchStart, Some("m1"), Some("s1"), None))];
         // Finalize happens 42s after the (never-terminated) start.
         let finalize_secs = parse_ts_secs_pub("2023-11-14T10:00:42Z");
         let got = aggregate_records_emitted(&lines, "m1", finalize_secs);
@@ -537,9 +533,9 @@ mod tests {
             // in production (`mission_bookend_record`), open the whole
             // time finalize runs. Must contribute NOTHING to
             // dispatch_seconds/open_dispatches.
-            line(rec_src("2023-11-14T10:00:00Z", "dispatch start", Some("m1"), Some("m1"), None, Some("mission"))),
+            line(rec_src("2023-11-14T10:00:00Z", darkmux_flow::FlowAction::DispatchStart, Some("m1"), Some("m1"), None, Some("mission"))),
             // A real seat dispatch, also left open (no terminal).
-            line(rec("2023-11-14T10:30:00Z", "dispatch start", Some("m1"), Some("s-seat"), None)),
+            line(rec("2023-11-14T10:30:00Z", darkmux_flow::FlowAction::DispatchStart, Some("m1"), Some("s-seat"), None)),
         ];
         let got = aggregate_records_emitted(&lines, "m1", finalize_secs);
         // Only the seat dispatch's 30 minutes counts — NOT the wrapper's
@@ -549,7 +545,7 @@ mod tests {
         assert_eq!(got.dispatch_pairs, 0);
         // The wrapper record still counts as a real record of this mission.
         assert_eq!(got.total_records, 2);
-        assert_eq!(got.by_action.get("dispatch start"), Some(&2));
+        assert_eq!(got.by_action.get("dispatch.start"), Some(&2));
     }
 
     #[test]
@@ -559,8 +555,8 @@ mod tests {
         // returned), it must not be counted as a dispatch pair — it is
         // liveness, not seat work.
         let lines = vec![
-            line(rec_src("2023-11-14T10:00:00Z", "dispatch start", Some("m1"), Some("m1"), None, Some("mission"))),
-            line(rec_src("2023-11-14T11:00:00Z", "dispatch complete", Some("m1"), Some("m1"), None, Some("mission"))),
+            line(rec_src("2023-11-14T10:00:00Z", darkmux_flow::FlowAction::DispatchStart, Some("m1"), Some("m1"), None, Some("mission"))),
+            line(rec_src("2023-11-14T11:00:00Z", darkmux_flow::FlowAction::DispatchComplete, Some("m1"), Some("m1"), None, Some("mission"))),
         ];
         let got = aggregate_records_emitted(&lines, "m1", 0);
         assert_eq!(got.dispatch_pairs, 0);
@@ -574,10 +570,10 @@ mod tests {
         let finalize_secs = parse_ts_secs_pub("2023-11-14T10:10:00Z");
         let lines = vec![
             // First start on s1, never terminated...
-            line(rec("2023-11-14T10:00:00Z", "dispatch start", Some("m1"), Some("s1"), None)),
+            line(rec("2023-11-14T10:00:00Z", darkmux_flow::FlowAction::DispatchStart, Some("m1"), Some("s1"), None)),
             // ...then a SECOND start on the same session_id, also never
             // terminated. The first segment must not be silently dropped.
-            line(rec("2023-11-14T10:05:00Z", "dispatch start", Some("m1"), Some("s1"), None)),
+            line(rec("2023-11-14T10:05:00Z", darkmux_flow::FlowAction::DispatchStart, Some("m1"), Some("s1"), None)),
         ];
         let got = aggregate_records_emitted(&lines, "m1", finalize_secs);
         // Both segments are credited to the FINALIZE clock, not to the
@@ -594,9 +590,9 @@ mod tests {
     #[test]
     fn a_repeated_start_that_later_terminates_pairs_against_the_second_start_only() {
         let lines = vec![
-            line(rec("2023-11-14T10:00:00Z", "dispatch start", Some("m1"), Some("s1"), None)),
-            line(rec("2023-11-14T10:05:00Z", "dispatch start", Some("m1"), Some("s1"), None)),
-            line(rec("2023-11-14T10:07:00Z", "dispatch.complete", Some("m1"), Some("s1"), None)),
+            line(rec("2023-11-14T10:00:00Z", darkmux_flow::FlowAction::DispatchStart, Some("m1"), Some("s1"), None)),
+            line(rec("2023-11-14T10:05:00Z", darkmux_flow::FlowAction::DispatchStart, Some("m1"), Some("s1"), None)),
+            line(rec("2023-11-14T10:07:00Z", darkmux_flow::FlowAction::DispatchComplete, Some("m1"), Some("s1"), None)),
         ];
         let got = aggregate_records_emitted(&lines, "m1", 0);
         // First segment flushed to finalize_secs=0 at the second start —
@@ -612,7 +608,7 @@ mod tests {
     fn machine_uid_field_names_which_machines_samples_were_joined() {
         let lines = vec![line(rec(
             "2023-11-14T10:00:00Z",
-            "dispatch start",
+            darkmux_flow::FlowAction::DispatchStart,
             Some("m1"),
             Some("s1"),
             Some("mac-1"),
@@ -623,7 +619,7 @@ mod tests {
 
     #[test]
     fn no_machine_uid_on_any_matched_record_leaves_the_field_none() {
-        let lines = vec![line(rec("2023-11-14T10:00:00Z", "dispatch start", Some("m1"), Some("s1"), None))];
+        let lines = vec![line(rec("2023-11-14T10:00:00Z", darkmux_flow::FlowAction::DispatchStart, Some("m1"), Some("s1"), None))];
         let got = aggregate_records_emitted(&lines, "m1", 0);
         assert_eq!(got.machine_uid, None);
     }
@@ -631,16 +627,16 @@ mod tests {
     #[test]
     fn host_samples_counted_only_inside_window_and_only_for_the_missions_machine() {
         let lines = vec![
-            line(rec("2023-11-14T10:00:00Z", "dispatch start", Some("m1"), Some("s1"), Some("mac-1"))),
-            line(rec("2023-11-14T10:01:00Z", "dispatch complete", Some("m1"), Some("s1"), Some("mac-1"))),
+            line(rec("2023-11-14T10:00:00Z", darkmux_flow::FlowAction::DispatchStart, Some("m1"), Some("s1"), Some("mac-1"))),
+            line(rec("2023-11-14T10:01:00Z", darkmux_flow::FlowAction::DispatchComplete, Some("m1"), Some("s1"), Some("mac-1"))),
             // Inside the window, matching machine — counted.
-            line(rec("2023-11-14T10:00:30Z", "machine.telemetry", None, None, Some("mac-1"))),
+            line(rec("2023-11-14T10:00:30Z", darkmux_flow::FlowAction::MachineTelemetry, None, None, Some("mac-1"))),
             // Inside the window, WRONG machine — not counted.
-            line(rec("2023-11-14T10:00:31Z", "machine.telemetry", None, None, Some("mac-2"))),
+            line(rec("2023-11-14T10:00:31Z", darkmux_flow::FlowAction::MachineTelemetry, None, None, Some("mac-2"))),
             // Outside the window (before first_ts) — not counted.
-            line(rec("2023-11-14T09:59:00Z", "machine.telemetry", None, None, Some("mac-1"))),
+            line(rec("2023-11-14T09:59:00Z", darkmux_flow::FlowAction::MachineTelemetry, None, None, Some("mac-1"))),
             // Outside the window (after last_ts) — not counted.
-            line(rec("2023-11-14T10:02:00Z", "machine.telemetry", None, None, Some("mac-1"))),
+            line(rec("2023-11-14T10:02:00Z", darkmux_flow::FlowAction::MachineTelemetry, None, None, Some("mac-1"))),
         ];
         let got = aggregate_records_emitted(&lines, "m1", 0);
         assert_eq!(got.host_samples_in_window, 1);
@@ -649,9 +645,9 @@ mod tests {
     #[test]
     fn wall_seconds_is_last_minus_first_ts_of_the_missions_own_records() {
         let lines = vec![
-            line(rec("2023-11-14T10:00:00Z", "dispatch start", Some("m1"), Some("s1"), None)),
-            line(rec("2023-11-14T10:05:00Z", "dispatch.turn", Some("m1"), Some("s1"), None)),
-            line(rec("2023-11-14T10:10:00Z", "dispatch complete", Some("m1"), Some("s1"), None)),
+            line(rec("2023-11-14T10:00:00Z", darkmux_flow::FlowAction::DispatchStart, Some("m1"), Some("s1"), None)),
+            line(rec("2023-11-14T10:05:00Z", darkmux_flow::FlowAction::DispatchTurn, Some("m1"), Some("s1"), None)),
+            line(rec("2023-11-14T10:10:00Z", darkmux_flow::FlowAction::DispatchComplete, Some("m1"), Some("s1"), None)),
         ];
         let got = aggregate_records_emitted(&lines, "m1", 0);
         assert_eq!(got.wall_seconds, 600.0);
@@ -659,7 +655,7 @@ mod tests {
 
     #[test]
     fn no_records_for_the_mission_is_an_honest_all_zero_block() {
-        let lines = vec![line(rec("2023-11-14T10:00:00Z", "dispatch start", Some("other"), Some("s1"), None))];
+        let lines = vec![line(rec("2023-11-14T10:00:00Z", darkmux_flow::FlowAction::DispatchStart, Some("other"), Some("s1"), None))];
         let got = aggregate_records_emitted(&lines, "m1", 0);
         assert_eq!(got, RecordsEmitted::default());
     }
@@ -809,7 +805,7 @@ mod disk_cost_check {
                 // toward the reviewer's ~733 bytes/line average), and a
                 // sprinkling of `machine.telemetry` samples.
                 let (mission, action, session): (String, &str, String) = match i % 100 {
-                    0 => ("m-cost".to_string(), "dispatch start", "s-cost".to_string()),
+                    0 => ("m-cost".to_string(), "dispatch.start", "s-cost".to_string()),
                     1 => ("m-cost".to_string(), "dispatch.complete", "s-cost".to_string()),
                     2 => (String::new(), "machine.telemetry", String::new()),
                     n => (format!("other-mission-{}", n % 37), "dispatch.turn", format!("s-{}", n)),
@@ -876,9 +872,9 @@ mod cost_check {
             let ts = format!("2023-11-14T10:{:02}:{:02}Z", (i / 3600) % 60, sec);
             let mission = if i % 10 == 0 { "sibling" } else { "m-cost" };
             let (action, session) = match i % 50 {
-                0 => ("dispatch start", Some(format!("s{}", i / 50))),
-                1 => ("dispatch.complete", Some(format!("s{}", i / 50))),
-                _ => ("dispatch.turn", Some(format!("s{}", i / 50))),
+                0 => (darkmux_flow::FlowAction::DispatchStart, Some(format!("s{}", i / 50))),
+                1 => (darkmux_flow::FlowAction::DispatchComplete, Some(format!("s{}", i / 50))),
+                _ => (darkmux_flow::FlowAction::DispatchTurn, Some(format!("s{}", i / 50))),
             };
             lines.push((
                 FlowRecord {
@@ -887,7 +883,7 @@ mod cost_check {
                     category: darkmux_flow::Category::Work,
                     tier: darkmux_flow::Tier::Local,
                     stage: darkmux_flow::Stage::Dispatch,
-                    action: action.to_string(),
+                    action,
                     handle: "coder".to_string(),
                     phase_id: None,
                     session_id: session,
