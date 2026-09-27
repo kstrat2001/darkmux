@@ -1,6 +1,6 @@
 [package]
 name = "darkmux-fleet"
-version = "3.13.0"
+version = "4.0.0-rc.1"
 edition = "2021"
 description = "darkmux fleet — roster/topology, secure work submission between machines, and dispatch routing"
 license = "MIT"
