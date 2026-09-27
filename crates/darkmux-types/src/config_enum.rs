@@ -852,6 +852,32 @@ mod tests {
         (!name.is_empty()).then_some(name)
     }
 
+    /// A `match` arm whose patterns are all string literals (`"hub" =>`,
+    /// `"a" | "b" =>`): a hand-rolled token parse.
+    fn is_literal_arm(t: &str) -> bool {
+        t.starts_with('"') && t.contains("=>") && {
+            let lhs = t.split("=>").next().unwrap_or("");
+            lhs.split('|').all(|p| {
+                let p = p.trim();
+                p.len() >= 2 && p.starts_with('"') && p.ends_with('"')
+            })
+        }
+    }
+
+    /// (#2947 review C2) The reviewer's three probes, committed: each shape
+    /// that stayed green before the scan was widened is recognized.
+    #[test]
+    fn the_scan_recognizes_the_review_probe_shapes() {
+        assert_eq!(enum_decl("pub enum ZzProbeBudgetPolicy { Off, Warn }").as_deref(), Some("ZzProbeBudgetPolicy"));
+        assert_eq!(enum_decl("pub(crate) enum ZzProbeMode { A, B }").as_deref(), Some("ZzProbeMode"));
+        assert_eq!(enum_decl("    enum Private {").as_deref(), Some("Private"));
+        assert_eq!(enum_decl("/// an enum in prose"), None);
+        assert!(is_literal_arm(r#""fast" => 1,"#));
+        assert!(is_literal_arm(r#""a" | "b" => Some(true),"#));
+        assert!(!is_literal_arm(r#""msg" + x => y"#.split(" + ").next().unwrap()), "no arrow, no arm");
+        assert!(!is_literal_arm(r#"Some(x) => 1,"#));
+    }
+
     /// (#2947, widened in review C2) An enum-valued setting must be in the
     /// registry. Three structural scans, each failing on a new unregistered
     /// shape:
@@ -963,6 +989,7 @@ mod tests {
         assert!(invocations >= 8, "found only {invocations} config_enum! invocations");
 
         // 3. No hand-rolled token parse in the accessor / schema files.
+        let mut literal_arms_seen = 0;
         for file in ["config_access.rs", "config.rs"] {
             let src = std::fs::read_to_string(crate_src.join(file)).unwrap();
             let mut current_fn = String::new();
@@ -981,14 +1008,9 @@ mod tests {
                     }
                     continue;
                 }
-                let literal_arm = t.starts_with('"') && t.contains("=>") && !t.starts_with("\"") && {
-                    let lhs = t.split("=>").next().unwrap_or("");
-                    lhs.split('|').all(|p| {
-                        let p = p.trim();
-                        p.len() >= 2 && p.starts_with('"') && p.ends_with('"')
-                    })
-                };
+                let literal_arm = is_literal_arm(t);
                 if literal_arm {
+                    literal_arms_seen += 1;
                     assert!(
                         LITERAL_ARMS_ALLOWED.iter().any(|(f, _)| *f == current_fn),
                         "{file}: `{current_fn}` matches a config string against literals (`{t}`): \
@@ -997,6 +1019,9 @@ mod tests {
                 }
             }
         }
+        // Anti-vacuity: the scan must see the allowed boolean vocabulary's
+        // own arms, or it is not recognizing match arms at all.
+        assert!(literal_arms_seen >= 2, "the literal-arm scan saw {literal_arms_seen} arms");
     }
 
     /// `docs/ENVIRONMENT.md`'s row for each setting carries the value list
