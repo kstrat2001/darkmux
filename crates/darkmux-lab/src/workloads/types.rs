@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct VerifySpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub must_contain: Vec<String>,
@@ -43,7 +43,7 @@ pub(crate) struct VerifySpec {
     pub coverage_min_pct: Option<f32>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ExpectedSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fast_cluster_seconds: Option<(u64, u64)>,
@@ -58,15 +58,12 @@ pub(crate) struct ExpectedSpec {
     // (`crate::lab::fixture::FixtureManifest`), since the count is a
     // property of the fixture (what "untouched" means), not of the
     // workload (which merely requires a fixture). `crate::lab::verify_gate`
-    // reads it from there. Some on-disk workload documents (e.g. the
-    // operator's `~/.darkmux/workloads/refresh-rotation.json`) still carry
-    // `"expected": {"test_count_baseline": 14}` — that is now a harmless,
-    // ignored extra key (config leniency: unknown fields on a struct
-    // without `deny_unknown_fields` are silently skipped on read), not a
-    // migration hazard.
+    // reads it from there. A workload document still carrying
+    // `"expected": {"test_count_baseline": N}` is refused by the unknown-key
+    // gate with that removal named (`user_files::workload_retired`).
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct WorkloadSpec {
     pub id: String,
     pub provider: String,
@@ -170,12 +167,28 @@ pub(crate) struct WorkloadSpec {
     /// Rust fixture). `None` → the default slim runtime image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
-    /// Provider-specific overflow.
+    /// (`tool-bench`) Trials per task. Read as JSON and parsed by the
+    /// provider, which accepts a quoted or integral-float number and names a
+    /// bad one (`tool_bench::knob_u64_strict`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trials: Option<serde_json::Value>,
+    /// (`tool-bench`) The per-task dispatch timeout override, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "taskTimeoutSeconds")]
+    pub task_timeout_seconds: Option<serde_json::Value>,
+    /// (`tool-bench`) The chaining ladder's depths.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "chainDepths")]
+    pub chain_depths: Option<serde_json::Value>,
+    /// (`tool-bench`) The task generator's seed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<serde_json::Value>,
+    /// Forward-compat overflow: an unknown key lands here so a load survives
+    /// it; the unknown-key gate refuses it (`darkmux_types::user_files`).
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct WorkloadManifest {
     pub workload: WorkloadSpec,
 }
@@ -399,17 +412,13 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// An unknown key still loads (it lands in `extras`); the unknown-key
+    /// gate is what refuses it.
     #[test]
-    fn workload_manifest_extras_captured() {
+    fn workload_manifest_unknown_key_still_loads() {
         let json = r#"{"workload":{"id":"x","provider":"custom","customField":"customValue"}}"#;
         let parsed: WorkloadManifest = serde_json::from_str(json).unwrap();
-        let v = parsed
-            .workload
-            .extras
-            .get("customField")
-            .and_then(|x| x.as_str())
-            .unwrap();
-        assert_eq!(v, "customValue");
+        assert!(parsed.workload.extras.contains_key("customField"));
     }
 
     #[test]
@@ -458,8 +467,8 @@ mod tests {
 
     /// (#2833) `test_count_baseline` was removed from `ExpectedSpec`. A
     /// still-installed on-disk workload document carrying the old key must
-    /// keep parsing (config leniency — unknown fields are silently
-    /// ignored), not fail to load.
+    /// keep parsing (loading never crashes); the unknown-key gate is what
+    /// refuses it, naming the removal (`user_files::workload_retired`).
     #[test]
     fn expected_spec_ignores_retired_test_count_baseline_key() {
         let json = r#"{"slow_rate": 0.5, "test_count_baseline": 14}"#;

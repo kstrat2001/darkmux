@@ -16,6 +16,7 @@
 pub mod crawl;
 pub mod lab;
 pub mod providers;
+pub mod user_files;
 pub mod workloads;
 
 /// (#2928, lab decision) Every lab benchmark dispatch opts out of the live

@@ -108,7 +108,7 @@
   "crates/darkmux-trajectory/src/event.rs::TrajectoryEvent::ts": 35,
   "crates/darkmux-trajectory/src/fold.rs::TrajectoryFold::apply": 35,
   "crates/darkmux-types/src/endpoint.rs::ModelEndpoint::validate": 19,
-  "crates/darkmux-types/src/endpoint.rs::UsageLimits::validate": 24,
+  "crates/darkmux-types/src/endpoint.rs::UsageLimits::validate": 21,
   "crates/darkmux-types/src/residency_lease.rs::LeaseGuard::identifiers_i_should_lead": 16,
   "plugins/darkmux-bundler-rust/src/facts.rs::extract_calls": 16,
   "plugins/darkmux-bundler-rust/src/scan.rs::sanitize_line": 18,

@@ -18,16 +18,21 @@
 //!   config itself.
 //!
 //! Schema shape mirrors `RuntimeCompactionConfig` (typed `Option`s +
-//! `#[serde(flatten)] extras` for forward-compat overflow); see its
-//! round-trip invariant tests for the pattern this file's tests copy.
+//! `#[serde(flatten)] extras`, so a load survives an unknown key); see its
+//! round-trip invariant tests for the pattern this file's tests copy. An
+//! unknown key still loads, but every entry point refuses it at preflight
+//! and `darkmux doctor` fails it (`crate::user_files`, CONFIG 2.0).
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// Semver of the `config.json` shape. Additive field/section adds are a
-/// **minor** bump (older binaries safely ignore unknown keys via `extras`);
-/// renaming/retyping a field is **major**. Mirrors the `FLOW_SCHEMA_VERSION`
+/// Semver of the `config.json` shape. Since 2.0 an unknown key is refused
+/// (`crate::user_files`), so a config written for a newer darkmux is refused
+/// by an older one: a field/section add is a **minor** bump (a newer binary
+/// reads every older file), renaming/retyping/removing a field is **major**.
+/// The history below records, for 1.x, what an older binary did with each
+/// addition then (it ignored it). Mirrors the `FLOW_SCHEMA_VERSION`
 /// discipline (`crates/darkmux-flow/src/schema.rs`).
 // 1.1 (#933): additive `fleet{}` block (fleet.mode). Minor bump — an older
 // binary tolerates it (all-Option + `extras` overflow), per the lenient-read
@@ -345,12 +350,30 @@ use std::path::Path;
 //           as `refuse`. A string read leniently and refused where it is
 //           consumed (#2947): an older binary ignores the field and keeps
 //           its one-job-at-a-time listener.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.33";
+//   2.0 (darkmux 4.0, MAJOR): an unknown key is refused. `config.json` still
+//           loads with one (`extras` catches it, so one typo never discards
+//           the rest), but every entry point that reads the file refuses it
+//           at preflight and `darkmux doctor` fails it, naming the key's
+//           dotted path and the closest valid key (`crate::user_files`, the
+//           same gate as every other user file). The valid keys are derived
+//           from this type's JSON schema, never listed. A retired key is
+//           named with what replaced it: `remote.max_tokens_per_execution`
+//           (renamed, `RENAMED_SETTINGS`) and every other key a past
+//           `DarkmuxConfig` had (`RETIRED_SETTINGS`, built from `git log`). A leftover
+//           of any of the three used to be warned about and ignored; now it
+//           refuses. A value of the wrong type (`"port": "x"`) is refused the
+//           same way, naming the expected type and what it got: one such
+//           value used to fail the typed load and silently drop EVERY setting
+//           to its default (Redis and audit off). The breaking change is the
+//           reading rule, not the shape: no field changed.
+pub const CONFIG_SCHEMA_VERSION: &str = "2.0";
 
 /// (#2902 step 5) A setting RENAMED in 4.0, with no alias. `config set`
-/// refuses the old key naming the new one; `darkmux doctor` (Warn) and every
-/// dispatch / launch / lab-run preflight (a one-line warning) name a leftover
-/// old key in `config.json` or the env, which nothing reads.
+/// refuses the old key naming the new one; a leftover old key in
+/// `config.json` is an unknown key, refused by every preflight and failed by
+/// `darkmux doctor` with this rename as its message (`user_files`); a
+/// leftover old env var, which nothing reads, is named by doctor (Warn) and
+/// by every dispatch / launch / lab-run preflight (a one-line warning).
 #[derive(Debug, Clone, Copy)]
 pub struct RenamedSetting {
     pub old_key: &'static str,
@@ -373,47 +396,101 @@ pub const RENAMED_SETTINGS: &[RenamedSetting] = &[
     },
 ];
 
-/// A leftover old key found in the config or the env.
+/// A `config.json` key an older darkmux read (and `init` may have written)
+/// that this one does not. The unknown-key gate (`user_files`) names it with
+/// `line` instead of guessing a near-miss. Built from `git log` of this file
+/// (every field a past `DarkmuxConfig` carried that this one does not);
+/// `every_historical_config_key_is_named_as_retired` pins the set. Settings
+/// renamed in 4.0 that also had an env var are [`RENAMED_SETTINGS`].
+#[derive(Debug, Clone, Copy)]
+pub struct RetiredSetting {
+    /// The dotted key; a block (`review`) covers every key inside it.
+    pub key: &'static str,
+    /// What replaced it, or that nothing did, and what to do.
+    pub line: &'static str,
+}
+
+/// Every retired `config.json` key that is not a [`RENAMED_SETTINGS`] entry.
+pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
+    RetiredSetting {
+        key: "dirs.notebook",
+        line: "removed in 4.0 (#2913): the notebook verbs retired; the bundled `darkmux-lab-notebook` skill writes \
+               an entry wherever your own instructions say. Delete it",
+    },
+    RetiredSetting {
+        // flow-action-guard:allow — a retired config key, refused by name
+        key: "radio.router_profile",
+        line: "removed in CONFIG 1.28: radio routing runs on the machine's utility model, `internal.utility` in \
+               profiles.json. Delete it",
+    },
+    RetiredSetting {
+        key: "dirs.openclaw_config",
+        line: "removed with the openclaw runtime (#1405): nothing reads it. Delete it",
+    },
+    RetiredSetting {
+        key: "dirs.runtime_agents",
+        line: "removed with the openclaw runtime (#1405): nothing reads it. Delete it",
+    },
+    RetiredSetting {
+        key: "gh",
+        line: "renamed to `cmd` (#2003): move `gh.enabled` / `gh.allowed` to `cmd.enabled` / `cmd.allowed`",
+    },
+    RetiredSetting {
+        key: "orchestrator",
+        line: "removed in #1766 (`init` wrote it from #663): flow records no longer carry an orchestrator. \
+               Delete it",
+    },
+    RetiredSetting {
+        key: "remote.stage_budget_policy",
+        line: "renamed to `remote.step_budget_policy` in 4.0 (#2902), which takes `off` or `warn` (`wait` is an \
+               endpoint budget's policy only)",
+    },
+    RetiredSetting {
+        key: "review",
+        line: "removed with the review funnel (#2310): `review` runs as a mission config now, and its judge knobs \
+               went with the funnel. Delete the block",
+    },
+    RetiredSetting {
+        key: "runtime.telemetry_record_every_samples",
+        line: "removed in #2413: one machine-scoped host sampler replaced the per-dispatch curve; its cadence is \
+               `runtime.host_sampler_interval_ms`. Delete it",
+    },
+];
+
+/// A leftover old env var of a renamed setting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenamedLeftover {
     pub setting_old_key: &'static str,
-    /// `config.json key `...`` or `env var ...`.
+    /// `env var ...`.
     pub found_in: String,
     /// The operator line: what is ignored, its new name, and the advice.
     pub line: String,
 }
 
-/// Every leftover renamed setting in `cfg` (a key landed in `remote.extras`)
-/// or `env`.
-pub fn renamed_leftovers(cfg: &DarkmuxConfig, env: &dyn Fn(&str) -> Option<String>) -> Vec<RenamedLeftover> {
-    let mut out = Vec::new();
-    for r in RENAMED_SETTINGS {
-        let leaf = r.old_key.rsplit('.').next().unwrap_or(r.old_key);
-        let mut found: Vec<String> = Vec::new();
-        if let Some(v) = cfg.remote.as_ref().and_then(|x| x.extras.get(leaf)) {
-            found.push(format!("config.json key `{}` ({v})", r.old_key));
-        }
-        if let Some(v) = env(r.old_env).filter(|v| !v.trim().is_empty()) {
-            found.push(format!("env var {} ({v})", r.old_env));
-        }
-        for f in found {
-            out.push(RenamedLeftover {
+/// Every renamed setting whose old env var is still set. (A leftover old
+/// `config.json` key is an unknown key, which `user_files` refuses.)
+pub fn renamed_leftovers(env: &dyn Fn(&str) -> Option<String>) -> Vec<RenamedLeftover> {
+    RENAMED_SETTINGS
+        .iter()
+        .filter_map(|r| {
+            let v = env(r.old_env).filter(|v| !v.trim().is_empty())?;
+            let found_in = format!("env var {} ({v})", r.old_env);
+            Some(RenamedLeftover {
                 setting_old_key: r.old_key,
                 line: format!(
-                    "{f} is ignored: renamed to `{}` (env {}) in 4.0 (#2902); {}",
+                    "{found_in} is ignored: renamed to `{}` (env {}) in 4.0 (#2902); {}",
                     r.new_key, r.new_env, r.advice
                 ),
-                found_in: f,
-            });
-        }
-    }
-    out
+                found_in,
+            })
+        })
+        .collect()
 }
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
 /// from the file falls through to its env/built-in default at the accessor.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DarkmuxConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<String>,
@@ -488,13 +565,14 @@ pub struct DarkmuxConfig {
     /// Forward-compat overflow — unknown top-level keys land here and
     /// re-serialize flat (a newer config read by an older binary).
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Directory/path overrides. Each layers `env(DARKMUX_*) > config.dirs.X >
 /// the `DarkmuxPaths` built-in` at the accessor (path unification lands in
 /// #661 Slice 3). Values support `~` expansion.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DirsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub flows: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub audit: Option<String>,
@@ -530,7 +608,7 @@ pub struct DirsConfig {
     /// different changes for the same observation produce two records rather
     /// than the second overwriting the first.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub mods: Option<String>,
-    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The shipped default for `redis.maxlen` (`XADD MAXLEN ~ N` retention) — the
@@ -560,7 +638,7 @@ pub const DEFAULT_REDIS_MAXLEN: usize = 10_000;
 /// The **password is NEVER here** — it lives in the macOS Keychain (item
 /// `darkmux-redis`), assembled at runtime (Slice 5). `DARKMUX_REDIS_URL` (full
 /// URL, password inline) still wins as the env override regardless of `enabled`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RedisConfig {
     /// The gate: `true` → assemble + connect; `false`/absent → off (unless the
     /// `DARKMUX_REDIS_URL` env override is set). Declared first so it reads at
@@ -571,7 +649,7 @@ pub struct RedisConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub db: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub stream: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub maxlen: Option<usize>,
-    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The hash-chained audit sink (#163) — a **feature block gated by `enabled`**,
@@ -579,18 +657,18 @@ pub struct RedisConfig {
 /// false` + the default `dir`. Today's env equivalent (`DARKMUX_AUDIT_DIR`
 /// presence) still wins as the override; the config gating wires in #661.
 /// POSIX-only sink (the env var is recognized but skipped on Windows).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AuditConfig {
     /// The gate: `true` → the AuditFileSink writes a hash-chained (BLAKE3)
     /// per-day JSONL that `darkmux flow integrity-check` walks to detect chain
     /// breaks; `false`/absent → off. Declared first.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub dir: Option<String>,
-    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Per-dispatch runtime behavior knobs.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RuntimeBehaviorConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub inactivity_timeout_seconds: Option<u64>,
     /// (#1276) Bounded model-load/unload phase for gestalt host-port calls:
@@ -804,7 +882,7 @@ pub struct RuntimeBehaviorConfig {
     /// that module's doc — it must work before config/Redis/audit/flow are
     /// touched), so it does its own minimal raw peek at this same key.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub liveness_retention_hours: Option<u64>,
-    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// (#2110/#2109) The thermal governor's pace/breaker tuning — a **feature
@@ -1011,7 +1089,7 @@ crate::config_enum!(HookCategory, "flow record category", [
 /// (#2846) One detector's settings. Split per detector rather than one global
 /// policy because the detectors are independent: an engine whose reasoning
 /// repeats is not necessarily one whose tool calls cycle.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct DetectorConfig {
     /// The raw token. `Option<String>`, not `Option<DetectionPolicy>` — see
     /// [`DetectionPolicy`]'s own doc for the config-discarding failure that
@@ -1019,21 +1097,23 @@ pub struct DetectorConfig {
     /// `config_access::detection_degeneracy_policy`.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub policy: Option<String>,
     #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schemars(skip)]
     pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// (#2846) The detector block. Only `degeneracy` is wired today.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct DetectionConfig {
     /// The repeated-output gate (`runtime/src/reasoning_loop.rs`). Under
     /// `observe` the check-in still fires on exactly the same cadence and the
     /// tail ratio is still computed and recorded; what stops is the cut.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub degeneracy: Option<DetectorConfig>,
     #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schemars(skip)]
     pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ThermalConfig {
     /// The gate: `true`/absent → governor + breaker active; `false` → the
     /// sampler still reads the OS thermal state (for telemetry) but never
@@ -1091,7 +1171,7 @@ pub struct ThermalConfig {
     /// an ordinary tier-3 pause/resume regardless of how many have
     /// happened this run. Default `true`.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub tier4_enabled: Option<bool>,
-    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// (#2706) **The battery-charge policy** — three knobs, and the start
@@ -1134,7 +1214,7 @@ pub struct ThermalConfig {
 /// `refuse_start_below_min` and `pause_running_below_min` ARE the gates,
 /// one per policy, and a third master switch would make "off" expressible
 /// two ways.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PowerConfig {
     /// The charge floor, in percent. Default `50`.
     ///
@@ -1159,7 +1239,7 @@ pub struct PowerConfig {
     /// than pausing into a state it cannot leave (see
     /// `power_policy::BatteryEvent::PauseUnsupported`).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub pause_running_below_min: Option<bool>,
-    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Fleet position (#933) — the machine's declared place in a multi-node fleet,
@@ -1177,7 +1257,7 @@ pub struct PowerConfig {
 /// parse (which would brick every setting). The raw token is kept so `darkmux
 /// doctor` can flag it against what the operator actually wrote (#934);
 /// `FleetMode::parse` does the typed interpretation at the accessor.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FleetConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub mode: Option<String>,
     /// (#2916) Which overlay network verifies a connecting machine. See
@@ -1194,7 +1274,7 @@ pub struct FleetConfig {
     /// whose seat is busy: `refuse` or `queue`. See [`BusyPolicy`]. A
     /// string, read leniently and refused where it is consumed (#2947).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub busy_policy: Option<String>,
-    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// (#2916) The identity source for fleet work submission: the overlay
@@ -1204,7 +1284,7 @@ pub struct FleetConfig {
 /// refuses it at preflight on both sides, and `darkmux doctor` reports
 /// Fail. Stored as a string, like `fleet.mode`, so a typo never fails the
 /// whole-config parse.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct FleetIdentityConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub provider: Option<String>,
     /// Path to the provider's command-line tool, when it is not on `PATH`
@@ -1212,7 +1292,7 @@ pub struct FleetIdentityConfig {
     /// `PATH`). Absent = the provider's usual command name. Not written by
     /// `init`: a literal would be wrong on most machines.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub bin: Option<String>,
-    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// (#2916) The dedicated work-submission listener `darkmux serve` opens
@@ -1221,18 +1301,18 @@ pub struct FleetIdentityConfig {
 /// so every connection it accepts can be asked "which node is this".
 /// An `enabled`-gated feature block: `init` writes `enabled: false` with the
 /// default port visible.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct FleetListenerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub enabled: Option<bool>,
     /// TCP port on the overlay address. Built-in default `8766`. The fleet
     /// uses ONE port: a sender dials the roster host of the target on its
     /// own resolved port, so set the same value on every machine.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub port: Option<u16>,
-    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// (#2916) One allow-list entry: a machine this machine takes work from.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct AcceptWorkEntry {
     /// The overlay network's stable id for the peer's node, resolved by
     /// `darkmux machine trust`. An entry without one never matches.
@@ -1257,7 +1337,7 @@ pub struct AcceptWorkEntry {
     /// outside the base). `false` or absent: a job carrying a `workdir` is
     /// refused. The workspace handoff (#755) builds on this.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub workspace: Option<bool>,
-    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// (#1260/#1177) Remote (hosted-endpoint) dispatch knobs: the per-step cap
@@ -1278,7 +1358,7 @@ pub struct AcceptWorkEntry {
 /// is not metered by this cap; an ENDPOINT window budget
 /// (`endpoints.<id>.limits` in `profiles.json`) does cover it. Tokens only,
 /// never currency.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RemoteConfig {
     /// A per-step cap on hosted tokens: remote `total_tokens` one step may
     /// spend before `step_budget_policy` applies. No default (#2902 step
@@ -1310,7 +1390,7 @@ pub struct RemoteConfig {
     /// via `config set remote.concurrent_cap <n>` once real hosted-
     /// endpoint rate-limit tiers justify a higher value.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub concurrent_cap: Option<u32>,
-    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// (#2765) Where the `darkmux serve` daemon listens — and, just as
@@ -1345,7 +1425,7 @@ pub struct RemoteConfig {
 /// non-secret gate for it is `runtime.daemon_auth_enabled`. `config set`
 /// refuses `serve.token` with the `security add-generic-password` form —
 /// that refusal predates this block and is unchanged by it.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ServeConfig {
     /// TCP port the daemon listens on. Built-in default `8765`. A
     /// `--port` on the command line still wins outright, matching the
@@ -1355,7 +1435,7 @@ pub struct ServeConfig {
     /// (loopback-only). A non-loopback bind is refused without a resolved
     /// serve token — that gate is unchanged and lives in `darkmux-serve`.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub bind: Option<String>,
-    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// (#2775) The periodic `machine.rollup` flow record — ONE heartbeat
@@ -1425,7 +1505,7 @@ pub struct ServeConfig {
 /// row — because the failure it prevents is silent: `doctor` is a FRESH
 /// process, so it reads the new file and reports the feature on while the
 /// daemon that will never see it emits nothing.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MachineRollupConfig {
     /// The gate: `true` → the daemon's host sampler emits a
     /// `machine.rollup` record every `period_seconds`; `false`/absent →
@@ -1437,7 +1517,7 @@ pub struct MachineRollupConfig {
     /// (`runtime.host_sampler_interval_ms`, `redis.maxlen`), never
     /// "emit continuously", which is what a naive `>=` would give it.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub period_seconds: Option<u64>,
-    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// (#1230 Packet 5) Mission-board drift-detection knobs — consumed by
@@ -1451,7 +1531,7 @@ pub struct MachineRollupConfig {
 /// config block. Rust-only rename — the serde field name stays `mission`
 /// (see `DarkmuxConfig::mission`), so operator `config.json` files are
 /// untouched; pre-1.0 no-compat-baggage applies to the type name.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MissionBoardConfig {
     /// How many days an Active mission may sit with zero `Complete` phases
     /// before `mission status` flags it as stale (default 14). The concrete
@@ -1459,7 +1539,7 @@ pub struct MissionBoardConfig {
     /// no drift surfaced at all, because the pre-#1230-Packet-5 detector
     /// only checked Closed+non-terminal and Active+all-terminal.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub stale_active_days: Option<u64>,
-    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// (#1698 Packet B2) The radio interpreter's own staffing + persona knobs —
@@ -1468,7 +1548,7 @@ pub struct MissionBoardConfig {
 /// ordinary role-profile/default-profile precedence, not an error), and
 /// separate from `RuntimeBehaviorConfig` because they're specific to the
 /// `radio` interpreter (routing + answering), not general dispatch behavior.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RadioConfig {
     // (#2914, CONFIG 1.28) `router_profile` REMOVED. The ROUTING seat runs on
     // the machine's utility model (`internal.utility` in profiles.json), not
@@ -1499,7 +1579,7 @@ pub struct RadioConfig {
     /// after parsing, so widening this field costs nothing and removes both
     /// hazards.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub humor: Option<u64>,
-    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// (#1685) The operator's own `gh` CLI credential gate — a **feature block
@@ -1537,7 +1617,7 @@ pub struct RadioConfig {
 /// operator opts each one in by listing it here. Fails closed on both
 /// counts: `enabled: false` blocks every verb regardless of `allowed`, and
 /// a verb absent from `allowed` is blocked even with `enabled: true`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CmdConfig {
     /// The gate: `true` → the `allowed` list is consulted at all;
     /// `false`/absent → every `cmd`-declaring config is refused,
@@ -1549,7 +1629,7 @@ pub struct CmdConfig {
     /// `darkmux config set cmd.allowed <comma-separated-list>` replaces the
     /// whole list (there is no incremental add today — see the PR-flow guide).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub allowed: Option<Vec<String>>,
-    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// (#2093) Flow-record hooks — a fourth `FlowSink` kind: match → POST. A
@@ -1564,7 +1644,7 @@ pub struct CmdConfig {
 /// background drainer POSTs it to `http` with bounded retries. The write
 /// path never blocks on the network — see `darkmux_flow::hooks` for the
 /// sink implementation.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HooksConfig {
     /// The gate: `true` → the drainer thread starts and `rules` are
     /// consulted; `false`/absent → off, regardless of `rules`. Declared
@@ -1611,7 +1691,7 @@ pub struct HooksConfig {
     /// TERMINAL failure past this cap, not a giant POST. Visible default
     /// `1048576` (1 MiB).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub jq_max_output_bytes: Option<u64>,
-    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// (#2183) One `headers` map entry's value: either a plain (non-secret)
@@ -1621,7 +1701,7 @@ pub struct HooksConfig {
 /// holds whatever string the header needs, never a raw token darkmux
 /// would have to format itself). `#[serde(untagged)]` — a bare JSON string
 /// is `Literal`; an object with a `keychain_item` key is `Keychain`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum HeaderValue {
     Literal(String),
@@ -1629,7 +1709,7 @@ pub enum HeaderValue {
 }
 
 /// One hook rule: a predicate (`match`) plus an HTTP outcome (`http`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HookRule {
     /// Renamed `match` on the wire (a Rust keyword) — see `HookMatch`.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "match")]
@@ -1701,7 +1781,7 @@ pub struct HookRule {
     /// `DARKMUX_HOOK_SECRET_0` for `rules[0]`) — that env var, when set,
     /// wins over this field on every platform.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub signing_secret_keychain_item: Option<String>,
-    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// A hook rule's match predicate — every field is an independent AND'd
@@ -1717,7 +1797,7 @@ pub struct HookRule {
 /// **An all-`None` match is deliberately NOT a catch-all** — it matches
 /// nothing, and `darkmux doctor` warns (a rule an operator forgot to fill
 /// in should look broken, not silently subscribe to everything).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HookMatch {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub action: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub session_id: Option<String>,
@@ -2247,29 +2327,26 @@ mod tests {
         assert_eq!(back.remote.as_ref().unwrap().concurrent_cap, Some(1));
     }
 
+    /// (#2902 step 5) A leftover renamed env var is found and named with its
+    /// new name and the advice. A leftover old `config.json` key is not a
+    /// leftover here: it is an unknown key, which `user_files` refuses with
+    /// the same rename (`config_retired_keys_name_their_replacement`).
+    #[test]
+    fn renamed_leftovers_are_found_in_the_env() {
+        let env = |k: &str| (k == "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION").then(|| "9".to_string());
+        let found = renamed_leftovers(&env);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].line.contains("env var DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION (9) is ignored"));
+        assert!(found[0].line.contains("renamed to `remote.max_tokens_per_step`") && found[0].line.contains("500000 was darkmux's old default"));
+        assert!(renamed_leftovers(&|_| None).is_empty());
+        let blank = |_: &str| Some("  ".to_string());
+        assert!(renamed_leftovers(&blank).is_empty(), "an empty env value reads as unset");
+    }
+
     /// (#2914) `radio.router_profile` is REMOVED (CONFIG 1.28): routing runs
     /// on the machine's utility model. `with_defaults()` no longer writes it,
     /// and an older config still carrying it loads leniently into
-    /// `radio.extras`, where `darkmux doctor` names it.
-    /// (#2902 step 5) A leftover renamed key, in config.json (it lands in
-    /// `remote.extras`) or the env, is found and named with its new name
-    /// and the advice; the new keys are not leftovers.
-    #[test]
-    fn renamed_leftovers_are_found_in_config_and_env() {
-        let old: DarkmuxConfig = serde_json::from_str(r#"{"remote":{"max_tokens_per_execution":500000}}"#).unwrap();
-        let found = renamed_leftovers(&old, &|_| None);
-        assert_eq!(found.len(), 1);
-        assert!(found[0].line.contains("config.json key `remote.max_tokens_per_execution` (500000) is ignored"), "{}", found[0].line);
-        assert!(found[0].line.contains("renamed to `remote.max_tokens_per_step`") && found[0].line.contains("500000 was darkmux's old default"));
-        let env = |k: &str| (k == "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION").then(|| "9".to_string());
-        let found = renamed_leftovers(&DarkmuxConfig::default(), &env);
-        assert_eq!(found.len(), 1);
-        assert!(found[0].line.contains("env var DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION (9) is ignored"));
-        let new: DarkmuxConfig = serde_json::from_str(r#"{"remote":{"max_tokens_per_step":5}}"#).unwrap();
-        assert!(renamed_leftovers(&new, &|_| None).is_empty());
-        assert!(renamed_leftovers(&DarkmuxConfig::with_defaults(), &|_| None).is_empty());
-    }
-
+    /// `radio.extras`; the unknown-key gate refuses it (`RETIRED_SETTINGS`).
     #[test]
     fn radio_router_profile_is_removed_and_a_leftover_lands_in_extras() {
         let cfg = DarkmuxConfig::with_defaults();

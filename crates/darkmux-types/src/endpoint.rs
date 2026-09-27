@@ -52,7 +52,7 @@ impl EndpointKind {
 
 /// The backend darkmux manages at a managed endpoint. Named only as a VALUE
 /// (`"managed": "lmstudio"`), never in a field or type name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ManagedBackend {
     /// LM Studio, loaded and unloaded through `lms`.
@@ -62,7 +62,7 @@ pub enum ManagedBackend {
 /// The request shape an endpoint accepts. Both are OpenAI-compatible chat
 /// completions; they differ in the fields around the messages, which are
 /// assembled identically for both (contract 6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Dialect {
     /// `max_completion_tokens`, an optional `reasoning_effort`, no
@@ -125,7 +125,7 @@ crate::config_enum!(Dialect, "endpoint dialect", [
 ///
 /// There is deliberately no action that stops a run: a hard stop is the
 /// operator's own `darkmux mission abort`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum BudgetPolicy {
     /// Nothing is counted.
@@ -167,7 +167,7 @@ impl BudgetPolicy {
 /// `remote.max_tokens_per_step` (the per-step cap) and
 /// `remote.concurrent_cap` still apply. Whether the per-endpoint pair
 /// replaces those two is not decided (#2902).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct UsageLimits {
     /// Tokens one dispatch (one execution) may spend at this endpoint. Not
     /// enforced (see the type doc).
@@ -191,12 +191,13 @@ pub struct UsageLimits {
     pub warn_at: Option<f64>,
     /// Forward-compat overflow.
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// A usage budget over a ROLLING period (`"period": "1d"` is the last 24
 /// hours from now, with no calendar reset), in tokens, calls, or both.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct UsageWindow {
     /// `<n>m`, `<n>h` or `<n>d`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -206,6 +207,7 @@ pub struct UsageWindow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calls: Option<u64>,
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -280,14 +282,6 @@ impl UsageLimits {
     /// Shape checks: the window's period, `warn_at`'s range, and the
     /// policy's value.
     pub fn validate(&self) -> Result<(), String> {
-        // (#2902 step 5 review MF2) A misspelled KEY lands in `extras` and
-        // would silently disarm the budget (`windw` is no window, `polcy` is
-        // the default policy, `tokns` drops the token budget). Read
-        // leniently, refused here, naming the key and the nearest valid one.
-        unknown_key("limits", &self.extras, LIMITS_KEYS)?;
-        if let Some(w) = &self.window {
-            unknown_key("limits.window", &w.extras, WINDOW_KEYS)?;
-        }
         if let Some(Lenient::Known(p)) = &self.policy {
             if p.counts() && !self.window.as_ref().is_some_and(UsageWindow::is_set) {
                 return Err(format!(
@@ -343,36 +337,6 @@ impl UsageLimits {
     }
 }
 
-/// The keys `limits` knows.
-const LIMITS_KEYS: &[&str] = &["window", "policy", "warn_at", "tokens_per_dispatch", "concurrent_calls"];
-/// The keys `limits.window` knows.
-const WINDOW_KEYS: &[&str] = &["period", "tokens", "calls"];
-
-/// An error naming the first unknown key in `extras` and the nearest known
-/// one, or `Ok` when there is none.
-fn unknown_key(at: &str, extras: &serde_json::Map<String, serde_json::Value>, known: &[&str]) -> Result<(), String> {
-    let Some(key) = extras.keys().next() else { return Ok(()) };
-    let nearest = known.iter().min_by_key(|k| edit_distance(key, k)).copied().unwrap_or("");
-    Err(format!(
-        "{at} has an unknown key `{key}` (did you mean `{nearest}`?); valid keys: {}",
-        known.join(", ")
-    ))
-}
-
-/// Levenshtein distance, for a "did you mean" suggestion.
-fn edit_distance(a: &str, b: &str) -> usize {
-    let b: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    for (i, ca) in a.chars().enumerate() {
-        let mut cur = vec![i + 1];
-        for (j, cb) in b.iter().enumerate() {
-            cur.push((prev[j] + usize::from(ca != *cb)).min(prev[j + 1] + 1).min(cur[j] + 1));
-        }
-        prev = cur;
-    }
-    prev[b.len()]
-}
-
 /// `<n>m`, `<n>h` or `<n>d` in seconds, `n >= 1`.
 pub fn period_secs(p: &str) -> Option<u64> {
     let unit = p.chars().last()?;
@@ -399,7 +363,7 @@ fn is_period(p: &str) -> bool {
 /// verbatim; a number outside the integer range comes back in float form,
 /// e.g. `1e+23`). Nothing writes `profiles.json` today, so this matters only
 /// to `profile list --json`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum Lenient<T> {
     Known(T),
@@ -441,7 +405,7 @@ pub enum EndpointSource {
 
 /// An endpoint a model is served from. Absent on a [`crate::ProfileModel`] ⇒
 /// the managed LM Studio default.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ModelEndpoint {
     /// Base URL of an UNMANAGED OpenAI-compatible server, up to (not
     /// including) `/chat/completions`, e.g. `https://api.openai.com/v1`.
@@ -484,6 +448,7 @@ pub struct ModelEndpoint {
     pub source: EndpointSource,
     /// Forward-compat overflow.
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -717,7 +682,7 @@ pub fn url_host(url: &str) -> Option<String> {
 /// Auth for an endpoint. The secret is **never** stored here — only where it
 /// lives: a macOS Keychain item *name* and/or an environment variable's
 /// *name*. The machine holding the item is the endpoint's keymaster.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct EndpointAuth {
     /// Header mechanics: `api-key` or `bearer`. Absent ⇒ no auth header.
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
@@ -733,11 +698,12 @@ pub struct EndpointAuth {
     pub key_env: Option<String>,
     /// Forward-compat overflow.
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The header mechanics for an endpoint's auth.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum EndpointAuthType {
     /// `api-key: <secret>`.
@@ -790,6 +756,21 @@ impl EndpointAuth {
             Some(item) => CredentialSource::Keychain(item),
             None => CredentialSource::Missing { key_env },
         }
+    }
+}
+
+/// The schema of `ProfileModel.endpoint` (read through [`endpoint_field`]):
+/// an id naming an `endpoints` entry, or an inline endpoint object. Used only
+/// as `#[schemars(with)]`, so the unknown-key gate checks an inline
+/// endpoint's keys against [`ModelEndpoint`].
+pub struct EndpointFieldSchema;
+
+impl schemars::JsonSchema for EndpointFieldSchema {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "EndpointField".into()
+    }
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({"anyOf": [{"type": "string"}, generator.subschema_for::<ModelEndpoint>()]})
     }
 }
 

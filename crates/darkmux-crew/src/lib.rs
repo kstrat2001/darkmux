@@ -199,6 +199,9 @@ pub mod thermal_bands;
 // (#2110/#2109) Host-side thermal governor + breaker — see the module doc.
 pub mod thermal_governor;
 pub mod types;
+/// The crew library's user files through the unknown-key gate, and the
+/// preflight every work-starting entry point calls.
+pub mod user_files;
 // (#1959) A generic mission input: named sources materialized into a
 // read-only tree, filtered by include/exclude globs. Promoted out of the
 // crawl module's `CorpusManifest` — see the module doc for the descope

@@ -684,46 +684,15 @@ fn get_path<'a>(root: &'a Value, key: &str) -> Option<&'a Value> {
     Some(cur)
 }
 
-/// "Did you mean" suffix for an unknown key — up to 3 closest known keys by
-/// Levenshtein distance (≤ 3), else a pointer to `config list`.
+/// "Did you mean" suffix for an unknown key: the closest settable key, by
+/// the one suggester every unknown-key message uses
+/// (`darkmux_types::user_files::closest`).
 fn suggestion(key: &str) -> String {
     let keys = all_keys();
-    let near = nearest(key, keys.iter().map(|(k, _)| *k));
-    if near.is_empty() {
-        " — run `darkmux config list` to see the settable keys".to_string()
-    } else {
-        format!(" — did you mean: {}?", near.join(", "))
+    match darkmux_types::user_files::closest(key, keys.iter().map(|(k, _)| *k)) {
+        Some(near) => format!(" — did you mean `{near}`? (`darkmux config list` shows every settable key)"),
+        None => " — run `darkmux config list` to see the settable keys".to_string(),
     }
-}
-
-/// Up to 3 entries of `candidates` closest to `key` by Levenshtein distance
-/// (≤ 3), nearest first. The general form behind [`suggestion`]'s
-/// `config.json`-specific "did you mean" — `mission_launch`'s undeclared-
-/// `--param` warning reuses this directly rather than re-implementing
-/// distance scoring a second time in the same crate (silent-miss audit,
-/// 2026-09-06).
-pub(crate) fn nearest<'a>(key: &str, candidates: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
-    let mut scored: Vec<(usize, &'a str)> =
-        candidates.map(|c| (levenshtein(key, c), c)).filter(|(d, _)| *d <= 3).collect();
-    scored.sort_by_key(|(d, _)| *d);
-    scored.into_iter().take(3).map(|(_, c)| c).collect()
-}
-
-/// Tiny inline Levenshtein (two-row DP) — a 10-line need beats a crate, per the
-/// dep-discipline convention.
-fn levenshtein(a: &str, b: &str) -> usize {
-    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    let mut cur = vec![0usize; b.len() + 1];
-    for (i, ca) in a.iter().enumerate() {
-        cur[0] = i + 1;
-        for (j, cb) in b.iter().enumerate() {
-            let cost = if ca == cb { 0 } else { 1 };
-            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
-        }
-        std::mem::swap(&mut prev, &mut cur);
-    }
-    prev[b.len()]
 }
 
 #[cfg(test)]
@@ -1059,7 +1028,7 @@ mod tests {
         let f = tmp();
         let err = set_at(f.path(), "redis.hsot", "x").unwrap_err().to_string();
         assert!(err.contains("unknown config key"), "{err}");
-        assert!(err.contains("redis.host"), "suggests the near key: {err}");
+        assert!(err.contains("did you mean `redis.host`?"), "suggests the near key: {err}");
     }
 
     #[test]
@@ -1547,12 +1516,6 @@ mod tests {
         assert!(!out.contains(CANARY), "the value must never reach stdout: {out}");
         assert!(out.contains("redacted"), "the key is still shown, marked: {out}");
         assert!(out.contains("machine_id"), "the rest of the config still renders: {out}");
-    }
-
-    #[test]
-    fn levenshtein_basic() {
-        assert_eq!(levenshtein("host", "hsot"), 2);
-        assert_eq!(levenshtein("fleet.mode", "fleet.mode"), 0);
     }
 
     /// (#2774 review C7) The two surfaces an operator can set a boolean

@@ -1280,6 +1280,10 @@ mod tests {
             verify: None,
             expected: None,
             image: None,
+            trials: None,
+            task_timeout_seconds: None,
+            chain_depths: None,
+            seed: None,
             extras: BTreeMap::new(),
         }
     }

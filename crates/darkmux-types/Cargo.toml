@@ -32,6 +32,11 @@ dirs = "5.0"
 # extracted from four independent copies across darkmux-lab, darkmux-flow,
 # darkmux-fleet, and the e2e test harness. Already a direct dep of all four.
 libc = "0.2"
+# The unknown-key gate for user files (`user_files`) reads each file kind's
+# valid keys from its Rust type's derived JSON schema, so a new field is valid
+# the moment it exists and no hand list can drift. Already in the build graph
+# (agent-client-protocol depends on it), so this adds no new crate.
+schemars = "1.2"
 # (#2695) Optional, feature-gated: present only when `test-support` is on.
 # See the feature's own comment.
 tempfile = { version = "3.10", optional = true }

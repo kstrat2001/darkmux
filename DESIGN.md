@@ -516,7 +516,7 @@ Three choices shape it:
 
 **Secrets are carved out, never plaintext config.** A `config.json` is a file an operator writes, edits, and might share or commit. So the one thing it never holds is a password: the Redis password and the serve-daemon bearer token live in the macOS Keychain, read at runtime and wrapped so they can only ever reach a log redacted. `config.redis` holds the non-secret connection bits; the Keychain holds the secret. (One other carve-out, for a different reason: `DARKMUX_HOME`, the pointer that *locates* the config root, stays an env var because it can't live inside the file it's there to find.)
 
-The schema is lenient on read (every field optional, unknown keys preserved), so a newer config never bricks an older binary and a hand-edited file never panics the CLI. Loud validation is `darkmux doctor`'s job, not the hot load path. Additive schema changes are a minor version bump; the operator's file keeps working across them.
+Loading is lenient (every field optional, unknown keys caught by an overflow map), so a hand-edited or malformed file never panics the CLI and `darkmux doctor` always runs. Consuming is not: since CONFIG 2.0 a key the schema does not know is refused at every entry point's preflight and failed by doctor, naming the closest valid key, so a typo can never silently do nothing. The valid keys are derived from the Rust type (`darkmux_types::user_files`), and the same gate covers every user file. Additive schema changes are a minor version bump; an older binary refuses a newer file's new key.
 
 ## Endpoints: what darkmux does there, not where they are
 

@@ -997,7 +997,7 @@ fn cmd_mission_dispatch(
     // Planned -> Running: the dispatch-scope settings always (the work is a
     // dispatch wherever it runs), and the fleet-submission ones when the
     // work is sent to another machine.
-    darkmux_profiles::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
+    darkmux_crew::user_files::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
     if machine.is_some() {
         darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::FleetSubmission)?;
     }
@@ -1230,7 +1230,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
     // mission is minted. `--skip-preflight` does not waive it: that flag
     // skips the Docker/daemon probe, and a bad config value is not a probe
     // result that could be stale or wrong.
-    darkmux_profiles::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
+    darkmux_crew::user_files::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
     let DispatchInvocation {
         role,
         message,
@@ -1890,7 +1890,7 @@ fn cmd_profile(sub: ProfileCmd) -> Result<i32> {
             };
 
             let suggestion = heuristics::suggest_profile(&meta, task);
-            let json = heuristics::suggestion_to_profile_json(&name, &model, &suggestion, None);
+            let json = heuristics::suggestion_to_profile_json(&name, &model, &suggestion);
             // Pretty-print
             println!("{}", serde_json::to_string_pretty(&json)?);
             eprintln!();

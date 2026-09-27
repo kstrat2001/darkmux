@@ -239,28 +239,29 @@ fn a_typo_in_limits_is_an_error_never_no_budget() {
 
 /// (review MF2) The reviewer's four misspelled-KEY probes, committed. Each
 /// used to disarm the budget silently (no window, the default policy, a
-/// dropped token budget); each is now an error naming the key and the
-/// nearest valid one, at the gate and in preflight's registry pass.
+/// dropped token budget). Each is now an unknown key in `profiles.json`,
+/// which every dispatching preflight refuses (`darkmux_types::user_files`),
+/// naming the key and the nearest valid one.
 #[test]
-fn a_misspelled_key_in_limits_is_an_error_naming_it() {
+fn a_misspelled_key_in_limits_is_an_unknown_key_naming_the_nearest() {
     let probes = [
-        (serde_json::json!({"windw": {"period": "1d", "tokens": 10}, "policy": "wait"}), "windw", "window"),
-        (serde_json::json!({"polcy": "wait", "window": {"period": "1d", "tokens": 10}}), "polcy", "policy"),
-        (serde_json::json!({"policy": "wait", "window": {"period": "1d", "tokns": 10, "calls": 400}}), "tokns", "tokens"),
-        (serde_json::json!({"policy": "wait", "window": {"tokns": 10}}), "tokns", "tokens"),
+        (serde_json::json!({"windw": {"period": "1d", "tokens": 10}, "policy": "wait"}), "limits.windw", "limits.window"),
+        (serde_json::json!({"polcy": "wait", "window": {"period": "1d", "tokens": 10}}), "limits.polcy", "limits.policy"),
+        (serde_json::json!({"policy": "wait", "window": {"period": "1d", "tokns": 10, "calls": 400}}), "limits.window.tokns", "limits.window.tokens"),
+        (serde_json::json!({"policy": "wait", "window": {"tokns": 10}}), "limits.window.tokns", "limits.window.tokens"),
     ];
     for (limits, key, nearest) in probes {
-        let err = EndpointBudget::of(&named(limits.clone())).expect_err(&format!("{limits} must not be Ok"));
-        assert!(err.contains(&format!("unknown key `{key}`")) && err.contains(&format!("did you mean `{nearest}`")), "{limits}: {err}");
-        let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
+        let doc = serde_json::json!({
             "profiles": {"p": {"models": [{"id": "m", "endpoint": "azure"}]}},
             "endpoints": {"azure": {"url": "https://h.example/v1", "limits": limits}},
-        }))
-        .unwrap();
-        reg.materialize_endpoints();
-        let invalid = darkmux_types::config_enum::invalid_endpoint_limits(&reg);
-        assert_eq!(invalid.len(), 1, "{limits}: {invalid:?}");
-        assert!(invalid[0].problem.contains(key), "{:?}", invalid[0]);
+        });
+        let keys = darkmux_types::user_files::key_issues::<darkmux_types::ProfileRegistry>(&doc, &darkmux_types::user_files::no_retired);
+        let msgs: Vec<String> = keys.iter().map(ToString::to_string).collect();
+        assert_eq!(keys.len(), 1, "{limits}: {msgs:?}");
+        assert!(
+            msgs[0].contains(&format!("unknown key `endpoints.azure.{key}`: did you mean `endpoints.azure.{nearest}`?")),
+            "{limits}: {msgs:?}"
+        );
     }
     // A policy that governs nothing is named too.
     let err = EndpointBudget::of(&named(serde_json::json!({"policy": "wait"}))).unwrap_err();
@@ -964,10 +965,12 @@ fn budget_messages_have_no_double_spaces() {
     let mut pacer = BudgetPacer::new(budget(BudgetPolicy::Wait, Some(1_000), None, None), None);
     pacer.on_tick(0, dir.path(), &OtherPacing::default(), &caller, &stop_env);
     env.said.borrow_mut().extend(stop_env.said.borrow().iter().cloned());
-    for e in ["2M", "windw"] {
-        let limits = if e == "2M" { serde_json::json!({"window": {"period": "1d", "tokens": "2M"}}) } else { serde_json::json!({"windw": {}}) };
-        env.said.borrow_mut().push(EndpointBudget::of(&named(limits)).unwrap_err());
-    }
+    let limits = serde_json::json!({"window": {"period": "1d", "tokens": "2M"}});
+    env.said.borrow_mut().push(EndpointBudget::of(&named(limits)).unwrap_err());
+    // A misspelled `limits` key is the unknown-key gate's message.
+    let typo = serde_json::json!({"endpoints": {"a": {"url": "https://h.example/v1", "limits": {"windw": {}}}}});
+    let keys = darkmux_types::user_files::key_issues::<darkmux_types::ProfileRegistry>(&typo, &darkmux_types::user_files::no_retired);
+    env.said.borrow_mut().extend(keys.iter().map(ToString::to_string));
     let mut messages: Vec<String> = env.said.borrow().clone();
     messages.extend(env.emitted.borrow().iter().filter_map(|r| r.payload.as_ref()?.get("message")?.as_str().map(str::to_string)));
     let err = EndpointBudget::of(&named(serde_json::json!({"window": {"period": "1d", "tokens": "2M"}}))).unwrap_err();

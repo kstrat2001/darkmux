@@ -17,6 +17,15 @@ code (`darkmux_types::config_access`):
 The env tier is read **live per access**, so a `set_var` in a test or a
 power-user `export` still wins.
 
+A `config.json` key darkmux does not know (a typo, or a key a newer or older
+darkmux spells differently) is refused: every `dispatch`, `mission launch` and
+`lab run` refuses to start, naming the key and the closest valid one, and
+`darkmux doctor` reports it as Fail. A value of the wrong type (`"port": "x"`)
+is refused the same way, naming the expected type and what it got. The file
+still loads, so doctor always runs. An unset or misspelled env var name, by contrast, is simply not read:
+the environment is shared with every other program, so darkmux cannot tell a
+typo from somebody else's variable.
+
 ## Boolean values — one vocabulary
 
 Every boolean `DARKMUX_*` variable accepts the **same tokens**, and so does

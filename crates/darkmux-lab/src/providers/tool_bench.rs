@@ -166,8 +166,8 @@ struct TaskSpec {
 }
 
 /// Generate the full task ladder from one seed. Pure — unit-testable without
-/// dispatching, and the same seed reproduces the same fixture (`seed` in the
-/// workload extras).
+/// dispatching, and the same seed reproduces the same fixture (the
+/// workload's `seed`).
 fn generate_tasks(seed: u64, chain_depths: &[u32]) -> Vec<TaskSpec> {
     let mut rng = Rng::new(seed);
     let mut tasks = Vec::new();
@@ -723,7 +723,7 @@ fn build_rows(trials: &[Trial<'_>], k: u32, artifact: &scores::ArtifactKey) -> V
     rows
 }
 
-// ─── manifest-extras parsing ────────────────────────────────────────────
+// ─── manifest knob parsing ──────────────────────────────────────────────
 
 /// Accept an `f64` as an integral `u64` only if it is finite, non-negative,
 /// has no fractional part, and is strictly below `u64::MAX as f64`.
@@ -758,7 +758,7 @@ fn quoted_number_to_u64(s: &str) -> Option<u64> {
     t.parse::<u64>().ok().or_else(|| t.parse::<f64>().ok().and_then(integral_f64_to_u64))
 }
 
-/// Read one `extras` key as a number, leniently accepting any of three JSON
+/// Read one workload knob as a number, leniently accepting any of three JSON
 /// forms. The workload manifest's own doc comment invites an operator to
 /// "override by copying this manifest into your workloads dir" — a
 /// hand-edited JSON file is exactly as likely to quote a number as not
@@ -776,19 +776,15 @@ fn quoted_number_to_u64(s: &str) -> Option<u64> {
 /// count, "an integer" for a key like `seed` that legitimately accepts
 /// zero — since the keys this parses don't all mean the same thing and one
 /// shared phrase would misdescribe at least one of them.
-fn extras_u64_strict(
-    extras: &BTreeMap<String, serde_json::Value>,
-    key: &str,
-    expect: &str,
-) -> Result<Option<u64>> {
-    match extras.get(key) {
+fn knob_u64_strict(value: Option<&serde_json::Value>, key: &str, expect: &str) -> Result<Option<u64>> {
+    match value {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(v) => v
             .as_u64()
             .or_else(|| v.as_f64().and_then(integral_f64_to_u64))
             .or_else(|| v.as_str().and_then(quoted_number_to_u64))
             .map(Some)
-            .ok_or_else(|| anyhow!("workload extras.{key} must be {expect}, got {v}")),
+            .ok_or_else(|| anyhow!("workload `{key}` must be {expect}, got {v}")),
     }
 }
 
@@ -817,7 +813,7 @@ const MAX_CHAIN_DEPTH: u32 = 1000;
 const MAX_CHAIN_LADDER_LEN: usize = 20;
 
 /// The `chainDepths` array, leniently. Same string-or-number-or-integral-float
-/// tolerance as [`extras_u64_strict`] applied per element — a hand-authored
+/// tolerance as [`knob_u64_strict`] applied per element — a hand-authored
 /// ALL-STRING array like `["2", "4", "6"]` used to have every element
 /// silently filtered out by `.as_u64()` (every element fails → empty `Vec`
 /// → the `!v.is_empty()` guard discarded it) and fall back to the default
@@ -834,13 +830,13 @@ const MAX_CHAIN_LADDER_LEN: usize = 20;
 /// rather than the silent-type-coercion bug this closes. An array with
 /// more than [`MAX_CHAIN_LADDER_LEN`] entries is refused for the same
 /// reason as an over-cap single depth — see that constant's own doc.
-fn chain_depths_strict(extras: &BTreeMap<String, serde_json::Value>) -> Result<Vec<u32>> {
+fn chain_depths_strict(value: Option<&serde_json::Value>) -> Result<Vec<u32>> {
     const DEFAULT: [u32; 3] = [2, 4, 6];
-    match extras.get("chainDepths") {
+    match value {
         None | Some(serde_json::Value::Null) => Ok(DEFAULT.to_vec()),
         Some(v) => {
             let arr = v.as_array().ok_or_else(|| {
-                anyhow!("workload extras.chainDepths must be an array of positive integers, got {v}")
+                anyhow!("workload `chainDepths` must be an array of positive integers, got {v}")
             })?;
             if arr.is_empty() {
                 return Ok(DEFAULT.to_vec());
@@ -869,7 +865,7 @@ fn chain_depths_strict(extras: &BTreeMap<String, serde_json::Value>) -> Result<V
             // describe what it actually counts.
             ensure!(
                 arr.len() <= MAX_CHAIN_LADDER_LEN,
-                "workload extras.chainDepths has {} entries, above the cap of {MAX_CHAIN_LADDER_LEN} \
+                "workload `chainDepths` has {} entries, above the cap of {MAX_CHAIN_LADDER_LEN} \
                  — this cap counts raw array entries (before de-duplication), because after \
                  de-duplication each distinct depth becomes its own chaining task with up to \
                  `depth` hop files, so a long array is refused as a conservative bound on how many \
@@ -885,7 +881,7 @@ fn chain_depths_strict(extras: &BTreeMap<String, serde_json::Value>) -> Result<V
                     .or_else(|| d.as_str().and_then(quoted_number_to_u64))
                     .ok_or_else(|| {
                         anyhow!(
-                            "workload extras.chainDepths must contain only positive integers, got {d}"
+                            "workload `chainDepths` must contain only positive integers, got {d}"
                         )
                     })?;
                 // (MUST FIX, third-round frontier review) The message above
@@ -900,14 +896,14 @@ fn chain_depths_strict(extras: &BTreeMap<String, serde_json::Value>) -> Result<V
                 // disclaims and generation would just discard.
                 ensure!(
                     n >= 1,
-                    "workload extras.chainDepths contains {n}, but every depth must be a positive \
+                    "workload `chainDepths` contains {n}, but every depth must be a positive \
                      integer — `0` would be silently raised to the chaining minimum (2) by \
                      generate_tasks rather than used as written. Use a real depth (>= 1), or omit \
                      chainDepths for the default ladder."
                 );
                 ensure!(
                     n <= MAX_CHAIN_DEPTH as u64,
-                    "workload extras.chainDepths contains {n}, above the cap of {MAX_CHAIN_DEPTH} \
+                    "workload `chainDepths` contains {n}, above the cap of {MAX_CHAIN_DEPTH} \
                      — every unit of depth is another hop file the sandbox has to generate and \
                      another required tool call in the task, so a value this large turns one \
                      manifest key into an effectively unbounded loop. Lower the value."
@@ -976,8 +972,8 @@ impl WorkloadProvider for ToolBenchProvider {
         // a clamp here can't silently override a bound the operator typed
         // elsewhere the way an un-ranged `taskTimeoutSeconds` would.
         let trials_per_task =
-            extras_u64_strict(&wl.extras, "trials", "a positive integer")?.unwrap_or(1).clamp(1, 20) as u32;
-        // (#2587) `extras.taskTimeoutSeconds` must reach the ONE
+            knob_u64_strict(wl.trials.as_ref(), "trials", "a positive integer")?.unwrap_or(1).clamp(1, 20) as u32;
+        // (#2587) `taskTimeoutSeconds` must reach the ONE
         // `DispatchOpts` field the container-agentic path actually reads.
         // Every tool-bench task dispatches a tool-granting role
         // (`darkmux_crew::dispatch::dispatch`'s default container path),
@@ -1005,7 +1001,7 @@ impl WorkloadProvider for ToolBenchProvider {
         // itself has to stop asserting a value it doesn't own. The omitted
         // key now takes the same standing env/config/600 path every other
         // workload takes.
-        let task_timeout_extra = extras_u64_strict(&wl.extras, "taskTimeoutSeconds", "a positive integer")?;
+        let task_timeout_extra = knob_u64_strict(wl.task_timeout_seconds.as_ref(), "taskTimeoutSeconds", "a positive integer")?;
         // The valid range is refused loudly rather than silently clamped:
         // now that this value is live and genuinely outranks the
         // operator's own configuration, silently substituting a floor or
@@ -1055,14 +1051,14 @@ impl WorkloadProvider for ToolBenchProvider {
             // `<= 3600` ceiling that is unique to this key (see above).
             ensure!(
                 n >= 1,
-                "workload extras.taskTimeoutSeconds must be >= 1 — `0` resolves to an \
+                "workload `taskTimeoutSeconds` must be >= 1 — `0` resolves to an \
                  already-expired inactivity deadline (an instant kill) on the container path, \
                  not 'unbounded' or 'shortest allowed'. Omit taskTimeoutSeconds for the standing \
                  env/config/600 default, or set a real positive bound."
             );
             ensure!(
                 (MIN_TASK_TIMEOUT_SECONDS..=MAX_TASK_TIMEOUT_SECONDS).contains(&n),
-                "workload extras.taskTimeoutSeconds is {n}, outside the allowed range \
+                "workload `taskTimeoutSeconds` is {n}, outside the allowed range \
                  {MIN_TASK_TIMEOUT_SECONDS}-{MAX_TASK_TIMEOUT_SECONDS} seconds. This value \
                  outranks your own env/config inactivity setting when present, so it is refused \
                  rather than silently clamped to a bound you didn't type — pick a value inside \
@@ -1073,7 +1069,7 @@ impl WorkloadProvider for ToolBenchProvider {
         }
         let timeout_override_seconds: Option<u32> = task_timeout_extra.map(|n| n as u32);
         let timeout = timeout_override_seconds.unwrap_or(600);
-        let chain_depths: Vec<u32> = chain_depths_strict(&wl.extras)?;
+        let chain_depths: Vec<u32> = chain_depths_strict(wl.chain_depths.as_ref())?;
         // Fresh nonces per run unless the operator pins `seed` to reproduce a
         // fixture. Regenerability is the anti-memorization property.
         let now_ms = SystemTime::now()
@@ -1088,7 +1084,7 @@ impl WorkloadProvider for ToolBenchProvider {
         // "positive integer" is still wrong for seed (0 is legitimate);
         // "non-negative integer" is the one phrase that is never untrue for
         // this key's actual domain.
-        let seed = extras_u64_strict(&wl.extras, "seed", "a non-negative integer")?
+        let seed = knob_u64_strict(wl.seed.as_ref(), "seed", "a non-negative integer")?
             .unwrap_or_else(|| (now_ms as u64) ^ ((std::process::id() as u64) << 32));
 
         let tasks = generate_tasks(seed, &chain_depths);
@@ -1097,7 +1093,7 @@ impl WorkloadProvider for ToolBenchProvider {
         // Forensics: the full fixture (prompts, files, expected answers) so a
         // surprising score is auditable straight from the run dir.
         // `task_timeout_override_seconds` is recorded here too, but it is
-        // ONLY the manifest's own override — the value `extras.taskTimeoutSeconds`
+        // ONLY the manifest's own override — the value `taskTimeoutSeconds`
         // resolved to, or `null` when the key was omitted. It is NOT the
         // dispatch's effective inactivity bound: on the omitted-key path
         // (the shipped manifest's own path) this is always `null`, even
@@ -1478,7 +1474,7 @@ fn dispatch_task(
         resume_from: None,
         host_out: None,
         max_turns_override: None,
-        timeout_override_seconds, // (#2587) routed from extras.taskTimeoutSeconds
+        timeout_override_seconds, // (#2587) routed from the workload's taskTimeoutSeconds
         role_id: role_id.to_string(),
         message: prompt.to_string(),
         session: session_id.clone(),
@@ -2377,7 +2373,7 @@ not json — tolerated
     // ─── workload manifest ───
 
     #[test]
-    fn embedded_workload_manifest_parses_with_knobs_in_extras() {
+    fn embedded_workload_manifest_parses_with_its_knobs() {
         let json = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../templates/builtin/workloads/tool-bench.json"
@@ -2387,24 +2383,25 @@ not json — tolerated
         assert_eq!(m.workload.id, "tool-bench");
         assert_eq!(m.workload.provider, "tool-bench");
         assert_eq!(m.workload.role.as_deref(), Some("tool-bench"));
-        assert_eq!(m.workload.extras.get("trials").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(m.workload.trials.as_ref().and_then(|v| v.as_u64()), Some(1));
+        assert!(m.workload.extras.is_empty(), "every shipped knob is a declared field");
         let depths: Vec<u64> = m
             .workload
-            .extras
-            .get("chainDepths")
+            .chain_depths
+            .as_ref()
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|d| d.as_u64()).collect())
             .expect("chainDepths present");
         assert_eq!(depths, vec![2, 4, 6]);
     }
 
-    // ─── #2587: extras.taskTimeoutSeconds → DispatchOpts.timeout_override_seconds ───
+    // ─── #2587: taskTimeoutSeconds → DispatchOpts.timeout_override_seconds ───
     //
     // Every test injects the dispatch (`ToolBenchProvider::with_dispatch`) —
     // no container, no real model. This is the same end-to-end-pin pattern
     // #2542/#2586 established for the crawl unit step, reused here: read
     // the value off the SAME `DispatchOpts` `run()` actually constructs,
-    // never a re-derivation of the extras-parsing logic.
+    // never a re-derivation of the knob-parsing logic.
 
     use darkmux_crew::dispatch::{DispatchOpts, DispatchResult};
     use std::sync::Mutex;
@@ -2690,7 +2687,7 @@ not json — tolerated
     // ─── manifest-key sweep (#2587): trials / seed / chainDepths ───
     //
     // Same silent-drop-on-wrong-type hazard as taskTimeoutSeconds, on the
-    // other keys this provider reads from `extras`. These exercise the
+    // other knobs this provider reads. These exercise the
     // shared helpers directly rather than the full `run()` loop — `trials`
     // and `seed` don't feed a `DispatchOpts` field at all (they size the
     // task loop / seed the RNG), so there is no dispatch-level pin to add;
@@ -2698,25 +2695,25 @@ not json — tolerated
     // `run()` calls.
 
     #[test]
-    fn extras_u64_strict_accepts_the_string_form_like_the_number_form() {
+    fn knob_u64_strict_accepts_the_string_form_like_the_number_form() {
         let mut extras = BTreeMap::new();
         extras.insert("trials".to_string(), serde_json::json!("5"));
-        assert_eq!(extras_u64_strict(&extras, "trials", "a positive integer").unwrap(), Some(5));
+        assert_eq!(knob_u64_strict(extras.get("trials"), "trials", "a positive integer").unwrap(), Some(5));
         extras.insert("trials".to_string(), serde_json::json!(5));
-        assert_eq!(extras_u64_strict(&extras, "trials", "a positive integer").unwrap(), Some(5));
+        assert_eq!(knob_u64_strict(extras.get("trials"), "trials", "a positive integer").unwrap(), Some(5));
     }
 
     #[test]
-    fn extras_u64_strict_reads_a_genuinely_absent_key_as_none() {
-        let extras = BTreeMap::new();
-        assert_eq!(extras_u64_strict(&extras, "seed", "a non-negative integer").unwrap(), None);
+    fn knob_u64_strict_reads_a_genuinely_absent_key_as_none() {
+        let extras: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        assert_eq!(knob_u64_strict(extras.get("seed"), "seed", "a non-negative integer").unwrap(), None);
     }
 
     #[test]
-    fn extras_u64_strict_refuses_garbage_by_name_instead_of_defaulting() {
+    fn knob_u64_strict_refuses_garbage_by_name_instead_of_defaulting() {
         let mut extras = BTreeMap::new();
         extras.insert("trials".to_string(), serde_json::json!("many"));
-        let err = extras_u64_strict(&extras, "trials", "a positive integer")
+        let err = knob_u64_strict(extras.get("trials"), "trials", "a positive integer")
             .expect_err("garbage must be refused");
         let msg = format!("{err:#}");
         assert!(msg.contains("trials"), "the key is named: {msg}");
@@ -2733,11 +2730,11 @@ not json — tolerated
     // phrase that is never untrue for this key's real domain — see the
     // negative-seed tests below for the case "an integer" got wrong.
     #[test]
-    fn extras_u64_strict_describes_seed_as_a_non_negative_integer_not_a_positive_integer() {
+    fn knob_u64_strict_describes_seed_as_a_non_negative_integer_not_a_positive_integer() {
         let mut extras = BTreeMap::new();
         extras.insert("seed".to_string(), serde_json::json!("not-a-number"));
         let err =
-            extras_u64_strict(&extras, "seed", "a non-negative integer").expect_err("garbage refused");
+            knob_u64_strict(extras.get("seed"), "seed", "a non-negative integer").expect_err("garbage refused");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("must be a non-negative integer"),
@@ -2749,7 +2746,7 @@ not json — tolerated
         );
     }
 
-    // The unit test above only proves `extras_u64_strict` HONORS whatever
+    // The unit test above only proves `knob_u64_strict` HONORS whatever
     // `expect` string it's handed — it does not prove `run()`'s own call
     // site for `seed` actually passes "a non-negative integer" rather than
     // "a positive integer". This drives the real call site end to end so a
@@ -2775,10 +2772,10 @@ not json — tolerated
     // integer, got -5" is self-contradicting — the real constraint is
     // non-negativity, which the message must actually say.
     #[test]
-    fn extras_u64_strict_describes_a_negative_seed_as_needing_non_negative_not_merely_an_integer() {
+    fn knob_u64_strict_describes_a_negative_seed_as_needing_non_negative_not_merely_an_integer() {
         let mut extras = BTreeMap::new();
         extras.insert("seed".to_string(), serde_json::json!(-5));
-        let err = extras_u64_strict(&extras, "seed", "a non-negative integer")
+        let err = knob_u64_strict(extras.get("seed"), "seed", "a non-negative integer")
             .expect_err("a negative seed must be refused");
         let msg = format!("{err:#}");
         assert!(msg.contains("-5"), "the offending value is named: {msg}");
@@ -2806,10 +2803,10 @@ not json — tolerated
     // a YAML-to-JSON conversion produces — it must route identically to the
     // bare-integer and quoted-string forms already covered above.
     #[test]
-    fn extras_u64_strict_accepts_the_integral_float_form_too() {
+    fn knob_u64_strict_accepts_the_integral_float_form_too() {
         let mut extras = BTreeMap::new();
         extras.insert("trials".to_string(), serde_json::json!(5.0));
-        assert_eq!(extras_u64_strict(&extras, "trials", "a positive integer").unwrap(), Some(5));
+        assert_eq!(knob_u64_strict(extras.get("trials"), "trials", "a positive integer").unwrap(), Some(5));
     }
 
     // (Also fix, second-round frontier review) The bare-float leniency
@@ -2822,41 +2819,41 @@ not json — tolerated
     // bare, once it's round-tripped through a shell or a template. Both
     // forms must resolve identically.
     #[test]
-    fn extras_u64_strict_accepts_a_quoted_integral_float_like_the_bare_form() {
+    fn knob_u64_strict_accepts_a_quoted_integral_float_like_the_bare_form() {
         let mut extras = BTreeMap::new();
         extras.insert("trials".to_string(), serde_json::json!("5.0"));
         assert_eq!(
-            extras_u64_strict(&extras, "trials", "a positive integer").unwrap(),
+            knob_u64_strict(extras.get("trials"), "trials", "a positive integer").unwrap(),
             Some(5),
             "a quoted decimal form must resolve exactly like its bare float form"
         );
     }
 
     #[test]
-    fn extras_u64_strict_accepts_a_quoted_exponent_form() {
+    fn knob_u64_strict_accepts_a_quoted_exponent_form() {
         let mut extras = BTreeMap::new();
         extras.insert("trials".to_string(), serde_json::json!("4.5e1"));
         assert_eq!(
-            extras_u64_strict(&extras, "trials", "a positive integer").unwrap(),
+            knob_u64_strict(extras.get("trials"), "trials", "a positive integer").unwrap(),
             Some(45),
             "a quoted exponent form (4.5e1 == 45) must be accepted, the same as a bare one"
         );
     }
 
     #[test]
-    fn extras_u64_strict_refuses_a_quoted_non_integral_float() {
+    fn knob_u64_strict_refuses_a_quoted_non_integral_float() {
         let mut extras = BTreeMap::new();
         extras.insert("trials".to_string(), serde_json::json!("5.5"));
-        let err = extras_u64_strict(&extras, "trials", "a positive integer")
+        let err = knob_u64_strict(extras.get("trials"), "trials", "a positive integer")
             .expect_err("a quoted fractional value must be refused, same as its bare form");
         assert!(format!("{err:#}").contains("5.5"));
     }
 
     #[test]
-    fn extras_u64_strict_refuses_a_non_integral_float() {
+    fn knob_u64_strict_refuses_a_non_integral_float() {
         let mut extras = BTreeMap::new();
         extras.insert("trials".to_string(), serde_json::json!(5.5));
-        let err = extras_u64_strict(&extras, "trials", "a positive integer")
+        let err = knob_u64_strict(extras.get("trials"), "trials", "a positive integer")
             .expect_err("a fractional value must be refused, not truncated");
         assert!(format!("{err:#}").contains("5.5"));
     }
@@ -2868,16 +2865,16 @@ not json — tolerated
     // `u64::MAX as f64` (i.e. `2^64`, genuinely `u64::MAX + 1`) passed the
     // filter, and the subsequent `f as u64` cast then silently SATURATED it
     // to `u64::MAX` — no error, no indication anything was out of range.
-    // `seed` is the one caller of `extras_u64_strict` with no downstream
+    // `seed` is the one caller of `knob_u64_strict` with no downstream
     // range check (trials clamps, taskTimeoutSeconds range-refuses), so this
     // is the call site where the silent saturation would actually reach an
     // operator: a seed one past the real max would silently become
     // `u64::MAX` instead of being refused.
     #[test]
-    fn extras_u64_strict_refuses_a_float_that_rounds_up_past_u64_max_instead_of_saturating() {
+    fn knob_u64_strict_refuses_a_float_that_rounds_up_past_u64_max_instead_of_saturating() {
         let mut extras = BTreeMap::new();
         extras.insert("seed".to_string(), serde_json::json!(u64::MAX as f64));
-        let result = extras_u64_strict(&extras, "seed", "a non-negative integer");
+        let result = knob_u64_strict(extras.get("seed"), "seed", "a non-negative integer");
         assert!(
             result.is_err(),
             "a float at u64::MAX's own rounded-up ceiling is one past the true max and must be \
@@ -2889,7 +2886,7 @@ not json — tolerated
     fn chain_depths_strict_accepts_mixed_string_and_number_elements() {
         let mut extras = BTreeMap::new();
         extras.insert("chainDepths".to_string(), serde_json::json!(["2", 4, "6"]));
-        assert_eq!(chain_depths_strict(&extras).unwrap(), vec![2, 4, 6]);
+        assert_eq!(chain_depths_strict(extras.get("chainDepths")).unwrap(), vec![2, 4, 6]);
     }
 
     // (Also fix, frontier review) A genuinely MIXED array used to keep its
@@ -2905,8 +2902,8 @@ not json — tolerated
         let mut mixed = BTreeMap::new();
         mixed.insert("chainDepths".to_string(), serde_json::json!(["2", 4, "6"]));
         assert_eq!(
-            chain_depths_strict(&all_string).unwrap(),
-            chain_depths_strict(&mixed).unwrap(),
+            chain_depths_strict(all_string.get("chainDepths")).unwrap(),
+            chain_depths_strict(mixed.get("chainDepths")).unwrap(),
             "an all-string array and a mixed array holding the same depths must resolve identically"
         );
     }
@@ -2915,24 +2912,24 @@ not json — tolerated
     fn chain_depths_strict_accepts_integral_float_elements() {
         let mut extras = BTreeMap::new();
         extras.insert("chainDepths".to_string(), serde_json::json!([2.0, 4, "6"]));
-        assert_eq!(chain_depths_strict(&extras).unwrap(), vec![2, 4, 6]);
+        assert_eq!(chain_depths_strict(extras.get("chainDepths")).unwrap(), vec![2, 4, 6]);
     }
 
     // (Also fix, second-round frontier review) Same quoted/bare parity gap
-    // as `extras_u64_strict` — a quoted decimal element (`"4.0"`) must
+    // as `knob_u64_strict` — a quoted decimal element (`"4.0"`) must
     // resolve exactly like its bare float form.
     #[test]
     fn chain_depths_strict_accepts_a_quoted_integral_float_element() {
         let mut extras = BTreeMap::new();
         extras.insert("chainDepths".to_string(), serde_json::json!(["2", "4.0", 6]));
-        assert_eq!(chain_depths_strict(&extras).unwrap(), vec![2, 4, 6]);
+        assert_eq!(chain_depths_strict(extras.get("chainDepths")).unwrap(), vec![2, 4, 6]);
     }
 
     #[test]
     fn chain_depths_strict_refuses_a_garbage_element_by_name() {
         let mut extras = BTreeMap::new();
         extras.insert("chainDepths".to_string(), serde_json::json!([2, "soon"]));
-        let err = chain_depths_strict(&extras).expect_err("a garbage element must be refused");
+        let err = chain_depths_strict(extras.get("chainDepths")).expect_err("a garbage element must be refused");
         assert!(format!("{err:#}").contains("soon"));
     }
 
@@ -2946,7 +2943,7 @@ not json — tolerated
     fn chain_depths_strict_refuses_a_zero_depth_instead_of_silently_raising_it() {
         let mut extras = BTreeMap::new();
         extras.insert("chainDepths".to_string(), serde_json::json!([2, 0, 4]));
-        let err = chain_depths_strict(&extras)
+        let err = chain_depths_strict(extras.get("chainDepths"))
             .expect_err("0 must be refused, not silently raised to the chaining minimum");
         let msg = format!("{err:#}");
         assert!(msg.contains('0'), "the offending value is named: {msg}");
@@ -2960,17 +2957,17 @@ not json — tolerated
     fn chain_depths_strict_refuses_a_non_array_value_instead_of_defaulting() {
         let mut extras = BTreeMap::new();
         extras.insert("chainDepths".to_string(), serde_json::json!("2,4,6"));
-        let err = chain_depths_strict(&extras).expect_err("a non-array value must be refused");
+        let err = chain_depths_strict(extras.get("chainDepths")).expect_err("a non-array value must be refused");
         assert!(format!("{err:#}").contains("array"));
     }
 
     #[test]
     fn chain_depths_strict_falls_back_to_the_default_ladder_when_absent_or_empty() {
-        let extras = BTreeMap::new();
-        assert_eq!(chain_depths_strict(&extras).unwrap(), vec![2, 4, 6]);
+        let extras: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        assert_eq!(chain_depths_strict(extras.get("chainDepths")).unwrap(), vec![2, 4, 6]);
         let mut extras2 = BTreeMap::new();
         extras2.insert("chainDepths".to_string(), serde_json::json!([]));
-        assert_eq!(chain_depths_strict(&extras2).unwrap(), vec![2, 4, 6]);
+        assert_eq!(chain_depths_strict(extras2.get("chainDepths")).unwrap(), vec![2, 4, 6]);
     }
 
     // (Also fix, frontier review) A value above `MAX_CHAIN_DEPTH` must be
@@ -2981,7 +2978,7 @@ not json — tolerated
     fn chain_depths_strict_refuses_a_depth_above_the_cap() {
         let mut extras = BTreeMap::new();
         extras.insert("chainDepths".to_string(), serde_json::json!([2, MAX_CHAIN_DEPTH + 1]));
-        let err = chain_depths_strict(&extras).expect_err("a depth above the cap must be refused");
+        let err = chain_depths_strict(extras.get("chainDepths")).expect_err("a depth above the cap must be refused");
         let msg = format!("{err:#}");
         assert!(msg.contains(&(MAX_CHAIN_DEPTH + 1).to_string()), "the offending value is named: {msg}");
         assert!(msg.contains(&MAX_CHAIN_DEPTH.to_string()), "the cap is named: {msg}");
@@ -2991,7 +2988,7 @@ not json — tolerated
     fn chain_depths_strict_accepts_a_depth_exactly_at_the_cap() {
         let mut extras = BTreeMap::new();
         extras.insert("chainDepths".to_string(), serde_json::json!([MAX_CHAIN_DEPTH]));
-        assert_eq!(chain_depths_strict(&extras).unwrap(), vec![MAX_CHAIN_DEPTH]);
+        assert_eq!(chain_depths_strict(extras.get("chainDepths")).unwrap(), vec![MAX_CHAIN_DEPTH]);
     }
 
     // (Also fix, frontier review) A value that overflows `u32` entirely
@@ -3003,7 +3000,7 @@ not json — tolerated
         let mut extras = BTreeMap::new();
         extras.insert("chainDepths".to_string(), serde_json::json!([2, (u32::MAX as u64) + 1]));
         let err =
-            chain_depths_strict(&extras).expect_err("a value above u32::MAX must be refused, not saturated");
+            chain_depths_strict(extras.get("chainDepths")).expect_err("a value above u32::MAX must be refused, not saturated");
         let msg = format!("{err:#}");
         assert!(
             !msg.contains(&u32::MAX.to_string()),
@@ -3029,7 +3026,7 @@ not json — tolerated
         // per-element cap alone does not catch this.
         let ladder: Vec<u32> = (2..=(MAX_CHAIN_LADDER_LEN as u32 + 3)).collect();
         extras.insert("chainDepths".to_string(), serde_json::json!(ladder));
-        let err = chain_depths_strict(&extras)
+        let err = chain_depths_strict(extras.get("chainDepths"))
             .expect_err("a ladder with more distinct depths than the aggregate cap must be refused");
         let msg = format!("{err:#}");
         assert!(
@@ -3053,7 +3050,7 @@ not json — tolerated
         let mut extras = BTreeMap::new();
         let ladder = vec![2u32; MAX_CHAIN_LADDER_LEN + 1];
         extras.insert("chainDepths".to_string(), serde_json::json!(ladder));
-        let err = chain_depths_strict(&extras).expect_err(
+        let err = chain_depths_strict(extras.get("chainDepths")).expect_err(
             "a repeated-value ladder over the raw-entry cap must still be refused — it generates \
              one task, but the cap is deliberately conservative on raw length",
         );
@@ -3070,7 +3067,7 @@ not json — tolerated
         let mut extras = BTreeMap::new();
         let ladder: Vec<u32> = (2..(2 + MAX_CHAIN_LADDER_LEN as u32)).collect();
         extras.insert("chainDepths".to_string(), serde_json::json!(ladder.clone()));
-        assert_eq!(chain_depths_strict(&extras).unwrap(), ladder);
+        assert_eq!(chain_depths_strict(extras.get("chainDepths")).unwrap(), ladder);
     }
 
     // ─── manifest sweep: the SHIPPED tool-bench.json takes the absent-key path ───

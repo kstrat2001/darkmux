@@ -30,6 +30,7 @@ pub mod size;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_isolation;
 pub mod style;
+pub mod user_files;
 pub mod workdir;
 
 use serde::{Deserialize, Serialize};
@@ -70,7 +71,7 @@ pub fn build_version() -> String {
 /// Unknown variant names fail to deserialize with a clear error — no
 /// silent typo-induced zero-weight bugs. Pre-1.0 schema growth is fine;
 /// removing a variant is breaking, so seed conservatively.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
     /// Code generation + understanding. Benchmarks: HumanEval, MBPP,
@@ -94,6 +95,31 @@ pub enum Capability {
 /// capped by the `Capability` variant count).
 pub type CapabilityProfile = BTreeMap<Capability, f32>;
 
+/// The schema of a [`CapabilityProfile`] field, for the unknown-key gate
+/// (`user_files`). Derived schemas lose a map's key type when the key enum
+/// documents its variants, which would let a misspelled capability pass the
+/// gate and then fail the load; this names each [`Capability`] token (read
+/// from that enum's own schema, never listed here) as the only valid key.
+/// Used only as `#[schemars(with)]`.
+pub struct CapabilityProfileSchema;
+
+impl schemars::JsonSchema for CapabilityProfileSchema {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "CapabilityProfile".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let enum_schema = schemars::schema_for!(Capability).to_value();
+        let tokens = user_files::enum_tokens(&enum_schema);
+        // A map (so `_comment` is an entry here, not a note) whose keys must
+        // be a capability token.
+        schemars::json_schema!({
+            "type": "object",
+            "additionalProperties": {"type": "number"},
+            "propertyNames": {"enum": tokens},
+        })
+    }
+}
+
 // (#2310 P1) `PartialEq` added so `ProfileModel` can compose into
 // `ResolvedSeatStaffing`/`ResolvedReviewRoles` (darkmux-crew's
 // resourcing.rs) and, through those, into `darkmux-lab`'s `ReviewContext`
@@ -102,7 +128,7 @@ pub type CapabilityProfile = BTreeMap<Capability, f32>;
 // `Capability`/`ModelEndpoint` both derive `PartialEq`, and
 // `serde_json::Map`'s does too), so this is additive, not a new
 // obligation on existing fields.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProfileModel {
     pub id: String,
     /// Context window. For a LOCAL model this is the load parameter (a
@@ -135,6 +161,7 @@ pub struct ProfileModel {
     /// against it," which read as an inert field and made a live selection
     /// knob look safe to populate blindly.)
     #[serde(default)]
+    #[schemars(with = "CapabilityProfileSchema")]
     pub capabilities: CapabilityProfile,
     /// The endpoint this model is served from. Absent ⇒ the managed LM
     /// Studio default. (#2902 step 4) Written as an id naming an entry of the
@@ -145,10 +172,12 @@ pub struct ProfileModel {
     /// is a *declared* window (darkmux cannot load-set it) rather than a
     /// load parameter.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "endpoint::endpoint_field")]
+    #[schemars(with = "Option<endpoint::EndpointFieldSchema>")]
     pub endpoint: Option<ModelEndpoint>,
     /// Forward-compat overflow — unknown keys land here and
     /// re-serialize flat (a newer config read by an older binary).
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -199,8 +228,8 @@ impl ProfileModel {
 
 /// Runtime block of a profile. (A `config_path` field — the removed
 /// openclaw-config patch target — was deleted with the openclaw path in
-/// #1405; serde tolerates the stale key in an old `profiles.json`.)
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// #1405; the stale key still loads, and the unknown-key gate refuses it.)
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProfileRuntime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u64>,
@@ -213,7 +242,7 @@ pub struct ProfileRuntime {
 /// result can be dropped from context without invoking the compactor
 /// model. v0.1 ships the field shape only; the consumer is added in
 /// Step 3 (#352 sub-issue list).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct Tier1Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eviction_after_unreferenced_turns: Option<u32>,
@@ -229,7 +258,7 @@ pub struct Tier1Config {
 /// entries override matching defaults at consume-time. Unknown slot
 /// names are accepted (forward-compat for per-role schema extensions
 /// in v0.2+).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct Tier2Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<String>,
@@ -241,7 +270,7 @@ pub struct Tier2Config {
 /// nor tier-2 keeps the dispatch viable, the agent emits partial state
 /// plus a reframe marker rather than compressing further. Step 6 of
 /// #352 wires up the consumer.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct ReserveConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bail_after_token_count: Option<u64>,
@@ -276,7 +305,7 @@ pub struct ReserveConfig {
 ///   carrying a labeled-markdown rendering of the slots. Operator-
 ///   opt-in via `profile.runtime.compaction.strategy: "structured-
 ///   slot"`. T2-B implements the compactor; T2-C wires the routing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum CompactionStrategy {
     /// Today's default — narrative middle-replace via prose summary.
@@ -285,7 +314,7 @@ pub enum CompactionStrategy {
     StructuredSlot,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RuntimeCompactionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<CompactionStrategy>,
@@ -328,6 +357,7 @@ pub struct RuntimeCompactionConfig {
     /// unchanged. Nothing reads them: a key with no typed field has no
     /// effect on compaction.
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -362,15 +392,15 @@ impl RuntimeCompactionConfig {
 // (#1426 phase 3) `RegistryHooks`/`ProfileHookCommand` (the registry's
 // `hooks.pre_swap`/`hooks.post_swap` blocks) were deleted with the retired
 // `swap` verb — swap's executor was their ONLY trigger, so the hooks retire
-// with it. Lenient-on-read (the `#[serde(flatten)] extras` overflow on
-// `ProfileRegistry`) means an operator profiles.json still carrying a
-// `hooks` block parses fine and is ignored.
+// with it. An operator profiles.json still carrying a `hooks` block parses
+// fine (the `#[serde(flatten)] extras` overflow on `ProfileRegistry`), and
+// the unknown-key gate refuses it, naming the removal.
 
 /// Machine-level internal bindings — darkmux's own standing infrastructure
 /// for this machine, a sibling to the operator's `profiles`. Decoupled from
 /// any single profile so swapping a profile never changes the
 /// compaction model. (#590)
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RegistryInternal {
     /// The machine's **utility model** — the standing support model darkmux
     /// runs its OWN jobs on (compaction, radio routing; #2914). The operator
@@ -397,7 +427,7 @@ pub struct RegistryInternal {
 /// spelling, still read) or an object declaring the model's own context
 /// window. Untagged so both spellings parse from the same key; the object
 /// form serializes back as an object, the bare form as a string.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum UtilityBinding {
     /// `"utility": "<model-id>"` — no window declared. Consumers that need
@@ -408,7 +438,7 @@ pub enum UtilityBinding {
 }
 
 /// (#2914) The object form of [`UtilityBinding`].
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct UtilityModel {
     pub id: String,
     /// The window the utility model is loaded at, and the size a compaction
@@ -421,6 +451,7 @@ pub struct UtilityModel {
     /// other direction: a binary from before 2.0 cannot read the object at
     /// all, see `PROFILES_SCHEMA_VERSION`.)
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -449,7 +480,7 @@ impl UtilityBinding {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -469,6 +500,7 @@ pub struct Profile {
     /// Forward-compat overflow — unknown keys land here and
     /// re-serialize flat (a newer config read by an older binary).
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -490,8 +522,9 @@ impl Profile {
 }
 
 /// Semver of the `profiles.json` registry shape. Additive field/section adds
-/// are a **minor** bump (older binaries safely ignore unknown keys via
-/// `extras`); renaming/retyping a field is **major**. Mirrors the
+/// are a **minor** bump; renaming/retyping a field is **major**. An unknown
+/// key still loads (`extras`), but every dispatching entry point refuses it
+/// (`user_files`), so an older binary refuses a newer registry's new key. Mirrors the
 /// `CONFIG_SCHEMA_VERSION` discipline (`darkmux_types::config`) — this is
 /// the registry's first formalized constant (the `schema_version` field on
 /// [`ProfileRegistry`] predates it as free-text, operator-set text; no
@@ -564,7 +597,7 @@ pub const PROFILES_SCHEMA_VERSION: &str = "2.0";
 // (#2310 P1) `PartialEq` added — same reason as `ProfileModel`'s own note:
 // this is a field of `ResolvedSeatStaffing`, which needs it to compose into
 // `ReviewContext`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BundleSelector {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fact_families: Vec<String>,
@@ -573,6 +606,7 @@ pub struct BundleSelector {
     /// Forward-compat overflow — unknown keys land here and re-serialize
     /// flat (a newer config read by an older binary).
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -611,17 +645,17 @@ impl std::fmt::Display for QuarantinedEntryKind {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProfileRegistry {
     pub profiles: BTreeMap<String, Profile>,
-    /// Schema version — additive field/section adds are a minor bump
-    /// (older binaries safely ignore unknown keys via `extras`);
-    /// renaming/retyping a field is major.
+    /// Schema version — additive field/section adds are a minor bump;
+    /// renaming/retyping a field is major (see `PROFILES_SCHEMA_VERSION`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<String>,
     // (#1426 phase 3) A `hooks` field (RegistryHooks — pre/post-swap shell
     // commands) lived here until the `swap` verb retired; a registry still
-    // carrying that block parses fine (it lands in `extras`) and is ignored.
+    // carrying that block parses fine (it lands in `extras`) and the
+    // unknown-key gate refuses it, naming the removal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_profile: Option<String>,
     /// Machine-level internal bindings (the utility model, …) — sibling to
@@ -640,8 +674,8 @@ pub struct ProfileRegistry {
     // (#1426 ship-2) The `crews` map retired from the profiles schema — a crew
     // is now a DERIVED VIEW of a mission's resourcing, not a declared entity
     // (round-4 decision). A profiles.json still carrying a `crews` key parses
-    // fine: the key overflows into `extras` below (lenient-on-read) and
-    // re-serializes flat, harmless residue. Review staffing now comes from the
+    // fine (the key overflows into `extras` below), and the unknown-key gate
+    // refuses it, naming the removal. Review staffing now comes from the
     // role→profile resolver (`darkmux_crew::resourcing`, #1475) — each review
     // role resolves via its binding: a `--param <role>=<profile>` launch
     // override, else the `role_profiles` map, else `default_profile`.
@@ -654,6 +688,7 @@ pub struct ProfileRegistry {
     /// Forward-compat overflow — unknown top-level keys land here and
     /// re-serialize flat (a newer config read by an older binary).
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -928,7 +963,7 @@ impl RegistryIssue {
 // return loaded-model state as JSON for the flow viewer's toolbar pill.
 // `Deserialize` (#1426) so `darkmux machine status <id>` can read a roster
 // peer's residents back out of that same endpoint's JSON.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LoadedModel {
     pub identifier: String,
     pub model: String,

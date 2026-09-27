@@ -55,7 +55,7 @@ use std::path::{Path, PathBuf};
 /// where `json` is the verbatim manifest. This makes `cargo install --path .`
 /// self-contained — users don't need a checked-out source tree to use the
 /// built-in workloads.
-const EMBEDDED_WORKLOADS: &[(&str, &str)] = &[
+pub(crate) const EMBEDDED_WORKLOADS: &[(&str, &str)] = &[
     (
         "quick-q",
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/workloads/quick-q.json")),
@@ -274,6 +274,31 @@ pub fn list_available(user_dir: Option<&Path>) -> Vec<String> {
         set.insert((*id).to_string());
     }
     set.into_iter().collect()
+}
+
+/// Every directory a workload document is read from on disk: the user tier
+/// (`<user root>/workloads`), then the on-disk built-in template dirs (the
+/// embedded tier is compiled in, not a file).
+pub(crate) fn on_disk_dirs(user_root: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![user_root.join("workloads")];
+    dirs.extend(builtin_dirs());
+    dirs
+}
+
+/// Every workload document in `dir`, in both layouts [`find_in_dir`]
+/// resolves: `<id>.json` and `<id>/workload.json`.
+pub(crate) fn documents_in(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut docs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter_map(|p| match p.is_dir() {
+            true => Some(p.join("workload.json")).filter(|w| w.is_file()),
+            false => Some(p).filter(|f| f.extension().is_some_and(|e| e == "json")),
+        })
+        .collect();
+    docs.sort();
+    docs
 }
 
 fn find_in_dir(dir: &Path, id: &str) -> Option<PathBuf> {
