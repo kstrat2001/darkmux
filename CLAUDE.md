@@ -338,14 +338,19 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    for the same event. Every action is a `darkmux_flow::FlowAction` variant, spelled
    `<scope>.<event>[.<detail>]` (lowercase, two or three dot-separated segments), and the
    wire string lives in exactly one place: `crates/darkmux-flow/src/action.rs`. Producers
-   build the enum; no constructor, builder or helper takes an action as a string. Consumers
-   match on the enum, never on a string. The pre-4.0 spellings (`dispatch start`,
-   `step result`, `mission close`, `note`, `verdict: <v>`, ...) live only in
+   build the enum; no constructor, builder or helper takes an action as a string, and
+   `FlowAction`'s public deserializer refuses an unknown or retired action. Consumers match
+   on the enum, never on a string. The pre-4.0 spellings (`dispatch start`, `step result`,
+   `mission close`, `note`, `verdict: <v>`, `sprint *`, ...) live only in
    `darkmux_flow::legacy`, and every reader goes through `darkmux_flow::reader`, which
-   upgrades them on read; archives are append-only and are never rewritten. An action this
-   build does not know reads as `FlowAction::Other`, is never treated as vocabulary, and is
-   counted by `darkmux doctor`. `scripts/flow-action-guard.py` (CI) fails on any flow
-   action written as a string literal outside the vocabulary. The bookends
+   upgrades them on read; archives are append-only and are never rewritten. An action
+   darkmux retired with no current equivalent (`telemetry.process`, `funnel.*`, ...) reads as
+   `FlowAction::Retired`; one this build does not know reads as `FlowAction::Other` and is
+   counted by `darkmux doctor`. Neither can be written: every sink write goes through
+   `FlowSinkWrite::write`, which refuses both before any sink sees the record.
+   `scripts/flow-action-guard.py` (CI) fails on a flow action written by hand (a literal, a
+   format string, a prefix test, `concat!`, or JSON inside a string) outside the vocabulary.
+   Hook rules written in an old exact spelling are read as the current action. The bookends
    `dispatch.start`/`dispatch.complete` are still emitted at BOTH grains today (the whole
    run, and an inner role execution); separating the run grain is the migration below. What
    entry 8 fixes is the WORD used in code, docs and UI, where `dispatch` had come to mean

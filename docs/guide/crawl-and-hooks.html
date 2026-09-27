@@ -122,17 +122,17 @@ graph:
 
     <h3>The record sequence</h3>
     <p>Generic mission and dispatch bookends wrap each unit:</p>
-    <pre><code>mission start          <span class="comment"># operator-tier: the graph this run minted (and what it pruned)</span>
-phase start
-step complete           <span class="comment"># one per rule: the plan it wrote</span>
-step start
-dispatch start          <span class="comment"># local-tier: role=crawler, the assembled prompt, the model</span>
+    <pre><code>mission.start          <span class="comment"># operator-tier: the graph this run minted (and what it pruned)</span>
+phase.start
+step.complete           <span class="comment"># one per rule: the plan it wrote</span>
+step.start
+dispatch.start          <span class="comment"># local-tier: role=crawler, the assembled prompt, the model</span>
 dispatch.turn / dispatch.tool / dispatch.reasoning   <span class="comment"># the loop, repeated per turn</span>
 dispatch.rest           <span class="comment"># only when runtime.turn_delay_ms is set — see the knobs table below</span>
-dispatch complete        <span class="comment"># wall_ms, rests, total_turns, total_tools, total_tokens</span>
-step complete            <span class="comment"># the unit's typed outcome: findings, wall_ms, per-unit token counts</span>
+dispatch.complete        <span class="comment"># wall_ms, rests, total_turns, total_tools, total_tokens</span>
+step.complete            <span class="comment"># the unit's typed outcome: findings, wall_ms, per-unit token counts</span>
 <span class="comment"># ...repeated per planned unit...</span>
-mission close            <span class="comment"># units_completed/errored/skipped, stopped_by, tokens_per_hour</span></code></pre>
+mission.close            <span class="comment"># units_completed/errored/skipped, stopped_by, tokens_per_hour</span></code></pre>
     <p>Real records from a completed crawl, scrubbed of local paths and the machine id:</p>
     <pre><code>{"action":"mission.start","tier":"operator","mission_id":"crawl-1787979698-b5961a",
  "payload":{"graph":{"tasks_in_config":9,"tasks_minted":3,
@@ -250,9 +250,9 @@ darkmux mod show &lt;key&gt;</code></pre>
     "rules": [
       { "match": { "action": "dispatch.tool", "payload.tool_name": "create_finding", "payload.ok": true },
         "http": "http://127.0.0.1:8790/events" },
-      { "match": { "action": "step *" },
+      { "match": { "action": "step.*" },
         "http": "http://127.0.0.1:8790/events" },
-      { "match": { "action": "mission *" },
+      { "match": { "action": "mission.*" },
         "http": "http://127.0.0.1:8790/events" }
     ]
   }
@@ -282,7 +282,7 @@ darkmux mod show &lt;key&gt;</code></pre>
   "hooks": {
     "enabled": true,
     "rules": [
-      { "match": { "action": "step *" },
+      { "match": { "action": "step.*" },
         "http": "http://100.64.1.2:8790/events",
         "signing_secret_keychain_item": "darkmux-hook-crawl-tracker" }
     ]
@@ -303,9 +303,9 @@ Hooks
       undelivered: 0
       last delivery: 2026-08-29T05:04:41Z
       last drainer heartbeat: 2026-08-29T15:06:14Z
-  #1: action=step * -> http://127.0.0.1:8790/events
+  #1: action=step.* -> http://127.0.0.1:8790/events
       undelivered: 0
-  #2: action=mission * -> http://127.0.0.1:8790/events
+  #2: action=mission.* -> http://127.0.0.1:8790/events
       undelivered: 0</code></pre>
     <p>Undelivered count, last delivery, and the drainer's heartbeat tell "nothing to send" from "stuck."</p>
 
@@ -436,7 +436,7 @@ http.createServer((req, res) => {
     <p><strong>Data boundary.</strong> This seat sends the finding and the source lines it names to a third party. Use it on public repositories only. Work under a client or employer boundary stays on a local seat or on that organization's own endpoint — the attended hook path exists for exactly that case.</p>
 
     <h3>What the seat costs, in tokens</h3>
-    <p>Every dispatch writes a <code>dispatch complete</code> flow record carrying <code>prompt_tokens</code>, <code>completion_tokens</code> and, for a remote seat, <code>endpoint</code>. Sum the <code>coder</code> handle for one mission and put it beside the diff you fed in:</p>
+    <p>Every dispatch writes a <code>dispatch.complete</code> flow record carrying <code>prompt_tokens</code>, <code>completion_tokens</code> and, for a remote seat, <code>endpoint</code>. Sum the <code>coder</code> handle for one mission and put it beside the diff you fed in:</p>
     <pre><code>jq -r 'select(.action == "dispatch.complete" and .handle == "coder"
               and .mission_id == "&lt;mission-id&gt;")
        | [.payload.prompt_tokens, .payload.completion_tokens] | @tsv' \

@@ -322,14 +322,14 @@ def replay(source, plan, machine, now_ms, session_id):
     # records rather than assumed, so re-importing a different session does
     # not silently re-skin the wrong half of its telemetry.
     source_primary = next((r.get("model") for r in source
-                           if r.get("action") == "dispatch start" and r.get("model")), None)
+                           if r.get("action") == "dispatch.start" and r.get("model")), None)
     # The runs board reads a run's ROLE from the record `handle`
     # (`runs.rs:1403` — `agg.role` falls back to the bookend's handle), so a
     # replay that renames only the session id shows every run as the recorded
     # session's role. Read the source handle rather than assuming "crawler",
     # so re-importing a different session stays correct.
     source_role = next((r.get("handle") for r in source
-                        if r.get("action") == "dispatch start" and r.get("handle")), None)
+                        if r.get("action") == "dispatch.start" and r.get("handle")), None)
     span = max(r["t_ms"] for r in source)
     live = plan.get("live", False)
     if live:
@@ -348,7 +348,7 @@ def replay(source, plan, machine, now_ms, session_id):
         # A live run has not finished, so it must not carry a terminal record.
         # Dropping it is what the daemon reads as "still running" — the same
         # bookend rule contract 2 states, honored rather than simulated.
-        if live and r.get("action") in ("dispatch complete", "dispatch error"):
+        if live and r.get("action") in ("dispatch.complete", "dispatch.error"):
             continue
         r["ts"] = iso(start + t)
         r["session_id"] = session_id

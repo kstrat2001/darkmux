@@ -112,8 +112,28 @@ darkmux release.
   --action` accepts only known actions. **Migration:** a consumer of the
   flow stream outside darkmux (a hook receiver, a script over the day files
   or Redis) must read the dotted spellings. A hook rule whose `match.action`
-  names a retired spelling never matches again: `darkmux doctor` flags it
-  `CANNOT MATCH` and names the spelling to write instead.
+  names an old exact spelling (`dispatch complete`) still matches: the hook
+  layer reads it as its current action, and `darkmux doctor` flags it `OLD
+  SPELLING` with what to write instead. A spaced glob is read as its dotted
+  twin only when that twin matches exactly what it used to (`step *` reads
+  as `step.*`); one that would match more (`dispatch *`, `mission *`,
+  `phase *`) matches nothing, and both `darkmux doctor` (`CANNOT MATCH`) and
+  the hook sink at startup say so.
+- **Every machine in a fleet upgrades together** (FLOW 2.0.0). A 4.0 reader
+  upgrades a 3.x peer's records, but a 3.x reader does not know the dotted
+  spellings: a 3.x hub misreads a 4.0 peer's records (its missions never
+  end, its step results aren't folded). **Migration:** upgrade every
+  machine in the fleet before relying on the hub's views.
+- **Dotted hook globs now match the bookends too** (FLOW 2.0.0). Before 4.0
+  these actions were spaced, so a dotted glob never saw them: `dispatch.*`
+  now also matches `dispatch.start` / `complete` / `error` / `route`;
+  `mission.*` also matches `mission.start` / `close` / `abort` / `pause` /
+  `resume`; `step.*` (which matched nothing before) matches `step.start` /
+  `complete` / `error` / `result` / `timing` / `seat_unresolved`; and
+  `phase.*` matches `phase.start` / `complete` / `abandon` / `added` /
+  `id_ambiguous` and `phase.review.begin` / `aborted` / `dispatch` /
+  `failed` / `verdict`. **Migration:** a receiver behind one of these globs
+  sees more records; narrow the rule (`dispatch.tool`) if it should not.
 
 - **The degeneracy detector's policy values name the action: `off`,
   `record`, `warn`, `conclude`** (#2947). `enforce` is now `conclude` (still
