@@ -383,6 +383,8 @@ pub(crate) fn assert_one_usage_record<'a>(
 /// One record's contribution: the twin of `usageContribution`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageAmount {
+    /// What the record's counts add up to, for display sums: its total, else
+    /// whatever halves it reported. A lower bound when a half is missing.
     pub total: u64,
     pub prompt: u64,
     pub completion: u64,
@@ -390,6 +392,11 @@ pub struct UsageAmount {
     pub purpose: UsagePurpose,
     /// True when the payload carried any token count.
     pub reported: bool,
+    /// What the call SPENT, by the one total rule
+    /// ([`darkmux_trajectory::UsageCounts::total_tokens`]): `None` when it is
+    /// unknown (no usage, or no prompt count). The endpoint budget reads
+    /// this, never `total`.
+    pub spend: Option<u64>,
 }
 
 /// True for a usage record (`telemetry.tokens`), by either mark it carries
@@ -477,7 +484,15 @@ pub fn amount_of(p: &serde_json::Value) -> UsageAmount {
         total = num(p.get("remote_tokens"));
     }
     let cached = p.get("cached_tokens").filter(|c| is_finite_number(c)).map(|c| num(Some(c)));
-    UsageAmount { total, prompt, completion, cached, purpose: usage_purpose(p), reported: has_any_token_counts(p) }
+    UsageAmount {
+        total,
+        prompt,
+        completion,
+        cached,
+        purpose: usage_purpose(p),
+        reported: has_any_token_counts(p),
+        spend: darkmux_trajectory::UsageCounts::from_provider(p).total_tokens(),
+    }
 }
 
 /// The per-record half of the sum: what one usage record adds, or `None`

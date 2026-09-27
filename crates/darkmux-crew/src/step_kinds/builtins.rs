@@ -1067,7 +1067,7 @@ impl DispatchSingleShotStepKind {
             crate::budget::settle_step_live(
                 &step_bucket,
                 max_tokens,
-                conservative_hosted_spend(reply.counts.total_tokens(), max_tokens),
+                crate::budget::conservative_hosted_spend(reply.counts.total_tokens(), max_tokens),
                 1,
                 &step.id,
                 &budget_caller,
@@ -1195,16 +1195,6 @@ impl DispatchSingleShotStepKind {
 // `dispatch.single_shot`'s hosted arm) is unchanged and documented on `run`
 // below.
 
-/// (#1442 gate C4) What one hosted call SPENDS from the bucket: its usage
-/// total ([`darkmux_trajectory::UsageCounts::total_tokens`], the amount its
-/// usage record carries) when the reply reported one, else — conservatively
-/// — the `max_tokens` the call was granted. An endpoint that omits
-/// usage entirely must not mint an infinite allowance (spending 0 per call
-/// would let an omitting endpoint dispatch the whole collection off the
-/// meter); over-counting a capped grant is the safe direction.
-fn conservative_hosted_spend(total_tokens: Option<u64>, granted_max_tokens: u32) -> u64 {
-    total_tokens.unwrap_or(u64::from(granted_max_tokens))
-}
 
 /// (#1442) One `dispatch.map` item's outcome, serialized (in input-collection
 /// order) into the step's `output` JSON array. A downstream step reads this
@@ -2594,7 +2584,7 @@ fn map_hosted_item(
                 crate::budget::settle_step_live(
                     bucket,
                     clamped,
-                    conservative_hosted_spend(reply.counts.total_tokens(), clamped),
+                    crate::budget::conservative_hosted_spend(reply.counts.total_tokens(), clamped),
                     1,
                     step_label,
                     caller,
@@ -4825,6 +4815,32 @@ mod tests {
         assert_eq!(out.total_tokens, Some(42));
     }
 
+    /// A reply that reports its completion but not its prompt has an
+    /// UNKNOWN spend (the prompt is usually most of it), so the call settles
+    /// the whole granted cap, the same as a reply that reported nothing,
+    /// and its record carries no total.
+    #[test]
+    fn a_map_call_with_no_prompt_count_settles_the_granted_cap() {
+        let bucket = Arc::new(Mutex::new(RemoteBudget::new(None, darkmux_types::config::StepBudgetPolicy::Warn)));
+        let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
+            Ok(crate::single_shot::SingleShotReply {
+                content: "answer".into(),
+                model: None,
+                counts: darkmux_trajectory::UsageCounts { completion: Some(12), ..Default::default() },
+            })
+        });
+        let mut calls = Vec::new();
+        let out = map_hosted_item(
+            0, &bucket, &map_ep(), "gpt-5.1", "sys", "user", 4_096, 0, 0, 0, Some(&ovr),
+            &mut calls, "s1", &crate::budget::BudgetCaller::default(),
+        );
+        let record = map_call_token_payload(&calls[0], 0, true, "gpt-5.1", "ep", None);
+        assert!(record.get("total_tokens").is_none_or(|t| t.is_null()), "{record}");
+        assert_eq!(record["completion_tokens"], 12, "the partial count is still recorded");
+        assert_eq!(bucket.lock().unwrap().used(), 4_096, "spend unknown: the granted cap, never 12");
+        assert_eq!(out.total_tokens, None);
+    }
+
     /// (#1605 QA finding, kept) An item whose first dispatch errored and
     /// whose retry came back empty reports the ERROR, never a fabricated
     /// empty success.
@@ -5100,9 +5116,9 @@ mod tests {
         // (#1442 gate C4) A reply that reports usage spends what it reports;
         // a reply that OMITS usage spends the clamped max_tokens it was
         // granted — an omitting endpoint must not mint an infinite allowance.
-        assert_eq!(conservative_hosted_spend(Some(1234), 4096), 1234);
-        assert_eq!(conservative_hosted_spend(None, 4096), 4096);
-        assert_eq!(conservative_hosted_spend(None, 0), 0);
+        assert_eq!(crate::budget::conservative_hosted_spend(Some(1234), 4096), 1234);
+        assert_eq!(crate::budget::conservative_hosted_spend(None, 4096), 4096);
+        assert_eq!(crate::budget::conservative_hosted_spend(None, 0), 0);
     }
 
     /// (#1530 dogfood) A map item's `telemetry.tokens` record carries the

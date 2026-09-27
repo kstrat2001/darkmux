@@ -352,7 +352,7 @@ fn the_extractor_discriminates_between_neighboring_functions() {
 
     // And the other direction: a genuinely model-free function must NOT
     // report a beat, or a `true` here means nothing.
-    let pure = fn_body(&read_src("src/step_kinds/builtins.rs"), "conservative_hosted_spend");
+    let pure = fn_body(&read_src("src/budget.rs"), "conservative_hosted_spend");
     assert!(
         !pure.contains(PRESENCE_CALL),
         "a pure helper reported a presence beat — the extractor is over-reaching"

@@ -113,13 +113,15 @@ impl UsageCounts {
     }
 
     /// THE total of one call: the provider's own total when it sent one,
-    /// else prompt + completion when it reported a split, else `None`.
-    /// Arithmetic on reported numbers only. The usage record, every token
-    /// sum and a step's budget settle all read this.
+    /// else prompt + completion when it reported BOTH, else `None`: a split
+    /// missing a half is not a total, and the prompt half is usually most
+    /// of the spend. `None` means the call's spend is unknown, which a
+    /// budget must never read as small. The usage record, every token sum
+    /// and a step's budget settle all read this.
     pub fn total_tokens(&self) -> Option<u64> {
         self.total.or(match (self.prompt, self.completion) {
-            (None, None) => None,
-            (p, c) => Some(p.unwrap_or(0).saturating_add(c.unwrap_or(0))),
+            (Some(p), Some(c)) => Some(p.saturating_add(c)),
+            _ => None,
         })
     }
 }
@@ -130,7 +132,9 @@ pub struct TokenSum {
     pub prompt: u64,
     pub completion: u64,
     /// Each call's [`UsageCounts::total_tokens`], summed: never recomputed
-    /// as prompt + completion over the whole run.
+    /// as prompt + completion over the whole run. A call whose total is
+    /// unknown adds nothing here (its reported halves still add to
+    /// `prompt`/`completion`).
     pub total: u64,
     /// `None` until a call reports the field.
     pub reasoning: Option<u64>,
@@ -162,7 +166,9 @@ mod tests {
         let split = UsageCounts { prompt: Some(30), completion: Some(12), ..Default::default() };
         assert_eq!(split.total_tokens(), Some(42));
         let half = UsageCounts { completion: Some(12), ..Default::default() };
-        assert_eq!(half.total_tokens(), Some(12));
+        assert_eq!(half.total_tokens(), None, "a split missing its prompt half is no total: the spend is unknown");
+        let other_half = UsageCounts { prompt: Some(30), ..Default::default() };
+        assert_eq!(other_half.total_tokens(), None);
         assert_eq!(UsageCounts::default().total_tokens(), None, "nothing reported is no total, not 0");
         assert!(!UsageCounts::default().reported());
     }
@@ -240,7 +246,8 @@ mod tests {
         s.add(&UsageCounts { prompt: Some(10), completion: Some(2), total: Some(20), ..Default::default() });
         s.add(&UsageCounts { prompt: Some(5), completion: Some(1), ..Default::default() });
         s.add(&UsageCounts::default());
-        assert_eq!((s.prompt, s.completion, s.total), (15, 3, 26));
+        s.add(&UsageCounts { completion: Some(7), ..Default::default() });
+        assert_eq!((s.prompt, s.completion, s.total), (15, 10, 26), "a call with no known total adds none");
         assert_eq!(s.reasoning, None, "no call reported reasoning");
         s.add(&UsageCounts { reasoning: Some(0), ..Default::default() });
         assert_eq!(s.reasoning, Some(0), "a reported 0 is a 0");

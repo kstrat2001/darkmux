@@ -10187,8 +10187,8 @@
     }
 
     /// (#795) A `usage` object missing a count omits that count from the
-    /// record (unreported, never a fabricated 0); the total is still the
-    /// one rule over what was reported.
+    /// record (unreported, never a fabricated 0), and with no prompt count
+    /// the call's total is unknown, so the record carries none.
     #[test]
     fn turn_tokens_payload_omits_an_unreported_count() {
         let event = serde_json::json!({
@@ -10199,7 +10199,7 @@
         let payload = turn_tokens_payload(&mc(event.clone()), "coder", "m", "ep", None);
         assert!(payload.get("prompt_tokens").is_none(), "{payload}");
         assert_eq!(payload["completion_tokens"], 500);
-        assert_eq!(payload["total_tokens"], 500);
+        assert!(payload.get("total_tokens").is_none(), "{payload}");
     }
 
     /// (#2877) A `model.partial` event carrying the new runtime fields
@@ -17134,6 +17134,61 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWarn]);
         let w = env.payload(darkmux_flow::FlowAction::BudgetWarn);
         assert_eq!((w["scope"].as_str(), w["spent"].as_u64(), w["limit"].as_u64()), (Some("step"), Some(9), Some(5)), "{w}");
+    }
+
+    /// A reply with no prompt count has an unknown spend: the step settles
+    /// the granted cap, and the usage record carries no total.
+    #[test]
+    #[serial]
+    fn dispatch_remote_settles_the_granted_cap_when_the_prompt_count_is_unreported() {
+        let (base_url, rx) = one_shot_http_mock(
+            r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"completion_tokens":3}}"#,
+        );
+        let home = TempDir::new().unwrap();
+        let flows_dir = TempDir::new().unwrap();
+        let keys = ["DARKMUX_HOME", "DARKMUX_FLOWS_DIR", "DARKMUX_REDIS_URL", "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP"];
+        let prev: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "5");
+        }
+        let session = format!("budget-unmetered-remote-{}", std::process::id());
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "pr-reviewer".to_string();
+        opts.session_id = Some(session.clone());
+        opts.phase_id = None;
+        let mut pm: darkmux_types::ProfileModel =
+            serde_json::from_str(&format!(r#"{{"id":"gpt-remote","endpoint":{{"url":"{base_url}"}}}}"#)).unwrap();
+        pm.endpoint.as_mut().unwrap().source = darkmux_types::EndpointSource::Named("azure".into());
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
+        let result = crate::budget::with_test_env(env.clone(), || {
+            dispatch_remote(
+                &opts,
+                &quarantine_test_role(),
+                "system prompt",
+                &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap(),
+            )
+        });
+        let records = drain_flow_records_for_session(flows_dir.path(), &session);
+        unsafe {
+            for (k, v) in keys.iter().zip(prev) {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        result.expect("the mock answers");
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(), "the endpoint was called");
+        let rec = crate::usage::assert_one_usage_record(&records, crate::usage::CallKind::SingleShot, "dispatch_remote (named)");
+        assert!(rec["payload"].get("total_tokens").is_none(), "{rec}");
+        assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWarn]);
+        let w = env.payload(darkmux_flow::FlowAction::BudgetWarn);
+        // No prompt count: the spend is unknown, so the step is charged the
+        // whole granted cap (4096 by default), never the 3 it reported.
+        assert_eq!((w["scope"].as_str(), w["spent"].as_u64(), w["limit"].as_u64()), (Some("step"), Some(4096), Some(5)), "{w}");
     }
 
     /// (#2902 step 1b) Drive the tailer with `events` and return its session's

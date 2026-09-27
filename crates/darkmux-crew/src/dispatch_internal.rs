@@ -2587,7 +2587,6 @@ fn single_shot_body(
     cap: Option<u32>,
     reasoning_effort: Option<&str>,
 ) -> serde_json::Value {
-    let default_cap = if reasoning_effort.is_some() { 16384 } else { 4096 };
     crate::single_shot::chat_body(&crate::single_shot::ChatBody {
         dialect,
         model: model_id,
@@ -2595,10 +2594,16 @@ fn single_shot_body(
             { "role": "system", "content": system_prompt },
             { "role": "user", "content": message },
         ]),
-        max_tokens: cap.unwrap_or(default_cap),
+        max_tokens: single_shot_cap(cap, reasoning_effort),
         temperature: None,
         reasoning_effort,
     })
+}
+
+/// The `max_tokens` a hosted single-shot request is granted: the caller's
+/// cap, else a default sized for whether the model reasons.
+fn single_shot_cap(cap: Option<u32>, reasoning_effort: Option<&str>) -> u32 {
+    cap.unwrap_or(if reasoning_effort.is_some() { 16384 } else { 4096 })
 }
 
 /// If this dispatch's resolved model is REMOTE, return the pieces the hosted
@@ -3559,7 +3564,10 @@ fn dispatch_remote(
     crate::budget::settle_step_live(
         &step_bucket,
         0,
-        counts.total_tokens().unwrap_or(0),
+        crate::budget::conservative_hosted_spend(
+            counts.total_tokens(),
+            single_shot_cap(opts.max_completion_tokens, ep.reasoning_effort.as_deref()),
+        ),
         1,
         "dispatch",
         &budget_caller,

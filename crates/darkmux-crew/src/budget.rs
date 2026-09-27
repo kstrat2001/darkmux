@@ -195,6 +195,10 @@ pub enum Metric {
 pub enum BreachLevel {
     /// At or past `warn_at` of the budget, still under it.
     Early,
+    /// Under a token budget, but a call in the window has an unknown spend
+    /// (it reported no prompt count, or no usage at all), so the window
+    /// cannot be metered: `spent` is only a lower bound.
+    Unmetered,
     /// At or past the budget.
     AtLimit,
 }
@@ -206,6 +210,9 @@ pub struct Breach {
     pub metric: Metric,
     pub spent: u64,
     pub limit: u64,
+    /// Calls in the window whose spend is unknown; `spent` counts none of
+    /// them.
+    pub unmetered: u64,
 }
 
 /// What the pure evaluation says about the next call.
@@ -221,19 +228,27 @@ pub enum Verdict {
 }
 
 /// Spend inside the window: `(epoch second, tokens)` per usage record,
-/// oldest first.
-pub type WindowEntries = Vec<(i64, u64)>;
+/// oldest first. `None` tokens: the call's spend is unknown
+/// ([`darkmux_trajectory::UsageCounts::total_tokens`]).
+pub type WindowEntries = Vec<(i64, Option<u64>)>;
 
 /// THE decision, pure: `entries` are this endpoint's records, `now` the
 /// injected clock. A record at second `t` is inside the window while
 /// `now < t + period`, so it leaves the window at exactly `t + period`.
-pub fn evaluate(b: &EndpointBudget, entries: &[(i64, u64)], now: i64) -> Verdict {
+///
+/// An unknown spend is never read as small: under a token budget, a window
+/// holding one is [`BreachLevel::Unmetered`], surfaced (and the call goes
+/// ahead) under `warn` and `wait` alike, since there is no number to wait
+/// on. A known spend already at the limit still breaches as usual.
+pub fn evaluate(b: &EndpointBudget, entries: &[(i64, Option<u64>)], now: i64) -> Verdict {
     if !b.policy.counts() {
         return Verdict::Proceed;
     }
     let period = b.window.period_secs as i64;
-    let inside: Vec<(i64, u64)> = entries.iter().copied().filter(|(t, _)| now < t + period && *t <= now).collect();
-    let tokens: u64 = inside.iter().map(|(_, n)| *n).fold(0u64, u64::saturating_add);
+    let inside: Vec<(i64, Option<u64>)> =
+        entries.iter().copied().filter(|(t, _)| now < t + period && *t <= now).collect();
+    let tokens: u64 = inside.iter().filter_map(|(_, n)| *n).fold(0u64, u64::saturating_add);
+    let unmetered = inside.iter().filter(|(_, n)| n.is_none()).count() as u64;
     let calls = inside.len() as u64;
     let measured = [(Metric::Tokens, tokens, b.window.tokens), (Metric::Calls, calls, b.window.calls)];
 
@@ -242,11 +257,11 @@ pub fn evaluate(b: &EndpointBudget, entries: &[(i64, u64)], now: i64) -> Verdict
     for (metric, spent, limit) in measured {
         let Some(limit) = limit else { continue };
         if spent >= limit {
-            at_limit.push(Breach { level: BreachLevel::AtLimit, metric, spent, limit });
+            at_limit.push(Breach { level: BreachLevel::AtLimit, metric, spent, limit, unmetered });
         } else if let Some(f) = b.warn_at {
             let threshold = ((limit as f64) * f).ceil() as u64;
             if spent >= threshold && early.is_none() {
-                early = Some(Breach { level: BreachLevel::Early, metric, spent, limit });
+                early = Some(Breach { level: BreachLevel::Early, metric, spent, limit, unmetered });
             }
         }
     }
@@ -266,6 +281,9 @@ pub fn evaluate(b: &EndpointBudget, entries: &[(i64, u64)], now: i64) -> Verdict
         }
         return Verdict::Warn(first);
     }
+    if let (true, Some(limit)) = (unmetered > 0, b.window.tokens) {
+        return Verdict::Warn(Breach { level: BreachLevel::Unmetered, metric: Metric::Tokens, spent: tokens, limit, unmetered });
+    }
     match early {
         Some(br) => Verdict::Warn(br),
         None => Verdict::Proceed,
@@ -275,14 +293,14 @@ pub fn evaluate(b: &EndpointBudget, entries: &[(i64, u64)], now: i64) -> Verdict
 /// When the oldest records have left the window far enough for `br`'s
 /// metric to be under its limit again. `None` for a limit of 0 (there is
 /// never room).
-fn resume_at_for(inside: &[(i64, u64)], br: &Breach, period: i64) -> Option<i64> {
+fn resume_at_for(inside: &[(i64, Option<u64>)], br: &Breach, period: i64) -> Option<i64> {
     if br.limit == 0 {
         return None;
     }
     let mut remaining = br.spent;
     for (t, n) in inside {
         remaining = remaining.saturating_sub(match br.metric {
-            Metric::Tokens => *n,
+            Metric::Tokens => n.unwrap_or(0),
             Metric::Calls => 1,
         });
         if remaining < br.limit {
@@ -290,6 +308,17 @@ fn resume_at_for(inside: &[(i64, u64)], br: &Breach, period: i64) -> Option<i64>
         }
     }
     None
+}
+
+/// (#1442 gate C4) What one hosted call SPENDS from a step's bucket: its
+/// total ([`darkmux_trajectory::UsageCounts::total_tokens`], the amount its
+/// usage record carries) when the spend is known, else, conservatively, the
+/// `max_tokens` the call was granted. The spend is unknown when the reply
+/// reported no usage, or a split without its prompt half; charging 0 (or
+/// the completion alone) would let such an endpoint run off the meter, and
+/// over-counting a capped grant is the safe direction.
+pub fn conservative_hosted_spend(total_tokens: Option<u64>, granted_max_tokens: u32) -> u64 {
+    total_tokens.unwrap_or(u64::from(granted_max_tokens))
 }
 
 // ── The window ledger ───────────────────────────────────────────────────
@@ -307,8 +336,9 @@ struct DayFile {
     head: Vec<u8>,
     tail: Vec<u8>,
     /// `(endpoint id, epoch second, tokens)` for every usage record in the
-    /// bytes read that carries an `endpoint_id`.
-    entries: Vec<(String, i64, u64)>,
+    /// bytes read that carries an `endpoint_id`; `None` tokens when the
+    /// call's spend is unknown.
+    entries: Vec<(String, i64, Option<u64>)>,
 }
 
 /// How many bytes of a day file's start, and of the bytes just before the
@@ -425,7 +455,7 @@ fn read_at(file: &mut std::fs::File, at: u64, len: u64) -> Option<Vec<u8>> {
 /// One line to a ledger entry: a usage record that carries an
 /// `endpoint_id` and a parseable `ts`. A cheap substring test first, so the
 /// JSON of every OTHER record (the vast majority) is never parsed.
-fn parse_entry(line: &[u8]) -> Option<(String, i64, u64)> {
+fn parse_entry(line: &[u8]) -> Option<(String, i64, Option<u64>)> {
     const NEEDLE: &[u8] = b"\"endpoint_id\"";
     if line.len() < NEEDLE.len() || !line.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
         return None;
@@ -434,7 +464,7 @@ fn parse_entry(line: &[u8]) -> Option<(String, i64, u64)> {
     let amount = crate::usage::usage_contribution(&v)?;
     let id = crate::usage::payload_of(&v).get("endpoint_id")?.as_str()?.to_string();
     let ts = crate::records_emitted::parse_ts_secs(v.get("ts")?.as_str()?)?;
-    Some((id, ts, amount.total))
+    Some((id, ts, amount.spend))
 }
 
 /// The process's ledger over the configured flows dir.
@@ -813,24 +843,43 @@ fn record(
 }
 
 fn warn(b: &EndpointBudget, br: &Breach, caller: &BudgetCaller<'_>, env: &dyn BudgetEnv) {
-    let what = match br.level {
-        BreachLevel::AtLimit => "has reached its budget".to_string(),
-        BreachLevel::Early => format!("is at {}% of its budget", (br.spent.saturating_mul(100)) / br.limit.max(1)),
-    };
-    let message = format!(
-        "darkmux: ⚠ endpoint `{}` {what}: {} of {} {} in the last {} ({})",
-        b.endpoint_id,
-        br.spent,
-        br.limit,
-        metric_word(br.metric),
-        b.period,
-        match b.policy {
-            // (review #2) An early warning under `wait` continues too: calls
-            // wait only once the budget is reached.
-            BudgetPolicy::Wait => "policy wait: continuing; calls wait once the budget is reached",
-            _ => "policy warn: continuing",
+    let message = match br.level {
+        BreachLevel::Unmetered => format!(
+            "darkmux: ⚠ endpoint `{}` cannot be metered: {} call(s) in the last {} reported no complete \
+             token count (no prompt count, or no usage), so its spend is at least {} of {} {} ({})",
+            b.endpoint_id,
+            br.unmetered,
+            b.period,
+            br.spent,
+            br.limit,
+            metric_word(br.metric),
+            match b.policy {
+                BudgetPolicy::Wait => "policy wait: continuing; there is no known spend to wait on",
+                _ => "policy warn: continuing",
+            }
+        ),
+        BreachLevel::AtLimit | BreachLevel::Early => {
+            let what = if br.level == BreachLevel::AtLimit {
+                "has reached its budget".to_string()
+            } else {
+                format!("is at {}% of its budget", (br.spent.saturating_mul(100)) / br.limit.max(1))
+            };
+            format!(
+                "darkmux: ⚠ endpoint `{}` {what}: {} of {} {} in the last {} ({})",
+                b.endpoint_id,
+                br.spent,
+                br.limit,
+                metric_word(br.metric),
+                b.period,
+                match b.policy {
+                    // (review #2) An early warning under `wait` continues too:
+                    // calls wait only once the budget is reached.
+                    BudgetPolicy::Wait => "policy wait: continuing; calls wait once the budget is reached",
+                    _ => "policy warn: continuing",
+                }
+            )
         }
-    );
+    };
     env.say(&message);
     env.emit(record(
         darkmux_flow::Level::Warn,
@@ -844,6 +893,7 @@ fn warn(b: &EndpointBudget, br: &Breach, caller: &BudgetCaller<'_>, env: &dyn Bu
             "metric": br.metric,
             "spent": br.spent,
             "limit": br.limit,
+            "unmetered_calls": br.unmetered,
             "period": b.period,
             "warn_at": b.warn_at,
             "message": message,
