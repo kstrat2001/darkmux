@@ -36,6 +36,14 @@ export const LIVE_WINDOW_MS = 24 * 60 * 60 * 1000;
  * presence — see `flowLiveSessions` below. */
 export const FLOW_LIVE_TTL_MS = 300 * 1000;
 
+/** (#2902 step 5) How long past its announced resume time a budget wait
+ * stays open with no further word from its waiter. A waiter still held at
+ * its resume time announces again (a new `budget.wait` with the new time),
+ * and one whose window has room writes `budget.resume` within one poll
+ * (half a second) plus a registry re-read; a wait silent this long past its
+ * resume time has lost its process, and reads as neither live nor resting. */
+export const BUDGET_WAIT_GRACE_MS = 60 * 1000;
+
 /** `RECENT_CAP` — viewer.html:1052. Default cap on the recent-runs list. */
 export const RECENT_CAP = 20;
 
@@ -898,6 +906,33 @@ export function sessionCloseEdge(data: FlowRecord[], sid: string, missionId?: st
   return c ?? e;
 }
 
+/** (#2902 step 5, 5th review MF1) The budget wait still OPEN in `own` as
+ * of `t`: the newest `budget.wait` at or before `t`, with no
+ * `budget.resume`, `budget.stop`, dispatch terminal or `session.end` after
+ * it, and not silent past its resume time plus [`BUDGET_WAIT_GRACE_MS`].
+ * `null` otherwise. A hosted call's gate writes its wait BEFORE any
+ * `dispatch start` (contract 2), so this is the one piece of live work a
+ * session can have with no start at all: every liveness gate asks it. */
+export function openBudgetWait(own: readonly FlowRecord[], t: number): FlowRecord | null {
+  let open: FlowRecord | null = null;
+  for (const r of own) {
+    if (r.action === "budget.wait" && T(r.ts) <= t && (!open || T(r.ts) >= T(open.ts))) open = r;
+  }
+  if (!open) return null;
+  const at = T(open.ts);
+  const closed = own.some(
+    (r) =>
+      T(r.ts) >= at &&
+      T(r.ts) <= t &&
+      r !== open &&
+      (r.action === "budget.resume" || r.action === "budget.stop" || isDispatchTerminal(r.action) || r.action === "session.end"),
+  );
+  if (closed) return null;
+  const p = (open.payload ?? (open as { fields?: unknown }).fields ?? {}) as { wait_seconds?: unknown };
+  const secs = typeof p.wait_seconds === "number" && Number.isFinite(p.wait_seconds) ? Math.max(0, p.wait_seconds) : 0;
+  return t <= at + secs * 1000 + BUDGET_WAIT_GRACE_MS ? open : null;
+}
+
 /** `sessionRunning()` — viewer.html:1183-1187. THE single source of truth for
  * "is this session in flight?"
  *
@@ -940,6 +975,9 @@ export function sessionRunning(
   const close = sessionCloseEdge(data, sid, missionId);
   if (close && T(close.ts) <= t) return false;
   const own = sessionRecords(data, sid);
+  // (#2902 step 5) A call held by its budget is running, however long ago
+  // its wait was announced (a day window's wait outlasts the TTL below).
+  if (openBudgetWait(own, t)) return true;
   const started = own.some((r) => isDispatchStart(r.action) && T(r.ts) <= t);
   if (!started) return false;
   const activityTimes = own.filter((r) => T(r.ts) <= t).map((r) => T(r.ts));
@@ -1060,14 +1098,21 @@ export function flowLiveSessions(data: FlowRecord[], nowMs: number, liveMode = t
   if (!liveMode) return new Set();
   const lastBySid = new Map<string, number>();
   const started = new Set<string>();
+  const waited = new Set<string>();
   for (const r of data) {
     if (!r.session_id) continue;
     const t = T(r.ts);
     const prev = lastBySid.get(r.session_id);
     if (prev === undefined || t > prev) lastBySid.set(r.session_id, t);
     if (isDispatchStart(r.action)) started.add(r.session_id);
+    if (r.action === "budget.wait") waited.add(r.session_id);
   }
   const out = new Set<string>();
+  // (#2902 step 5) A hosted call held by its budget has no start yet (its
+  // gate runs before the bookends), and its one record can be hours old.
+  for (const sid of waited) {
+    if (openBudgetWait(sessionRecords(data, sid), nowMs)) out.add(sid);
+  }
   for (const sid of started) {
     if (sessEnd(data, sid) || dispatchEnd(data, sid)) continue; // terminal/abandoned → not running
     if (nowMs - (lastBySid.get(sid) ?? 0) <= FLOW_LIVE_TTL_MS) out.add(sid);

@@ -72,7 +72,9 @@ export function machActive(
     (r) =>
       T(r.ts) <= t &&
       uidOf(r) === m &&
-      isDispatchStart(r.action) &&
+      // (#2902 step 5) Or a hosted call's budget wait: its gate runs before
+      // the bookends, so while it waits there is no start to find.
+      (isDispatchStart(r.action) || r.action === "budget.wait") &&
       sessionRunning(data, liveSet, r.session_id ?? "", t),
   );
 }

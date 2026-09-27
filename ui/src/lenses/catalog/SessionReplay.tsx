@@ -25,7 +25,7 @@ import { livenessState } from "../../components/LivenessPulse";
 import { TokenScope } from "../../components/TokenScope";
 import { usePlaybackClock } from "../../lib/pageClockRate";
 import { WALL_CLOCK } from "../../lib/restHand";
-import { liveStateLabel, toolReadout, type LiveStateReading } from "../../lib/tokenRate";
+import { liveStateLabel, reasonForLine, toolReadout, type LiveStateReading } from "../../lib/tokenRate";
 import { leftTrimWidth } from "../../lib/leftTrim";
 import { REPLAY_GRANULARITY_NOTE, useLiveOverlay } from "../../lib/liveChannel";
 import { scopeStateOf, type ScopeState } from "../../lib/scopeMorph";
@@ -302,8 +302,9 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
                   // same slot: "thermal · serious". The words only: the
                   // countdown is already the tube's center (TOOL GEN's
                   // seconds are not, which is why its line carries them).
-                  // Nothing when the record names no reason.
-                  live.restReason
+                  // Nothing when the record names no reason. Trimmed to the
+                  // line (the lamp status keeps it whole).
+                  reasonForLine(live.restReason)
                 : toolLine
                   ? toolLine.path
                     ? `${toolLine.action} · ${toolLine.path}`

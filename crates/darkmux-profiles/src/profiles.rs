@@ -58,11 +58,22 @@ fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 }
 
 pub fn load_registry(explicit: Option<&str>) -> Result<LoadedRegistry> {
+    load_registry_with(explicit, true)
+}
+
+/// (#2902 step 5) [`load_registry`] without the one-line quarantine warning,
+/// for a caller that only inspects the registry (the preflight's endpoint
+/// budget pass) ahead of the load that will print it.
+pub fn load_registry_quiet(explicit: Option<&str>) -> Result<LoadedRegistry> {
+    load_registry_with(explicit, false)
+}
+
+fn load_registry_with(explicit: Option<&str>, announce: bool) -> Result<LoadedRegistry> {
     // Precedence: explicit --profiles flag > DARKMUX_PROFILES env var > default
     // search locations. The two override paths fail-fast on missing files
     // so that a typo'd path doesn't silently pick up an unrelated registry.
     if let Some(p) = explicit {
-        return load_from(PathBuf::from(p), "--profiles flag");
+        return load_from(PathBuf::from(p), "--profiles flag", announce);
     }
     // (#2632 CONSIDER 3) The one instrumented chokepoint for
     // `DARKMUX_PROFILES` — previously had no audited path at all, so crew's
@@ -71,13 +82,13 @@ pub fn load_registry(explicit: Option<&str>) -> Result<LoadedRegistry> {
     darkmux_types::env_audit::audit_env_read("DARKMUX_PROFILES");
     if let Ok(p) = env::var("DARKMUX_PROFILES") {
         if !p.is_empty() {
-            return load_from(PathBuf::from(p), "DARKMUX_PROFILES env var");
+            return load_from(PathBuf::from(p), "DARKMUX_PROFILES env var", announce);
         }
     }
     let candidates = default_locations();
     for path in &candidates {
         if path.exists() {
-            return load_from(path.clone(), "default search");
+            return load_from(path.clone(), "default search", announce);
         }
     }
     let listed = candidates
@@ -94,7 +105,7 @@ pub fn load_registry(explicit: Option<&str>) -> Result<LoadedRegistry> {
     );
 }
 
-fn load_from(path: PathBuf, source: &str) -> Result<LoadedRegistry> {
+fn load_from(path: PathBuf, source: &str, announce: bool) -> Result<LoadedRegistry> {
     if !path.exists() {
         bail!(
             "darkmux: registry not found at {} (specified via {}). \
@@ -107,7 +118,7 @@ fn load_from(path: PathBuf, source: &str) -> Result<LoadedRegistry> {
         .with_context(|| format!("reading registry at {}", path.display()))?;
     let registry = parse_registry_lenient(&raw)
         .with_context(|| format!("parsing JSON at {}", path.display()))?;
-    if !registry.quarantined.is_empty() {
+    if announce && !registry.quarantined.is_empty() {
         // One warning line per load (matching the loud-but-brief style of
         // this crate's other operator warnings); full per-entry detail lives
         // in `darkmux doctor`.

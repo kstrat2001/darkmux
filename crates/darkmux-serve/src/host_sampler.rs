@@ -893,8 +893,7 @@ fn build_machine_rollup_record_with(
 /// Spawn the daemon-side host sampler thread. `interval_ms` is the
 /// resolved `config_access::host_sampler_interval_ms()` cadence; `0`
 /// disables the sampler entirely and this returns `None` without spawning
-/// anything (the "0 means hard off" convention shared with
-/// `remote.max_tokens_per_execution`). The returned thread runs until
+/// anything (the "0 means hard off" convention). The returned thread runs until
 /// `stop_flag` is set, polling it every [`STOP_POLL_INTERVAL`] so shutdown
 /// is prompt rather than blocking for a full sample interval — the same
 /// teardown shape `dispatch_internal::run_telemetry_sampler` uses.

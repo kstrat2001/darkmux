@@ -57,6 +57,8 @@ export function activityOf(r: FlowRecord): string {
     if (r.source === "process") return "host telemetry";
     if (r.source === "lms") return "lms";
     if (r.source === "runtime") return "runtime";
+    // (#2902 step 5) budget.warn / budget.wait / budget.resume.
+    if (r.source === "budget") return "budget";
     return "telemetry";
   }
   return a || "other";

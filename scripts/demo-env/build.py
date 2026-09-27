@@ -695,7 +695,7 @@ def main():
         "audit": {"enabled": False, "dir": "~/.darkmux/audit"},
         "runtime": {"inactivity_timeout_seconds": 600, "strict_selection": False,
                     "feedback_injection": True, "check_updates": False},
-        "remote": {"max_tokens_per_execution": 500000},
+        "remote": {"max_tokens_per_step": None, "step_budget_policy": None},
         "fleet": {"mode": hero["fleet_mode"]},
     }, indent=2) + "\n")
 

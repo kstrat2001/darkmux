@@ -72,6 +72,33 @@ darkmux release.
 
 ### Changed (breaking, 4.0)
 
+- **The per-step cap on hosted tokens is renamed, has no default, and
+  never stops a step: a step that used to stop at 500,000 hosted tokens now
+  runs to completion unless you set a cap** (#2902 step 5).
+  `remote.max_tokens_per_execution` is now `remote.max_tokens_per_step`
+  (env `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` is now
+  `DARKMUX_REMOTE_MAX_TOKENS_PER_STEP`): a per-step cap on hosted tokens,
+  where `dispatch.map` steps naming the same `bucket_group` share one
+  allowance. Clean break, no alias: `darkmux config set` refuses the old key
+  naming the new one, the old key is read by nothing, and `darkmux doctor`
+  names a leftover old key in `config.json` or the env with the exact
+  rename. It has no built-in default any more (unset means no cap), and
+  reaching a cap never stops the step: the new `remote.step_budget_policy`
+  (env `DARKMUX_REMOTE_STEP_BUDGET_POLICY`) is `warn` (the default: a CLI
+  line and a `budget.warn` flow record, and the step keeps going) or `off`.
+  There is no `wait` for a step (a step has no rolling window to wait on;
+  `wait` is an endpoint budget's value) and `wait` there is refused at
+  preflight. Before, a step that reached its cap skipped its remaining
+  hosted calls, and each call's `max_tokens` was clamped to what was left;
+  neither happens now. A cap of `0` is no cap (a `0` on a darkmux bound
+  means unbounded), where before it refused every hosted call. `init`
+  writes both keys visibly as `null`. CONFIG 1.32. **Migration:** a
+  `config.json` written by an earlier `init` carries
+  `"max_tokens_per_execution": 500000` in its `remote` block; nothing reads
+  it now, so it no longer caps anything. Delete it, or, to keep a cap, run
+  `darkmux config set remote.max_tokens_per_step <n>` (and rename an
+  exported `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`).
+
 - **The degeneracy detector's policy values name the action: `off`,
   `record`, `warn`, `conclude`** (#2947). `enforce` is now `conclude` (still
   the default, behavior unchanged: on repeating output the runtime closes
@@ -221,6 +248,45 @@ darkmux release.
   instead of the name of the call that had just finished. A runtime older
   than this release writes no plan for its calls, so its turns carry no
   lists either and read the same way.
+- **Per-endpoint budgets** (#2902 step 5). An endpoint declared under
+  `endpoints` in `profiles.json` (and named by id) can carry a rolling
+  budget, `"limits": {"window": {"period": "1d", "tokens": 2000000}}`: the
+  last 24 hours from now, counted from this machine's usage records, with
+  no calendar reset (`tokens`, `calls`, or both; the period is `<n>m`,
+  `<n>h` or `<n>d`; `0` is not a budget and is refused: set `policy` to
+  `off` to turn one off, and under `off` the number is left alone; a 0
+  edited in while a call waits is refused the same way, said once on the
+  CLI, and the wait keeps the budget it had). `limits.policy` says what reaching it does: `warn`
+  (the default once a budget is set: a warning on the CLI, a Warn-level
+  `budget.warn` flow record, and the work keeps going), `wait` (calls to
+  that endpoint pause until enough of the window has expired to have room,
+  saying how long on the CLI, in a `budget.wait` record the run page shows
+  and in `darkmux mission status`, then resume; the run is never stopped,
+  no work is lost, and the wait extends the run's wall-clock bound), or
+  `off` (nothing is counted). An optional `limits.warn_at` (e.g. `0.8`)
+  warns once ahead of the limit; darkmux never picks one. Nothing is
+  counted unless you set a budget: `profiles.example.json` ships the fields
+  as `null`. An unregistered `policy`, or `limits` that cannot be read or
+  whose `period` does not parse, refuses every `dispatch`, `mission launch`
+  and `lab run` at preflight, naming the `profiles.json` path and the valid
+  shape, and is a Fail in `darkmux doctor`, which also shows each budget's
+  policy and the spend in its window. `darkmux mission abort` (or Ctrl-C)
+  ends a wait without sending: the wait checks its mission's status on disk
+  every half second, and an agentic-remote run the budget holds between
+  turns is ended rather than released; either way an announced wait that
+  ends this way is closed by a `budget.stop` record. The viewer reads a hosted call's wait as
+  `REST budget · <endpoint>` until it resumes, on the run page and the
+  fleet card, live and in playback, although the call has not started yet
+  (a waiter silent a minute past its resume time has died and stops
+  reading as live); a day window's wait counts down as `23h 53m`, and a
+  long endpoint id is trimmed to fit the line. A misspelled
+  key in `limits` (`windw`, `polcy`, `tokns`) is refused the same way,
+  naming the nearest valid key. Budgets apply to
+  calls darkmux sends to an endpoint it does not manage; `tokens_per_dispatch`
+  and `concurrent_calls` are still shown and not enforced, and
+  `remote.concurrent_cap` still applies. FLOW 1.65.0 (`endpoint_id` on usage
+  records, the four `budget.*` actions: warn, wait, resume, stop).
+
 - **`darkmux machine trust <name>` / `machine untrust <name>`** (#2916).
   Trust adds `fleet.accept_work.<name>` to THIS machine's config.json (and
   touches nothing else): the peer's node is looked up through the identity

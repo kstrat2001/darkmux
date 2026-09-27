@@ -434,5 +434,33 @@ describe("toolCallPath (#2963)", () => {
 
   it("escapes bidi and zero-width control characters in the path", () => {
     expect(toolCallPath({ tool_name: "write", args: JSON.stringify({ path: "src/a\u202Egnp.ts" }) })).toBe("src/a⟨U+202E⟩gnp.ts");
+
+  });
+});
+
+describe("budget records (#2902 step 5)", () => {
+  const rec = (action: string, payload: Record<string, unknown>) =>
+    ({ ts: "2026-09-27T10:00:00Z", action, category: "telemetry", source: "budget", payload }) as unknown as FlowRecord;
+
+  it("a wait says what it waits on and for how long, in words, never clock-shaped", () => {
+    expect(recordDetail(rec("budget.wait", { scope: "endpoint", endpoint_id: "azure", wait_seconds: 843 }))).toBe(
+      "azure: waiting 15m",
+    );
+    expect(recordDetail(rec("budget.wait", { scope: "endpoint", endpoint_id: "azure", wait_seconds: 3840 }))).toBe(
+      "azure: waiting 1h 4m",
+    );
+  });
+
+  it("a warning names the spend and the budget; a resume names the wait", () => {
+    expect(
+      recordDetail(rec("budget.warn", { endpoint_id: "azure", spent: 2000000, limit: 2000000, metric: "tokens", period: "1d" })),
+    ).toBe("azure: 2000000/2000000 tokens per 1d");
+    expect(recordDetail(rec("budget.resume", { endpoint_id: "azure", waited_ms: 45000 }))).toBe("azure: resumed after 45s");
+    expect(recordDetail(rec("budget.stop", { endpoint_id: "azure", reason: "mission `m` is aborted" }))).toBe(
+      "azure: wait stopped (mission `m` is aborted)",
+    );
+    expect(recordObject(rec("budget.wait", { endpoint_id: "azure", wait_seconds: 60 })).text).toBe(
+      "azure: waiting 1m",
+    );
   });
 });

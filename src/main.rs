@@ -971,7 +971,7 @@ fn cmd_mission_dispatch(
     // Planned -> Running: the dispatch-scope settings always (the work is a
     // dispatch wherever it runs), and the fleet-submission ones when the
     // work is sent to another machine.
-    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
+    darkmux_profiles::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
     if machine.is_some() {
         darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::FleetSubmission)?;
     }
@@ -1191,7 +1191,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
     // mission is minted. `--skip-preflight` does not waive it: that flag
     // skips the Docker/daemon probe, and a bad config value is not a probe
     // result that could be stale or wrong.
-    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
+    darkmux_profiles::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
     let DispatchInvocation {
         role,
         message,

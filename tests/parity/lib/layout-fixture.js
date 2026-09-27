@@ -80,6 +80,20 @@ function build(sid) {
 // identity, so it adds no second card.
 const tick = (d, hms) => ({ ts: at(d, hms), action: "layout tick", category: "debug", source: "layout", ...MACHINE });
 
+/** (#2902 step 5) A hosted call's budget wait, as the gate writes it
+ *  (`budget.rs::announce_wait`), announced at 12:00:08. */
+const budgetWait = (b, d, endpoint, secs) =>
+  b.rec(
+    at(d, "12:00:08"),
+    "budget.wait",
+    {
+      scope: "endpoint", endpoint_id: endpoint, policy: "wait", metric: "tokens", spent: 2000, limit: 2000, period: "1d",
+      wait_seconds: secs, resume_at: new Date(msOf(d, "12:00:08") + secs * 1000).toISOString().replace(".000Z", "Z"), pid: 1,
+      message: `darkmux: endpoint \`${endpoint}\` has reached its budget`,
+    },
+    { category: "telemetry", source: "budget", level: "warn", model: "gpt-layout" },
+  );
+
 /** Every state the MODEL section and a fleet card can show. Days are two
  *  apart so a live page's 24h window never reaches a neighbor's records. */
 const STATES = [
@@ -177,6 +191,9 @@ const STATES = [
     ["rest-battery", "2026-09-16", { reason: "battery", state: "18%" }, "battery · 18%", "battery"],
     ["rest-episode-limit", "2026-09-18", { reason: "thermal-episode-limit", state: "serious" }, "thermal hold · serious", "thermal hold"],
     ["rest-unknown", "2026-09-20", { reason: "solar-flare" }, "solar-flare", "solar-flare"],
+    // (#2902 step 5) A budget pause on an agentic-remote run: the budget
+    // pacer writes `state` as the endpoint id.
+    ["rest-budget", "2026-07-22", { reason: "budget", state: "azure" }, "budget · azure", "budget"],
   ].map(([id, date, why, words, phoneWords]) => ({
     id, date, now: "12:00:12",
     runText: new RegExp(`run state: rest \\d+s · ${words}$`),
@@ -188,6 +205,52 @@ const STATES = [
     armed: why.reason.startsWith("thermal"),
     recs: (b, d) => [...b.prefix(d, {}, true, why.reason.startsWith("thermal")), b.rec(at(d, "12:00:08"), "dispatch.rest", { ms: 20000, turn: 1, ...why }), tick(d, "12:00:12")],
   })),
+  // (#2902 step 5, 5th review MF1) A HOSTED call held by its endpoint's
+  // budget. Its gate writes one `budget.wait` (how long, which endpoint)
+  // BEFORE any `dispatch start` (contract 2: the bookends open only around
+  // the model call), and no `dispatch.rest`. It reads as the same REST words
+  // as the agentic pause, on the run page and the fleet card, live and in
+  // playback, with and without Redis presence.
+  ...[
+    // A standalone `darkmux dispatch` to a hosted endpoint: the wait is the
+    // session's first and only record.
+    { id: "rest-budget-hosted", date: "2026-07-20", endpoint: "azure", secs: 20, rest: "\\d+s", words: "budget · azure" },
+    // (5th review C7) A day window and a long endpoint id: the countdown is
+    // "23h 53m", and the id is trimmed so the line fits.
+    // Minutes round up (never under-report): 85996 s left is "23h 54m". The
+    // lamp status keeps the full id; the one-line slots trim it.
+    { id: "rest-budget-hosted-long", date: "2026-07-18", endpoint: "azure-openai-eastus2-prod", secs: 86_000, rest: "23h 54m", words: "budget · azure-opena…", full: "budget · azure-openai-eastus2-prod", tube: "23h 54m" },
+  ].map(({ id, date, endpoint, secs, rest, words, full, tube }) => ({
+    id, date, now: "12:00:12", tubeText: tube,
+    runText: new RegExp(`run state: rest ${rest} · ${full ?? words}$`), noteText: new RegExp(`^${words}$`), rateText: new RegExp(`^${words}$`), rateTextPhone: /^budget$/,
+    recs: (b, d) => [budgetWait(b, d, endpoint, secs), tick(d, "12:00:12")],
+  })),
+  // A mission's hosted `dispatch.map` step held by its budget: the wait is on
+  // the step's task session, under the mission's run-grain session. With
+  // Redis presence (the task session beats: `presence`) and without it (the
+  // records alone decide, as in playback).
+  ...[
+    { id: "rest-budget-mission-presence", date: "2026-07-24", presence: true },
+    { id: "rest-budget-mission", date: "2026-07-26", presence: false },
+  ].map(({ id, date, presence }) => {
+    const mid = `layout-mission-${id}`;
+    const task = `layout-task-${id}`;
+    return {
+      id, date, now: "12:00:12", runSid: `layout-run-${id}`,
+      presence: presence ? [{ session_id: task, mission_id: mid }] : undefined,
+      runText: /run state: rest \d+s · budget · azure$/, noteText: /^budget · azure$/, rateText: /^budget · azure$/, rateTextPhone: /^budget$/,
+      recs: (b, d) => {
+        const m = { mission_id: mid };
+        return [
+          { ts: at(d, "11:59:59"), action: "mission start", session_id: `layout-run-${id}`, ...m, ...MACHINE, payload: {} },
+          { ts: at(d, "11:59:59"), action: "dispatch start", source: "mission", session_id: `layout-run-${id}`, handle: "coder", ...m, ...MACHINE, payload: {} },
+          { ts: at(d, "12:00:01"), action: "step start", session_id: task, handle: "probe", ...m, ...MACHINE, payload: {} },
+          { ...budgetWait(b, d, "azure", 20), session_id: task, handle: "probe", ...m },
+          tick(d, "12:00:12"),
+        ];
+      },
+    };
+  }),
   // (#2950) The same run config's non-rest states, so the thermal REST
   // states are measured against states of a run like theirs (armed), not
   // against a run whose ACTIVE TIME has no thermal line at all.
@@ -295,7 +358,7 @@ const STATES = [
  *  suite measures one execution, and only the fleet card has a pager. */
 const MULTI = {
   id: "multi-exec",
-  date: "2026-07-26",
+  date: "2026-07-10",
   now: "12:00:12",
   recs: (b, d) => {
     const b2 = build("layout-exec-multi-exec-2");
@@ -329,6 +392,15 @@ for (const s of [...STATES, ...HEROES, MULTI]) {
 }
 
 const ALL = [...STATES, ...HEROES, MULTI];
+// Each state owns its day: two states on one date would merge into one day's
+// records and measure neither (#2902 step 5: a rebase once put two there).
+{
+  const seen = new Map();
+  for (const s of ALL) {
+    if (seen.has(s.date)) throw new Error(`layout fixture: ${s.id} and ${seen.get(s.date)} share ${s.date}`);
+    seen.set(s.date, s.id);
+  }
+}
 const byDate = new Map(ALL.map((s) => [s.date, s.records]));
 
 /** A date well after every fixture day: a page pinned here reads each
@@ -362,7 +434,7 @@ const MACHINE_SPECS = {
   generated_at_ms: 0,
 };
 
-async function installLayoutRoutes(page, { blockStream = false, machineSpecs = false, holdRuns = false, roster = false, holdPresence = false } = {}) {
+async function installLayoutRoutes(page, { blockStream = false, machineSpecs = false, holdRuns = false, roster = false, holdPresence = false, presence } = {}) {
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
     const p = url.pathname;
@@ -374,6 +446,9 @@ async function installLayoutRoutes(page, { blockStream = false, machineSpecs = f
     // answers, so "offline" cannot be claimed yet. `roster`: one declared
     // machine that is never seen, which renders as an offline card.
     if (holdPresence && p === "/fleet/machines/live") return new Promise(() => {});
+    // (#2902 step 5) Redis session presence for a state that has it: the
+    // sessions the daemon reports as beating right now.
+    if (presence && p === "/fleet/sessions/live") return json({ sessions: presence, meta: { sources: { fleet: { state: "ok" } }, complete: true } });
     if (roster && p === "/fleet/roster") return json({ machines: [{ id: "layout-offline", address: "100.64.0.9:8765", added_unix_ms: 1 }], error: null });
     if (/^\/flow\/\d{4}-\d{2}-\d{2}\/stream$/.test(p)) {
       if (blockStream) return route.fulfill({ status: 503, contentType: "text/plain", body: "layout harness: stream refused\n" });

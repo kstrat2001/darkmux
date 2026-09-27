@@ -139,6 +139,7 @@ pub mod power_policy;
 // promotion of what was two hand-copied buckets (`step_kinds::MapRemoteBucket`
 // and `darkmux-lab`'s own `RemoteBucket`) into one public home both the
 // `dispatch.map` fan-out and `darkmux-lab`'s review pipeline construct.
+pub mod budget;
 pub mod remote_budget;
 // (#2421) Mission-envelope records-emitted aggregation — see the module doc
 // for why this lives here rather than in `darkmux-serve`.

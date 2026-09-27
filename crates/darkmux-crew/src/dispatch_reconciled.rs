@@ -209,7 +209,7 @@ pub(crate) fn dispatch_reconciled_with(
     // and `ensure_wave_loaded`: without this, the fleet receiver's runner
     // reconciled (and could evict / load) models, and only then did
     // `dispatch()`'s own preflight refuse.
-    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
+    darkmux_profiles::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
     match claim {
         SeatClaim::LocalModel(placement) => {
             // Scoped to exactly this reconcile-and-dispatch window — a

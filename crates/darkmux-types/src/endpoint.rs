@@ -117,32 +117,85 @@ crate::config_enum!(Dialect, "endpoint dialect", [
         "`max_tokens` + `temperature`, no `reasoning_effort` (managed LM Studio default)",
 ]);
 
-/// Standard usage limits for one endpoint (#2902 step 4: the SHAPE only).
+/// (#2902 step 5) What darkmux does when an endpoint's budget is reached.
+/// Registered on the #2947 `ConfigEnum` rule: an unregistered value is
+/// refused at preflight, never resolved to a fallback. (`wait` is an
+/// endpoint budget's value only: the per-step cap, `remote.step_budget_policy`,
+/// has `off` and `warn`, `config::StepBudgetPolicy`.)
 ///
-/// **Not enforced yet.** These are parsed, validated and shown by
-/// `darkmux doctor`; enforcement is #2902 step 5, which replaces today's
-/// `remote.*` knobs with one per-endpoint regime. Until then the existing
-/// `remote.max_tokens_per_execution` / `remote.concurrent_cap` still apply
-/// and these values change nothing.
+/// There is deliberately no action that stops a run: a hard stop is the
+/// operator's own `darkmux mission abort`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BudgetPolicy {
+    /// Nothing is counted.
+    Off,
+    /// A breach is surfaced (CLI line, flow record, doctor) and the work
+    /// keeps going.
+    Warn,
+    /// Calls to the endpoint pause until the budget has room again (for a
+    /// rolling window: until enough of it has expired), then resume. The
+    /// run is never killed and no work is lost.
+    Wait,
+}
+
+crate::config_enum!(BudgetPolicy, "budget policy", [
+    Off = "off" => "nothing is counted",
+    Warn = "warn" => "a breach is surfaced and the work keeps going (the default once a budget is set)",
+    Wait = "wait" => "calls pause until the budget has room again, then resume; the run is never stopped",
+]);
+
+impl BudgetPolicy {
+    /// True when the policy counts spend at all.
+    pub fn counts(self) -> bool {
+        !matches!(self, BudgetPolicy::Off)
+    }
+}
+
+/// Standard usage limits for one endpoint.
+///
+/// **What is enforced (#2902 step 5).** The rolling `window` budget
+/// (`tokens`, `calls`, or both, over `period`), under `policy` (`off` /
+/// `warn` / `wait`, see [`BudgetPolicy`]), with an optional early warning
+/// at `warn_at` (a fraction of the budget). Enforcement applies to an
+/// endpoint darkmux does not manage (the calls it SENDS), declared in the
+/// `endpoints` map and named by id, because the usage records it sums are
+/// keyed by that id (`endpoint_id`).
+///
+/// **What is not.** `tokens_per_dispatch` and `concurrent_calls` are parsed,
+/// validated and shown by `darkmux doctor`, and change nothing:
+/// `remote.max_tokens_per_step` (the per-step cap) and
+/// `remote.concurrent_cap` still apply. Whether the per-endpoint pair
+/// replaces those two is not decided (#2902).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UsageLimits {
-    /// Tokens one dispatch (one execution) may spend at this endpoint.
+    /// Tokens one dispatch (one execution) may spend at this endpoint. Not
+    /// enforced (see the type doc).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens_per_dispatch: Option<u64>,
-    /// Calls in flight at once.
+    /// Calls in flight at once. Not enforced (see the type doc).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrent_calls: Option<u32>,
-    /// A budget over a period of time.
+    /// A budget over a rolling period of time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<UsageWindow>,
+    /// What a breach does. Absent: `warn` once a budget is set (with no
+    /// budget set, nothing is counted either way). Read leniently: an
+    /// unknown value is kept and refused by name at preflight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<Lenient<BudgetPolicy>>,
+    /// An early warning at this fraction of the budget (e.g. `0.8`), ahead
+    /// of the at-limit one. Unset: only the at-limit warning fires; darkmux
+    /// never picks a threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warn_at: Option<f64>,
     /// Forward-compat overflow.
     #[serde(flatten)]
     pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
-/// A usage budget over a period (`"period": "1d"`), in tokens, calls, or
-/// both. Whether the window is calendar or rolling is decided with
-/// enforcement (#2902 step 5); the shape carries the period as written.
+/// A usage budget over a ROLLING period (`"period": "1d"` is the last 24
+/// hours from now, with no calendar reset), in tokens, calls, or both.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UsageWindow {
     /// `<n>m`, `<n>h` or `<n>d`.
@@ -154,6 +207,27 @@ pub struct UsageWindow {
     pub calls: Option<u64>,
     #[serde(flatten)]
     pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+impl UsageWindow {
+    /// True when a number is set: a window with neither `tokens` nor
+    /// `calls` (the shipped example's all-null shape) is no budget.
+    pub fn is_set(&self) -> bool {
+        self.tokens.is_some() || self.calls.is_some()
+    }
+
+    /// The period in seconds, when it parses.
+    pub fn period_secs(&self) -> Option<u64> {
+        self.period.as_deref().and_then(period_secs)
+    }
+}
+
+/// A window budget ready to enforce: the parsed period and the numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowBudget {
+    pub period_secs: u64,
+    pub tokens: Option<u64>,
+    pub calls: Option<u64>,
 }
 
 impl UsageLimits {
@@ -184,30 +258,137 @@ impl UsageLimits {
         parts.join(" · ")
     }
 
-    /// Shape checks only (enforcement is step 5).
+    /// The window budget, when one is set and its period parses.
+    pub fn window_budget(&self) -> Option<WindowBudget> {
+        let w = self.window.as_ref().filter(|w| w.is_set())?;
+        Some(WindowBudget { period_secs: w.period_secs()?, tokens: w.tokens, calls: w.calls })
+    }
+
+    /// The policy in force. Written: that value (an unregistered one is an
+    /// error naming it). Absent: `warn` when a window budget is set, `off`
+    /// otherwise, so a budget the operator writes warns by default and no
+    /// budget counts nothing.
+    pub fn resolved_policy(&self) -> Result<BudgetPolicy, String> {
+        match &self.policy {
+            Some(Lenient::Known(p)) => Ok(*p),
+            Some(Lenient::Unrecognized(raw)) => Err(raw.as_str().map(str::to_string).unwrap_or_else(|| raw.to_string())),
+            None if self.window.as_ref().is_some_and(UsageWindow::is_set) => Ok(BudgetPolicy::Warn),
+            None => Ok(BudgetPolicy::Off),
+        }
+    }
+
+    /// Shape checks: the window's period, `warn_at`'s range, and the
+    /// policy's value.
     pub fn validate(&self) -> Result<(), String> {
+        // (#2902 step 5 review MF2) A misspelled KEY lands in `extras` and
+        // would silently disarm the budget (`windw` is no window, `polcy` is
+        // the default policy, `tokns` drops the token budget). Read
+        // leniently, refused here, naming the key and the nearest valid one.
+        unknown_key("limits", &self.extras, LIMITS_KEYS)?;
         if let Some(w) = &self.window {
-            if w.tokens.is_none() && w.calls.is_none() {
+            unknown_key("limits.window", &w.extras, WINDOW_KEYS)?;
+        }
+        if let Some(Lenient::Known(p)) = &self.policy {
+            if p.counts() && !self.window.as_ref().is_some_and(UsageWindow::is_set) {
+                return Err(format!(
+                    "limits.policy `{}` is set but no `window` budget is: a policy with no budget governs \
+                     nothing. Set `window` (`period` and `tokens` or `calls`), or drop `policy`",
+                    crate::config_enum::ConfigEnum::token(*p)
+                ));
+            }
+        }
+        if let Some(w) = &self.window {
+            // (zero doctrine) A `0` on a darkmux bound means unbounded,
+            // never "instantly"; a zero budget would be an eternal wait, so
+            // it is refused rather than read either way. Under `off` the
+            // number is inert (nothing is counted), so it is left alone:
+            // `off` is exactly what the refusal tells the operator to set.
+            let off = matches!(&self.policy, Some(Lenient::Known(p)) if !p.counts());
+            for (field, n) in [("tokens", w.tokens), ("calls", w.calls)] {
+                if !off && n == Some(0) {
+                    return Err(format!(
+                        "limits.window.{field} is 0: 0 is not a budget; set policy off to turn it off"
+                    ));
+                }
+            }
+            if !w.is_set() && w.period.is_some() {
                 return Err("limits.window sets neither `tokens` nor `calls`".to_string());
             }
-            match w.period.as_deref() {
-                Some(p) if is_period(p) => {}
-                Some(p) => {
-                    return Err(format!(
-                        "limits.window.period must be `<n>m`, `<n>h` or `<n>d` (got {p:?})"
-                    ))
+            if w.is_set() {
+                match w.period.as_deref() {
+                    Some(p) if is_period(p) => {}
+                    Some(p) => {
+                        return Err(format!(
+                            "limits.window.period must be `<n>m`, `<n>h` or `<n>d` (got {p:?})"
+                        ))
+                    }
+                    None => return Err("limits.window needs a `period` (`<n>m`, `<n>h` or `<n>d`)".to_string()),
                 }
-                None => return Err("limits.window needs a `period` (`<n>m`, `<n>h` or `<n>d`)".to_string()),
             }
+        }
+        if let Some(f) = self.warn_at {
+            if !(f.is_finite() && f > 0.0 && f < 1.0) {
+                return Err(format!(
+                    "limits.warn_at must be a fraction between 0 and 1 (e.g. 0.8), got {f}"
+                ));
+            }
+        }
+        if let Err(raw) = self.resolved_policy() {
+            return Err(format!(
+                "limits.policy `{raw}` is not a budget policy; valid: {}",
+                <BudgetPolicy as crate::config_enum::ConfigEnum>::TOKENS.join(", ")
+            ));
         }
         Ok(())
     }
 }
 
+/// The keys `limits` knows.
+const LIMITS_KEYS: &[&str] = &["window", "policy", "warn_at", "tokens_per_dispatch", "concurrent_calls"];
+/// The keys `limits.window` knows.
+const WINDOW_KEYS: &[&str] = &["period", "tokens", "calls"];
+
+/// An error naming the first unknown key in `extras` and the nearest known
+/// one, or `Ok` when there is none.
+fn unknown_key(at: &str, extras: &serde_json::Map<String, serde_json::Value>, known: &[&str]) -> Result<(), String> {
+    let Some(key) = extras.keys().next() else { return Ok(()) };
+    let nearest = known.iter().min_by_key(|k| edit_distance(key, k)).copied().unwrap_or("");
+    Err(format!(
+        "{at} has an unknown key `{key}` (did you mean `{nearest}`?); valid keys: {}",
+        known.join(", ")
+    ))
+}
+
+/// Levenshtein distance, for a "did you mean" suggestion.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            cur.push((prev[j] + usize::from(ca != *cb)).min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+/// `<n>m`, `<n>h` or `<n>d` in seconds, `n >= 1`.
+pub fn period_secs(p: &str) -> Option<u64> {
+    let unit = p.chars().last()?;
+    let n: u64 = p[..p.len() - unit.len_utf8()].parse().ok().filter(|n| *n >= 1)?;
+    let per = match unit {
+        'm' => 60,
+        'h' => 3_600,
+        'd' => 86_400,
+        _ => return None,
+    };
+    n.checked_mul(per)
+}
+
 /// `<n>m`, `<n>h` or `<n>d` with `n >= 1`.
 fn is_period(p: &str) -> bool {
-    let Some(unit) = p.chars().last() else { return false };
-    matches!(unit, 'm' | 'h' | 'd') && p[..p.len() - 1].parse::<u32>().is_ok_and(|n| n >= 1)
+    period_secs(p).is_some()
 }
 
 /// (#2902 review M1) A value read leniently: the known shape, or whatever was
@@ -294,8 +475,8 @@ pub struct ModelEndpoint {
     /// ([`EndpointKind::default_dialect`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialect: Option<Lenient<Dialect>>,
-    /// Standard usage limits (the shape only; not enforced yet, see
-    /// [`UsageLimits`]).
+    /// Usage limits and the budget policy (see [`UsageLimits`] for which
+    /// are enforced).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<Lenient<UsageLimits>>,
     /// How this value was written. Runtime-only.
@@ -444,6 +625,12 @@ impl ModelEndpoint {
             Some(Lenient::Known(l)) => l.summary(),
             Some(Lenient::Unrecognized(_)) => "(unreadable)".to_string(),
         }
+    }
+
+    /// (#2902 step 5) The endpoint's readable limits, `None` when absent or
+    /// unreadable (an unreadable `limits` is `validate`'s finding).
+    pub fn known_limits(&self) -> Option<&UsageLimits> {
+        self.limits.as_ref().and_then(|l| l.known().ok())
     }
 
     /// The host (authority, userinfo stripped) of an unmanaged endpoint's
@@ -809,6 +996,37 @@ mod tests {
         assert_eq!(ok.validate(), Ok(()));
     }
 
+    /// (#2902 step 5, zero doctrine) A window of 0 tokens or 0 calls is not
+    /// a budget: refused, naming the field and the way to turn a budget
+    /// off. Unset stays fine, and so does `policy: off` with a real number.
+    #[test]
+    fn a_zero_window_is_refused_and_names_policy_off() {
+        let with_policy = |policy: Option<BudgetPolicy>, tokens: Option<u64>, calls: Option<u64>| ModelEndpoint {
+            url: Some("https://h/v1".into()),
+            limits: Some(
+                UsageLimits {
+                    policy: policy.map(Lenient::Known),
+                    window: Some(UsageWindow { period: Some("1d".into()), tokens, calls, ..Default::default() }),
+                    ..Default::default()
+                }
+                .into(),
+            ),
+            ..Default::default()
+        };
+        let with = |tokens: Option<u64>, calls: Option<u64>| with_policy(None, tokens, calls);
+        let t = with(Some(0), None).validate().unwrap_err();
+        assert!(t.contains("limits.window.tokens is 0") && t.contains("set policy off"), "{t}");
+        let c = with(None, Some(0)).validate().unwrap_err();
+        assert!(c.contains("limits.window.calls is 0") && c.contains("set policy off"), "{c}");
+        assert_eq!(with(Some(1), Some(1)).validate(), Ok(()));
+        // (5th review MF2) Under `off` the number is inert: the operator did
+        // what the refusal asks, so it is not refused. `warn` and `wait` are.
+        assert_eq!(with_policy(Some(BudgetPolicy::Off), Some(0), Some(0)).validate(), Ok(()), "off + 0 is fine");
+        for p in [BudgetPolicy::Warn, BudgetPolicy::Wait] {
+            assert!(with_policy(Some(p), Some(0), None).validate().unwrap_err().contains("is 0"), "{p:?} + 0");
+        }
+    }
+
     #[test]
     #[serial_test::serial] // sets and clears a test-only env var
     fn credential_source_prefers_a_present_env_var_then_the_keychain() {
@@ -906,7 +1124,7 @@ mod tests {
 
         let limits = pm(r#"{"id":"m","endpoint":{"url":"https://h/v1","limits":{"tokens_per_dispatch":"500k"}}}"#);
         let ep = limits.endpoint.as_ref().unwrap();
-        assert_eq!(ep.kind().unwrap(), EndpointKind::Unmanaged, "limits are not enforced, so they never block a call");
+        assert_eq!(ep.kind().unwrap(), EndpointKind::Unmanaged, "unreadable limits never decide routing");
         assert!(ep.validate().unwrap_err().contains("limits"), "{:?}", ep.validate());
         assert_eq!(ep.limits_summary(), "(unreadable)");
     }

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { K_TO_M, MISSING, clkrange, compactThousands, fmtC, fmtElapsed, memBytes, memPct, memStateCls, reclaimableNote } from "./format";
+import { K_TO_M, MISSING, clkrange, compactDuration, compactThousands, fmtC, fmtElapsed, memBytes, memPct, memStateCls, reclaimableNote } from "./format";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -367,5 +367,17 @@ describe("fmtC — compact token counts (#2842)", () => {
     expect(fmtC(9_999_999)).toBe("10.0M");
     expect(fmtC(10_000_000)).toBe("10M");
     expect(fmtC(12_345_678)).toBe("12M");
+  });
+});
+
+describe("compactDuration (#2902 step 5)", () => {
+  it("rounds minutes UP, so a countdown never under-reports; seconds under a minute are exact", () => {
+    expect(compactDuration(119)).toBe("2m");
+    expect(compactDuration(120)).toBe("2m");
+    expect(compactDuration(23 * 3600 + 53 * 60 + 59)).toBe("23h 54m");
+    expect(compactDuration(23 * 3600 + 53 * 60)).toBe("23h 53m");
+    expect(compactDuration(59)).toBe("59s");
+    expect(compactDuration(1)).toBe("1s");
+    expect(compactDuration(0)).toBe("0s");
   });
 });

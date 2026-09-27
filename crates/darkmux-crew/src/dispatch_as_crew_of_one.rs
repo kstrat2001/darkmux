@@ -88,7 +88,9 @@ pub(crate) fn dispatch_as_crew_of_one_with(
 ) -> Result<DispatchResult> {
     // (#2947 review M1) Bad enum config refuses before the mission is
     // minted and before `run_step_graph` reconciles residency.
-    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
+    // (#2902 step 5 review C-d) Against the registry THIS dispatch uses
+    // (`--profiles-file`), so a bad budget there refuses before minting.
+    darkmux_profiles::preflight_with(darkmux_types::config_enum::Scope::Dispatch, opts.config_path.as_deref())?;
     // (#1509 — found live, tests/cli.rs's ack-gate integration tests) The
     // licensed-adjacent operator-consent gate MUST run before any model
     // residency action, never after. Inside `dispatch_internal::dispatch`
@@ -1144,6 +1146,49 @@ mod tests {
         assert!(calls.lock().unwrap().is_empty(), "the step ran");
         let missions_dir = crate::loader::missions_dir();
         let minted = std::fs::read_dir(&missions_dir).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(minted, 0, "a mission was minted before the refusal");
+    }
+
+    /// (#2902 step 5 review C-d) A bad budget in the dispatch's OWN
+    /// `--profiles-file` refuses before a mission is minted (the default
+    /// registry is clean; only the file the command names is bad).
+    #[test]
+    #[serial_test::serial]
+    fn a_bad_budget_in_the_commands_profiles_file_refuses_before_minting() {
+        let _guard = RunGuard::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let kind = FakeDispatchKind {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            should_err: false,
+            placement: placement(),
+            calls: calls.clone(),
+        };
+        let registry = test_registry(kind);
+        let host = Arc::new(Mutex::new(MockHost::new().cataloged("test-model", 5_000_000_000)));
+        let host_for_factory = host.clone();
+        let host_factory = move || -> Box<dyn darkmux_gestalt::ModelHost> {
+            Box::new(SharedMockHost(host_for_factory.clone()))
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let pf = dir.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":4096}]}},
+                "endpoints":{"azure":{"url":"https://h.example/v1",
+                    "limits":{"policy":"wait","window":{"period":"1d","tokns":10}}}}}"#,
+        )
+        .unwrap();
+        let mut opts = test_opts("coder", "x");
+        opts.config_path = Some(pf.to_string_lossy().to_string());
+        let result = dispatch_as_crew_of_one_with(opts, &registry, &host_factory);
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains("dispatch: refusing to start: bad config"), "{msg}");
+        assert!(msg.contains("endpoints.azure.limits") && msg.contains("tokns"), "{msg}");
+        assert!(host.lock().unwrap().ops.is_empty(), "host touched before the refusal");
+        assert!(calls.lock().unwrap().is_empty(), "the step ran");
+        let minted = std::fs::read_dir(crate::loader::missions_dir()).map(|d| d.count()).unwrap_or(0);
         assert_eq!(minted, 0, "a mission was minted before the refusal");
     }
 

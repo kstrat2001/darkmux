@@ -42,6 +42,19 @@ function machineSpecs(overrides: Partial<MachineSpecs> & Pick<MachineSpecs, "mac
 const T_MAX = Date.parse("2026-08-09T00:00:00.000Z");
 
 describe("machActive", () => {
+  // (#2902 step 5, 5th review MF1) A hosted call held by its budget writes
+  // `budget.wait` BEFORE any `dispatch start`: the machine is in flight
+  // while the wait is open, live or in playback, with or without presence.
+  it("is true for a machine whose only session is an open budget wait (no dispatch start yet)", () => {
+    const data: FlowRecord[] = [
+      rec({ ts: "2026-08-08T20:00:00.000Z", machine_uid: "m1", session_id: "s1", action: "budget.wait", payload: { endpoint_id: "azure", wait_seconds: 86_000 } }),
+    ];
+    expect(machActive(data, new Set(), "m1", T_MAX)).toBe(true);
+    expect(machActive(data, new Set(["s1"]), "m1", T_MAX)).toBe(true);
+    const resumed = [...data, rec({ ts: "2026-08-08T21:00:00.000Z", machine_uid: "m1", session_id: "s1", action: "budget.resume" })];
+    expect(machActive(resumed, new Set(), "m1", T_MAX)).toBe(false);
+  });
+
   it("is true when a dispatch.start on the machine belongs to a live session", () => {
     const data: FlowRecord[] = [rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start" })];
     expect(machActive(data, new Set(["s1"]), "m1", T_MAX)).toBe(true);

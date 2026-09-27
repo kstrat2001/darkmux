@@ -14,6 +14,7 @@
 //! | `requested_model` | the model id darkmux put on the wire                           |
 //! | `reported_model`  | the response's own `model` field; ABSENT when it had none      |
 //! | `endpoint`        | the endpoint darkmux called, as a fact (see below)             |
+//! | `endpoint_id`     | the `endpoints` id the call was made through; ABSENT for an unnamed endpoint (#2902 step 5) |
 //! | `token_source`    | `"provider"` when the reply carried a usage block, else `"absent"` |
 //! | `prompt_tokens` · `completion_tokens` · `total_tokens` · `reasoning_tokens` · `cached_tokens` | the counts, provider total wins |
 //!
@@ -267,6 +268,11 @@ pub struct CallFacts<'a> {
     pub requested_model: &'a str,
     pub reported_model: Option<&'a str>,
     pub endpoint: &'a str,
+    /// (#2902 step 5) The profile registry's `endpoints` id this call was
+    /// made through (`ModelEndpoint::named_id`), when it has one. What an
+    /// endpoint's rolling-window budget sums by (`crate::budget`); the
+    /// `endpoint` label above is a host/model display string, not a key.
+    pub endpoint_id: Option<&'a str>,
 }
 
 /// THE writer: one call's canonical `telemetry.tokens` payload.
@@ -285,6 +291,9 @@ pub fn usage_payload(facts: &CallFacts<'_>, counts: &UsageCounts) -> serde_json:
     }
     if let Some(m) = facts.reported_model {
         obj.insert("reported_model".into(), serde_json::json!(m));
+    }
+    if let Some(id) = facts.endpoint_id {
+        obj.insert("endpoint_id".into(), serde_json::json!(id));
     }
     if !counts.reported() {
         obj.insert("token_source".into(), serde_json::json!("absent"));
@@ -397,12 +406,150 @@ pub(crate) fn assert_one_usage_record<'a>(
     rec
 }
 
+// ── (#2902 step 5) Reading a usage record back ──────────────────────────
+//
+// The per-record half of every token sum: what ONE `telemetry.tokens`
+// record contributes, in one value domain. Moved here from
+// `darkmux_serve::usage_sum` (which re-exports it unchanged, and remains the
+// fold over many records: `run list --usage`, `GET /runs`) so the endpoint
+// budget's rolling-window sum (`crate::budget`) reads a record exactly the
+// way the fold does. The viewer's twin is `ui/src/lib/usageRecords.ts`.
+
+/// One record's contribution: the twin of `usageContribution`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageAmount {
+    pub total: u64,
+    pub prompt: u64,
+    pub completion: u64,
+    pub cached: Option<u64>,
+    pub purpose: UsagePurpose,
+    /// True when the payload carried any token count.
+    pub reported: bool,
+}
+
+/// True for a usage record (`telemetry.tokens`), in either spelling the
+/// stream carries it (category + source, or the action).
+pub fn is_usage_record(v: &serde_json::Value) -> bool {
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str());
+    (s("category") == Some("telemetry") && s("source") == Some(USAGE_SOURCE))
+        || s("action") == Some(USAGE_ACTION)
+}
+
+pub fn payload_of(v: &serde_json::Value) -> &serde_json::Value {
+    static EMPTY: serde_json::Value = serde_json::Value::Null;
+    v.get("payload").unwrap_or(&EMPTY)
+}
+
+/// The largest count either side holds exactly: `2^53`, the edge of a JS
+/// number's integer range and comfortably inside `u64`. Every count is
+/// clamped to it, so a sum of clamped counts is the same arithmetic in
+/// both twins (`usageRecords.ts` spells the same constant).
+pub const MAX_COUNT: u64 = 1 << 53;
+
+/// THE value domain, shared with the viewer's `num`: a finite number is
+/// floored to an integer and clamped to `[0, MAX_COUNT]`; anything else (a
+/// string, a bool, null, a negative) reads as 0. "Reported" is judged by
+/// this same reading everywhere, so a negative count is not a count.
+fn num(v: Option<&serde_json::Value>) -> u64 {
+    let Some(x) = v else { return 0 };
+    if let Some(u) = x.as_u64() {
+        return u.min(MAX_COUNT);
+    }
+    match x.as_f64() {
+        // `as u64` already saturates and truncates toward zero; the clamp
+        // is what keeps the two twins on one edge.
+        Some(f) if f.is_finite() && f > 0.0 => (f as u64).min(MAX_COUNT),
+        _ => 0,
+    }
+}
+
+/// True when a value is a finite number at all — the presence test for
+/// `cached_tokens` (a reported `-3` is a reported 0, not an absence).
+fn is_finite_number(v: &serde_json::Value) -> bool {
+    v.as_u64().is_some() || v.as_i64().is_some() || v.as_f64().is_some_and(f64::is_finite)
+}
+
+/// A record's `purpose`. Records from before flow schema 1.59.0 carry none;
+/// for those (THE LEGACY RULE, the only one) a compactor call is utility and
+/// anything else, a legacy `dispatch complete` included, is work. The twin
+/// of `usagePurpose`.
+pub fn usage_purpose(payload: &serde_json::Value) -> UsagePurpose {
+    if let Some(p) = payload.get("purpose") {
+        if let Ok(purpose) = serde_json::from_value::<UsagePurpose>(p.clone()) {
+            return purpose;
+        }
+    }
+    let compaction = payload
+        .get("call_kind")
+        .and_then(|k| serde_json::from_value::<CallKind>(k.clone()).ok())
+        == Some(CallKind::Compaction);
+    if compaction {
+        UsagePurpose::Utility
+    } else {
+        UsagePurpose::Work
+    }
+}
+
+/// True when a payload carries any token count (the twin of
+/// `hasAnyTokenCounts`).
+pub fn has_any_token_counts(p: &serde_json::Value) -> bool {
+    num(p.get("total_tokens")) > 0
+        || num(p.get("prompt_tokens")) > 0
+        || num(p.get("completion_tokens")) > 0
+        || num(p.get("remote_tokens")) > 0
+}
+
+pub fn amount_of(p: &serde_json::Value) -> UsageAmount {
+    let prompt = num(p.get("prompt_tokens"));
+    let completion = num(p.get("completion_tokens"));
+    let mut total = num(p.get("total_tokens"));
+    if total == 0 {
+        total = prompt + completion;
+    }
+    if total == 0 {
+        // The retired review path's spelling of its own spend, on a legacy
+        // `dispatch complete` only.
+        total = num(p.get("remote_tokens"));
+    }
+    let cached = p.get("cached_tokens").filter(|c| is_finite_number(c)).map(|c| num(Some(c)));
+    UsageAmount { total, prompt, completion, cached, purpose: usage_purpose(p), reported: has_any_token_counts(p) }
+}
+
+/// The per-record half of the sum: what one usage record adds, or `None`
+/// when `v` is not a usage record.
+pub fn usage_contribution(v: &serde_json::Value) -> Option<UsageAmount> {
+    if !is_usage_record(v) {
+        return None;
+    }
+    Some(amount_of(payload_of(v)))
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// (#2902 step 5) `endpoint_id` is written when the call went through a
+    /// named endpoint, and absent otherwise (never an empty string): the
+    /// endpoint budget sums records by it.
+    #[test]
+    fn endpoint_id_is_written_only_for_a_named_endpoint() {
+        let facts = |endpoint_id| CallFacts {
+            call_kind: CallKind::SingleShot,
+            role_id: None,
+            requested_model: "m",
+            reported_model: None,
+            endpoint: "h/m",
+            endpoint_id,
+        };
+        let counts = UsageCounts { total: Some(5), ..Default::default() };
+        assert_eq!(usage_payload(&facts(Some("azure")), &counts)["endpoint_id"], "azure");
+        assert!(usage_payload(&facts(None), &counts).get("endpoint_id").is_none());
+        assert_eq!(usage_payload(&facts(Some("azure")), &UsageCounts::default())["endpoint_id"], "azure", "an absent-usage record still names its endpoint");
+    }
     use super::*;
 
     fn facts(reported: Option<&'static str>) -> CallFacts<'static> {
         CallFacts {
+            endpoint_id: None,
             call_kind: CallKind::SingleShot,
             role_id: None,
             requested_model: "m",
@@ -434,6 +581,7 @@ mod tests {
     fn purpose_names_darkmux_utility_jobs_and_nothing_else() {
         let purpose = |call_kind, role_id| {
             let f = CallFacts {
+                endpoint_id: None,
                 call_kind,
                 role_id,
                 requested_model: "m",
@@ -468,6 +616,7 @@ mod tests {
     fn a_utility_usage_record_names_its_job_and_work_carries_none() {
         let payload = |call_kind, role_id| {
             let f = CallFacts {
+                endpoint_id: None,
                 call_kind,
                 role_id,
                 requested_model: "m",

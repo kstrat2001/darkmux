@@ -22,7 +22,7 @@ import { usePlaybackClock } from "../../lib/pageClockRate";
 import { WALL_CLOCK } from "../../lib/restHand";
 import { UtilityGlyph } from "../../components/UtilityGlyph";
 import { scopeStateOf } from "../../lib/scopeMorph";
-import { liveStateLabel } from "../../lib/tokenRate";
+import { liveStateLabel, reasonForLine } from "../../lib/tokenRate";
 import { tokensOffMeter } from "./savings";
 import { hybridNote } from "./hybridNote";
 import { NotesDialog } from "../../components/NotesDialog";
@@ -1260,7 +1260,7 @@ export function FleetLens({
                           selectedExec.state === "rest" && selectedExec.restReason
                           ? (
                               <>
-                                <span className="mach-scope__why mach-scope__why--full">{selectedExec.restReason}</span>
+                                <span className="mach-scope__why mach-scope__why--full">{reasonForLine(selectedExec.restReason)}</span>
                                 <span className="mach-scope__why mach-scope__why--word">{selectedExec.restReasonWord ?? selectedExec.restReason}</span>
                               </>
                             )

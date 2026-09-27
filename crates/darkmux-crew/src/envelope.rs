@@ -29,7 +29,7 @@
 //! [`MissionOutcomeStatus`] has four values. A mission driver's OWN
 //! conversion logic decides which one applies (this module does not
 //! prescribe the mission-type-specific thresholds — see `CLAUDE.md`'s
-//! `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` budget-policy text for the
+//! `DARKMUX_REMOTE_MAX_TOKENS_PER_STEP` budget-policy text for the
 //! review pipeline's own rules), but the SHAPE of the decision is uniform:
 //!
 //! - **Clean** — the mission produced its full intended output with no
@@ -355,15 +355,16 @@ pub struct PhaseOutcome {
     pub reason: Option<String>,
 }
 
-/// One pipeline stage's remote token-bucket outcome — the generic shape
+/// One remote token bucket's outcome (a per-step cap since #2902 step 5; a
+/// "pipeline stage" in pre-4.0 envelopes) — the generic shape
 /// every mission-type-specific budget record (e.g. `darkmux-lab`'s
 /// `ReviewEnvelope::remote_budgets`, typed
 /// `Vec<crate::remote_budget::RemoteBudgetRecord>`) maps onto. Field-for-
 /// field identical by design so a mapping is a pure struct-literal copy,
 /// never a lossy translation. `RemoteBudgetRecord` moved into this crate
 /// alongside its producing bucket type in #1877, but stays a DISTINCT type
-/// from this row on purpose — `RemoteBudgetRecord` is a review-pipeline
-/// stage's own accounting output, `RemoteBudgetRow` is `MissionEnvelope`'s
+/// from this row on purpose — `RemoteBudgetRecord` is a bucket's own
+/// accounting output, `RemoteBudgetRow` is `MissionEnvelope`'s
 /// generic mapping target; unifying them is a separate call from the
 /// bucket-type extraction #1877 made.
 #[derive(Debug, Clone, Serialize, Deserialize)]

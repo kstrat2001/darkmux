@@ -388,13 +388,18 @@ pub(crate) fn spawn_wall_clock_watchdog(started: std::time::Instant, bound_secon
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let guard = WallClockStopGuard(std::sync::Arc::clone(&stop));
     if !cfg!(test) {
-        let deadline = started + std::time::Duration::from_secs(bound_seconds);
+        // (#2902 step 5) Time darkmux itself held the run (a budget `wait`)
+        // does not count against its bound: the deadline is re-read every
+        // tick, moving out by every millisecond recorded since this run
+        // started (`darkmux_types::run_pause`).
+        let paused_at_start = darkmux_types::run_pause::total_ms();
         std::thread::spawn(move || {
             loop {
                 if stop.load(std::sync::atomic::Ordering::SeqCst) {
                     return;
                 }
-                if std::time::Instant::now() >= deadline {
+                let held = darkmux_types::run_pause::total_ms().saturating_sub(paused_at_start);
+                if std::time::Instant::now() >= wall_clock_deadline(started, bound_seconds, held) {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
@@ -407,6 +412,14 @@ pub(crate) fn spawn_wall_clock_watchdog(started: std::time::Instant, bound_secon
         });
     }
     Some(guard)
+}
+
+/// (#2902 step 5) A run's wall-clock deadline: `started` plus its bound,
+/// plus every millisecond darkmux held the run on purpose (`held_ms`, a
+/// budget wait), so the operator's own budget never trips the run's own
+/// time limit. Pure, so the extension is tested without the thread.
+pub(crate) fn wall_clock_deadline(started: std::time::Instant, bound_seconds: u64, held_ms: u64) -> std::time::Instant {
+    started + std::time::Duration::from_secs(bound_seconds) + std::time::Duration::from_millis(held_ms)
 }
 
 // (#2310 P4d) Test-only since the bespoke review launcher — its last
@@ -465,6 +478,22 @@ mod tests {
             spawn_wall_clock_watchdog(std::time::Instant::now(), 0).is_none(),
             "a `0` bound must be a documented no-op, never a real (or instant) deadline"
         );
+    }
+
+    /// (#2902 step 5) A budget wait extends the deadline by exactly the
+    /// time held; no hold leaves it at the bound.
+    #[test]
+    fn a_budget_hold_extends_the_wall_clock_deadline_by_the_time_held() {
+        let t0 = std::time::Instant::now();
+        assert_eq!(wall_clock_deadline(t0, 60, 0), t0 + std::time::Duration::from_secs(60));
+        assert_eq!(wall_clock_deadline(t0, 60, 90_000), t0 + std::time::Duration::from_secs(150));
+        // The watchdog thread (skipped under cfg(test)) must use it, with
+        // the process's hold counter, re-read each tick.
+        let src = include_str!("launch_guard.rs");
+        let body = &src[src.find("fn spawn_wall_clock_watchdog(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(body.contains("wall_clock_deadline(started, bound_seconds, held)"), "the thread uses the extended deadline");
+        assert!(body.contains("run_pause::total_ms().saturating_sub(paused_at_start)"), "re-read every tick");
     }
 
     /// A non-zero bound engages the watchdog (returns a live guard) —
