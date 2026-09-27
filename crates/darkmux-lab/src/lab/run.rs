@@ -87,7 +87,7 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
     // (#2947) Bad enum config refuses before a run directory is minted.
     // Every lab verb that runs a workload (`lab run`, `lab loop`, and the
     // benches built on this function) comes through here.
-    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::LabRun)?;
+    darkmux_profiles::preflight_with(darkmux_types::config_enum::Scope::LabRun, opts.config_path.as_deref())?;
     let paths = paths::resolve(ResolveScope::Auto);
     paths::ensure(&paths)?;
 

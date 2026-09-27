@@ -1077,21 +1077,42 @@ pub fn max_stall_recoveries_with_source() -> (Option<u32>, Source) {
 }
 
 // ── Remote (hosted-endpoint) dispatch (#1260/#1177) ──
-/// The per-EXECUTION remote token allowance — an execution is one pipeline
-/// stage (any endpoint-staffed `dispatch.map`/`dispatch.internal` step —
-/// `review`'s own `create-mod-dispatch` seat is the shipped example, #2310
-/// P4d; a bare dispatch is one execution). Only REMOTE (endpoint-staffed)
-/// calls draw from it. Resolves `env(DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION) >
-/// config.remote.max_tokens_per_execution > 500000` (operator decision on
-/// #1260 — tokens only, never currency).
-pub fn remote_max_tokens_per_execution() -> u64 {
-    let cfg = config().remote.as_ref().and_then(|r| r.max_tokens_per_execution);
-    pick_parsed("DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION", cfg, Some(500_000)).unwrap()
+/// A per-step cap on hosted tokens (#2902 step 5; renamed from the
+/// per-execution allowance in 4.0): the hosted tokens one step may spend
+/// before `remote.step_budget_policy` applies. `dispatch.map` steps naming
+/// the same `bucket_group` share one allowance. Resolves
+/// `env(DARKMUX_REMOTE_MAX_TOKENS_PER_STEP)`, then
+/// `config.remote.max_tokens_per_step`, then none: there is no built-in
+/// default, `None` is no cap. Tokens only, never currency (#1260).
+pub fn remote_max_tokens_per_step() -> Option<u64> {
+    let cfg = config().remote.as_ref().and_then(|r| r.max_tokens_per_step);
+    // (#2902 step 5) No built-in default: unset is no per-step cap. An
+    // unparseable env value falls through to the config tier, the same
+    // lenient rule every numeric accessor follows.
+    // (zero doctrine) `0` is no cap, the same as unset.
+    pick_parsed("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", cfg, None).filter(|n| *n > 0)
 }
+
+/// (#2902 step 5) What a step that reaches its per-step cap does: `off` or
+/// `warn` (operator, 2026-09-27: `wait` is an endpoint budget's value only).
+/// Registered `ConfigEnum` (`remote.step_budget_policy`, env
+/// `DARKMUX_REMOTE_STEP_BUDGET_POLICY`), absent = `warn`. An unregistered
+/// value (including `wait`) is an error, refused at preflight.
+pub fn remote_step_budget_policy() -> Result<crate::config::StepBudgetPolicy, crate::config_enum::BadEnumValue> {
+    resolve_enum("remote.step_budget_policy").map(|(v, _)| v)
+}
+
+/// (#2902 step 5) Every leftover RENAMED setting (`config::RENAMED_SETTINGS`)
+/// in the live config or env: read by nothing, so named loudly (doctor Warn,
+/// a preflight warning line). Never refused.
+pub fn renamed_setting_leftovers() -> Vec<crate::config::RenamedLeftover> {
+    crate::config::renamed_leftovers(config(), &env_str)
+}
+
 /// (#1230 Packet 1) Max CONCURRENT remote dispatches
 /// `darkmux_crew::concurrent_dispatch::run_bounded` runs at once. Resolves
 /// `env(DARKMUX_REMOTE_CONCURRENT_CAP) > config.remote.concurrent_cap > 1`
-/// — mirrors `remote_max_tokens_per_execution`'s wiring exactly.
+/// — mirrors `remote_max_tokens_per_step`'s wiring exactly.
 ///
 /// **Default is `1`, not `4` (#1665 review CONSIDER 5).** This accessor
 /// went unwired at every real call site for a while (#2681 found it: every
@@ -1161,9 +1182,8 @@ pub fn radio_humor() -> u8 {
 /// above that the ceiling scales with the value (at `480`, 16 days).
 /// Resolves
 /// `env(DARKMUX_ACP_IDLE_EXIT_MINUTES) > config.runtime.acp_idle_exit_minutes > 30`.
-/// `0` disables self-exit entirely (an explicit opt-out, mirroring
-/// `remote.max_tokens_per_execution`'s `0`-means-hard-off convention
-/// elsewhere in this file).
+/// `0` disables self-exit entirely (the "0 on a darkmux bound means
+/// unbounded" rule, CLAUDE.md).
 pub fn acp_idle_exit_minutes() -> u64 {
     let cfg = config().runtime.as_ref().and_then(|r| r.acp_idle_exit_minutes);
     pick_parsed("DARKMUX_ACP_IDLE_EXIT_MINUTES", cfg, Some(30)).unwrap()
@@ -1467,8 +1487,7 @@ pub fn turn_delay_ms_with_source() -> (u64, Source) {
 /// continuous host sampler (the machine stats drawer's live feed). Resolves
 /// `env(DARKMUX_HOST_SAMPLER_INTERVAL_MS) > config.runtime.
 /// host_sampler_interval_ms > 5000` — mirrors `turn_delay_ms`'s wiring
-/// exactly. `0` disables the sampler entirely (an explicit opt-out, same
-/// convention as `remote.max_tokens_per_execution`'s `0`).
+/// exactly. `0` disables the sampler entirely (an explicit opt-out).
 pub fn host_sampler_interval_ms() -> u64 {
     let cfg = config().runtime.as_ref().and_then(|r| r.host_sampler_interval_ms);
     pick_parsed("DARKMUX_HOST_SAMPLER_INTERVAL_MS", cfg, Some(5000)).unwrap()
@@ -3680,20 +3699,24 @@ mod tests {
         }
     }
 
-    // ── remote_max_tokens_per_execution (#1260): env > config > 500000 ──
+    // ── remote_max_tokens_per_step (#1260, #2902 step 5): env > config > none ──
     #[serial_test::serial]
     #[test]
-    fn remote_max_tokens_per_execution_env_then_default() {
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+    fn remote_max_tokens_per_step_env_then_config_then_none() {
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
         let prev = std::env::var(k).ok();
         unsafe { std::env::remove_var(k); }
-        // No env + the empty test config (#811) → the built-in 500K default.
-        assert_eq!(remote_max_tokens_per_execution(), 500_000);
+        // (#2902 step 5) No env + the empty test config (#811) → NO per-step
+        // budget. The built-in 500000 is gone.
+        assert_eq!(remote_max_tokens_per_step(), None);
         unsafe { std::env::set_var(k, "25000"); }
-        assert_eq!(remote_max_tokens_per_execution(), 25_000, "env tier wins live");
-        // An unparseable env value falls through to the default, never panics.
+        assert_eq!(remote_max_tokens_per_step(), Some(25_000), "env tier wins live");
+        // An unparseable env value falls through (to no budget), never panics.
         unsafe { std::env::set_var(k, "half-a-million"); }
-        assert_eq!(remote_max_tokens_per_execution(), 500_000);
+        assert_eq!(remote_max_tokens_per_step(), None);
+        // (zero doctrine) `0` on a darkmux bound is unbounded: no cap.
+        unsafe { std::env::set_var(k, "0"); }
+        assert_eq!(remote_max_tokens_per_step(), None, "0 is no cap");
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),

@@ -24,8 +24,8 @@ import type { RosterMachineEntry } from "../../types/handwritten";
  * fallbacks is load-bearing, and what happens when each is the only one left.
  */
 
-const UID_A = "F9ACF59C-0E8B-5092-A6B4-7C07070737D2";
-const UID_B = "382A2016-41FD-5729-BF22-9C1A91F1BEDD";
+const UID_A = "00000000-0000-4000-8000-ABCDEF000011";
+const UID_B = "00000000-0000-4000-8000-ABCDEF000006";
 
 function beat(uid: string, name: string): [string, PresenceBeat] {
   return [

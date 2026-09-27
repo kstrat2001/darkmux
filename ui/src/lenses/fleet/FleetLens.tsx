@@ -22,12 +22,12 @@ import { usePlaybackClock } from "../../lib/pageClockRate";
 import { WALL_CLOCK } from "../../lib/restHand";
 import { UtilityGlyph } from "../../components/UtilityGlyph";
 import { scopeStateOf } from "../../lib/scopeMorph";
-import { liveStateLabel } from "../../lib/tokenRate";
+import { liveStateLabel, reasonForLine } from "../../lib/tokenRate";
 import { tokensOffMeter } from "./savings";
 import { hybridNote } from "./hybridNote";
 import { NotesDialog } from "../../components/NotesDialog";
 import { openModalEl } from "../../lib/dialogManager";
-import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, rosterOnlyEntries, rosterAliasFor, specUnknownLabel, cardFace, type CardSourcesAnswered } from "./cards";
+import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, rosterOnlyEntries, rosterAliasFor, specUnknownLabel, cardFace, NO_SIGNAL_STAT, type CardSourcesAnswered } from "./cards";
 import { useLatch } from "../../hooks/useLatch";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
 import type { MachineSpecs } from "../../types/handwritten";
@@ -617,7 +617,7 @@ export function FleetLens({
   }, []);
   const liveWindow = useFlowWindow(wallNow);
   const flowWindow = records !== undefined
-    ? { data: records, tMax: tMax ?? 0, settled: true }
+    ? { data: records, tMax: tMax ?? 0, settled: true, failure: null }
     : liveWindow;
   // (Playback parity, Change A — "one clock") The clock every bracketing
   // derivation below reads: the playhead when scrubbed, the real wall
@@ -767,9 +767,15 @@ export function FleetLens({
   // `/machine/specs` is live-only (see `specsQuery`); a replay has no self
   // identity to wait for.
   const specsAnswered = useLatch(!livePolling || specsQuery.status !== "pending");
+  // (#2965) A failed flow read settles the window with no records, which
+  // is what a quiet window looks like: the flow source has not answered
+  // while its read is failing, so the claims it backs hold "no signal".
+  // `FlowReadNotice` (app-level) says why. The latch still covers the
+  // midnight rollover: a new day's PENDING key is not a failure.
+  const flowKnown = flowAnswered && flowWindow.failure === null;
   const answered = useMemo<CardSourcesAnswered>(
-    () => ({ flow: flowAnswered, presence: presenceAnswered, sessions: sessionsAnswered, runs: runsAnswered, specs: specsAnswered }),
-    [flowAnswered, presenceAnswered, sessionsAnswered, runsAnswered, specsAnswered],
+    () => ({ flow: flowKnown, presence: presenceAnswered, sessions: sessionsAnswered, runs: runsAnswered, specs: specsAnswered }),
+    [flowKnown, presenceAnswered, sessionsAnswered, runsAnswered, specsAnswered],
   );
 
 
@@ -999,7 +1005,9 @@ export function FleetLens({
         // reads no live sample, and a precise clock re-rendered it per
         // sample.
         nowMs={playhead == null ? liveEdgeClock * 1000 : playheadT}
-        settled={flowWindow.settled}
+        // (#2965) Its zeros are a negative claim off the same read: a failed
+        // one keeps the loading silhouette rather than counting up to "0".
+        settled={flowWindow.settled && flowWindow.failure === null}
       />
       <RunsUnreadableNotice unreadable={runsUnreadable} message={runsErrorMessage} />
       <RosterUnreadableNotice error={rosterError} />
@@ -1048,6 +1056,12 @@ export function FleetLens({
           // live readouts (tube, rate line, pager) draw on `face.tube`, so an
           // offline card shows its powered-off screen and nothing live.
           const face = cardFace(card, showsReading, answered);
+          // (#2955 review) The page's execution has no live state: the
+          // page lost the daemon (`liveStateWhileConnected`'s downgrade).
+          // Its status line is the plain "no signal" every other card
+          // shows, with the dim dot, not a lit reading; the tube shows
+          // static and the card stays active (its machine IS running).
+          const readingNoSignal = face.tube === "reading" && selectedExec != null && selectedExec.state === null;
           // `card.liveTokRate !== null` (the scope's mount gate below) only
           // ever holds when at least one execution is running, so
           // `selectedExec` is non-null everywhere it's read below — this is
@@ -1089,7 +1103,7 @@ export function FleetLens({
             // (#2958) `face`, not the card's raw flags: "offline" waits on
             // the sources that could contradict it. `nosignal` gives the dot
             // the absent dot's no-reading gray, without dimming the card.
-            className={`mach${face.active ? " active" : ""}${face.absent ? " absent" : ""}${face.noSignal ? " nosignal" : ""}`}
+            className={`mach${face.active ? " active" : ""}${face.absent ? " absent" : ""}${face.noSignal || readingNoSignal ? " nosignal" : ""}`}
             data-act="machine"
             data-arg={encodeMachineKey(machineKeyCtx, card.uid)}
             role="button"
@@ -1161,12 +1175,6 @@ export function FleetLens({
                 (a powered-off screen), so no card changes size when its
                 data arrives or its machine comes and goes. */}
             <div className="mach-body mach-body--scope">
-              <div className="stat">
-                <span className="dot" />
-                {/* (#2958) "idle" before its sources answer is a default,
-                    not a reading: see `cardFace`. */}
-                {face.stat}
-              </div>
               {/* (#2877) Live token-rate scope. Rendered ONLY when the card
                   computed a reading (`liveTokRate !== null` — live mode,
                   active, and at least one running session has produced two
@@ -1183,9 +1191,18 @@ export function FleetLens({
                   execution now (`selectedExec` — the sole one when there's
                   only one running), not a machine-wide aggregate: the tube,
                   its color and this word all belong to one run. */}
-              {face.tube === "reading" && selectedExec && (
+              {/* (#2955, operator 2026-09-27: the card is one height in
+                  every state) The reading takes the STATUS line's place, dot
+                  included, instead of a line of its own under it: with a
+                  reading, "dispatch in flight" says less than "42 tok/s" or
+                  "processing ~36k" does, and a second line grew the desktop
+                  card 23px whenever a model ran. Same slot either way, so
+                  one execution's text beside the tube is two rows, as an
+                  idle card's is. (A second execution still adds the pager
+                  row below; the layout spec's fixme records it.) */}
+              {face.tube === "reading" && selectedExec && !readingNoSignal ? (
                 <div
-                  className="mach-scope__rate"
+                  className="stat mach-scope__rate"
                   data-tone={selectedExec.state ?? "none"}
                   data-carried={selectedExec.carried ? "true" : "false"}
                   data-thinking={selectedExec.state === "generating" && selectedExec.thinking === true ? "true" : undefined}
@@ -1199,6 +1216,7 @@ export function FleetLens({
                         : undefined
                   }
                 >
+                  <span className="dot" />
                   {selectedExec.state === "generating"
                     ? // (#2886 pass 5, MUST — fresh-reviewer finding F3) A GEN
                       // lamp with no reading yet (fewer than two same-turn
@@ -1212,17 +1230,17 @@ export function FleetLens({
                       // says "think" for the same opening seconds.
                       selectedExec.tokensPerSec != null
                       ? `${fmtN(Math.round(selectedExec.tokensPerSec))} ${selectedExec.thinking ? "think tok/s" : "tok/s"}`
-                      : selectedExec.thinking
+                      : // (#2955 review) The whole status line now, so the
+                        // unit stays beside the "not yet measured" mark.
+                        selectedExec.thinking
                         ? "— think tok/s"
-                        : "—"
-                    : // (#2886 pass 3) `state: null` here (rather than the
-                      // "no live execution" case, ruled out since
-                      // `card.liveTokRate !== null` implies something IS
-                      // running) is `liveStateWhileConnected`'s
-                      // disconnection downgrade, applied per execution — say
-                      // so, not "stalled".
+                        : "— tok/s"
+                    : // (#2886 pass 3) `state: null` (the disconnection
+                      // downgrade) renders the plain status line below
+                      // (`readingNoSignal`), so this arm only narrows the
+                      // type for `liveStateLabel`.
                       selectedExec.state === null
-                      ? "no signal"
+                      ? NO_SIGNAL_STAT
                       : // (#2890, operator) The prompt's estimated size lives
                         // here, not in the tube (whose center is the brain for
                         // all of PROMPT). "processing ~36k", not "processing
@@ -1242,7 +1260,7 @@ export function FleetLens({
                           selectedExec.state === "rest" && selectedExec.restReason
                           ? (
                               <>
-                                <span className="mach-scope__why mach-scope__why--full">{selectedExec.restReason}</span>
+                                <span className="mach-scope__why mach-scope__why--full">{reasonForLine(selectedExec.restReason)}</span>
                                 <span className="mach-scope__why mach-scope__why--word">{selectedExec.restReasonWord ?? selectedExec.restReason}</span>
                               </>
                             )
@@ -1258,6 +1276,13 @@ export function FleetLens({
                             compacting: selectedExec.compacting,
                             compactingSeconds: selectedExec.compactingSeconds,
                           })}
+                </div>
+              ) : (
+                <div className="stat">
+                  <span className="dot" />
+                  {/* (#2958) "idle" before its sources answer is a default,
+                      not a reading: see `cardFace`. */}
+                  {readingNoSignal ? NO_SIGNAL_STAT : face.stat}
                 </div>
               )}
               {/* (#2881) The pager: shown only with 2+ running executions —

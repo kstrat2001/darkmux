@@ -91,6 +91,8 @@ function mockMachineFetch(opts: {
   holdFlow?: boolean | Promise<void>;
   /** (#2958) Paths whose answer waits on the given promise. */
   hold?: Record<string, Promise<void>>;
+  /** (#2965) Both `/flow/<day>` reads answer with this HTTP error status. */
+  failFlow?: number;
 } = {}) {
   const today = todayUTC();
   const yesterday = prevDateUTC(today);
@@ -112,6 +114,9 @@ function mockMachineFetch(opts: {
     if (path === "/machine/resources") {
       resourcesCalled.value = true;
       return Promise.resolve(new Response(JSON.stringify(opts.resources ?? RESOURCES), { status: 200 }));
+    }
+    if (opts.failFlow && (path === `/flow/${today}` || path === `/flow/${yesterday}`)) {
+      return Promise.resolve(new Response("boom", { status: opts.failFlow, statusText: "Internal Server Error" }));
     }
     if (opts.holdFlow && (path === `/flow/${today}` || path === `/flow/${yesterday}`)) {
       if (opts.holdFlow === true) return new Promise<Response>(() => {});
@@ -156,7 +161,7 @@ describe("MachineLens", () => {
   // (#2921 follow-up) A remote machine known only by its hardware uid: the
   // placeholder names it from the roster when it can, and otherwise says how
   // to name it; it never prints the uid.
-  const FAKE_UID = "0A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
+  const FAKE_UID = "00000000-0000-4000-8000-ABCDEF000001";
   const uidOnly = () => [{ ts: new Date(Date.now() - 60_000).toISOString(), action: "dispatch.turn", machine_uid: FAKE_UID }];
   const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
   it("(#2921) a uid-only remote machine with a roster entry is named by it", async () => {
@@ -262,17 +267,18 @@ describe("MachineLens", () => {
   // outranks the specs name, self-vs-other) is fully covered without a
   // DOM render in `ui/src/lib/flow.test.ts`'s own `(#2814)`-tagged tests.
   it("(#2814) never leaks the raw hardware uid into the page, even when the window names nothing", async () => {
+    const uid = "00000000-0000-4000-8000-ABCDEF000011";
     mockMachineFetch({
       specs: {
         machine_id: "MacBook-Pro",
-        machine_uid: "F9ACF59C-0E8B-5092-A6B4-7C07070737D2",
+        machine_uid: uid,
         cpu_brand: "M5 Max",
         ram_total_bytes: 137438953472,
       },
     });
     renderMachine(null);
     await waitFor(() => expect(screen.getByText(/limit source/i)).toBeInTheDocument());
-    expect(document.body.textContent).not.toContain("F9ACF59C");
+    expect(document.body.textContent).not.toContain(uid.slice(0, 8));
   });
 
   // Inverted, so the fix cannot be "treat every drilled uid as local": a
@@ -559,6 +565,43 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
     open();
     await waitFor(() => expect(container.querySelector(".machine-drawer__idle-line")!.textContent).toBe("idle · no samples in the last 10 min"));
     expect(section.querySelector(".mm-utility__id")?.textContent).toBe("no utility model seen");
+  });
+
+  // (#2965) A failed flow read settles the window, but it is not an answer
+  // that nothing happened: the page's "idle" lines are negative claims about
+  // exactly the records that are missing. They hold "no signal", as on the
+  // fleet page, and the app-level `FlowReadNotice` names the failure.
+  it("(#2965) a remote machine page says no signal, not idle, when the flow read fails", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" },
+      liveMachines: [{ machine_uid: "remote-uid", display_name: "studio", schema_version: "1", beat_ts_ms: 1, specs: "M1 Max · 32 GB" }],
+      failFlow: 500,
+    });
+    const { container } = renderMachine("remote-uid");
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([u]) => String(u) === `/flow/${todayUTC()}`)).toBe(true));
+    await waitFor(() => expect(container.querySelector(".machine-drawer__idle-line")).not.toBeNull());
+    // Let every read settle before judging the page: the failure is an answer.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
+    expect(container.querySelector(".machine-drawer__idle-line")!.textContent).toBe("no signal");
+    const section = container.querySelector('[data-testid="machine-utility"]')!;
+    expect(section.querySelector(".mm-utility__live")?.textContent).toBe("no signal");
+  });
+
+  it("(#2965) this machine's Utility section says no signal, not idle, when the flow read fails", async () => {
+    mockMachineFetch({ ...withUtility, failFlow: 500 });
+    const { container } = renderMachine(null);
+    const section = await waitFor(() => {
+      const el = container.querySelector('[data-testid="machine-utility"]');
+      expect(el).toBeTruthy();
+      return el as HTMLElement;
+    });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
+    expect(section.querySelector(".mm-utility__live")?.textContent).toBe("no signal");
+    expect([...section.querySelectorAll(".mm-utility__job")].map((r) => r.textContent)).toEqual(["compacting——", "radio routing——", "other——"]);
   });
 
   // (#2958 second review, point 2) Only the FIRST answer counts, as on the

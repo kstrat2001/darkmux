@@ -27,7 +27,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use darkmux_crew::usage::{CallKind, UsagePurpose};
+use darkmux_crew::usage::UsagePurpose;
 
 /// The sum of a set of records: the Rust twin of `usageRecords.ts`'s
 /// `UsageSum`, field for field.
@@ -86,114 +86,13 @@ impl UsageSum {
     }
 }
 
-/// One record's contribution: the twin of `usageContribution`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UsageAmount {
-    pub total: u64,
-    pub prompt: u64,
-    pub completion: u64,
-    pub cached: Option<u64>,
-    pub purpose: UsagePurpose,
-    /// True when the payload carried any token count.
-    pub reported: bool,
-}
-
-/// True for a usage record (`telemetry.tokens`), in either spelling the
-/// stream carries it (category + source, or the action).
-pub fn is_usage_record(v: &serde_json::Value) -> bool {
-    let s = |k: &str| v.get(k).and_then(|x| x.as_str());
-    (s("category") == Some("telemetry") && s("source") == Some(darkmux_crew::usage::USAGE_SOURCE))
-        || s("action") == Some(darkmux_crew::usage::USAGE_ACTION)
-}
-
-fn payload_of(v: &serde_json::Value) -> &serde_json::Value {
-    static EMPTY: serde_json::Value = serde_json::Value::Null;
-    v.get("payload").unwrap_or(&EMPTY)
-}
-
-/// The largest count either side holds exactly: `2^53`, the edge of a JS
-/// number's integer range and comfortably inside `u64`. Every count is
-/// clamped to it, so a sum of clamped counts is the same arithmetic in
-/// both twins (`usageRecords.ts` spells the same constant).
-pub const MAX_COUNT: u64 = 1 << 53;
-
-/// THE value domain, shared with the viewer's `num`: a finite number is
-/// floored to an integer and clamped to `[0, MAX_COUNT]`; anything else (a
-/// string, a bool, null, a negative) reads as 0. "Reported" is judged by
-/// this same reading everywhere, so a negative count is not a count.
-fn num(v: Option<&serde_json::Value>) -> u64 {
-    let Some(x) = v else { return 0 };
-    if let Some(u) = x.as_u64() {
-        return u.min(MAX_COUNT);
-    }
-    match x.as_f64() {
-        // `as u64` already saturates and truncates toward zero; the clamp
-        // is what keeps the two twins on one edge.
-        Some(f) if f.is_finite() && f > 0.0 => (f as u64).min(MAX_COUNT),
-        _ => 0,
-    }
-}
-
-/// True when a value is a finite number at all — the presence test for
-/// `cached_tokens` (a reported `-3` is a reported 0, not an absence).
-fn is_finite_number(v: &serde_json::Value) -> bool {
-    v.as_u64().is_some() || v.as_i64().is_some() || v.as_f64().is_some_and(f64::is_finite)
-}
-
-/// A record's `purpose`. Records from before flow schema 1.59.0 carry none;
-/// for those (THE LEGACY RULE, the only one) a compactor call is utility and
-/// anything else, a legacy `dispatch complete` included, is work. The twin
-/// of `usagePurpose`.
-pub fn usage_purpose(payload: &serde_json::Value) -> UsagePurpose {
-    if let Some(p) = payload.get("purpose") {
-        if let Ok(purpose) = serde_json::from_value::<UsagePurpose>(p.clone()) {
-            return purpose;
-        }
-    }
-    let compaction = payload
-        .get("call_kind")
-        .and_then(|k| serde_json::from_value::<CallKind>(k.clone()).ok())
-        == Some(CallKind::Compaction);
-    if compaction {
-        UsagePurpose::Utility
-    } else {
-        UsagePurpose::Work
-    }
-}
-
-/// True when a payload carries any token count (the twin of
-/// `hasAnyTokenCounts`).
-fn has_any_token_counts(p: &serde_json::Value) -> bool {
-    num(p.get("total_tokens")) > 0
-        || num(p.get("prompt_tokens")) > 0
-        || num(p.get("completion_tokens")) > 0
-        || num(p.get("remote_tokens")) > 0
-}
-
-fn amount_of(p: &serde_json::Value) -> UsageAmount {
-    let prompt = num(p.get("prompt_tokens"));
-    let completion = num(p.get("completion_tokens"));
-    let mut total = num(p.get("total_tokens"));
-    if total == 0 {
-        total = prompt + completion;
-    }
-    if total == 0 {
-        // The retired review path's spelling of its own spend, on a legacy
-        // `dispatch complete` only.
-        total = num(p.get("remote_tokens"));
-    }
-    let cached = p.get("cached_tokens").filter(|c| is_finite_number(c)).map(|c| num(Some(c)));
-    UsageAmount { total, prompt, completion, cached, purpose: usage_purpose(p), reported: has_any_token_counts(p) }
-}
-
-/// The per-record half of the sum: what one usage record adds, or `None`
-/// when `v` is not a usage record.
-pub fn usage_contribution(v: &serde_json::Value) -> Option<UsageAmount> {
-    if !is_usage_record(v) {
-        return None;
-    }
-    Some(amount_of(payload_of(v)))
-}
+// (#2902 step 5) The per-record half of the sum (what ONE usage record
+// contributes, and the value domain it reads counts in) lives in
+// `darkmux_crew::usage`, so the endpoint budget's rolling-window sum (in
+// `darkmux_crew::budget`, below this crate in the dependency graph) and this
+// fold read a record the same way. Re-exported here unchanged.
+pub use darkmux_crew::usage::{is_usage_record, usage_contribution, usage_purpose, UsageAmount, MAX_COUNT};
+use darkmux_crew::usage::{amount_of, has_any_token_counts, payload_of};
 
 /// The identity of ONE RUN, `(session_id, mission_id)`: the twin of
 /// `runKey`. A bare session id is not one (`session_id::task` is

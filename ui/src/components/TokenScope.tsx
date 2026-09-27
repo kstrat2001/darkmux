@@ -1,3 +1,4 @@
+import { compactDuration } from "../lib/format";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { flushSync } from "react-dom";
 import { PHOSPHOR_FALLBACK, toneRgb, type Rgb, type ScopeTone } from "../lib/scopeTone";
@@ -711,7 +712,9 @@ export function TokenScope({
   // would drop up to a second off the tick). Until the first frame, and with
   // reduced motion, the caller's label.
   const handNum = !reduce && restEnd !== null && restNum !== null && restNum.end === restEnd ? restNum : null;
-  const shownLabel = handNum !== null ? `${handNum.n}s` : whole !== null ? eased : centerLabel;
+  // (#2902 step 5) In the caller's form: a day-long budget wait counts
+  // "23h 53m", never raw seconds.
+  const shownLabel = handNum !== null ? compactDuration(handNum.n) : whole !== null ? eased : centerLabel;
   const showIcon = state === "tools";
   // (#2889, #2890) While the model generates the call: a wrench over the
   // "tool gen" caption. When darkmux runs the tool the icon becomes the

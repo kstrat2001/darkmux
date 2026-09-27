@@ -1450,8 +1450,22 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
     // before `board_partition` even runs. A machine reader always gets the
     // whole board (`record exhaustively, display selectively`: the filter is
     // display-only). `--limit`/pagination already followed this same rule.
+    // (#2902 step 5) Calls waiting on a budget right now, read back from
+    // this machine's flow log (`budget.wait` with no later `budget.resume`,
+    // from a process still alive). Shown above the board: a wait is the
+    // one state on it that is the operator's own limit at work.
+    let widest = darkmux_profiles::profiles::load_registry_quiet(None)
+        .ok()
+        .and_then(|l| crew::budget::widest_window_secs(&l.registry));
+    let budget_waits = crew::budget::active_waits(
+        &flows_dir,
+        now as i64,
+        crew::budget::waits_lookback_secs(widest),
+        &crew::host_sampler_lock::pid_alive,
+    );
+
     if json {
-        return run_json(&views, &peer, &fleet.state);
+        return run_json(&views, &peer, &fleet.state, &budget_waits);
     }
 
     // Resolved once, above the early return, so every prose line in this
@@ -1462,6 +1476,13 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
     // actively wrong advice while a peer's mission is running. Fall through
     // to the normal renderer instead, which prints an empty local section
     // set, the peer section, and the fleet-scoped rollup.
+    // (#2902 step 5) Printed before anything else, the empty board included:
+    // a wait can hold a dispatch that owns no mission.
+    for line in budget_wait_lines(&budget_waits) {
+        for l in wrap_indented(&line, 2, width) {
+            println!("{}", style::warn(&l));
+        }
+    }
     if views.is_empty() && peer.is_empty() {
         // (#1582) The prose wraps; the command does not. Same rule the drift
         // suggestions follow, for the same reason — this is the one command a
@@ -1508,6 +1529,7 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
             if visible.len() == 1 { "" } else { "s" }
         ))
     );
+
     // (#1569 packet A) Resolved ONCE per board, not per row: on a hub/peer
     // this may spawn `tailscale serve status --json`, and doing that 82 times
     // for an 82-mission board would be absurd. It short-circuits to loopback
@@ -1987,9 +2009,41 @@ fn board_json(views: &[MissionView], peer: &[Run], fleet_state: &SourceState) ->
     })
 }
 
-fn run_json(views: &[MissionView], peer: &[Run], fleet_state: &SourceState) -> Result<i32> {
-    println!("{}", serde_json::to_string_pretty(&board_json(views, peer, fleet_state))?);
+fn run_json(
+    views: &[MissionView],
+    peer: &[Run],
+    fleet_state: &SourceState,
+    budget_waits: &[crew::budget::ActiveWait],
+) -> Result<i32> {
+    let mut board = board_json(views, peer, fleet_state);
+    // (#2902 step 5) Additive: every call waiting on a budget now.
+    board["budget_waits"] = serde_json::to_value(budget_waits)?;
+    println!("{}", serde_json::to_string_pretty(&board)?);
     Ok(0)
+}
+
+/// (#2902 step 5) One line per call waiting on a budget: what it waits on,
+/// for which mission, and how long, when that is known. Pure, so the
+/// wording is tested without a flow log.
+fn budget_wait_lines(waits: &[crew::budget::ActiveWait]) -> Vec<String> {
+    waits
+        .iter()
+        .map(|w| {
+            let what = format!("endpoint `{}`", w.subject);
+            let whose = w
+                .mission_id
+                .as_deref()
+                .map(|m| format!(" (mission {})", short_handle(m).unwrap_or(m)))
+                .unwrap_or_default();
+            let when = match (w.resumes_in_secs, w.resume_at.as_deref()) {
+                (Some(secs), Some(at)) => {
+                    format!("resumes in about {} (at {at})", crew::budget::human_duration(secs))
+                }
+                _ => "until the budget is raised".to_string(),
+            };
+            format!("⏸ waiting on a budget: {what}{whose}, {when}")
+        })
+        .collect()
 }
 
 /// Board ordering: drifted first (attention leads), then most-recently-touched,
@@ -2303,6 +2357,30 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (#2902 step 5) `mission status` says what a waiting call waits on,
+    /// whose mission, and how long, or that it waits on the operator.
+    #[test]
+    fn budget_wait_lines_say_what_whose_and_how_long() {
+        let w = |scope: &str, subject: &str, secs: Option<u64>| crew::budget::ActiveWait {
+            scope: scope.into(),
+            subject: subject.into(),
+            mission_id: Some("review-1790000000-a1b2c3".into()),
+            session_id: Some("s".into()),
+            resume_at: secs.map(|_| "2026-09-27T12:14:09Z".into()),
+            resumes_in_secs: secs,
+            message: String::new(),
+        };
+        let lines = budget_wait_lines(&[w("endpoint", "azure", Some(843)), w("endpoint", "zero", None)]);
+        assert_eq!(
+            lines,
+            vec![
+                "⏸ waiting on a budget: endpoint `azure` (mission a1b2c3), resumes in about 14m 3s (at 2026-09-27T12:14:09Z)".to_string(),
+                "⏸ waiting on a budget: endpoint `zero` (mission a1b2c3), until the budget is raised".to_string(),
+            ]
+        );
+        assert!(budget_wait_lines(&[]).is_empty(), "no wait, no line: the board is unchanged");
+    }
     use crate::crew::types::MissionSpec;
     use darkmux_serve::RunKind;
 

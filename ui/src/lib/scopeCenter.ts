@@ -1,3 +1,4 @@
+import { compactDuration } from "./format";
 import type { ScopeState } from "./scopeMorph";
 
 /** What one scope reading puts in the tube's center, for EVERY surface that
@@ -66,7 +67,7 @@ export function scopeCenter(r: ScopeCenterInput): ScopeCenter {
         ? String(Math.round(r.tokensPerSec))
         : "—"
       : resting
-        ? `${r.restSecondsLeft}s`
+        ? compactDuration(r.restSecondsLeft ?? 0)
         : null,
     // (#2890, operator) "tok/s" while thinking too: "think tok/s" did not
     // fit inside the wave, and the violet shimmer plus the card's rate line

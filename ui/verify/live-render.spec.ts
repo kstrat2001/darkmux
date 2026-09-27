@@ -86,7 +86,7 @@ test("data state: a non-empty fleet renders one card per machine", async ({ page
         meta: { sources: { fleet: { state: "ok" } }, complete: true },
         machines: [
         {
-          machine_uid: "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+          machine_uid: "00000000-0000-4000-8000-ABFCA7779F06",
           display_name: "MacBook-Pro",
           schema_version: "1.18.0",
           beat_ts_ms: Date.now(),
@@ -94,7 +94,7 @@ test("data state: a non-empty fleet renders one card per machine", async ({ page
           loaded_models: ["darkmux:qwen3.6-35b-a3b-turboquant-mlx"],
         },
         {
-          machine_uid: "E3F5FE8A-1460-E6FF-663F-760A6D75B9C9",
+          machine_uid: "00000000-0000-4000-8000-E3F5FE8A1460",
           display_name: "m1-max-32gb-studio",
           schema_version: "1.18.0",
           beat_ts_ms: Date.now(),

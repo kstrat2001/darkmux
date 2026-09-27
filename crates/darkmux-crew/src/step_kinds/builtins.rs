@@ -19,23 +19,11 @@
 use super::types::{
     CwdPolicy, MapDispatchOverride, OverrideDispatchCall, SeatClaim, StepKind, StepOutcome, StepRunCtx,
 };
-use super::MIN_VIABLE_MAP_GRANT;
 use crate::remote_budget::RemoteBudget;
 use crate::types::{Step, Task};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-
-/// (#1442) The named per-item reason a `dispatch.map` hosted item records
-/// when the remote per-execution bucket refuses its FIRST attempt. Public
-/// (and `const`) because downstream reconstruction — the review pipeline's
-/// dedup boundary rebuilding per-seat member accounting from
-/// [`MapItemResult`]s — must distinguish a budget SKIP (call never fired;
-/// not a draw) from a dispatch ERROR (call fired and failed; a real draw),
-/// and matching this one canonical string is how it does so without the
-/// generic block growing a domain-shaped result field.
-pub const MAP_BUDGET_SKIP_ERROR: &str =
-    "remote token budget exhausted for this step — call skipped";
 
 /// Compose a step kind's base prompt/message with the gathered output of
 /// its already-`Complete` dependencies. Shared by `dispatch.internal` and
@@ -720,19 +708,6 @@ impl StepKind for DispatchInternalStepKind {
     }
 }
 
-/// (#1412) Clamp a requested `max_tokens` down to the per-execution remote
-/// token allowance so one hosted call cannot request more completion
-/// tokens than the whole execution is allowed to spend. `budget == 0` is
-/// unreachable in practice (the hosted arm calls `admit_remote_execution`
-/// first, which already refuses a zero budget), but the clamp stays
-/// total/defensive rather than assuming its caller's ordering. A `budget`
-/// wider than `u32::MAX` (the allowance is `u64`, `max_tokens` on the wire
-/// is `u32`) saturates instead of wrapping.
-fn clamp_hosted_max_tokens(requested: u32, budget: u64) -> u32 {
-    let budget_u32 = u32::try_from(budget).unwrap_or(u32::MAX);
-    requested.min(budget_u32)
-}
-
 /// Wraps `single_shot::single_shot_chat` (local LMStudio) /
 /// `single_shot_chat_hosted` (a remote OpenAI-compatible endpoint) — one
 /// container-free chat-completions call, no agent loop. Required
@@ -744,29 +719,13 @@ fn clamp_hosted_max_tokens(requested: u32, budget: u64) -> u32 {
 /// (`darkmux_types::ModelEndpoint` JSON — presence selects the HOSTED
 /// dialect instead of local).
 ///
-/// **Hosted-arm metering (#1412).** The LOCAL dialect (LMStudio) is
-/// unmetered by design — `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` governs
-/// REMOTE spend only. The HOSTED dialect now goes through the same minimum
-/// gate `dispatch_remote` uses (`dispatch_internal::admit_remote_execution`)
-/// before the call fires, so a `0` allowance refuses with a typed error
-/// instead of dispatching off the meter, plus a `max_tokens` clamp
-/// (`clamp_hosted_max_tokens`) so one call can't request more than the
-/// allowance in one shot. **Reading:** each `dispatch.single_shot` step is
-/// its own execution (one pipeline stage) — a graph with several
-/// endpoint-bearing single-shot steps draws the allowance once PER STEP,
-/// not once for the whole graph, matching how a bare `dispatch` (also
-/// gated by `admit_remote_execution`) counts as one execution. This is the
-/// minimum regime, not the full one: there is no cross-call bucket here
-/// (each step gets a fresh allowance check), unlike the review funnel's
-/// per-stage `crate::remote_budget::RemoteBudget` (#1877 promoted it into
-/// this crate — it no longer lives only in `darkmux-lab::lab::review`),
-/// which accumulates spend across many calls in one stage. The type being
-/// reachable now does not make this kind's regime the same one: wiring
-/// this kind onto a shared `RemoteBudget` bucket instead of a fresh
-/// per-step allowance is a real behavior change, not a rename — that
-/// consolidation is #1414's job. This PR closes the silent-bypass gap
-/// (#1412); the shared-bucket regime is a deliberate follow-up, not a
-/// scope cut hiding in this diff.
+/// **Hosted-arm budgets (#1412, #2902 step 5).** The LOCAL dialect
+/// (LMStudio) is never metered. The HOSTED arm passes the endpoint's
+/// rolling-window budget (`crate::budget::admit_endpoint`) and reserves
+/// against this step's per-step cap (a fresh `RemoteBudget` from
+/// `remote.max_tokens_per_step`) before the call, and settles the cap with
+/// the call's real spend after it. Neither refuses or clamps a call: a
+/// breach warns, and an endpoint `wait` holds the call until there is room.
 pub struct DispatchSingleShotStepKind;
 
 /// (#1444 review) The hosted `dispatch.single_shot` step's "step result"
@@ -785,7 +744,7 @@ pub struct DispatchSingleShotStepKind;
 /// crate's `lmstudio::CompletionTokensDetails::reasoning_tokens`).
 fn hosted_single_shot_step_payload(
     step_id: &str,
-    budget: u64,
+    budget: Option<u64>,
     max_tokens_requested: u32,
     max_tokens_sent: u32,
     reply: &crate::single_shot::SingleShotReply,
@@ -794,6 +753,8 @@ fn hosted_single_shot_step_payload(
         "step_id": step_id,
         "kind": "dispatch.single_shot",
         "runtime": "direct",
+        // (#2902 step 5, CLAUDE.md contract 8: the wire keeps its historical
+        // spelling) The per-step cap, under the key v3.13.0 shipped.
         "remote_max_tokens_per_execution": budget,
         "max_tokens_requested": max_tokens_requested,
         "max_tokens_sent": max_tokens_sent,
@@ -1070,32 +1031,50 @@ impl DispatchSingleShotStepKind {
 
         let reply = if let Some(endpoint) = &endpoint {
 
-            // (#1412) Admit gate FIRST — a budget of 0 refuses before any
-            // HTTP call is even constructed, mirroring `dispatch_remote`'s
-            // ordering (meter before the network, never after). No
-            // `.with_context` wrap here on purpose: `admit_remote_execution`
-            // already names the step-independent bucket reason in full, the
-            // same bare error `dispatch_remote` surfaces — wrapping it would
-            // just bury that message under a second "step `s1` ..." layer.
-            let budget = darkmux_types::config_access::remote_max_tokens_per_execution();
-            crate::dispatch_internal::admit_remote_execution(budget)?;
+            // (#2902 step 5) Both budgets before the network, never after:
+            // the endpoint's window, then this step's per-step cap. A breach
+            // warns; an endpoint `wait` holds the call (the step stays live,
+            // its heartbeat beating) until there is room. Nothing is clamped.
+            let caller_session = darkmux_types::session_id::task(&step.task_id);
+            let caller_mission = crate::dispatch::resolve_mission_for_phase(Some(&task.phase_id));
+            let budget_caller = crate::budget::BudgetCaller {
+                role_id: None,
+                session_id: Some(&caller_session),
+                model: Some(wire_model.as_ref()),
+                mission_id: caller_mission.as_deref(),
+                phase_id: Some(&task.phase_id),
+                profiles_file: config_str(step, "config_path"),
+            };
+            crate::budget::admit_endpoint(endpoint, &budget_caller)?;
+            let step_bucket = std::sync::Mutex::new(
+                RemoteBudget::from_config(None).map_err(|e| anyhow::anyhow!(e.to_string()))?,
+            );
+            let budget = step_bucket.lock().unwrap_or_else(|p| p.into_inner()).budget();
+            crate::budget::admit_step(&step_bucket, max_tokens);
 
-            let clamped_max_tokens = clamp_hosted_max_tokens(max_tokens, budget);
             let req = HostedSingleShotRequest {
                 endpoint,
                 model: wire_model.as_ref(),
                 system,
                 user: &user,
-                max_tokens: clamped_max_tokens,
+                max_tokens,
                 timeout_seconds,
             };
             let reply = single_shot_chat_hosted(&req)
                 .with_context(|| format!("step `{}` dispatch.single_shot (hosted)", step.id))?;
+            crate::budget::settle_step_live(
+                &step_bucket,
+                max_tokens,
+                reply.total_tokens.unwrap_or(u64::from(max_tokens)),
+                1,
+                &step.id,
+                &budget_caller,
+            );
 
             // (#1412) Surface actual spend the same way `dispatch_remote`
             // embeds totals in its `dispatch complete` record, so a hosted
             // single-shot step's token usage is visible even without the
-            // full per-stage bucket regime.
+            // full per-step bucket regime.
             flow_records.push(darkmux_flow::FlowRecord {
                 ts: darkmux_flow::ts_utc_now(),
                 level: darkmux_flow::Level::Info,
@@ -1118,7 +1097,7 @@ impl DispatchSingleShotStepKind {
                     &step.id,
                     budget,
                     max_tokens,
-                    clamped_max_tokens,
+                    max_tokens,
                     &reply,
                 )),
                 work_id: None,
@@ -1164,7 +1143,13 @@ impl DispatchSingleShotStepKind {
             None,
             // A step runs no role (#2914: `None` → the call's `purpose` is decided
             // by its kind alone).
-            reply.usage_payload(crate::usage::CallKind::SingleShot, None, wire_model.as_ref(), &usage_endpoint),
+            reply.usage_payload(
+                crate::usage::CallKind::SingleShot,
+                None,
+                wire_model.as_ref(),
+                &usage_endpoint,
+                endpoint.as_ref().and_then(|ep| ep.named_id()),
+            ),
         );
         match ctx {
             Some(c) => c.emit(usage_record),
@@ -1952,29 +1937,31 @@ impl DispatchMapStepKind {
             crate::dispatch::resolve_mission_for_phase(Some(&task.phase_id)),
         );
 
-        // Per-EXECUTION remote allowance. When the step named a
-        // `bucket_group`, the SCHEDULER already resolved the group's SHARED
-        // bucket and handed it in through `ctx.remote_bucket()` — every
-        // sibling step of the group meters one allowance BETWEEN them
-        // (#1442, the allowance-multiplication fix). Ungrouped (or ctx-free)
-        // steps get their own step-scoped bucket from the same budget, so
-        // the one-execution contract reads identically either way. Local
-        // items never draw from it. `bucket_budget` (u64, optional) lets a
-        // LAUNCHER stamp its already-resolved per-execution allowance into
-        // the step's own config — self-describing config, and the same
-        // value the scheduler honors when it creates a group bucket —
-        // instead of this block re-reading the environment at run time;
-        // absent, the `config_access` resolution applies as before.
+        // The per-step cap. When the step named a `bucket_group`, the
+        // SCHEDULER already resolved the group's SHARED bucket and handed it
+        // in through `ctx.remote_bucket()`, so sibling steps of the group
+        // meter one allowance between them (#1442). Ungrouped (or ctx-free)
+        // steps get their own step-scoped bucket. `bucket_budget` (u64,
+        // optional) is a launcher-stamped number in the step's own config;
+        // absent, `remote.max_tokens_per_step` applies, and (#2902 step
+        // 5) with neither there is no cap at all. Local items never
+        // draw from it.
         let bucket: Arc<Mutex<RemoteBudget>> = match ctx.and_then(|c| c.remote_bucket()) {
             Some(shared) => shared.clone(),
-            None => {
-                let budget = step
-                    .config
-                    .get("bucket_budget")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or_else(darkmux_types::config_access::remote_max_tokens_per_execution);
-                Arc::new(Mutex::new(RemoteBudget::new(budget, MIN_VIABLE_MAP_GRANT)))
-            }
+            None => Arc::new(Mutex::new(
+                RemoteBudget::from_config(step.config.get("bucket_budget").and_then(|v| v.as_u64()))
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+            )),
+        };
+        let budget_session = darkmux_types::session_id::task(&step.task_id);
+        let budget_mission = crate::dispatch::resolve_mission_for_phase(Some(&task.phase_id));
+        let budget_caller = crate::budget::BudgetCaller {
+            role_id: task.role_id.as_deref(),
+            session_id: Some(&budget_session),
+            model: Some(wire_model.as_ref()),
+            mission_id: budget_mission.as_deref(),
+            phase_id: Some(&task.phase_id),
+            profiles_file: config_str(step, "config_path"),
         };
         // (#1442 ship-2b) The scheduler-supplied dispatch override, if any —
         // threaded into every item's arm; `None` on all production paths.
@@ -1996,6 +1983,7 @@ impl DispatchMapStepKind {
                 Some(ep) => map_hosted_item(
                     index, &bucket, ep, wire_model.as_ref(), item_system, &user, max_tokens,
                     timeout_seconds, retry_on_empty, retry_on_error, ovr, &mut calls,
+                    &step.id, &budget_caller,
                 ),
                 None => map_local_item(
                     index, wire_model.as_ref(), item_system, &user, temperature, max_tokens,
@@ -2044,6 +2032,7 @@ impl DispatchMapStepKind {
                             endpoint.is_some(),
                             wire_model.as_ref(),
                             &usage_endpoint,
+                            endpoint.as_ref().and_then(|ep| ep.named_id()),
                         ),
                     ),
                     &mut batched,
@@ -2323,6 +2312,7 @@ fn map_call_token_payload(
     remote: bool,
     requested_model: &str,
     endpoint: &str,
+    endpoint_id: Option<&str>,
 ) -> serde_json::Value {
     let mut payload = crate::usage::usage_payload(
         &crate::usage::CallFacts {
@@ -2331,6 +2321,7 @@ fn map_call_token_payload(
             requested_model,
             reported_model: call.reported_model.as_deref(),
             endpoint,
+            endpoint_id,
         },
         &call.counts,
     );
@@ -2367,7 +2358,7 @@ fn map_item_token_payload(
         },
         reported_model: res.served_model.clone(),
     };
-    Some(map_call_token_payload(&call, res.index, remote, requested_model, endpoint))
+    Some(map_call_token_payload(&call, res.index, remote, requested_model, endpoint, None))
 }
 
 /// (#1530 dogfood) Fold one reply's usage split into the running per-item
@@ -2603,14 +2594,14 @@ fn map_local_item(
     }
 }
 
-/// (#1442) One HOSTED map item — the remote-bucketed sibling of
-/// [`map_local_item`]. Each attempt (including a `retry_on_empty` or
-/// `retry_on_error`, #1605, retry) draws from the SHARED per-execution
-/// bucket: it admits before the call, clamps `max_tokens` to what remains
-/// (#1442 gate C6), and spends the conservative cost after. A first-attempt
-/// exhaustion is the named skip (`ok: false`); a LATER-attempt exhaustion
-/// stops retrying and keeps the empty-but-dispatched result already earned
-/// (never a spurious skip for an item that did fire).
+/// (#1442) One HOSTED map item: the budgeted sibling of [`map_local_item`].
+/// Each attempt (including a `retry_on_empty` or `retry_on_error`, #1605,
+/// retry) first passes the endpoint's rolling-window budget and the SHARED
+/// per-step bucket (#2902 step 5: `crate::budget`), then settles its real cost
+/// against the cap after the call. No attempt is ever skipped or clamped for
+/// budget: a breach warns, and an endpoint `wait` holds the attempt until
+/// there is room. Only a run stopped during a wait (Ctrl-C, `mission abort`)
+/// ends the item early, reported as its error, with nothing sent.
 #[allow(clippy::too_many_arguments)]
 fn map_hosted_item(
     index: usize,
@@ -2625,6 +2616,8 @@ fn map_hosted_item(
     retry_on_error: u32,
     ovr: Option<&MapDispatchOverride>,
     calls: &mut Vec<MapCall>,
+    step_label: &str,
+    caller: &crate::budget::BudgetCaller<'_>,
 ) -> MapItemResult {
     use crate::single_shot::HostedSingleShotRequest;
     let mut sum = 0u64;
@@ -2638,8 +2631,7 @@ fn map_hosted_item(
     // shape as `sum`), and the ENDPOINT-reported served model — captured from
     // the reply body's `model` field (last non-`None` across attempts wins, so
     // a later usage-less reply never erases a served model an earlier attempt
-    // reported). A first-attempt budget skip fires no call, so both stay at
-    // their honest zero/`None`.
+    // reported).
     let mut wall_ms = 0u64;
     let mut served_model: Option<String> = None;
     let mut empty_budget = retry_on_empty;
@@ -2652,45 +2644,33 @@ fn map_hosted_item(
     // of states that reach it without re-deriving that honesty.
     let mut last_error: Option<String> = None;
     let mut error_retries_used = 0u32;
-    let mut attempt: u32 = 0;
     loop {
-        // (#1442 fan-out) admit_reserve grants — and RESERVES — the clamped
-        // completion cap in one locked operation, so concurrent sibling
-        // steps sharing this bucket (`bucket_group`) cannot all admit
-        // against the same untouched balance; see the method's own doc.
-        let granted = bucket
-            .lock()
-            .expect("map remote bucket mutex poisoned")
-            .admit_reserve(max_tokens);
-        let Some(clamped) = granted else {
-            if attempt == 0 {
-                return MapItemResult {
-                    index,
-                    ok: false,
-                    content: String::new(),
-                    error: Some(MAP_BUDGET_SKIP_ERROR.to_string()),
-                    total_tokens: None,
-                    // No call fired, so there is no split — and (#1444
-                    // review) no details — to report either.
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                    reasoning_tokens: None,
-                    cached_tokens: None,
-                    served_model: None,
-                    wall_ms,
-                    retried: 0,
-                };
-            }
-            // A retry the bucket can no longer fund — stop, keep what fired.
-            // (#1605 QA finding) Reachable ONLY on a retry, which means the
-            // first attempt errored: sibling steps sharing this bucket_group
-            // can drain it during the backoff window. Falling through to the
-            // `ok: true` tail here would report a clean empty draw for an
-            // item that only ever failed — and downstream that is counted as
-            // a fired draw, suppressing both the "dispatch failed" warning
-            // and the all-draws-failed gate this very PR hardens.
-            break;
-        };
+        // (#2902 step 5) The endpoint's window, then the shared per-step cap
+        // (which RESERVES this attempt's cap, so concurrent siblings of one
+        // `bucket_group` see each other). The endpoint budget may warn or,
+        // under `wait`, hold; only a run stopped during a wait (or limits
+        // that cannot be used) returns here, and then nothing is sent.
+        let admitted = crate::budget::admit_endpoint(endpoint, caller);
+        if admitted.is_ok() {
+            crate::budget::admit_step(bucket, max_tokens);
+        }
+        if let Err(e) = admitted {
+            return MapItemResult {
+                index,
+                ok: false,
+                content: String::new(),
+                error: Some(format!("{e:#}")),
+                total_tokens: item_total_tokens(any_usage, sum),
+                prompt_tokens: item_split_tokens(any_split, psum),
+                completion_tokens: item_split_tokens(any_split, csum),
+                reasoning_tokens: item_split_tokens(any_reasoning, rsum),
+                cached_tokens: item_split_tokens(any_cached, cachesum),
+                served_model,
+                wall_ms,
+                retried: error_retries_used,
+            };
+        }
+        let clamped = max_tokens;
         let req = HostedSingleShotRequest {
             endpoint,
             model,
@@ -2718,10 +2698,14 @@ fn map_hosted_item(
         match dispatch {
             Ok(reply) => {
                 calls.push(MapCall::from_reply(&reply));
-                bucket
-                    .lock()
-                    .expect("map remote bucket mutex poisoned")
-                    .settle(clamped, conservative_hosted_spend(reply.total_tokens, clamped), 1);
+                crate::budget::settle_step_live(
+                    bucket,
+                    clamped,
+                    conservative_hosted_spend(reply.total_tokens, clamped),
+                    1,
+                    step_label,
+                    caller,
+                );
                 if let Some(t) = reply.total_tokens {
                     sum += t;
                     any_usage = true;
@@ -2760,7 +2744,7 @@ fn map_hosted_item(
                         retried: error_retries_used,
                     };
                 }
-                // Empty content — retry (if the bucket funds another attempt).
+                // Empty content: retry, when `retry_on_empty` allows.
                 if empty_budget == 0 {
                     break;
                 }
@@ -2772,7 +2756,7 @@ fn map_hosted_item(
             Err(e) => {
                 // Release the reservation — a dispatch-level error spent
                 // nothing (the pre-reserve accounting billed 0 here too).
-                bucket.lock().expect("map remote bucket mutex poisoned").settle(clamped, 0, 1);
+                crate::budget::settle_step_live(bucket, clamped, 0, 1, step_label, caller);
                 if error_budget == 0 {
                     return MapItemResult {
                         index,
@@ -2795,11 +2779,10 @@ fn map_hosted_item(
                 std::thread::sleep(RETRY_ON_ERROR_BACKOFF);
             }
         }
-        attempt += 1;
     }
     // (#1605 QA finding) `ok` is a claim about what actually happened. An
-    // item that reaches here after an errored attempt (the bucket-starved
-    // retry path) must report that error, not an empty success.
+    // item that reaches here after an errored attempt (an error retry that
+    // came back empty) must report that error, not an empty success.
     MapItemResult {
         index,
         ok: last_error.is_none(),
@@ -4917,175 +4900,317 @@ mod tests {
         assert!(reason.contains("n_ctx"), "the reason names the missing field: {reason}");
     }
 
-    #[test]
-    fn map_remote_bucket_admits_until_exhausted_then_skips() {
-        // (#1617 review) Magnitudes scaled x1000 from the original 100/60.
-        // Those were arbitrary small numbers chosen to exercise the ARITHMETIC,
-        // but they sit below `MIN_VIABLE_MAP_GRANT` — so once the starvation
-        // floor landed, this test was measuring the floor instead of the
-        // accounting it exists to pin. Same shape, realistic token counts.
-        let mut b = RemoteBudget::new(100_000, MIN_VIABLE_MAP_GRANT);
-        let g1 = b.admit_reserve(60_000).expect("fresh bucket admits");
-        b.settle(g1, 60_000, 1);
-        let g2 = b.admit_reserve(60_000).expect("still under budget");
-        b.settle(g2, 60_000, 1); // now 120k >= 100k (the endpoint reported above its grant)
-        assert!(b.admit_reserve(60_000).is_none(), "over budget -> skip");
-        assert_eq!(b.skipped(), 1);
+    fn map_ep() -> darkmux_types::ModelEndpoint {
+        darkmux_types::ModelEndpoint { url: Some("http://127.0.0.1:1".to_string()), ..Default::default() }
     }
 
+    /// (#2902 step 5) A spent per-step cap under `warn` never skips or
+    /// clamps a map item: the call fires with the FULL requested cap, and
+    /// the item is ok. (Pre-4.0 this item was skipped with a named reason,
+    /// and a nearly-spent bucket clamped the cap.)
     #[test]
-    fn a_bucket_starved_retry_reports_the_error_not_a_fabricated_empty_success() {
-        // (#1605 QA finding) The regression the retry arm introduced. Before
-        // `retry_on_error`, an `Err` returned immediately, so the loop's
-        // fallthrough could only be reached after a dispatched-but-EMPTY
-        // reply — `ok: true, error: None` was honest there. Retrying widened
-        // the reachable set without re-deriving that: if the bucket is
-        // drained during the 200ms backoff (siblings sharing a `bucket_group`
-        // run concurrently — exactly the near-exhaustion regime), the retry's
-        // admit is refused, the loop breaks, and the item fell through
-        // claiming a clean empty draw for a dispatch that only ever FAILED.
-        //
-        // Downstream that is counted as a fired draw: no "dispatch failed"
-        // warning, and the all-draws-failed gate — the very thing #1605
-        // hardens — is suppressed. An error laundered into reduced coverage,
-        // on the path built to stop exactly that.
-        //
-        // The race is driven deterministically: the override errors on the
-        // first call and drains the shared bucket from inside that call, so
-        // by the time the retry asks to be admitted there is nothing left.
-        let budget = 10_000u64;
-        let bucket = Arc::new(Mutex::new(RemoteBudget::new(budget, MIN_VIABLE_MAP_GRANT)));
-        let drain = Arc::clone(&bucket);
+    fn a_spent_step_cap_under_warn_never_skips_or_clamps_an_item() {
+        let bucket = Arc::new(Mutex::new(RemoteBudget::new(Some(1_000), darkmux_types::config::StepBudgetPolicy::Warn)));
+        {
+            let mut b = bucket.lock().unwrap();
+            b.admit_reserve(0);
+            b.settle(0, 5_000, 1);
+            assert!(b.exhausted());
+        }
+        let sent = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let seen = Arc::clone(&sent);
+        let ovr: MapDispatchOverride = Arc::new(move |call: &OverrideDispatchCall<'_>| {
+            seen.lock().unwrap().push(call.max_tokens);
+            Ok(crate::single_shot::SingleShotReply {
+                content: "answer".into(),
+                total_tokens: Some(700),
+                prompt_tokens: None,
+                completion_tokens: None,
+                reasoning_tokens: None,
+                cached_tokens: None,
+                model: None,
+            })
+        });
+        let out = map_hosted_item(
+            0, &bucket, &map_ep(), "gpt-5.1", "sys", "user", 4_096, 1, 0, 0, Some(&ovr),
+            &mut Vec::new(), "s1", &crate::budget::BudgetCaller::default(),
+        );
+        assert!(out.ok, "{out:?}");
+        assert_eq!(out.content, "answer");
+        assert_eq!(*sent.lock().unwrap(), vec![4_096], "fired once, with the full cap");
+        assert_eq!(bucket.lock().unwrap().used(), 5_700, "settled with the real spend");
+    }
+
+    /// (#1605 QA finding, kept) An item whose first dispatch errored and
+    /// whose retry came back empty reports the ERROR, never a fabricated
+    /// empty success.
+    #[test]
+    fn an_errored_then_empty_item_reports_the_error_not_a_fabricated_success() {
+        let bucket = Arc::new(Mutex::new(RemoteBudget::new(None, darkmux_types::config::StepBudgetPolicy::Warn)));
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
+        let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
+            let mut n = seen.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                anyhow::bail!("endpoint refused the draw")
+            }
+            Ok(crate::single_shot::SingleShotReply {
+                content: String::new(),
+                total_tokens: Some(1),
+                prompt_tokens: None,
+                completion_tokens: None,
+                reasoning_tokens: None,
+                cached_tokens: None,
+                model: None,
+            })
+        });
+        let out = map_hosted_item(
+            0, &bucket, &map_ep(), "gpt-5.1", "sys", "user", 1_000, 1, 0, 1, Some(&ovr),
+            &mut Vec::new(), "s1", &crate::budget::BudgetCaller::default(),
+        );
+        assert!(!out.ok, "{out:?}");
+        assert!(out.error.as_deref().unwrap_or_default().contains("endpoint refused the draw"), "{out:?}");
+        assert_eq!(*calls.lock().unwrap(), 2);
+    }
+
+    /// A named endpoint with a 1-token daily budget under `policy`.
+    fn budgeted_ep(policy: &str) -> darkmux_types::ModelEndpoint {
+        let mut ep: darkmux_types::ModelEndpoint = serde_json::from_value(json!({
+            "url": "http://127.0.0.1:1",
+            "limits": { "policy": policy, "window": { "period": "1d", "tokens": 1 } },
+        }))
+        .unwrap();
+        ep.source = darkmux_types::EndpointSource::Named("azure".into());
+        ep
+    }
+
+    /// (#2902 step 5 review M1) An endpoint `wait` on an ABORTED mission
+    /// ends without sending: the waiter reads the mission's terminal state
+    /// from disk (what `darkmux mission abort` writes, from another
+    /// process) and the transport is never called.
+    #[test]
+    #[serial_test::serial]
+    fn a_map_item_waiting_on_an_aborted_missions_budget_never_sends() {
+        let crew = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        unsafe { std::env::set_var("DARKMUX_CREW_DIR", crew.path()) };
+        let mpath = crate::lifecycle::mission_path("m-aborted");
+        std::fs::create_dir_all(mpath.parent().unwrap()).unwrap();
+        std::fs::write(&mpath, r#"{"id":"m-aborted","status":"aborted"}"#).unwrap();
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::full_window().reading_disk_for_stops());
         let calls = Arc::new(Mutex::new(0usize));
         let seen = Arc::clone(&calls);
         let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
             *seen.lock().unwrap() += 1;
-            // Consume the rest of the allowance mid-call, the way a
-            // concurrent sibling step would.
-            if let Ok(mut b) = drain.lock() {
-                if let Some(g) = b.admit_reserve(budget as u32) {
-                    b.settle(g, budget, 1);
-                }
-            }
-            anyhow::bail!("endpoint refused the draw")
+            anyhow::bail!("must not be called")
         });
-        let endpoint = darkmux_types::ModelEndpoint {
-            url: Some("http://127.0.0.1:1".to_string()),
-            ..Default::default()
-        };
-
-        let out = map_hosted_item(
-            0, &bucket, &endpoint, "gpt-5.1", "sys", "user", 1_000, 1, 0, 1, Some(&ovr),
-            &mut Vec::new(),
-        );
-
-        assert!(
-            !out.ok,
-            "an item whose only dispatch errored must never report ok: {out:?}"
-        );
-        assert!(
-            out.error.is_some(),
-            "the error must survive the bucket-starved retry, not be dropped: {out:?}"
-        );
-        assert!(
-            out.error.as_deref().unwrap_or_default().contains("endpoint refused the draw"),
-            "and it must be the REAL error, not a generic budget message: {out:?}"
-        );
-        assert_eq!(*calls.lock().unwrap(), 1, "the retry was starved, so only one call fired");
+        let bucket = Arc::new(Mutex::new(RemoteBudget::new(None, darkmux_types::config::StepBudgetPolicy::Warn)));
+        let caller = crate::budget::BudgetCaller { mission_id: Some("m-aborted"), ..Default::default() };
+        let out = crate::budget::with_test_env(env.clone(), || {
+            map_hosted_item(
+                0, &bucket, &budgeted_ep("wait"), "gpt-5.1", "sys", "user", 1_000, 1, 0, 0, Some(&ovr),
+                &mut Vec::new(), "s1", &caller,
+            )
+        });
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
+        assert!(!out.ok);
+        let err = out.error.unwrap_or_default();
+        assert!(err.contains("mission `m-aborted` is aborted") && err.contains("nothing was sent"), "{err}");
+        assert_eq!(*calls.lock().unwrap(), 0, "the transport is never called");
     }
 
+    /// (5th review C2) A hosted map item settles its REPLY's spend into
+    /// the step bucket: a 10-token cap and a 12-token reply warn with
+    /// `spent: 12` (settling 0 would leave the cap silent).
     #[test]
-    fn map_remote_bucket_reservation_holds_the_grant_until_settled() {
-        // (#1442 fan-out) The reserve-then-settle shape: a granted call's cap
-        // is held against the budget WHILE the call is in flight, so a
-        // concurrent sibling admitting mid-flight sees the reservation —
-        // never the untouched balance (the allowance-multiplication race a
-        // spend-after pair reintroduces under `seats x k` sibling
-        // concurrency).
-        let mut b = RemoteBudget::new(100, MIN_VIABLE_MAP_GRANT);
-        let granted = b.admit_reserve(4096).expect("admits");
-        assert_eq!(granted, 100, "the grant clamps to what remains");
-        assert!(b.admit_reserve(10).is_none(), "an in-flight reservation blocks siblings");
-        assert_eq!(b.skipped(), 1);
-        // Settling with the real (higher) usage keeps the overshoot honest…
-        b.settle(granted, 600, 1);
-        assert!(b.exhausted());
-        // …and settling an ERRORED call with 0 releases the whole grant.
-        let mut b2 = RemoteBudget::new(100, MIN_VIABLE_MAP_GRANT);
-        let g = b2.admit_reserve(4096).expect("admits");
-        b2.settle(g, 0, 1);
-        assert_eq!(b2.remaining(), 100, "an errored call spends nothing");
+    fn a_hosted_map_item_settles_its_reply_into_the_step_cap() {
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
+        let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
+            Ok(crate::single_shot::SingleShotReply {
+                content: "ok".into(), total_tokens: Some(12), prompt_tokens: None, completion_tokens: None,
+                reasoning_tokens: None, cached_tokens: None, model: None,
+            })
+        });
+        let bucket = Arc::new(Mutex::new(RemoteBudget::new(Some(10), darkmux_types::config::StepBudgetPolicy::Warn)));
+        let ep: darkmux_types::ModelEndpoint = serde_json::from_value(json!({ "url": "https://h.example/v1" })).unwrap();
+        let out = crate::budget::with_test_env(env.clone(), || {
+            map_hosted_item(
+                0, &bucket, &ep, "gpt-5.1", "sys", "user", 5, 1, 0, 0, Some(&ovr),
+                &mut Vec::new(), "s1", &crate::budget::BudgetCaller::default(),
+            )
+        });
+        assert!(out.ok, "{out:?}");
+        assert_eq!(env.actions(), vec![crate::budget::BUDGET_WARN_ACTION.to_string()]);
+        let w = env.payload(crate::budget::BUDGET_WARN_ACTION);
+        assert_eq!((w["scope"].as_str(), w["spent"].as_u64(), w["limit"].as_u64()), (Some("step"), Some(12), Some(10)), "{w}");
     }
 
-    /// (#1610 / #1617 review) The same starvation class the judge bucket was
-    /// floored against, which this bucket carried unfloored.
-    ///
-    /// A grant too small to hold a reply "succeeds", the endpoint truncates
-    /// mid-JSON, and the caller reads the debris as a result. On this bucket —
-    /// the `dispatch.map` fan-out, i.e. the probe stage — that is reduced
-    /// COVERAGE reported as a clean run. A low-flag review must mean "few
-    /// flags", never "we stopped looking and said nothing".
+    /// (#2902 step 5 review C1) The endpoint gate fires on the map path: a
+    /// full window under `warn` warns through the gate before the call.
     #[test]
-    fn map_remote_bucket_denies_a_starved_grant_instead_of_truncating() {
-        // A budget that was never small, spent down to a sliver: a probe asks
-        // for a usable cap and would be handed 40 tokens. That is the failure.
-        let mut b = RemoteBudget::new(100_000, MIN_VIABLE_MAP_GRANT);
-        let g = b.admit_reserve(99_960).expect("the first draw admits");
-        b.settle(g, 99_960, 1);
-        assert_eq!(b.remaining(), 40);
-        assert!(
-            b.admit_reserve(4096).is_none(),
-            "a 40-token grant cannot hold a reply — deny it rather than truncate"
-        );
-        assert_eq!(b.skipped(), 1, "and COUNT it, or the run reports coverage it never had");
+    fn the_endpoint_gate_fires_on_a_hosted_map_item() {
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::full_window());
+        let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
+            Ok(crate::single_shot::SingleShotReply {
+                content: "ok".into(), total_tokens: Some(1), prompt_tokens: None, completion_tokens: None,
+                reasoning_tokens: None, cached_tokens: None, model: None,
+            })
+        });
+        let bucket = Arc::new(Mutex::new(RemoteBudget::new(None, darkmux_types::config::StepBudgetPolicy::Warn)));
+        let out = crate::budget::with_test_env(env.clone(), || {
+            map_hosted_item(
+                0, &bucket, &budgeted_ep("warn"), "gpt-5.1", "sys", "user", 1_000, 1, 0, 0, Some(&ovr),
+                &mut Vec::new(), "s1", &crate::budget::BudgetCaller::default(),
+            )
+        });
+        assert!(out.ok, "{out:?}");
+        assert_eq!(env.actions(), vec![crate::budget::BUDGET_WARN_ACTION.to_string()], "the gate fired");
+    }
 
-        // Not starvation: the operator configured a tiny BUDGET. That is
-        // policy — the only documented refusal value for the knob is 0, so a
-        // floor that swallowed small budgets would invent a second one.
-        let mut tiny = RemoteBudget::new(100, MIN_VIABLE_MAP_GRANT);
+    /// (#2902 step 5 review C1) The endpoint gate fires on the hosted
+    /// `dispatch.single_shot` arm, before its call: a full window under
+    /// `wait` with the run stopped returns the gate's error and the step
+    /// never reaches its transport (no hosted-call error context).
+    #[test]
+    fn the_endpoint_gate_fires_on_a_hosted_single_shot_step() {
+        let reg = tempfile::TempDir::new().unwrap();
+        let pf = reg.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":1}]}},
+                "endpoints":{"azure":{"url":"http://127.0.0.1:1",
+                    "limits":{"policy":"wait","window":{"period":"1d","tokens":1}}}}}"#,
+        )
+        .unwrap();
+        let s = step(
+            "s1",
+            "dispatch.single_shot",
+            json!({ "model": "gpt-5.1", "user": "hi", "endpoint": "azure", "config_path": pf.to_str().unwrap(), "timeout_seconds": 1 }),
+        );
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::full_window().stopped_after(1, "mission `x` is aborted"));
+        let msg = crate::budget::with_test_env(env.clone(), || {
+            format!("{:#}", DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err())
+        });
+        assert!(msg.contains("stopped waiting on endpoint `azure`'s budget"), "{msg}");
+        assert!(!msg.contains("dispatch.single_shot (hosted)"), "nothing was sent: {msg}");
         assert_eq!(
-            tiny.admit_reserve(4096),
-            Some(100),
-            "a deliberately small budget is operator policy, not a starved grant"
+            env.actions(),
+            vec![crate::budget::BUDGET_WAIT_ACTION.to_string(), crate::budget::BUDGET_STOP_ACTION.to_string()],
+            "the ended wait is recorded as a stop"
         );
-        assert_eq!(tiny.skipped(), 0);
-
-        // A healthy bucket grants the full ask untouched — the floor must be
-        // invisible on the path that matters most.
-        let mut healthy = RemoteBudget::new(100_000, MIN_VIABLE_MAP_GRANT);
-        assert_eq!(healthy.admit_reserve(4096), Some(4096));
-        assert_eq!(healthy.skipped(), 0);
     }
 
-    #[test]
-    fn map_remote_bucket_zero_budget_is_exhausted_from_the_first_item() {
-        // The hard opt-out: a 0 allowance refuses every hosted call, the same
-        // as `admit_remote_execution` refuses a single hosted dispatch.
-        let mut b = RemoteBudget::new(0, MIN_VIABLE_MAP_GRANT);
-        assert!(b.admit_reserve(10).is_none(), "zero budget admits nothing");
-        assert!(b.exhausted());
+    /// A registry naming endpoint `azure` at `url` (no limits), returning
+    /// the tempdir guard and the registry path.
+    fn azure_registry(url: &str) -> (tempfile::TempDir, String) {
+        let reg = tempfile::TempDir::new().unwrap();
+        let pf = reg.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            json!({
+                "profiles": {"p": {"models": [{"id": "m", "n_ctx": 1}]}},
+                "endpoints": {"azure": {"url": url}},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let path = pf.to_str().unwrap().to_string();
+        (reg, path)
     }
 
+    /// (#2902 step 5 review, 3rd pass MUST FIX 1) A hosted
+    /// `dispatch.single_shot` against a NAMED endpoint stamps that id on its
+    /// usage record (what the endpoint's window sums by), and settles the
+    /// REPLY's total into the per-step bucket: a 10-token cap and a
+    /// 12-token reply warn with `spent: 12`. Settling 0 (or the reservation)
+    /// would leave the bucket silent.
     #[test]
-    fn map_remote_bucket_remaining_shrinks_with_spend_and_never_underflows() {
-        // (#1442 gate C6) The per-item clamp target: what is LEFT, not the
-        // full budget — a late item must not be granted more than remains.
-        // (#1617 review) Scaled x1000 from 100/70/30 for the same reason as
-        // `..._admits_until_exhausted_then_skips` above: the original numbers
-        // are below the starvation floor, so they would exercise it rather
-        // than the clamp arithmetic this test is about.
-        let mut b = RemoteBudget::new(100_000, MIN_VIABLE_MAP_GRANT);
-        assert_eq!(b.remaining(), 100_000);
-        let g = b.admit_reserve(70_000).expect("admits");
-        b.settle(g, 70_000, 1);
-        assert_eq!(b.remaining(), 30_000, "a later item's grant clamps to 30k, not 100k");
-        assert_eq!(
-            b.admit_reserve(40_960).expect("still admits"),
-            30_000,
-            "the grant reads the remaining allowance"
+    #[serial_test::serial] // DARKMUX_REMOTE_MAX_TOKENS_PER_STEP
+    fn a_named_hosted_single_shot_stamps_its_endpoint_id_and_settles_the_reply() {
+        let server = httpmock::MockServer::start();
+        let mock = usage_mock(&server, true);
+        let (_reg, pf) = azure_registry(&format!("{}/v1", server.base_url()));
+        let s = step(
+            "s1",
+            "dispatch.single_shot",
+            json!({ "model": "gpt-5.1", "user": "hi", "endpoint": "azure", "config_path": pf, "max_tokens": 5 }),
         );
-        b.settle(30_000, 60_000, 1); // overshoot: the endpoint reported above its grant
-        assert_eq!(b.remaining(), 0, "saturating, never an underflow wrap");
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
+        let out = with_env(&[("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "10")], || {
+            crate::budget::with_test_env(env.clone(), || {
+                DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new())
+            })
+        })
+        .expect("mock answers");
+        mock.assert_hits(1);
+        let recs = as_values(&out.flow_records);
+        let rec = crate::usage::assert_one_usage_record(&recs, crate::usage::CallKind::SingleShot, "single_shot (named)");
+        assert_eq!(rec["payload"]["endpoint_id"], "azure", "{rec}");
+        assert_eq!(env.actions(), vec![crate::budget::BUDGET_WARN_ACTION.to_string()]);
+        let w = env.payload(crate::budget::BUDGET_WARN_ACTION);
+        assert_eq!(w["scope"], "step");
+        assert_eq!(w["spent"], 12, "the reply's total, not the 5-token grant: {w}");
+        assert_eq!(w["limit"], 10);
+    }
+
+    /// (#2902 step 5 review, zero doctrine) A per-step cap of 0 is NO cap:
+    /// a 12-token reply against `0` warns nothing and reports no budget,
+    /// where a real cap of 10 warns (the test above).
+    #[test]
+    #[serial_test::serial] // DARKMUX_REMOTE_MAX_TOKENS_PER_STEP
+    fn a_zero_step_cap_is_no_cap_and_never_warns() {
+        let server = httpmock::MockServer::start();
+        let _mock = usage_mock(&server, true);
+        let (_reg, pf) = azure_registry(&format!("{}/v1", server.base_url()));
+        let s = step(
+            "s1",
+            "dispatch.single_shot",
+            json!({ "model": "gpt-5.1", "user": "hi", "endpoint": "azure", "config_path": pf, "max_tokens": 5 }),
+        );
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
+        let out = with_env(&[("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "0")], || {
+            crate::budget::with_test_env(env.clone(), || {
+                DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new())
+            })
+        })
+        .expect("mock answers");
+        assert!(env.actions().is_empty(), "no cap, no warning: {:?}", env.actions());
+        let recs = as_values(&out.flow_records);
+        let step_rec = recs
+            .iter()
+            .find(|r| r["payload"].get("remote_max_tokens_per_execution").is_some())
+            .unwrap_or_else(|| panic!("the step's telemetry record: {recs:#?}"));
+        assert!(step_rec["payload"]["remote_max_tokens_per_execution"].is_null(), "no cap is reported: {step_rec}");
+    }
+
+    /// (#2902 step 5 review, 3rd pass MUST FIX 1) A hosted `dispatch.map`
+    /// item against a NAMED endpoint stamps that id on its per-call usage
+    /// record.
+    #[test]
+    fn a_named_hosted_map_item_stamps_its_endpoint_id() {
+        let server = httpmock::MockServer::start();
+        let mock = usage_mock(&server, true);
+        let (_reg, pf) = azure_registry(&format!("{}/v1", server.base_url()));
+        let s = map_step(json!({
+            "model": "gpt-5.1", "user_template": "check {item}", "collection": ["a"],
+            "endpoint": "azure", "config_path": pf,
+        }));
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
+        let out = crate::budget::with_test_env(env.clone(), || {
+            DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new())
+        })
+        .expect("mock answers");
+        mock.assert_hits(1);
+        let recs = as_values(&out.flow_records);
+        let rec = crate::usage::assert_one_usage_record(&recs, crate::usage::CallKind::MapItem, "map item (named)");
+        assert_eq!(rec["payload"]["endpoint_id"], "azure", "{rec}");
+        assert_eq!(rec["payload"]["remote"], true);
     }
 
     #[test]
@@ -5173,7 +5298,7 @@ mod tests {
             cached_tokens: Some(64),
             model: Some("hosted".to_string()),
         };
-        let payload = hosted_single_shot_step_payload("s1", 500_000, 4096, 4096, &reply);
+        let payload = hosted_single_shot_step_payload("s1", Some(500_000), 4096, 4096, &reply);
         assert_eq!(payload["reasoning_tokens"], 1024);
         assert_eq!(payload["cached_tokens"], 64);
         // Neighbors, so a copy-paste slip between fields cannot pass.
@@ -5201,7 +5326,7 @@ mod tests {
             cached_tokens: None,
             model: None,
         };
-        let payload = hosted_single_shot_step_payload("s1", 500_000, 4096, 4096, &reply);
+        let payload = hosted_single_shot_step_payload("s1", Some(500_000), 4096, 4096, &reply);
         let obj = payload.as_object().expect("object");
         assert!(obj.contains_key("reasoning_tokens"), "the key stays present");
         assert!(payload["reasoning_tokens"].is_null(), "null, never a fabricated 0");
@@ -5606,44 +5731,33 @@ mod tests {
         }
     }
 
+    /// (#2902 step 5) A per-step cap of 0 under the default `warn` skips
+    /// nothing: every hosted item is dispatched (counted through the
+    /// override), each is ok. Pre-4.0 every item was skipped.
     #[test]
     #[serial_test::serial]
-    fn dispatch_map_hosted_bucket_exhaustion_mid_collection_skips_remaining_items() {
-        // Budget 0 (the hard opt-out) exhausts from the first item, so every
-        // hosted item is SKIPPED with the named budget reason — no HTTP call
-        // fires (proven by the distinct skip message, not a connect error).
-        // This exercises the mid-collection exhaustion policy at its edge: the
-        // whole collection is skipped, each item recording the same reason.
-        let budget_key = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
-        let prev = std::env::var(budget_key).ok();
-        unsafe {
-            std::env::set_var(budget_key, "0");
-        }
+    fn dispatch_map_a_zero_step_cap_under_warn_dispatches_every_item() {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let seen = calls.clone();
+        clear_hosted_override();
+        install_hosted_override(move |_req| {
+            seen.set(seen.get() + 1);
+            Ok(hosted_reply(Some(10)))
+        });
         let s = map_step(json!({
             "model": "gpt-5.1",
             "user_template": "check {item}",
             "collection": ["a", "b", "c"],
-            "endpoint": { "url": "http://127.0.0.1:1" },
-            "timeout_seconds": 1,
+            "endpoint": { "url": "https://example.com" },
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let out = with_env(&[("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "0")], || {
+            DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap()
+        });
+        clear_hosted_override();
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
         assert_eq!(results.len(), 3);
-        assert!(results.iter().all(|r| !r.ok));
-        for r in &results {
-            let msg = r.error.as_deref().unwrap();
-            assert!(msg.contains("remote token budget exhausted"), "budget skip named: {msg}");
-            assert!(
-                !msg.to_lowercase().contains("connect") && !msg.to_lowercase().contains("curl"),
-                "no HTTP call was attempted (skipped before the network): {msg}"
-            );
-        }
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(budget_key, v),
-                None => std::env::remove_var(budget_key),
-            }
-        }
+        assert!(results.iter().all(|r| r.ok), "{results:?}");
+        assert_eq!(calls.get(), 3, "every item dispatched");
     }
 
     // ── (#1442 gate) dispatch.map hosted-seam tests ─────────────────────
@@ -5674,16 +5788,12 @@ mod tests {
         }
     }
 
+    /// (#2902 step 5) Item 1 spends the whole 100-token per-step cap;
+    /// under the default `warn`, items 2 and 3 are still dispatched and ok,
+    /// each reporting its real usage.
     #[test]
     #[serial_test::serial]
-    fn dispatch_map_hosted_partial_exhaustion_mid_collection() {
-        // item 1 spends the WHOLE 100-token allowance, so the SHARED bucket
-        // is exhausted for items 2 and 3 — they skip with the named reason.
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
-        let prev = std::env::var(k).ok();
-        unsafe {
-            std::env::set_var(k, "100");
-        }
+    fn dispatch_map_a_step_cap_reached_mid_collection_keeps_going_under_warn() {
         clear_hosted_override();
         install_hosted_override(|_req| Ok(hosted_reply(Some(100))));
         let s = map_step(json!({
@@ -5692,25 +5802,15 @@ mod tests {
             "collection": ["a", "b", "c"],
             "endpoint": { "url": "https://example.com" },
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap();
+        let out = with_env(&[("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "100")], || {
+            DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap()
+        });
         clear_hosted_override();
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
         assert_eq!(results.len(), 3);
-        assert!(results[0].ok, "item 1 dispatched and succeeded");
-        assert_eq!(results[0].total_tokens, Some(100), "item 1 reported its real usage");
-        for r in &results[1..] {
-            assert!(!r.ok, "item {} skipped after exhaustion", r.index);
-            let msg = r.error.as_deref().unwrap();
-            assert!(msg.contains("remote token budget exhausted"), "named skip reason: {msg}");
-            // (#1442 gate) A skipped item reports HONEST None — never a
-            // fabricated 0 that a run-level token sum would silently swallow.
-            assert_eq!(r.total_tokens, None, "skipped item's total_tokens stays honest None");
-        }
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
+        for r in &results {
+            assert!(r.ok, "item {} dispatched: {r:?}", r.index);
+            assert_eq!(r.total_tokens, Some(100));
         }
     }
 
@@ -5722,7 +5822,7 @@ mod tests {
         // result array never fabricates a number the endpoint didn't send.
         // (The bucket still charges the conservative clamped grant so an
         // omitting endpoint can't run the whole collection off the meter.)
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
         let prev = std::env::var(k).ok();
         unsafe {
             std::env::set_var(k, "500000");
@@ -5782,7 +5882,7 @@ mod tests {
         // First attempt returns empty (but bills 50), the retry returns real
         // content (bills 70). retry_on_empty=1 → the item ends ok with the
         // non-empty content and tokens SUMMED across both attempts.
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
         let prev = std::env::var(k).ok();
         unsafe {
             std::env::set_var(k, "500000");
@@ -5817,7 +5917,7 @@ mod tests {
         // Both attempts empty (bill 50 + 60). retry_on_empty=1 exhausts, and
         // the item ends ok:true with EMPTY content (dispatched, no usable
         // result) and the full spend billed — never a flag from nothing.
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
         let prev = std::env::var(k).ok();
         unsafe {
             std::env::set_var(k, "500000");
@@ -5851,7 +5951,7 @@ mod tests {
     fn dispatch_map_retry_on_empty_default_off_accepts_the_first_empty_reply() {
         // With no retry_on_empty configured (default 0), an empty reply is
         // accepted as-is on the FIRST attempt — one call, tokens from it only.
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
         let prev = std::env::var(k).ok();
         unsafe {
             std::env::set_var(k, "500000");
@@ -5928,7 +6028,7 @@ mod tests {
         // First attempt errors (a transient blip); retry_on_error=1 fires
         // ONE retry, which succeeds. The item ends ok:true and exactly TWO
         // calls fired — not zero, not more than the bounded budget.
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
         let prev = std::env::var(k).ok();
         unsafe {
             std::env::set_var(k, "500000");
@@ -5967,7 +6067,7 @@ mod tests {
         // Every attempt errors. retry_on_error=1 permits exactly ONE retry —
         // two calls total, then the item isolates as ok:false carrying the
         // LAST attempt's error. A THIRD call would mean the bound leaked.
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
         let prev = std::env::var(k).ok();
         unsafe {
             std::env::set_var(k, "500000");
@@ -6012,7 +6112,7 @@ mod tests {
         // policy, preserved for every caller that doesn't opt in), a single
         // dispatch error isolates on the FIRST attempt — exactly one call,
         // matching pre-#1605 behavior byte-for-byte.
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
         let prev = std::env::var(k).ok();
         unsafe {
             std::env::set_var(k, "500000");
@@ -6124,7 +6224,7 @@ mod tests {
     #[test]
     #[serial_test::serial] // mutates the remote-budget env var
     fn dispatch_map_hosted_telemetry_reports_its_seat_as_remote() {
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
         let prev = std::env::var(k).ok();
         unsafe {
             std::env::set_var(k, "500000");
@@ -6234,7 +6334,7 @@ mod tests {
         //
         // Contract violations recur — this is the second (#1272 was the
         // first) — so this asserts the SHAPE, not one field.
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
         let prev = std::env::var(k).ok();
         unsafe {
             std::env::set_var(k, "500000");
@@ -6867,7 +6967,7 @@ mod tests {
         // real (seam-controlled) ~15ms — the HOSTED item must surface BOTH the
         // served model verbatim and a nonzero cumulative wall, in its result,
         // its per-item flow record, AND (wall) the step aggregate's sum.
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
         let prev = std::env::var(k).ok();
         unsafe {
             std::env::set_var(k, "500000");
@@ -6919,7 +7019,7 @@ mod tests {
         // An endpoint that omits `model` yields an honest `None` served_model —
         // never a fabricated empty string and never the requested model echoed
         // back as if served.
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
         let prev = std::env::var(k).ok();
         unsafe {
             std::env::set_var(k, "500000");
@@ -6996,7 +7096,7 @@ mod tests {
         // proves two calls ran; `wall_ms` is their CUMULATIVE sum (>= the 40ms
         // floor of two 20ms sleeps, minus <2ms of millis truncation) — the same
         // per-attempt accumulation `total_tokens` already uses.
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
         let prev = std::env::var(k).ok();
         unsafe {
             std::env::set_var(k, "500000");
@@ -7050,87 +7150,76 @@ mod tests {
         }
     }
 
-    // ── (#1412) dispatch.single_shot hosted-arm metering ────────────────
+    // ── (#1412, #2902 step 5) dispatch.single_shot hosted-arm budgets ───
 
-    #[test]
-    fn clamp_hosted_max_tokens_never_exceeds_the_budget() {
-        assert_eq!(clamp_hosted_max_tokens(4096, 500_000), 4096, "well under budget: unchanged");
-        assert_eq!(clamp_hosted_max_tokens(4096, 1_000), 1_000, "clamped down to the budget");
-        assert_eq!(
-            clamp_hosted_max_tokens(4096, 0),
-            0,
-            "a zero budget clamps to zero (defensive — unreachable via the admit gate, \
-             which already refuses budget 0 before this runs)"
-        );
-        assert_eq!(
-            clamp_hosted_max_tokens(100, u64::MAX),
-            100,
-            "a budget wider than u32::MAX saturates rather than wrapping, and never inflates a small request"
-        );
+    fn with_env<T>(vars: &[(&str, &str)], f: impl FnOnce() -> T) -> T {
+        let prev: Vec<(String, Option<String>)> =
+            vars.iter().map(|(k, _)| (k.to_string(), std::env::var(k).ok())).collect();
+        for (k, v) in vars {
+            unsafe { std::env::set_var(k, v) };
+        }
+        let out = f();
+        for (k, v) in prev {
+            unsafe {
+                match v {
+                    Some(v) => std::env::set_var(&k, v),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
+        out
     }
 
+    /// (#2902 step 5) A per-step cap of 0 is no cap (the zero doctrine:
+    /// a `0` on a darkmux bound means unbounded): the hosted call is
+    /// ATTEMPTED (proven by the hosted arm's own error context against an
+    /// unroutable port), and the error is the network's, never a budget
+    /// refusal. Pre-4.0, 0 refused.
     #[test]
     #[serial_test::serial]
-    fn dispatch_single_shot_hosted_arm_refuses_when_budget_is_zero_before_any_http_call() {
-        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
-        let prev = std::env::var(k).ok();
-        unsafe {
-            std::env::set_var(k, "0");
-        }
-
-        // The endpoint URL is deliberately unroutable (port 1 refuses
-        // immediately) with a 1s timeout: if the admit gate did NOT fire
-        // first, this call would fail with a connection error instead of
-        // the budget-exhausted message asserted below. The DISTINCT error
-        // text is the proof that `single_shot_chat_hosted` (and therefore
-        // the HTTP call) was never reached.
+    fn dispatch_single_shot_hosted_arm_under_warn_calls_even_with_a_zero_step_cap() {
         let s = step(
             "s1",
             "dispatch.single_shot",
-            json!({
-                "model": "gpt-5.1",
-                "user": "hi",
-                "endpoint": { "url": "http://127.0.0.1:1" },
-                "timeout_seconds": 1,
-            }),
+            json!({ "model": "gpt-5.1", "user": "hi", "endpoint": { "url": "http://127.0.0.1:1" }, "timeout_seconds": 1 }),
         );
-        let err = DispatchSingleShotStepKind
-            .run(&s, &empty_task(), &BTreeMap::new())
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("remote token budget exhausted"),
-            "expected the admit-gate's typed refusal, got: {msg}"
-        );
-        assert!(
-            msg.contains("max_tokens_per_execution"),
-            "the error names the exhausted bucket: {msg}"
-        );
-        assert!(
-            !msg.to_lowercase().contains("curl") && !msg.to_lowercase().contains("connect"),
-            "no sign of an attempted network call in the error: {msg}"
-        );
+        let msg = with_env(&[("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "0")], || {
+            format!("{:#}", DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err())
+        });
+        assert!(msg.contains("dispatch.single_shot (hosted)"), "the call was attempted: {msg}");
+        assert!(!msg.contains("budget"), "no budget refusal: {msg}");
+    }
 
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
+    /// (#2902 step 5, operator 2026-09-27) The per-step cap has no `wait`:
+    /// a step whose policy says `wait` is refused before anything is sent,
+    /// naming the value and the valid ones, never run as some other policy.
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_single_shot_refuses_a_step_policy_of_wait_before_sending() {
+        let s = step(
+            "s1",
+            "dispatch.single_shot",
+            json!({ "model": "gpt-5.1", "user": "hi", "endpoint": { "url": "http://127.0.0.1:1" }, "timeout_seconds": 1 }),
+        );
+        let msg = with_env(
+            &[("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "0"), ("DARKMUX_REMOTE_STEP_BUDGET_POLICY", "wait")],
+            || format!("{:#}", DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new()).unwrap_err()),
+        );
+        assert!(msg.contains("`wait`") && msg.contains("remote.step_budget_policy"), "{msg}");
+        assert!(msg.contains("off") && msg.contains("warn"), "{msg}");
+        assert!(!msg.contains("dispatch.single_shot (hosted)"), "nothing was sent: {msg}");
     }
 
     #[test]
     #[serial_test::serial]
     fn dispatch_single_shot_local_arm_is_unmetered_by_the_remote_budget() {
-        let budget_key = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let budget_key = "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP";
         let url_key = "DARKMUX_LMSTUDIO_URL";
         let prev_budget = std::env::var(budget_key).ok();
         let prev_url = std::env::var(url_key).ok();
         unsafe {
-            // The hard opt-out. If the LOCAL dialect were (wrongly) gated
-            // by the remote budget, this would fail with the same
-            // "remote token budget exhausted" message the hosted-arm test
-            // above asserts on. It must not.
+            // A spent per-step cap. If the LOCAL dialect were (wrongly)
+            // gated by it, the error would name the budget. It must not.
             std::env::set_var(budget_key, "0");
             std::env::set_var(url_key, "http://127.0.0.1:1");
         }
@@ -7145,8 +7234,8 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(
-            !msg.contains("remote token budget exhausted"),
-            "the LOCAL dialect must never be gated by DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION: {msg}"
+            !msg.contains("budget"),
+            "the LOCAL dialect must never be gated by DARKMUX_REMOTE_MAX_TOKENS_PER_STEP: {msg}"
         );
         assert!(
             msg.contains("dispatch.single_shot (local)"),

@@ -17,10 +17,12 @@
 # that is the other half of this mechanism, not a nice-to-have — a pin with
 # no updater is just deferred staleness.
 #
-# NOT the MSRV. `Cargo.toml`'s `rust-version` is the minimum darkmux claims
-# to compile on, and it is currently unverified (#1793).
+# NOT the MSRV. Each manifest's `rust-version` is the minimum that package
+# claims to compile on; ci.yml's `msrv` job checks every one of them
+# (scripts/ci-msrv-check.sh, #1793).
 #
-#   ⚠ An MSRV job written the obvious way is VACUOUS because of this file.
+#   ⚠ An MSRV job written the obvious way is VACUOUS because of this file
+#     (the script asserts the toolchain it asked for is the one that ran).
 #     Installing 1.88 and setting it default does nothing — this toolchain
 #     file overrides it, and the job reports a green "MSRV verified" having
 #     tested 1.97.1. Use `cargo +1.88 …` or `RUSTUP_TOOLCHAIN=1.88`, which

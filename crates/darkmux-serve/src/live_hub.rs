@@ -148,31 +148,22 @@ impl FileId {
     }
 }
 
-static INGEST: OnceLock<Arc<IngestState>> = OnceLock::new();
-
-/// This daemon's ingest, once bound (for `/health`).
-pub(crate) fn ingest_state() -> Option<&'static Arc<IngestState>> {
-    INGEST.get()
-}
-
 /// How often the ingest checks that its socket file is still its own.
-const OWNERSHIP_CHECK: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const OWNERSHIP_CHECK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Bind the ingest socket at `path` (keyed by `port`, the port this daemon
-/// bound) and serve it on a dedicated thread for the daemon's lifetime.
-/// Bound whatever `runtime.live_sample_ms` says: the knob is the
-/// producers' cadence, and a daemon always accepts. `None` (with one stderr
-/// line) when the socket cannot be bound: the daemon serves on without a
-/// live channel.
-pub(crate) fn spawn_ingest(path: PathBuf, port: u16) -> Option<std::thread::JoinHandle<()>> {
-    let (handle, state) = spawn_ingest_checking(path, port, OWNERSHIP_CHECK)?;
-    let _ = INGEST.set(state);
-    Some(handle)
-}
-
-/// [`spawn_ingest`] with the ownership-check interval as a parameter
-/// (tests), returning the state instead of registering it.
-pub(crate) fn spawn_ingest_checking(
+/// bound) and serve it on a dedicated thread for the daemon's lifetime,
+/// checking every `check_every` ([`OWNERSHIP_CHECK`] in production) that the
+/// socket file is still this daemon's. Bound whatever
+/// `runtime.live_sample_ms` says: the knob is the producers' cadence, and a
+/// daemon always accepts. `None` (with one stderr line) when the socket
+/// cannot be bound: the daemon serves on without a live channel.
+///
+/// The returned state belongs to the caller, which hands it to the router it
+/// serves (`/health`) and to its shutdown. Nothing is registered
+/// process-wide, so a second ingest in the same process can never be
+/// reported as, or mistaken for, the first.
+pub(crate) fn spawn_ingest(
     path: PathBuf,
     port: u16,
     check_every: std::time::Duration,

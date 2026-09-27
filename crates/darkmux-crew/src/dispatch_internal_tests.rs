@@ -269,17 +269,205 @@
         assert_eq!(both["max_completion_tokens"], 8000, "an explicit cap wins");
     }
 
-    /// (#1260, FIX 2) A bare remote `dispatch` is metered as ONE
-    /// execution: any positive per-execution allowance admits the single
-    /// hosted call; a zero allowance (a hard operator opt-out) refuses it
-    /// with a typed error NAMING the bucket, never dispatching off the meter.
+    /// (#2902 step 5) A bare hosted `dispatch` passes the endpoint budget
+    /// gate and reserves against the per-step cap before its first record,
+    /// and settles the cap after the call. Checked on the source with
+    /// comments stripped (the full ordering rule is
+    /// `usage_conformance::every_hosted_call_site_passes_the_budget_gates`);
+    /// the gate firing is `the_endpoint_gate_fires_on_dispatch_remote`.
     #[test]
-    fn admit_remote_execution_gates_on_the_per_execution_budget() {
-        assert!(admit_remote_execution(500_000).is_ok(), "a positive allowance admits the one call");
-        assert!(admit_remote_execution(1).is_ok(), "even a tiny positive allowance admits a single call");
-        let err = admit_remote_execution(0).unwrap_err().to_string();
-        assert!(err.contains("remote token budget exhausted"), "{err}");
-        assert!(err.contains("max_tokens_per_execution"), "the error names the bucket: {err}");
+    fn dispatch_remote_passes_both_budget_gates_before_any_record() {
+        let src: String = include_str!("dispatch_internal.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = &src[src.find("fn dispatch_remote(").expect("dispatch_remote")..];
+        let body = &body[..body.find("\n}\n").expect("fn end")];
+        let open = body.find("bookend.open(").expect("bookend opens");
+        let endpoint_gate = body.find("crate::budget::admit_endpoint(ep,").expect("endpoint gate");
+        let step_gate = body.find("crate::budget::admit_step(").expect("per-step reservation");
+        let call = body.find("remote_chat_completion(").expect("the call");
+        let settle = body.find("crate::budget::settle_step_live(").expect("per-step settle");
+        assert!(endpoint_gate < open && step_gate < open, "both run before the first record");
+        assert!(settle > call, "the per-step cap is settled with the call's real spend");
+        assert!(!src.contains("fn admit_remote_execution("), "the pre-4.0 zero-refusal gate is gone");
+        // (3rd review #4) A call the gate holds is live work: the presence
+        // heartbeat starts before the gate, the bookend only after it.
+        let beat = body.find("session_presence::spawn_session_emitter(").expect("heartbeat");
+        assert!(beat < endpoint_gate, "the heartbeat runs through a budget wait");
+    }
+
+    /// (3rd review #4) The agentic pre-start gate holds a start behind a
+    /// heartbeat, so the held run is live on the fleet's presence.
+    #[test]
+    fn the_agentic_prestart_gate_runs_under_a_heartbeat() {
+        let src: String = include_str!("dispatch_internal.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let from = src.find("if let Some(t) = &agentic_pm {").expect("the pre-start gate block");
+        let block = &src[from..];
+        let gate = block.find("crate::budget::admit_endpoint(").expect("the gate");
+        let beat = block.find("let _gate_beat = matches!(crate::budget::EndpointBudget::of(&t.endpoint), Ok(Some(_))).then(|| {")
+            .expect("a heartbeat, spawned only for an endpoint with a budget (5th review C3)");
+        assert!(beat < gate, "the heartbeat is held across the gate");
+    }
+
+    /// (#2902 step 5 review C1, M1) The endpoint gate FIRES on
+    /// `dispatch_remote`: an endpoint whose window is full under `wait`, on a
+    /// run that was stopped, returns the gate's error, and the endpoint
+    /// never receives a request.
+    #[test]
+    #[serial]
+    fn the_endpoint_gate_fires_on_dispatch_remote() {
+        let (base_url, rx) = one_shot_http_mock(r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+        let home = TempDir::new().unwrap();
+        let flows_dir = TempDir::new().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+        }
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "pr-reviewer".to_string();
+        opts.session_id = Some(format!("budget-gate-remote-{}", std::process::id()));
+        opts.phase_id = None;
+        let mut pm: darkmux_types::ProfileModel = serde_json::from_str(&format!(
+            r#"{{"id":"gpt-remote","endpoint":{{"url":"{base_url}","limits":{{"policy":"wait","window":{{"period":"1d","tokens":1}}}}}}}}"#
+        ))
+        .unwrap();
+        pm.endpoint.as_mut().unwrap().source = darkmux_types::EndpointSource::Named("azure".into());
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::full_window().stopped_after(1, "mission `m` is aborted"));
+        let result = crate::budget::with_test_env(env.clone(), || {
+            dispatch_remote(&opts, &quarantine_test_role(), "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap())
+        });
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+        let err = format!("{:#}", result.expect_err("a stopped wait must not dispatch"));
+        assert!(err.contains("stopped waiting on endpoint `azure`'s budget") && err.contains("nothing was sent"), "{err}");
+        assert_eq!(
+            env.actions(),
+            vec![crate::budget::BUDGET_WAIT_ACTION.to_string(), crate::budget::BUDGET_STOP_ACTION.to_string()],
+            "the ended wait is recorded as a stop"
+        );
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(), "the endpoint received no request");
+    }
+
+    /// (#2902 step 5 review C-a) The agentic-remote container path's
+    /// PRE-START gate, driven through the real `dispatch()`: a tool-granting
+    /// role on a budgeted endpoint whose window is full under `wait`, on a
+    /// run that was stopped, returns the gate's error before any Docker work
+    /// (none is available here, so reaching it would fail differently).
+    #[test]
+    #[serial]
+    fn the_agentic_remote_prestart_gate_fires_before_the_container() {
+        let reg = TempDir::new().unwrap();
+        let pf = reg.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"p":{"models":[{"id":"gpt-remote","endpoint":"azure"}]}},"default_profile":"p",
+                "endpoints":{"azure":{"url":"http://127.0.0.1:1",
+                    "limits":{"policy":"wait","window":{"period":"1d","tokens":1}}}}}"#,
+        )
+        .unwrap();
+        let home = TempDir::new().unwrap();
+        let flows_dir = TempDir::new().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+        }
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "code-reviewer".to_string();
+        opts.profile_name = Some("p".to_string());
+        opts.config_path = Some(pf.to_string_lossy().to_string());
+        opts.session_id = Some(format!("budget-gate-agentic-{}", std::process::id()));
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::full_window().stopped_after(1, "mission `m` is aborted"));
+        let result = crate::budget::with_test_env(env.clone(), || dispatch(opts));
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+        let err = format!("{:#}", result.expect_err("a stopped wait must not start the container"));
+        assert!(err.contains("stopped waiting on endpoint `azure`'s budget") && err.contains("nothing was sent"), "{err}");
+        assert_eq!(
+            env.actions(),
+            vec![crate::budget::BUDGET_WAIT_ACTION.to_string(), crate::budget::BUDGET_STOP_ACTION.to_string()],
+            "the ended wait is recorded as a stop"
+        );
+    }
+
+    /// (#2902 step 5 review C-a, MF1) The sampler's pacer call, driven on
+    /// the real `run_telemetry_sampler`: a held run that was stopped is
+    /// never released; the pace file keeps `pause`, a `budget.stop` is
+    /// recorded, and the run is ended the way an interrupt ends it.
+    #[test]
+    #[serial]
+    fn the_sampler_pacer_ends_a_stopped_run_it_holds() {
+        darkmux_types::interrupt::reset_for_test();
+        let out = TempDir::new().unwrap();
+        let mut ep: darkmux_types::ModelEndpoint = serde_json::from_str(
+            r#"{"url":"http://127.0.0.1:1","limits":{"policy":"wait","window":{"period":"1d","tokens":1}}}"#,
+        )
+        .unwrap();
+        ep.source = darkmux_types::EndpointSource::Named("azure".into());
+        let pacer = crate::budget::BudgetPacer::new(crate::budget::EndpointBudget::of(&ep).unwrap().unwrap(), None);
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::full_window().stopped("mission `m` is aborted"));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopper = Arc::clone(&stop);
+        // End the sampler once the interrupt was raised (or after a bound),
+        // never on a fixed guess at how long its first tick takes.
+        let t = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !darkmux_types::interrupt::is_set() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(50));
+            }
+            stopper.store(true, Ordering::SeqCst);
+        });
+        crate::budget::with_test_env(env.clone(), || {
+            run_telemetry_sampler(
+                stop,
+                "coder".into(),
+                "s-pacer".into(),
+                "gpt-remote".into(),
+                None,
+                None,
+                Some("m".into()),
+                None,
+                out.path().to_path_buf(),
+                None,
+                crate::thermal_governor::ThermalGovernorConfig::from_env().unwrap(),
+                Some(pacer),
+            )
+        });
+        t.join().unwrap();
+        let interrupted = darkmux_types::interrupt::is_set();
+        darkmux_types::interrupt::reset_for_test();
+        assert!(interrupted, "the stopped run is ended the way an interrupt ends it");
+        // (5th review C6) Stopped before any wait was announced: no orphan
+        // `budget.stop` (a stop record always follows its wait).
+        assert!(!env.actions().contains(&crate::budget::BUDGET_STOP_ACTION.to_string()), "{:?}", env.actions());
+        let pace: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(crate::pace_file::path(out.path())).unwrap()).unwrap();
+        assert_eq!((pace["pause"].as_bool(), pace["reason"].as_str()), (Some(true), Some("budget")), "{pace}");
     }
 
     /// Hosted-response classification (pure): the happy path passes through;
@@ -7507,6 +7695,7 @@
                 None, // (#2794) compactor_model
                 None,
                 None, // (#2902) endpoint
+                None, // (#2902 step 5) endpoint id
                 None, // (#2902 step 1b) compactor endpoint
                 None, // (#2928) live sender
             )
@@ -10244,7 +10433,7 @@
             "finish_reason": "tool_calls",
             "usage": { "prompt_tokens": 24000, "completion_tokens": 850 },
         });
-        let payload = turn_tokens_payload(&event, "coder", "m", "ep");
+        let payload = turn_tokens_payload(&event, "coder", "m", "ep", None);
         assert_eq!(payload["turn_seq"], 12);
         assert_eq!(payload["prompt_tokens"], 24000);
         assert_eq!(payload["completion_tokens"], 850);
@@ -10273,7 +10462,7 @@
                 "reasoning_tokens": 1024, "cached_tokens": 64,
             },
         });
-        let payload = turn_tokens_payload(&event, "coder", "m", "ep");
+        let payload = turn_tokens_payload(&event, "coder", "m", "ep", None);
         assert_eq!(payload["reasoning_tokens"], 1024);
         assert_eq!(payload["cached_tokens"], 64);
         assert!(payload["reasoning_tokens"].as_u64().unwrap() <= payload["completion_tokens"].as_u64().unwrap());
@@ -10298,7 +10487,7 @@
             "seq": 4,
             "usage": { "prompt_tokens": 9970, "completion_tokens": 128, "total_tokens": 11598 },
         });
-        let payload = turn_tokens_payload(&event, "coder", "m", "ep");
+        let payload = turn_tokens_payload(&event, "coder", "m", "ep", None);
         assert_eq!(
             payload["total_tokens"], 11598,
             "the provider's own total must win; prompt + completion (10098) understates by 1500"
@@ -10318,7 +10507,7 @@
             "seq": 5,
             "usage": { "prompt_tokens": 300, "completion_tokens": 45 },
         });
-        let payload = turn_tokens_payload(&event, "coder", "m", "ep");
+        let payload = turn_tokens_payload(&event, "coder", "m", "ep", None);
         assert_eq!(payload["total_tokens"], 345, "no reported total → derive from the split");
     }
 
@@ -10553,11 +10742,11 @@
     #[test]
     fn turn_tokens_payload_marks_absent_or_null_usage_absent() {
         let absent = serde_json::json!({ "type": "model.completed", "seq": 3 });
-        assert_eq!(turn_tokens_payload(&absent, "coder", "m", "ep")["token_source"], "absent", "absent usage → an absent record, no counts");
+        assert_eq!(turn_tokens_payload(&absent, "coder", "m", "ep", None)["token_source"], "absent", "absent usage → an absent record, no counts");
         let null = serde_json::json!({
             "type": "model.completed", "seq": 3, "usage": serde_json::Value::Null,
         });
-        assert_eq!(turn_tokens_payload(&null, "coder", "m", "ep")["token_source"], "absent", "null usage → an absent record, no counts");
+        assert_eq!(turn_tokens_payload(&null, "coder", "m", "ep", None)["token_source"], "absent", "null usage → an absent record, no counts");
     }
 
     /// (#795) Defensive: a `usage` object missing a count degrades that
@@ -10570,7 +10759,7 @@
             "seq": 1,
             "usage": { "completion_tokens": 500 },
         });
-        let payload = turn_tokens_payload(&event, "coder", "m", "ep");
+        let payload = turn_tokens_payload(&event, "coder", "m", "ep", None);
         assert_eq!(payload["prompt_tokens"], 0);
         assert_eq!(payload["completion_tokens"], 500);
         assert_eq!(payload["total_tokens"], 500);
@@ -14667,6 +14856,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
             None,
             None, // (#2902) endpoint
+            None, // (#2902 step 5) endpoint id
             None, // (#2902 step 1b) compactor endpoint
             None, // (#2928) live sender
         );
@@ -15023,6 +15213,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 None, // (#2794) compactor_model
                 None,
                 None, // (#2902) endpoint
+                None, // (#2902 step 5) endpoint id
                 None, // (#2902 step 1b) compactor endpoint
                 None, // (#2928) live sender
             );
@@ -15113,6 +15304,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 host_out_for_closure,
                 None,
                 crate::thermal_governor::ThermalGovernorConfig::from_env().unwrap(),
+                None, // (#2902 step 5) no endpoint budget
             );
             *handle_holder_for_closure.lock().unwrap() = Some(handle);
             panic!("simulated panic between the sampler's spawn and dispatch()'s own stores");
@@ -16694,7 +16886,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             .iter()
             .map(|e| {
                 let ev: serde_json::Value = serde_json::from_str(e).unwrap();
-                super::turn_tokens_payload(&ev, "coder", "m", "ep")["total_tokens"].as_u64().unwrap()
+                super::turn_tokens_payload(&ev, "coder", "m", "ep", None)["total_tokens"].as_u64().unwrap()
             })
             .sum();
         assert_eq!(per_turn_sum, 11598 + 150);
@@ -17346,6 +17538,170 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(p["total_tokens"], 130);
         assert_eq!(p["token_source"], "provider");
         assert!(p.get("reported_model").is_none(), "the event named no model: {p}");
+    }
+
+    /// (#2902 step 5 review, 3rd pass MUST FIX 1) The container path's
+    /// per-turn usage record carries the hosted brain's endpoint id, the key
+    /// an endpoint's window budget sums by.
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
+    fn usage_conformance_container_turn_stamps_the_endpoint_id() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            "sess-usage-epid".into(),
+            "coder".into(),
+            "gpt-hosted".into(),
+        )
+        .with_endpoint(Some("azure:gpt-hosted".into()))
+        .with_endpoint_id(Some("azure".into()));
+        state.handle_event(
+            r#"{"type":"model.completed","seq":1,"finish_reason":"stop","usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}"#,
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+        let records = drain_flow_records_for_session(tmp.path(), "sess-usage-epid");
+        let rec = crate::usage::assert_one_usage_record(&records, crate::usage::CallKind::Turn, "container turn (named)");
+        assert_eq!(rec["payload"]["endpoint_id"], "azure", "{rec}");
+    }
+
+    /// (#2902 step 5 review, 3rd pass MUST FIX 1) What `dispatch()` hands
+    /// the tailer as its endpoint id: the hosted brain's registry id when
+    /// named, nothing for an inline endpoint or a local brain.
+    #[test]
+    fn the_tailer_endpoint_id_is_the_hosted_brains_registry_id() {
+        let mut pm: darkmux_types::ProfileModel =
+            serde_json::from_str(r#"{"id":"gpt-remote","endpoint":{"url":"https://h.example/v1"}}"#).unwrap();
+        let inline = crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap();
+        assert_eq!(tailer_endpoint_id(Some(&inline)), None, "an inline endpoint has no id");
+        pm.endpoint.as_mut().unwrap().source = darkmux_types::EndpointSource::Named("azure".into());
+        let named = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
+        assert_eq!(tailer_endpoint_id(Some(&named)).as_deref(), Some("azure"));
+        assert_eq!(tailer_endpoint_id(None), None, "a local brain");
+    }
+
+    /// Top-level comma-separated arguments of the call that starts at
+    /// `open` (the index of its `(`), comments already stripped.
+    fn call_args(src: &str, open: usize) -> Vec<String> {
+        let (mut depth, mut cur, mut out) = (0i32, String::new(), Vec::new());
+        for ch in src[open..].chars() {
+            match ch {
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    if depth == 1 {
+                        continue;
+                    }
+                }
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if !cur.trim().is_empty() {
+                            out.push(cur.trim().to_string());
+                        }
+                        return out;
+                    }
+                }
+                ',' if depth == 1 => {
+                    out.push(cur.trim().to_string());
+                    cur.clear();
+                    continue;
+                }
+                _ => {}
+            }
+            cur.push(ch);
+        }
+        out
+    }
+
+    /// (5th review C2) The CALL SITE hands the tailer the hosted brain's
+    /// endpoint id, in the `endpoint_id` position: the helper is pinned by
+    /// `the_tailer_endpoint_id_is_the_hosted_brains_registry_id`, this pins
+    /// that `dispatch()` passes it (a `None` there stamps nothing, and the
+    /// endpoint's window never sums a container run's turns).
+    #[test]
+    fn dispatch_passes_the_endpoint_id_to_the_tailer() {
+        let src: String = include_str!("dispatch_internal.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let sig = src.find("fn spawn_guarded_tailer(").expect("signature") + "fn spawn_guarded_tailer".len();
+        let params: Vec<String> =
+            call_args(&src, sig).iter().map(|p| p.split(':').next().unwrap().trim().to_string()).collect();
+        let at = params.iter().position(|p| p == "endpoint_id").expect("an endpoint_id parameter");
+        let call = src.find("spawn_guarded_tailer(\n        &stop_flag,").expect("dispatch()'s call") + "spawn_guarded_tailer".len();
+        let args = call_args(&src, call);
+        assert_eq!(args.len(), params.len(), "{args:#?}");
+        assert_eq!(args[at], "tailer_endpoint_id(agentic_pm.as_ref())", "{args:#?}");
+    }
+
+    /// (#2902 step 5 review, 3rd pass MUST FIX 1) `dispatch_remote` against
+    /// a NAMED endpoint stamps its id on the usage record and settles the
+    /// REPLY's total into the per-step bucket: a 5-token cap and a 9-token
+    /// reply warn with `spent: 9` (settling 0 would stay silent).
+    #[test]
+    #[serial]
+    fn dispatch_remote_stamps_the_endpoint_id_and_settles_the_reply() {
+        let (base_url, rx) = one_shot_http_mock(
+            r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":6,"completion_tokens":3,"total_tokens":9}}"#,
+        );
+        let home = TempDir::new().unwrap();
+        let flows_dir = TempDir::new().unwrap();
+        let keys = ["DARKMUX_HOME", "DARKMUX_FLOWS_DIR", "DARKMUX_REDIS_URL", "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP"];
+        let prev: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "5");
+        }
+        let session = format!("budget-epid-remote-{}", std::process::id());
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "pr-reviewer".to_string();
+        opts.session_id = Some(session.clone());
+        opts.phase_id = None;
+        let mut pm: darkmux_types::ProfileModel =
+            serde_json::from_str(&format!(r#"{{"id":"gpt-remote","endpoint":{{"url":"{base_url}"}}}}"#)).unwrap();
+        pm.endpoint.as_mut().unwrap().source = darkmux_types::EndpointSource::Named("azure".into());
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
+        let result = crate::budget::with_test_env(env.clone(), || {
+            dispatch_remote(
+                &opts,
+                &quarantine_test_role(),
+                "system prompt",
+                &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap(),
+            )
+        });
+        let records = drain_flow_records_for_session(flows_dir.path(), &session);
+        unsafe {
+            for (k, v) in keys.iter().zip(prev) {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        result.expect("the mock answers");
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(), "the endpoint was called");
+        let rec = crate::usage::assert_one_usage_record(&records, crate::usage::CallKind::SingleShot, "dispatch_remote (named)");
+        assert_eq!(rec["payload"]["endpoint_id"], "azure", "{rec}");
+        assert_eq!(env.actions(), vec![crate::budget::BUDGET_WARN_ACTION.to_string()]);
+        let w = env.payload(crate::budget::BUDGET_WARN_ACTION);
+        assert_eq!((w["scope"].as_str(), w["spent"].as_u64(), w["limit"].as_u64()), (Some("step"), Some(9), Some(5)), "{w}");
     }
 
     /// (#2902 step 1b) Drive the tailer with `events` and return its session's

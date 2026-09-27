@@ -302,6 +302,18 @@ pub fn spawn_session_emitter(
     spawn_with_client(client, session_id, role, model, mission_id)
 }
 
+/// (#2902 step 5, 6th review MF) The session id a beat is keyed on: the
+/// run's own (`scope_to_run`), the same id `mission_launch` stamps on the
+/// run's flow records. A hosted step passes the bare `task-<id>` every
+/// mission from one config shares, so a bare key named no run in
+/// particular and never matched its scoped records. Idempotent.
+fn presence_session_id(session_id: String, mission_id: Option<&str>) -> String {
+    match mission_id {
+        Some(mid) => darkmux_types::session_id::scope_to_run(&session_id, mid),
+        None => session_id,
+    }
+}
+
 /// (#2227) The emitter body, taking an explicit client. Split out of
 /// [`spawn_session_emitter`] purely so the TEARDOWN path — a beat thread
 /// blocked inside `write_session_beat`, joined by [`SessionEmitter::stop`] —
@@ -316,6 +328,7 @@ fn spawn_with_client(
     model: Option<String>,
     mission_id: Option<String>,
 ) -> Option<SessionEmitter> {
+    let session_id = presence_session_id(session_id, mission_id.as_deref());
     let machine_uid = darkmux_hardware::machine_uid().map(str::to_string);
     let display_name = crate::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
 
@@ -363,6 +376,17 @@ fn spawn_with_client(
 
 #[cfg(test)]
 mod tests {
+    /// (6th review MF) A hosted step's bare `task-<id>` beats under its run's
+    /// scoped id, the one its flow records carry; a standalone id, or one
+    /// already scoped, is unchanged.
+    #[test]
+    fn a_task_beat_is_keyed_on_its_runs_session() {
+        assert_eq!(presence_session_id("task-probe".into(), Some("m-b")), "task-probe-m-b");
+        assert_eq!(presence_session_id("task-probe-m-b".into(), Some("m-b")), "task-probe-m-b");
+        assert_eq!(presence_session_id("dispatch-coder-1".into(), Some("m-b")), "dispatch-coder-1");
+        assert_eq!(presence_session_id("task-probe".into(), None), "task-probe");
+    }
+
     use super::*;
 
     /// (#2344) A minimal, in-process, RESP-speaking fake Redis peer that
@@ -617,6 +641,22 @@ mod tests {
         );
     }
 
+    /// (6th review MF) The emitter beats under the RUN's session: a hosted
+    /// step spawns it with its bare `task-<id>` and its mission, and the key
+    /// is the scoped id its flow records carry; `stop()` removes that key.
+    #[test]
+    fn a_step_emitter_beats_and_stops_under_its_runs_session() {
+        let fake = fake_redis::FakeRedis::spawn();
+        let client = redis::Client::open(fake.url().as_str()).expect("open fake client");
+        let scoped = session_key("task-probe-m-b");
+        let emitter = spawn_with_client(client, "task-probe".into(), None, None, Some("m-b".into()))
+            .expect("spawn emitter");
+        wait_until(|| fake.contains(&scoped), "the beat under the run's scoped session");
+        assert!(!fake.contains(&session_key("task-probe")), "never the bare, shared key");
+        emitter.stop();
+        assert!(!fake.contains(&scoped), "stop() removes the scoped key");
+    }
+
     /// (#2344) THE regression this issue is about, at the emitter level: an
     /// early `?`-return between spawn and the explicit `stop()` simply lets
     /// the emitter go out of scope. Before the fix, `Drop` only halted the
@@ -718,7 +758,7 @@ mod tests {
     fn sample_beat() -> SessionBeat {
         SessionBeat {
             session_id: "crew-dispatch-coder-1780493601894484-internal".into(),
-            machine_uid: Some("564D1234-ABCD-5678-9EF0-1234567890AB".into()),
+            machine_uid: Some("00000000-0000-4000-8000-ABCDEF000009".into()),
             display_name: "laptop".into(),
             role: Some("coder".into()),
             model: Some("qwen3.6-35b".into()),

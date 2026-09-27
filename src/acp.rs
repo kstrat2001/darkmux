@@ -1695,7 +1695,7 @@ async fn run_no_slash_route(
     // (#2947 review C4) Bad enum config refuses before the routing call,
     // said in the panel as it is, rather than the routing dispatch failing
     // and the turn degrading into an "answering seat failed" fallback.
-    if let Err(bad) = darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::Dispatch) {
+    if let Err(bad) = darkmux_profiles::preflight(darkmux_types::config_enum::Scope::Dispatch) {
         cx.send_notification(agent_chunk(session_id, format!("darkmux radio: {bad}\n")))?;
         return Ok(());
     }

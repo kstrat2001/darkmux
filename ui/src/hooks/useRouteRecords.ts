@@ -193,5 +193,9 @@ export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): Rou
     };
   }
 
-  return { records: flowWindow.data, loading: false, historical: false, error: null };
+  // (#2965) A live route's log IS the live window, so the window's failed
+  // day read is its error: otherwise the log says "no events yet" off a read
+  // that never happened.
+  const f = flowWindow.failure;
+  return { records: flowWindow.data, loading: false, historical: false, error: f ? { status: f.status, message: f.message } : null };
 }

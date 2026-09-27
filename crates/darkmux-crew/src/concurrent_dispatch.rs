@@ -27,7 +27,7 @@
 //! Every dispatch path in darkmux today is synchronous blocking I/O
 //! (`std::process::Command`, blocking HTTP via `ureq`) and neither
 //! `darkmux-crew` nor `darkmux-lab` depends on tokio. `std::thread::scope`
-//! (stable since Rust 1.63, workspace MSRV 1.80 covers it) gives bounded,
+//! (stable since Rust 1.63, crate MSRV 1.86 covers it) gives bounded,
 //! borrow-checked concurrency for exactly this shape without pulling in an
 //! async runtime — see this repo's CLAUDE.md dependency-discipline
 //! convention ("a 10-line inline module beats a crate for small one-off

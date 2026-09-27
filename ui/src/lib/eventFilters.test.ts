@@ -35,6 +35,8 @@ describe("activityOf", () => {
     expect(activityOf(rec({ action: "session.end" }))).toBe("session end");
     expect(activityOf(rec({ action: "machine.online" }))).toBe("machine online");
     expect(activityOf(rec({ action: "note" }))).toBe("note");
+    // (#2902 step 5) Budget records are their own facet, not generic telemetry.
+    expect(activityOf(rec({ action: "budget.wait", category: "telemetry", source: "budget" }))).toBe("budget");
     expect(activityOf(rec({ action: undefined, source: "orchestrator" }))).toBe("note");
   });
 

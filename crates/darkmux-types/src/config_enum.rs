@@ -35,9 +35,9 @@
 //! **Adding an enum setting** is: implement [`ConfigEnum`] with
 //! [`config_enum!`], add an [`EnumSetting::of`] entry to [`ENUM_SETTINGS`],
 //! and write the typed accessor as a one-line call to
-//! `config_access::resolve_enum`. Nothing else. A budget `policy` of
-//! `off`/`warn`/`stop` (#2902 step 5) would be exactly those three
-//! lines plus a `Scope` list. The conformance tests below iterate the
+//! `config_access::resolve_enum`. Nothing else. The per-step cap's
+//! `remote.step_budget_policy` (#2902 step 5) is exactly those three lines
+//! plus a `Scope` list. The conformance tests below iterate the
 //! registry, so the new entry inherits the preflight/doctor/config-set/help
 //! assertions without a test of its own, and `every_enum_in_the_config_schema_is_registered`
 //! fails until an enum declared in the config schema is registered.
@@ -326,6 +326,9 @@ pub enum SetIn {
     /// The concrete `config.json` path (for a per-item setting, with its
     /// index: `hooks.rules[2].match.level`).
     Config(String),
+    /// (#2902 step 5) A path in the profile registry (`profiles.json`),
+    /// e.g. `endpoints.azure.limits.policy`: a per-endpoint enum.
+    Profiles(String),
 }
 
 impl std::fmt::Display for SetIn {
@@ -333,6 +336,7 @@ impl std::fmt::Display for SetIn {
         match self {
             SetIn::Env(var) => write!(f, "env var {var}"),
             SetIn::Config(key) => write!(f, "config.json key `{key}`"),
+            SetIn::Profiles(path) => write!(f, "profiles.json key `{path}`"),
         }
     }
 }
@@ -375,6 +379,7 @@ impl BadEnumValue {
                 format!("edit `{path}` in ~/.darkmux/config.json to {tokens}")
             }
             SetIn::Config(key) => format!("darkmux config set {key} {tokens}"),
+            SetIn::Profiles(path) => format!("edit `{path}` in profiles.json to {tokens}"),
         }
     }
 
@@ -454,6 +459,99 @@ pub fn bad_hook_rule_values(rules: &[crate::config::HookRule]) -> Vec<BadEnumVal
         .collect()
 }
 
+/// (#2902 step 5) Every unregistered budget `policy` in a profile registry:
+/// each `endpoints.<id>.limits.policy`, and each inline endpoint's on a
+/// profile model (`profiles.<p>.models[<i>].endpoint.limits.policy`). The
+/// same rule as a config enum: never resolved to a fallback, refused at
+/// preflight by every entry point that dispatches (`darkmux_profiles::
+/// preflight`), Fail in doctor. A per-endpoint enum lives in
+/// `profiles.json`, not `config.json`, so it is not an [`EnumSetting`]: this
+/// is its registry pass.
+pub fn bad_endpoint_budget_policies(reg: &crate::ProfileRegistry) -> Vec<BadEnumValue> {
+    use crate::endpoint::{BudgetPolicy, Lenient};
+    fn raw_of(ep: &crate::ModelEndpoint) -> Option<String> {
+        match ep.limits.as_ref()?.known().ok()?.policy.as_ref()? {
+            Lenient::Known(_) => None,
+            Lenient::Unrecognized(v) => Some(v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())),
+        }
+    }
+    let bad = |raw: String, path: String| BadEnumValue {
+        key: "endpoints.<id>.limits.policy",
+        kind: BudgetPolicy::KIND,
+        raw,
+        renamed_to: None,
+        set_in: SetIn::Profiles(path),
+        values: BudgetPolicy::TABLE,
+    };
+    let mut out = Vec::new();
+    for (id, ep) in &reg.endpoints {
+        if let Some(raw) = raw_of(ep) {
+            out.push(bad(raw, format!("endpoints.{id}.limits.policy")));
+        }
+    }
+    for (pname, profile) in &reg.profiles {
+        for (i, m) in profile.models.iter().enumerate() {
+            let Some(ep) = m.endpoint.as_ref().filter(|e| e.source == crate::endpoint::EndpointSource::Inline) else {
+                continue;
+            };
+            if let Some(raw) = raw_of(ep) {
+                out.push(bad(raw, format!("profiles.{pname}.models[{i}].endpoint.limits.policy")));
+            }
+        }
+    }
+    out
+}
+
+/// (#2902 step 5) The valid shape of an endpoint's `limits`, for a refusal.
+pub const LIMITS_SHAPE: &str = "`limits`: {\"window\": {\"period\": \"<n>m|<n>h|<n>d\", \"tokens\": <integer>, \
+     \"calls\": <integer>}, \"policy\": \"off\"|\"warn\"|\"wait\", \"warn_at\": <a fraction between 0 and 1>, \
+     \"tokens_per_dispatch\": <integer>, \"concurrent_calls\": <integer>}";
+
+/// (#2902 step 5 review M2) Every endpoint `limits` that cannot be used as
+/// written: unreadable (one mistyped field, `"tokens": "2M"`, makes the whole
+/// value unreadable, and an unreadable budget must never silently count
+/// nothing), or readable but invalid (a set window whose `period` does not
+/// parse, `warn_at` outside (0, 1)). An unregistered `policy` in readable
+/// limits is [`bad_endpoint_budget_policies`]'s, not this. Same coverage:
+/// `endpoints.<id>` and inline endpoints on profile models.
+pub fn invalid_endpoint_limits(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> {
+    use crate::endpoint::Lenient;
+    fn problem(ep: &crate::ModelEndpoint) -> Option<String> {
+        match ep.limits.as_ref()? {
+            Lenient::Unrecognized(raw) => Some(match serde_json::from_value::<crate::UsageLimits>(raw.clone()) {
+                Err(e) => format!("`limits` could not be read ({e})"),
+                Ok(_) => "`limits` could not be read".to_string(),
+            }),
+            Lenient::Known(l) => {
+                if l.resolved_policy().is_err() {
+                    return None; // bad_endpoint_budget_policies names it
+                }
+                l.validate().err()
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut push = |path: String, p: String| {
+        out.push(InvalidSetting { set_in: SetIn::Profiles(path), problem: p, valid: LIMITS_SHAPE.to_string() })
+    };
+    for (id, ep) in &reg.endpoints {
+        if let Some(p) = problem(ep) {
+            push(format!("endpoints.{id}.limits"), p);
+        }
+    }
+    for (pname, profile) in &reg.profiles {
+        for (i, m) in profile.models.iter().enumerate() {
+            let Some(ep) = m.endpoint.as_ref().filter(|e| e.source == crate::endpoint::EndpointSource::Inline) else {
+                continue;
+            };
+            if let Some(p) = problem(ep) {
+                push(format!("profiles.{pname}.models[{i}].endpoint.limits"), p);
+            }
+        }
+    }
+    out
+}
+
 /// Every bad value in the registry right now, resolved through the live
 /// tiers. `darkmux doctor`'s generic check reports each as Fail.
 pub fn bad_values() -> Vec<BadEnumValue> {
@@ -467,18 +565,40 @@ pub fn bad_values() -> Vec<BadEnumValue> {
 pub struct PreflightRefusal {
     pub scope: Scope,
     pub bad: Vec<BadEnumValue>,
+    /// (#2902 step 5) Settings that are not a bad ENUM value but cannot be
+    /// used as written (an endpoint's unreadable `limits`, a window period
+    /// that does not parse). Empty for a config.json-only preflight.
+    pub invalid: Vec<InvalidSetting>,
+}
+
+/// (#2902 step 5) A setting that cannot be used as written, where it is and
+/// what the valid shape is. Its `Display` is the operator line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidSetting {
+    /// Where it was set (a `profiles.json` path).
+    pub set_in: SetIn,
+    /// What is wrong, e.g. the parser's own message.
+    pub problem: String,
+    /// The valid shape.
+    pub valid: String,
+}
+
+impl std::fmt::Display for InvalidSetting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}. valid: {}", self.set_in, self.problem, self.valid)
+    }
 }
 
 impl std::fmt::Display for PreflightRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "{}: refusing to start: bad config (#2947)", self.scope.label())?;
-        for (i, b) in self.bad.iter().enumerate() {
-            write!(f, "  {}\n    {}\n    fix: {}", b.summary(), b.valid_line(), b.fix())?;
-            if i + 1 < self.bad.len() {
-                writeln!(f)?;
-            }
-        }
-        Ok(())
+        let mut lines: Vec<String> = self
+            .bad
+            .iter()
+            .map(|b| format!("  {}\n    {}\n    fix: {}", b.summary(), b.valid_line(), b.fix()))
+            .collect();
+        lines.extend(self.invalid.iter().map(|v| format!("  {}: {}\n    valid: {}", v.set_in, v.problem, v.valid)));
+        write!(f, "{}", lines.join("\n"))
     }
 }
 
@@ -497,7 +617,7 @@ pub fn preflight(scope: Scope) -> Result<(), PreflightRefusal> {
     if bad.is_empty() {
         Ok(())
     } else {
-        Err(PreflightRefusal { scope, bad })
+        Err(PreflightRefusal { scope, bad, invalid: Vec::new() })
     }
 }
 
@@ -526,6 +646,9 @@ fn read_thermal_pause_at(c: &DarkmuxConfig) -> Option<&str> {
 }
 fn read_thermal_resume_at(c: &DarkmuxConfig) -> Option<&str> {
     c.runtime.as_ref()?.thermal.as_ref()?.resume_at.as_deref()
+}
+fn read_remote_step_budget_policy(c: &DarkmuxConfig) -> Option<&str> {
+    c.remote.as_ref()?.step_budget_policy.as_deref()
 }
 fn read_fleet_mode(c: &DarkmuxConfig) -> Option<&str> {
     c.fleet.as_ref()?.mode.as_deref()
@@ -587,6 +710,15 @@ pub static ENUM_SETTINGS: &[EnumSetting] = &[
         "fair",
         DISPATCHING,
         read_thermal_resume_at,
+    ),
+    // (#2902 step 5) The per-step cap's policy (`off` / `warn`). Shipped
+    // `warn`: with no cap set (the shipped state) nothing is counted.
+    EnumSetting::of::<crate::config::StepBudgetPolicy>(
+        "remote.step_budget_policy",
+        Some("DARKMUX_REMOTE_STEP_BUDGET_POLICY"),
+        "warn",
+        DISPATCHING,
+        read_remote_step_budget_policy,
     ),
     EnumSetting::of::<crate::config::FleetMode>(
         "fleet.mode",
@@ -818,6 +950,8 @@ mod tests {
         check::<HookCategory>();
         check::<crate::endpoint::ManagedBackend>();
         check::<crate::endpoint::Dialect>();
+        check::<crate::endpoint::BudgetPolicy>();
+        check::<crate::config::StepBudgetPolicy>();
     }
 
     /// The production half of a source file: everything before its test
@@ -934,7 +1068,7 @@ mod tests {
             ("Read", "how the registry reads a value, not a setting"),
             ("SetIn", "where a bad value was set, not a setting"),
         ];
-        const PROFILE_ENUMS: &[&str] = &["ManagedBackend", "Dialect"];
+        const PROFILE_ENUMS: &[&str] = &["ManagedBackend", "Dialect", "BudgetPolicy"];
         const LITERAL_ARMS_ALLOWED: &[(&str, &str)] = &[(
             "parse_bool_token",
             "the one boolean-token vocabulary (1/true/yes/on, 0/false/no/off), not an enum setting",

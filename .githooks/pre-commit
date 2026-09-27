@@ -4,7 +4,9 @@
 #
 # THIS REPO IS PUBLIC. Two jobs, in priority order:
 #
-#   1. Refuse to commit engagement-private content.
+#   1. Refuse to commit engagement-private content, including network
+#      identifiers and real hardware uids (#2957): all scanned by
+#      scripts/engagement-sentinel-guard.py, which CI also runs.
 #   2. Keep `docs/demo/index.html` in lockstep with the viewer bundle.
 #
 # Install (one-time, per clone):

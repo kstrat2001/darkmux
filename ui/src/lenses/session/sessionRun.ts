@@ -649,8 +649,13 @@ export function runRegions(
   // dispatch reported as perpetually in flight. Guarding the elapsed-time
   // arithmetic against skew while leaving the terminal SELECTION exposed to
   // it was the inconsistency.
+  // (#2902 step 5) A hosted call's gate writes `budget.stop` when its run
+  // is stopped mid-wait, BEFORE any bookend (the call is never sent): with
+  // no `dispatch start` after it, it is this run's close.
+  const startAfter = (r: FlowRecord) =>
+    data.some((o) => o.session_id === sid && isDispatchStart(o.action) && T(o.ts) >= T(r.ts));
   const isTerminal = (r: FlowRecord) =>
-    isDispatchTerminal(r.action) || r.action === "session.end";
+    isDispatchTerminal(r.action) || r.action === "session.end" || (r.action === "budget.stop" && !startAfter(r));
   const sessionTerminals = data.filter((r) => r.session_id === sid && isTerminal(r)).sort((a, b) => T(a.ts) - T(b.ts));
   const inAttemptCloses = sessionTerminals.filter(inAttempt);
   // Prefer terminals inside the attempt window; fall back to any terminal on
@@ -660,7 +665,9 @@ export function runRegions(
   const skewedClose = inAttemptCloses.length === 0 && sessionTerminals.length > 0;
   const attemptCloses = inAttemptCloses.length ? inAttemptCloses : sessionTerminals;
   const close = attemptCloses[0] ?? null;
-  const c = attemptCloses.find((r) => r.action !== "session.end") ?? null;
+  // Not a `budget.stop`: it closes the run but is no completion, and reading
+  // it as one would call a stopped wait a clean finish.
+  const c = attemptCloses.find((r) => r.action !== "session.end" && r.action !== "budget.stop") ?? null;
   // A close with an unparsable `ts` still terminates the run — it is a
   // terminal record, and `NaN <= nowMs` being false must not resurrect it.
   const closeTs = close ? finiteTs(close) : null;
@@ -938,8 +945,13 @@ export function runRegions(
   // A dispatch that has started but reported nothing yet is model work with
   // no telemetry, and must keep its pane — otherwise a live run would render
   // no model metrics until its first turn landed, and then grow a pane.
+  // (#2902 step 5) A hosted call held by its endpoint's budget writes its
+  // `budget.wait` BEFORE `dispatch start` (the gate runs before the
+  // bookends): it is model work waiting to be sent, and its pane (where
+  // REST reads "budget · <endpoint>") must not grow in when it is.
+  const heldByBudget = data.some((r) => r.session_id === sid && r.action === "budget.wait");
   const hasModelWork =
-    d != null || loads.length > 0 || turnsValue != null || tokIn != null || tokOut != null || cx.length > 0 || comps.length > 0;
+    d != null || heldByBudget || loads.length > 0 || turnsValue != null || tokIn != null || tokOut != null || cx.length > 0 || comps.length > 0;
   // (#2759) The MODEL pane's own gate. Own-session evidence keeps the
   // existing behavior byte-for-byte (including the `d != null` "started, no
   // telemetry yet" case); otherwise a rolled-up execution elsewhere in the

@@ -1,7 +1,8 @@
 import type { FlowRecord } from "../types/handwritten";
 import { isTurnUsage } from "./usageRecords";
-import { isDispatchStart, isDispatchTerminal } from "./flow";
+import { isDispatchStart, isDispatchTerminal, openBudgetWait } from "./flow";
 import { cleanToolPath, toolCallPath } from "./recordDetail";
+import { compactDuration } from "./format";
 import { UTILITY_JOB, UTILITY_JOB_DEFAULT_STALL_MS, isUtilityEnd, isUtilityStart, utilityJobOf } from "./utilityJobs";
 
 /** (#2877) Live token-rate scope — pure derivation from flow records
@@ -685,6 +686,25 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
       // before the start it ends (both can share one whole-second `ts`).
       const endedAt = num(fields(r).ended_at_ms);
       m = { atMs: Math.max(endedAt !== null && endedAt > 0 ? endedAt : atMs, marker.atMs), kind: "prompt" };
+    } else if (r.action === "budget.wait") {
+      // (#2902 step 5) A HOSTED call held by its endpoint's budget (a
+      // dispatch, a single-shot or map step): the host announces the wait
+      // once, with how long, and writes no `dispatch.rest` (there is no
+      // runtime to rest). It reads as the same REST an agentic run's budget
+      // pause does: "budget · <endpoint>", counting down to the resume time.
+      const f = fields(r);
+      const secs = num(f.wait_seconds);
+      if (secs !== null && secs > 0) {
+        m = { atMs, kind: "rest", restMs: secs * 1000 };
+        const why = restReasonLabel("budget", typeof f.endpoint_id === "string" ? f.endpoint_id : undefined);
+        if (why !== null) {
+          m.restReason = why;
+          m.restReasonWord = restReasonWord("budget") ?? why;
+        }
+      }
+    } else if (r.action === "budget.resume" || r.action === "budget.stop") {
+      // The held call went ahead (or the run stopped): the wait is over.
+      m = { atMs, kind: "prompt" };
     } else if (r.action === "dispatch.rest") {
       // Only the completed-rest shape (`ms` present) counts — the
       // announce-only sibling (`pause: false, delay_ms`, no `ms`) is the
@@ -815,8 +835,11 @@ function isThinking(beats: HeartbeatSample[]): boolean {
   return last.chars > 0 && last.visible === 0;
 }
 
+// (#2902 step 5, 5th review C1) `budget.stop`: a wait ended because its run
+// was stopped. A hosted call's gate writes it before any bookend (the call
+// is never sent), so it closes the execution the way a terminal does.
 const isCloseEdge = (a: string | undefined): boolean =>
-  isDispatchTerminal(a) || a === "session.end";
+  isDispatchTerminal(a) || a === "session.end" || a === "budget.stop";
 
 /** The executions a live reading may come from, as of `nowMs`: not one that
  *  has already closed (its last rate and its last marker are history, and a
@@ -850,6 +873,12 @@ export function liveExecutions(perExecutionRecords: FlowRecord[][], nowMs: numbe
         r.action === "dispatch.tool" ||
         r.action === "dispatch.rest"
       ) {
+        evidence = true;
+      } else if (r.action === "budget.wait" && openBudgetWait(recs, nowMs)) {
+        // (#2902 step 5) A hosted call waiting on its budget is live work
+        // before its first bookend (the gate runs before `dispatch start`),
+        // while the wait is OPEN: a waiter silent past its resume time has
+        // died, and is not live.
         evidence = true;
       }
     }
@@ -910,6 +939,9 @@ const REST_REASON_WORDS: Record<string, string> = {
   // The governor's tier-4 OperatorHold: a pause that waits for the operator.
   "thermal-episode-limit": "thermal hold",
   battery: "battery",
+  // (#2902 step 5) An endpoint budget's `wait` pausing an agentic-remote run
+  // (the pacer's `state` is the endpoint id): "budget · azure".
+  budget: "budget",
   paused: "paused",
 };
 
@@ -918,6 +950,26 @@ export function restReasonLabel(reason: unknown, state: unknown): string | null 
   if (word === null) return null;
   const s = typeof state === "string" ? state.trim() : "";
   return s ? `${word} · ${s}` : word;
+}
+
+/** (#2902 step 5, 5th review C7) The longest state a one-line readout slot
+ *  holds whole. A budget's state is the endpoint id, which the operator names
+ *  and can make any length ("azure-openai-eastus2-prod"); past this it is cut
+ *  with an ellipsis so "budget · <id>" fits the slot. */
+const STATE_MAX_CHARS = 12;
+
+/** (6th review) A rest reason for a ONE-LINE slot (the run page's note line,
+ *  a fleet card's status line): the state trimmed to fit. Everywhere with
+ *  room (the lamp status, a hover title) keeps [`restReasonLabel`]'s full
+ *  form, so two endpoints sharing a prefix can be told apart. */
+export function reasonForLine(reason: string): string {
+  const at = reason.indexOf(" · ");
+  return at < 0 ? reason : `${reason.slice(0, at)} · ${trimState(reason.slice(at + 3))}`;
+}
+
+function trimState(s: string): string {
+  const chars = [...s];
+  return chars.length > STATE_MAX_CHARS ? `${chars.slice(0, STATE_MAX_CHARS - 1).join("")}…` : s;
 }
 
 /** (#2950, operator 2026-09-27) The reason's words WITHOUT its state
@@ -942,7 +994,8 @@ export function liveStateLabel(reading: LiveStateReading): string {
       // (#2950) With why, when the rest's record says: "rest 12s · thermal ·
       // serious" (the run page's lamp status reads it whole). The two
       // readout lines show `restReason` alone, beside the tube's countdown.
-      return [`rest ${reading.restSecondsLeft ?? 0}s`, ...(reading.restReason ? [reading.restReason] : [])].join(" · ");
+      // (#2902 step 5) A day window's wait counts down as "23h 53m".
+      return [`rest ${compactDuration(reading.restSecondsLeft ?? 0)}`, ...(reading.restReason ? [reading.restReason] : [])].join(" · ");
     case "prompt":
       // (#2915) Compacting: the elapsed seconds, counting like REST.
       if (reading.compacting) return `compacting · ${reading.compactingSeconds ?? 0}s`;

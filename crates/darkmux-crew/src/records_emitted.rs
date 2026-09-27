@@ -6,7 +6,7 @@
 //! `MissionEnvelope::records_emitted` (`MISSION_ENVELOPE_SCHEMA` 1.2 -> 1.3,
 //! additive) so a run is self-describing about its own stream cost the same
 //! way it already carries its staffing snapshot (`FunnelEnvelope::staffing`,
-//! CLAUDE.md's `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` doctrine — a
+//! CLAUDE.md's `DARKMUX_REMOTE_MAX_TOKENS_PER_STEP` doctrine — a
 //! resolved run-shape snapshot lives ON the envelope rather than requiring a
 //! reader to re-derive it). `darkmux mission debrief` renders the persisted
 //! block.
@@ -154,7 +154,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// epoch seconds. `None` on anything that doesn't match the exact shape — a
 /// malformed/absent ts degrades to "no flow-derived timestamp", never a
 /// panic. Mirrors `darkmux-serve::runs::parse_flow_ts`.
-fn parse_ts_secs(ts: &str) -> Option<i64> {
+pub(crate) fn parse_ts_secs(ts: &str) -> Option<i64> {
     let b = ts.as_bytes();
     if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b[19] != b'Z'
     {

@@ -23,6 +23,8 @@ import {
   liveStateWhileConnected,
   lastHeartbeatMs,
   toolReadout,
+  liveExecutions,
+  reasonForLine,
 } from "./tokenRate";
 
 const SID = "darkmux-coder-1790125784225";
@@ -478,6 +480,61 @@ describe("deriveLiveState", () => {
     expect(deriveLiveState(recs, beatAtMs + STALL_AFTER_MS + 1_000)).toEqual({ state: "tools" });
   });
 
+  // (#2902 step 5) A hosted call held by its endpoint budget: no
+  // `dispatch.rest` is written, yet it reads REST "budget · <endpoint>",
+  // counting to the announced resume, and ends at `budget.resume`/`stop`.
+  it("reads a hosted budget wait as REST budget · <endpoint> until it resumes", () => {
+    const at = (ms: number) => new Date(ms).toISOString();
+    const wait = { ts: at(1_000), action: "budget.wait", session_id: SID, payload: { endpoint_id: "azure", wait_seconds: 60 } } as unknown as FlowRecord;
+    expect(deriveLiveState([wait], 11_000)).toEqual({
+      state: "rest", restSecondsLeft: 50, restEndMs: 61_000, restReason: "budget · azure", restReasonWord: "budget",
+    });
+    const resumed = { ts: at(20_000), action: "budget.resume", session_id: SID, payload: { endpoint_id: "azure" } } as unknown as FlowRecord;
+    expect(deriveLiveState([wait, resumed], 21_000).state).toBe("prompt");
+    expect(aggregateLiveState([[wait]], 11_000)?.state).toBe("rest");
+    // (5th review C1) Stopped: the wait is over, and the execution is closed
+    // (the call was never sent), never left reading PROMPT or live.
+    const stopped = { ts: at(20_000), action: "budget.stop", session_id: SID, payload: { endpoint_id: "azure" } } as unknown as FlowRecord;
+    expect(deriveLiveState([wait, stopped], 21_000).state).toBe("prompt");
+    expect(liveExecutions([[wait, stopped]], 21_000)).toEqual([]);
+    // An agentic-remote run the pacer held, then stopped: it has other
+    // evidence (its start), and the stop still closes it at once, before the
+    // run's own terminal record lands.
+    const start = { ts: at(0), action: "dispatch start", session_id: SID, payload: {} } as unknown as FlowRecord;
+    expect(liveExecutions([[start, wait, stopped]], 21_000)).toEqual([]);
+    expect(aggregateLiveState([[wait, stopped]], 21_000)).toBeNull();
+  });
+
+  // (5th review C1) A waiter that died mid-wait writes nothing more. Past its
+  // resume time plus the grace it is not a live execution, and not REST.
+  it("a budget wait silent past its resume time plus the grace is not live", () => {
+    const at = (ms: number) => new Date(ms).toISOString();
+    const wait = { ts: at(1_000), action: "budget.wait", session_id: SID, payload: { endpoint_id: "azure", wait_seconds: 60 } } as unknown as FlowRecord;
+    expect(liveExecutions([[wait]], 61_000 + 59_000)).toHaveLength(1);
+    expect(liveExecutions([[wait]], 61_000 + 61_000)).toEqual([]);
+    expect(aggregateLiveState([[wait]], 61_000 + 61_000)).toBeNull();
+  });
+
+  // (5th review C7) A day window's wait reads as a compact duration, and a
+  // long endpoint id is trimmed so the line fits its slot.
+  it("a long wait reads 23h 53m, then minutes, then seconds; a long endpoint id is trimmed", () => {
+    const at = (ms: number) => new Date(ms).toISOString();
+    const secs = 23 * 3600 + 53 * 60;
+    const wait = { ts: at(0), action: "budget.wait", session_id: SID, payload: { endpoint_id: "azure-openai-eastus2-prod", wait_seconds: secs } } as unknown as FlowRecord;
+    const r = deriveLiveState([wait], 0);
+    // (6th review) The full id where there is room (the lamp status, the
+    // hover title): two endpoints sharing a prefix stay distinct. Trimmed
+    // only for the one-line slots (the note line, the card's status line).
+    expect(r.restReason).toBe("budget · azure-openai-eastus2-prod");
+    expect(liveStateLabel(r)).toBe("rest 23h 53m · budget · azure-openai-eastus2-prod");
+    expect(reasonForLine(r.restReason ?? "")).toBe("budget · azure-opena…");
+    expect(reasonForLine("thermal · serious")).toBe("thermal · serious");
+    expect(reasonForLine("battery")).toBe("battery");
+    expect(liveStateLabel(deriveLiveState([wait], (secs - 12 * 60) * 1000))).toMatch(/^rest 12m · /);
+    expect(liveStateLabel(deriveLiveState([wait], (secs - 45) * 1000))).toMatch(/^rest 45s · /);
+    expect(restReasonLabel("thermal", "serious")).toBe("thermal · serious");
+  });
+
   it("is rest with a countdown while inside a reported rest's ms window, then falls to prompt once it elapses", () => {
     const recs = [tool(0), rest(1_000, 15_000)];
     // 1s into the 15s window → 14s left (ceil).
@@ -647,6 +704,7 @@ describe("restReasonLabel", () => {
     ["thermal-critical", "critical", "thermal breaker · critical"],
     ["thermal-episode-limit", "serious", "thermal hold · serious"],
     ["battery", "18%", "battery · 18%"],
+    ["budget", "azure", "budget · azure"],
     ["paused", undefined, "paused"],
     ["solar-flare", "x9", "solar-flare · x9"],
     ["toString", undefined, "toString"],

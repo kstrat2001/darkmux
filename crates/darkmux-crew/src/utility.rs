@@ -245,6 +245,7 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
         Some(job.role_id),
         &wire_model,
         &crate::usage::lmstudio_endpoint(job.base_url_override),
+        None,
     );
     if job_kind.is_some() {
         let ended_at_ms = crate::usage::unix_ms_now();

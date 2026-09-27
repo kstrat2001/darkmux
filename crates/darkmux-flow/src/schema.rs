@@ -77,8 +77,52 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.64.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.65.0";
 // Version history:
+//   1.65.0 (#2902 step 5, budgets): additive, four actions and one usage
+//           field.
+//
+//           USAGE: `telemetry.tokens.payload.endpoint_id`, the profile
+//           registry's `endpoints` id a call was made through, when the
+//           endpoint was named by id (absent for an inline or managed
+//           endpoint, and on every record written before this version). An
+//           endpoint's rolling-window budget sums its records by this key;
+//           records without it are never counted against a budget.
+//
+//           ACTIONS (category `telemetry`, source `budget`), each with
+//           `scope` (`endpoint` | `step`), `endpoint_id` (endpoint scope)
+//           or `step` (step scope: the step id, or `dispatch` for a bare
+//           hosted dispatch), and a human `message`:
+//           - `budget.warn` (level `warn`): a budget was reached, or its
+//             `warn_at` fraction was, and the call went ahead. Adds
+//             `policy`, `level` (`early` | `at_limit`), `metric` (`tokens` |
+//             `calls`), `spent`, `limit`, and for an endpoint `period` and
+//             `warn_at`.
+//           - `budget.wait` (level `warn`, endpoint scope only): calls are
+//             held under the `wait` policy. Adds `policy` (`wait`), `metric`,
+//             `spent`, `limit`, `period`, `resume_at` (a record-`ts`-shaped
+//             string) and `wait_seconds`, and `pid` (the waiting process,
+//             so a reader can tell a live wait from a dead one). A wait
+//             still waiting at `resume_at` is announced again with its new
+//             resume time.
+//           - `budget.resume` (level `info`): a held call went ahead. Adds
+//             `waited_ms` and `pid`.
+//           `dispatch.rest` gains the reason `budget` (the pace-file pause
+//           an agentic-remote dispatch takes while its endpoint's window is
+//           full); its payload shape is unchanged.
+//           `step result.payload.remote_max_tokens_per_execution` (hosted
+//           `dispatch.single_shot`) keeps its shipped spelling (CLAUDE.md
+//           contract 8: the wire keeps its historical spelling) though the
+//           config key it echoes is now `remote.max_tokens_per_step`; it is
+//           null when no per-step cap is set (no default since 4.0), and
+//           `max_tokens_sent` now always equals `max_tokens_requested` (no
+//           call is clamped). An older reader ignores all of it.
+//           `budget.stop` (level `warn`, endpoint scope): a budget wait
+//           ended because its run was stopped (Ctrl-C, `mission abort`, an
+//           abandoned phase), closing its `budget.wait`. Written only
+//           after a `budget.wait` was: by a hosted call's gate (the call is
+//           never sent) and by the pacer holding an agentic-remote
+//           container (the run is ended). Adds `reason`, `waited_ms`, `pid`.
 //   1.64.0 (#2963): additive, two payload keys on `dispatch.turn`, each
 //           listing the turn's tool calls that RUN, in run order: a call
 //           the runtime will not dispatch (a real tool not granted, not a
@@ -2198,7 +2242,13 @@ pub fn flows_dir() -> PathBuf {
 /// ISO 8601 UTC date string from current time — `YYYY-MM-DD`. Used for
 /// per-day file naming (one JSONL file per UTC day), NOT for record `ts`.
 pub fn day_utc_now() -> String {
-    let secs = current_epoch_secs();
+    day_utc_at(current_epoch_secs())
+}
+
+/// (#2902 step 5) The day-file stem (`YYYY-MM-DD`) a record written at
+/// `secs` lands in: the window reader names exactly the files a rolling
+/// window can touch.
+pub fn day_utc_at(secs: i64) -> String {
     let (y, m, d) = epoch_to_yyyymmdd(secs);
     format!("{:04}-{:02}-{:02}", y, m, d)
 }
@@ -2207,7 +2257,12 @@ pub fn day_utc_now() -> String {
 /// Used for `FlowRecord.ts`. Seconds precision is sufficient for the
 /// dispatch / phase timing surfaces; finer precision is a future bump.
 pub fn ts_utc_now() -> String {
-    let secs = current_epoch_secs();
+    ts_utc_at(current_epoch_secs())
+}
+
+/// (#2902 step 5) A record-`ts`-shaped string (`YYYY-MM-DDTHH:MM:SSZ`) for
+/// any epoch second, e.g. when a budget wait will resume.
+pub fn ts_utc_at(secs: i64) -> String {
     let (y, mo, d) = epoch_to_yyyymmdd(secs);
     let (h, mi, s) = epoch_to_hhmmss(secs);
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s)

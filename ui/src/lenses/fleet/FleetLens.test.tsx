@@ -152,6 +152,15 @@ function mockFleetFetch(opts: {
    *  is slow to answer one endpoint (the operator measured `/runs` at 3.3 s).
    *  Resolve the promise to let the answer through. */
   hold?: Record<string, Promise<void>>;
+  /** (#2965) Paths that answer with this HTTP error status: a daemon whose
+   *  read of that endpoint failed. */
+  fail?: Record<string, number>;
+  /** (#2965) Paths whose FIRST read answers 500 and every later one normally:
+   *  a blip that has since healed. */
+  failOnce?: string[];
+  /** (#2965) Further days that answer `200 []`: the mock names today and
+   *  yesterday when it is built, so a day reached by a rollover needs this. */
+  emptyDays?: string[];
 } = {}) {
   const today = todayUTC();
   const yesterday = prevDateUTC(today);
@@ -165,6 +174,14 @@ function mockFleetFetch(opts: {
     }),
   );
   function answer(path: string): Promise<Response> {
+    const once = opts.failOnce?.indexOf(path) ?? -1;
+    if (once >= 0) {
+      opts.failOnce!.splice(once, 1);
+      return Promise.resolve(new Response("boom", { status: 500, statusText: "Internal Server Error" }));
+    }
+    if (opts.emptyDays?.some((d) => path === `/flow/${d}`)) return Promise.resolve(new Response("[]", { status: 200 }));
+    const failed = opts.fail?.[path];
+    if (failed) return Promise.resolve(new Response("boom", { status: failed, statusText: "Internal Server Error" }));
     if (path === `/flow/${today}`) return Promise.resolve(new Response(JSON.stringify(opts.flowToday ?? []), { status: 200 }));
     if (path === `/flow/${yesterday}`) return Promise.resolve(new Response(JSON.stringify(opts.flowYesterday ?? []), { status: 200 }));
     if (path === "/fleet/machines/live") {
@@ -1284,7 +1301,13 @@ describe("FleetLens pager (#2881)", () => {
       </QueryClientProvider>,
     );
     await waitFor(() => expect(document.querySelector(".mach-scope__rate")).not.toBeNull());
-    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("—");
+    // (#2955 review) Now the whole status line, a bare "—" said nothing:
+    // "— tok/s", as the thinking case reads "— think tok/s". A known state
+    // (generating) with no number yet keeps the reading style and the lit
+    // dot; only "no signal" (no state at all) takes the dim, plain line.
+    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("— tok/s");
+    expect(document.querySelector(".mach-scope__rate")).toBe(document.querySelector(".mach .stat"));
+    expect(document.querySelector(".mach")!.className).not.toContain("nosignal");
     expect(latestTokenScopeProps()).toMatchObject({ tokensPerSec: null, state: "generating" });
   });
 
@@ -1416,7 +1439,10 @@ describe("FleetLens pager (#2881)", () => {
     await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
     fireEvent.click(screen.getByLabelText("next execution"));
     expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("reviewer");
-    expect(document.querySelector(".mach-scope__rate")!.textContent?.toLowerCase()).toBe("no signal");
+    // (#2955 review) The plain no-signal status line, dim dot, not the reading.
+    expect(document.querySelector(".mach .stat")!.textContent).toBe("no signal");
+    expect(document.querySelector(".mach-scope__rate")).toBeNull();
+    expect(document.querySelector(".mach")!.className).toContain("nosignal");
     expect(latestTokenScopeProps()).toMatchObject({ state: "nosignal" });
   });
 });
@@ -1602,8 +1628,8 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
   // only the uid join can catch it.
   it("a roster entry whose machine_uid matches a live beat under a wholly different name does not duplicate its card, and the MACHINE's name titles it", async () => {
     mockFleetFetch({
-      machines: [{ machine_uid: "F9ACF59C-UID", display_name: "MacBook-Pro", schema_version: "1.20.0", beat_ts_ms: 1 }],
-      roster: [{ id: "laptop", address: "127.0.0.1:8765", added_unix_ms: 1000, machine_uid: "F9ACF59C-UID" }],
+      machines: [{ machine_uid: "00000000-0000-4000-8000-ABCDEF000020", display_name: "MacBook-Pro", schema_version: "1.20.0", beat_ts_ms: 1 }],
+      roster: [{ id: "laptop", address: "127.0.0.1:8765", added_unix_ms: 1000, machine_uid: "00000000-0000-4000-8000-ABCDEF000020" }],
     });
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     renderFleetLens({}, queryClient);
@@ -1645,7 +1671,7 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
   // it never widens into "any roster entry with a uid is accounted for."
   it("a roster entry with a machine_uid matching no known machine still renders its own offline card", async () => {
     mockFleetFetch({
-      machines: [{ machine_uid: "F9ACF59C-UID", display_name: "MacBook-Pro", schema_version: "1.20.0", beat_ts_ms: 1 }],
+      machines: [{ machine_uid: "00000000-0000-4000-8000-ABCDEF000020", display_name: "MacBook-Pro", schema_version: "1.20.0", beat_ts_ms: 1 }],
       roster: [{ id: "mini-1", address: "100.64.1.9:8765", added_unix_ms: 1000, machine_uid: "NEVER-SEEN-UID" }],
     });
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -1698,10 +1724,11 @@ describe("FleetLens — this machine identifies itself without the flow window (
   // roster entry as already-accounted-for — so nothing accounts for it. The
   // daemon answering the request drew nothing at all about itself.
   it("(#2814) renders THIS machine's own card from /machine/specs alone — empty window, no beats, no roster", async () => {
+    const uid = "00000000-0000-4000-8000-ABCDEF000011";
     mockFleetFetch({
       specs: {
         machine_id: "MacBook-Pro",
-        machine_uid: "F9ACF59C-0E8B-5092-A6B4-7C07070737D2",
+        machine_uid: uid,
         cpu_brand: "Apple M5 Max",
         ram_total_bytes: 137438953472,
       },
@@ -1714,7 +1741,7 @@ describe("FleetLens — this machine identifies itself without the flow window (
     expect(cards.length).toBe(1);
     // Its own name — not the raw uid `nameOf` falls back to.
     expect(cards[0].textContent).toContain("MacBook-Pro");
-    expect(cards[0].textContent).not.toContain("F9ACF59C");
+    expect(cards[0].textContent).not.toContain(uid.slice(0, 8));
     // Its own hardware — read directly, never "hardware not reported".
     expect(cards[0].textContent).toContain("Apple M5 Max · 128 GB");
     expect(cards[0].textContent).not.toContain("hardware not reported");
@@ -1728,7 +1755,7 @@ describe("FleetLens — this machine identifies itself without the flow window (
   // direction.
   it("(#2814) does NOT draw a second card when the window already knows this machine's uid", async () => {
     const today = todayUTC();
-    const uid = "F9ACF59C-0E8B-5092-A6B4-7C07070737D2";
+    const uid = "00000000-0000-4000-8000-ABCDEF000011";
     mockFleetFetch({
       flowToday: [
         { ts: `${today}T10:00:00.000Z`, machine_uid: uid, machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
@@ -1747,7 +1774,7 @@ describe("FleetLens — this machine identifies itself without the flow window (
   // card list unconditionally, so without the uid join in `rosterOnlyEntries`
   // that stale entry draws an "offline" phantom beside the live self card.
   it("(#2814) a stale roster entry carrying this machine's uid does not draw a phantom", async () => {
-    const uid = "F9ACF59C-0E8B-5092-A6B4-7C07070737D2";
+    const uid = "00000000-0000-4000-8000-ABCDEF000011";
     mockFleetFetch({
       roster: [{ id: "laptop", machine_uid: uid, address: "100.64.1.2:8765", added_unix_ms: 1000 }],
       specs: { machine_id: "MacBook-Pro", machine_uid: uid, cpu_brand: "Apple M5 Max" },
@@ -1940,7 +1967,9 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
     await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
     expect(queryClient.getQueryState(queryKeys.runs())?.status, "/runs is still unanswered").toBe("pending");
     const card = document.querySelector(".mach")!;
-    expect(stat(card)).toBe("dispatch in flight");
+    // (#2955) The live reading is the status line: shown at once, in
+    // "dispatch in flight"'s place.
+    expect(stat(card)).toMatch(/tok\/s$/);
     expect(card.className).toContain("active");
     expect(card.className).not.toContain("nosignal");
     expect(card.querySelectorAll('[data-testid="fleet-token-scope"]')).toHaveLength(1);
@@ -2064,6 +2093,79 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
     expect(scope[0].querySelector('.token-scope-bezel[data-state="off"]')).not.toBeNull();
     expect(card.querySelector('[data-testid="token-scope-probe"]')).toBeNull();
     expect(card.querySelector(".mach-scope__rate")).toBeNull();
+  });
+
+  // (#2965) A failed flow read is not an answer that nothing happened. Both
+  // `/flow/<day>` reads fail while presence shows the machine beating: the
+  // records that would say it is working are exactly the ones missing, so
+  // "idle · 0 running" is a claim nothing read. The card holds "no signal"
+  // (and the app-level `FlowReadNotice` names the failure).
+  for (const [what, failing] of [
+    ["both days", () => [`/flow/${todayUTC()}`, `/flow/${prevDateUTC(todayUTC())}`]],
+    ["today alone", () => [`/flow/${todayUTC()}`]],
+  ] as const) {
+    it(`says 'no signal', not 'idle', when the flow read fails (${what})`, async () => {
+      const paths: string[] = failing();
+      mockFleetFetch({ machines: BEAT, specs: SPECS, runs: [], fail: Object.fromEntries(paths.map((p) => [p, 500])) });
+      const queryClient = newClient();
+      renderFleetLens({}, queryClient);
+      await waitForFleetQueriesSettled(queryClient);
+      // Every source has answered, the failed flow read included: nothing is
+      // still loading, so "no signal" here is the failure's, not a load's.
+      await waitFor(() => {
+        for (const key of [queryKeys.fleetSessionsLive(), queryKeys.runs(), queryKeys.flowDate(todayUTC()), queryKeys.flowDate(prevDateUTC(todayUTC()))]) {
+          expect(queryClient.getQueryState(key)?.status, JSON.stringify(key)).toBe("success");
+        }
+      });
+      await waitFor(() => expect(document.querySelector('.fleet-lens[data-state="loaded"]')).not.toBeNull());
+      await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+      for (const card of Array.from(document.querySelectorAll(".mach"))) {
+        expect(stat(card)).toBe("no signal");
+        expect(card.textContent).not.toContain("idle");
+        expect(card.textContent).not.toContain("offline");
+        expect(card.querySelector(".runs")!.textContent).toBe("—");
+        expect(cardScope(card)).toMatchObject({ state: "nosignal" });
+        expect(utilLabel(card)).toMatch(/no signal$/);
+      }
+      // The token panel's zeros are a negative claim off the same read: it
+      // keeps its loading silhouette rather than counting up to "0".
+      expect(document.querySelector(".savings")!.getAttribute("data-settled")).toBe("false");
+    });
+  }
+
+  // (#2965 review) A failure at the UTC-midnight rollover: the new day's
+  // first read fails. The latch that keeps a PENDING new day from blinking
+  // the cards back must not also hide a FAILED one; and the failed day is
+  // retried, so the card heals on its own once the read succeeds.
+  it("a failed read of the new day at UTC midnight says 'no signal', then heals when the retry succeeds", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    vi.setSystemTime(new Date("2026-06-15T23:59:58.000Z"));
+    mockFleetFetch({ machines: BEAT, runs: [], failOnce: ["/flow/2026-06-16"], emptyDays: ["2026-06-16"] });
+    renderFleetLens();
+    await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("idle"));
+    vi.setSystemTime(new Date("2026-06-16T00:00:03.000Z"));
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+    });
+    await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("no signal"));
+    expect(document.querySelector(".savings")!.getAttribute("data-settled")).toBe("false");
+    await act(async () => {
+      vi.advanceTimersByTime(21_000);
+    });
+    await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("idle"));
+    expect(document.querySelector(".savings")!.getAttribute("data-settled")).toBe("true");
+  });
+
+  // (#2965) The inverted case: the same machine, the same sources, every read
+  // healthy, reads "idle". Without it the test above passes for a card that
+  // could never say "idle" at all.
+  it("the same fleet with healthy flow reads says 'idle' — the inverted case", async () => {
+    mockFleetFetch({ machines: BEAT, specs: SPECS, runs: [] });
+    renderFleetLens({}, newClient());
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    await waitFor(() => {
+      for (const card of Array.from(document.querySelectorAll(".mach"))) expect(stat(card)).toBe("idle");
+    });
   });
 
   it("a replay has its records in hand and never shows 'no signal'", async () => {
@@ -2209,13 +2311,16 @@ describe("savings hero: nothing leaks while loading (#2830)", () => {
       });
       renderFleetLens({ connected: false });
 
-      const rate = await waitFor(() => {
-        const el = document.querySelector(".mach-scope__rate");
-        expect(el, "the rate line should be mounted").toBeTruthy();
-        return el as HTMLElement;
-      });
-      expect(rate.textContent?.toLowerCase()).toContain("no signal");
-      expect(rate.textContent?.toLowerCase()).not.toContain("stalled");
+      // (#2955 review) "no signal" looks the same everywhere: the plain
+      // status line with the dim dot (`.mach.nosignal`), never the lit
+      // reading style, even on a card whose machine is running.
+      await waitFor(() => expect(document.querySelector('[data-testid="fleet-token-scope"]')).not.toBeNull());
+      const card = document.querySelector(".mach")!;
+      await waitFor(() => expect(card.querySelector(".stat")!.textContent).toBe("no signal"));
+      expect(card.querySelector(".mach-scope__rate"), "not the reading style").toBeNull();
+      expect(card.className, "the dim dot").toContain("nosignal");
+      expect(card.className, "the machine is still running").toContain("active");
+      expect(latestTokenScopeProps()).toMatchObject({ state: "nosignal" });
     });
   });
 });
@@ -2315,12 +2420,15 @@ describe("(#2911) the fleet card ticks while an execution is live", () => {
       ],
     });
     renderFleetLens();
-    await waitFor(() => expect(document.querySelector(".mach")?.textContent).toContain("dispatch in flight"));
+    // (#2955) A running card's status line may hold its reading ("rest
+    // 10m") rather than "dispatch in flight", so "running" is the card's
+    // `active` class here, and "idle" is the status line's own word.
+    await waitFor(() => expect(document.querySelector(".mach")?.className).toContain("active"));
     act(() => {
       vi.advanceTimersByTime(2_000);
     });
-    expect(document.querySelector(".mach")!.textContent).not.toContain("dispatch in flight");
-    expect(document.querySelector(".mach")!.textContent).toContain("idle");
+    expect(document.querySelector(".mach")!.className).not.toContain("active");
+    expect(document.querySelector(".mach .stat")!.textContent).toBe("idle");
   });
 
   it("an online machine with nothing running drives no clock at all", async () => {
@@ -2393,6 +2501,42 @@ describe("(#2911) fleet card wording", () => {
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
     expect(document.querySelector(".mach")!.textContent).toContain("dispatch in flight");
     expect(latestTokenScopeProps()).toMatchObject({ state: "idle", centerUnit: "no model working" });
+  });
+
+  // (#2955, operator 2026-09-27) The card is one height in every state, so a
+  // live reading takes the status line's place instead of a line of its own:
+  // the reading IS the status line, dot included, and the text rows beside
+  // the tube are the same two ("stat", "runs") running or not.
+  const textRows = (card: Element) =>
+    [...card.querySelector(".mach-body--scope")!.children].filter((c) => !c.classList.contains("mach-scope")).map((c) => c.className.split(" ")[0]);
+
+  it("(#2955) a live reading rides the status line: no extra row", async () => {
+    renderAt(
+      [
+        { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+        { ts: at(0), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 0 } },
+        { ts: at(2), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 2000, generated_chars: 800 } },
+      ] as FlowRecord[],
+      3,
+    );
+    await waitFor(() => expect(document.querySelector(".mach-scope__rate")).not.toBeNull());
+    const card = document.querySelector(".mach")!;
+    const stat = card.querySelector(".stat")!;
+    expect(card.querySelector(".mach-scope__rate"), "the reading is the status line itself").toBe(stat);
+    expect(stat.querySelector(".dot"), "the status dot stays on the line").not.toBeNull();
+    expect(stat.textContent).toBe("100 tok/s");
+    expect(textRows(card)).toEqual(["stat", "runs"]);
+  });
+
+  it("(#2955) a card with nothing running has the same two text rows", async () => {
+    mockFleetFetch({
+      machines: [{ machine_uid: "u1", display_name: "MacBook-Pro", schema_version: "1.43.0", beat_ts_ms: Date.now() }],
+      runs: [{ id: "lab-1", kind: "lab", status: "running", machine: "MacBook-Pro", tracked: true }],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    expect(document.querySelector(".mach .stat")!.textContent).toBe("dispatch in flight");
+    expect(textRows(document.querySelector(".mach")!)).toEqual(["stat", "runs"]);
   });
 
   it("a machine with nothing running still says 'idle' in the tube", async () => {
@@ -2557,7 +2701,7 @@ describe("(#2926) fleet card: THINK opener and TOOL GEN, from the real run", () 
 // labeled with that uid: it lands in screenshots and identifies the machine.
 describe("(#2921) fleet page: no hardware uid is ever rendered as a label", () => {
   // Fixture uid, uppercase like the real ones; not any real machine's.
-  const FAKE_UID = "0A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
+  const FAKE_UID = "00000000-0000-4000-8000-ABCDEF000001";
   const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
   function renderFleet(records: FlowRecord[]) {
     const playhead = pepperAt("10:51:33");
@@ -2616,8 +2760,8 @@ describe("(#2921) fleet page: no hardware uid is ever rendered as a label", () =
 });
 
 describe("(#2921 follow-up) fleet page: roster names and unnamed ordinals", () => {
-  const A = "0A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
-  const B = "1B2C3D4E-5F60-4182-93A4-B5C6D7E8F9A0";
+  const A = "00000000-0000-4000-8000-ABCDEF000001";
+  const B = "00000000-0000-4000-8000-ABCDEF000003";
   const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
   const start = (uid: string, sid: string, agoMs: number) => ({
     ts: new Date(Date.now() - agoMs).toISOString(),
@@ -2656,12 +2800,13 @@ describe("(#2921 follow-up) fleet page: roster names and unnamed ordinals", () =
 
 // (#2929) The machine a card link names rides in the address bar, so it is a
 // machine KEY (the machine's name, or "unnamed-<n>"), never the hardware uid.
-// FAKE uuids, mixed case, so a leak would be caught case-insensitively.
+// FAKE uuids in the repo's fake form with hex LETTERS in the tail, one lowercase
+// and the rest uppercase, so a leak would be caught case-insensitively.
 describe("(#2929) fleet-card links carry a machine key, never the hardware uid", () => {
   const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
-  const NAMED = "0A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
-  const UNNAMED_1 = "1b2c3d4e-5f60-4172-9384-b5c6d7e8f9a0";
-  const UNNAMED_2 = "2C3D4E5F-6071-4283-A495-C6D7E8F9A0B1";
+  const NAMED = "00000000-0000-4000-8000-ABCDEF000001";
+  const UNNAMED_1 = "00000000-0000-4000-8000-abcdef000002";
+  const UNNAMED_2 = "00000000-0000-4000-8000-ABCDEF000004";
 
   function mountThree() {
     const today = todayUTC();

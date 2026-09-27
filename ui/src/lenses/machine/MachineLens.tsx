@@ -200,7 +200,10 @@ export function MachineLens({
   const flowWindow = useFlowWindow(nowMs);
   // (#2958) The window's FIRST answer: a new day's pending key at UTC
   // midnight does not send the page back to "no signal".
-  const flowAnswered = useLatch(flowWindow.settled);
+  // (#2965) ...and not while a day's read is failing: a failed read settles
+  // the window with no records, which is what "idle" reads. The app-level
+  // `FlowReadNotice` names the failure.
+  const flowAnswered = useLatch(flowWindow.settled) && flowWindow.failure === null;
   const liveMachines = useLiveMachines(daemonBacked);
 
   const specsQuery = useQuery({
