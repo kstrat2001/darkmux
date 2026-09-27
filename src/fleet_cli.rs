@@ -1122,6 +1122,9 @@ pub(crate) fn fleet_submission_doctor_checks() -> Vec<crate::doctor::Check> {
         } else {
             None
         },
+        busy_policy: darkmux_types::config_access::fleet_busy_policy().ok().map(|p| p.as_str().to_string()),
+        hosted_cap: darkmux_types::config_access::remote_concurrent_cap(),
+        local_machine: darkmux_flow::resolve_machine_id(),
     };
     crate::doctor::fleet_submission_checks(&facts)
 }

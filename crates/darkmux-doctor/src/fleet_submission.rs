@@ -63,6 +63,15 @@ pub struct FleetSubmissionFacts {
     /// What the running daemon reports about its listener (`/health`'s
     /// `fleet_listener`), when the daemon answered.
     pub daemon_listener_state: Option<String>,
+    /// (#2916 stage 2) `fleet.busy_policy`'s token, or `None` when the
+    /// value is bad (the generic enum-settings row reports that).
+    pub busy_policy: Option<String>,
+    /// (#2916 stage 2) This machine's `remote.concurrent_cap`: hosted jobs
+    /// it runs at once (`0` = unbounded).
+    pub hosted_cap: u32,
+    /// (#2916 stage 2) This machine's resolved `machine_id`: the name a
+    /// `profile@machine` address uses for it.
+    pub local_machine: Option<String>,
 }
 
 fn check(name: &str, status: Status, message: String, hint: Option<String>) -> Check {
@@ -164,8 +173,18 @@ fn identity_row(f: &FleetSubmissionFacts) -> Check {
             "fleet identity",
             Status::Pass,
             format!(
-                "{value}: this machine is `{local_name}`{}",
-                local_addr.as_deref().map(|a| format!(" at {a}")).unwrap_or_default()
+                "{value}: this machine is `{local_name}`{}{}",
+                local_addr.as_deref().map(|a| format!(" at {a}")).unwrap_or_default(),
+                // (#2916 stage 2, decision 10) Addresses resolve at dispatch
+                // time against the roster, by machine_id; presence reads it
+                // once per daemon start.
+                f.local_machine
+                    .as_deref()
+                    .map(|m| format!(
+                        "; profile addresses name it `<profile>@{m}` (its machine_id; after `darkmux \
+                         config set machine_id`, restart `darkmux serve` so presence shows the new name)"
+                    ))
+                    .unwrap_or_default()
             ),
             None,
         ),
@@ -186,7 +205,7 @@ fn listener_row(f: &FleetSubmissionFacts) -> Check {
         _ => format!("<overlay address>:{}", f.port),
     };
     match f.listener_bound {
-        Some(true) => check("fleet listener", Status::Pass, format!("listening on {addr}"), None),
+        Some(true) => check("fleet listener", Status::Pass, format!("listening on {addr}{}", busy_note(f)), None),
         Some(false) => check(
             "fleet listener",
             Status::Warn,
@@ -208,6 +227,21 @@ fn listener_row(f: &FleetSubmissionFacts) -> Check {
             None,
         ),
     }
+}
+
+/// (#2916 stage 2) What a busy seat gets, for the listener row.
+fn busy_note(f: &FleetSubmissionFacts) -> String {
+    let Some(policy) = f.busy_policy.as_deref() else { return String::new() };
+    let hosted = if f.hosted_cap == 0 {
+        "hosted jobs unbounded".to_string()
+    } else {
+        format!("hosted jobs up to {} (remote.concurrent_cap)", f.hosted_cap)
+    };
+    let past = match policy {
+        "queue" => "queues the rest",
+        _ => "refuses the rest at once",
+    };
+    format!("; one job per local model, {hosted}; fleet.busy_policy `{policy}` {past}")
 }
 
 fn trust_row(f: &FleetSubmissionFacts) -> Check {
@@ -315,6 +349,9 @@ mod tests {
             retired_streams: vec![],
             queue_consumers: vec![],
             daemon_listener_state: None,
+            busy_policy: Some("refuse".into()),
+            hosted_cap: 1,
+            local_machine: Some("studio".into()),
         }
     }
 
@@ -331,8 +368,27 @@ mod tests {
         assert!(t.message.contains("verified by tailscale"), "{}", t.message);
         assert!(t.message.contains("laptop may run host, coder-studio (roles: radio-host; images: runtime only; workspace: no)"), "{}", t.message);
         assert!(t.message.contains("node `laptop`, online"), "{}", t.message);
-        assert_eq!(row(&rows, "fleet listener").message, "listening on 100.64.0.2:8766");
+        assert_eq!(
+            row(&rows, "fleet listener").message,
+            "listening on 100.64.0.2:8766; one job per local model, hosted jobs up to 1 \
+             (remote.concurrent_cap); fleet.busy_policy `refuse` refuses the rest at once"
+        );
         assert!(row(&rows, "fleet identity").message.contains("this machine is `studio`"));
+    }
+
+    /// (#2916 stage 2) The rows say how a busy seat is answered, and what
+    /// name a `profile@machine` address uses for this machine.
+    #[test]
+    fn the_rows_name_the_busy_policy_and_the_address_name() {
+        let f = FleetSubmissionFacts { busy_policy: Some("queue".into()), hosted_cap: 0, ..facts() };
+        let rows = fleet_submission_checks(&f);
+        let l = &row(&rows, "fleet listener").message;
+        assert!(l.contains("hosted jobs unbounded") && l.contains("`queue` queues the rest"), "{l}");
+        let i = &row(&rows, "fleet identity").message;
+        assert!(i.contains("`<profile>@studio`") && i.contains("restart `darkmux serve`"), "{i}");
+        // A bad policy value is the enum-settings row's to report, not this one's.
+        let f = FleetSubmissionFacts { busy_policy: None, ..facts() };
+        assert_eq!(row(&fleet_submission_checks(&f), "fleet listener").message, "listening on 100.64.0.2:8766");
     }
 
     /// (#2947) A bad provider value gets no `fleet identity` row: the

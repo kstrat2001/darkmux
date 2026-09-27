@@ -99,6 +99,47 @@ darkmux release.
   `darkmux config set remote.max_tokens_per_step <n>` (and rename an
   exported `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`).
 
+- **A profile names the machine that runs it: `profile@machine`; `dispatch
+  --machine` is removed** (#2916 stage 2, no alias). `darkmux dispatch
+  <role> --profile host@studio` sends the dispatch to the studio's fleet
+  listener (stage 1's authenticated channel, below), and the studio resolves
+  `host` against its OWN registry and loads it; the sending machine needs no
+  profile of that name. An address naming this machine runs here, on the
+  bare name. The machine part is a `machine_id` (letters, digits, `-`,
+  `_`), resolved at dispatch time against this machine's roster,
+  case-insensitively. The receiver is the only judge of the profile: an
+  undefined name is refused by name, never replaced by its
+  `default_profile`. On a path that runs only on this machine (the lab, a
+  mission step, until mission steps route), an address is refused naming
+  it, never read as an undefined local name. The sender's `dispatch route`
+  record carries `profile_address`; tokens are counted once, by the machine
+  that runs the model, never on the sender's records. A profile name that
+  contains `@` cannot be addressed. **Migration:** `darkmux dispatch <role>
+  --machine <m> [--profile <p>]` becomes `darkmux dispatch <role> --profile
+  <p>@<m>`; name the profile on `<m>` that the job should run on (with no
+  `--profile`, the old form resolved the role's binding on `<m>`; name that
+  profile now). `darkmux mission dispatch` keeps its own `--machine` until
+  it is retired (#2954).
+
+- **Busy is decided per seat, and a receiver chooses refuse or queue**
+  (#2916 stage 2). A worker no longer runs one submitted job at a time. A
+  job on a LOCAL model holds that model for its run (LM Studio serves one
+  request at a time per instance), so a second job for the same model is
+  busy while a job for a different local model runs beside it; a job on a
+  HOSTED endpoint runs beside others up to the receiver's own
+  `remote.concurrent_cap`. Past either limit the receiver's new
+  `fleet.busy_policy` answers (CONFIG 1.33, `refuse` by default, written
+  visibly by `init`): `refuse` says `busy: <machine> is running other work
+  on that seat (...)` at once, naming what runs; `queue` holds the job
+  (first come, first served per seat; at most 4 queued per sending
+  machine) and tells the sender it is waiting, with a `queued` line every
+  20 seconds until it runs. The sender prints the receiver's words
+  verbatim. A bad value is refused at the listener's start and reported
+  Fail by `darkmux doctor` (#2947). The work-submission wire moves to
+  schema `6` (a reply body is newline-delimited: `queued` lines, then the
+  answer), so both machines must run the same darkmux; a mismatch is
+  refused naming both versions.
+
 - **The degeneracy detector's policy values name the action: `off`,
   `record`, `warn`, `conclude`** (#2947). `enforce` is now `conclude` (still
   the default, behavior unchanged: on repeating output the runtime closes
