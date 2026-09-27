@@ -9,8 +9,10 @@
 //! foreign resident sharing the weights is a
 //! [`ResidencyDecision::ForeignDuplicate`] fact — respected as pool
 //! consumption, never a reuse candidate — and the planner decides
-//! load-alongside vs Block-on-capacity. The tests below carry the ported
-//! fixtures.
+//! load-alongside vs Block-on-capacity. One residency decision still lives
+//! outside the planner: the dispatch preflight in
+//! `darkmux_crew::dispatch_internal` (`ensure_model_resident_from`) makes its
+//! own reuse/reload call. The tests below carry the ported fixtures.
 
 use crate::desired::Placement;
 use crate::facts::ResidentFact;

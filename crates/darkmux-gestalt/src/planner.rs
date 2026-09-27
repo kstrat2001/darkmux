@@ -42,10 +42,10 @@
 
 use crate::desired::Placement;
 use crate::estimator::FootprintEstimator;
-use crate::facts::{CallerIntent, CatalogFact, Facts};
+use crate::facts::{CallerIntent, CatalogFact, Facts, ResidentFact};
 use crate::ownership::is_darkmux_owned;
 use crate::plan::{
-    Action, EvictionOrder, ExecHint, OwnedTarget, Plan, PlannedAction, Precondition, Reason,
+    Action, EvictionOrder, OwnedTarget, Plan, PlannedAction, Precondition, Reason,
     Warning,
 };
 use crate::residency::{decide_residency, ResidencyDecision};
@@ -99,7 +99,7 @@ pub struct AcquireOpts {
     /// is unloaded mid-generation. Left un-widened for now (the fix would
     /// change this field's documented "namespaced identifiers" contract, a
     /// bigger decision than this qualifier); extend the seeding check in
-    /// `plan_acquire` if aliased pins become a real operational pattern.
+    /// `Acquisition::new` if aliased pins become a real operational pattern.
     pub pinned: Vec<String>,
 }
 
@@ -141,531 +141,542 @@ struct ReconcileFree {
 
 /// THE pure acquisition planner. See module docs; the per-arm behavior is
 /// specified by the table tests below, one row per #1278-family bug class.
+///
+/// The passes run in a fixed order, each a method on `Acquisition`:
+/// per-desired decisions, Exclusive pass 1, estimation, the #1243 budget
+/// arm's flat refusals, the surviving reconciles' stale credits, the budget
+/// arm's fit half, the #1140 pool-headroom arm, then assembly.
 pub fn plan_acquire(
     desired: &[Placement],
     facts: &Facts,
     opts: AcquireOpts,
     est: &dyn FootprintEstimator,
 ) -> Plan {
-    let mut warnings: Vec<Warning> = Vec::new();
-
-    // ── per-desired decisions, in desired-input order ────────────────────
-    let mut decisions: Vec<PlannedAction> = Vec::new();
-    // Resident identifiers a decision reuses or reconciles — never pass-1
-    // unloaded, never eviction candidates (a claimed resident is targeted
-    // at most once).
-    let mut claimed: BTreeSet<String> = BTreeSet::new();
-    // (#1487 PR1) Pinned externals — identifiers a CONCURRENT darkmux
-    // command is actively dispatching to, seeded into `claimed` up front so
-    // every check below that already skips a claimed resident (pass-1,
-    // the #1243 budget eviction loop, the #1140 pool-headroom eviction
-    // loop, and — #2669 — the per-desired `Reconcile` arm) protects the pin
-    // too, with zero new branching. Because a
-    // pinned-but-claimed resident is therefore never added to `removed`,
-    // it stays counted as occupied in `resident_base`/`single_pool_headroom`
-    // — the occupancy half of the contract falls out of the SAME mechanism,
-    // not a second one. Only actually-resident, darkmux-owned pins count: a
-    // lease naming a model that has since left residency (or a caller that
-    // passed a non-namespaced identifier) is a no-op, never fabricated
-    // occupancy — `facts.residents` (i.e. `lms ps`) is always the truth.
-    for id in &opts.pinned {
-        if is_darkmux_owned(id) && facts.residents.iter().any(|r| r.identifier == *id) {
-            claimed.insert(id.clone());
-        }
-    }
-    // (#2672 CONSIDER 3) A SEPARATE tracker, disjoint in origin from
-    // `claimed` above: identifiers claimed by THIS call's OWN earlier
-    // decisions (a `Reuse` or a successful `Reconcile`), never by
-    // `opts.pinned` alone. `claimed` conflates two causes the Reconcile
-    // arm's Block below needs to tell apart — an EXTERNAL pin (a
-    // concurrent darkmux command, or a same-process sibling) can genuinely
-    // clear with time (the pinning command finishing its own dispatch), so
-    // `ensure_wave_loaded`'s bounded retry-hold is worth attempting; a
-    // SAME-PLAN collision (two placements in this one `desired` list
-    // resolving to the identical stale resident — `facts` is a single
-    // snapshot, so retrying `plan_acquire` with the same input regenerates
-    // the IDENTICAL collision every time) can never clear no matter how
-    // long anything waits. `Reason::ClaimedResidentInsufficientCtx`'s own
-    // `clearable` field is `!same_plan_claimed.contains(&stale_identifier)`
-    // at the point of the Block — see its construction below.
-    let mut same_plan_claimed: BTreeSet<String> = BTreeSet::new();
-    // Reconcile unload-halves, committed after the refusal passes (see
-    // ReconcileFree).
-    let mut reconcile_frees: Vec<ReconcileFree> = Vec::new();
-    // Decision index → the foreign duplicate behind a load-alongside Load
-    // (identifier, pool cost) — the pool arm Blocks these, naming the
-    // instance, when the copy cannot fit alongside.
-    let mut foreign_dups: BTreeMap<usize, (String, Option<u64>)> = BTreeMap::new();
-
+    let mut acq = Acquisition::new(desired, facts, &opts.pinned);
     for p in desired {
-        match decide_residency(&facts.residents, p) {
-            ResidencyDecision::LoadFresh => {
-                // (#1276) Existence fast-fail: refuse before any load
-                // attempt can hang. Skipped — not failed — when the catalog
-                // is unavailable (leniency; the Deadline port backstops
-                // execution instead).
-                if let Some(catalog) = facts.catalog.as_deref() {
-                    if !catalog.iter().any(|c| c.model_key == p.model_key) {
-                        decisions.push(PlannedAction {
-                            action: Action::Block {
-                                model_key: p.model_key.clone(),
-                                resident_identifier: None,
-                            },
-                            reason: Reason::UnknownModelKey {
-                                nearest: nearest_model_keys(&p.model_key, catalog),
-                            },
-                            precondition: Precondition::None,
-                        });
-                        continue;
-                    }
-                }
-                decisions.push(PlannedAction {
-                    action: Action::Load {
-                        model_key: p.model_key.clone(),
-                        identifier: p.identifier.clone(),
-                        min_ctx: p.min_ctx,
-                    },
-                    reason: Reason::NoResident,
-                    precondition: Precondition::NoResidentForModelKey {
-                        model_key: p.model_key.clone(),
-                    },
-                });
-            }
-            ResidencyDecision::Reuse { identifier, resident_ctx } => {
-                claimed.insert(identifier.clone());
-                same_plan_claimed.insert(identifier.clone());
-                push_reuse(&mut decisions, &mut warnings, identifier, resident_ctx, p.min_ctx);
-            }
-            ResidencyDecision::Reconcile { stale_identifier, stale_ctx } => {
-                // (#2669) A stale resident already in `claimed` — seeded
-                // from `opts.pinned` up front, or claimed by an earlier
-                // decision in THIS same plan — must never be targeted by an
-                // unload-then-reload: unloading it here is the exact #1487
-                // hazard pass-1/budget/pool already refuse to commit,
-                // reached through a different arm. `decide_residency` picks
-                // this arm purely from ctx vs. `facts.residents`, with no
-                // visibility into `claimed`, so the check has to live here,
-                // before the stale is claimed a SECOND time (the "a claimed
-                // resident is targeted at most once" invariant documented
-                // on `claimed` above). Refuse honestly instead — the same
-                // shape the budget arm already uses for a pinned resident
-                // (`pinned_resident_blocks_budget_load_never_evicted_1487`):
-                // a `Block` naming the claimed instance, never an eviction.
-                if claimed.contains(&stale_identifier) {
-                    // (#2672 CONSIDER 3) `clearable` distinguishes WHY this
-                    // is claimed: an external pin (never in
-                    // `same_plan_claimed`) can genuinely resolve once its
-                    // holder finishes, so `ensure_wave_loaded`'s bounded
-                    // retry-hold is worth attempting; a same-plan
-                    // collision (this identifier already claimed by an
-                    // EARLIER decision in THIS SAME `desired` list) can
-                    // never resolve by waiting — `facts` is one fixed
-                    // snapshot, so re-running `plan_acquire` on the exact
-                    // same input regenerates the identical Block every
-                    // time.
-                    let clearable = !same_plan_claimed.contains(&stale_identifier);
-                    decisions.push(PlannedAction {
-                        action: Action::Block {
-                            model_key: p.model_key.clone(),
-                            resident_identifier: Some(stale_identifier.clone()),
-                        },
-                        reason: Reason::ClaimedResidentInsufficientCtx {
-                            identifier: stale_identifier,
-                            resident_ctx: stale_ctx,
-                            min_ctx: p.min_ctx,
-                            clearable,
-                        },
-                        precondition: Precondition::None,
-                    });
-                } else {
-                    claimed.insert(stale_identifier.clone());
-                    same_plan_claimed.insert(stale_identifier.clone());
-                    let stale_target = OwnedTarget::claim(&stale_identifier, Some(&p.identifier))
-                        .expect("decide_residency only reconciles darkmux-owned or exact-alias residents");
-                    reconcile_frees.push(ReconcileFree {
-                        stale: ReconcileStale::locate(facts, &stale_identifier, decisions.len()),
-                        unload: PlannedAction {
-                            action: Action::Unload { target: stale_target },
-                            reason: Reason::InsufficientCtx,
-                            precondition: Precondition::ResidentPresent {
-                                identifier: stale_identifier,
-                                at_ctx: Some(stale_ctx),
-                            },
-                        },
-                    });
-                    decisions.push(PlannedAction {
-                        action: Action::Load {
-                            model_key: p.model_key.clone(),
-                            identifier: p.identifier.clone(),
-                            min_ctx: p.min_ctx,
-                        },
-                        reason: Reason::InsufficientCtx,
-                        precondition: Precondition::NoOwnedResidentForModelKey {
-                            model_key: p.model_key.clone(),
-                            identifier: p.identifier.clone(),
-                        },
-                    });
-                }
-            }
-            ResidencyDecision::ForeignDuplicate { foreign_identifier } => {
-                // Absolute ownership (operator, 2026-07-10, #1274): the
-                // user-loaded duplicate has unknown load config (the #1135
-                // ghost) — never reused, never touched. darkmux plans its
-                // own namespaced copy alongside; the budget/pool arms below
-                // Block it (naming the foreign instance in the pool case)
-                // when it cannot fit. No #1276 catalog check here: the
-                // resident duplicate is existence proof for the weights.
-                let foreign_bytes = facts
-                    .residents
-                    .iter()
-                    .find(|r| r.identifier == foreign_identifier)
-                    .and_then(|r| r.est_bytes);
-                warnings.push(Warning::ForeignDuplicateResident {
-                    foreign_identifier: foreign_identifier.clone(),
-                    est_bytes: foreign_bytes,
-                });
-                foreign_dups.insert(decisions.len(), (foreign_identifier.clone(), foreign_bytes));
-                decisions.push(PlannedAction {
-                    action: Action::Load {
-                        model_key: p.model_key.clone(),
-                        identifier: p.identifier.clone(),
-                        min_ctx: p.min_ctx,
-                    },
-                    reason: Reason::ForeignDuplicateLoadAlongside { foreign_identifier },
-                    precondition: Precondition::NoOwnedResidentForModelKey {
-                        model_key: p.model_key.clone(),
-                        identifier: p.identifier.clone(),
-                    },
-                });
-            }
-        }
+        acq.decide(p);
     }
-
-    // ── Exclusive pass 1: unload the no-longer-desired, respect user state ─
-    let desired_idents: BTreeSet<&str> = desired.iter().map(|p| p.identifier.as_str()).collect();
-    // Unloads keyed by resident index so the final assembly can emit them in
-    // host-reported order regardless of which pass produced them.
-    let mut unloads: Vec<(usize, PlannedAction)> = Vec::new();
-    // Resident indexes leaving residency (pass-1 unloads + reconcile stales
-    // + evictions) — the freed-bytes and remaining-base bookkeeping below.
-    let mut removed: BTreeSet<usize> = BTreeSet::new();
-    let mut user_state_respected: Vec<String> = Vec::new();
-
-    if opts.scope == AcquireScope::Exclusive {
-        for (idx, r) in facts.residents.iter().enumerate() {
-            if !is_darkmux_owned(&r.identifier) {
-                // Foreign — never touched (a load-alongside duplicate
-                // included). Listed as respected unless a decision claims it
-                // as this call's own explicit alias.
-                let used = claimed.contains(&r.identifier)
-                    || desired_idents.contains(r.identifier.as_str());
-                if !used {
-                    user_state_respected.push(r.identifier.clone());
-                }
-                continue;
-            }
-            if desired_idents.contains(r.identifier.as_str()) || claimed.contains(&r.identifier) {
-                continue; // wanted (or already targeted by a reconcile)
-            }
-            // (#1280 guard) Evicting the standing utility binding is legal
-            // but never silent — a swap-shaped caller that forgot the
-            // utility seat would otherwise evict the compactor quietly.
-            warn_if_utility_binding(&mut warnings, facts, &r.identifier);
-            let target = OwnedTarget::claim(&r.identifier, None)
-                .expect("namespaced residents always claim");
-            unloads.push((
-                idx,
-                PlannedAction {
-                    action: Action::Unload { target },
-                    reason: Reason::NoLongerDesired,
-                    precondition: Precondition::ResidentPresent {
-                        identifier: r.identifier.clone(),
-                        at_ctx: Some(r.ctx),
-                    },
-                },
-            ));
-            removed.insert(idx);
-        }
-    }
-
-    // ── estimate pending loads (only when a budget or pool arm will run) ──
-    let budget_active = facts.budget.max_darkmux_bytes.is_some();
+    let user_state_respected = match opts.scope {
+        AcquireScope::Exclusive => acq.exclusive_pass1(),
+        AcquireScope::Additive => Vec::new(),
+    };
+    let budget = facts.budget.max_darkmux_bytes;
     let pool_arm_active = opts.intent == CallerIntent::Auto && facts.pools.len() == 1;
-    let mut pendings: Vec<Pending> = Vec::new();
-    if budget_active || pool_arm_active {
-        for (i, d) in decisions.iter().enumerate() {
-            let Action::Load { model_key, min_ctx, .. } = &d.action else { continue };
-            let e = est.estimate_bytes(model_key, *min_ctx, facts.catalog.as_deref());
-            if e.is_none() {
-                warnings.push(Warning::LoadEstimateUnknown { model_key: model_key.clone() });
-            }
-            pendings.push(Pending { decision_idx: i, model_key: model_key.clone(), est: e });
-        }
+    if budget.is_some() || pool_arm_active {
+        acq.estimate_pending_loads(est);
     }
-
-    let mut exec_hint = ExecHint::Concurrent;
-
-    // ── #1243 budget arm, refusal half ───────────────────────────────────
-    if let Some(budget) = facts.budget.max_darkmux_bytes {
-        warn_unknown_owned_resident_bytes(&mut warnings, facts);
-        // A load whose estimate alone exceeds the whole budget is refused
-        // for BOTH intents — no eviction sequence can ever satisfy it. The
-        // refusal names the BUDGET even behind a foreign duplicate: the cap
-        // counts only darkmux-owned bytes, so ejecting the user copy could
-        // never make this fit (capacity honesty — see module docs).
-        for pend in &pendings {
-            if pend.est.is_some_and(|e| e > budget) {
-                decisions[pend.decision_idx] = PlannedAction {
-                    action: Action::Block {
-                        model_key: pend.model_key.clone(),
-                        resident_identifier: None,
-                    },
-                    reason: Reason::BudgetRefuse {
-                        est_bytes: pend.est.expect("checked is_some"),
-                        budget_bytes: budget,
-                    },
-                    precondition: Precondition::None,
-                };
-            }
-        }
+    if let Some(budget) = budget {
+        acq.budget_flat_refusals(budget);
     }
-
     // Reconcile stales leave residency too (freed before their reload) —
     // committed via the SHARED removal-timing helper, AFTER the refusal
     // pass: a refused reconcile no longer unloads its stale, so that
     // resident stays counted as occupying. (The unload ACTION commits later
     // still — after every refusal opportunity.)
-    commit_surviving_stales(reconcile_frees.iter().map(|rf| &rf.stale), &mut removed, |i| {
-        is_load_like(&decisions[i].action)
-    });
-
-    // ── #1243 budget arm, fit half ───────────────────────────────────────
-    if let Some(budget) = facts.budget.max_darkmux_bytes {
-        // Base = darkmux-owned residents that remain after pass 1 +
-        // reconcile stales. User loads NEVER count (#1243) — physical
-        // pressure cross-checks are doctor scope.
-        let mut base: u64 = resident_base(facts, &removed);
-        let need = pending_sum(&decisions, &pendings);
-        if base + need > budget {
-            match opts.intent {
-                CallerIntent::OperatorExplicit => {
-                    // Operator intent wins, loudly — the Load stays.
-                    warnings.push(Warning::BudgetExceededOperatorOverride {
-                        est_new_bytes: need,
-                        darkmux_resident_bytes: base,
-                        budget_bytes: budget,
-                    });
-                }
-                CallerIntent::Auto => {
-                    // Evict idle darkmux-owned residents in host-reported
-                    // order (#1243; named honestly — no recency fact exists,
-                    // so this is NOT LRU). Unknown-size residents are never
-                    // chosen: the plan cannot account the gain (they already
-                    // warned above and count 0 against the base).
-                    for (idx, r) in facts.residents.iter().enumerate() {
-                        if base + need <= budget {
-                            break;
-                        }
-                        if removed.contains(&idx)
-                            || !is_darkmux_owned(&r.identifier)
-                            || desired_idents.contains(r.identifier.as_str())
-                            || claimed.contains(&r.identifier)
-                        {
-                            continue;
-                        }
-                        let Some(freeing) = r.est_bytes else { continue };
-                        warn_if_utility_binding(&mut warnings, facts, &r.identifier);
-                        unloads.push((
-                            idx,
-                            PlannedAction {
-                                action: Action::Unload {
-                                    target: OwnedTarget::claim(&r.identifier, None)
-                                        .expect("namespaced residents always claim"),
-                                },
-                                reason: Reason::BudgetEvict {
-                                    freeing_bytes: freeing,
-                                    need_bytes: need,
-                                    budget_bytes: budget,
-                                    eviction_order: EvictionOrder::HostReported,
-                                },
-                                precondition: Precondition::ResidentPresent {
-                                    identifier: r.identifier.clone(),
-                                    at_ctx: Some(r.ctx),
-                                },
-                            },
-                        ));
-                        removed.insert(idx);
-                        base = base.saturating_sub(freeing);
-                    }
-                    if base + need > budget {
-                        // Auto never breaches (#1243): refuse any load that
-                        // cannot fit even alone after every eviction; the
-                        // survivors each fit alone, so if together they
-                        // still exceed, serialize them.
-                        for pend in &pendings {
-                            if !is_load_like(&decisions[pend.decision_idx].action) {
-                                continue;
-                            }
-                            let e = pend.est.unwrap_or(0);
-                            if base + e > budget {
-                                decisions[pend.decision_idx] = PlannedAction {
-                                    action: Action::Block {
-                                        model_key: pend.model_key.clone(),
-                                        resident_identifier: None,
-                                    },
-                                    reason: Reason::BudgetRefuse {
-                                        est_bytes: e,
-                                        budget_bytes: budget,
-                                    },
-                                    precondition: Precondition::None,
-                                };
-                            }
-                        }
-                        if base + pending_sum(&decisions, &pendings) > budget {
-                            exec_hint = ExecHint::Sequential;
-                        }
-                    }
-                }
-            }
-        }
+    acq.commit_surviving_stale_credits();
+    if let Some(budget) = budget {
+        acq.budget_fit(budget, opts.intent);
     }
-
-    // ── #1140 pool-headroom arm (Auto only; single-pool v1 rule) ─────────
-    // Pool facts are advisory headroom, not an operator contract: the arm
-    // evicts to make room and serializes when it can't, and refuses ONLY a
-    // load-alongside behind a foreign duplicate (whose bytes darkmux may not
-    // free — the one shortfall with a nameable, un-evictable cause). Every
-    // other shortfall falls through to the executor's #1139
-    // insufficient-resources fast-fail backstop. With zero or multiple pools
-    // the arm is skipped (a placement→pool mapping fact arrives with a
-    // second ResourceProbe).
     if pool_arm_active {
-        if let Some(pool) = facts.pools.values().next() {
-            let snapshot_available = pool.available_bytes;
-            // Snapshot plus every planned free (pass 1, budget evictions,
-            // surviving reconcile stales) — the shared #1140 accounting.
-            let mut effective = single_pool_headroom(facts, &removed)
-                .expect("pool_arm_active implies exactly one pool");
-            let need = pending_sum(&decisions, &pendings);
-            if need > effective {
-                for (idx, r) in facts.residents.iter().enumerate() {
-                    if need <= effective {
-                        break;
-                    }
-                    if removed.contains(&idx)
-                        || !is_darkmux_owned(&r.identifier)
-                        || desired_idents.contains(r.identifier.as_str())
-                        || claimed.contains(&r.identifier)
-                    {
-                        continue;
-                    }
-                    let Some(freeing) = r.est_bytes else { continue };
-                    warn_if_utility_binding(&mut warnings, facts, &r.identifier);
-                    unloads.push((
-                        idx,
-                        PlannedAction {
-                            action: Action::Unload {
-                                target: OwnedTarget::claim(&r.identifier, None)
-                                    .expect("namespaced residents always claim"),
-                            },
-                            reason: Reason::BudgetEvict {
-                                freeing_bytes: freeing,
-                                need_bytes: need,
-                                budget_bytes: snapshot_available,
-                                eviction_order: EvictionOrder::HostReported,
-                            },
-                            precondition: Precondition::ResidentPresent {
-                                identifier: r.identifier.clone(),
-                                at_ctx: Some(r.ctx),
-                            },
-                        },
-                    ));
-                    removed.insert(idx);
-                    effective += freeing;
-                }
-                if need > effective {
-                    // A load-alongside that cannot fit even alone Blocks,
-                    // naming the foreign duplicate whose bytes darkmux may
-                    // not free (absolute ownership, 2026-07-10, #1274).
-                    for pend in &pendings {
-                        if !is_load_like(&decisions[pend.decision_idx].action) {
-                            continue;
-                        }
-                        let Some((fid, fbytes)) = foreign_dups.get(&pend.decision_idx) else {
-                            continue;
-                        };
-                        let e = pend.est.unwrap_or(0);
-                        if e > effective {
-                            decisions[pend.decision_idx] = PlannedAction {
-                                action: Action::Block {
-                                    model_key: pend.model_key.clone(),
-                                    resident_identifier: Some(fid.clone()),
-                                },
-                                reason: Reason::ForeignDuplicateNoCapacity {
-                                    foreign_identifier: fid.clone(),
-                                    foreign_bytes: *fbytes,
-                                    est_bytes: e,
-                                    limit_bytes: effective,
-                                },
-                                precondition: Precondition::None,
-                            };
-                        }
-                    }
-                    if pending_sum(&decisions, &pendings) > effective {
-                        let load_count = pendings
-                            .iter()
-                            .filter(|p| is_load_like(&decisions[p.decision_idx].action))
-                            .count();
-                        let all_fit_alone = pendings
-                            .iter()
-                            .filter(|p| is_load_like(&decisions[p.decision_idx].action))
-                            .all(|p| p.est.unwrap_or(0) <= effective);
-                        if load_count > 1 && all_fit_alone {
-                            exec_hint = ExecHint::Sequential;
-                        }
-                    }
-                }
+        acq.pool_headroom_arm();
+    }
+    acq.into_plan(user_state_respected)
+}
+
+/// The working state of one `plan_acquire` call.
+struct Acquisition<'a> {
+    facts: &'a Facts,
+    /// Identifiers the desired placements load under — never pass-1
+    /// unloaded, never eviction candidates.
+    desired_idents: BTreeSet<&'a str>,
+    warnings: Vec<Warning>,
+    /// Per-desired decisions, in desired-input order.
+    decisions: Vec<PlannedAction>,
+    /// Resident identifiers a decision reuses or reconciles, plus live
+    /// pins — never pass-1 unloaded, never eviction candidates (a claimed
+    /// resident is targeted at most once).
+    claimed: BTreeSet<String>,
+    /// (#2672 CONSIDER 3) The subset of `claimed` claimed by THIS call's
+    /// OWN earlier decisions (a `Reuse` or a successful `Reconcile`), never
+    /// by a pin alone. `Reason::ClaimedResidentInsufficientCtx`'s
+    /// `clearable` is `false` exactly for identifiers in here: a SAME-PLAN
+    /// collision (two placements in this one `desired` list resolving to
+    /// the identical stale resident) regenerates on every retry, because
+    /// `facts` is a single snapshot; an EXTERNAL pin can clear with time,
+    /// so `ensure_wave_loaded`'s bounded retry-hold is worth attempting.
+    same_plan_claimed: BTreeSet<String>,
+    /// Reconcile unload-halves, committed after the refusal passes (see
+    /// [`ReconcileFree`]).
+    reconcile_frees: Vec<ReconcileFree>,
+    /// Decision index → the foreign duplicate behind a load-alongside Load
+    /// (identifier, pool cost) — the pool arm Blocks these, naming the
+    /// instance, when the copy cannot fit alongside.
+    foreign_dups: BTreeMap<usize, (String, Option<u64>)>,
+    /// Unloads keyed by resident index so assembly can emit them in
+    /// host-reported order regardless of which pass produced them.
+    unloads: Vec<(usize, PlannedAction)>,
+    /// Resident indexes leaving residency (pass-1 unloads + surviving
+    /// reconcile stales + evictions) — the freed-bytes and remaining-base
+    /// bookkeeping.
+    removed: BTreeSet<usize>,
+    pendings: Vec<Pending>,
+}
+
+impl<'a> Acquisition<'a> {
+    /// (#1487 PR1) Pinned externals — identifiers a CONCURRENT darkmux
+    /// command is actively dispatching to — are seeded into `claimed` up
+    /// front, so every check that already skips a claimed resident
+    /// (pass-1, both eviction arms, and — #2669 — the per-desired
+    /// `Reconcile` arm) protects the pin too. A pinned resident is
+    /// therefore never added to `removed` and stays counted as occupied in
+    /// `resident_base`/`single_pool_headroom`: the occupancy half of the
+    /// contract falls out of the same mechanism. Only actually-resident,
+    /// darkmux-owned pins count: a lease naming a model that has since left
+    /// residency (or a non-namespaced identifier) is a no-op, never
+    /// fabricated occupancy — `facts.residents` (i.e. `lms ps`) is the truth.
+    fn new(desired: &'a [Placement], facts: &'a Facts, pinned: &[String]) -> Self {
+        let claimed = pinned
+            .iter()
+            .filter(|id| is_darkmux_owned(id) && facts.residents.iter().any(|r| r.identifier == **id))
+            .cloned()
+            .collect();
+        Acquisition {
+            facts,
+            desired_idents: desired.iter().map(|p| p.identifier.as_str()).collect(),
+            warnings: Vec::new(),
+            decisions: Vec::new(),
+            claimed,
+            same_plan_claimed: BTreeSet::new(),
+            reconcile_frees: Vec::new(),
+            foreign_dups: BTreeMap::new(),
+            unloads: Vec::new(),
+            removed: BTreeSet::new(),
+            pendings: Vec::new(),
+        }
+    }
+
+    /// One placement's decision, in desired-input order.
+    fn decide(&mut self, p: &Placement) {
+        match decide_residency(&self.facts.residents, p) {
+            ResidencyDecision::LoadFresh => self.decide_load_fresh(p),
+            ResidencyDecision::Reuse { identifier, resident_ctx } => {
+                self.claim_for_this_plan(&identifier);
+                push_reuse(&mut self.decisions, &mut self.warnings, identifier, resident_ctx, p.min_ctx);
+            }
+            ResidencyDecision::Reconcile { stale_identifier, stale_ctx } => {
+                self.decide_reconcile(p, stale_identifier, stale_ctx)
+            }
+            ResidencyDecision::ForeignDuplicate { foreign_identifier } => {
+                self.decide_foreign_duplicate(p, foreign_identifier)
             }
         }
     }
 
-    // ── commit reconcile unload-halves (post-refusal — see ReconcileFree) ─
-    for rf in reconcile_frees {
-        if is_load_like(&decisions[rf.stale.decision_idx].action) {
-            unloads.push((rf.stale.resident_idx, rf.unload));
+    fn claim_for_this_plan(&mut self, identifier: &str) {
+        self.claimed.insert(identifier.to_string());
+        self.same_plan_claimed.insert(identifier.to_string());
+    }
+
+    /// (#1276) Existence fast-fail: refuse before any load attempt can
+    /// hang. Skipped — not failed — when the catalog is unavailable
+    /// (leniency; the Deadline port backstops execution instead).
+    fn decide_load_fresh(&mut self, p: &Placement) {
+        if let Some(catalog) = self.facts.catalog.as_deref() {
+            if !catalog.iter().any(|c| c.model_key == p.model_key) {
+                self.decisions.push(block(
+                    &p.model_key,
+                    None,
+                    Reason::UnknownModelKey { nearest: nearest_model_keys(&p.model_key, catalog) },
+                ));
+                return;
+            }
+        }
+        self.decisions.push(load_for(
+            p,
+            Reason::NoResident,
+            Precondition::NoResidentForModelKey { model_key: p.model_key.clone() },
+        ));
+    }
+
+    /// (#2669) A stale resident already in `claimed` — a pin, or claimed by
+    /// an earlier decision in THIS same plan — is never targeted by an
+    /// unload-then-reload: that is the #1487 hazard pass-1 and both
+    /// eviction arms already refuse, reached through a different arm.
+    /// `decide_residency` picks this arm purely from ctx vs.
+    /// `facts.residents`, with no visibility into `claimed`, so the check
+    /// lives here, before the stale is claimed a second time. The refusal
+    /// is a `Block` naming the claimed instance, never an eviction.
+    fn decide_reconcile(&mut self, p: &Placement, stale_identifier: String, stale_ctx: u64) {
+        if self.claimed.contains(&stale_identifier) {
+            let clearable = !self.same_plan_claimed.contains(&stale_identifier);
+            self.decisions.push(block(
+                &p.model_key,
+                Some(stale_identifier.clone()),
+                Reason::ClaimedResidentInsufficientCtx {
+                    identifier: stale_identifier,
+                    resident_ctx: stale_ctx,
+                    min_ctx: p.min_ctx,
+                    clearable,
+                },
+            ));
+            return;
+        }
+        self.claim_for_this_plan(&stale_identifier);
+        let stale_target = OwnedTarget::claim(&stale_identifier, Some(&p.identifier))
+            .expect("decide_residency only reconciles darkmux-owned or exact-alias residents");
+        self.reconcile_frees.push(ReconcileFree {
+            stale: ReconcileStale::locate(self.facts, &stale_identifier, self.decisions.len()),
+            unload: PlannedAction {
+                action: Action::Unload { target: stale_target },
+                reason: Reason::InsufficientCtx,
+                precondition: Precondition::ResidentPresent {
+                    identifier: stale_identifier,
+                    at_ctx: Some(stale_ctx),
+                },
+            },
+        });
+        self.decisions.push(load_for(p, Reason::InsufficientCtx, no_owned_resident(p)));
+    }
+
+    /// Absolute ownership (operator, 2026-07-10, #1274): the user-loaded
+    /// duplicate has unknown load config (the #1135 ghost) — never reused,
+    /// never touched. darkmux plans its own namespaced copy alongside; the
+    /// budget/pool arms Block it (naming the foreign instance in the pool
+    /// case) when it cannot fit. No #1276 catalog check here: the resident
+    /// duplicate is existence proof for the weights.
+    fn decide_foreign_duplicate(&mut self, p: &Placement, foreign_identifier: String) {
+        let foreign_bytes = resident_bytes(self.facts, &foreign_identifier);
+        self.warnings.push(Warning::ForeignDuplicateResident {
+            foreign_identifier: foreign_identifier.clone(),
+            est_bytes: foreign_bytes,
+        });
+        self.foreign_dups
+            .insert(self.decisions.len(), (foreign_identifier.clone(), foreign_bytes));
+        self.decisions.push(load_for(
+            p,
+            Reason::ForeignDuplicateLoadAlongside { foreign_identifier },
+            no_owned_resident(p),
+        ));
+    }
+
+    /// Exclusive pass 1: unload the no-longer-desired, respect user state.
+    /// Returns the foreign residents left alone and unused.
+    fn exclusive_pass1(&mut self) -> Vec<String> {
+        let mut respected = Vec::new();
+        for (idx, r) in self.facts.residents.iter().enumerate() {
+            if !is_darkmux_owned(&r.identifier) {
+                // Foreign — never touched (a load-alongside duplicate
+                // included). Listed as respected unless a decision claims
+                // it as this call's own explicit alias.
+                if !self.is_wanted(&r.identifier) {
+                    respected.push(r.identifier.clone());
+                }
+                continue;
+            }
+            if self.is_wanted(&r.identifier) {
+                continue;
+            }
+            // (#1280 guard) Evicting the standing utility binding is legal
+            // but never silent — a swap-shaped caller that forgot the
+            // utility seat would otherwise evict the compactor quietly.
+            warn_if_utility_binding(&mut self.warnings, self.facts, &r.identifier);
+            self.unloads.push((idx, unload_owned(r, Reason::NoLongerDesired)));
+            self.removed.insert(idx);
+        }
+        respected
+    }
+
+    /// Desired, or already targeted by a decision (or pinned).
+    fn is_wanted(&self, identifier: &str) -> bool {
+        self.desired_idents.contains(identifier) || self.claimed.contains(identifier)
+    }
+
+    /// Estimate every Load decision (only when a budget or pool arm will
+    /// run). An unknown estimate warns and counts 0.
+    fn estimate_pending_loads(&mut self, est: &dyn FootprintEstimator) {
+        for (i, d) in self.decisions.iter().enumerate() {
+            let Action::Load { model_key, min_ctx, .. } = &d.action else { continue };
+            let e = est.estimate_bytes(model_key, *min_ctx, self.facts.catalog.as_deref());
+            if e.is_none() {
+                self.warnings.push(Warning::LoadEstimateUnknown { model_key: model_key.clone() });
+            }
+            self.pendings.push(Pending { decision_idx: i, model_key: model_key.clone(), est: e });
         }
     }
 
-    // ── assembly: refusals, then the free phase, then the rest ───────────
-    // (#2674 refuse-fast) Every `Block` sorts to the FRONT of the action
-    // list, ahead of the free phase and every load — so no mutating action
-    // can commit before every refusal in this SAME plan has been decided.
-    // This is the same free/commit discipline `ReconcileFree` already
-    // applies to one reconcile's own stale ("a refused reconcile must not
-    // unload its stale"), raised to the whole plan: before #2674, a plan
-    // whose LATER placement Blocked still emitted an EARLIER placement's
-    // pass-1 unload / reconcile pair / fresh load ahead of it, and
-    // `execute_plan` — which runs actions in order and stops at the first
-    // failure, a `Block` included — committed those host-side before ever
-    // reaching the refusal. The wave then failed over a host matching
-    // neither the pre-plan nor the desired state (orphaned residency).
-    // Refusals are non-mutating, so hoisting them costs nothing to execute
-    // and makes a serialized plan lead with WHY it will not proceed.
-    // Relative order among the refusals themselves is preserved
-    // (desired-input order), so the refusal a caller reports is unchanged.
-    unloads.sort_by_key(|(idx, _)| *idx);
-    let (blocks, proceeding): (Vec<PlannedAction>, Vec<PlannedAction>) =
-        decisions.into_iter().partition(|d| matches!(d.action, Action::Block { .. }));
-    let mut actions: Vec<PlannedAction> = blocks;
-    actions.extend(unloads.into_iter().map(|(_, a)| a));
-    actions.extend(proceeding);
-    Plan {
-        actions,
-        quarantined: Vec::new(),
-        user_state_respected,
-        warnings,
-        exec_hint,
+    /// #1243 budget arm, refusal half. A load whose estimate alone exceeds
+    /// the whole budget is refused for BOTH intents — no eviction sequence
+    /// can ever satisfy it. The refusal names the BUDGET even behind a
+    /// foreign duplicate: the cap counts only darkmux-owned bytes, so
+    /// ejecting the user copy could never make this fit (capacity honesty —
+    /// see module docs).
+    fn budget_flat_refusals(&mut self, budget: u64) {
+        warn_unknown_owned_resident_bytes(&mut self.warnings, self.facts);
+        for pend in &self.pendings {
+            if let Some(e) = pend.est.filter(|&e| e > budget) {
+                self.decisions[pend.decision_idx] = block(
+                    &pend.model_key,
+                    None,
+                    Reason::BudgetRefuse { est_bytes: e, budget_bytes: budget },
+                );
+            }
+        }
     }
+
+    fn commit_surviving_stale_credits(&mut self) {
+        let decisions = &self.decisions;
+        commit_surviving_stales(
+            self.reconcile_frees.iter().map(|rf| &rf.stale),
+            &mut self.removed,
+            |i| is_load_like(&decisions[i].action),
+        );
+    }
+
+    /// #1243 budget arm, fit half. Base = darkmux-owned residents that
+    /// remain after pass 1 + surviving reconcile stales. User loads NEVER
+    /// count (#1243) — physical pressure cross-checks are doctor scope.
+    ///
+    /// The arm exists to make room for pending loads, so it runs only when
+    /// the loads that survived the flat refusals need bytes: a base already
+    /// over budget with nothing to add (nothing desired, everything reused,
+    /// every load refused, or only unpriced or zero-sized loads, which
+    /// count 0) evicts nothing and claims no override.
+    fn budget_fit(&mut self, budget: u64, intent: CallerIntent) {
+        let need = self.pending_sum();
+        if need == 0 {
+            return;
+        }
+        let base = resident_base(self.facts, &self.removed);
+        if base + need <= budget {
+            return;
+        }
+        match intent {
+            // Operator intent wins, loudly — the Load stays.
+            CallerIntent::OperatorExplicit => {
+                self.warnings.push(Warning::BudgetExceededOperatorOverride {
+                    est_new_bytes: need,
+                    darkmux_resident_bytes: base,
+                    budget_bytes: budget,
+                })
+            }
+            CallerIntent::Auto => self.budget_fit_auto(budget, base, need),
+        }
+    }
+
+    /// Auto never breaches (#1243): evict idle darkmux-owned residents,
+    /// then refuse any load that cannot fit even alone after every
+    /// eviction.
+    fn budget_fit_auto(&mut self, budget: u64, base: u64, need: u64) {
+        let freed = self.evict_idle(base + need - budget, |freeing| Reason::BudgetEvict {
+            freeing_bytes: freeing,
+            need_bytes: need,
+            budget_bytes: budget,
+            eviction_order: EvictionOrder::HostReported,
+        });
+        let base = base - freed;
+        if base + need <= budget {
+            return;
+        }
+        for pend in &self.pendings {
+            if !is_load_like(&self.decisions[pend.decision_idx].action) {
+                continue;
+            }
+            let e = pend.est.unwrap_or(0);
+            if base + e > budget {
+                self.decisions[pend.decision_idx] = block(
+                    &pend.model_key,
+                    None,
+                    Reason::BudgetRefuse { est_bytes: e, budget_bytes: budget },
+                );
+            }
+        }
+    }
+
+    /// #1140 pool-headroom arm (Auto only; single-pool v1 rule). Pool facts
+    /// are advisory headroom, not an operator contract: the arm evicts to
+    /// make room, and refuses ONLY a
+    /// load-alongside behind a foreign duplicate (whose bytes darkmux may
+    /// not free — the one shortfall with a nameable, un-evictable cause).
+    /// Every other shortfall falls through to the executor's #1139
+    /// insufficient-resources fast-fail backstop. With zero or multiple
+    /// pools the arm is skipped (a placement→pool mapping fact arrives with
+    /// a second ResourceProbe).
+    fn pool_headroom_arm(&mut self) {
+        let snapshot_available = self
+            .facts
+            .pools
+            .values()
+            .next()
+            .expect("the pool arm runs only with exactly one pool")
+            .available_bytes;
+        // Snapshot plus every planned free (pass 1, budget evictions,
+        // surviving reconcile stales) — the shared #1140 accounting.
+        let effective = single_pool_headroom(self.facts, &self.removed)
+            .expect("the pool arm runs only with exactly one pool");
+        let need = self.pending_sum();
+        if need <= effective {
+            return;
+        }
+        let freed = self.evict_idle(need - effective, |freeing| Reason::BudgetEvict {
+            freeing_bytes: freeing,
+            need_bytes: need,
+            budget_bytes: snapshot_available,
+            eviction_order: EvictionOrder::HostReported,
+        });
+        let effective = effective + freed;
+        if need > effective {
+            self.refuse_foreign_duplicates_over(effective);
+        }
+    }
+
+    /// A load-alongside that cannot fit even alone Blocks, naming the
+    /// foreign duplicate whose bytes darkmux may not free (absolute
+    /// ownership, 2026-07-10, #1274).
+    fn refuse_foreign_duplicates_over(&mut self, effective: u64) {
+        for pend in &self.pendings {
+            if !is_load_like(&self.decisions[pend.decision_idx].action) {
+                continue;
+            }
+            let Some((fid, fbytes)) = self.foreign_dups.get(&pend.decision_idx) else {
+                continue;
+            };
+            let e = pend.est.unwrap_or(0);
+            if e > effective {
+                self.decisions[pend.decision_idx] = block(
+                    &pend.model_key,
+                    Some(fid.clone()),
+                    Reason::ForeignDuplicateNoCapacity {
+                        foreign_identifier: fid.clone(),
+                        foreign_bytes: *fbytes,
+                        est_bytes: e,
+                        limit_bytes: effective,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Evict idle darkmux-owned residents in host-reported order (#1243;
+    /// named honestly — no recency fact exists, so this is NOT LRU) until
+    /// `short` bytes are freed or no candidate remains. Unknown-size
+    /// residents are never chosen: the plan cannot account the gain. Shared
+    /// by the budget and pool arms. Returns the bytes freed.
+    fn evict_idle(&mut self, short: u64, reason: impl Fn(u64) -> Reason) -> u64 {
+        let mut freed = 0;
+        for (idx, r) in self.facts.residents.iter().enumerate() {
+            if freed >= short {
+                break;
+            }
+            let Some(freeing) = self.evictable_bytes(idx, r) else { continue };
+            warn_if_utility_binding(&mut self.warnings, self.facts, &r.identifier);
+            self.unloads.push((idx, unload_owned(r, reason(freeing))));
+            self.removed.insert(idx);
+            freed += freeing;
+        }
+        freed
+    }
+
+    /// The bytes evicting resident `idx` would free, or `None` when it is
+    /// not an eviction candidate: already leaving, user state, wanted, or
+    /// of unknown size.
+    fn evictable_bytes(&self, idx: usize, r: &ResidentFact) -> Option<u64> {
+        if self.removed.contains(&idx) || !is_darkmux_owned(&r.identifier) || self.is_wanted(&r.identifier) {
+            return None;
+        }
+        r.est_bytes
+    }
+
+    fn pending_sum(&self) -> u64 {
+        pending_sum(&self.decisions, &self.pendings)
+    }
+
+
+    /// Assembly: refusals, then the free phase, then the rest.
+    ///
+    /// (#2674 refuse-fast) Every `Block` sorts to the FRONT of the action
+    /// list, ahead of the free phase and every load — so no mutating action
+    /// can commit before every refusal in this SAME plan has been decided.
+    /// `execute_plan` runs actions in order and stops at the first failure,
+    /// a `Block` included; a mutation ahead of a refusal would commit
+    /// host-side on a plan that was always going to fail (orphaned
+    /// residency). Refusals are non-mutating, so hoisting them costs nothing
+    /// to execute and makes a serialized plan lead with WHY it will not
+    /// proceed. Relative order among the refusals themselves is preserved
+    /// (desired-input order), so the refusal a caller reports is unchanged.
+    fn into_plan(mut self, user_state_respected: Vec<String>) -> Plan {
+        // Commit reconcile unload-halves (post-refusal — see ReconcileFree).
+        for rf in std::mem::take(&mut self.reconcile_frees) {
+            if is_load_like(&self.decisions[rf.stale.decision_idx].action) {
+                self.unloads.push((rf.stale.resident_idx, rf.unload));
+            }
+        }
+        self.unloads.sort_by_key(|(idx, _)| *idx);
+        let (blocks, proceeding): (Vec<PlannedAction>, Vec<PlannedAction>) =
+            self.decisions.into_iter().partition(|d| matches!(d.action, Action::Block { .. }));
+        let mut actions: Vec<PlannedAction> = blocks;
+        actions.extend(self.unloads.into_iter().map(|(_, a)| a));
+        actions.extend(proceeding);
+        Plan {
+            actions,
+            quarantined: Vec::new(),
+            user_state_respected,
+            warnings: self.warnings,
+        }
+    }
+}
+
+/// A non-mutating refusal.
+fn block(model_key: &str, resident_identifier: Option<String>, reason: Reason) -> PlannedAction {
+    PlannedAction {
+        action: Action::Block { model_key: model_key.to_string(), resident_identifier },
+        reason,
+        precondition: Precondition::None,
+    }
+}
+
+/// A Load of `p` under its own identifier.
+fn load_for(p: &Placement, reason: Reason, precondition: Precondition) -> PlannedAction {
+    PlannedAction {
+        action: Action::Load {
+            model_key: p.model_key.clone(),
+            identifier: p.identifier.clone(),
+            min_ctx: p.min_ctx,
+        },
+        reason,
+        precondition,
+    }
+}
+
+/// The precondition of a Load that expects no OWNED copy of the weights (a
+/// reconcile reload, a load-alongside) — a foreign copy may remain.
+fn no_owned_resident(p: &Placement) -> Precondition {
+    Precondition::NoOwnedResidentForModelKey {
+        model_key: p.model_key.clone(),
+        identifier: p.identifier.clone(),
+    }
+}
+
+/// The Unload of a `darkmux:*` resident (pass 1, evictions, release). The
+/// expect is the namespace contract: every caller filters on
+/// `is_darkmux_owned` first, and `OwnedTarget` refuses anything else.
+fn unload_owned(r: &ResidentFact, reason: Reason) -> PlannedAction {
+    PlannedAction {
+        action: Action::Unload {
+            target: OwnedTarget::claim(&r.identifier, None).expect("namespaced residents always claim"),
+        },
+        reason,
+        precondition: Precondition::ResidentPresent {
+            identifier: r.identifier.clone(),
+            at_ctx: Some(r.ctx),
+        },
+    }
+}
+
+/// The reported footprint of the resident named `identifier` (`None` when
+/// it is not resident or its size is unknown). Shared with the #1285 wave
+/// scheduler's foreign-duplicate bookkeeping.
+pub(crate) fn resident_bytes(facts: &Facts, identifier: &str) -> Option<u64> {
+    facts.residents.iter().find(|r| r.identifier == identifier).and_then(|r| r.est_bytes)
 }
 
 /// Refcounted, deduplicated release — the #1279 fix by construction: the
@@ -710,17 +721,7 @@ pub fn plan_release(releasing: &[Placement], still_active: &[Placement], facts: 
         if !emitted.insert(r.identifier.as_str()) {
             continue; // duplicate resident rows collapse to one unload
         }
-        actions.push(PlannedAction {
-            action: Action::Unload {
-                target: OwnedTarget::claim(&r.identifier, None)
-                    .expect("namespaced residents always claim"),
-            },
-            reason: Reason::LastWanterReleased { seats },
-            precondition: Precondition::ResidentPresent {
-                identifier: r.identifier.clone(),
-                at_ctx: Some(r.ctx),
-            },
-        });
+        actions.push(unload_owned(r, Reason::LastWanterReleased { seats }));
     }
     Plan { actions, ..Default::default() }
 }
@@ -897,7 +898,7 @@ mod tests {
 
     use super::*;
     use crate::estimator::FixedEstimator;
-    use crate::facts::{Budget, Facts, PoolFact, PoolId, Pools, ResidentFact};
+    use crate::facts::{Budget, CatalogFact, Facts, PoolFact, PoolId, Pools, ResidentFact};
     use std::collections::BTreeMap;
 
     const GB: u64 = 1_000_000_000;
@@ -1876,6 +1877,76 @@ mod tests {
     }
 
     #[test]
+    fn budget_arm_never_evicts_without_a_surviving_load() {
+        // The darkmux base alone already exceeds the budget. With nothing
+        // left to load, whether nothing was desired, everything is reused,
+        // or the only load was refused flat, there is no pending load to
+        // make room for: nothing is evicted, and no override is claimed.
+        let f = Facts {
+            residents: vec![
+                resident("darkmux:idle", "idle", 8_000, Some(20 * GB)),
+                resident("darkmux:kept", "kept", 32_000, Some(GB)),
+            ],
+            budget: Budget { max_darkmux_bytes: Some(15 * GB) },
+            ..Default::default()
+        };
+        // "unpriced" has no estimate (counts 0); "empty" is priced at 0.
+        let est = est_map(&[("huge", 16 * GB), ("empty", 0)]);
+        let cases: [(&str, Vec<Placement>); 5] = [
+            ("nothing desired", vec![]),
+            ("reuse only", vec![placement("kept", 8_000)]),
+            ("only load refused flat", vec![placement("huge", 8_000)]),
+            ("only load unpriced", vec![placement("unpriced", 8_000)]),
+            ("only load zero-sized", vec![placement("empty", 8_000)]),
+        ];
+        for (label, desired) in cases {
+            for intent in [CallerIntent::Auto, CallerIntent::OperatorExplicit] {
+                let plan = plan_acquire(&desired, &f, opts(intent, AcquireScope::Additive), &est);
+                assert!(
+                    !plan.actions.iter().any(|a| matches!(a.action, Action::Unload { .. })),
+                    "{label}/{intent:?}: evicted toward no pending load: {plan:?}"
+                );
+                assert!(
+                    !plan.warnings.iter().any(|w| matches!(w, Warning::BudgetExceededOperatorOverride { .. })),
+                    "{label}/{intent:?}: override warning with nothing loading: {plan:?}"
+                );
+            }
+        }
+        // Recovery: the same over-budget base with a real pending load still
+        // evicts to make room for it.
+        let plan = plan_acquire(&[placement("m", 8_000)], &f, additive_auto(), &est_map(&[("m", 5 * GB)]));
+        assert!(plan.actions.iter().any(|a| matches!(a.action, Action::Unload { .. })), "{plan:?}");
+    }
+
+    #[test]
+    fn budget_eviction_stops_once_the_load_fits_exactly() {
+        // Equality edge on the eviction walk: after evicting the first idle
+        // resident the pending load fits the budget EXACTLY, so the second
+        // idle resident stays. A `>=` flipped to `>` in the stop condition
+        // evicts it too while every wide-margin row stays green.
+        let f = Facts {
+            residents: vec![
+                resident("darkmux:idle1", "idle1", 8_000, Some(10 * GB)),
+                resident("darkmux:idle2", "idle2", 8_000, Some(10 * GB)),
+            ],
+            budget: Budget { max_darkmux_bytes: Some(30 * GB) },
+            ..Default::default()
+        };
+        let plan =
+            plan_acquire(&[placement("m", 8_000)], &f, additive_auto(), &est_map(&[("m", 20 * GB)]));
+        let unloaded: Vec<&str> = plan
+            .actions
+            .iter()
+            .filter_map(|a| match &a.action {
+                Action::Unload { target } => Some(target.identifier()),
+                Action::Load { .. } | Action::Reuse { .. } | Action::Block { .. } => None,
+            })
+            .collect();
+        assert_eq!(unloaded, vec!["darkmux:idle1"]);
+        assert_eq!(plan.actions.last().map(|a| &a.action), Some(&load_action("m", 8_000).action));
+    }
+
+    #[test]
     fn budget_operator_override_warns_1243() {
         // Same over-budget shape, operator-explicit: the Load survives, the
         // numbers are loud, nothing is evicted.
@@ -1972,9 +2043,9 @@ mod tests {
     }
 
     #[test]
-    fn budget_sequential_hint() {
-        // The #1243 serialize arm: two loads that each fit alone but not
-        // together — both Loads survive, hint says run them one at a time.
+    fn budget_loads_that_fit_alone_both_survive() {
+        // Two loads that each fit the #1243 budget alone but not together,
+        // nothing evictable: neither is refused, both Loads survive.
         let f = Facts {
             budget: Budget { max_darkmux_bytes: Some(30 * GB) },
             ..Default::default()
@@ -1989,7 +2060,6 @@ mod tests {
             plan,
             Plan {
                 actions: vec![load_action("a", 8_000), load_action("b", 8_000)],
-                exec_hint: ExecHint::Sequential,
                 ..Default::default()
             }
         );
@@ -2644,6 +2714,237 @@ mod tests {
                 reason: Reason::BudgetRefuse { est_bytes: 15 * GB, budget_bytes: 30 * GB },
                 precondition: Precondition::None,
             }
+        );
+    }
+
+    // ── the namespace contract, swept across every plan_acquire branch ───
+
+    /// One swept scenario: its inputs and the plan they produced.
+    struct Swept {
+        desired: Vec<Placement>,
+        facts: Facts,
+        opts: AcquireOpts,
+        plan: Plan,
+    }
+
+    /// Every combination of a small resident universe, desired set, catalog,
+    /// intent, scope, budget, pool and pin set, planned. The universe is
+    /// chosen so the sweep reaches every `plan_acquire` branch (asserted by
+    /// the non-vacuity check in the contract test below): an undersized and
+    /// an oversized owned resident, a foreign duplicate, an explicit-alias
+    /// resident, an idle owned resident (the eviction candidate and utility
+    /// binding), unrelated user state, and an unknown-size owned resident.
+    fn sweep() -> Vec<Swept> {
+        let own_a = [None, Some(4_096u64), Some(64_000)];
+        let desired_sets: Vec<Vec<Placement>> = vec![
+            vec![],
+            vec![placement("a", 32_000)],
+            vec![placement("a", 32_000), aliased("b", 32_000, "alias-b")],
+            vec![placement("b", 8_000), placement("a", 32_000)],
+            vec![placement("a", 32_000), placement_seat("a", 48_000, "second")],
+            vec![placement("zzz", 8_000)],
+            vec![placement("c", 8_000)],
+        ];
+        let catalog = Some(
+            ["a", "b", "c", "idle", "x", "nosize"]
+                .iter()
+                .map(|k| CatalogFact { model_key: k.to_string(), size_bytes: Some(GB) })
+                .collect::<Vec<_>>(),
+        );
+        let pools = |avail: u64| -> Pools {
+            BTreeMap::from([(
+                PoolId("unified".into()),
+                PoolFact { capacity_bytes: 64 * GB, available_bytes: avail },
+            )])
+        };
+        // "c" is deliberately unpriced: the LoadEstimateUnknown path.
+        let est = est_map(&[("a", 10 * GB), ("b", 6 * GB), ("zzz", GB)]);
+        let mut out = Vec::new();
+        for own in own_a {
+            for bits in 0u8..16 {
+                let mut residents = Vec::new();
+                if let Some(ctx) = own {
+                    residents.push(resident("darkmux:a", "a", ctx, Some(10 * GB)));
+                }
+                if bits & 1 != 0 {
+                    residents.push(resident("a-user", "a", 64_000, Some(12 * GB)));
+                }
+                if bits & 2 != 0 {
+                    residents.push(resident("alias-b", "b", 4_096, Some(6 * GB)));
+                }
+                if bits & 4 != 0 {
+                    residents.push(resident("darkmux:idle", "idle", 8_000, Some(20 * GB)));
+                }
+                if bits & 8 != 0 {
+                    residents.push(resident("user-x", "x", 8_000, Some(5 * GB)));
+                    residents.push(resident("darkmux:nosize", "nosize", 8_000, None));
+                }
+                for desired in &desired_sets {
+                    for cat in [None, catalog.clone()] {
+                        for budget in [None, Some(15 * GB), Some(40 * GB)] {
+                            for pool in [Pools::new(), pools(5 * GB), pools(12 * GB)] {
+                                for pinned in [&[][..], &["darkmux:a"], &["darkmux:idle"], &["user-x"]] {
+                                    for intent in [CallerIntent::Auto, CallerIntent::OperatorExplicit] {
+                                        for scope in [AcquireScope::Exclusive, AcquireScope::Additive] {
+                                            let facts = Facts {
+                                                residents: residents.clone(),
+                                                catalog: cat.clone(),
+                                                pools: pool.clone(),
+                                                budget: Budget { max_darkmux_bytes: budget },
+                                                utility_binding: Some("darkmux:idle".into()),
+                                            };
+                                            let opts = opts_pinned(intent, scope, pinned);
+                                            let plan = plan_acquire(desired, &facts, opts.clone(), &est);
+                                            out.push(Swept { desired: desired.clone(), facts, opts, plan });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Exhaustive (no wildcard) so a new Reason variant must be placed.
+    fn reason_label(r: &Reason) -> &'static str {
+        match r {
+            Reason::NoResident => "NoResident",
+            Reason::SufficientCtxResident => "SufficientCtxResident",
+            Reason::InsufficientCtx => "InsufficientCtx",
+            Reason::ForeignDuplicateLoadAlongside { .. } => "ForeignDuplicateLoadAlongside",
+            Reason::ForeignDuplicateNoCapacity { .. } => "ForeignDuplicateNoCapacity",
+            Reason::UnknownModelKey { .. } => "UnknownModelKey",
+            Reason::NoLongerDesired => "NoLongerDesired",
+            Reason::LastWanterReleased { .. } => "LastWanterReleased",
+            Reason::BudgetEvict { .. } => "BudgetEvict",
+            Reason::BudgetRefuse { .. } => "BudgetRefuse",
+            Reason::ClaimedResidentInsufficientCtx { clearable: true, .. } => "ClaimedClearable",
+            Reason::ClaimedResidentInsufficientCtx { clearable: false, .. } => "ClaimedSamePlan",
+        }
+    }
+
+    fn warning_label(w: &Warning) -> &'static str {
+        match w {
+            Warning::BudgetExceededOperatorOverride { .. } => "BudgetExceededOperatorOverride",
+            Warning::ResidentBytesUnknown { .. } => "ResidentBytesUnknown",
+            Warning::CtxDivergence { .. } => "CtxDivergence",
+            Warning::UtilityBindingEvicted { .. } => "UtilityBindingEvicted",
+            Warning::ForeignDuplicateResident { .. } => "ForeignDuplicateResident",
+            Warning::LoadEstimateUnknown { .. } => "LoadEstimateUnknown",
+        }
+    }
+
+    #[test]
+    fn namespace_contract_holds_on_every_swept_branch() {
+        // CLAUDE.md contract 4 (#1274), checked on every plan the sweep
+        // produces: darkmux only ever mutates or reuses what it owns (a
+        // `darkmux:*` identifier, or the exact alias a desired placement
+        // loads under); user state is never unloaded, never reused, never
+        // loaded under; a live pin is never unloaded; Exclusive scope lists
+        // every untouched foreign resident as respected.
+        let swept = sweep();
+        let mut reasons: BTreeSet<&str> = BTreeSet::new();
+        let mut warnings: BTreeSet<&str> = BTreeSet::new();
+        let mut budget_evict = false;
+        let mut pool_evict = false;
+        for Swept { desired, facts, opts, plan } in &swept {
+            let ctx = || format!("desired={desired:?}\nfacts={facts:?}\nopts={opts:?}\nplan={plan:?}");
+            let own_alias = |id: &str| desired.iter().any(|p| p.identifier == id);
+            let ours = |id: &str| is_darkmux_owned(id) || own_alias(id);
+            let resident_ids: BTreeSet<&str> =
+                facts.residents.iter().map(|r| r.identifier.as_str()).collect();
+            let live_pins: BTreeSet<&str> = opts
+                .pinned
+                .iter()
+                .map(String::as_str)
+                .filter(|id| is_darkmux_owned(id) && resident_ids.contains(id))
+                .collect();
+            let first_load = plan.actions.iter().position(|a| matches!(a.action, Action::Load { .. }));
+            let last_block = plan.actions.iter().rposition(|a| matches!(a.action, Action::Block { .. }));
+            for (i, pa) in plan.actions.iter().enumerate() {
+                reasons.insert(reason_label(&pa.reason));
+                if pa.action.is_mutating() {
+                    assert_ne!(pa.precondition, Precondition::None, "mutation without precondition\n{}", ctx());
+                    assert!(last_block.is_none_or(|b| b < i), "a mutation precedes a refusal\n{}", ctx());
+                }
+                match &pa.action {
+                    Action::Unload { target } => {
+                        let id = target.identifier();
+                        assert!(ours(id), "unloads user state {id}\n{}", ctx());
+                        assert!(resident_ids.contains(id), "phantom unload {id}\n{}", ctx());
+                        assert!(!live_pins.contains(id), "unloads a live pin {id}\n{}", ctx());
+                        assert!(first_load.is_none_or(|l| i < l), "an Unload follows a Load\n{}", ctx());
+                        if let Reason::BudgetEvict { .. } = pa.reason {
+                            if facts.budget.max_darkmux_bytes.is_some() { budget_evict = true } else { pool_evict = true }
+                        }
+                    }
+                    Action::Load { model_key, identifier, .. } => {
+                        assert!(
+                            desired.iter().any(|p| p.identifier == *identifier && p.model_key == *model_key),
+                            "loads something no placement asked for\n{}",
+                            ctx()
+                        );
+                        assert!(ours(identifier), "loads under a foreign identifier\n{}", ctx());
+                    }
+                    Action::Reuse { identifier, .. } => {
+                        assert!(ours(identifier), "reuses user state {identifier}\n{}", ctx());
+                    }
+                    Action::Block { .. } => {}
+                }
+            }
+            for w in &plan.warnings {
+                warnings.insert(warning_label(w));
+            }
+            let respected: BTreeSet<&str> = plan.user_state_respected.iter().map(String::as_str).collect();
+            match opts.scope {
+                AcquireScope::Additive => assert!(respected.is_empty(), "{}", ctx()),
+                AcquireScope::Exclusive => {
+                    for id in &resident_ids {
+                        let expected = !ours(id);
+                        assert_eq!(respected.contains(id), expected, "respected set for {id}\n{}", ctx());
+                    }
+                }
+            }
+        }
+        // Non-vacuity: the sweep genuinely reached every acquisition branch.
+        for want in [
+            "NoResident", "SufficientCtxResident", "InsufficientCtx", "ForeignDuplicateLoadAlongside",
+            "ForeignDuplicateNoCapacity", "UnknownModelKey", "NoLongerDesired", "BudgetEvict",
+            "BudgetRefuse", "ClaimedClearable", "ClaimedSamePlan",
+        ] {
+            assert!(reasons.contains(want), "sweep never produced {want}: {reasons:?}");
+        }
+        for want in [
+            "BudgetExceededOperatorOverride", "ResidentBytesUnknown", "CtxDivergence",
+            "UtilityBindingEvicted", "ForeignDuplicateResident", "LoadEstimateUnknown",
+        ] {
+            assert!(warnings.contains(want), "sweep never produced {want}: {warnings:?}");
+        }
+        assert!(budget_evict && pool_evict, "both eviction arms reached");
+    }
+
+    #[test]
+    fn pool_headroom_shortfall_without_a_foreign_duplicate_is_never_refused() {
+        // The #1140 arm refuses only a load-alongside behind a foreign
+        // duplicate. Loads that exceed the pool headroom together, or even
+        // alone, with nothing evictable all stay Loads: the executor's
+        // #1139 fast-fail owns that shortfall.
+        let f = Facts {
+            pools: BTreeMap::from([(
+                PoolId("unified".into()),
+                PoolFact { capacity_bytes: 64 * GB, available_bytes: 12 * GB },
+            )]),
+            ..Default::default()
+        };
+        let desired = [placement("b", 8_000), placement("a", 8_000), placement("big", 8_000)];
+        let est = est_map(&[("a", 10 * GB), ("b", 6 * GB), ("big", 20 * GB)]);
+        let plan = plan_acquire(&desired, &f, additive_auto(), &est);
+        assert_eq!(
+            plan.actions,
+            vec![load_action("b", 8_000), load_action("a", 8_000), load_action("big", 8_000)]
         );
     }
 

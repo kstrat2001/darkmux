@@ -1335,7 +1335,7 @@ fn utility_in_profiles_status(registry: &darkmux_types::ProfileRegistry) -> Chec
     };
     // Match on the bare model key in either spelling, the same comparison
     // every utility-model check in darkmux-crew uses.
-    let bare = |id: &str| id.strip_prefix("darkmux:").unwrap_or(id).to_string();
+    let bare = |id: &str| darkmux_gestalt::bare_model_key(id).to_string();
     let utility_key = bare(utility);
     let mut offenders: Vec<(String, Option<u32>)> = registry
         .profiles
@@ -7301,16 +7301,18 @@ fn check_platform_and_provider() -> Check {
     // Pass when a non-generic provider claims the hardware (i.e. we have
     // validated rules for it). Warn when only generic matched — heuristics
     // will work but suggestions are unvalidated for this platform.
-    if provider.id() == "generic" {
+    if provider.is_generic() {
         Check {
             name: "platform / heuristics".into(),
             status: Status::Warn,
             message: format!("{summary} → provider=`generic` (unvalidated)"),
             hint: Some(
-                "darkmux ships rules for Apple Silicon at 64GB and 128GB+. Your hardware \
-                 doesn't match a validated provider; profile draft suggestions will use \
+                "darkmux ships rules for Apple Silicon at 32GB, 64GB and 128GB+ (the \
+                 128GB tier is measured; 32GB and 64GB are extrapolated from it). Your \
+                 hardware doesn't match any of them; profile draft suggestions will use \
                  conservative defaults. Consider opening a PR with measured rules for \
-                 your platform — see src/heuristics/ for the trait + existing examples."
+                 your platform — see crates/darkmux-heuristics/ for the trait + existing \
+                 examples."
                     .into(),
             ),
         }

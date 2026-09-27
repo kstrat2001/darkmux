@@ -755,6 +755,7 @@ dependencies = [
  "darkmux-crew",
  "darkmux-eureka",
  "darkmux-flow",
+ "darkmux-gestalt",
  "darkmux-hardware",
  "darkmux-heuristics",
  "darkmux-profiles",

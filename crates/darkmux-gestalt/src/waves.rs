@@ -86,7 +86,7 @@ use crate::estimator::FootprintEstimator;
 use crate::facts::Facts;
 use crate::plan::{Reason, Warning};
 use crate::planner::{
-    commit_surviving_stales, resident_base, single_pool_headroom,
+    commit_surviving_stales, resident_base, resident_bytes, single_pool_headroom,
     warn_unknown_owned_resident_bytes, ReconcileStale,
 };
 use crate::residency::{decide_residency, ResidencyDecision};
@@ -295,96 +295,133 @@ pub fn plan_waves(
     mode: WaveMode,
 ) -> Result<WaveSchedule, ForceParallelRefused> {
     let mut warnings: Vec<Warning> = Vec::new();
-
-    // ── classify + price each placement (input order) ────────────────────
-    // A Reuse placement's bytes are already in the base ⇒ zero additional
-    // cost. Reconcile stale credits are DEFERRED (the shared #1243/#1140
-    // removal-timing accounting — module docs): a stale leaves the budget
-    // base and joins the pool's freeable headroom only once its reconcile
-    // survives every refusal pass. Unknown estimates count 0 and warn — the
-    // planner's documented degradation, never a panic.
-    let mut costs: Vec<u64> = Vec::with_capacity(placements.len());
-    let mut stales: Vec<ReconcileStale> = Vec::new();
-    // Placement index → the foreign duplicate (identifier, pool cost)
-    // behind it: a pool-bound refusal names the instance (the planner's
-    // #1140 arm vocabulary, absolute ownership #1274).
-    let mut foreign_dups: BTreeMap<usize, (String, Option<u64>)> = BTreeMap::new();
-    for (i, p) in placements.iter().enumerate() {
-        match decide_residency(&facts.residents, p) {
-            ResidencyDecision::Reuse { .. } => costs.push(0),
-            decision => {
-                match &decision {
-                    ResidencyDecision::Reconcile { stale_identifier, .. } => {
-                        stales.push(ReconcileStale::locate(facts, stale_identifier, i));
-                    }
-                    ResidencyDecision::ForeignDuplicate { foreign_identifier } => {
-                        let bytes = facts
-                            .residents
-                            .iter()
-                            .find(|r| r.identifier == *foreign_identifier)
-                            .and_then(|r| r.est_bytes);
-                        foreign_dups.insert(i, (foreign_identifier.clone(), bytes));
-                    }
-                    _ => {}
-                }
-                let e = est.estimate_bytes(&p.model_key, p.min_ctx, facts.catalog.as_deref());
-                if e.is_none() {
-                    warnings.push(Warning::LoadEstimateUnknown { model_key: p.model_key.clone() });
-                }
-                costs.push(e.unwrap_or(0));
-            }
-        }
-    }
-
-    let budget = facts.budget.max_darkmux_bytes;
-    if budget.is_some() {
+    let priced = Priced::classify(placements, facts, est, &mut warnings);
+    if facts.budget.max_darkmux_bytes.is_some() {
         warn_unknown_owned_resident_bytes(&mut warnings, facts);
     }
-
-    // ── ForceParallel: whole-schedule arithmetic, no per-placement refusals ─
-    // Every reconcile in the single demanded wave executes (its unload half
-    // precedes the loads), so every stale credit commits.
-    if mode == WaveMode::ForceParallel {
-        let mut removed: BTreeSet<usize> = BTreeSet::new();
-        commit_surviving_stales(&stales, &mut removed, |_| true);
-        let limit = Ceilings::compute(facts, &removed).effective();
-        let need: u64 = costs.iter().sum();
-        if let Some(l) = limit.filter(|&l| need > l) {
-            return Err(ForceParallelRefused { need_bytes: need, limit_bytes: l });
+    let pack: Packer = match mode {
+        WaveMode::ForceParallel => return force_parallel(placements, facts, &priced, warnings),
+        WaveMode::ForceSequential => pack_one_per_wave,
+        WaveMode::Auto => pack_first_fit,
+    };
+    let (refused, limit) = refusal_passes(facts, &priced);
+    let mut refusals: Vec<WaveRefusal> = Vec::new();
+    let mut survivors: Vec<(Placement, u64)> = Vec::new();
+    for ((p, cost), refusal) in placements.iter().zip(&priced.costs).zip(refused) {
+        match refusal {
+            Some(reason) => refusals.push(WaveRefusal { placement: p.clone(), reason }),
+            None => survivors.push((p.clone(), *cost)),
         }
-        let waves: Vec<Vec<Placement>> =
-            if placements.is_empty() { Vec::new() } else { vec![placements.to_vec()] };
-        return Ok(WaveSchedule {
-            waves,
-            refusals: Vec::new(),
-            mode,
-            effective_limit_bytes: limit,
-            warnings,
-        });
     }
+    let waves = pack(&survivors, limit);
+    Ok(WaveSchedule { waves, refusals, mode, effective_limit_bytes: limit, warnings })
+}
 
-    // ── refusal passes (Auto + ForceSequential): plan_acquire's ordering ──
-    // Flat refusals first against the un-credited accounting, then commit
-    // the stale credits of surviving reconciles, then the fit pass against
-    // the updated base (module docs). A refused reconcile keeps its stale
-    // loaded and counted — refusal is non-destructive.
-    let mut refused: Vec<Option<Reason>> = vec![None; placements.len()];
+/// A per-mode packer: survivors (placement, cost) in input order and the
+/// effective limit in, waves out.
+type Packer = fn(&[(Placement, u64)], Option<u64>) -> Vec<Vec<Placement>>;
+
+/// Each placement's additional cost plus the residency facts the refusal
+/// passes need, in input order.
+struct Priced {
+    /// A Reuse placement's bytes are already in the base ⇒ zero
+    /// additional cost. Unknown estimates count 0 and warn — the planner's
+    /// documented degradation, never a panic.
+    costs: Vec<u64>,
+    /// Reconcile stales. Their credits are DEFERRED (the shared
+    /// #1243/#1140 removal-timing accounting — module docs): a stale leaves
+    /// the budget base and joins the pool's freeable headroom only once its
+    /// reconcile survives every refusal pass.
+    stales: Vec<ReconcileStale>,
+    /// Placement index → the foreign duplicate (identifier, pool cost)
+    /// behind it: a pool-bound refusal names the instance (the planner's
+    /// #1140 arm vocabulary, absolute ownership #1274).
+    foreign_dups: BTreeMap<usize, (String, Option<u64>)>,
+}
+
+impl Priced {
+    fn classify(
+        placements: &[Placement],
+        facts: &Facts,
+        est: &dyn FootprintEstimator,
+        warnings: &mut Vec<Warning>,
+    ) -> Self {
+        let mut priced =
+            Priced { costs: Vec::with_capacity(placements.len()), stales: Vec::new(), foreign_dups: BTreeMap::new() };
+        let mut estimate = |p: &Placement| {
+            let e = est.estimate_bytes(&p.model_key, p.min_ctx, facts.catalog.as_deref());
+            if e.is_none() {
+                warnings.push(Warning::LoadEstimateUnknown { model_key: p.model_key.clone() });
+            }
+            e.unwrap_or(0)
+        };
+        for (i, p) in placements.iter().enumerate() {
+            let cost = match decide_residency(&facts.residents, p) {
+                ResidencyDecision::Reuse { .. } => 0,
+                ResidencyDecision::LoadFresh => estimate(p),
+                ResidencyDecision::Reconcile { stale_identifier, .. } => {
+                    priced.stales.push(ReconcileStale::locate(facts, &stale_identifier, i));
+                    estimate(p)
+                }
+                ResidencyDecision::ForeignDuplicate { foreign_identifier } => {
+                    let bytes = resident_bytes(facts, &foreign_identifier);
+                    priced.foreign_dups.insert(i, (foreign_identifier, bytes));
+                    estimate(p)
+                }
+            };
+            priced.costs.push(cost);
+        }
+        priced
+    }
+}
+
+/// ForceParallel: whole-schedule arithmetic, no per-placement refusals.
+/// Every reconcile in the single demanded wave executes (its unload half
+/// precedes the loads), so every stale credit commits.
+fn force_parallel(
+    placements: &[Placement],
+    facts: &Facts,
+    priced: &Priced,
+    warnings: Vec<Warning>,
+) -> Result<WaveSchedule, ForceParallelRefused> {
+    let mut removed: BTreeSet<usize> = BTreeSet::new();
+    commit_surviving_stales(&priced.stales, &mut removed, |_| true);
+    let limit = Ceilings::compute(facts, &removed).effective();
+    let need: u64 = priced.costs.iter().sum();
+    if let Some(l) = limit.filter(|&l| need > l) {
+        return Err(ForceParallelRefused { need_bytes: need, limit_bytes: l });
+    }
+    let waves: Vec<Vec<Placement>> =
+        if placements.is_empty() { Vec::new() } else { vec![placements.to_vec()] };
+    Ok(WaveSchedule {
+        waves,
+        refusals: Vec::new(),
+        mode: WaveMode::ForceParallel,
+        effective_limit_bytes: limit,
+        warnings,
+    })
+}
+
+/// The refusal passes (Auto + ForceSequential), in `plan_acquire`'s
+/// ordering: flat refusals first against the un-credited accounting, then
+/// the stale credits of surviving reconciles commit, then the fit pass
+/// against the updated base (module docs). A refused reconcile keeps its
+/// stale loaded and counted — refusal is non-destructive. Returns each
+/// placement's refusal (input order) and the effective limit.
+fn refusal_passes(facts: &Facts, priced: &Priced) -> (Vec<Option<Reason>>, Option<u64>) {
+    let mut refused: Vec<Option<Reason>> = vec![None; priced.costs.len()];
+    let budget = facts.budget.max_darkmux_bytes;
 
     // Flat half: an estimate exceeding the WHOLE #1243 budget can never
-    // fit, whatever frees happen (plan_acquire's flat pass; both refusal
-    // halves carry the CONFIGURED budget, never the min'd effective limit).
+    // fit, whatever frees happen (plan_acquire's flat pass).
     if let Some(b) = budget {
-        for (i, &cost) in costs.iter().enumerate() {
-            if cost > b {
-                refused[i] = Some(Reason::BudgetRefuse { est_bytes: cost, budget_bytes: b });
-            }
-        }
+        refuse_over_budget(&mut refused, &priced.costs, b, b);
     }
 
     // Stale credits for surviving reconciles only — the shared removal-
     // timing helper (one implementation of the #1243/#1140 rule, not two).
     let mut removed: BTreeSet<usize> = BTreeSet::new();
-    commit_surviving_stales(&stales, &mut removed, |i| refused[i].is_none());
+    commit_surviving_stales(&priced.stales, &mut removed, |i| refused[i].is_none());
 
     let ceilings = Ceilings::compute(facts, &removed);
     let limit = ceilings.effective();
@@ -394,11 +431,7 @@ pub fn plan_waves(
     // cannot fit the budget atop it is refused (plan_acquire's
     // post-eviction refusal, naming the configured budget).
     if let (Some(b), Some(h)) = (budget, ceilings.budget_headroom) {
-        for (i, &cost) in costs.iter().enumerate() {
-            if refused[i].is_none() && cost > h {
-                refused[i] = Some(Reason::BudgetRefuse { est_bytes: cost, budget_bytes: b });
-            }
-        }
+        refuse_over_budget(&mut refused, &priced.costs, h, b);
     }
 
     // Pool half: a survivor exceeding the effective limit is pool-bound
@@ -406,82 +439,75 @@ pub fn plan_waves(
     // produced the limit), and only a foreign duplicate is ever
     // pool-refused — its bytes are the pressure darkmux may not free
     // (absolute ownership, #1274; the planner's #1140 arm). Non-foreign
-    // pool-bound placements proceed alone in their own wave below; the
+    // pool-bound placements proceed alone in their own wave; the
     // executor's #1139 fast-fail owns physical shortfall (module docs).
     if let Some(l) = limit {
-        for (i, &cost) in costs.iter().enumerate() {
-            let Some((fid, fbytes)) = foreign_dups.get(&i) else { continue };
-            if refused[i].is_none() && cost > l {
-                refused[i] = Some(Reason::ForeignDuplicateNoCapacity {
-                    foreign_identifier: fid.clone(),
-                    foreign_bytes: *fbytes,
-                    est_bytes: cost,
-                    limit_bytes: l,
-                });
-            }
+        refuse_foreign_duplicates_over(&mut refused, priced, l);
+    }
+    (refused, limit)
+}
+
+/// Refuse every not-yet-refused cost above `bound`, naming the CONFIGURED
+/// budget (never the min'd effective limit) — both budget refusal halves.
+fn refuse_over_budget(refused: &mut [Option<Reason>], costs: &[u64], bound: u64, budget: u64) {
+    for (slot, &cost) in refused.iter_mut().zip(costs) {
+        if slot.is_none() && cost > bound {
+            *slot = Some(Reason::BudgetRefuse { est_bytes: cost, budget_bytes: budget });
         }
     }
+}
 
-    // ── partition per mode ───────────────────────────────────────────────
+fn refuse_foreign_duplicates_over(refused: &mut [Option<Reason>], priced: &Priced, limit: u64) {
+    for (&i, (fid, fbytes)) in &priced.foreign_dups {
+        let cost = priced.costs[i];
+        if refused[i].is_none() && cost > limit {
+            refused[i] = Some(Reason::ForeignDuplicateNoCapacity {
+                foreign_identifier: fid.clone(),
+                foreign_bytes: *fbytes,
+                est_bytes: cost,
+                limit_bytes: limit,
+            });
+        }
+    }
+}
+
+/// ForceSequential: one survivor per wave, in input order.
+fn pack_one_per_wave(survivors: &[(Placement, u64)], _limit: Option<u64>) -> Vec<Vec<Placement>> {
+    survivors.iter().map(|(p, _)| vec![p.clone()]).collect()
+}
+
+/// Auto: first-fit in input order (the packing rule, module docs).
+fn pack_first_fit(survivors: &[(Placement, u64)], limit: Option<u64>) -> Vec<Vec<Placement>> {
+    let Some(l) = limit else {
+        // No known constraint — one wave, executor backstops. (No refusals
+        // exist here: every refusal requires a budget or pool fact, which
+        // would make the limit Some.)
+        return if survivors.is_empty() {
+            Vec::new()
+        } else {
+            vec![survivors.iter().map(|(p, _)| p.clone()).collect()]
+        };
+    };
     let mut waves: Vec<Vec<Placement>> = Vec::new();
-    let mut refusals: Vec<WaveRefusal> = Vec::new();
-    match mode {
-        WaveMode::ForceParallel => {
-            unreachable!("ForceParallel returned its whole-schedule result above")
-        }
-        WaveMode::ForceSequential => {
-            for (i, p) in placements.iter().enumerate() {
-                if let Some(reason) = refused[i].take() {
-                    refusals.push(WaveRefusal { placement: p.clone(), reason });
-                    continue;
-                }
-                waves.push(vec![p.clone()]);
+    // Running per-wave totals for the first-fit walk.
+    let mut loads: Vec<u64> = Vec::new();
+    for (p, cost) in survivors {
+        // A pool-bound survivor (refusal division, module docs) exceeds the
+        // limit alone, so no wave fits it and first-fit never adds a
+        // companion — it rides alone, with the executor's #1139 backstop
+        // owning the shortfall.
+        match loads.iter().position(|&w| w + cost <= l) {
+            Some(w_idx) => {
+                waves[w_idx].push(p.clone());
+                loads[w_idx] += cost;
             }
-        }
-        WaveMode::Auto => {
-            // Running per-wave totals for the first-fit walk.
-            let mut loads: Vec<u64> = Vec::new();
-            for (i, p) in placements.iter().enumerate() {
-                if let Some(reason) = refused[i].take() {
-                    refusals.push(WaveRefusal { placement: p.clone(), reason });
-                    continue;
-                }
-                let cost = costs[i];
-                let Some(l) = limit else {
-                    // No known constraint — one wave, executor backstops.
-                    // (No refusals exist here: every refusal requires a
-                    // budget or pool fact, which would make the limit Some.)
-                    if waves.is_empty() {
-                        waves.push(Vec::new());
-                    }
-                    waves[0].push(p.clone());
-                    continue;
-                };
-                if cost > l {
-                    // Pool-bound survivor (refusal division, module docs):
-                    // alone in its own wave — its load alone exceeds the
-                    // limit, so first-fit never adds a companion — with the
-                    // executor's #1139 backstop owning the shortfall.
-                    waves.push(vec![p.clone()]);
-                    loads.push(cost);
-                    continue;
-                }
-                // First-fit in input order (the packing rule, module docs).
-                match loads.iter().position(|&w| w + cost <= l) {
-                    Some(w_idx) => {
-                        waves[w_idx].push(p.clone());
-                        loads[w_idx] += cost;
-                    }
-                    None => {
-                        waves.push(vec![p.clone()]);
-                        loads.push(cost);
-                    }
-                }
+            None => {
+                waves.push(vec![p.clone()]);
+                loads.push(*cost);
             }
         }
     }
-
-    Ok(WaveSchedule { waves, refusals, mode, effective_limit_bytes: limit, warnings })
+    waves
 }
 
 #[cfg(test)]
@@ -495,7 +521,7 @@ mod tests {
     use super::*;
     use crate::estimator::{ArchEstimator, ArchFacts, FixedEstimator};
     use crate::facts::{Budget, CatalogFact, Facts, PoolFact, PoolId, Pools, ResidentFact};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     const GB: u64 = 1_000_000_000;
     // The #1286 probed potentials (weights + KV at profile ctx + margin).
@@ -555,6 +581,116 @@ mod tests {
             PoolId("unified".into()),
             PoolFact { capacity_bytes: 128 * GB, available_bytes: available },
         )])
+    }
+
+    // ── characterization sweep ───────────────────────────────────────────
+
+    /// Every combination of a small resident universe (undersized /
+    /// sufficient owned copy, foreign duplicate, alias resident, idle and
+    /// unknown-size owned residents), placement set, budget, pool and mode.
+    type SweptSchedule = (Vec<Placement>, Facts, WaveMode, Result<WaveSchedule, ForceParallelRefused>);
+
+    fn wave_sweep() -> Vec<SweptSchedule> {
+        let placement_sets: Vec<Vec<Placement>> = vec![
+            vec![],
+            vec![placement("a", 32_000)],
+            vec![placement("a", 32_000), aliased("b", 32_000, "alias-b"), placement("c", 8_000)],
+            vec![placement("big", 8_000), placement("b", 8_000), placement("a", 32_000), placement("c", 8_000)],
+        ];
+        // "c" is deliberately unpriced: the unknown-estimate path.
+        let est = est_map(&[("a", 10 * GB), ("b", 6 * GB), ("big", 30 * GB)]);
+        let mut out = Vec::new();
+        for own in [None, Some(4_096u64), Some(64_000)] {
+            for bits in 0u8..8 {
+                let mut residents = Vec::new();
+                if let Some(ctx) = own {
+                    residents.push(resident("darkmux:a", "a", ctx, Some(10 * GB)));
+                }
+                if bits & 1 != 0 {
+                    residents.push(resident("a-user", "a", 64_000, Some(12 * GB)));
+                }
+                if bits & 2 != 0 {
+                    residents.push(resident("alias-b", "b", 4_096, Some(6 * GB)));
+                }
+                if bits & 4 != 0 {
+                    residents.push(resident("darkmux:idle", "idle", 8_000, Some(8 * GB)));
+                    residents.push(resident("darkmux:nosize", "nosize", 8_000, None));
+                }
+                for placements in &placement_sets {
+                    for budget in [None, Some(15 * GB), Some(25 * GB)] {
+                        for pools in [Pools::new(), single_pool(9 * GB), single_pool(20 * GB)] {
+                            for mode in [WaveMode::Auto, WaveMode::ForceParallel, WaveMode::ForceSequential] {
+                                let facts = Facts {
+                                    residents: residents.clone(),
+                                    pools: pools.clone(),
+                                    budget: Budget { max_darkmux_bytes: budget },
+                                    ..Default::default()
+                                };
+                                let r = plan_waves(placements, &facts, &est, mode);
+                                out.push((placements.clone(), facts, mode, r));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_placement_is_scheduled_exactly_once_across_a_sweep() {
+        let mut seen_refusal_kinds: BTreeSet<&str> = BTreeSet::new();
+        let mut seen_multi_wave = false;
+        let mut seen_force_parallel_refused = false;
+        for (placements, facts, mode, result) in wave_sweep() {
+            let ctx = format!("placements={placements:?}\nfacts={facts:?}\nmode={mode:?}\nresult={result:?}");
+            let schedule = match (mode, result) {
+                (WaveMode::ForceParallel, Err(refused)) => {
+                    assert!(refused.need_bytes > refused.limit_bytes, "{ctx}");
+                    seen_force_parallel_refused = true;
+                    continue;
+                }
+                (WaveMode::ForceParallel, Ok(s)) => {
+                    assert!(s.waves.len() <= 1 && s.refusals.is_empty(), "{ctx}");
+                    s
+                }
+                (WaveMode::Auto | WaveMode::ForceSequential, Err(_)) => panic!("only ForceParallel errs\n{ctx}"),
+                (WaveMode::Auto | WaveMode::ForceSequential, Ok(s)) => s,
+            };
+            assert_eq!(schedule.mode, mode, "{ctx}");
+            // Every placement appears exactly once, and input order holds
+            // within each wave and among the refusals.
+            let mut scheduled: Vec<&Placement> = schedule.waves.iter().flatten().collect();
+            scheduled.extend(schedule.refusals.iter().map(|r| &r.placement));
+            assert_eq!(scheduled.len(), placements.len(), "{ctx}");
+            for p in &placements {
+                assert!(scheduled.contains(&p), "{p:?} lost\n{ctx}");
+            }
+            let position = |p: &Placement| placements.iter().position(|q| q == p).unwrap();
+            for w in &schedule.waves {
+                assert!(!w.is_empty(), "empty wave\n{ctx}");
+                assert!(w.windows(2).all(|x| position(&x[0]) < position(&x[1])), "{ctx}");
+            }
+            if mode == WaveMode::ForceSequential {
+                assert!(schedule.waves.iter().all(|w| w.len() == 1), "{ctx}");
+            }
+            seen_multi_wave |= schedule.waves.len() > 1;
+            for r in &schedule.refusals {
+                match &r.reason {
+                    Reason::BudgetRefuse { budget_bytes, .. } => {
+                        assert_eq!(Some(*budget_bytes), facts.budget.max_darkmux_bytes, "names the configured budget\n{ctx}");
+                        seen_refusal_kinds.insert("budget");
+                    }
+                    Reason::ForeignDuplicateNoCapacity { foreign_identifier, .. } => {
+                        assert!(!foreign_identifier.starts_with("darkmux:"), "{ctx}");
+                        seen_refusal_kinds.insert("foreign");
+                    }
+                    other => panic!("unexpected refusal reason {other:?}\n{ctx}"),
+                }
+            }
+        }
+        assert_eq!(seen_refusal_kinds.len(), 2, "{seen_refusal_kinds:?}");
+        assert!(seen_multi_wave && seen_force_parallel_refused);
     }
 
     // ── #1877: wave_schedule_to_exec_mode's own table ────────────────────
@@ -765,6 +901,27 @@ mod tests {
             .expect("only ForceParallel refuses the whole schedule");
         assert_eq!(schedule.waves, vec![placements]);
         assert_eq!(schedule.refusals, vec![]);
+    }
+
+    #[test]
+    fn estimate_exactly_at_the_budget_headroom_is_not_refused() {
+        // Equality edges on both budget refusal halves: an estimate equal
+        // to the whole budget (flat half), and one equal to the headroom
+        // left atop an un-evictable darkmux base (fit half), both schedule.
+        let placements = vec![placement("devstral", 32_768)];
+        let schedule =
+            plan_waves(&placements, &budget_gb(26), &est_map(&[("devstral", 26 * GB)]), WaveMode::Auto)
+                .expect("only ForceParallel refuses the whole schedule");
+        assert_eq!((schedule.waves, schedule.refusals), (vec![placements.clone()], vec![]));
+
+        let facts = Facts {
+            residents: vec![resident("darkmux:other", "other", 8_000, Some(6 * GB))],
+            ..budget_gb(26)
+        };
+        let schedule =
+            plan_waves(&placements, &facts, &est_map(&[("devstral", 20 * GB)]), WaveMode::Auto)
+                .expect("only ForceParallel refuses the whole schedule");
+        assert_eq!((schedule.waves, schedule.refusals), (vec![placements], vec![]));
     }
 
     // ── packing-rule rows ────────────────────────────────────────────────

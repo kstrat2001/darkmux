@@ -222,7 +222,7 @@ pub fn choose_worker_model(
 ) -> Option<String> {
     let llms: Vec<&darkmux_profiles::lms::ModelMeta> = available.iter().filter(|m| m.model_type == "llm").collect();
     for id in loaded {
-        let key = id.strip_prefix("darkmux:").unwrap_or(id);
+        let key = darkmux_gestalt::bare_model_key(id);
         if let Some(m) = llms.iter().find(|m| m.model_key == key) {
             return Some(m.model_key.clone());
         }
