@@ -19,6 +19,7 @@ describe("leftTrimWidth (#2963)", () => {
 
   it("never narrows below the ellipsis, and does nothing it cannot measure", () => {
     expect(leftTrimWidth({ available: 12, full: 200, chars: 20, ellipsis: 10 })).toBe(10.5);
+    expect(leftTrimWidth({ available: 5, full: 200, chars: 20, ellipsis: 10 })).toBe(10.5);
     expect(leftTrimWidth({ available: 0, full: 0, chars: 20, ellipsis: 10 })).toBeNull();
     expect(leftTrimWidth({ available: 95, full: 200, chars: 0, ellipsis: 10 })).toBeNull();
   });
