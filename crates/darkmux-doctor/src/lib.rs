@@ -138,7 +138,6 @@ pub fn run() -> DoctorReport {
     let mut checks = vec![
         check_build_info(),
         check_profile_registry(),
-        check_crews_residue(),
         // (#2707) Read-only: counts what darkmux left in the temp root.
         check_temp_residue(),
         check_mission_config_registry(),
@@ -169,8 +168,6 @@ pub fn run() -> DoctorReport {
         check_openai_base_url_conflict(),
         check_redis_config(),
         check_gh_allowlist(),
-        check_removed_review_config_block(),
-        check_removed_telemetry_record_every_samples(),
         check_removed_radio_router_staffing(),
         check_removed_notebook_settings(),
         check_retired_role_leftovers(),
@@ -1359,8 +1356,8 @@ fn utility_in_profiles_status(registry: &darkmux_types::ProfileRegistry) -> Chec
 /// binding in the dynamic map), and the `DARKMUX_RADIO_ROUTER_PROFILE` env
 /// var. Routing runs on the machine's utility model now, so each of these
 /// is inert; `Warn` naming whichever are still set, with the one fix.
-/// Same shape as `check_removed_review_config_block` (the key is read off
-/// `radio.extras`, where the typed struct no longer has a field for it).
+/// The key is read off `radio.extras`, where the typed struct no longer has
+/// a field for it.
 fn check_removed_radio_router_staffing() -> Check {
     let cfg = darkmux_types::config::DarkmuxConfig::load_resolved();
     let router_profile_present = cfg.radio.as_ref().is_some_and(|r| r.extras.contains_key("router_profile"));
@@ -2546,78 +2543,6 @@ fn build_hooks_check(
 /// holds the leftover key (#2913 review C4).
 fn resolved_config_path() -> std::path::PathBuf {
     darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config
-}
-
-/// (#1876/#1877; #2310 P4d; #2404 P4d round 3) The `review{}` config block
-/// (`judge_fail_on_any_skip` / `judge_concurrency`) was REMOVED from
-/// `DarkmuxConfig` in CONFIG_SCHEMA_VERSION 1.22 — the review funnel those
-/// knobs tuned was deleted in #2310 P4d, and darkmux is pre-1.0 (no
-/// deprecate-in-place; remove outright). Because the field is gone, a
-/// `config.json` still carrying a `review` key lands it in the top-level
-/// `extras` overflow (lenient-on-read) instead of a typed field — this
-/// check looks THERE, not at a typed accessor that no longer exists.
-///
-/// `Pass` when `extras` has no `review` key at all (the common case, and
-/// the case `DarkmuxConfig::with_defaults()` must produce — a regression
-/// here is exactly what let the round-2 field survive one review pass).
-/// `Warn`, naming the key, when an old config still has it.
-fn check_removed_review_config_block() -> Check {
-    let name = "review.judge_* (removed)";
-    let cfg = darkmux_types::config::DarkmuxConfig::load_resolved();
-    if !cfg.extras.contains_key("review") {
-        return Check {
-            name: name.into(),
-            status: Status::Pass,
-            message: "not present".into(),
-            hint: None,
-        };
-    }
-    Check {
-        name: name.into(),
-        status: Status::Warn,
-        // Hardcoded, not `CONFIG_SCHEMA_VERSION` — that constant marches
-        // forward with every future schema bump, but the `review` block
-        // was removed in ONE specific past version (1.22). Formatting the
-        // live constant here would make this message quietly lie about
-        // WHEN the removal happened the moment the schema bumps again.
-        message: "config.json has a `review` key — removed in CONFIG 1.22; delete it from config.json".into(),
-        hint: Some(format!(
-            "the review funnel this block configured was deleted in #2310 P4d; remove the \
-             `review` block from {} — it is read leniently but has no effect",
-            resolved_config_path().display()
-        )),
-    }
-}
-
-/// (#2413 M5) `runtime.telemetry_record_every_samples` is retired — the
-/// per-dispatch `machine.telemetry` curve it configured a downsample rate
-/// for is gone (one machine-scoped sampler now owns that emission). Same
-/// shape as `check_removed_review_config_block` just above: `Pass` when
-/// absent (including a fresh `with_defaults()` config), `Warn` naming the
-/// key and telling the operator to delete it when present.
-fn check_removed_telemetry_record_every_samples() -> Check {
-    let name = "runtime.telemetry_record_every_samples (removed)";
-    let cfg = darkmux_types::config::DarkmuxConfig::load_resolved();
-    let present = cfg
-        .runtime
-        .as_ref()
-        .is_some_and(|r| r.extras.contains_key("telemetry_record_every_samples"));
-    if !present {
-        return Check { name: name.into(), status: Status::Pass, message: "not present".into(), hint: None };
-    }
-    Check {
-        name: name.into(),
-        status: Status::Warn,
-        message: "config.json has `runtime.telemetry_record_every_samples` — retired in CONFIG 1.22; \
-                  delete it from config.json"
-            .into(),
-        hint: Some(
-            "the per-dispatch machine.telemetry curve it downsampled is gone (#2413) — remove \
-             `telemetry_record_every_samples` from the `runtime` block in ~/.darkmux/config.json; \
-             it is read leniently but has no effect"
-                .into(),
-        ),
-    }
 }
 
 /// (#2913, 4.0) `dirs.notebook` and `DARKMUX_NOTEBOOK_DIR` are removed —
@@ -5511,39 +5436,28 @@ fn loopback_http_body(host: &str, port: u16, path: &str) -> Option<String> {
     response.split_once("\r\n\r\n").map(|(_, b)| b.to_string())
 }
 
-/// What a running daemon told us about itself on `/health`.
+/// What a running daemon told us about itself on `/health` (#1461).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum DaemonBuild {
-    /// The daemon reports its full build identity (#1461+).
-    Modern {
-        /// `build` — package version PLUS git short SHA, so two daemons built
-        /// from different commits at the same package version are
-        /// distinguishable.
-        build: String,
-        /// `binary_mtime` — when the binary the daemon loaded was last written.
-        /// `None` from a daemon that couldn't stat its own exe.
-        binary_mtime: Option<u64>,
-    },
-    /// A daemon predating #1461 reports only `darkmux_version`. Comparing that
-    /// bare version against this binary's build-tagged one would not be an
-    /// apples-to-apples comparison — but no comparison is needed: a daemon
-    /// with no `build` field was necessarily compiled before this code existed,
-    /// so it is stale by construction.
-    Legacy(String),
+struct DaemonBuild {
+    /// `build` — package version PLUS git short SHA, so two daemons built
+    /// from different commits at the same package version are
+    /// distinguishable.
+    build: String,
+    /// `binary_mtime` — when the binary the daemon loaded was last written.
+    /// `None` from a daemon that couldn't stat its own exe.
+    binary_mtime: Option<u64>,
 }
 
-/// Pull the running daemon's build identity out of a `/health` body.
+/// Pull the running daemon's build identity out of a `/health` body. `None`
+/// when there is none to read, including a pre-#1461 daemon that reports no
+/// `build` field.
 fn parse_daemon_build(health_body: &str) -> Option<DaemonBuild> {
     let v: serde_json::Value = serde_json::from_str(health_body).ok()?;
-    if let Some(build) = v.get("build").and_then(|b| b.as_str()) {
-        return Some(DaemonBuild::Modern {
-            build: build.to_string(),
-            binary_mtime: v.get("binary_mtime").and_then(|m| m.as_u64()),
-        });
-    }
-    v.get("darkmux_version")
-        .and_then(|b| b.as_str())
-        .map(|s| DaemonBuild::Legacy(s.to_string()))
+    let build = v.get("build").and_then(|b| b.as_str())?;
+    Some(DaemonBuild {
+        build: build.to_string(),
+        binary_mtime: v.get("binary_mtime").and_then(|m| m.as_u64()),
+    })
 }
 
 /// Modification time of the darkmux binary doctor is running from, in whole
@@ -5627,9 +5541,11 @@ fn classify_daemon_freshness(
 ) -> Check {
     let Some(running) = running else {
         // No daemon is the common case — most users never run one. Silent.
+        // A pre-#1461 daemon (no build id) lands here too: the reachability
+        // check still reports that it answered.
         return not_applicable(
             DAEMON_FRESHNESS_CHECK_NAME,
-            "no darkmux serve daemon running on this machine",
+            "no darkmux serve daemon reporting a build id on this machine",
         );
     };
     let warn = |message: String| Check {
@@ -5639,12 +5555,7 @@ fn classify_daemon_freshness(
         hint: restart_daemon_hint(),
     };
     match running {
-        DaemonBuild::Legacy(v) => warn(format!(
-            "a darkmux serve daemon is running an OLDER build than this binary \
-             ({installed_build}) — it reports darkmux {v} with no build id, which only a daemon \
-             started before this check shipped does, so it cannot have your latest code"
-        )),
-        DaemonBuild::Modern { build, .. } if build != installed_build => warn(format!(
+        DaemonBuild { build, .. } if build != installed_build => warn(format!(
             "a darkmux serve daemon is running a DIFFERENT build ({build}) than this binary \
              ({installed_build}) — it serves its in-memory code until restarted, so anything you \
              verify against it is testing that build, not this one"
@@ -5653,7 +5564,7 @@ fn classify_daemon_freshness(
         // same commit-plus-dirty-marker before and after a reinstall from an
         // uncommitted tree, so the binary can have been replaced underneath a
         // still-running daemon without the tag moving at all.
-        DaemonBuild::Modern {
+        DaemonBuild {
             build,
             binary_mtime: Some(daemon_mtime),
         } if installed_mtime.is_some_and(|installed| installed != daemon_mtime) => {
@@ -5694,7 +5605,7 @@ fn classify_daemon_freshness(
                 }
             }
         }
-        DaemonBuild::Modern { build, .. } => Check {
+        DaemonBuild { build, .. } => Check {
             name: DAEMON_FRESHNESS_CHECK_NAME.into(),
             status: Status::Pass,
             message: format!("running daemon matches this binary ({build})"),
@@ -6117,55 +6028,6 @@ fn check_profile_registry() -> Check {
                 .to_string(),
             hint: Some("run `darkmux init` to create one".into()),
         },
-    }
-}
-
-/// (#1426 ship-2) The `crews` map retired from the profiles schema — a crew is
-/// now a DERIVED view of a mission's resourcing, staffed by
-/// `darkmux_crew::resourcing`, never declared. A profiles.json still carrying a
-/// `crews` key parses fine (the key overflows into `ProfileRegistry.extras`,
-/// lenient-on-read) and is harmless residue. This check just NOTES that residue
-/// so an operator upgrading from a pre-2.0 profiles.json knows the map no
-/// longer does anything and can delete it at leisure. Cheap: it inspects the
-/// already-parsed `extras`, no per-entry work.
-fn check_crews_residue() -> Check {
-    let registry = match profiles::load_registry(None) {
-        Ok(r) => r,
-        Err(e) => {
-            return Check {
-                name: "crews residue".into(),
-                status: Status::Warn,
-                message: format!("can't inspect the registry (load failed: {e})"),
-                hint: None,
-            };
-        }
-    };
-
-    if registry.registry.extras.contains_key("crews") {
-        Check {
-            name: "crews residue".into(),
-            // WARN, not Pass-with-hint (gate CONSIDER): a config block that no
-            // longer does anything merits the warn tier — the operator should
-            // learn their declared crews stopped being read, not skim past it.
-            status: Status::Warn,
-            message: "a legacy `crews` map is present and DOES NOTHING — it stopped being read \
-                      in 2.0"
-                .into(),
-            hint: Some(
-                "the `crews` map retired in 2.0 (#1426) — review staffing is now the role→profile \
-                 rollup (#1475): each review role resolves via a `--param <role>=<profile>` launch \
-                 override, else the `role_profiles` map in config.json, else `default_profile`. The \
-                 key is harmless residue; delete it from ~/.darkmux/profiles.json."
-                    .into(),
-            ),
-        }
-    } else {
-        Check {
-            name: "crews residue".into(),
-            status: Status::Pass,
-            message: "no legacy crews residue".into(),
-            hint: None,
-        }
     }
 }
 
@@ -9933,110 +9795,6 @@ mod tests {
         assert!(!check.message.contains("env"), "the env tier is absent here: {}", check.message);
     }
 
-    // ─── (#2404 P4d round 3) check_removed_review_config_block — removed field ─
-
-    #[serial_test::serial]
-    #[test]
-    fn check_review_judge_removed_passes_when_review_key_absent() {
-        let home = tempfile::TempDir::new().unwrap();
-        std::fs::write(home.path().join("config.json"), r#"{"schema_version":"1.22"}"#).unwrap();
-        let prev_home = std::env::var("DARKMUX_HOME").ok();
-        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
-        let check = check_removed_review_config_block();
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
-        assert_eq!(check.status, Status::Pass, "{}", check.message);
-    }
-
-    /// The test that would have caught round 2's regression: a config
-    /// produced by `DarkmuxConfig::with_defaults()` itself — the exact
-    /// shape `darkmux init` writes — must Pass this check. Round 2 shipped
-    /// `with_defaults()` still populating a `review` block, which this
-    /// check (had it existed then) would have flagged as Warn on a
-    /// brand-new, never-hand-edited config.
-    #[serial_test::serial]
-    #[test]
-    fn check_review_judge_removed_passes_against_with_defaults() {
-        use darkmux_types::config::DarkmuxConfig;
-        let home = tempfile::TempDir::new().unwrap();
-        let contents = serde_json::to_string_pretty(&DarkmuxConfig::with_defaults()).unwrap();
-        std::fs::write(home.path().join("config.json"), contents).unwrap();
-        let prev_home = std::env::var("DARKMUX_HOME").ok();
-        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
-        let check = check_removed_review_config_block();
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
-        assert_eq!(
-            check.status,
-            Status::Pass,
-            "with_defaults() must never itself trip the removed-key warning: {}",
-            check.message
-        );
-    }
-
-    /// (#2913 review C4) Same as the notebook check: the hint names the
-    /// config file darkmux read, not a hardcoded default path.
-    #[serial_test::serial]
-    #[test]
-    fn check_review_judge_removed_hint_names_the_resolved_config_path() {
-        let home = tempfile::TempDir::new().unwrap();
-        let cfg = home.path().join("config.json");
-        std::fs::write(&cfg, r#"{"review":{"judge_concurrency":1}}"#).unwrap();
-        let prev_home = std::env::var("DARKMUX_HOME").ok();
-        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
-        let check = check_removed_review_config_block();
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
-        let hint = check.hint.expect("a removal step");
-        assert!(hint.contains(&cfg.display().to_string()), "names the resolved file: {hint}");
-        assert!(!hint.contains("~/.darkmux/config.json"), "no hardcoded default path: {hint}");
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn check_review_judge_removed_warns_and_names_the_key_when_present() {
-        let home = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            home.path().join("config.json"),
-            r#"{"schema_version":"1.21","review":{"judge_concurrency":1}}"#,
-        )
-        .unwrap();
-        let prev_home = std::env::var("DARKMUX_HOME").ok();
-        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
-        let check = check_removed_review_config_block();
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
-        assert!(check.message.contains("review"), "names the key: {}", check.message);
-        // The literal "1.22", not `CONFIG_SCHEMA_VERSION` — the `review`
-        // block was removed in that ONE specific past version, which never
-        // changes even as the live schema version marches forward with
-        // future bumps. Asserting against the live constant would pass
-        // today and silently start asserting the WRONG thing the moment
-        // the schema bumps again.
-        assert!(
-            check.message.contains("1.22"),
-            "names the schema version it was removed in: {}",
-            check.message
-        );
-    }
-
     // ─── (#2765) check_serve_address / the resolved daemon locator ────────
 
     /// The row exists because the failure is INVISIBLE from the host: a
@@ -10216,7 +9974,7 @@ mod tests {
                         // read_to_end terminate).
                         let mut scratch = [0u8; 1024];
                         let _ = std::io::Read::read(&mut stream, &mut scratch);
-                        let body = format!("{{\"darkmux_version\":\"{SENTINEL}\"}}");
+                        let body = format!("{{\"darkmux_version\":\"0.0.0\",\"build\":\"{SENTINEL}\"}}");
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                             body.len()
@@ -10250,8 +10008,8 @@ mod tests {
         assert_eq!(
             check.status,
             Status::Warn,
-            "a legacy daemon answered on the CONFIGURED port, so the check must \
-             have reached it: {check:?}"
+            "a daemon with a different build answered on the CONFIGURED port, so \
+             the check must have reached it: {check:?}"
         );
         assert!(
             check.message.contains(SENTINEL),
@@ -10535,76 +10293,6 @@ mod tests {
     fn check_removed_notebook_settings_treats_empty_env_as_unset() {
         let check = notebook_settings_check(r#"{"schema_version":"1.22"}"#, Some("  "));
         assert_eq!(check.status, Status::Pass, "{}", check.message);
-    }
-
-    // ─── (#2413 M5) check_removed_telemetry_record_every_samples ──────────
-
-    #[serial_test::serial]
-    #[test]
-    fn check_telemetry_record_every_samples_removed_passes_when_absent() {
-        let home = tempfile::TempDir::new().unwrap();
-        std::fs::write(home.path().join("config.json"), r#"{"schema_version":"1.22"}"#).unwrap();
-        let prev_home = std::env::var("DARKMUX_HOME").ok();
-        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
-        let check = check_removed_telemetry_record_every_samples();
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
-        assert_eq!(check.status, Status::Pass, "{}", check.message);
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn check_telemetry_record_every_samples_removed_passes_against_with_defaults() {
-        use darkmux_types::config::DarkmuxConfig;
-        let home = tempfile::TempDir::new().unwrap();
-        let contents = serde_json::to_string_pretty(&DarkmuxConfig::with_defaults()).unwrap();
-        std::fs::write(home.path().join("config.json"), contents).unwrap();
-        let prev_home = std::env::var("DARKMUX_HOME").ok();
-        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
-        let check = check_removed_telemetry_record_every_samples();
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
-        assert_eq!(
-            check.status,
-            Status::Pass,
-            "with_defaults() must never itself trip the removed-key warning: {}",
-            check.message
-        );
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn check_telemetry_record_every_samples_warns_and_names_the_key_when_present() {
-        let home = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            home.path().join("config.json"),
-            r#"{"schema_version":"1.21","runtime":{"telemetry_record_every_samples":30}}"#,
-        )
-        .unwrap();
-        let prev_home = std::env::var("DARKMUX_HOME").ok();
-        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
-        let check = check_removed_telemetry_record_every_samples();
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
-        assert!(check.message.contains("telemetry_record_every_samples"), "names the key: {}", check.message);
-        assert!(
-            check.message.contains("1.22"),
-            "names the schema version it was retired in: {}",
-            check.message
-        );
     }
 
     // ─── (#2653) check_liveness_retention ───
@@ -12090,7 +11778,7 @@ mod tests {
 
     /// A daemon reporting `build` and the mtime of the binary it loaded.
     fn modern(build: &str, mtime: u64) -> Option<DaemonBuild> {
-        Some(DaemonBuild::Modern {
+        Some(DaemonBuild {
             build: build.into(),
             binary_mtime: Some(mtime),
         })
@@ -12171,7 +11859,7 @@ mod tests {
         // its own: fall back to the build tag alone rather than inventing a
         // finding out of a missing input.
         let c = classify_daemon_freshness(
-            Some(DaemonBuild::Modern {
+            Some(DaemonBuild {
                 build: "2.0.0 (a1b2c3d)".into(),
                 binary_mtime: None,
             }),
@@ -12182,22 +11870,6 @@ mod tests {
 
         let c = classify_daemon_freshness(modern("2.0.0 (a1b2c3d)", 1000), "2.0.0 (a1b2c3d)", None);
         assert_eq!(c.status, Status::Pass, "{}", c.message);
-    }
-
-    #[test]
-    fn daemon_freshness_warns_when_the_daemon_predates_the_build_field() {
-        // A daemon with no `build` field was compiled before this check shipped,
-        // so it is stale by construction — no version comparison needed (and
-        // none is made: a bare version vs a build-tagged one is not comparable).
-        let c = classify_daemon_freshness(
-            Some(DaemonBuild::Legacy("1.18.5".into())),
-            "2.0.0 (a1b2c3d)",
-            Some(1000),
-        );
-        assert_eq!(c.status, Status::Warn, "{}", c.message);
-        assert!(c.message.contains("1.18.5"), "{}", c.message);
-        assert!(c.message.contains("2.0.0 (a1b2c3d)"), "{}", c.message);
-        assert!(c.hint.as_deref().unwrap().contains("darkmux serve"));
     }
 
     #[test]
@@ -12224,7 +11896,7 @@ mod tests {
         let body = r#"{"darkmux_version":"2.0.0","build":"2.0.0 (a1b2c3d)","binary_mtime":1700}"#;
         assert_eq!(
             parse_daemon_build(body),
-            Some(DaemonBuild::Modern {
+            Some(DaemonBuild {
                 build: "2.0.0 (a1b2c3d)".into(),
                 binary_mtime: Some(1700)
             })
@@ -12234,11 +11906,11 @@ mod tests {
     #[test]
     fn daemon_build_tolerates_a_daemon_that_could_not_stat_its_own_exe() {
         // `binary_mtime: null` is a real shape the daemon emits — it must parse
-        // as Modern-without-mtime, not fall through to Legacy.
+        // as a build without an mtime, not as no build at all.
         let body = r#"{"darkmux_version":"2.0.0","build":"2.0.0 (a1b2c3d)","binary_mtime":null}"#;
         assert_eq!(
             parse_daemon_build(body),
-            Some(DaemonBuild::Modern {
+            Some(DaemonBuild {
                 build: "2.0.0 (a1b2c3d)".into(),
                 binary_mtime: None
             })
@@ -12246,14 +11918,12 @@ mod tests {
     }
 
     #[test]
-    fn daemon_build_reads_a_pre_build_field_daemon_as_legacy() {
-        // A daemon older than #1461 has no `build` field — classified as Legacy
-        // rather than silently compared against a build-tagged string.
+    fn daemon_build_is_none_without_a_build_field() {
+        // (4.0) A daemon older than #1461 reports no `build` field. There is
+        // no Legacy classification any more: without a build id there is
+        // nothing to compare, the same as no daemon at all.
         let body = r#"{"darkmux_version":"1.18.5","flow_schema_version":"1.4"}"#;
-        assert_eq!(
-            parse_daemon_build(body),
-            Some(DaemonBuild::Legacy("1.18.5".into()))
-        );
+        assert!(parse_daemon_build(body).is_none());
     }
 
     #[test]
@@ -12532,7 +12202,6 @@ mod tests {
             classify_daemon_freshness(modern("old", 1000), "new", Some(2000)),
             // Same build tag, reinstalled binary — the dev-box case.
             classify_daemon_freshness(modern("same", 1000), "same", Some(2000)),
-            classify_daemon_freshness(Some(DaemonBuild::Legacy("1.18.5".into())), "new", Some(1000)),
             classify_binary_vs_source(Some("0ldc0de"), Some("a1b2c3d")),
             classify_runtime_image_freshness(tags(&[("darkmux-runtime:latest", Some("1.0.0"))]), "2.0.0"),
             classify_runtime_binary_cache(true, Some(cache_stamp("1.0.0", None)), "2.0.0"),
@@ -13048,10 +12717,8 @@ mod tests {
         // binary-vs-source + runtime-image-freshness [#1461] + role-profiles
         // [#1475] + cmd-gate-allowlist [#1685] + unpriceable-residents
         // [#1819] + unreachable-residents [#1944] +
-        // review-judge-exhaustion-policy [#1876/#1877] +
         // turn-delay [#2094] + reasoning-checkpoint-interval [#2165] +
         // host-sampler-interval [#2107, #1833] +
-        // telemetry-record-every-samples [#2111] +
         // generation-checkpoint-interval [#2171] +
         // thermal-governor [#2110/#2109] +
         // mission-envelope-readability [#1881] + hooks [#2093] +
@@ -13125,12 +12792,14 @@ mod tests {
         // `check_enum_settings`, which contributes one row per registered
         // enum setting.
         //
-        // (4.0 cleanup) 65: `check_legacy_mission_layout` left with the
-        // `mission migrate` verb it pointed at, and
+        // (4.0 cleanup) 62: `check_legacy_mission_layout` left with the
+        // `mission migrate` verb it pointed at,
         // `check_legacy_compaction_extras` with the openclaw passthrough it
-        // warned about.
+        // warned about, and three residue checks for pre-3.x removals
+        // (`check_crews_residue`, `check_removed_review_config_block`,
+        // `check_removed_telemetry_record_every_samples`).
         let expected =
-            65 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            62 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -15338,46 +15007,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    // ─── #1426 ship-2: check_crews_residue tests ─────────────────────
-
-    #[serial_test::serial]
-    #[test]
-    fn check_crews_residue_passes_clean_when_no_crews_key() {
-        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
-        std::fs::write(
-            &config_path,
-            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}}}"#,
-        )
-        .unwrap();
-
-        let check = check_crews_residue();
-        assert_eq!(check.status, Status::Pass);
-        assert!(check.message.contains("no legacy crews residue"));
-        assert!(check.hint.is_none());
-    }
-
-    /// A pre-2.0 profiles.json still carrying a `crews` map parses fine (the
-    /// key overflows into `extras`) and surfaces as a WARN — a config block
-    /// that no longer does anything merits the warn tier, so the operator
-    /// learns their declared crews stopped being read. Never an error (the
-    /// residue is harmless to every code path).
-    #[serial_test::serial]
-    #[test]
-    fn check_crews_residue_warns_on_legacy_crews_key() {
-        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
-        std::fs::write(
-            &config_path,
-            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
-                "crews":{"review-deep":{"seats":{"review-probe":[{"profile":"fast"}]}}}}"#,
-        )
-        .unwrap();
-
-        let check = check_crews_residue();
-        assert_eq!(check.status, Status::Warn);
-        assert!(check.message.contains("DOES NOTHING"), "got: {}", check.message);
-        assert!(check.hint.as_deref().unwrap().contains("retired in 2.0"));
     }
 
     // ─── #1284 Packet 1: check_mission_config_registry ───────────────

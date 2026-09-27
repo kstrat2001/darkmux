@@ -95,6 +95,12 @@ darkmux release.
   unrecognized extras: kept on round-trip, read by nothing. **Migration:**
   none required; delete the keys if you like (`custom_instructions` is the
   typed field).
+- **Doctor's residue checks for pre-3.x removals:** the `crews` map in
+  `profiles.json`, the `review{}` config block,
+  `runtime.telemetry_record_every_samples`, and the "daemon predates the
+  build field" verdict. Each key is still read leniently and ignored.
+  **Migration:** delete any of those keys still present (3.x's `darkmux
+  doctor` names them).
 
 ### Changed (breaking, 4.0)
 
