@@ -5131,7 +5131,7 @@ mod tests {
             &registry_path,
             serde_json::json!({
                 "default_profile": "p",
-                "profiles": {"p": {"models": [{"id": "m-local", "n_ctx": 8192, "role": "primary"}]}}
+                "profiles": {"p": {"models": [{"id": "m-local", "n_ctx": 8192}]}}
             })
             .to_string(),
         )

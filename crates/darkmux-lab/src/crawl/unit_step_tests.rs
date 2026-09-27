@@ -2170,7 +2170,7 @@ fn two_units_and_a_summary_run_through_the_real_scheduler() {
         &registry_path,
         serde_json::json!({
             "default_profile": "p",
-            "profiles": {"p": {"models": [{"id": "m-local", "n_ctx": 8192, "role": "primary"}]}}
+            "profiles": {"p": {"models": [{"id": "m-local", "n_ctx": 8192}]}}
         })
         .to_string(),
     )
@@ -2724,7 +2724,7 @@ fn a_unit_declares_the_crawler_seats_residency_so_siblings_wave_pack() {
         &registry,
         serde_json::json!({
             "default_profile": "p",
-            "profiles": {"p": {"models": [{"id": "m-local", "n_ctx": 8192, "role": "primary"}]}}
+            "profiles": {"p": {"models": [{"id": "m-local", "n_ctx": 8192}]}}
         })
         .to_string(),
     )
@@ -2779,7 +2779,7 @@ fn residency_resolves_the_tasks_own_role_not_a_hardcoded_crawler() {
         &registry,
         serde_json::json!({
             "default_profile": "p",
-            "profiles": {"p": {"models": [{"id": "m-local", "n_ctx": 8192, "role": "primary"}]}}
+            "profiles": {"p": {"models": [{"id": "m-local", "n_ctx": 8192}]}}
         })
         .to_string(),
     )
