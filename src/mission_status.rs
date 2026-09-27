@@ -586,7 +586,8 @@ fn peer_mission_lines(peer: &[Run], now: u64, width: Option<usize>) -> Vec<Strin
     for r in peer {
         let id = ellipsize(&r.id, id_w);
         let machine = ellipsize(r.machine.as_deref().unwrap_or("unknown machine"), machine_w);
-        let age = relative_age(now, peer_last_seen(r).unwrap_or(now));
+        // No timestamp at all is an unknown age, never "now".
+        let age = peer_last_seen(r).map_or_else(|| "—".to_string(), |ts| relative_age(now, ts));
         let status = peer_status_word(r.status, r.abandoned_reason);
         out.push(format!(
             "  ◇ {id:<id_w$}  {machine:<machine_w$}  {age:>age_w$}  {status}",
@@ -5452,6 +5453,15 @@ mod tests {
              fleet: could not reach the shared stream and nothing was cached — this board covers this machine's\n\
              own missions only"
         );
+    }
+
+    /// A peer run carrying no timestamp at all has an UNKNOWN age — the row
+    /// must not claim it is current.
+    #[test]
+    fn a_peer_row_with_no_timestamp_shows_an_unknown_age() {
+        let rows = peer_mission_lines(&[peer("review-peer-2", RunStatus::Running, None)], BOARD_NOW, Some(100));
+        let row = strip_ansi(rows.last().unwrap());
+        assert_eq!(row, "  ◇ review-peer-2  peer-a    —  running");
     }
 
     #[test]
