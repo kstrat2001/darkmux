@@ -49,7 +49,7 @@ fn build_hooks_check(
         }];
     }
     if rules.is_empty() {
-        return vec![no_rules_check(provenance, outbox_dir)];
+        return vec![no_rules_check(provenance, outbox_dir, config_path)];
     }
     let summaries = darkmux_flow::hooks::summarize_configured_rules(rules, outbox_dir);
     let rule_checks: Vec<Check> = summaries
@@ -64,17 +64,17 @@ fn build_hooks_check(
     out
 }
 
-fn no_rules_check(provenance: &str, outbox_dir: &Path) -> Check {
+fn no_rules_check(provenance: &str, outbox_dir: &Path, config_path: &Path) -> Check {
     Check {
         name: "hooks".into(),
         status: Status::Warn,
         message: format!("enabled ({provenance}) but no rules configured — outbox_dir={}", outbox_dir.display()),
-        hint: Some(
-            "Add a rule to config.json's `hooks.rules`, e.g. `darkmux config set hooks.rules \
-             '[{\"match\":{\"action\":\"dispatch.tool\",\"payload.tool_name\":\"create_finding\",\
-             \"payload.ok\":true},\"http\":\"http://127.0.0.1:8790/events\"}]'`."
-                .into(),
-        ),
+        hint: Some(format!(
+            "Add a rule to {}'s `hooks.rules`, e.g. `darkmux config set hooks.rules \
+             '[{{\"match\":{{\"action\":\"dispatch.tool\",\"payload.tool_name\":\"create_finding\",\
+             \"payload.ok\":true}},\"http\":\"http://127.0.0.1:8790/events\"}}]'`.",
+            config_path.display()
+        )),
     }
 }
 
@@ -563,6 +563,26 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_HOOKS_ENABLED"),
             }
         }
+    }
+
+    /// `check_hooks` names the config file doctor actually reads — under
+    /// `DARKMUX_HOME`, not `~/.darkmux` — in the remedy it prints.
+    #[serial_test::serial]
+    #[test]
+    fn check_hooks_names_the_config_file_under_darkmux_home() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let prev = std::env::var("DARKMUX_HOOKS_ENABLED").ok();
+        unsafe { std::env::set_var("DARKMUX_HOOKS_ENABLED", "true") };
+        let hint = check_hooks().remove(0).hint;
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOOKS_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_HOOKS_ENABLED"),
+            }
+        }
+        let want = state.path().join("config.json");
+        let hint = hint.unwrap();
+        assert!(hint.starts_with(&format!("Add a rule to {}'s `hooks.rules`", want.display())), "{hint}");
     }
 
     /// (#2093 merge-gate finding 14) `build_hooks_check` now returns ONE
@@ -1361,7 +1381,7 @@ mod tests {
             format!("enabled (config.json) but no rules configured — outbox_dir={}", tmp.path().display())
         );
         let hint = checks[0].hint.as_deref().unwrap();
-        assert!(hint.starts_with("Add a rule to config.json's `hooks.rules`"), "{hint}");
+        assert!(hint.starts_with("Add a rule to /darkmux-root/config.json's `hooks.rules`"), "{hint}");
         assert!(hint.contains("darkmux config set hooks.rules"), "{hint}");
     }
 
