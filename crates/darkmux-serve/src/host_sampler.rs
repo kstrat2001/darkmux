@@ -1983,7 +1983,7 @@ mod tests {
                     "{}\n",
                     serde_json::json!({
                         "ts": live_start, "level": "info", "category": "work", "tier": "local",
-                        "stage": "dispatch", "action": "dispatch start", "handle": "h",
+                        "stage": "dispatch", "action": "dispatch.start", "handle": "h",
                         "session_id": "live-session-1",
                     })
                 ),
@@ -2040,7 +2040,7 @@ mod tests {
                     "{}",
                     serde_json::json!({
                         "ts": live_start, "level": "info", "category": "work", "tier": "local",
-                        "stage": "dispatch", "action": "dispatch start", "handle": "h",
+                        "stage": "dispatch", "action": "dispatch.start", "handle": "h",
                         "session_id": "just-appeared",
                     })
                 )

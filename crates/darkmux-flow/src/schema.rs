@@ -2374,7 +2374,7 @@ mod forward_compat_tests {
             "category": "quantum",
             "tier": "orbital",
             "stage": "teleport",
-            "action": "dispatch start",
+            "action": "dispatch.start",
             "handle": "seat-1",
             "session_id": "task-t1",
             "model": "gpt-4o"
@@ -2443,7 +2443,7 @@ mod forward_compat_tests {
             "category": "audit",
             "tier": "local",
             "stage": "dispatch",
-            "action": "dispatch start",
+            "action": "dispatch.start",
             "handle": "seat-1"
         }"#;
         let rec: FlowRecord = serde_json::from_str(wire).unwrap();

@@ -549,7 +549,7 @@ describe("applyRecordToMetrics", () => {
 
     // An action `applyRecordToMetrics` doesn't recognize as tok/turn/tool/
     // complete/stepResult/start/terminal — a pure heartbeat.
-    m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "telemetry.heartbeat", ts: "2026-08-19T00:05:00Z" }), idx, "m1");
+    m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "wibble.heartbeat", ts: "2026-08-19T00:05:00Z" }), idx, "m1");
 
     expect(m, "a changed lastTs must produce a NEW map reference (the no-op guard's own contract)").not.toBe(afterStart);
     expect(m["a-step"].lastTs).toBeGreaterThan(startLastTs);

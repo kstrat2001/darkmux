@@ -36,9 +36,9 @@ describe("the tagged fields are opaque to string logic", () => {
     // @ts-expect-error a regex test
     hits.push(/^dispatch\./.test(r.action));
     // @ts-expect-error a string method
-    hits.push(!!r.action?.startsWith("dispatch."));
+    hits.push(!!r.action?.startsWith("dispatch.")); // eslint-disable-line @typescript-eslint/no-unsafe-call
     // @ts-expect-error a string method on the category
-    hits.push(!!r.category?.endsWith("metry"));
+    hits.push(!!r.category?.endsWith("metry")); // eslint-disable-line @typescript-eslint/no-unsafe-call
     const byName: Record<string, boolean> = { "dispatch.start": true };
     // @ts-expect-error the field as a map key
     hits.push(!!byName[r.action!]);

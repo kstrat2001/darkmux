@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, act } from "@testing-library/react";
 import { TokenScope, waveAt } from "./TokenScope";
+import { maxOf, minOf } from "../lib/numbers";
 
 // (#2890) What the operator SEES inside the tube, per state. The canvas
 // itself cannot draw under jsdom (no 2D context), so these assert on the
@@ -311,7 +312,7 @@ describe("(#2911) waveAt: the harmonic shimmer, stated", () => {
         expect(p).toBeGreaterThanOrEqual(1 - 0.12 - 1e-6);
         expect(p).toBeLessThanOrEqual(1 + 0.12 + 1e-6);
       }
-      expect(Math.max(...peaks) - Math.min(...peaks)).toBeGreaterThan(0.05);
+      expect((maxOf(peaks) ?? NaN) - (minOf(peaks) ?? NaN)).toBeGreaterThan(0.05);
     }
   });
 });

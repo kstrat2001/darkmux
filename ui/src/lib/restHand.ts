@@ -78,7 +78,7 @@ export function pageNowOf(clock: PageClock, perfMs: number, dateMs: number): num
 }
 
 /** Seconds left in the rest (fractional, never negative). */
-export function restSecondsLeftExact(restEndMs: number, pageNowMs: number): number {
+function restSecondsLeftExact(restEndMs: number, pageNowMs: number): number {
   return Math.max(0, (restEndMs - pageNowMs) / 1000);
 }
 
@@ -91,7 +91,7 @@ export function restShownSeconds(restEndMs: number, pageNowMs: number): number {
 /** The fraction of the current second the dot has drawn, `1 − frac(seconds
  *  left)`: 0 at the tick (the moment the number drops), approaching 1 just
  *  before the next. 0 once the rest has ended. */
-export function restHandProgress(restEndMs: number, pageNowMs: number): number {
+function restHandProgress(restEndMs: number, pageNowMs: number): number {
   const s = restSecondsLeftExact(restEndMs, pageNowMs);
   if (s <= 0) return 0;
   const frac = s - Math.floor(s);

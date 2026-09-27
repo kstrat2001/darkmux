@@ -115,12 +115,12 @@ export function taskAggMetrics(task: GraphNode, metrics: MetricsMap, now: number
   return { show: ai || tokens > 0 || turns > 0 || generating, tokens, turns, generating, elapsedMs, spanMs, sumMs, wallMs: spanMs };
 }
 
-export interface TimelineStep {
+interface TimelineStep {
   step: NonNullable<GraphNode["steps"]>[number];
   meter: StepMeter;
 }
 
-export interface TimelineTask {
+interface TimelineTask {
   task: GraphNode;
   waitsOn: string[];
   agg: TaskAggMetrics;

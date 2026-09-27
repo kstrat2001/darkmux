@@ -30,8 +30,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../../../..");
 
 function readCorpus(name: string): RawRecord[] {
-  const raw = JSON.parse(readFileSync(path.join(REPO_ROOT, "tests/parity/corpus", name), "utf8"));
-  return raw.records as RawRecord[];
+  const raw = JSON.parse(readFileSync(path.join(REPO_ROOT, "tests/parity/corpus", name), "utf8")) as { records: RawRecord[] };
+  return raw.records;
 }
 
 /** The `=== stage ===` section of a legacy golden, in the SAME normalized

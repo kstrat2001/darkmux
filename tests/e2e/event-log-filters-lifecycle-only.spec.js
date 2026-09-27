@@ -31,7 +31,7 @@ const PHONE = { width: 390, height: 844 };
 // The fixture (`tests/fixtures/filters-lifecycle-only-flow.jsonl`) carries
 // 11 records, 9 distinct `act` facet values, all lifecycle/telemetry:
 // machine online/offline, dispatch start/end, mission start/close, phase
-// begin/complete, step start/complete, host telemetry. No stored picks
+// start/complete, step start/complete, host telemetry. No stored picks
 // means no explicit include/exclude for any of them, so the backstop shows
 // every NON-PERIODIC one — 10 of the 11 rows (the `machine.telemetry` row
 // stays hidden), and the Filters button reads "filters, 1 active" because

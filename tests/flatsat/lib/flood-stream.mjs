@@ -24,7 +24,7 @@ async function main() {
         category: "work",
         tier: "local",
         stage: "dispatch",
-        action: i % 2 === 0 ? "dispatch start" : "dispatch complete",
+        action: i % 2 === 0 ? "dispatch.start" : "dispatch.complete",
         handle: "flood",
         session_id: `flood-${Math.floor(i / 2)}`,
         source: "scheduler",

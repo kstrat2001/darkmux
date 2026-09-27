@@ -25,9 +25,9 @@
  *    whatever the cut, so a malformed record is visible and wrong-looking,
  *    never silently dropped (a terminal with a bad clock still closes its
  *    run).
- * 2. It contributes nothing to time arithmetic: `timesOf` skips it, so it
- *    moves no minimum, maximum, span, rate or "last activity". A pick by
- *    time (the latest name, the earliest start) takes it only when no timed
+ * 2. It contributes nothing to time arithmetic: it moves no minimum,
+ *    maximum, span, rate or "last activity". A pick by time
+ *    (`latestByTime`, `earliestByTime`) takes it only when no timed
  *    candidate exists, so a malformed record can always be outvoted.
  * 3. It sorts after every timed record (`byTime`), in arrival order.
  */
@@ -44,6 +44,7 @@ import { isPlainObject } from "./guards";
 /** An action the live channel synthesizes and the daemon never writes: a
  *  utility job's end as a live sample delivers it (`lib/liveChannel.ts`).
  *  Its durable twin is the job's usage record or `utility.error`. */
+// flow-action-guard:allow — a live-only action the daemon never writes
 type LiveOnlyAction = "utility.end";
 
 /** Every action spelling this build knows. */
@@ -68,10 +69,10 @@ export interface Tag<K extends string, W extends string> {
 }
 
 export type NormAction = Tag<"action", string>;
-export type NormLevel = Tag<"level", string>;
-export type NormCategory = Tag<"category", string>;
-export type NormStage = Tag<"stage", string>;
-export type NormTier = Tag<"tier", string>;
+type NormLevel = Tag<"level", string>;
+type NormCategory = Tag<"category", string>;
+type NormStage = Tag<"stage", string>;
+type NormTier = Tag<"tier", string>;
 
 declare const normBrand: unique symbol;
 
@@ -175,6 +176,7 @@ const ACTION_WIRE = {
   ThermalTier5EjectFailed: "thermal.tier5_eject_failed",
   UtilityStart: "utility.start",
   UtilityError: "utility.error",
+  // flow-action-guard:allow — a live-only action the daemon never writes
   UtilityEnd: "utility.end",
 } as const satisfies Record<string, Action>;
 
@@ -228,7 +230,9 @@ type Covers<U, O> = [Exclude<U, ValuesOf<O>>] extends [never] ? true : false;
 type Assert<T extends true> = T;
 /** Compile-time proof that every member of each generated union has a name
  *  above: one `Assert` per union, so a variant ts-rs adds without a name
- *  here fails to typecheck on its own line. */
+ *  here fails to typecheck on its own line. Exported only so the compiler
+ *  keeps it; nothing imports it.
+ *  @public */
 export type EveryVariantNamed = [
   Assert<Covers<Action, typeof ACTION_WIRE>>,
   Assert<Covers<Level, typeof LEVEL_WIRE>>,
@@ -242,6 +246,7 @@ export type EveryVariantNamed = [
  *  daemon serves it as written. Keyed by the generated union, so a retired
  *  spelling ts-rs adds without an entry here is a type error. */
 const RETIRED_WIRE: { readonly [W in RetiredAction]: true } = {
+  // flow-action-guard:allow-start — the retired spellings, keyed by the generated union
   "telemetry.process": true,
   "funnel.step": true,
   "funnel.ruling": true,
@@ -264,6 +269,7 @@ const RETIRED_WIRE: { readonly [W in RetiredAction]: true } = {
   "crawl.mission.completed": true,
   "crawl.unit.started": true,
   "crawl.unit.completed": true,
+  // flow-action-guard:allow-end
 };
 
 const KNOWN_ACTIONS: ReadonlySet<string> = new Set([...Object.values(ACTION_WIRE), ...Object.keys(RETIRED_WIRE)]);
@@ -383,14 +389,6 @@ export const isDispatchFamily = (a: NormAction | undefined): boolean => a !== un
 
 // ─── time policy ──────────────────────────────────────────────────────────
 
-/** `tMs` of every timed record, in order. The one way to do arithmetic on a
- *  set's timestamps (policy rule 2). */
-export function timesOf(records: readonly NormRecord[]): number[] {
-  const out: number[] = [];
-  for (const r of records) if (r.tMs !== null) out.push(r.tMs);
-  return out;
-}
-
 /** Ascending by `tMs`, untimed records last (policy rule 3). Stable. */
 export function byTime(a: NormRecord, b: NormRecord): number {
   if (a.tMs === null) return b.tMs === null ? 0 : 1;
@@ -415,6 +413,21 @@ export function latestByTime<R extends NormRecord>(records: readonly R[]): R | u
     if (r.tMs === null) {
       if (best === undefined || best.tMs === null) best = r;
     } else if (best === undefined || best.tMs === null || r.tMs >= best.tMs) {
+      best = r;
+    }
+  }
+  return best;
+}
+
+/** The earliest record by time, under policy rule 2: the earliest timed one
+ *  (the first in arrival order on a tie), and an untimed one (the first) only
+ *  when none is timed. `latestByTime`'s mirror. */
+export function earliestByTime<R extends NormRecord>(records: readonly R[]): R | undefined {
+  let best: R | undefined;
+  for (const r of records) {
+    if (r.tMs === null) {
+      if (best === undefined) best = r;
+    } else if (best === undefined || best.tMs === null || r.tMs < best.tMs) {
       best = r;
     }
   }

@@ -10,6 +10,9 @@ import { norm, type RawRecord } from "../testing/records";
 import { closeOpenModal } from "../lib/dialogManager";
 import { PageJudgementContext } from "../hooks/useJudgement";
 
+/** The part of the persisted filter state these tests read back. */
+type StoredFilters = { q: string; act: { include: string[]; exclude: string[] } };
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // `ui/src/components/` -> repo root is three levels up.
 const REPO_ROOT = path.resolve(__dirname, "../../..");
@@ -116,6 +119,7 @@ describe("EventLogColumn", () => {
   it("states vocabulary skew beside the totals: records whose action this build does not know", () => {
     const records = [
       rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s-alpha" }),
+      // flow-action-guard:allow — an old spelling is this test's input
       rec({ ts: "2026-08-08T12:01:00.000Z", action: "dispatch start", session_id: "s-alpha" }),
       rec({ ts: "2026-08-08T12:02:00.000Z", action: "wibble.fired", session_id: "s-alpha" }),
     ];
@@ -486,7 +490,7 @@ describe("EventLogColumn", () => {
     fireEvent.change(within(paneA).getByPlaceholderText("filter events…"), { target: { value: "s-cloud" } });
     expect(paneA.querySelectorAll('[data-act="rec"]').length).toBe(1);
 
-    const storedAfterA = JSON.parse(window.sessionStorage.getItem("dmux.eventfilters")!);
+    const storedAfterA = JSON.parse(window.sessionStorage.getItem("dmux.eventfilters")!) as StoredFilters;
     expect(storedAfterA.q).toBe("s-cloud");
 
     // Pane B receives a fresh `records` array (a routine live-poll tick),
@@ -514,7 +518,7 @@ describe("EventLogColumn", () => {
       />,
     );
 
-    const storedAfterB = JSON.parse(window.sessionStorage.getItem("dmux.eventfilters")!);
+    const storedAfterB = JSON.parse(window.sessionStorage.getItem("dmux.eventfilters")!) as StoredFilters;
     expect(storedAfterB.q).toBe("s-cloud");
   });
 
@@ -544,7 +548,7 @@ describe("EventLogColumn", () => {
     expect(header.checked).toBe(true);
     fireEvent.click(header);
     expect(container.querySelectorAll('[data-act="rec"]').length).toBe(0);
-    const stored = JSON.parse(window.sessionStorage.getItem("dmux.eventfilters")!);
+    const stored = JSON.parse(window.sessionStorage.getItem("dmux.eventfilters")!) as StoredFilters;
     expect([...stored.act.exclude].sort()).toEqual(["reasoning", "tool call"]);
     expect(stored.act.include).toEqual([]);
     // Back on: the same header, now unchecked, re-includes exactly those two.
@@ -1226,8 +1230,8 @@ describe("EventLogColumn — turns (#2863)", () => {
     it("does not re-render on the clock's tick when it shows no turn whose state can change", async () => {
       vi.useFakeTimers({ now: T + 11_000 });
       const fleetOnly = [
-        rec({ ts: at(0), action: "telemetry.heartbeat", session_id: "s-a", machine_id: "MacBook-Pro", payload: {} } as never),
-        rec({ ts: at(1), action: "telemetry.heartbeat", session_id: "s-b", machine_id: "MacBook-Pro", payload: {} } as never),
+        rec({ ts: at(0), action: "wibble.heartbeat", session_id: "s-a", machine_id: "MacBook-Pro", payload: {} } as never),
+        rec({ ts: at(1), action: "wibble.heartbeat", session_id: "s-b", machine_id: "MacBook-Pro", payload: {} } as never),
       ];
       let renders = 0;
       render(

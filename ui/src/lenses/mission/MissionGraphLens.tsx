@@ -267,14 +267,14 @@ function legendDots() {
  * nobody types — so the header shows the name, the sub-line shows the hash,
  * and the epoch becomes the start time when no record has said otherwise.
  * An id in any other shape is shown whole. */
-export function splitMissionId(id: string): { name: string; epoch: number | null; hash: string | null } {
+function splitMissionId(id: string): { name: string; epoch: number | null; hash: string | null } {
   const m = /^(.+)-(\d{10})-([0-9a-f]{4,8})$/.exec(id);
   if (!m) return { name: id, epoch: null, hash: null };
   return { name: m[1], epoch: Number(m[2]) * 1000, hash: m[3] };
 }
 /** Mission-wide span from the per-step metrics the fold already keeps:
  * earliest step start, latest step end (0 when unknown). */
-export function missionSpan(metrics: MetricsMap): { start: number; end: number } {
+function missionSpan(metrics: MetricsMap): { start: number; end: number } {
   let start = 0;
   let end = 0;
   for (const k of Object.keys(metrics)) {

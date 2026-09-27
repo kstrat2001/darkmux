@@ -3,6 +3,7 @@ import { computeTMax, computeTMin } from "../lib/flow";
 import { recordsAsOf, type NormRecord } from "../lib/ingest";
 import { isMissionLifecycle, spanOf } from "../lib/lifecycle";
 import { runIndex, type RunGroup } from "../lib/runRef";
+import { maxOf, minOf } from "../lib/numbers";
 
 /** (#2346) What the transport's `tMin`/`tMax` scope to. `day` (the
  * default) is the pre-existing behavior — the whole loaded day. A
@@ -79,8 +80,8 @@ function focusRange(dayRecords: NormRecord[], focus: PlaybackFocus): { tMin: num
   const starts = spans.flatMap((s) => (s.startMs === null ? [] : [s.startMs]));
   const ends = spans.flatMap((s) => (s.endMs === null ? [] : [s.endMs]));
   return {
-    tMin: starts.length ? Math.min(...starts) : computeTMin(scoped),
-    tMax: ends.length ? Math.max(...ends) : computeTMax(scoped),
+    tMin: minOf(starts) ?? computeTMin(scoped),
+    tMax: maxOf(ends) ?? computeTMax(scoped),
   };
 }
 
@@ -121,7 +122,7 @@ function focusRuns(focus: Exclude<PlaybackFocus, { kind: "day" }>): { runs: read
  * live viewer saw it. The cycle steps UP from there (1s/s → 5s/s → 30s/s →
  * 1m/s → 10m/s → 1h/s) and wraps; 5s/s and 30s/s sit between real time and
  * 1m/s, which on its own "goes direct to hyper mode" (operator). */
-export const SPEEDS = [1, 5, 30, 60, 600, 3600] as const;
+const SPEEDS = [1, 5, 30, 60, 600, 3600] as const;
 export type Speed = (typeof SPEEDS)[number];
 export const DEFAULT_SPEED: Speed = 1;
 export const PLAY_TICK_MS = 100;

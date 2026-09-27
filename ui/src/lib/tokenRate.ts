@@ -67,7 +67,7 @@ export interface HeartbeatSample {
 /** (#2889) The `phase` value a heartbeat carries while the model writes a
  *  tool call. Spelled once in the runtime (`WRITING_TOOL_CALL_PHASE`,
  *  `runtime/src/trajectory.rs`) and matched literally here. */
-export const WRITING_TOOL_CALL_PHASE = "writing_tool_call";
+const WRITING_TOOL_CALL_PHASE = "writing_tool_call";
 
 /** Every `dispatch.turn.heartbeat` in `records`, reduced to time-ordered
  * samples. Additive-field aware (#2877 flow-schema 1.55.0): prefers the new
@@ -220,7 +220,7 @@ function checkpointedTurns(records: NormRecord[]): Set<unknown> {
 
 /** The fewest chars a finished turn must have produced before its chars/token
  *  ratio is trusted over the default. */
-export const MIN_CALIBRATION_CHARS = 2_000;
+const MIN_CALIBRATION_CHARS = 2_000;
 
 /** A FINISHED run's generation rate reading: how many of the turns that
  *  paired a `generation_ms` with billed `completion_tokens` actually went

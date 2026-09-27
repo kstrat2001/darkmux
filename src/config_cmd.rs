@@ -936,6 +936,7 @@ mod tests {
     fn radio_router_staffing_keys_are_refused_with_the_fix() {
         let f = tmp();
         let p = f.path();
+        // flow-action-guard:allow — a retired config key, refused by name
         let err = set_at(p, "radio.router_profile", "radio").unwrap_err().to_string();
         assert!(err.contains("unknown config key"), "{err}");
         let err = set_at(p, "role_profiles.radio-router", "radio").unwrap_err().to_string();

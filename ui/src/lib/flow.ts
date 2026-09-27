@@ -28,7 +28,7 @@ import type { AbandonReason } from "../types/generated/AbandonReason";
 import { isPlainObject } from "./guards";
 import { missionClosed } from "./lifecycle";
 import { runIndex } from "./runRef";
-import { ACTION, CATEGORY, byTime, ingestJsonl, ingestRecord, latestByTime, recKey, recordsAsOf, recordsSince, timesOf, type NormRecord } from "./ingest";
+import { ACTION, CATEGORY, byTime, earliestByTime, ingestJsonl, ingestRecord, latestByTime, recKey, recordsAsOf, recordsSince, type NormRecord } from "./ingest";
 
 /** `LIVE_WINDOW_MS` — viewer.html:3374. The rolling live window `RAW` is
  * bounded to; also the "N records · last Nh" meta-line's hour figure. */
@@ -88,8 +88,8 @@ const utcDay = (t: number): string => new Date(t).toISOString().slice(0, 10);
  * are not guaranteed to arrive sorted, so this scans rather than reading the
  * first element. */
 export function earliestRecordDate(records: readonly NormRecord[]): string | null {
-  const ts = timesOf(records);
-  return ts.length ? utcDay(Math.min(...ts)) : null;
+  const first = earliestByTime(records)?.tMs;
+  return first == null ? null : utcDay(first);
 }
 
 /** Header owns liveness (operator, 2026-09-03): a mission page is a RECORDING
@@ -215,8 +215,7 @@ export function buildFlowWindow(yesterday: readonly NormRecord[], today: readonl
 
 /** `recompute()`'s tMax — viewer.html:1040-1041. */
 export function computeTMax(data: readonly NormRecord[]): number {
-  const ts = timesOf(data);
-  return ts.length ? Math.max(...ts) : Date.now();
+  return latestByTime(data)?.tMs ?? Date.now();
 }
 
 /** `recompute()`'s tMin — viewer.html:1051. Unused while `/next` was
@@ -224,8 +223,7 @@ export function computeTMax(data: readonly NormRecord[]): number {
  * spans `tMin..tMax`, which is what makes the axis describe the recorded day
  * rather than the last 24 hours of wall-clock. */
 export function computeTMin(data: readonly NormRecord[]): number {
-  const ts = timesOf(data);
-  return ts.length ? Math.min(...ts) : Date.now();
+  return earliestByTime(data)?.tMs ?? Date.now();
 }
 
 /** `uidOf()` — viewer.html:1107. */

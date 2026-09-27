@@ -112,7 +112,7 @@ const ROWS: Array<[string, Kind, Record<string, unknown>]> = [
 ];
 
 export const PEPPER_SID = "darkmux-coding-refresh-rotation-fixture";
-export const PEPPER_MACHINE = "MacBook-Pro";
+const PEPPER_MACHINE = "MacBook-Pro";
 const KIND_ACTION: Record<Kind, NormAction> = {
   start: ACTION.DispatchStart,
   beat: ACTION.DispatchTurnHeartbeat,

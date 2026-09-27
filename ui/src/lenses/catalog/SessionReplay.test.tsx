@@ -27,7 +27,7 @@ function latestTokenScopeProps(): Record<string, unknown> {
   const nodes = document.querySelectorAll('[data-testid="token-scope-probe"]');
   const last = nodes[nodes.length - 1];
   if (!last) throw new Error("no TokenScope probe rendered");
-  return JSON.parse(last.getAttribute("data-props")!);
+  return JSON.parse(last.getAttribute("data-props")!) as Record<string, unknown>;
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -893,7 +893,7 @@ describe("SessionReplay", () => {
   });
 
   it("renders the real run view — header, brief, metrics, signals — against the recorded corpus fixture", async () => {
-    const raw = JSON.parse(readFileSync(path.join(REPO_ROOT, "tests/parity/corpus/flow-session-task-list.json"), "utf8"));
+    const raw: unknown = JSON.parse(readFileSync(path.join(REPO_ROOT, "tests/parity/corpus/flow-session-task-list.json"), "utf8"));
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify(raw), { status: 200 }))));
     renderReplay("task-list");
     // The chip is the one element that says the running word; other text may too.
@@ -1544,7 +1544,7 @@ describe("(#2911) the MODEL section, ticking and wording", () => {
   afterEach(() => {
     vi.useRealTimers();
   });
-  const probe = () => JSON.parse(document.querySelector('[data-testid="run-token-scope"] [data-testid="token-scope-probe"]')!.getAttribute("data-props")!);
+  const probe = () => JSON.parse(document.querySelector('[data-testid="run-token-scope"] [data-testid="token-scope-probe"]')!.getAttribute("data-props")!) as Record<string, unknown>;
 
   it("the REST countdown counts down every second with no new records", async () => {
     vi.useFakeTimers();

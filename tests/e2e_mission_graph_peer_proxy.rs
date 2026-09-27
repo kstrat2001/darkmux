@@ -87,7 +87,7 @@ fn attribute_mission_locally(reader: &FleetNode, mission_id: &str, owner_machine
     let today = darkmux_flow::day_utc_now();
     let day_file = reader.flows_dir.join(format!("{today}.jsonl"));
     let record = format!(
-        r#"{{"ts":"{today}T10:00:00Z","action":"mission start","mission_id":"{mission_id}","machine_id":"{owner_machine_id}"}}"#
+        r#"{{"ts":"{today}T10:00:00Z","action":"mission.start","mission_id":"{mission_id}","machine_id":"{owner_machine_id}"}}"#
     );
     std::fs::write(&day_file, record + "\n").expect("write day-file attribution record");
 }

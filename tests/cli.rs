@@ -6681,12 +6681,12 @@ fn run_list_usage_breakdown_end_to_end() {
         serde_json::json!({ "ts": now, "action": "telemetry.tokens", "category": "telemetry", "source": "tokens", "session_id": sid, "handle": "coder", "payload": payload })
     };
     let records = [
-        serde_json::json!({ "ts": now, "action": "dispatch start", "session_id": "sess-modern", "handle": "coder" }),
+        serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "sess-modern", "handle": "coder" }),
         usage("sess-modern", serde_json::json!({ "call_kind": "turn", "purpose": "work", "requested_model": "qwen-a", "reported_model": "qwen-a-served", "endpoint": "http://127.0.0.1:1234/v1", "token_source": "provider", "prompt_tokens": 1000, "completion_tokens": 200, "total_tokens": 1200, "cached_tokens": 300 })),
         usage("sess-modern", serde_json::json!({ "call_kind": "compaction", "purpose": "utility", "requested_model": "util-4b", "endpoint": "http://127.0.0.1:1234/v1", "token_source": "provider", "prompt_tokens": 80, "completion_tokens": 10, "total_tokens": 90 })),
-        serde_json::json!({ "ts": now, "action": "dispatch complete", "session_id": "sess-modern", "handle": "coder", "payload": { "total_tokens": 99_999 } }),
-        serde_json::json!({ "ts": now, "action": "dispatch start", "session_id": "sess-legacy", "handle": "reviewer" }),
-        serde_json::json!({ "ts": now, "action": "dispatch complete", "session_id": "sess-legacy", "handle": "reviewer", "payload": { "total_tokens": 700, "prompt_tokens": 600, "completion_tokens": 100 } }),
+        serde_json::json!({ "ts": now, "action": "dispatch.complete", "session_id": "sess-modern", "handle": "coder", "payload": { "total_tokens": 99_999 } }),
+        serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "sess-legacy", "handle": "reviewer" }),
+        serde_json::json!({ "ts": now, "action": "dispatch.complete", "session_id": "sess-legacy", "handle": "reviewer", "payload": { "total_tokens": 700, "prompt_tokens": 600, "completion_tokens": 100 } }),
     ];
     let body: String = records.iter().map(|r| format!("{r}\n")).collect();
     fs::write(flows.path().join(format!("{day}.jsonl")), body).unwrap();
@@ -9032,6 +9032,7 @@ fn mission_status_recorded_session_end_describes_an_observation_not_an_absence()
     );
     let suggest: Vec<&str> = hit["suggest"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
     assert!(
+        // flow-action-guard:allow — the CLI verb, not an action
         suggest.iter().any(|s| s.contains("mission abort")),
         "a positively recorded end is a reasonable abort case: {suggest:?}"
     );
@@ -9076,7 +9077,7 @@ fn mission_status_stale_session_with_no_terminal_drifts_and_renders_for_a_human(
         flows.path().join(format!("{day}.jsonl")),
         serde_json::json!({
             "ts": "2024-01-01T09:00:00Z",
-            "action": "dispatch start",
+            "action": "dispatch.start",
             "session_id": "e2e-stale-session",
             "mission_id": "stale-session-e2e",
             "handle": "coder",
@@ -9108,6 +9109,7 @@ fn mission_status_stale_session_with_no_terminal_drifts_and_renders_for_a_human(
     );
     let suggest: Vec<&str> = hit["suggest"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
     assert!(
+        // flow-action-guard:allow — the CLI verb, not an action
         suggest.iter().any(|s| s.contains("mission abort")),
         "a genuinely stale session is a real abort case: {suggest:?}"
     );
@@ -11622,7 +11624,7 @@ fn write_peer_mission_day_file(
     let start = now - 3600;
     let (day, start_ts) = utc_day_and_ts(start);
     let (_, close_ts) = utc_day_and_ts(start + 300);
-    let mut lines = vec![rec(&start_ts, "mission start")];
+    let mut lines = vec![rec(&start_ts, "mission.start")];
     if let Some(action) = terminal_action {
         lines.push(rec(&close_ts, action));
     }

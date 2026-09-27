@@ -1136,6 +1136,7 @@ mod tests {
                 config: json!({}),
                 started_ts: None,
                 completed_ts: None,
+                // flow-action-guard:allow — step output prose, not an action
                 output: Some("dispatch error".into()),
             },
         )
@@ -1581,6 +1582,7 @@ mod tests {
                 config: json!({}),
                 started_ts: None,
                 completed_ts: None,
+                // flow-action-guard:allow — step output prose, not an action
                 output: Some("dispatch error".into()),
             },
         )
@@ -1724,6 +1726,7 @@ mod tests {
                 config: json!({}),
                 started_ts: None,
                 completed_ts: None,
+                // flow-action-guard:allow — step output prose, not an action
                 output: Some("dispatch error".into()),
             },
         )
@@ -1784,6 +1787,7 @@ mod tests {
                 config: json!({ "rule": "existing-solution" }),
                 started_ts: None,
                 completed_ts: None,
+                // flow-action-guard:allow — step output prose, not an action
                 output: Some("dispatch error".into()),
             },
         )

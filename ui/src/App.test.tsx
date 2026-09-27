@@ -26,8 +26,7 @@ vi.mock("./lenses/fleet/FleetLens", async (importOriginal) => {
       fleetLensProbe.enabled ? (
         <div data-testid="fleet-lens-probe" data-props={JSON.stringify(props)} />
       ) : (
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        <actual.FleetLens {...(props as any)} />
+        <actual.FleetLens {...(props as unknown as Parameters<typeof actual.FleetLens>[0])} />
       ),
   };
 });
@@ -170,7 +169,7 @@ describe("App", () => {
       </QueryClientProvider>,
     );
     await waitFor(() => expect(document.querySelector('[data-testid="fleet-lens-probe"]')).toBeInTheDocument());
-    const props = JSON.parse(document.querySelector('[data-testid="fleet-lens-probe"]')!.getAttribute("data-props")!);
+    const props = JSON.parse(document.querySelector('[data-testid="fleet-lens-probe"]')!.getAttribute("data-props")!) as { connected: unknown; lastContactMs: unknown };
     expect(props.connected).toBe(false);
     expect(typeof props.lastContactMs).toBe("number");
   });

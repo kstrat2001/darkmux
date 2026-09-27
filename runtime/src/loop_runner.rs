@@ -9279,7 +9279,7 @@ mod tests {
 
         let raw = std::fs::read_to_string(tmp.path().join(".darkmux-runtime/trajectory.jsonl")).unwrap();
         let events: Vec<serde_json::Value> = raw.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
-        assert!(events.iter().any(|v| v["type"] == "dispatch.per_turn_cap_salvaged" || v["type"].as_str().is_some_and(|t| t.contains("salvage"))), "the salvage fired: {raw}");
+        assert!(events.iter().any(|v| v["type"] == "dispatch.per_turn_cap.salvaged"), "the salvage fired: {raw}");
         let completed = events.iter().find(|v| v["type"] == "model.completed" && v["tool_calls"].is_array()).expect("the cut call's record");
         assert!(completed["tool_calls"][0].get("runs").is_none(), "the well-formed call runs: {completed}");
         assert_eq!(completed["tool_calls"][1]["runs"], false, "the call the cut left malformed does not: {completed}");

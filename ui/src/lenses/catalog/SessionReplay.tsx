@@ -145,7 +145,7 @@ export function ScopeLamps({
  *  tool's line puts the file in its own box that trims from the LEFT, so a
  *  long path loses its leading folders and keeps its file name; the whole
  *  line is the hover. One line either way (`styles.css`). */
-export function ScopeNote({ note, tool }: { note: string | null; tool?: { action: string; path?: string } }) {
+function ScopeNote({ note, tool }: { note: string | null; tool?: { action: string; path?: string } }) {
   if (!note) return null;
   if (!tool?.path) return <div className="modelbox__note">{note}</div>;
   return (

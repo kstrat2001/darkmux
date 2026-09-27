@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { tokensOffMeter } from "./savings";
 import { hasAnyTokenCounts } from "../../lib/usageRecords";
-import { CATEGORY, ACTION, recordsAsOf, timesOf, type NormRecord } from "../../lib/ingest";
+import { CATEGORY, ACTION, recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { norm, normAll, type RawRecord } from "../../testing/records";
 
 /** (#2919) Vocabulary. `local` / `cloud` / `unknown` (and their `*Runs`
@@ -1592,7 +1592,7 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
 describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
   const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..");
   const day = (name: string): NormRecord[] =>
-    normAll(JSON.parse(readFileSync(path.join(REPO_ROOT, `tests/parity/corpus/${name}.json`), "utf8")));
+    normAll(JSON.parse(readFileSync(path.join(REPO_ROOT, `tests/parity/corpus/${name}.json`), "utf8")) as RawRecord[]);
   const corpus = [...day("flow-yesterday"), ...day("flow-today")];
 
   /**
@@ -1608,7 +1608,7 @@ describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
    * positions. The other three never fall.
    */
   it("ALL TOKENS never falls across all 2,073 playheads", () => {
-    const heads = [...new Set(timesOf(corpus))].sort((a, b) => a - b);
+    const heads = [...new Set(corpus.flatMap((r) => (r.tMs === null ? [] : [r.tMs])))].sort((a, b) => a - b);
     expect(heads.length).toBe(2073);
     let prevTotal = 0;
     let last = tokensOffMeter([]);

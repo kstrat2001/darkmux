@@ -1013,6 +1013,7 @@ mod tests {
         let mut call = |_msg: &str| -> Result<String> { Err(anyhow::anyhow!("dispatch failed: no model loaded")) };
         let decision = route("please review this", &fixture_catalog(), &mut call);
         match decision {
+            // flow-action-guard:allow — error prose, not an action
             RouteDecision::Unavailable { error } => assert!(error.contains("dispatch failed"), "{error}"),
             other => panic!("expected Unavailable, got {other:?}"),
         }

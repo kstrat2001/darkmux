@@ -29,7 +29,7 @@ import type { NormRecord } from "./ingest";
 
 /** `missions` — `recompute()`, viewer.html:1052. Distinct `mission_id`s in
  * record order, which is timestamp order, so "first" means oldest. */
-export function missionIds(data: NormRecord[]): string[] {
+function missionIds(data: NormRecord[]): string[] {
   return [...new Set(data.filter((r) => r.mission_id).map((r) => r.mission_id as string))];
 }
 
@@ -43,7 +43,7 @@ export function missionIds(data: NormRecord[]): string[] {
  * already have `metaLine.ts`; this module is only ever reached from a replay,
  * so the live arm is deliberately absent rather than reimplemented here.
  */
-export function replayMissions(data: NormRecord[]): string[] {
+function replayMissions(data: NormRecord[]): string[] {
   return missionIds(data);
 }
 

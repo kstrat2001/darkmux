@@ -90,7 +90,7 @@ const DEFAULT_DETAIL_PCT = 38;
  * collapses the column to the existing #1066 rail instead, so there is one
  * collapsed state, not a second one. The page beside it keeps at least
  * `PAGE_MIN_PX`. */
-export const MIN_COL_WIDTH_PX = 380;
+const MIN_COL_WIDTH_PX = 380;
 
 /** (#2863) A turn header's figures. A turn past `SLOW_TURN_MS` shows its
  * time in amber; thinking tokens are named once they are a real share. */
@@ -108,7 +108,7 @@ export function fmtTurnDuration(ms: number, approx: boolean): string {
 
 // (#2863) The context bar's explanation: fill = prompt tokens this turn,
 // yellow mark = where compaction kicks in.
-export function ctxTitle(inTok: number, window: number, threshold: number | null): string {
+function ctxTitle(inTok: number, window: number, threshold: number | null): string {
   const base = `context: ${inTok.toLocaleString()} of ${window.toLocaleString()} tokens (${Math.round((100 * inTok) / window)}%)`;
   return threshold ? `${base}\nyellow mark: compaction starts at ${threshold.toLocaleString()} tokens` : base;
 }

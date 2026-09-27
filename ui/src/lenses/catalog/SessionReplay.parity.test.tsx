@@ -14,8 +14,8 @@ import { render, act, cleanup } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { SessionReplay } from "./SessionReplay";
 import { buildFleetCard } from "../fleet/cards";
-import { shapeRecords } from "../../lib/flow";
-import { ACTION, ingest, isAsOf, timesOf } from "../../lib/ingest";
+import { computeTMax, shapeRecords } from "../../lib/flow";
+import { ACTION, ingest, isAsOf } from "../../lib/ingest";
 
 // The shared 1 s clock (`lib/clock.ts`) captures `Date.now()` when it is
 // imported and serves that to a ticking page's first render, before its
@@ -116,7 +116,7 @@ describe("parity: fleet card, live vs playback at the same recorded instant", ()
     const liveData = shapeRecords(ingest(upTo(X)));
     const NALL = shapeRecords(ALLN);
     const livePresence = new Set([SID]);
-    const liveTMax = Math.max(...timesOf(liveData));
+    const liveTMax = computeTMax(liveData);
     const live = buildFleetCard(liveData, new Map(), null, livePresence, false, m, true, liveTMax);
     // playback: the whole day, no presence, playhead X (PlaybackLens -> FleetLens historical)
     const play = buildFleetCard(NALL, new Map(), null, new Set(), false, m, false, X);

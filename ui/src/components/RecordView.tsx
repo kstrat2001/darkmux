@@ -248,7 +248,7 @@ function Group({ name, obj }: { name: string; obj: Record<string, unknown> }) {
  *  nothing they need here, since the record's own `machine_id` already says
  *  which machine wrote it. The field stays listed so the record's shape does
  *  not change. */
-export const MASKED_UID = "hidden";
+const MASKED_UID = "hidden";
 
 /** The record with every `machine_uid` (at any depth) replaced by
  *  `MASKED_UID`, for the rows and the raw JSON alike. */

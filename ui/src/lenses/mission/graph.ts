@@ -100,11 +100,11 @@ export const COL_W = 260;
  * row (`4:56 319k tok 7 turns 19 tools`) is ~247px on its own, after a
  * ~84px step lead and 30px of tree rail. 360 covers that with slack for one
  * more digit; the meter's CSS ellipsis is the backstop past it. */
-export const TASK_W_WITH_STEPS = 360;
+const TASK_W_WITH_STEPS = 360;
 
 /** (#2104) A card's width is decided by its content class, here, once —
  * the layout, the React Flow node style and the phase box all read it. */
-export function taskWidth(task: GraphNode): number {
+function taskWidth(task: GraphNode): number {
   return (task.steps || []).length ? TASK_W_WITH_STEPS : COL_W;
 }
 export const COL_GAP = 80;
@@ -115,19 +115,19 @@ export const COL_GAP = 80;
 // two-step siblings overlapped by ~30 px each. `tests/e2e/mission-lens-
 // layout-geometry.spec.js` asserts no two task boxes intersect; if the CSS
 // grows a card again, that test is the thing that says so.
-export const TASK_MIN_PITCH = 70;
-export const TASK_HEADER_H = 68;
-export const STEP_ROW_H = 28;
-export const TASK_GAP = 16;
+const TASK_MIN_PITCH = 70;
+const TASK_HEADER_H = 68;
+const STEP_ROW_H = 28;
+const TASK_GAP = 16;
 export const PHASE_LABEL_W = 40;
-export const BAND_GAP = 40;
+const BAND_GAP = 40;
 export const BAND_PAD = 56;
 
-export function taskPitch(stepCount: number): number {
+function taskPitch(stepCount: number): number {
   return Math.max(TASK_MIN_PITCH, TASK_HEADER_H + stepCount * STEP_ROW_H + TASK_GAP);
 }
 
-export interface LayoutBox {
+interface LayoutBox {
   x: number;
   y: number;
   w: number;
@@ -451,7 +451,7 @@ export function stepForRecord(rec: NormRecord, idx: GraphIndex, missionId: strin
  * unscoped records beside post-1.43.0 scoped ones, the state every
  * upgrading operator actually has — resolves identically under both
  * spellings. Returns "" when the id carries no such suffix. */
-export function unscopeSession(sessionId: string, missionId: string): string {
+function unscopeSession(sessionId: string, missionId: string): string {
   if (!missionId) return "";
   const suffix = "-" + missionId;
   if (!sessionId.endsWith(suffix)) return "";

@@ -311,7 +311,7 @@ catch-all, and the step detail lens scopes by raw session id instead of by step.
 
 The target is one resolver per language, bound by a shared fixture both test suites consume
 so the two implementations cannot drift, and **no kind-keyed registry in any consumer** — a
-consumer that switches on `step.kind` to infer record shape is the snowflake being deleted,
+consumer that switches on the step's `kind` to infer record shape is the snowflake being deleted,
 not a fix for it. Attribution must be inferable from records alone. *(target)*
 
 ### Dispatch names the top of the ladder, not the bottom
@@ -607,6 +607,7 @@ It **fails closed on both counts**: `enabled: false` blocks every declaring conf
 
 **The gate knows nothing about what it is gating.** It compares one string against a list. It has no model of pull requests, no knowledge of any tool's subcommands, no notion of what "merge" means. That is deliberate: the operator's configs name their own commands, and the operator opts each one in.
 
+<!-- flow-action-guard:allow — a policy field, not an action -->
 This is why the field is `cmd` and not `gh_verb`, which is what it was called until schema 3.0. The mechanism was always neutral, but the *name* was not, and a name is what people build on: a GitLab user was allowlisting `mr-merge` under `gh.allowed`, and a config gating `terraform apply` — which wants this gate exactly as much — had to declare a GitHub-shaped field to get a check that has nothing to do with GitHub. Renaming it cost one schema major and zero migrations, because no document had declared it yet. Waiting would have cost both.
 
 **One asymmetry is worth stating plainly, because it drove the migration's design.** The gate fails *open* for configs that declare nothing: a config with no `cmd` is never blocked, which is correct — most configs dispatch models and touch nothing outside darkmux, and requiring every one of them to declare a name would make the gate noise. But it means a config that *loses* its declaration silently loses its gate. So a document still carrying the old `gh_verb` key is a loud validation **Error**, never a quiet overflow into the forward-compat bag where unknown keys normally land. An unrecognized field is usually harmless; this one would specifically un-protect the thing it was added to protect.

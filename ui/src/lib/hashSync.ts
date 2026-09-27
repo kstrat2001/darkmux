@@ -221,6 +221,5 @@ export function useSyncHash(route: Route): void {
     writeHash(canonicalHash(route));
     // `route` is a referentially-stable snapshot from `useHashRoute` (only
     // changes identity when the hash actually moved) — safe as a direct dep.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [route]);
 }
