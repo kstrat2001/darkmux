@@ -76,6 +76,7 @@ fn parallel_fleet_adds_keep_every_entry() {
                 .args([
                     "machine", "add", &id,
                     "--address", &format!("127.0.0.1:{}", 10000 + i),
+                    "--allow-loopback",
                 ])
                 .output()
                 .expect("running `darkmux fleet add`")

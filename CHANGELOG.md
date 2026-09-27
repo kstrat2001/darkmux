@@ -95,6 +95,29 @@ darkmux release.
   #2915 will show why. One model-load seat tag, `utility`, replaces the
   `compactor`/`utility` pair on `telemetry.lms` records. FLOW schema
   1.60.0.
+- **`machine add` refuses a loopback address, and a roster entry's id is
+  the machine's `machine_id`** (#2924, groundwork for #2916). The documented
+  way to register a machine in its own roster was `machine add <me>
+  --address 127.0.0.1:8765`, which put an address in the roster that no
+  peer can use: other machines read the roster (the daemon serves it to
+  every viewer), and a loopback address reaches whichever machine reads it.
+  `machine add` now exits 2 on an address that reaches only the reading
+  machine (`127.x` including short forms like `127.1`, `::1`, `0.0.0.0`,
+  `::`, their v4-mapped forms, `localhost`) and names the fix;
+  `--allow-loopback` keeps it for several daemons on one host (a same-host
+  test fleet), and the entry records that it was intended. Whether an entry
+  is THIS machine (and so gets its hardware identity recorded) is now
+  decided by its id matching this machine's `machine_id`, not by a loopback
+  address. `machine list`, `machine status <id>` and `machine resources
+  <id>` reach this machine's own entry at the local daemon, so the roster
+  address stays the name peers dial. The hub guide and the
+  `darkmux-add-machine` skill register every machine, the hub included,
+  under its `machine_id` at its tailnet DNS name. **Migration:** for an
+  existing loopback entry, re-add it with the DNS name (`darkmux machine
+  add <id> --address <tailnet-dns-name>`, which keeps its added time; if
+  `darkmux doctor` also reports the entry renamed, remove it and add it
+  under the machine's current name instead, as that row says). `darkmux
+  doctor` lists each one.
 
 ### Added
 
@@ -121,6 +144,33 @@ darkmux release.
   `profiles.example.json` (what `darkmux init` writes) uses the id form.
   PROFILES schema stays 2.0: the string form joins that unreleased major
   (a binary from before it quarantines a profile that uses it).
+- **`darkmux doctor` checks the fleet roster against the fleet** (#2924).
+  Two rows, shown when a roster exists. `roster addresses` flags an entry
+  whose address reaches only the reading machine (an entry added with
+  `--allow-loopback` is reported as intentional). `roster identity` checks
+  each entry against the `machine_id` of the machine it describes, the one
+  name flow records, presence beats and the viewer already use. It warns
+  only on evidence: the entry's own hardware identity now goes by another
+  name (both repairs offered, rename the entry or set that machine's
+  `machine_id`, never the second when another machine already holds the
+  name), or flow history links the name to exactly one machine that now
+  goes by another name (a conservative repair: no address reuse and no
+  `machine_id` change, since session-only names land in history too; the
+  same conservative repair applies when a declared uid's current name is
+  only known from history). A second entry for a machine that already has
+  its own is a duplicate to remove. A name several machines have used, a
+  name only this machine used (session names collect there), a name whose
+  machine already has its own entry, or one nothing is known about (the
+  normal state of a peer that is off) is a note, not a warning. The row
+  says when presence could not be read and when this machine's
+  `machine_id` comes from a `DARKMUX_MACHINE_ID` override, which is then
+  not used to judge its own entry. Nothing in the roster or config is
+  rewritten. Flow history is read only when this machine and presence
+  cannot settle an entry, and only the last 120 flow files.
+- **Roster entries keep fields the running binary does not know** (#2924).
+  A `machine add` by an older binary used to drop a newer field (such as
+  `loopback_intended`) or an operator's hand-added one; unknown entry
+  fields are now written back unchanged.
 
 - **`/machine-status` is a built-in advertised command** (#2918). "Which
   models are loaded on this machine right now?" was refused: the catalog
@@ -182,6 +232,12 @@ darkmux release.
   warns on an unlabeled `:latest` (it used to pass) and lists other
   unlabeled local tags.
 
+- **`darkmux doctor`'s `machine_id` row names the tier the value came from**
+  (#2924). It printed `(from hostname)` whenever `DARKMUX_MACHINE_ID` was
+  unset, so a `config.json` `machine_id` was labeled as the hostname. The
+  row now reads `from DARKMUX_MACHINE_ID env`, `from config.json
+  machine_id`, or `from hostname`, and the hostname hint names `darkmux
+  config set machine_id`.
 - **radio says the model is busy instead of queueing behind it** (#2917).
   One LM Studio instance serves one request at a time, and darkmux caps
   concurrency only within one process, so `darkmux radio` fired while a

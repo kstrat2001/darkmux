@@ -267,9 +267,10 @@ sleep 14                                            <span class="comment"># Thro
 launchctl list | grep com.darkmux.serve            <span class="comment"># expect: a NEW PID</span></code></pre>
 
     <h3>Register the hub in its own fleet roster</h3>
-    <p><strong>Use the port this daemon actually listens on.</strong> A roster address is the one place <code>serve.port</code> is <em>not</em> consulted &mdash; a roster entry normally names another machine, and one machine's config must not silently redirect traffic aimed at another, so a portless roster address defaults to <code>8765</code> regardless of what you set. That carve-out is right for a peer and wrong for this self entry, so type the port. <code>darkmux doctor</code>'s <code>serve address</code> row prints the resolved one.</p>
-    <pre><code>darkmux machine add &lt;your-machine-id&gt; --address 127.0.0.1:8765   <span class="comment"># 8765 unless you set serve.port</span>
+    <p>Register the hub under its own <code>machine_id</code> (the name <code>darkmux doctor</code>&rsquo;s <code>machine_id</code> row prints) and its tailnet DNS name. That one name is what flow records, presence and the roster join on. Don&rsquo;t use <code>127.0.0.1</code>: other machines read this roster, and a loopback address reaches whichever machine reads it, so <code>machine add</code> refuses it. <code>tailscale status</code> prints the DNS name.</p>
+    <pre><code>darkmux machine add &lt;your-machine-id&gt; --address &lt;hub-tailnet-dns-name&gt;
 darkmux machine list</code></pre>
+    <p><code>machine list</code> marks the hub's own row as this machine and probes it at the local daemon (the <code>serve address</code> row of <code>darkmux doctor</code>), so it reads reachable here. The DNS name is what <em>peers</em> dial; with the daemon on loopback behind <code>tailscale serve</code>, what they can reach is the <a href="#viewer">Serve</a> port, not <code>:8765</code> (see the <a href="fleet.html">fleet guide</a>'s note on peer daemons).</p>
 
     <h3>Phase 2 rollback</h3>
     <pre><code><span class="comment"># brew path:</span>

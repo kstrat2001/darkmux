@@ -67,6 +67,8 @@ fn populate_roster_via_cli(viewer: &e2e::harness::FleetNode, peers: &[&e2e::harn
             .args([
                 "machine", "add", &peer.machine_id,
                 "--address", &format!("127.0.0.1:{}", peer.daemon_port),
+                // Same-host test fleet: loopback does reach the peer (#2924).
+                "--allow-loopback",
             ])
             .output()
             .expect("running `darkmux machine add`");
@@ -137,6 +139,28 @@ fn fleet_status_deep_aggregates_specs_from_reachable_peers() {
         has_ram_signal || has_version_signal,
         "--deep must surface a spec dimension (ram or version); got:\n{stdout}"
     );
+    // (#2924) EACH node reachable, not just "some spec showed up": node-b
+    // alone satisfied the checks above while node-a, the CLI's own entry,
+    // was being dialed at the built-in 8765 instead of its loopback port.
+    assert_reachable(node_a, &["node-a", "node-b"]);
+}
+
+/// Every named roster row in `viewer`'s `machine list --json` is reachable.
+fn assert_reachable(viewer: &e2e::harness::FleetNode, ids: &[&str]) {
+    let out = viewer
+        .cmd()
+        .args(["machine", "list", "--json"])
+        .output()
+        .expect("running `darkmux machine list --json`");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("machine list --json");
+    for id in ids {
+        let row = v["machines"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|r| r["id"] == *id))
+            .unwrap_or_else(|| panic!("{id} row missing: {v}"));
+        assert_eq!(row["reachable"], true, "{id} must be reachable: {row}");
+    }
 }
 
 #[test]
@@ -163,6 +187,7 @@ fn fleet_status_deep_degrades_gracefully_for_unreachable_peers() {
         .args([
             "machine", "add", "ghost-machine",
             "--address", "127.0.0.1:1",
+            "--allow-loopback",
         ])
         .output()
         .expect("adding ghost-machine to roster");
@@ -187,6 +212,7 @@ fn fleet_status_deep_degrades_gracefully_for_unreachable_peers() {
     );
     // node-a's specs should be present (it's local + reachable).
     assert!(stdout.contains("node-a"), "node-a row missing: {stdout}");
+    assert_reachable(node_a, &["node-a"]);
     // ghost-machine should appear, with some indication it's unreachable
     // (the existing `machine list` already prints unreachability; --deep
     // must not regress that).
