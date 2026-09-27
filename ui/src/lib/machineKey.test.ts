@@ -11,11 +11,13 @@ import {
 import type { FlowRecord, PresenceBeat } from "../types/handwritten";
 
 // FAKE hardware uids — UUID-shaped so the no-uid assertions below have
-// something uid-shaped to catch. All in the repo's fake form (#2957).
-const UID_A = "00000000-0000-4000-8000-000000000001";
-const UID_B = "00000000-0000-4000-8000-000000000002";
-const UID_C = "00000000-0000-4000-8000-000000000004";
-const UID_D = "00000000-0000-4000-8000-000000000007";
+// something uid-shaped to catch. All in the repo's fake form (#2957), with hex
+// LETTERS in the tail and mixed case across the set (UID_B lowercase), so
+// every case-insensitivity assertion below has a letter to fold.
+const UID_A = "00000000-0000-4000-8000-ABCDEF000001";
+const UID_B = "00000000-0000-4000-8000-abcdef000002";
+const UID_C = "00000000-0000-4000-8000-ABCDEF000004";
+const UID_D = "00000000-0000-4000-8000-ABCDEF000007";
 
 const rec = (uid: string, ts: string, machine_id?: string): FlowRecord =>
   ({ ts, machine_uid: uid, ...(machine_id ? { machine_id } : {}) }) as FlowRecord;
@@ -130,8 +132,8 @@ describe("(#2929) machine keys — what the URL hash carries instead of the hard
     // Two FAKE uids whose hashes share their first 6 hex digits (found by
     // search): the page lengthens the hash to tell them apart, and a 6-hex
     // key minted while only one was known no longer names exactly one.
-    const COLL_1 = "00000000-0000-4000-8000-000000001751";
-    const COLL_2 = "00000000-0000-4000-8000-000000002098";
+    const COLL_1 = "00000000-0000-4000-8000-ABCDEF002282";
+    const COLL_2 = "00000000-0000-4000-8000-ABCDEF002416";
     it("two machines whose short hashes collide get distinct, longer keys", () => {
       expect(h(COLL_1)).toBe(h(COLL_2));
       const c = ctx([rec(COLL_1, "2026-09-27T01:00:00Z"), rec(COLL_2, "2026-09-27T02:00:00Z")]);

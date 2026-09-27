@@ -340,7 +340,7 @@ mod tests {
 
     fn sample_beat() -> PresenceBeat {
         PresenceBeat {
-            machine_uid: "00000000-0000-4000-8000-000000000009".into(),
+            machine_uid: "00000000-0000-4000-8000-ABCDEF000009".into(),
             display_name: "laptop".into(),
             schema_version: "1.10.0".into(),
             beat_ts_ms: 1_780_000_000_000,
@@ -408,8 +408,8 @@ mod tests {
     #[test]
     fn presence_key_is_namespaced_on_uid() {
         assert_eq!(
-            presence_key("00000000-0000-4000-8000-000000000009"),
-            "darkmux:presence:00000000-0000-4000-8000-000000000009"
+            presence_key("00000000-0000-4000-8000-ABCDEF000009"),
+            "darkmux:presence:00000000-0000-4000-8000-ABCDEF000009"
         );
     }
 

@@ -1802,7 +1802,7 @@ describe("App — presence coverage on the masthead", () => {
 // in the route chrome (`#logscope`) the way its fleet card is — here by its
 // roster id — and the uid never reaches the page text.
 describe("(#2921) machine route chrome names a uid-only machine", () => {
-  const FAKE_UID = "00000000-0000-4000-8000-000000000001";
+  const FAKE_UID = "00000000-0000-4000-8000-ABCDEF000001";
   const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
   function mount(roster: unknown[]) {
     window.location.hash = `#lens=machine&uid=${FAKE_UID}`;

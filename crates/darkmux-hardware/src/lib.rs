@@ -335,12 +335,12 @@ mod tests {
     #[test]
     fn parses_io_platform_uuid_from_sample() {
         let sample = r#"
-    "IOPlatformUUID" = "00000000-0000-4000-8000-000000000009"
+    "IOPlatformUUID" = "00000000-0000-4000-8000-ABCDEF000009"
     "IOPlatformSerialNumber" = "C02XYZ123"
 "#;
         assert_eq!(
             parse_io_platform_uuid(sample).as_deref(),
-            Some("00000000-0000-4000-8000-000000000009")
+            Some("00000000-0000-4000-8000-ABCDEF000009")
         );
     }
 

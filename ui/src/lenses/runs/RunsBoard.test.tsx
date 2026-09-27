@@ -764,7 +764,7 @@ describe("RunsBoard — the machine pin (#1809)", () => {
 
   // (#2921 follow-up) A pinned machine the window knows only by uid is named
   // the way its fleet card is: this daemon's specs name, else its roster id.
-  const FAKE_UID = "00000000-0000-4000-8000-000000000001";
+  const FAKE_UID = "00000000-0000-4000-8000-ABCDEF000001";
   const uidOnlyToday = () => [{ ts: `${todayUTC()}T00:00:00Z`, machine_uid: FAKE_UID }];
   it("(#2921) a uid-only pinned machine that is THIS daemon reads its specs name", async () => {
     mockPinnedFetch({ flowToday: uidOnlyToday(), specs: { machine_id: "scratch-box", machine_uid: FAKE_UID } });
@@ -825,7 +825,7 @@ describe("RunsBoard — the machine pin (#1809)", () => {
   });
 
   it("(#2929) a link shared with the earlier `~` separator opens its machine and is rewritten to the `_` form", async () => {
-    const TWIN = "00000000-0000-4000-8000-000000000002";
+    const TWIN = "00000000-0000-4000-8000-ABCDEF000002";
     mockPinnedFetch({
       flowToday: [
         { ts: `${todayUTC()}T00:00:00Z`, machine_uid: FAKE_UID, machine_id: "MacBook-Pro" },
@@ -851,7 +851,7 @@ describe("RunsBoard — the machine pin (#1809)", () => {
   });
 
   it("(#2929) two unnamed machines: the second's key pins the second one, not the first", async () => {
-    const OTHER = "00000000-0000-4000-8000-000000000002";
+    const OTHER = "00000000-0000-4000-8000-ABCDEF000002";
     mockPinnedFetch({
       flowToday: [
         { ts: `${todayUTC()}T00:00:00Z`, machine_uid: FAKE_UID },
@@ -877,7 +877,7 @@ describe("RunsBoard — the machine pin (#1809)", () => {
 
   it("(#2929 C4) an old uid link that resolves to nothing is rewritten to the not-found marker once settled", async () => {
     mockPinnedFetch();
-    const gone = "00000000-0000-4000-8000-000000000007".toLowerCase();
+    const gone = "00000000-0000-4000-8000-ABCDEF000007".toLowerCase();
     window.location.hash = `#lens=runs&machine=${gone}`;
     const { container } = renderBoard("all", null, gone);
     await waitFor(() => expect(window.location.hash).toBe("#lens=runs&machine=not-found"));
@@ -886,7 +886,7 @@ describe("RunsBoard — the machine pin (#1809)", () => {
   });
 
   it("(#2929 C4) an old uid link to a roster-declared machine never seen opens its roster card by name", async () => {
-    const DECLARED = "00000000-0000-4000-8000-000000000008";
+    const DECLARED = "00000000-0000-4000-8000-ABCDEF000008";
     mockPinnedFetch({ roster: [{ id: "garage-mac", address: "a:1", added_unix_ms: 1, machine_uid: DECLARED }] });
     window.location.hash = `#lens=runs&machine=${DECLARED}`;
     const { container } = renderBoard("all", null, DECLARED);

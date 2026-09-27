@@ -381,7 +381,7 @@ describe("MachineDrawer (#2107)", () => {
   });
 
   it("(#2921) a hardware uid the window never named is not the machine name: specs names this machine", () => {
-    const UID = "00000000-0000-4000-8000-000000000001";
+    const UID = "00000000-0000-4000-8000-ABCDEF000001";
     render(
       <MachineDrawer
         route={{ kind: "fleet" }}

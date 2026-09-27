@@ -196,10 +196,10 @@ describe("specOf", () => {
   // with presence off, and after a rename whose old records aged out. The
   // machine standing on its own hardware then reports "hardware not
   // reported" about hardware it read directly.
-  const specsWithUid = { ...specs, machine_uid: "00000000-0000-4000-8000-000000000011" };
+  const specsWithUid = { ...specs, machine_uid: "00000000-0000-4000-8000-ABCDEF000011" };
 
   it("(#2814) recognises THIS machine on an empty window with no beats, via the reported uid", () => {
-    expect(specOf([], new Map(), specsWithUid, "00000000-0000-4000-8000-000000000011")).toBe("Apple M5 Max · 128 GB");
+    expect(specOf([], new Map(), specsWithUid, "00000000-0000-4000-8000-ABCDEF000011")).toBe("Apple M5 Max · 128 GB");
   });
 
   it("(#2814) recognises THIS machine when the window knows the uid ONLY under a stale name", () => {
@@ -207,8 +207,8 @@ describe("specOf", () => {
     // only the old name survives in the window, so the alias set holds
     // `laptop` and specs reports `MacBook-Pro` — the name join misses, the
     // uid join cannot.
-    const data: FlowRecord[] = [rec({ machine_uid: "00000000-0000-4000-8000-000000000011", machine_id: "laptop" })];
-    expect(specOf(data, new Map(), specsWithUid, "00000000-0000-4000-8000-000000000011")).toBe("Apple M5 Max · 128 GB");
+    const data: FlowRecord[] = [rec({ machine_uid: "00000000-0000-4000-8000-ABCDEF000011", machine_id: "laptop" })];
+    expect(specOf(data, new Map(), specsWithUid, "00000000-0000-4000-8000-ABCDEF000011")).toBe("Apple M5 Max · 128 GB");
   });
 
   it("(#2814) a reported uid does NOT credit a different machine with this host's hardware", () => {
@@ -716,7 +716,7 @@ describe("buildFleetCard", () => {
   // daemon can name from its own config. A card titled with a 36-character
   // UUID is the display half of "self is unknown".
   it("(#2814) this machine's own card carries its name and hardware on an empty window", () => {
-    const uid = "00000000-0000-4000-8000-000000000011";
+    const uid = "00000000-0000-4000-8000-ABCDEF000011";
     const specs = machineSpecs({
       machine_id: "MacBook-Pro",
       machine_uid: uid,
@@ -734,7 +734,7 @@ describe("buildFleetCard", () => {
   // observation (#2030 — a value that cannot be outvoted is the defect, not
   // the fix).
   it("(#2814) a name the window actually observed still outranks the specs name", () => {
-    const uid = "00000000-0000-4000-8000-000000000011";
+    const uid = "00000000-0000-4000-8000-ABCDEF000011";
     const specs = machineSpecs({ machine_id: "MacBook-Pro", machine_uid: uid, cpu_brand: "Apple M5 Max" });
     const data: FlowRecord[] = [rec({ machine_uid: uid, machine_id: "MacBook-Pro.local" })];
     const card = buildFleetCard(data, new Map(), specs, new Set(), false, uid, true, T_MAX);
@@ -854,8 +854,8 @@ describe("rosterOnlyEntries", () => {
   // same-name fixture would pass against the bug this is meant to catch;
   // this one is deliberately shaped so ONLY the uid join can exclude it.
   it("excludes a roster entry whose machine_uid matches a live beat reporting under a WHOLLY DIFFERENT name", () => {
-    const roster = [rosterEntry({ id: "laptop", machine_uid: "DEADBEEF-UID" })];
-    const live = new Map([["DEADBEEF-UID", beat({ machine_uid: "DEADBEEF-UID", display_name: "MacBook-Pro" })]]);
+    const roster = [rosterEntry({ id: "laptop", machine_uid: "00000000-0000-4000-8000-ABCDEF000020" })];
+    const live = new Map([["00000000-0000-4000-8000-ABCDEF000020", beat({ machine_uid: "00000000-0000-4000-8000-ABCDEF000020", display_name: "MacBook-Pro" })]]);
     expect(rosterOnlyEntries([], live, roster)).toEqual([]);
   });
 
@@ -863,8 +863,8 @@ describe("rosterOnlyEntries", () => {
   // — the uid join must work off `machineUids`'s flow-derived half too, not
   // only the presence-beat half.
   it("excludes a roster entry whose machine_uid matches flow history under a different name", () => {
-    const roster = [rosterEntry({ id: "laptop", machine_uid: "DEADBEEF-UID" })];
-    const data: FlowRecord[] = [rec({ machine_uid: "DEADBEEF-UID", machine_id: "MacBook-Pro" })];
+    const roster = [rosterEntry({ id: "laptop", machine_uid: "00000000-0000-4000-8000-ABCDEF000020" })];
+    const data: FlowRecord[] = [rec({ machine_uid: "00000000-0000-4000-8000-ABCDEF000020", machine_id: "MacBook-Pro" })];
     expect(rosterOnlyEntries(data, new Map(), roster)).toEqual([]);
   });
 
@@ -875,7 +875,7 @@ describe("rosterOnlyEntries", () => {
   // stays a real, renderable state (issue #2768's own constraint).
   it("still reports a roster entry with a machine_uid that matches no known uid", () => {
     const roster = [rosterEntry({ id: "mini-1", machine_uid: "UNSEEN-UID" })];
-    const live = new Map([["DEADBEEF-UID", beat({ machine_uid: "DEADBEEF-UID", display_name: "MacBook-Pro" })]]);
+    const live = new Map([["00000000-0000-4000-8000-ABCDEF000020", beat({ machine_uid: "00000000-0000-4000-8000-ABCDEF000020", display_name: "MacBook-Pro" })]]);
     expect(rosterOnlyEntries([], live, roster)).toEqual(roster);
   });
 
@@ -886,7 +886,7 @@ describe("rosterOnlyEntries", () => {
   // never fall back to a uid guess.
   it("a roster entry with no machine_uid falls through to the pre-existing name-matching behavior unchanged", () => {
     const roster = [rosterEntry({ id: "laptop" })];
-    const live = new Map([["DEADBEEF-UID", beat({ machine_uid: "DEADBEEF-UID", display_name: "MacBook-Pro" })]]);
+    const live = new Map([["00000000-0000-4000-8000-ABCDEF000020", beat({ machine_uid: "00000000-0000-4000-8000-ABCDEF000020", display_name: "MacBook-Pro" })]]);
     // No uid to join on, and the names share nothing — still reported.
     expect(rosterOnlyEntries([], live, roster)).toEqual(roster);
   });
@@ -899,15 +899,15 @@ describe("rosterOnlyEntries", () => {
   // beside the machine's own live one. The uid is the join that survives
   // the rename.
   it("(#2814) excludes a roster entry declaring THIS machine's uid under a stale name, on an empty window", () => {
-    const roster = [rosterEntry({ id: "laptop", machine_uid: "DEADBEEF-UID" })];
-    const specs = machineSpecs({ machine_id: "MacBook-Pro", machine_uid: "DEADBEEF-UID" });
+    const roster = [rosterEntry({ id: "laptop", machine_uid: "00000000-0000-4000-8000-ABCDEF000020" })];
+    const specs = machineSpecs({ machine_id: "MacBook-Pro", machine_uid: "00000000-0000-4000-8000-ABCDEF000020" });
     expect(rosterOnlyEntries([], new Map(), roster, specs)).toEqual([]);
   });
 
   it("(#2814) still reports a roster entry whose uid is NOT this machine's, on the same empty window", () => {
     // Inverted: the self uid must suppress only the entry that names it.
     const roster = [rosterEntry({ id: "studio", machine_uid: "OTHER-UID" })];
-    const specs = machineSpecs({ machine_id: "MacBook-Pro", machine_uid: "DEADBEEF-UID" });
+    const specs = machineSpecs({ machine_id: "MacBook-Pro", machine_uid: "00000000-0000-4000-8000-ABCDEF000020" });
     expect(rosterOnlyEntries([], new Map(), roster, specs)).toEqual(roster);
   });
 });
@@ -920,16 +920,16 @@ describe("rosterAliasFor", () => {
   // and the card for this machine rendered as `laptop` while the activity
   // lane beneath it said `MacBook-Pro`.
   it("returns the operator's alias when it differs from the machine's own name", () => {
-    const roster = [rosterEntry({ id: "laptop", machine_uid: "DEADBEEF-UID" })];
-    expect(rosterAliasFor("DEADBEEF-UID", roster, "MacBook-Pro")).toBe("laptop");
+    const roster = [rosterEntry({ id: "laptop", machine_uid: "00000000-0000-4000-8000-ABCDEF000020" })];
+    expect(rosterAliasFor("00000000-0000-4000-8000-ABCDEF000020", roster, "MacBook-Pro")).toBe("laptop");
   });
 
   // THE REGRESSION, pinned: the alias must never become the title. A caller
   // applies this as secondary text; the machine's own name is the title.
   it("does not return an alias equal to the machine's own name", () => {
-    const roster = [rosterEntry({ id: "MacBook-Pro", machine_uid: "DEADBEEF-UID" })];
+    const roster = [rosterEntry({ id: "MacBook-Pro", machine_uid: "00000000-0000-4000-8000-ABCDEF000020" })];
     expect(
-      rosterAliasFor("DEADBEEF-UID", roster, "MacBook-Pro"),
+      rosterAliasFor("00000000-0000-4000-8000-ABCDEF000020", roster, "MacBook-Pro"),
     ).toBeUndefined();
   });
 
@@ -937,22 +937,22 @@ describe("rosterAliasFor", () => {
   // two aliases a single machine legitimately carries (see `nameOf`'s #2030
   // doc), and showing either beside the other is noise, not provenance.
   it("folds a .local or case variant rather than showing the name twice", () => {
-    const roster = [rosterEntry({ id: "macbook-pro.local", machine_uid: "DEADBEEF-UID" })];
+    const roster = [rosterEntry({ id: "macbook-pro.local", machine_uid: "00000000-0000-4000-8000-ABCDEF000020" })];
     expect(
-      rosterAliasFor("DEADBEEF-UID", roster, "MacBook-Pro"),
+      rosterAliasFor("00000000-0000-4000-8000-ABCDEF000020", roster, "MacBook-Pro"),
     ).toBeUndefined();
   });
 
   // Inverted case: no roster entry names this uid — never invent an alias.
   it("returns undefined when no roster entry names this uid", () => {
-    const roster = [rosterEntry({ id: "laptop", machine_uid: "DEADBEEF-UID" })];
+    const roster = [rosterEntry({ id: "laptop", machine_uid: "00000000-0000-4000-8000-ABCDEF000020" })];
     expect(rosterAliasFor("some-other-uid", roster, "MacBook-Pro")).toBeUndefined();
   });
 
   // An entry with no machine_uid at all never matches any uid.
   it("returns undefined for a roster with no resolved uids", () => {
     const roster = [rosterEntry({ id: "laptop" })];
-    expect(rosterAliasFor("DEADBEEF-UID", roster, "MacBook-Pro")).toBeUndefined();
+    expect(rosterAliasFor("00000000-0000-4000-8000-ABCDEF000020", roster, "MacBook-Pro")).toBeUndefined();
   });
 });
 

@@ -1602,8 +1602,8 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
   // only the uid join can catch it.
   it("a roster entry whose machine_uid matches a live beat under a wholly different name does not duplicate its card, and the MACHINE's name titles it", async () => {
     mockFleetFetch({
-      machines: [{ machine_uid: "DEADBEEF-UID", display_name: "MacBook-Pro", schema_version: "1.20.0", beat_ts_ms: 1 }],
-      roster: [{ id: "laptop", address: "127.0.0.1:8765", added_unix_ms: 1000, machine_uid: "DEADBEEF-UID" }],
+      machines: [{ machine_uid: "00000000-0000-4000-8000-ABCDEF000020", display_name: "MacBook-Pro", schema_version: "1.20.0", beat_ts_ms: 1 }],
+      roster: [{ id: "laptop", address: "127.0.0.1:8765", added_unix_ms: 1000, machine_uid: "00000000-0000-4000-8000-ABCDEF000020" }],
     });
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     renderFleetLens({}, queryClient);
@@ -1645,7 +1645,7 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
   // it never widens into "any roster entry with a uid is accounted for."
   it("a roster entry with a machine_uid matching no known machine still renders its own offline card", async () => {
     mockFleetFetch({
-      machines: [{ machine_uid: "DEADBEEF-UID", display_name: "MacBook-Pro", schema_version: "1.20.0", beat_ts_ms: 1 }],
+      machines: [{ machine_uid: "00000000-0000-4000-8000-ABCDEF000020", display_name: "MacBook-Pro", schema_version: "1.20.0", beat_ts_ms: 1 }],
       roster: [{ id: "mini-1", address: "100.64.1.9:8765", added_unix_ms: 1000, machine_uid: "NEVER-SEEN-UID" }],
     });
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -1698,10 +1698,11 @@ describe("FleetLens — this machine identifies itself without the flow window (
   // roster entry as already-accounted-for — so nothing accounts for it. The
   // daemon answering the request drew nothing at all about itself.
   it("(#2814) renders THIS machine's own card from /machine/specs alone — empty window, no beats, no roster", async () => {
+    const uid = "00000000-0000-4000-8000-ABCDEF000011";
     mockFleetFetch({
       specs: {
         machine_id: "MacBook-Pro",
-        machine_uid: "00000000-0000-4000-8000-000000000011",
+        machine_uid: uid,
         cpu_brand: "Apple M5 Max",
         ram_total_bytes: 137438953472,
       },
@@ -1714,7 +1715,7 @@ describe("FleetLens — this machine identifies itself without the flow window (
     expect(cards.length).toBe(1);
     // Its own name — not the raw uid `nameOf` falls back to.
     expect(cards[0].textContent).toContain("MacBook-Pro");
-    expect(cards[0].textContent).not.toContain("DEADBEEF");
+    expect(cards[0].textContent).not.toContain(uid.slice(0, 8));
     // Its own hardware — read directly, never "hardware not reported".
     expect(cards[0].textContent).toContain("Apple M5 Max · 128 GB");
     expect(cards[0].textContent).not.toContain("hardware not reported");
@@ -1728,7 +1729,7 @@ describe("FleetLens — this machine identifies itself without the flow window (
   // direction.
   it("(#2814) does NOT draw a second card when the window already knows this machine's uid", async () => {
     const today = todayUTC();
-    const uid = "00000000-0000-4000-8000-000000000011";
+    const uid = "00000000-0000-4000-8000-ABCDEF000011";
     mockFleetFetch({
       flowToday: [
         { ts: `${today}T10:00:00.000Z`, machine_uid: uid, machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
@@ -1747,7 +1748,7 @@ describe("FleetLens — this machine identifies itself without the flow window (
   // card list unconditionally, so without the uid join in `rosterOnlyEntries`
   // that stale entry draws an "offline" phantom beside the live self card.
   it("(#2814) a stale roster entry carrying this machine's uid does not draw a phantom", async () => {
-    const uid = "00000000-0000-4000-8000-000000000011";
+    const uid = "00000000-0000-4000-8000-ABCDEF000011";
     mockFleetFetch({
       roster: [{ id: "laptop", machine_uid: uid, address: "100.64.1.2:8765", added_unix_ms: 1000 }],
       specs: { machine_id: "MacBook-Pro", machine_uid: uid, cpu_brand: "Apple M5 Max" },
@@ -2557,7 +2558,7 @@ describe("(#2926) fleet card: THINK opener and TOOL GEN, from the real run", () 
 // labeled with that uid: it lands in screenshots and identifies the machine.
 describe("(#2921) fleet page: no hardware uid is ever rendered as a label", () => {
   // Fixture uid, uppercase like the real ones; not any real machine's.
-  const FAKE_UID = "00000000-0000-4000-8000-000000000001";
+  const FAKE_UID = "00000000-0000-4000-8000-ABCDEF000001";
   const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
   function renderFleet(records: FlowRecord[]) {
     const playhead = pepperAt("10:51:33");
@@ -2616,8 +2617,8 @@ describe("(#2921) fleet page: no hardware uid is ever rendered as a label", () =
 });
 
 describe("(#2921 follow-up) fleet page: roster names and unnamed ordinals", () => {
-  const A = "00000000-0000-4000-8000-000000000001";
-  const B = "00000000-0000-4000-8000-000000000003";
+  const A = "00000000-0000-4000-8000-ABCDEF000001";
+  const B = "00000000-0000-4000-8000-ABCDEF000003";
   const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
   const start = (uid: string, sid: string, agoMs: number) => ({
     ts: new Date(Date.now() - agoMs).toISOString(),
@@ -2656,12 +2657,13 @@ describe("(#2921 follow-up) fleet page: roster names and unnamed ordinals", () =
 
 // (#2929) The machine a card link names rides in the address bar, so it is a
 // machine KEY (the machine's name, or "unnamed-<n>"), never the hardware uid.
-// FAKE uuids, mixed case, so a leak would be caught case-insensitively.
+// FAKE uuids in the repo's fake form with hex LETTERS in the tail, one lowercase
+// and the rest uppercase, so a leak would be caught case-insensitively.
 describe("(#2929) fleet-card links carry a machine key, never the hardware uid", () => {
   const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
-  const NAMED = "00000000-0000-4000-8000-000000000001";
-  const UNNAMED_1 = "00000000-0000-4000-8000-000000000002";
-  const UNNAMED_2 = "00000000-0000-4000-8000-000000000004";
+  const NAMED = "00000000-0000-4000-8000-ABCDEF000001";
+  const UNNAMED_1 = "00000000-0000-4000-8000-abcdef000002";
+  const UNNAMED_2 = "00000000-0000-4000-8000-ABCDEF000004";
 
   function mountThree() {
     const today = todayUTC();

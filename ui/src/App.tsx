@@ -497,7 +497,7 @@ export function App() {
   // (#2814) `displayNameOf`, not `nameOf` — see that function's own doc.
   // `localUid` is a real hardware uid now even on an empty window, and
   // `nameOf` echoes a uid it has never seen named, so the crumb would read
-  // `DEADBEEF-…` where it used to read `MacBook-Pro`.
+  // `<uid head>-…` where it used to read `MacBook-Pro`.
   const localName = localUid != null ? displayNameOf(flowWindow.data, liveMachines, specs, localUid) : null;
   // (drill-in packet) The MACHINE route's own target — the local machine
   // for `uid: null`, or the drilled uid's own name otherwise. `nameOf` is

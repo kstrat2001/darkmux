@@ -718,7 +718,7 @@ mod tests {
     fn sample_beat() -> SessionBeat {
         SessionBeat {
             session_id: "crew-dispatch-coder-1780493601894484-internal".into(),
-            machine_uid: Some("00000000-0000-4000-8000-000000000009".into()),
+            machine_uid: Some("00000000-0000-4000-8000-ABCDEF000009".into()),
             display_name: "laptop".into(),
             role: Some("coder".into()),
             model: Some("qwen3.6-35b".into()),

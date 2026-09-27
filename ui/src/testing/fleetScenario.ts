@@ -124,7 +124,7 @@ export function buildScenario(spec: ScenarioSpec): Scenario {
 export const UPGRADE_SKEW: ScenarioSpec = {
   machines: [
     {
-      uid: "00000000-0000-4000-8000-000000000011",
+      uid: "00000000-0000-4000-8000-ABCDEF000011",
       name: "MacBook-Pro",
       darkmuxVersion: "3.7.1",
       schemaVersion: "1.51.0",
@@ -132,7 +132,7 @@ export const UPGRADE_SKEW: ScenarioSpec = {
       records: 40,
     },
     {
-      uid: "00000000-0000-4000-8000-000000000006",
+      uid: "00000000-0000-4000-8000-ABCDEF000006",
       name: "m1-max-32gb-studio",
       darkmuxVersion: "3.7.0",
       schemaVersion: "1.42.0",

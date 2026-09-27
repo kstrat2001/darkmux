@@ -156,7 +156,7 @@ describe("MachineLens", () => {
   // (#2921 follow-up) A remote machine known only by its hardware uid: the
   // placeholder names it from the roster when it can, and otherwise says how
   // to name it; it never prints the uid.
-  const FAKE_UID = "00000000-0000-4000-8000-000000000001";
+  const FAKE_UID = "00000000-0000-4000-8000-ABCDEF000001";
   const uidOnly = () => [{ ts: new Date(Date.now() - 60_000).toISOString(), action: "dispatch.turn", machine_uid: FAKE_UID }];
   const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
   it("(#2921) a uid-only remote machine with a roster entry is named by it", async () => {
@@ -262,17 +262,18 @@ describe("MachineLens", () => {
   // outranks the specs name, self-vs-other) is fully covered without a
   // DOM render in `ui/src/lib/flow.test.ts`'s own `(#2814)`-tagged tests.
   it("(#2814) never leaks the raw hardware uid into the page, even when the window names nothing", async () => {
+    const uid = "00000000-0000-4000-8000-ABCDEF000011";
     mockMachineFetch({
       specs: {
         machine_id: "MacBook-Pro",
-        machine_uid: "00000000-0000-4000-8000-000000000011",
+        machine_uid: uid,
         cpu_brand: "M5 Max",
         ram_total_bytes: 137438953472,
       },
     });
     renderMachine(null);
     await waitFor(() => expect(screen.getByText(/limit source/i)).toBeInTheDocument());
-    expect(document.body.textContent).not.toContain("DEADBEEF");
+    expect(document.body.textContent).not.toContain(uid.slice(0, 8));
   });
 
   // Inverted, so the fix cannot be "treat every drilled uid as local": a
