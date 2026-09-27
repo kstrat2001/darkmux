@@ -71,7 +71,7 @@ darkmux release.
   untouched.
 - **`darkmux mission migrate` and the pre-#148 flat mission layout.**
   Flat `<root>/missions/<id>.json` / `<root>/phases/<id>.json` files are
-  not read, and the doctor check that pointed at the verb is gone.
+  not read; `darkmux doctor` FAILS naming each one still present.
   **Migration:** run `darkmux mission migrate --apply` on 3.x before
   upgrading.
 - **The pre-Beat-33 `<root>/crew/{roles,missions,phases,crews,skills}`

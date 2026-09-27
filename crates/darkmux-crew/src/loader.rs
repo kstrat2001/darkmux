@@ -623,7 +623,9 @@ pub(crate) fn load_crews() -> Result<Vec<Crew>> {
 ///
 /// Walks `<crew_root>/missions/` and for each **subdirectory** containing a
 /// `mission.json`, deserializes it. A plain file directly under
-/// `<crew_root>/missions/` is not a mission and is skipped.
+/// `<crew_root>/missions/` is not a mission and is skipped here;
+/// `darkmux doctor` fails on a pre-#148 flat `<id>.json` so the skip is
+/// never silent.
 ///
 /// Built-in missions (currently empty) are merged last, same as other loaders.
 pub fn load_missions() -> Result<Vec<Mission>> {

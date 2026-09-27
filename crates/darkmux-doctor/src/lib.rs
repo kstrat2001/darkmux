@@ -208,6 +208,7 @@ pub fn run() -> DoctorReport {
         check_role_profiles(),
         check_role_tool_vocab_typos(),
         check_beat33_legacy_crew_dir(),
+        check_flat_mission_files(),
         check_mission_envelope_readability(),
     ]);
     let checks = [checks, check_enum_settings(), check_hooks(), eureka_checks()].concat();
@@ -390,6 +391,47 @@ fn installed_skill_content(targets: &[PathBuf], name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// (4.0) Pre-#148 flat mission files: `<root>/missions/<id>.json` and
+/// `<root>/phases/<id>.json`. 4.0 deleted `mission migrate` and does not read
+/// them, so a leftover one is state the operator would otherwise lose
+/// silently. Fail, naming every file. Read-only: no migration logic here.
+fn check_flat_mission_files() -> Check {
+    let root = darkmux_crew::loader::user_state_root();
+    let mut found: Vec<String> = Vec::new();
+    for sub in ["missions", "phases"] {
+        let Ok(entries) = std::fs::read_dir(root.join(sub)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.extension().is_some_and(|e| e == "json") {
+                found.push(path.display().to_string());
+            }
+        }
+    }
+    found.sort();
+    if found.is_empty() {
+        return Check {
+            name: "flat mission files".into(),
+            status: Status::Pass,
+            message: "no flat mission files".into(),
+            hint: None,
+        };
+    }
+    Check {
+        name: "flat mission files".into(),
+        status: Status::Fail,
+        message: format!(
+            "{} pre-#148 flat mission file(s) that 4.0 no longer reads: {}",
+            found.len(),
+            found.join(", ")
+        ),
+        hint: Some(
+            "run `darkmux mission migrate --apply` on 3.x before upgrading, or delete them".into(),
+        ),
+    }
 }
 
 /// Detect operators still on the pre-Beat-33 `<root>/crew/{roles,
@@ -12792,14 +12834,16 @@ mod tests {
         // `check_enum_settings`, which contributes one row per registered
         // enum setting.
         //
-        // (4.0 cleanup) 62: `check_legacy_mission_layout` left with the
+        // (4.0 cleanup) 63: `check_flat_mission_files` joined (the Fail
+        // that replaced the `mission migrate` pointer). Before it, 62:
+        // `check_legacy_mission_layout` left with the
         // `mission migrate` verb it pointed at,
         // `check_legacy_compaction_extras` with the openclaw passthrough it
         // warned about, and three residue checks for pre-3.x removals
         // (`check_crews_residue`, `check_removed_review_config_block`,
         // `check_removed_telemetry_record_every_samples`).
         let expected =
-            62 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            63 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -14685,6 +14729,41 @@ mod tests {
         assert!(!check.message.contains("scribe.json"), "only files that exist: {}", check.message);
         let hint = check.hint.expect("a fix");
         assert!(hint.contains("delete"), "the fix: {hint}");
+    }
+
+    // ─── (4.0) check_flat_mission_files ──────────────────────────────
+
+    #[serial_test::serial]
+    #[test]
+    fn flat_mission_files_fail_naming_each_file() {
+        let guard = CrewRootGuard::new();
+        std::fs::create_dir_all(guard.path().join("missions")).unwrap();
+        std::fs::create_dir_all(guard.path().join("phases")).unwrap();
+        std::fs::write(guard.path().join("missions").join("alpha.json"), "{}").unwrap();
+        std::fs::write(guard.path().join("phases").join("s1.json"), "{}").unwrap();
+        let check = check_flat_mission_files();
+        assert_eq!(check.status, Status::Fail, "{}", check.message);
+        assert!(check.message.contains("missions/alpha.json"), "{}", check.message);
+        assert!(check.message.contains("phases/s1.json"), "{}", check.message);
+        assert!(check.message.contains("4.0 no longer reads"), "{}", check.message);
+        let hint = check.hint.expect("names the fix");
+        assert!(hint.contains("darkmux mission migrate --apply"), "{hint}");
+        assert!(hint.contains("delete them"), "{hint}");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn flat_mission_files_pass_on_the_per_mission_layout() {
+        // A per-mission dir holding `mission.json` and its own `phases/` is
+        // the current layout, never a finding.
+        let guard = CrewRootGuard::new();
+        let m = guard.path().join("missions").join("alpha");
+        std::fs::create_dir_all(m.join("phases")).unwrap();
+        std::fs::write(m.join("mission.json"), "{}").unwrap();
+        std::fs::write(m.join("phases").join("s1.json"), "{}").unwrap();
+        let check = check_flat_mission_files();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("no flat mission files"), "{}", check.message);
     }
 
     #[serial_test::serial]
