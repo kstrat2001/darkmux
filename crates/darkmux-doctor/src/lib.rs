@@ -35,7 +35,9 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Ordered by severity (`Pass < Warn < Fail`), so the worst of several is
+/// their `max`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Status {
     Pass,
     Warn,
@@ -75,15 +77,7 @@ pub struct EmbeddedSkill {
 
 impl DoctorReport {
     pub fn worst_status(&self) -> Status {
-        let mut worst = Status::Pass;
-        for c in &self.checks {
-            match (c.status, worst) {
-                (Status::Fail, _) => return Status::Fail,
-                (Status::Warn, Status::Pass) => worst = Status::Warn,
-                _ => {}
-            }
-        }
-        worst
+        self.checks.iter().map(|c| c.status).max().unwrap_or(Status::Pass)
     }
 
     pub(crate) fn pass_count(&self) -> usize {

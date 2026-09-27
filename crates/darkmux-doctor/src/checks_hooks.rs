@@ -5,28 +5,21 @@
 //! carrying the worst status across them.
 
 use crate::{Check, Status};
+use darkmux_flow::hooks::HookRuleSummary;
+use darkmux_types::config::{HookMatch, HookRule};
+use std::collections::HashSet;
+use std::path::Path;
 
 /// (#2093) Surface the flow-record hook sink's resolved state: whether it's
-/// enabled (with provenance), and — when it is — every configured rule's
-/// match + URL + undelivered-line count, flagging a rule whose match is
-/// empty (Warn — matches nothing, likely an operator forgot to fill it in)
-/// or whose URL isn't loopback (Fail — `HookSink::new` refuses the whole
-/// sink over this, so it's a hard block, not a suggestion).
-///
-/// (#2093 merge-gate finding 14) Returns ONE `Check` per flagged rule
-/// (`hooks.rule.<index>`), not a single aggregate — so a flag attaches
-/// to the rule it names in the checks list itself, the same shape
-/// `eureka_checks()` already established for a check family with more
-/// than one member. Provenance distinguishes `env` / `config.json` /
-/// `default` (mirrors `check_step_command_timeout`'s own three-way
-/// provenance) — previously any non-`env` case was reported as
-/// `config.json` even when NEITHER tier actually set it.
+/// enabled (with provenance), and — when it is — one row per configured rule
+/// naming its match, destination, and undelivered-line count, with every
+/// problem flagged on the row of the rule it belongs to (the same shape
+/// `eureka_checks()` established for a check family with more than one
+/// member). Provenance distinguishes `env` / `config.json` / `default`.
 pub(crate) fn check_hooks() -> Vec<Check> {
     // (#2450 review) Provenance comes from `config_access`, which owns the
-    // `env > config.json > default` ladder for every setting. The local copy
-    // this replaces asked the config tier via `DarkmuxConfig::load_resolved()`,
-    // which has no #811 test seam and so read the operator's REAL config.json
-    // from inside the unit tests — see `hooks_enabled_provenance`'s own doc.
+    // `env > config.json > default` ladder for every setting and has the
+    // #811 test seam a direct `DarkmuxConfig::load_resolved()` read lacks.
     let provenance = darkmux_types::config_access::hooks_enabled_provenance();
     let enabled = darkmux_types::config_access::hooks_enabled();
     let rules = darkmux_types::config_access::hooks_rules();
@@ -35,16 +28,330 @@ pub(crate) fn check_hooks() -> Vec<Check> {
     build_hooks_check(enabled, provenance, &rules, &outbox_dir, &today_actions, &crate::resolved_config_path())
 }
 
-/// The literal `action=<value>` predicate from a `describe_match`
-/// rendering, when present — the same string-based extraction
-/// `hooks_match_risks_observing_the_observer` already performs against
-/// this rendered form (`HookRuleSummary` carries only the description,
-/// not the structured `HookMatch`; good enough for a doctor Warn, not a
-/// security boundary). `describe_match` always emits `action=...` FIRST
-/// when present, so a leading-prefix match is sufficient.
-fn action_from_match_desc(match_desc: &str) -> Option<&str> {
-    let rest = match_desc.strip_prefix("action=")?;
-    Some(rest.split(", ").next().unwrap_or(rest))
+/// The pure rollup `check_hooks()` delegates to — split out so it's testable
+/// against synthetic rules without the global config/env tier (#811 empties
+/// `config()` in test builds, so there's no way to inject `hooks.rules`
+/// through the real accessor path in a unit test).
+fn build_hooks_check(
+    enabled: bool,
+    provenance: &str,
+    rules: &[HookRule],
+    outbox_dir: &Path,
+    today_actions: &HashSet<String>,
+    config_path: &Path,
+) -> Vec<Check> {
+    if !enabled {
+        return vec![Check {
+            name: "hooks".into(),
+            status: Status::Pass,
+            message: format!("disabled ({provenance})"),
+            hint: None,
+        }];
+    }
+    if rules.is_empty() {
+        return vec![no_rules_check(provenance, outbox_dir)];
+    }
+    let summaries = darkmux_flow::hooks::summarize_configured_rules(rules, outbox_dir);
+    let rule_checks: Vec<Check> = summaries
+        .iter()
+        .zip(rules)
+        .map(|(s, rule)| rule_check(s, &rule.r#match.clone().unwrap_or_default(), today_actions, config_path))
+        .collect();
+    let mut out = vec![overview_check(provenance, outbox_dir, &summaries, &rule_checks)];
+    out.extend(rule_checks);
+    let current_keys: HashSet<&str> = summaries.iter().map(|s| s.key.as_str()).collect();
+    out.extend(stray_check(&stray_outbox_files(&current_keys, outbox_dir)));
+    out
+}
+
+fn no_rules_check(provenance: &str, outbox_dir: &Path) -> Check {
+    Check {
+        name: "hooks".into(),
+        status: Status::Warn,
+        message: format!("enabled ({provenance}) but no rules configured — outbox_dir={}", outbox_dir.display()),
+        hint: Some(
+            "Add a rule to config.json's `hooks.rules`, e.g. `darkmux config set hooks.rules \
+             '[{\"match\":{\"action\":\"dispatch.tool\",\"payload.tool_name\":\"create_finding\",\
+             \"payload.ok\":true},\"http\":\"http://127.0.0.1:8790/events\"}]'`."
+                .into(),
+        ),
+    }
+}
+
+/// The `hooks` row: the worst rule status, and every rule's own message
+/// listed under it.
+fn overview_check(provenance: &str, outbox_dir: &Path, summaries: &[HookRuleSummary], rule_checks: &[Check]) -> Check {
+    let worst = rule_checks.iter().map(|c| c.status).max().unwrap_or(Status::Pass);
+    let lines: Vec<String> =
+        summaries.iter().zip(rule_checks).map(|(s, c)| format!("  #{}: {}", s.index, c.message)).collect();
+    Check {
+        name: "hooks".into(),
+        status: worst,
+        message: format!(
+            "enabled ({provenance}) — {} rule(s), outbox_dir={}\n{}",
+            summaries.len(),
+            outbox_dir.display(),
+            lines.join("\n")
+        ),
+        hint: (worst != Status::Pass).then(|| "See the individual `hooks.rule.*` checks below for which rule(s).".into()),
+    }
+}
+
+/// One problem on one rule: what the row says, and how bad it is.
+struct RuleFlag {
+    text: String,
+    status: Status,
+}
+
+impl RuleFlag {
+    fn warn(text: impl Into<String>) -> Self {
+        Self { text: text.into(), status: Status::Warn }
+    }
+    fn fail(text: impl Into<String>) -> Self {
+        Self { text: text.into(), status: Status::Fail }
+    }
+}
+
+/// The `hooks.rule.<index>` row. Its status is the worst of its flags.
+fn rule_check(s: &HookRuleSummary, rule_match: &HookMatch, today_actions: &HashSet<String>, config_path: &Path) -> Check {
+    let flags = rule_flags(s, rule_match, today_actions);
+    let status = flags.iter().map(|f| f.status).max().unwrap_or(Status::Pass);
+    let flag_str = if flags.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", flags.iter().map(|f| f.text.as_str()).collect::<Vec<_>>().join("; "))
+    };
+    let message = format!(
+        "{} -> {} [{}, {}]{} (undelivered: {}){flag_str}",
+        s.match_desc,
+        s.url,
+        target_kind(s),
+        signing(s),
+        transform_suffix(s),
+        s.undelivered
+    );
+    Check {
+        name: format!("hooks.rule.{}", s.index),
+        status,
+        message,
+        hint: rule_hint(&receiver_reason_lines(s), !flags.is_empty(), config_path),
+    }
+}
+
+/// Every flag on one rule, in the order the row prints them.
+fn rule_flags(s: &HookRuleSummary, rule_match: &HookMatch, today_actions: &HashSet<String>) -> Vec<RuleFlag> {
+    [
+        empty_match_flag(s),
+        refusal_flag(s),
+        tailnet_unsigned_flag(s),
+        dropped_writes_flag(s),
+        stalled_flag(s),
+        quarantined_flag(s),
+        receiver_rejected_flag(s),
+        observer_flag(rule_match),
+        never_matched_flag(s, rule_match, today_actions),
+        transform_failed_flag(s),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn empty_match_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
+    s.is_empty_match.then(|| RuleFlag::warn("EMPTY MATCH — matches nothing"))
+}
+
+/// A refused rule is refused at load. A rule with both or neither of
+/// `http`/`file` is refused for its destination FIELDS, not its URL, and
+/// says so; otherwise the URL satisfied neither the loopback nor the
+/// tailnet policy (#2135 option 2) — a valid tailnet rule is not this case.
+fn refusal_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
+    if let Some(problem) = s.destination_problem {
+        return Some(RuleFlag::fail(format!("DESTINATION REFUSED — {}; refused at load", problem.describe())));
+    }
+    s.is_refused.then(|| RuleFlag::fail("URL REFUSED — neither loopback nor a Tailscale address; refused at load"))
+}
+
+/// (#2135 option 2) An unsigned TAILNET target is fine inside the tailnet
+/// (WireGuard already authenticates + encrypts the peer), but the receiver
+/// has no way to attribute the record's sender beyond the body itself.
+fn tailnet_unsigned_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
+    (s.is_tailnet && !s.signed).then(|| {
+        RuleFlag::warn(
+            "TAILNET TARGET, UNSIGNED — attribution is unsigned; fine inside the tailnet, required beyond it",
+        )
+    })
+}
+
+/// (#2093 merge-gate finding 9) Dropped writes (over the outbox cap, or an
+/// append failure) are a Warn, not a Fail: delivery for every OTHER pending
+/// line keeps working.
+fn dropped_writes_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
+    (s.dropped_appends > 0).then(|| {
+        RuleFlag::warn(format!(
+            "{} write(s) dropped so far (over the outbox cap, or an append failure)",
+            s.dropped_appends
+        ))
+    })
+}
+
+/// (fix-round finding 1) A STALLED rule has stopped attempting deliveries.
+fn stalled_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
+    s.stalled.then(|| {
+        RuleFlag::warn(format!(
+            "STALLED — {} consecutive cursor-write failure(s); the drainer has stopped attempting new \
+             deliveries for this rule until its cursor file becomes writable again",
+            s.cursor_write_failures
+        ))
+    })
+}
+
+/// (fix-round finding 7) Quarantined (invalid-JSON) lines are never
+/// redelivered.
+fn quarantined_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
+    (s.quarantined_lines > 0)
+        .then(|| RuleFlag::warn(format!("{} line(s) quarantined (invalid JSON — never redelivered)", s.quarantined_lines)))
+}
+
+/// (#2273) The receiver accepted a delivery's HTTP request (2xx) but its
+/// response body reported it rejected some or all of the record(s) inside —
+/// a third outcome, distinct from a transport failure and a clean accept.
+/// darkmux never retries it (a receiver-side content rejection is usually
+/// permanent), so the line is consumed; this row is where an operator who
+/// missed the `hook.fired` Warn record still finds out.
+///
+/// Keyed on the CUMULATIVE `receiver_rejected_total`, never on
+/// `last_receiver_rejected`: the latter lives on the `.last` sidecar, which
+/// every terminal outcome replaces whole, so one clean delivery after 400
+/// rejections would erase it. The last delivery's own count is named as
+/// context when present. Describes the count and the actor; never calls
+/// the receiver misconfigured.
+fn receiver_rejected_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
+    if s.receiver_rejected_total == 0 {
+        return None;
+    }
+    let last_clause = match s.last_receiver_rejected {
+        Some(n) if !s.last_receiver_rejected_reasons.is_empty() => {
+            format!("; {n} on the last delivery — the receiver's reason(s) below")
+        }
+        Some(n) => format!("; {n} on the last delivery"),
+        None => String::new(),
+    };
+    Some(RuleFlag::warn(format!(
+        "{} record(s) reported rejected by the receiver so far (request accepted, content \
+         rejected — consumed, not retried){last_clause}",
+        s.receiver_rejected_total
+    )))
+}
+
+/// (#2196) The receiver's own stated reason(s) for its last rejection, as
+/// pre-bounded hint lines — empty when there is no rejection or no reason.
+///
+/// (#2196 fix-round 4) Receiver text NEVER joins a row's `message`, for two
+/// structural reasons: `message` is word-wrapped to `output_width()`, which
+/// reads `COLUMNS` — not exported to child processes by zsh or bash — so
+/// doctor renders at its 100-column default, the terminal re-wraps, and a
+/// continuation lands at column 0 where doctor's flush-left rows (header,
+/// verdict banner, summary) live; and `verdict_banner_at` quotes the worst
+/// check's whole `message` onto a flush-left line of its own. Every hint line
+/// is printed behind an indent, and these lines are bounded so the finished
+/// row stays under the narrowest supported terminal width.
+fn receiver_reason_lines(s: &HookRuleSummary) -> Vec<String> {
+    if s.receiver_rejected_total == 0 || s.last_receiver_rejected.is_none() {
+        return Vec::new();
+    }
+    if s.last_receiver_rejected_reasons.is_empty() {
+        return Vec::new();
+    }
+    darkmux_flow::hooks::rejection_reason_display_lines(
+        &s.last_receiver_rejected_reasons,
+        darkmux_flow::hooks::REJECTION_REASON_HINT_INDENT,
+    )
+}
+
+fn observer_flag(rule_match: &HookMatch) -> Option<RuleFlag> {
+    hooks_match_risks_observing_the_observer(rule_match)
+        .then(|| RuleFlag::warn("matches telemetry / a bare `*` action — the observer must not join the observed"))
+}
+
+/// (silent-miss audit, 2026-09-06) A rule with ZERO deliveries ever (nothing
+/// undelivered, no terminal outcome) reads as merely quiet — but it may have
+/// NEVER matched because its action names the other bookend spelling
+/// (`HookMatch::action` is a literal glob; it does not tolerate both
+/// spellings the way `darkmux_flow`'s shared matchers do). When today's flow
+/// day file carries the other spelling, that silence has an explanation.
+fn never_matched_flag(s: &HookRuleSummary, rule_match: &HookMatch, today_actions: &HashSet<String>) -> Option<RuleFlag> {
+    if s.undelivered != 0 || s.last_delivery_ts.is_some() {
+        return None;
+    }
+    let configured = rule_match.action.as_deref()?;
+    let other = crate::other_bookend_spelling(configured).filter(|o| today_actions.contains(*o))?;
+    Some(RuleFlag::warn(format!(
+        "NEVER MATCHED (zero deliveries) — configured for action=\"{configured}\", but today's flow \
+         records use \"{other}\" instead; this looks like a bookend-spelling mismatch, not a quiet rule"
+    )))
+}
+
+/// (#2183) A `transform` that failed to load refuses THIS rule only
+/// (`HookSink::new` disables it, the rest of the sink keeps running), so it
+/// fails this row without the whole sink reading as broken.
+fn transform_failed_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
+    match (&s.transform_name, &s.transform_status) {
+        (Some(name), Some(Err(reason))) => Some(RuleFlag::fail(format!("TRANSFORM `{name}` FAILED TO LOAD — {reason}"))),
+        _ => None,
+    }
+}
+
+/// `, transform: <name> (blake3:<hash>)`, `[FAILED]` in place of the hash
+/// when it did not load, or nothing when the rule has no transform.
+fn transform_suffix(s: &HookRuleSummary) -> String {
+    match (&s.transform_name, &s.transform_status) {
+        (Some(name), Some(Ok(hash))) => format!(", transform: {name} (blake3:{hash})"),
+        (Some(name), Some(Err(_))) => format!(", transform: {name} [FAILED]"),
+        _ => String::new(),
+    }
+}
+
+/// (#2135 option 2) What the destination is — the URL is the policy
+/// decision, and this makes it legible. (#2183) `file` is the no-network
+/// transport, with no URL policy or signature to report.
+fn target_kind(s: &HookRuleSummary) -> &'static str {
+    if s.destination_problem.is_some() {
+        "refused"
+    } else if s.is_file {
+        "file"
+    } else if s.is_loopback {
+        "loopback"
+    } else if s.is_tailnet {
+        "tailnet"
+    } else {
+        "refused"
+    }
+}
+
+fn signing(s: &HookRuleSummary) -> &'static str {
+    if s.is_file {
+        "n/a"
+    } else if s.signed {
+        "signed"
+    } else {
+        "unsigned"
+    }
+}
+
+/// The receiver's reason(s) first — they are evidence, and an operator
+/// reading a rejection wants the receiver's words before advice about the
+/// local config — then the config remedy when the row carries any flag.
+fn rule_hint(reason_lines: &[String], flagged: bool, config_path: &Path) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    if !reason_lines.is_empty() {
+        lines.push("the receiver's stated reason(s) for the last rejection:".into());
+        lines.extend(reason_lines.iter().cloned());
+    }
+    if flagged {
+        lines.push(format!("Fix this rule in {} (or `darkmux config set hooks.rules ...`).", config_path.display()));
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 /// (#2093 merge-gate finding 17) True when a rule's match risks the
@@ -54,21 +361,44 @@ fn action_from_match_desc(match_desc: &str) -> Option<&str> {
 /// predicate, which (among everything else) catches every telemetry record.
 /// Reads the typed match, so a payload value that merely spells one of
 /// these is not mistaken for it.
-fn hooks_match_risks_observing_the_observer(m: &darkmux_types::config::HookMatch) -> bool {
-    let bare_star =
-        m.action.as_deref() == Some("*") && darkmux_types::config::HookMatch { action: None, ..m.clone() }.is_empty();
+fn hooks_match_risks_observing_the_observer(m: &HookMatch) -> bool {
+    let bare_star = m.action.as_deref() == Some("*") && HookMatch { action: None, ..m.clone() }.is_empty();
     m.category.as_deref() == Some("telemetry")
         || m.action.as_deref().is_some_and(|a| a.starts_with("telemetry."))
         || bare_star
 }
 
-/// (#2093 merge-gate finding 15) `*.outbox.jsonl` files in `outbox_dir`
-/// whose key (the content-hash `rule_key` — see `darkmux_flow::hooks`'
-/// own doc) matches no CURRENTLY-configured rule. Belongs to a rule
-/// since removed from config (or edited enough to change its
-/// `match`/`http`) — the outbox still holds whatever was undelivered
-/// when that happened, and nothing will ever drain it again unless the
-/// rule comes back verbatim.
+/// (#2093 merge-gate finding 15) The `hooks.stray` row, when any outbox file
+/// belongs to no current rule — named, rather than silently taking up disk
+/// forever. (fix-round finding 6) Each file carries its undelivered line
+/// count and its sibling sidecars: an operator deciding "safe to delete?"
+/// needs both.
+fn stray_check(stray: &[StrayOutbox]) -> Option<Check> {
+    if stray.is_empty() {
+        return None;
+    }
+    let details: Vec<String> = stray
+        .iter()
+        .map(|s| {
+            let name = s.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let siblings =
+                if s.siblings.is_empty() { String::new() } else { format!("; siblings: {}", s.siblings.join(", ")) };
+            format!("{name} ({} undelivered line(s){siblings})", s.undelivered)
+        })
+        .collect();
+    Some(Check {
+        name: "hooks.stray".into(),
+        status: Status::Warn,
+        message: format!("{} outbox file(s) belong to no currently-configured rule: {}", stray.len(), details.join(", ")),
+        hint: Some(
+            "A rule was removed or edited since these were written. `darkmux flow drain --file <path> \
+             --to <loopback url>` delivers a stray file's undelivered lines before you delete it; once \
+             undelivered is 0, it (and its sibling sidecars) are safe to remove."
+                .into(),
+        ),
+    })
+}
+
 /// (fix-round finding 6) One stray `*.outbox.jsonl` file — one whose
 /// owning rule no longer exists in current config — plus the detail an
 /// operator deciding "safe to delete?" actually needs: how many lines
@@ -89,14 +419,19 @@ struct StrayOutbox {
 const HOOK_SIDECAR_SUFFIXES: &[&str] =
     &[".cursor", ".last", ".dropped", ".rejected", ".drain.lock", ".outbox.jsonl.quarantine"];
 
-fn stray_outbox_files(rules: &[darkmux_types::config::HookRule], outbox_dir: &std::path::Path) -> Vec<StrayOutbox> {
-    // (#2183) Reuse `summarize_configured_rules`'s OWN key derivation
-    // (`.key`) rather than recomputing `rule_key` by hand from `r.http`
-    // alone — a `file`-transport rule has no `http`, so hand-rolling this
-    // from `r.http.unwrap_or_default()` would key every `file` rule on
-    // the empty string and misreport its real outbox as stray.
-    let current_keys: std::collections::HashSet<String> =
-        darkmux_flow::hooks::summarize_configured_rules(rules, outbox_dir).into_iter().map(|s| s.key).collect();
+/// (#2093 merge-gate finding 15) `*.outbox.jsonl` files in `outbox_dir`
+/// whose key (the content-hash `rule_key`) matches no currently configured
+/// rule: a rule since removed, or edited enough to change its key. Nothing
+/// drains such a file again unless the rule comes back verbatim.
+///
+/// `current_keys` are the configured rules' `HookRuleSummary::key`s — the
+/// summary's own key derivation, never one recomputed here: a `file` rule
+/// has no `http`, so keying on `http` alone would misreport its real outbox
+/// as stray (#2183).
+fn stray_outbox_files(
+    current_keys: &HashSet<&str>,
+    outbox_dir: &Path,
+) -> Vec<StrayOutbox> {
     let Ok(entries) = std::fs::read_dir(outbox_dir) else {
         return Vec::new();
     };
@@ -126,362 +461,6 @@ fn stray_outbox_files(rules: &[darkmux_types::config::HookRule], outbox_dir: &st
             Some(StrayOutbox { path, undelivered, siblings })
         })
         .collect()
-}
-
-/// The pure rollup `check_hooks()` delegates to — split out so it's testable
-/// against synthetic rules without the global config/env tier (#811 empties
-/// `config()` in test builds, so there's no way to inject `hooks.rules`
-/// through the real accessor path in a unit test).
-fn build_hooks_check(
-    enabled: bool,
-    provenance: &str,
-    rules: &[darkmux_types::config::HookRule],
-    outbox_dir: &std::path::Path,
-    today_actions: &std::collections::HashSet<String>,
-    config_path: &std::path::Path,
-) -> Vec<Check> {
-    let name = "hooks";
-    if !enabled {
-        return vec![Check { name: name.into(), status: Status::Pass, message: format!("disabled ({provenance})"), hint: None }];
-    }
-    if rules.is_empty() {
-        return vec![Check {
-            name: name.into(),
-            status: Status::Warn,
-            message: format!("enabled ({provenance}) but no rules configured — outbox_dir={}", outbox_dir.display()),
-            hint: Some(
-                "Add a rule to config.json's `hooks.rules`, e.g. `darkmux config set hooks.rules \
-                 '[{\"match\":{\"action\":\"dispatch.tool\",\"payload.tool_name\":\"create_finding\",\
-                 \"payload.ok\":true},\"http\":\"http://127.0.0.1:8790/events\"}]'`."
-                    .into(),
-            ),
-        }];
-    }
-
-    let summaries = darkmux_flow::hooks::summarize_configured_rules(rules, outbox_dir);
-    let mut worst = Status::Pass;
-    let mut overview_lines = Vec::with_capacity(summaries.len());
-    let mut rule_checks = Vec::with_capacity(summaries.len());
-
-    for (s, rule) in summaries.iter().zip(rules) {
-        let rule_match = rule.r#match.clone().unwrap_or_default();
-        let mut flags = Vec::new();
-        // (#2196 fix-round 4, MUST FIX G at the doctor surface) The
-        // receiver's own reason text NEVER joins `message`. It rides
-        // these pre-bounded hint lines instead — see the `receiver_rejected_total`
-        // block below for why, and `darkmux_flow::hooks::rejection_reason_display_lines`
-        // for the budget.
-        let mut reason_hint_lines: Vec<String> = Vec::new();
-        let mut rule_status = Status::Pass;
-        if s.is_empty_match {
-            flags.push("EMPTY MATCH — matches nothing".to_string());
-            rule_status = Status::Warn;
-        }
-        // (#2135 option 2) A URL satisfying NEITHER the loopback nor the
-        // tailnet policy is what `HookSink::new` refuses the whole sink
-        // over — a valid tailnet rule (`is_tailnet: true`) is NOT this
-        // case and must not read as broken.
-        //
-        // A rule with both or neither of `http`/`file` is refused for its
-        // destination FIELDS, not its URL, and says so.
-        if let Some(problem) = s.destination_problem {
-            flags.push(format!("DESTINATION REFUSED — {}; refused at load", problem.describe()));
-            rule_status = Status::Fail;
-        } else if s.is_refused {
-            flags.push("URL REFUSED — neither loopback nor a Tailscale address; refused at load".to_string());
-            rule_status = Status::Fail;
-        }
-        // (#2135 option 2) An unsigned TAILNET target is fine inside the
-        // tailnet (WireGuard already authenticates + encrypts the peer),
-        // but the receiver has no way to attribute the record's sender
-        // beyond the body itself — worth a Warn, not a Fail.
-        if s.is_tailnet && !s.signed {
-            flags.push(
-                "TAILNET TARGET, UNSIGNED — attribution is unsigned; fine inside the tailnet, required beyond it"
-                    .to_string(),
-            );
-            if rule_status == Status::Pass {
-                rule_status = Status::Warn;
-            }
-        }
-        // (#2093 merge-gate finding 9) A rule that's been dropping writes
-        // (over the outbox cap, or an append failure) is a Warn — not a
-        // Fail, since delivery for every OTHER pending line keeps working.
-        if s.dropped_appends > 0 {
-            flags.push(format!(
-                "{} write(s) dropped so far (over the outbox cap, or an append failure)",
-                s.dropped_appends
-            ));
-            if rule_status == Status::Pass {
-                rule_status = Status::Warn;
-            }
-        }
-        // (fix-round finding 1) A STALLED rule has stopped attempting
-        // deliveries entirely — surfaced loudly, same severity as the
-        // other operational (not config-validation) flags here.
-        if s.stalled {
-            flags.push(format!(
-                "STALLED — {} consecutive cursor-write failure(s); the drainer has stopped attempting new \
-                 deliveries for this rule until its cursor file becomes writable again",
-                s.cursor_write_failures
-            ));
-            if rule_status == Status::Pass {
-                rule_status = Status::Warn;
-            }
-        }
-        // (fix-round finding 7) Quarantined (invalid-JSON) lines are
-        // never redelivered — worth naming, same as a dropped append.
-        if s.quarantined_lines > 0 {
-            flags.push(format!("{} line(s) quarantined (invalid JSON — never redelivered)", s.quarantined_lines));
-            if rule_status == Status::Pass {
-                rule_status = Status::Warn;
-            }
-        }
-        // (#2273) The receiver accepted a delivery's HTTP request (2xx)
-        // but its own response body reported it rejected some or all of
-        // the record(s) inside it — a THIRD outcome, distinct from a
-        // transport failure and a clean accept. darkmux never retries
-        // this: a receiver-side content rejection is (per
-        // `DeliveryOutcome::Success`'s own doc) usually permanent, so
-        // retrying would just repeat it forever — the line is consumed
-        // same as a clean delivery. This is where an operator who missed
-        // the `hook.fired` flow record (now emitted at Warn, not Info,
-        // for exactly this case) still finds out it happened.
-        //
-        // (#2273 fix-round finding 1) Keyed on the CUMULATIVE
-        // `receiver_rejected_total`, never on `last_receiver_rejected`.
-        // The latter lives on the `.last` sidecar, which every terminal
-        // outcome truncate-replaces in full — so 400 rejections followed
-        // by ONE clean delivery leaves it `None`, and a check keyed on it
-        // reports the rule clean seconds after those losses. The total is
-        // a counter sidecar of its own (`<key>.rejected`), never reset —
-        // the same substrate `dropped_appends` uses, for the same reason.
-        // The last delivery's own count is still named when present, as
-        // context.
-        //
-        // Describing only, per this project's stance: names the count and
-        // the actor, never characterizes the receiver as misconfigured.
-        if s.receiver_rejected_total > 0 {
-            // (#2196) The receiver's own stated reason(s) for that last
-            // rejection, when its body carried any — the count alone
-            // tells an operator SOMETHING was thrown away, never WHY, so
-            // this is what saves a replay against a scratch receiver or a
-            // trip through the receiver's own log to find out.
-            //
-            // (#2196 fix-round 4, MUST FIX G at the doctor surface) The
-            // reason text is deliberately NOT interpolated into
-            // `message`, which is where it lived through fix-round 3.
-            // Two independent reasons, both structural:
-            //
-            //  * `message` is word-wrapped by `render_check_block` to
-            //    `output_width()` and its CONTINUATIONS are indented —
-            //    but `output_width()` reads `COLUMNS`, and `COLUMNS` is
-            //    not exported to child processes by zsh or bash
-            //    (measured). So doctor renders at its 100-column DEFAULT
-            //    however wide the operator's terminal really is, the
-            //    terminal re-wraps every line past its own width, and the
-            //    continuation lands at column 0 — where doctor's three
-            //    flush-left rows live (the `darkmux doctor — N checks`
-            //    header, the `●` verdict banner, and the summary). Proven
-            //    against the real renderer: a receiver could put
-            //    `● ok — every check passed` at column 0 of a 60-column
-            //    terminal, under a genuine `broken` banner.
-            //  * `verdict_banner_at` quotes the worst check's whole
-            //    `message` onto a FLUSH-LEFT line of its own. Anything in
-            //    `message` is one status away from being printed at
-            //    column 0 with no indent at all.
-            //
-            // The hint path has neither problem: every hint line is
-            // printed behind `"        → "` or ten spaces, and the lines
-            // below are pre-bounded so the finished row stays under the
-            // narrowest supported terminal width.
-            let last_clause = match s.last_receiver_rejected {
-                Some(n) if !s.last_receiver_rejected_reasons.is_empty() => {
-                    reason_hint_lines = darkmux_flow::hooks::rejection_reason_display_lines(
-                        &s.last_receiver_rejected_reasons,
-                        darkmux_flow::hooks::REJECTION_REASON_HINT_INDENT,
-                    );
-                    format!("; {n} on the last delivery — the receiver's reason(s) below")
-                }
-                Some(n) => format!("; {n} on the last delivery"),
-                None => String::new(),
-            };
-            flags.push(format!(
-                "{} record(s) reported rejected by the receiver so far (request accepted, content \
-                 rejected — consumed, not retried){last_clause}",
-                s.receiver_rejected_total
-            ));
-            if rule_status == Status::Pass {
-                rule_status = Status::Warn;
-            }
-        }
-        if hooks_match_risks_observing_the_observer(&rule_match) {
-            flags.push(
-                "matches telemetry / a bare `*` action — the observer must not join the observed".to_string(),
-            );
-            if rule_status == Status::Pass {
-                rule_status = Status::Warn;
-            }
-        }
-        // (silent-miss audit, 2026-09-06) A rule with ZERO deliveries ever
-        // (nothing currently undelivered, and no terminal outcome has ever
-        // landed) reads as merely quiet — a healthy rule waiting for a
-        // matching record is indistinguishable from one that has NEVER
-        // matched a single record because it was written against the
-        // wrong bookend spelling (`HookMatch::action` is a literal glob;
-        // it does NOT tolerate both spellings the way `darkmux_flow`'s
-        // shared matchers do). If today's flow day file holds at least
-        // one record carrying the OTHER spelling of this rule's configured
-        // action, that silence has an explanation worth naming instead of
-        // leaving the operator to notice only when nothing ever arrives.
-        if s.undelivered == 0 && s.last_delivery_ts.is_none() {
-            if let Some(configured) = action_from_match_desc(&s.match_desc) {
-                if let Some(other) = crate::other_bookend_spelling(configured) {
-                    if today_actions.contains(other) {
-                        flags.push(format!(
-                            "NEVER MATCHED (zero deliveries) — configured for action=\"{configured}\", but \
-                             today's flow records use \"{other}\" instead; this looks like a bookend-spelling \
-                             mismatch, not a quiet rule"
-                        ));
-                        if rule_status == Status::Pass {
-                            rule_status = Status::Warn;
-                        }
-                    }
-                }
-            }
-        }
-        if worst == Status::Pass && rule_status != Status::Pass {
-            worst = rule_status;
-        } else if rule_status == Status::Fail {
-            worst = Status::Fail;
-        }
-
-        // (#2183) A `transform` that failed to load is a load-time
-        // refusal SCOPED TO THIS RULE (`HookSink::new` disables just this
-        // rule, the rest of the sink keeps running) — Fail here too, so
-        // the row that's actually broken is the one operator sees red,
-        // without the whole `hooks` check reading as catastrophic.
-        let transform_suffix = match (&s.transform_name, &s.transform_status) {
-            (Some(name), Some(Ok(hash))) => format!(", transform: {name} (blake3:{hash})"),
-            (Some(name), Some(Err(reason))) => {
-                flags.push(format!("TRANSFORM `{name}` FAILED TO LOAD — {reason}"));
-                rule_status = Status::Fail;
-                format!(", transform: {name} [FAILED]")
-            }
-            _ => String::new(),
-        };
-        if worst == Status::Pass && rule_status != Status::Pass {
-            worst = rule_status;
-        } else if rule_status == Status::Fail {
-            worst = Status::Fail;
-        }
-
-        let flag_str = if flags.is_empty() { String::new() } else { format!(" [{}]", flags.join("; ")) };
-        // (#2135 option 2) `loopback`/`tailnet`/`refused` + `signed`/
-        // `unsigned` — the visibility the operator's design asked for in
-        // place of a config gate: the URL is the decision, this row is
-        // what makes it legible. (#2183) `file` names the no-network
-        // testing-tier transport instead — there's no URL policy or
-        // signature to report for it.
-        let target_kind = if s.destination_problem.is_some() {
-            "refused"
-        } else if s.is_file {
-            "file"
-        } else if s.is_loopback {
-            "loopback"
-        } else if s.is_tailnet {
-            "tailnet"
-        } else {
-            "refused"
-        };
-        let signed = if s.is_file { "n/a" } else if s.signed { "signed" } else { "unsigned" };
-        let message = format!(
-            "{} -> {} [{target_kind}, {signed}]{transform_suffix} (undelivered: {}){flag_str}",
-            s.match_desc, s.url, s.undelivered
-        );
-        overview_lines.push(format!("  #{}: {message}", s.index));
-        rule_checks.push(Check {
-            name: format!("hooks.rule.{}", s.index),
-            status: rule_status,
-            message,
-            hint: {
-                // (#2196 fix-round 4) The receiver's quoted reason(s)
-                // ride here as their own lines, ahead of the config
-                // remedy — they are EVIDENCE, and an operator reading a
-                // rejection wants the receiver's words before any advice
-                // about the local config. Each line is already bounded so
-                // that doctor's hint prefix plus the line stays under the
-                // narrowest supported terminal width; doctor's own
-                // `wrap_hanging` only ever narrows a line further, so the
-                // bound survives whatever `output_width()` resolves to.
-                let mut hint_lines: Vec<String> = Vec::new();
-                if !reason_hint_lines.is_empty() {
-                    hint_lines.push("the receiver's stated reason(s) for the last rejection:".into());
-                    hint_lines.extend(reason_hint_lines.iter().cloned());
-                }
-                if !flags.is_empty() {
-                    hint_lines.push(format!(
-                        "Fix this rule in {} (or `darkmux config set hooks.rules ...`).",
-                        config_path.display()
-                    ));
-                }
-                if hint_lines.is_empty() {
-                    None
-                } else {
-                    Some(hint_lines.join("\n"))
-                }
-            },
-        });
-    }
-
-    let overview = Check {
-        name: name.into(),
-        status: worst,
-        message: format!(
-            "enabled ({provenance}) — {} rule(s), outbox_dir={}\n{}",
-            summaries.len(),
-            outbox_dir.display(),
-            overview_lines.join("\n")
-        ),
-        hint: if worst != Status::Pass {
-            Some("See the individual `hooks.rule.*` checks below for which rule(s).".into())
-        } else {
-            None
-        },
-    };
-    let mut out = vec![overview];
-    out.extend(rule_checks);
-
-    // (#2093 merge-gate finding 15) A file that belongs to no CURRENT
-    // rule — named so, rather than silently taking up disk forever.
-    let stray = stray_outbox_files(rules, outbox_dir);
-    if !stray.is_empty() {
-        // (fix-round finding 6) Name each stray file's undelivered line
-        // count and its sibling sidecars — an operator deciding whether
-        // it's "safe to delete" needs both, not just the outbox name.
-        let details: Vec<String> = stray
-            .iter()
-            .map(|s| {
-                let name = s.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let siblings =
-                    if s.siblings.is_empty() { String::new() } else { format!("; siblings: {}", s.siblings.join(", ")) };
-                format!("{name} ({} undelivered line(s){siblings})", s.undelivered)
-            })
-            .collect();
-        out.push(Check {
-            name: "hooks.stray".into(),
-            status: Status::Warn,
-            message: format!("{} outbox file(s) belong to no currently-configured rule: {}", stray.len(), details.join(", ")),
-            hint: Some(
-                "A rule was removed or edited since these were written. `darkmux flow drain --file <path> \
-                 --to <loopback url>` delivers a stray file's undelivered lines before you delete it; once \
-                 undelivered is 0, it (and its sibling sidecars) are safe to remove."
-                    .into(),
-            ),
-        });
-    }
-
-    out
 }
 
 #[cfg(test)]
@@ -1552,6 +1531,27 @@ mod tests {
         assert_eq!(lines.first().copied(), Some("the receiver's stated reason(s) for the last rejection:"));
         assert!(lines[1..lines.len() - 1].iter().any(|l| l.contains("\"bad\"")), "{hint}");
         assert_eq!(lines.last().copied(), Some(REMEDY));
+    }
+
+    /// Reasons are only quoted as "the last rejection's" when the last
+    /// delivery actually carried a rejection count; otherwise nothing on the
+    /// row says which delivery they belong to.
+    #[test]
+    fn reasons_without_a_last_delivery_count_are_not_quoted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rule = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        let key = key_of(&rule);
+        std::fs::write(
+            tmp.path().join(format!("{key}.last")),
+            r#"{"ts":"2026-01-01T00:00:00Z","ok":true,"last_receiver_rejected_reasons":["stale"]}"#,
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join(format!("{key}.rejected")), "4").unwrap();
+        let checks = checks_for(&[rule], tmp.path());
+        let row = named(&checks, "hooks.rule.0");
+        assert_eq!(row.status, Status::Warn);
+        assert!(!row.message.contains("on the last delivery"), "{}", row.message);
+        assert_eq!(row.hint.as_deref(), Some(REMEDY), "no reason block without a count to attach it to");
     }
 
     #[test]
