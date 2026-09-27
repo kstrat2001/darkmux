@@ -413,6 +413,11 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    `darkmux config set` refuses it; and help (`config set <key>` with no value, `config list`,
    `config set --help`) lists the valid values with their meanings. `--skip-preflight` does not
    waive it: that flag skips a Docker probe, and a bad config value is not a probe result.
+   A setting that no work-starting entry point reads is refused by no preflight, by design, and
+   its registry entry carries a `no_scope_reason` that doctor prints instead of claiming a
+   refusal: today `fleet.mode` (a bad value only makes viewer links use the direct address, with
+   a warning) and a hook rule's `match.level` / `match.category` (a bad value turns the hooks sink
+   off, loudly, while the run continues without it).
 
    Retired spellings are refused too, naming the replacement ("`enforce` was renamed to `conclude`
    in 4.0"): a rename never reads the old word as the new one. Policy values name the action
