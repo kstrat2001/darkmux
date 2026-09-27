@@ -97,20 +97,38 @@ fn overview_check(provenance: &str, outbox_dir: &Path, summaries: &[HookRuleSumm
     }
 }
 
-/// One problem on one rule: what the row says, and how bad it is.
+/// One problem on one rule: what the row says, how bad it is, and where
+/// its cure lives.
 struct RuleFlag {
     text: String,
     status: Status,
+    cause: FlagCause,
+}
+
+/// Whether editing the rule's config is the cure, which decides the hint.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlagCause {
+    /// The rule as written is the problem; the config remedy applies.
+    Config,
+    /// Delivery went wrong at run time (drops, a stall, quarantined lines,
+    /// receiver rejections, give-ups); editing config will not clear it.
+    Delivery,
 }
 
 impl RuleFlag {
     fn warn(text: impl Into<String>) -> Self {
-        Self { text: text.into(), status: Status::Warn }
+        Self { text: text.into(), status: Status::Warn, cause: FlagCause::Config }
     }
     fn fail(text: impl Into<String>) -> Self {
-        Self { text: text.into(), status: Status::Fail }
+        Self { text: text.into(), status: Status::Fail, cause: FlagCause::Config }
+    }
+    fn delivery(self) -> Self {
+        Self { cause: FlagCause::Delivery, ..self }
     }
 }
+
+/// The hint line a delivery-side flag carries in place of the config remedy.
+const DELIVERY_HINT: &str = "`darkmux flow status` shows this rule's delivery history.";
 
 /// The `hooks.rule.<index>` row. Its status is the worst of its flags.
 fn rule_check(s: &HookRuleSummary, rule_match: &HookMatch, today_actions: &HashSet<String>, config_path: &Path) -> Check {
@@ -134,7 +152,7 @@ fn rule_check(s: &HookRuleSummary, rule_match: &HookMatch, today_actions: &HashS
         name: format!("hooks.rule.{}", s.index),
         status,
         message,
-        hint: rule_hint(&receiver_reason_lines(s), !flags.is_empty(), config_path),
+        hint: rule_hint(&receiver_reason_lines(s), &last_error_lines(s), &flags, config_path),
     }
 }
 
@@ -146,6 +164,7 @@ fn rule_flags(s: &HookRuleSummary, rule_match: &HookMatch, today_actions: &HashS
         tailnet_unsigned_flag(s),
         dropped_writes_flag(s),
         stalled_flag(s),
+        giving_up_flag(s),
         quarantined_flag(s),
         receiver_rejected_flag(s),
         observer_flag(rule_match),
@@ -192,6 +211,7 @@ fn dropped_writes_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
             "{} write(s) dropped so far (over the outbox cap, or an append failure)",
             s.dropped_appends
         ))
+        .delivery()
     })
 }
 
@@ -203,6 +223,7 @@ fn stalled_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
              deliveries for this rule until its cursor file becomes writable again",
             s.cursor_write_failures
         ))
+        .delivery()
     })
 }
 
@@ -210,7 +231,7 @@ fn stalled_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
 /// redelivered.
 fn quarantined_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
     (s.quarantined_lines > 0)
-        .then(|| RuleFlag::warn(format!("{} line(s) quarantined (invalid JSON — never redelivered)", s.quarantined_lines)))
+        .then(|| RuleFlag::warn(format!("{} line(s) quarantined (invalid JSON — never redelivered)", s.quarantined_lines)).delivery())
 }
 
 /// (#2273) The receiver accepted a delivery's HTTP request (2xx) but its
@@ -237,11 +258,14 @@ fn receiver_rejected_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
         Some(n) => format!("; {n} on the last delivery"),
         None => String::new(),
     };
-    Some(RuleFlag::warn(format!(
-        "{} record(s) reported rejected by the receiver so far (request accepted, content \
-         rejected — consumed, not retried){last_clause}",
-        s.receiver_rejected_total
-    )))
+    Some(
+        RuleFlag::warn(format!(
+            "{} record(s) reported rejected by the receiver so far (request accepted, content \
+             rejected — consumed, not retried){last_clause}",
+            s.receiver_rejected_total
+        ))
+        .delivery(),
+    )
 }
 
 /// (#2196) The receiver's own stated reason(s) for its last rejection, as
@@ -267,6 +291,25 @@ fn receiver_reason_lines(s: &HookRuleSummary) -> Vec<String> {
         &s.last_receiver_rejected_reasons,
         darkmux_flow::hooks::REJECTION_REASON_HINT_INDENT,
     )
+}
+
+/// The rule's last terminal outcome was a give-up (`last_error` is cleared by
+/// the next successful delivery, so this is the CURRENT state). The error
+/// itself rides the hint via [`last_error_lines`], never the message: it is
+/// not all darkmux's own voice (a refused redirect embeds the receiver's
+/// `Location`), and `message` reaches flush-left rows — see
+/// [`receiver_reason_lines`].
+fn giving_up_flag(s: &HookRuleSummary) -> Option<RuleFlag> {
+    s.last_error.as_ref().map(|_| RuleFlag::warn("deliveries are giving up — the last error is below").delivery())
+}
+
+/// The last give-up's error as sanitized, width-bounded hint lines, under
+/// a label — the same treatment `flow status` gives this field (#2694).
+fn last_error_lines(s: &HookRuleSummary) -> Vec<String> {
+    let Some(err) = &s.last_error else { return Vec::new() };
+    let mut lines = vec!["the last delivery's error:".to_string()];
+    lines.extend(darkmux_flow::hooks::untrusted_display_lines(err, darkmux_flow::hooks::REJECTION_REASON_HINT_INDENT));
+    lines
 }
 
 fn observer_flag(rule_match: &HookMatch) -> Option<RuleFlag> {
@@ -339,17 +382,22 @@ fn signing(s: &HookRuleSummary) -> &'static str {
     }
 }
 
-/// The receiver's reason(s) first — they are evidence, and an operator
-/// reading a rejection wants the receiver's words before advice about the
-/// local config — then the config remedy when the row carries any flag.
-fn rule_hint(reason_lines: &[String], flagged: bool, config_path: &Path) -> Option<String> {
+/// Evidence first — the receiver's reason(s), then the last give-up's error:
+/// an operator wants the other side's words before advice — then the cure for
+/// each KIND of flag on the row: the config remedy only when a config-caused
+/// flag is present, and the `flow status` pointer when a delivery-side one is.
+fn rule_hint(reason_lines: &[String], error_lines: &[String], flags: &[RuleFlag], config_path: &Path) -> Option<String> {
     let mut lines: Vec<String> = Vec::new();
     if !reason_lines.is_empty() {
         lines.push("the receiver's stated reason(s) for the last rejection:".into());
         lines.extend(reason_lines.iter().cloned());
     }
-    if flagged {
+    lines.extend(error_lines.iter().cloned());
+    if flags.iter().any(|f| f.cause == FlagCause::Config) {
         lines.push(format!("Fix this rule in {} (or `darkmux config set hooks.rules ...`).", config_path.display()));
+    }
+    if flags.iter().any(|f| f.cause == FlagCause::Delivery) {
+        lines.push(DELIVERY_HINT.into());
     }
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
@@ -1350,7 +1398,7 @@ mod tests {
             "{}",
             row.message
         );
-        assert_eq!(row.hint.as_deref(), Some(REMEDY));
+        assert_eq!(row.hint.as_deref(), Some(DELIVERY_HINT), "dropped writes are not a config problem");
         let overview = named(&checks, "hooks");
         assert_eq!(overview.status, Status::Warn);
         assert_eq!(overview.hint.as_deref(), Some("See the individual `hooks.rule.*` checks below for which rule(s)."));
@@ -1517,7 +1565,7 @@ mod tests {
     }
 
     #[test]
-    fn receiver_reasons_lead_the_hint_and_the_remedy_closes_it() {
+    fn receiver_reasons_lead_the_hint_and_the_delivery_hint_closes_it() {
         let tmp = tempfile::TempDir::new().unwrap();
         let rule = hook_rule(Some("crawl.*"), Some(LOOPBACK));
         let key = key_of(&rule);
@@ -1532,7 +1580,7 @@ mod tests {
         let lines: Vec<&str> = hint.lines().collect();
         assert_eq!(lines.first().copied(), Some("the receiver's stated reason(s) for the last rejection:"));
         assert!(lines[1..lines.len() - 1].iter().any(|l| l.contains("\"bad\"")), "{hint}");
-        assert_eq!(lines.last().copied(), Some(REMEDY));
+        assert_eq!(lines.last().copied(), Some(DELIVERY_HINT), "a receiver rejection is not a config problem");
     }
 
     /// Reasons are only quoted as "the last rejection's" when the last
@@ -1553,7 +1601,85 @@ mod tests {
         let row = named(&checks, "hooks.rule.0");
         assert_eq!(row.status, Status::Warn);
         assert!(!row.message.contains("on the last delivery"), "{}", row.message);
-        assert_eq!(row.hint.as_deref(), Some(REMEDY), "no reason block without a count to attach it to");
+        assert_eq!(row.hint.as_deref(), Some(DELIVERY_HINT), "no reason block without a count to attach it to");
+    }
+
+    /// A rule whose last terminal outcome was a give-up is not healthy: it
+    /// warns, names the error in the hint (never the message — the text is
+    /// not all darkmux's own, see `receiver_reason_lines`), and points at
+    /// `flow status`, not at config.
+    #[test]
+    fn a_rule_whose_deliveries_give_up_warns_with_the_last_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rule = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        std::fs::write(
+            tmp.path().join(format!("{}.last", key_of(&rule))),
+            r#"{"ts":"2026-01-01T00:00:00Z","ok":false,"error":"connection refused (os error 61)"}"#,
+        )
+        .unwrap();
+        let checks = checks_for(&[rule], tmp.path());
+        let row = named(&checks, "hooks.rule.0");
+        assert_eq!(row.status, Status::Warn, "{}", row.message);
+        assert!(row.message.ends_with("[deliveries are giving up — the last error is below]"), "{}", row.message);
+        assert!(!row.message.contains("connection refused"), "{}", row.message);
+        let hint = row.hint.clone().unwrap();
+        let lines: Vec<&str> = hint.lines().collect();
+        assert_eq!(lines.first().copied(), Some("the last delivery's error:"), "{hint}");
+        assert!(lines.iter().any(|l| l.contains("connection refused (os error 61)")), "{hint}");
+        assert_eq!(lines.last().copied(), Some(DELIVERY_HINT), "{hint}");
+        assert!(!hint.contains("Fix this rule"), "{hint}");
+    }
+
+    /// The last error is not all darkmux's text: a raw newline or an over-wide
+    /// value must not reach column 0 when doctor renders the row.
+    #[test]
+    fn a_give_up_error_renders_indented_and_bounded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rule = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        let err = format!("redirect refused\n● ok — every check passed {}", "q".repeat(300));
+        std::fs::write(
+            tmp.path().join(format!("{}.last", key_of(&rule))),
+            serde_json::json!({"ts": "2026-01-01T00:00:00Z", "ok": false, "error": err}).to_string(),
+        )
+        .unwrap();
+        let checks = checks_for(&[rule], tmp.path());
+        let block = render_check_block(named(&checks, "hooks.rule.0"), 100);
+        let min = darkmux_flow::hooks::MIN_SUPPORTED_TERMINAL_WIDTH;
+        let mut error_lines = 0;
+        for line in block.iter().map(|l| strip_ansi(l)) {
+            assert!(!line.starts_with('●'), "{line:?}");
+            if line.contains("qqqq") || line.contains("redirect refused") {
+                error_lines += 1;
+                assert!(line.starts_with("        "), "not indented: {line:?}");
+                assert!(darkmux_flow::hooks::display_columns(&line) < min, "too wide: {line:?}");
+            }
+        }
+        assert!(error_lines > 1, "{block:?}");
+    }
+
+    /// A clean last delivery after earlier give-ups clears the flag: the
+    /// `.last` sidecar holds only the latest terminal outcome.
+    #[test]
+    fn a_clean_last_delivery_is_not_giving_up() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rule = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        std::fs::write(tmp.path().join(format!("{}.last", key_of(&rule))), r#"{"ts":"2026-01-01T00:00:00Z","ok":true}"#)
+            .unwrap();
+        let checks = checks_for(&[rule], tmp.path());
+        assert_eq!(named(&checks, "hooks.rule.0").status, Status::Pass);
+    }
+
+    /// Config-caused and delivery-side flags on one rule each bring their own
+    /// hint: the config remedy for the one, `flow status` for the other.
+    #[test]
+    fn a_config_flag_and_a_delivery_flag_each_bring_their_own_hint() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rule = hook_rule(None, Some(LOOPBACK));
+        std::fs::write(tmp.path().join(format!("{}.dropped", key_of(&rule))), "1").unwrap();
+        let checks = checks_for(&[rule], tmp.path());
+        assert_eq!(named(&checks, "hooks.rule.0").hint.as_deref(), Some(format!("{REMEDY}\n{DELIVERY_HINT}").as_str()));
+        let only_config = checks_for(&[hook_rule(None, Some(LOOPBACK))], &tmp.path().join("fresh"));
+        assert_eq!(named(&only_config, "hooks.rule.0").hint.as_deref(), Some(REMEDY));
     }
 
     #[test]
