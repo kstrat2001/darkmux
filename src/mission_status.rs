@@ -5163,4 +5163,273 @@ mod tests {
         let stale = board_json(&[], &[], &SourceState::Stale { age_ms: 1, detail: "x" });
         assert_eq!(stale["summary"]["fleet_complete"], false);
     }
+
+    // ─── characterization: the human board renderer, branch by branch ───────
+
+    const BOARD_NOW: u64 = 10 * 86_400;
+
+    fn board<'a>(views: &'a [MissionView<'a>]) -> Board<'a> {
+        Board {
+            views,
+            peer: &[],
+            fleet_state: &SourceState::Off,
+            now: BOARD_NOW,
+            width: Some(100),
+            limit: None,
+            unlimited: false,
+            missions_only: false,
+            link_base: "http://127.0.0.1:8765/",
+            all_link: None,
+        }
+    }
+
+    fn text(lines: Vec<String>) -> String {
+        lines.iter().map(|l| strip_ansi(l)).collect::<Vec<_>>().join("\n")
+    }
+
+    fn drift(detail: &str, suggest: &[&str]) -> Drift {
+        Drift { kind: "k", detail: detail.into(), suggest: suggest.iter().map(|s| s.to_string()).collect() }
+    }
+
+    fn peer(id: &str, status: RunStatus, ts: Option<u64>) -> Run {
+        Run {
+            id: id.to_string(),
+            kind: RunKind::Mission,
+            status,
+            machine: Some("peer-a".to_string()),
+            route: None,
+            role: None,
+            model: None,
+            started_ts: ts,
+            completed_ts: None,
+            updated_ts: ts,
+            tracked: false,
+            session_id: None,
+            abandoned_reason: None,
+            tokens: None,
+        }
+    }
+
+    /// Three active missions, one drifted, sorted the way `run` sorts them.
+    fn three_active() -> Vec<Mission> {
+        (0..3)
+            .map(|i| {
+                let mut m = mission(&format!("alpha-{i}"), MissionStatus::Active);
+                m.created_ts = BOARD_NOW - 3600 * (i as u64 + 1);
+                m
+            })
+            .collect()
+    }
+
+    fn views_of(ms: &[Mission]) -> Vec<MissionView<'_>> {
+        let mut vs: Vec<MissionView> = ms.iter().map(|m| view(m, 1, 1)).collect();
+        vs[1].drifts.push(drift(
+            "a long detail that explains what drifted on this mission and why it matters to the operator reading it",
+            &["darkmux mission finalize alpha-1   # every phase is done", "darkmux mission status"],
+        ));
+        vs.sort_by(board_order);
+        vs
+    }
+
+    #[test]
+    fn board_prints_sections_rows_drift_and_the_rollup() {
+        let ms = three_active();
+        let vs = views_of(&ms);
+        assert_eq!(
+            text(render_board(&board(&vs))),
+            "mission status — 3 missions\n\
+             \n\
+             ACTIVE (3)\n  \
+             ◆ alpha-1   2h    1/2  ▓▓░░  1 complete · 1 running\n      \
+             ⚠ a long detail that explains what drifted on this mission and why it matters to the operator\n        \
+             reading it\n        \
+             → darkmux mission finalize alpha-1\n          \
+             every phase is done\n        \
+             → darkmux mission status\n  \
+             ◆ alpha-0   1h    1/2  ▓▓░░  1 complete · 1 running\n  \
+             ◆ alpha-2   3h    1/2  ▓▓░░  1 complete · 1 running\n\
+             \n\
+             1 mission needs attention — run the suggested commands above to reconcile"
+        );
+    }
+
+    #[test]
+    fn a_clean_board_ends_on_the_checkmark() {
+        let ms = three_active();
+        let vs: Vec<MissionView> = ms.iter().map(|m| view(m, 2, 0)).collect();
+        let out = text(render_board(&board(&vs)));
+        assert!(out.ends_with("\n\n✓ board is clean — every mission's phases are reconciled"), "{out}");
+    }
+
+    #[test]
+    fn a_limit_in_a_terminal_names_the_flag_and_the_hidden_drift() {
+        let ms = three_active();
+        let mut vs = views_of(&ms);
+        vs.reverse(); // put the drifted mission past the limit
+        let mut b = board(&vs);
+        b.limit = Some(1);
+        assert_eq!(
+            text(render_board(&b)),
+            "mission status — 3 missions\n\
+             \n\
+             ACTIVE (3)\n  \
+             ◆ alpha-2   3h    1/2  ▓▓░░  1 complete · 1 running\n  \
+             … 2 more (1 of 3 shown) — `--all` for every mission\n  \
+             ⚠ 1 hidden mission needs attention — run with `--all`\n\
+             \n\
+             1 mission needs attention — run the suggested commands above to reconcile (some are hidden — `--all`\n\
+             to see them)"
+        );
+    }
+
+    #[test]
+    fn a_limit_in_a_panel_offers_one_link_instead_of_the_flag() {
+        let mut ms = three_active();
+        ms.extend((0..2).map(|i| mission(&format!("done-{i}"), MissionStatus::Finalized)));
+        let mut vs = views_of(&ms);
+        vs.reverse();
+        let mut b = board(&vs);
+        b.limit = Some(1);
+        b.all_link = Some("http://127.0.0.1:8765/#lens=console&panel=mission-status-all");
+        let out = text(render_board(&b));
+        assert!(out.contains("  … 2 more (1 of 3 shown)\n  ⚠ 1 hidden mission needs attention\n"), "{out}");
+        assert!(out.contains("  … 1 more (1 of 2 shown)\n"), "{out}");
+        assert_eq!(out.matches("→ show every mission").count(), 1, "one link for the whole board: {out}");
+        assert!(!out.contains("--all"), "{out}");
+        assert!(out.ends_with("(some are hidden — open\nthe full board above)"), "{out}");
+    }
+
+    #[test]
+    fn default_limits_are_ten_open_and_eight_closed_and_unlimited_lifts_them() {
+        let mut ms: Vec<Mission> = (0..11).map(|i| mission(&format!("a{i:02}"), MissionStatus::Active)).collect();
+        ms.extend((0..9).map(|i| mission(&format!("f{i:02}"), MissionStatus::Finalized)));
+        let vs: Vec<MissionView> = ms.iter().map(|m| view(m, 1, 0)).collect();
+        let out = text(render_board(&board(&vs)));
+        assert!(out.contains("… 1 more (10 of 11 shown)"), "{out}");
+        assert!(out.contains("… 1 more (8 of 9 shown)"), "{out}");
+        let mut b = board(&vs);
+        b.unlimited = true;
+        let out = text(render_board(&b));
+        assert!(!out.contains("more ("), "{out}");
+        assert!(out.contains("a10") && out.contains("f08"), "{out}");
+    }
+
+    #[test]
+    fn sections_print_in_lifecycle_order_and_empty_ones_are_omitted() {
+        let ms = [
+            mission("gone", MissionStatus::Aborted),
+            mission("done", MissionStatus::Finalized),
+            mission("live", MissionStatus::Active),
+        ];
+        let vs: Vec<MissionView> = ms.iter().map(|m| view(m, 1, 0)).collect();
+        let out = text(render_board(&board(&vs)));
+        let headers: Vec<&str> = out.lines().filter(|l| l.ends_with("(1)")).collect();
+        assert_eq!(headers, ["ACTIVE (1)", "FINALIZED (1)", "ABORTED (1)"]);
+    }
+
+    #[test]
+    fn minted_runs_show_by_default_with_a_filter_hint_and_hide_under_missions() {
+        let named = mission("doom-loop-m4", MissionStatus::Active);
+        let mut minted = mission("dispatch-code-reviewer-1785589698-5d6a-0", MissionStatus::Active);
+        minted.spec = Some(minted_spec());
+        let mut vs = vec![view(&named, 1, 0), view(&minted, 1, 0)];
+        vs[1].drifts.push(drift("stale", &[]));
+
+        let out = text(render_board(&board(&vs)));
+        assert!(out.contains("mission status — 2 missions"), "{out}");
+        assert!(out.contains("→ `--missions` for named missions only"), "{out}");
+
+        let mut b = board(&vs);
+        b.all_link = Some("http://x/#lens=console&panel=mission-status-all");
+        assert!(!text(render_board(&b)).contains("--missions"), "no flag advice inside a panel");
+
+        let mut b = board(&vs);
+        b.missions_only = true;
+        let out = text(render_board(&b));
+        assert!(out.contains("mission status — 1 mission\n"), "{out}");
+        assert!(
+            out.contains("+1 run instance filtered out, 1 needs attention — drop `--missions` to include them"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with("\n\n1 filtered-out run instance needs attention — drop `--missions` to see it and its reconcile command"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_board_drops_the_phase_mix_first() {
+        let ms = three_active();
+        let vs = views_of(&ms);
+        let mut b = board(&vs);
+        b.width = Some(30);
+        let out = text(render_board(&b));
+        assert!(out.contains("alpha-0"), "{out}");
+        assert!(!out.contains("complete ·"), "{out}");
+    }
+
+    #[test]
+    fn graph_prune_and_growth_each_get_their_own_line() {
+        let m = mission("review-1", MissionStatus::Active);
+        let mut v = view(&m, 1, 0);
+        v.graph = Some(crew::mission_config::prune::PruneReport {
+            steps_in_config: 5,
+            steps_minted: 3,
+            pruned: vec![crew::mission_config::prune::Pruned {
+                id: "s".into(),
+                kind: "step".into(),
+                reason: "disabled".into(),
+            }],
+            grown: vec![serde_json::from_value(serde_json::json!({
+                "phase": "p", "task_template": "t", "from": "plan", "source": "items", "items": 2,
+                "minted": ["a", "b"]
+            }))
+            .unwrap()],
+            ..Default::default()
+        });
+        let vs = [v];
+        let out = text(render_board(&board(&vs)));
+        assert!(out.contains("\n      · graph: 3 of 5 steps minted (2 left out by config)\n"), "{out}");
+        assert!(out.contains("\n      · graph: grew 2 task(s) from `plan`\n"), "{out}");
+    }
+
+    #[test]
+    fn an_empty_board_points_at_the_launch_commands() {
+        assert_eq!(
+            text(render_empty_board(&SourceState::Off, Some(100))),
+            "  no missions yet — launch one from a config with:\n  \
+             → darkmux mission config list\n  \
+             → darkmux mission launch <config-id>"
+        );
+        assert_eq!(
+            text(render_empty_board(&SourceState::Unavailable { detail: "x" }, Some(100))),
+            "  no missions yet — launch one from a config with:\n  \
+             → darkmux mission config list\n  \
+             → darkmux mission launch <config-id>\n\
+             \n\
+             fleet: could not reach the shared stream and nothing was cached — this board covers this machine's\n\
+             own missions only"
+        );
+    }
+
+    #[test]
+    fn a_partial_fleet_read_is_qualified_before_the_peer_rows_and_in_the_rollup() {
+        let p = [peer("review-peer-1", RunStatus::Running, Some(BOARD_NOW - 120))];
+        let mut b = board(&[]);
+        b.peer = &p;
+        b.fleet_state = &SourceState::Stale { age_ms: 90_000, detail: "x" };
+        assert_eq!(
+            text(render_board(&b)),
+            "mission status — 0 missions\n\
+             \n\
+             fleet: could not reach the shared stream; showing a peer-mission snapshot 1m old — this board's\n\
+             fleet view may be missing recent work\n\
+             \n\
+             OBSERVED ON THE FLEET (1) — seen via the shared flow stream, not owned by this machine\n  \
+             ◇ review-peer-1  peer-a   2m  running\n\
+             \n\
+             this machine's missions are reconciled — the fleet-wide read did not complete; peer missions may be\n\
+             missing (see note above)"
+        );
+    }
 }
