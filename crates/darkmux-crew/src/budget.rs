@@ -667,7 +667,7 @@ pub fn admit_with(mut b: EndpointBudget, caller: &BudgetCaller<'_>, env: &dyn Bu
                 return Ok(());
             }
             Verdict::Warn(br) => {
-                if env.last_level(&key).map_or(true, |l| l < br.level) {
+                if env.last_level(&key).is_none_or(|l| l < br.level) {
                     warn(&b, &br, caller, env);
                 }
                 env.set_last_level(&key, Some(br.level));
@@ -1105,7 +1105,7 @@ impl BudgetPacer {
                 None
             }
             Verdict::Warn(br) => {
-                if env.last_level(&key).map_or(true, |l| l < br.level) {
+                if env.last_level(&key).is_none_or(|l| l < br.level) {
                     warn(&self.budget, &br, caller, env);
                 }
                 env.set_last_level(&key, Some(br.level));
