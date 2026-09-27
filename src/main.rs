@@ -459,14 +459,7 @@ fn lessons_tier(global: bool) -> (std::path::PathBuf, &'static str) {
     }
 }
 
-/// (#1426, decision 17) `memory correction list` — the first verb #849's
-/// persisted adjudication corrections have ever had. Read-only: corrections are
-/// recorded by the review path as flow notes, never authored here.
-///
-/// Reads through `crew::corrections::scan`, the SAME definition the coder-brief
-/// injection reads, so `--mission` shows precisely the set that mission's next
-/// brief would carry — the verb can't drift from the behavior it reports on.
-/// The phase sessions `darkmux correction list --mission <mid>` scans: the
+/// The phase sessions `memory correction list --mission <mid>` scans: the
 /// coder runs of the mission's own phases.
 fn correction_phase_sessions(mid: &str) -> Result<crew::corrections::PhaseSessions> {
     fleet::validate_identifier("mission", mid)?;
@@ -478,6 +471,13 @@ fn correction_phase_sessions(mid: &str) -> Result<crew::corrections::PhaseSessio
     Ok(crew::corrections::PhaseSessions::new(mid, m.phase_ids.iter().cloned()))
 }
 
+/// (#1426, decision 17) `memory correction list` — the first verb #849's
+/// persisted adjudication corrections have ever had. Read-only: corrections are
+/// recorded by the review path as flow notes, never authored here.
+///
+/// Reads through `crew::corrections::scan`, the SAME definition the coder-brief
+/// injection reads, so `--mission` shows precisely the set that mission's next
+/// brief would carry — the verb can't drift from the behavior it reports on.
 fn cmd_correction(sub: CorrectionCmd) -> Result<i32> {
     match sub {
         CorrectionCmd::List {
