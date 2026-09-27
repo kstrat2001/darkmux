@@ -3652,6 +3652,7 @@ fn dispatch_remote(
         stderr: String::new(),
         session_id,
         out_dir: None,
+        trajectory: None,
     })
 }
 
@@ -4010,6 +4011,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
         stderr: String::new(),
         session_id,
         out_dir: None,
+        trajectory: None,
     })
 }
 
@@ -6584,6 +6586,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // to coding_task so it reads the trajectory from here rather than
         // from the sandbox.
         out_dir: Some(host_out),
+        trajectory: Some(trajectory_summary.fold),
     })
 }
 
@@ -7071,10 +7074,12 @@ pub fn read_out_dir_text(out_dir: &Path, rel: &str) -> Option<String> {
     read_out_dir_text_with(out_dir, rel, &stderr_warning_sink)
 }
 
-/// A dispatch's trajectory, folded: THE host read of a trajectory still in
-/// the model-writable out-dir (the crawl's units, the coder phase), through
+/// A trajectory still in a model-writable out-dir, folded, through
 /// [`read_out_dir_text`] so a planted symlink or FIFO is refused, not
-/// followed. A missing or refused file folds empty.
+/// followed. A missing or refused file folds empty. A live dispatch never
+/// needs this: its caller reads `DispatchResult::trajectory`, the tailer's
+/// fold. The one reader is `lab inspect`'s fallback for a run recorded
+/// before the run directory kept its own trajectory copy.
 pub fn out_dir_trajectory(out_dir: &Path) -> darkmux_trajectory::TrajectoryFold {
     let rel = Path::new(darkmux_trajectory::TRAJECTORY_SUBDIR).join(darkmux_trajectory::TRAJECTORY_FILE);
     read_out_dir_text(out_dir, &rel.to_string_lossy())

@@ -437,6 +437,11 @@ fn real_container_dispatch_executes_a_scripted_multi_turn_tool_call_sequence() {
          tool-call turn genuinely round-tripped before the trigger-matched stop turn fired, \
          not that the loop got lucky and matched the fallback stop response first"
     );
+    assert_eq!(
+        result.trajectory.as_ref().map(|fold| fold.turns()),
+        Some(2),
+        "the result carries the tailer's fold, the same reading the envelope's turns came from"
+    );
     let final_assistant = envelope
         .get("final_assistant")
         .and_then(Value::as_str)

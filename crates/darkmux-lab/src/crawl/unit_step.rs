@@ -561,16 +561,14 @@ pub fn default_unit_max_turns(unit: &Unit) -> u32 {
 
 /// (#2193) Whether this unit's LAST `n` turns collectively made no
 /// progress: no `create_finding` ATTEMPT (accepted or rejected) and no
-/// path read that an earlier turn hadn't already read. Best-effort — a
-/// missing/unreadable trajectory reports `false`, never escalating a unit
-/// this code can't fully inspect. A unit that hasn't run `n` turns yet
-/// reports `false`: the bound only fires once there IS a full trailing
-/// window to judge.
-pub fn unit_hit_no_progress_bound(out_dir: &Path, n: usize) -> bool {
+/// path read that an earlier turn hadn't already read, judged over the
+/// dispatch's own fold (`DispatchResult::trajectory`). A unit that hasn't
+/// run `n` turns yet reports `false`: the bound only fires once there IS a
+/// full trailing window to judge.
+pub fn unit_hit_no_progress_bound(fold: &darkmux_trajectory::TrajectoryFold, n: usize) -> bool {
     if n == 0 {
         return false;
     }
-    let fold = unit_trajectory(out_dir);
     let mut by_turn: BTreeMap<u64, bool> = BTreeMap::new();
     let mut read_paths_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for t in &fold.tools {
@@ -596,19 +594,12 @@ pub fn unit_hit_no_progress_bound(out_dir: &Path, n: usize) -> bool {
     by_turn.values().rev().take(n).all(|progressed| !progressed)
 }
 
-/// This unit's trajectory, through the one fold, read with the contained
-/// out-dir reader. A missing, unreadable or refused file folds empty.
-fn unit_trajectory(out_dir: &Path) -> darkmux_trajectory::TrajectoryFold {
-    darkmux_crew::dispatch_internal::out_dir_trajectory(out_dir)
-}
-
 /// (#1959) Count `create_finding` tool calls THIS unit's dispatch made
-/// that the runtime rejected (`tool.completed` with `ok == false`). A
-/// missing/unreadable trajectory or an unparseable line is silently
-/// skipped — this is a best-effort operator-facing count, never a
+/// that the runtime rejected (`tool.completed` with `ok == false`), from the
+/// dispatch's own fold. A best-effort operator-facing count, never a
 /// correctness-bearing value.
-pub fn count_rejected_create_findings(out_dir: &Path) -> usize {
-    unit_trajectory(out_dir).tools.iter().filter(|t| t.name == "create_finding" && !t.ok).count()
+pub fn count_rejected_create_findings(fold: &darkmux_trajectory::TrajectoryFold) -> usize {
+    fold.tools.iter().filter(|t| t.name == "create_finding" && !t.ok).count()
 }
 
 // ── crawler seat (#2188) ─────────────────────────────────────────────────
@@ -1566,16 +1557,15 @@ impl StepKind for CrawlUnitStepKind {
             // (#2193) No-progress bound — only over a dispatch that actually
             // ran and reported a clean `"stop"`. Never overrides an already-
             // `error`/`timeout` label: those are more specific failure shapes.
+            // Both counts read the dispatch's own fold of its trajectory,
+            // never the model-writable out-dir.
             let out_dir = outcome.as_ref().ok().and_then(|r| r.out_dir.clone());
-            if result == "stop" {
-                if let Some(d) = &out_dir {
-                    if unit_hit_no_progress_bound(d, cfg.no_progress_turns) {
-                        result = UNIT_BUDGET_EXHAUSTED.to_string();
-                    }
-                }
+            let fold = outcome.as_ref().ok().and_then(|r| r.trajectory.as_ref());
+            if result == "stop" && fold.is_some_and(|f| unit_hit_no_progress_bound(f, cfg.no_progress_turns)) {
+                result = UNIT_BUDGET_EXHAUSTED.to_string();
             }
 
-            let exclusions = out_dir.as_deref().map(count_rejected_create_findings).unwrap_or(0);
+            let exclusions = fold.map(count_rejected_create_findings).unwrap_or(0);
             // (#2302) ONE read of `findings.jsonl` yields both the count and
             // the keys. (#2360) Rule-namespaced for the SAME reason
             // `unit_dir` above is: `<rule>.<unit>.findings.jsonl`, not
