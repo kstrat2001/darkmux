@@ -496,6 +496,11 @@ describe("deriveLiveState", () => {
     const stopped = { ts: at(20_000), action: "budget.stop", session_id: SID, payload: { endpoint_id: "azure" } } as unknown as FlowRecord;
     expect(deriveLiveState([wait, stopped], 21_000).state).toBe("prompt");
     expect(liveExecutions([[wait, stopped]], 21_000)).toEqual([]);
+    // An agentic-remote run the pacer held, then stopped: it has other
+    // evidence (its start), and the stop still closes it at once, before the
+    // run's own terminal record lands.
+    const start = { ts: at(0), action: "dispatch start", session_id: SID, payload: {} } as unknown as FlowRecord;
+    expect(liveExecutions([[start, wait, stopped]], 21_000)).toEqual([]);
     expect(aggregateLiveState([[wait, stopped]], 21_000)).toBeNull();
   });
 
