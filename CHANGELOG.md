@@ -77,10 +77,15 @@ darkmux release.
   `verify=pass (no verify spec)`; its outcome is now no verify at all, so
   `lab run` prints no verify note, `lab run inspect`'s note reads `verify:
   not checked — no verify spec`, and `lab loop` reads such a run with no
-  tool calls as `failed`
-  rather than `inert-false-pass` (both exit 1). **Migration:** a script that
+  tool calls as `failed` rather than `inert-false-pass` (both exit 1). **Migration:** a script that
   grepped for `verify=pass` on a no-verify workload should key on the exit
   code instead.
+- **`lab characterize` and `lab tune` exit 1 on a failed verify** (#2982),
+  through the same gate as `lab run`; they used to exit 0 whenever every
+  dispatch completed. They, and `lab loop`, also exit 130 when a signal
+  ends the run, as `lab run` already did. **Migration:** a script that
+  treated exit 0 from these verbs as "the dispatch ran" should expect 1
+  when the workload's verify fails.
 - **Two lab runs in the same second no longer share a run dir, so a run id
   can carry a claim suffix** (#2981). The second run used to overwrite the
   first's artifacts. A run whose `<workload>-<profile>-<epoch>-<n>`

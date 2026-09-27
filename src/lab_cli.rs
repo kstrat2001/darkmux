@@ -114,29 +114,30 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
     }
 }
 
-/// Install the SIGTERM/SIGINT/SIGHUP handlers and the reap watchdog for a
-/// verb that dispatches through `lab_run` (or `dispatch`, for `lab eval`).
-/// Without the handlers a signal kills the process with no unwind, orphaning
-/// the dispatch's docker container or `curl` child (#2262, #2463). `lab_run`
-/// already writes a terminal `lifecycle.json` on any dispatch `Err`, and the
-/// dispatch's own bookend guard emits `dispatch.error`, so the handlers and
-/// the watchdog (which kills a registered `curl` child on the tool-less
-/// hosted path, see `spawn_reap_watchdog`) are all a lab verb adds. Called
-/// once, ahead of the verb's whole run loop: `interrupt::is_set()` never
-/// resets, so one signal ends the whole invocation. Hold the returned guard
-/// for the verb's lifetime.
-fn arm_signal_handling() -> crate::launch_guard::WatchdogStopGuard {
+/// Run a lab verb that dispatches through `lab_run` (or `dispatch`, for
+/// `lab eval`) under signal handling: the one exit path every such verb
+/// shares.
+///
+/// Installs the SIGTERM/SIGINT/SIGHUP handlers and the reap watchdog for the
+/// verb's lifetime. Without them a signal kills the process with no unwind,
+/// orphaning the dispatch's docker container or `curl` child (#2262, #2463).
+/// `lab_run` already writes a terminal `lifecycle.json` on any dispatch
+/// `Err`, and the dispatch's own bookend guard emits `dispatch.error`, so
+/// the handlers and the watchdog (which kills a registered `curl` child on
+/// the tool-less hosted path, see `spawn_reap_watchdog`) are all a lab verb
+/// adds. Armed once, ahead of the verb's whole run loop:
+/// `interrupt::is_set()` never resets, so one signal ends the whole
+/// invocation.
+///
+/// (#2462) A verb a signal ended exits 130, matching `mission launch`, so a
+/// wrapper script can tell "the operator stopped this" from a failure by
+/// exit code alone. `report_*`, not the bare `reap_and_exit_on_signal`: the
+/// force-exit runs before `main` prints the error, so the bare call would
+/// discard the interrupt message.
+fn signal_aware<T>(verb: impl FnOnce() -> Result<T>) -> Result<T> {
     crate::launch_guard::arm();
-    crate::launch_guard::spawn_reap_watchdog()
-}
-
-/// Exit code for a verb whose outcome is "did every dispatch complete".
-fn exit_code_all_dispatched(outcomes: &[lab::run::RunOutcome]) -> i32 {
-    if outcomes.iter().all(|o| o.ok) {
-        0
-    } else {
-        1
-    }
+    let _reap_watchdog = crate::launch_guard::spawn_reap_watchdog();
+    verb().inspect_err(crate::launch_guard::report_reap_and_exit_on_signal)
 }
 
 /// (#1465) `lab workload list`. `list_available` always includes the fixed,
@@ -169,24 +170,16 @@ fn cmd_lab_run_dispatch(
              `lab run compare <a> <b>`)"
         )
     })?;
-    let _reap_watchdog = arm_signal_handling();
-    let outcomes = lab::run::lab_run(lab::run::RunOpts {
-        workload_id,
-        profile_name: profile,
-        runs,
-        config_path: profiles,
-        quiet,
-        loop_override: None,
-        inject_context: None,
-    })
-    .inspect_err(|e| {
-        // (#2462) A run a signal ended exits 130, matching `mission
-        // launch`, so a wrapper script can tell "the operator stopped this"
-        // from a failure by exit code alone. A no-op when no signal was
-        // observed. `report_*`, not the bare `reap_and_exit_on_signal`: the
-        // force-exit runs before `main` prints the error, so the bare call
-        // would discard the interrupt message.
-        crate::launch_guard::report_reap_and_exit_on_signal(e);
+    let outcomes = signal_aware(|| {
+        lab::run::lab_run(lab::run::RunOpts {
+            workload_id,
+            profile_name: profile,
+            runs,
+            config_path: profiles,
+            quiet,
+            loop_override: None,
+            inject_context: None,
+        })
     })?;
     if !quiet {
         println!("\n{} run(s) complete:", outcomes.len());
@@ -194,13 +187,7 @@ fn cmd_lab_run_dispatch(
             println!("  {} — {}", o.run_id, o.notes.join(" | "));
         }
     }
-    // (#2494) Gate on BOTH the dispatch path and the workload's own verify,
-    // so `lab run <w> && echo PASS` never prints PASS over failed tests. A
-    // `None` verify (nothing declared one) is not a failure.
-    let all_ok = outcomes
-        .iter()
-        .all(|o| o.ok && o.verify_passed != Some(false));
-    Ok(if all_ok { 0 } else { 1 })
+    Ok(lab::run::exit_code(&outcomes))
 }
 
 /// `lab eval`'s condition flags, most specific first. clap already refuses
@@ -223,25 +210,22 @@ fn bench_mode(freeform: bool, agentic: bool, dialectic: bool) -> lab::review_ben
 /// only the cases not yet scored; `scores.json` is written when the loop
 /// completes.
 fn cmd_lab_eval(opts: lab::review_bench::ReviewBenchOpts) -> Result<i32> {
-    let _reap_watchdog = arm_signal_handling();
-    lab::review_bench::run_review_bench(opts)?;
+    signal_aware(|| lab::review_bench::run_review_bench(opts))?;
     Ok(0)
 }
 
 /// `lab characterize`: a single `lab_run`, reported.
 fn cmd_lab_characterize(opts: lab::characterize::CharacterizeOpts) -> Result<i32> {
-    let _reap_watchdog = arm_signal_handling();
-    let report = lab::characterize::characterize(&opts)?;
+    let report = signal_aware(|| lab::characterize::characterize(&opts))?;
     lab::characterize::print_report(&report);
-    Ok(exit_code_all_dispatched(&report.outcomes))
+    Ok(lab::run::exit_code(&report.outcomes))
 }
 
 /// `lab tune`: `lab_run` with `--runs N`, reported as a distribution.
 fn cmd_lab_tune(opts: lab::tune::TuneOpts) -> Result<i32> {
-    let _reap_watchdog = arm_signal_handling();
-    let report = lab::tune::tune(&opts)?;
+    let report = signal_aware(|| lab::tune::tune(&opts))?;
     lab::tune::print_report(&report);
-    Ok(exit_code_all_dispatched(&report.outcomes))
+    Ok(lab::run::exit_code(&report.outcomes))
 }
 
 /// (#1465, #491) `lab fixture list|register|unregister`.
