@@ -285,16 +285,17 @@ mod tests {
     /// declared is not.
     #[test]
     fn a_bimodal_set_with_failures_renders_clusters_and_counts() {
-        let mut runs = vec![outcome(200), outcome(220), outcome(900)];
+        let mut runs = vec![outcome(200), outcome(220), outcome(230), outcome(900)];
         runs[0].ok = false;
         runs[1].verify_passed = Some(false);
         runs[2].verify_passed = None;
+        runs[3].verify_passed = Some(false);
         let text = render_report(&tune_report(runs));
-        assert!(text.contains("│  fast cluster: n=2 mean=210s range=200s–220s\n"), "{text}");
+        assert!(text.contains("│  fast cluster: n=3 mean=216s range=200s–230s\n"), "{text}");
         assert!(text.contains("│  slow cluster: n=1 mean=900s range=900s–900s\n"), "{text}");
-        assert!(text.contains("│  slow rate:   33%\n"), "{text}");
-        assert!(text.contains("⚠ 1 of 3 dispatches failed"), "{text}");
-        assert!(text.contains("⚠ 1 of 3 runs failed verify"), "{text}");
+        assert!(text.contains("│  slow rate:   25%\n"), "{text}");
+        assert!(text.contains("⚠ 1 of 4 dispatches failed"), "{text}");
+        assert!(text.contains("⚠ 2 of 4 runs failed verify"), "{text}");
         assert!(text.contains("Slow cluster present"), "{text}");
     }
 

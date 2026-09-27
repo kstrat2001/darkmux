@@ -72,6 +72,21 @@ darkmux release.
 
 ### Changed (breaking, 4.0)
 
+- **A lab run with no verify spec reports verify "not checked", not a pass**
+  (#2982). A `prompt` workload that declares no verify used to record
+  `verify=pass (no verify spec)`; its outcome is now no verify at all, so
+  `lab run` prints no verify note, `lab run inspect`'s note reads `verify:
+  not checked — no verify spec`, and `lab loop` reads such a run with no
+  tool calls as `failed`
+  rather than `inert-false-pass` (both exit 1). **Migration:** a script that
+  grepped for `verify=pass` on a no-verify workload should key on the exit
+  code instead.
+- **Two lab runs in the same second no longer share a run dir, so a run id
+  can carry a claim suffix** (#2981). The second run used to overwrite the
+  first's artifacts. A run whose `<workload>-<profile>-<epoch>-<n>`
+  directory already exists now claims
+  `<n>.2`, `<n>.3`, … instead of writing into it. **Migration:** a tool that
+  parses the last segment of a run id as an integer must accept `<n>.<k>`.
 - **The per-step cap on hosted tokens is renamed, has no default, and
   never stops a step: a step that used to stop at 500,000 hosted tokens now
   runs to completion unless you set a cap** (#2902 step 5).

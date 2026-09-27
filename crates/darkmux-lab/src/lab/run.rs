@@ -33,14 +33,11 @@ pub struct RunOpts {
     pub inject_context: Option<String>,
 }
 
-/// `run_dir` is the canonical path to the run's output directory.
-/// Public-API surface — downstream tools (the lab-notebook skill, viewer
-/// loading) read it after `lab run` completes. The CLI itself prints
-/// `run_id` and not the full path, hence the dead-code lint.
-#[allow(dead_code)]
+/// One run of `lab_run`.
 #[derive(Debug, Clone)]
 pub struct RunOutcome {
     pub run_id: String,
+    /// The run's own directory, created by this run alone (#2981).
     pub run_dir: std::path::PathBuf,
     /// Did the dispatch itself complete successfully (runtime exit 0, reply
     /// payload received)? Distinct from `verify_passed` — a dispatch can
@@ -109,375 +106,273 @@ fn apply_inject_context(
 }
 
 pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
-    // (#2947) Bad enum config refuses before a run directory is minted.
+    // (#2947) Bad enum config refuses before a run directory is claimed.
     // Every lab verb that runs a workload (`lab run`, `lab loop`, and the
     // benches built on this function) comes through here.
     darkmux_profiles::preflight_with(darkmux_types::config_enum::Scope::LabRun, opts.config_path.as_deref())?;
     let paths = paths::resolve(ResolveScope::Auto);
     paths::ensure(&paths)?;
 
-    // (#2590, #2613) The workload USER tier is forced to the home root — a
-    // SEPARATE resolution from `paths` above. `paths` stays `Auto`
-    // (cwd-sensitive) on purpose: it governs run-artifact placement
-    // (`darkmux_types::config_access::lab_dir()`, resolved independently
-    // below) and the sandbox FALLBACK (`paths.sandboxes`, used by
-    // `resolve_source_sandbox` further down when a workload has no
-    // `requires_fixture`) — deliberately project-local when the cwd has a
-    // `.darkmux/`. The fixture REGISTRY lookup `resolve_source_sandbox`
-    // also performs is NOT part of that project-local behavior: since
-    // #2613 it resolves independently via `ResolveScope::ForceUser`,
-    // ignoring `paths` (and therefore cwd) entirely — see that function's
-    // own doc comment. Folding the workload *document* lookup into that
-    // same `Auto` root is what let a stale
-    // `./.darkmux/workloads/<id>.json` silently outrank the embedded
-    // workload of the same id, and let a cwd-only id resolve at all — the
-    // exact bug class #1012 closed for crew/mission state and #2432 closed
-    // for mission configs' user tier. `mission_config::load`'s
-    // `crate::loader::user_state_root()` forces `ResolveScope::ForceUser`
-    // for precisely this reason; the workload loader now does the same.
+    // (#2590) The workload document resolves at the HOME tier, never from a
+    // project-local `.darkmux/` in the cwd, which could otherwise outrank the
+    // embedded workload of the same id. `paths` above stays `Auto` on
+    // purpose: it only places the sandbox fallback, which is deliberately
+    // project-local.
     let user_workloads_root = paths::resolve(ResolveScope::ForceUser).root;
     let mut loaded_workload = load(&opts.workload_id, Some(user_workloads_root.as_path()))?;
-
-    // (#1004) Loop-lab A/B "with-context" arm: splice the caller-built
-    // engagement-context blocks in FRONT of the workload's own prompt, so the
-    // dispatch carries the same context a real coder brief would. Resolve the
-    // workload's effective prompt (inline or from promptFile) first, then
-    // inline the combined text into `prompt` (clearing `prompt_file`) — both
-    // providers read `manifest.workload.prompt` via `resolve_prompt`, so this
-    // one splice covers prompt + coding-task workloads with no provider change.
     apply_inject_context(&mut loaded_workload, opts.inject_context.as_deref());
 
     let registry_loaded = load_registry(opts.config_path.as_deref())?;
-    // (#2902, operator decision 2026-09-26) With no `--profile`, the run is
-    // on the profile the workload's ROLE is bound to (`role_profiles`),
-    // else `default_profile`: the same precedence `darkmux dispatch <role>`
-    // resolves, so the run's `profile=` stamp names the profile that ran.
-    // (#2902 re-review C3) The role is the one the PROVIDER dispatches as
-    // (`WorkloadProvider::dispatch_role`), so the profile chosen here and
-    // the role that runs cannot disagree (tool-bench's own `tool-bench`
-    // default, a prompt workload's `runtime.default_role`, …).
+    // (#2902) With no `--profile`, the run is on the profile bound to the
+    // role the PROVIDER dispatches as, else `default_profile`: the same
+    // precedence `darkmux dispatch <role>` resolves.
     let run_role = workload_role(&loaded_workload);
     let mapped = run_role.as_deref().and_then(darkmux_types::config_access::role_profile);
-    let profile_name = run_profile_name(opts.profile_name.as_deref(), run_role.as_deref(), mapped, &registry_loaded.registry)?;
+    let profile_name =
+        run_profile_name(opts.profile_name.as_deref(), run_role.as_deref(), mapped, &registry_loaded.registry)?;
     let profile = get_profile(&registry_loaded.registry, &profile_name)?;
 
-    // (#365/#544) Best-effort provenance guard: if the operator swapped a
-    // different profile before this dispatch (or the default_profile
-    // doesn't match what's loaded), the manifest's `profile=` tag would
-    // silently misattribute the runtime envelope. Compare the requested
-    // profile's declared models against `lms ps` and warn (never block —
-    // operator-sovereignty: the operator may have swapped deliberately).
-    // The check runs per-run inside the loop below: with `--runs N` the
-    // loaded model can drift between runs (LMStudio eviction under memory
-    // pressure), and each run is independently stamped `profile=<name>`.
-    // `prev_envelope_warns` dedups a stable picture so a persistent
-    // mismatch warns once, not once-per-run.
-    let mut prev_envelope_warns: Option<Vec<String>> = None;
-
+    let run = OneRun { opts: &opts, paths: &paths, workload: &loaded_workload, profile, profile_name: &profile_name };
     let runs = opts.runs.max(1);
-    let mut outcomes: Vec<RunOutcome> = Vec::new();
+    let mut envelope = EnvelopeWarnings::default();
+    (1..=runs).map(|i| run.run(i, runs, &mut envelope)).collect()
+}
 
-    for i in 1..=runs {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+/// Everything one run of a `lab_run` invocation shares with the others.
+struct OneRun<'a> {
+    opts: &'a RunOpts,
+    paths: &'a paths::DarkmuxPaths,
+    workload: &'a crate::workloads::types::LoadedWorkload,
+    profile: &'a darkmux_types::Profile,
+    profile_name: &'a str,
+}
+
+impl OneRun<'_> {
+    /// Run `i` of `runs`: claim a run dir, materialize its sandbox, run the
+    /// provider, settle the verify verdict, and record the run complete.
+    fn run(&self, i: u32, runs: u32, envelope: &mut EnvelopeWarnings) -> Result<RunOutcome> {
+        let workload_id = &self.opts.workload_id;
+        let source_sandbox_dir = resolve_source_sandbox(self.workload, self.paths)
+            .with_context(|| format!("resolving source sandbox for workload `{workload_id}`"))?;
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         // Through `lab_dir()`, not `paths.runs`: the lab READER scans that
         // root, it honors DARKMUX_LAB_DIR / config.dirs.lab, and it is
-        // cfg-isolated in test builds (#994). Resolving the write root
-        // independently is how a run lands somewhere the reader never looks.
+        // cfg-isolated in test builds (#994).
         let (run_id, run_dir) = claim_run_dir(
             &darkmux_types::config_access::lab_dir(),
-            &opts.workload_id,
-            &profile_name,
+            workload_id,
+            self.profile_name,
             stamp,
             i,
         )?;
-        // (#488 Phase 1 / #490 Phase 3) The workload's *source* sandbox
-        // is what gets COW-cloned per run. Phase 3 resolution shape:
-        //   1. If workload declares `requires_fixture: <name@version>`,
-        //      consult the lab registry for a fixture satisfying that
-        //      requirement → use its path.
-        //   2. Else fall back to `{paths.sandboxes}/<workload-id>/`
-        //      (the convention for workloads with setupContent or no
-        //      external dependency).
-        // No env-var fallback per the no-compat-baggage-pre-1.0 doctrine.
-        let source_sandbox_dir =
-            resolve_source_sandbox(&loaded_workload, &paths).with_context(|| {
-                format!(
-                    "resolving source sandbox for workload `{}`",
-                    opts.workload_id
-                )
-            })?;
-        // (#488) Phase 1 — the per-run sandbox lives UNDER the per-run
-        // dir, isolated from every other run's edits. Each run starts
-        // either as a COW clone of the source sandbox (if it exists)
-        // OR as a fresh empty dir that the provider's setup() will
-        // populate (workloads with setupContent).
+        if !self.opts.quiet {
+            self.announce(i, runs, &run_id, envelope);
+        }
+        // The lifecycle bookend comes directly after the dir exists and
+        // before the first fallible step, so a live run is visible from its
+        // first moment (#1937) and every `?` below leaves a terminal record
+        // (#1930).
+        let lifecycle = lifecycle::RunLifecycle::start(&run_dir, &run_id, workload_id, self.profile_name)?;
+        // (#488) Each run works on a sandbox of its own under its run dir.
         let per_run_sandbox_dir = run_dir.join("sandbox");
+        let baseline_hash = materialize_sandbox(&source_sandbox_dir, &per_run_sandbox_dir, self.opts.quiet)?;
+        let (mut result, lifecycle) = self.run_provider(&run_dir, &per_run_sandbox_dir, lifecycle)?;
 
-        if !opts.quiet {
-            // (#2553) Names the WINNING tier, same as `mission launch`'s
-            // banner does for mission configs — the operator can no longer
-            // be left wondering whether a workload resolved from the
-            // embedded built-in, an on-disk override, or a user-tier copy.
-            println!(
-                "[lab] run {i}/{runs} — workload={} ({} tier) profile={} → {}",
-                opts.workload_id, loaded_workload.source, profile_name, run_id
-            );
-
-            // (#365/#544) Per-run envelope check. An `lms ps` failure is
-            // surfaced distinctly (verification didn't run) rather than
-            // silently skipped — methodology citations depend on knowing
-            // the verification status.
-            let warns = match darkmux_profiles::lms::list_loaded() {
-                Ok(loaded) => {
-                    crate::lab::profile_check::envelope_warnings(profile, &profile_name, &loaded)
-                }
-                Err(e) => vec![format!(
-                    "could not verify profile-load match — `lms ps` failed ({e}); \
-                     this run's `profile={profile_name}` tag is unverified. (#365)"
-                )],
-            };
-            if prev_envelope_warns.as_ref() != Some(&warns) {
-                for w in &warns {
-                    eprintln!("[lab] warn: {w}");
-                }
-                prev_envelope_warns = Some(warns);
-            }
+        // (#489) Best-effort: fixture provenance is observability, not
+        // correctness, so a manifest that cannot be enriched never fails
+        // the run.
+        if let Err(e) = enrich_manifest_with_fixture_info(&run_dir, baseline_hash.as_deref(), &source_sandbox_dir) {
+            warn(self.opts.quiet, &format!("enriching manifest with fixture info skipped: {e}"));
         }
-
-        // The lifecycle bookend goes here — directly after the directory
-        // exists and BEFORE the first fallible step, so every `?` below is
-        // covered by its RAII terminal guard. Two bugs closed by this one
-        // placement: the scan can now classify a LIVE run as a lab run from
-        // its first moment (#1937, previously it had to wait for end-of-run
-        // artifacts and meanwhile showed as an untracked DISPATCH), and a run
-        // that ERRORS gets a terminal record instead of falling through to an
-        // idle-time guess (#1930).
-        let mut lifecycle = lifecycle::RunLifecycle::start(
-            &run_dir,
-            &run_id,
-            &opts.workload_id,
-            &profile_name,
-        )?;
-
-        // (#488) Phase 1 — materialize the per-run sandbox. If the
-        // source exists, COW-clone it (cheap on APFS/btrfs/xfs;
-        // fallback to deep copy elsewhere). If not, create an empty
-        // dir for the provider's setup() to populate. This is the
-        // load-bearing isolation: subsequent runs get fresh sandboxes
-        // and never observe prior runs' edits.
-        //
-        // (#489) Phase 2 — compute baseline_hash, then (#496) hash the
-        // per-run sandbox AFTER the COW clone rather than the source
-        // before it. The COW copy is byte-identical, so the recorded
-        // value is unchanged — but hashing the clone closes the race
-        // window where a concurrent writer could mutate the source
-        // between the hash and the clone, leaving baseline_hash not
-        // matching what the clone actually copied. The per-run sandbox
-        // is private to this run, so nothing else touches it between the
-        // clone and the hash. Best-effort: skip silently for
-        // self-contained workloads (no source yet) — the provider's
-        // setup() populates the empty dir; baseline_hash stays None.
-        let baseline_hash: Option<String> = if source_sandbox_dir.exists() {
-            // Prune run-artifact dirs (.darkmux-runtime, coverage, .git,
-            // …) from the clone so a stale dropping in a fixture source
-            // can't contaminate this run. node_modules is deliberately
-            // NOT in RUN_ARTIFACT_DIRS — the in-sandbox tests need it; the
-            // hash drops it separately via HASH_ONLY_EXCLUDES. Because the
-            // baseline_hash below runs on this now-pruned clone, the
-            // run-path baseline is clean for free. (lab-contamination fix)
-            cow_clone_dir_excluding(
-                &source_sandbox_dir,
-                &per_run_sandbox_dir,
-                artifact_dirs::RUN_ARTIFACT_DIRS,
-            )
-            .with_context(|| {
-                format!(
-                    "cow-cloning source sandbox {} → {}",
-                    source_sandbox_dir.display(),
-                    per_run_sandbox_dir.display()
-                )
-            })?;
-            match hash_sandbox_dir(&per_run_sandbox_dir) {
-                Ok(h) => Some(h),
-                Err(e) => {
-                    if !opts.quiet {
-                        eprintln!(
-                            "[lab] warn: baseline_hash for {} skipped: {e}",
-                            per_run_sandbox_dir.display()
-                        );
-                    }
-                    None
-                }
-            }
-        } else {
-            fs::create_dir_all(&per_run_sandbox_dir).with_context(|| {
-                format!("creating empty per-run sandbox {}", per_run_sandbox_dir.display())
-            })?;
-            None
-        };
-
-        let provider_id = loaded_workload.manifest.workload.provider.clone();
-        // (#488) Phase 1 — provider operates against the per-run
-        // sandbox, not the source. Provider has no awareness of the
-        // COW step; it just gets a sandbox dir and works against it.
-        // `Drop` would record this as `interrupted`, which is true but less
-        // useful than the reason. Naming the error explicitly is the whole
-        // point of #1930 — "it errored, and here is why" beats "it stopped".
-        let mut result = match with_provider(&provider_id, |p| {
-            p.setup(&loaded_workload, &run_dir, &per_run_sandbox_dir)?;
-            p.run(
-                &loaded_workload,
-                &run_dir,
-                &per_run_sandbox_dir,
-                profile,
-                &profile_name,
-                opts.config_path.as_deref(),
-                opts.loop_override.as_ref(),
-                // (#2511) The provider calls this at most once, right after
-                // minting its own dispatch session id — attaching it to the
-                // still-`Running` lifecycle record BEFORE the dispatch
-                // fires, so a live lab row is joinable to its own flow
-                // session for the run's whole dispatch phase, not only
-                // once `manifest.json` lands at the end.
-                &mut |sid: &str| lifecycle.set_session_id(sid),
-            )
-        }) {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) | Err(e) => {
-                // (#2462) A caught SIGINT/SIGTERM/SIGHUP is why `dispatch`
-                // itself failed here — darkmux's own reap watchdog
-                // (`launch_guard::spawn_reap_watchdog`, armed by the CLI
-                // before calling `lab_run`) kills this run's in-flight
-                // child the moment the signal lands, which is what turns
-                // into the `Err` we're holding right now. `is_set()` is
-                // the SAME sticky, process-wide flag the watchdog itself
-                // polls, checked here — after the fact, not raced against
-                // — so a run that genuinely failed on its own (no signal
-                // ever observed) still records `Error` exactly as before.
-                // Recording `Error` unconditionally is
-                // the #2462 bug: it archives the operator's own Ctrl-C as
-                // "the endpoint broke", pointing a debugging operator at a
-                // provider that never failed.
-                if darkmux_types::interrupt::is_set() {
-                    lifecycle.finish_interrupted(&e);
-                } else {
-                    lifecycle.finish_error(&e);
-                }
-                return Err(e);
-            }
-        };
-
-        // (#489) Phase 2 — enrich the provider-written manifest.json
-        // with fixture provenance (baseline_hash + source_fixture_path).
-        // Provider's manifest stays workload/runtime-focused; lab adds
-        // the cross-cutting fixture-integrity fields. Best-effort: a
-        // missing or malformed manifest is logged but doesn't fail the
-        // run (observability data, not correctness).
-        if let Err(e) = enrich_manifest_with_fixture_info(
-            &run_dir,
-            baseline_hash.as_deref(),
-            &source_sandbox_dir,
-        ) {
-            if !opts.quiet {
-                eprintln!(
-                    "[lab] warn: enriching manifest with fixture info skipped: {e}"
-                );
-            }
-        }
-
-        // (#2833) The write-the-tests work gate. Runs AFTER the fixture-info
-        // enrichment above so `final_hash` (top-level, from the provider) and
-        // `fixture.baseline_hash` (just written) are both on disk to compare.
-        // A no-op unless the fixture declares `baseline.test_count` (or the
-        // workload declares a coverage threshold with no baseline, which
-        // gets a warning instead) — that's resolved inside `verify_gate::
-        // apply` itself, from `source_sandbox_dir`'s `.fixture.json`. When
-        // the gate DOES fire, its verdict is synced back onto `result.verify`
-        // (in-memory) so the notes below, and `RunOutcome::verify_passed`,
-        // agree with what just landed in `manifest.json` — the CLI's own
-        // printed line must not contradict the artifact `lab run
-        // stats`/`inspect` reads.
-        //
-        // FAIL-CLOSED on `Err` (#2833 review finding 4): `verify_gate::apply`
-        // is itself fail-closed once a baseline is known declared — it only
-        // bubbles `Err` when it couldn't even read/write `manifest.json` at
-        // all, so there was nothing to force a recorded failure into. That
-        // residual case still must not leave a stale/raw PASS standing in
-        // the CLI's own in-memory view, so it's forced here too, even though
-        // nothing could be persisted to disk.
-        match crate::lab::verify_gate::apply(
+        // (#2833) The write-the-tests work gate runs after the enrichment,
+        // so both hashes it compares are on disk.
+        let coverage_min_pct = self.workload.manifest.workload.verify.as_ref().and_then(|v| v.coverage_min_pct);
+        let gate = crate::lab::verify_gate::apply(
             &run_dir,
             &source_sandbox_dir,
             &per_run_sandbox_dir,
             result.ok,
-            loaded_workload
-                .manifest
-                .workload
-                .verify
-                .as_ref()
-                .and_then(|v| v.coverage_min_pct),
-        ) {
-            Ok(Some(gate)) => {
-                if let Some(v) = result.verify.as_mut() {
-                    v.passed = gate.passed;
-                    v.details = gate.details;
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                if !opts.quiet {
-                    eprintln!(
-                        "[lab] warn: applying verify work gate failed ({e}) — \
-                         failing verify closed rather than trusting the raw result"
-                    );
-                }
-                if let Some(v) = result.verify.as_mut() {
-                    v.passed = false;
-                    v.details = format!("verify gate could not be applied: {e}");
-                }
-            }
+            coverage_min_pct,
+        );
+        if let Some(w) = settle_verify(result.verify.as_mut(), gate) {
+            warn(self.opts.quiet, &w);
         }
 
-        let mut notes = vec![
-            format!("provider={}", provider_id),
-            format!("wall={}s", result.duration_ms / 1000),
-            if result.ok {
-                "ok".to_string()
-            } else {
-                format!("error: {}", result.error.as_deref().unwrap_or("unknown"))
-            },
-        ];
-        if let Some(v) = result.verify.as_ref() {
-            notes.push(format!(
-                "verify={} ({})",
-                if v.passed { "pass" } else { "fail" },
-                v.details
-            ));
-        }
-
-        if !opts.quiet {
+        let provider_id = &self.workload.manifest.workload.provider;
+        let notes = run_notes(provider_id, &result);
+        if !self.opts.quiet {
             println!("  {}", notes.join(" | "));
         }
-
-        // Reached the end of the run. `result.ok` is the WORK's outcome and is
-        // carried in the outcome/notes; the lifecycle records that the run
-        // itself ran to completion rather than being cut short.
+        // `result.ok` is the WORK's outcome, carried in the outcome; the
+        // lifecycle records that the run itself ran to completion.
         lifecycle.finish_complete();
-
-        outcomes.push(RunOutcome {
+        Ok(RunOutcome {
             run_id,
             run_dir,
             ok: result.ok,
             verify_passed: result.verify.as_ref().map(|v| v.passed),
             duration_ms: result.duration_ms,
             notes,
-        });
+        })
     }
 
-    Ok(outcomes)
+    /// The run banner, naming the tier the workload resolved from (#2553),
+    /// and (#365/#544) a warning when the loaded models do not match the
+    /// profile this run is stamped with. Checked per run, since a model can
+    /// be evicted between runs.
+    fn announce(&self, i: u32, runs: u32, run_id: &str, envelope: &mut EnvelopeWarnings) {
+        println!(
+            "[lab] run {i}/{runs} — workload={} ({} tier) profile={} → {run_id}",
+            self.opts.workload_id, self.workload.source, self.profile_name
+        );
+        for w in envelope.fresh(envelope_check(self.profile, self.profile_name)) {
+            eprintln!("[lab] warn: {w}");
+        }
+    }
+
+    /// Set the provider up and run it against the per-run sandbox, handing
+    /// the lifecycle back to finish. A provider error ends the run with that
+    /// error named on its lifecycle record (#1930), or recorded as
+    /// interrupted when a caught signal is why the dispatch failed (#2462).
+    fn run_provider(
+        &self,
+        run_dir: &Path,
+        sandbox: &Path,
+        mut lifecycle: lifecycle::RunLifecycle,
+    ) -> Result<(crate::workloads::types::RunResult, lifecycle::RunLifecycle)> {
+        let result = with_provider(&self.workload.manifest.workload.provider, |p| {
+            p.setup(self.workload, run_dir, sandbox)?;
+            p.run(
+                self.workload,
+                run_dir,
+                sandbox,
+                self.profile,
+                self.profile_name,
+                self.opts.config_path.as_deref(),
+                self.opts.loop_override.as_ref(),
+                // (#2511) Called right after the provider mints its dispatch
+                // session id, before the dispatch fires, so a live run is
+                // joinable to its flow session for its whole dispatch phase.
+                &mut |sid: &str| lifecycle.set_session_id(sid),
+            )
+        })
+        .and_then(|r| r);
+        match result {
+            Ok(r) => Ok((r, lifecycle)),
+            Err(e) => {
+                if darkmux_types::interrupt::is_set() {
+                    lifecycle.finish_interrupted(&e);
+                } else {
+                    lifecycle.finish_error(&e);
+                }
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Envelope warnings already printed, so a mismatch that holds across
+/// `--runs N` warns once rather than once per run.
+#[derive(Default)]
+struct EnvelopeWarnings {
+    last: Option<Vec<String>>,
+}
+
+impl EnvelopeWarnings {
+    /// The warnings to print for this run: all of them when they differ from
+    /// the last run's, none when they are the same.
+    fn fresh(&mut self, warns: Vec<String>) -> Vec<String> {
+        if self.last.as_ref() == Some(&warns) {
+            return Vec::new();
+        }
+        self.last = Some(warns.clone());
+        warns
+    }
+}
+
+/// The loaded models against the profile's declared ones. A failed `lms ps`
+/// is its own warning, so a run whose profile tag went unverified says so.
+fn envelope_check(profile: &darkmux_types::Profile, profile_name: &str) -> Vec<String> {
+    match darkmux_profiles::lms::list_loaded() {
+        Ok(loaded) => crate::lab::profile_check::envelope_warnings(profile, profile_name, &loaded),
+        Err(e) => vec![format!(
+            "could not verify profile-load match — `lms ps` failed ({e}); \
+             this run's `profile={profile_name}` tag is unverified. (#365)"
+        )],
+    }
+}
+
+fn warn(quiet: bool, msg: &str) {
+    if !quiet {
+        eprintln!("[lab] warn: {msg}");
+    }
+}
+
+/// (#488, #489, #496) Materialize the per-run sandbox. With a source, it is
+/// a COW clone of it with run-artifact dirs pruned, and the returned
+/// baseline hash is of the CLONE (byte-identical, and immune to a writer
+/// racing the source). Without one, the provider's setup populates an empty
+/// dir and there is no baseline hash. A hash failure warns and yields none.
+fn materialize_sandbox(source: &Path, per_run: &Path, quiet: bool) -> Result<Option<String>> {
+    if !source.exists() {
+        fs::create_dir_all(per_run)
+            .with_context(|| format!("creating empty per-run sandbox {}", per_run.display()))?;
+        return Ok(None);
+    }
+    cow_clone_dir_excluding(source, per_run, artifact_dirs::RUN_ARTIFACT_DIRS).with_context(|| {
+        format!("cow-cloning source sandbox {} → {}", source.display(), per_run.display())
+    })?;
+    match hash_sandbox_dir(per_run) {
+        Ok(h) => Ok(Some(h)),
+        Err(e) => {
+            warn(quiet, &format!("baseline_hash for {} skipped: {e}", per_run.display()));
+            Ok(None)
+        }
+    }
+}
+
+/// (#2833) Bring the in-memory verify in line with the work gate, so the
+/// outcome and the notes agree with what the gate wrote to `manifest.json`.
+/// A gate that could not be applied at all fails the verify CLOSED, even
+/// though nothing could be persisted. Returns the warning to show for that
+/// case.
+fn settle_verify(
+    verify: Option<&mut crate::workloads::types::VerifyOutcome>,
+    gate: Result<Option<crate::lab::verify_gate::WorkGateResult>>,
+) -> Option<String> {
+    let (passed, details, warning) = match gate {
+        Ok(None) => return None,
+        Ok(Some(g)) => (g.passed, g.details, None),
+        Err(e) => (
+            false,
+            format!("verify gate could not be applied: {e}"),
+            Some(format!(
+                "applying verify work gate failed ({e}) — failing verify closed rather than trusting the raw result"
+            )),
+        ),
+    };
+    if let Some(v) = verify {
+        v.passed = passed;
+        v.details = details;
+    }
+    warning
+}
+
+/// The one-line summary `lab run` prints per run.
+fn run_notes(provider_id: &str, result: &crate::workloads::types::RunResult) -> Vec<String> {
+    let mut notes = vec![
+        format!("provider={provider_id}"),
+        format!("wall={}s", result.duration_ms / 1000),
+        if result.ok {
+            "ok".to_string()
+        } else {
+            format!("error: {}", result.error.as_deref().unwrap_or("unknown"))
+        },
+    ];
+    if let Some(v) = &result.verify {
+        notes.push(format!("verify={} ({})", if v.passed { "pass" } else { "fail" }, v.details));
+    }
+    notes
 }
 
 /// A run id: `<workload>-<profile>-<epoch_secs>-<n>`. `stats` reads the
