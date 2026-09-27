@@ -80,16 +80,23 @@ pub(crate) fn render_report(r: &CharacterizeReport) -> String {
     out
 }
 
-/// The one-line verdict: a failed dispatch dominates a failed verify, which
-/// dominates the wall-clock read. `None` when there were no runs.
+/// The one-line verdict: a failed or errored dispatch dominates a failed
+/// verify, which dominates the wall-clock read of the runs that completed.
+/// `None` when there were no runs.
 fn verdict(outcomes: &[RunOutcome]) -> Option<String> {
-    let slowest = outcomes.iter().map(|o| o.duration_ms / 1000).max()?;
+    if outcomes.is_empty() {
+        return None;
+    }
+    if outcomes.iter().any(|o| !o.ok) {
+        return Some(
+            "at least one dispatch failed — inspect `darkmux lab run inspect <run-id>` \
+             and check `darkmux doctor` for setup problems"
+                .to_string(),
+        );
+    }
+    let slowest = outcomes.iter().map(|o| o.duration_ms / 1000).max().unwrap_or(0);
     let timing = classify_wall_clock(slowest);
-    Some(if outcomes.iter().any(|o| !o.ok) {
-        "at least one dispatch failed — inspect `darkmux lab run inspect <run-id>` \
-         and check `darkmux doctor` for setup problems"
-            .to_string()
-    } else if outcomes.iter().any(RunOutcome::verify_failed) {
+    Some(if outcomes.iter().any(RunOutcome::verify_failed) {
         format!(
             "dispatch succeeded ({timing}) BUT the workload's verify check failed — \
              the model didn't produce the expected reply. This is normal for non-deterministic \
@@ -148,6 +155,7 @@ mod tests {
             verify_passed,
             duration_ms: secs * 1000,
             notes: vec!["provider=stub".into()],
+            provider_error: None,
         }
     }
 
@@ -209,6 +217,18 @@ mod tests {
         assert_eq!(r.workload, "wchar");
         assert_eq!(r.outcomes.len(), 1);
         assert_eq!(crate::lab::run::exit_code(&r.outcomes), 1, "a failed verify fails characterize");
+    }
+
+    /// (#2986) A run whose provider errored is marked and names its error,
+    /// and the verdict is a failed dispatch.
+    #[test]
+    fn an_errored_run_is_marked_with_its_error() {
+        let mut errored = outcome("r2", false, None, 0);
+        errored.provider_error = Some("boom".into());
+        errored.notes = vec!["provider=stub".into(), "error: boom".into()];
+        let text = render_report(&report(vec![errored]));
+        assert!(text.contains("  ✗ r2 — 0s\n      provider=stub\n      error: boom\n"), "{text}");
+        assert!(text.contains("verdict: at least one dispatch failed"), "{text}");
     }
 
     #[test]

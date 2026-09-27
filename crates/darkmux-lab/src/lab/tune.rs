@@ -82,6 +82,9 @@ pub fn tune(opts: &TuneOpts) -> Result<TuneReport> {
     })
 }
 
+/// Distribution stats over the runs that COMPLETED (#2986): an errored run
+/// has no wall clock worth measuring, and is named in the report instead.
+///
 /// Bimodal cluster detection. We call the boundary the **midpoint between
 /// min and max** wall clock — runs at or below midpoint are "fast cluster",
 /// above are "slow cluster". This is intentionally simple — it catches the
@@ -89,7 +92,7 @@ pub fn tune(opts: &TuneOpts) -> Result<TuneReport> {
 /// runs are within 1.5× of each other, treat as a single cluster (no
 /// meaningful bimodal signal).
 pub(crate) fn compute_stats(outcomes: &[RunOutcome]) -> DistributionStats {
-    let secs: Vec<u128> = outcomes.iter().map(|o| o.duration_ms / 1000).collect();
+    let secs: Vec<u128> = outcomes.iter().filter(|o| o.completed()).map(|o| o.duration_ms / 1000).collect();
     let n = secs.len();
     if n == 0 {
         return DistributionStats {
@@ -188,15 +191,18 @@ pub(crate) fn render_report(r: &TuneReport) -> String {
     let s = &r.stats;
     if s.n == 0 {
         p!(out, "(no runs completed)");
+        render_errored(&mut out, &r.outcomes);
         return out;
     }
     render_wall_clock(&mut out, s);
     p!(out);
     render_failures(&mut out, &r.outcomes, s.n);
+    render_errored(&mut out, &r.outcomes);
     p!(out);
     p!(out, "Next steps:");
     p!(out, "  • `darkmux lab run inspect <run-id>` for any individual run");
-    if let [first, .., last] = r.outcomes.as_slice() {
+    let completed: Vec<_> = r.outcomes.iter().filter(|o| o.completed()).collect();
+    if let [first, .., last] = completed.as_slice() {
         p!(out, "  • `darkmux lab run compare {} {}` for a head-to-head diff", first.run_id, last.run_id);
     }
     if s.slow_cluster.count > 0 {
@@ -230,8 +236,18 @@ fn cluster_line(c: &ClusterStats) -> String {
     )
 }
 
+/// (#2986) Each run whose provider errored before completing, by name.
+fn render_errored(out: &mut String, outcomes: &[RunOutcome]) {
+    for o in outcomes {
+        if let Some(e) = &o.provider_error {
+            p!(out, "✗ {} errored before completing: {e}", o.run_id);
+        }
+    }
+}
+
+/// Failures among the `n` runs that completed.
 fn render_failures(out: &mut String, outcomes: &[RunOutcome], n: usize) {
-    let dispatch_failures = outcomes.iter().filter(|o| !o.ok).count();
+    let dispatch_failures = outcomes.iter().filter(|o| o.completed() && !o.ok).count();
     let verify_failures = outcomes.iter().filter(|o| o.verify_failed()).count();
     if dispatch_failures > 0 {
         p!(
@@ -258,6 +274,7 @@ mod tests {
             verify_passed: Some(true),
             duration_ms: (secs as u128) * 1000,
             notes: vec![],
+            provider_error: None,
         }
     }
 
@@ -321,6 +338,49 @@ mod tests {
         assert_eq!(r.outcomes.len(), 2);
         assert_eq!(r.stats.n, 2);
         assert_eq!(crate::lab::run::exit_code(&r.outcomes), 0);
+    }
+
+    /// (#2986) A provider error on run 2 of 4 fails that run only: the
+    /// batch keeps going, all four outcomes come back, the errored run is
+    /// named, the stats cover the three that completed, and the verb still
+    /// exits 1.
+    #[test]
+    #[serial_test::serial]
+    fn a_failed_run_mid_batch_keeps_every_other_outcome() {
+        use crate::lab::run::run_tests::{script, Lab, Script};
+        let lab = Lab::scripted(&["wbatch"]);
+        script(Script { ok: true, verify: Some(true), run_err_on_call: Some(2), ..Default::default() });
+        let r = tune(&TuneOpts { workload: "wbatch".into(), profile: None, runs: 4, config: Some(lab.profiles.clone()) })
+            .unwrap();
+        assert_eq!(r.outcomes.len(), 4);
+        let failed: Vec<_> = r.outcomes.iter().filter(|o| o.provider_error.is_some()).collect();
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].run_id.ends_with("-2"), "{}", failed[0].run_id);
+        assert!(!failed[0].ok);
+        assert_eq!(failed[0].provider_error.as_deref(), Some("scripted failure on run 2"));
+        assert_eq!(crate::lab::run::exit_code(&r.outcomes), 1);
+        assert_eq!(r.stats.n, 3, "stats cover the completed runs");
+        let text = render_report(&r);
+        assert!(
+            text.contains(&format!("✗ {} errored before completing: scripted failure on run 2\n", failed[0].run_id)),
+            "{text}"
+        );
+        assert!(!text.contains("dispatches failed"), "an errored run is not a completed failed dispatch: {text}");
+    }
+
+    /// (#2986) When every run errored there are no stats, and each errored
+    /// run is still named.
+    #[test]
+    fn a_batch_where_every_run_errored_names_each_one() {
+        let mut o = outcome(0);
+        o.ok = false;
+        o.provider_error = Some("boom".into());
+        let text = render_report(&tune_report(vec![o]));
+        assert_eq!(
+            text,
+            "darkmux tune — workload `w` profile `(default)` × 0 run(s)\n\n(no runs completed)\n\
+             ✗ test-0 errored before completing: boom\n"
+        );
     }
 
     #[test]

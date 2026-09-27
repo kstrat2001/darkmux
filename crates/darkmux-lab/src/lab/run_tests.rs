@@ -20,13 +20,19 @@ pub(crate) struct Script {
     pub(crate) write_manifest: bool,
     /// The `verify` value written into `manifest.json` (when written).
     pub(crate) manifest_verify: Option<serde_json::Value>,
+    /// Fail `run` on this call (1-based, counted from `script`) only.
+    pub(crate) run_err_on_call: Option<u32>,
 }
 
 static SCRIPT: Mutex<Option<Script>> = Mutex::new(None);
 
 pub(crate) fn script(s: Script) {
     *SCRIPT.lock().unwrap() = Some(s);
+    SCRIPT_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
 }
+
+/// `run` calls since the last `script`.
+static SCRIPT_CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 static CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -60,6 +66,10 @@ impl WorkloadProvider for ScriptedProvider {
     ) -> Result<RunResult> {
         let s = SCRIPT.lock().unwrap().clone().unwrap_or_default();
         on_session_id("darkmux-stub-scripted");
+        let nth = SCRIPT_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if s.run_err_on_call == Some(nth) {
+            return Err(anyhow!("scripted failure on run {nth}"));
+        }
         if let Some(p) = &loaded.manifest.workload.prompt {
             fs::write(run_dir.join("prompt"), p)?;
         }
@@ -316,6 +326,7 @@ fn the_exit_gate_fails_on_a_failed_dispatch_or_a_failed_verify_only() {
         verify_passed,
         duration_ms: 0,
         notes: vec![],
+        provider_error: None,
     };
     assert_eq!(exit_code(&[]), 0);
     assert_eq!(exit_code(&[o(true, None)]), 0);
@@ -369,11 +380,12 @@ fn a_failed_dispatch_is_a_completed_run_with_an_error_note() {
     assert_eq!(lifecycle::read(&o.run_dir).unwrap().status, lifecycle::LifecycleStatus::Complete);
 }
 
-/// A provider that errors in setup or run, or is not registered at all,
-/// ends `lab_run` with that error and records the run as errored.
+/// (#2986) A provider that errors in setup or run, or is not registered at
+/// all, fails that run: the run is recorded as errored and returned as a
+/// failed outcome naming the error, and the batch goes on to the next run.
 #[test]
 #[serial_test::serial]
-fn a_provider_error_ends_the_run_and_records_it_errored() {
+fn a_provider_error_fails_the_run_and_the_batch_goes_on() {
     let lab = Lab::new(
         r#"{"default_profile":"fast","profiles":{"fast":{"models":[{"id":"model-a","n_ctx":32000}]}}}"#,
         &[
@@ -381,28 +393,28 @@ fn a_provider_error_ends_the_run_and_records_it_errored() {
             serde_json::json!({ "id": "wu", "provider": "no-such-provider", "prompt": "hi" }),
         ],
     );
-    let root = darkmux_types::config_access::lab_dir();
-    let only_run = || {
-        let dirs: Vec<_> = fs::read_dir(&root).unwrap().flatten().map(|e| e.path()).collect();
-        assert_eq!(dirs.len(), 1, "{dirs:?}");
-        let rec = lifecycle::read(&dirs[0]).unwrap();
-        fs::remove_dir_all(&dirs[0]).unwrap();
-        rec
-    };
     for (s, want) in [
         (Script { setup_err: true, ..Default::default() }, "scripted setup failure"),
         (Script { run_err: true, ..Default::default() }, "scripted run failure"),
     ] {
         script(s);
-        let err = lab.run("we", 2).unwrap_err();
-        assert_eq!(err.to_string(), want);
-        let rec = only_run();
-        assert_eq!(rec.status, lifecycle::LifecycleStatus::Error);
-        assert_eq!(rec.error.as_deref(), Some(want));
+        let out = lab.run("we", 2).unwrap();
+        assert_eq!(out.len(), 2, "both runs are attempted");
+        for o in &out {
+            assert!(!o.ok && !o.passed());
+            assert_eq!(o.verify_passed, None);
+            assert_eq!(o.provider_error.as_deref(), Some(want));
+            assert_eq!(o.notes, [format!("provider={SCRIPTED}"), format!("error: {want}")]);
+            let rec = lifecycle::read(&o.run_dir).unwrap();
+            assert_eq!(rec.status, lifecycle::LifecycleStatus::Error);
+            assert_eq!(rec.error.as_deref(), Some(want));
+        }
+        assert_eq!(exit_code(&out), 1);
     }
-    let err = lab.run("wu", 1).unwrap_err();
-    assert!(err.to_string().contains("unknown workload provider: \"no-such-provider\""), "{err}");
-    assert_eq!(only_run().status, lifecycle::LifecycleStatus::Error);
+    let o = lab.run("wu", 1).unwrap().remove(0);
+    let err = o.provider_error.unwrap();
+    assert!(err.contains("unknown workload provider: \"no-such-provider\""), "{err}");
+    assert_eq!(lifecycle::read(&o.run_dir).unwrap().status, lifecycle::LifecycleStatus::Error);
 }
 
 /// (#2462) A provider error while a signal is set records the run as

@@ -47,9 +47,20 @@ pub struct RunOutcome {
     pub verify_passed: Option<bool>,
     pub duration_ms: u128,
     pub notes: Vec<String>,
+    /// (#2986) The error the provider raised, when the run ended before the
+    /// provider returned a result. `None` for a run that completed, whether
+    /// or not its dispatch succeeded. An errored run is a failed run: `ok`
+    /// is false.
+    pub provider_error: Option<String>,
 }
 
 impl RunOutcome {
+    /// (#2986) The provider ran to completion and returned a result, so the
+    /// run's timing and verify are real measurements.
+    pub fn completed(&self) -> bool {
+        self.provider_error.is_none()
+    }
+
     /// The workload's verify ran and failed. A verify nothing declared
     /// (`None`) is not a failure.
     pub fn verify_failed(&self) -> bool {
@@ -176,27 +187,16 @@ impl OneRun<'_> {
         // (#488) Each run works on a sandbox of its own under its run dir.
         let per_run_sandbox_dir = run_dir.join("sandbox");
         let baseline_hash = materialize_sandbox(&source_sandbox_dir, &per_run_sandbox_dir, self.opts.quiet)?;
-        let (mut result, lifecycle) = self.run_provider(&run_dir, &per_run_sandbox_dir, lifecycle)?;
+        let started = std::time::Instant::now();
+        let (mut result, lifecycle) = match self.run_provider(&run_dir, &per_run_sandbox_dir, lifecycle)? {
+            ProviderRun::Completed(done) => *done,
+            ProviderRun::Errored(e) => {
+                let provider_id = &self.workload.manifest.workload.provider;
+                return Ok(errored_outcome(provider_id, run_id, run_dir, started.elapsed(), &e));
+            }
+        };
 
-        // (#489) Best-effort: fixture provenance is observability, not
-        // correctness, so a manifest that cannot be enriched never fails
-        // the run.
-        if let Err(e) = enrich_manifest_with_fixture_info(&run_dir, baseline_hash.as_deref(), &source_sandbox_dir) {
-            warn(self.opts.quiet, &format!("enriching manifest with fixture info skipped: {e}"));
-        }
-        // (#2833) The write-the-tests work gate runs after the enrichment,
-        // so both hashes it compares are on disk.
-        let coverage_min_pct = self.workload.manifest.workload.verify.as_ref().and_then(|v| v.coverage_min_pct);
-        let gate = crate::lab::verify_gate::apply(
-            &run_dir,
-            &source_sandbox_dir,
-            &per_run_sandbox_dir,
-            result.ok,
-            coverage_min_pct,
-        );
-        if let Some(w) = settle_verify(result.verify.as_mut(), gate) {
-            warn(self.opts.quiet, &w);
-        }
+        self.record_fixture_and_gate(&run_dir, &source_sandbox_dir, &per_run_sandbox_dir, baseline_hash.as_deref(), &mut result);
 
         let provider_id = &self.workload.manifest.workload.provider;
         let notes = run_notes(provider_id, &result);
@@ -213,7 +213,39 @@ impl OneRun<'_> {
             verify_passed: result.verify.as_ref().map(|v| v.passed),
             duration_ms: result.duration_ms,
             notes,
+            provider_error: None,
         })
+    }
+
+    /// After the provider completed: enrich its manifest with the fixture's
+    /// provenance, then apply the work gate and settle the verify verdict.
+    fn record_fixture_and_gate(
+        &self,
+        run_dir: &Path,
+        source: &Path,
+        sandbox: &Path,
+        baseline_hash: Option<&str>,
+        result: &mut crate::workloads::types::RunResult,
+    ) {
+        // (#489) Best-effort: fixture provenance is observability, not
+        // correctness, so a manifest that cannot be enriched never fails
+        // the run.
+        if let Err(e) = enrich_manifest_with_fixture_info(run_dir, baseline_hash, source) {
+            warn(self.opts.quiet, &format!("enriching manifest with fixture info skipped: {e}"));
+        }
+        // (#2833) The write-the-tests work gate runs after the enrichment,
+        // so both hashes it compares are on disk.
+        let coverage_min_pct = self.workload.manifest.workload.verify.as_ref().and_then(|v| v.coverage_min_pct);
+        let gate = crate::lab::verify_gate::apply(
+            run_dir,
+            source,
+            sandbox,
+            result.ok,
+            coverage_min_pct,
+        );
+        if let Some(w) = settle_verify(result.verify.as_mut(), gate) {
+            warn(self.opts.quiet, &w);
+        }
     }
 
     /// The run banner, naming the tier the workload resolved from (#2553),
@@ -231,15 +263,16 @@ impl OneRun<'_> {
     }
 
     /// Set the provider up and run it against the per-run sandbox, handing
-    /// the lifecycle back to finish. A provider error ends the run with that
-    /// error named on its lifecycle record (#1930), or recorded as
-    /// interrupted when a caught signal is why the dispatch failed (#2462).
+    /// the lifecycle back to finish. A provider error is recorded on the
+    /// run's lifecycle (#1930) and fails this run only (#2986): the batch
+    /// goes on. A caught signal is the one error that ends the batch, recorded
+    /// as interrupted rather than as a provider failure (#2462).
     fn run_provider(
         &self,
         run_dir: &Path,
         sandbox: &Path,
         mut lifecycle: lifecycle::RunLifecycle,
-    ) -> Result<(crate::workloads::types::RunResult, lifecycle::RunLifecycle)> {
+    ) -> Result<ProviderRun> {
         let result = with_provider(&self.workload.manifest.workload.provider, |p| {
             p.setup(self.workload, run_dir, sandbox)?;
             p.run(
@@ -258,16 +291,45 @@ impl OneRun<'_> {
         })
         .and_then(|r| r);
         match result {
-            Ok(r) => Ok((r, lifecycle)),
-            Err(e) => {
-                if darkmux_types::interrupt::is_set() {
-                    lifecycle.finish_interrupted(&e);
-                } else {
-                    lifecycle.finish_error(&e);
-                }
+            Ok(r) => Ok(ProviderRun::Completed(Box::new((r, lifecycle)))),
+            Err(e) if darkmux_types::interrupt::is_set() => {
+                lifecycle.finish_interrupted(&e);
                 Err(e)
             }
+            Err(e) => {
+                lifecycle.finish_error(&e);
+                let id = run_dir.file_name().unwrap_or_default().to_string_lossy();
+                eprintln!("[lab] run {id} failed: {e:#}");
+                Ok(ProviderRun::Errored(e))
+            }
         }
+    }
+}
+
+/// How the provider's part of one run ended, short of a signal.
+enum ProviderRun {
+    Completed(Box<(crate::workloads::types::RunResult, lifecycle::RunLifecycle)>),
+    Errored(anyhow::Error),
+}
+
+/// (#2986) The outcome of a run whose provider raised an error: a failed run,
+/// kept alongside the batch's other outcomes rather than discarding them.
+fn errored_outcome(
+    provider_id: &str,
+    run_id: String,
+    run_dir: std::path::PathBuf,
+    elapsed: std::time::Duration,
+    e: &anyhow::Error,
+) -> RunOutcome {
+    let error = format!("{e:#}");
+    RunOutcome {
+        notes: vec![format!("provider={provider_id}"), format!("error: {error}")],
+        run_id,
+        run_dir,
+        ok: false,
+        verify_passed: None,
+        duration_ms: elapsed.as_millis(),
+        provider_error: Some(error),
     }
 }
 

@@ -86,6 +86,14 @@ darkmux release.
   ends the run, as `lab run` already did. **Migration:** a script that
   treated exit 0 from these verbs as "the dispatch ran" should expect 1
   when the workload's verify fails.
+- **A provider error fails one lab run, not the batch** (#2986). When run
+  k of N errored, `lab run`, `lab characterize` and `lab tune` stopped and
+  discarded runs 1..k-1. Now the errored run is recorded (its lifecycle
+  reads `error`, and stderr names it), returned as a failed outcome, and
+  the batch goes on; only a signal stops it. The exit code is still 1.
+  `lab tune`'s stats cover the runs that completed, and it names each
+  errored run. **Migration:** a script that read "exit 1 with an error
+  message" as "nothing after this ran" should read the per-run lines.
 - **Two lab runs in the same second no longer share a run dir, so a run id
   can carry a claim suffix** (#2981). The second run used to overwrite the
   first's artifacts. A run whose `<workload>-<profile>-<epoch>-<n>`
