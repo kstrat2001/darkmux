@@ -229,12 +229,13 @@ mod tests {
     #[test]
     fn a_breach_counts_settled_spend_not_siblings_in_flight() {
         let mut b = RemoteBudget::new(Some(10_000), StepBudgetPolicy::Warn);
-        for _ in 0..3 {
-            b.admit_reserve(4_096); // three siblings in flight: 12288 reserved
+        for _ in 0..4 {
+            b.admit_reserve(4_096); // four siblings in flight: 16384 reserved
         }
         b.settle(4_096, 500, 1);
+        assert_eq!((b.settled(), b.used()), (500, 12_788), "the reviewer's numbers");
+        assert!(!b.exhausted(), "12788 in use but only 500 spent");
         assert_eq!(b.take_breach(), None, "500 settled of 10000: no breach");
-        assert_eq!((b.settled(), b.used()), (500, 8_692));
         b.settle(4_096, 9_600, 1);
         assert_eq!(b.take_breach(), Some(StepBreach { used: 10_100, budget: 10_000 }));
     }

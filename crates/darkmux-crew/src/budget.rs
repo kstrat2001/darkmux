@@ -1049,10 +1049,9 @@ impl BudgetPacer {
         if !self.pausing {
             return None;
         }
-        // (review MF1) Never release a stopped run.
-        if let Some(reason) = env.stop_reason(caller) {
-            return Some(self.stop(reason, caller, env));
-        }
+        // (review MF1) A stopped run never reaches here while held: every
+        // tick of a held run checks the stop first (`on_tick`), before the
+        // window, a reload or a release.
         self.pausing = false;
         self.announced = None;
         let state = self.state();
