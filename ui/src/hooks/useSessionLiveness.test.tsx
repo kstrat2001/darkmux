@@ -58,6 +58,7 @@ vi.mock("./useLiveSessionIds", () => ({
 const LIVE: FlowWindowResult = {
   settled: true,
   tMax: 0,
+  failure: null,
   data: [{ action: "LIVE-RECORD" }] as never,
 };
 

@@ -791,7 +791,10 @@ export const NO_SIGNAL_STAT = "no signal";
  *  this mount (success or failure; a source this mount never reads counts
  *  as answered). A failed read counts: it has its own notice
  *  (`RunsUnreadableNotice`, `FleetCoverageNotice`), and waiting on it would
- *  hold "no signal" forever. `/fleet/roster` and `/machine/specs` are not
+ *  hold "no signal" forever. The flow window is the exception (#2965): its
+ *  failed read yields an empty window, which every negative claim here would
+ *  read as "nothing happened", so `flow` is false while a day's read is
+ *  failing (and `FlowReadNotice` names it). `/fleet/roster` and `/machine/specs` are not
  *  sources here: they decide which cards exist and what hardware they name,
  *  never what a machine is doing. The caller latches each one, so only the
  *  FIRST answer counts: a later pending read (a refetch, or the flow

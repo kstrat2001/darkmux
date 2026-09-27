@@ -152,6 +152,15 @@ function mockFleetFetch(opts: {
    *  is slow to answer one endpoint (the operator measured `/runs` at 3.3 s).
    *  Resolve the promise to let the answer through. */
   hold?: Record<string, Promise<void>>;
+  /** (#2965) Paths that answer with this HTTP error status: a daemon whose
+   *  read of that endpoint failed. */
+  fail?: Record<string, number>;
+  /** (#2965) Paths whose FIRST read answers 500 and every later one normally:
+   *  a blip that has since healed. */
+  failOnce?: string[];
+  /** (#2965) Further days that answer `200 []`: the mock names today and
+   *  yesterday when it is built, so a day reached by a rollover needs this. */
+  emptyDays?: string[];
 } = {}) {
   const today = todayUTC();
   const yesterday = prevDateUTC(today);
@@ -165,6 +174,14 @@ function mockFleetFetch(opts: {
     }),
   );
   function answer(path: string): Promise<Response> {
+    const once = opts.failOnce?.indexOf(path) ?? -1;
+    if (once >= 0) {
+      opts.failOnce!.splice(once, 1);
+      return Promise.resolve(new Response("boom", { status: 500, statusText: "Internal Server Error" }));
+    }
+    if (opts.emptyDays?.some((d) => path === `/flow/${d}`)) return Promise.resolve(new Response("[]", { status: 200 }));
+    const failed = opts.fail?.[path];
+    if (failed) return Promise.resolve(new Response("boom", { status: failed, statusText: "Internal Server Error" }));
     if (path === `/flow/${today}`) return Promise.resolve(new Response(JSON.stringify(opts.flowToday ?? []), { status: 200 }));
     if (path === `/flow/${yesterday}`) return Promise.resolve(new Response(JSON.stringify(opts.flowYesterday ?? []), { status: 200 }));
     if (path === "/fleet/machines/live") {
@@ -2076,6 +2093,79 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
     expect(scope[0].querySelector('.token-scope-bezel[data-state="off"]')).not.toBeNull();
     expect(card.querySelector('[data-testid="token-scope-probe"]')).toBeNull();
     expect(card.querySelector(".mach-scope__rate")).toBeNull();
+  });
+
+  // (#2965) A failed flow read is not an answer that nothing happened. Both
+  // `/flow/<day>` reads fail while presence shows the machine beating: the
+  // records that would say it is working are exactly the ones missing, so
+  // "idle · 0 running" is a claim nothing read. The card holds "no signal"
+  // (and the app-level `FlowReadNotice` names the failure).
+  for (const [what, failing] of [
+    ["both days", () => [`/flow/${todayUTC()}`, `/flow/${prevDateUTC(todayUTC())}`]],
+    ["today alone", () => [`/flow/${todayUTC()}`]],
+  ] as const) {
+    it(`says 'no signal', not 'idle', when the flow read fails (${what})`, async () => {
+      const paths: string[] = failing();
+      mockFleetFetch({ machines: BEAT, specs: SPECS, runs: [], fail: Object.fromEntries(paths.map((p) => [p, 500])) });
+      const queryClient = newClient();
+      renderFleetLens({}, queryClient);
+      await waitForFleetQueriesSettled(queryClient);
+      // Every source has answered, the failed flow read included: nothing is
+      // still loading, so "no signal" here is the failure's, not a load's.
+      await waitFor(() => {
+        for (const key of [queryKeys.fleetSessionsLive(), queryKeys.runs(), queryKeys.flowDate(todayUTC()), queryKeys.flowDate(prevDateUTC(todayUTC()))]) {
+          expect(queryClient.getQueryState(key)?.status, JSON.stringify(key)).toBe("success");
+        }
+      });
+      await waitFor(() => expect(document.querySelector('.fleet-lens[data-state="loaded"]')).not.toBeNull());
+      await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+      for (const card of Array.from(document.querySelectorAll(".mach"))) {
+        expect(stat(card)).toBe("no signal");
+        expect(card.textContent).not.toContain("idle");
+        expect(card.textContent).not.toContain("offline");
+        expect(card.querySelector(".runs")!.textContent).toBe("—");
+        expect(cardScope(card)).toMatchObject({ state: "nosignal" });
+        expect(utilLabel(card)).toMatch(/no signal$/);
+      }
+      // The token panel's zeros are a negative claim off the same read: it
+      // keeps its loading silhouette rather than counting up to "0".
+      expect(document.querySelector(".savings")!.getAttribute("data-settled")).toBe("false");
+    });
+  }
+
+  // (#2965 review) A failure at the UTC-midnight rollover: the new day's
+  // first read fails. The latch that keeps a PENDING new day from blinking
+  // the cards back must not also hide a FAILED one; and the failed day is
+  // retried, so the card heals on its own once the read succeeds.
+  it("a failed read of the new day at UTC midnight says 'no signal', then heals when the retry succeeds", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    vi.setSystemTime(new Date("2026-06-15T23:59:58.000Z"));
+    mockFleetFetch({ machines: BEAT, runs: [], failOnce: ["/flow/2026-06-16"], emptyDays: ["2026-06-16"] });
+    renderFleetLens();
+    await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("idle"));
+    vi.setSystemTime(new Date("2026-06-16T00:00:03.000Z"));
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+    });
+    await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("no signal"));
+    expect(document.querySelector(".savings")!.getAttribute("data-settled")).toBe("false");
+    await act(async () => {
+      vi.advanceTimersByTime(21_000);
+    });
+    await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("idle"));
+    expect(document.querySelector(".savings")!.getAttribute("data-settled")).toBe("true");
+  });
+
+  // (#2965) The inverted case: the same machine, the same sources, every read
+  // healthy, reads "idle". Without it the test above passes for a card that
+  // could never say "idle" at all.
+  it("the same fleet with healthy flow reads says 'idle' — the inverted case", async () => {
+    mockFleetFetch({ machines: BEAT, specs: SPECS, runs: [] });
+    renderFleetLens({}, newClient());
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    await waitFor(() => {
+      for (const card of Array.from(document.querySelectorAll(".mach"))) expect(stat(card)).toBe("idle");
+    });
   });
 
   it("a replay has its records in hand and never shows 'no signal'", async () => {
