@@ -501,21 +501,13 @@ pub(crate) fn envelope_meta(stdout: &str) -> EnvelopeMeta {
     let Some(v) = parse_envelope(stdout) else {
         return EnvelopeMeta::default();
     };
+    // The host writes this block from the trajectory fold, `total_tokens`
+    // included (each call's total by the one total rule), so it is read as
+    // written, never re-derived from the split.
     let m = v.get("metrics").cloned().unwrap_or(serde_json::Value::Null);
-    let total = m
-        .get("total_tokens")
-        .and_then(|t| t.as_u64())
-        .or_else(|| {
-            let p = m.get("prompt_tokens").and_then(|t| t.as_u64());
-            let c = m.get("completion_tokens").and_then(|t| t.as_u64());
-            match (p, c) {
-                (Some(p), Some(c)) => Some(p + c),
-                _ => None,
-            }
-        });
     EnvelopeMeta {
         model: m.get("model").and_then(|s| s.as_str()).map(str::to_string),
-        total_tokens: total,
+        total_tokens: m.get("total_tokens").and_then(|t| t.as_u64()),
         infra_exit: false,
         runtime_error: v.get("result").and_then(|r| r.as_str()) == Some("error"),
     }
@@ -821,10 +813,14 @@ mod tests {
 
     #[test]
     fn envelope_meta_extracts_model_and_tokens() {
-        let stdout = "pulling image...\n{\"result\":\"stop\",\"metrics\":{\"model\":\"m-x\",\"prompt_tokens\":100,\"completion_tokens\":25}}";
+        let stdout = "pulling image...\n{\"result\":\"stop\",\"metrics\":{\"model\":\"m-x\",\"prompt_tokens\":100,\"completion_tokens\":25,\"total_tokens\":125}}";
         let m = envelope_meta(stdout);
         assert_eq!(m.model.as_deref(), Some("m-x"));
         assert_eq!(m.total_tokens, Some(125));
+        // The block's own total is read as written, never re-derived: a
+        // provider total above the split survives.
+        let above = envelope_meta(r#"{"result":"stop","metrics":{"prompt_tokens":9970,"completion_tokens":128,"total_tokens":11598}}"#);
+        assert_eq!(above.total_tokens, Some(11598));
         // Garbage stdout degrades to None, never errors.
         let g = envelope_meta("not json at all");
         assert!(g.model.is_none() && g.total_tokens.is_none());
@@ -847,7 +843,7 @@ mod tests {
         let stdout = "{\"status\":\"Downloading\",\"id\":\"sha256:abc\"}\n\
                       {\"status\":\"Extracting\",\"id\":\"sha256:abc\"}\n\
                       {\"result\":\"stop\",\"final_assistant\":\"ANSWER: DMX-K7RW2MPQ\",\
-                        \"metrics\":{\"model\":\"m-x\",\"prompt_tokens\":8,\"completion_tokens\":2}}";
+                        \"metrics\":{\"model\":\"m-x\",\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}";
         let m = envelope_meta(stdout);
         assert_eq!(m.model.as_deref(), Some("m-x"), "a JSON progress line ahead of the envelope is not the envelope");
         assert_eq!(m.total_tokens, Some(10));
@@ -952,7 +948,7 @@ mod tests {
     /// infra zero.
     #[test]
     fn envelope_meta_with_exit_keeps_real_tokens_when_model_is_missing() {
-        let stdout = r#"{"result":"stop","metrics":{"prompt_tokens":30000,"completion_tokens":11200}}"#;
+        let stdout = r#"{"result":"stop","metrics":{"prompt_tokens":30000,"completion_tokens":11200,"total_tokens":41200}}"#;
         let m = envelope_meta_with_exit(stdout, 137);
         assert_eq!(m.model, None, "no model field in this envelope — a real, if incomplete, dialect");
         assert_eq!(m.total_tokens, Some(41200), "real token count must survive a non-zero exit");
@@ -979,7 +975,7 @@ mod tests {
     /// infra would flatter every model's score, which is worse than the bug.
     #[test]
     fn envelope_meta_with_exit_never_overrides_a_recovered_envelope() {
-        let stdout = "{\"result\":\"stop\",\"metrics\":{\"model\":\"m-x\",\"prompt_tokens\":180,\"completion_tokens\":20}}";
+        let stdout = "{\"result\":\"stop\",\"metrics\":{\"model\":\"m-x\",\"prompt_tokens\":180,\"completion_tokens\":20,\"total_tokens\":200}}";
         // Clean exit, real envelope, real tokens — untouched.
         let ok = envelope_meta_with_exit(stdout, 0);
         assert_eq!(ok.total_tokens, Some(200));

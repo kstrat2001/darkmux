@@ -1625,7 +1625,7 @@ mod tests {
             "{{\"status\":\"Downloading\",\"id\":\"sha256:abc\"}}\n\
              {{\"status\":\"Extracting\",\"id\":\"sha256:abc\"}}\n\
              {{\"result\":\"stop\",\"final_assistant\":\"ANSWER: {exp}\",\
-               \"metrics\":{{\"model\":\"m-x\",\"prompt_tokens\":8,\"completion_tokens\":2}}}}"
+               \"metrics\":{{\"model\":\"m-x\",\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}}}"
         );
 
         let reply = extract_reply(&stdout);
@@ -1862,7 +1862,7 @@ not json — tolerated
     /// `scores::is_infra_failure` rather than an exit-code bool.
     fn ran() -> EnvelopeMeta {
         envelope_meta_with_exit(
-            r#"{"result":"stop","metrics":{"model":"m-x","prompt_tokens":400,"completion_tokens":100}}"#,
+            r#"{"result":"stop","metrics":{"model":"m-x","prompt_tokens":400,"completion_tokens":100,"total_tokens":500}}"#,
             0,
         )
     }
@@ -1968,7 +1968,7 @@ not json — tolerated
         let t = nonce_task();
         let exp = expected_nonce(&t);
         let escalated = envelope_meta_with_exit(
-            r#"{"result":"stop","metrics":{"model":"m-x","prompt_tokens":900,"completion_tokens":300}}"#,
+            r#"{"result":"stop","metrics":{"model":"m-x","prompt_tokens":900,"completion_tokens":300,"total_tokens":1200}}"#,
             1,
         );
         assert_eq!(escalated.total_tokens, Some(1200), "the envelope parsed");
@@ -2001,7 +2001,7 @@ not json — tolerated
         let t = nonce_task();
         let exp = expected_nonce(&t);
         let zero_tokens = envelope_meta_with_exit(
-            r#"{"result":"error","metrics":{"model":"m-x","prompt_tokens":0,"completion_tokens":0}}"#,
+            r#"{"result":"error","metrics":{"model":"m-x","prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}"#,
             0,
         );
         let sc = score_task(&t, &zero_tokens, &format!("ANSWER: {exp}"), &TrajStats::default());
@@ -2022,7 +2022,7 @@ not json — tolerated
         // reading — the zero is a missing MEASUREMENT here, not evidence of
         // a dead dispatch, and the parsed verdict is what says so.
         let usage_less = envelope_meta_with_exit(
-            r#"{"result":"stop","metrics":{"model":"m-x","prompt_tokens":0,"completion_tokens":0}}"#,
+            r#"{"result":"stop","metrics":{"model":"m-x","prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}"#,
             1,
         );
         assert_eq!(usage_less.total_tokens, Some(0));
@@ -2049,7 +2049,7 @@ not json — tolerated
     fn score_task_marks_infra_fail_on_a_zero_token_envelope_at_a_clean_exit() {
         let t = nonce_task();
         let quota_dead = envelope_meta_with_exit(
-            r#"{"result":"error","metrics":{"model":"m-x","prompt_tokens":0,"completion_tokens":0}}"#,
+            r#"{"result":"error","metrics":{"model":"m-x","prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}"#,
             0,
         );
         assert_eq!(quota_dead.total_tokens, Some(0), "the runtime's error path emits literal zeros");
@@ -2169,7 +2169,7 @@ not json — tolerated
         // The one event, parsed once — both benches see the same envelope
         // and the same exit code.
         let escalated = envelope_meta_with_exit(
-            r#"{"result":"stop","metrics":{"model":"m-x","prompt_tokens":900,"completion_tokens":300}}"#,
+            r#"{"result":"stop","metrics":{"model":"m-x","prompt_tokens":900,"completion_tokens":300,"total_tokens":1200}}"#,
             1,
         );
         assert_eq!(escalated.total_tokens, Some(1200));
