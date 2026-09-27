@@ -360,7 +360,7 @@ fn ellipsize(s: &str, max: usize) -> String {
 /// pushes a line past the terminal width, costing role, route AND machine
 /// together on a row that would otherwise have fit.
 fn short_model(model: &str) -> &str {
-    model.strip_prefix("darkmux:").unwrap_or(model)
+    darkmux_gestalt::bare_model_key(model)
 }
 
 /// The narrow-pane subtitle: everything [`subtitle_for`] carries, plus the

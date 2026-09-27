@@ -63,7 +63,9 @@ pub use estimator::{
     DEFAULT_TRANSIENT_MARGIN_BYTES,
 };
 pub use facts::{Budget, CallerIntent, CatalogFact, Facts, PoolFact, PoolId, Pools, ResidentFact};
-pub use ownership::{ctx_sufficient, is_darkmux_owned, namespaced_identifier, DARKMUX_NAMESPACE};
+pub use ownership::{
+    bare_model_key, ctx_sufficient, is_darkmux_owned, namespaced_identifier, DARKMUX_NAMESPACE,
+};
 pub use plan::{
     Action, EvictionOrder, ForeignTargetError, OwnedTarget, Plan, PlannedAction,
     Precondition, Reason, Warning,

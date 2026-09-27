@@ -37,6 +37,20 @@ pub fn namespaced_identifier(model_key: &str, explicit: Option<&str>) -> String 
     format!("{DARKMUX_NAMESPACE}{model_key}")
 }
 
+/// The loadable model key for a value that may carry the darkmux namespace:
+/// `darkmux:foo` becomes `foo`; anything without the prefix (a bare key, or
+/// a user's own identifier) comes back unchanged. The inverse of
+/// [`namespaced_identifier`]'s default wrap. Strips ONE prefix: a doubled
+/// `darkmux:darkmux:…` is never minted (see the normalize guard above), so
+/// it is not normalized here either.
+///
+/// The namespace is a load-time decoration, never part of the key: `lms ps`
+/// reports a darkmux load as `identifier=darkmux:foo, modelKey=foo`, so a
+/// comparison or load against a prefixed string always misses.
+pub fn bare_model_key(value: &str) -> &str {
+    value.strip_prefix(DARKMUX_NAMESPACE).unwrap_or(value)
+}
+
 /// `true` if this identifier was minted by darkmux (begins with our
 /// namespace). A pure prefix check — the namespace IS the ownership record;
 /// there is no separate ledger to go stale.
@@ -61,6 +75,20 @@ pub fn ctx_sufficient(loaded_ctx: u64, wanted_n_ctx: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_model_key_strips_only_a_leading_namespace() {
+        assert_eq!(bare_model_key("darkmux:qwen3-4b"), "qwen3-4b");
+        // Inverse: anything not carrying the prefix comes back unchanged.
+        assert_eq!(bare_model_key("qwen3-4b"), "qwen3-4b");
+        assert_eq!(bare_model_key("my-alias"), "my-alias");
+        assert_eq!(bare_model_key("xdarkmux:qwen"), "xdarkmux:qwen");
+        assert_eq!(bare_model_key(""), "");
+        // One prefix only.
+        assert_eq!(bare_model_key("darkmux:darkmux:q"), "darkmux:q");
+        // Round trip with the default wrap.
+        assert_eq!(bare_model_key(&namespaced_identifier("q", None)), "q");
+    }
 
     // Golden vectors mirroring `darkmux_profiles::swap`'s own tests.
 

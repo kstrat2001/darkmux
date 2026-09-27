@@ -12963,9 +12963,7 @@ pub(crate) fn is_reloadable_target(
 /// Pure and borrowing, so the strip is unit-testable without a live `lms` and
 /// costs no allocation on the hot path.
 pub(crate) fn bare_model_key(value: &str) -> &str {
-    value
-        .strip_prefix(darkmux_gestalt::DARKMUX_NAMESPACE)
-        .unwrap_or(value)
+    darkmux_gestalt::bare_model_key(value)
 }
 
 /// (#2318) Serializes the residency preflight's check-then-load window inside

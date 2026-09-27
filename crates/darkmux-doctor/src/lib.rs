@@ -1404,7 +1404,7 @@ fn utility_in_profiles_status(registry: &darkmux_types::ProfileRegistry) -> Chec
     };
     // Match on the bare model key in either spelling, the same comparison
     // every utility-model check in darkmux-crew uses.
-    let bare = |id: &str| id.strip_prefix("darkmux:").unwrap_or(id).to_string();
+    let bare = |id: &str| darkmux_gestalt::bare_model_key(id).to_string();
     let utility_key = bare(utility);
     let mut offenders: Vec<(String, Option<u32>)> = registry
         .profiles
