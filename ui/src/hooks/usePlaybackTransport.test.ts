@@ -110,10 +110,10 @@ describe("usePlaybackTransport", () => {
       act(() => {
         vi.advanceTimersByTime(100);
       });
-      // The fake clock's performance.now() at this tick: t - tMin elapsed
-      // since play began, which the transport measured with the same clock.
-      const started = result.current.tickWallMs - (result.current.t - result.current.tMin);
-      expect(started).toBeCloseTo(result.current.tickWallMs - 100 * (i + 1), 6);
+      // This tick computed t at this very moment (the fake clock stands
+      // still between the interval firing and this read).
+      expect(result.current.t - result.current.tMin).toBe(100 * (i + 1));
+      expect(result.current.tickWallMs).toBe(performance.now());
     }
     const before = result.current.tickWallMs;
     act(() => {
