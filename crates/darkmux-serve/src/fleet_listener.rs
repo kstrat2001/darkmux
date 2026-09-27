@@ -72,6 +72,15 @@ pub(crate) struct FleetListenerState {
     /// that spreads connections over several addresses (a subnet router)
     /// is still capped once it is identified.
     pub node_slots: Arc<KeySlots<String>>,
+    /// (#2947) This machine's dispatch-scope config preflight, run per
+    /// submission before the job is accepted. `Err` carries the refusal
+    /// text. Production: `config_enum::preflight(Scope::Dispatch)`.
+    pub config_preflight: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+}
+
+/// (#2947) The production config preflight a submission runs.
+pub(crate) fn dispatch_config_preflight() -> Result<(), String> {
+    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::Dispatch).map_err(|e| e.to_string())
 }
 
 impl FleetListenerState {
@@ -97,6 +106,7 @@ impl FleetListenerState {
             busy: Arc::new(Mutex::new(None)),
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
+            config_preflight: Arc::new(dispatch_config_preflight),
         }
     }
 }
@@ -331,6 +341,14 @@ async fn submit_handler(
     Extension(admitted): Extension<Admitted>,
     body: Bytes,
 ) -> Response {
+    // (#2947 review M1) A job this machine would refuse at its dispatch
+    // preflight (a bad enum config value) is refused HERE, synchronously,
+    // before the busy slot is taken or the job is accepted: otherwise the
+    // sender reads "accepted" and the failure arrives later, after the
+    // runner has already reconciled residency.
+    if let Err(detail) = (state.config_preflight)() {
+        return refuse(&state, Some(peer_addr.ip()), &Refusal::BadConfig { detail });
+    }
     let receiver = state.receiver.clone();
     let sub = match WorkSubmission::parse(&body) {
         Ok(s) => s,
@@ -690,6 +708,15 @@ mod tests {
     }
 
     fn start(peer: Option<darkmux_fleet::NodeIdentity>, down: bool, job_ms: u64) -> Harness {
+        start_with_preflight(peer, down, job_ms, Arc::new(|| Ok(())))
+    }
+
+    fn start_with_preflight(
+        peer: Option<darkmux_fleet::NodeIdentity>,
+        down: bool,
+        job_ms: u64,
+        config_preflight: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+    ) -> Harness {
         let local = test_node("nSTUDIO", "studio", "100.64.0.2");
         let provider = StaticIdentityProvider {
             local,
@@ -726,6 +753,7 @@ mod tests {
             busy: busy.clone(),
             refusal_log: refusal_log.clone(),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
+            config_preflight,
         };
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         std_listener.set_nonblocking(true).unwrap();
@@ -846,6 +874,49 @@ mod tests {
         }
     }
 
+    /// (#2947 review M1) A receiver whose own config would refuse the
+    /// dispatch refuses the SUBMISSION synchronously: 503 with the preflight
+    /// text, the busy slot never taken, the job never executed.
+    #[test]
+    fn a_bad_config_receiver_refuses_the_submission_synchronously() {
+        let h = start_with_preflight(
+            Some(laptop()),
+            false,
+            0,
+            Arc::new(|| Err("dispatch: refusing to start: bad config (#2947) `seroius`".to_string())),
+        );
+        let (code, reply) = post(&h, TOKEN, job("s-bad", None), false);
+        assert_eq!(code, 503, "{reply:?}");
+        assert_eq!(reply.status, "refused");
+        let reason = reply.reason.unwrap_or_default();
+        assert!(reason.contains("`seroius`") && reason.contains("darkmux doctor"), "{reason}");
+        assert!(h.busy.lock().unwrap().is_none(), "the busy slot was taken");
+        assert!(h.ran.lock().unwrap().is_empty(), "the job ran");
+    }
+
+    /// (#2947) The production state's preflight is the real dispatch-scope
+    /// preflight, not a stub: a bad env value makes it refuse.
+    #[serial_test::serial]
+    #[test]
+    fn the_production_submission_preflight_is_the_dispatch_scope_preflight() {
+        let prev = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
+        unsafe { std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "seroius") };
+        let state = FleetListenerState::production(
+            "studio".into(),
+            Arc::new(StaticIdentityProvider { local: test_node("nS", "studio", "100.64.0.2"), peers: vec![], down: None }),
+            None,
+        );
+        let r = (state.config_preflight)();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT"),
+            }
+        }
+        let err = r.unwrap_err();
+        assert!(err.contains("dispatch: refusing to start") && err.contains("`seroius`"), "{err}");
+    }
+
     #[test]
     fn a_busy_machine_says_so_at_once_and_frees_the_slot_when_done() {
         let h = start(Some(laptop()), false, 600);
@@ -892,6 +963,7 @@ mod tests {
             busy: Arc::new(Mutex::new(None)),
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
+            config_preflight: Arc::new(|| Ok(())),
         };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let resp = rt.block_on(async {
@@ -927,6 +999,7 @@ mod tests {
             busy: Arc::new(Mutex::new(None)),
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
+            config_preflight: Arc::new(|| Ok(())),
         };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let resp = rt.block_on(async {
@@ -1119,6 +1192,7 @@ mod tests {
             busy: Arc::new(Mutex::new(None)),
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
+            config_preflight: Arc::new(|| Ok(())),
         };
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         std_listener.set_nonblocking(true).unwrap();
@@ -1171,6 +1245,7 @@ mod tests {
             busy: Arc::new(Mutex::new(None)),
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(1)),
+            config_preflight: Arc::new(|| Ok(())),
         };
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         std_listener.set_nonblocking(true).unwrap();

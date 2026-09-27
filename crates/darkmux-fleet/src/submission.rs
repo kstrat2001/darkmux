@@ -142,6 +142,12 @@ pub enum Refusal {
     Busy { session_id: String },
     /// (#2916 round 3 C5) One node already has its cap of requests in flight.
     TooManyAtOnce { peer: String },
+    /// (#2947) This machine's own config has an unregistered value in an
+    /// enum-valued setting a dispatch reads; the job would refuse at its
+    /// own preflight, so it is refused before it is accepted. `detail` is
+    /// the preflight refusal (setting key, the bad value, where it was
+    /// set, the valid values): config values, never secrets.
+    BadConfig { detail: String },
 }
 
 impl Refusal {
@@ -152,7 +158,11 @@ impl Refusal {
             Refusal::Misaddressed { .. } => 421,
             Refusal::SchemaMismatch { .. } | Refusal::BadRequest(_) => 400,
             Refusal::NoWorkProfile { .. } => 422,
-            Refusal::Busy { .. } | Refusal::TooManyAtOnce { .. } | Refusal::NoTokenConfigured | Refusal::IdentityUnavailable { .. } => 503,
+            Refusal::Busy { .. }
+            | Refusal::TooManyAtOnce { .. }
+            | Refusal::NoTokenConfigured
+            | Refusal::IdentityUnavailable { .. }
+            | Refusal::BadConfig { .. } => 503,
             _ => 403,
         }
     }
@@ -231,6 +241,10 @@ impl Refusal {
             Refusal::Busy { session_id } => format!(
                 "{receiver} is busy running {session_id}; it runs one submitted job at a time. \
                  Retry when that finishes"
+            ),
+            Refusal::BadConfig { detail } => format!(
+                "{receiver} cannot run work until its own config is fixed (on {receiver}: \
+                 `darkmux doctor`). {detail}"
             ),
         }
     }

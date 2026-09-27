@@ -86,6 +86,9 @@ pub(crate) fn dispatch_as_crew_of_one_with(
     registry: &StepKindRegistry,
     host_factory: &(dyn Fn() -> Box<dyn ModelHost> + Sync),
 ) -> Result<DispatchResult> {
+    // (#2947 review M1) Bad enum config refuses before the mission is
+    // minted and before `run_step_graph` reconciles residency.
+    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
     // (#1509 — found live, tests/cli.rs's ack-gate integration tests) The
     // licensed-adjacent operator-consent gate MUST run before any model
     // residency action, never after. Inside `dispatch_internal::dispatch`
@@ -1104,6 +1107,45 @@ mod tests {
     // bookends, which live inside `dispatch_internal::dispatch`, unchanged
     // by this PR) is exercised by the existing docker-gated
     // `mock_dispatch_proof.rs` harness and by live dogfood, not here.
+
+    /// (#2947 review M1) A bad enum value refuses before a mission is
+    /// minted, before the step runs, and before any host operation.
+    #[test]
+    #[serial_test::serial]
+    fn a_bad_enum_value_refuses_before_minting_or_touching_the_host() {
+        let _guard = RunGuard::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let kind = FakeDispatchKind {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            should_err: false,
+            placement: placement(),
+            calls: calls.clone(),
+        };
+        let registry = test_registry(kind);
+        let host = Arc::new(Mutex::new(MockHost::new().cataloged("test-model", 5_000_000_000)));
+        let host_for_factory = host.clone();
+        let host_factory = move || -> Box<dyn darkmux_gestalt::ModelHost> {
+            Box::new(SharedMockHost(host_for_factory.clone()))
+        };
+        let prev = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
+        unsafe { std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "seroius") };
+        let result = dispatch_as_crew_of_one_with(test_opts("coder", "x"), &registry, &host_factory);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT"),
+            }
+        }
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains("dispatch: refusing to start: bad config"), "{msg}");
+        assert!(host.lock().unwrap().ops.is_empty(), "host touched before the refusal");
+        assert!(calls.lock().unwrap().is_empty(), "the step ran");
+        let missions_dir = crate::loader::missions_dir();
+        let minted = std::fs::read_dir(&missions_dir).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(minted, 0, "a mission was minted before the refusal");
+    }
 
     #[test]
     #[serial_test::serial]
