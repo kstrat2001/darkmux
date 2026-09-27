@@ -949,9 +949,7 @@ pub fn resolve_rules(rules: &[HookRule], outbox_dir: &Path) -> Result<Vec<Resolv
 /// caller (`HookSink::new`) can isolate one bad rule's refusal from the
 /// rest of the sink (#2183's "load-time refusal for that RULE only").
 pub fn resolve_one_rule(index: usize, r: &HookRule, outbox_dir: &Path) -> Result<ResolvedRule> {
-    let http = r.http.clone().filter(|s| !s.trim().is_empty());
-    let file = r.file.clone().filter(|s| !s.trim().is_empty());
-    let (url, target_kind, file_dir) = match destination(http.as_deref(), file.as_deref()) {
+    let (url, target_kind, file_dir) = match destination(r) {
         Err(problem) => bail!("hook rule #{index} {}", problem.describe()),
         Ok(Destination::Http(u)) => {
             let target_kind = validate_hook_target_url(u).with_context(|| format!("hook rule #{index}"))?;
@@ -1035,8 +1033,7 @@ pub fn rules_with_drain_lock_held_elsewhere(rules: &[HookRule], outbox_dir: &Pat
 
 /// Why a rule's destination is refused before any URL policy applies: a rule
 /// needs exactly one of `http` or `file` (blank counts as unset). Decided in
-/// one place, [`destination`], which both [`resolve_one_rule`] (refusing) and
-/// [`summarize_configured_rules`] (reporting) call.
+/// one place, [`destination`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DestinationProblem {
@@ -1060,14 +1057,98 @@ enum Destination<'a> {
     File(&'a str),
 }
 
-/// Exactly one of `http` / `file`, or why not. Callers pass the fields
-/// already blank-filtered.
-fn destination<'a>(http: Option<&'a str>, file: Option<&'a str>) -> Result<Destination<'a>, DestinationProblem> {
-    match (http, file) {
+/// Exactly one of `http` / `file` (a blank field counts as unset), or why
+/// not — the one decision behind refusing a rule at load
+/// ([`resolve_one_rule`], [`HookSink::new`]) and reporting it
+/// ([`summarize_configured_rules`]).
+fn destination(r: &HookRule) -> Result<Destination<'_>, DestinationProblem> {
+    fn set(field: &Option<String>) -> Option<&str> {
+        field.as_deref().filter(|s| !s.trim().is_empty())
+    }
+    match (set(&r.http), set(&r.file)) {
         (Some(url), None) => Ok(Destination::Http(url)),
         (None, Some(dir)) => Ok(Destination::File(dir)),
         (Some(_), Some(_)) => Err(DestinationProblem::BothHttpAndFile),
         (None, None) => Err(DestinationProblem::NoDestination),
+    }
+}
+
+#[cfg(test)]
+mod destination_tests {
+    use super::*;
+
+    fn rule(http: Option<&str>, file: Option<&str>) -> HookRule {
+        HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: http.map(str::to_string),
+            signing_secret_keychain_item: None,
+            file: file.map(str::to_string),
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }
+    }
+
+    /// Each shape gets its OWN problem, and the refusal and the summary
+    /// both carry it — swapping the two variants must go red here.
+    #[test]
+    fn both_and_neither_are_named_apart_by_the_refusal_and_the_summary() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let both = rule(Some("http://127.0.0.1:8790/e"), Some("/tmp/x"));
+        let neither = rule(None, None);
+        let err = resolve_one_rule(0, &both, tmp.path()).err().unwrap().to_string();
+        assert_eq!(err, "hook rule #0 names BOTH `http` and `file` — a rule needs exactly one destination");
+        let err = resolve_one_rule(0, &neither, tmp.path()).err().unwrap().to_string();
+        assert_eq!(err, "hook rule #0 has no destination — set exactly one of `http` or `file`");
+        let s = summarize_configured_rules(&[both, neither], tmp.path());
+        assert_eq!(s[0].destination_problem, Some(DestinationProblem::BothHttpAndFile));
+        assert_eq!(s[1].destination_problem, Some(DestinationProblem::NoDestination));
+    }
+
+    /// A blank field is unset, in the refusal and the summary alike.
+    #[test]
+    fn a_blank_field_counts_as_unset() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = summarize_configured_rules(&[rule(Some("  "), Some("/tmp/x")), rule(Some(" "), None)], tmp.path());
+        assert_eq!(s[0].destination_problem, None);
+        assert!(s[0].is_file);
+        assert_eq!(s[1].destination_problem, Some(DestinationProblem::NoDestination));
+    }
+
+    /// A rule refused for its destination FIELDS has no transport: its
+    /// http URL, however valid, is not a loopback or tailnet target.
+    #[test]
+    fn a_destination_refused_rule_reports_no_transport() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = summarize_configured_rules(
+            &[rule(Some("http://100.64.1.2:8790/e"), Some("/tmp/x")), rule(Some("http://127.0.0.1:8790/e"), Some("/tmp/x"))],
+            tmp.path(),
+        );
+        for r in &s {
+            assert!(r.is_refused && !r.is_tailnet && !r.is_loopback && !r.is_file, "{r:?}");
+        }
+    }
+
+    /// `HookSink::new` isolates a failed `transform` to its own rule only
+    /// when the rule's destination is otherwise sound; a both-destination
+    /// rule with a transform still refuses the whole sink.
+    #[test]
+    fn a_bad_destination_with_a_transform_still_refuses_the_sink() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut r = rule(Some("http://127.0.0.1:8790/e"), Some("/tmp/x"));
+        r.transform = Some("no-such-adapter.jq".into());
+        struct Discard;
+        impl FlowSink for Discard {
+            fn write(&self, _record: &FlowRecord) -> Result<()> {
+                Ok(())
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Discard".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        let err = HookSink::new(&[r], tmp.path().to_path_buf(), Arc::new(Discard)).err();
+        assert!(err.is_some_and(|e| format!("{e:#}").contains("names BOTH")));
     }
 }
 
@@ -1239,23 +1320,20 @@ pub fn summarize_configured_rules(rules: &[HookRule], outbox_dir: &Path) -> Vec<
         .enumerate()
         .map(|(index, r)| {
             let m = r.r#match.clone().unwrap_or_default();
-            let http = r.http.clone().filter(|s| !s.trim().is_empty());
-            let file = r.file.clone().filter(|s| !s.trim().is_empty());
-            let is_file = file.is_some() && http.is_none();
             // (#2183) Both-or-neither is a load-time refusal (see
             // `resolve_one_rule`); a summary never bails, so that state
             // renders as `is_refused` here too, with `destination_problem`
-            // naming why so a reader does not blame the URL.
-            let destination_problem = destination(http.as_deref(), file.as_deref()).err();
-            let url = if is_file {
-                let expanded = expand_tilde_dir(file.as_deref().unwrap_or_default());
-                format!("file://{}", expanded.display())
-            } else {
-                http.clone().unwrap_or_default()
+            // naming why — and with no transport, so a reader neither blames
+            // the URL nor sees a loopback/tailnet target that will never run.
+            let (url, is_file, target_kind, destination_problem) = match destination(r) {
+                Ok(Destination::File(dir)) => (format!("file://{}", expand_tilde_dir(dir).display()), true, None, None),
+                Ok(Destination::Http(u)) => (u.to_string(), false, validate_hook_target_url(u).ok(), None),
+                // The URL still names the outbox key, as it did before this
+                // rule's other field was set.
+                Err(problem) => (r.http.clone().unwrap_or_default(), false, None, Some(problem)),
             };
-            let target_kind = if is_file { None } else { validate_hook_target_url(&url).ok() };
-            let is_loopback = !is_file && target_kind == Some(HookTargetKind::Loopback);
-            let is_tailnet = !is_file && target_kind == Some(HookTargetKind::Tailnet);
+            let is_loopback = target_kind == Some(HookTargetKind::Loopback);
+            let is_tailnet = target_kind == Some(HookTargetKind::Tailnet);
             let is_refused = destination_problem.is_some() || (!is_file && target_kind.is_none());
             let signed = r.signing_secret_keychain_item.as_ref().is_some_and(|s| !s.trim().is_empty());
             let key = rule_key(&m, &url);
@@ -3903,14 +3981,10 @@ impl HookSink {
             match resolve_one_rule(index, r, &outbox_dir) {
                 Ok(rr) => resolved.push(rr),
                 Err(e) => {
-                    let destination_ok = {
-                        let http = r.http.clone().filter(|s| !s.trim().is_empty());
-                        let file = r.file.clone().filter(|s| !s.trim().is_empty());
-                        match (&http, &file) {
-                            (Some(u), None) => validate_hook_target_url(u).is_ok(),
-                            (None, Some(_)) => true,
-                            _ => false,
-                        }
+                    let destination_ok = match destination(r) {
+                        Ok(Destination::Http(u)) => validate_hook_target_url(u).is_ok(),
+                        Ok(Destination::File(_)) => true,
+                        Err(_) => false,
                     };
                     if destination_ok && r.transform.as_ref().is_some_and(|t| !t.trim().is_empty()) {
                         eprintln!(
