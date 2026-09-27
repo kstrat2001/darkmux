@@ -3257,7 +3257,10 @@ mod tests {
         //   1.63.0 — (#2947) policy tokens off/record/warn/conclude (was
         //            off/observe/enforce) and the additive
         //            `dispatch.degeneracy.warning` action.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.63.0");
+        //   1.64.0 — (#2963) `dispatch.turn.payload.tool_names` and
+        //            `tool_paths`: each tool call's name and path argument,
+        //            so the viewer names the running call and its file.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.64.0");
     }
 
     #[test]

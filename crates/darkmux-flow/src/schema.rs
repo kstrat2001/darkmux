@@ -77,8 +77,35 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.63.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.64.0";
 // Version history:
+//   1.64.0 (#2963): additive, two payload keys on `dispatch.turn`, each
+//           listing the turn's tool calls that RUN, in run order: a call
+//           the runtime will not dispatch (a real tool not granted, not a
+//           tool at all, or cut off mid-arguments) is left out, so index k
+//           is the k-th call that runs, and `tool_calls_count` (which counts
+//           every call the model made) can be larger than either list. The
+//           runtime marks such a call `runs: false` on its `model.completed`
+//           entry, from the same plan its dispatch follows, and marks the
+//           record `calls_planned: true`; a record without that marker (a
+//           runtime older than the marks) gets neither list, rather than
+//           reading as "every call runs".
+//
+//           `tool_names`: each running call's tool name, `null` for a name
+//           that is not a known runtime tool (a model-invented name never
+//           rides the stream). PRESENT, possibly empty, whenever the turn
+//           made any calls, so its length is how many will complete.
+//
+//           `tool_paths`: each running call's `path` argument, `null` for a
+//           call without one. Only the path argument of a tool that takes
+//           one (read, write, edit, search), never any other argument; a
+//           path over 4 KiB is `null`, never clipped. ABSENT when no running
+//           call has a path.
+//
+//           The viewer names `tool_names[k]` (the word and the icon) and
+//           `tool_paths[k]` while the turn's k-th running call runs. A
+//           reader that does not know the keys sees 1.63.0 unchanged, and a
+//           pre-1.64.0 record never carries them.
 //   1.63.0 (#2947): the degeneracy detector's policy vocabulary names the
 //           action, and one additive action.
 //
