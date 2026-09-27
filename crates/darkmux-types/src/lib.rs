@@ -248,10 +248,8 @@ pub struct ReserveConfig {
 }
 
 /// Profile-level compaction config — typed surface for the v0.1
-/// commitments (see #354) plus an `extras` overflow that carries
-/// openclaw-shape passthrough fields (`model`, `mode`,
-/// `customInstructions`, `maxHistoryShare`, `recentTurnsPreserve`)
-/// and any forward-compat fields darkmux doesn't yet recognize.
+/// commitments (see #354) plus an `extras` overflow that carries any key
+/// darkmux doesn't recognize (lenient on read, contract 7).
 ///
 /// **Wire-format invariant**: serializes to the same JSON shape as
 /// the pre-typed `serde_json::Map<String, serde_json::Value>` it
@@ -305,12 +303,8 @@ pub struct RuntimeCompactionConfig {
     /// `threshold_tokens` (the absolute hard ceiling); either fires
     /// first wins.
     ///
-    /// Range 0.1-0.9 (mirrors openclaw's range for similar fields).
-    /// Defaults: unset → only the absolute threshold trigger applies.
-    /// Replaces the operator-frustrating openclaw-shape
-    /// `maxHistoryShare` extras passthrough — darkmux owns this knob
-    /// with a name that reflects what it actually does (a TRIGGER, not
-    /// openclaw's post-compaction history cap). (#368 clean break)
+    /// Range 0.1-0.9. Defaults: unset → only the absolute threshold
+    /// trigger applies. (#368)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threshold_ratio: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -325,25 +319,12 @@ pub struct RuntimeCompactionConfig {
     /// steer what the compactor preserves (e.g. "Preserve verbatim X /
     /// list active files with what was learned").
     ///
-    /// **Schema isolation**: each runtime owns its own config — this
-    /// field is the typed replacement for the dead-letter
-    /// `extras["customInstructions"]` openclaw passthrough. The
-    /// internal runtime now reads this typed field only; the
-    /// migration off the extras shape (heuristic generator + doctor
-    /// warning for legacy operator profiles) is tracked under
-    /// [#380](https://github.com/kstrat2001/darkmux/issues/380) and
-    /// has not landed yet — operators with `extras["customInstructions"]`
-    /// in their profile silently get the value ignored until that
-    /// follow-up ships.
     /// See DESIGN.md "Schema isolation: each runtime owns its own config".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_instructions: Option<String>,
-    /// Openclaw-shape passthrough + forward-compat overflow. Read by
-    /// existing consumers (`phase_cli` reads `maxHistoryShare`; openclaw
-    /// runtime config-patching reads `model` / `mode` /
-    /// `customInstructions`). Future Step 7 of #352 will stamp the
-    /// resolved config onto each dispatch's flow record; until then
-    /// the field is operator-owned passthrough.
+    /// Unrecognized keys, kept so a hand-edited `profiles.json` round-trips
+    /// unchanged. Nothing reads them: a key with no typed field has no
+    /// effect on compaction.
     #[serde(flatten)]
     pub extras: serde_json::Map<String, serde_json::Value>,
 }
@@ -1495,13 +1476,11 @@ mod tests {
         );
     }
 
-    /// Backward-compat invariant: openclaw-shape passthrough fields
-    /// (`model`, `mode`, `customInstructions`, `maxHistoryShare`,
-    /// `recentTurnsPreserve`) deserialize into `.extras` and
-    /// re-serialize at the same nesting level as typed fields. A
-    /// pre-#357 `profiles.json` parses unchanged.
+    /// Unrecognized keys deserialize into `.extras` and re-serialize at
+    /// the same nesting level as typed fields. A pre-#357 `profiles.json`
+    /// parses unchanged.
     #[test]
-    fn runtime_compaction_config_openclaw_passthrough_lands_in_extras() {
+    fn runtime_compaction_config_unknown_keys_land_in_extras() {
         let json = r#"{
             "mode": "default",
             "model": "lmstudio/qwen3-4b-instruct-2507",
@@ -1536,10 +1515,10 @@ mod tests {
         assert!(!obj.contains_key("extras"));
     }
 
-    /// Mixed v0.1 typed fields + openclaw extras serialize to a
+    /// Mixed v0.1 typed fields + unrecognized keys serialize to a
     /// single flat JSON object — the wire-format invariant that
     /// keeps `profiles.json` files diff-stable when an operator
-    /// adds tier-2 fields next to existing openclaw passthrough.
+    /// adds tier-2 fields next to keys darkmux does not read.
     #[test]
     fn runtime_compaction_config_mixed_serializes_flat() {
         let json = r#"{

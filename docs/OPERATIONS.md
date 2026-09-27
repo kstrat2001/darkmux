@@ -337,7 +337,7 @@ The case for darkmux: **once you accept that static configs leave performance on
 - ✅ Flow substrate: `LocalFileSink` (always) + `AuditFileSink` (BLAKE3 hash chain, verifiable via `flow integrity-check`; opt-in) + `RedisSink` (coordination; opt-in), composed via `TeeSink`
 - ✅ `darkmux flow status` + `darkmux flow integrity-check` diagnostic verbs
 - ✅ Observability daemon (`darkmux serve`) + `/flow` + `/lab` web viewers
-- ✅ Doctor: 30+ pre-flight checks with actionable hints, plus a legacy-extras warning that flags profiles still carrying pre-#380 compaction keys (`mode`, `maxHistoryShare`, …)
+- ✅ Doctor: 30+ pre-flight checks with actionable hints
 
 **On the roadmap (active):**
 

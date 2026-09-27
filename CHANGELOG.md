@@ -89,6 +89,12 @@ darkmux release.
   were accepted and silently ignored since; `--k` claimed a value above 1
   was a loud error, and it was not. **Migration:** drop the flags; they
   never changed a run.
+- **Doctor's "legacy compaction extras" check.** The openclaw-shape keys
+  it warned about (`mode`, `maxHistoryShare`, `recentTurnsPreserve`,
+  `customInstructions` under `runtime.compaction`) now ride as ordinary
+  unrecognized extras: kept on round-trip, read by nothing. **Migration:**
+  none required; delete the keys if you like (`custom_instructions` is the
+  typed field).
 
 ### Changed (breaking, 4.0)
 
