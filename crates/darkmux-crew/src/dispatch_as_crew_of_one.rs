@@ -817,7 +817,7 @@ mod tests {
 
     fn test_registry(kind: FakeDispatchKind) -> StepKindRegistry {
         let registry = StepKindRegistry::new();
-        registry.register_alias("dispatch.internal", std::sync::Arc::new(kind)).unwrap();
+        registry.register(std::sync::Arc::new(kind)).unwrap();
         registry
     }
 
