@@ -22,6 +22,16 @@ pub use runner::*;
 pub use seats::*;
 pub use submission::*;
 
+/// A test's session: an ad-hoc dispatch `nonce` of `coder` in mission `m-1`.
+#[cfg(test)]
+pub(crate) fn test_session(nonce: &str) -> darkmux_types::session_id::SessionId {
+    darkmux_types::session_id::SessionId::adhoc(
+        darkmux_types::session_id::RunId::mission("m-1").expect("a literal run id is never empty"),
+        "coder",
+        nonce,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,14 +499,4 @@ mod tests {
             "legacy target_tier field must be rejected post-#590; got: {result:?}"
         );
     }
-}
-
-/// A test's session: an ad-hoc dispatch `nonce` of `coder` in mission `m-1`.
-#[cfg(test)]
-pub(crate) fn test_session(nonce: &str) -> darkmux_types::session_id::SessionId {
-    darkmux_types::session_id::SessionId::adhoc(
-        darkmux_types::session_id::RunId::mission("m-1").expect("a literal run id is never empty"),
-        "coder",
-        nonce,
-    )
 }

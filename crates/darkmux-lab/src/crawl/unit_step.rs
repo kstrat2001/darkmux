@@ -1273,7 +1273,7 @@ impl StepKind for CrawlUnitStepKind {
             // `touch`, or a pre-#2454 breaker) still binds everyone, because
             // only a human knows what that one meant. See
             // `thermal_governor::stop_hold_for_mission`.
-            if let Some(hold) = thermal_governor::stop_hold_for_mission(&stop_path, &mission_id) {
+            if let Some(hold) = thermal_governor::stop_hold_for_mission(&stop_path, mission_id) {
                 // The operator MUST be able to get unstuck from the message
                 // alone — the file is invisible otherwise, and the way out
                 // differs by which kind of stop this is.
@@ -1335,7 +1335,7 @@ impl StepKind for CrawlUnitStepKind {
                     output: darkmux_crew::step_output::Output::wrap(
                         UNIT_OUTCOME_KIND,
                         outcome_record,
-                        darkmux_crew::step_output::Producer::of(&mission_id, &task.id, &step.id),
+                        darkmux_crew::step_output::Producer::of(mission_id, &task.id, &step.id),
                     )
                     .to_output_string()?,
                     flow_records: Vec::new(),
@@ -1671,7 +1671,7 @@ impl StepKind for CrawlUnitStepKind {
             output: darkmux_crew::step_output::Output::wrap(
                 UNIT_OUTCOME_KIND,
                 outcome_record,
-                darkmux_crew::step_output::Producer::of(&mission_id, &task.id, &step.id),
+                darkmux_crew::step_output::Producer::of(mission_id, &task.id, &step.id),
             )
             .to_output_string()?,
             flow_records: Vec::new(),
@@ -1812,7 +1812,7 @@ impl StepKind for CrawlSummaryStepKind {
             output: darkmux_crew::step_output::Output::wrap(
                 CRAWL_SUMMARY_OUTPUT_KIND,
                 summary,
-                darkmux_crew::step_output::Producer::of(&mission_id, &task.id, &step.id),
+                darkmux_crew::step_output::Producer::of(mission_id, &task.id, &step.id),
             )
             .to_output_string()?,
             flow_records: Vec::new(),

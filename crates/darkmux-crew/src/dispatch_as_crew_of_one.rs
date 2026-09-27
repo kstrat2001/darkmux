@@ -157,7 +157,7 @@ pub(crate) fn dispatch_as_crew_of_one_with(
     let mission_id = opts
         .session
         .mission_id()
-        .ok_or_else(|| anyhow!("dispatch: a crew-of-one dispatch runs in a mission run, not `{}`", opts.session))?
+        .ok_or_else(|| anyhow!("dispatch: a crew-of-one dispatch runs in a mission's own run, not in `{}`", opts.session))?
         .to_string();
     let mission_path = lifecycle::mission_path(&mission_id);
     if mission_path.exists() {

@@ -2034,7 +2034,7 @@ fn step_lifecycle_record_with_payload(
     let level = if action == darkmux_flow::FlowAction::StepError { Level::Warn } else { Level::Info };
     FlowRecord {
         source: Some("scheduler".to_string()),
-        payload: payload,
+        payload,
         ..FlowRecord::for_session(&SessionId::task(run.clone(), &step.task_id), level, Category::Work, Stage::Dispatch, action, step.id.clone())
     }
 }
