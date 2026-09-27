@@ -101,8 +101,16 @@ function stageNextBundle(servedDir, configName) {
     );
   }
 
+  // Atomic: copy to a temp name, then rename over `index.html`. A config
+  // file is evaluated again in every Playwright worker, so this runs while
+  // an earlier worker's page may be loading `index.html`; a plain
+  // `copyFileSync` truncated it first, and a page that loaded in that window
+  // read half a bundle. A rename swaps the whole file in one step.
   fs.mkdirSync(servedDir, { recursive: true });
-  fs.copyFileSync(NEXT_HTML, path.join(servedDir, 'index.html'));
+  const target = path.join(servedDir, 'index.html');
+  const tmp = path.join(servedDir, `.index.html.${process.pid}.${Date.now()}.tmp`);
+  fs.copyFileSync(NEXT_HTML, tmp);
+  fs.renameSync(tmp, target);
 }
 
 module.exports = { stageNextBundle, NEXT_HTML };
