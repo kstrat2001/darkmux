@@ -12,9 +12,15 @@
 //! anything, and doctor reports it as Fail. Both name the file, the key's
 //! dotted path, and the closest valid key.
 //!
-//! **One mechanism, derived from the type.** Each file kind's valid keys are
-//! its Rust type's derived JSON schema ([`schemars::JsonSchema`]), walked
-//! against the raw document by [`unknown_keys`]. A new field is valid the
+//! **A value of the wrong type is refused the same way** ([`Issue::WrongType`]):
+//! one such value fails the whole typed load, which for `config.json` means
+//! every setting falls back to its default, and for a user role, skill or
+//! rule means the builtin of the same id silently stands in.
+//!
+//! **One mechanism, derived from the type.** Each file kind's valid keys and
+//! value types are its Rust type's derived JSON schema
+//! ([`schemars::JsonSchema`]), walked against the raw document by
+//! [`key_issues`]. A new field is valid the
 //! moment it exists; there is no key list to keep in step. The schema honors
 //! serde's own attributes (`rename`, `rename_all`, `flatten`, `tag`,
 //! `untagged`), so the keys it knows are the keys serde routes to a field.
@@ -144,38 +150,44 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-/// One key a document carries that its schema does not know.
+/// One key a document carries that its schema does not accept: a key the
+/// schema does not know, or a value of the wrong type.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnknownKey {
+pub struct KeyIssue {
     /// The key's dotted path from the document root (`redis.hots`,
     /// `hooks.rules[0].match.levle`).
     pub path: String,
-    /// What to write instead.
-    pub hint: KeyHint,
+    /// What is wrong, and what to write instead.
+    pub issue: Issue,
 }
 
-/// What an [`UnknownKey`]'s message tells the operator to do.
+/// What is wrong at one key, and what its message tells the operator.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KeyHint {
-    /// The closest valid key at that level (its full dotted path) and every
-    /// valid key there. `closest` is `None` only for an object that has no
-    /// named keys at all.
-    Closest { closest: Option<String>, valid: Vec<String> },
+pub enum Issue {
+    /// A key the schema does not know: the closest valid key at that level
+    /// (its full dotted path) and every valid key there. `closest` is `None`
+    /// only for an object that has no named keys at all.
+    Unknown { closest: Option<String>, valid: Vec<String> },
     /// A key darkmux retired: the operator line naming what replaced it.
     Retired(String),
+    /// A known key whose value the schema does not accept. One such value
+    /// fails the whole typed load (`config.json` falls back to every
+    /// default), so it is refused like an unknown key.
+    WrongType { expected: String, got: String },
 }
 
-impl fmt::Display for UnknownKey {
+impl fmt::Display for KeyIssue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.hint {
-            KeyHint::Closest { closest, valid } => {
+        match &self.issue {
+            Issue::Unknown { closest, valid } => {
                 write!(f, "unknown key `{}`", self.path)?;
                 if let Some(c) = closest {
                     write!(f, ": did you mean `{c}`?")?;
                 }
                 write!(f, " (valid keys here: {})", valid.join(", "))
             }
-            KeyHint::Retired(line) => write!(f, "unknown key `{}`: {line}", self.path),
+            Issue::Retired(line) => write!(f, "unknown key `{}`: {line}", self.path),
+            Issue::WrongType { expected, got } => write!(f, "`{}` must be {expected}, got {got}", self.path),
         }
     }
 }
@@ -190,13 +202,14 @@ pub fn no_retired(_: &str) -> Option<String> {
     None
 }
 
-/// Every key in `doc` that `T`'s schema does not know, in key order. A
-/// retired key names its replacement instead of the closest key.
-pub fn unknown_keys<T: JsonSchema>(doc: &Value, retired: RetiredLookup<'_>) -> Vec<UnknownKey> {
+/// Every key in `doc` that `T`'s schema does not accept, in key order: a key
+/// it does not know (a retired one names its replacement instead of the
+/// closest key), or a value of the wrong type.
+pub fn key_issues<T: JsonSchema>(doc: &Value, retired: RetiredLookup<'_>) -> Vec<KeyIssue> {
     let schema = schemars::schema_for!(T);
     let root = schema.as_value();
     let mut walker = Walker { root, retired, out: Vec::new() };
-    walker.walk(root, doc, "", "");
+    walker.walk(&[root], doc, "", "");
     walker.out
 }
 
@@ -216,16 +229,22 @@ enum Others<'a> {
     Map(&'a Value),
 }
 
-/// The keys an object schema names, and what it does with the rest.
+/// The keys an object schema names (each with every schema it may follow,
+/// when several accepted shapes name it), and what it does with the rest.
 struct ObjectShape<'a> {
-    named: BTreeMap<&'a str, &'a Value>,
+    named: BTreeMap<&'a str, Vec<&'a Value>>,
     others: Others<'a>,
 }
 
 struct Walker<'a, 'r> {
     root: &'a Value,
     retired: RetiredLookup<'r>,
-    out: Vec<UnknownKey>,
+    out: Vec<KeyIssue>,
+}
+
+/// The `anyOf`/`oneOf`/`allOf` branches of a node.
+fn branches(node: &Value) -> impl Iterator<Item = &Value> {
+    ["anyOf", "oneOf", "allOf"].into_iter().flat_map(|c| node.get(c).and_then(Value::as_array).into_iter().flatten())
 }
 
 impl<'a> Walker<'a, '_> {
@@ -258,14 +277,12 @@ impl<'a> Walker<'a, '_> {
     fn object_shape(&self, node: &'a Value) -> Option<ObjectShape<'a>> {
         let node = self.resolve(node)?;
         let mut shape: Option<ObjectShape<'a>> = own_shape(node);
-        for combo in ["anyOf", "oneOf", "allOf"] {
-            for branch in node.get(combo).and_then(Value::as_array).into_iter().flatten() {
-                if let Some(b) = self.object_shape(branch) {
-                    shape = Some(match shape {
-                        None => b,
-                        Some(s) => merge(s, b),
-                    });
-                }
+        for branch in branches(node) {
+            if let Some(b) = self.object_shape(branch) {
+                shape = Some(match shape {
+                    None => b,
+                    Some(s) => merge(s, b),
+                });
             }
         }
         shape
@@ -274,50 +291,173 @@ impl<'a> Walker<'a, '_> {
     /// The item schema of an array `node` accepts, across branches.
     fn items(&self, node: &'a Value) -> Option<&'a Value> {
         let node = self.resolve(node)?;
-        if let Some(items) = node.get("items") {
-            return Some(items);
-        }
-        ["anyOf", "oneOf", "allOf"]
-            .iter()
-            .flat_map(|c| node.get(*c).and_then(Value::as_array).into_iter().flatten())
-            .find_map(|b| self.items(b))
+        node.get("items").or_else(|| branches(node).find_map(|b| self.items(b)))
     }
 
-    /// Walk `doc` against `node`. `path` is the display path, `bare` the
-    /// retired-key lookup's form of it ([`RetiredLookup`]).
-    fn walk(&mut self, node: &'a Value, doc: &Value, path: &str, bare: &str) {
+    /// Whether `node` accepts `value`'s type (and, for a number, its range;
+    /// for an enum or a tag, its token). Keys inside an object are the
+    /// walk's business, not this.
+    fn accepts(&self, node: &'a Value, value: &Value) -> bool {
+        let Some(node) = self.resolve(node) else { return true };
+        let own = own_accepts(node, value);
+        let has_any = node.get("anyOf").is_some() || node.get("oneOf").is_some();
+        let any = !has_any
+            || ["anyOf", "oneOf"]
+                .iter()
+                .flat_map(|c| node.get(*c).and_then(Value::as_array).into_iter().flatten())
+                .any(|b| self.accepts(b, value));
+        let all = node.get("allOf").and_then(Value::as_array).into_iter().flatten().all(|b| self.accepts(b, value));
+        own && any && all
+    }
+
+    /// What `node` accepts, in operator words.
+    fn describe(&self, node: &'a Value) -> Vec<String> {
+        let Some(node) = self.resolve(node) else { return vec!["anything".to_string()] };
+        let own = own_description(node);
+        if !own.is_empty() {
+            return own;
+        }
+        branches(node).flat_map(|b| self.describe(b)).collect()
+    }
+
+    /// Walk `doc` against the schemas `nodes` (several when merged shapes
+    /// name one key). `path` is the display path, `bare` the retired-key
+    /// lookup's form of it ([`RetiredLookup`]).
+    fn walk(&mut self, nodes: &[&'a Value], doc: &Value, path: &str, bare: &str) {
+        let accepting: Vec<&'a Value> = nodes.iter().copied().filter(|n| self.accepts(n, doc)).collect();
+        if accepting.is_empty() {
+            let mut expected: Vec<String> = nodes.iter().flat_map(|n| self.describe(n)).collect();
+            expected.dedup();
+            let issue = Issue::WrongType { expected: expected.join(" or "), got: shorten(&doc.to_string()) };
+            self.out.push(KeyIssue { path: path.to_string(), issue });
+            return;
+        }
         match doc {
-            Value::Object(map) => {
-                let Some(shape) = self.object_shape(node) else { return };
-                for (key, value) in map.iter().filter(|(k, _)| k.as_str() != COMMENT_KEY) {
-                    let p = join(path, key);
-                    match (shape.named.get(key.as_str()), &shape.others) {
-                        (Some(sub), _) => self.walk(sub, value, &p, &join(bare, key)),
-                        (None, Others::Map(sub)) => self.walk(sub, value, &p, &join(bare, "*")),
-                        (None, Others::Free) => {}
-                        (None, Others::Refused) => self.refuse(&shape, path, p, &join(bare, key), key),
-                    }
-                }
-            }
+            Value::Object(map) => self.walk_object(&accepting, map, path, bare),
             Value::Array(items) => {
-                let Some(item) = self.items(node) else { return };
+                let item_nodes: Vec<&'a Value> = accepting.iter().filter_map(|n| self.items(n)).collect();
+                if item_nodes.is_empty() {
+                    return;
+                }
                 for (i, value) in items.iter().enumerate() {
-                    self.walk(item, value, &format!("{path}[{i}]"), bare);
+                    self.walk(&item_nodes, value, &format!("{path}[{i}]"), bare);
                 }
             }
             _ => {}
         }
     }
 
+    fn walk_object(&mut self, nodes: &[&'a Value], map: &serde_json::Map<String, Value>, path: &str, bare: &str) {
+        let Some(shape) = nodes.iter().filter_map(|n| self.object_shape(n)).reduce(merge) else { return };
+        for (key, value) in map.iter().filter(|(k, _)| k.as_str() != COMMENT_KEY) {
+            let p = join(path, key);
+            match (shape.named.get(key.as_str()), &shape.others) {
+                (Some(subs), _) => self.walk(subs, value, &p, &join(bare, key)),
+                (None, Others::Map(sub)) => self.walk(&[*sub], value, &p, &join(bare, "*")),
+                (None, Others::Free) => {}
+                (None, Others::Refused) => self.refuse(&shape, path, p, &join(bare, key), key),
+            }
+        }
+    }
+
     fn refuse(&mut self, shape: &ObjectShape<'a>, parent: &str, path: String, bare: &str, key: &str) {
-        let hint = match (self.retired)(bare) {
-            Some(line) => KeyHint::Retired(line),
-            None => KeyHint::Closest {
+        let issue = match (self.retired)(bare) {
+            Some(line) => Issue::Retired(line),
+            None => Issue::Unknown {
                 closest: closest(key, shape.named.keys().copied()).map(|c| join(parent, c)),
                 valid: shape.named.keys().map(|k| k.to_string()).collect(),
             },
         };
-        self.out.push(UnknownKey { path, hint });
+        self.out.push(KeyIssue { path, issue });
+    }
+}
+
+/// Whether a node's own `const`, `enum` and `type` constraints accept
+/// `value` (a node with none of them accepts anything).
+fn own_accepts(node: &Value, value: &Value) -> bool {
+    if let Some(c) = node.get("const") {
+        return c == value;
+    }
+    if let Some(tokens) = node.get("enum").and_then(Value::as_array) {
+        return tokens.contains(value);
+    }
+    let Some(types) = node.get("type") else { return true };
+    let one = |t: &Value| t.as_str().is_some_and(|t| type_accepts(t, node, value));
+    match types {
+        Value::Array(ts) => ts.iter().any(one),
+        t => one(t),
+    }
+}
+
+/// Whether one JSON-schema `type` name accepts `value`, including an
+/// integer's `minimum`/`maximum`.
+fn type_accepts(t: &str, node: &Value, value: &Value) -> bool {
+    match t {
+        "string" => value.is_string(),
+        "boolean" => value.is_boolean(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        "null" => value.is_null(),
+        "number" => value.is_number() && in_range(node, value),
+        "integer" => (value.is_i64() || value.is_u64()) && in_range(node, value),
+        _ => true,
+    }
+}
+
+fn in_range(node: &Value, value: &Value) -> bool {
+    let v = value.as_f64().unwrap_or(f64::NAN);
+    let min = node.get("minimum").and_then(Value::as_f64).unwrap_or(f64::NEG_INFINITY);
+    let max = node.get("maximum").and_then(Value::as_f64).unwrap_or(f64::INFINITY);
+    v >= min && v <= max
+}
+
+/// A node's own constraints in operator words; empty when it has none (its
+/// branches say it instead). `null` is left out beside another type: it
+/// means "unset", which every optional key allows.
+fn own_description(node: &Value) -> Vec<String> {
+    if let Some(c) = node.get("const") {
+        return vec![token(c)];
+    }
+    if let Some(tokens) = node.get("enum").and_then(Value::as_array) {
+        return vec![format!("one of {}", tokens.iter().map(token).collect::<Vec<_>>().join(", "))];
+    }
+    let types: Vec<&str> = match node.get("type") {
+        Some(Value::Array(ts)) => ts.iter().filter_map(Value::as_str).collect(),
+        Some(Value::String(t)) => vec![t.as_str()],
+        _ => return Vec::new(),
+    };
+    let named: Vec<&str> = if types.len() > 1 { types.into_iter().filter(|t| *t != "null").collect() } else { types };
+    named.into_iter().map(|t| type_words(t, node)).collect()
+}
+
+fn token(v: &Value) -> String {
+    match v.as_str() {
+        Some(s) => format!("`{s}`"),
+        None => format!("`{v}`"),
+    }
+}
+
+fn type_words(t: &str, node: &Value) -> String {
+    let (min, max) = (node.get("minimum").and_then(Value::as_i64), node.get("maximum").and_then(Value::as_u64));
+    match (t, min, max) {
+        ("integer", Some(lo), Some(hi)) => format!("an integer from {lo} to {hi}"),
+        ("integer", Some(0), None) => "a non-negative integer".to_string(),
+        ("integer", _, _) => "an integer".to_string(),
+        ("number", _, _) => "a number".to_string(),
+        ("string", _, _) => "a string".to_string(),
+        ("boolean", _, _) => "true or false".to_string(),
+        ("array", _, _) => "a list".to_string(),
+        ("object", _, _) => "an object".to_string(),
+        (other, _, _) => other.to_string(),
+    }
+}
+
+/// A value as JSON, cut to 60 characters so a pasted blob never floods the
+/// message.
+fn shorten(text: &str) -> String {
+    match text.char_indices().nth(60) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_string(),
     }
 }
 
@@ -339,7 +479,7 @@ fn own_shape(node: &Value) -> Option<ObjectShape<'_>> {
         Some(schema) => Others::Map(schema),
     };
     Some(ObjectShape {
-        named: props.into_iter().flatten().map(|(k, v)| (k.as_str(), v)).collect(),
+        named: props.into_iter().flatten().map(|(k, v)| (k.as_str(), vec![v])).collect(),
         others,
     })
 }
@@ -355,14 +495,20 @@ fn declares_object(node: &Value) -> bool {
 }
 
 fn has_combinators(node: &Value) -> bool {
-    ["anyOf", "oneOf", "allOf"].iter().any(|c| node.get(*c).is_some())
+    branches(node).next().is_some()
 }
 
 /// Two shapes accepted at one place (two enum variants, say): a key either
-/// names is valid; the more permissive treatment of other keys wins.
+/// names is valid, following either's schema; the more permissive treatment
+/// of other keys wins.
 fn merge<'a>(mut a: ObjectShape<'a>, b: ObjectShape<'a>) -> ObjectShape<'a> {
-    for (k, v) in b.named {
-        a.named.entry(k).or_insert(v);
+    for (k, vs) in b.named {
+        let slot = a.named.entry(k).or_default();
+        for v in vs {
+            if !slot.iter().any(|x| std::ptr::eq(*x, v)) {
+                slot.push(v);
+            }
+        }
     }
     a.others = match (a.others, b.others) {
         (Others::Free, _) | (_, Others::Free) => Others::Free,
@@ -384,7 +530,7 @@ pub enum Problem {
     /// The file is not valid JSON (the parser's message).
     NotJson(String),
     /// Keys the file's schema does not know.
-    UnknownKeys(Vec<UnknownKey>),
+    Keys(Vec<KeyIssue>),
 }
 
 /// One user file that the gate refuses: where it is, what kind it is, and
@@ -403,7 +549,7 @@ impl fmt::Display for FileProblem {
         match &self.problem {
             Problem::Unreadable(e) => write!(f, "could not be read ({e})"),
             Problem::NotJson(e) => write!(f, "not valid JSON ({e})"),
-            Problem::UnknownKeys(keys) => {
+            Problem::Keys(keys) => {
                 let lines: Vec<String> = keys.iter().map(ToString::to_string).collect();
                 write!(f, "{}", lines.join("; "))
             }
@@ -421,11 +567,11 @@ pub fn check_text<T: JsonSchema>(
     let problem = match serde_json::from_str::<Value>(text) {
         Err(e) => Problem::NotJson(e.to_string()),
         Ok(doc) => {
-            let keys = unknown_keys::<T>(&doc, retired);
+            let keys = key_issues::<T>(&doc, retired);
             if keys.is_empty() {
                 return None;
             }
-            Problem::UnknownKeys(keys)
+            Problem::Keys(keys)
         }
     };
     Some(FileProblem { kind, path: path.to_path_buf(), problem })

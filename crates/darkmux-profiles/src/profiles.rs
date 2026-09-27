@@ -59,9 +59,22 @@ fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 
 /// The registry file at `path` checked for keys its schema does not know
 /// (`darkmux_types::user_files`). `None` when it is clean or absent.
+///
+/// A wrong-type VALUE is not reported here, unlike every other user file:
+/// the registry does not fall back to defaults over one. A mistyped profile
+/// or endpoint entry is quarantined by name, loudly, and the rest of the
+/// registry keeps working ([`parse_registry_lenient`], #1282); a mistype in
+/// the registry's shell fails the load outright. Neither is silent.
 pub fn user_file_problem(path: &Path) -> Option<darkmux_types::user_files::FileProblem> {
-    use darkmux_types::user_files::{check_path, UserFileKind};
-    check_path::<ProfileRegistry>(UserFileKind::Profiles, path, &registry_retired)
+    use darkmux_types::user_files::{check_path, Issue, Problem, UserFileKind};
+    let mut found = check_path::<ProfileRegistry>(UserFileKind::Profiles, path, &registry_retired)?;
+    if let Problem::Keys(keys) = &mut found.problem {
+        keys.retain(|k| !matches!(k.issue, Issue::WrongType { .. }));
+        if keys.is_empty() {
+            return None;
+        }
+    }
+    Some(found)
 }
 
 /// `profiles.json`'s retired keys (path with array indices dropped), named

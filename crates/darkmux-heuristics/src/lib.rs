@@ -786,7 +786,7 @@ mod tests {
         ] {
             let s = suggest_profile_for(&m, task, &apple_silicon_128gb());
             let doc = serde_json::json!({ "profiles": suggestion_to_profile_json("p", &m.model_key, &s) });
-            let keys = darkmux_types::user_files::unknown_keys::<darkmux_types::ProfileRegistry>(
+            let keys = darkmux_types::user_files::key_issues::<darkmux_types::ProfileRegistry>(
                 &doc,
                 &darkmux_types::user_files::no_retired,
             );

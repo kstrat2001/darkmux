@@ -30,7 +30,12 @@ darkmux release.
   `model`, `customInstructions`, `maxHistoryShare`, `recentTurnsPreserve`)
   in `profiles.json`; `gh_verb` and a task's `expand` in a mission config;
   `expected.test_count_baseline` in a workload; `hash_exclude` in a fixture
-  manifest. `_comment` is accepted anywhere as a note. **Migration:** run
+  manifest. `_comment` is accepted anywhere as a note. A value of the wrong
+  type (`"port": "x"`) is refused the same way, naming the expected type and
+  what it got: one used to make `config.json` silently fall back to every
+  default (Redis and audit off), and made a user role, skill or rule
+  silently lose to the builtin of the same id. A mistyped `profiles.json`
+  entry keeps its loud per-entry quarantine instead. **Migration:** run
   `darkmux doctor` and delete or rename each key its `user file keys` rows
   name. A fixture registered from an older darkmux checkout keeps its old
   `.fixture.json`; delete `hash_exclude` from it, or re-run

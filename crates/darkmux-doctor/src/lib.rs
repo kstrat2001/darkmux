@@ -16149,6 +16149,20 @@ mod user_file_key_tests {
         assert!(rows[1].message.contains("not valid JSON"), "{}", rows[1].message);
     }
 
+    /// A `config.json` value of the wrong type (one of which drops every
+    /// setting to its default on load) is a Fail row with the preflight's
+    /// message.
+    #[test]
+    fn a_mistyped_config_value_is_a_fail_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"redis": {"enabled": true, "port": "x"}}"#).unwrap();
+        let problem = darkmux_types::user_files::config_json_problem_at(&path).unwrap();
+        let rows = user_file_key_rows(&[problem]);
+        assert_eq!(rows[0].status, Status::Fail);
+        assert!(rows[0].message.contains("`redis.port` must be an integer from 0 to 65535, got \"x\""), "{}", rows[0].message);
+    }
+
     /// Doctor runs to completion against a user file with a syntax error and
     /// one with an unknown key, and reports each as its own Fail row.
     #[serial_test::serial]

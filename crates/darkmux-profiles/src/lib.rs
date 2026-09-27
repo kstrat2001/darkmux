@@ -133,7 +133,7 @@ mod user_file_tests {
     fn the_file_check_reports_every_unknown_key() {
         let (_d, path) = write(&with_key("/profiles/p", "modles"));
         let p = crate::profiles::user_file_problem(std::path::Path::new(&path)).unwrap();
-        let Problem::UnknownKeys(keys) = p.problem else { panic!("{p:?}") };
+        let Problem::Keys(keys) = p.problem else { panic!("{p:?}") };
         assert_eq!(keys.iter().map(|k| k.path.as_str()).collect::<Vec<_>>(), ["profiles.p.modles"]);
     }
 
@@ -164,7 +164,7 @@ mod retired_registry_key_tests {
         )
         .unwrap();
         let p = crate::profiles::user_file_problem(&path).unwrap();
-        let Problem::UnknownKeys(keys) = &p.problem else { panic!("{p:?}") };
+        let Problem::Keys(keys) = &p.problem else { panic!("{p:?}") };
         let msgs: Vec<String> = keys.iter().map(ToString::to_string).collect();
         for (key, says) in [
             ("crews", "removed in 2.0 (#1426)"),
@@ -177,5 +177,30 @@ mod retired_registry_key_tests {
             assert!(msgs.iter().any(|m| m.starts_with(&format!("unknown key `{key}`: {says}"))), "{key}: {msgs:#?}");
         }
         assert_eq!(keys.len(), 6, "{msgs:#?}");
+    }
+}
+
+#[cfg(test)]
+mod wrong_type_tests {
+    /// A mistyped profile entry is quarantined (#1282), loudly, and the
+    /// rest of the registry keeps working: the gate leaves it to that and
+    /// refuses nothing over it.
+    #[test]
+    fn a_mistyped_profile_is_quarantined_not_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        std::fs::write(
+            &path,
+            r#"{"profiles": {"good": {"models": [{"id": "m", "n_ctx": 1}]}, "bad": {"models": [{"id": "m", "n_ctx": "big"}]}}}"#,
+        )
+        .unwrap();
+        let loaded = crate::profiles::load_registry_quiet(Some(path.to_str().unwrap())).unwrap();
+        assert_eq!(loaded.registry.quarantined.len(), 1, "the bad entry is quarantined by name");
+        assert!(loaded.registry.profiles.contains_key("good"));
+        assert_eq!(crate::profiles::user_file_problem(&path), None);
+        let with_typo = r#"{"profiles": {"bad": {"models": [{"id": "m", "n_ctx": "big", "n_ctxx": 1}]}}}"#;
+        std::fs::write(&path, with_typo).unwrap();
+        let msg = crate::profiles::user_file_problem(&path).unwrap().to_string();
+        assert!(msg.contains("unknown key `profiles.bad.models[0].n_ctxx`") && !msg.contains("must be"), "{msg}");
     }
 }

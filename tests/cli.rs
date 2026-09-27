@@ -13078,3 +13078,34 @@ fn doctor_runs_to_completion_against_broken_user_files() {
         assert!(stdout.contains("✓ build"), "doctor ran to completion: {stdout}");
     }
 }
+
+/// A user role with one mistyped value would be skipped by the loader and
+/// silently replaced by the builtin of the same id. Every consuming entry
+/// point refuses it instead, naming the file, the path, the expected type
+/// and what it got, before minting anything.
+#[test]
+fn a_mistyped_value_in_a_user_file_is_refused_by_every_consuming_entry_point() {
+    let empty_path = TempDir::new().unwrap();
+    let role = r#"{"id":"code-reviewer","description":"d","tool_palette":{"allow":[]},"escalation_contract":"bail-with-explanation","skills":"code-reviewing"}"#;
+    for args in [
+        &["dispatch", "code-reviewer", "hello"][..],
+        &["mission", "launch", "review", "--dry-run"][..],
+        &["lab", "run", "quick-q"][..],
+    ] {
+        let mut cmd = darkmux_std_cmd();
+        cmd.env("PATH", empty_path.path()).args(args);
+        let home = darkmux_home_of(&cmd);
+        let path = home.join("roles/code-reviewer.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, role).unwrap();
+        let out = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{args:?} succeeded: {stderr}");
+        assert!(stderr.contains("refusing to start: bad config") && stderr.contains(&path.display().to_string()), "{args:?}: {stderr}");
+        assert!(stderr.contains("`skills` must be a list, got \"code-reviewing\""), "{args:?}: {stderr}");
+        let mut written = Vec::new();
+        collect_files(&home, &mut written);
+        written.retain(|p| p != &path && !p.components().any(|c| c.as_os_str() == "liveness"));
+        assert!(written.is_empty(), "{args:?} wrote state before refusing: {written:?}");
+    }
+}

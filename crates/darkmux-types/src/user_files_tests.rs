@@ -42,14 +42,14 @@ struct Probe {
     extras: serde_json::Map<String, Value>,
 }
 
-fn paths(keys: &[UnknownKey]) -> Vec<&str> {
+fn paths(keys: &[KeyIssue]) -> Vec<&str> {
     keys.iter().map(|k| k.path.as_str()).collect()
 }
 
-fn closest_of(k: &UnknownKey) -> Option<&str> {
-    match &k.hint {
-        KeyHint::Closest { closest, .. } => closest.as_deref(),
-        KeyHint::Retired(_) => None,
+fn closest_of(k: &KeyIssue) -> Option<&str> {
+    match &k.issue {
+        Issue::Unknown { closest, .. } => closest.as_deref(),
+        Issue::Retired(_) | Issue::WrongType { .. } => None,
     }
 }
 
@@ -72,12 +72,12 @@ fn known_keys_at_every_level_pass() {
         "shape": {"kind": "circle", "radius": 1.0},
         "type": "t",
     });
-    assert_eq!(unknown_keys::<Probe>(&doc, &no_retired), vec![]);
+    assert_eq!(key_issues::<Probe>(&doc, &no_retired), vec![]);
 }
 
 #[test]
 fn an_unknown_top_level_key_names_the_closest_valid_key() {
-    let keys = unknown_keys::<Probe>(&json!({"rediss": {}}), &no_retired);
+    let keys = key_issues::<Probe>(&json!({"rediss": {}}), &no_retired);
     assert_eq!(paths(&keys), ["rediss"]);
     assert_eq!(closest_of(&keys[0]), Some("redis"));
     let msg = keys[0].to_string();
@@ -87,7 +87,7 @@ fn an_unknown_top_level_key_names_the_closest_valid_key() {
 
 #[test]
 fn an_unknown_nested_key_names_its_full_path_and_the_closest_sibling() {
-    let keys = unknown_keys::<Probe>(&json!({"redis": {"hots": "h"}}), &no_retired);
+    let keys = key_issues::<Probe>(&json!({"redis": {"hots": "h"}}), &no_retired);
     assert_eq!(paths(&keys), ["redis.hots"]);
     assert_eq!(closest_of(&keys[0]), Some("redis.host"));
 }
@@ -99,7 +99,7 @@ fn keys_inside_arrays_maps_and_enum_variants_are_checked() {
         "by_name": {"a": {"hst": "x"}},
         "shape": {"kind": "square", "sid": 2.0},
     });
-    let keys = unknown_keys::<Probe>(&doc, &no_retired);
+    let keys = key_issues::<Probe>(&doc, &no_retired);
     assert_eq!(paths(&keys), ["by_name.a.hst", "list[1].prot", "shape.sid"]);
     assert_eq!(closest_of(&keys[1]), Some("list[1].port"));
     assert_eq!(closest_of(&keys[2]), Some("shape.side"));
@@ -108,28 +108,28 @@ fn keys_inside_arrays_maps_and_enum_variants_are_checked() {
 #[test]
 fn a_comment_key_is_valid_at_every_level() {
     let doc = json!({"_comment": "why", "redis": {"_comment": "and here"}, "list": [{"_comment": 1}]});
-    assert_eq!(unknown_keys::<Probe>(&doc, &no_retired), vec![]);
+    assert_eq!(key_issues::<Probe>(&doc, &no_retired), vec![]);
 }
 
 #[test]
 fn free_maps_and_untyped_values_take_any_key() {
     let doc = json!({"free": {"a": 1}, "anything": {"deep": {"er": 1}}});
-    assert_eq!(unknown_keys::<Probe>(&doc, &no_retired), vec![]);
+    assert_eq!(key_issues::<Probe>(&doc, &no_retired), vec![]);
 }
 
 #[test]
 fn a_retired_key_names_its_replacement_instead_of_a_guess() {
     let retired = |p: &str| (p == "list.old").then(|| "renamed to `list.port`".to_string());
-    let keys = unknown_keys::<Probe>(&json!({"list": [{"old": 1}]}), &retired);
+    let keys = key_issues::<Probe>(&json!({"list": [{"old": 1}]}), &retired);
     assert_eq!(keys.len(), 1);
-    assert_eq!(keys[0].hint, KeyHint::Retired("renamed to `list.port`".into()));
+    assert_eq!(keys[0].issue, Issue::Retired("renamed to `list.port`".into()));
     assert_eq!(keys[0].to_string(), "unknown key `list[0].old`: renamed to `list.port`");
 }
 
 #[test]
 fn a_retired_key_under_a_map_is_looked_up_with_the_map_key_as_a_wildcard() {
     let retired = |p: &str| (p == "by_name.*.old").then(|| "removed".to_string());
-    let keys = unknown_keys::<Probe>(&json!({"by_name": {"any": {"old": 1}}}), &retired);
+    let keys = key_issues::<Probe>(&json!({"by_name": {"any": {"old": 1}}}), &retired);
     assert_eq!(keys[0].to_string(), "unknown key `by_name.any.old`: removed");
 }
 
@@ -147,8 +147,8 @@ fn a_new_field_is_valid_without_being_listed_anywhere() {
         nested_quokka: Option<Inner>,
     }
     let doc = json!({"zanzibar_quokka_ratio": 3, "nested_quokka": {"port": 1}});
-    assert_eq!(unknown_keys::<Fresh>(&doc, &no_retired), vec![]);
-    let keys = unknown_keys::<Fresh>(&json!({"zanzibar_quokka_rati": 3}), &no_retired);
+    assert_eq!(key_issues::<Fresh>(&doc, &no_retired), vec![]);
+    let keys = key_issues::<Fresh>(&json!({"zanzibar_quokka_rati": 3}), &no_retired);
     assert_eq!(closest_of(&keys[0]), Some("zanzibar_quokka_ratio"));
 }
 
@@ -184,10 +184,10 @@ fn check_dir_reads_every_json_file_and_skips_the_rest() {
 
 // ── config.json ──
 
-fn config_keys(doc: Value) -> Vec<UnknownKey> {
+fn config_keys(doc: Value) -> Vec<KeyIssue> {
     let text = doc.to_string();
     match config_problem(&text) {
-        Some(FileProblem { problem: Problem::UnknownKeys(k), .. }) => k,
+        Some(FileProblem { problem: Problem::Keys(k), .. }) => k,
         other => panic!("expected unknown keys, got {other:?}"),
     }
 }
@@ -300,4 +300,72 @@ fn a_test_build_skips_the_operators_own_state() {
     assert!(is_operator_state(&home.join(".config/darkmux/profiles.json")));
     assert!(!is_operator_state(&home.join("elsewhere/config.json")));
     assert_eq!(check_path::<Probe>(UserFileKind::Config, &home.join(".darkmux/config.json"), &no_retired), None);
+}
+
+// ── wrong-type values ──
+
+fn wrong_type(k: &KeyIssue) -> Option<(&str, &str)> {
+    match &k.issue {
+        Issue::WrongType { expected, got } => Some((expected.as_str(), got.as_str())),
+        _ => None,
+    }
+}
+
+/// One mistyped value fails the whole typed load, which for `config.json`
+/// means every setting falls back to its default (Redis and audit off).
+/// The gate names it: the path, the expected type, and what it got.
+#[test]
+fn a_mistyped_config_value_is_named_with_its_expected_type() {
+    let text = r#"{"redis": {"enabled": true, "port": "x"}, "audit": {"enabled": true}}"#;
+    assert!(serde_json::from_str::<crate::config::DarkmuxConfig>(text).is_err(), "precondition: the typed load fails");
+    let keys = config_keys(serde_json::from_str(text).unwrap());
+    assert_eq!(paths(&keys), ["redis.port"]);
+    assert_eq!(wrong_type(&keys[0]), Some(("an integer from 0 to 65535", "\"x\"")));
+    assert_eq!(keys[0].to_string(), "`redis.port` must be an integer from 0 to 65535, got \"x\"");
+}
+
+#[test]
+fn wrong_types_are_found_at_every_level_and_in_every_json_type() {
+    let doc = json!({
+        "redis": {"port": 70000, "enabled": "yes"},
+        "hooks": {"rules": [{"file": 5}]},
+        "role_profiles": {"coder": ["not", "a", "string"]},
+        "machine_id": null,
+    });
+    let keys = config_keys(doc);
+    let found: Vec<(&str, Option<(&str, &str)>)> = keys.iter().map(|k| (k.path.as_str(), wrong_type(k))).collect();
+    assert_eq!(
+        found,
+        [
+            ("hooks.rules[0].file", Some(("a string", "5"))),
+            ("redis.enabled", Some(("true or false", "\"yes\""))),
+            ("redis.port", Some(("an integer from 0 to 65535", "70000"))),
+            ("role_profiles.coder", Some(("a string", "[\"not\",\"a\",\"string\"]"))),
+        ]
+    );
+}
+
+#[test]
+fn enum_variants_free_values_and_null_options_are_accepted_or_named() {
+    let ok = json!({"shape": {"kind": "square", "side": 2}, "anything": [1, {"x": null}], "redis": null, "type": null});
+    assert_eq!(key_issues::<Probe>(&ok, &no_retired), vec![]);
+    let bad = key_issues::<Probe>(&json!({"shape": {"kind": "hexagon"}, "list": {"port": 1}}), &no_retired);
+    let found: Vec<(&str, Option<(&str, &str)>)> = bad.iter().map(|k| (k.path.as_str(), wrong_type(k))).collect();
+    assert_eq!(found, [("list", Some(("a list", "{\"port\":1}"))), ("shape.kind", Some(("`circle` or `square`", "\"hexagon\"")))]);
+}
+
+/// A long value is shortened in the message, never printed whole.
+#[test]
+fn a_long_wrong_value_is_shortened() {
+    let long = "y".repeat(200);
+    let keys = key_issues::<Probe>(&json!({"type": [long]}), &no_retired);
+    let (_, got) = wrong_type(&keys[0]).unwrap();
+    assert!(got.chars().count() <= 61 && got.ends_with('…'), "{got}");
+}
+
+/// What `darkmux init` writes and a clean config have no wrong types either.
+#[test]
+fn the_init_written_config_has_no_wrong_types() {
+    let init = serde_json::to_value(crate::config::DarkmuxConfig::with_defaults()).unwrap();
+    assert_eq!(key_issues::<crate::config::DarkmuxConfig>(&init, &no_retired), vec![]);
 }

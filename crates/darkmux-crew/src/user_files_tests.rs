@@ -5,7 +5,7 @@
 
 use super::*;
 use darkmux_types::test_isolation::IsolatedState;
-use darkmux_types::user_files::{no_retired, open_objects, unknown_keys, Problem};
+use darkmux_types::user_files::{no_retired, open_objects, key_issues, Problem};
 use serde_json::{json, Value};
 
 fn embedded(table: &[(&str, &str)], id: &str) -> Value {
@@ -172,7 +172,7 @@ fn every_shipped_document_has_no_unknown_keys() {
     fn check<T: schemars::JsonSchema>(table: &[(&str, &str)]) {
         for (id, text) in table {
             let doc: Value = serde_json::from_str(text).unwrap();
-            assert_eq!(unknown_keys::<T>(&doc, &no_retired), vec![], "builtin {id}");
+            assert_eq!(key_issues::<T>(&doc, &no_retired), vec![], "builtin {id}");
         }
     }
     check::<Role>(crate::loader::BUILTIN_ROLES);
@@ -204,4 +204,24 @@ fn a_retired_mission_config_key_names_its_replacement() {
     let msg = problems(UserFileKind::MissionConfig).iter().map(ToString::to_string).collect::<String>();
     assert!(msg.contains("unknown key `gh_verb`: RENAMED to `cmd` in schema 3.0"), "{msg}");
     assert!(msg.contains("unknown key `phases[0].tasks[0].expand`: REMOVED in schema 2.0"), "{msg}");
+}
+
+/// A user role with one mistyped value fails its typed load, and the loader
+/// skips it, so the BUILTIN role of the same id silently runs in its place.
+/// The gate refuses it at every consuming preflight, naming the path, the
+/// expected type and what it got.
+#[test]
+#[serial_test::serial]
+fn a_mistyped_value_is_refused_where_the_loader_would_fall_back_to_the_builtin() {
+    let state = IsolatedState::new();
+    let mut role = embedded(crate::loader::BUILTIN_ROLES, "code-reviewer");
+    role["skills"] = json!("code-reviewing");
+    write(&state, "roles", &role);
+    let loaded = crate::loader::load_roles().unwrap();
+    let reviewer = loaded.iter().find(|r| r.id == "code-reviewer").unwrap();
+    assert!(!reviewer.skills.is_empty() && reviewer.prompt_path.is_none(), "precondition: the builtin stood in");
+    for scope in [Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun] {
+        let refusal = preflight(scope).expect_err("refused").to_string();
+        assert!(refusal.contains("`skills` must be a list, got \"code-reviewing\""), "{scope:?}: {refusal}");
+    }
 }

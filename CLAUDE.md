@@ -270,6 +270,12 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    at preflight, before minting anything, and doctor reports it as Fail, one row per file.
    Both name the file, the key's dotted path and the closest valid key (the same shape as
    contract 9's enum refusal); a retired key names what replaced it instead of a guess.
+   **A value of the wrong type is refused the same way**, naming the path, the expected
+   type and what it got: one such value fails the whole typed load, which for `config.json`
+   means every setting falls back to its default (Redis and audit silently off) and for a
+   user role, skill or rule means the builtin of the same id silently stands in. The
+   registry is the one exception: it already quarantines a mistyped profile or endpoint
+   entry by name (#1282), loudly, so the gate leaves that to it.
    `darkmux config set` refuses an unknown key through the same suggester. Semantic
    validation of a known key's VALUE still lives at resolution and in doctor, never on the
    load path (#1269), and a value that fails it is refused where it is consumed, never
@@ -279,7 +285,8 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    The mechanism is one module, `darkmux-types/src/user_files.rs`: each kind's valid keys
    are its Rust type's derived JSON schema (`schemars::JsonSchema`), walked against the raw
    document, so a new field is valid the moment it exists and no key list can drift; nested
-   blocks, list items, map values and enum variants are walked too. The `extras` overflow is
+   blocks, list items, map values and enum variants are walked too, and each value is checked
+   against the schema's type, integer range, enum tokens and variant tags. The `extras` overflow is
    `#[schemars(skip)]` (it catches keys, it does not validate them); a flattened map that IS
    the schema (a hook rule's `match`) stays open, and each kind's `open_objects` test pins
    that set. `_comment` is valid anywhere, as a note for the reader. `closest` is the only

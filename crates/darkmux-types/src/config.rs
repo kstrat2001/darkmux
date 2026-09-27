@@ -361,8 +361,11 @@ use std::path::Path;
 //           (renamed, `RENAMED_SETTINGS`), `dirs.notebook` and
 //           `radio.router_profile` (removed, `REMOVED_SETTINGS`). A leftover
 //           of any of the three used to be warned about and ignored; now it
-//           refuses. The breaking change is the reading rule, not the shape:
-//           no field changed.
+//           refuses. A value of the wrong type (`"port": "x"`) is refused the
+//           same way, naming the expected type and what it got: one such
+//           value used to fail the typed load and silently drop EVERY setting
+//           to its default (Redis and audit off). The breaking change is the
+//           reading rule, not the shape: no field changed.
 pub const CONFIG_SCHEMA_VERSION: &str = "2.0";
 
 /// (#2902 step 5) A setting RENAMED in 4.0, with no alias. `config set`

@@ -1102,7 +1102,7 @@ mod tests {
             ("Read", "how the registry reads a value, not a setting"),
             ("SetIn", "where a bad value was set, not a setting"),
             ("UserFileKind", "which kind of user file the unknown-key gate checked, not a setting"),
-            ("KeyHint", "what an unknown-key refusal suggests, not a setting"),
+            ("Issue", "what the user-file key gate found at one key, not a setting"),
             ("Problem", "what the unknown-key gate found wrong with a file, not a setting"),
             ("Others", "how a schema treats keys it does not name, internal to the gate"),
         ];

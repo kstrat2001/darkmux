@@ -5,7 +5,7 @@
 
 use super::*;
 use darkmux_types::test_isolation::IsolatedState;
-use darkmux_types::user_files::{no_retired, open_objects, unknown_keys};
+use darkmux_types::user_files::{no_retired, open_objects, key_issues};
 use serde_json::{json, Value};
 
 fn quick_q() -> Value {
@@ -148,9 +148,9 @@ fn clean_files_pass() {
 fn every_shipped_document_has_no_unknown_keys() {
     for (id, text) in crate::workloads::load::EMBEDDED_WORKLOADS {
         let doc: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(unknown_keys::<WorkloadManifest>(&doc, &no_retired), vec![], "builtin workload {id}");
+        assert_eq!(key_issues::<WorkloadManifest>(&doc, &no_retired), vec![], "builtin workload {id}");
     }
-    assert_eq!(unknown_keys::<FixtureManifest>(&tiny_fixture(), &no_retired), vec![]);
+    assert_eq!(key_issues::<FixtureManifest>(&tiny_fixture(), &no_retired), vec![]);
 }
 
 #[test]
@@ -194,4 +194,17 @@ fn every_shipped_template_file_has_no_unknown_keys() {
     ));
     let lines: Vec<String> = found.iter().map(ToString::to_string).collect();
     assert!(lines.is_empty(), "{lines:#?}");
+}
+
+/// A mistyped value in a workload is refused by the lab preflight, naming
+/// the path, the expected type and what it got.
+#[test]
+#[serial_test::serial]
+fn a_mistyped_workload_value_is_refused() {
+    let state = IsolatedState::new();
+    let mut wl = quick_q();
+    wl["workload"]["verify"] = json!({"must_contain": "four"});
+    write_workload(&state, &wl);
+    let refusal = preflight_with(Scope::LabRun, None).unwrap_err().to_string();
+    assert!(refusal.contains("`workload.verify.must_contain` must be a list, got \"four\""), "{refusal}");
 }

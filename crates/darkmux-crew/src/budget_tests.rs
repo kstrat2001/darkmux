@@ -235,7 +235,7 @@ fn a_misspelled_key_in_limits_is_an_unknown_key_naming_the_nearest() {
             "profiles": {"p": {"models": [{"id": "m", "endpoint": "azure"}]}},
             "endpoints": {"azure": {"url": "https://h.example/v1", "limits": limits}},
         });
-        let keys = darkmux_types::user_files::unknown_keys::<darkmux_types::ProfileRegistry>(&doc, &darkmux_types::user_files::no_retired);
+        let keys = darkmux_types::user_files::key_issues::<darkmux_types::ProfileRegistry>(&doc, &darkmux_types::user_files::no_retired);
         let msgs: Vec<String> = keys.iter().map(ToString::to_string).collect();
         assert_eq!(keys.len(), 1, "{limits}: {msgs:?}");
         assert!(
@@ -947,7 +947,7 @@ fn budget_messages_have_no_double_spaces() {
     env.said.borrow_mut().push(EndpointBudget::of(&named(limits)).unwrap_err());
     // A misspelled `limits` key is the unknown-key gate's message.
     let typo = serde_json::json!({"endpoints": {"a": {"url": "https://h.example/v1", "limits": {"windw": {}}}}});
-    let keys = darkmux_types::user_files::unknown_keys::<darkmux_types::ProfileRegistry>(&typo, &darkmux_types::user_files::no_retired);
+    let keys = darkmux_types::user_files::key_issues::<darkmux_types::ProfileRegistry>(&typo, &darkmux_types::user_files::no_retired);
     env.said.borrow_mut().extend(keys.iter().map(ToString::to_string));
     let mut messages: Vec<String> = env.said.borrow().clone();
     messages.extend(env.emitted.borrow().iter().filter_map(|r| r.payload.as_ref()?.get("message")?.as_str().map(str::to_string)));
