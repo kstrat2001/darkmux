@@ -2525,9 +2525,6 @@ fn settle_session_index(idx: &mut HashMap<String, SessionAgg>) {
     }
 }
 
-
-
-
 /// The chronologically-EARLIEST session by `start_ts` (lexical compare —
 /// the flow schema's ISO-8601 `YYYY-MM-DDTHH:MM:SSZ` sorts correctly as a
 /// plain string). Sessions with no `start_ts` at all are excluded from the
