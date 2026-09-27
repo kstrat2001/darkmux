@@ -526,6 +526,25 @@ pub fn usage_contribution(v: &serde_json::Value) -> Option<UsageAmount> {
 
 #[cfg(test)]
 mod tests {
+
+    /// (#2902 step 5) `endpoint_id` is written when the call went through a
+    /// named endpoint, and absent otherwise (never an empty string): the
+    /// endpoint budget sums records by it.
+    #[test]
+    fn endpoint_id_is_written_only_for_a_named_endpoint() {
+        let facts = |endpoint_id| CallFacts {
+            call_kind: CallKind::SingleShot,
+            role_id: None,
+            requested_model: "m",
+            reported_model: None,
+            endpoint: "h/m",
+            endpoint_id,
+        };
+        let counts = UsageCounts { total: Some(5), ..Default::default() };
+        assert_eq!(usage_payload(&facts(Some("azure")), &counts)["endpoint_id"], "azure");
+        assert!(usage_payload(&facts(None), &counts).get("endpoint_id").is_none());
+        assert_eq!(usage_payload(&facts(Some("azure")), &UsageCounts::default())["endpoint_id"], "azure", "an absent-usage record still names its endpoint");
+    }
     use super::*;
 
     fn facts(reported: Option<&'static str>) -> CallFacts<'static> {
