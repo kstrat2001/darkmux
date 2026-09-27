@@ -209,24 +209,25 @@ pub fn unknown_actions_in(dir: &Path, days: usize) -> UnknownActions {
 
 /// A line's top-level `action` string without parsing the record. darkmux
 /// writes `action` before `payload`, so the first `"action"` key is the
-/// record's own. A line whose action carries an escape, or whose key is
-/// followed by anything but a string, is parsed in full instead.
+/// record's own. Whenever that quick read does not land cleanly (an earlier
+/// VALUE spelled `"action"`, an escape in the action, a non-string action),
+/// the line is parsed in full instead.
 pub fn action_field(line: &str) -> Option<std::borrow::Cow<'_, str>> {
-    const KEY: &str = "\"action\"";
-    let rest = &line[line.find(KEY)? + KEY.len()..];
-    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
-    let quick = rest.strip_prefix('"').and_then(|body| {
-        let end = body.find('"')?;
-        let wire = &body[..end];
-        (!wire.contains('\\')).then_some(wire)
-    });
-    match quick {
+    match quick_action_field(line) {
         Some(wire) => Some(std::borrow::Cow::Borrowed(wire)),
         None => {
             let v: Value = serde_json::from_str(line).ok()?;
             v.get("action")?.as_str().map(|s| std::borrow::Cow::Owned(s.to_string()))
         }
     }
+}
+
+fn quick_action_field(line: &str) -> Option<&str> {
+    const KEY: &str = "\"action\"";
+    let rest = &line[line.find(KEY)? + KEY.len()..];
+    let body = rest.trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
+    let wire = &body[..body.find('"')?];
+    (!wire.contains('\\')).then_some(wire)
 }
 
 #[cfg(test)]
@@ -307,6 +308,7 @@ mod tests {
             (r#"{"action":"we\"ird"}"#, Some("we\"ird")),
             (r#"{"_type":"schema"}"#, None),
             (r#"{"action":7}"#, None),
+            (r#"{"ts":"t","handle":"action","action":"future.thing"}"#, Some("future.thing")),
         ];
         for (line, want) in cases {
             assert_eq!(action_field(line).as_deref(), want, "{line}");

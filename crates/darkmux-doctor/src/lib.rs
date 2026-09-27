@@ -2219,9 +2219,9 @@ fn check_hooks() -> Vec<Check> {
 /// current one (`darkmux_flow::hooks::effective_action_pattern`), or that it
 /// matches no action at all.
 fn action_pattern_flag(configured: &str) -> Option<String> {
-    use darkmux_flow::hooks::{action_pattern_can_match, dotted_twin, effective_action_pattern};
+    use darkmux_flow::hooks::{action_pattern_can_match, effective_action_pattern, matching_dotted_twin};
     if !action_pattern_can_match(configured) {
-        let hint = dotted_twin(configured)
+        let hint = matching_dotted_twin(configured)
             .map(|t| format!("; `{t}` matches the dotted actions, and more than the old spelling did"))
             .unwrap_or_default();
         return Some(format!(
@@ -8812,6 +8812,19 @@ mod tests {
             attribution_headers: None,
             extras: Default::default(),
         }]
+    }
+
+    /// The CANNOT MATCH hint names a dotted twin only when the twin can
+    /// match: `dispatchh *` and `sprint *` get none.
+    #[test]
+    fn cannot_match_names_only_a_twin_that_can_match() {
+        let flag = action_pattern_flag("dispatch *").unwrap();
+        assert!(flag.contains("`dispatch.*` matches"), "{flag}");
+        for pattern in ["dispatchh *", "sprint *"] {
+            let flag = action_pattern_flag(pattern).unwrap();
+            assert!(flag.contains("CANNOT MATCH"), "{flag}");
+            assert!(!flag.contains(".*`"), "no twin hint for {pattern}: {flag}");
+        }
     }
 
     /// Unknown actions in the archive warn with their count and names; none

@@ -127,12 +127,24 @@ pub fn action_glob_matches(pattern: &str, action: &str) -> bool {
 /// deliver nothing; `darkmux doctor` names them too.
 fn warn_unmatchable_rules(rules: &[HookRule]) {
     for (index, pattern) in unmatchable_rule_patterns(rules) {
-        let hint = dotted_twin(pattern).map(|t| format!("; did you mean `{t}`?")).unwrap_or_default();
+        let hint = unmatchable_hint(pattern);
         eprintln!(
             "flow::HookSink: rule #{index}'s action `{pattern}` matches no action darkmux writes \
              (actions are spelled `<scope>.<event>`){hint}"
         );
     }
+}
+
+/// The "did you mean" tail for an unmatchable pattern: its dotted twin, when
+/// that twin can match anything; empty otherwise.
+fn unmatchable_hint(pattern: &str) -> String {
+    matching_dotted_twin(pattern).map(|t| format!("; did you mean `{t}`?")).unwrap_or_default()
+}
+
+/// A spaced glob's dotted twin, only when the twin matches at least one
+/// action darkmux writes (`dispatchh *` and `sprint *` have none).
+pub fn matching_dotted_twin(pattern: &str) -> Option<String> {
+    dotted_twin(pattern).filter(|t| crate::FlowAction::KNOWN_WIRE.iter().any(|w| action_glob_matches(t, w)))
 }
 
 /// `(rule index, pattern)` for every rule whose action pattern cannot match.
@@ -143,6 +155,16 @@ fn unmatchable_rule_patterns(rules: &[HookRule]) -> Vec<(usize, &str)> {
         .filter_map(|(i, r)| Some((i, r.r#match.as_ref()?.action.as_deref()?)))
         .filter(|(_, p)| !action_pattern_can_match(p))
         .collect()
+}
+
+/// A rule's match as the write path uses it: its `action` pattern read once,
+/// at load, through [`effective_action_pattern`], so [`hook_match`] stays a
+/// plain glob per record.
+pub fn resolve_match(mut m: HookMatch) -> HookMatch {
+    if let Some(pat) = m.action.take() {
+        m.action = Some(effective_action_pattern(&pat).into_owned());
+    }
+    m
 }
 
 /// The action glob a rule means under 4.0. A rule written before 4.0 names
@@ -245,7 +267,7 @@ pub fn hook_match(m: &HookMatch, record: &FlowRecord) -> bool {
         return false;
     }
     if let Some(pat) = m.action.as_deref() {
-        if !action_glob_matches(&effective_action_pattern(pat), record.action.as_str()) {
+        if !action_glob_matches(pat, record.action.as_str()) {
             return false;
         }
     }
@@ -945,6 +967,8 @@ fn read_last_status(path: &Path) -> Option<LastStatus> {
 #[derive(Debug, Clone)]
 pub struct ResolvedRule {
     pub index: usize,
+    /// The configured match with its action resolved ([`resolve_match`]);
+    /// the outbox key comes from the match as configured.
     pub match_: HookMatch,
     pub url: String,
     pub outbox_path: PathBuf,
@@ -1038,8 +1062,11 @@ pub fn resolve_one_rule(index: usize, r: &HookRule, outbox_dir: &Path) -> Result
             (format!("file://{}", expanded.display()), None, Some(expanded))
         }
     };
-    let match_ = r.r#match.clone().unwrap_or_default();
-    let key = rule_key(&match_, &url);
+    let configured = r.r#match.clone().unwrap_or_default();
+    // The outbox key is the CONFIGURED match's, so resolving the action does
+    // not strand an existing outbox.
+    let key = rule_key(&configured, &url);
+    let match_ = resolve_match(configured);
     let (outbox_path, cursor_path) = outbox_paths(outbox_dir, &key);
     let last_status_path = last_status_path(outbox_dir, &key);
     let drain_lock_path = drain_lock_path(outbox_dir, &key);
@@ -4473,11 +4500,41 @@ mod tests {
         assert_eq!(effective_action_pattern("sprint start"), "phase.start");
         assert_eq!(effective_action_pattern("step *"), "step.*");
         assert_eq!(effective_action_pattern("dispatch.tool"), "dispatch.tool", "a current pattern is untouched");
-        let m = HookMatch { action: Some("dispatch complete".to_string()), ..Default::default() };
+        // Resolved once, at load: the write path's `hook_match` is a plain
+        // glob and does no upgrade work per record.
+        let raw = HookMatch { action: Some("dispatch complete".to_string()), ..Default::default() };
+        assert!(!hook_match(&raw, &record(crate::FlowAction::DispatchComplete)), "no per-write upgrade");
+        let m = resolve_match(raw);
         assert!(hook_match(&m, &record(crate::FlowAction::DispatchComplete)));
         assert!(!hook_match(&m, &record(crate::FlowAction::DispatchError)));
-        let m = HookMatch { action: Some("step *".to_string()), ..Default::default() };
+        let m = resolve_match(HookMatch { action: Some("step *".to_string()), ..Default::default() });
         assert!(hook_match(&m, &record(crate::FlowAction::StepResult)));
+    }
+
+    /// A loaded rule carries its resolved action, and its outbox key is still
+    /// the configured match's (an existing outbox is not stranded).
+    #[test]
+    fn a_loaded_rule_is_resolved_once_and_keeps_its_outbox_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let configured = HookMatch { action: Some("dispatch complete".to_string()), ..Default::default() };
+        let rule = HookRule {
+            r#match: Some(configured.clone()),
+            http: Some("http://127.0.0.1:8790/events".to_string()),
+            ..Default::default()
+        };
+        let resolved = resolve_one_rule(0, &rule, tmp.path()).unwrap();
+        assert_eq!(resolved.match_.action.as_deref(), Some("dispatch.complete"));
+        let key = rule_key(&configured, "http://127.0.0.1:8790/events");
+        assert_eq!(resolved.outbox_path, outbox_paths(tmp.path(), &key).0);
+    }
+
+    /// The load-time hint names a dotted twin only when the twin can match.
+    #[test]
+    fn the_unmatchable_hint_names_only_a_twin_that_can_match() {
+        assert_eq!(unmatchable_hint("dispatch *"), "; did you mean `dispatch.*`?");
+        assert_eq!(unmatchable_hint("dispatchh *"), "");
+        assert_eq!(unmatchable_hint("sprint *"), "");
+        assert_eq!(unmatchable_hint("dispatchh.*"), "");
     }
 
     /// The inverse: a spaced glob whose dotted twin would match MORE than it
@@ -4487,7 +4544,7 @@ mod tests {
         for pattern in ["dispatch *", "mission *", "phase *"] {
             assert_eq!(effective_action_pattern(pattern), pattern, "{pattern} must not widen");
         }
-        let m = HookMatch { action: Some("dispatch *".to_string()), ..Default::default() };
+        let m = resolve_match(HookMatch { action: Some("dispatch *".to_string()), ..Default::default() });
         assert!(!hook_match(&m, &record(crate::FlowAction::DispatchTurn)), "not silently widened");
         let rule = |action: &str| HookRule {
             r#match: Some(HookMatch { action: Some(action.to_string()), ..Default::default() }),

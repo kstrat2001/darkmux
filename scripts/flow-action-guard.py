@@ -139,6 +139,14 @@ def hits_in_line(line, vocab):
     return found
 
 
+def marker_only(line, vocab):
+    """True for a line carrying an allow marker and no hit of its own: only
+    such a line lends its marker to the line below it."""
+    if ALLOW not in line:
+        return False
+    return not hits_in_line(line.split("//", 1)[0], vocab)
+
+
 def violations(text, vocab):
     out = []
     lines = strip_test_modules(text).split("\n")
@@ -147,7 +155,7 @@ def violations(text, vocab):
             continue
         code = line.split("//", 1)[0] if "//" in line and '"' not in line.split("//", 1)[1] else line
         hits = hits_in_line(code, vocab)
-        allowed = int(ALLOW in line) + int(i > 0 and ALLOW in lines[i - 1] and ALLOW not in line)
+        allowed = int(ALLOW in line) + int(i > 0 and marker_only(lines[i - 1], vocab) and ALLOW not in line)
         for hit in hits[allowed:]:
             out.append((i + 1, hit))
     return out
@@ -189,6 +197,7 @@ def self_test():
         ('// flow-action-guard:allow — trajectory event\n"dispatch.start" => x', 0),
         ('"dispatch.start" => x, // flow-action-guard:allow — trajectory event', 0),
         ('// flow-action-guard:allow — one only\nf("dispatch.start", "dispatch start")', 1),
+        ('f("dispatch.start") // flow-action-guard:allow — this line\ng("dispatch start")', 1),
         ('fn f() {}\n#[cfg(test)]\nmod tests {\n    let a = "dispatch.start";\n}', 0),
         ('#[cfg(test)]\nmod tests {\n    fn t() { let a = 1; }\n}\nfn after() { let a = "dispatch.start"; }', 1),
         ('#[cfg(test)]\nmod tests {\n    fn t() { let a = "{"; let b = \'{\'; }\n}\nfn after() { let a = "dispatch.start"; }', 1),
