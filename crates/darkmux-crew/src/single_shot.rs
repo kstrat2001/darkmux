@@ -107,6 +107,7 @@ impl SingleShotReply {
         role_id: Option<&str>,
         requested_model: &str,
         endpoint: &str,
+        endpoint_id: Option<&str>,
     ) -> serde_json::Value {
         crate::usage::usage_payload(
             &crate::usage::CallFacts {
@@ -115,6 +116,7 @@ impl SingleShotReply {
                 requested_model,
                 reported_model: self.model.as_deref(),
                 endpoint,
+                endpoint_id,
             },
             &self.usage_counts(),
         )

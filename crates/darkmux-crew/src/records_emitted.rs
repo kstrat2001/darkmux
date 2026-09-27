@@ -154,7 +154,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// epoch seconds. `None` on anything that doesn't match the exact shape — a
 /// malformed/absent ts degrades to "no flow-derived timestamp", never a
 /// panic. Mirrors `darkmux-serve::runs::parse_flow_ts`.
-fn parse_ts_secs(ts: &str) -> Option<i64> {
+pub(crate) fn parse_ts_secs(ts: &str) -> Option<i64> {
     let b = ts.as_bytes();
     if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b[19] != b'Z'
     {

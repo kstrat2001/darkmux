@@ -1173,39 +1173,34 @@ pub fn run_step_graph(
             // shared bucket (get-or-create), so grouped siblings share ONE
             // allowance. Ungrouped steps carry `None` and fall back to a
             // step-scoped bucket inside the kind.
-            let remote_bucket = step_snapshot
-                .config
-                .get("bucket_group")
-                .and_then(|v| v.as_str())
-                .map(|group| {
+            let remote_bucket = match step_snapshot.config.get("bucket_group").and_then(|v| v.as_str()) {
+                None => None,
+                Some(group) => {
                     // (#1442 ship-2b) A launcher may stamp the group's
-                    // already-resolved per-execution allowance into the
-                    // step's own config (`bucket_budget`, u64) — the same
-                    // self-describing-config key `dispatch.map`'s
-                    // step-scoped fallback honors. Sibling steps of one
-                    // group are expected to declare the SAME value; the
-                    // first step to create the group's bucket wins (the
-                    // bucket lives for the whole graph run). Absent, the
-                    // `config_access` resolution applies as before.
-                    let budget = step_snapshot
-                        .config
-                        .get("bucket_budget")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or_else(
-                            darkmux_types::config_access::remote_max_tokens_per_execution,
-                        );
-                    bucket_groups
-                        .entry(group.to_string())
-                        .or_insert_with(|| {
-                            std::sync::Arc::new(std::sync::Mutex::new(
-                                crate::remote_budget::RemoteBudget::new(
-                                    budget,
-                                    crate::step_kinds::MIN_VIABLE_MAP_GRANT,
-                                ),
-                            ))
-                        })
-                        .clone()
-                });
+                    // budget into the step's own config (`bucket_budget`,
+                    // u64), the same key `dispatch.map`'s step-scoped
+                    // fallback honors. Sibling steps of one group are
+                    // expected to declare the SAME value; the first step to
+                    // create the group's bucket wins (the bucket lives for
+                    // the whole graph run). Absent, `remote.max_tokens_per_
+                    // execution` applies, and (#2902 step 5) with neither
+                    // there is no stage budget.
+                    let explicit = step_snapshot.config.get("bucket_budget").and_then(|v| v.as_u64());
+                    let bucket = match bucket_groups.get(group) {
+                        Some(b) => b.clone(),
+                        None => {
+                            let b = std::sync::Arc::new(std::sync::Mutex::new(
+                                crate::remote_budget::RemoteBudget::from_config(explicit)
+                                    .map_err(|e| anyhow::anyhow!(e.to_string()))
+                                    .with_context_step(&step_snapshot)?,
+                            ));
+                            bucket_groups.insert(group.to_string(), b.clone());
+                            b
+                        }
+                    };
+                    Some(bucket)
+                }
+            };
             let ctx = crate::step_kinds::StepRunCtx::new(
                 Some(tx.clone()),
                 remote_bucket,
@@ -3884,12 +3879,12 @@ mod tests {
             let entry = match ctx.remote_bucket() {
                 Some(b) => {
                     let mut g = b.lock().expect("bucket poisoned");
-                    // Reserve the WHOLE remaining allowance (u32::MAX
-                    // requested clamps to what's left) — the reservation is
-                    // never settled down, so one admitted step exhausts the
-                    // shared bucket for its siblings, the same shape the old
-                    // admit-then-spend(remaining) pair produced.
-                    let admitted = g.admit_reserve(u32::MAX).is_some();
+                    // (#2902 step 5) "Admitted" = the shared stage still had
+                    // room when this step arrived. Then reserve far past the
+                    // budget and never settle it down, so the next grouped
+                    // sibling finds the SAME bucket spent.
+                    let admitted = !g.exhausted();
+                    let _ = g.admit_reserve(u32::MAX);
                     (step.id.clone(), true, admitted)
                 }
                 None => (step.id.clone(), false, false),
@@ -3960,7 +3955,7 @@ mod tests {
         let b = entries.iter().find(|e| e.0 == "b-step").expect("b ran");
         assert!(a.1 && b.1, "both grouped steps got a scheduler-supplied shared bucket");
         assert!(a.2, "step A admitted (fresh shared allowance)");
-        assert!(!b.2, "step B refused — the SAME bucket A exhausted, one allowance shared between them");
+        assert!(!b.2, "step B found the SAME bucket A spent: one allowance shared between them");
     }
 
     #[test]

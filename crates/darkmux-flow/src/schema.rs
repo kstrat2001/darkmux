@@ -2198,7 +2198,13 @@ pub fn flows_dir() -> PathBuf {
 /// ISO 8601 UTC date string from current time — `YYYY-MM-DD`. Used for
 /// per-day file naming (one JSONL file per UTC day), NOT for record `ts`.
 pub fn day_utc_now() -> String {
-    let secs = current_epoch_secs();
+    day_utc_at(current_epoch_secs())
+}
+
+/// (#2902 step 5) The day-file stem (`YYYY-MM-DD`) a record written at
+/// `secs` lands in: the window reader names exactly the files a rolling
+/// window can touch.
+pub fn day_utc_at(secs: i64) -> String {
     let (y, m, d) = epoch_to_yyyymmdd(secs);
     format!("{:04}-{:02}-{:02}", y, m, d)
 }
@@ -2207,7 +2213,12 @@ pub fn day_utc_now() -> String {
 /// Used for `FlowRecord.ts`. Seconds precision is sufficient for the
 /// dispatch / phase timing surfaces; finer precision is a future bump.
 pub fn ts_utc_now() -> String {
-    let secs = current_epoch_secs();
+    ts_utc_at(current_epoch_secs())
+}
+
+/// (#2902 step 5) A record-`ts`-shaped string (`YYYY-MM-DDTHH:MM:SSZ`) for
+/// any epoch second, e.g. when a budget wait will resume.
+pub fn ts_utc_at(secs: i64) -> String {
     let (y, mo, d) = epoch_to_yyyymmdd(secs);
     let (h, mi, s) = epoch_to_hhmmss(secs);
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s)

@@ -74,13 +74,13 @@ pub(crate) struct FleetListenerState {
     pub node_slots: Arc<KeySlots<String>>,
     /// (#2947) This machine's dispatch-scope config preflight, run per
     /// submission before the job is accepted. `Err` carries the refusal
-    /// text. Production: `config_enum::preflight(Scope::Dispatch)`.
+    /// text. Production: `darkmux_profiles::preflight(Scope::Dispatch)`.
     pub config_preflight: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
 }
 
 /// (#2947) The production config preflight a submission runs.
 pub(crate) fn dispatch_config_preflight() -> Result<(), String> {
-    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::Dispatch).map_err(|e| e.to_string())
+    darkmux_profiles::preflight(darkmux_types::config_enum::Scope::Dispatch).map_err(|e| e.to_string())
 }
 
 impl FleetListenerState {

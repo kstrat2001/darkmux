@@ -1084,9 +1084,42 @@ pub fn max_stall_recoveries_with_source() -> (Option<u32>, Source) {
 /// calls draw from it. Resolves `env(DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION) >
 /// config.remote.max_tokens_per_execution > 500000` (operator decision on
 /// #1260 — tokens only, never currency).
-pub fn remote_max_tokens_per_execution() -> u64 {
+pub fn remote_max_tokens_per_execution() -> Option<u64> {
     let cfg = config().remote.as_ref().and_then(|r| r.max_tokens_per_execution);
-    pick_parsed("DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION", cfg, Some(500_000)).unwrap()
+    // (#2902 step 5) No built-in default: unset is no stage budget. An
+    // unparseable env value falls through to the config tier, the same
+    // lenient rule every numeric accessor follows.
+    pick_parsed("DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION", cfg, None)
+}
+
+/// (#2902 step 5) What a stage that reaches its budget does. Registered
+/// `ConfigEnum` (`remote.stage_budget_policy`, env
+/// `DARKMUX_REMOTE_STAGE_BUDGET_POLICY`), absent = `warn`. An unregistered
+/// value is an error, refused at preflight.
+pub fn remote_stage_budget_policy() -> Result<crate::endpoint::BudgetPolicy, crate::config_enum::BadEnumValue> {
+    resolve_enum("remote.stage_budget_policy").map(|(v, _)| v)
+}
+
+/// (#2902 step 5) The stage budget and its policy read FRESH from disk (and
+/// the env), for a stage waiting on its budget: the process-wide config is
+/// loaded once, so a `darkmux config set remote.max_tokens_per_execution`
+/// made in another shell during the wait is only seen through this. Test
+/// builds read the (overridable) test config tier instead of the disk.
+pub fn remote_stage_budget_fresh() -> (Option<u64>, Result<crate::endpoint::BudgetPolicy, crate::config_enum::BadEnumValue>) {
+    #[cfg(not(any(test, feature = "test-support")))]
+    let owned = crate::config::DarkmuxConfig::load_resolved();
+    #[cfg(any(test, feature = "test-support"))]
+    let owned = config().clone();
+    let budget = pick_parsed(
+        "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION",
+        owned.remote.as_ref().and_then(|r| r.max_tokens_per_execution),
+        None,
+    );
+    let setting = crate::config_enum::setting("remote.stage_budget_policy").expect("registered");
+    let policy = crate::config_enum::resolve_in(setting, &owned, env_str).map(|(t, _)| {
+        <crate::endpoint::BudgetPolicy as crate::config_enum::ConfigEnum>::from_token(t).expect("a registered token")
+    });
+    (budget, policy)
 }
 /// (#1230 Packet 1) Max CONCURRENT remote dispatches
 /// `darkmux_crew::concurrent_dispatch::run_bounded` runs at once. Resolves
@@ -3687,13 +3720,14 @@ mod tests {
         let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
         let prev = std::env::var(k).ok();
         unsafe { std::env::remove_var(k); }
-        // No env + the empty test config (#811) → the built-in 500K default.
-        assert_eq!(remote_max_tokens_per_execution(), 500_000);
+        // (#2902 step 5) No env + the empty test config (#811) → NO stage
+        // budget. The built-in 500000 is gone.
+        assert_eq!(remote_max_tokens_per_execution(), None);
         unsafe { std::env::set_var(k, "25000"); }
-        assert_eq!(remote_max_tokens_per_execution(), 25_000, "env tier wins live");
-        // An unparseable env value falls through to the default, never panics.
+        assert_eq!(remote_max_tokens_per_execution(), Some(25_000), "env tier wins live");
+        // An unparseable env value falls through (to no budget), never panics.
         unsafe { std::env::set_var(k, "half-a-million"); }
-        assert_eq!(remote_max_tokens_per_execution(), 500_000);
+        assert_eq!(remote_max_tokens_per_execution(), None);
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),

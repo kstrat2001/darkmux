@@ -269,17 +269,24 @@
         assert_eq!(both["max_completion_tokens"], 8000, "an explicit cap wins");
     }
 
-    /// (#1260, FIX 2) A bare remote `dispatch` is metered as ONE
-    /// execution: any positive per-execution allowance admits the single
-    /// hosted call; a zero allowance (a hard operator opt-out) refuses it
-    /// with a typed error NAMING the bucket, never dispatching off the meter.
+    /// (#2902 step 5) A bare hosted `dispatch` passes BOTH budgets (the
+    /// endpoint's window, then its own stage) before its first record, so a
+    /// `wait` holds it with no orphaned in-flight session, and settles the
+    /// stage after the call. Checked on the source: running the arm needs a
+    /// real endpoint. The behavior of each gate is pinned in `budget_tests`.
     #[test]
-    fn admit_remote_execution_gates_on_the_per_execution_budget() {
-        assert!(admit_remote_execution(500_000).is_ok(), "a positive allowance admits the one call");
-        assert!(admit_remote_execution(1).is_ok(), "even a tiny positive allowance admits a single call");
-        let err = admit_remote_execution(0).unwrap_err().to_string();
-        assert!(err.contains("remote token budget exhausted"), "{err}");
-        assert!(err.contains("max_tokens_per_execution"), "the error names the bucket: {err}");
+    fn dispatch_remote_passes_both_budget_gates_before_any_record() {
+        let src = include_str!("dispatch_internal.rs");
+        let body = &src[src.find("fn dispatch_remote(").expect("dispatch_remote")..];
+        let body = &body[..body.find("\n}\n").expect("fn end")];
+        let open = body.find("bookend.open(").expect("bookend opens");
+        let endpoint_gate = body.find("crate::budget::admit_endpoint(ep,").expect("endpoint gate");
+        let stage_gate = body.find("crate::budget::admit_stage(").expect("stage gate");
+        let call = body.find("remote_chat_completion(").expect("the call");
+        let settle = body.find("crate::budget::settle_stage(").expect("stage settle");
+        assert!(endpoint_gate < open && stage_gate < open, "both gates run before the first record");
+        assert!(settle > call, "the stage is settled with the call's real spend");
+        assert!(!src.contains("fn admit_remote_execution("), "the pre-4.0 zero-refusal gate is gone");
     }
 
     /// Hosted-response classification (pure): the happy path passes through;
@@ -7507,6 +7514,7 @@
                 None, // (#2794) compactor_model
                 None,
                 None, // (#2902) endpoint
+                None, // (#2902 step 5) endpoint id
                 None, // (#2902 step 1b) compactor endpoint
                 None, // (#2928) live sender
             )
@@ -10244,7 +10252,7 @@
             "finish_reason": "tool_calls",
             "usage": { "prompt_tokens": 24000, "completion_tokens": 850 },
         });
-        let payload = turn_tokens_payload(&event, "coder", "m", "ep");
+        let payload = turn_tokens_payload(&event, "coder", "m", "ep", None);
         assert_eq!(payload["turn_seq"], 12);
         assert_eq!(payload["prompt_tokens"], 24000);
         assert_eq!(payload["completion_tokens"], 850);
@@ -10273,7 +10281,7 @@
                 "reasoning_tokens": 1024, "cached_tokens": 64,
             },
         });
-        let payload = turn_tokens_payload(&event, "coder", "m", "ep");
+        let payload = turn_tokens_payload(&event, "coder", "m", "ep", None);
         assert_eq!(payload["reasoning_tokens"], 1024);
         assert_eq!(payload["cached_tokens"], 64);
         assert!(payload["reasoning_tokens"].as_u64().unwrap() <= payload["completion_tokens"].as_u64().unwrap());
@@ -10298,7 +10306,7 @@
             "seq": 4,
             "usage": { "prompt_tokens": 9970, "completion_tokens": 128, "total_tokens": 11598 },
         });
-        let payload = turn_tokens_payload(&event, "coder", "m", "ep");
+        let payload = turn_tokens_payload(&event, "coder", "m", "ep", None);
         assert_eq!(
             payload["total_tokens"], 11598,
             "the provider's own total must win; prompt + completion (10098) understates by 1500"
@@ -10318,7 +10326,7 @@
             "seq": 5,
             "usage": { "prompt_tokens": 300, "completion_tokens": 45 },
         });
-        let payload = turn_tokens_payload(&event, "coder", "m", "ep");
+        let payload = turn_tokens_payload(&event, "coder", "m", "ep", None);
         assert_eq!(payload["total_tokens"], 345, "no reported total → derive from the split");
     }
 
@@ -10553,11 +10561,11 @@
     #[test]
     fn turn_tokens_payload_marks_absent_or_null_usage_absent() {
         let absent = serde_json::json!({ "type": "model.completed", "seq": 3 });
-        assert_eq!(turn_tokens_payload(&absent, "coder", "m", "ep")["token_source"], "absent", "absent usage → an absent record, no counts");
+        assert_eq!(turn_tokens_payload(&absent, "coder", "m", "ep", None)["token_source"], "absent", "absent usage → an absent record, no counts");
         let null = serde_json::json!({
             "type": "model.completed", "seq": 3, "usage": serde_json::Value::Null,
         });
-        assert_eq!(turn_tokens_payload(&null, "coder", "m", "ep")["token_source"], "absent", "null usage → an absent record, no counts");
+        assert_eq!(turn_tokens_payload(&null, "coder", "m", "ep", None)["token_source"], "absent", "null usage → an absent record, no counts");
     }
 
     /// (#795) Defensive: a `usage` object missing a count degrades that
@@ -10570,7 +10578,7 @@
             "seq": 1,
             "usage": { "completion_tokens": 500 },
         });
-        let payload = turn_tokens_payload(&event, "coder", "m", "ep");
+        let payload = turn_tokens_payload(&event, "coder", "m", "ep", None);
         assert_eq!(payload["prompt_tokens"], 0);
         assert_eq!(payload["completion_tokens"], 500);
         assert_eq!(payload["total_tokens"], 500);
@@ -14667,6 +14675,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
             None,
             None, // (#2902) endpoint
+            None, // (#2902 step 5) endpoint id
             None, // (#2902 step 1b) compactor endpoint
             None, // (#2928) live sender
         );
@@ -15023,6 +15032,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 None, // (#2794) compactor_model
                 None,
                 None, // (#2902) endpoint
+                None, // (#2902 step 5) endpoint id
                 None, // (#2902 step 1b) compactor endpoint
                 None, // (#2928) live sender
             );
@@ -15113,6 +15123,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 host_out_for_closure,
                 None,
                 crate::thermal_governor::ThermalGovernorConfig::from_env().unwrap(),
+                None, // (#2902 step 5) no endpoint budget
             );
             *handle_holder_for_closure.lock().unwrap() = Some(handle);
             panic!("simulated panic between the sampler's spawn and dispatch()'s own stores");
@@ -16694,7 +16705,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             .iter()
             .map(|e| {
                 let ev: serde_json::Value = serde_json::from_str(e).unwrap();
-                super::turn_tokens_payload(&ev, "coder", "m", "ep")["total_tokens"].as_u64().unwrap()
+                super::turn_tokens_payload(&ev, "coder", "m", "ep", None)["total_tokens"].as_u64().unwrap()
             })
             .sum();
         assert_eq!(per_turn_sum, 11598 + 150);

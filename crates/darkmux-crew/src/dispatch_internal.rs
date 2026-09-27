@@ -2600,43 +2600,6 @@ fn single_shot_body(
     })
 }
 
-/// (#1260) Gate a bare remote `dispatch` against the per-EXECUTION
-/// remote token bucket. Per the operator's scope split, a bare dispatch
-/// IS one execution (config doc: `RemoteConfig`), so its single hosted call
-/// draws from a fresh per-execution allowance. A single call only "exhausts"
-/// a fresh bucket when the operator has set the allowance to zero — a hard
-/// opt-out — in which case the call is refused with a typed error NAMING the
-/// bucket rather than dispatching off the meter; any positive allowance
-/// admits the one call (the spend is then accounted in the `dispatch.complete`
-/// record's `total_tokens`, spend-after). The AGENTIC-remote container path
-/// (#1187 — a tool-granting role on an endpoint profile, multi-call loop) is
-/// NOT metered in 1.18.0; only this single-shot path and the review pipeline's
-/// seats are — see the module scope note / issue #1260 follow-up.
-///
-/// `pub(crate)` (#1412): `step_kinds::builtins::DispatchSingleShotStepKind`'s
-/// hosted arm reuses this exact gate rather than inventing a second zero-
-/// allowance check — same minimum regime, one definition of "budget 0
-/// refuses." The full per-stage regime (`crate::remote_budget::RemoteBudget`
-/// — #1877 promoted it into this crate from `darkmux-lab`'s review funnel)
-/// is a SEPARATE, richer mechanism this gate does not call into: this
-/// function is a one-shot admission check with no ongoing bucket state,
-/// while `RemoteBudget` accumulates spend across many calls in one stage.
-/// Wiring this single-shot path onto `RemoteBudget` instead is a real
-/// behavior change (a fresh allowance per call today vs. a shared one),
-/// not a rename — #1414's job, not #1877's.
-pub(crate) fn admit_remote_execution(budget: u64) -> Result<()> {
-    if budget == 0 {
-        bail!(
-            "remote token budget exhausted: the per-execution allowance \
-             (config.remote.max_tokens_per_execution / \
-             DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION) is 0 — this hosted dispatch is \
-             refused because it has no allowance left. Raise the allowance above 0 to dispatch \
-             to a remote endpoint."
-        );
-    }
-    Ok(())
-}
-
 /// If this dispatch's resolved model is REMOTE, return the pieces the hosted
 /// path needs (role, system prompt, model). `Ok(None)` ⇒ local — the caller
 /// falls through to the unchanged container path (which re-loads the role;
@@ -3442,10 +3405,6 @@ fn dispatch_remote(
 ) -> Result<DispatchResult> {
     let ep = &target.endpoint;
     let pm = &target.model;
-    // (#1260) Meter this bare dispatch as one execution BEFORE any record
-    // is emitted — a zero allowance refuses the call cleanly, without leaving
-    // an orphaned in-flight session in the viewer.
-    admit_remote_execution(darkmux_types::config_access::remote_max_tokens_per_execution())?;
     let session_id = opts
         .session_id
         .clone()
@@ -3486,6 +3445,25 @@ fn dispatch_remote(
         Some(mid) => darkmux_types::session_id::scope_to_run(&session_id, mid),
         None => session_id,
     };
+
+    // (#2902 step 5) The budgets, BEFORE any bookend is emitted: the
+    // endpoint's rolling-window budget, then this execution's stage budget
+    // (a bare hosted dispatch is one execution). Neither ever refuses: a
+    // breach warns, or under `wait` this blocks until there is room (the
+    // wait is reported and extends the run's wall-clock bound). A wait
+    // interrupted by an abort returns before anything was sent.
+    let budget_caller = crate::budget::BudgetCaller {
+        role_id: Some(&opts.role_id),
+        session_id: Some(&session_id),
+        model: Some(&pm.id),
+        mission_id: mission_id.as_deref(),
+        phase_id: phase,
+    };
+    crate::budget::admit_endpoint(ep, &budget_caller)?;
+    let stage_bucket = std::sync::Mutex::new(
+        crate::remote_budget::RemoteBudget::from_config(None).map_err(|e| anyhow!(e.to_string()))?,
+    );
+    crate::budget::admit_stage(&stage_bucket, 0, "dispatch", &budget_caller, &crate::budget::LiveEnv)?;
 
     // (#1230 Packet 0) `dispatch_remote` previously had NO bookend guard at
     // all — a panic mid-hosted-call (or any future early return added
@@ -3636,8 +3614,10 @@ fn dispatch_remote(
             Some(&opts.role_id),
             &pm.id,
             &label,
+            ep.named_id(),
         ),
     );
+    crate::budget::settle_stage(&stage_bucket, 0, ttok, 1, "dispatch", &budget_caller, &crate::budget::LiveEnv);
 
 
     let mut complete_payload = serde_json::json!({
@@ -3771,7 +3751,7 @@ fn dispatch_remote(
 /// than adding speculative shape for a consumer that doesn't exist yet.
 pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> {
     // (#2947) Bad enum config refuses before anything, same as `dispatch`.
-    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
+    darkmux_profiles::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
     darkmux_flow::daemon_probe::nudge_if_daemon_unreachable("dispatch");
     crate::dispatch::require_licensed_adjacent_ack(&opts.role_id)
         .context("licensed-adjacent role dispatch requires acknowledgment")?;
@@ -4022,6 +4002,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
             Some(&opts.role_id),
             &model_id,
             &crate::usage::lmstudio_endpoint(opts.model_base_url_override.as_deref()),
+            None,
         ),
     );
 
@@ -4909,7 +4890,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // is the one place that covers them all. Deliberately NOT gated on
     // `opts.skip_preflight`: that flag skips the Docker/daemon probe, and a
     // bad config value is not a probe result that could be stale.
-    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
+    darkmux_profiles::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
     // 0. Pre-flight: nudge the operator if the daemon isn't up. The
     //    dispatch will still write flow records to disk, but they
     //    won't be observable in the viewer until the daemon comes up.
@@ -5541,6 +5522,25 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     }
     let remote_needs_auth = remote_auth.is_some();
 
+    // (#2902 step 5) An agentic-remote brain calls its endpoint from inside
+    // the container, turn after turn. Its budget is checked here, before
+    // the container starts (a `wait` holds the start, reported and never
+    // stopping the run), and then between turns by the host sampler's
+    // budget pacer, which pauses the runtime through the pace file the way
+    // the thermal governor does.
+    if let Some(t) = &agentic_pm {
+        crate::budget::admit_endpoint(
+            &t.endpoint,
+            &crate::budget::BudgetCaller {
+                role_id: Some(&opts.role_id),
+                session_id: Some(&session_id),
+                model: Some(&model),
+                mission_id: mission_id.as_deref(),
+                phase_id: phase_id.as_deref(),
+            },
+        )?;
+    }
+
     // 5. Emit dispatch.start flow record with runtime metadata in payload
     //    (#204). Pairs with dispatch.complete below via session_id.
     let mut dispatch_start_payload = dispatch_start_payload_json(
@@ -6083,6 +6083,10 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         Some(remote_endpoint_raw_label.clone().unwrap_or_else(|| {
             crate::usage::lmstudio_endpoint(opts.model_base_url_override.as_deref())
         })),
+        // (#2902 step 5) The `endpoints` id a hosted brain's turns go
+        // through, stamped on each turn's usage record so the endpoint's
+        // window budget sums them.
+        agentic_pm.as_ref().and_then(|t| t.endpoint.named_id().map(str::to_string)),
         // (#2902 step 1b) The compactor's endpoint: always the LMStudio base,
         // hosted brain or not (the runtime never routes the compactor through
         // the hosted URL; `runtime/src/main.rs`, #1187).
@@ -6205,6 +6209,12 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         host_out.clone(),
         opts.record_context.clone(),
         crate::thermal_governor::ThermalGovernorConfig::from_env()?,
+        // (#2902 step 5) The in-run half of an agentic-remote brain's
+        // endpoint budget (the pre-start half ran before `dispatch start`).
+        match &agentic_pm {
+            Some(t) => crate::budget::EndpointBudget::of(&t.endpoint).map_err(|e| anyhow!(e))?,
+            None => None,
+        },
     );
 
     // (#2642) External, whole-`dispatch()`-level panic-injection hook for
@@ -7776,6 +7786,7 @@ fn spawn_guarded_tailer(
     compactor_model: Option<String>,
     record_context: Option<serde_json::Value>,
     endpoint: Option<String>,
+    endpoint_id: Option<String>,
     compactor_endpoint: Option<String>,
     live: Option<darkmux_flow::live::LiveSender>,
 ) -> (StopFlagGuard, thread::JoinHandle<TrajectorySummary>) {
@@ -7802,6 +7813,7 @@ fn spawn_guarded_tailer(
             compactor_model,
             record_context,
             endpoint,
+            endpoint_id,
             compactor_endpoint,
             live,
         )
@@ -7849,6 +7861,7 @@ fn run_tailer(
     compactor_model: Option<String>,
     record_context: Option<serde_json::Value>,
     endpoint: Option<String>,
+    endpoint_id: Option<String>,
     compactor_endpoint: Option<String>,
     live: Option<darkmux_flow::live::LiveSender>,
 ) -> TrajectorySummary {
@@ -7868,6 +7881,7 @@ fn run_tailer(
     .with_compaction_threshold(compaction_threshold)
     .with_compactor_model(compactor_model)
     .with_endpoint(endpoint)
+    .with_endpoint_id(endpoint_id)
     .with_compactor_endpoint(compactor_endpoint)
     .with_record_context(record_context)
     // (#2928) The live channel, off when `runtime.live_sample_ms` is 0.
@@ -8578,6 +8592,7 @@ fn spawn_guarded_sampler(
     host_out: PathBuf,
     record_context: Option<serde_json::Value>,
     thermal_config: crate::thermal_governor::ThermalGovernorConfig,
+    budget: Option<crate::budget::EndpointBudget>,
 ) -> (StopFlagGuard, thread::JoinHandle<(HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary)>) {
     let guard = StopFlagGuard(Arc::clone(sampler_stop));
     let stop = Arc::clone(sampler_stop);
@@ -8595,6 +8610,7 @@ fn spawn_guarded_sampler(
             host_out,
             record_context,
             thermal_config,
+            budget,
         )
     });
     (guard, handle)
@@ -8621,7 +8637,11 @@ fn run_telemetry_sampler(
     // an error the dispatch returns, rather than on this thread, which has
     // no way to refuse.
     thermal_config: crate::thermal_governor::ThermalGovernorConfig,
+    // (#2902 step 5) An agentic-remote brain's endpoint budget, when it
+    // counts (see `crate::budget::BudgetPacer`). `None` for a local brain.
+    budget: Option<crate::budget::EndpointBudget>,
 ) -> (HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary) {
+    let mut budget_pacer = budget.map(crate::budget::BudgetPacer::new);
     // (#2107) Relative to THIS sampler's own start, not wall-clock — the
     // reduction only needs the gaps BETWEEN samples, and a relative clock
     // makes `reduce_host_stats` testable with plain integers instead of
@@ -9144,6 +9164,32 @@ fn run_telemetry_sampler(
             }
         }
 
+        // (#2902 step 5) The endpoint budget of an agentic-remote brain,
+        // whose calls the runtime makes inside the container: under `wait`
+        // a full window pauses the runtime between turns through the pace
+        // file (reason `budget`), yielding to a thermal or battery pause
+        // that already holds it. Decided AFTER both governors, so it reads
+        // their post-decision state; reported as `dispatch.rest` like theirs.
+        if let Some(pacer) = budget_pacer.as_mut() {
+            let others_pausing = governors.thermal.is_pausing() || governors.battery.is_pacing();
+            let caller = crate::budget::BudgetCaller {
+                role_id: Some(&role_id),
+                session_id: Some(&session_id),
+                model: Some(&model),
+                mission_id: mission_id.as_deref(),
+                phase_id: phase_id.as_deref(),
+            };
+            match pacer.on_tick(thermal_elapsed_ms, &host_out, others_pausing, &caller, &crate::budget::LiveEnv) {
+                Some(crate::budget::PacerEvent::Paused { state }) => {
+                    emit_rest(crate::budget::PACE_REASON, &state, true)
+                }
+                Some(crate::budget::PacerEvent::Resumed { state }) => {
+                    emit_rest(crate::budget::PACE_REASON, &state, false)
+                }
+                None => {}
+            }
+        }
+
         if sample.cpu_pct.is_some() || sample.mem_pct.is_some() || sample.gpu_pct.is_some() {
             // (#2107) Record the raw reading, timestamped against this
             // sampler's own clock. The REDUCTION (peak/mean/p95/duty) is a
@@ -9434,6 +9480,10 @@ struct TailerState {
     /// resolved LMStudio base. Stamped on every per-turn usage record.
     /// `None` only in test fixtures that never set it.
     endpoint: Option<String>,
+    /// (#2902 step 5) The `endpoints` id of a hosted brain's endpoint,
+    /// stamped as `endpoint_id` on each per-turn usage record (what the
+    /// endpoint's window budget sums). `None` for a local brain.
+    endpoint_id: Option<String>,
     /// (#2902 step 1b) The endpoint the runtime's COMPACTOR client called:
     /// always the resolved LMStudio base (host-side form), because the
     /// runtime never routes the compactor through a hosted brain's URL or
@@ -9579,6 +9629,7 @@ impl TailerState {
             inactivity_secs,
             compaction_threshold: None,
             endpoint: None,
+            endpoint_id: None,
             compactor_endpoint: None,
             record_context: None,
             live: None,
@@ -9594,6 +9645,12 @@ impl TailerState {
     /// only production `run_tailer` opts in.
     fn with_endpoint(mut self, endpoint: Option<String>) -> Self {
         self.endpoint = endpoint;
+        self
+    }
+
+    /// (#2902 step 5) The hosted brain's `endpoints` id; see the field.
+    fn with_endpoint_id(mut self, endpoint_id: Option<String>) -> Self {
+        self.endpoint_id = endpoint_id;
         self
     }
 
@@ -9799,6 +9856,7 @@ impl TailerState {
             inactivity_secs: 600,
             compaction_threshold: None,
             endpoint: None,
+            endpoint_id: None,
             compactor_endpoint: None,
             record_context: None,
             live: None,
@@ -9955,6 +10013,7 @@ impl TailerState {
                         &self.role_id,
                         &self.model,
                         self.endpoint.as_deref().unwrap_or_default(),
+                        self.endpoint_id.as_deref(),
                     );
                     // (#2263 review, minor) `u32::try_from(..).unwrap_or(u32::MAX)`,
                     // not `as u32` — an `as` cast WRAPS on a u64 that exceeds
@@ -10994,6 +11053,7 @@ fn turn_tokens_payload(
     role_id: &str,
     requested_model: &str,
     endpoint: &str,
+    endpoint_id: Option<&str>,
 ) -> serde_json::Value {
     // (#2902 step 1a) Through the one accounting writer. `turn_seq` is the
     // one field only a turn has. (#2902 step 1b) `reported_model` is the
@@ -11006,6 +11066,7 @@ fn turn_tokens_payload(
             requested_model,
             reported_model: event_model_id(event, "reported_model").as_deref(),
             endpoint,
+            endpoint_id,
         },
         &turn_usage_counts(event),
     );
@@ -11057,6 +11118,9 @@ fn compaction_call_tokens_payload(
             requested_model: &requested_model,
             reported_model: event_model_id(event, "reported_model").as_deref(),
             endpoint,
+            // A compactor call goes to the machine's LMStudio, never through
+            // a hosted brain's endpoint.
+            endpoint_id: None,
         },
         &turn_usage_counts(event),
     );

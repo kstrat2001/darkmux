@@ -341,7 +341,7 @@ fn default_scores_path(ts_ms: u128) -> PathBuf {
 pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
     // (#2947) `lab eval` is a lab run too: bad enum config refuses before
     // the first case is loaded or dispatched.
-    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::LabRun)?;
+    darkmux_profiles::preflight(darkmux_types::config_enum::Scope::LabRun)?;
     let cases = load_cases(&opts.cases_dir)?;
     if cases.is_empty() {
         return Err(anyhow!(

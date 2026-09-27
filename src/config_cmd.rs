@@ -1219,6 +1219,7 @@ mod tests {
                         let cfg = config_enum::config_with_value(s, raw);
                         _guard = Some(darkmux_types::config_access::set_config_for_test(cfg));
                     }
+                    SetIn::Profiles(_) => unreachable!("a config.json setting is never set in profiles.json"),
                 }
                 // Preflight, per scope.
                 for scope in Scope::ALL {

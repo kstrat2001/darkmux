@@ -20,6 +20,7 @@ pub mod flock;
 pub mod interrupt;
 pub mod paths;
 pub mod residency_lease;
+pub mod run_pause;
 pub mod session_id;
 pub mod size;
 /// (#2695/#2697/#2698) The single test-isolation guard. Gated the same
@@ -35,7 +36,7 @@ use std::collections::BTreeMap;
 
 pub use endpoint::{
     CredentialSource, Dialect, Lenient, EndpointAuth, EndpointAuthType, EndpointError, EndpointKind, EndpointSource,
-    ManagedBackend, ModelEndpoint, UsageLimits, UsageWindow,
+    BudgetPolicy, ManagedBackend, ModelEndpoint, UsageLimits, UsageWindow, WindowBudget,
 };
 
 /// (#1129) The running build's identifier — single source of truth for the

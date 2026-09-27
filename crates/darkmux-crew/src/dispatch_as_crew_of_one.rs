@@ -88,7 +88,7 @@ pub(crate) fn dispatch_as_crew_of_one_with(
 ) -> Result<DispatchResult> {
     // (#2947 review M1) Bad enum config refuses before the mission is
     // minted and before `run_step_graph` reconciles residency.
-    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
+    darkmux_profiles::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
     // (#1509 — found live, tests/cli.rs's ack-gate integration tests) The
     // licensed-adjacent operator-consent gate MUST run before any model
     // residency action, never after. Inside `dispatch_internal::dispatch`

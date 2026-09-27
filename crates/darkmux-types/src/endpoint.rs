@@ -117,32 +117,83 @@ crate::config_enum!(Dialect, "endpoint dialect", [
         "`max_tokens` + `temperature`, no `reasoning_effort` (managed LM Studio default)",
 ]);
 
-/// Standard usage limits for one endpoint (#2902 step 4: the SHAPE only).
+/// (#2902 step 5) What darkmux does when an endpoint's budget is reached.
+/// The same three words every budget uses (`remote.stage_budget_policy`
+/// too), registered on the #2947 `ConfigEnum` rule: an unregistered value is
+/// refused at preflight, never resolved to a fallback.
 ///
-/// **Not enforced yet.** These are parsed, validated and shown by
-/// `darkmux doctor`; enforcement is #2902 step 5, which replaces today's
-/// `remote.*` knobs with one per-endpoint regime. Until then the existing
-/// `remote.max_tokens_per_execution` / `remote.concurrent_cap` still apply
-/// and these values change nothing.
+/// There is deliberately no action that stops a run: a hard stop is the
+/// operator's own `darkmux mission abort`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BudgetPolicy {
+    /// Nothing is counted.
+    Off,
+    /// A breach is surfaced (CLI line, flow record, doctor) and the work
+    /// keeps going.
+    Warn,
+    /// Calls to the endpoint pause until the budget has room again (for a
+    /// rolling window: until enough of it has expired), then resume. The
+    /// run is never killed and no work is lost.
+    Wait,
+}
+
+crate::config_enum!(BudgetPolicy, "budget policy", [
+    Off = "off" => "nothing is counted",
+    Warn = "warn" => "a breach is surfaced and the work keeps going (the default once a budget is set)",
+    Wait = "wait" => "calls pause until the budget has room again, then resume; the run is never stopped",
+]);
+
+impl BudgetPolicy {
+    /// True when the policy counts spend at all.
+    pub fn counts(self) -> bool {
+        !matches!(self, BudgetPolicy::Off)
+    }
+}
+
+/// Standard usage limits for one endpoint.
+///
+/// **What is enforced (#2902 step 5).** The rolling `window` budget
+/// (`tokens`, `calls`, or both, over `period`), under `policy` (`off` /
+/// `warn` / `wait`, see [`BudgetPolicy`]), with an optional early warning
+/// at `warn_at` (a fraction of the budget). Enforcement applies to an
+/// endpoint declared in the `endpoints` map and named by id, because the
+/// usage records it sums are keyed by that id (`endpoint_id`).
+///
+/// **What is not.** `tokens_per_dispatch` and `concurrent_calls` are parsed,
+/// validated and shown by `darkmux doctor`, and change nothing:
+/// `remote.max_tokens_per_execution` (the stage budget) and
+/// `remote.concurrent_cap` still apply. Whether the per-endpoint pair
+/// replaces those two is not decided (#2902).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UsageLimits {
-    /// Tokens one dispatch (one execution) may spend at this endpoint.
+    /// Tokens one dispatch (one execution) may spend at this endpoint. Not
+    /// enforced (see the type doc).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens_per_dispatch: Option<u64>,
-    /// Calls in flight at once.
+    /// Calls in flight at once. Not enforced (see the type doc).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrent_calls: Option<u32>,
-    /// A budget over a period of time.
+    /// A budget over a rolling period of time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<UsageWindow>,
+    /// What a breach does. Absent: `warn` once a budget is set (with no
+    /// budget set, nothing is counted either way). Read leniently: an
+    /// unknown value is kept and refused by name at preflight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<Lenient<BudgetPolicy>>,
+    /// An early warning at this fraction of the budget (e.g. `0.8`), ahead
+    /// of the at-limit one. Unset: only the at-limit warning fires; darkmux
+    /// never picks a threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warn_at: Option<f64>,
     /// Forward-compat overflow.
     #[serde(flatten)]
     pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
-/// A usage budget over a period (`"period": "1d"`), in tokens, calls, or
-/// both. Whether the window is calendar or rolling is decided with
-/// enforcement (#2902 step 5); the shape carries the period as written.
+/// A usage budget over a ROLLING period (`"period": "1d"` is the last 24
+/// hours from now, with no calendar reset), in tokens, calls, or both.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UsageWindow {
     /// `<n>m`, `<n>h` or `<n>d`.
@@ -154,6 +205,27 @@ pub struct UsageWindow {
     pub calls: Option<u64>,
     #[serde(flatten)]
     pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+impl UsageWindow {
+    /// True when a number is set: a window with neither `tokens` nor
+    /// `calls` (the shipped example's all-null shape) is no budget.
+    pub fn is_set(&self) -> bool {
+        self.tokens.is_some() || self.calls.is_some()
+    }
+
+    /// The period in seconds, when it parses.
+    pub fn period_secs(&self) -> Option<u64> {
+        self.period.as_deref().and_then(period_secs)
+    }
+}
+
+/// A window budget ready to enforce: the parsed period and the numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowBudget {
+    pub period_secs: u64,
+    pub tokens: Option<u64>,
+    pub calls: Option<u64>,
 }
 
 impl UsageLimits {
@@ -184,30 +256,77 @@ impl UsageLimits {
         parts.join(" · ")
     }
 
-    /// Shape checks only (enforcement is step 5).
+    /// The window budget, when one is set and its period parses.
+    pub fn window_budget(&self) -> Option<WindowBudget> {
+        let w = self.window.as_ref().filter(|w| w.is_set())?;
+        Some(WindowBudget { period_secs: w.period_secs()?, tokens: w.tokens, calls: w.calls })
+    }
+
+    /// The policy in force. Written: that value (an unregistered one is an
+    /// error naming it). Absent: `warn` when a window budget is set, `off`
+    /// otherwise, so a budget the operator writes warns by default and no
+    /// budget counts nothing.
+    pub fn resolved_policy(&self) -> Result<BudgetPolicy, String> {
+        match &self.policy {
+            Some(Lenient::Known(p)) => Ok(*p),
+            Some(Lenient::Unrecognized(raw)) => Err(raw.as_str().map(str::to_string).unwrap_or_else(|| raw.to_string())),
+            None if self.window.as_ref().is_some_and(UsageWindow::is_set) => Ok(BudgetPolicy::Warn),
+            None => Ok(BudgetPolicy::Off),
+        }
+    }
+
+    /// Shape checks: the window's period, `warn_at`'s range, and the
+    /// policy's value.
     pub fn validate(&self) -> Result<(), String> {
         if let Some(w) = &self.window {
-            if w.tokens.is_none() && w.calls.is_none() {
+            if !w.is_set() && w.period.is_some() {
                 return Err("limits.window sets neither `tokens` nor `calls`".to_string());
             }
-            match w.period.as_deref() {
-                Some(p) if is_period(p) => {}
-                Some(p) => {
-                    return Err(format!(
-                        "limits.window.period must be `<n>m`, `<n>h` or `<n>d` (got {p:?})"
-                    ))
+            if w.is_set() {
+                match w.period.as_deref() {
+                    Some(p) if is_period(p) => {}
+                    Some(p) => {
+                        return Err(format!(
+                            "limits.window.period must be `<n>m`, `<n>h` or `<n>d` (got {p:?})"
+                        ))
+                    }
+                    None => return Err("limits.window needs a `period` (`<n>m`, `<n>h` or `<n>d`)".to_string()),
                 }
-                None => return Err("limits.window needs a `period` (`<n>m`, `<n>h` or `<n>d`)".to_string()),
             }
+        }
+        if let Some(f) = self.warn_at {
+            if !(f.is_finite() && f > 0.0 && f < 1.0) {
+                return Err(format!(
+                    "limits.warn_at must be a fraction between 0 and 1 (e.g. 0.8), got {f}"
+                ));
+            }
+        }
+        if let Err(raw) = self.resolved_policy() {
+            return Err(format!(
+                "limits.policy `{raw}` is not a budget policy; valid: {}",
+                <BudgetPolicy as crate::config_enum::ConfigEnum>::TOKENS.join(", ")
+            ));
         }
         Ok(())
     }
 }
 
+/// `<n>m`, `<n>h` or `<n>d` in seconds, `n >= 1`.
+pub fn period_secs(p: &str) -> Option<u64> {
+    let unit = p.chars().last()?;
+    let n: u64 = p[..p.len() - unit.len_utf8()].parse().ok().filter(|n| *n >= 1)?;
+    let per = match unit {
+        'm' => 60,
+        'h' => 3_600,
+        'd' => 86_400,
+        _ => return None,
+    };
+    n.checked_mul(per)
+}
+
 /// `<n>m`, `<n>h` or `<n>d` with `n >= 1`.
 fn is_period(p: &str) -> bool {
-    let Some(unit) = p.chars().last() else { return false };
-    matches!(unit, 'm' | 'h' | 'd') && p[..p.len() - 1].parse::<u32>().is_ok_and(|n| n >= 1)
+    period_secs(p).is_some()
 }
 
 /// (#2902 review M1) A value read leniently: the known shape, or whatever was
@@ -294,8 +413,8 @@ pub struct ModelEndpoint {
     /// ([`EndpointKind::default_dialect`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialect: Option<Lenient<Dialect>>,
-    /// Standard usage limits (the shape only; not enforced yet, see
-    /// [`UsageLimits`]).
+    /// Usage limits and the budget policy (see [`UsageLimits`] for which
+    /// are enforced).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<Lenient<UsageLimits>>,
     /// How this value was written. Runtime-only.
@@ -444,6 +563,12 @@ impl ModelEndpoint {
             Some(Lenient::Known(l)) => l.summary(),
             Some(Lenient::Unrecognized(_)) => "(unreadable)".to_string(),
         }
+    }
+
+    /// (#2902 step 5) The endpoint's readable limits, `None` when absent or
+    /// unreadable (an unreadable `limits` is `validate`'s finding).
+    pub fn known_limits(&self) -> Option<&UsageLimits> {
+        self.limits.as_ref().and_then(|l| l.known().ok())
     }
 
     /// The host (authority, userinfo stripped) of an unmanaged endpoint's

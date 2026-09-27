@@ -4479,14 +4479,24 @@ fn keychain_item_present(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// (#2902 step 4) `endpoints`: what the registry's `endpoints` map declares,
-/// one line per endpoint (what darkmux does there, the request dialect,
-/// where the credential lives by NAME, and its usage limits), and the move
-/// to name each inline endpoint by id. Limits are parsed and shown here but
-/// NOT ENFORCED until #2902 step 5; the line says so.
+/// (#2902 steps 4 and 5) `endpoints`: what the registry's `endpoints` map
+/// declares, one line per endpoint (what darkmux does there, the request
+/// dialect, where the credential lives by NAME, its limits and its budget),
+/// and the move to name each inline endpoint by id. For a budget that
+/// counts, the line shows its policy and the spend so far in its rolling
+/// window (this machine's usage records, read through the same window
+/// reader the gate uses). An unregistered budget `policy` is Fail: every
+/// dispatch, mission launch and lab run refuses it at preflight.
 fn check_endpoints() -> Check {
     match profiles::load_registry(None) {
-        Ok(l) => endpoints_status(&l.registry),
+        Ok(l) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let mut ledger = darkmux_crew::budget::Ledger::new(darkmux_types::config_access::flows_dir());
+            endpoints_status(&l.registry, &mut |b| ledger.window(&b.endpoint_id, now, b.window.period_secs))
+        }
         Err(e) => Check {
             name: "endpoints".into(),
             status: Status::Warn,
@@ -4496,9 +4506,66 @@ fn check_endpoints() -> Check {
     }
 }
 
-/// Pure decision for [`check_endpoints`].
-fn endpoints_status(registry: &darkmux_types::ProfileRegistry) -> Check {
+/// The budget half of one endpoint's line.
+fn endpoint_budget_note(
+    id: &str,
+    ep: &darkmux_types::ModelEndpoint,
+    spend: &mut dyn FnMut(&darkmux_crew::budget::EndpointBudget) -> darkmux_crew::budget::WindowEntries,
+) -> String {
+    let Some(limits) = ep.known_limits() else { return String::new() };
+    let unenforced = match (limits.tokens_per_dispatch.is_some(), limits.concurrent_calls.is_some()) {
+        (false, false) => "",
+        _ => " (tokens_per_dispatch and concurrent_calls are shown, not enforced)",
+    };
+    let mut named = ep.clone();
+    named.source = darkmux_types::EndpointSource::Named(id.to_string());
+    match darkmux_crew::budget::EndpointBudget::of(&named) {
+        Err(_) => String::new(), // the Fail row names it
+        Ok(None) => match limits.resolved_policy() {
+            Ok(darkmux_types::BudgetPolicy::Off) if limits.window.as_ref().is_some_and(|w| w.is_set()) => {
+                format!("; budget off (nothing is counted){unenforced}")
+            }
+            _ if limits.window.as_ref().is_some_and(|w| w.is_set()) => {
+                format!("; window budget unusable (its period does not parse){unenforced}")
+            }
+            _ => format!("; no window budget{unenforced}"),
+        },
+        Ok(Some(b)) => {
+            let entries = spend(&b);
+            let tokens: u64 = entries.iter().map(|(_, n)| *n).sum();
+            let policy = darkmux_types::config_enum::ConfigEnum::token(b.policy);
+            let warn_at = b.warn_at.map(|f| format!(", early warning at {:.0}%", f * 100.0)).unwrap_or_default();
+            format!(
+                "; budget {policy}{warn_at}: spent {tokens} tokens in {} calls over the last {}{unenforced}",
+                entries.len(),
+                b.period
+            )
+        }
+    }
+}
+
+/// Pure decision for [`check_endpoints`]; `spend` reads one budget's window.
+fn endpoints_status(
+    registry: &darkmux_types::ProfileRegistry,
+    spend: &mut dyn FnMut(&darkmux_crew::budget::EndpointBudget) -> darkmux_crew::budget::WindowEntries,
+) -> Check {
     let name = "endpoints".to_string();
+    let bad = darkmux_types::config_enum::bad_endpoint_budget_policies(registry);
+    if !bad.is_empty() {
+        let fix = bad.iter().map(|b| b.fix()).collect::<Vec<_>>().join("; ");
+        return Check {
+            name,
+            status: Status::Fail,
+            message: format!(
+                "{}; {}",
+                bad.iter().map(|b| b.summary()).collect::<Vec<_>>().join("; "),
+                bad[0].valid_line()
+            ),
+            hint: Some(format!(
+                "Every dispatch, mission launch and lab run refuses to start until this is fixed: {fix}. (#2902)"
+            )),
+        };
+    }
     let mut lines: Vec<String> = Vec::new();
     for (id, ep) in &registry.endpoints {
         let kind = match ep.kind() {
@@ -4519,16 +4586,33 @@ fn endpoints_status(registry: &darkmux_types::ProfileRegistry) -> Check {
         };
         let limits = Some(ep.limits_summary())
             .filter(|s| !s.is_empty())
-            .map(|s| format!("; limits {s} (not enforced yet, #2902 step 5)"))
+            .map(|s| format!("; limits {s}"))
             .unwrap_or_default();
-        lines.push(format!("`{id}`: {kind}, {dialect}, {credential}{limits}"));
+        let budget = endpoint_budget_note(id, ep, spend);
+        lines.push(format!("`{id}`: {kind}, {dialect}, {credential}{limits}{budget}"));
     }
-    let advice: Vec<String> = registry
+    let mut advice: Vec<String> = registry
         .validate()
         .into_iter()
         .filter(|i| i.severity == darkmux_types::IssueSeverity::Advice)
         .map(|i| i.message)
         .collect();
+    // (#2902 step 5) A window budget on an INLINE endpoint is not enforced:
+    // its usage records carry no `endpoints` id to sum by.
+    for (pname, profile) in &registry.profiles {
+        for m in &profile.models {
+            let Some(ep) = m.endpoint.as_ref().filter(|e| e.source == darkmux_types::EndpointSource::Inline) else {
+                continue;
+            };
+            if ep.known_limits().and_then(|l| l.window.as_ref()).is_some_and(|w| w.is_set()) {
+                advice.push(format!(
+                    "profile \"{pname}\" model \"{}\" sets a window budget on an inline endpoint, which is \
+                     not enforced: a budget is summed by `endpoints` id, so declare the endpoint there",
+                    m.id
+                ));
+            }
+        }
+    }
     let listed = if lines.is_empty() {
         "no `endpoints` declared".to_string()
     } else {
@@ -4547,7 +4631,8 @@ fn endpoints_status(registry: &darkmux_types::ProfileRegistry) -> Check {
             hint: Some(
                 "Inline `endpoint` objects still work. Declaring each endpoint once under the \
                  top-level `endpoints` map and naming it by id (`\"endpoint\": \"<id>\"`) keeps \
-                 its url, auth and limits in one place for every profile that uses it. (#2902)"
+                 its url, auth and limits in one place for every profile that uses it, and is \
+                 what lets its window budget be enforced. (#2902)"
                     .into(),
             ),
         }
@@ -13171,10 +13256,16 @@ mod tests {
         r
     }
 
-    /// (#2902 step 4) `endpoints` lists what each declared endpoint is, by
-    /// name only (never a secret), with its limits marked unenforced.
+    fn no_spend(_: &darkmux_crew::budget::EndpointBudget) -> darkmux_crew::budget::WindowEntries {
+        Vec::new()
+    }
+
+    /// (#2902 steps 4 and 5) `endpoints` lists what each declared endpoint
+    /// is, by name only (never a secret), with its budget policy and the
+    /// spend in its rolling window; the per-dispatch and concurrency limits
+    /// are marked not enforced.
     #[test]
-    fn endpoints_check_lists_each_endpoint_and_says_limits_are_not_enforced() {
+    fn endpoints_check_lists_each_endpoint_with_its_budget_and_window_spend() {
         let r = materialized(
             r#"{"profiles":{"p":{"models":[{"id":"gpt-4o","endpoint":"azure"}]}},
                 "endpoints":{
@@ -13183,20 +13274,53 @@ mod tests {
                         "limits":{"tokens_per_dispatch":500000,"window":{"period":"1d","tokens":2000000}}},
                     "lms":{"managed":"lmstudio"}}}"#,
         );
-        let c = endpoints_status(&r);
+        let mut asked = Vec::new();
+        let c = endpoints_status(&r, &mut |b| {
+            asked.push(b.endpoint_id.clone());
+            vec![(1, 1_200_000), (2, 300_000)]
+        });
         assert_eq!(c.status, Status::Pass, "{}", c.message);
         assert!(c.message.contains("`azure`: unmanaged, r.example"), "host only, userinfo stripped: {}", c.message);
         assert!(!c.message.contains("tok@") && !c.message.contains("deployments"), "{}", c.message);
         assert!(c.message.contains("credential from Keychain `darkmux-azure`"), "{}", c.message);
-        assert!(c.message.contains("500000 tokens/dispatch · 2000000 tokens per 1d (not enforced yet"), "{}", c.message);
+        assert!(c.message.contains("limits 500000 tokens/dispatch · 2000000 tokens per 1d"), "{}", c.message);
+        assert!(
+            c.message.contains("budget warn: spent 1500000 tokens in 2 calls over the last 1d"),
+            "absent policy + a set budget = warn, with the window's spend: {}",
+            c.message
+        );
+        assert!(c.message.contains("shown, not enforced"), "{}", c.message);
         assert!(c.message.contains("`lms`: managed (lmstudio), chat-completions-max-tokens"), "{}", c.message);
+        assert_eq!(asked, vec!["azure".to_string()], "only a counting budget reads the window");
+    }
+
+    /// (#2902 step 5) An unregistered budget policy is Fail, naming the raw
+    /// value, where it was set and the valid values; `off` reads nothing.
+    #[test]
+    fn endpoints_check_fails_on_an_unregistered_policy_and_off_reads_nothing() {
+        let bad = materialized(
+            r#"{"profiles":{"p":{"models":[{"id":"m","endpoint":"e"}]}},
+                "endpoints":{"e":{"url":"https://h.example/v1","limits":{"policy":"stop","window":{"period":"1d","tokens":5}}}}}"#,
+        );
+        let c = endpoints_status(&bad, &mut no_spend);
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("`stop`") && c.message.contains("endpoints.e.limits.policy"), "{}", c.message);
+        for v in ["off", "warn", "wait"] {
+            assert!(c.message.contains(v), "{v}: {}", c.message);
+        }
+        let off = materialized(
+            r#"{"profiles":{"p":{"models":[{"id":"m","endpoint":"e"}]}},
+                "endpoints":{"e":{"url":"https://h.example/v1","limits":{"policy":"off","window":{"period":"1d","tokens":5}}}}}"#,
+        );
+        let c = endpoints_status(&off, &mut |_| panic!("an `off` budget must not read the window"));
+        assert!(c.message.contains("budget off (nothing is counted)"), "{}", c.message);
     }
 
     /// (#2902 step 4) An inline endpoint still works; doctor names the move.
     #[test]
     fn endpoints_check_names_the_move_from_inline_to_an_id() {
         let r = materialized(r#"{"profiles":{"p":{"models":[{"id":"grok-4","endpoint":{"url":"https://api.x.ai/v1"}}]}}}"#);
-        let c = endpoints_status(&r);
+        let c = endpoints_status(&r, &mut no_spend);
         assert_eq!(c.status, Status::Pass, "advice, not a warning, for a working inline endpoint");
         assert!(c.message.contains("advice: "), "{}", c.message);
         assert!(c.message.contains("move the object to `endpoints.\"api.x.ai\"`"), "{}", c.message);
