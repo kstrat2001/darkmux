@@ -5154,8 +5154,12 @@ mod tests {
         })
         .expect("mock answers");
         assert!(env.actions().is_empty(), "no cap, no warning: {:?}", env.actions());
-        let o: serde_json::Value = serde_json::from_str(&out.output).unwrap();
-        assert!(o["remote_max_tokens_per_execution"].is_null(), "no cap is reported: {o}");
+        let recs = as_values(&out.flow_records);
+        let step_rec = recs
+            .iter()
+            .find(|r| r["payload"].get("remote_max_tokens_per_execution").is_some())
+            .unwrap_or_else(|| panic!("the step's telemetry record: {recs:#?}"));
+        assert!(step_rec["payload"]["remote_max_tokens_per_execution"].is_null(), "no cap is reported: {step_rec}");
     }
 
     /// (#2902 step 5 review, 3rd pass MUST FIX 1) A hosted `dispatch.map`
