@@ -709,8 +709,20 @@ pub enum Problem {
     Unreadable(String),
     /// The file is not valid JSON (the parser's message).
     NotJson(String),
-    /// Keys the file's schema does not know.
+    /// Keys the file's schema does not accept.
     Keys(Vec<KeyIssue>),
+}
+
+/// Which files of a kind a check reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// Every file on disk, for `darkmux doctor`: a file nothing loads is
+    /// still reported, with a [`FileProblem::note`] saying why it refuses
+    /// nothing.
+    Every,
+    /// Only the files an operation would load, for a preflight: the
+    /// effective copy of each id, never one another tier shadows.
+    Effective,
 }
 
 /// One user file that the gate refuses: where it is, what kind it is, and
@@ -721,6 +733,9 @@ pub struct FileProblem {
     pub kind: UserFileKind,
     pub path: PathBuf,
     pub problem: Problem,
+    /// Why this file refuses nothing, when it refuses nothing (it is
+    /// shadowed, or only a run that binds it reads it). Doctor only.
+    pub note: Option<String>,
 }
 
 impl fmt::Display for FileProblem {
@@ -733,8 +748,45 @@ impl fmt::Display for FileProblem {
                 let lines: Vec<String> = keys.iter().map(ToString::to_string).collect();
                 write!(f, "{}", lines.join("; "))
             }
+        }?;
+        match &self.note {
+            Some(note) => write!(f, " ({note})"),
+            None => Ok(()),
         }
     }
+}
+
+/// Check tiered documents: `docs` is every `(id, path)` in precedence order
+/// (the first copy of an id is the one that loads). [`Reach::Effective`]
+/// checks only those; [`Reach::Every`] checks all, noting on a shadowed copy
+/// which file shadows it.
+pub fn check_tiered<T: JsonSchema + 'static>(
+    kind: UserFileKind,
+    docs: &[(String, PathBuf)],
+    retired: RetiredLookup<'_>,
+    reach: Reach,
+) -> Vec<FileProblem> {
+    let mut first: BTreeMap<&str, &Path> = BTreeMap::new();
+    let mut out = Vec::new();
+    for (id, path) in docs {
+        let shadowed_by = match first.get(id.as_str()) {
+            Some(winner) => Some(*winner),
+            None => {
+                first.insert(id, path);
+                None
+            }
+        };
+        if shadowed_by.is_some() && reach == Reach::Effective {
+            continue;
+        }
+        if let Some(mut found) = check_path::<T>(kind, path, retired) {
+            found.note = shadowed_by.map(|w| {
+                format!("shadowed by {}: never loaded, so nothing refuses to start over it", escape_text(&w.display().to_string()))
+            });
+            out.push(found);
+        }
+    }
+    out
 }
 
 /// Check one document's text against `T`. `None` when it is clean.
@@ -754,7 +806,7 @@ pub fn check_text<T: JsonSchema + 'static>(
             Problem::Keys(keys)
         }
     };
-    Some(FileProblem { kind, path: path.to_path_buf(), problem })
+    Some(FileProblem { kind, path: path.to_path_buf(), problem, note: None })
 }
 
 /// Check the file at `path` against `T`. `None` when it is clean or absent.
@@ -765,7 +817,7 @@ pub fn check_path<T: JsonSchema + 'static>(kind: UserFileKind, path: &Path, reti
     match std::fs::read_to_string(path) {
         Ok(text) => check_text::<T>(kind, path, &text, retired),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => Some(FileProblem { kind, path: path.to_path_buf(), problem: Problem::Unreadable(e.to_string()) }),
+        Err(e) => Some(FileProblem { kind, path: path.to_path_buf(), problem: Problem::Unreadable(e.to_string()), note: None }),
     }
 }
 

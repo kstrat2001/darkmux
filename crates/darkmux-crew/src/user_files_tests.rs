@@ -5,7 +5,7 @@
 
 use super::*;
 use darkmux_types::test_isolation::IsolatedState;
-use darkmux_types::user_files::{no_retired, open_objects, key_issues, Problem};
+use darkmux_types::user_files::{key_issues, no_retired, open_objects, Problem, Reach};
 use serde_json::{json, Value};
 
 fn embedded(table: &[(&str, &str)], id: &str) -> Value {
@@ -102,7 +102,7 @@ fn each_kind_refuses_an_unknown_key_at_every_consuming_preflight_naming_the_clos
         for (doc, key, closest) in &case.probes {
             let state = IsolatedState::new();
             let path = write(&state, case.subdir, doc);
-            let found = problems(case.kind);
+            let found = problems(case.kind, Reach::Every);
             assert_eq!(found.len(), 1, "{:?} {key}: {found:?}", case.kind);
             let msg = found[0].to_string();
             assert!(msg.contains(&path.display().to_string()), "names the file: {msg}");
@@ -131,7 +131,7 @@ fn clean_documents_pass_and_nothing_is_refused() {
     let state = IsolatedState::new();
     for case in cases() {
         write(&state, case.subdir, &case.clean);
-        assert_eq!(problems(case.kind), vec![], "{:?}", case.kind);
+        assert_eq!(problems(case.kind, Reach::Every), vec![], "{:?}", case.kind);
     }
     for scope in Scope::ALL {
         assert_eq!(preflight(scope), Ok(()), "{scope:?}");
@@ -160,7 +160,7 @@ fn a_syntax_error_is_reported_not_skipped() {
     let state = IsolatedState::new();
     std::fs::create_dir_all(state.join("roles")).unwrap();
     std::fs::write(state.join("roles/broken.json"), "{\"id\": ").unwrap();
-    let found = problems(UserFileKind::Role);
+    let found = problems(UserFileKind::Role, Reach::Every);
     assert!(matches!(found.as_slice(), [p] if matches!(p.problem, Problem::NotJson(_))), "{found:?}");
     assert!(preflight(Scope::Dispatch).is_err());
 }
@@ -201,7 +201,7 @@ fn a_retired_mission_config_key_names_its_replacement() {
     mission["gh_verb"] = json!("pr-merge");
     mission["phases"][0]["tasks"][0]["expand"] = json!({"over": "items"});
     write(&state, "mission-configs", &mission);
-    let msg = problems(UserFileKind::MissionConfig).iter().map(ToString::to_string).collect::<String>();
+    let msg = problems(UserFileKind::MissionConfig, Reach::Every).iter().map(ToString::to_string).collect::<String>();
     assert!(msg.contains("unknown key `gh_verb`: RENAMED to `cmd` in schema 3.0"), "{msg}");
     assert!(msg.contains("unknown key `phases[0].tasks[0].expand`: REMOVED in schema 2.0"), "{msg}");
 }
@@ -233,7 +233,7 @@ fn a_mistyped_value_is_refused_where_the_loader_would_fall_back_to_the_builtin()
 fn a_partial_rule_override_is_not_missing_keys() {
     let state = IsolatedState::new();
     write(&state, "rules", &json!({"id": "existing-solution", "window": 40}));
-    assert_eq!(problems(UserFileKind::Rule), vec![]);
+    assert_eq!(problems(UserFileKind::Rule, Reach::Every), vec![]);
 }
 
 /// (review C3) Every role key a released darkmux had and this one does not,
@@ -246,7 +246,41 @@ fn every_historical_role_key_is_named_as_retired() {
     role["capabilities"] = json!(["code-reviewing"]);
     role["tier"] = json!("large");
     write(&state, "roles", &role);
-    let msg = problems(UserFileKind::Role).iter().map(ToString::to_string).collect::<String>();
+    let msg = problems(UserFileKind::Role, Reach::Every).iter().map(ToString::to_string).collect::<String>();
     assert!(msg.contains("unknown key `capabilities`: renamed to `skills`"), "{msg}");
     assert!(msg.contains("unknown key `tier`: removed in #605"), "{msg}");
+}
+
+/// (review C4) A mission-config copy another tier shadows is never loaded,
+/// so the launch preflight does not refuse over it; the effective copy is
+/// what counts. Doctor still names the shadowed copy, and says so.
+#[test]
+#[serial_test::serial]
+fn a_shadowed_mission_config_does_not_block_a_launch() {
+    let state = IsolatedState::new();
+    let tpl = state.join("tpl");
+    std::fs::create_dir_all(tpl.join("mission-configs")).unwrap();
+    unsafe { std::env::set_var("DARKMUX_TEMPLATES_DIR", &tpl) };
+    let good = embedded(crate::mission_config::load::EMBEDDED_MISSION_CONFIGS, "machine-status");
+    let bad = with_key(good.clone(), "", "phase");
+    std::fs::write(tpl.join("mission-configs/machine-status.json"), bad.to_string()).unwrap();
+    // The user tier holds a clean copy of the same id: it wins, the template never loads.
+    write_named(&state, "mission-configs", "machine-status", &good);
+    let launch = preflight(Scope::MissionLaunch);
+    let every = problems(UserFileKind::MissionConfig, Reach::Every);
+    // The shadowing copy removed: the bad one is the effective copy now.
+    std::fs::remove_file(state.join("mission-configs/machine-status.json")).unwrap();
+    let unshadowed = preflight(Scope::MissionLaunch).err().map(|r| r.to_string());
+    unsafe { std::env::remove_var("DARKMUX_TEMPLATES_DIR") };
+    assert_eq!(launch, Ok(()), "a shadowed copy must not block the launch");
+    assert_eq!(every.len(), 1, "{every:?}");
+    let msg = every[0].to_string();
+    assert!(msg.contains("shadowed by") && msg.contains("never loaded"), "doctor says why it does not refuse: {msg}");
+    assert!(unshadowed.is_some_and(|r| r.contains("unknown key `phase`")), "the effective copy is still refused");
+}
+
+fn write_named(state: &IsolatedState, subdir: &str, id: &str, doc: &Value) {
+    let dir = state.join(subdir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{id}.json")), doc.to_string()).unwrap();
 }

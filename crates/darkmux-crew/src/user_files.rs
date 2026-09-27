@@ -6,23 +6,25 @@
 //! consumes. `darkmux-lab` adds workloads and fixtures for a lab run.
 
 use darkmux_types::config_enum::{PreflightRefusal, Scope};
-use darkmux_types::user_files::{check_dir, no_retired, FileProblem, UserFileKind};
+use darkmux_types::user_files::{check_dir, check_tiered, no_retired, FileProblem, Reach, UserFileKind};
 
 use crate::mission_config::MissionConfig;
 use crate::rules::Rule;
 use crate::types::{Crew, Role, Skill};
 
-/// Every problem in the on-disk files of `kind` this crate owns. A kind
-/// another crate owns has nothing here.
-pub fn problems(kind: UserFileKind) -> Vec<FileProblem> {
+/// Every problem in the on-disk files of `kind` this crate owns, at `reach`
+/// (mission configs are tiered: a shadowed copy is only in
+/// [`Reach::Every`]). A kind another crate owns has nothing here.
+pub fn problems(kind: UserFileKind, reach: Reach) -> Vec<FileProblem> {
     match kind {
         UserFileKind::Role => check_dir::<Role>(kind, &crate::loader::roles_dir(), &role_retired),
         UserFileKind::Skill => check_dir::<Skill>(kind, &crate::loader::skills_dir(), &no_retired),
         UserFileKind::Crew => check_dir::<Crew>(kind, &crate::loader::crews_dir(), &no_retired),
-        UserFileKind::MissionConfig => crate::mission_config::load::on_disk_dirs()
-            .iter()
-            .flat_map(|d| check_dir::<MissionConfig>(kind, d, &crate::mission_config::retired_key))
-            .collect(),
+        UserFileKind::MissionConfig => {
+            let docs: Vec<(String, std::path::PathBuf)> =
+                crate::mission_config::load::on_disk_dirs().iter().flat_map(|d| json_docs_by_stem(d)).collect();
+            check_tiered::<MissionConfig>(kind, &docs, &crate::mission_config::retired_key, reach)
+        }
         UserFileKind::Rule => check_dir::<Rule>(kind, &crate::rules::user_rules_dir(), &no_retired)
             .into_iter()
             .filter_map(without_missing_keys)
@@ -33,6 +35,19 @@ pub fn problems(kind: UserFileKind) -> Vec<FileProblem> {
         | UserFileKind::LabFixture
         | UserFileKind::WorkspaceSpec => Vec::new(),
     }
+}
+
+/// `(id, path)` of every `<id>.json` directly in `dir`, in name order.
+fn json_docs_by_stem(dir: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut docs: Vec<(String, std::path::PathBuf)> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "json"))
+        .filter_map(|p| Some((p.file_stem()?.to_str()?.to_string(), p)))
+        .collect();
+    docs.sort();
+    docs
 }
 
 /// A role manifest's retired keys: every key a past `Role` had and this one
@@ -70,7 +85,7 @@ pub fn preflight_with(scope: Scope, profiles_file: Option<&str>) -> Result<(), P
     let mut refusal = darkmux_profiles::preflight_with(scope, profiles_file)
         .err()
         .unwrap_or_else(|| PreflightRefusal::none(scope));
-    refusal.files.extend(UserFileKind::consumed_by(scope).flat_map(problems));
+    refusal.files.extend(UserFileKind::consumed_by(scope).flat_map(|k| problems(k, Reach::Effective)));
     refusal.into_result()
 }
 

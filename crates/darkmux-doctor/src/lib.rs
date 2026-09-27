@@ -1944,8 +1944,10 @@ fn user_file_problems(kind: darkmux_types::user_files::UserFileKind) -> Vec<dark
         | UserFileKind::Skill
         | UserFileKind::Crew
         | UserFileKind::MissionConfig
-        | UserFileKind::Rule => darkmux_crew::user_files::problems(kind),
-        UserFileKind::Workload | UserFileKind::LabFixture => darkmux_lab::user_files::problems(kind),
+        | UserFileKind::Rule => darkmux_crew::user_files::problems(kind, darkmux_types::user_files::Reach::Every),
+        UserFileKind::Workload | UserFileKind::LabFixture => {
+            darkmux_lab::user_files::problems(kind, darkmux_types::user_files::Reach::Every)
+        }
         UserFileKind::WorkspaceSpec => Vec::new(),
     }
 }
@@ -1964,9 +1966,10 @@ fn user_file_key_rows(problems: &[darkmux_types::user_files::FileProblem]) -> Ve
         .iter()
         .map(|p| {
             let refused_by: Vec<&str> = p.kind.scopes().iter().map(|s| s.label()).collect();
-            let consequence = match refused_by.is_empty() {
-                true => "Nothing that starts work reads this file, so nothing refuses to start over it".to_string(),
-                false => format!("Refused at preflight by: {}", refused_by.join(", ")),
+            let consequence = match (&p.note, refused_by.is_empty()) {
+                (Some(_), _) => String::new(),
+                (None, true) => ". Nothing that starts work reads this file, so nothing refuses to start over it".to_string(),
+                (None, false) => format!(". Refused at preflight by: {}", refused_by.join(", ")),
             };
             Check {
                 // The file name keeps the row's name column narrow; the
@@ -1978,7 +1981,7 @@ fn user_file_key_rows(problems: &[darkmux_types::user_files::FileProblem]) -> Ve
                     )
                 ),
                 status: Status::Fail,
-                message: format!("{p}. {consequence}"),
+                message: format!("{p}{consequence}"),
                 hint: Some("rename each key to the valid one named, or delete it; loading ignores it".into()),
             }
         })

@@ -131,17 +131,25 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
     // (#2947) Bad enum config refuses before a run directory is claimed.
     // Every lab verb that runs a workload (`lab run`, `lab loop`, and the
     // benches built on this function) comes through here.
-    crate::user_files::preflight_with(darkmux_types::config_enum::Scope::LabRun, opts.config_path.as_deref())?;
-    let paths = paths::resolve(ResolveScope::Auto);
-    paths::ensure(&paths)?;
-
+    //
     // (#2590) The workload document resolves at the HOME tier, never from a
     // project-local `.darkmux/` in the cwd, which could otherwise outrank the
-    // embedded workload of the same id. `paths` above stays `Auto` on
-    // purpose: it only places the sandbox fallback, which is deliberately
-    // project-local.
+    // embedded workload of the same id. It is read (never written) before
+    // the preflight, which checks the fixture it binds; a workload that does
+    // not load still gets the preflight's precise refusal first.
     let user_workloads_root = paths::resolve(ResolveScope::ForceUser).root;
-    let mut loaded_workload = load(&opts.workload_id, Some(user_workloads_root.as_path()))?;
+    let loaded = load(&opts.workload_id, Some(user_workloads_root.as_path()));
+    let binds = loaded.as_ref().ok().and_then(|w| w.manifest.workload.requires_fixture.clone());
+    crate::user_files::preflight_with(
+        darkmux_types::config_enum::Scope::LabRun,
+        opts.config_path.as_deref(),
+        binds.as_deref(),
+    )?;
+    let mut loaded_workload = loaded?;
+    // `paths` stays `Auto` on purpose: it only places the sandbox fallback,
+    // which is deliberately project-local.
+    let paths = paths::resolve(ResolveScope::Auto);
+    paths::ensure(&paths)?;
     apply_inject_context(&mut loaded_workload, opts.inject_context.as_deref());
 
     let registry_loaded = load_registry(opts.config_path.as_deref())?;

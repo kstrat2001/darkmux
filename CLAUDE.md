@@ -268,6 +268,10 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    never discards the rest of the file), and `darkmux doctor` still runs against a file that
    is not even JSON. **Consuming refuses**: every entry point that consumes the file refuses
    at preflight, before minting anything, and doctor reports it as Fail, one row per file.
+   A preflight refuses only over a file the operation would load: the effective copy of each
+   mission config and workload id (a copy another tier shadows never loads), and the one lab
+   fixture the run's workload binds. Doctor fails every file, and says when one is shadowed
+   or only read by a run that binds it.
    Both name the file, the key's dotted path and the closest valid key (the same shape as
    contract 9's enum refusal); a retired key names what replaced it instead of a guess.
    **A value of the wrong type, or a missing required key, is refused the same way**, naming the path, the expected

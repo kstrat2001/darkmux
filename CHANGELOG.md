@@ -42,7 +42,10 @@ darkmux release.
   silently lose to the builtin of the same id. A mistyped `profiles.json`
   entry keeps its loud per-entry quarantine instead. **Migration:** run
   `darkmux doctor` and delete or rename each key its `user file keys` rows
-  name. A fixture registered from an older darkmux checkout keeps its old
+  name. A preflight refuses only over files the run would load: the
+  effective copy of each mission config and workload (a shadowed copy is
+  reported by doctor, not refused), and the fixture the run binds. A fixture
+  registered from an older darkmux checkout keeps its old
   `.fixture.json`; delete `hash_exclude` from it, or re-run
   `scripts/lab-init.sh --force` from a current checkout.
 - **A mission config's `source_input` and `ticket` are declared fields.**

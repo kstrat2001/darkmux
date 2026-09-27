@@ -5,7 +5,7 @@
 
 use super::*;
 use darkmux_types::test_isolation::IsolatedState;
-use darkmux_types::user_files::{no_retired, open_objects, key_issues};
+use darkmux_types::user_files::{key_issues, no_retired, open_objects, Reach};
 use serde_json::{json, Value};
 
 fn quick_q() -> Value {
@@ -41,11 +41,16 @@ fn register_fixture(state: &IsolatedState, doc: &Value) -> std::path::PathBuf {
     let manifest = dir.join(".fixture.json");
     std::fs::write(&manifest, doc.to_string()).unwrap();
     let registry = json!({"fixtures": {"probe": {
-        "path": dir, "content_hash": "x", "hashed_at": "2026-01-01T00:00:00Z", "manifest_version": "1.0"
+        "path": dir, "content_hash": "x", "hashed_at": "2026-01-01T00:00:00Z", "manifest_version": "1.0",
+        "satisfies": PROBE_FIXTURE
     }}});
     std::fs::write(state.join("lab-registry.json"), registry.to_string()).unwrap();
     manifest
 }
+
+/// The requirement the probe fixture satisfies, which a workload names to
+/// bind it.
+const PROBE_FIXTURE: &str = "probe-suite@1.0";
 
 fn assert_refused(msg: &str, path: &std::path::Path, key: &str, closest: &str) {
     assert!(msg.contains(&path.display().to_string()), "names the file: {msg}");
@@ -66,13 +71,13 @@ fn a_workload_with_an_unknown_key_is_refused_by_the_lab_preflight() {
     for (doc, key, closest) in probes {
         let state = IsolatedState::new();
         let path = write_workload(&state, &doc);
-        let found = problems(UserFileKind::Workload);
+        let found = problems(UserFileKind::Workload, Reach::Every);
         assert_eq!(found.len(), 1, "{key}: {found:?}");
         assert_refused(&found[0].to_string(), &path, key, closest);
-        let refusal = preflight_with(Scope::LabRun, None).expect_err(key).to_string();
+        let refusal = preflight_with(Scope::LabRun, None, Some(PROBE_FIXTURE)).expect_err(key).to_string();
         assert_refused(&refusal, &path, key, closest);
         for scope in [Scope::Dispatch, Scope::MissionLaunch, Scope::FleetSubmission] {
-            assert_eq!(preflight_with(scope, None), Ok(()), "a workload is consumed only by a lab run ({scope:?})");
+            assert_eq!(preflight_with(scope, None, None), Ok(()), "a workload is consumed only by a lab run ({scope:?})");
         }
     }
 }
@@ -90,7 +95,7 @@ fn a_fixture_manifest_with_an_unknown_key_is_refused_by_the_lab_preflight() {
     for (doc, key, closest) in probes {
         let state = IsolatedState::new();
         let path = register_fixture(&state, &doc);
-        let refusal = preflight_with(Scope::LabRun, None).expect_err(key).to_string();
+        let refusal = preflight_with(Scope::LabRun, None, Some(PROBE_FIXTURE)).expect_err(key).to_string();
         assert_refused(&refusal, &path, key, closest);
     }
 }
@@ -105,7 +110,7 @@ fn a_retired_key_names_its_removal() {
     let mut fx = tiny_fixture();
     fx["hash_exclude"] = json!(["__pycache__"]);
     register_fixture(&state, &fx);
-    let refusal = preflight_with(Scope::LabRun, None).unwrap_err().to_string();
+    let refusal = preflight_with(Scope::LabRun, None, Some(PROBE_FIXTURE)).unwrap_err().to_string();
     assert!(refusal.contains("unknown key `workload.expected.test_count_baseline`: removed in #2833"), "{refusal}");
     assert!(refusal.contains("unknown key `hash_exclude`: removed in #610"), "{refusal}");
 }
@@ -139,7 +144,7 @@ fn clean_files_pass() {
     let state = IsolatedState::new();
     write_workload(&state, &quick_q());
     register_fixture(&state, &tiny_fixture());
-    assert_eq!(preflight_with(Scope::LabRun, None), Ok(()));
+    assert_eq!(preflight_with(Scope::LabRun, None, Some(PROBE_FIXTURE)), Ok(()));
 }
 
 /// What darkmux ships must never be refused: every embedded workload and
@@ -205,7 +210,7 @@ fn a_mistyped_workload_value_is_refused() {
     let mut wl = quick_q();
     wl["workload"]["verify"] = json!({"must_contain": "four"});
     write_workload(&state, &wl);
-    let refusal = preflight_with(Scope::LabRun, None).unwrap_err().to_string();
+    let refusal = preflight_with(Scope::LabRun, None, Some(PROBE_FIXTURE)).unwrap_err().to_string();
     assert!(refusal.contains("`workload.verify.must_contain` must be a list, got \"four\""), "{refusal}");
 }
 
@@ -315,7 +320,72 @@ fn every_historical_workload_and_fixture_key_is_named_as_retired() {
     let mut fx = tiny_fixture();
     fx["hash_include"] = json!(["src"]);
     register_fixture(&state, &fx);
-    let refusal = preflight_with(Scope::LabRun, None).unwrap_err().to_string();
+    let refusal = preflight_with(Scope::LabRun, None, Some(PROBE_FIXTURE)).unwrap_err().to_string();
     assert!(refusal.contains("unknown key `workload.agent`: renamed to `role`"), "{refusal}");
     assert!(refusal.contains("unknown key `hash_include`: removed in #610"), "{refusal}");
+}
+
+/// (review C4) One bad registered fixture must not block every lab run:
+/// only the fixture the run binds is checked. Doctor still names it, and
+/// says no workload being run needs it.
+#[test]
+#[serial_test::serial]
+fn a_bad_fixture_blocks_only_the_run_that_binds_it() {
+    let state = IsolatedState::new();
+    write_workload(&state, &quick_q());
+    register_fixture(&state, &with_key(tiny_fixture(), "", "zzz_bogus"));
+    assert_eq!(preflight_with(Scope::LabRun, None, None), Ok(()), "a run binding no fixture is not refused");
+    assert_eq!(preflight_with(Scope::LabRun, None, Some("other-suite@1.0")), Ok(()), "nor one binding another");
+    let bound = preflight_with(Scope::LabRun, None, Some(PROBE_FIXTURE)).unwrap_err().to_string();
+    assert!(bound.contains("unknown key `zzz_bogus`"), "{bound}");
+    let every = problems(UserFileKind::LabFixture, Reach::Every);
+    assert_eq!(every.len(), 1);
+    assert!(every[0].to_string().contains("only a run that binds"), "{}", every[0]);
+}
+
+/// (review C4) A workload copy another tier shadows is never loaded.
+#[test]
+#[serial_test::serial]
+fn a_shadowed_workload_does_not_block_a_run() {
+    let state = IsolatedState::new();
+    let tpl = state.join("tpl");
+    std::fs::create_dir_all(tpl.join("workloads")).unwrap();
+    unsafe { std::env::set_var("DARKMUX_TEMPLATES_DIR", &tpl) };
+    std::fs::write(tpl.join("workloads/quick-q.json"), with_key(quick_q(), "/workload", "promt").to_string()).unwrap();
+    write_workload_named(&state, "quick-q", &quick_q());
+    let run = preflight_with(Scope::LabRun, None, None);
+    let every = problems(UserFileKind::Workload, Reach::Every);
+    unsafe { std::env::remove_var("DARKMUX_TEMPLATES_DIR") };
+    assert_eq!(run, Ok(()));
+    assert_eq!(every.len(), 1);
+    assert!(every[0].to_string().contains("shadowed by"), "{}", every[0]);
+}
+
+fn write_workload_named(state: &IsolatedState, id: &str, doc: &Value) {
+    std::fs::create_dir_all(state.join("workloads")).unwrap();
+    std::fs::write(state.join(format!("workloads/{id}.json")), doc.to_string()).unwrap();
+}
+
+/// `lab run` checks the fixture its workload binds, before minting.
+#[test]
+#[serial_test::serial]
+fn lab_run_refuses_the_bad_fixture_its_workload_binds() {
+    let state = IsolatedState::new();
+    let mut wl = quick_q();
+    wl["workload"]["id"] = json!("probe-fx");
+    wl["workload"]["requires_fixture"] = json!(PROBE_FIXTURE);
+    write_workload_named(&state, "probe-fx", &wl);
+    register_fixture(&state, &with_key(tiny_fixture(), "", "zzz_bogus"));
+    let err = crate::lab::run::lab_run(crate::lab::run::RunOpts {
+        workload_id: "probe-fx".into(),
+        profile_name: None,
+        runs: 1,
+        config_path: None,
+        quiet: true,
+        loop_override: None,
+        inject_context: None,
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("lab run: refusing to start") && err.contains("unknown key `zzz_bogus`"), "{err}");
 }
