@@ -31,7 +31,6 @@
 
 use serde::Serialize;
 use std::collections::HashSet;
-use std::path::PathBuf;
 
 /// How many of the most-recent day-files a correction scan reads. Corrections
 /// are carried forward WITHIN a mission's working window; an unbounded scan
@@ -69,34 +68,14 @@ pub fn scan(days: usize, sessions: Option<&HashSet<String>>) -> Vec<Correction> 
         return Vec::new();
     }
     let flows_dir = darkmux_types::config_access::flows_dir();
-    let Ok(entries) = std::fs::read_dir(&flows_dir) else {
-        return Vec::new();
-    };
-    let mut day_files: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
-        .collect();
-    // Day-files are date-named, so a lexical sort is chronological.
-    day_files.sort();
-    // The most-recent `days`, restored to oldest→newest within the window.
-    let recent: Vec<PathBuf> = day_files
-        .iter()
-        .rev()
-        .take(days)
-        .rev()
-        .cloned()
-        .collect();
+    // The most-recent `days`, oldest→newest within the window.
+    let mut recent = darkmux_flow::reader::recent_day_files(&flows_dir, days);
+    recent.reverse();
 
     let mut out: Vec<Correction> = Vec::new();
     for day in &recent {
-        let Ok(raw) = std::fs::read_to_string(day) else {
-            continue;
-        };
-        for line in raw.lines() {
-            let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
-            if r.get("action").and_then(|v| v.as_str()) != Some("note")
+        for r in darkmux_flow::reader::day_file_records(day) {
+            if darkmux_flow::reader::action_of(&r) != Some(darkmux_flow::FlowAction::OperatorNote)
                 || r.get("source").and_then(|v| v.as_str()) != Some("adjudication")
             {
                 continue;

@@ -630,6 +630,7 @@ pub(crate) fn parse_trajectory(raw: &str) -> Trajectory {
                 }
             }
             // The per-call-cap gate.
+            // flow-action-guard:allow — a runtime trajectory event type, not a flow action
             "dispatch.checkpoint" => {
                 if let Some(p) = body.get("policy").and_then(|v| v.as_str()) {
                     t.policy = Some(p.to_string());
@@ -812,7 +813,8 @@ pub(crate) fn scan_flow_lines(
         if line.is_empty() {
             continue;
         }
-        let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Some(r) = darkmux_flow::reader::parse_value(line) else { continue };
+        let action = darkmux_flow::reader::action_of(&r);
         let p = r.get("payload");
         let clock = p.and_then(|p| as_u64(p.get("sampled_at_ms")));
         if clock.is_some_and(|ts| ts > stop_after) {
@@ -822,7 +824,7 @@ pub(crate) fn scan_flow_lines(
         if let Some(sid) = session_id {
             if r.get("session_id").and_then(|v| v.as_str()) == Some(sid) {
                 facts.records_for_session += 1;
-                if r.get("action").and_then(|v| v.as_str()) == Some("dispatch start") {
+                if action == Some(darkmux_flow::FlowAction::DispatchStart) {
                     if let Some(b) = p.and_then(|p| p.get("bounds")).and_then(|b| b.as_object()) {
                         for (k, v) in b {
                             facts.bounds.entry(k.clone()).or_insert_with(|| v.clone());
@@ -832,7 +834,7 @@ pub(crate) fn scan_flow_lines(
             }
         }
 
-        if r.get("action").and_then(|v| v.as_str()) != Some("machine.telemetry") {
+        if action != Some(darkmux_flow::FlowAction::MachineTelemetry) {
             continue;
         }
         let (Some(p), Some(ts)) = (p, clock) else { continue };
@@ -1436,11 +1438,13 @@ pub(crate) fn derive_stats(
             have_telemetry_samples: !flows.samples.is_empty(),
             have_flow_records: flows.records_for_session > 0,
             missing_required_events: missing_required,
+            // flow-action-guard:allow — a runtime trajectory event type, not a flow action
             checkpoint_events_seen: t.seen_types.contains("dispatch.checkpoint"),
             // The mutation that proves this guard: repoint the parse at a
             // name that does not exist and `checkpoint_events_seen` stays
             // true while the count drops to zero. That CONTRADICTION is the
             // signal.
+            // flow-action-guard:allow — a runtime trajectory event type, not a flow action
             checkpoint_parse_consistent: !(t.seen_types.contains("dispatch.checkpoint")
                 && cp_observations == 0),
             verdict_matches_ratio: judged == by_ratio,

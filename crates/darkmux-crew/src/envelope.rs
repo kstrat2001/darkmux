@@ -1384,10 +1384,10 @@ mod tests {
             re.total_records, 4,
             "m9's 2 synthetic + finalize's own `phase complete` + `mission close`, never the sibling's"
         );
-        assert_eq!(re.by_action.get("dispatch start"), Some(&1));
+        assert_eq!(re.by_action.get("dispatch.start"), Some(&1));
         assert_eq!(re.by_action.get("dispatch.complete"), Some(&1));
-        assert_eq!(re.by_action.get("phase complete"), Some(&1));
-        assert_eq!(re.by_action.get("mission close"), Some(&1));
+        assert_eq!(re.by_action.get("phase.complete"), Some(&1));
+        assert_eq!(re.by_action.get("mission.close"), Some(&1));
         assert_eq!(re.by_action.values().sum::<u64>(), 4, "no sibling leakage into the totals");
         assert_eq!(re.dispatch_seconds, 5.0, "the ONLY dispatch bookend pair present, unaffected by the lifecycle records");
         assert!(re.wall_seconds >= 5.0, "wall_seconds spans at least the synthetic window: {}", re.wall_seconds);

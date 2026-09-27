@@ -6,6 +6,7 @@
 
 use crate::{Check, Status};
 use darkmux_flow::hooks::HookRuleSummary;
+use darkmux_flow::{FlowAction, FlowScope};
 use darkmux_types::config::{HookMatch, HookRule};
 use std::collections::HashSet;
 use std::path::Path;
@@ -24,8 +25,7 @@ pub(crate) fn check_hooks() -> Vec<Check> {
     let enabled = darkmux_types::config_access::hooks_enabled();
     let rules = darkmux_types::config_access::hooks_rules();
     let outbox_dir = darkmux_types::config_access::hooks_outbox_dir();
-    let today_actions = crate::today_flow_actions();
-    build_hooks_check(enabled, provenance, &rules, &outbox_dir, &today_actions, &crate::resolved_config_path())
+    build_hooks_check(enabled, provenance, &rules, &outbox_dir, &crate::resolved_config_path())
 }
 
 /// The pure rollup `check_hooks()` delegates to — split out so it's testable
@@ -37,7 +37,6 @@ fn build_hooks_check(
     provenance: &str,
     rules: &[HookRule],
     outbox_dir: &Path,
-    today_actions: &HashSet<String>,
     config_path: &Path,
 ) -> Vec<Check> {
     if !enabled {
@@ -55,7 +54,7 @@ fn build_hooks_check(
     let rule_checks: Vec<Check> = summaries
         .iter()
         .zip(rules)
-        .map(|(s, rule)| rule_check(s, &rule.r#match.clone().unwrap_or_default(), today_actions, config_path))
+        .map(|(s, rule)| rule_check(s, &rule.r#match.clone().unwrap_or_default(), config_path))
         .collect();
     let mut out = vec![overview_check(provenance, outbox_dir, &summaries, &rule_checks)];
     out.extend(rule_checks);
@@ -131,8 +130,8 @@ impl RuleFlag {
 const DELIVERY_HINT: &str = "`darkmux flow status` shows this rule's delivery history.";
 
 /// The `hooks.rule.<index>` row. Its status is the worst of its flags.
-fn rule_check(s: &HookRuleSummary, rule_match: &HookMatch, today_actions: &HashSet<String>, config_path: &Path) -> Check {
-    let flags = rule_flags(s, rule_match, today_actions);
+fn rule_check(s: &HookRuleSummary, rule_match: &HookMatch, config_path: &Path) -> Check {
+    let flags = rule_flags(s, rule_match);
     let status = flags.iter().map(|f| f.status).max().unwrap_or(Status::Pass);
     let flag_str = if flags.is_empty() {
         String::new()
@@ -157,7 +156,7 @@ fn rule_check(s: &HookRuleSummary, rule_match: &HookMatch, today_actions: &HashS
 }
 
 /// Every flag on one rule, in the order the row prints them.
-fn rule_flags(s: &HookRuleSummary, rule_match: &HookMatch, today_actions: &HashSet<String>) -> Vec<RuleFlag> {
+fn rule_flags(s: &HookRuleSummary, rule_match: &HookMatch) -> Vec<RuleFlag> {
     [
         empty_match_flag(s),
         refusal_flag(s),
@@ -168,7 +167,8 @@ fn rule_flags(s: &HookRuleSummary, rule_match: &HookMatch, today_actions: &HashS
         quarantined_flag(s),
         receiver_rejected_flag(s),
         observer_flag(rule_match),
-        never_matched_flag(s, rule_match, today_actions),
+        cannot_match_flag(rule_match),
+        old_spelling_flag(rule_match),
         transform_failed_flag(s),
     ]
     .into_iter()
@@ -317,22 +317,36 @@ fn observer_flag(rule_match: &HookMatch) -> Option<RuleFlag> {
         .then(|| RuleFlag::warn("matches telemetry / a bare `*` action — the observer must not join the observed"))
 }
 
-/// (silent-miss audit, 2026-09-06) A rule with ZERO deliveries ever (nothing
-/// undelivered, no terminal outcome) reads as merely quiet — but it may have
-/// NEVER matched because its action names the other bookend spelling
-/// (`HookMatch::action` is a literal glob; it does not tolerate both
-/// spellings the way `darkmux_flow`'s shared matchers do). When today's flow
-/// day file carries the other spelling, that silence has an explanation.
-fn never_matched_flag(s: &HookRuleSummary, rule_match: &HookMatch, today_actions: &HashSet<String>) -> Option<RuleFlag> {
-    if s.undelivered != 0 || s.last_delivery_ts.is_some() {
+/// A rule whose `action` pattern matches no action darkmux writes can never
+/// deliver, however quiet it looks. Decided from the vocabulary
+/// ([`darkmux_flow::hooks::action_pattern_can_match`], the same test
+/// `HookSink::new` warns with), never from what today's records happen to
+/// carry. The hint names the dotted twin only when that twin can match.
+fn cannot_match_flag(rule_match: &HookMatch) -> Option<RuleFlag> {
+    let configured = rule_match.action.as_deref()?;
+    if darkmux_flow::hooks::action_pattern_can_match(configured) {
         return None;
     }
-    let configured = rule_match.action.as_deref()?;
-    let other = crate::other_bookend_spelling(configured).filter(|o| today_actions.contains(*o))?;
+    let hint = darkmux_flow::hooks::matching_dotted_twin(configured)
+        .map(|t| format!("; `{t}` matches the dotted actions, and more than the old spelling did"))
+        .unwrap_or_default();
     Some(RuleFlag::warn(format!(
-        "NEVER MATCHED (zero deliveries) — configured for action=\"{configured}\", but today's flow \
-         records use \"{other}\" instead; this looks like a bookend-spelling mismatch, not a quiet rule"
+        "CANNOT MATCH — action=\"{configured}\" matches no action darkmux writes \
+         (actions are spelled `<scope>.<event>`){hint}"
     )))
+}
+
+/// A rule written against a pre-4.0 spelling still delivers: the sink reads
+/// it as its current action ([`darkmux_flow::hooks::effective_action_pattern`]).
+/// Named so the config can be updated to what the sink actually matches.
+fn old_spelling_flag(rule_match: &HookMatch) -> Option<RuleFlag> {
+    let configured = rule_match.action.as_deref()?;
+    let effective = darkmux_flow::hooks::effective_action_pattern(configured);
+    (effective != configured).then(|| {
+        RuleFlag::warn(format!(
+            "OLD SPELLING — action=\"{configured}\" is read as \"{effective}\"; write \"{effective}\" instead"
+        ))
+    })
 }
 
 /// (#2183) A `transform` that failed to load refuses THIS rule only
@@ -404,18 +418,21 @@ fn rule_hint(reason_lines: &[String], error_lines: &[String], flags: &[RuleFlag]
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
-/// The telemetry records darkmux writes today (`Category::Telemetry`):
-/// the dispatch instruments and the host sampler. Each is tried at `info`
-/// and at `warn`, the level detector firings are written at.
-const TELEMETRY_ACTIONS: &[&str] = &[
-    "telemetry.tokens",
-    "telemetry.detector",
-    "telemetry.runtime",
-    "telemetry.lms",
-    "telemetry.context",
-    "telemetry.compaction",
-    "machine.telemetry",
-];
+/// The telemetry samples darkmux writes (`Category::Telemetry`): every
+/// action in the `telemetry` scope (the dispatch instruments) and the host
+/// sampler's `machine.telemetry`. Read off [`FlowAction`], so an instrument
+/// added to the vocabulary is covered without touching this check.
+fn is_telemetry_sample(action: &FlowAction) -> bool {
+    action.scope() == Some(FlowScope::Telemetry) || *action == FlowAction::MachineTelemetry
+}
+
+/// Every telemetry sample's wire spelling (see [`is_telemetry_sample`]).
+fn telemetry_actions() -> impl Iterator<Item = &'static str> {
+    FlowAction::KNOWN_WIRE
+        .iter()
+        .copied()
+        .filter(|wire| FlowAction::parse_known(wire).is_ok_and(|a| is_telemetry_sample(&a)))
+}
 
 /// (#2093 merge-gate finding 17) True when a rule would deliver a telemetry
 /// record — the observer joining the observed (this project's own doctrine,
@@ -426,7 +443,9 @@ const TELEMETRY_ACTIONS: &[&str] = &[
 /// match. A rule narrowed by a payload predicate or an id never matches a
 /// synthetic record, so it is not flagged.
 fn hooks_match_risks_observing_the_observer(m: &HookMatch) -> bool {
-    TELEMETRY_ACTIONS.iter().flat_map(|action| ["info", "warn"].map(|level| (action, level))).any(|(action, level)| {
+    // Each sample is tried at `info` and at `warn`, the level detector
+    // firings are written at.
+    telemetry_actions().flat_map(|action| ["info", "warn"].map(|level| (action, level))).any(|(action, level)| {
         let record: darkmux_flow::FlowRecord = serde_json::from_value(serde_json::json!({
             "ts": "", "level": level, "category": "telemetry", "tier": "local",
             "stage": "dispatch", "action": action, "handle": ""
@@ -617,7 +636,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let rules = vec![
             HookRule {
-                r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+                r#match: Some(HookMatch { action: Some(live_action()), ..Default::default() }),
                 http: Some("http://127.0.0.1:8790/events".to_string()),
                 signing_secret_keychain_item: None,
                 file: None,
@@ -647,7 +666,7 @@ mod tests {
                 extras: Default::default(),
             },
         ];
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), std::path::Path::new(TEST_CONFIG_PATH));
         assert_eq!(checks.len(), 4, "1 overview + 3 per-rule checks");
 
         let overview = checks.iter().find(|c| c.name == "hooks").unwrap();
@@ -655,7 +674,7 @@ mod tests {
 
         let healthy = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(healthy.status, Status::Pass, "{}", healthy.message);
-        assert!(healthy.message.contains("crawl.*"), "{}", healthy.message);
+        assert!(healthy.message.contains(&live_action()), "{}", healthy.message);
         assert!(healthy.message.contains("undelivered"), "{}", healthy.message);
 
         let empty_match = checks.iter().find(|c| c.name == "hooks.rule.1").unwrap();
@@ -680,7 +699,7 @@ mod tests {
         use darkmux_types::config::{HookMatch, HookRule};
         let tmp = tempfile::TempDir::new().unwrap();
         let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some(live_action()), ..Default::default() }),
             http: Some("http://100.64.1.2:8790/events".to_string()),
             signing_secret_keychain_item: None,
             file: None,
@@ -689,7 +708,7 @@ mod tests {
             attribution_headers: None,
             extras: Default::default(),
         }];
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), std::path::Path::new(TEST_CONFIG_PATH));
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.status, Status::Warn, "{}", rule.message);
         assert!(!rule.message.contains("URL REFUSED"), "a valid tailnet target is not refused: {}", rule.message);
@@ -703,7 +722,7 @@ mod tests {
         use darkmux_types::config::{HookMatch, HookRule};
         let tmp = tempfile::TempDir::new().unwrap();
         let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some(live_action()), ..Default::default() }),
             http: Some("http://100.64.1.2:8790/events".to_string()),
             signing_secret_keychain_item: Some("darkmux-hook-0".to_string()),
             file: None,
@@ -712,7 +731,7 @@ mod tests {
             attribution_headers: None,
             extras: Default::default(),
         }];
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), std::path::Path::new(TEST_CONFIG_PATH));
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.status, Status::Pass, "{}", rule.message);
         assert!(rule.message.contains("[tailnet, signed]"), "{}", rule.message);
@@ -748,7 +767,7 @@ mod tests {
                 extras: Default::default(),
             },
         ];
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), std::path::Path::new(TEST_CONFIG_PATH));
         let telemetry = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(telemetry.status, Status::Warn, "{}", telemetry.message);
         assert!(telemetry.message.contains("observer must not join the observed"), "{}", telemetry.message);
@@ -758,109 +777,77 @@ mod tests {
         assert!(bare_star.message.contains("observer must not join the observed"), "{}", bare_star.message);
     }
 
-    /// (silent-miss audit, 2026-09-06) A rule configured for the DOTTED
-    /// spelling (`dispatch.complete`) that has NEVER delivered anything
-    /// (fresh outbox dir: `undelivered == 0`, `last_delivery_ts == None`)
-    /// reads as merely quiet — UNTIL today's flow day file is shown to
-    /// carry the SPACED spelling instead, which is exactly the
-    /// bookend-spelling mismatch `HookMatch::action`'s literal glob
-    /// cannot tolerate (unlike `darkmux_flow`'s shared matchers). Both
-    /// spellings must be named.
-    #[test]
-    fn hooks_check_warns_when_rule_never_matched_but_todays_records_use_the_other_spelling() {
-        use darkmux_types::config::{HookMatch, HookRule};
-        let tmp = tempfile::TempDir::new().unwrap();
-        let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("dispatch.complete".to_string()), ..Default::default() }),
-            http: Some("http://127.0.0.1:8790/events".to_string()),
-            signing_secret_keychain_item: None,
-            file: None,
-            transform: None,
-            headers: None,
-            attribution_headers: None,
-            extras: Default::default(),
-        }];
-        let mut today_actions = std::collections::HashSet::new();
-        today_actions.insert("dispatch complete".to_string());
+    fn one_rule_matching(action: &str) -> Vec<darkmux_types::config::HookRule> {
+        vec![hook_rule(Some(action), Some("http://127.0.0.1:8790/events"))]
+    }
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &today_actions, std::path::Path::new(TEST_CONFIG_PATH));
-        let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
+    fn rule_row(action: &str) -> Check {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let checks = build_hooks_check(true, "config.json", &one_rule_matching(action), tmp.path(), std::path::Path::new(TEST_CONFIG_PATH));
+        named(&checks, "hooks.rule.0").clone()
+    }
+
+    /// The CANNOT MATCH hint names a dotted twin only when the twin can
+    /// match: `dispatchh *` and `sprint *` get none.
+    #[test]
+    fn cannot_match_names_only_a_twin_that_can_match() {
+        let flag = cannot_match_flag(&one_rule_matching("dispatch *")[0].r#match.clone().unwrap()).unwrap();
+        assert!(flag.text.contains("`dispatch.*` matches"), "{}", flag.text);
+        for pattern in ["dispatchh *", "sprint *"] {
+            let flag = cannot_match_flag(&one_rule_matching(pattern)[0].r#match.clone().unwrap()).unwrap();
+            assert!(flag.text.contains("CANNOT MATCH"), "{}", flag.text);
+            assert!(!flag.text.contains(".*`"), "no twin hint for {pattern}: {}", flag.text);
+        }
+    }
+
+    /// (4.0) A rule written against an old spelling still delivers (the
+    /// hook layer reads it as its current action) and warns with what to
+    /// write instead; a spaced glob whose dotted twin would widen it cannot
+    /// match, and says so.
+    #[test]
+    fn hooks_check_warns_on_a_rule_written_against_a_retired_spelling() {
+        let rule = rule_row("dispatch complete");
         assert_eq!(rule.status, Status::Warn, "{}", rule.message);
-        assert!(rule.message.contains("NEVER MATCHED"), "{}", rule.message);
-        assert!(rule.message.contains("dispatch.complete"), "must name the CONFIGURED spelling: {}", rule.message);
-        assert!(rule.message.contains("dispatch complete"), "must name the OTHER spelling seen: {}", rule.message);
+        assert!(rule.message.contains("OLD SPELLING"), "{}", rule.message);
+        assert!(!rule.message.contains("CANNOT MATCH"), "an upgraded spelling delivers: {}", rule.message);
+        let current = FlowAction::DispatchComplete.as_str();
+        assert!(rule.message.contains(&format!("write \"{current}\" instead")), "names the current one: {}", rule.message);
+        let rule = rule_row("dispatch *");
+        assert!(rule.message.contains("CANNOT MATCH"), "{}", rule.message);
+        assert!(rule.message.contains("`dispatch.*` matches"), "{}", rule.message);
+        assert!(!rule.message.contains("OLD SPELLING"), "a pattern that cannot match is not an old spelling: {}", rule.message);
     }
 
-    /// The negative space around the test above: with NOTHING in today's
-    /// flow day file naming the other spelling, the same never-delivered
-    /// rule stays Pass — a genuinely quiet, correctly-configured rule
-    /// (e.g. one waiting for its first matching dispatch of the day) must
-    /// not be flagged.
+    /// A glob that matches no action at all (a typo, an invented scope, a
+    /// retired action) warns too, without a suggestion it does not have.
+    /// The retired case is deliberate: `crawl.*` names only
+    /// [`darkmux_flow::legacy::RetiredAction`]s, which the reader knows and
+    /// no writer emits, so a rule for them can never deliver.
     #[test]
-    fn hooks_check_no_alias_warn_when_todays_actions_dont_carry_the_other_spelling() {
-        use darkmux_types::config::{HookMatch, HookRule};
-        let tmp = tempfile::TempDir::new().unwrap();
-        let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("dispatch.complete".to_string()), ..Default::default() }),
-            http: Some("http://127.0.0.1:8790/events".to_string()),
-            signing_secret_keychain_item: None,
-            file: None,
-            transform: None,
-            headers: None,
-            attribution_headers: None,
-            extras: Default::default(),
-        }];
-        // Empty today_actions: no evidence of the alias, so no warn.
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
-        let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
-        assert_eq!(rule.status, Status::Pass, "{}", rule.message);
-        assert!(!rule.message.contains("NEVER MATCHED"), "{}", rule.message);
+    fn hooks_check_warns_on_a_glob_that_matches_no_action() {
+        let retired = darkmux_flow::legacy::RetiredAction::CrawlFinding.as_str();
+        let retired_glob = format!("{}.*", retired.split('.').next().unwrap());
+        for pattern in ["dispatchh.*", retired, retired_glob.as_str()] {
+            let rule = rule_row(pattern);
+            assert_eq!(rule.status, Status::Warn, "{pattern}: {}", rule.message);
+            assert!(rule.message.contains("CANNOT MATCH"), "{pattern}: {}", rule.message);
+            assert!(!rule.message.contains("instead"), "{pattern}: {}", rule.message);
+        }
     }
 
-    /// (round-2 audit, 2026-09-06 — C4) The other half of the negative
-    /// space: a rule that HAS actually delivered (a real `.last` sidecar
-    /// from a genuine terminal outcome, the same shape the drainer
-    /// writes) must stay Pass even when today's flow day file ALSO
-    /// happens to carry the other spelling of its configured action —
-    /// the alias-drift Warn is specifically for a rule that has NEVER
-    /// matched anything; a rule that clearly HAS matched (and delivered)
-    /// is not that case, whatever else today's records contain. Red-proved
-    /// by replacing the `undelivered == 0 && last_delivery_ts.is_none()`
-    /// gate with `if true`: this test then fails because it would warn
-    /// regardless of the genuine prior delivery.
+    /// The inverse: a current action, and a glob that reaches some, stay
+    /// Pass, whether or not the rule has ever delivered. (A bare `*` warns
+    /// for another reason, the observer check, never for CANNOT MATCH.)
     #[test]
-    fn hooks_check_no_alias_warn_when_the_rule_has_actually_delivered() {
-        use darkmux_types::config::{HookMatch, HookRule};
-        let tmp = tempfile::TempDir::new().unwrap();
-        let m = HookMatch { action: Some("dispatch.complete".to_string()), ..Default::default() };
-        let url = "http://127.0.0.1:8790/events".to_string();
-        let rules = vec![HookRule {
-            r#match: Some(m.clone()),
-            http: Some(url.clone()),
-            signing_secret_keychain_item: None,
-            file: None,
-            transform: None,
-            headers: None,
-            attribution_headers: None,
-            extras: Default::default(),
-        }];
-        // A genuine prior delivery: the `.last` sidecar the drainer
-        // itself writes on a terminal outcome (`write_last_status`).
-        let key = darkmux_flow::hooks::rule_key(&m, &url);
-        std::fs::write(tmp.path().join(format!("{key}.last")), r#"{"ts":"2026-01-01T00:00:00Z","ok":true}"#).unwrap();
-
-        let mut today_actions = std::collections::HashSet::new();
-        today_actions.insert("dispatch complete".to_string()); // the other spelling, ALSO present today
-
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &today_actions, std::path::Path::new(TEST_CONFIG_PATH));
-        let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
-        assert_eq!(rule.status, Status::Pass, "{}", rule.message);
-        assert!(
-            !rule.message.contains("NEVER MATCHED"),
-            "a rule with an actual prior delivery must not be flagged, even with the other \
-             spelling also present today: {}",
-            rule.message
-        );
+    fn hooks_check_passes_a_rule_that_can_match() {
+        let action = live_action();
+        let glob = format!("{}.*", action.split('.').next().unwrap());
+        for pattern in [action.as_str(), glob.as_str()] {
+            let rule = rule_row(pattern);
+            assert_eq!(rule.status, Status::Pass, "{pattern}: {}", rule.message);
+        }
+        let rule = rule_row("*");
+        assert!(!rule.message.contains("CANNOT MATCH"), "{}", rule.message);
     }
 
     /// (#2196 fix-round 4) Every line `print_report` emits FLUSH LEFT
@@ -944,7 +931,7 @@ mod tests {
         .unwrap();
         std::fs::write(tmp.path().join(format!("{key}.rejected")), "1").unwrap();
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), std::path::Path::new(TEST_CONFIG_PATH));
         checks.into_iter().find(|c| c.name == "hooks.rule.0").unwrap()
     }
 
@@ -1103,7 +1090,7 @@ mod tests {
     /// tempdir standing in for the outbox dir.
     fn rejection_fixture_rule() -> (darkmux_types::config::HookRule, String) {
         use darkmux_types::config::{HookMatch, HookRule};
-        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let m = HookMatch { action: Some(live_action()), ..Default::default() };
         let url = "http://127.0.0.1:8790/events".to_string();
         let key = darkmux_flow::hooks::rule_key(&m, &url);
         (
@@ -1139,7 +1126,7 @@ mod tests {
         .unwrap();
         std::fs::write(tmp.path().join(format!("{key}.rejected")), "3").unwrap();
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), std::path::Path::new(TEST_CONFIG_PATH));
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.status, Status::Warn, "{}", rule.message);
         assert!(rule.message.contains("3 record(s) reported rejected by the receiver"), "{}", rule.message);
@@ -1162,7 +1149,7 @@ mod tests {
         .unwrap();
         std::fs::write(tmp.path().join(format!("{key}.rejected")), "1").unwrap();
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), std::path::Path::new(TEST_CONFIG_PATH));
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.status, Status::Warn, "{}", rule.message);
         // (#2196 fix-round 2, MUST FIX C) The fixture's 47-column raw
@@ -1225,7 +1212,7 @@ mod tests {
         .unwrap();
         std::fs::write(tmp.path().join(format!("{key}.rejected")), "3").unwrap();
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), std::path::Path::new(TEST_CONFIG_PATH));
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.message.matches("3 on the last delivery").count(), 1, "{}", rule.message);
         assert!(!rule.message.contains("()"), "no empty parens when there's no reason: {}", rule.message);
@@ -1249,7 +1236,7 @@ mod tests {
         std::fs::write(tmp.path().join(format!("{key}.last")), r#"{"ts":"2026-01-01T00:00:00Z","ok":true}"#).unwrap();
         std::fs::write(tmp.path().join(format!("{key}.rejected")), "400").unwrap();
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), std::path::Path::new(TEST_CONFIG_PATH));
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(
             rule.status,
@@ -1279,7 +1266,7 @@ mod tests {
         let rules = vec![rule_cfg];
         std::fs::write(tmp.path().join(format!("{key}.last")), r#"{"ts":"2026-01-01T00:00:00Z","ok":true}"#).unwrap();
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), std::path::Path::new(TEST_CONFIG_PATH));
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.status, Status::Pass, "{}", rule.message);
         assert!(!rule.message.contains("rejected"), "{}", rule.message);
@@ -1294,7 +1281,7 @@ mod tests {
         use darkmux_types::config::{HookMatch, HookRule};
         let tmp = tempfile::TempDir::new().unwrap();
         let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some(live_action()), ..Default::default() }),
             http: Some("http://127.0.0.1:8790/events".to_string()),
             signing_secret_keychain_item: None,
             file: None,
@@ -1313,7 +1300,7 @@ mod tests {
         // silently left behind by whoever acts on this listing.
         std::fs::write(tmp.path().join("127.0.0.1-9999-deadbeefdeadbeef.rejected"), "5").unwrap();
 
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), std::path::Path::new(TEST_CONFIG_PATH));
         let stray = checks.iter().find(|c| c.name == "hooks.stray").expect("a stray-file check must be present");
         assert_eq!(stray.status, Status::Warn, "{}", stray.message);
         assert!(stray.message.contains("127.0.0.1-9999-deadbeefdeadbeef"), "{}", stray.message);
@@ -1325,7 +1312,7 @@ mod tests {
         use darkmux_types::config::{HookMatch, HookRule};
         let tmp = tempfile::TempDir::new().unwrap();
         let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some(live_action()), ..Default::default() }),
             http: Some("http://127.0.0.1:8790/events".to_string()),
             signing_secret_keychain_item: None,
             file: None,
@@ -1334,7 +1321,7 @@ mod tests {
             attribution_headers: None,
             extras: Default::default(),
         }];
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), std::path::Path::new(TEST_CONFIG_PATH));
         assert!(checks.iter().all(|c| c.name != "hooks.stray"), "no stray files → no stray check emitted");
     }
 
@@ -1347,6 +1334,13 @@ mod tests {
     /// `DARKMUX_HOME` fails here.
     const TEST_CONFIG_PATH: &str = "/darkmux-root/config.json";
     const REMEDY: &str = "Fix this rule in /darkmux-root/config.json (or `darkmux config set hooks.rules ...`).";
+
+    /// The action the fixtures' rules match: one darkmux writes today, taken
+    /// from its [`FlowAction`] so a rename moves the fixtures with it rather
+    /// than leaving every rule matching nothing.
+    fn live_action() -> String {
+        FlowAction::StepComplete.as_str().to_string()
+    }
 
     fn hook_rule(action: Option<&str>, http: Option<&str>) -> darkmux_types::config::HookRule {
         darkmux_types::config::HookRule {
@@ -1369,7 +1363,7 @@ mod tests {
     }
 
     fn checks_for(rules: &[darkmux_types::config::HookRule], dir: &std::path::Path) -> Vec<Check> {
-        build_hooks_check(true, "config.json", rules, dir, &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH))
+        build_hooks_check(true, "config.json", rules, dir, std::path::Path::new(TEST_CONFIG_PATH))
     }
 
     fn named<'a>(checks: &'a [Check], name: &str) -> &'a Check {
@@ -1380,7 +1374,7 @@ mod tests {
     fn disabled_is_one_pass_row_even_with_rules_configured() {
         let tmp = tempfile::TempDir::new().unwrap();
         let rules = vec![hook_rule(None, Some("http://10.0.0.5/x"))];
-        let checks = build_hooks_check(false, "env", &rules, tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
+        let checks = build_hooks_check(false, "env", &rules, tmp.path(), std::path::Path::new(TEST_CONFIG_PATH));
         assert_eq!(checks.len(), 1, "{checks:?}");
         assert_eq!(checks[0].name, "hooks");
         assert_eq!(checks[0].status, Status::Pass);
@@ -1391,7 +1385,7 @@ mod tests {
     #[test]
     fn enabled_with_no_rules_names_the_outbox_dir_and_an_example_rule() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let checks = build_hooks_check(true, "config.json", &[], tmp.path(), &std::collections::HashSet::new(), std::path::Path::new(TEST_CONFIG_PATH));
+        let checks = build_hooks_check(true, "config.json", &[], tmp.path(), std::path::Path::new(TEST_CONFIG_PATH));
         assert_eq!(checks.len(), 1, "{checks:?}");
         assert_eq!(checks[0].status, Status::Warn);
         assert_eq!(
@@ -1406,11 +1400,11 @@ mod tests {
     #[test]
     fn a_healthy_loopback_rule_is_one_clean_row_and_a_clean_overview() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let checks = checks_for(&[hook_rule(Some("crawl.*"), Some(LOOPBACK))], tmp.path());
+        let checks = checks_for(&[hook_rule(Some(&live_action()), Some(LOOPBACK))], tmp.path());
         assert_eq!(checks.len(), 2, "{checks:?}");
         let row = named(&checks, "hooks.rule.0");
         assert_eq!(row.status, Status::Pass);
-        assert_eq!(row.message, format!("action=crawl.* -> {LOOPBACK} [loopback, unsigned] (undelivered: 0)"));
+        assert_eq!(row.message, format!("action={} -> {LOOPBACK} [loopback, unsigned] (undelivered: 0)", live_action()));
         assert!(row.hint.is_none(), "a clean rule carries no remedy");
         let overview = named(&checks, "hooks");
         assert_eq!(overview.status, Status::Pass);
@@ -1428,7 +1422,7 @@ mod tests {
     #[test]
     fn dropped_writes_warn_with_their_count() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let rule = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        let rule = hook_rule(Some(&live_action()), Some(LOOPBACK));
         std::fs::write(tmp.path().join(format!("{}.dropped", key_of(&rule))), "2").unwrap();
         let checks = checks_for(&[rule], tmp.path());
         let row = named(&checks, "hooks.rule.0");
@@ -1447,7 +1441,7 @@ mod tests {
     #[test]
     fn a_stalled_rule_warns_with_its_failure_count() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let rule = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        let rule = hook_rule(Some(&live_action()), Some(LOOPBACK));
         std::fs::write(
             tmp.path().join(format!("{}.last", key_of(&rule))),
             r#"{"ts":"2026-01-01T00:00:00Z","ok":false,"cursor_write_failures":3,"stalled":true}"#,
@@ -1462,7 +1456,7 @@ mod tests {
     #[test]
     fn quarantined_lines_warn_with_their_count() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let rule = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        let rule = hook_rule(Some(&live_action()), Some(LOOPBACK));
         std::fs::write(tmp.path().join(format!("{}.outbox.jsonl.quarantine", key_of(&rule))), "x\ny\n").unwrap();
         let checks = checks_for(&[rule], tmp.path());
         let row = named(&checks, "hooks.rule.0");
@@ -1488,7 +1482,7 @@ mod tests {
     #[test]
     fn a_payload_value_spelling_the_telemetry_category_is_not_the_observer_warning() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut m = darkmux_types::config::HookMatch { action: Some("crawl.finding".into()), ..Default::default() };
+        let mut m = darkmux_types::config::HookMatch { action: Some(live_action()), ..Default::default() };
         m.extras.insert("payload.note".into(), serde_json::json!("category=telemetry"));
         let mut rule = hook_rule(None, Some(LOOPBACK));
         rule.r#match = Some(m);
@@ -1537,18 +1531,18 @@ mod tests {
     #[test]
     fn a_file_rule_reports_its_path_and_no_url_policy() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut rule = hook_rule(Some("crawl.*"), None);
+        let mut rule = hook_rule(Some(&live_action()), None);
         rule.file = Some("/tmp/darkmux-hook-sink.jsonl".into());
         let checks = checks_for(&[rule], tmp.path());
         let row = named(&checks, "hooks.rule.0");
         assert_eq!(row.status, Status::Pass, "{}", row.message);
-        assert_eq!(row.message, "action=crawl.* -> file:///tmp/darkmux-hook-sink.jsonl [file, n/a] (undelivered: 0)");
+        assert_eq!(row.message, format!("action={} -> file:///tmp/darkmux-hook-sink.jsonl [file, n/a] (undelivered: 0)", live_action()));
     }
 
     #[test]
     fn a_failed_transform_fails_only_its_own_rule_row() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut broken = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        let mut broken = hook_rule(Some(&live_action()), Some(LOOPBACK));
         broken.transform = Some("no-such-adapter-for-this-test.jq".into());
         let checks = checks_for(&[broken, hook_rule(Some("dispatch.*"), Some(LOOPBACK))], tmp.path());
         let row = named(&checks, "hooks.rule.0");
@@ -1568,7 +1562,7 @@ mod tests {
         std::fs::create_dir_all(&adapters).unwrap();
         std::fs::write(adapters.join("ok.jq"), ".").unwrap();
         let hash = darkmux_flow::hook_transform::load_adapter(&adapters, "ok.jq").unwrap().short_hash;
-        let mut rule = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        let mut rule = hook_rule(Some(&live_action()), Some(LOOPBACK));
         rule.transform = Some("ok.jq".into());
         let checks = checks_for(&[rule], state.path());
         let row = named(&checks, "hooks.rule.0");
@@ -1579,7 +1573,7 @@ mod tests {
     #[test]
     fn a_later_warn_rule_never_downgrades_an_earlier_fail() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let rules = [hook_rule(Some("crawl.*"), Some("http://10.0.0.5/x")), hook_rule(None, Some(LOOPBACK))];
+        let rules = [hook_rule(Some(&live_action()), Some("http://10.0.0.5/x")), hook_rule(None, Some(LOOPBACK))];
         let checks = checks_for(&rules, tmp.path());
         assert_eq!(named(&checks, "hooks.rule.0").status, Status::Fail);
         assert_eq!(named(&checks, "hooks.rule.1").status, Status::Warn);
@@ -1599,7 +1593,7 @@ mod tests {
     #[test]
     fn a_rule_with_both_http_and_file_is_refused() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut rule = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        let mut rule = hook_rule(Some(&live_action()), Some(LOOPBACK));
         rule.file = Some("/tmp/x.jsonl".into());
         let checks = checks_for(&[rule], tmp.path());
         let row = named(&checks, "hooks.rule.0");
@@ -1607,8 +1601,9 @@ mod tests {
         assert_eq!(
             row.message,
             format!(
-                "action=crawl.* -> {LOOPBACK} [refused, n/a] (undelivered: 0) [DESTINATION REFUSED — names \
-                 BOTH `http` and `file` — a rule needs exactly one destination; refused at load]"
+                "action={} -> {LOOPBACK} [refused, n/a] (undelivered: 0) [DESTINATION REFUSED — names \
+                 BOTH `http` and `file` — a rule needs exactly one destination; refused at load]",
+                live_action()
             ),
             "the URL itself is fine; what is refused is naming two destinations"
         );
@@ -1620,27 +1615,33 @@ mod tests {
     #[test]
     fn a_both_destinations_rule_with_a_tailnet_url_gets_no_transport_flags() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut rule = hook_rule(Some("crawl.*"), Some("http://100.64.1.2:8790/e"));
+        let mut rule = hook_rule(Some(&live_action()), Some("http://100.64.1.2:8790/e"));
         rule.file = Some("/tmp/x.jsonl".into());
         let checks = checks_for(&[rule], tmp.path());
         let row = named(&checks, "hooks.rule.0");
         assert_eq!(
             row.message,
-            "action=crawl.* -> http://100.64.1.2:8790/e [refused, n/a] (undelivered: 0) [DESTINATION REFUSED — \
-             names BOTH `http` and `file` — a rule needs exactly one destination; refused at load]"
+            format!(
+                "action={} -> http://100.64.1.2:8790/e [refused, n/a] (undelivered: 0) [DESTINATION REFUSED — \
+                 names BOTH `http` and `file` — a rule needs exactly one destination; refused at load]",
+                live_action()
+            )
         );
     }
 
     #[test]
     fn a_rule_with_no_destination_is_refused() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let checks = checks_for(&[hook_rule(Some("crawl.*"), None)], tmp.path());
+        let checks = checks_for(&[hook_rule(Some(&live_action()), None)], tmp.path());
         let row = named(&checks, "hooks.rule.0");
         assert_eq!(row.status, Status::Fail, "{}", row.message);
         assert_eq!(
             row.message,
-            "action=crawl.* -> (no destination) [refused, n/a] (undelivered: 0) [DESTINATION REFUSED — has no \
-             destination — set exactly one of `http` or `file`; refused at load]",
+            format!(
+                "action={} -> (no destination) [refused, n/a] (undelivered: 0) [DESTINATION REFUSED — has no \
+                 destination — set exactly one of `http` or `file`; refused at load]",
+                live_action()
+            ),
             "there is no URL to refuse; what is missing is a destination"
         );
     }
@@ -1648,7 +1649,7 @@ mod tests {
     #[test]
     fn receiver_reasons_lead_the_hint_and_the_delivery_hint_closes_it() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let rule = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        let rule = hook_rule(Some(&live_action()), Some(LOOPBACK));
         let key = key_of(&rule);
         std::fs::write(
             tmp.path().join(format!("{key}.last")),
@@ -1670,7 +1671,7 @@ mod tests {
     #[test]
     fn reasons_without_a_last_delivery_count_are_not_quoted() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let rule = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        let rule = hook_rule(Some(&live_action()), Some(LOOPBACK));
         let key = key_of(&rule);
         std::fs::write(
             tmp.path().join(format!("{key}.last")),
@@ -1692,7 +1693,7 @@ mod tests {
     #[test]
     fn a_rule_whose_deliveries_give_up_warns_with_the_last_error() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let rule = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        let rule = hook_rule(Some(&live_action()), Some(LOOPBACK));
         std::fs::write(
             tmp.path().join(format!("{}.last", key_of(&rule))),
             r#"{"ts":"2026-01-01T00:00:00Z","ok":false,"error":"connection refused (os error 61)"}"#,
@@ -1716,7 +1717,7 @@ mod tests {
     #[test]
     fn a_give_up_error_renders_indented_and_bounded() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let rule = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        let rule = hook_rule(Some(&live_action()), Some(LOOPBACK));
         let err = format!("redirect refused\n● ok — every check passed {}", "q".repeat(300));
         std::fs::write(
             tmp.path().join(format!("{}.last", key_of(&rule))),
@@ -1775,7 +1776,7 @@ mod tests {
     #[test]
     fn a_clean_last_delivery_is_not_giving_up() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let rule = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        let rule = hook_rule(Some(&live_action()), Some(LOOPBACK));
         std::fs::write(tmp.path().join(format!("{}.last", key_of(&rule))), r#"{"ts":"2026-01-01T00:00:00Z","ok":true}"#)
             .unwrap();
         let checks = checks_for(&[rule], tmp.path());
@@ -1801,7 +1802,7 @@ mod tests {
         let stray = "127.0.0.1-9999-0123456789abcdef";
         std::fs::write(tmp.path().join(format!("{stray}.outbox.jsonl")), "{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n").unwrap();
         std::fs::write(tmp.path().join(format!("{stray}.cursor")), "8").unwrap();
-        let checks = checks_for(&[hook_rule(Some("crawl.*"), Some(LOOPBACK))], tmp.path());
+        let checks = checks_for(&[hook_rule(Some(&live_action()), Some(LOOPBACK))], tmp.path());
         let row = named(&checks, "hooks.stray");
         assert_eq!(row.status, Status::Warn);
         assert_eq!(
@@ -1833,7 +1834,7 @@ mod tests {
     fn a_missing_outbox_dir_is_not_a_stray_row() {
         let tmp = tempfile::TempDir::new().unwrap();
         let missing = tmp.path().join("never-created");
-        let checks = checks_for(&[hook_rule(Some("crawl.*"), Some(LOOPBACK))], &missing);
+        let checks = checks_for(&[hook_rule(Some(&live_action()), Some(LOOPBACK))], &missing);
         assert_eq!(checks.len(), 2, "{checks:?}");
         assert_eq!(named(&checks, "hooks").status, Status::Pass);
     }
@@ -1841,7 +1842,7 @@ mod tests {
     #[test]
     fn a_configured_rules_own_outbox_is_never_stray() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let rule = hook_rule(Some("crawl.*"), Some(LOOPBACK));
+        let rule = hook_rule(Some(&live_action()), Some(LOOPBACK));
         std::fs::write(tmp.path().join(format!("{}.outbox.jsonl", key_of(&rule))), "{\"a\":1}\n").unwrap();
         let checks = checks_for(&[rule], tmp.path());
         assert!(checks.iter().all(|c| c.name != "hooks.stray"), "{checks:?}");

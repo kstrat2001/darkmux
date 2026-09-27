@@ -6,13 +6,16 @@
 //! `~/.darkmux/flows/` (overridable via `DARKMUX_FLOWS_DIR`). The first write
 //! atomically prepends a schema header so partial-file recovery is possible.
 
+mod action;
 pub mod daemon_probe;
 pub(crate) mod hmac_sha256;
 pub mod hook_transform;
 pub mod hooks;
+pub mod legacy;
 pub mod live;
 pub mod presence;
 pub mod presence_reconciler;
+pub mod reader;
 pub mod session_presence;
 
 mod bookend;
@@ -20,6 +23,7 @@ mod integrity;
 mod schema;
 mod status;
 
+pub use action::{FlowAction, FlowScope, UnknownAction};
 pub use bookend::*;
 pub use integrity::*;
 pub use schema::*;
@@ -84,12 +88,57 @@ pub trait FlowSink: Send + Sync {
     /// that DO want to react to write failures — e.g., a fleet
     /// coordinator might want to fall back to a local-file sink on
     /// network failure).
-    fn write(&self, record: &FlowRecord) -> Result<()>;
+    ///
+    /// Implemented as `persist`, never called directly: callers write
+    /// through [`FlowSinkWrite::write`], the one place a record is checked,
+    /// and a [`CheckedRecord`] can be made nowhere else.
+    fn persist(&self, record: CheckedRecord<'_>) -> Result<()>;
 
     /// Introspection for diagnostics. Required so `darkmux flow status`
     /// and the doctor's `flow-sink-health` check can describe the active
     /// sink graph without per-sink-type knowledge.
     fn info(&self) -> SinkInfo;
+}
+
+/// A record that passed the write check: its action is one darkmux writes
+/// today, never [`FlowAction::Other`] (unknown) or [`FlowAction::Retired`].
+/// Its field is private, so the only way to hand one to a sink is
+/// [`FlowSinkWrite::write`], the one chokepoint every sink's write goes
+/// through.
+#[derive(Clone, Copy)]
+pub struct CheckedRecord<'a>(&'a FlowRecord);
+
+impl<'a> CheckedRecord<'a> {
+    fn check(record: &'a FlowRecord) -> Result<Self> {
+        match &record.action {
+            FlowAction::Other(unknown) => {
+                anyhow::bail!("refusing to write a flow record whose action `{}` is not one darkmux knows", unknown.as_str())
+            }
+            FlowAction::Retired(retired) => {
+                anyhow::bail!("refusing to write a flow record with the retired action `{}`", retired.as_str())
+            }
+            _ => Ok(Self(record)),
+        }
+    }
+
+    /// The record.
+    pub fn get(self) -> &'a FlowRecord {
+        self.0
+    }
+}
+
+/// How every record reaches a sink. Blanket-implemented for every
+/// [`FlowSink`] (and `dyn FlowSink`), so no sink can supply its own: an
+/// unknown or retired action is refused here, before any sink sees it.
+pub trait FlowSinkWrite {
+    /// Check `record`, then persist it.
+    fn write(&self, record: &FlowRecord) -> Result<()>;
+}
+
+impl<S: FlowSink + ?Sized> FlowSinkWrite for S {
+    fn write(&self, record: &FlowRecord) -> Result<()> {
+        self.persist(CheckedRecord::check(record)?)
+    }
 }
 
 /// File-based flow sink: appends to per-day JSONL files under
@@ -186,7 +235,8 @@ impl FlowSink for LocalFileSink {
     // serialization on Linux/macOS keep concurrent writers to a shared day-file
     // from tearing each other's lines — the best-effort, lock-free counterpart
     // to AuditFileSink's tear-proof `flock`.
-    fn write(&self, record: &FlowRecord) -> Result<()> {
+    fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
         let dir = local_sink_dir();
         let day = day_utc_now();
         let path = dir.join(format!("{day}.jsonl"));
@@ -276,17 +326,9 @@ fn audit_dir_default() -> PathBuf {
 /// file → 0 (nothing to report).
 pub fn count_audit_write_failures_today() -> usize {
     let path = flows_dir().join(format!("{}.jsonl", day_utc_now()));
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return 0;
-    };
-    content
-        .lines()
-        .filter(|l| {
-            serde_json::from_str::<serde_json::Value>(l)
-                .ok()
-                .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(|s| s == "audit.write_failed"))
-                .unwrap_or(false)
-        })
+    reader::day_file_records(&path)
+        .iter()
+        .filter(|v| reader::action_of(v) == Some(FlowAction::AuditWriteFailed))
         .count()
 }
 
@@ -327,7 +369,8 @@ impl Default for AuditFileSink {
 
 #[cfg(unix)]
 impl FlowSink for AuditFileSink {
-    fn write(&self, record: &FlowRecord) -> Result<()> {
+    fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
         let day = day_utc_now();
         let path = self.dir.join(format!("{day}.jsonl"));
         audit_record_at(record, &path)
@@ -1343,7 +1386,8 @@ impl RedisSink {
 }
 
 impl FlowSink for RedisSink {
-    fn write(&self, record: &FlowRecord) -> Result<()> {
+    fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
         // (#388) Once disabled, skip silently — no connection attempt
         // (so no 500ms timeout) and no log. Returning Ok keeps this
         // best-effort coordination sink from masking the durable
@@ -1487,7 +1531,7 @@ impl TeeSink {
         let mut bc = dropped.clone();
         bc.level = crate::schema::Level::Error;
         bc.category = crate::schema::Category::Audit;
-        bc.action = "audit.write_failed".to_string();
+        bc.action = crate::FlowAction::AuditWriteFailed;
         // Never carry chain fields on the casual-sink breadcrumb.
         bc.prev_hash = None;
         bc.hash = None;
@@ -1506,7 +1550,8 @@ impl TeeSink {
 }
 
 impl FlowSink for TeeSink {
-    fn write(&self, record: &FlowRecord) -> Result<()> {
+    fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
         // Best-effort: record per-sink failures but always attempt every
         // sink. Return the first error (so callers can react if they
         // want); log the rest to stderr so the operator sees them.
@@ -1971,6 +2016,36 @@ mod tests {
 
     // ─── (#388) RedisSink graceful-disable-on-unreachable ────────────
 
+    /// An action read from an archive that this build does not know is never
+    /// written back: both write entry points refuse it before any sink sees
+    /// it, and a known action still goes through.
+    #[test]
+    fn an_unknown_action_is_refused_on_write_and_a_known_one_is_not() {
+        struct Counting(std::sync::atomic::AtomicUsize);
+        impl FlowSink for Counting {
+            fn persist(&self, _record: crate::CheckedRecord<'_>) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Counting".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        let sink = Counting(Default::default());
+        let mut unknown = minimal_record();
+        unknown.action = crate::legacy::read_action("future.thing");
+        assert!(record_via(&sink, &unknown).is_err());
+        assert!(record_to(&sink, unknown).is_err());
+        let mut retired = minimal_record();
+        retired.action = crate::legacy::read_action("telemetry.process");
+        assert!(matches!(retired.action, FlowAction::Retired(_)));
+        assert!(record_via(&sink, &retired).is_err());
+        assert!(record_to(&sink, retired).is_err());
+        assert_eq!(sink.0.load(std::sync::atomic::Ordering::Relaxed), 0, "no sink saw the unknown or retired action");
+        assert!(record_via(&sink, &minimal_record()).is_ok());
+        assert_eq!(sink.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
     fn minimal_record() -> FlowRecord {
         FlowRecord {
             ts: "2025-01-15T12:34:56Z".to_string(),
@@ -1978,7 +2053,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Dispatch,
-            action: "test".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "t".to_string(),
             phase_id: None,
             session_id: None,
@@ -2083,7 +2158,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Dispatch,
-            action: "ran".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "test-1".to_string(),
             phase_id: None,
             session_id: None,
@@ -2119,14 +2194,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("2025-01-15.jsonl");
 
-        let r = |action: &str| FlowRecord {
+        let r = |handle: &str| FlowRecord {
             ts: "2025-01-15T12:34:56Z".to_string(),
             level: Level::Info,
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Dispatch,
-            action: action.to_string(),
-            handle: "test".to_string(),
+            action: crate::FlowAction::OperatorNote,
+            handle: handle.to_string(),
             phase_id: None,
             session_id: None,
             source: None,
@@ -2189,7 +2264,7 @@ mod tests {
                 thread::spawn(move || {
                     for i in 0..per_thread {
                         let mut rec = minimal_record();
-                        rec.action = format!("thr{t}-rec{i}");
+                        rec.handle = format!("thr{t}-rec{i}");
                         record_at(&rec, &path).unwrap();
                     }
                 })
@@ -2205,7 +2280,7 @@ mod tests {
         for (n, line) in contents.lines().enumerate() {
             let v: Value = serde_json::from_str(line)
                 .unwrap_or_else(|e| panic!("torn line {n}: {e}: {line:?}"));
-            if let Some(a) = v["action"].as_str() {
+            if let Some(a) = v["handle"].as_str() {
                 markers.insert(a.to_string());
             }
         }
@@ -2228,7 +2303,7 @@ mod tests {
             category: Category::Audit,
             tier: Tier::Local,
             stage: Stage::Estimate,
-            action: "budget_check".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "handle-42".to_string(),
             phase_id: Some("sp-100".to_string()),
             session_id: Some("sess-abc".to_string()),
@@ -2260,7 +2335,7 @@ mod tests {
         assert_eq!(parsed["category"], "audit");
         assert_eq!(parsed["tier"], "local");
         assert_eq!(parsed["stage"], "estimate");
-        assert_eq!(parsed["action"], "budget_check");
+        assert_eq!(parsed["action"], "operator.note");
         assert_eq!(parsed["handle"], "handle-42");
 
         // Optional fields should be present (not omitted) when set.
@@ -2275,7 +2350,7 @@ mod tests {
 
         // Round-trip: parse back into FlowRecord.
         let roundtrip: FlowRecord = serde_json::from_str(rec_line).unwrap();
-        assert_eq!(roundtrip.action, "budget_check");
+        assert_eq!(roundtrip.action, crate::FlowAction::OperatorNote);
         assert_eq!(roundtrip.handle, "handle-42");
     }
 
@@ -2295,7 +2370,7 @@ mod tests {
                 category: Category::Review,
                 tier: Tier::Frontier,
                 stage: Stage::Scope,
-                action: "scope_review".to_string(),
+                action: crate::FlowAction::OperatorNote,
                 handle: "ex-path-1".to_string(),
                 phase_id: None,
                 session_id: None,
@@ -2326,7 +2401,7 @@ mod tests {
         assert_eq!(lines.len(), 2); // header + record
 
         let parsed: Value = serde_json::from_str(lines[1]).unwrap();
-        assert_eq!(parsed["action"], "scope_review");
+        assert_eq!(parsed["action"], "operator.note");
     }
 
     #[serial_test::serial]
@@ -2341,7 +2416,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Ship,
-            action: "deploy".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "ship-1".to_string(),
             phase_id: None,
             session_id: None,
@@ -2396,7 +2471,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Review,
-            action: "env_test".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "ev-1".to_string(),
             phase_id: None,
             session_id: None,
@@ -2446,7 +2521,7 @@ mod tests {
         );
 
         let contents = fs::read_to_string(found.unwrap()).unwrap();
-        assert!(contents.contains("env_test"));
+        assert!(contents.contains("ev-1"));
     }
 
     #[test]
@@ -2543,7 +2618,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "test".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
@@ -2569,7 +2644,7 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert!(lines[0].contains("\"_type\":\"schema\""), "line 1 = header");
-        assert!(lines[1].contains("\"action\":\"test\""), "line 2 = record");
+        assert!(lines[1].contains("\"action\":\"operator.note\""), "line 2 = record");
 
         unsafe {
             match prev {
@@ -2593,7 +2668,8 @@ mod tests {
         }
     }
     impl FlowSink for InMemorySink {
-        fn write(&self, record: &FlowRecord) -> Result<()> {
+        fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
             self.captured.lock().unwrap().push(record.clone());
             Ok(())
         }
@@ -2614,7 +2690,8 @@ mod tests {
             captured: std::sync::Mutex<Vec<FlowRecord>>,
         }
         impl FlowSink for KindedRecorder {
-            fn write(&self, r: &FlowRecord) -> Result<()> {
+            fn persist(&self, r: crate::CheckedRecord<'_>) -> Result<()> {
+        let r = r.get();
                 self.captured.lock().unwrap().push(r.clone());
                 Ok(())
             }
@@ -2624,7 +2701,7 @@ mod tests {
         }
         struct FailingAudit;
         impl FlowSink for FailingAudit {
-            fn write(&self, _r: &FlowRecord) -> Result<()> {
+            fn persist(&self, _r: crate::CheckedRecord<'_>) -> Result<()> {
                 Err(anyhow::anyhow!("audit dir unwritable (test)"))
             }
             fn info(&self) -> SinkInfo {
@@ -2642,7 +2719,7 @@ mod tests {
         ]);
 
         let mut rec = minimal_record();
-        rec.action = "dispatch.complete".to_string();
+        rec.action = crate::FlowAction::DispatchComplete;
         rec.session_id = Some("sess-1".to_string());
 
         // TeeSink returns Err (the audit child failed), but the breadcrumb is
@@ -2655,8 +2732,8 @@ mod tests {
             2,
             "local sink should hold the original record + the audit-failure breadcrumb"
         );
-        assert_eq!(captured[0].action, "dispatch.complete", "original first");
-        assert_eq!(captured[1].action, "audit.write_failed", "breadcrumb second");
+        assert_eq!(captured[0].action, crate::FlowAction::DispatchComplete, "original first");
+        assert_eq!(captured[1].action, crate::FlowAction::AuditWriteFailed, "breadcrumb second");
         assert!(matches!(captured[1].level, Level::Error));
         assert!(matches!(captured[1].category, Category::Audit));
         assert!(captured[1].prev_hash.is_none() && captured[1].hash.is_none());
@@ -2719,7 +2796,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "explicit-sink".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
@@ -2760,7 +2837,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "tee-test".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
@@ -2788,7 +2865,7 @@ mod tests {
     /// shouldn't prevent the others from receiving the record.
     struct FailingSink;
     impl FlowSink for FailingSink {
-        fn write(&self, _record: &FlowRecord) -> Result<()> {
+        fn persist(&self, _record: crate::CheckedRecord<'_>) -> Result<()> {
             anyhow::bail!("simulated sink failure for test")
         }
         fn info(&self) -> SinkInfo {
@@ -2815,7 +2892,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "tee-fail".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
@@ -2858,7 +2935,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "default-path".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
@@ -2880,7 +2957,7 @@ mod tests {
         let path = tmp.path().join(format!("{day}.jsonl"));
         assert!(path.exists(), "default sink should have written to {}", path.display());
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("\"action\":\"default-path\""));
+        assert!(content.contains("\"action\":\"operator.note\""));
 
         unsafe {
             match prev {
@@ -3262,7 +3339,9 @@ mod tests {
         //            so the viewer names the running call and its file.
         //   1.65.0 — (#2902 step 5) `endpoint_id` on usage records and the
         //            `budget.warn` / `budget.wait` / `budget.resume` / `budget.stop` actions.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.65.0");
+        //   2.0.0 — (4.0) MAJOR: one wire spelling per action, dotted on
+        //            write; retired spellings upgrade on read.
+        assert_eq!(FLOW_SCHEMA_VERSION, "2.0.0");
     }
 
     #[test]
@@ -3310,7 +3389,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "test".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
@@ -3345,7 +3424,7 @@ mod tests {
                 category: Category::Work,
                 tier: Tier::Operator,
                 stage: Stage::Dispatch,
-                action: "init".to_string(),
+                action: crate::FlowAction::OperatorNote,
                 handle: "schema-check".to_string(),
                 phase_id: None,
                 session_id: None,
@@ -3528,7 +3607,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "x".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "y".to_string(),
             phase_id: None,
             session_id: None,
@@ -3556,7 +3635,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "x".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "y".to_string(),
             phase_id: None,
             session_id: None,
@@ -3599,7 +3678,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "auto-pop".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
@@ -3650,7 +3729,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "x".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "y".to_string(),
             phase_id: None,
             session_id: None,
@@ -3683,7 +3762,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "x".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "y".to_string(),
             phase_id: None,
             session_id: None,
@@ -3756,7 +3835,7 @@ mod tests {
                 category: Category::Work,
                 tier: Tier::Operator,
                 stage: Stage::Scope,
-                action: "pre-1.8-record".to_string(),
+                action: crate::FlowAction::OperatorNote,
                 handle: format!("h-{i}"),
                 phase_id: None,
                 session_id: None,
@@ -3821,7 +3900,7 @@ mod tests {
                 category: Category::Work,
                 tier: Tier::Operator,
                 stage: Stage::Scope,
-                action: format!("audit-{i}"),
+                action: crate::FlowAction::OperatorNote,
                 handle: format!("rec-{i}"),
                 phase_id: None,
                 session_id: None,
@@ -3870,7 +3949,7 @@ mod tests {
                 category: Category::Work,
                 tier: Tier::Operator,
                 stage: Stage::Scope,
-                action: format!("audit-{i}"),
+                action: crate::FlowAction::OperatorNote,
                 handle: format!("rec-{i}"),
                 phase_id: None,
                 session_id: None,
@@ -3941,7 +4020,7 @@ mod tests {
                 category: Category::Work,
                 tier: Tier::Operator,
                 stage: Stage::Scope,
-                action: format!("audit-{i}"),
+                action: crate::FlowAction::OperatorNote,
                 handle: format!("rec-{i}"),
                 phase_id: None,
                 session_id: None,
@@ -4048,7 +4127,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "post-recovery".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
@@ -4113,7 +4192,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Operator,
             stage: Stage::Scope,
-            action: "x".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: handle.to_string(),
             phase_id: None,
             session_id: None,
@@ -4518,7 +4597,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Local,
             stage: Stage::Dispatch,
-            action: "test-unresponsive-redis".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "test".to_string(),
             phase_id: None,
             session_id: None,
@@ -4729,7 +4808,7 @@ mod tests {
             category: Category::Work,
             tier: Tier::Local,
             stage: Stage::Dispatch,
-            action: "test-silent-redis-peer".to_string(),
+            action: crate::FlowAction::OperatorNote,
             handle: "test".to_string(),
             phase_id: None,
             session_id: None,
@@ -4895,7 +4974,7 @@ mod tests {
 
         for i in 0..5 {
             let mut rec = minimal_record();
-            rec.action = format!("action-{i}");
+            rec.handle = format!("action-{i}");
             rec.reasoning = Some(format!("reasoning {i}"));
             crate::integrity::audit_record_at(&rec, &path).unwrap();
         }
@@ -4916,7 +4995,6 @@ mod tests {
         fn fresh_chain(path: &std::path::Path, n: usize) {
             for i in 0..n {
                 let mut rec = minimal_record();
-                rec.action = format!("action-{i}");
                 rec.handle = format!("rec-{i}");
                 crate::integrity::audit_record_at(&rec, path).unwrap();
             }
@@ -4962,7 +5040,7 @@ mod tests {
             // record that follows it.
             let (rec0_hash, _) = lines[1].split_once(' ').unwrap();
             let mut forged = minimal_record();
-            forged.action = "forged".to_string();
+            forged.handle = "forged".to_string();
             forged.prev_hash = Some(rec0_hash.to_string());
             forged.hash = None;
             let forged_json = serde_json::to_string(&forged).unwrap();
@@ -5150,7 +5228,7 @@ mod tests {
             "an older/newer reader must still parse a mission.grow record — the payload is \
              free-form and every added field is optional",
         );
-        assert_eq!(rec.action, "mission.grow");
+        assert_eq!(rec.action, crate::FlowAction::MissionGrow);
         let payload = rec.payload.expect("the record carries its payload");
         assert_eq!(payload["producer_status"], serde_json::json!("error"));
         assert_eq!(payload["reason"], serde_json::json!("producer_errored"));

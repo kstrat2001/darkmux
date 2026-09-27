@@ -42,6 +42,7 @@ mod ev {
     pub const INTRA_TURN_STALL: &str = "dispatch.intra_turn_stall.recovered";
     pub const REPEATED_FAILURE: &str = "dispatch.tool.repeated_failure";
     pub const PER_TURN_CAP: &str = "dispatch.per_turn_cap.salvaged";
+    // flow-action-guard:allow — a runtime trajectory event type, not a flow action
     pub const FEEDBACK_INJECTED: &str = "dispatch.feedback.injected";
     pub const TOOL_COMPLETED: &str = "tool.completed";
 }

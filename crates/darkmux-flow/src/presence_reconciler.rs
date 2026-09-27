@@ -147,17 +147,15 @@ fn reappeared_machines<'a>(
 /// EXPLICITLY to the *subject* machine — for an offline edge that's the
 /// DISAPPEARED peer, not the local observer — which suppresses the write-time
 /// auto-stamp (`record_to` stamps only when the field is `None`). Category is
-/// `Machinery` (lifecycle, not work) and the event type rides in `action`
-/// (free-form string — no enum variant, so no schema bump / cross-version
-/// deser break).
-fn build_machine_edge_record(action: &str, machine_uid: &str, display_name: &str) -> FlowRecord {
+/// `Machinery` (lifecycle, not work) and the event type rides in `action`.
+fn build_machine_edge_record(action: crate::FlowAction, machine_uid: &str, display_name: &str) -> FlowRecord {
     FlowRecord {
         ts: crate::ts_utc_now(),
         level: crate::Level::Info,
         category: crate::Category::Machinery,
         tier: crate::Tier::Local,
         stage: crate::Stage::Dispatch,
-        action: action.to_string(),
+        action,
         handle: display_name.to_string(),
         phase_id: None,
         session_id: None,
@@ -220,7 +218,7 @@ fn build_session_end_record(beat: &SessionBeat) -> FlowRecord {
         category: crate::Category::Machinery,
         tier: crate::Tier::Local,
         stage: crate::Stage::Dispatch,
-        action: "session.end".to_string(),
+        action: crate::FlowAction::SessionEnd,
         handle: beat.role.clone().unwrap_or_else(|| beat.session_id.clone()),
         phase_id: None,
         session_id: Some(beat.session_id.clone()),
@@ -247,7 +245,7 @@ pub fn emit_machine_online_edge() {
         return;
     };
     let display_name = crate::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
-    let _ = crate::record(build_machine_edge_record("machine.online", uid, &display_name));
+    let _ = crate::record(build_machine_edge_record(crate::FlowAction::MachineOnline, uid, &display_name));
 }
 
 /// Spawn the presence reconciler on a dedicated OS thread (sync redis client;
@@ -337,7 +335,7 @@ pub fn spawn_reconciler_thread() -> Option<std::thread::JoinHandle<()>> {
                                     // write fails, so it doesn't hold the 60s
                                     // claim with no edge recorded (lost bracket).
                                     if crate::record(build_machine_edge_record(
-                                        "machine.offline",
+                                        crate::FlowAction::MachineOffline,
                                         &gone.machine_uid,
                                         &gone.display_name,
                                     ))
@@ -368,7 +366,7 @@ pub fn spawn_reconciler_thread() -> Option<std::thread::JoinHandle<()>> {
                             for back in reappeared_machines(&last_uids, &now_machines) {
                                 if claim_edge(&client, "machine-online", &back.machine_uid)
                                     && crate::record(build_machine_edge_record(
-                                        "machine.online",
+                                        crate::FlowAction::MachineOnline,
                                         &back.machine_uid,
                                         &back.display_name,
                                     ))
@@ -617,7 +615,7 @@ mod tests {
         // (explicit machine_uid/machine_id suppress the observer auto-stamp),
         // and carry the session id + role for the viewer to bracket it.
         let rec = build_session_end_record(&sbeat("crew-dispatch-coder-1-internal", "coder"));
-        assert_eq!(rec.action, "session.end");
+        assert_eq!(rec.action, crate::FlowAction::SessionEnd);
         assert_eq!(rec.session_id.as_deref(), Some("crew-dispatch-coder-1-internal"));
         assert_eq!(rec.machine_uid.as_deref(), Some("UID-1"));
         assert_eq!(rec.machine_id.as_deref(), Some("laptop"));
@@ -630,10 +628,10 @@ mod tests {
         // The edge's machine_uid/machine_id must be the DISAPPEARED peer (so
         // it's set explicitly and the write-time auto-stamp — which would put
         // the local observer's uid — is suppressed).
-        let rec = build_machine_edge_record("machine.offline", "PEER-UID", "studio");
+        let rec = build_machine_edge_record(crate::FlowAction::MachineOffline, "PEER-UID", "studio");
         assert_eq!(rec.machine_uid.as_deref(), Some("PEER-UID"));
         assert_eq!(rec.machine_id.as_deref(), Some("studio"));
-        assert_eq!(rec.action, "machine.offline");
+        assert_eq!(rec.action, crate::FlowAction::MachineOffline);
         assert_eq!(rec.source.as_deref(), Some(EDGE_SOURCE));
         assert!(matches!(rec.category, crate::Category::Machinery));
     }

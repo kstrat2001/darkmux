@@ -178,6 +178,42 @@ darkmux release.
   it now, so it no longer caps anything. Delete it, or, to keep a cap, run
   `darkmux config set remote.max_tokens_per_step <n>` (and rename an
   exported `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`).
+- **Flow actions have one spelling per event** (FLOW 2.0.0). Every action
+  is `<scope>.<event>[.<detail>]`: `dispatch start` is now `dispatch.start`,
+  `step result` is `step.result`, `mission close` is `mission.close`,
+  `note` is `operator.note`, `tier-decision` is `tier.decision`, and
+  `verdict: <v>` is `phase.review.verdict` with the verdict in
+  `payload.verdict` (the full list is in `crates/darkmux-flow/src/schema.rs`).
+  darkmux's own readers, the daemon routes included, upgrade pre-4.0
+  archives on read and never rewrite them. An action retired with no
+  current equivalent (`telemetry.process`, `funnel.*`, the old
+  `mission.run.*`, `crawl.*` launcher records) still reads, as retired; an
+  action this build does not know still reads and `darkmux doctor` names it. `darkmux flow record
+  --action` accepts only known actions. **Migration:** a consumer of the
+  flow stream outside darkmux (a hook receiver, a script over the day files
+  or Redis) must read the dotted spellings. A hook rule whose `match.action`
+  names an old exact spelling (`dispatch complete`) still matches: the hook
+  layer reads it as its current action, and `darkmux doctor` flags it `OLD
+  SPELLING` with what to write instead. A spaced glob is read as its dotted
+  twin only when that twin matches exactly what it used to (`step *` reads
+  as `step.*`); one that would match more (`dispatch *`, `mission *`,
+  `phase *`) matches nothing, and both `darkmux doctor` (`CANNOT MATCH`) and
+  the hook sink at startup say so.
+- **Every machine in a fleet upgrades together** (FLOW 2.0.0). A 4.0 reader
+  upgrades a 3.x peer's records, but a 3.x reader does not know the dotted
+  spellings: a 3.x hub misreads a 4.0 peer's records (its missions never
+  end, its step results aren't folded). **Migration:** upgrade every
+  machine in the fleet before relying on the hub's views.
+- **Dotted hook globs now match the bookends too** (FLOW 2.0.0). Before 4.0
+  these actions were spaced, so a dotted glob never saw them: `dispatch.*`
+  now also matches `dispatch.start` / `complete` / `error` / `route`;
+  `mission.*` also matches `mission.start` / `close` / `abort` / `pause` /
+  `resume`; `step.*` (which matched nothing before) matches `step.start` /
+  `complete` / `error` / `result` / `timing` / `seat_unresolved`; and
+  `phase.*` matches `phase.start` / `complete` / `abandon` / `added` /
+  `id_ambiguous` and `phase.review.begin` / `aborted` / `dispatch` /
+  `failed` / `verdict`. **Migration:** a receiver behind one of these globs
+  sees more records; narrow the rule (`dispatch.tool`) if it should not.
 
 - **A profile names the machine that runs it: `profile@machine`; `dispatch
   --machine` is removed** (#2916 stage 2, no alias). `darkmux dispatch

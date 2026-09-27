@@ -480,8 +480,8 @@ fn scan_flow_records_for_session(flows_dir: &Path, session_id: &str) -> (bool, b
             // error"; see `darkmux-flow/src/schema.rs::FlowRecord` and
             // `dispatch_internal.rs`'s emission call sites).
             match record.get("action").and_then(Value::as_str) {
-                Some("dispatch start") => saw_start = true,
-                Some("dispatch complete") | Some("dispatch error") => saw_complete = true,
+                Some("dispatch.start") => saw_start = true,
+                Some("dispatch.complete") | Some("dispatch.error") => saw_complete = true,
                 _ => {}
             }
         }
@@ -695,7 +695,7 @@ fn dispatch_start_inactivity_bounds(flows_dir: &Path, session_id: &str) -> Value
             if record.get("session_id").and_then(Value::as_str) != Some(session_id) {
                 continue;
             }
-            if record.get("action").and_then(Value::as_str) != Some("dispatch start") {
+            if record.get("action").and_then(Value::as_str) != Some("dispatch.start") {
                 continue;
             }
             return record

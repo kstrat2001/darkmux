@@ -122,6 +122,99 @@ pub fn action_glob_matches(pattern: &str, action: &str) -> bool {
         && pat_segs.iter().zip(act_segs.iter()).all(|(p, a)| segment_glob(p, a))
 }
 
+/// Say once, at load, which rules name an action pattern that matches no
+/// action darkmux writes (a spelling 4.0 retired, or a typo). They load and
+/// deliver nothing; `darkmux doctor` names them too.
+fn warn_unmatchable_rules(rules: &[HookRule]) {
+    for (index, pattern) in unmatchable_rule_patterns(rules) {
+        let hint = unmatchable_hint(pattern);
+        eprintln!(
+            "flow::HookSink: rule #{index}'s action `{pattern}` matches no action darkmux writes \
+             (actions are spelled `<scope>.<event>`){hint}"
+        );
+    }
+}
+
+/// The "did you mean" tail for an unmatchable pattern: its dotted twin, when
+/// that twin can match anything; empty otherwise.
+fn unmatchable_hint(pattern: &str) -> String {
+    matching_dotted_twin(pattern).map(|t| format!("; did you mean `{t}`?")).unwrap_or_default()
+}
+
+/// A spaced glob's dotted twin, only when the twin matches at least one
+/// action darkmux writes (`dispatchh *` and `sprint *` have none).
+pub fn matching_dotted_twin(pattern: &str) -> Option<String> {
+    dotted_twin(pattern).filter(|t| crate::FlowAction::KNOWN_WIRE.iter().any(|w| action_glob_matches(t, w)))
+}
+
+/// `(rule index, pattern)` for every rule whose action pattern cannot match.
+fn unmatchable_rule_patterns(rules: &[HookRule]) -> Vec<(usize, &str)> {
+    rules
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| Some((i, r.r#match.as_ref()?.action.as_deref()?)))
+        .filter(|(_, p)| !action_pattern_can_match(p))
+        .collect()
+}
+
+/// A rule's match as the write path uses it: its `action` pattern read once,
+/// at load, through [`effective_action_pattern`], so [`hook_match`] stays a
+/// plain glob per record.
+pub fn resolve_match(mut m: HookMatch) -> HookMatch {
+    if let Some(pat) = m.action.take() {
+        m.action = Some(effective_action_pattern(&pat).into_owned());
+    }
+    m
+}
+
+/// The action glob a rule means under 4.0. A rule written before 4.0 names
+/// the old spellings (`dispatch complete`, `step *`); those would match
+/// nothing now, silently. So:
+///
+/// * an exact old spelling reads as its current action;
+/// * a spaced glob reads as its dotted twin (`step *` -> `step.*`) ONLY when
+///   the twin matches exactly the actions the old glob matched, upgraded. A
+///   twin that would match MORE (`dispatch *` -> `dispatch.*` would add every
+///   `dispatch.turn` and `dispatch.tool` record) is not taken: the rule stays
+///   as written, matches nothing, and `darkmux doctor` and [`HookSink::new`]
+///   say so.
+///
+/// Anything else is returned as written.
+pub fn effective_action_pattern(pattern: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(current) = crate::legacy::upgrade_action(pattern) {
+        return std::borrow::Cow::Owned(current.as_str().to_string());
+    }
+    match dotted_twin(pattern) {
+        Some(twin) if !widens(pattern, &twin) => std::borrow::Cow::Owned(twin),
+        _ => std::borrow::Cow::Borrowed(pattern),
+    }
+}
+
+/// The dotted spelling of a spaced glob, when it has one.
+pub fn dotted_twin(pattern: &str) -> Option<String> {
+    (pattern.contains(' ') && pattern.contains('*')).then(|| pattern.replace(' ', "."))
+}
+
+/// True when `twin` matches a current action that `pattern` (an old spaced
+/// glob) never matched in its old spelling, or matches none at all.
+fn widens(pattern: &str, twin: &str) -> bool {
+    let old: std::collections::BTreeSet<&str> = crate::legacy::OLD_SPELLINGS
+        .iter()
+        .filter(|(spelling, _)| action_glob_matches(pattern, spelling))
+        .map(|(_, action)| action.as_str())
+        .collect();
+    let new: std::collections::BTreeSet<&str> =
+        crate::FlowAction::KNOWN_WIRE.iter().copied().filter(|w| action_glob_matches(twin, w)).collect();
+    old.is_empty() || old != new
+}
+
+/// True when `pattern`, read as [`effective_action_pattern`] reads it,
+/// matches at least one action darkmux writes.
+pub fn action_pattern_can_match(pattern: &str) -> bool {
+    let effective = effective_action_pattern(pattern);
+    crate::FlowAction::KNOWN_WIRE.iter().any(|w| action_glob_matches(&effective, w))
+}
+
 fn segment_glob(pattern: &str, value: &str) -> bool {
     if pattern == "*" {
         return true;
@@ -151,18 +244,13 @@ fn level_wire(l: Level) -> String {
         .unwrap_or_default()
 }
 
-/// (#2093 merge-gate finding 11) True when `action` is the sink's OWN
-/// vocabulary (or close enough to it that letting it through would risk
-/// a loop) — checked case-insensitively, and covering more than the
-/// literal `hook.fired`/`hook.failed` strings: the bare word `hook` (no
-/// dot), and the PLURAL `hooks.` prefix (a record naming the FEATURE,
-/// which an operator's own rule could plausibly emit under, e.g.
-/// `hooks.debug`) are refused too. A case-sensitive, singular-only
-/// `starts_with("hook.")` check would let `HOOK.FIRED` or a bare `hook`
-/// action straight through the guard it exists to be.
-fn is_hook_own_action(action: &str) -> bool {
-    let lower = action.to_ascii_lowercase();
-    lower == "hook" || lower.starts_with("hook.") || lower.starts_with("hooks.")
+/// (#2093 merge-gate finding 11) True when `action` must never reach a hook:
+/// the sink's OWN vocabulary (the `hook` scope — letting it through would
+/// loop), and any action this binary does not know. An unknown action is
+/// only ever READ from a record (see [`crate::FlowAction::Other`]); it is
+/// not vocabulary a rule can be written against.
+fn is_hook_own_action(action: &crate::FlowAction) -> bool {
+    !matches!(action.scope(), Some(scope) if scope != crate::FlowScope::Hook)
 }
 
 /// True when `record` satisfies `m`. Records whose `action` is the
@@ -179,7 +267,7 @@ pub fn hook_match(m: &HookMatch, record: &FlowRecord) -> bool {
         return false;
     }
     if let Some(pat) = m.action.as_deref() {
-        if !action_glob_matches(pat, &record.action) {
+        if !action_glob_matches(pat, record.action.as_str()) {
             return false;
         }
     }
@@ -879,6 +967,8 @@ fn read_last_status(path: &Path) -> Option<LastStatus> {
 #[derive(Debug, Clone)]
 pub struct ResolvedRule {
     pub index: usize,
+    /// The configured match with its action resolved ([`resolve_match`]);
+    /// the outbox key comes from the match as configured.
     pub match_: HookMatch,
     pub url: String,
     pub outbox_path: PathBuf,
@@ -965,8 +1055,11 @@ pub fn resolve_one_rule(index: usize, r: &HookRule, outbox_dir: &Path) -> Result
             (format!("file://{}", expanded.display()), None, Some(expanded))
         }
     };
-    let match_ = r.r#match.clone().unwrap_or_default();
-    let key = rule_key(&match_, &url);
+    let configured = r.r#match.clone().unwrap_or_default();
+    // The outbox key is the CONFIGURED match's, so resolving the action does
+    // not strand an existing outbox.
+    let key = rule_key(&configured, &url);
+    let match_ = resolve_match(configured);
     let (outbox_path, cursor_path) = outbox_paths(outbox_dir, &key);
     let last_status_path = last_status_path(outbox_dir, &key);
     let drain_lock_path = drain_lock_path(outbox_dir, &key);
@@ -1151,7 +1244,7 @@ mod destination_tests {
         r.transform = Some("no-such-adapter.jq".into());
         struct Discard;
         impl FlowSink for Discard {
-            fn write(&self, _record: &FlowRecord) -> Result<()> {
+            fn persist(&self, _record: crate::CheckedRecord<'_>) -> Result<()> {
                 Ok(())
             }
             fn info(&self) -> SinkInfo {
@@ -1646,6 +1739,12 @@ fn next_pending_line(outbox_path: &Path, cursor: u64) -> Option<(String, u64)> {
     }
     buf.pop(); // drop the trailing '\n' itself
     let line = String::from_utf8(buf).ok()?;
+    // A line a pre-4.0 binary enqueued goes out with its current spelling;
+    // a current one (or one that is not JSON) goes out byte for byte.
+    let line = match crate::reader::upgrade_line(&line) {
+        Some(std::borrow::Cow::Owned(upgraded)) => upgraded,
+        Some(std::borrow::Cow::Borrowed(_)) | None => line,
+    };
     Some((line, cursor + n as u64))
 }
 
@@ -3369,7 +3468,7 @@ fn emit_hook_record_with(
         payload["receiver_rejected_reasons"] = serde_json::Value::from(receiver_rejected_reasons.to_vec());
     }
 
-    let action = if success { "hook.fired" } else { "hook.failed" };
+    let action = if success { crate::FlowAction::HookFired } else { crate::FlowAction::HookFailed };
     // (#2273) Three outcomes, not two: transport FAILURE (`Error`),
     // transport success with a clean receiver accept (`Info`), and
     // transport success where the receiver's own response body reported
@@ -3394,7 +3493,7 @@ fn emit_hook_record_with(
         category: Category::Machinery,
         tier: Tier::Local,
         stage: Stage::Ship,
-        action: action.to_string(),
+        action,
         handle: host,
         phase_id: None,
         session_id: None,
@@ -3414,8 +3513,9 @@ fn emit_hook_record_with(
         work_id: None,
         attempt: None,
     };
+    let label = rec.action.to_string();
     if let Err(e) = crate::record_to(report_sink, rec) {
-        eprintln!("flow::HookSink: failed to emit {action}: {e:#}");
+        eprintln!("flow::HookSink: failed to emit {label}: {e:#}");
     }
 }
 
@@ -3438,7 +3538,7 @@ fn emit_dry_run_record(report_sink: &dyn FlowSink, rt: &RuleRuntime, delivered_l
         category: Category::Machinery,
         tier: Tier::Local,
         stage: Stage::Ship,
-        action: "hook.dry_run".to_string(),
+        action: crate::FlowAction::HookDryRun,
         handle: rt.rule.url.clone(),
         phase_id: None,
         session_id: None,
@@ -3484,7 +3584,7 @@ fn maybe_warn_dropped(rt: &RuleRuntime, report_sink: &dyn FlowSink, max_outbox_m
         category: Category::Machinery,
         tier: Tier::Local,
         stage: Stage::Ship,
-        action: "hook.failed".to_string(),
+        action: crate::FlowAction::HookFailed,
         handle: host,
         phase_id: None,
         session_id: None,
@@ -3541,7 +3641,7 @@ fn maybe_warn_busy(rt: &RuleRuntime, report_sink: &dyn FlowSink, orphan_count: u
         category: Category::Machinery,
         tier: Tier::Local,
         stage: Stage::Ship,
-        action: "hook.failed".to_string(),
+        action: crate::FlowAction::HookFailed,
         handle: host,
         phase_id: None,
         session_id: None,
@@ -3987,6 +4087,7 @@ impl HookSink {
         // destination), which still refuses the WHOLE sink, unchanged
         // pre-#2183 behavior (see `resolve_rules_refuses_on_first_non_
         // loopback`).
+        warn_unmatchable_rules(rules);
         let mut resolved = Vec::with_capacity(rules.len());
         for (index, r) in rules.iter().enumerate() {
             match resolve_one_rule(index, r, &outbox_dir) {
@@ -4101,7 +4202,8 @@ impl HookSink {
 }
 
 impl FlowSink for HookSink {
-    fn write(&self, record: &FlowRecord) -> Result<()> {
+    fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
         // Loop guard — never even considered against any rule. See
         // `is_hook_own_action`'s doc (#2093 merge-gate finding 11).
         if is_hook_own_action(&record.action) {
@@ -4450,6 +4552,7 @@ pub mod test_receiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FlowSinkWrite;
     use darkmux_types::config::HookMatch;
     use test_receiver::HookReceiver;
 
@@ -4464,7 +4567,7 @@ mod tests {
     /// `CapturingSink` instead (see `delivers_matching_record_and_emits_hook_fired`).
     struct NullSink;
     impl FlowSink for NullSink {
-        fn write(&self, _record: &FlowRecord) -> Result<()> {
+        fn persist(&self, _record: crate::CheckedRecord<'_>) -> Result<()> {
             Ok(())
         }
         fn info(&self) -> SinkInfo {
@@ -4479,7 +4582,7 @@ mod tests {
     /// own doc above.
     struct NoopSink;
     impl FlowSink for NoopSink {
-        fn write(&self, _record: &FlowRecord) -> Result<()> {
+        fn persist(&self, _record: crate::CheckedRecord<'_>) -> Result<()> {
             Ok(())
         }
         fn info(&self) -> SinkInfo {
@@ -4487,14 +4590,14 @@ mod tests {
         }
     }
 
-    fn record(action: &str) -> FlowRecord {
+    fn record(action: crate::FlowAction) -> FlowRecord {
         FlowRecord {
             ts: schema::ts_utc_now(),
             level: Level::Info,
             category: Category::Work,
             tier: Tier::Local,
             stage: Stage::Dispatch,
-            action: action.to_string(),
+            action,
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
@@ -4510,6 +4613,94 @@ mod tests {
             work_id: None,
             attempt: None,
         }
+    }
+
+    /// (4.0) A rule written against an old spelling keeps matching: an
+    /// exact old spelling reads as its current action, and a spaced glob as
+    /// its dotted twin when that twin matches exactly what the old glob did.
+    #[test]
+    fn an_old_spelling_rule_reads_as_its_current_action() {
+        assert_eq!(effective_action_pattern("dispatch complete"), "dispatch.complete");
+        assert_eq!(effective_action_pattern("sprint start"), "phase.start");
+        assert_eq!(effective_action_pattern("step *"), "step.*");
+        assert_eq!(effective_action_pattern("dispatch.tool"), "dispatch.tool", "a current pattern is untouched");
+        // Resolved once, at load: the write path's `hook_match` is a plain
+        // glob and does no upgrade work per record.
+        let raw = HookMatch { action: Some("dispatch complete".to_string()), ..Default::default() };
+        assert!(!hook_match(&raw, &record(crate::FlowAction::DispatchComplete)), "no per-write upgrade");
+        let m = resolve_match(raw);
+        assert!(hook_match(&m, &record(crate::FlowAction::DispatchComplete)));
+        assert!(!hook_match(&m, &record(crate::FlowAction::DispatchError)));
+        let m = resolve_match(HookMatch { action: Some("step *".to_string()), ..Default::default() });
+        assert!(hook_match(&m, &record(crate::FlowAction::StepResult)));
+    }
+
+    /// A loaded rule carries its resolved action, and its outbox key is still
+    /// the configured match's (an existing outbox is not stranded).
+    #[test]
+    fn a_loaded_rule_is_resolved_once_and_keeps_its_outbox_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let configured = HookMatch { action: Some("dispatch complete".to_string()), ..Default::default() };
+        let rule = HookRule {
+            r#match: Some(configured.clone()),
+            http: Some("http://127.0.0.1:8790/events".to_string()),
+            ..Default::default()
+        };
+        let resolved = resolve_one_rule(0, &rule, tmp.path()).unwrap();
+        assert_eq!(resolved.match_.action.as_deref(), Some("dispatch.complete"));
+        let key = rule_key(&configured, "http://127.0.0.1:8790/events");
+        assert_eq!(resolved.outbox_path, outbox_paths(tmp.path(), &key).0);
+    }
+
+    /// The load-time hint names a dotted twin only when the twin can match.
+    #[test]
+    fn the_unmatchable_hint_names_only_a_twin_that_can_match() {
+        assert_eq!(unmatchable_hint("dispatch *"), "; did you mean `dispatch.*`?");
+        assert_eq!(unmatchable_hint("dispatchh *"), "");
+        assert_eq!(unmatchable_hint("sprint *"), "");
+        assert_eq!(unmatchable_hint("dispatchh.*"), "");
+    }
+
+    /// The inverse: a spaced glob whose dotted twin would match MORE than it
+    /// used to is not widened, so it matches nothing and is reported.
+    #[test]
+    fn a_widening_glob_is_left_as_written_and_reported() {
+        for pattern in ["dispatch *", "mission *", "phase *"] {
+            assert_eq!(effective_action_pattern(pattern), pattern, "{pattern} must not widen");
+        }
+        let m = resolve_match(HookMatch { action: Some("dispatch *".to_string()), ..Default::default() });
+        assert!(!hook_match(&m, &record(crate::FlowAction::DispatchTurn)), "not silently widened");
+        let rule = |action: &str| HookRule {
+            r#match: Some(HookMatch { action: Some(action.to_string()), ..Default::default() }),
+            ..Default::default()
+        };
+        let rules = vec![rule("dispatch *"), rule("step *"), rule("dispatchh.*"), rule("dispatch complete"), rule("*")];
+        let bad: Vec<(usize, &str)> = unmatchable_rule_patterns(&rules);
+        assert_eq!(bad, vec![(0, "dispatch *"), (2, "dispatchh.*")]);
+    }
+
+    /// (4.0) An outbox line a pre-4.0 binary enqueued is delivered with its
+    /// current spelling; the cursor still advances past the bytes on disk.
+    #[test]
+    fn a_pre_4_0_outbox_line_is_delivered_with_its_current_spelling() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("r.outbox.jsonl");
+        let old = r#"{"action":"dispatch complete","handle":"h"}"#;
+        let current = r#"{"action":"dispatch.turn","handle":"h"}"#;
+        std::fs::write(&path, format!("{old}\n{current}\n")).unwrap();
+        let (first, cursor) = next_pending_line(&path, 0).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(v["action"], "dispatch.complete");
+        assert_eq!(cursor, old.len() as u64 + 1, "the cursor counts the bytes on disk");
+        let (second, _) = next_pending_line(&path, cursor).unwrap();
+        assert_eq!(second, current, "a current line is delivered byte for byte");
+    }
+
+    /// A record told apart from its siblings by `handle` alone.
+    fn marked(marker: &str) -> FlowRecord {
+        let mut r = record(crate::FlowAction::OperatorNote);
+        r.handle = marker.to_string();
+        r
     }
 
     // ─── 1. Match predicate ───────────────────────────────────────────
@@ -4535,7 +4726,7 @@ mod tests {
 
     #[test]
     fn hook_match_exact_fields() {
-        let mut r = record("crawl.finding");
+        let mut r = record(crate::FlowAction::MissionGrow);
         r.session_id = Some("s1".to_string());
         r.mission_id = Some("m1".to_string());
         r.machine_id = Some("studio".to_string());
@@ -4552,7 +4743,7 @@ mod tests {
 
     #[test]
     fn hook_match_category_and_level() {
-        let mut r = record("telemetry.tokens");
+        let mut r = record(crate::FlowAction::TelemetryTokens);
         r.category = Category::Telemetry;
         r.level = Level::Warn;
         assert!(hook_match(&HookMatch { category: Some("telemetry".to_string()), ..Default::default() }, &r));
@@ -4572,7 +4763,7 @@ mod tests {
 
     #[test]
     fn payload_predicate_matches_on_tool_name() {
-        let mut r = record("dispatch.tool");
+        let mut r = record(crate::FlowAction::DispatchTool);
         r.payload = Some(serde_json::json!({"tool_name": "create_finding", "ok": true}));
         let m = payload_match(&[("tool_name", serde_json::json!("create_finding"))]);
         assert!(hook_match(&m, &r));
@@ -4583,7 +4774,7 @@ mod tests {
 
     #[test]
     fn payload_predicate_distinguishes_ok_true_from_ok_false() {
-        let mut r = record("dispatch.tool");
+        let mut r = record(crate::FlowAction::DispatchTool);
         r.payload = Some(serde_json::json!({"tool_name": "create_finding", "ok": true}));
         assert!(hook_match(&payload_match(&[("ok", serde_json::json!(true))]), &r));
         assert!(!hook_match(&payload_match(&[("ok", serde_json::json!(false))]), &r));
@@ -4595,7 +4786,7 @@ mod tests {
 
     #[test]
     fn payload_predicate_on_a_missing_key_never_matches() {
-        let mut r = record("dispatch.tool");
+        let mut r = record(crate::FlowAction::DispatchTool);
         r.payload = Some(serde_json::json!({"tool_name": "create_finding"}));
         // `outcome` isn't in this payload at all.
         assert!(!hook_match(&payload_match(&[("outcome", serde_json::json!("ok"))]), &r));
@@ -4607,7 +4798,7 @@ mod tests {
 
     #[test]
     fn payload_predicate_resolves_a_nested_dotted_path() {
-        let mut r = record("dispatch.tool");
+        let mut r = record(crate::FlowAction::DispatchTool);
         r.payload = Some(serde_json::json!({"tool_name": "read", "detections": {"count": 3}}));
         assert!(hook_match(&payload_match(&[("detections.count", serde_json::json!(3))]), &r));
         assert!(!hook_match(&payload_match(&[("detections.count", serde_json::json!(4))]), &r));
@@ -4637,7 +4828,7 @@ mod tests {
 
     #[test]
     fn payload_predicate_combines_with_action_and_every_other_field_anded() {
-        let mut r = record("dispatch.tool");
+        let mut r = record(crate::FlowAction::DispatchTool);
         r.payload = Some(serde_json::json!({"tool_name": "create_finding", "ok": true}));
         let m = HookMatch {
             action: Some("dispatch.tool".to_string()),
@@ -4660,7 +4851,7 @@ mod tests {
 
     #[test]
     fn empty_match_matches_nothing() {
-        let r = record("crawl.finding");
+        let r = record(crate::FlowAction::MissionGrow);
         assert!(!hook_match(&HookMatch::default(), &r));
     }
 
@@ -4668,27 +4859,37 @@ mod tests {
     fn hook_actions_never_match_any_rule() {
         // Even the maximally-permissive `*` action pattern must not catch
         // the sink's own firing/failure records — loop prevention.
-        let r = record("hook.fired");
+        let r = record(crate::FlowAction::HookFired);
         assert!(!hook_match(&HookMatch { action: Some("*".to_string()), ..Default::default() }, &r));
-        let r = record("hook.failed");
+        let r = record(crate::FlowAction::HookFailed);
         assert!(!hook_match(&HookMatch { action: Some("*".to_string()), ..Default::default() }, &r));
     }
 
-    /// (#2093 merge-gate finding 11) The loop guard must catch case
-    /// variants and near-miss spellings a naive `starts_with("hook.")`
-    /// lets through: an upper/mixed-case `HOOK.FIRED`, the bare word
-    /// `hook` with no dot at all, and the PLURAL `hooks.` prefix (a
-    /// record naming the feature, not the sink's own vocabulary).
+    /// (#2093 merge-gate finding 11) The loop guard refuses the sink's own
+    /// `hook` scope, and every action this binary does not know: an
+    /// upper/mixed-case `HOOK.FIRED`, the bare word `hook`, the plural
+    /// `hooks.` prefix. Those can only arrive READ from a record, never
+    /// written, and none of them is vocabulary a rule matches.
     #[test]
-    fn hook_actions_never_match_case_insensitively_or_bare_or_plural_prefix() {
-        let vectors = ["HOOK.FIRED", "Hook.Failed", "hook", "hooks.status"];
-        for action in vectors {
+    fn hook_scope_and_unknown_actions_never_match() {
+        let unknown = ["HOOK.FIRED", "Hook.Failed", "hook", "hooks.status", "future.thing"]
+            .map(crate::legacy::read_action);
+        let own = [crate::FlowAction::HookFired, crate::FlowAction::HookFailed, crate::FlowAction::HookDryRun];
+        for action in unknown.into_iter().chain(own) {
+            let label = action.to_string();
             let r = record(action);
             assert!(
                 !hook_match(&HookMatch { action: Some("*".to_string()), ..Default::default() }, &r),
-                "must be excluded by the loop guard: {action}"
+                "must be excluded by the loop guard: {label}"
             );
         }
+    }
+
+    /// The inverse: a known action outside the `hook` scope passes the guard.
+    #[test]
+    fn a_known_non_hook_action_passes_the_loop_guard() {
+        let r = record(crate::FlowAction::DispatchTool);
+        assert!(hook_match(&HookMatch { action: Some("*".to_string()), ..Default::default() }, &r));
     }
 
     // ─── URL policy ─────────────────────────────────────────────────────
@@ -4825,7 +5026,7 @@ mod tests {
 
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
-        sink.write(&record("dispatch start")).unwrap();
+        sink.write(&record(crate::FlowAction::DispatchStart)).unwrap();
         assert!(wait_until(|| receiver.request_count() == 1, Duration::from_secs(3)));
 
         // Give the drainer a moment to persist the last-status file after the
@@ -4882,9 +5083,9 @@ mod tests {
         let m = HookMatch { level: Some(" Info ".into()), category: Some(" work ".into()), ..Default::default() };
         let rule = HookRule { r#match: Some(m.clone()), ..Default::default() };
         assert!(darkmux_types::config_enum::bad_hook_rule_values(&[rule]).is_empty(), "padded is valid");
-        assert!(hook_match(&m, &record("dispatch start")), "and a valid value must match");
+        assert!(hook_match(&m, &record(crate::FlowAction::DispatchStart)), "and a valid value must match");
         let other = HookMatch { level: Some(" warn ".into()), ..Default::default() };
-        assert!(!hook_match(&other, &record("dispatch start")), "a different level still does not");
+        assert!(!hook_match(&other, &record(crate::FlowAction::DispatchStart)), "a different level still does not");
     }
 
     /// (#2947 review C2) The hook-rule config vocabulary (declared in
@@ -4928,7 +5129,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let receiver = HookReceiver::start();
         let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some("mission.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
             file: None,
@@ -4940,8 +5141,8 @@ mod tests {
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
 
-        sink.write(&record("crawl.finding")).unwrap();
-        sink.write(&record("dispatch start")).unwrap(); // non-matching — appends nothing
+        sink.write(&record(crate::FlowAction::MissionGrow)).unwrap();
+        sink.write(&record(crate::FlowAction::DispatchStart)).unwrap(); // non-matching — appends nothing
 
         // Give the append a moment to land (write() itself is synchronous,
         // but read the file only after both writes to keep this simple).
@@ -4972,7 +5173,7 @@ mod tests {
             let sink = sink.clone();
             handles.push(std::thread::spawn(move || {
                 for j in 0..10 {
-                    sink.write(&record(&format!("work.item.{i}.{j}"))).unwrap();
+                    sink.write(&marked(&format!("item.{i}.{j}"))).unwrap();
                 }
             }));
         }
@@ -5007,7 +5208,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let receiver = HookReceiver::start();
         let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some("mission.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
             file: None,
@@ -5020,7 +5221,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -5032,18 +5234,18 @@ mod tests {
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
 
-        sink.write(&record("crawl.finding")).unwrap();
+        sink.write(&record(crate::FlowAction::MissionGrow)).unwrap();
 
         assert!(wait_until(|| receiver.request_count() == 1, Duration::from_secs(3)));
         let bodies = receiver.bodies();
         let delivered: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
-        assert_eq!(delivered["action"], "crawl.finding");
+        assert_eq!(delivered["action"], "mission.grow");
 
-        assert!(wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"), Duration::from_secs(3)));
+        assert!(wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFired), Duration::from_secs(3)));
         {
             let guard = capture.0.lock().unwrap();
-            let fired = guard.iter().find(|r| r.action == "hook.fired").unwrap();
-            assert_eq!(fired.payload.as_ref().unwrap()["delivered_action"], "crawl.finding");
+            let fired = guard.iter().find(|r| r.action == crate::FlowAction::HookFired).unwrap();
+            assert_eq!(fired.payload.as_ref().unwrap()["delivered_action"], "mission.grow");
         }
 
         // The cursor must have ADVANCED past the delivered line: without
@@ -5115,7 +5317,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let receiver = HookReceiver::start();
         let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some("mission.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
             file: None,
@@ -5127,7 +5329,7 @@ mod tests {
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
 
-        let mut r = record("crawl.finding");
+        let mut r = record(crate::FlowAction::MissionGrow);
         r.machine_id = Some("studio".to_string());
         r.machine_uid = Some("uid-123".to_string());
         sink.write(&r).unwrap();
@@ -5136,7 +5338,7 @@ mod tests {
         let headers = receiver.headers();
         let h = &headers[0];
         assert!(h.contains_key("x-darkmux-delivery"), "{h:?}");
-        assert_eq!(h.get("x-darkmux-event").map(String::as_str), Some("crawl.finding"), "{h:?}");
+        assert_eq!(h.get("x-darkmux-event").map(String::as_str), Some("mission.grow"), "{h:?}");
         assert_eq!(h.get("x-darkmux-machine-id").map(String::as_str), Some("studio"), "{h:?}");
         assert_eq!(h.get("x-darkmux-machine-uid").map(String::as_str), Some("uid-123"), "{h:?}");
         assert!(h.contains_key("x-darkmux-sender"), "{h:?}");
@@ -5194,14 +5396,14 @@ mod tests {
         let rules = vec![
             // Decoys at index 0 and 1 — each resolves cleanly (a valid
             // destination is required) but can never match the
-            // "crawl.finding" record this test writes, so neither ever
+            // "mission.grow" record this test writes, so neither ever
             // delivers or competes with the real assertions below. Exist
             // ONLY to push the signed rule off the two shared env keys
             // other tests in this file do read.
             decoy("/decoy-never-fires-0"),
             decoy("/decoy-never-fires-1"),
             HookRule {
-                r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+                r#match: Some(HookMatch { action: Some("mission.*".to_string()), ..Default::default() }),
                 http: Some(receiver.url("/events")),
                 signing_secret_keychain_item: Some("darkmux-hook-test-2".to_string()),
                 file: None,
@@ -5221,7 +5423,7 @@ mod tests {
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
 
-        sink.write(&record("crawl.finding")).unwrap();
+        sink.write(&record(crate::FlowAction::MissionGrow)).unwrap();
         assert!(wait_until(|| receiver.request_count() == 1, Duration::from_secs(3)));
 
         let headers = receiver.headers();
@@ -5254,7 +5456,7 @@ mod tests {
         // unchanged.
         assert_eq!(sanitize_header_value("caf\u{e9}"), "caf_");
         assert_eq!(sanitize_header_value("line1\r\nX-Injected: pwned"), "line1__X-Injected: pwned");
-        assert_eq!(sanitize_header_value("crawl.finding"), "crawl.finding");
+        assert_eq!(sanitize_header_value("mission.grow"), "mission.grow");
         assert_eq!(sanitize_header_value("with a tab\there"), "with a tab\there");
         assert_eq!(sanitize_header_value("an en\u{2013}dash"), "an en_dash");
     }
@@ -5284,7 +5486,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let receiver = HookReceiver::start();
         let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some("mission.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
             file: None,
@@ -5296,7 +5498,7 @@ mod tests {
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
 
-        let mut r = record("crawl.finding");
+        let mut r = record(crate::FlowAction::MissionGrow);
         // "café" with a combining accent, plus a literal en-dash — both
         // outside the printable-ASCII allowlist.
         r.machine_id = Some("caf\u{e9}\u{2013}peer".to_string());
@@ -5326,7 +5528,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let receiver = HookReceiver::start();
         let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some("mission.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
             file: None,
@@ -5338,7 +5540,7 @@ mod tests {
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
 
-        let mut r = record("crawl.finding");
+        let mut r = record(crate::FlowAction::MissionGrow);
         r.machine_id = Some("line1\r\nX-Injected: pwned".to_string());
         sink.write(&r).unwrap();
 
@@ -5378,7 +5580,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let receiver = HookReceiver::start().with_status_sequence([500, 200]);
         let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some("mission.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
             file: None,
@@ -5390,7 +5592,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -5402,7 +5605,7 @@ mod tests {
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
 
-        sink.write(&record("crawl.finding")).unwrap();
+        sink.write(&record(crate::FlowAction::MissionGrow)).unwrap();
 
         assert!(wait_until(|| receiver.request_count() >= 2, Duration::from_secs(5)), "expected a retry after the 500");
         let headers = receiver.headers();
@@ -5410,9 +5613,9 @@ mod tests {
         let second_id = headers[1].get("x-darkmux-delivery").unwrap().clone();
         assert_eq!(first_id, second_id, "same undelivered line — same delivery id across retries");
 
-        assert!(wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"), Duration::from_secs(3)));
+        assert!(wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFired), Duration::from_secs(3)));
         let guard = capture.0.lock().unwrap();
-        let fired = guard.iter().find(|r| r.action == "hook.fired").unwrap();
+        let fired = guard.iter().find(|r| r.action == crate::FlowAction::HookFired).unwrap();
         assert_eq!(fired.payload.as_ref().unwrap()["delivery_id"], serde_json::Value::String(first_id));
     }
 
@@ -5444,7 +5647,7 @@ mod tests {
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
 
         let start = Instant::now();
-        sink.write(&record("dispatch start")).unwrap();
+        sink.write(&record(crate::FlowAction::DispatchStart)).unwrap();
         let elapsed = start.elapsed();
         assert!(elapsed < Duration::from_millis(100), "write() must not block on the network, took {elapsed:?}");
 
@@ -5472,7 +5675,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -5483,15 +5687,15 @@ mod tests {
         let capture = Arc::new(CapturingSink::default());
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
-        sink.write(&record("dispatch error")).unwrap();
+        sink.write(&record(crate::FlowAction::DispatchError)).unwrap();
 
         assert!(wait_until(|| receiver.request_count() >= 3, Duration::from_secs(5)));
         assert!(
-            wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.failed"), Duration::from_secs(2)),
+            wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFailed), Duration::from_secs(2)),
             "hook.failed emitted after 3 client-error attempts"
         );
         let failed = capture.0.lock().unwrap();
-        let failed = failed.iter().find(|r| r.action == "hook.failed").unwrap();
+        let failed = failed.iter().find(|r| r.action == crate::FlowAction::HookFailed).unwrap();
         assert_eq!(failed.payload.as_ref().unwrap()["attempt"], 3);
 
         // Cursor advanced past the skipped line — it's gone from the pending queue.
@@ -5519,7 +5723,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -5530,15 +5735,15 @@ mod tests {
         let capture = Arc::new(CapturingSink::default());
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
-        sink.write(&record("dispatch error")).unwrap();
+        sink.write(&record(crate::FlowAction::DispatchError)).unwrap();
 
         assert!(wait_until(|| receiver.request_count() >= 3, Duration::from_secs(8)));
         assert!(
-            wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"), Duration::from_secs(2)),
+            wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFired), Duration::from_secs(2)),
             "eventually delivered"
         );
         let fired = capture.0.lock().unwrap();
-        let fired = fired.iter().find(|r| r.action == "hook.fired").unwrap();
+        let fired = fired.iter().find(|r| r.action == crate::FlowAction::HookFired).unwrap();
         assert_eq!(fired.payload.as_ref().unwrap()["attempt"], 3, "500, 500, 200 = 3 attempts total");
     }
 
@@ -5547,7 +5752,8 @@ mod tests {
     #[derive(Default)]
     struct CapturingSink(Mutex<Vec<FlowRecord>>);
     impl FlowSink for CapturingSink {
-        fn write(&self, record: &FlowRecord) -> Result<()> {
+        fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
             self.0.lock().unwrap().push(record.clone());
             Ok(())
         }
@@ -5591,15 +5797,15 @@ mod tests {
         let capture = Arc::new(CapturingSink::default());
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
-        sink.write(&record("dispatch start")).unwrap();
+        sink.write(&record(crate::FlowAction::DispatchStart)).unwrap();
 
         assert!(
-            wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.failed"), Duration::from_secs(3)),
+            wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFailed), Duration::from_secs(3)),
             "a 3xx must be treated as a PERMANENT failure, not retried forever"
         );
         {
             let guard = capture.0.lock().unwrap();
-            let failed = guard.iter().find(|r| r.action == "hook.failed").unwrap();
+            let failed = guard.iter().find(|r| r.action == crate::FlowAction::HookFailed).unwrap();
             let err = failed.payload.as_ref().unwrap()["error"].as_str().unwrap_or_default();
             assert!(err.contains("redirect refused"), "reason should name the redirect refusal: {err}");
             assert!(err.contains("302"), "reason should name the status: {err}");
@@ -5651,10 +5857,10 @@ mod tests {
         let capture = Arc::new(CapturingSink::default());
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
-        sink.write(&record("dispatch start")).unwrap();
+        sink.write(&record(crate::FlowAction::DispatchStart)).unwrap();
 
         assert!(
-            wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.failed"), Duration::from_secs(3)),
+            wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFailed), Duration::from_secs(3)),
             "a 3xx must be treated as a PERMANENT failure"
         );
         assert!(wait_until(
@@ -5692,7 +5898,7 @@ mod tests {
         // And the same text is what the flow record carries — the sidecar
         // is not the only consumer.
         let guard = capture.0.lock().unwrap();
-        let failed = guard.iter().find(|r| r.action == "hook.failed").unwrap();
+        let failed = guard.iter().find(|r| r.action == crate::FlowAction::HookFailed).unwrap();
         assert_eq!(failed.payload.as_ref().unwrap()["error"].as_str().unwrap_or_default(), err);
     }
 
@@ -5717,10 +5923,10 @@ mod tests {
         let capture = Arc::new(CapturingSink::default());
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
-        sink.write(&record("dispatch start")).unwrap();
+        sink.write(&record(crate::FlowAction::DispatchStart)).unwrap();
 
         assert!(
-            wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.failed"), Duration::from_secs(3)),
+            wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFailed), Duration::from_secs(3)),
             "307 must also be refused as a permanent failure"
         );
         assert_never_contacted(&attacker);
@@ -6180,7 +6386,7 @@ mod tests {
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
         let cursor_path = sink.rules[0].rule.cursor_path.clone();
         set_force_cursor_write_failure(&cursor_path, true);
-        sink.write(&record("storm.candidate")).unwrap();
+        sink.write(&record(crate::FlowAction::OperatorNote)).unwrap();
 
         // One pending record; the receiver accepts every POST, but the
         // cursor can never be persisted, so every "delivery" is really a
@@ -6191,7 +6397,7 @@ mod tests {
         let request_count = receiver.request_count();
         assert!(request_count <= 3, "cursor-write failures must back off, not storm the receiver — saw {request_count} requests");
 
-        let fired_count = capture.0.lock().unwrap().iter().filter(|r| r.action == "hook.fired").count();
+        let fired_count = capture.0.lock().unwrap().iter().filter(|r| r.action == crate::FlowAction::HookFired).count();
         assert!(fired_count <= 3, "hook.fired must not fire once per redelivery-storm attempt — saw {fired_count}");
 
         let summaries = summarize_configured_rules(&rules, tmp.path());
@@ -6205,7 +6411,7 @@ mod tests {
         // Recovery: the cursor becomes writable again.
         set_force_cursor_write_failure(&cursor_path, false);
         assert!(
-            wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"), Duration::from_secs(3)),
+            wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFired), Duration::from_secs(3)),
             "once the cursor is writable again the pending record must actually deliver"
         );
         assert!(
@@ -6312,10 +6518,10 @@ mod tests {
         {
             let report: Arc<dyn FlowSink> = Arc::new(NullSink);
             let sink = HookSink::new_for_test_with_max_outbox_mb(&rules, tmp.path().to_path_buf(), report, 1).unwrap();
-            let mut big = record("work.big");
+            let mut big = record(crate::FlowAction::OperatorNote);
             big.reasoning = Some("x".repeat(2 * 1024 * 1024));
             sink.write(&big).unwrap();
-            sink.write(&record("work.drop.1")).unwrap();
+            sink.write(&record(crate::FlowAction::OperatorNote)).unwrap();
         }
         let after_1 = summarize_configured_rules(&rules, tmp.path())[0].dropped_appends;
 
@@ -6325,7 +6531,7 @@ mod tests {
         {
             let report: Arc<dyn FlowSink> = Arc::new(NullSink);
             let sink = HookSink::new_for_test_with_max_outbox_mb(&rules, tmp.path().to_path_buf(), report, 1).unwrap();
-            sink.write(&record("work.drop.2")).unwrap();
+            sink.write(&record(crate::FlowAction::OperatorNote)).unwrap();
         }
         let after_2 = summarize_configured_rules(&rules, tmp.path())[0].dropped_appends;
 
@@ -6333,7 +6539,7 @@ mod tests {
         {
             let report: Arc<dyn FlowSink> = Arc::new(NullSink);
             let sink = HookSink::new_for_test_with_max_outbox_mb(&rules, tmp.path().to_path_buf(), report, 1).unwrap();
-            sink.write(&record("work.drop.3")).unwrap();
+            sink.write(&record(crate::FlowAction::OperatorNote)).unwrap();
         }
         let after_3 = summarize_configured_rules(&rules, tmp.path())[0].dropped_appends;
 
@@ -6362,11 +6568,11 @@ mod tests {
         let capture = Arc::new(CapturingSink::default());
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
-        sink.write(&record("dispatch start")).unwrap();
+        sink.write(&record(crate::FlowAction::DispatchStart)).unwrap();
 
-        assert!(wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"), Duration::from_secs(3)));
+        assert!(wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFired), Duration::from_secs(3)));
         let guard = capture.0.lock().unwrap();
-        let fired = guard.iter().find(|r| r.action == "hook.fired").unwrap();
+        let fired = guard.iter().find(|r| r.action == crate::FlowAction::HookFired).unwrap();
         assert!(
             fired.machine_id.is_some(),
             "hook.fired must go through the same stamping path every other producer uses (machine_id present)"
@@ -6550,7 +6756,7 @@ mod tests {
         // (must be dropped, since undelivered is now already over the 1
         // MiB cap).
         let big_reasoning = "x".repeat(2 * 1024 * 1024);
-        let mut big = record("work.big");
+        let mut big = record(crate::FlowAction::OperatorNote);
         big.reasoning = Some(big_reasoning);
         sink.write(&big).unwrap();
         assert_eq!(
@@ -6559,7 +6765,7 @@ mod tests {
             "the first (over-cap-pushing) write lands — the check is against bytes BEFORE this write"
         );
 
-        sink.write(&record("work.small")).unwrap();
+        sink.write(&record(crate::FlowAction::OperatorNote)).unwrap();
         assert_eq!(
             undelivered_line_count(&sink.rules[0].rule.outbox_path, 0),
             1,
@@ -6613,22 +6819,22 @@ mod tests {
         let capture = Arc::new(CapturingSink::default());
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
-        sink.write(&record("work.valid")).unwrap();
+        sink.write(&record(crate::FlowAction::OperatorNote)).unwrap();
 
         assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(5)));
         // Give any (incorrect) further delivery attempt time to happen.
         std::thread::sleep(POLL_INTERVAL * 5);
         assert_eq!(receiver.request_count(), 1, "only the valid line was ever POSTed — the torn line must never reach the network");
         let delivered: serde_json::Value = serde_json::from_str(&receiver.bodies()[0]).unwrap();
-        assert_eq!(delivered["action"], "work.valid");
+        assert_eq!(delivered["action"], "operator.note");
 
-        assert!(wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.failed"), Duration::from_secs(3)));
-        assert!(wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"), Duration::from_secs(3)));
+        assert!(wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFailed), Duration::from_secs(3)));
+        assert!(wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFired), Duration::from_secs(3)));
         let guard = capture.0.lock().unwrap();
-        let fired: Vec<_> = guard.iter().filter(|r| r.action == "hook.fired").collect();
+        let fired: Vec<_> = guard.iter().filter(|r| r.action == crate::FlowAction::HookFired).collect();
         assert_eq!(fired.len(), 1, "exactly one hook.fired — never for the torn line");
-        assert_eq!(fired[0].payload.as_ref().unwrap()["delivered_action"], "work.valid");
-        let failed: Vec<_> = guard.iter().filter(|r| r.action == "hook.failed").collect();
+        assert_eq!(fired[0].payload.as_ref().unwrap()["delivered_action"], "operator.note");
+        let failed: Vec<_> = guard.iter().filter(|r| r.action == crate::FlowAction::HookFailed).collect();
         assert_eq!(failed.len(), 1, "exactly one hook.failed — the quarantined torn line");
         let reason = failed[0].payload.as_ref().unwrap()["error"].as_str().unwrap_or_default();
         assert_eq!(reason, "invalid outbox line");
@@ -6678,9 +6884,9 @@ mod tests {
         let quarantine_path = PathBuf::from(format!("{}.quarantine", outbox_path.display()));
         assert!(!quarantine_path.exists(), "a valid-JSON-but-no-action line must NOT be quarantined");
 
-        assert!(wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"), Duration::from_secs(3)));
+        assert!(wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFired), Duration::from_secs(3)));
         let guard = capture.0.lock().unwrap();
-        let fired = guard.iter().find(|r| r.action == "hook.fired").unwrap();
+        let fired = guard.iter().find(|r| r.action == crate::FlowAction::HookFired).unwrap();
         assert_eq!(
             fired.payload.as_ref().unwrap()["delivered_action"],
             serde_json::Value::Null,
@@ -6790,7 +6996,7 @@ mod tests {
         let capture = Arc::new(CapturingSink::default());
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
-        sink.write(&record("dispatch error")).unwrap();
+        sink.write(&record(crate::FlowAction::DispatchError)).unwrap();
 
         // After 500, 400 — exactly one client error so far, one retryable.
         assert!(wait_until(|| receiver.request_count() >= 2, Duration::from_secs(5)));
@@ -6801,7 +7007,7 @@ mod tests {
             "must NOT give up after just one 4xx mixed in with a retryable failure"
         );
         assert!(
-            !capture.0.lock().unwrap().iter().any(|r| r.action == "hook.failed"),
+            !capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFailed),
             "no hook.failed yet — only 1 of 3 required client errors observed (2 total attempts)"
         );
 
@@ -6811,7 +7017,7 @@ mod tests {
         // take several seconds — bound generously rather than tightening
         // the assertion window.
         assert!(
-            wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.failed"), Duration::from_secs(15)),
+            wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFailed), Duration::from_secs(15)),
             "gives up once 3 client errors (not 3 total attempts) are observed"
         );
     }
@@ -6835,16 +7041,16 @@ mod tests {
         let capture = Arc::new(CapturingSink::default());
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
-        sink.write(&record("dispatch start")).unwrap();
+        sink.write(&record(crate::FlowAction::DispatchStart)).unwrap();
 
         // 3 consecutive 429s would exceed MAX_CLIENT_ERROR_ATTEMPTS (3) if
         // miscounted as client errors — it must NOT give up, and must
         // eventually succeed on the 4th (200) response.
         assert!(
-            wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"), Duration::from_secs(8)),
+            wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFired), Duration::from_secs(8)),
             "429 is retryable — must eventually succeed, never give up as a client error"
         );
-        assert!(!capture.0.lock().unwrap().iter().any(|r| r.action == "hook.failed"), "429 must never produce hook.failed");
+        assert!(!capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFailed), "429 must never produce hook.failed");
     }
 
     #[test]
@@ -6864,9 +7070,9 @@ mod tests {
         let capture = Arc::new(CapturingSink::default());
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
-        sink.write(&record("dispatch start")).unwrap();
+        sink.write(&record(crate::FlowAction::DispatchStart)).unwrap();
 
-        assert!(wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"), Duration::from_secs(5)));
+        assert!(wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFired), Duration::from_secs(5)));
     }
 
     #[test]
@@ -6927,7 +7133,7 @@ mod tests {
 
         let n = 21;
         for i in 0..n {
-            sink1.write(&record(&format!("work.item.{i}"))).unwrap();
+            sink1.write(&marked(&format!("item.{i}"))).unwrap();
         }
 
         assert!(wait_until(|| receiver.request_count() >= n, Duration::from_secs(15)));
@@ -6943,9 +7149,9 @@ mod tests {
         let bodies = receiver.bodies();
         let actions: std::collections::BTreeSet<String> = bodies
             .iter()
-            .map(|b| serde_json::from_str::<serde_json::Value>(b).unwrap()["action"].as_str().unwrap().to_string())
+            .map(|b| serde_json::from_str::<serde_json::Value>(b).unwrap()["handle"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(actions.len(), n, "{n} distinct actions delivered, none repeated");
+        assert_eq!(actions.len(), n, "{n} distinct records delivered, none repeated");
 
         let seq = observed.lock().unwrap();
         for w in seq.windows(2) {
@@ -6977,7 +7183,7 @@ mod tests {
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
         {
             let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report.clone()).unwrap();
-            sink.write(&record("dispatch start")).unwrap();
+            sink.write(&record(crate::FlowAction::DispatchStart)).unwrap();
             std::thread::sleep(Duration::from_millis(150)); // let the drainer try + fail at least once
         }
 
@@ -7001,7 +7207,7 @@ mod tests {
     #[test]
     fn outbox_and_cursor_paths_named_by_content_hash_not_index() {
         let dir = PathBuf::from("/tmp/x");
-        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let m = HookMatch { action: Some("mission.*".to_string()), ..Default::default() };
         let key = rule_key(&m, "http://127.0.0.1:8790/events");
         let (outbox, cursor) = outbox_paths(&dir, &key);
         // Readable host prefix + a stable hash suffix, NOT an array index.
@@ -7012,7 +7218,7 @@ mod tests {
         // Deterministic — the SAME rule content always yields the SAME key.
         assert_eq!(rule_key(&m, "http://127.0.0.1:8790/events"), key);
         // A DIFFERENT match yields a DIFFERENT key, even at the same host.
-        let m2 = HookMatch { action: Some("crawl.other".to_string()), ..Default::default() };
+        let m2 = HookMatch { action: Some("mission.other".to_string()), ..Default::default() };
         assert_ne!(rule_key(&m2, "http://127.0.0.1:8790/events"), key);
     }
 
@@ -7024,7 +7230,7 @@ mod tests {
     /// position.
     #[test]
     fn rule_key_is_immune_to_reordering_unlike_the_old_index_scheme() {
-        let rule_a = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let rule_a = HookMatch { action: Some("mission.*".to_string()), ..Default::default() };
         let rule_b = HookMatch { action: Some("dispatch.*".to_string()), ..Default::default() };
         let url = "http://127.0.0.1:8790/events";
 
@@ -7049,7 +7255,7 @@ mod tests {
     fn resolve_rules_paths_are_stable_across_reordering() {
         let tmp = tempfile::TempDir::new().unwrap();
         let rule_a = HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some("mission.*".to_string()), ..Default::default() }),
             http: Some("http://127.0.0.1:8790/a".to_string()),
             signing_secret_keychain_item: None,
             file: None,
@@ -7092,7 +7298,7 @@ mod tests {
         let disabled: Arc<dyn FlowSink> = Arc::new(NullSink);
         let start = Instant::now();
         for i in 0..n {
-            disabled.write(&record(&format!("work.item.{i}"))).unwrap();
+            disabled.write(&marked(&format!("item.{i}"))).unwrap();
         }
         let disabled_elapsed = start.elapsed();
 
@@ -7110,7 +7316,7 @@ mod tests {
                 extras: Default::default(),
             },
             HookRule {
-                r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+                r#match: Some(HookMatch { action: Some("mission.*".to_string()), ..Default::default() }),
                 http: Some("http://127.0.0.1:1/b".to_string()),
                 signing_secret_keychain_item: None,
                 file: None,
@@ -7134,7 +7340,7 @@ mod tests {
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
         let start = Instant::now();
         for i in 0..n {
-            sink.write(&record(&format!("work.item.{i}"))).unwrap();
+            sink.write(&marked(&format!("item.{i}"))).unwrap();
         }
         let enabled_elapsed = start.elapsed();
 
@@ -7155,7 +7361,7 @@ mod tests {
         let receiver = HookReceiver::start()
             .with_response_body(r#"{"ok":true,"accepted":0,"rejected":1,"results":[{"ok":false,"error":"rule must be a string"}]}"#);
         let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some("mission.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
             file: None,
@@ -7167,7 +7373,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -7178,12 +7385,12 @@ mod tests {
         let capture = Arc::new(CapturingSink::default());
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
-        sink.write(&record("crawl.finding")).unwrap();
+        sink.write(&record(crate::FlowAction::MissionGrow)).unwrap();
         assert!(wait_until(
-            || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"),
+            || capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFired),
             Duration::from_secs(3)
         ));
-        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == "hook.fired").cloned().unwrap();
+        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == crate::FlowAction::HookFired).cloned().unwrap();
         let rejected = fired.payload.as_ref().and_then(|p| p.get("receiver_rejected")).and_then(|v| v.as_u64());
         assert_eq!(rejected, Some(1), "{fired:?}");
         // (#2273) A receiver rejection is a THIRD outcome, distinct from
@@ -7196,7 +7403,7 @@ mod tests {
         // flow record — so a SEPARATE `darkmux doctor` invocation can
         // still see the rejection after this event has scrolled off the
         // stream.
-        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let m = HookMatch { action: Some("mission.*".to_string()), ..Default::default() };
         let key = rule_key(&m, &receiver.url("/events"));
         let last = read_last_status(&last_status_path(tmp.path(), &key)).expect("`.last` sidecar must exist");
         assert_eq!(last.last_receiver_rejected, Some(1), "{last:?}");
@@ -7219,7 +7426,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let receiver = HookReceiver::start();
         let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some("mission.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
             file: None,
@@ -7231,7 +7438,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -7242,18 +7450,18 @@ mod tests {
         let capture = Arc::new(CapturingSink::default());
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
-        sink.write(&record("crawl.finding")).unwrap();
+        sink.write(&record(crate::FlowAction::MissionGrow)).unwrap();
         assert!(wait_until(
-            || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"),
+            || capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFired),
             Duration::from_secs(3)
         ));
-        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == "hook.fired").cloned().unwrap();
+        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == crate::FlowAction::HookFired).cloned().unwrap();
         assert!(
             fired.payload.as_ref().and_then(|p| p.get("receiver_rejected")).is_none(),
             "a clean accept must never carry a receiver_rejected field: {fired:?}"
         );
         assert_eq!(level_wire(fired.level), "info", "{fired:?}");
-        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let m = HookMatch { action: Some("mission.*".to_string()), ..Default::default() };
         let key = rule_key(&m, &receiver.url("/events"));
         let last = read_last_status(&last_status_path(tmp.path(), &key)).expect("`.last` sidecar must exist");
         assert_eq!(last.last_receiver_rejected, None, "{last:?}");
@@ -7279,7 +7487,7 @@ mod tests {
     fn receiver_rejected_total_survives_a_later_clean_delivery() {
         let tmp = tempfile::TempDir::new().unwrap();
         let receiver = HookReceiver::start().with_response_body(r#"{"ok":true,"accepted":0,"rejected":1}"#);
-        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let m = HookMatch { action: Some("mission.*".to_string()), ..Default::default() };
         let url = receiver.url("/events");
         let rules = vec![HookRule {
             r#match: Some(m.clone()),
@@ -7296,7 +7504,7 @@ mod tests {
         let key = rule_key(&m, &url);
         let last_path = last_status_path(tmp.path(), &key);
 
-        sink.write(&record("crawl.finding")).unwrap();
+        sink.write(&record(crate::FlowAction::MissionGrow)).unwrap();
         assert!(
             wait_until(
                 || read_last_status(&last_path).and_then(|s| s.last_receiver_rejected) == Some(1),
@@ -7311,7 +7519,7 @@ mod tests {
         // is the rendezvous: it can only happen once the SECOND delivery's
         // terminal status write has landed.
         receiver.set_response_body(None);
-        sink.write(&record("crawl.finding")).unwrap();
+        sink.write(&record(crate::FlowAction::MissionGrow)).unwrap();
         assert!(
             wait_until(
                 || read_last_status(&last_path).is_some_and(|s| s.last_receiver_rejected.is_none()),
@@ -7344,7 +7552,7 @@ mod tests {
             r#"{"ok":true,"accepted":2,"rejected":1,"results":[{"ok":true},{"ok":true},{"ok":false,"error":"payload field \"file\" must be a non-empty string"}]}"#,
         );
         let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some("mission.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
             file: None,
@@ -7356,7 +7564,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -7367,12 +7576,12 @@ mod tests {
         let capture = Arc::new(CapturingSink::default());
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
-        sink.write(&record("crawl.finding")).unwrap();
+        sink.write(&record(crate::FlowAction::MissionGrow)).unwrap();
         assert!(wait_until(
-            || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"),
+            || capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFired),
             Duration::from_secs(3)
         ));
-        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == "hook.fired").cloned().unwrap();
+        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == crate::FlowAction::HookFired).cloned().unwrap();
         let reasons: Vec<String> = fired
             .payload
             .as_ref()
@@ -7395,7 +7604,7 @@ mod tests {
         );
         assert_eq!(level_wire(fired.level), "warn", "{fired:?}");
 
-        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let m = HookMatch { action: Some("mission.*".to_string()), ..Default::default() };
         let key = rule_key(&m, &receiver.url("/events"));
         let last = read_last_status(&last_status_path(tmp.path(), &key)).expect("`.last` sidecar must exist");
         assert_eq!(
@@ -7423,7 +7632,7 @@ mod tests {
             r#"{"ok":true,"accepted":0,"rejected":2,"results":[{"ok":false,"error":"reason A"},{"ok":false,"error":"reason B"}]}"#,
         );
         let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some("mission.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
             file: None,
@@ -7434,10 +7643,10 @@ mod tests {
         }];
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
-        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let m = HookMatch { action: Some("mission.*".to_string()), ..Default::default() };
         let key = rule_key(&m, &receiver.url("/events"));
         let last_path = last_status_path(tmp.path(), &key);
-        sink.write(&record("crawl.finding")).unwrap();
+        sink.write(&record(crate::FlowAction::MissionGrow)).unwrap();
         assert!(
             wait_until(
                 || read_last_status(&last_path).is_some_and(|s| s.last_receiver_rejected == Some(2)),
@@ -7464,7 +7673,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let receiver = HookReceiver::start().with_response_body("not valid json at all {{{");
         let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some("mission.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
             file: None,
@@ -7476,7 +7685,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -7487,12 +7697,12 @@ mod tests {
         let capture = Arc::new(CapturingSink::default());
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
-        sink.write(&record("crawl.finding")).unwrap();
+        sink.write(&record(crate::FlowAction::MissionGrow)).unwrap();
         assert!(wait_until(
-            || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"),
+            || capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFired),
             Duration::from_secs(3)
         ));
-        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == "hook.fired").cloned().unwrap();
+        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == crate::FlowAction::HookFired).cloned().unwrap();
         assert_eq!(level_wire(fired.level), "info", "{fired:?}");
         assert!(
             fired.payload.as_ref().and_then(|p| p.get("receiver_rejected")).is_none(),
@@ -7502,7 +7712,7 @@ mod tests {
             fired.payload.as_ref().and_then(|p| p.get("receiver_rejected_reasons")).is_none(),
             "no reasons can exist without a parseable body: {fired:?}"
         );
-        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let m = HookMatch { action: Some("mission.*".to_string()), ..Default::default() };
         let key = rule_key(&m, &receiver.url("/events"));
         let summary = summarize_configured_rules(&rules, tmp.path()).remove(0);
         assert_eq!(summary.receiver_rejected_total, 0, "{summary:?}");
@@ -7521,7 +7731,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let receiver = HookReceiver::start().with_response_body(r#"{"ok":true}"#);
         let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some("mission.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
             file: None,
@@ -7532,10 +7742,10 @@ mod tests {
         }];
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
-        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let m = HookMatch { action: Some("mission.*".to_string()), ..Default::default() };
         let key = rule_key(&m, &receiver.url("/events"));
         let last_path = last_status_path(tmp.path(), &key);
-        sink.write(&record("crawl.finding")).unwrap();
+        sink.write(&record(crate::FlowAction::MissionGrow)).unwrap();
         assert!(
             wait_until(|| read_last_status(&last_path).is_some(), Duration::from_secs(3)),
             "the clean delivery must land"
@@ -7576,7 +7786,7 @@ mod tests {
             r#"{"ok":true,"results":[{"ok":false,"error":"CLEAN-MISMARK"}]}"#,
         );
         let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some("mission.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
             file: None,
@@ -7588,7 +7798,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -7599,22 +7810,22 @@ mod tests {
         let capture = Arc::new(CapturingSink::default());
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
-        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let m = HookMatch { action: Some("mission.*".to_string()), ..Default::default() };
         let key = rule_key(&m, &receiver.url("/events"));
         let last_path = last_status_path(tmp.path(), &key);
-        sink.write(&record("crawl.finding")).unwrap();
+        sink.write(&record(crate::FlowAction::MissionGrow)).unwrap();
         assert!(
             wait_until(|| read_last_status(&last_path).is_some(), Duration::from_secs(3)),
             "the delivery must land"
         );
         assert!(
             wait_until(
-                || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"),
+                || capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFired),
                 Duration::from_secs(3)
             ),
             "hook.fired must land"
         );
-        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == "hook.fired").cloned().unwrap();
+        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == crate::FlowAction::HookFired).cloned().unwrap();
         assert!(
             fired.payload.as_ref().and_then(|p| p.get("receiver_rejected")).is_none(),
             "no top-level `rejected` key in the body means no count to disclose: {fired:?}"
@@ -8253,7 +8464,7 @@ mod tests {
             r#"{"ok":true,"rejected":0,"results":[{"ok":false,"error":"ZERO-COUNT-LEAK"}]}"#,
         );
         let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some("mission.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
             file: None,
@@ -8265,7 +8476,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -8276,22 +8488,22 @@ mod tests {
         let capture = Arc::new(CapturingSink::default());
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
-        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let m = HookMatch { action: Some("mission.*".to_string()), ..Default::default() };
         let key = rule_key(&m, &receiver.url("/events"));
         let last_path = last_status_path(tmp.path(), &key);
-        sink.write(&record("crawl.finding")).unwrap();
+        sink.write(&record(crate::FlowAction::MissionGrow)).unwrap();
         assert!(
             wait_until(|| read_last_status(&last_path).is_some(), Duration::from_secs(3)),
             "the delivery must land"
         );
         assert!(
             wait_until(
-                || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"),
+                || capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFired),
                 Duration::from_secs(3)
             ),
             "hook.fired must land"
         );
-        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == "hook.fired").cloned().unwrap();
+        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == crate::FlowAction::HookFired).cloned().unwrap();
         assert!(
             fired.payload.as_ref().and_then(|p| p.get("receiver_rejected")).is_none(),
             "rejected: 0 is not a count to disclose: {fired:?}"
@@ -8398,7 +8610,7 @@ mod tests {
             serde_json::Value::String(poisoned.to_string())
         ));
         let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            r#match: Some(HookMatch { action: Some("mission.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
             file: None,
@@ -8410,7 +8622,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -8421,16 +8634,16 @@ mod tests {
         let capture = Arc::new(CapturingSink::default());
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
-        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let m = HookMatch { action: Some("mission.*".to_string()), ..Default::default() };
         let key = rule_key(&m, &receiver.url("/events"));
         let last_path = last_status_path(tmp.path(), &key);
-        sink.write(&record("crawl.finding")).unwrap();
+        sink.write(&record(crate::FlowAction::MissionGrow)).unwrap();
         assert!(wait_until(|| read_last_status(&last_path).is_some(), Duration::from_secs(3)));
         assert!(wait_until(
-            || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"),
+            || capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFired),
             Duration::from_secs(3)
         ));
-        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == "hook.fired").cloned().unwrap();
+        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == crate::FlowAction::HookFired).cloned().unwrap();
         let reasons: Vec<String> = fired
             .payload
             .as_ref()
@@ -8519,7 +8732,7 @@ mod tests {
         }];
         let tmp = tempfile::TempDir::new().unwrap();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), Arc::new(NoopSink)).unwrap();
-        let mut rec = record("dispatch.tool");
+        let mut rec = record(crate::FlowAction::DispatchTool);
         rec.payload = Some(serde_json::json!({"tool_name": "create_finding"}));
         sink.write(&rec).unwrap();
         assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(3)));
@@ -8544,7 +8757,7 @@ mod tests {
             ..Default::default()
         }];
         let sink = HookSink::new(&rules, outbox_dir, Arc::new(NoopSink)).unwrap();
-        let mut rec = record("dispatch.tool");
+        let mut rec = record(crate::FlowAction::DispatchTool);
         rec.payload = Some(serde_json::json!({"tool_name": "create_finding"}));
         sink.write(&rec).unwrap();
         assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(3)));
@@ -8569,7 +8782,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -8580,9 +8794,9 @@ mod tests {
         let capture = Arc::new(CapturingSink::default());
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, outbox_dir, report).unwrap();
-        sink.write(&record("dispatch.tool")).unwrap();
+        sink.write(&record(crate::FlowAction::DispatchTool)).unwrap();
         assert!(wait_until(
-            || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.failed"),
+            || capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFailed),
             Duration::from_secs(3)
         ));
         // Give the drainer several extra poll cycles — a bug that
@@ -8592,7 +8806,7 @@ mod tests {
         drop(sink);
         clear_darkmux_home();
         assert_eq!(receiver.request_count(), 0, "a jq error must never reach the network");
-        let failed: Vec<_> = capture.0.lock().unwrap().iter().filter(|r| r.action == "hook.failed").cloned().collect();
+        let failed: Vec<_> = capture.0.lock().unwrap().iter().filter(|r| r.action == crate::FlowAction::HookFailed).cloned().collect();
         assert_eq!(failed.len(), 1, "quarantined once, never retried: {failed:?}");
         let err = failed[0].payload.as_ref().and_then(|p| p.get("error")).and_then(|v| v.as_str()).unwrap_or("");
         assert!(err.contains("adapter boom"), "{err}");
@@ -8632,7 +8846,7 @@ mod tests {
             ..Default::default()
         }];
         let sink = HookSink::new(&rules, outbox_dir, Arc::new(NoopSink)).unwrap();
-        let mut rec = record("dispatch.tool");
+        let mut rec = record(crate::FlowAction::DispatchTool);
         rec.payload = Some(serde_json::json!({"tool_name": "create_finding"}));
         sink.write(&rec).unwrap();
         assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(3)));
@@ -8682,7 +8896,7 @@ mod tests {
                 ..Default::default()
             },
             HookRule {
-                r#match: Some(HookMatch { action: Some("fine.*".to_string()), ..Default::default() }),
+                r#match: Some(HookMatch { action: Some("operator.*".to_string()), ..Default::default() }),
                 http: Some(receiver.url("/events")),
                 ..Default::default()
             },
@@ -8690,7 +8904,7 @@ mod tests {
         // Construction must NOT fail — the bad-adapter rule is dropped,
         // the healthy rule still runs.
         let sink = HookSink::new(&rules, outbox_dir, Arc::new(NoopSink)).unwrap();
-        sink.write(&record("fine.thing")).unwrap();
+        sink.write(&record(crate::FlowAction::OperatorNote)).unwrap();
         assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(3)));
         drop(sink);
         clear_darkmux_home();
@@ -8719,7 +8933,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -8730,11 +8945,11 @@ mod tests {
         let capture = Arc::new(CapturingSink::default());
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, outbox_dir, report).unwrap();
-        let mut rec = record("dispatch.tool");
+        let mut rec = record(crate::FlowAction::DispatchTool);
         rec.payload = Some(serde_json::json!({"tool_name": "create_finding"}));
         sink.write(&rec).unwrap();
         assert!(wait_until(
-            || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.dry_run"),
+            || capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookDryRun),
             Duration::from_secs(3)
         ));
         drop(sink);
@@ -8815,7 +9030,7 @@ mod tests {
         }];
         let tmp = tempfile::TempDir::new().unwrap();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), Arc::new(NoopSink)).unwrap();
-        sink.write(&record("dispatch.tool")).unwrap();
+        sink.write(&record(crate::FlowAction::DispatchTool)).unwrap();
         assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(3)));
         drop(sink);
         let headers = receiver.headers();
@@ -8869,7 +9084,8 @@ mod tests {
         #[derive(Default)]
         struct CapturingSink(Mutex<Vec<FlowRecord>>);
         impl FlowSink for CapturingSink {
-            fn write(&self, record: &FlowRecord) -> Result<()> {
+            fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+        let record = record.get();
                 self.0.lock().unwrap().push(record.clone());
                 Ok(())
             }
@@ -8888,7 +9104,7 @@ mod tests {
         // immediately (never spawns), and the SAME undelivered line is
         // what accumulates `consecutive_busy` toward the stall threshold.
         for _ in 0..5 {
-            sink.write(&record("dispatch.tool")).unwrap();
+            sink.write(&record(crate::FlowAction::DispatchTool)).unwrap();
         }
         // (a) A rate-limited hook.failed names the backlog — fires on
         // the FIRST Busy outcome (no prior warning to rate-limit against).
@@ -8899,7 +9115,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .iter()
-                    .any(|r| r.action == "hook.failed"
+                    .any(|r| r.action == crate::FlowAction::HookFailed
                         && r.payload.as_ref().and_then(|p| p.get("error")).and_then(|v| v.as_str())
                             .is_some_and(|e| e.contains("transform backlogged"))),
                 Duration::from_secs(5)

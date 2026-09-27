@@ -199,6 +199,7 @@ pub fn run() -> DoctorReport {
         check_binary_split_brain(),
         check_audit_integrity(),
         check_audit_write_drops(),
+        check_unknown_flow_actions(),
         check_state_file_permissions(),
         check_daemon_auth(),
         check_utility_model_binding(),
@@ -777,6 +778,45 @@ fn summarize_audit_reports(reports: &[darkmux_flow::IntegrityReport]) -> Check {
             reports.len()
         ),
         hint: None,
+    }
+}
+
+/// How many of the newest day files [`check_unknown_flow_actions`] reads.
+const UNKNOWN_ACTION_SCAN_DAYS: usize = 7;
+
+/// Records in the recent flow archive whose action this darkmux does not
+/// know. They still read (lenient on read, contract 5), and they are never
+/// taken as vocabulary: a newer darkmux wrote them, or something outside
+/// darkmux did. Named here so neither case goes unseen.
+fn check_unknown_flow_actions() -> Check {
+    let dir = darkmux_types::config_access::flows_dir();
+    unknown_flow_actions_check(&darkmux_flow::reader::unknown_actions_in(&dir, UNKNOWN_ACTION_SCAN_DAYS))
+}
+
+fn unknown_flow_actions_check(tally: &darkmux_flow::reader::UnknownActions) -> Check {
+    let name = "flow action vocabulary".to_string();
+    if tally.total() == 0 {
+        return Check {
+            name,
+            status: Status::Pass,
+            message: format!("every action in the last {UNKNOWN_ACTION_SCAN_DAYS} day file(s) is one this darkmux knows"),
+            hint: None,
+        };
+    }
+    let names: Vec<String> = tally.by_name().iter().map(|(a, n)| format!("{a} ({n})")).collect();
+    Check {
+        name,
+        status: Status::Warn,
+        message: format!(
+            "{} record(s) in the last {UNKNOWN_ACTION_SCAN_DAYS} day file(s) carry an action this darkmux does not know: {}",
+            tally.total(),
+            names.join(", ")
+        ),
+        hint: Some(
+            "They read as-is and nothing acts on them. A newer darkmux on this machine or a peer \
+             writes actions this build does not know; upgrading this binary names them."
+                .into(),
+        ),
     }
 }
 
@@ -2073,47 +2113,6 @@ fn check_gh_allowlist() -> Check {
         status: Status::Pass,
         message: format!("enabled ({provenance}) — allowed: {}", allowed.join(", ")),
         hint: None,
-    }
-}
-
-/// (silent-miss audit, 2026-09-06) Every DISTINCT `action` value present in
-/// today's flow day file — read once here so the hooks check can flag
-/// a rule that has NEVER matched anything because its `match.action` names
-/// the OTHER bookend spelling from what today's records actually carry
-/// (`darkmux_flow::is_dispatch_start`/`is_dispatch_complete`/
-/// `is_dispatch_error` tolerate both spellings; a hook rule's own
-/// `HookMatch::action` glob does not — see `checks_hooks::never_matched_flag`,
-/// the check this feeds). Not a general flow reader: reads
-/// exactly one file (today's), and returns an empty set on any
-/// read/parse failure or a line that isn't a JSON object with a string
-/// `action` — the same descriptive-not-refusing posture the rest of
-/// `darkmux doctor` takes when a file is missing, absent, or malformed.
-fn today_flow_actions() -> std::collections::HashSet<String> {
-    let dir = darkmux_types::config_access::flows_dir();
-    let path = dir.join(format!("{}.jsonl", darkmux_flow::day_utc_now()));
-    let Ok(text) = std::fs::read_to_string(&path) else { return std::collections::HashSet::new() };
-    text.lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter_map(|v| v.get("action").and_then(|a| a.as_str()).map(str::to_string))
-        .collect()
-}
-
-/// The "other" spelling of a known dispatch-bookend action — `None` for
-/// anything else. Scoped deliberately to the six literal spellings
-/// `darkmux_flow`'s shared matchers already know about (three bookends ×
-/// two spellings), not every action string: this is the ONE vocabulary
-/// where "configured for one spelling, records carry the other" is a
-/// known, structural drift risk (see `CLAUDE.md`'s "Dispatch liveness"
-/// contract) rather than an operator simply misspelling an arbitrary verb.
-fn other_bookend_spelling(action: &str) -> Option<&'static str> {
-    match action {
-        "dispatch.start" => Some("dispatch start"),
-        "dispatch start" => Some("dispatch.start"),
-        "dispatch.complete" => Some("dispatch complete"),
-        "dispatch complete" => Some("dispatch.complete"),
-        "dispatch.error" => Some("dispatch error"),
-        "dispatch error" => Some("dispatch.error"),
-        _ => None,
     }
 }
 
@@ -9768,6 +9767,21 @@ mod tests {
         }
     }
 
+    /// Unknown actions in the archive warn with their count and names; none
+    /// passes.
+    #[test]
+    fn unknown_flow_actions_warn_with_count_and_names_and_none_pass() {
+        let mut tally = darkmux_flow::reader::UnknownActions::default();
+        assert_eq!(unknown_flow_actions_check(&tally).status, Status::Pass);
+        for a in ["future.thing", "future.thing", "dispatch start", "other.x"] {
+            tally.observe(&serde_json::json!({ "action": a }));
+        }
+        let check = unknown_flow_actions_check(&tally);
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.starts_with("3 record(s)"), "{}", check.message);
+        assert!(check.message.contains("future.thing (2), other.x (1)"), "{}", check.message);
+    }
+
     #[test]
     fn summarize_audit_reports_broken_chain_is_fail() {
         let broken = darkmux_flow::IntegrityReport {
@@ -11811,8 +11825,10 @@ mod tests {
         //
         // (4.0 integration) 64: the cleanup's 63 plus
         // `check_renamed_budget_settings` (#2902 step 5).
+        //
+        // (4.0 flow vocabulary) 65: `check_unknown_flow_actions` joined.
         let expected =
-            64 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            65 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

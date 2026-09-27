@@ -11,74 +11,38 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// The dispatch-lifecycle action vocabulary (#1852).
-///
-/// `FlowRecord::action` is a bare `String` while its neighbours (`category`,
-/// `tier`, `stage`) are enums — so the one field every consumer JOINS on is
-/// the only one nothing constrains. Two producer lineages consequently spell
-/// the bookends differently: `darkmux-crew` and the CLI emit the SPACED form,
-/// `darkmux-lab` and the runtime emit the DOTTED one. Consumers cope through
-/// THREE independent defenses: a normalizer in the React viewer's `flow.ts`
-/// (the sole surviving normalizer since the legacy viewer's own, in
-/// `viewer.html`, retired along with that file, #1806); the
-/// [`is_dispatch_start`]/[`is_dispatch_complete`]/[`is_dispatch_error`]
-/// helpers right here, which are now the ONE Rust-side hedge — both
-/// `serve/lib.rs` call sites and `serve/runs.rs` route through these
-/// functions rather than each carrying its own `||` comparison, so a fix
-/// here fixes every Rust consumer at once; and the mission-graph lens's
-/// own inline `||` hedges (`ui/src/lenses/mission/graph.ts`: `action ===
-/// "dispatch complete" || action === "dispatch.complete"`, etc. — folded
-/// into the React port #1868, the standalone `mission-graph.html` page
-/// this doc used to cite is retired), which stay genuinely independent
-/// because nothing routes this module's action matching through
-/// `flow.ts`'s shared normalizer either.
-///
-/// That is not currently a live bug — every consumer that needs to cope, does.
-/// It is fragile in the obvious way: it works until the next consumer
-/// forgets, and `savings.ts` is already correct only *because* its data
-/// passed through `buildFlowWindow` first, a coupling nothing states or
-/// tests.
-///
-/// These constants carry the SPACED value deliberately: it is what is on disk,
-/// in Redis, and in every historical record. Changing the emitted string would
-/// be a data-shape change requiring a `FLOW_SCHEMA_VERSION` bump and would
-/// strand history. The point here is to make the string un-retypeable, not to
-/// pick a winner — that is a separate decision, and a migration.
-pub const DISPATCH_START: &str = "dispatch start";
-/// See [`DISPATCH_START`].
-pub const DISPATCH_COMPLETE: &str = "dispatch complete";
-/// See [`DISPATCH_START`].
-pub const DISPATCH_ERROR: &str = "dispatch error";
-
-/// True for either spelling of a dispatch-start bookend.
-///
-/// Consumers MUST use these rather than comparing a literal: a record may
-/// carry either spelling depending on which lineage emitted it, and which
-/// spelling arrives is not a property a call site can reason about locally.
-pub fn is_dispatch_start(action: &str) -> bool {
-    action == DISPATCH_START || action == "dispatch.start"
-}
-
-/// True for either spelling of a dispatch-complete bookend. See
-/// [`is_dispatch_start`].
-pub fn is_dispatch_complete(action: &str) -> bool {
-    action == DISPATCH_COMPLETE || action == "dispatch.complete"
-}
-
-/// True for either spelling of a dispatch-error bookend. See
-/// [`is_dispatch_start`].
-pub fn is_dispatch_error(action: &str) -> bool {
-    action == DISPATCH_ERROR || action == "dispatch.error"
-}
-
-/// True for any dispatch-lifecycle terminal (complete OR error) — the
-/// "did this dispatch stop" question, which several consumers ask.
-pub fn is_dispatch_terminal(action: &str) -> bool {
-    is_dispatch_complete(action) || is_dispatch_error(action)
-}
-
-pub const FLOW_SCHEMA_VERSION: &str = "1.65.0";
+pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 // Version history:
+//   2.0.0 (4.0): MAJOR, the action vocabulary is closed and has one spelling
+//           per event. Every action is a `FlowAction` variant (`action.rs`),
+//           spelled `<scope>.<event>[.<detail>]`: lowercase, two or three
+//           dot-separated segments. Dotted only on write; a spaced or
+//           otherwise retired spelling in an archive is upgraded on read by
+//           `darkmux_flow::reader` (the table is `legacy.rs`), and an
+//           archive is never rewritten. Renamed: `dispatch start` /
+//           `complete` / `error` / `route` -> `dispatch.*`; `step start` /
+//           `complete` / `error` / `result` / `timing` -> `step.*`,
+//           `step seat unresolved` -> `step.seat_unresolved`; `phase start`
+//           / `complete` / `abandon` / `added` (and the pre-rename `sprint
+//           start` / `complete` / `abandon` / `added` / `review begin`)
+//           -> `phase.*`,
+//           `ambiguous-phase-id` -> `phase.id_ambiguous`; `phase review
+//           begin` / `aborted` -> `phase.review.*`, `dispatch
+//           code-reviewer` -> `phase.review.dispatch`, `dispatch failed`
+//           -> `phase.review.failed`, `verdict: <v>` ->
+//           `phase.review.verdict` with the verdict in `payload.verdict`;
+//           `mission start` / `close` / `abort` / `pause` / `resume` ->
+//           `mission.*`; `note` -> `operator.note`, `catch` ->
+//           `operator.catch`, `tier-decision` -> `tier.decision`. An action
+//           darkmux retired with no current equivalent (`telemetry.process`,
+//           `funnel.*`, the old `mission.run.*` / `mission.compile.*` /
+//           `mission reopen`, the literal launcher's `crawl.*`) reads as
+//           `FlowAction::Retired`: known, never written, not counted as
+//           unknown. An action this build does not know reads as
+//           `FlowAction::Other`, is never written, and `darkmux doctor`
+//           names it. A consumer outside
+//           darkmux reads the dotted spellings; darkmux's own readers
+//           upgrade old archives.
 //   1.65.0 (#2902 step 5, budgets): additive, four actions and one usage
 //           field.
 //
@@ -2023,6 +1987,8 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.65.0";
 //           exactly as it did before this fix — only the name changed.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
 pub enum Level {
     Error,
@@ -2058,6 +2024,8 @@ pub enum Level {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
 pub enum Category {
     Work,
@@ -2076,6 +2044,8 @@ pub enum Category {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
     Operator,
@@ -2088,6 +2058,8 @@ pub enum Tier {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "kebab-case")]
 pub enum Stage {
     Scope,
@@ -2120,7 +2092,7 @@ pub struct FlowRecord {
     pub category: Category,
     pub tier: Tier,
     pub stage: Stage,
-    pub action: String,
+    pub action: crate::FlowAction,
     pub handle: String,
     /// Sprint→Phase rename read-compat: historical flow records on disk
     /// (append-only JSONL, never rewritten) carry this under the pre-
@@ -2396,7 +2368,7 @@ mod forward_compat_tests {
         assert!(matches!(rec.category, Category::Unknown));
         assert!(matches!(rec.tier, Tier::Unknown));
         assert!(matches!(rec.stage, Stage::Unknown));
-        assert_eq!(rec.action, "dispatch start");
+        assert_eq!(rec.action, crate::FlowAction::DispatchStart);
         assert_eq!(rec.session_id.as_deref(), Some("task-t1"));
         assert_eq!(rec.model.as_deref(), Some("gpt-4o"));
     }

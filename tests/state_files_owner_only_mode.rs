@@ -18,7 +18,7 @@
 
 #![cfg(unix)]
 
-use darkmux_flow::FlowSink as _;
+use darkmux_flow::FlowSinkWrite as _;
 use std::os::unix::fs::PermissionsExt;
 
 // ===== DARKMUX-SPAWN-HELPERS: BEGIN (#2710) ==========================
@@ -357,7 +357,7 @@ fn flock_try_lock_exclusive_creates_files_owner_only_mode() {
 /// those land.
 struct NullSink;
 impl darkmux_flow::FlowSink for NullSink {
-    fn write(&self, _record: &darkmux_flow::FlowRecord) -> anyhow::Result<()> {
+    fn persist(&self, _record: darkmux_flow::CheckedRecord<'_>) -> anyhow::Result<()> {
         Ok(())
     }
     fn info(&self) -> darkmux_flow::SinkInfo {
@@ -365,14 +365,14 @@ impl darkmux_flow::FlowSink for NullSink {
     }
 }
 
-fn sample_record(action: &str) -> darkmux_flow::FlowRecord {
+fn sample_record(action: darkmux_flow::FlowAction) -> darkmux_flow::FlowRecord {
     darkmux_flow::FlowRecord {
         ts: darkmux_flow::ts_utc_now(),
         level: darkmux_flow::Level::Info,
         category: darkmux_flow::Category::Work,
         tier: darkmux_flow::Tier::Local,
         stage: darkmux_flow::Stage::Dispatch,
-        action: action.to_string(),
+        action,
         handle: "h".to_string(),
         phase_id: None,
         session_id: None,
@@ -411,7 +411,7 @@ fn hook_outbox_and_status_sidecar_are_owner_only_mode() {
         let report: std::sync::Arc<dyn darkmux_flow::FlowSink> = std::sync::Arc::new(NullSink);
         let sink = darkmux_flow::hooks::HookSink::new(&rules, outbox_dir.clone(), report).expect("HookSink::new");
 
-        sink.write(&sample_record("dispatch.start")).expect("write");
+        sink.write(&sample_record(darkmux_flow::FlowAction::DispatchStart)).expect("write");
 
         // Wait for delivery — proves both files (outbox + `.last`) exist.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -466,7 +466,7 @@ fn hook_quarantine_file_is_owner_only_mode() {
         // rule is actually wired up (a matching write that never delivers
         // would leave the quarantine assertion unreachable, not merely
         // failing for the wrong reason).
-        sink.write(&sample_record("dispatch.start")).expect("write");
+        sink.write(&sample_record(darkmux_flow::FlowAction::DispatchStart)).expect("write");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while receiver.request_count() == 0 && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -624,7 +624,7 @@ fn flow_jsonl_is_owner_only_mode() {
         category: darkmux_flow::Category::Work,
         tier: darkmux_flow::Tier::Local,
         stage: darkmux_flow::Stage::Dispatch,
-        action: "dispatch.start".to_string(),
+        action: darkmux_flow::FlowAction::DispatchStart,
         handle: "coder".to_string(),
         phase_id: None,
         session_id: None,

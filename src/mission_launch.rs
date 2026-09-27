@@ -311,7 +311,7 @@ fn emit_launch_cmd_audit(
 /// already closed for `emit_cmd_audit`.
 pub(crate) fn mission_bookend_record(
     level: flow::Level,
-    action: &str,
+    action: darkmux_flow::FlowAction,
     config_id: &str,
     mission_id: &str,
     payload: serde_json::Value,
@@ -1254,7 +1254,7 @@ pub fn launch(
     let mut bookend = flow::BookendGuard::new(&mut dispatch_sink, move |_id, _kind| {
         mission_bookend_record(
             flow::Level::Error,
-            "dispatch error",
+            darkmux_flow::FlowAction::DispatchError,
             &config_id_for_abort,
             &mission_id_for_abort,
             serde_json::json!({
@@ -1269,7 +1269,7 @@ pub fn launch(
         "dispatch",
         mission_bookend_record(
             flow::Level::Info,
-            "dispatch start",
+            darkmux_flow::FlowAction::DispatchStart,
             config_id,
             &mission_id,
             serde_json::json!({ "runtime": "mission" }),
@@ -1494,7 +1494,7 @@ pub fn launch(
                     }
                     bookend.emit_now(mission_bookend_record(
                         flow::Level::Info,
-                        "mission.grow",
+                        darkmux_flow::FlowAction::MissionGrow,
                         config_id,
                         &mission_id,
                         payload,
@@ -1758,7 +1758,7 @@ pub fn launch(
             "dispatch",
             mission_bookend_record(
                 flow::Level::Error,
-                "dispatch error",
+                darkmux_flow::FlowAction::DispatchError,
                 config_id,
                 &mission_id,
                 serde_json::json!({
@@ -1954,7 +1954,7 @@ pub fn launch(
         "dispatch",
         mission_bookend_record(
             if exit_code == 0 { flow::Level::Info } else { flow::Level::Error },
-            if exit_code == 0 { "dispatch complete" } else { "dispatch error" },
+            if exit_code == 0 { darkmux_flow::FlowAction::DispatchComplete } else { darkmux_flow::FlowAction::DispatchError },
             config_id,
             &mission_id,
             serde_json::json!({
@@ -3444,7 +3444,7 @@ fn coder_branch_terminal_bookend(
     let reached_gate = !gate_outcome_reached_no_gate(outcome);
     let record = mission_bookend_record(
         if reached_gate { flow::Level::Info } else { flow::Level::Error },
-        if reached_gate { "dispatch complete" } else { "dispatch error" },
+        if reached_gate { darkmux_flow::FlowAction::DispatchComplete } else { darkmux_flow::FlowAction::DispatchError },
         config_id,
         mission_id,
         serde_json::json!({
@@ -6048,7 +6048,7 @@ mod tests {
             .filter(|r| {
                 let action = r.get("action").and_then(|v| v.as_str()).unwrap_or("");
                 let source = r.get("source").and_then(|v| v.as_str()).unwrap_or("");
-                source == "scheduler" && (action == "step start" || action == "step complete")
+                source == "scheduler" && (action == "step.start" || action == "step.complete")
             })
             .collect();
         assert!(
@@ -6165,7 +6165,7 @@ mod tests {
         let records = read_all_flow_records();
         let timing: Vec<&serde_json::Value> = records
             .iter()
-            .filter(|r| r.get("action").and_then(|v| v.as_str()) == Some("step timing"))
+            .filter(|r| r.get("action").and_then(|v| v.as_str()) == Some("step.timing"))
             .collect();
         assert_eq!(
             timing.len(),
@@ -8763,12 +8763,12 @@ mod tests {
     fn mission_bookend_record_stamps_mission_source_session_and_mission_id() {
         let rec = mission_bookend_record(
             flow::Level::Info,
-            "dispatch start",
+            darkmux_flow::FlowAction::DispatchStart,
             "coder-phase",
             "coder-phase-123-abcdef",
             serde_json::json!({ "runtime": "mission" }),
         );
-        assert_eq!(rec.action, "dispatch start");
+        assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchStart);
         assert_eq!(rec.handle, "coder-phase");
         assert_eq!(rec.session_id.as_deref(), Some("coder-phase-123-abcdef"));
         assert_eq!(rec.mission_id.as_deref(), Some("coder-phase-123-abcdef"));
@@ -8792,14 +8792,14 @@ mod tests {
     // `reached_gate = success` mutation named in the finding) failed
     // `coder_branch_terminal_bookend_ok_2_qa_blockers_still_reaches_the_gate`
     // and `..._ok_3_qa_unavailable_still_reaches_the_gate` below: both
-    // asserted `action == "dispatch complete"` and instead got
+    // asserted `action == "dispatch.complete"` and instead got
     // `"dispatch error"`.
 
     #[test]
     fn coder_branch_terminal_bookend_ok_0_clean_reaches_the_gate() {
         let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(0), "coder-phase", "m-1");
         assert!(reached_gate);
-        assert_eq!(rec.action, "dispatch complete");
+        assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchComplete);
         assert!(matches!(rec.level, flow::Level::Info), "{:?}", rec.level);
         assert_eq!(rec.payload.as_ref().unwrap()["result_class"], serde_json::json!("ok"));
         assert_eq!(rec.payload.as_ref().unwrap()["gate"], serde_json::json!("coder-phase"));
@@ -8813,7 +8813,7 @@ mod tests {
         // `dispatch complete`, never `dispatch error`.
         let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(2), "coder-phase", "m-2");
         assert!(reached_gate, "Ok(2) (QA blockers) must still reach the gate");
-        assert_eq!(rec.action, "dispatch complete");
+        assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchComplete);
         assert!(matches!(rec.level, flow::Level::Info), "{:?}", rec.level);
     }
 
@@ -8821,7 +8821,7 @@ mod tests {
     fn coder_branch_terminal_bookend_ok_3_qa_unavailable_still_reaches_the_gate() {
         let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(3), "coder-phase", "m-3");
         assert!(reached_gate, "Ok(3) (QA unavailable) must still reach the gate");
-        assert_eq!(rec.action, "dispatch complete");
+        assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchComplete);
         assert!(matches!(rec.level, flow::Level::Info), "{:?}", rec.level);
     }
 
@@ -8829,7 +8829,7 @@ mod tests {
     fn coder_branch_terminal_bookend_ok_1_coder_dispatch_failure_never_reaches_the_gate() {
         let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(1), "coder-phase", "m-4");
         assert!(!reached_gate);
-        assert_eq!(rec.action, "dispatch error");
+        assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchError);
         assert!(matches!(rec.level, flow::Level::Error), "{:?}", rec.level);
         assert_eq!(rec.payload.as_ref().unwrap()["result_class"], serde_json::json!("error"));
     }
@@ -8839,7 +8839,7 @@ mod tests {
         let (reached_gate, rec) =
             coder_branch_terminal_bookend(&Err(anyhow!("worktree already exists")), "coder-phase", "m-5");
         assert!(!reached_gate);
-        assert_eq!(rec.action, "dispatch error");
+        assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchError);
         assert!(matches!(rec.level, flow::Level::Error), "{:?}", rec.level);
     }
 
@@ -8880,7 +8880,7 @@ mod tests {
             let mut guard = flow::BookendGuard::new(&mut sink, move |_id, _kind| {
                 mission_bookend_record(
                     flow::Level::Error,
-                    "dispatch error",
+                    darkmux_flow::FlowAction::DispatchError,
                     "panic-test-config",
                     "panic-test-mission",
                     serde_json::json!({
@@ -8895,7 +8895,7 @@ mod tests {
                 "dispatch",
                 mission_bookend_record(
                     flow::Level::Info,
-                    "dispatch start",
+                    darkmux_flow::FlowAction::DispatchStart,
                     "panic-test-config",
                     "panic-test-mission",
                     serde_json::json!({ "runtime": "mission" }),
@@ -8906,8 +8906,8 @@ mod tests {
         std::panic::set_hook(prev_hook);
         assert!(result.is_err(), "the panic must propagate out of catch_unwind");
         assert_eq!(records.len(), 2, "expected [start, abort]: {records:#?}");
-        assert_eq!(records[0].action, "dispatch start");
-        assert_eq!(records[1].action, "dispatch error");
+        assert_eq!(records[0].action, darkmux_flow::FlowAction::DispatchStart);
+        assert_eq!(records[1].action, darkmux_flow::FlowAction::DispatchError);
         assert_eq!(records[1].source.as_deref(), Some("mission"));
     }
 
@@ -8968,11 +8968,11 @@ mod tests {
         let mission_records: Vec<&serde_json::Value> =
             records.iter().filter(|r| r["source"] == "mission").collect();
         let starts: Vec<&&serde_json::Value> =
-            mission_records.iter().filter(|r| r["action"] == "dispatch start").collect();
+            mission_records.iter().filter(|r| r["action"] == "dispatch.start").collect();
         let completes: Vec<&&serde_json::Value> =
-            mission_records.iter().filter(|r| r["action"] == "dispatch complete").collect();
+            mission_records.iter().filter(|r| r["action"] == "dispatch.complete").collect();
         let errors: Vec<&&serde_json::Value> =
-            mission_records.iter().filter(|r| r["action"] == "dispatch error").collect();
+            mission_records.iter().filter(|r| r["action"] == "dispatch.error").collect();
         assert_eq!(
             starts.len(),
             1,
@@ -9049,9 +9049,9 @@ mod tests {
         let mission_records: Vec<&serde_json::Value> =
             records.iter().filter(|r| r["source"] == "mission").collect();
         let starts: Vec<&&serde_json::Value> =
-            mission_records.iter().filter(|r| r["action"] == "dispatch start").collect();
+            mission_records.iter().filter(|r| r["action"] == "dispatch.start").collect();
         let errors: Vec<&&serde_json::Value> =
-            mission_records.iter().filter(|r| r["action"] == "dispatch error").collect();
+            mission_records.iter().filter(|r| r["action"] == "dispatch.error").collect();
         assert_eq!(
             starts.len(),
             1,
@@ -9247,7 +9247,7 @@ mod tests {
         let records = read_all_flow_records();
         let timing: Vec<&serde_json::Value> = records
             .iter()
-            .filter(|r| r.get("action").and_then(|v| v.as_str()) == Some("step timing"))
+            .filter(|r| r.get("action").and_then(|v| v.as_str()) == Some("step.timing"))
             .collect();
         assert_eq!(
             timing.len(),
@@ -9272,7 +9272,7 @@ mod tests {
         // this arc had to make explicit rather than merge silently.
         let step_result: Vec<&serde_json::Value> = records
             .iter()
-            .filter(|r| r.get("action").and_then(|v| v.as_str()) == Some("step result"))
+            .filter(|r| r.get("action").and_then(|v| v.as_str()) == Some("step.result"))
             .collect();
         assert_eq!(step_result.len(), 1, "the worktree kind's own step-result companion must still fire");
         assert_eq!(step_result[0]["payload"]["kind"], serde_json::json!("mission.worktree"));

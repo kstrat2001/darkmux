@@ -47,7 +47,7 @@ use darkmux_types::style;
 /// Best-effort (observability, never loop-failing).
 fn emit_run_record(
     level: flow::Level,
-    action: &str,
+    action: darkmux_flow::FlowAction,
     mission_id: &str,
     phase_id: &str,
     session_id: &str,
@@ -102,7 +102,7 @@ pub(crate) fn emit_step_result(
     }
     let _ = flow::record(crew::dispatch::build_dispatch_record_with_payload(
         level,
-        "step result",
+        darkmux_flow::FlowAction::StepResult,
         "mission-run",
         session_id,
         None,
@@ -1515,7 +1515,10 @@ fn teardown_and_terminate_phase(
     let session_id = darkmux_types::session_id::mission_run(mission_id, &phase.id);
     emit_run_record(
         flow::Level::Info,
-        &format!("mission.run.{}", kind.verb()),
+        match kind {
+            MissionTerminal::Finalize => darkmux_flow::FlowAction::MissionRunFinalize,
+            MissionTerminal::Abort => darkmux_flow::FlowAction::MissionRunAbort,
+        },
         mission_id,
         &phase.id,
         &session_id,
@@ -2347,34 +2350,14 @@ fn mission_cautions(
         return Vec::new();
     }
     let flows_dir = darkmux_types::config_access::flows_dir();
-    let Ok(entries) = std::fs::read_dir(&flows_dir) else {
-        return Vec::new();
-    };
-    let mut days: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
-        .collect();
-    days.sort();
-    let recent: Vec<PathBuf> = days
-        .iter()
-        .rev()
-        .take(CAUTION_LOOKBACK_DAYS)
-        .rev()
-        .cloned()
-        .collect();
+    let recent = flow::reader::recent_day_files(&flows_dir, CAUTION_LOOKBACK_DAYS);
 
     // (match, fresh, severity_rank, ts, bullet) — sorted file-in-play-first,
     // then fresh-over-stale, then severity, then recency below; deduped (a
     // pathology that recurred verbatim shouldn't repeat) and capped.
     let mut found: Vec<(u8, u8, u8, String, String)> = Vec::new();
     for day in &recent {
-        let Ok(raw) = std::fs::read_to_string(day) else {
-            continue;
-        };
-        for line in raw.lines() {
-            let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
+        for r in flow::reader::day_file_records(day) {
             // A caution = a detector telemetry record scoped to this mission.
             if r.get("category").and_then(|v| v.as_str()) != Some("telemetry") {
                 continue;
@@ -2893,7 +2876,7 @@ pub fn nudge_mission_debrief(mission_id: &str) {
         category: flow::Category::Review,
         tier: flow::Tier::Operator,
         stage: flow::Stage::Debrief,
-        action: "mission.debrief.prompt".to_string(),
+        action: darkmux_flow::FlowAction::MissionDebriefPrompt,
         handle: mission_id.to_string(),
         phase_id: None,
         // (#1436) The canonical mission-lifecycle session id — the same hyphen

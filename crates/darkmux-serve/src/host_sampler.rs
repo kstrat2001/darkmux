@@ -352,7 +352,7 @@ fn build_thermal_transition_record_with(
         category: darkmux_flow::Category::Machinery,
         tier: darkmux_flow::Tier::Local,
         stage: darkmux_flow::Stage::Dispatch,
-        action: "machine.thermal".to_string(),
+        action: darkmux_flow::FlowAction::MachineThermal,
         handle: display_name,
         phase_id: None,
         session_id: None,
@@ -478,7 +478,7 @@ fn build_battery_health_record(
         category: darkmux_flow::Category::Machinery,
         tier: darkmux_flow::Tier::Local,
         stage: darkmux_flow::Stage::Dispatch,
-        action: "machine.battery_health".to_string(),
+        action: darkmux_flow::FlowAction::MachineBatteryHealth,
         handle: display_name,
         phase_id: None,
         session_id: None,
@@ -653,7 +653,7 @@ fn build_battery_transition_record_with(
         category: darkmux_flow::Category::Machinery,
         tier: darkmux_flow::Tier::Local,
         stage: darkmux_flow::Stage::Dispatch,
-        action: "machine.battery".to_string(),
+        action: darkmux_flow::FlowAction::MachineBattery,
         handle: display_name,
         phase_id: None,
         session_id: None,
@@ -726,11 +726,6 @@ fn battery_edge(
 //    tightened debug cadence is visible in the data instead of inferred
 //    from row spacing.
 
-/// The flow-record action for the periodic aggregate. `machine.*` hook
-/// matching already covers it, and dotted `payload.*` predicates already
-/// let a rule subscribe to one section — which is exactly why this feature
-/// needed no change to the hook layer at all.
-pub(crate) const MACHINE_ROLLUP_ACTION: &str = "machine.rollup";
 
 /// (#2775) The residency section — what is loaded and how much unified
 /// memory is left for AI, for a subscriber deciding whether to schedule
@@ -872,7 +867,7 @@ fn build_machine_rollup_record_with(
         category: darkmux_flow::Category::Machinery,
         tier: darkmux_flow::Tier::Local,
         stage: darkmux_flow::Stage::Dispatch,
-        action: MACHINE_ROLLUP_ACTION.to_string(),
+        action: darkmux_flow::FlowAction::MachineRollup,
         handle: display_name,
         phase_id: None,
         session_id: None,
@@ -1333,7 +1328,7 @@ mod tests {
 
         let (known, rec) = battery_edge(Some(&on_ac), &sample_with_battery(Some(unplugged)), 50, 1_000);
         let rec = rec.expect("unplugging is a transition");
-        assert_eq!(rec.action, "machine.battery");
+        assert_eq!(rec.action, darkmux_flow::FlowAction::MachineBattery);
         assert!(
             matches!(rec.level, darkmux_flow::Level::Info),
             "normal laptop life is not a warning"
@@ -1451,7 +1446,7 @@ mod tests {
         // at all.
         let (known, rec) = battery_health_edge(None, Some(&health_with(26)), 3_600_000, 1_000);
         let rec = rec.expect("the first reading IS the machine fact");
-        assert_eq!(rec.action, "machine.battery_health");
+        assert_eq!(rec.action, darkmux_flow::FlowAction::MachineBatteryHealth);
         assert!(
             matches!(rec.level, darkmux_flow::Level::Info),
             "inventory numbers are not a verdict"
@@ -2288,7 +2283,7 @@ mod tests {
         for r in &records {
             assert!(matches!(r.category, darkmux_flow::Category::Machinery));
             assert!(matches!(r.tier, darkmux_flow::Tier::Local));
-            assert_eq!(r.action, "machine.thermal");
+            assert_eq!(r.action, darkmux_flow::FlowAction::MachineThermal);
             assert!(r.mission_id.is_none(), "no mission context — the daemon runs independently of any dispatch");
             assert!(r.session_id.is_none());
         }
@@ -2515,7 +2510,7 @@ mod tests {
         );
         assert!(
             darkmux_crew::host_source::HOST_READING_ACTIONS.iter().any(|(action, duty)| *action
-                == "machine.battery_health"
+                == darkmux_flow::FlowAction::MachineBatteryHealth
                 && matches!(duty, darkmux_crew::host_source::StampDuty::Exempt(_))),
             "and the registry must say so, with the reason, so the next sweep reads the call \
              instead of re-deriving it"
@@ -2546,7 +2541,7 @@ mod tests {
             11,
             5_000,
         );
-        assert_eq!(rec.action, MACHINE_ROLLUP_ACTION);
+        assert_eq!(rec.action, darkmux_flow::FlowAction::MachineRollup);
         assert_eq!(rec.source.as_deref(), Some("host-sampler"));
         let p = rec.payload.expect("payload");
         // The lens's own keys, not re-spelled and not wrapped.
@@ -2800,7 +2795,7 @@ mod tests {
             if let Ok(text) = std::fs::read_to_string(&day_path) {
                 for line in text.lines() {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                        if v.get("action").and_then(|a| a.as_str()) == Some(MACHINE_ROLLUP_ACTION) {
+                        if v.get("action").and_then(|a| a.as_str()) == Some("machine.rollup") {
                             found.push(v);
                         }
                     }

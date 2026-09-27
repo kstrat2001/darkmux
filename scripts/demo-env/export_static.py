@@ -63,7 +63,7 @@ REAL days the current build wrote, so the committed `.jsonl` always covers
 whatever `build.py --now` (default: real now) just anchored the world to; and
 `/runs` gives the REAL run list, where exactly the ONE replay `build.py`
 marked `live=True` reads as running, because that is the only session missing
-its terminal `dispatch complete`/`dispatch error` record (the same bookend
+its terminal `dispatch.complete`/`dispatch.error` record (the same bookend
 contract 2 states). `demo-lab-runs.json` mirrors `/lab/runs` for the same
 "stop hand-authoring what a real route already answers" reason. Since #2032
 packet 1 the world registers a real lab fixture (`demo-tiny-py`), so this

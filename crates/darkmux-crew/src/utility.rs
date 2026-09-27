@@ -199,7 +199,7 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
             tx.send(&live_utility_edge(&payload, "start", job.role_id, &wire_model, started_at_ms));
         }
         let _ = darkmux_flow::record(crate::usage::utility_marker_record(
-            crate::usage::UTILITY_START_ACTION,
+            darkmux_flow::FlowAction::UtilityStart,
             job.role_id,
             &wire_model,
             payload,
@@ -225,7 +225,7 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
                 let mut payload = serde_json::json!({ "job": kind, "model": wire_model });
                 crate::usage::stamp_utility_end(&mut payload, &job_id, started_at_ms, crate::usage::unix_ms_now());
                 let _ = darkmux_flow::record(crate::usage::utility_marker_record(
-                    crate::usage::UTILITY_ERROR_ACTION,
+                    darkmux_flow::FlowAction::UtilityError,
                     job.role_id,
                     &wire_model,
                     payload,
