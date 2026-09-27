@@ -624,7 +624,8 @@ describe("(#2961) REST's seconds hand", () => {
   it("without an end time REST keeps the caller's number and the older drifting dot", () => {
     const h = harness(false);
     const { container } = render(<TokenScope tokensPerSec={0} size="tile" state="rest" centerLabel="3s" centerUnit="resting" />);
-    for (const t of [100, 200, 300]) h.step(t);
+    // Long enough for any eased hand-over to have finished.
+    for (let t = 100; t <= 1500; t += 100) h.step(t);
     expect(num(container)?.textContent).toBe("3s");
     expect(h.head()).toBeNull();
     expect(h.ellipses()).toBe(0);
