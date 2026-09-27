@@ -60,7 +60,7 @@ fn build_hooks_check(
     let mut out = vec![overview_check(provenance, outbox_dir, &summaries, &rule_checks)];
     out.extend(rule_checks);
     let current_keys: HashSet<&str> = summaries.iter().map(|s| s.key.as_str()).collect();
-    out.extend(stray_check(&stray_outbox_files(&current_keys, outbox_dir)));
+    out.extend(stray_check(stray_outbox_files(&current_keys, outbox_dir)));
     out
 }
 
@@ -373,10 +373,12 @@ fn hooks_match_risks_observing_the_observer(m: &HookMatch) -> bool {
 /// forever. (fix-round finding 6) Each file carries its undelivered line
 /// count and its sibling sidecars: an operator deciding "safe to delete?"
 /// needs both.
-fn stray_check(stray: &[StrayOutbox]) -> Option<Check> {
+fn stray_check(mut stray: Vec<StrayOutbox>) -> Option<Check> {
     if stray.is_empty() {
         return None;
     }
+    // Name order, not `read_dir` order, so the row is stable run to run.
+    stray.sort_by(|a, b| a.path.cmp(&b.path));
     let details: Vec<String> = stray
         .iter()
         .map(|s| {
@@ -1571,6 +1573,19 @@ mod tests {
             )
         );
         assert!(row.hint.as_deref().unwrap().starts_with("A rule was removed or edited since these were written."));
+    }
+
+    /// The stray row lists files in name order, whatever order the
+    /// filesystem returned them in, so two runs of doctor print the same row.
+    #[test]
+    fn stray_files_are_listed_in_name_order() {
+        let stray = |name: &str| StrayOutbox { path: format!("/o/{name}").into(), undelivered: 0, siblings: Vec::new() };
+        let check = stray_check(vec![stray("b.outbox.jsonl"), stray("a.outbox.jsonl")]).unwrap();
+        assert!(
+            check.message.ends_with(": a.outbox.jsonl (0 undelivered line(s)), b.outbox.jsonl (0 undelivered line(s))"),
+            "{}",
+            check.message
+        );
     }
 
     /// A fresh install has no outbox dir yet: that is not a problem, and not
