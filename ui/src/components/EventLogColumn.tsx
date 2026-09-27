@@ -633,14 +633,19 @@ export function EventLogColumn({
   // header, and the layout would shift under the operator's own filter.
   // Grouped once per change, not on every render (playback re-renders often).
   // Turn headers read each run's lifecycle at the page's judgement (the
-  // playhead, or now ticking with presence: `useJudgement`, what the run
-  // page reads), as of the newest record in a static recording at rest.
+  // playhead, or now with presence: `useJudgement`, what the run page
+  // reads), as of the newest record in a static recording at rest. The
+  // clock ticks only while a header shows a turn in progress, the one state
+  // time alone can change; otherwise nothing here re-renders on it.
   const policy = useLifecyclePolicy();
-  const judgement = useJudgement();
+  const [ticking, setTicking] = useState(false);
+  const judgement = useJudgement(ticking, records);
   const listItems = useMemo(
     () => turnItems(visibleRecs, records, judgement?.asOf, policy, judgement?.presence),
     [visibleRecs, records, policy, judgement],
   );
+  const canChange = listItems.some((i) => i.kind === "turn" && i.turn.why === "in progress");
+  useEffect(() => setTicking(canChange), [canChange]);
   // (#2878) Arrival motion. Keyed off `records` (the FULL, unfiltered set
   // this pane was given), never `visibleRecs`/`listItems` — a record
   // revealed by loosening a filter is not "new", only one this pane never
