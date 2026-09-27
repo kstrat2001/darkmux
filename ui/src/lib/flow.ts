@@ -26,24 +26,13 @@ import type { PresenceBeat } from "../types/handwritten";
 import type { RunStatus } from "../types/generated/RunStatus";
 import type { AbandonReason } from "../types/generated/AbandonReason";
 import { isPlainObject } from "./guards";
-import { ACTION, CATEGORY, byTime, ingestJsonl, ingestRecord, isAsOf, latestByTime, recKey, recordsAsOf, recordsSince, timesOf, type NormAction, type NormRecord } from "./ingest";
+import { missionClosed } from "./lifecycle";
+import { runIndex } from "./runRef";
+import { ACTION, CATEGORY, byTime, ingestJsonl, ingestRecord, latestByTime, recKey, recordsAsOf, recordsSince, timesOf, type NormRecord } from "./ingest";
 
 /** `LIVE_WINDOW_MS` — viewer.html:3374. The rolling live window `RAW` is
  * bounded to; also the "N records · last Nh" meta-line's hour figure. */
 export const LIVE_WINDOW_MS = 24 * 60 * 60 * 1000;
-
-/** `FLOW_LIVE_TTL_MS` — viewer.html:3342. How recent a session's last
- * record must be (vs wall-clock now) to count as "live" absent Redis
- * presence — see `flowLiveSessions` below. */
-export const FLOW_LIVE_TTL_MS = 300 * 1000;
-
-/** (#2902 step 5) How long past its announced resume time a budget wait
- * stays open with no further word from its waiter. A waiter still held at
- * its resume time announces again (a new `budget.wait` with the new time),
- * and one whose window has room writes `budget.resume` within one poll
- * (half a second) plus a registry re-read; a wait silent this long past its
- * resume time has lost its process, and reads as neither live nor resting. */
-export const BUDGET_WAIT_GRACE_MS = 60 * 1000;
 
 
 /** `todayUTC()` — viewer.html:3369. */
@@ -110,8 +99,7 @@ export function earliestRecordDate(records: readonly NormRecord[]): string | nul
  * a mission's work spans many sessions. Returns the replay day, or null while
  * the mission is still running. */
 export function missionReplayDate(records: readonly NormRecord[]): string | null {
-  const terminal = records.some((r) => r.action === ACTION.MissionClose || r.action === ACTION.MissionAbort);
-  return terminal ? earliestRecordDate(records) : null;
+  return missionClosed(runIndex(records).groups) ? earliestRecordDate(records) : null;
 }
 
 /** The `/flow-mission/:id` response body's own `truncated` flag —
@@ -547,258 +535,6 @@ export function localMachineUid(
   return machineUids(data, liveMachines).find((x) => machineNames(data, liveMachines, x).has(machineId)) ?? machineId;
 }
 
-/** `sessionsOn()` — viewer.html:1124. */
-export function sessionsOn(data: NormRecord[], m: string): string[] {
-  return [...new Set(data.filter((r) => uidOf(r) === m && r.session_id).map((r) => r.session_id as string))];
-}
-
-/** One machine's (session_id, mission_id) PAIR — the fleet timeline's own
- * unit of a "bar" (#2125). `sessionsOn` above dedups on `session_id` alone,
- * which review missions violate on purpose: `dispatch.map`'s per-item
- * session id is `session_id::task(&step.task_id)` — a FIXED string per
- * review config (`task-review-probe-mid-task` etc), reused verbatim by
- * every review run (`crates/darkmux-crew/src/step_kinds/
- * builtins.rs::DispatchMapStepKind::dispatch_session_id`, and the
- * server-side `#1918` doc names the same defect). Two DIFFERENT review
- * missions on the same machine therefore share one `session_id` but carry
- * DIFFERENT `mission_id`s — `sessionsOn`'s plain string-set collapses them
- * into ONE entry, so `dispatchRec`/`dispatchEnd` (unscoped `Array.find`)
- * paired whichever mission's `dispatch start` happened to come first with
- * whichever mission's terminal/abort happened to come first, drawing one
- * bar spanning both missions' real spans — measured live as a 20-hour
- * "canceled" span for a mission that actually ran 23 minutes.
- *
- * `missionId` is `undefined` for a session that never carried one (a bare
- * `dispatch --profile` outside any mission) — those keep behaving exactly
- * as `sessionsOn` always has, since there is nothing to disambiguate. */
-export interface MachineSessionRun {
-  sessionId: string;
-  missionId?: string;
-}
-export function sessionRunsOn(data: NormRecord[], m: string): MachineSessionRun[] {
-  const seen = new Set<string>();
-  const out: MachineSessionRun[] = [];
-  // (#2125 follow-up) A session's bookends (`session.end`, some dispatch
-  // records) may carry no `mission_id` while its work records do. Those
-  // mission-less records belong to the session's mission when it has exactly
-  // ONE; only a session that genuinely spans several missions (the review
-  // pipeline's reused step sessions) keeps them apart. Without this, one
-  // session renders as two overlapping bars.
-  const missionsBySid = new Map<string, Set<string>>();
-  for (const r of data) {
-    if (uidOf(r) !== m || !r.session_id || !r.mission_id) continue;
-    let set = missionsBySid.get(r.session_id);
-    if (!set) { set = new Set(); missionsBySid.set(r.session_id, set); }
-    set.add(r.mission_id);
-  }
-  for (const r of data) {
-    if (uidOf(r) !== m || !r.session_id) continue;
-    const only = missionsBySid.get(r.session_id);
-    const missionId = r.mission_id || (only && only.size === 1 ? [...only][0] : undefined);
-    const key = `${r.session_id}\x1f${missionId ?? ""}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push({ sessionId: r.session_id, missionId });
-  }
-  return out;
-}
-
-/** (#2911) One window's records grouped by `session_id`, each group in the
- * window's own order. Built once per window ARRAY (a `WeakMap` keyed on its
- * identity) and reused by every per-session lookup below.
- *
- * Why it exists: those lookups (`dispatchRec`, `sessEnd`, `sessionRunning`)
- * used to scan the whole window per session, and the fleet cards, the
- * flow-derived liveness set and the activity timeline ask them for every
- * session on every render. That was affordable while the lens only
- * re-rendered on new records; once a live execution re-renders it every
- * second (#2911's countdown tick) it was the bulk of a ~100 ms hitch per
- * second on a busy day. The window array is stable across those ticks
- * (`useFlowWindow` keys it on a coarse edge), so the index is built once
- * per new window and each tick's lookups touch one session's records.
- *
- * The contract this relies on: a window array is never mutated after it is
- * first read. Every producer builds a new array (`buildFlowWindow`, the
- * playback slices), so that already holds; a caller that appended to an
- * array in place after reading it would get the stale grouping. */
-const sessionIndexCache = new WeakMap<readonly NormRecord[], Map<unknown, readonly NormRecord[]>>();
-/** Returned on every miss, shared: typed `readonly` (as are the groups) so a
- *  caller cannot `push` into it and corrupt every later lookup. */
-const NO_RECORDS: readonly NormRecord[] = [];
-let sessionIndexBuilds = 0;
-
-/** Test-only: how many session indexes have been built. A test that ticks a
- *  lens asserts this does NOT move, which pins that the window array stayed
- *  the same object across the tick. It cannot see whether a lookup went
- *  through the index (a whole-window scan builds nothing); the callers'
- *  own tests pin that by reading from an index the array has outgrown. */
-export function __sessionIndexBuilds(): number {
-  return sessionIndexBuilds;
-}
-
-export function sessionRecords(data: readonly NormRecord[], sid: string): readonly NormRecord[] {
-  let index = sessionIndexCache.get(data);
-  if (!index) {
-    // Keyed on `session_id` exactly as the record carries it, whatever its
-    // type: the scans this replaces compared `r.session_id === sid`, and a
-    // `Map` key matches the same way (SameValueZero). Its one difference,
-    // `NaN` equal to itself, is answered below the way the scan answered it.
-    const groups = new Map<unknown, NormRecord[]>();
-    for (const r of data) {
-      if (!r) continue;
-      const group = groups.get(r.session_id);
-      if (group) group.push(r);
-      else groups.set(r.session_id, [r]);
-    }
-    index = groups;
-    sessionIndexCache.set(data, index);
-    sessionIndexBuilds++;
-  }
-  if (Number.isNaN(sid)) return NO_RECORDS;
-  return index.get(sid) ?? NO_RECORDS;
-}
-
-/** `dispatch()` — viewer.html:1125. `missionId` (#2125), when given, scopes
- * the match to records naming that mission — see `sessionRunsOn`'s own doc
- * for why a bare `session_id` match is unsafe for a review-shaped session.
- * `undefined` (every pre-existing caller) preserves the exact prior
- * session_id-only behavior. */
-export function dispatchRec(data: NormRecord[], sid: string, act: "start" | "complete" | "error", missionId?: string): NormRecord | undefined {
-  const action = DISPATCH_ACT[act];
-  return sessionRecords(data, sid).find(
-    (r) => r.session_id === sid && r.action === action && (missionId === undefined || !r.mission_id || r.mission_id === missionId),
-  );
-}
-
-/** `dispatchEnd()` — viewer.html:1131. */
-export function dispatchEnd(data: NormRecord[], sid: string, missionId?: string): NormRecord | undefined {
-  return dispatchRec(data, sid, "complete", missionId) ?? dispatchRec(data, sid, "error", missionId);
-}
-
-const DISPATCH_ACT = { start: ACTION.DispatchStart, complete: ACTION.DispatchComplete, error: ACTION.DispatchError } as const;
-
-/** `dispatchErrored()` — viewer.html:1132. */
-export const dispatchErrored = (rec: NormRecord | undefined): boolean => !!rec && rec.action === ACTION.DispatchError;
-
-/** `dispatchKilled()` — viewer.html:1133. Watchdog kill = exit 137. */
-export const dispatchKilled = (rec: NormRecord | undefined): boolean =>
-  dispatchErrored(rec) && (rec?.payload as { exit_code?: number } | undefined)?.exit_code === 137;
-
-/** `sessEnd()` — viewer.html:1149. `missionId` (#2125) — see `dispatchRec`'s
- * own doc. */
-export function sessEnd(data: NormRecord[], sid: string, missionId?: string): NormRecord | undefined {
-  return sessionRecords(data, sid).find(
-    (r) => r.session_id === sid && r.action === ACTION.SessionEnd && (missionId === undefined || !r.mission_id || r.mission_id === missionId),
-  );
-}
-
-/** `sessionCloseEdge()` — viewer.html:1171-1175. The EARLIEST of the dispatch
- * terminal and the reconciler's `session.end`. Every "is this session done /
- * where does its bar end" decision goes through here rather than bare
- * `dispatchEnd`: a session whose ONLY terminal is `session.end` (abandoned,
- * hard-killed, shipped without a clean complete) must read as ENDED, not
- * in-flight to the playhead.
- *
- * (#2125) `missionId`, threaded straight through — an abort closes only ITS
- * OWN mission's open steps; a bare `mission_id`-less lookup would let a
- * SIBLING mission's abort (or `session.end`) close this one's bar too. */
-export function sessionCloseEdge(data: NormRecord[], sid: string, missionId?: string): NormRecord | undefined {
-  const c = dispatchEnd(data, sid, missionId);
-  const e = sessEnd(data, sid, missionId);
-  if (c && e) return byTime(c, e) <= 0 ? c : e;
-  return c ?? e;
-}
-
-/** (#2902 step 5, 5th review MF1) The budget wait still OPEN in `own` as
- * of `t`: the newest `budget.wait` at or before `t`, with no
- * `budget.resume`, `budget.stop`, dispatch terminal or `session.end` after
- * it, and not silent past its resume time plus [`BUDGET_WAIT_GRACE_MS`].
- * `null` otherwise. A hosted call's gate writes its wait BEFORE any
- * `dispatch start` (contract 2), so this is the one piece of live work a
- * session can have with no start at all: every liveness gate asks it. */
-export function openBudgetWait(own: readonly NormRecord[], t: number): NormRecord | null {
-  const seen = recordsAsOf(own, t);
-  const open = latestByTime(seen.filter((r) => r.action === ACTION.BudgetWait));
-  if (!open) return null;
-  if (seen.some((r) => r !== open && r.action !== undefined && BUDGET_WAIT_CLOSERS.has(r.action) && byTime(r, open) >= 0)) return null;
-  // A wait with no usable time has no deadline to outlive (the bad-timestamp
-  // policy): it stays open until something closes it.
-  if (open.tMs === null) return open;
-  const p = (open.payload ?? open.fields ?? {}) as { wait_seconds?: unknown };
-  const secs = typeof p.wait_seconds === "number" && Number.isFinite(p.wait_seconds) ? Math.max(0, p.wait_seconds) : 0;
-  return t <= open.tMs + secs * 1000 + BUDGET_WAIT_GRACE_MS ? open : null;
-}
-
-/** What ends a budget wait: its call went ahead, its run was stopped, or its
- *  execution or session ended. */
-const BUDGET_WAIT_CLOSERS: ReadonlySet<NormAction> = new Set<NormAction>([
-  ACTION.BudgetResume,
-  ACTION.BudgetStop,
-  ACTION.DispatchComplete,
-  ACTION.DispatchError,
-  ACTION.SessionEnd,
-]);
-
-/** `sessionRunning()` — viewer.html:1183-1187. THE single source of truth for
- * "is this session in flight?"
- *
- * (Playback parity, Change A, finding #7) This used to run two DIFFERENT
- * algorithms selected by a `liveMode` boolean: live trusted `liveSet`
- * (presence) alone; replay asked only "is there a close edge before `t`",
- * with no staleness check. A session that started, sent one heartbeat, and
- * then went silent for 30 minutes with no terminal record read
- * `running=true` under the replay arm and `running=false` under live's own
- * flow-derived fallback (`flowLiveSessions`) at the identical instant.
- *
- * Now there is ONE algorithm, run over records up to `t` in both modes:
- *
- * 1. Presence (`liveSet`) — an OPTIONAL, purely ADDITIVE input. If it says
- *    the session is live, that's authoritative; it never subtracts. A
- *    replay caller always passes an empty set (there is no presence to
- *    read about a past day), so this branch is simply never true there.
- * 2. A close edge at or before `t` — the session is done, full stop.
- * 3. Otherwise, TTL-self-healing exactly like the live flow-derived
- *    fallback: the session must have started by `t`, and its most recent
- *    activity as of `t` must be within `FLOW_LIVE_TTL_MS`. This is what
- *    makes step 2's absence non-authoritative forever — an orphaned
- *    session with no terminal record ages out of "running" the same way in
- *    both modes, measured from `t` rather than `Date.now()` so a replay at
- *    a past instant gets the SAME answer a live viewer got at that instant.
- *
- * (#2125) `missionId` narrows the close-edge lookup only — presence has no
- * mission dimension to disambiguate (it's a bare session-id set, and
- * `dispatch.map`'s hosted seats never write to it at all — see
- * `liveSessionSet`'s own #2123 doc), so that collision risk, if any, lives
- * entirely in that separate, already-fixed gap, not here. */
-export function sessionRunning(
-  data: NormRecord[],
-  liveSet: Set<string>,
-  sid: string,
-  t: number,
-  missionId?: string,
-): boolean {
-  if (liveSet.has(sid)) return true;
-  const close = sessionCloseEdge(data, sid, missionId);
-  if (close && isAsOf(close, t)) return false;
-  // (#2902 step 5) A call held by its budget is running, however long ago
-  // its wait was announced (a day window's wait outlasts the TTL below).
-  if (openBudgetWait(sessionRecords(data, sid), t)) return true;
-  const own = recordsAsOf(sessionRecords(data, sid), t);
-  if (!own.some((r) => r.action === ACTION.DispatchStart)) return false;
-  const activityTimes = timesOf(own);
-  const lastActivity = activityTimes.length ? Math.max(...activityTimes) : -Infinity;
-  return t - lastActivity <= FLOW_LIVE_TTL_MS;
-}
-
-/** `statusVisual()` — viewer.html:1140-1145. Only `lbl` is consumed here —
- * `cls`/`pill` are CSS class names in legacy, invisible to `innerText`. */
-export interface RunStatePredicates {
-  open: boolean;
-  errored: boolean;
-  killed: boolean;
-  clean: boolean;
-}
-
 /** What a lens is allowed to say about a run: one canonical status, plus the
  * payload facts a LABEL may render it with. */
 export interface RunState {
@@ -808,29 +544,6 @@ export interface RunState {
   killed: boolean;
   /** `abandoned` only. Mirrors `Run.abandoned_reason` on the wire. */
   abandonReason?: AbandonReason;
-}
-
-/**
- * (#2813) Map a lens's locally-derived predicates onto the CANONICAL
- * `RunStatus`. This is the only place the flow-record lenses are allowed to
- * decide a status, and it can only ever return one of the six the server
- * defines.
- *
- * The predicates themselves stay where they are — each lens derives them from
- * a different slice of the flow stream and they are not interchangeable. What
- * changes is that they now SELECT a status instead of inventing one.
- *
- * The old mapping, preserved exactly: `open` -> running; `errored` -> error
- * (with `killed` as a nuance WITHIN error, which is what the legacy
- * `killed ? "killed" : "errored"` meant — `killed` was never a peer of
- * `abandoned`); `clean` -> complete; anything else -> abandoned with no
- * ending recorded, which is what the legacy `"canceled"` described.
- */
-export function runStateFrom(p: RunStatePredicates): RunState {
-  if (p.open) return { status: "running", killed: false };
-  if (p.errored) return { status: "error", killed: p.killed };
-  if (p.clean) return { status: "complete", killed: false };
-  return { status: "abandoned", killed: false, abandonReason: "noterminal" };
 }
 
 /**
@@ -887,100 +600,6 @@ export function machPresent(
   // The latest edge by time; an untimed one only when no edge is timed.
   const last = latestByTime(edges);
   return last === undefined ? null : last.action === ACTION.MachineOnline;
-}
-
-/** `flowLiveSessions()` — viewer.html:1343-1358. Flow-derived liveness
- * fallback for when Redis session-presence (`/fleet/sessions/live`) is
- * empty. `nowMs` is REAL wall-clock now (frozen via Playwright's clock in
- * the parity spec), not `tMax` — see the legacy comment this ports. */
-export function flowLiveSessions(data: NormRecord[], nowMs: number, liveMode = true): Set<string> {
-  // `if(!document.body.classList.contains('live-mode')) return new Set();`
-  // (viewer.html:3378) — the gate this port dropped, because until #1800 P2
-  // nothing here ever ran outside live mode. Without it a REPLAY derives
-  // liveness from flow records and reads a past day's sessions as running
-  // right now: cards go "dispatch in flight", the machine card counts
-  // "N running" instead of the day's specialists, and timeline bars draw
-  // yellow. Replay is presence-agnostic by construction.
-  if (!liveMode) return new Set();
-  const lastBySid = new Map<string, number>();
-  const started = new Set<string>();
-  const waited = new Set<string>();
-  for (const r of data) {
-    if (!r.session_id) continue;
-    const prev = lastBySid.get(r.session_id);
-    if (r.tMs !== null && (prev === undefined || r.tMs > prev)) lastBySid.set(r.session_id, r.tMs);
-    if (r.action === ACTION.DispatchStart) started.add(r.session_id);
-    if (r.action === ACTION.BudgetWait) waited.add(r.session_id);
-  }
-  const out = new Set<string>();
-  // (#2902 step 5) A hosted call held by its budget has no start yet (its
-  // gate runs before the bookends), and its one record can be hours old.
-  for (const sid of waited) {
-    if (openBudgetWait(sessionRecords(data, sid), nowMs)) out.add(sid);
-  }
-  for (const sid of started) {
-    if (sessEnd(data, sid) || dispatchEnd(data, sid)) continue; // terminal/abandoned → not running
-    if (nowMs - (lastBySid.get(sid) ?? 0) <= FLOW_LIVE_TTL_MS) out.add(sid);
-  }
-  return out;
-}
-
-/** `liveSessionSet()` — viewer.html:1373-1379, widened (#2123). Legacy (and
- * this port until now) treated Redis presence as all-or-nothing: ANY beat
- * anywhere in the fleet made the WHOLE presence set authoritative, and the
- * flow-derived fallback below was never even consulted. That was safe only
- * under an assumption that stopped holding once darkmux grew more than one
- * dispatch path: `darkmux:session-presence:<sid>` is refreshed by
- * `dispatch.internal`'s own container-heartbeat thread
- * (`crates/darkmux-crew/src/dispatch_internal.rs`) — the ONE writer, grep-
- * confirmed. A mission/review dispatch that fans out through `dispatch.map`
- * (hosted/remote probe + judge seats, no container, no heartbeat thread —
- * see `crates/darkmux-crew/src/step_kinds/builtins.rs::DispatchMapStepKind`)
- * never writes a beat AT ALL, for any of its sessions.
- *
- * On a Redis-enabled multi-machine fleet (`config.redis.enabled`, the
- * fleet-topology default — Studio hub + laptop peer), presence is near-never
- * EMPTY: the hub's own `dispatch.internal` work keeps `liveSessionIds`
- * non-zero pretty much continuously. Before this fix that non-zero-but-
- * elsewhere set silently WON over the flow-derived fallback, so a live
- * review mission's own sessions — never beaten, always absent from
- * presence — read as not-running on every machine in the fleet: the fleet
- * card's "0 running" and a machine card stuck on "idle" while LM Studio
- * burned tokens (#2123's reported symptom).
- *
- * The fix: UNION rather than either/or. Presence still answers instantly
- * and cheaply for whatever it DOES cover (`dispatch.internal` work); the
- * flow-derived heuristic — already correct and already exercised whenever
- * Redis is off entirely — fills in exactly the sessions presence has no
- * opinion about, rather than being shadowed by an unrelated beat elsewhere
- * in the fleet. `flowLiveSessions` already gates itself off in replay mode
- * (`liveMode=false` returns `new Set()`), so a replay's presence-agnostic
- * contract is unchanged by this — it still reads only from `liveSessionIds`,
- * which is itself always empty in replay (`useLiveSessionIds`'s `enabled`
- * gate). */
-export function liveSessionSet(
-  data: NormRecord[],
-  liveSessionIds: Set<string>,
-  nowMs: number,
-  liveMode = true,
-): Set<string> {
-  const flowDerived = flowLiveSessions(data, nowMs, liveMode);
-  if (!liveSessionIds.size) return flowDerived;
-  if (!flowDerived.size) return liveSessionIds;
-  return new Set([...liveSessionIds, ...flowDerived]);
-}
-
-/** `lastTs()` — viewer.html:1187. A session's last recorded activity —
- * where an orphan's timeline bar ends when it aged out of presence with no
- * close-edge (so the bar stops at its last sign of life, not at "now").
- * `missionId` (#2125) narrows to one mission's own activity — see
- * `dispatchRec`'s own doc; `undefined` preserves the exact prior behavior. */
-export function lastTs(data: NormRecord[], sid: string, missionId?: string): number {
-  let m = 0;
-  for (const r of data) {
-    if (r.session_id === sid && (missionId === undefined || r.mission_id === missionId) && r.tMs !== null && r.tMs > m) m = r.tMs;
-  }
-  return m;
 }
 
 function compKey(sessionId: string | undefined, ts: string | undefined): string {

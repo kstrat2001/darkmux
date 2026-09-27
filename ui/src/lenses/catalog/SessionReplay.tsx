@@ -9,6 +9,9 @@ import { fetchJson, type FetchResult } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useSessionLiveness } from "../../hooks/useSessionLiveness";
 import { flowToRenderModel } from "../../lib/flow";
+import { NO_PRESENCE, isRunning, lifecycleAt, type Presence } from "../../lib/lifecycle";
+import { useLifecyclePolicy } from "../../hooks/useLifecyclePolicy";
+import { sessionRun } from "../../lib/runRef";
 import { ACTION, CATEGORY, ingest, recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { useNowMs } from "../../lib/clock";
 import { clkhm } from "../../lib/format";
@@ -16,12 +19,6 @@ import { getSource } from "../../lib/source";
 import { useDay } from "../../hooks/useDay";
 import { injectedPlaybackDate } from "../../lib/injectedMeta";
 
-/** (#1972) How long a run may go silent before it is treated as abandoned
- *  rather than live. Mirrors the host watchdog's own default
- *  (`DARKMUX_INACTIVITY_TIMEOUT_SECONDS` = 600s): past that point the
- *  container has been hard-killed, so a still-ticking counter would be
- *  asserting something the harness has already ruled out. */
-export const STALE_AFTER_MS = 600_000;
 import { livenessState } from "../../components/LivenessPulse";
 import { TokenScope } from "../../components/TokenScope";
 import { usePlaybackClock } from "../../lib/pageClockRate";
@@ -529,7 +526,11 @@ export function SessionReplay({
   // a mission's run-grain session never beats itself, so without it the page
   // is never live, fetches once, and freezes on its first read.
   const [livenessMissionId, setLivenessMissionId] = useState<string | null>(null);
-  const { shouldPoll, endedByPresence } = useSessionLiveness(sessionId, livenessMissionId);
+  const { isLive, shouldPoll, endedByPresence } = useSessionLiveness(sessionId, livenessMissionId);
+  // Presence, as the lifecycle's additive input: it holds this run open
+  // against the staleness clock, never against a record that closed it.
+  const presence = useMemo<Presence>(() => (isLive ? new Set([sessionId]) : NO_PRESENCE), [isLive, sessionId]);
+  const policy = useLifecyclePolicy();
 
   // (#2065) A static build has no `/flow-session/<id>` to reach — the demo's
   // dispatch-row tap 404'd here. Read the committed file instead (the same
@@ -648,7 +649,7 @@ export function SessionReplay({
   const all = enrichedRaw;
   const records = all && playhead !== null ? recordsAsOf(all, playhead) : all;
   const data = records ? flowToRenderModel(records) : [];
-  const base = records && records.length ? runRegions(data, sessionId) : null;
+  const hasRecords = !!records && records.length > 0;
   // Gated on PLAYBACK too, not just on the run's own liveness. A recorded
   // session that never emitted a terminal record still reads as `live`, and
   // in a static/playback build there is no wall clock it could sensibly
@@ -659,28 +660,19 @@ export function SessionReplay({
   // A run with no terminal record is not automatically LIVE. One that died in
   // January has no `dispatch.complete` either, and ticking its counter up to
   // now would read `17:51:54 so far` and climbing — abandonment rendered as
-  // liveness. The host watchdog hard-kills a dispatch after
-  // `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` (600s by default), so a run that has
-  // emitted nothing for longer than that CANNOT still be running.
+  // liveness. Whether it is still running is the run's lifecycle
+  // (`lib/lifecycle.ts`) as of the page clock, the same answer the fleet
+  // card and the timeline give: silent past the daemon's staleness window,
+  // it has stopped with no ending recorded.
   //
-  // `Date.now()` here is a plain per-render read feeding a boolean, not a
-  // `useSyncExternalStore` snapshot — the value it produces is stable once
-  // past the threshold, so it cannot drive the render loop this file's clock
-  // is careful to avoid.
-  //
-  // (#2011) `endedByPresence` is the one signal that OVERRIDES all of this.
-  // The quiet-threshold above is a heuristic standing in for knowledge we
-  // sometimes actually have: presence watching this session disappear is
-  // direct evidence the run stopped, so the counter should not spend a
-  // further ten minutes climbing toward the watchdog timeout before it
-  // admits that. It is deliberately NOT `!sessionIsLive` — a session presence
-  // never listed at all (a replay, a January run, or a machine with Redis
-  // switched off, where `/fleet/sessions/live` returns an empty set for
-  // everything) is not evidence of anything, and gating on mere absence would
-  // freeze the live clock on those machines. Only the observed transition
-  // counts. Note the counter can step BACKWARDS at that moment, from the
-  // ticked value to the last record's own elapsed time; that is the point —
-  // the run's last sign of life is a fact, and the seconds since are not.
+  // (#2011) `endedByPresence` stops the clock sooner. Presence watching this
+  // session disappear is direct evidence the run stopped, so the counter
+  // should not climb toward the staleness window before it admits that. It
+  // is deliberately NOT `!isLive` — a session presence never listed at all
+  // (a replay, a January run, or a machine with Redis switched off, where
+  // `/fleet/sessions/live` returns an empty set for everything) is not
+  // evidence of anything. Only the observed transition counts. It decides
+  // the clock and the pulse (the activity axis), never the run's status.
   // (Playback parity, Change A) `clockNow` — `playhead ?? wallNow` — is the
   // ONE "now" every render-time derivation below reads, in both modes. This
   // used to be `Date.now()` unconditionally (finding #1's `quietMs`, and
@@ -694,8 +686,9 @@ export function SessionReplay({
   // what does, at the live edge only.
   const wallNow = Date.now();
   const clockNow = playhead ?? wallNow;
-  const quietMs = base?.lastBeatMs != null ? clockNow - base.lastBeatMs : Infinity;
-  const plausiblyRunning = (base?.live ?? false) && quietMs < STALE_AFTER_MS && !endedByPresence;
+  const pageRun = hasRecords ? sessionRun(data, sessionId, clockNow) : null;
+  const plausiblyRunning =
+    pageRun !== null && isRunning(lifecycleAt(pageRun, clockNow, policy, presence)) && !endedByPresence;
   // (#2757) `playhead === null` — a non-null playhead means the operator has
   // actively parked the shell's transport away from the live edge (`App.tsx`'s
   // `isPlayheadReady`: `transport.scrubbed && transport.t < transport.tMax`;
@@ -721,12 +714,14 @@ export function SessionReplay({
   // The override actually fed to `runRegions`: the playhead when scrubbed
   // (unconditionally — a playhead means a replay, and a replay's clock is
   // never "no override", full stop); otherwise the ticking clock's own
-  // snapshot while plausibly running, or `undefined` (record-time only) once
-  // the run is done/stale/static — `runRegions`'s own `Math.max(override,
-  // tMax)` clamp means passing nothing here is exactly equivalent to
-  // freezing at the newest record, which is what a finished/stale run
-  // should do either way.
-  const clockOverride: number | undefined = playhead ?? (ticking ? nowMs : undefined);
+  // snapshot while plausibly running, or the wall clock once it is not (so a
+  // run gone silent reads as stopped, as it does on every other surface).
+  // `undefined` is record time only (`runRegions` clamps to the newest
+  // record): for a static or injected-date build, which has no wall clock to
+  // judge a recording against, and (#2011) once presence saw the run go,
+  // where the clock stops at the run's last sign of life.
+  const frozenAtRecords = source.kind === "static" || injectedPlaybackDate() != null || endedByPresence;
+  const clockOverride: number | undefined = playhead ?? (ticking ? nowMs : frozenAtRecords ? undefined : wallNow);
 
   if (!session) {
     return <SessionPendingHeader sessionId={sessionId} />;
@@ -756,13 +751,12 @@ export function SessionReplay({
   }
 
 
-  // `base` is non-null here: the `count === 0` guard above already returned.
   // (#2071) The playhead can sit BEFORE this run's first record (rewind on
-  // a day the run started partway into): the cut slice is empty, `base` is
-  // null, and the header below would dereference it — measured as "the
+  // a day the run started partway into): the cut slice is empty, and the
+  // header below would have nothing to read — measured as "the
   // dispatch lens stopped rendering" through the error boundary. Say what
   // is true instead: at this instant the run has not started.
-  if (!base) {
+  if (!hasRecords) {
     return (
       <div data-state="before-start" role="status" aria-label={`Session ${sessionId} not started yet`}>
         <div className="stagehdr">session replay</div>
@@ -790,7 +784,7 @@ export function SessionReplay({
   // "right now", not about the playhead's moment.
   const effectiveConnected = connected || playhead !== null;
   const effectiveLastContactMs = playhead !== null ? null : lastContactMs;
-  const view = runRegions(data, sessionId, clockOverride, effectiveConnected, effectiveLastContactMs, ticking ? liveOverlay : null);
+  const view = runRegions(data, sessionId, clockOverride, effectiveConnected, effectiveLastContactMs, ticking ? liveOverlay : null, presence, policy);
   // `animate: plausiblyRunning`, not `ticking` — `ticking` is now purely the
   // "should the shared clock subscribe" perf gate (see its own doc above)
   // and is unconditionally `false` in playback (`playhead === null` fails
@@ -798,7 +792,7 @@ export function SessionReplay({
   // in playback regardless of whether the run was actually still going as
   // of the playhead. `plausiblyRunning` is computed from `clockNow` above,
   // so it answers the SAME question live and replayed.
-  const liveness = livenessState({ done: !view.live, animate: plausiblyRunning, lastBeatMs: view.lastBeatMs, nowMs: clockNow });
+  const liveness = livenessState({ done: view.phase === "closed", animate: plausiblyRunning, lastBeatMs: view.lastBeatMs, nowMs: clockNow });
   const scopeHero = modelScopeHero(view);
 
   return (

@@ -183,8 +183,7 @@ describe("buildActivityTimeline — parity: liveMode no longer changes the windo
   // session starting AFTER `tMax` (here, one minute past the day's true
   // ceiling — a stand-in for "hasn't happened yet as of the playhead")
   // must draw no bar at all, not a phantom sliver at the track's right edge
-  // (which is what `sessionRunning` finding no close-edge — because
-  // there's nothing to close yet — would otherwise produce).
+  // (its lifecycle reads `not_started` there).
   it("a session that hasn't started yet as of the playhead draws no bar at all", () => {
     const notYetStarted: NormRecord[] = [
       rec({ machine_uid: "m1", session_id: "s-future", action: "dispatch.start", ts: new Date(TMAX + 60000).toISOString() }),
@@ -220,9 +219,8 @@ describe("buildActivityTimeline — parity: liveMode no longer changes the windo
  * OLDER review mission ran that exact step to completion ~17h before a
  * NEWER one started, and the newer mission's abort got matched against the
  * OLDER mission's `dispatch.start` — one 20-hour "canceled" bar where two
- * short, correctly-bounded ones belonged. `sessionRunsOn` (keyed on
- * (session_id, mission_id), not session_id alone) plus `missionId` threaded
- * into `dispatchRec`/`dispatchEnd`/`sessEnd` is the fix under test.
+ * short, correctly-bounded ones belonged. One bar per run, a
+ * `(session_id, mission_id)` pair (`lib/runRef.ts`), is the fix under test.
  */
 describe("buildActivityTimeline — reused step session ids across missions (#2125)", () => {
   const uids = ["m1"];

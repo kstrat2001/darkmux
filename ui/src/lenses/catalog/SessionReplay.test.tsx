@@ -739,29 +739,33 @@ describe("SessionReplay", () => {
   // ── (#1973 audit) accessibility ────────────────────────────────────
 
   it("(#1973) the pill and the pulse never tell CONTRADICTORY stories about the same run", async () => {
-    // A run that opened and went silent for weeks has no terminal record, so
-    // the pill says RUNNING — while liveness correctly says it cannot still
-    // be executing. Feeding ONE boolean to both made the pulse announce
-    // "finished" beside a green RUNNING pill: the same run, the same view,
-    // opposite claims, and only a screen-reader user would ever have seen the
-    // contradiction.
+    // A run that opened and went silent for weeks has no terminal record. It
+    // has stopped with no ending recorded (`lib/lifecycle.ts`: silent past
+    // the staleness window), and the pill and the pulse both say so: the
+    // pill never reads RUNNING beside a pulse that knows better, and the
+    // pulse never claims the run FINISHED.
     vi.useFakeTimers();
-    const t0 = 1_800_000_000_000;
-    vi.setSystemTime(t0);
-    const records = [
-      { ts: new Date(t0 - 40 * 24 * 3600_000).toISOString(), action: "dispatch.start", session_id: "s-stale", machine_id: "M", payload: { role: "coder" } },
-    ];
-    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
-    renderReplay("s-stale");
-    await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    try {
+      const t0 = 1_800_000_000_000;
+      vi.setSystemTime(t0);
+      const records = [
+        { ts: new Date(t0 - 40 * 24 * 3600_000).toISOString(), action: "dispatch.start", session_id: "s-stale", machine_id: "M", payload: { role: "coder" } },
+      ];
+      vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+      renderReplay("s-stale");
+      await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
 
-    const pill = document.querySelector(".session-run__header .pill")?.textContent ?? "";
-    const pulseLabel = document.querySelector(".pill[data-live]")?.getAttribute("title") ?? "";
-    expect(pill).toContain("running"); // the chip's one running word; CSS uppercases it on screen
-    // The pulse may say "may be abandoned"; it must NOT claim the run finished.
-    expect(pulseLabel).not.toContain("finished");
-    expect(document.querySelector(".pill[data-live]")?.getAttribute("data-live")).toBe("stale");
-    vi.useRealTimers();
+      const pillEl = document.querySelector(".session-run__header .pill");
+      const pill = pillEl?.textContent ?? "";
+      expect(pill.toLowerCase()).toContain("no ending recorded");
+      expect(pill.toLowerCase()).not.toContain("running");
+      // Not a running chip, so no pulse rides it; its description says the
+      // run may be abandoned, never that it finished.
+      expect(pillEl?.getAttribute("data-live")).toBeNull();
+      expect(pillEl?.getAttribute("title")).toContain("may be abandoned");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("(#1973) signal severity is available WITHOUT sight — not only as colour, class and a data attribute", async () => {
@@ -819,7 +823,7 @@ describe("SessionReplay", () => {
     // The non-live-region requirement is unchanged and now applies to the
     // pill: its liveness rides `title` (a DESCRIPTION, so the pill keeps its
     // own accessible name from its text) and it must never announce.
-    const pulse = document.querySelector(".pill[data-live]");
+    const pulse = document.querySelector(".session-run__header .pill");
     expect(pulse?.getAttribute("title")).toBeTruthy();
     expect(pulse?.getAttribute("aria-live")).toBeNull();
   });
@@ -880,16 +884,15 @@ describe("SessionReplay", () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify(raw), { status: 200 }))));
     renderReplay("task-list");
     // The chip is the one element that says the running word; other text may too.
-    await waitFor(() => expect(document.querySelector(".session-run__header .pill")?.textContent).toContain("running"));
-    expect(screen.getByText(/FETCH-RENDER/)).toBeInTheDocument();
+    // `task-list` is ONE session id 24 missions shared (a scheduler task id).
+    // The page reads the run that opened last (`runRef.ts`'s `sessionRun`),
+    // never the 24 blended into one 17-hour "run", and its step closed.
+    await waitFor(() => expect(document.querySelector(".session-run__header .pill")?.textContent?.toLowerCase()).toContain("complete"));
+    expect(screen.getByText(/LIST-STEP/)).toBeInTheDocument();
     expect(screen.getByText(/task-list on/)).toBeInTheDocument();
     expect(screen.getByText("LMStudio · local · this machine")).toBeInTheDocument();
-    expect(screen.getByText(/07:36:48 · running/)).toBeInTheDocument();
-    // (U3-7/U5-2) Rebaselined with the golden: legacy's `fmt()` had no hour
-    // rollover, so this 17h51m run read "1071:54". One formatter now
-    // (`fmtElapsed`), and it says hours. See `tests/parity/README.md` on
-    // hand-editing a golden, and `lib/format.ts` for the divergence.
-    expect(screen.getByText("17:51:54 so far")).toBeInTheDocument();
+    expect(screen.getByText(/^\d\d:28:40 → \d\d:28:42 \(0:02\)$/)).toBeInTheDocument();
+    expect(screen.getByText("0:02")).toBeInTheDocument();
     // Same reason as the track below: this corpus did no model work, so the
     // MODEL pane is absent and TURNS with it. The SYSTEM pane still renders.
     expect(screen.queryByText("TURNS")).not.toBeInTheDocument();

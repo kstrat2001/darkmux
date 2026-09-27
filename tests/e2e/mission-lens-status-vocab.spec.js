@@ -17,7 +17,7 @@
 //   own first column" — a more precise, faster unit-level proof of the same
 //   `computeLayout` behavior than a `boundingBox()` comparison gives.
 // - "a step running since long ago stops pulsing" / "a heartbeat keeps a
-//   slow seat alive" (the `STEP_LIVENESS_WINDOW_MS` gate) are covered by
+//   slow seat alive" (the staleness gate) are covered by
 //   `graph.test.ts`'s "stepMeterFor liveness" describe block.
 // - "an unknown status does not become permanent" (the `keepPageStatus`
 //   arrival-vs-held asymmetry) is covered by `graph.test.ts`'s

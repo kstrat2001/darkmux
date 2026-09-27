@@ -152,6 +152,24 @@ darkmux release.
   directory already exists now claims
   `<n>.2`, `<n>.3`, … instead of writing into it. **Migration:** a tool that
   parses the last segment of a run id as an integer must accept `<n>.<k>`.
+- **Every viewer surface judges a run the same way, by the daemon's own
+  staleness rule.** The fleet card, the activity timeline, the run page's
+  pill, clock and pulse, the live token scope, the mission graph's step
+  meter and playback all read one lifecycle (`ui/src/lib/lifecycle.ts`), so
+  the same run states the same phase on each at the same moment. A run
+  silent for twice the runtime's inactivity budget (`runtime.inactivity_
+  timeout_seconds`, 20 minutes by default, the rule `/runs` already used)
+  reads as stopped with no ending recorded everywhere: the fleet card
+  waited 5 minutes before, and the run page's pill said RUNNING forever.
+  The STALLED word is the earlier signal, after 30 seconds of silence. A
+  session id two missions share is two runs on every surface (#2125); a
+  relaunch under the same id is its own attempt; a terminal with an
+  unparsable timestamp closes the run on the fleet card too. A hosted call
+  held by its endpoint's budget is running while it waits, on `/runs` as
+  well (it no longer reads Abandoned after 20 minutes of a longer wait), and
+  a wait the operator stopped reads **aborted**. `/runs` gains
+  `policy: {stale_after_ms, budget_wait_grace_ms}`, the numbers it judged
+  by (additive). **Migration:** none.
 - **The per-step cap on hosted tokens is renamed, has no default, and
   never stops a step: a step that used to stop at 500,000 hosted tokens now
   runs to completion unless you set a cap** (#2902 step 5).

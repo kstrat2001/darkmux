@@ -9,6 +9,7 @@
  * the SAME goldens `mission-graph-goldens.spec.ts` captured from the
  * standalone page, and the e2e behavioral specs assert on these classes too.
  */
+import type { LifecyclePolicy } from "../../lib/lifecycle";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ReactFlow, {
   Background,
@@ -53,6 +54,8 @@ interface MissionNodeData {
   steps: GraphNode["steps"];
   metrics: MetricsMap;
   now: number;
+  /** The daemon's lifecycle policy: a step's staleness window. */
+  policy: LifecyclePolicy;
   /** (#2189, step drill-in) Threaded through from `MissionCanvas`'s own
    * props, same as `metrics`/`now` above — see this file's own doc on
    * `onNodeClick` for why a single-step task also gets a whole-card click
@@ -82,7 +85,7 @@ function MissionNode({ data }: NodeProps<MissionNodeData>) {
             <StepRow
               key={s.id}
               step={s}
-              meter={stepMeterFor(s, data.metrics, data.now)}
+              meter={stepMeterFor(s, data.metrics, data.now, data.policy)}
               extraClass="mn-step-row"
               selected={data.selectedStepId === s.id}
               onSelect={data.onSelectStep}
@@ -220,6 +223,7 @@ function toRfNodes(
   layout: ReturnType<typeof computeLayout>,
   metrics: MetricsMap,
   now: number,
+  policy: LifecyclePolicy,
   selectedStepId: string | null | undefined,
   onSelectStep: ((stepId: string) => void) | undefined,
 ): Node[] {
@@ -255,6 +259,7 @@ function toRfNodes(
         steps: n.steps || [],
         metrics,
         now,
+        policy,
         selectedStepId,
         onSelectStep,
       },
@@ -287,6 +292,7 @@ export function MissionCanvas({
   edges: graphEdges,
   metrics,
   now,
+  policy,
   note,
   minimapOn,
   selectedStepId,
@@ -296,6 +302,7 @@ export function MissionCanvas({
   edges: GraphEdge[];
   metrics: MetricsMap;
   now: number;
+  policy: LifecyclePolicy;
   note?: string;
   minimapOn: boolean;
   /** (#2189, step drill-in) See `MissionGraphLens`'s own doc for where
@@ -444,10 +451,10 @@ export function MissionCanvas({
   const rfNodes = useMemo(
     () =>
       withMeasuredDimensions(
-        toRfNodes(graphNodes, layout, metrics, now, selectedStepId, onSelectStep),
+        toRfNodes(graphNodes, layout, metrics, now, policy, selectedStepId, onSelectStep),
         dimsRef.current,
       ),
-    [graphNodes, layout, metrics, now, selectedStepId, onSelectStep],
+    [graphNodes, layout, metrics, now, policy, selectedStepId, onSelectStep],
   );
   const rfEdges = useMemo(() => toRfEdges(graphEdges, graphNodes), [graphEdges, graphNodes]);
 

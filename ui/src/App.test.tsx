@@ -1188,7 +1188,7 @@ describe("App", () => {
           { ts: "2026-08-07T09:00:00.000Z", category: "dispatch", action: "dispatch.start", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1", mission_id: "m-one" },
           { ts: "2026-08-07T09:30:00.000Z", category: "dispatch", action: "dispatch.complete", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1", mission_id: "m-one" },
           ...(missionClosed
-            ? [{ ts: "2026-08-07T09:31:00.000Z", category: "mission", action: "mission.close", machine_uid: "m1", machine_id: "MacBook-Pro", mission_id: "m-one" }]
+            ? [{ ts: "2026-08-07T09:31:00.000Z", category: "mission", action: "mission.close", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "mission-m-one", mission_id: "m-one" }]
             : []),
         ];
         if (path === "/flow-session/s1") return Promise.resolve(new Response(JSON.stringify({ records: recs, count: 2, truncated: false, generated_at_ms: 1 }), { status: 200 }));
@@ -1589,7 +1589,7 @@ describe("App", () => {
     window.location.hash = "#dispatch=s-narrow";
     renderApp();
     await waitFor(() => expect(document.querySelector(".session-run__header .pill")).toBeTruthy());
-    const slider = screen.getByRole("slider");
+    const slider = await screen.findByRole("slider");
     const runStartMs = Date.parse("2026-09-04T00:11:48.000Z");
     const runEndMs = Date.parse("2026-09-04T02:06:37.000Z");
     const dayEndMs = Date.parse("2026-09-04T21:00:00.000Z");

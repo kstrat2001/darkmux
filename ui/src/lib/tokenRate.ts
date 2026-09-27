@@ -1,9 +1,10 @@
 import { isTurnUsage } from "./usageRecords";
-import { openBudgetWait } from "./flow";
+import { DEFAULT_POLICY, NO_PRESENCE, isRunning, lifecycleAt, type LifecyclePolicy, type Presence } from "./lifecycle";
+import { currentRun, groupOfRecords } from "./runRef";
 import { cleanToolPath, toolCallPath } from "./recordDetail";
 import { compactDuration } from "./format";
 import { UTILITY_JOB, UTILITY_JOB_DEFAULT_STALL_MS, isUtilityEnd, isUtilityStart, utilityJobOf } from "./utilityJobs";
-import { ACTION, byTime, isDispatchTerminal, recordsAsOf, type NormAction, type NormRecord } from "./ingest";
+import { ACTION, byTime, recordsAsOf, type NormRecord } from "./ingest";
 
 /** (#2877) Live token-rate scope — pure derivation from flow records
  * already fetched for a session; zero model work, matches CLAUDE.md's "the
@@ -832,55 +833,23 @@ function isThinking(beats: HeartbeatSample[]): boolean {
   return last.chars > 0 && last.visible === 0;
 }
 
-// (#2902 step 5, 5th review C1) `budget.stop`: a wait ended because its run
-// was stopped. A hosted call's gate writes it before any bookend (the call
-// is never sent), so it closes the execution the way a terminal does.
-const isCloseEdge = (a: NormAction | undefined): boolean =>
-  isDispatchTerminal(a) || a === ACTION.SessionEnd || a === ACTION.BudgetStop;
-
-const EXECUTION_EVIDENCE: ReadonlySet<NormAction> = new Set<NormAction>([
-  ACTION.DispatchTurnHeartbeat,
-  ACTION.DispatchTurn,
-  ACTION.DispatchTool,
-  ACTION.DispatchRest,
-]);
-
-/** The executions a live reading may come from, as of `nowMs`: not one that
- *  has already closed (its last rate and its last marker are history, and a
- *  finished execution's trailing `dispatch.turn` read as PROMPT forever),
- *  and not a mission's own run-grain session (its `dispatch start` is
- *  mission-sourced and bookends the whole run; it never generates, and its
- *  start read as PROMPT over a genuinely stalled execution). */
-/** (#2881) The retired review launcher's whole-run bookend source (deleted
- *  in #2310 P4d). It bookended the WHOLE run, never a seat, so on an
- *  archived record it is run-grain exactly like today's `"mission"`, and
- *  archives are append-only (contract 8): readers stay bilingual. */
-const RETIRED_REVIEW_RUN_SOURCE = "review";
-
-export function liveExecutions(perExecutionRecords: NormRecord[][], nowMs: number): NormRecord[][] {
+/** The executions a live reading may come from, as of `nowMs`: execution-
+ *  grain record sets (`runRef.ts`'s `grainOf`) whose lifecycle is running
+ *  (`lifecycle.ts`). Not one that has closed or gone stale (its last rate
+ *  and its last marker are history, and a finished execution's trailing
+ *  `dispatch.turn` read as PROMPT forever); not a mission's own run-grain
+ *  session (its start bookends the whole run and never generates); not a
+ *  lifecycle session (`mission.start`, `step.start`), which carries no model
+ *  work and read as PROMPT over a genuinely stalled execution. */
+export function liveExecutions(
+  perExecutionRecords: NormRecord[][],
+  nowMs: number,
+  policy: LifecyclePolicy = DEFAULT_POLICY,
+  presence: Presence = NO_PRESENCE,
+): NormRecord[][] {
   return perExecutionRecords.filter((recs) => {
-    let runGrain = false;
-    // A set is an execution only if it carries execution evidence. A
-    // mission's lifecycle session (`mission start`, `phase start`) and its
-    // scheduler task sessions (`step start`/`step complete`) carry none;
-    // they read as PROMPT and outranked a real stall on every crawl.
-    let evidence = false;
-    for (const r of recordsAsOf(recs, nowMs)) {
-      if (isCloseEdge(r.action)) return false;
-      if (r.action === ACTION.DispatchStart) {
-        evidence = true;
-        if (r.source === "mission" || r.source === RETIRED_REVIEW_RUN_SOURCE) runGrain = true;
-      } else if (r.action !== undefined && EXECUTION_EVIDENCE.has(r.action)) {
-        evidence = true;
-      } else if (r.action === ACTION.BudgetWait && openBudgetWait(recs, nowMs)) {
-        // (#2902 step 5) A hosted call waiting on its budget is live work
-        // before its first bookend (the gate runs before `dispatch start`),
-        // while the wait is OPEN: a waiter silent past its resume time has
-        // died, and is not live.
-        evidence = true;
-      }
-    }
-    return evidence && !runGrain;
+    const g = groupOfRecords(recordsAsOf(recs, nowMs));
+    return g.grain === "execution" && isRunning(lifecycleAt(currentRun(g, nowMs), nowMs, policy, presence));
   });
 }
 
@@ -897,9 +866,14 @@ const STATE_PRIORITY: Record<LiveState, number> = { generating: 0, rest: 1, tool
  * card's `runningSessionIds`, or a mission's rolled-up sibling sessions) —
  * the best (lowest-`STATE_PRIORITY`) reading among them. `"prompt"` when
  * there are no executions at all, matching a fresh session's own default. */
-export function aggregateLiveState(perExecutionRecords: NormRecord[][], nowMs: number): LiveStateReading | null {
+export function aggregateLiveState(
+  perExecutionRecords: NormRecord[][],
+  nowMs: number,
+  policy: LifecyclePolicy = DEFAULT_POLICY,
+  presence: Presence = NO_PRESENCE,
+): LiveStateReading | null {
   let best: LiveStateReading | null = null;
-  for (const recs of liveExecutions(perExecutionRecords, nowMs)) {
+  for (const recs of liveExecutions(perExecutionRecords, nowMs, policy, presence)) {
     const reading = deriveLiveState(recs, nowMs);
     if (!best || STATE_PRIORITY[reading.state] < STATE_PRIORITY[best.state]) best = reading;
   }
@@ -1059,11 +1033,16 @@ export interface AggregatedTokenRate {
  * it. Returns `null` only when NOT ONE execution has a reading, so the
  * caller can distinguish "genuinely 0 tok/s right now" reporting from
  * "nothing to report yet" (though today both render the same "0"). */
-export function aggregateTokenRate(perExecutionRecords: NormRecord[][], nowMs: number): AggregatedTokenRate | null {
+export function aggregateTokenRate(
+  perExecutionRecords: NormRecord[][],
+  nowMs: number,
+  policy: LifecyclePolicy = DEFAULT_POLICY,
+  presence: Presence = NO_PRESENCE,
+): AggregatedTokenRate | null {
   let any = false;
   let total = 0;
   let carried = false;
-  for (const recs of liveExecutions(perExecutionRecords, nowMs)) {
+  for (const recs of liveExecutions(perExecutionRecords, nowMs, policy, presence)) {
     // Only an execution that is generating right now contributes: a resting
     // or tool-running one still has a "last rate" from its last turn, and a
     // mission summed them (review: 350 tok/s with one execution at ~40).

@@ -13,12 +13,16 @@
  */
 
 import type { Run } from "./generated/Run";
+import type { RunsPolicy } from "./generated/RunsPolicy";
 
 /** `GET /runs` — the wrapper `runs_handler` builds around `Vec<Run>`.
  * Source: `crates/darkmux-serve/src/lib.rs::runs_handler`. */
 export interface RunsResponse {
   runs: Run[];
   generated_at_ms: number;
+  /** The lifecycle policy every row was judged by. Absent from a daemon
+   *  that predates it. */
+  policy?: RunsPolicy;
 }
 
 /**
@@ -686,8 +690,9 @@ export interface MachineLoad {
 
 /** `GET /fleet/sessions/live` — `axum::Json(Vec<LiveSessionBeat>)`, the
  * session-presence twin of `PresenceBeat` above (same crate, same hand-write
- * rationale — see that type's doc comment). Only `session_id` is consumed by
- * the machine lens's `liveSessionSet()` port (`lib/flow.ts`); the daemon
+ * rationale — see that type's doc comment). Only `session_id` (and the
+ * optional `mission_id`) is consumed, as the presence input to each run's
+ * lifecycle (`lib/lifecycle.ts`); the daemon
  * sends more fields (see `tests/parity/corpus/fleet-sessions-live.json`,
  * empty in the recorded corpus — no session was live at record time), widen
  * this interface if a future lens needs them.

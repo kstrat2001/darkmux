@@ -1,6 +1,6 @@
+import { DEFAULT_POLICY } from "../../lib/lifecycle";
 import { describe, expect, it } from "vitest";
 import { groupTimeline, initMinimap, isNarrowViewport, persistMinimap, taskAggMetrics, timelineActive } from "./timeline";
-import { STEP_LIVENESS_WINDOW_MS } from "./graph";
 import type { GraphEdge, GraphNode, MetricsMap } from "./graph";
 
 const PHASE: GraphNode = { id: "p1", label: "Investigate", kind: "phase", status: "complete", depth: 0 };
@@ -251,10 +251,10 @@ describe("taskAggMetrics task-level duration (#2269)", () => {
   it("(#2343) a step whose last signal is long stale does not keep the task card generating", () => {
     // Same refinement, the freshness half: `stepMeterFor` drops
     // `generating` once nothing has been heard inside
-    // `STEP_LIVENESS_WINDOW_MS`. The aggregate followed the raw status
+    // `DEFAULT_POLICY.staleAfterMs`. The aggregate followed the raw status
     // instead, so a dead step kept the card pulsing indefinitely.
     const task = seq({ startedTs: T0, completedTs: T0 + 60_000 }, { startedTs: T0 + 61_000 });
     expect(taskAggMetrics(task, {}, T0 + 100_000).generating).toBe(true);
-    expect(taskAggMetrics(task, {}, T0 + 61_000 + STEP_LIVENESS_WINDOW_MS + 1_000).generating).toBe(false);
+    expect(taskAggMetrics(task, {}, T0 + 61_000 + DEFAULT_POLICY.staleAfterMs + 1_000).generating).toBe(false);
   });
 });

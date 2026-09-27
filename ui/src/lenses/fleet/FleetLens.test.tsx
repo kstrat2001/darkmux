@@ -7,7 +7,9 @@ import { QueryClientProvider, QueryClient } from "@tanstack/react-query";
 import { FleetLens } from "./FleetLens";
 
 import { pepperAt, pepperRecords } from "../../testing/pepperGrinderRun";
-import { todayUTC, prevDateUTC, FLOW_LIVE_TTL_MS, __sessionIndexBuilds } from "../../lib/flow";
+import { todayUTC, prevDateUTC } from "../../lib/flow";
+import { DEFAULT_POLICY } from "../../lib/lifecycle";
+import { __runIndexBuilds } from "../../lib/runRef";
 import { ACTION, __asOfFilterRuns } from "../../lib/ingest";
 import { tokensOffMeter } from "./savings";
 import { closeOpenModal } from "../../lib/dialogManager";
@@ -62,7 +64,7 @@ function latestTokenScopeProps(): Record<string, unknown> {
 }
 
 // (#1913) Every fixture below anchors its records at "T10:00" of `today`
-// (`todayUTC()`), and liveness (`flowLiveSessions`, `FLOW_LIVE_TTL_MS`) is
+// (`todayUTC()`), and liveness (each run's lifecycle, `DEFAULT_POLICY.staleAfterMs`) is
 // judged against REAL wall-clock now. Left alone, that means the suite's
 // pass/fail depended on what time of day it happened to run: before 10:00
 // UTC the fixture sits in the future (trivially "fresh"), and after
@@ -72,7 +74,7 @@ function latestTokenScopeProps(): Record<string, unknown> {
 // something inherited from the clock. `toFake: ["Date"]` leaves
 // setTimeout/setInterval alone, so `waitFor()`'s real-timer polling still
 // works.
-const FROZEN_NOW = "2026-06-15T10:02:00.000Z"; // 2 minutes after the T10:00 anchor, well inside FLOW_LIVE_TTL_MS
+const FROZEN_NOW = "2026-06-15T10:02:00.000Z"; // 2 minutes after the T10:00 anchor, well inside DEFAULT_POLICY.staleAfterMs
 
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ["Date"] });
@@ -353,7 +355,7 @@ describe("FleetLens", () => {
   // (#1923) A machine whose lab run is BETWEEN dispatches — the COW clone,
   // the baseline hash, the verify command, scoring — has no dispatch in
   // flight, so no contract-2 bookends and no presence key: flow sees nothing
-  // and `machActive`/`sessionsOn` have nothing to read. The `/runs` lab row
+  // and `machActive` has no run to read. The `/runs` lab row
   // (written at start, RAII-guarded) is the only source that stays "running"
   // across that whole span, and without it the card reads "idle" /
   // "0 running" while the run is very much live.
@@ -899,12 +901,12 @@ describe("FleetLens", () => {
     expect(window.location.hash).toBe("#dispatch=s1");
   });
 
-  // (#1913) The two tests below pin BOTH sides of the `FLOW_LIVE_TTL_MS`
+  // (#1913) The two tests below pin BOTH sides of the `DEFAULT_POLICY.staleAfterMs`
   // boundary explicitly, rather than relying on the other tests in this
   // file happening to sit comfortably inside it. Before this fix neither
   // direction was asserted: a session's liveness was implicitly "whatever
   // real wall-clock now happened to be" relative to a `T10:00` fixture.
-  it("(#1913) a session 1s under the FLOW_LIVE_TTL_MS boundary still reads 1 running", async () => {
+  it("(#1913) a session 1s under the DEFAULT_POLICY.staleAfterMs boundary still reads 1 running", async () => {
     const today = todayUTC();
     const lastRecordMs = Date.parse(`${today}T10:00:00.000Z`);
     mockFleetFetch({
@@ -914,7 +916,7 @@ describe("FleetLens", () => {
       machines: [{ uid: "u1", name: "MacBook-Pro", last_seen_ms: lastRecordMs }],
       specs: { machine_id: "MacBook-Pro", cpu_brand: "Apple M5 Max" },
     });
-    vi.setSystemTime(new Date(lastRecordMs + FLOW_LIVE_TTL_MS - 1000));
+    vi.setSystemTime(new Date(lastRecordMs + DEFAULT_POLICY.staleAfterMs - 1000));
     renderFleetLens();
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
     const card = document.querySelector(".mach")!;
@@ -922,7 +924,7 @@ describe("FleetLens", () => {
     expect(card.querySelector(".runs--live")).not.toBeNull();
   });
 
-  it("(#1913) a session 1s past the FLOW_LIVE_TTL_MS boundary reads 0 running, not stuck live", async () => {
+  it("(#1913) a session 1s past the DEFAULT_POLICY.staleAfterMs boundary reads 0 running, not stuck live", async () => {
     const today = todayUTC();
     const lastRecordMs = Date.parse(`${today}T10:00:00.000Z`);
     mockFleetFetch({
@@ -932,7 +934,7 @@ describe("FleetLens", () => {
       machines: [{ uid: "u1", name: "MacBook-Pro", last_seen_ms: lastRecordMs }],
       specs: { machine_id: "MacBook-Pro", cpu_brand: "Apple M5 Max" },
     });
-    vi.setSystemTime(new Date(lastRecordMs + FLOW_LIVE_TTL_MS + 1000));
+    vi.setSystemTime(new Date(lastRecordMs + DEFAULT_POLICY.staleAfterMs + 1000));
     renderFleetLens();
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
     const card = document.querySelector(".mach")!;
@@ -1077,7 +1079,7 @@ describe("FleetLens pager (#2881)", () => {
   });
 
   // (#2886 pass 5, MUST — fresh-reviewer finding F2) A mission's seats all
-  // collapse to ONE top-level run (`topLevelRunSessionIds`), but the pager
+  // collapse to ONE top-level run (`topLevelRuns`), but the pager
   // shows one page per seat — so `runsCount` (1) and `card.executions.length`
   // (9) genuinely disagree here, unlike the plain-dispatches case above
   // where they agree by construction.
@@ -2238,9 +2240,8 @@ describe("savings hero: nothing leaks while loading (#2830)", () => {
     // timers are installed, so `todayUTC()` here would read the REAL
     // wall-clock date and build timestamps chronologically AFTER
     // FROZEN_NOW, which fails every `T(ts) <= t` liveness check silently
-    // (found live: `machActive` read false, `sessionRunning` still read
-    // true via a different path, so the card rendered "idle" with a
-    // contradictory "1 running" tap target).
+    // (found live: the card rendered "idle" with a contradictory
+    // "1 running" tap target).
     // Anchored so the LAST heartbeat sits 2s before FROZEN_NOW (10:02:00) —
     // fresh under STALL_AFTER_MS (30s).
     const t1a = "2026-06-15T10:00:00.000Z";
@@ -2359,8 +2360,8 @@ describe("(#2911) the fleet card ticks while an execution is live", () => {
     // across ticks", which pins the window half: the merged array stayed the
     // same object. It does NOT pin that the card's lookups use the index (a
     // lookup reverted to a whole-window scan builds nothing either); that
-    // half is pinned where each lookup lives, in `flow.test.ts`
-    // (`sessionRunning`) and `cards.test.ts` (the heartbeat reads).
+    // half is pinned where each lookup lives, in `flow.test.ts` (the run
+    // index) and `cards.test.ts` (the heartbeat reads).
     vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
     vi.setSystemTime(new Date(FROZEN_NOW));
     mockFleetFetch({
@@ -2371,7 +2372,7 @@ describe("(#2911) the fleet card ticks while an execution is live", () => {
     });
     renderFleetLens();
     await waitFor(() => expect(document.querySelector(".mach-scope__rate")?.textContent).toBe("rest 20s"));
-    const builds = __sessionIndexBuilds();
+    const builds = __runIndexBuilds();
     for (let i = 0; i < 3; i++) {
       act(() => {
         vi.advanceTimersByTime(1_000);
@@ -2379,7 +2380,7 @@ describe("(#2911) the fleet card ticks while an execution is live", () => {
     }
     // The card DID recompute: the countdown moved three seconds.
     expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("rest 17s");
-    expect(__sessionIndexBuilds()).toBe(builds);
+    expect(__runIndexBuilds()).toBe(builds);
   });
 
   it("the flow-derived live TTL expires on the tick, with no new record", async () => {
@@ -2387,8 +2388,8 @@ describe("(#2911) the fleet card ticks while an execution is live", () => {
     vi.setSystemTime(new Date(FROZEN_NOW));
     mockFleetFetch({
       flowToday: [
-        { ts: ago(FLOW_LIVE_TTL_MS - 500), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s-old", action: "dispatch.start", handle: "darkmux/coder" },
-        { ts: ago(FLOW_LIVE_TTL_MS - 1_500), machine_uid: "u1", session_id: "s-old", action: "dispatch.rest", payload: { ms: 600_000 } },
+        { ts: ago(DEFAULT_POLICY.staleAfterMs - 500), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s-old", action: "dispatch.start", handle: "darkmux/coder" },
+        { ts: ago(DEFAULT_POLICY.staleAfterMs - 1_500), machine_uid: "u1", session_id: "s-old", action: "dispatch.rest", payload: { ms: 600_000 } },
       ],
     });
     renderFleetLens();

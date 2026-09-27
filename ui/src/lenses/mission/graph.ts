@@ -26,6 +26,7 @@
 import { compactThousands, fmtElapsed, type CompactStyle } from "../../lib/format";
 import { PURPOSE, isUsageRecord, stepTokensWithLegacyFallback, usageContribution } from "../../lib/usageRecords";
 import { ACTION, CATEGORY, byTimeNewestFirst, isAfter, isDispatchFamily, isDispatchTerminal, type NormAction, type NormRecord } from "../../lib/ingest";
+import { DEFAULT_POLICY, isStale, type LifecyclePolicy } from "../../lib/lifecycle";
 
 // ─── wire types (crates/darkmux-serve/src/mission_graph.rs) ────────────────
 
@@ -887,12 +888,7 @@ export function hhmmss(ts: string | number): string {
   return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
 }
 
-// ─── step meter (mission-graph.html: stepStartMs, stepMeterFor,
-// STEP_LIVENESS_WINDOW_MS) ───────────────────────────────────────────────────
-
-/** Twice the runtime's default inactivity budget (600s) — see
- * mission-graph.html's own extensive comment. */
-export const STEP_LIVENESS_WINDOW_MS = 1200 * 1000;
+// ─── step meter (mission-graph.html: stepStartMs, stepMeterFor) ────────────
 
 export function stepStartMs(step: GraphStep, m: StepMetrics | undefined): number {
   if (m && m.startTs) return m.startTs;
@@ -921,17 +917,16 @@ export interface StepMeter {
   wallMs: number;
 }
 
-/** `stepMeterFor` — mission-graph.html. `lastSignal` reads this port's
- * derived `m.lastTs` (see this module's own doc) in place of legacy's
- * out-of-React `STEP_LAST_RX` wall-clock ref. */
-export function stepMeterFor(step: GraphStep, metrics: MetricsMap, now: number): StepMeter {
+/** `stepMeterFor` — mission-graph.html. A running step is in flight until
+ * its last signal (this port's derived `m.lastTs`, else its start) is older
+ * than the lifecycle policy's staleness window: the same rule
+ * (`lib/lifecycle.ts`'s `isStale`) every other surface judges a run by. */
+export function stepMeterFor(step: GraphStep, metrics: MetricsMap, now: number, policy: LifecyclePolicy = DEFAULT_POLICY): StepMeter {
   const m = metrics[step.id];
   const d = stepDisplayMetrics(m);
   const show = isAiKind(step.kind) || d.has;
-  const lastSignal = (m && m.lastTs) || 0;
-  const startedAt = stepStartMs(step, m);
-  const freshEnough = lastSignal ? now - lastSignal < STEP_LIVENESS_WINDOW_MS : !!startedAt && now - startedAt < STEP_LIVENESS_WINDOW_MS;
-  const generating = step.status === "running" && freshEnough;
+  const lastSignal = (m && m.lastTs) || stepStartMs(step, m) || null;
+  const generating = step.status === "running" && !isStale(lastSignal, now, policy);
   const startMs = stepStartMs(step, m);
   const elapsedMs = generating && startMs && now ? Math.max(0, now - startMs) : 0;
   const endMs = stepEndMs(step, m) || (step.status === "running" && now ? now : 0);
@@ -975,7 +970,7 @@ export interface StepHeaderField {
  * home in `GraphStep`/`StepMetrics` yet. Scanned NEWEST-FIRST so the most
  * recent record wins when more than one carries the same key (a crawl unit
  * can emit `source`/`rule` more than once while working through a batch). */
-export function buildStepHeaderFields(step: GraphStep, metrics: MetricsMap, now: number, stepRecords: NormRecord[]): StepHeaderField[] {
+export function buildStepHeaderFields(step: GraphStep, metrics: MetricsMap, now: number, stepRecords: NormRecord[], policy: LifecyclePolicy = DEFAULT_POLICY): StepHeaderField[] {
   const fields: StepHeaderField[] = [];
   fields.push({ key: "unit", label: "unit", value: step.label || step.id });
   if (step.kind) fields.push({ key: "kind", label: "kind", value: step.kind });
@@ -1004,7 +999,7 @@ export function buildStepHeaderFields(step: GraphStep, metrics: MetricsMap, now:
   fields.push({ key: "status", label: "status", value: step.status || "planned" });
 
   const m = metrics[step.id];
-  const meter = stepMeterFor(step, metrics, now);
+  const meter = stepMeterFor(step, metrics, now, policy);
   const startMs = stepStartMs(step, m);
   if (startMs) {
     const endMs = m && m.endTs ? m.endTs : meter.generating ? now : 0;

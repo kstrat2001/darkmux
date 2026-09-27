@@ -139,7 +139,7 @@ test('a long mission id truncates on the phone instead of wrapping the masthead 
       body: JSON.stringify({
         records: [
           { ts: '2026-08-07T09:00:00Z', category: 'dispatch', action: 'dispatch.start', mission_id: longId },
-          { ts: '2026-08-07T09:31:00Z', category: 'mission', action: 'mission.close', mission_id: longId },
+          { ts: '2026-08-07T09:31:00Z', category: 'mission', action: 'mission.close', session_id: `mission-${longId}`, mission_id: longId },
         ],
         count: 2,
         truncated: false,

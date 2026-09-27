@@ -1999,6 +1999,7 @@ async fn runs_handler(State(state): State<AppState>) -> axum::Json<serde_json::V
         "runs": runs,
         "generated_at_ms": current_millis(),
         "meta": source_state::coverage_meta(&fleet_state),
+        "policy": runs::runs_policy(),
     }))
 }
 

@@ -14,8 +14,19 @@ import { render, act, cleanup } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { SessionReplay } from "./SessionReplay";
 import { buildFleetCard } from "../fleet/cards";
-import { liveSessionSet, shapeRecords } from "../../lib/flow";
+import { shapeRecords } from "../../lib/flow";
 import { ACTION, ingest, isAsOf, timesOf } from "../../lib/ingest";
+
+// The shared 1 s clock (`lib/clock.ts`) captures `Date.now()` when it is
+// imported and serves that to a ticking page's first render, before its
+// first tick. In a browser that capture is never AHEAD of the records (it is
+// at most as old as the page). Here the probe freezes time days in the past,
+// so an unpinned capture would be the real, later date, and the first frame
+// would judge the run against a future instant. Pinned below every probe
+// instant, before the module loads.
+vi.hoisted(() => {
+  vi.useFakeTimers({ now: Date.parse("2026-09-24T00:00:00Z") });
+});
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // `ui/src/lenses/catalog/` -> repo root is four levels up.
@@ -104,12 +115,11 @@ describe("parity: fleet card, live vs playback at the same recorded instant", ()
     // live: the window as received by X; presence lists the session; t = window tMax (FleetLens live arm)
     const liveData = shapeRecords(ingest(upTo(X)));
     const NALL = shapeRecords(ALLN);
-    const liveSet = liveSessionSet(liveData, new Set([SID]), X, true);
+    const livePresence = new Set([SID]);
     const liveTMax = Math.max(...timesOf(liveData));
-    const live = buildFleetCard(liveData, new Map(), null, liveSet, false, m, true, liveTMax);
+    const live = buildFleetCard(liveData, new Map(), null, livePresence, false, m, true, liveTMax);
     // playback: the whole day, no presence, playhead X (PlaybackLens -> FleetLens historical)
-    const playSet = liveSessionSet(NALL, new Set(), X + 6 * 3600_000, false);
-    const play = buildFleetCard(NALL, new Map(), null, playSet, false, m, false, X);
+    const play = buildFleetCard(NALL, new Map(), null, new Set(), false, m, false, X);
     const pick = (c: typeof live) => ({
       active: c.active,
       stat: c.stat,

@@ -160,9 +160,9 @@ describe("SessionReplay — the run finishing while the page is open (#2011)", (
   it("stops the elapsed counter when presence says the run is gone, even with no terminal record", async () => {
     // The abandoned case: the host process was killed, so no clean
     // `dispatch complete` is ever written, and the reconciler's `session.end`
-    // edge may not have landed yet. Before this, the counter kept climbing for
-    // a further ten minutes (`STALE_AFTER_MS`, the watchdog's kill timeout)
-    // and then froze on whatever wrong number it had reached. Presence having
+    // edge may not have landed yet. Before this, the counter kept climbing
+    // until the run went stale and then froze on whatever wrong number it
+    // had reached. Presence having
     // SEEN the session disappear is proof the run stopped; that beats a
     // ten-minute silence heuristic.
     vi.useFakeTimers();
