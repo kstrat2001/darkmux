@@ -1086,6 +1086,86 @@
       ],
       "phase": "not_started",
       "status": "planned"
+    },
+    {
+      "name": "a budget.resume in the same second as its wait ends the wait",
+      "as_of": "2026-09-27T10:25:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "s1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        },
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "budget.wait",
+          "session_id": "s1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "wait_seconds": 1800
+          }
+        },
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "budget.resume",
+          "session_id": "s1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "stale",
+      "status": "abandoned",
+      "abandoned_reason": "noterminal"
+    },
+    {
+      "name": "a relaunch does not inherit the earlier attempt's budget wait",
+      "as_of": "2026-09-27T10:30:00Z",
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "s1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        },
+        {
+          "ts": "2026-09-27T10:00:30Z",
+          "action": "budget.wait",
+          "session_id": "s1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "wait_seconds": 1800
+          }
+        },
+        {
+          "ts": "2026-09-27T10:05:00Z",
+          "action": "dispatch.start",
+          "session_id": "s1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "stale",
+      "status": "abandoned",
+      "abandoned_reason": "noterminal"
+    },
+    {
+      "name": "a terminal from a skewed clock that arrives before its start closes the run",
+      "as_of": "2026-09-27T10:00:20Z",
+      "records": [
+        {
+          "ts": "2026-09-27T09:59:55Z",
+          "action": "dispatch.complete",
+          "session_id": "s1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        },
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "s1",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "closed",
+      "status": "complete"
     }
   ]
 }
