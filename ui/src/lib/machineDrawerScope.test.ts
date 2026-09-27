@@ -15,14 +15,14 @@ const proc = (ts: string, cpu: number, machine_uid?: string): NormRecord => norm
 describe("resolveDrawerScope (#2107)", () => {
   it("on a dispatch route, scopes to the dispatch's own route records and labels it", () => {
     const routeRecords = [proc("2026-01-01T00:00:00Z", 5)];
-    const s = resolveDrawerScope({ kind: "dispatch", dispatchId: "d1" }, routeRecords, [], null, Date.parse("2026-01-01T00:00:00Z"));
+    const s = resolveDrawerScope({ kind: "dispatch", dispatchId: "d1", missionId: null }, routeRecords, [], null, Date.parse("2026-01-01T00:00:00Z"));
     expect(s.scopeLabel).toBe("this dispatch");
     expect(s.samples.map((p) => p.cpu)).toEqual([5]);
   });
 
   it("dispatch route records are sorted chronologically regardless of input order", () => {
     const routeRecords = [proc("2026-01-01T00:00:04Z", 40), proc("2026-01-01T00:00:00Z", 0)];
-    const s = resolveDrawerScope({ kind: "dispatch", dispatchId: "d1" }, routeRecords, [], null, 0);
+    const s = resolveDrawerScope({ kind: "dispatch", dispatchId: "d1", missionId: null }, routeRecords, [], null, 0);
     expect(s.samples.map((p) => p.cpu)).toEqual([0, 40]);
   });
 
@@ -105,7 +105,7 @@ describe("resolveDrawerScope (#2107)", () => {
 
 describe("lastKnown (#2107 phone feedback)", () => {
   it("is null on the dispatch branch even when samples is empty", () => {
-    const s = resolveDrawerScope({ kind: "dispatch", dispatchId: "d1" }, [], [], null, 0);
+    const s = resolveDrawerScope({ kind: "dispatch", dispatchId: "d1", missionId: null }, [], [], null, 0);
     expect(s.samples).toEqual([]);
     expect(s.lastKnown).toBeNull();
   });
@@ -194,7 +194,7 @@ describe("machine.telemetry recognition (#2413)", () => {
 
   it("a mixed window of old telemetry.process and new machine.telemetry records both fold in, oldest first, on a dispatch route", () => {
     const routeRecords = [machineTelemetry("2026-01-01T00:00:02Z", 20), proc("2026-01-01T00:00:00Z", 10)];
-    const s = resolveDrawerScope({ kind: "dispatch", dispatchId: "d1" }, routeRecords, [], null, Date.parse("2026-01-01T00:00:02Z"));
+    const s = resolveDrawerScope({ kind: "dispatch", dispatchId: "d1", missionId: null }, routeRecords, [], null, Date.parse("2026-01-01T00:00:02Z"));
     expect(s.samples.map((p) => p.cpu)).toEqual([10, 20]);
   });
 

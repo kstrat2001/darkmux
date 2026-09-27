@@ -80,7 +80,7 @@ describe("Masthead", () => {
 
   it("hides the refresh control on a replay route (nothing live to refetch)", () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
-    renderMasthead({ kind: "dispatch", dispatchId: "abc-123" });
+    renderMasthead({ kind: "dispatch", dispatchId: "abc-123", missionId: null });
     expect(screen.queryByTitle("Refetch now")).not.toBeInTheDocument();
     vi.unstubAllGlobals();
   });
@@ -186,7 +186,7 @@ describe("Masthead — static-build badge suppression (#1801)", () => {
 
   it("a daemon dispatch page reads LIVE (the live word) until the shell knows its day, then names that day — the pill is the ONE indicator, never a separate badge (#2412)", () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
-    const unknown = renderMasthead({ kind: "dispatch", dispatchId: "s1" } as never);
+    const unknown = renderMasthead({ kind: "dispatch", dispatchId: "s1", missionId: null } as never);
     // (header owns liveness, 2026-09-03) Day unknown ⇒ the subject is still
     // running ⇒ this is a live page ⇒ the pill's own dot carries it.
     expect(unknown.container.querySelector(".catalog-toggle")?.textContent).toContain("LIVE");
@@ -249,7 +249,7 @@ describe("live pill on every daemon-backed route (#2412)", () => {
     expect(container.querySelector("#modebadge")).toBeNull();
   });
   it("renders on the dispatch route, and reflects a dropped stream", () => {
-    const { container } = renderMasthead({ kind: "dispatch", dispatchId: "d1" } as Route, "reconnecting");
+    const { container } = renderMasthead({ kind: "dispatch", dispatchId: "d1", missionId: null } as Route, "reconnecting");
     expect(container.querySelector(".catalog-toggle")?.textContent).toMatch(/live/i);
     expect(container.querySelector("#modebadge")).toBeNull();
   });

@@ -35,6 +35,7 @@ import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW
 import type { MachineSpecs } from "../../types/handwritten";
 import { runsForMachine } from "../runs/format";
 import { recordsAsOf, type NormRecord } from "../../lib/ingest";
+import { dispatchHash } from "../../lib/route";
 
 /** `ICON.machine` (viewer.html:935) — the generic processor/chip glyph
  * every fleet card renders, since `MACH_ICON` (the per-machine form-factor
@@ -107,7 +108,7 @@ function machineDrillHash(machineKey: string): string {
  * "several things running here". */
 function machineRunsHash(machineKey: string, runningSessionIds: string[]): string | null {
   if (runningSessionIds.length === 0) return null;
-  if (runningSessionIds.length === 1) return `dispatch=${encodeURIComponent(runningSessionIds[0])}`;
+  if (runningSessionIds.length === 1) return dispatchHash(runningSessionIds[0], null);
   return machineDrillHash(machineKey);
 }
 
@@ -429,12 +430,12 @@ const TimelineLanes = memo(function TimelineLanes({ timeline }: { timeline: Retu
                 role="button"
                 tabIndex={0}
                 onClick={() => {
-                  location.hash = `dispatch=${encodeURIComponent(bar.sid)}`;
+                  location.hash = bar.hash;
                 }}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" || e.key === " ") {
                     e.preventDefault();
-                    location.hash = `dispatch=${encodeURIComponent(bar.sid)}`;
+                    location.hash = bar.hash;
                   }
                 }}
               />

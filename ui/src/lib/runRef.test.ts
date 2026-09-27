@@ -33,6 +33,12 @@ describe("runIndex: a session id two missions share", () => {
     expect(sessionRun(shared, "task-probe", Date.parse(at(620)))?.ref.missionId).toBe("B");
     expect(sessionRun(shared, "task-probe", Date.parse(at(100)))?.ref.missionId).toBe("A");
   });
+
+  it("a session route naming a mission reads that mission's run, whichever ran last", () => {
+    expect(sessionRun(shared, "task-probe", Date.parse(at(620)), "A")?.ref.missionId).toBe("A");
+    expect(sessionRun(shared, "task-probe", Date.parse(at(620)), "B")?.ref.missionId).toBe("B");
+    expect(sessionRun(shared, "task-probe", Date.parse(at(620)), "C")).toBeNull();
+  });
 });
 
 describe("runIndex: attribution of a record naming no mission", () => {

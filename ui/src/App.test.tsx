@@ -1027,7 +1027,7 @@ describe("App", () => {
     // this the scoping case below passes vacuously.
     await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(2));
     fireEvent.click(document.querySelector('[data-act="step-row"]')!);
-    await waitFor(() => expect(window.location.hash).toBe("#dispatch=crew-dispatch-coder-1788254029192466-0"));
+    await waitFor(() => expect(window.location.hash).toBe("#dispatch=crew-dispatch-coder-1788254029192466-0&dispatch.mission=m1"));
   });
 
   it("(#2223) a generic-launch step drills into its emitter-default `step-<id>` dispatch session", async () => {
@@ -1045,7 +1045,7 @@ describe("App", () => {
     await waitFor(() => expect(document.querySelector('[data-act="step-row"]')).not.toBeNull());
     await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(2));
     fireEvent.click(document.querySelector('[data-act="step-row"]')!);
-    await waitFor(() => expect(window.location.hash).toBe("#dispatch=step-step-a"));
+    await waitFor(() => expect(window.location.hash).toBe("#dispatch=step-step-a&dispatch.mission=m1"));
   });
 
   it("(#2223) a step with records but NO dispatch evidence still scopes, never routing to an empty detail view", async () => {
@@ -1252,6 +1252,35 @@ describe("App", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("a dispatch link naming its mission opens THAT run: the header and the event log read the same one", async () => {
+    // Two missions share the session id (#2125). Mission A's run failed,
+    // mission B's later run completed; a link to A must not show B.
+    const base = { category: "dispatch", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s-shared", handle: "coder" };
+    const session = [
+      { ...base, ts: "2026-08-07T10:00:00.000Z", action: "dispatch.start", mission_id: "m-a" },
+      { ...base, ts: "2026-08-07T10:01:00.000Z", action: "dispatch.error", mission_id: "m-a" },
+      { ...base, ts: "2026-08-07T10:02:00.000Z", action: "dispatch.start", mission_id: "m-b" },
+      { ...base, ts: "2026-08-07T10:02:30.000Z", action: "dispatch.turn", mission_id: "m-b" },
+      { ...base, ts: "2026-08-07T10:03:00.000Z", action: "dispatch.complete", mission_id: "m-b" },
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        const path = String(url);
+        if (path === "/flow-session/s-shared") return Promise.resolve(new Response(JSON.stringify({ records: session, count: 5, truncated: false, generated_at_ms: 1 }), { status: 200 }));
+        if (path.startsWith("/flow/")) return Promise.resolve(new Response(JSON.stringify(session), { status: 200 }));
+        if (path === "/fleet/sessions/live") return Promise.resolve(new Response(JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
+        if (path === "/fleet/machines/live") return Promise.resolve(new Response(JSON.stringify({ machines: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    );
+    window.location.hash = "#dispatch=s-shared&dispatch.mission=m-a";
+    renderApp();
+    await waitFor(() => expect(document.querySelector(".session-run__header")).toBeInTheDocument());
+    expect(document.querySelector(".session-run__header")?.textContent ?? "").not.toMatch(/^COMPLETE/);
+    await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(2));
   });
 
   it("a dispatch that is still running is a live view: no date, the pill's LIVE dot, no transport", async () => {

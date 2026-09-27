@@ -249,13 +249,33 @@ function openingRank(run: RunRecords, asOf: number): number {
   return run.attempt.opening.tMs ?? Infinity;
 }
 
-/** A session route's run: of the session's groups, the one whose current
- *  attempt opened most recently as of `asOf`. A `#dispatch=<id>` link names
- *  a session only, so when two missions share the id this picks the one that
- *  ran last, never a blend of both. `null` for a session with no records. */
-export function sessionRun(data: readonly NormRecord[], sessionId: string, asOf: number): RunRecords | null {
+/** The groups a session route means: the named mission's alone when the
+ *  route names one (`#dispatch=<id>&dispatch.mission=<id>`), else every
+ *  mission's on the session. */
+function routeGroups(data: readonly NormRecord[], sessionId: string, missionId: string | null): readonly RunGroup[] {
+  const groups = runIndex(data).groupsOfSession(sessionId);
+  return missionId === null ? groups : groups.filter((g) => g.missionId === missionId);
+}
+
+/** `data` as a session route naming a mission means it: the session's own
+ *  records narrowed to that mission's run, every other session's kept (a
+ *  run page reads its mission's other sessions too). Unchanged when the
+ *  route names no mission. The run page and the event log both read
+ *  through this, so they show the run `sessionRun` heads. */
+export function sessionRouteRecords<R extends NormRecord>(data: readonly R[], sessionId: string, missionId: string | null): R[] {
+  if (missionId === null) return data as R[];
+  const own = new Set<NormRecord>(routeGroups(data, sessionId, missionId)[0]?.records ?? []);
+  return data.filter((r) => r.session_id !== sessionId || own.has(r));
+}
+
+/** A session route's run: of the route's groups (`routeGroups`), the one
+ *  whose current attempt opened most recently as of `asOf`. A link naming
+ *  a session only picks, when two missions share the id, the one that ran
+ *  last, never a blend of both. `null` for a session (or named mission)
+ *  with no records. */
+export function sessionRun(data: readonly NormRecord[], sessionId: string, asOf: number, missionId: string | null = null): RunRecords | null {
   let best: RunRecords | null = null;
-  for (const g of runIndex(data).groupsOfSession(sessionId)) {
+  for (const g of routeGroups(data, sessionId, missionId)) {
     const run = currentRun(g, asOf);
     if (best === null || openingRank(run, asOf) > openingRank(best, asOf)) best = run;
   }

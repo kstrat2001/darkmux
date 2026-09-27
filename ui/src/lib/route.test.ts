@@ -122,17 +122,22 @@ describe("parseRoute", () => {
 
   it("parses #dispatch=<id> — the canonical spelling (#1974)", () => {
     setHash("#dispatch=abc-123");
-    expect(parseRoute()).toEqual({ kind: "dispatch", dispatchId: "abc-123" });
+    expect(parseRoute()).toEqual({ kind: "dispatch", dispatchId: "abc-123", missionId: null });
   });
 
   it("(#1974) still parses the legacy #session=<id> alias, so old bookmarks and printed deep links resolve", () => {
     setHash("#session=abc-123");
-    expect(parseRoute()).toEqual({ kind: "dispatch", dispatchId: "abc-123" });
+    expect(parseRoute()).toEqual({ kind: "dispatch", dispatchId: "abc-123", missionId: null });
+  });
+
+  it("carries the run's mission when the link names one (a session id several missions share)", () => {
+    setHash("#dispatch=abc-123&dispatch.mission=m-1");
+    expect(parseRoute()).toEqual({ kind: "dispatch", dispatchId: "abc-123", missionId: "m-1" });
   });
 
   it("(#1974) prefers the canonical dispatch= when a malformed hash carries both, so canonicalHash's rewrite is idempotent rather than oscillating", () => {
     setHash("#dispatch=canonical&session=legacy");
-    expect(parseRoute()).toEqual({ kind: "dispatch", dispatchId: "canonical" });
+    expect(parseRoute()).toEqual({ kind: "dispatch", dispatchId: "canonical", missionId: null });
   });
 
   it("parses #mission=<id> as the mission-graph lens route (#1868)", () => {
@@ -494,7 +499,7 @@ describe("isLiveRoute — a daemon-less build is never live, on any lens", () =>
     // tail and the presence poll run there exactly as on every other lens.
     // These two used to be excluded so the lens could mount its OWN tail and
     // paint its OWN pill; that is the inconsistency this flips.
-    expect(isLiveRoute({ kind: "dispatch", dispatchId: "s1" })).toBe(true);
+    expect(isLiveRoute({ kind: "dispatch", dispatchId: "s1", missionId: null })).toBe(true);
     expect(isLiveRoute({ kind: "mission", missionId: "m1", stepId: null })).toBe(true);
   });
 
@@ -541,6 +546,6 @@ describe("tokRateConnectionEvidence", () => {
   });
 
   it("null lastContactMs passes through unchanged on a live route", () => {
-    expect(tokRateConnectionEvidence({ kind: "dispatch", dispatchId: "s1" }, "live", null)).toEqual({ connected: true, lastContactMs: null });
+    expect(tokRateConnectionEvidence({ kind: "dispatch", dispatchId: "s1", missionId: null }, "live", null)).toEqual({ connected: true, lastContactMs: null });
   });
 });

@@ -11,7 +11,7 @@ import { useSessionLiveness } from "../../hooks/useSessionLiveness";
 import { flowToRenderModel, type StatusClass } from "../../lib/flow";
 import { NO_PRESENCE, isRunning, lifecycleAt, type Presence } from "../../lib/lifecycle";
 import { useLifecyclePolicy } from "../../hooks/useLifecyclePolicy";
-import { sessionRun } from "../../lib/runRef";
+import { sessionRouteRecords, sessionRun } from "../../lib/runRef";
 import { ACTION, CATEGORY, ingest, recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { useNowMs } from "../../lib/clock";
 import { clkhm } from "../../lib/format";
@@ -484,11 +484,16 @@ function BriefEntryContent({ entry }: { entry: BriefEntry }) {
 
 export function SessionReplay({
   sessionId,
+  missionId = null,
   playhead = null,
   connected = true,
   lastContactMs = null,
 }: {
   sessionId: string;
+  /** The mission whose run on this session the page shows, when the route
+   *  names one (`#dispatch=<sid>&dispatch.mission=<id>`): the session's
+   *  other missions' records are left out, so every region reads that run. */
+  missionId?: string | null;
   playhead?: number | null;
   /** (#2886 pass 3, "STALL while disconnected") Whether the page has a
    *  working connection to the daemon — derived by `App.tsx` from the
@@ -592,9 +597,10 @@ export function SessionReplay({
   const ownRaw = flowSrc === null ? daemonSlice : staticSlice;
   const ownMissionId = useMemo(() => {
     if (!ownRaw) return null;
+    if (missionId !== null) return missionId;
     const start = ownRaw.find((r) => r.session_id === sessionId && r.action === ACTION.DispatchStart);
     return start?.mission_id ?? null;
-  }, [ownRaw, sessionId]);
+  }, [ownRaw, sessionId, missionId]);
   useEffect(() => setLivenessMissionId(ownMissionId), [ownMissionId]);
   const ownHasTelemetry = useMemo(
     () => (ownRaw ? ownRaw.some((r) => r.session_id === sessionId && r.category === CATEGORY.Telemetry) : false),
@@ -654,7 +660,7 @@ export function SessionReplay({
   // daemon route, no transport) renders the whole slice as before.
   // (#2759) `enrichedRaw` is `ownRaw` (this session's own fetch) unless a
   // mission-wide fetch found MORE — see that computation's own doc above.
-  const all = enrichedRaw;
+  const all = useMemo(() => (enrichedRaw ? sessionRouteRecords(enrichedRaw, sessionId, missionId) : enrichedRaw), [enrichedRaw, sessionId, missionId]);
   const records = all && playhead !== null ? recordsAsOf(all, playhead) : all;
   const data = records ? flowToRenderModel(records) : [];
   const hasRecords = !!records && records.length > 0;

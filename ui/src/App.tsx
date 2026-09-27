@@ -35,7 +35,7 @@ import { ReadyHeadline } from "./components/ReadyHeadline";
 import { FleetCoverageNotice, useDegradedFleetSource } from "./components/FleetCoverageNotice";
 import { FlowReadNotice } from "./components/FlowReadNotice";
 import { displayNameOf, earliestRecordDate, firstRecordDate, localMachineUid, missionReplayDate, todayUTC } from "./lib/flow";
-import { isLiveRoute, showsEventLog, tokRateConnectionEvidence } from "./lib/route";
+import { dispatchHash, isLiveRoute, showsEventLog, tokRateConnectionEvidence } from "./lib/route";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "./lib/fetcher";
 import { queryKeys } from "./lib/queryKeys";
@@ -352,7 +352,7 @@ export function App() {
       if (stepId) {
         const dispatchId = stepDispatchSessions(missionRecordsRef.current, route.missionId)[stepId];
         if (dispatchId) {
-          location.hash = `dispatch=${encodeURIComponent(dispatchId)}`;
+          location.hash = dispatchHash(dispatchId, route.missionId);
           return;
         }
       }
@@ -1084,7 +1084,7 @@ function renderRoute(
       // Packet 4: a real fetch to /flow-session/<id> — see SessionReplay's
       // own doc for why the RENDER (not the fetch) is still a not-ported
       // notice.
-      return <SessionReplay sessionId={route.dispatchId} playhead={playhead} connected={connected} lastContactMs={routeLastContactMs} />;
+      return <SessionReplay sessionId={route.dispatchId} missionId={route.missionId} playhead={playhead} connected={connected} lastContactMs={routeLastContactMs} />;
     case "mission":
       // #1868: the mission-graph lens, folded in-place — see
       // `MissionGraphLens`'s own doc for the data sources and why this

@@ -153,15 +153,21 @@ describe("canonicalHash / parseRoute round-trip", () => {
   });
 
   it("dispatch round-trips on the canonical spelling (#1974)", () => {
-    const route: Route = { kind: "dispatch", dispatchId: "abc-123" };
+    const route: Route = { kind: "dispatch", dispatchId: "abc-123", missionId: null };
     expect(canonicalHash(route)).toBe("dispatch=abc-123");
+    expect(roundTrip(route)).toEqual(route);
+  });
+
+  it("a dispatch naming its mission round-trips with it", () => {
+    const route: Route = { kind: "dispatch", dispatchId: "abc-123", missionId: "m-1" };
+    expect(canonicalHash(route)).toBe("dispatch=abc-123&dispatch.mission=m-1");
     expect(roundTrip(route)).toEqual(route);
   });
 
   it("(#1974) a legacy #session= bookmark is REWRITTEN to the canonical #dispatch= form — which is what makes the alias one-release rather than permanent", () => {
     window.location.hash = "#session=abc-123";
     const route = parseRoute();
-    expect(route).toEqual({ kind: "dispatch", dispatchId: "abc-123" });
+    expect(route).toEqual({ kind: "dispatch", dispatchId: "abc-123", missionId: null });
     writeHash(canonicalHash(route));
     expect(window.location.hash).toBe("#dispatch=abc-123");
   });
