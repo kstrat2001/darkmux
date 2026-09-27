@@ -528,18 +528,6 @@ fn route_missing_message(id: &str, path: &str, address: &str) -> String {
     }
 }
 
-/// Normalize a roster address into an `http://host:port` daemon base URL,
-/// mirroring `fetch_machine_specs`' normalization (IPv6 / port-less forms).
-fn normalize_daemon_base(address: &str) -> String {
-    if address.contains("://") {
-        address.trim_end_matches('/').to_string()
-    } else if address.contains(':') {
-        format!("http://{address}")
-    } else {
-        format!("http://{address}:{}", crate::serve::DEFAULT_DAEMON_PORT)
-    }
-}
-
 pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
     let roster = fleet::load_roster()?;
 
@@ -1399,36 +1387,6 @@ pub(crate) fn cmd_machine_untrust(name: &str) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── normalize_daemon_base (#1426) — the three roster address forms ──
-
-    #[test]
-    fn normalize_daemon_base_passes_through_full_urls_sans_trailing_slash() {
-        assert_eq!(
-            normalize_daemon_base("http://studio.tailnet:9000/"),
-            "http://studio.tailnet:9000"
-        );
-        assert_eq!(
-            normalize_daemon_base("https://hub.example:8765"),
-            "https://hub.example:8765"
-        );
-    }
-
-    #[test]
-    fn normalize_daemon_base_prefixes_host_port_forms() {
-        assert_eq!(
-            normalize_daemon_base("100.64.0.2:8765"),
-            "http://100.64.0.2:8765"
-        );
-    }
-
-    #[test]
-    fn normalize_daemon_base_appends_default_port_to_bare_hosts() {
-        assert_eq!(
-            normalize_daemon_base("100.64.0.2"),
-            format!("http://100.64.0.2:{}", crate::serve::DEFAULT_DAEMON_PORT)
-        );
-    }
 
     // ── machine add: loopback refusal + self by machine_id (#2924) ──────
     //

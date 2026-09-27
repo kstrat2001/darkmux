@@ -179,7 +179,7 @@ impl RefusalLog {
             peers.retain(|ip, (start, _, sup)| {
                 if now.duration_since(*start) >= Self::WINDOW {
                     if *sup > 0 {
-                        lines.push(format!("darkmux fleet: suppressed {sup} refusal log line(s) from {ip} in the last minute"));
+                        lines.push(format!("darkmux serve: fleet listener: suppressed {sup} refusal log line(s) from {ip} in the last minute"));
                     }
                     false
                 } else {
@@ -190,7 +190,7 @@ impl RefusalLog {
         let over = self.overflow.swap(0, std::sync::atomic::Ordering::SeqCst);
         if over > 0 {
             lines.push(format!(
-                "darkmux fleet: suppressed {over} refusal log line(s) from addresses beyond the {} tracked",
+                "darkmux serve: fleet listener: suppressed {over} refusal log line(s) from addresses beyond the {} tracked",
                 Self::MAX_PEERS
             ));
         }
@@ -207,7 +207,7 @@ impl RefusalLog {
         };
         if let LogDecision::Write(prev) = decision {
             if let (Some(k), Some(ip)) = (prev, ip) {
-                eprintln!("darkmux fleet: suppressed {k} refusal log line(s) from {ip} in the last minute");
+                eprintln!("darkmux serve: fleet listener: suppressed {k} refusal log line(s) from {ip} in the last minute");
             }
             eprintln!("{line}");
             self.written.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -218,7 +218,7 @@ impl RefusalLog {
 fn refuse(state: &FleetListenerState, peer: Option<std::net::IpAddr>, r: &Refusal) -> Response {
     let receiver = &state.receiver;
     let code = StatusCode::from_u16(r.http_status()).unwrap_or(StatusCode::FORBIDDEN);
-    state.refusal_log.log(peer, &format!("darkmux fleet: refused — {}", r.reason(receiver)));
+    state.refusal_log.log(peer, &format!("darkmux serve: fleet listener: refused — {}", r.reason(receiver)));
     (code, Json(r.reply(receiver))).into_response()
 }
 
@@ -367,7 +367,7 @@ async fn submit_handler(
     let guard = BusyGuard(state.busy.clone());
     let session_id = job.session_id.clone();
     eprintln!(
-        "darkmux fleet: accepted {session_id} from {} (role {}, profile {profile})",
+        "darkmux serve: fleet listener: accepted {session_id} from {} (role {}, profile {profile})",
         admitted.peer_name, job.role_id
     );
 
@@ -556,7 +556,7 @@ pub(crate) async fn serve_bounded(
             r = listener.accept() => match r {
                 Ok(x) => x,
                 Err(e) => {
-                    eprintln!("darkmux fleet: accept failed ({e}); pausing 100ms");
+                    eprintln!("darkmux serve: fleet listener: accept failed ({e}); pausing 100ms");
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
@@ -597,7 +597,7 @@ pub(crate) fn spawn_if_enabled(shutdown: tokio::sync::watch::Receiver<bool>) {
     tokio::spawn(async move {
         if let Err(e) = run(shutdown).await {
             set_state("not started", format!("not started: {e}"));
-            eprintln!("{}", darkmux_types::style::warn(&format!("darkmux fleet: listener not started: {e}")));
+            eprintln!("{}", darkmux_types::style::warn(&format!("darkmux serve: fleet listener: listener not started: {e}")));
         }
     });
 }
@@ -620,11 +620,11 @@ async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<(), Str
             Ok(Err(e)) => {
                 set_state("waiting", format!("waiting for the {} network to answer (retrying every 30s)", provider.provider_name()));
                 eprintln!(
-                    "darkmux fleet: the {} network is not answering ({e:#}); retrying in 30s",
+                    "darkmux serve: fleet listener: the {} network is not answering ({e:#}); retrying in 30s",
                     provider.provider_name()
                 )
             }
-            Err(e) => eprintln!("darkmux fleet: identity check failed ({e}); retrying in 30s"),
+            Err(e) => eprintln!("darkmux serve: fleet listener: identity check failed ({e}); retrying in 30s"),
         }
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}

@@ -28,9 +28,8 @@ const REACHABILITY_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 /// the port in the address when it differs (`machine add studio --address
 /// 100.64.0.2:9000`), which is explicit input rather than a guess.
 ///
-/// The same reasoning covers `fleet_cli::normalize_daemon_base` /
-/// `fetch_machine_specs` and `darkmux_serve::peer_graph::
-/// normalize_daemon_base`, which build peer base URLs from the same
+/// The same reasoning covers `peer::split_address` (every CLI peer read
+/// and submission, #2916), which builds peer base URLs from the same
 /// portless form.
 ///
 /// (#2782 C10, superseded by #2924) The one case this reasoning used not to
