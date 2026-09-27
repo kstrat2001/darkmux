@@ -5034,6 +5034,9 @@ mod tests {
             "silent (no terminal record seen)",
             "the reason-less Abandoned case (defensive) must fall to the same honest wording"
         );
+        assert_eq!(peer_status_word(RunStatus::Error, None), "error");
+        assert_eq!(peer_status_word(RunStatus::Planned, None), "planned");
+        assert_eq!(peer_status_word(RunStatus::Unparseable, None), "unparseable");
     }
 
     #[test]
