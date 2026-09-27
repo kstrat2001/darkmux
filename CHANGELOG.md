@@ -275,7 +275,11 @@ darkmux release.
   every half second, and an agentic-remote run the budget holds between
   turns is ended rather than released; either way an announced wait that
   ends this way is closed by a `budget.stop` record. The viewer reads a hosted call's wait as
-  `REST budget · <endpoint>` until it resumes. A misspelled
+  `REST budget · <endpoint>` until it resumes, on the run page and the
+  fleet card, live and in playback, although the call has not started yet
+  (a waiter silent a minute past its resume time has died and stops
+  reading as live); a day window's wait counts down as `23h 53m`, and a
+  long endpoint id is trimmed to fit the line. A misspelled
   key in `limits` (`windw`, `polcy`, `tokns`) is refused the same way,
   naming the nearest valid key. Budgets apply to
   calls darkmux sends to an endpoint it does not manage; `tokens_per_dispatch`
