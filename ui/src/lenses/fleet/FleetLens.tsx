@@ -1138,7 +1138,15 @@ export function FleetLens({
                   data-tone={selectedExec.state ?? "none"}
                   data-carried={selectedExec.carried ? "true" : "false"}
                   data-thinking={selectedExec.state === "generating" && selectedExec.thinking === true ? "true" : undefined}
-                  title={selectedExec.state === "prompt" && selectedExec.promptLabel ? `estimated prompt size: ${selectedExec.promptLabel} tokens` : undefined}
+                  title={
+                    selectedExec.state === "prompt" && selectedExec.promptLabel
+                      ? `estimated prompt size: ${selectedExec.promptLabel} tokens`
+                      : // (#2950) The whole reason on hover, should a narrow
+                        // card ellipsize it.
+                        selectedExec.state === "rest" && selectedExec.restReason
+                        ? `resting: ${selectedExec.restReason}`
+                        : undefined
+                  }
                 >
                   {selectedExec.state === "generating"
                     ? // (#2886 pass 5, MUST — fresh-reviewer finding F3) A GEN
@@ -1171,7 +1179,13 @@ export function FleetLens({
                         // the size away on a phone and a 1000px desktop.
                         selectedExec.state === "prompt" && selectedExec.promptLabel
                         ? `processing ${selectedExec.promptLabel}`
-                        : liveStateLabel({
+                        : // (#2950) Why it rests, from the rest's own record
+                          // ("thermal · serious"), in place of "rest Ns": the
+                          // tube's center already counts the seconds down,
+                          // and the card's line has room for one of the two.
+                          selectedExec.state === "rest" && selectedExec.restReason
+                          ? selectedExec.restReason
+                          : liveStateLabel({
                             state: selectedExec.state,
                             restSecondsLeft: selectedExec.restSecondsLeft,
                             // (#2926) "tool gen · write · 18s": the tool

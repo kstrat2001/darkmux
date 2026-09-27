@@ -1473,6 +1473,20 @@ describe("modelScopeHero (#2890)", () => {
     expect(modelScopeHero({ liveTokScope: live, finishedTokRate: null })).toMatchObject({ state: "rest", centerLabel: "12s", centerUnit: "resting" });
   });
 
+  // (#2950) Why it rests goes in the readout slot TOOL GEN uses, never on
+  // the lamp or in the tube's center.
+  it("rest with a reason: the readout line says why; the center and the lamp are unchanged", () => {
+    const base = { tokensPerSec: 0, state: "rest", restSecondsLeft: 12, stalled: false, carried: false, noSignal: false };
+    const withWhy = { ...base, restReason: "thermal · serious" } as unknown as NonNullable<Parameters<typeof modelScopeHero>[0]["liveTokScope"]>;
+    const h = modelScopeHero({ liveTokScope: withWhy, finishedTokRate: null });
+    expect(h).toMatchObject({ state: "rest", centerLabel: "12s", centerUnit: "resting", note: "thermal · serious" });
+    const lamps = render(<ScopeLamps reading={h!.lamps} />);
+    expect(lamps.container.querySelector('.scope-lamp[data-on="true"] .scope-lamp__label')?.textContent).toBe("rest");
+    expect(lamps.container.querySelector(".scope-lamps")?.getAttribute("aria-label")).toBe("run state: rest 12s · thermal · serious");
+    const none = base as unknown as NonNullable<Parameters<typeof modelScopeHero>[0]["liveTokScope"]>;
+    expect(modelScopeHero({ liveTokScope: none, finishedTokRate: null })?.note).toBeNull();
+  });
+
   it("finished: the scope is driven by the average, so its wave matches the number", () => {
     expect(modelScopeHero({ liveTokScope: null, finishedTokRate: { average: "192", sub: null } })?.tokensPerSec).toBe(192);
     expect(modelScopeHero({ liveTokScope: null, finishedTokRate: { average: "—", sub: null } })?.tokensPerSec).toBe(0);

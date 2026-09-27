@@ -28,6 +28,7 @@ import { useIsMobile } from "../hooks/useIsMobile";
 import { ActivityIcon } from "./ActivityIcon";
 import { recordDetail, recordObject } from "../lib/recordDetail";
 import { turnItems } from "../lib/turnGroups";
+import { restReasonLabel } from "../lib/tokenRate";
 import { openModalEl } from "../lib/dialogManager";
 
 /** Row cap — `renderLog()`'s `all.slice(-50).reverse()` (viewer.html:2443):
@@ -1353,7 +1354,13 @@ export function EventLogColumn({
                             starts (#2877), so this row appears at the start
                             of the rest it describes. */}
                         rest {Math.round(ms / 1000)} s
-                        {typeof f.state === "string" ? ` · thermal: ${f.state}` : ""}
+                        {/* (#2950) Why, in the words the scope's readout
+                            uses. It read "thermal: <state>" for every
+                            state, so a battery rest said "thermal: 18%". */}
+                        {(() => {
+                          const why = restReasonLabel(f.reason, f.state);
+                          return why ? ` · ${why}` : "";
+                        })()}
                       </span>
                     </div>
                   );

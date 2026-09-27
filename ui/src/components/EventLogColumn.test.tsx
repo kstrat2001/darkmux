@@ -1204,8 +1204,16 @@ describe("EventLogColumn — turns (#2863)", () => {
   it("a rest is a divider between turns, still a selectable row", () => {
     render(<EventLogColumn scopeLabel="runs" records={records} visible />);
     const rest = document.querySelector(".eventlog__rec--rest")!;
-    expect(rest.textContent).toBe("rest 15 s · thermal: fair");
+    expect(rest.textContent).toBe("rest 15 s · thermal pacing · fair");
     expect(rest).toHaveAttribute("data-act", "rec");
+  });
+
+  // (#2950) The battery governor's rest carries the charge as its `state`;
+  // the row used to call every state "thermal".
+  it("a battery rest says battery, not thermal", () => {
+    const recs = [...records.slice(0, -1), r(11, "dispatch.rest", { ms: 2000, reason: "battery", state: "18%" })];
+    render(<EventLogColumn scopeLabel="runs" records={recs} visible />);
+    expect(document.querySelector(".eventlog__rec--rest")!.textContent).toBe("rest 2 s · battery · 18%");
   });
 
   // (#2863 review, finding 2) The governor's own state-change record
@@ -1222,7 +1230,7 @@ describe("EventLogColumn — turns (#2863)", () => {
     render(<EventLogColumn scopeLabel="runs" records={pacing} visible />);
     const rests = document.querySelectorAll(".eventlog__rec--rest");
     expect(rests).toHaveLength(1);
-    expect(rests[0].textContent).toBe("rest 15 s · thermal: fair");
+    expect(rests[0].textContent).toBe("rest 15 s · thermal pacing · fair");
     const pacingRow = document.querySelector(".eventlog__rec--pacing")!;
     expect(pacingRow).not.toBeNull();
     expect(pacingRow.textContent).toBe("pacing · 15 s between turns · thermal: fair");

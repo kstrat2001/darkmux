@@ -9,6 +9,7 @@ import {
   charsPerSecond,
   currentTokenRate,
   deriveLiveState,
+  restReasonLabel,
   executionRole,
   executionTokenReading,
   promptTokensLabel,
@@ -477,7 +478,7 @@ describe("deriveLiveState", () => {
   it("is rest with a countdown while inside a reported rest's ms window, then falls to prompt once it elapses", () => {
     const recs = [tool(0), rest(1_000, 15_000)];
     // 1s into the 15s window → 14s left (ceil).
-    expect(deriveLiveState(recs, 2_000)).toEqual({ state: "rest", restSecondsLeft: 14 });
+    expect(deriveLiveState(recs, 2_000)).toEqual({ state: "rest", restSecondsLeft: 14, restReason: "thermal pacing" });
     // Right at the boundary the window has fully elapsed.
     expect(deriveLiveState(recs, 1_000 + 15_000)).toEqual({ state: "prompt" });
     // Comfortably past it too.
@@ -527,7 +528,7 @@ describe("aggregateLiveState", () => {
   it("surfaces rest over tools/prompt when nothing is generating", () => {
     const toolsOnly = [tool(0)];
     const resting = [tool(0), rest(1_000, 15_000)];
-    expect(aggregateLiveState([toolsOnly, resting], 2_000)).toEqual({ state: "rest", restSecondsLeft: 14 });
+    expect(aggregateLiveState([toolsOnly, resting], 2_000)).toEqual({ state: "rest", restSecondsLeft: 14, restReason: "thermal pacing" });
   });
 
   it("falls back to stalled only when every execution is stalled", () => {
@@ -623,6 +624,62 @@ describe("averageGenerationRate", () => {
 describe("liveStateLabel", () => {
   it("names the prompt wait as 'processing prompt', not the bare word the page's prompt disclosure also uses", () => {
     expect(liveStateLabel({ state: "prompt" } as never)).toBe("processing prompt");
+  });
+  // (#2950) REST says why, after the countdown, in TOOL GEN's " · " form.
+  it("puts a rest's reason after its countdown, and nothing when there is none", () => {
+    expect(liveStateLabel({ state: "rest", restSecondsLeft: 12, restReason: "thermal · serious" })).toBe("rest 12s · thermal · serious");
+    expect(liveStateLabel({ state: "rest", restSecondsLeft: 12 })).toBe("rest 12s");
+  });
+});
+
+// (#2950) Why a runtime rested, in plain words, from the rest record's own
+// `reason` and `state`: every reason a producer writes today, an unknown
+// one verbatim, and nothing for a record that names none.
+describe("restReasonLabel", () => {
+  it.each([
+    ["turn_delay", undefined, "turn delay (config)"],
+    ["thermal-duty-cycle", "fair", "thermal pacing · fair"],
+    ["thermal-duty-cycle", undefined, "thermal pacing"],
+    ["thermal", "serious", "thermal · serious"],
+    ["thermal-critical", "critical", "thermal breaker · critical"],
+    ["thermal-episode-limit", "serious", "thermal hold · serious"],
+    ["battery", "18%", "battery · 18%"],
+    ["paused", undefined, "paused"],
+    ["solar-flare", "x9", "solar-flare · x9"],
+    ["toString", undefined, "toString"],
+  ])("%s / %s -> %s", (reason, state, want) => {
+    expect(restReasonLabel(reason, state)).toBe(want);
+  });
+  it("says nothing when the record names no reason, whatever its state", () => {
+    expect(restReasonLabel(undefined, undefined)).toBeNull();
+    expect(restReasonLabel("", "serious")).toBeNull();
+    expect(restReasonLabel(null, "serious")).toBeNull();
+    expect(restReasonLabel(42, undefined)).toBeNull();
+  });
+});
+
+describe("the rest reading carries the rest record's own reason", () => {
+  const restWith = (atMs: number, payload: Record<string, unknown>): FlowRecord =>
+    ({ ts: new Date(atMs).toISOString(), action: "dispatch.rest", session_id: SID, payload }) as unknown as FlowRecord;
+  it("a thermal pause names its state", () => {
+    const r = deriveLiveState([tool(0), restWith(1_000, { ms: 2_000, reason: "thermal", state: "serious", turn: 3 })], 1_500);
+    expect(r).toEqual({ state: "rest", restSecondsLeft: 2, restReason: "thermal · serious" });
+  });
+  it("the latest rest wins: a turn delay after a thermal pause reads as the turn delay", () => {
+    const recs = [tool(0), restWith(1_000, { ms: 2_000, reason: "thermal", state: "serious" }), restWith(3_000, { ms: 5_000, reason: "turn_delay" })];
+    expect(deriveLiveState(recs, 3_500)).toEqual({ state: "rest", restSecondsLeft: 5, restReason: "turn delay (config)" });
+  });
+  it("a rest record with no reason carries none", () => {
+    expect(deriveLiveState([tool(0), restWith(1_000, { ms: 15_000 })], 2_000)).toEqual({ state: "rest", restSecondsLeft: 14 });
+  });
+  it("a pacing announcement (no ms) never lends its reason to the rest", () => {
+    const recs = [tool(0), restWith(1_000, { ms: 15_000, reason: "turn_delay" }), restWith(1_500, { reason: "thermal-duty-cycle", state: "fair", pause: false, delay_ms: 15_000 })];
+    expect(deriveLiveState(recs, 2_000)).toEqual({ state: "rest", restSecondsLeft: 14, restReason: "turn delay (config)" });
+  });
+  it("the per-execution reading passes it on, and only while resting", () => {
+    const recs = [tool(0), restWith(1_000, { ms: 15_000, reason: "battery", state: "18%" })];
+    expect(executionTokenReading(recs, 2_000).restReason).toBe("battery · 18%");
+    expect(executionTokenReading(recs, 20_000).restReason).toBeUndefined();
   });
 });
 

@@ -24,6 +24,10 @@ const RUN = {
   lamps: ".session-run .modelbox__hero .scope-lamps",
   tube: ".session-run .modelbox__hero .token-scope-bezel",
 };
+// (#2950) The readout line under the lamps. Asserted for its words, never
+// measured into a size group: it is present in some states and absent in
+// others, and the boxes above must not notice.
+const NOTE = ".session-run .modelbox__hero .modelbox__note";
 // (#2915) `util`: the utility strip at the end of the name row. It is always
 // there, so it too must keep one size whatever the machine's utility job.
 const CARD = { card: ".mach", cardScope: ".mach-scope", rateLine: ".mach-scope__rate", util: ".mach-util" };
@@ -57,19 +61,32 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
         const { ctx, page } = await openState(browser, viewport, state, { mode, surface: "run" });
         const lamps = page.locator(RUN.lamps);
         await expect(lamps, `${state.id}: the page must reach this state before it is measured`).toHaveAttribute("aria-label", state.runText instanceof RegExp ? state.runText : new RegExp(state.runText));
+        // (#2950) A state that names its readout line shows exactly it, or
+        // (`null`) shows none.
+        if (state.noteText === null) await expect(page.locator(NOTE), `${state.id}: no readout line`).toHaveCount(0);
+        else if (state.noteText) await expect(page.locator(NOTE), `${state.id}: the readout line`).toHaveText(state.noteText);
         // Settle: the count-ups and the scope's morph run on timers, and a
         // size taken mid-frame would be a flake, not a finding.
         await page.waitForTimeout(400);
-        rows.push({ state: state.id, ...(await measure(page, RUN)) });
+        rows.push({ state: state.id, armed: state.armed === true, ...(await measure(page, RUN)) });
         await ctx.close();
       }
-      for (const key of Object.keys(RUN)) {
-        const groups = sizeGroups(rows, key);
-        expect(groups, `${key} changed size between states (${vpName}, ${mode}):\n  ${groups.join("\n  ")}`).toHaveLength(1);
+      // (#2950) One size per run CONFIG: a run with the thermal governor
+      // armed names its thermal rest under ACTIVE TIME from its start, so its
+      // states are measured against each other, not against an unarmed run's.
+      expect(rows.filter((r) => r.armed).length, "the armed config has states to compare").toBeGreaterThanOrEqual(5);
+      for (const armed of [false, true]) {
+        const config = rows.filter((r) => r.armed === armed);
+        for (const key of Object.keys(RUN)) {
+          const groups = sizeGroups(config, key);
+          expect(groups, `${key} changed size between states (${vpName}, ${mode}, thermal ${armed ? "armed" : "off"}):\n  ${groups.join("\n  ")}`).toHaveLength(1);
+        }
       }
       // The readout under the lamps is present in the tool-gen states and
       // absent elsewhere; that is the case the layout must absorb.
-      expect(rows.map((r) => r.state)).toEqual(expect.arrayContaining(["toolgen-named", "finished", "compacting", "radio-routing"]));
+      expect(rows.map((r) => r.state)).toEqual(
+        expect.arrayContaining(["toolgen-named", "finished", "compacting", "radio-routing", "rest", "rest-turn-delay", "rest-thermal", "rest-pacing", "rest-battery", "rest-episode-limit", "rest-unknown", "armed-generating", "armed-toolgen"]),
+      );
     });
 
     test(`fleet card: one size across its running states (${vpName}, ${mode})`, async ({ browser }) => {
@@ -90,7 +107,9 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
         rows.push({ state: state.id, running: !!state.rateText, ...(await measure(page, CARD)) });
         await ctx.close();
       }
-      expect(rows.map((r) => r.state)).toEqual(expect.arrayContaining(["compacting", "radio-routing", "utility-generic", "utility-stalled"]));
+      expect(rows.map((r) => r.state)).toEqual(
+        expect.arrayContaining(["compacting", "radio-routing", "utility-generic", "utility-stalled", "rest", "rest-thermal", "rest-episode-limit"]),
+      );
       const running = rows.filter((r) => r.running);
       for (const key of ["card", "cardScope", "rateLine", "util"]) {
         const groups = sizeGroups(running, key);
@@ -116,6 +135,16 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
 // operator's design call (reserve the line on an idle card, or fold the rate
 // into an existing line), so it is recorded here, not decided here.
 test.fixme("fleet card: the same size idle and running on a desktop (owner: the operator's call on where the rate line lives)", async () => {});
+
+// (#2950, found while adding the thermal REST states) With the thermal
+// governor armed, a FINISHED run's MODEL section is shorter than the same run
+// live: ACTIVE TIME's sub line reads "so far · 0 s thermal rest" while live
+// and wraps, and "0 s thermal rest" once finished and does not. Measured on
+// this fixture with an armed finished run: 414px live vs 386.6px finished on
+// a 1280px desktop, 905.1px vs 842.8px on a phone. On origin/main since #2890
+// (the sub line's wording), not introduced here; the fix (the words, or one
+// line reserved) is the operator's design call, so it is recorded, not decided.
+test.fixme("run page MODEL section: the same size live and finished with the thermal governor armed (owner: the operator's call on ACTIVE TIME's sub line)", async () => {});
 
 // (#2915 review, C7) The machine page's Utility section is ONE size whatever
 // the machine's utility jobs are doing: quiet, routing, compacting, a job
