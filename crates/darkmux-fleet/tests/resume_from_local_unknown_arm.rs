@@ -192,16 +192,16 @@ fn dispatch_routed_via_refuses_resume_from_on_the_local_unknown_arm_before_anyth
     );
 
     let mut opts = opts_for("pr-reviewer");
-    opts.machine = Some("peer-b".to_string());
+    opts.profile_name = Some("host@peer-b".to_string());
     opts.resume_from = Some(std::path::PathBuf::from("/tmp/darkmux-2584-checkpoint"));
 
     let err = darkmux_fleet::dispatch_routed_via(opts, |_opts| {
         panic!(
-            "local_dispatch must never be invoked for a --machine=peer-b dispatch on the \
+            "local_dispatch must never be invoked for a host@peer-b dispatch on the \
              local_unknown arm either"
         );
     })
-    .expect_err("--resume-from with --machine=<peer> must refuse on this arm too, not submit");
+    .expect_err("--resume-from with a remote profile address must refuse on this arm too, not submit");
     let msg = format!("{err:#}");
 
     // Env restoration now happens unconditionally when `_restore_env` drops
@@ -210,7 +210,7 @@ fn dispatch_routed_via_refuses_resume_from_on_the_local_unknown_arm_before_anyth
     // a manual block here that only ran on the success path.
 
     assert!(
-        msg.contains("--machine=peer-b"),
+        msg.contains("`host@peer-b`"),
         "must name the pinned target machine as the reason: {msg}"
     );
     assert!(

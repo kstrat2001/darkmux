@@ -80,7 +80,14 @@ impl WorkSubmission {
 }
 
 /// The reply, for every outcome. `status` is `completed`, `accepted`,
-/// `error` (the dispatch itself failed) or `refused`.
+/// `queued` (#2916 stage 2: the seat is busy and the receiver's
+/// `fleet.busy_policy` is `queue`), `error` (the dispatch itself failed) or
+/// `refused`.
+///
+/// A reply body is newline-delimited JSON, one reply per line. It is one
+/// line for every answer except a job the sender waits on that was queued:
+/// that body carries a `queued` line when it is queued (again at every
+/// heartbeat while it waits), then the final line.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SubmissionReply {
     pub status: String,
@@ -139,7 +146,12 @@ pub enum Refusal {
     NoWorkProfile { role: String, detail: String },
     SchemaMismatch { got: String },
     BadRequest(String),
-    Busy { session_id: String },
+    /// (#2916 stage 2) The job's seat is busy and this machine refuses
+    /// (`fleet.busy_policy = refuse`). `what` names what is running.
+    Busy { what: String },
+    /// (#2916 stage 2) The seat is busy, this machine queues, and the peer
+    /// already has as many jobs queued here as it may.
+    QueueFull { peer: String, what: String },
     /// (#2916 round 3 C5) One node already has its cap of requests in flight.
     TooManyAtOnce { peer: String },
     /// (#2947) This machine's own config has an unregistered value in an
@@ -159,6 +171,7 @@ impl Refusal {
             Refusal::SchemaMismatch { .. } | Refusal::BadRequest(_) => 400,
             Refusal::NoWorkProfile { .. } => 422,
             Refusal::Busy { .. }
+            | Refusal::QueueFull { .. }
             | Refusal::TooManyAtOnce { .. }
             | Refusal::NoTokenConfigured
             | Refusal::IdentityUnavailable { .. }
@@ -212,7 +225,8 @@ impl Refusal {
                  runtime image unless the entry lists others)"
             ),
             Refusal::FromSelf => format!(
-                "{receiver} does not take fleet work from itself; run it locally (drop --machine)"
+                "{receiver} does not take fleet work from itself; run it locally (address the \
+                 profile without `@{receiver}`)"
             ),
             Refusal::WorkspaceOutOfScope { peer } => format!(
                 "not in the allow-list scope: {receiver} does not let {peer} name a working \
@@ -238,9 +252,13 @@ impl Refusal {
                 "{receiver} is already handling as many requests from {peer} as it takes at once; \
                  retry when one finishes"
             ),
-            Refusal::Busy { session_id } => format!(
-                "{receiver} is busy running {session_id}; it runs one submitted job at a time. \
-                 Retry when that finishes"
+            Refusal::Busy { what } => format!(
+                "busy: {receiver} is running other work on that seat ({what}). Retry when it \
+                 finishes ({receiver}'s `fleet.busy_policy` is `refuse`)"
+            ),
+            Refusal::QueueFull { peer, what } => format!(
+                "busy: {receiver} is running other work on that seat ({what}), and {peer} already \
+                 has as many jobs queued on {receiver} as it may. Retry when one finishes"
             ),
             Refusal::BadConfig { detail } => format!(
                 "{receiver} cannot run work until its own config is fixed (on {receiver}: \
@@ -355,22 +373,30 @@ pub fn receiver_session_id(sender_session: &str, peer: &str) -> String {
 /// What the receiver's profile resolution made of a job's (role, profile).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProfileResolution {
-    /// A work profile, by the name it resolved to.
-    Work(String),
+    /// A work profile, by the name it resolved to, and the seat it invokes
+    /// (#2916 stage 2: busy is decided per seat).
+    Work { profile: String, seat: crate::seats::WorkSeat },
     /// The profile's only model is the machine's utility model.
     UtilityOnly(String),
     /// Nothing runnable resolves; the detail says why.
     Unresolved(String),
 }
 
-/// The job against the admitted peer's scope. Returns the profile to run
-/// (always the RESOLVED one, so what runs is exactly what was checked).
+/// What passed [`check_scope`]: the RESOLVED profile (so what runs is
+/// exactly what was checked) and the seat it invokes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedJob {
+    pub profile: String,
+    pub seat: crate::seats::WorkSeat,
+}
+
+/// The job against the admitted peer's scope.
 pub fn check_scope(
     receiver: &str,
     admitted: &Admitted,
     job: &WorkJob,
     resolution: ProfileResolution,
-) -> std::result::Result<String, Refusal> {
+) -> std::result::Result<ScopedJob, Refusal> {
     if !crate::job::same_machine(&job.target_machine, receiver) {
         return Err(Refusal::Misaddressed { target: job.target_machine.clone() });
     }
@@ -389,8 +415,8 @@ pub fn check_scope(
     if job.workdir.is_some() && !admitted.workspace {
         return Err(Refusal::WorkspaceOutOfScope { peer: admitted.peer_name.clone() });
     }
-    let profile = match resolution {
-        ProfileResolution::Work(p) => p,
+    let (profile, seat) = match resolution {
+        ProfileResolution::Work { profile, seat } => (profile, seat),
         ProfileResolution::UtilityOnly(p) => return Err(Refusal::UtilityProfile { profile: p }),
         ProfileResolution::Unresolved(detail) => {
             return Err(Refusal::NoWorkProfile { role: job.role_id.clone(), detail })
@@ -403,7 +429,7 @@ pub fn check_scope(
             allowed: admitted.profiles.clone(),
         });
     }
-    Ok(profile)
+    Ok(ScopedJob { profile, seat })
 }
 
 /// Resolve the profile a job would run on, against an already-loaded
@@ -441,7 +467,15 @@ pub fn classify_profile(
                 ProfileResolution::Unresolved(error)
             }
         }
-        Ok(Resolution::Target(t)) => ProfileResolution::Work(t.profile_name),
+        Ok(Resolution::Target(t)) => {
+            let model = t.model.id.clone();
+            let seat = if t.kind.is_managed() {
+                crate::seats::WorkSeat::Local { model }
+            } else {
+                crate::seats::WorkSeat::Hosted { model }
+            };
+            ProfileResolution::Work { profile: t.profile_name, seat }
+        }
     }
 }
 
@@ -476,9 +510,14 @@ pub fn submission_url(roster_address: &str, port: u16) -> Result<String> {
     Ok(format!("http://{host}:{port}{SUBMISSION_PATH}"))
 }
 
+/// The largest reply body a sender reads (a finished job's stdout and
+/// stderr ride in it).
+const MAX_REPLY_BYTES: u64 = 16 * 1024 * 1024;
+
 fn read_reply(
     where_: &str,
     resp: std::result::Result<ureq::Response, ureq::Error>,
+    on_progress: &mut dyn FnMut(&SubmissionReply),
 ) -> Result<(u16, SubmissionReply)> {
     let (code, resp) = match resp {
         Ok(r) => (r.status(), r),
@@ -487,29 +526,60 @@ fn read_reply(
             return Err(anyhow!("no answer from {where_}: {t}"));
         }
     };
-    let text = resp.into_string().context("reading the submission reply")?;
-    let reply: SubmissionReply = serde_json::from_str(&text).map_err(|_| {
+    read_reply_lines(where_, code, std::io::Read::take(resp.into_reader(), MAX_REPLY_BYTES), on_progress)
+}
+
+/// (#2916 stage 2) Read a newline-delimited reply body: every line before
+/// the last is a `queued` progress line, handed to `on_progress` as it
+/// arrives; the last line is the answer.
+pub(crate) fn read_reply_lines(
+    where_: &str,
+    code: u16,
+    body: impl std::io::Read,
+    on_progress: &mut dyn FnMut(&SubmissionReply),
+) -> Result<(u16, SubmissionReply)> {
+    use std::io::BufRead;
+    let not_a_listener = |text: &str| {
         anyhow!(
             "{where_} answered HTTP {code} but not as a darkmux fleet listener (is `fleet.listener` \
              enabled on that machine, on the same port as here?): {}",
             sanitize_remote_text(&text.chars().take(200).collect::<String>())
         )
-    })?;
-    Ok((code, reply))
+    };
+    let mut last: Option<SubmissionReply> = None;
+    for line in std::io::BufReader::new(body).lines() {
+        let line = line.context("reading the submission reply")?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let reply: SubmissionReply = serde_json::from_str(line).map_err(|_| not_a_listener(line))?;
+        // Only a `queued` line may be followed by another.
+        if last.take().is_some_and(|prev| prev.status != "queued") {
+            return Err(not_a_listener(line));
+        }
+        // Reported as it arrives: that is the point of sending it.
+        if reply.status == "queued" {
+            on_progress(&reply);
+        }
+        last = Some(reply);
+    }
+    last.map(|r| (code, r)).ok_or_else(|| not_a_listener(""))
 }
 
 /// Send one job to a VERIFIED target's fleet listener (the token is
 /// attached by `peer`, the only place that does). `Ok(reply)` for every
 /// answer the receiver gave (including a refusal); `Err` only when no
-/// answer came.
+/// answer came. `on_progress` hears each `queued` line as it arrives.
 pub fn send_submission(
     target: &crate::peer::PeerTarget,
     submission: &WorkSubmission,
     read_timeout: Duration,
+    on_progress: &mut dyn FnMut(&SubmissionReply),
 ) -> Result<(u16, SubmissionReply)> {
     let body = serde_json::to_string(submission).context("serializing the work submission")?;
     let where_ = format!("{}{SUBMISSION_PATH}", target.base());
-    read_reply(&where_, crate::peer::fleet_post_json(target, SUBMISSION_PATH, &body, read_timeout))
+    read_reply(&where_, crate::peer::fleet_post_json(target, SUBMISSION_PATH, &body, read_timeout), on_progress)
 }
 
 /// Tests only: send one job to `url` with an explicit token, unverified.
@@ -523,7 +593,30 @@ pub fn post_submission(
     let body = serde_json::to_string(submission).context("serializing the work submission")?;
     let base = url.strip_suffix(SUBMISSION_PATH).unwrap_or(url);
     let target = crate::peer::unverified_target_for_test(base);
-    read_reply(url, crate::peer::post_json_with_token_for_test(&target, SUBMISSION_PATH, &body, read_timeout, token))
+    read_reply(
+        url,
+        crate::peer::post_json_with_token_for_test(&target, SUBMISSION_PATH, &body, read_timeout, token),
+        &mut |_| {},
+    )
+}
+
+/// Tests only: [`post_submission`], collecting every `queued` progress line.
+#[cfg(any(test, feature = "test-support"))]
+pub fn post_submission_with_progress(
+    url: &str,
+    token: &str,
+    submission: &WorkSubmission,
+    read_timeout: Duration,
+    on_progress: &mut dyn FnMut(&SubmissionReply),
+) -> Result<(u16, SubmissionReply)> {
+    let body = serde_json::to_string(submission).context("serializing the work submission")?;
+    let base = url.strip_suffix(SUBMISSION_PATH).unwrap_or(url);
+    let target = crate::peer::unverified_target_for_test(base);
+    read_reply(
+        url,
+        crate::peer::post_json_with_token_for_test(&target, SUBMISSION_PATH, &body, read_timeout, token),
+        on_progress,
+    )
 }
 
 /// (#2916 review C1, re-review MUST 4) Text that came back from another
@@ -738,7 +831,17 @@ pub fn submit_work(job: WorkJob, wait: bool) -> Result<SubmissionReply> {
         Duration::from_secs(60)
     };
     let submission = WorkSubmission::new(job, wait);
-    let (code, mut reply) = send_submission(&peer, &submission, read_timeout)?;
+    // (#2916 stage 2) A waited-on job the receiver queued says so as it
+    // happens, verbatim (control characters removed). Without `--wait` the
+    // one `queued` reply is the answer, reported by the caller.
+    let mut on_progress = |r: &SubmissionReply| {
+        if wait {
+            if let Some(reason) = &r.reason {
+                eprintln!("darkmux dispatch: {}", sanitize_remote_text(reason));
+            }
+        }
+    };
+    let (code, mut reply) = send_submission(&peer, &submission, read_timeout, &mut on_progress)?;
     // (#2916 re-review C6) The echoed session id is printed and stored:
     // only a well-formed one is kept.
     if let Some(sid) = &reply.session_id {
@@ -747,7 +850,7 @@ pub fn submit_work(job: WorkJob, wait: bool) -> Result<SubmissionReply> {
         }
     }
     match reply.status.as_str() {
-        "completed" | "accepted" => Ok(reply),
+        "completed" | "accepted" | "queued" => Ok(reply),
         "error" => Err(anyhow!(
             "{target} accepted the job but the dispatch failed: {}",
             sanitize_remote_text(reply.reason.as_deref().unwrap_or("no reason given"))
@@ -829,11 +932,11 @@ mod tests {
         };
         let admitted = admit(token, identity, "tailscale", peer, Some("nSTUDIO"), &allow())?;
         let resolution = match prof {
-            Prof::InScope => ProfileResolution::Work("host".into()),
-            Prof::OutOfScope => ProfileResolution::Work("coder-big".into()),
+            Prof::InScope => work("host"),
+            Prof::OutOfScope => work("coder-big"),
             Prof::Utility => ProfileResolution::UtilityOnly("utility".into()),
         };
-        check_scope("studio", &admitted, &job(None), resolution)
+        check_scope("studio", &admitted, &job(None), resolution).map(|s| s.profile)
     }
 
     /// The auth matrix: token yes/no × node allowed/unknown/not-on-overlay/
@@ -926,7 +1029,7 @@ mod tests {
             images: vec!["rust:slim".into()],
             workspace: false,
         };
-        let work = || ProfileResolution::Work("host".into());
+        let work = || work("host");
         let mut j = job(None);
         j.role_id = "coder".into();
         assert!(matches!(check_scope("studio", &admitted, &j, work()), Err(Refusal::RoleOutOfScope { ref role, .. }) if role == "coder"));
@@ -936,10 +1039,10 @@ mod tests {
         j.image = Some("evil.example/x:latest".into());
         assert!(matches!(check_scope("studio", &admitted, &j, work()), Err(Refusal::ImageOutOfScope { .. })));
         j.image = Some("rust:slim".into());
-        assert_eq!(check_scope("studio", &admitted, &j, work()).unwrap(), "host");
+        assert_eq!(check_scope("studio", &admitted, &j, work()).unwrap().profile, "host");
         let mut j = job(None);
         j.target_machine = "Studio".into();
-        assert_eq!(check_scope("studio", &admitted, &j, work()).unwrap(), "host", "case-insensitive");
+        assert_eq!(check_scope("studio", &admitted, &j, work()).unwrap().profile, "host", "case-insensitive");
         assert_eq!(receiver_session_id("s-1", "laptop"), "s-1-from-laptop");
     }
 
@@ -955,17 +1058,17 @@ mod tests {
         let mut j = job(None);
         j.target_machine = "mini".into();
         assert!(matches!(
-            check_scope("studio", &admitted, &j, ProfileResolution::Work("host".into())),
+            check_scope("studio", &admitted, &j, work("host")),
             Err(Refusal::Misaddressed { .. })
         ));
         let mut j = job(None);
         j.workdir = Some("/tmp/x".into());
         assert!(matches!(
-            check_scope("studio", &admitted, &j, ProfileResolution::Work("host".into())),
+            check_scope("studio", &admitted, &j, work("host")),
             Err(Refusal::WorkspaceOutOfScope { .. })
         ));
         let with_ws = Admitted { workspace: true, ..admitted.clone() };
-        assert_eq!(check_scope("studio", &with_ws, &j, ProfileResolution::Work("host".into())).unwrap(), "host");
+        assert_eq!(check_scope("studio", &with_ws, &j, work("host")).unwrap().profile, "host");
         assert!(matches!(
             check_scope("studio", &admitted, &job(None), ProfileResolution::Unresolved("x".into())),
             Err(Refusal::NoWorkProfile { .. })
@@ -981,7 +1084,8 @@ mod tests {
         let r = Refusal::ProfileOutOfScope { peer: "macbook-pro".into(), profile: "x".into(), allowed: vec!["host".into()] };
         assert!(r.reason("studio").starts_with("not in the allow-list scope: profile x"), "{}", r.reason("studio"));
         assert_eq!(Refusal::Token.http_status(), 401);
-        assert_eq!(Refusal::Busy { session_id: "s".into() }.http_status(), 503);
+        assert_eq!(Refusal::Busy { what: "s".into() }.http_status(), 503);
+        assert_eq!(Refusal::QueueFull { peer: "p".into(), what: "s".into() }.http_status(), 503);
         let reply = Refusal::Token.reply("studio");
         assert_eq!(reply.status, "refused");
         assert!(!serde_json::to_string(&reply).unwrap().contains("nLAPTOP"));
@@ -1098,6 +1202,11 @@ mod tests {
         assert_eq!(submission_url("fd7a::2", 8766).unwrap(), "http://[fd7a::2]:8766/fleet/work");
     }
 
+    /// A work resolution on a local model.
+    fn work(profile: &str) -> ProfileResolution {
+        ProfileResolution::Work { profile: profile.into(), seat: crate::seats::WorkSeat::Local { model: "big".into() } }
+    }
+
     fn registry(json: &str) -> darkmux_types::ProfileRegistry {
         serde_json::from_str(json).unwrap()
     }
@@ -1123,12 +1232,53 @@ mod tests {
               "internal":{"utility":"small"}}"#,
         );
         let r = role();
-        assert_eq!(classify_profile(&reg, &r, Some("host"), None, "studio"), ProfileResolution::Work("host".into()));
-        assert_eq!(classify_profile(&reg, &r, None, None, "studio"), ProfileResolution::Work("host".into()));
+        assert_eq!(classify_profile(&reg, &r, Some("host"), None, "studio"), work("host"));
+        assert_eq!(classify_profile(&reg, &r, None, None, "studio"), work("host"));
         assert_eq!(classify_profile(&reg, &r, Some("utility"), None, "studio"), ProfileResolution::UtilityOnly("utility".into()));
         assert!(matches!(
             classify_profile(&reg, &r, Some("nope"), None, "studio"),
             ProfileResolution::Unresolved(ref d) if d.contains("not defined on studio")
         ));
+    }
+
+    /// (#2916 stage 2) Busy is decided per seat, so the resolution says what
+    /// the job invokes: a managed (local) model, or a hosted endpoint.
+    #[test]
+    fn classify_profile_names_the_seat_a_job_invokes() {
+        let reg = registry(
+            r#"{"profiles":{
+                "host":{"models":[{"id":"big","n_ctx":32000}]},
+                "cloud":{"models":[{"id":"gpt-x","n_ctx":32000,"endpoint":{"url":"https://api.example/v1"}}]}},
+              "default_profile":"host"}"#,
+        );
+        let r = role();
+        assert_eq!(
+            classify_profile(&reg, &r, Some("host"), None, "studio"),
+            ProfileResolution::Work { profile: "host".into(), seat: crate::seats::WorkSeat::Local { model: "big".into() } }
+        );
+        assert_eq!(
+            classify_profile(&reg, &r, Some("cloud"), None, "studio"),
+            ProfileResolution::Work { profile: "cloud".into(), seat: crate::seats::WorkSeat::Hosted { model: "gpt-x".into() } }
+        );
+    }
+
+    /// (#2916 stage 2) A reply body is newline-delimited: queued lines are
+    /// reported as they arrive, the last line is the answer, and anything
+    /// but a `queued` line followed by another is not a listener's reply.
+    #[test]
+    fn a_reply_body_reports_queued_lines_and_returns_the_last() {
+        let body = "{\"status\":\"queued\",\"reason\":\"busy (a)\"}\n{\"status\":\"queued\",\"reason\":\"busy (b)\"}\n{\"status\":\"completed\",\"exit_code\":0}\n";
+        let mut seen = Vec::new();
+        let (code, r) = read_reply_lines("x", 200, body.as_bytes(), &mut |p| seen.push(p.reason.clone().unwrap())).unwrap();
+        assert_eq!((code, r.status.as_str(), r.exit_code), (200, "completed", Some(0)));
+        assert_eq!(seen, vec!["busy (a)".to_string(), "busy (b)".to_string()]);
+        // One line: the answer, as before.
+        let (_, r) = read_reply_lines("x", 202, "{\"status\":\"accepted\"}".as_bytes(), &mut |_| panic!("no progress")).unwrap();
+        assert_eq!(r.status, "accepted");
+        // A final answer followed by more is not a listener's reply.
+        let bad = "{\"status\":\"completed\"}\n{\"status\":\"completed\"}\n";
+        assert!(read_reply_lines("x", 200, bad.as_bytes(), &mut |_| {}).is_err());
+        assert!(read_reply_lines("x", 200, "".as_bytes(), &mut |_| {}).is_err(), "an empty body is not an answer");
+        assert!(read_reply_lines("x", 200, "<html>".as_bytes(), &mut |_| {}).unwrap_err().to_string().contains("not as a darkmux fleet listener"));
     }
 }

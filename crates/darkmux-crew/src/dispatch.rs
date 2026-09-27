@@ -288,6 +288,10 @@ pub struct DispatchOpts {
     /// (`darkmux_fleet::submit_work`), which runs it only if its allow-list
     /// trusts this machine; the named machine runs it or refuses it, never
     /// another one. When `None`, the dispatch runs locally.
+    ///
+    /// (#2916 stage 2) No flag sets this any more: the machine comes from a
+    /// `profile@machine` address in `profile_name`, which
+    /// `darkmux_fleet::apply_profile_address` splits into the two fields.
     pub machine: Option<String>,
     /// Whether to block on completion when the dispatch routes to a
     /// remote machine (#246 PR-C.3). `true` — the default for
@@ -295,8 +299,7 @@ pub struct DispatchOpts {
     /// `session_id`'s `dispatch.complete` record and returns the
     /// outcome (preserves today's "spawn, block, see result" CLI
     /// ergonomics). `false` returns immediately with a synthetic
-    /// success result; the operator polls via `darkmux flow tail`
-    /// (or PR-D's `mission dispatch --no-wait` path).
+    /// success result; the operator polls via `darkmux flow tail`.
     ///
     /// Ignored when the dispatch runs locally — local dispatches are
     /// always synchronous.
@@ -1086,7 +1089,7 @@ pub fn emit_route_record_and_resolve_session(
         .session_id
         .clone()
         .unwrap_or_else(|| fresh_session_id(&opts.role_id));
-    let payload = build_route_payload(target_machine);
+    let payload = build_route_payload(target_machine, opts.profile_name.as_deref());
     let mission_id = resolve_mission_for_phase(opts.phase_id.as_deref());
     let _ = darkmux_flow::record(build_dispatch_record_with_payload(
         darkmux_flow::Level::Info,
@@ -1111,14 +1114,23 @@ pub fn emit_route_record_and_resolve_session(
 /// previously colored edges by `role_tier`/`local_tier`; keeping
 /// `target_machine` + `decision` is the agreed minimum the route record
 /// must still carry.
-fn build_route_payload(target_machine: Option<&str>) -> serde_json::Value {
-    serde_json::json!({
+///
+/// (#2916 stage 2) A routed dispatch also carries `profile_address`, the
+/// `profile@machine` it was sent as, so the sender's own record says what
+/// it asked for. Token counts are never on the sender's records: the
+/// machine that runs the model counts them (decision 6).
+fn build_route_payload(target_machine: Option<&str>, profile: Option<&str>) -> serde_json::Value {
+    let mut payload = serde_json::json!({
         "target_machine": target_machine,
         // `decision` makes the operator-visible verdict explicit in
         // the audit trail without re-deriving it from the other
         // fields (the topology UI uses this to color routing edges).
         "decision": if target_machine.is_some() { "pinned" } else { "local" },
-    })
+    });
+    if let (Some(t), Some(p)) = (target_machine, profile) {
+        payload["profile_address"] = serde_json::Value::String(format!("{p}@{t}"));
+    }
+    payload
 }
 
 /// Pure-function routing decision. `machine` is the operator's
@@ -1472,7 +1484,7 @@ mod tests {
     /// longer carries role_tier / local_tier.
     #[test]
     fn build_route_payload_no_target_has_local_decision() {
-        let p = build_route_payload(None);
+        let p = build_route_payload(None, None);
         assert_eq!(p["target_machine"], serde_json::Value::Null);
         assert_eq!(p["decision"], "local");
         assert!(
@@ -1492,7 +1504,7 @@ mod tests {
     /// substrate).
     #[test]
     fn build_route_payload_pinned_has_target_and_pinned_decision() {
-        let p = build_route_payload(Some("laptop"));
+        let p = build_route_payload(Some("laptop"), None);
         assert_eq!(p["target_machine"], "laptop");
         assert_eq!(p["decision"], "pinned");
     }
@@ -1501,11 +1513,24 @@ mod tests {
     /// exactly `target_machine` + `decision` and nothing tier-shaped.
     #[test]
     fn build_route_payload_minimum_shape_is_target_and_decision() {
-        let p = build_route_payload(Some("studio"));
+        let p = build_route_payload(Some("studio"), None);
         let obj = p.as_object().expect("route payload is a JSON object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(keys, vec!["decision", "target_machine"]);
+    }
+
+    /// (#2916 stage 2) A dispatch sent as `profile@machine` records the
+    /// address it asked for (additive; a local dispatch carries none), and
+    /// never a token count: the machine that runs the model counts tokens.
+    #[test]
+    fn build_route_payload_records_the_profile_address_of_a_routed_dispatch() {
+        let p = build_route_payload(Some("studio"), Some("host"));
+        assert_eq!(p["profile_address"], "host@studio");
+        let mut keys: Vec<&str> = p.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["decision", "profile_address", "target_machine"], "no token fields on the sender's record");
+        assert!(build_route_payload(None, Some("host")).get("profile_address").is_none(), "a local dispatch has no address");
     }
 
     // ─── routing_decision (Wave-E.7 #255) ─────────────────────────────

@@ -3215,7 +3215,7 @@ fn dispatch_refuses_a_record_ref_routed_to_another_machine() {
         .env("DARKMUX_FINDINGS_DIR", store.path())
         .env("DARKMUX_MACHINE_ID", "this-one")
         .args([
-            "dispatch", "health-research", "--finding", "sess-r/1", "--machine", "some-other-mac",
+            "dispatch", "health-research", "--finding", "sess-r/1", "--profile", "host@some-other-mac",
             "smoke",
         ])
         .assert()
@@ -3224,6 +3224,28 @@ fn dispatch_refuses_a_record_ref_routed_to_another_machine() {
             predicate::str::contains("cannot be routed to another machine")
                 .and(predicate::str::contains("requires operator acknowledgment").not()),
         );
+}
+
+/// (#2916 stage 2) `dispatch --machine` is gone, with no alias: the
+/// profile names its machine (`--profile <p>@<machine>`).
+#[test]
+fn dispatch_has_no_machine_flag() {
+    darkmux_cmd()
+        .args(["dispatch", "coder", "--machine", "studio", "hello"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument '--machine'"));
+}
+
+/// (#2916 stage 2) A malformed profile address is refused by name, before
+/// the message is read or anything is routed.
+#[test]
+fn dispatch_refuses_a_malformed_profile_address() {
+    darkmux_cmd()
+        .args(["dispatch", "coder", "--profile", "host@stu.dio", "hello"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("profile address `host@stu.dio`").and(predicate::str::contains("contains '.'")));
 }
 
 /// (#1426) The POSITIONAL message reaches the dispatch path. `health-research`

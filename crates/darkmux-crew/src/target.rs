@@ -144,6 +144,12 @@ pub fn resolve_in(
     allow_utility_model: bool,
 ) -> Result<Resolution> {
     if let Some(req) = profile_override {
+        // (#2916 stage 2) A `profile@machine` address reaching the local
+        // resolver is never read as an undefined local name: that would fall
+        // to `default_profile` (#1054) and run something else, here.
+        if let Some(msg) = darkmux_types::profile_address::local_only_refusal(req, "this dispatch path") {
+            bail!(msg);
+        }
         if let Some(msg) = registry.quarantine_error_for(req) {
             bail!(msg);
         }
@@ -283,6 +289,22 @@ mod resolve_tests {
         reg.materialize_endpoints();
         let err = super::resolve_in(&reg, &role(), None, None, false).unwrap_err();
         assert!(format!("{err:#}").contains("nope"), "{err:#}");
+    }
+
+    /// (#2916 stage 2) A `profile@machine` address that reaches the LOCAL
+    /// resolver (the lab, a mission step, anything that runs only here) is
+    /// refused naming it, never read as an undefined name that falls to
+    /// `default_profile` and runs the default model here.
+    #[test]
+    fn resolve_in_refuses_a_profile_address() {
+        let reg: darkmux_types::ProfileRegistry = serde_json::from_str(
+            r#"{"profiles":{"host":{"models":[{"id":"big","n_ctx":32000}]}},"default_profile":"host"}"#,
+        )
+        .unwrap();
+        let err = super::resolve_in(&reg, &role(), Some("host@studio"), None, false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("host@studio") && msg.contains("only on this machine"), "{msg}");
+        assert!(super::resolve_in(&reg, &role(), Some("host"), None, false).is_ok(), "a plain name still resolves");
     }
 }
 

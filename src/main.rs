@@ -147,7 +147,6 @@ fn run(cmd: Cmd) -> Result<i32> {
             phase_id,
             skip_preflight,
             json,
-            machine,
             no_wait,
             image,
             max_completion_tokens,
@@ -166,7 +165,6 @@ fn run(cmd: Cmd) -> Result<i32> {
             phase_id,
             skip_preflight,
             json,
-            machine,
             no_wait,
             image,
             max_completion_tokens,
@@ -1173,7 +1171,6 @@ struct DispatchInvocation {
     phase_id: Option<String>,
     skip_preflight: bool,
     json: bool,
-    machine: Option<String>,
     no_wait: bool,
     image: Option<String>,
     max_completion_tokens: Option<u32>,
@@ -1206,12 +1203,22 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         phase_id,
         skip_preflight,
         json,
-        machine,
         no_wait,
         image,
         max_completion_tokens,
         resume_from,
     } = inv;
+    // (#2916 stage 2) The machine comes from the profile address: parsed
+    // here, before the message is read, so a malformed address is refused
+    // first. `dispatch_routed_via` splits it for the dispatch itself.
+    let machine = match profile.as_deref() {
+        Some(p) if darkmux_types::profile_address::ProfileAddress::is_address(p) => {
+            darkmux_types::profile_address::ProfileAddress::parse(p)
+                .map_err(|e| anyhow::anyhow!("darkmux dispatch: {e}"))?
+                .machine
+        }
+        _ => None,
+    };
     // (#1426) Resolve the message in precedence order: positional MESSAGE >
     // `--message-from-file` > stdin. clap makes the positional and the file
     // flag mutually exclusive, so at most one of the first two is present.
@@ -1308,8 +1315,8 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
                 anyhow::bail!(
                     "--finding / --mod cannot be routed to another machine yet: a submitted \
                      job carries no record refs, and {target}'s own finding / \
-                     mod stores are its own. Run it on this machine (drop --machine), or \
-                     paste the record's content into the message."
+                     mod stores are its own. Run it on this machine (a profile without \
+                     `@{target}`), or paste the record's content into the message."
                 );
             }
         }
@@ -1340,7 +1347,9 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         json,
         workdir,
         phase_id,
-        machine,
+        // (#2916 stage 2) Set from the `profile@machine` address by
+        // `dispatch_routed_via`, never from a flag.
+        machine: None,
         wait: !no_wait,
         // A bare `dispatch` carries no profile-derived compaction config here;
         // the internal dispatch fills the runtime-required context window from
@@ -1414,7 +1423,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
     // `crew::dispatch::dispatch` primitive — see
     // `darkmux_crew::dispatch_as_crew_of_one`'s module doc for the full
     // rationale (closes the #1487 residency-lease bypass a raw `dispatch`
-    // fell through). `--machine` routing (and every other caller of
+    // fell through). `profile@machine` routing (and every other caller of
     // `fleet::dispatch_routed`) is untouched.
     let result = match fleet::dispatch_routed_via(opts, crew::dispatch_as_crew_of_one::dispatch_as_crew_of_one) {
         Ok(r) => r,

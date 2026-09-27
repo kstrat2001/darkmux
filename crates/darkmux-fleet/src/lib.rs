@@ -8,6 +8,7 @@ mod peer;
 mod roster;
 mod routing;
 mod runner;
+mod seats;
 mod submission;
 
 pub use identity::*;
@@ -16,6 +17,7 @@ pub use peer::*;
 pub use roster::*;
 pub use routing::*;
 pub use runner::*;
+pub use seats::*;
 pub use submission::*;
 
 #[cfg(test)]
