@@ -1513,6 +1513,12 @@ fn next_pending_line(outbox_path: &Path, cursor: u64) -> Option<(String, u64)> {
     }
     buf.pop(); // drop the trailing '\n' itself
     let line = String::from_utf8(buf).ok()?;
+    // A line a pre-4.0 binary enqueued goes out with its current spelling;
+    // a current one (or one that is not JSON) goes out byte for byte.
+    let line = match crate::reader::upgrade_line(&line) {
+        Some(std::borrow::Cow::Owned(upgraded)) => upgraded,
+        Some(std::borrow::Cow::Borrowed(_)) | None => line,
+    };
     Some((line, cursor + n as u64))
 }
 
@@ -4382,6 +4388,23 @@ mod tests {
             work_id: None,
             attempt: None,
         }
+    }
+
+    /// (4.0) An outbox line a pre-4.0 binary enqueued is delivered with its
+    /// current spelling; the cursor still advances past the bytes on disk.
+    #[test]
+    fn a_pre_4_0_outbox_line_is_delivered_with_its_current_spelling() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("r.outbox.jsonl");
+        let old = r#"{"action":"dispatch complete","handle":"h"}"#;
+        let current = r#"{"action":"dispatch.turn","handle":"h"}"#;
+        std::fs::write(&path, format!("{old}\n{current}\n")).unwrap();
+        let (first, cursor) = next_pending_line(&path, 0).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(v["action"], "dispatch.complete");
+        assert_eq!(cursor, old.len() as u64 + 1, "the cursor counts the bytes on disk");
+        let (second, _) = next_pending_line(&path, cursor).unwrap();
+        assert_eq!(second, current, "a current line is delivered byte for byte");
     }
 
     /// A record told apart from its siblings by `handle` alone.
