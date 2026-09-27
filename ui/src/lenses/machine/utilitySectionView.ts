@@ -44,18 +44,27 @@ export function utilitySectionView(args: {
   residentRow: MachineResourcesModel | null;
   /** (#2958) Whether the records this reads have arrived. Omitted: true. */
   settled?: boolean;
+  /** (#2958) Whether the page knows which machine it shows and, for this
+   *  machine, what `/machine/specs` says (the utility binding comes from
+   *  it). Until then the model and residency read "—": "no utility model
+   *  seen", "no utility model registered" and "another machine" are all
+   *  claims specs could contradict. Omitted: true. */
+  identityKnown?: boolean;
 }): UtilitySectionView {
   const noSignal = args.settled === false;
+  const identityKnown = args.identityKnown !== false;
   const binding = args.isLocal ? (args.specs?.utility_model ?? null) : null;
   const strip = utilityStrip(args.data, args.uid, args.nowMs, binding);
   const win = binding?.n_ctx != null ? `window ${binding.n_ctx.toLocaleString("en-US")}` : "window —";
-  const residency = !args.isLocal
-    ? "residency unknown (another machine)"
-    : strip.resident === true
-      ? `resident${args.residentRow?.current_bytes != null ? ` · ${memBytes(args.residentRow.current_bytes)}` : ""}`
-      : strip.resident === false
-        ? "not loaded"
-        : "no utility model registered";
+  const residency = !identityKnown
+    ? "—"
+    : !args.isLocal
+      ? "residency unknown (another machine)"
+      : strip.resident === true
+        ? `resident${args.residentRow?.current_bytes != null ? ` · ${memBytes(args.residentRow.current_bytes)}` : ""}`
+        : strip.resident === false
+          ? "not loaded"
+          : "no utility model registered";
   const job = strip.job;
   const liveLine = noSignal ? "no signal" : job ? (job.stalled ? `${job.word} · stalled` : `${job.word} · ${Math.max(0, Math.floor((args.nowMs - job.sinceMs) / 1000))}s`) : "idle";
   const mine = args.data.filter((r) => uidOf(r) === args.uid && T(r.ts) <= args.nowMs);
@@ -78,7 +87,7 @@ export function utilitySectionView(args: {
     strip,
     // (#2958) "no utility model seen" is a claim about the records; a model
     // named by `/machine/specs` is a reading and shows at once.
-    modelLine: strip.model ?? (noSignal ? "—" : "no utility model seen"),
+    modelLine: strip.model ?? (noSignal || !identityKnown ? "—" : "no utility model seen"),
     factsLine: `${win} · ${residency}`,
     liveLine,
     noSignal,

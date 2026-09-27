@@ -36,6 +36,22 @@ describe("(#2915) the machine page's Utility section", () => {
     expect(utilitySectionView({ data: [], uid: U, nowMs: ms(60), specs: specs({}), isLocal: true, residentRow: row, settled: true }).liveLine).toBe("idle");
   });
 
+  test("(#2958) before /machine/specs answers, the model and residency are pending, not 'not seen' or 'another machine'", () => {
+    // This machine, specs not yet read: the binding is unknown, so "no
+    // utility model seen/registered" would be a default, not a reading.
+    const local = utilitySectionView({ data: [], uid: U, nowMs: ms(60), specs: null, isLocal: true, residentRow: null, settled: true, identityKnown: false });
+    expect(local.modelLine).toBe("—");
+    expect(local.factsLine).toBe("window — · —");
+    // Not yet known to be another machine either.
+    const drill = utilitySectionView({ data: [], uid: U, nowMs: ms(60), specs: null, isLocal: false, residentRow: null, settled: true, identityKnown: false });
+    expect(drill.modelLine).toBe("—");
+    expect(drill.factsLine).toBe("window — · —");
+    // A model named by the records is a reading and shows at once.
+    expect(utilitySectionView({ data: [usage(1, "radio_routing", 40)], uid: U, nowMs: ms(60), specs: null, isLocal: false, residentRow: null, identityKnown: false }).modelLine).toBe("darkmux:util-4b");
+    // Once known, the same inputs say what they say.
+    expect(utilitySectionView({ data: [], uid: U, nowMs: ms(60), specs: null, isLocal: true, residentRow: null, settled: true, identityKnown: true }).factsLine).toBe("window — · no utility model registered");
+  });
+
   test("not loaded, and an undeclared window, are said plainly", () => {
     const v = utilitySectionView({ data: [], uid: U, nowMs: ms(60), specs: specs({ loaded: false, n_ctx: null }), isLocal: true, residentRow: null });
     expect(v.factsLine).toBe("window — · not loaded");
