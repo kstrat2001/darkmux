@@ -25,7 +25,7 @@
  */
 import { compactThousands, fmtElapsed, type CompactStyle } from "../../lib/format";
 import { PURPOSE, isUsageRecord, stepTokensWithLegacyFallback, usageContribution } from "../../lib/usageRecords";
-import { ACTION, CATEGORY, byTimeNewestFirst, isAfter, isDispatchFamily, isDispatchTerminal, type NormAction, type NormRecord } from "../../lib/ingest";
+import { ACTION, CATEGORY, byTime, byTimeNewestFirst, isAfter, isAsOf, isDispatchFamily, isDispatchTerminal, latestByTime, type NormAction, type NormRecord } from "../../lib/ingest";
 import { lifecycleAt, type LifecyclePhase, type LifecyclePolicy } from "../../lib/lifecycle";
 import { currentRun, groupOfRecords } from "../../lib/runRef";
 
@@ -948,13 +948,32 @@ export function recordsByStep(records: readonly NormRecord[], idx: GraphIndex, m
  *  flight outranks everything, so one working item keeps the step alive. */
 const PHASE_RANK: Record<LifecyclePhase, number> = { not_started: 0, closed: 1, stale: 2, waiting: 3, open: 4 };
 
+const STEP_BOOKENDS: ReadonlySet<NormAction> = new Set([ACTION.StepStart, ACTION.StepComplete, ACTION.StepError]);
+
+/** Whether the step's own latest bookend as of `now` is its terminal: the
+ *  scheduler's word on the step, which outranks any item session left
+ *  without a terminal of its own. */
+function stepEnded(sessions: StepSessions, now: number): boolean {
+  let latest: NormRecord | undefined;
+  for (const recs of sessions.values()) {
+    const b = latestByTime(recs.filter((r) => r.action !== undefined && STEP_BOOKENDS.has(r.action) && isAsOf(r, now)));
+    if (b && (!latest || byTime(b, latest) >= 0)) latest = b;
+  }
+  return latest !== undefined && latest.action !== ACTION.StepStart;
+}
+
 /** Each step's run lifecycle phase as of `now` (`lib/lifecycle.ts`), the
- *  one every surface judges a run by: each of its sessions judged on its
- *  own, and the step in flight while any of them is. */
+ *  one every surface judges a run by: closed once its own step terminal
+ *  landed; before that each of its sessions judged on its own, and the step
+ *  in flight while any of them is. */
 export function stepPhasesAt(byStep: ReadonlyMap<string, StepSessions>, now: number, policy: LifecyclePolicy): StepPhases {
   const out = new Map<string, LifecyclePhase>();
   for (const [stepId, sessions] of byStep) {
     let phase: LifecyclePhase = "not_started";
+    if (stepEnded(sessions, now)) {
+      out.set(stepId, "closed");
+      continue;
+    }
     for (const recs of sessions.values()) {
       const p = lifecycleAt(currentRun(groupOfRecords(recs), now), now, policy).phase;
       if (PHASE_RANK[p] > PHASE_RANK[phase]) phase = p;

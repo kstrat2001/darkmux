@@ -2,6 +2,7 @@ import { createContext, useContext, useMemo, type ReactNode } from "react";
 import { judgementAt, NO_PRESENCE, type Judgement, type Presence } from "../lib/lifecycle";
 import { useNowMs } from "../lib/clock";
 import { getSource } from "../lib/source";
+import { injectedPlaybackDate } from "../lib/injectedMeta";
 import { useLiveSessionIds } from "./useLiveSessionIds";
 
 /** The page's inputs to judging a run: its playhead (`null` at the live
@@ -16,14 +17,20 @@ export interface PageJudgementInputs {
 export const PageJudgementContext = createContext<PageJudgementInputs>({ playhead: null, live: NO_PRESENCE });
 
 /** What this page judges its runs at (`judgementAt`): the playhead when one
- *  is parked; else now, re-read once a second, with the live sessions. `null`
- *  on a daemon-less build at rest, which has no "now" of its own: its
- *  recording is judged as of its newest record. */
-export function useJudgement(): Judgement | null {
+ *  is parked; else now, with the live sessions. Now is re-read once a second
+ *  only while `ticking` (something shown can change with time alone), and
+ *  otherwise whenever `refresh` changes (what is shown changed). `null` when
+ *  the page has no "now" of its own and no playhead, a daemon-less build or
+ *  an injected `/play/<date>` page: its recording is judged as of its newest
+ *  record, as the run page judges it (`SessionReplay`'s `frozenAtRecords`). */
+export function useJudgement(ticking: boolean, refresh: unknown): Judgement | null {
   const { playhead, live } = useContext(PageJudgementContext);
-  const daemon = getSource().kind === "daemon";
-  const now = useNowMs(daemon && playhead === null);
-  return useMemo(() => (playhead === null && !daemon ? null : judgementAt(playhead, now, live)), [playhead, daemon, now, live]);
+  const frozen = getSource().kind !== "daemon" || injectedPlaybackDate() != null;
+  const clockNow = useNowMs(ticking && !frozen && playhead === null);
+  return useMemo(
+    () => (playhead === null && frozen ? null : judgementAt(playhead, ticking ? clockNow : Date.now(), live)),
+    [playhead, frozen, ticking, clockNow, live, refresh],
+  );
 }
 
 /** Provides the page's judgement inputs: `playhead` from the transport and

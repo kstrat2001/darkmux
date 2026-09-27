@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
+import { Profiler } from "react";
 import { render, screen, fireEvent, waitFor, act, within } from "@testing-library/react";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -1220,6 +1221,55 @@ describe("EventLogColumn — turns (#2863)", () => {
         vi.advanceTimersByTime(2_000);
       });
       expect(why2()).toBe("did not finish");
+    });
+
+    it("does not re-render on the clock's tick when it shows no turn whose state can change", async () => {
+      vi.useFakeTimers({ now: T + 11_000 });
+      const fleetOnly = [
+        rec({ ts: at(0), action: "telemetry.heartbeat", session_id: "s-a", machine_id: "MacBook-Pro", payload: {} } as never),
+        rec({ ts: at(1), action: "telemetry.heartbeat", session_id: "s-b", machine_id: "MacBook-Pro", payload: {} } as never),
+      ];
+      let renders = 0;
+      render(
+        <Profiler id="log" onRender={() => renders++}>
+          <EventLogColumn scopeLabel="fleet" records={fleetOnly} visible />
+        </Profiler>,
+      );
+      const settled = renders;
+      await act(async () => {
+        vi.advanceTimersByTime(5_000);
+      });
+      expect(renders).toBe(settled);
+    });
+
+    it("on an injected /play/<date> page judges as of the newest record, as the run page does", () => {
+      const metas = [["darkmux-mode", "play"], ["darkmux-date", "2026-09-23"]].map(([name, content]) => {
+        const m = document.createElement("meta");
+        m.setAttribute("name", name);
+        m.setAttribute("content", content);
+        document.head.appendChild(m);
+        return m;
+      });
+      try {
+        vi.useFakeTimers({ now: T + 10_000 + 60 * 60_000 });
+        render(<EventLogColumn scopeLabel="runs" records={open} visible />);
+        expect(why2()).toBe("in progress");
+      } finally {
+        metas.forEach((m) => m.remove());
+      }
+    });
+
+    it("judges records that arrive later at the time they arrive, not at mount", () => {
+      vi.useFakeTimers({ now: T + 20_000 });
+      const closed = [
+        rec({ ts: at(0), action: "dispatch.start", session_id: "s-old", machine_id: "MacBook-Pro", payload: {} } as never),
+        rec({ ts: at(5), action: "dispatch.complete", session_id: "s-old", machine_id: "MacBook-Pro", payload: {} } as never),
+      ];
+      const { rerender } = render(<EventLogColumn scopeLabel="runs" records={closed} visible />);
+      vi.setSystemTime(T + 30 * 60_000 + 11_000);
+      const later = open.map((r) => rec({ ...r, ts: new Date((r.tMs as number) + 30 * 60_000).toISOString() } as never));
+      rerender(<EventLogColumn scopeLabel="runs" records={later} visible />);
+      expect(why2()).toBe("in progress");
     });
 
     it("reads a parked playhead's instant, not now", () => {
