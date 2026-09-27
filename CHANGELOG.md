@@ -780,6 +780,16 @@ darkmux release.
 
 ### Fixed
 
+- **With serve auth on, a request proxied to loopback now needs the token**
+  (#2988). The daemon exempted any loopback connection from the bearer
+  check, and `tailscale serve` (the documented way a hub reaches the
+  tailnet) delivers every tailnet peer on loopback, so remote reads were
+  served without the token. The gate now uses the same test `/health`
+  already did: loopback AND no reverse-proxy header (`X-Forwarded-For`,
+  `Forwarded`, `Tailscale-User-*` and the like). A request made on the hub
+  itself stays open. **Visible consequence:** with a token configured, the
+  viewer opened through `tailscale serve` in a browser now answers 401. With
+  auth off (no token, the default) nothing changes: reads stay tailnet-open.
 - **Model output can no longer reach host files through symlinks** (#2869).
   Every host read or copy of a container-writable path (the out-dir,
   `.darkmux-runtime/`, the resume checkpoint, the live trajectory tailer,

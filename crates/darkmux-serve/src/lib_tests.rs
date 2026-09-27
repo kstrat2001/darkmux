@@ -1732,9 +1732,9 @@
     }
 
     /// Companion to the above: unlike the retired `/diff` gate,
-    /// `/worktree-summary` is open on LOOPBACK even when a token is
-    /// configured — a oneshot request has no `ConnectInfo` and is treated
-    /// as loopback, same as every other route on the general gate.
+    /// `/worktree-summary` is open to a request from this machine (a stated
+    /// loopback peer, no proxy header) even when a token is configured,
+    /// same as every other route on the general gate.
     #[tokio::test]
     #[serial_test::serial]
     async fn worktree_summary_open_on_loopback_even_with_token() {
@@ -1870,6 +1870,109 @@
         let resp = app.oneshot(req).await.unwrap();
         unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
         assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ─── (#2988) a proxied loopback request is not this machine ─────────
+    // `tailscale serve` (the documented way a hub reaches the tailnet)
+    // proxies every tailnet peer to loopback. With auth on, the gate must
+    // ask `is_local_request` — loopback AND no proxy header — or every
+    // peer behind the proxy reads the whole surface without the token.
+
+    /// Status of a loopback `/flow-days` request carrying `headers`,
+    /// through the real router, with the token env var set to `token_env`
+    /// for the duration (`None` = auth off).
+    async fn loopback_flow_status(token_env: Option<&str>, headers: &[(&str, &str)]) -> StatusCode {
+        match token_env {
+            Some(t) => unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", t) },
+            None => unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN") },
+        }
+        let app = build_router_local(PathBuf::new());
+        let mut b = Request::builder().uri("/flow-days");
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let mut req = b.body(Body::empty()).unwrap();
+        req.extensions_mut().insert(loopback_peer());
+        let resp = app.oneshot(req).await.unwrap();
+        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        resp.status()
+    }
+
+    const BEARER: &str = "Bearer sek-test-12345";
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn auth_on_plain_loopback_is_allowed_without_the_token() {
+        assert_ne!(loopback_flow_status(Some(TEST_TOKEN), &[]).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn auth_on_loopback_with_x_forwarded_for_and_no_token_is_refused() {
+        let status = loopback_flow_status(Some(TEST_TOKEN), &[("X-Forwarded-For", "100.64.0.7")]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "a tailnet peer behind `tailscale serve` is not loopback");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn auth_on_loopback_with_x_forwarded_for_and_the_token_is_allowed() {
+        let status = loopback_flow_status(
+            Some(TEST_TOKEN),
+            &[("X-Forwarded-For", "100.64.0.7"), ("Authorization", BEARER)],
+        )
+        .await;
+        assert_ne!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn auth_on_loopback_with_tailscale_user_login_and_no_token_is_refused() {
+        let status =
+            loopback_flow_status(Some(TEST_TOKEN), &[("Tailscale-User-Login", "someone@example.com")]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn auth_on_loopback_with_forwarded_and_no_token_is_refused() {
+        let status = loopback_flow_status(Some(TEST_TOKEN), &[("Forwarded", "for=100.64.0.7")]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// `/worktree-summary` (the numbers-only successor of the retired
+    /// `/diff`) sits behind the same gate: proxied loopback needs the token.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn auth_on_proxied_loopback_worktree_summary_needs_the_token() {
+        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        let app = build_router_local(PathBuf::new());
+        let mut req = Request::builder()
+            .uri("/worktree-summary/some-session")
+            .header("X-Forwarded-For", "100.64.0.7")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(loopback_peer());
+        let resp = app.oneshot(req).await.unwrap();
+        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Auth OFF (no token resolves — the default): reads stay open to
+    /// everything, proxied or not. Pins that #2988 changed nothing there.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn auth_off_every_loopback_shape_is_allowed() {
+        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        assert!(!darkmux_flow::serve_token_present(), "the default resolves no token");
+        for headers in [
+            &[][..],
+            &[("X-Forwarded-For", "100.64.0.7")][..],
+            &[("X-Forwarded-For", "100.64.0.7"), ("Authorization", BEARER)][..],
+            &[("Tailscale-User-Login", "someone@example.com")][..],
+            &[("Forwarded", "for=100.64.0.7")][..],
+        ] {
+            assert_ne!(loopback_flow_status(None, headers).await, StatusCode::UNAUTHORIZED, "{headers:?}");
+        }
     }
 
     /// The `/health` body for a loopback request carrying `headers`,

@@ -145,9 +145,10 @@ const PANEL_SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
 /// "observer joins the observed" failure, driven by a page the operator
 /// never opened on purpose.
 ///
-/// Bearer auth does not cover this: loopback is exempt by design, and under
-/// the documented `tailscale serve` phone-dashboard pattern every tailnet
-/// peer arrives as loopback too.
+/// Bearer auth does not cover this: a request from this machine
+/// (`is_local_request`) is exempt by design, and with auth off every
+/// tailnet peer behind the documented `tailscale serve` phone dashboard
+/// reads freely too.
 pub(crate) const PANEL_HEADER: &str = "x-darkmux-panel";
 
 /// Server-enforced floor between runs of a MANUAL-ONLY panel (TTL 0).
@@ -578,7 +579,7 @@ fn clamp_cols(cols: Option<u16>) -> u16 {
 /// before it is consulted. That is the #1286 perturbation this floor
 /// exists to prevent, reached by nothing more exotic than two open
 /// consoles — the laptop browser and the tailnet phone dashboard both
-/// arrive as loopback by design.
+/// reach the daemon on loopback by design.
 ///
 /// The clock now advances at ADMISSION rather than at completion, which
 /// is a deliberate trade with two consequences worth stating:

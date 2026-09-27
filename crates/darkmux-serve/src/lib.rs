@@ -375,10 +375,10 @@ pub(crate) fn build_router_with_worktrees_base(
 /// **Auth wiring (#881, narrowed #1387):** when a bearer token is configured
 /// (`darkmux_flow::serve_token_present()`), a **remote-only** gate (`auth_mw`)
 /// wraps the whole router — otherwise the router is byte-for-byte today's
-/// behavior (zero friction for the loopback-only default install). Loopback
-/// peers pass (the operator's own machine + the bundled viewer keep working),
-/// non-loopback peers must present the token. `/health` is always exempt
-/// (doctor's reachability probe). Layered INNER of CORS so preflight is
+/// behavior (zero friction for the loopback-only default install). A request
+/// from this machine (`is_local_request`) passes; every other request,
+/// including one proxied to loopback, must present the token. `/health` is
+/// always exempt (doctor's reachability probe). Layered INNER of CORS so preflight is
 /// handled by the CORS layer first.
 ///
 /// Prior to #1387 there was a SECOND, always-on gate wrapping only
@@ -582,19 +582,21 @@ fn request_token_ok(headers: &axum::http::HeaderMap) -> bool {
     tokens_match(presented.trim().as_bytes(), token.expose_for_compare().as_bytes())
 }
 
-/// (#881) Remote-only token gate for the whole read surface. Loopback peers
-/// pass (the operator's own machine + the bundled same-origin viewer keep
-/// working with zero friction); non-loopback peers must present the token.
-/// `/health` is always exempt so doctor's reachability probe (and external
-/// liveness checks) keep working. (#1663) A missing `ConnectInfo` is treated as
-/// REMOTE — see the fail-closed reasoning in the body. Tests that want the
-/// loopback exemption state it, via `build_router_local`.
+/// (#881) Remote-only token gate for the whole read surface. A request from
+/// THIS machine passes (the operator's own shell + the bundled same-origin
+/// viewer keep working with zero friction); anything else must present the
+/// token. `/health` is always exempt so doctor's reachability probe (and
+/// external liveness checks) keep working.
 ///
-/// **Trust assumption:** "loopback is trusted" holds for darkmux's deployment —
-/// bound directly (no reverse proxy) over a Tailscale tailnet that preserves the
-/// real peer IP. Behind a connection-terminating reverse proxy every peer would
-/// appear loopback and this gate would be bypassed. If darkmux ever grows a
-/// multi-tenant/shared-host or behind-proxy mode, revisit this exemption.
+/// "This machine" is [`is_local_request`], the one predicate every local
+/// decision in this daemon uses: a loopback peer address AND no reverse-proxy
+/// header. (#2988) Behind `tailscale serve`, the documented way a hub reaches
+/// the tailnet, every peer arrives on loopback with `X-Forwarded-For` set, so
+/// the address alone exempted the whole tailnet from the token.
+///
+/// (#1663) A missing `ConnectInfo` is not local, so it needs the token — see
+/// the fail-closed reasoning in the body. Tests that want the exemption state
+/// the peer, via `build_router_local`.
 async fn auth_mw(req: Request, next: Next) -> Response {
     if req.uri().path() == "/health" {
         return next.run(req).await;
@@ -610,7 +612,7 @@ async fn auth_mw(req: Request, next: Next) -> Response {
     // peer looks loopback — a tailnet-exposed daemon then serves flow
     // records, machine specs, mission state, and worktree summaries
     // unauthenticated, with every test still green and nothing visible to the
-    // operator (the viewer keeps working; loopback is exempt either way).
+    // operator (the viewer keeps working; this machine is exempt either way).
     //
     // Now that same refactor produces 401s on the first remote request
     // instead of silence. Tests inject `ConnectInfo` explicitly — see
@@ -620,12 +622,8 @@ async fn auth_mw(req: Request, next: Next) -> Response {
     // Same instinct `bind_requires_token` already applies just below: a bind
     // string that doesn't parse is treated as non-loopback, so a typo can't
     // sneak past the gate. Absence is not evidence of safety.
-    let is_remote = req
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| !ci.0.ip().is_loopback())
-        .unwrap_or(true);
-    if !is_remote || request_token_ok(req.headers()) {
+    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|ci| ci.0);
+    if is_local_request(peer, req.headers()) || request_token_ok(req.headers()) {
         next.run(req).await
     } else {
         unauthorized()
@@ -1170,7 +1168,7 @@ fn build_startup_banner(
     let non_loopback = !addr.ip().is_loopback();
     if token_present {
         lines.push(format!(
-            "  auth:           {} (remote reads require a bearer token; loopback open)",
+            "  auth:           {} (remote and proxied reads require a bearer token; this machine open)",
             darkmux_types::style::success("token set")
         ));
     } else if non_loopback {
@@ -3002,7 +3000,7 @@ fn machine_resources_cached_fresh() -> Option<serde_json::Value> {
 /// run artifacts (lab lens) and the flow stream (fleet lenses). Read-only,
 /// zero model dispatches; the gather stamps its own cost (`gather_ms`)
 /// into the payload. Auth: rides the same remote-only bearer gate as every
-/// other route (loopback open, remote requires the token) — nothing extra
+/// other route (this machine open, remote requires the token) — nothing extra
 /// here.
 ///
 /// (#2107, #1833, #2108) Attach the daemon-side host sampler's `load` block —
