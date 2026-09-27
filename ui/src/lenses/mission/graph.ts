@@ -26,7 +26,8 @@
 import { compactThousands, fmtElapsed, type CompactStyle } from "../../lib/format";
 import { PURPOSE, isUsageRecord, stepTokensWithLegacyFallback, usageContribution } from "../../lib/usageRecords";
 import { ACTION, CATEGORY, byTimeNewestFirst, isAfter, isDispatchFamily, isDispatchTerminal, type NormAction, type NormRecord } from "../../lib/ingest";
-import { DEFAULT_POLICY, isStale, type LifecyclePolicy } from "../../lib/lifecycle";
+import { lifecycleAt, type LifecyclePhase, type LifecyclePolicy } from "../../lib/lifecycle";
+import { currentRun, groupOfRecords } from "../../lib/runRef";
 
 // ─── wire types (crates/darkmux-serve/src/mission_graph.rs) ────────────────
 
@@ -917,16 +918,43 @@ export interface StepMeter {
   wallMs: number;
 }
 
-/** `stepMeterFor` — mission-graph.html. A running step is in flight until
- * its last signal (this port's derived `m.lastTs`, else its start) is older
- * than the lifecycle policy's staleness window: the same rule
- * (`lib/lifecycle.ts`'s `isStale`) every other surface judges a run by. */
-export function stepMeterFor(step: GraphStep, metrics: MetricsMap, now: number, policy: LifecyclePolicy = DEFAULT_POLICY): StepMeter {
+/** Each step's run phase as of an instant (`stepPhasesAt`), by step id. */
+export type StepPhases = ReadonlyMap<string, LifecyclePhase>;
+export const NO_STEP_PHASES: StepPhases = new Map();
+
+/** The records {@link stepForRecord} attributes to each step: a step's run,
+ *  whatever sessions it spans (its task session's step bookends, its
+ *  dispatch's own). Time order, as given. */
+export function recordsByStep(records: readonly NormRecord[], idx: GraphIndex, missionId: string): Map<string, NormRecord[]> {
+  const out = new Map<string, NormRecord[]>();
+  for (const rec of records) {
+    const sid = stepForRecord(rec, idx, missionId);
+    if (!sid) continue;
+    const list = out.get(sid);
+    if (list) list.push(rec);
+    else out.set(sid, [rec]);
+  }
+  return out;
+}
+
+/** Each step's run lifecycle phase as of `now` (`lib/lifecycle.ts`), the
+ *  one every surface judges a run by: a budget wait, staleness and a close
+ *  read here as they do on the run page. */
+export function stepPhasesAt(byStep: ReadonlyMap<string, readonly NormRecord[]>, now: number, policy: LifecyclePolicy): StepPhases {
+  const out = new Map<string, LifecyclePhase>();
+  for (const [stepId, recs] of byStep) out.set(stepId, lifecycleAt(currentRun(groupOfRecords(recs), now), now, policy).phase);
+  return out;
+}
+
+/** `stepMeterFor` — mission-graph.html. A running step is generating while
+ * its run is in flight by its lifecycle (`phases`, from `stepPhasesAt`):
+ * open or held by a budget wait. A step with no records of its own is not. */
+export function stepMeterFor(step: GraphStep, metrics: MetricsMap, now: number, phases: StepPhases = NO_STEP_PHASES): StepMeter {
   const m = metrics[step.id];
   const d = stepDisplayMetrics(m);
   const show = isAiKind(step.kind) || d.has;
-  const lastSignal = (m && m.lastTs) || stepStartMs(step, m) || null;
-  const generating = step.status === "running" && !isStale(lastSignal, now, policy);
+  const phase = phases.get(step.id);
+  const generating = step.status === "running" && (phase === "open" || phase === "waiting");
   const startMs = stepStartMs(step, m);
   const elapsedMs = generating && startMs && now ? Math.max(0, now - startMs) : 0;
   const endMs = stepEndMs(step, m) || (step.status === "running" && now ? now : 0);
@@ -970,7 +998,7 @@ export interface StepHeaderField {
  * home in `GraphStep`/`StepMetrics` yet. Scanned NEWEST-FIRST so the most
  * recent record wins when more than one carries the same key (a crawl unit
  * can emit `source`/`rule` more than once while working through a batch). */
-export function buildStepHeaderFields(step: GraphStep, metrics: MetricsMap, now: number, stepRecords: NormRecord[], policy: LifecyclePolicy = DEFAULT_POLICY): StepHeaderField[] {
+export function buildStepHeaderFields(step: GraphStep, metrics: MetricsMap, now: number, stepRecords: NormRecord[], phases: StepPhases = NO_STEP_PHASES): StepHeaderField[] {
   const fields: StepHeaderField[] = [];
   fields.push({ key: "unit", label: "unit", value: step.label || step.id });
   if (step.kind) fields.push({ key: "kind", label: "kind", value: step.kind });
@@ -999,7 +1027,7 @@ export function buildStepHeaderFields(step: GraphStep, metrics: MetricsMap, now:
   fields.push({ key: "status", label: "status", value: step.status || "planned" });
 
   const m = metrics[step.id];
-  const meter = stepMeterFor(step, metrics, now, policy);
+  const meter = stepMeterFor(step, metrics, now, phases);
   const startMs = stepStartMs(step, m);
   if (startMs) {
     const endMs = m && m.endTs ? m.endTs : meter.generating ? now : 0;

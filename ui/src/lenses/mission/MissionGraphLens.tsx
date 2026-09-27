@@ -76,6 +76,8 @@ import {
   normalizeMissionStatus,
   recordInMission,
   seedMetricsFromGraph,
+  recordsByStep,
+  stepPhasesAt,
   type GraphStep,
   type MetricsMap,
   type MissionGraph,
@@ -617,6 +619,11 @@ export function MissionGraphLens({
   const missionRunning = !!graph && workStatusKind(normalizeMissionStatus(graph.mission_status)) === "running";
   const now = useNow(anyRunning || missionRunning);
   const policy = useLifecyclePolicy();
+  // Each step's run phase as of `now`, from the records attributed to it:
+  // the lifecycle every surface reads, so a step reads generating exactly
+  // while its run is in flight on the run page too.
+  const stepRecords = useMemo(() => (idx ? recordsByStep(ascendingRecords, idx, missionId) : new Map<string, NormRecord[]>()), [ascendingRecords, idx, missionId]);
+  const phases = useMemo(() => stepPhasesAt(stepRecords, now, policy), [stepRecords, now, policy]);
   const proc = useProcReadout(flowTailQuery.data);
 
   // Needs `now` (elapsed time for a still-running step) — computed here,
@@ -624,8 +631,8 @@ export function MissionGraphLens({
   // above.
   const stepHeaderFields = useMemo(() => {
     if (!selectedStep) return null;
-    return buildStepHeaderFields(selectedStep, metrics, now, selectedStepRecords, policy);
-  }, [selectedStep, metrics, now, selectedStepRecords, policy]);
+    return buildStepHeaderFields(selectedStep, metrics, now, selectedStepRecords, phases);
+  }, [selectedStep, metrics, now, selectedStepRecords, phases]);
 
   useEffect(() => {
     onStepHeader?.(stepHeaderFields);
@@ -789,7 +796,7 @@ export function MissionGraphLens({
             edges={graph.edges}
             metrics={metrics}
             now={now}
-            policy={policy}
+            phases={phases}
             note={graph.note}
             expanded={expanded}
             onToggleTask={toggleTask}
@@ -802,7 +809,7 @@ export function MissionGraphLens({
             edges={graph.edges}
             metrics={metrics}
             now={now}
-            policy={policy}
+            phases={phases}
             note={graph.note}
             minimapOn={minimapOn}
             selectedStepId={selectedStepId}

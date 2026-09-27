@@ -1,4 +1,3 @@
-import { DEFAULT_POLICY } from "../../lib/lifecycle";
 import { describe, expect, it } from "vitest";
 import { groupTimeline, initMinimap, isNarrowViewport, persistMinimap, taskAggMetrics, timelineActive } from "./timeline";
 import type { GraphEdge, GraphNode, MetricsMap } from "./graph";
@@ -86,7 +85,7 @@ describe("taskAggMetrics", () => {
     const metrics: MetricsMap = {
       "b-step": { tokRun: 40, tokFinal: 0, turnRun: 2, turnFinal: 0, toolRun: 0, toolFinal: 0, usageSeen: true, startTs: now - 5000, endTs: 0, lastTs: now - 1000 },
     };
-    const agg = taskAggMetrics(TASK_B, metrics, now);
+    const agg = taskAggMetrics(TASK_B, metrics, now, new Map([["b-step", "open"]]));
     expect(agg.tokens).toBe(40);
     expect(agg.turns).toBe(2);
     expect(agg.generating).toBe(true);
@@ -191,7 +190,7 @@ describe("taskAggMetrics task-level duration (#2269)", () => {
   it("spans from the earliest step start to now while any step runs, not from the running step's start", () => {
     const now = T0 + 100_000;
     const task = seq({ startedTs: T0, completedTs: T0 + 60_000 }, { startedTs: T0 + 61_000 });
-    const agg = taskAggMetrics(task, {}, now);
+    const agg = taskAggMetrics(task, {}, now, new Map([["s2", "open"]]));
     expect(agg.generating).toBe(true);
     expect(agg.spanMs).toBe(100_000);
     expect(agg.elapsedMs).toBe(100_000);
@@ -248,13 +247,13 @@ describe("taskAggMetrics task-level duration (#2269)", () => {
     expect(agg.elapsedMs).toBe(0);
   });
 
-  it("(#2343) a step whose last signal is long stale does not keep the task card generating", () => {
+  it("(#2343) a step whose run went stale does not keep the task card generating", () => {
     // Same refinement, the freshness half: `stepMeterFor` drops
-    // `generating` once nothing has been heard inside
-    // `DEFAULT_POLICY.staleAfterMs`. The aggregate followed the raw status
-    // instead, so a dead step kept the card pulsing indefinitely.
+    // `generating` once the step's run reads stale by its lifecycle. The
+    // aggregate followed the raw status instead, so a dead step kept the
+    // card pulsing indefinitely.
     const task = seq({ startedTs: T0, completedTs: T0 + 60_000 }, { startedTs: T0 + 61_000 });
-    expect(taskAggMetrics(task, {}, T0 + 100_000).generating).toBe(true);
-    expect(taskAggMetrics(task, {}, T0 + 61_000 + DEFAULT_POLICY.staleAfterMs + 1_000).generating).toBe(false);
+    expect(taskAggMetrics(task, {}, T0 + 100_000, new Map([["s2", "open"]])).generating).toBe(true);
+    expect(taskAggMetrics(task, {}, T0 + 100_000, new Map([["s2", "stale"]])).generating).toBe(false);
   });
 });
