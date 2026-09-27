@@ -11711,32 +11711,53 @@ fn cap_json_result(value: Option<&serde_json::Value>, max: usize) -> serde_json:
 /// since a clipped path names a different file. `None` (the key is left
 /// out) when no call has a path. The viewer names `tool_paths[k]` while the
 /// turn's k-th call runs.
-/// (#2963) `dispatch.turn`'s `tool_names`: each of the turn's tool calls'
-/// name (`model.completed.tool_calls[i].name`), aligned by index with
-/// `tool_paths`, `null` for a name that is not a string or is over
-/// `MAX_TRAJ_FIELD_BYTES` (never clipped). Unlike the paths, present
-/// whenever the turn made any calls. The viewer names `tool_names[k]` (the
-/// word and the icon) while the turn's k-th call runs.
-fn turn_tool_names(event: &serde_json::Value) -> Option<serde_json::Value> {
+/// (#2963) The turn's tool calls that RUN, in order: the runtime marks a
+/// call it will not dispatch (ungranted, not a tool, cut off mid-arguments;
+/// its `plan_tool_calls`) `runs: false` on the `model.completed` entry.
+/// `None` when the event carries no `tool_calls` array.
+fn running_tool_calls(event: &serde_json::Value) -> Option<Vec<&serde_json::Value>> {
     let calls = event.get("tool_calls")?.as_array()?;
-    if calls.is_empty() {
+    Some(calls.iter().filter(|c| c.get("runs").and_then(|r| r.as_bool()) != Some(false)).collect())
+}
+
+/// (#2963 review, CONSIDER 2) A name the runtime knows as a tool: one some
+/// role-vocab token grants (`role_to_runtime` over `KNOWN_ROLE_VOCAB`, the
+/// one mapping). A model-invented name never rides the flow stream (#2169
+/// cleans them for the same reason).
+fn is_known_runtime_tool(name: &str) -> bool {
+    KNOWN_ROLE_VOCAB.iter().any(|token| role_to_runtime(token).contains(&name))
+}
+
+/// (#2963) `dispatch.turn`'s `tool_names`: the tool name of each call that
+/// RUNS (`running_tool_calls`), in order, `null` for a name that is not a
+/// known runtime tool. Present (possibly empty) whenever the turn made any
+/// calls, so its length is how many will complete; `None` for a turn with
+/// none. The viewer names `tool_names[k]` (the word and the icon) while the
+/// turn's k-th running call runs.
+fn turn_tool_names(event: &serde_json::Value) -> Option<serde_json::Value> {
+    if event.get("tool_calls")?.as_array()?.is_empty() {
         return None;
     }
     Some(serde_json::Value::Array(
-        calls
-            .iter()
+        running_tool_calls(event)?
+            .into_iter()
             .map(|c| match c.get("name").and_then(|n| n.as_str()) {
-                Some(n) if !n.is_empty() && n.len() <= MAX_TRAJ_FIELD_BYTES => serde_json::json!(n),
+                Some(n) if is_known_runtime_tool(n) => serde_json::json!(n),
                 _ => serde_json::Value::Null,
             })
             .collect(),
     ))
 }
 
+/// (#2963) `dispatch.turn`'s `tool_paths`: the runtime's `path` (the path
+/// argument only, never the content) of each call that RUNS, aligned with
+/// `tool_names`, `null` for a call without one. A path over
+/// `MAX_TRAJ_FIELD_BYTES` is `null`, not clipped, since a clipped path names
+/// a different file. `None` (the key is left out) when no running call has
+/// a path.
 fn turn_tool_paths(event: &serde_json::Value) -> Option<serde_json::Value> {
-    let calls = event.get("tool_calls")?.as_array()?;
-    let paths: Vec<serde_json::Value> = calls
-        .iter()
+    let paths: Vec<serde_json::Value> = running_tool_calls(event)?
+        .into_iter()
         .map(|c| match c.get("path").and_then(|p| p.as_str()) {
             Some(p) if !p.is_empty() && p.len() <= MAX_TRAJ_FIELD_BYTES => serde_json::json!(p),
             _ => serde_json::Value::Null,

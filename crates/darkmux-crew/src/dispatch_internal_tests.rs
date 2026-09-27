@@ -11674,12 +11674,40 @@
             { "id": "c", "name": 7, "arguments_chars": 1 },
             { "id": "d", "name": "x".repeat(MAX_TRAJ_FIELD_BYTES + 1), "arguments_chars": 1 },
         ]});
+        // (#2963 review, CONSIDER 2) A name that is not a known runtime tool
+        // never rides the flow stream, so `7` and the over-long name are
+        // `null`; so would a model-invented one be.
         assert_eq!(turn_tool_names(&ev), Some(serde_json::json!(["write", "read", null, null])));
+        let invented = serde_json::json!({ "tool_calls": [{ "id": "a", "name": "rm_rf_everything", "arguments_chars": 2 }] });
+        assert_eq!(turn_tool_names(&invented), Some(serde_json::json!([null])));
         let bash = serde_json::json!({ "tool_calls": [{ "id": "b", "name": "bash", "arguments_chars": 12 }] });
         assert_eq!(turn_tool_names(&bash), Some(serde_json::json!(["bash"])));
         assert_eq!(turn_tool_names(&serde_json::json!({ "tool_calls": [] })), None);
         assert_eq!(turn_tool_names(&serde_json::json!({ "tool_calls": null })), None);
         assert_eq!(turn_tool_names(&serde_json::json!({})), None);
+    }
+
+    /// (#2963 review, MUST FIX 1) Only the calls that RUN are in the lists.
+    /// The runtime marks a call it will not dispatch (ungranted, not a tool,
+    /// cut off mid-arguments) `runs: false` on its `model.completed` entry;
+    /// the lists skip it, so index k is the k-th call that runs, in order.
+    /// `tool_names` is present (possibly empty) whenever the turn made any
+    /// calls, so its length is the number that will complete.
+    #[test]
+    fn turn_lists_hold_only_the_calls_that_run() {
+        let ev = serde_json::json!({ "tool_calls": [
+            { "id": "a", "name": "write", "arguments_chars": 40, "path": "src/x.rs", "runs": false },
+            { "id": "b", "name": "read", "arguments_chars": 12, "path": "src/y.rs" },
+            { "id": "c", "name": "frobnicate", "arguments_chars": 2, "runs": false },
+            { "id": "d", "name": "edit", "arguments_chars": 30, "path": "src/z.rs", "runs": true },
+        ]});
+        assert_eq!(turn_tool_names(&ev), Some(serde_json::json!(["read", "edit"])));
+        assert_eq!(turn_tool_paths(&ev), Some(serde_json::json!(["src/y.rs", "src/z.rs"])));
+        let none_run = serde_json::json!({ "tool_calls": [
+            { "id": "a", "name": "write", "arguments_chars": 40, "path": "src/x.rs", "runs": false },
+        ]});
+        assert_eq!(turn_tool_names(&none_run), Some(serde_json::json!([])), "no call runs: an empty list, not a missing one");
+        assert_eq!(turn_tool_paths(&none_run), None);
     }
 
     /// (#2963) End to end through the tailer: the turn record carries the
