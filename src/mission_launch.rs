@@ -2461,17 +2461,6 @@ pub(crate) fn collect_inputs(
     Ok(collected)
 }
 
-/// (#2310 P4e) Fill every declared-but-unsupplied input that carries a
-/// document `default` into `collected`.
-///
-/// **Supplied always wins**, including a supplied empty string: the
-/// operator typing `--param mod_wait_seconds=` is a value, not an absence,
-/// and silently replacing it with the document's default would be the
-/// launcher substituting its judgment for the operator's.
-///
-/// An `ignored: true` input is never defaulted — the ignored-input warning
-/// keys on `collected.contains_key`, so a default would make every launch
-/// warn about an input the operator never typed.
 /// The inputs a step's `workspace` names (`"workspace": "{{<input>}}"`, the
 /// shape every plan step in a shipped config uses).
 fn workspace_spec_inputs(config: &MissionConfig) -> std::collections::BTreeSet<String> {
@@ -2506,6 +2495,17 @@ fn refuse_bad_workspace_specs(config: &MissionConfig, collected: &BTreeMap<Strin
     Ok(refusal.into_result()?)
 }
 
+/// (#2310 P4e) Fill every declared-but-unsupplied input that carries a
+/// document `default` into `collected`.
+///
+/// **Supplied always wins**, including a supplied empty string: the
+/// operator typing `--param mod_wait_seconds=` is a value, not an absence,
+/// and silently replacing it with the document's default would be the
+/// launcher substituting its judgment for the operator's.
+///
+/// An `ignored: true` input is never defaulted — the ignored-input warning
+/// keys on `collected.contains_key`, so a default would make every launch
+/// warn about an input the operator never typed.
 pub(crate) fn apply_input_defaults(
     config: &MissionConfig,
     collected: &mut BTreeMap<String, serde_json::Value>,
@@ -7164,6 +7164,30 @@ mod tests {
             "must point at the template to copy — the naming convention is documented nowhere \
              else: {msg}"
         );
+    }
+
+    /// (review C5 follow-up) A workspace path that comes only from the
+    /// input's document DEFAULT is checked too: the spec check runs after
+    /// defaults land, still before minting and before `--dry-run`.
+    #[test]
+    #[serial_test::serial]
+    fn a_bad_workspace_spec_from_an_input_default_is_refused_before_minting() {
+        let guard = LaunchTestGuard::new();
+        let spec_dir = tempfile::tempdir().unwrap();
+        let spec = spec_dir.path().join("spec.json");
+        std::fs::write(&spec, r#"{"name": "w", "sources": [{"id": "a", "path": "/x"}], "sourcs": []}"#).unwrap();
+        let doc = serde_json::json!({
+            "id": "ws-default", "name": "WS default",
+            "inputs": [{"name": "workspace", "default": spec.to_str().unwrap()}],
+            "phases": [{"id": "p1", "tasks": [{"id": "t1", "steps": [
+                {"id": "s1", "kind": "procedural.noop", "config": {"workspace": "{{workspace}}"}}
+            ]}]}],
+        });
+        guard.write_config("ws-default", &doc.to_string());
+        let err = launch("ws-default", None, &["dry_run=true".to_string()], None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("refusing to start") && msg.contains("unknown key `sourcs`"), "{msg}");
+        assert!(all_mission_ids().is_empty(), "nothing was minted");
     }
 
     // ── source_input/ticket hydration (#1284 review round 1, must-fix 2) ─
