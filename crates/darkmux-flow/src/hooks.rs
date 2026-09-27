@@ -1037,7 +1037,8 @@ pub fn rules_with_drain_lock_held_elsewhere(rules: &[HookRule], outbox_dir: &Pat
 /// needs exactly one of `http` or `file` (blank counts as unset). Decided in
 /// one place, [`destination`], which both [`resolve_one_rule`] (refusing) and
 /// [`summarize_configured_rules`] (reporting) call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DestinationProblem {
     BothHttpAndFile,
     NoDestination,
