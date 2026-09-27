@@ -468,6 +468,12 @@ export interface LiveStateReading {
    * (`Math.ceil` of the ms remaining) — present only when `state ===
    * "rest"`. */
   restSecondsLeft?: number;
+  /** (#2961) Present only when `state === "rest"`: when the rest window ends,
+   *  on the same clock `restSecondsLeft` counts against (the rest record's
+   *  `ts` plus its `ms`). The scope phases REST's seconds hand from it, so
+   *  the hand reaches 12 o'clock exactly when the countdown drops a number
+   *  (`lib/restHand.ts`). */
+  restEndMs?: number;
   /** (#2950) Present only when `state === "rest"` and the rest's own record
    *  says why (`reason`, with its `state` when it carries one): the plain
    *  words `restReasonLabel` makes of them ("thermal · serious", "battery ·
@@ -681,7 +687,7 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
     if (found.kind === "rest" && found.restMs != null) {
       const remaining = found.restMs - (nowMs - found.atMs);
       if (remaining > 0) {
-        const reading: LiveStateReading = { state: "rest", restSecondsLeft: Math.ceil(remaining / 1000) };
+        const reading: LiveStateReading = { state: "rest", restSecondsLeft: Math.ceil(remaining / 1000), restEndMs: found.atMs + found.restMs };
         if (found.restReason !== undefined) {
           reading.restReason = found.restReason;
           reading.restReasonWord = found.restReasonWord ?? found.restReason;
@@ -1060,6 +1066,9 @@ export interface ExecutionTokenReading {
   state: LiveState | null;
   /** Present only when `state === "rest"`. */
   restSecondsLeft?: number;
+  /** (#2961) Present only when `state === "rest"`. See
+   *  `LiveStateReading.restEndMs`. */
+  restEndMs?: number;
   /** (#2950) Present only when `state === "rest"` and the rest's record says
    *  why. See `LiveStateReading.restReason`. */
   restReason?: string;
@@ -1121,6 +1130,7 @@ export function executionTokenReading(
     role: executionRole(records),
     state,
     restSecondsLeft: state === "rest" ? liveState?.restSecondsLeft : undefined,
+    ...(state === "rest" && liveState?.restEndMs !== undefined ? { restEndMs: liveState.restEndMs } : {}),
     ...(state === "rest" && liveState?.restReason !== undefined
       ? { restReason: liveState.restReason, restReasonWord: liveState.restReasonWord ?? liveState.restReason }
       : {}),

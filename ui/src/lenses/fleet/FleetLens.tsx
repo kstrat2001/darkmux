@@ -18,6 +18,7 @@ import { fmtN, fmtC } from "../../lib/format";
 import { MachineIcon } from "../../components/MachineIcon";
 import { Shimmer } from "../../components/Placeholder";
 import { TokenScope } from "../../components/TokenScope";
+import { usePlaybackClockRate } from "../../lib/pageClockRate";
 import { UtilityGlyph } from "../../components/UtilityGlyph";
 import { scopeStateOf } from "../../lib/scopeMorph";
 import { liveStateLabel } from "../../lib/tokenRate";
@@ -627,6 +628,8 @@ export function FleetLens({
   // ceiling it always was (see `timeline.ts`'s own doc) — this is the
   // separate, moving "now" value.
   const playheadT = playhead ?? wallNow;
+  // (#2961) How fast the playhead moves, for REST's seconds hand.
+  const playbackClockRate = usePlaybackClockRate();
   // `enabled: false` stops the REQUEST, not just the result: an earlier draft
   // discarded the data while the hook kept polling `/fleet/machines/live`
   // every few seconds behind a replay.
@@ -1376,6 +1379,12 @@ export function FleetLens({
                       thinking: selectedExec.thinking === true,
                       compacting: selectedExec.compacting === true,
                     })}
+                    // (#2961) REST's seconds hand follows the page clock:
+                    // the playhead in playback (at the transport's speed
+                    // while it plays, still otherwise), the wall clock live.
+                    restEndMs={selectedExec.state === "rest" ? selectedExec.restEndMs : undefined}
+                    clockMs={playheadT}
+                    clockRate={playhead != null ? playbackClockRate : 1}
                     size="card"
                   />
                 </div>

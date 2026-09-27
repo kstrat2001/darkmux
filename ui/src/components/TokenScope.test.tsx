@@ -404,3 +404,156 @@ describe("(#2911) reduced motion is followed at runtime, not read once at mount"
     }
   });
 });
+
+// (#2961) REST's seconds hand, drawn and counted from the rest's end time on
+// the page clock.
+describe("(#2961) REST's seconds hand", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    delete (HTMLCanvasElement.prototype as unknown as Record<string, unknown>).clientWidth;
+    delete (HTMLCanvasElement.prototype as unknown as Record<string, unknown>).clientHeight;
+  });
+
+  /** A 200px canvas whose `arc` and `ellipse` calls are recorded, the page's
+   *  monotonic clock pinned at 0, and frames fired by hand. */
+  function harness(reduced: boolean) {
+    const arcs: { x: number; y: number; r: number }[] = [];
+    let ellipses = 0;
+    const ctx: unknown = new Proxy({} as Record<string | symbol, unknown>, {
+      get: (t, k) =>
+        k in t
+          ? t[k]
+          : (...a: number[]) => {
+              if (k === "arc") arcs.push({ x: a[0], y: a[1], r: a[2] });
+              if (k === "ellipse") ellipses += 1;
+              return ctx;
+            },
+      set: (t, k, v) => {
+        t[k] = v;
+        return true;
+      },
+    });
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(ctx as CanvasRenderingContext2D);
+    vi.spyOn(window, "matchMedia").mockImplementation(
+      (q: string) => ({ matches: reduced, media: q, addEventListener() {}, removeEventListener() {} }) as unknown as MediaQueryList,
+    );
+    vi.spyOn(performance, "now").mockReturnValue(0);
+    const frames = new Map<number, FrameRequestCallback>();
+    let nextId = 0;
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((cb) => {
+      nextId += 1;
+      frames.set(nextId, cb);
+      return nextId;
+    });
+    vi.spyOn(window, "cancelAnimationFrame").mockImplementation((id) => {
+      frames.delete(id);
+    });
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} unobserve() {} });
+    Object.defineProperties(HTMLCanvasElement.prototype, {
+      clientWidth: { configurable: true, get: () => 200 },
+      clientHeight: { configurable: true, get: () => 200 },
+    });
+    const step = (wallMs: number) => {
+      const [[id, cb]] = [...frames];
+      frames.delete(id);
+      arcs.length = 0;
+      ellipses = 0;
+      act(() => cb(wallMs));
+    };
+    // The hand's head: the dot of radius max(1.6, R * 0.045), R = 80.
+    const head = () => arcs.find((a) => Math.abs(a.r - 3.6) < 1e-9) ?? null;
+    return { step, head, arcs, ellipses: () => ellipses };
+  }
+
+  const END = 1_000_000;
+  const num = (c: HTMLElement) => c.querySelector(".token-scope-n");
+
+  it("the number drops in the frame the hand reaches 12 o'clock, and flares on that tick only", () => {
+    const h = harness(false);
+    // 5.5 s left at wall 0: "6s" until wall 500, "5s" from it.
+    const { container } = render(
+      <TokenScope tokensPerSec={0} size="tile" state="rest" centerLabel="6s" centerUnit="resting" restEndMs={END} clockMs={END - 5_500} clockRate={1} />,
+    );
+    for (const t of [100, 200, 300, 400, 499]) h.step(t);
+    expect(num(container)?.textContent).toBe("6s");
+    // The first number of the rest never flares.
+    expect(num(container)?.getAttribute("data-flare")).toBeNull();
+    h.step(500);
+    expect(num(container)?.textContent).toBe("5s");
+    expect(num(container)?.getAttribute("data-flare")).toBe("true");
+    // The hand is at 12 o'clock in that same frame: straight above center.
+    const top = h.head()!;
+    expect(top.x).toBeCloseTo(100, 6);
+    expect(top.y).toBeLessThan(100);
+    // A quarter second later it is at 3 o'clock, and the number holds.
+    h.step(750);
+    const q = h.head()!;
+    expect(q.x).toBeGreaterThan(100);
+    expect(q.y).toBeCloseTo(100, 6);
+    expect(num(container)?.textContent).toBe("5s");
+    // The trail is drawn (the comet's ellipse strokes).
+    expect(h.ellipses()).toBeGreaterThan(30);
+  });
+
+  it("follows the page clock's rate: at 5s/s a tick every 200 ms of wall time", () => {
+    const h = harness(false);
+    const { container } = render(
+      <TokenScope tokensPerSec={0} size="tile" state="rest" centerLabel="9s" centerUnit="resting" restEndMs={END} clockMs={END - 8_500} clockRate={5} />,
+    );
+    for (const t of [20, 40, 60, 80, 99]) h.step(t);
+    expect(num(container)?.textContent).toBe("9s");
+    h.step(100);
+    expect(num(container)?.textContent).toBe("8s");
+    h.step(299);
+    expect(num(container)?.textContent).toBe("8s");
+    h.step(300);
+    expect(num(container)?.textContent).toBe("7s");
+  });
+
+  it("paused (rate 0): the hand and the number stand still at the playhead, with no tick glow", () => {
+    const h = harness(false);
+    const { container, rerender } = render(
+      <TokenScope tokensPerSec={0} size="tile" state="rest" centerLabel="4s" centerUnit="resting" restEndMs={END} clockMs={END - 3_250} clockRate={0} />,
+    );
+    // The angle, not the point: the ring keeps breathing while paused.
+    const angleOf = (a: { x: number; y: number }) => Math.atan2(a.y - 100, a.x - 100);
+    h.step(100);
+    const at = angleOf(h.head()!);
+    // 3.25 s left: three quarters of the second swept, at 9 o'clock.
+    expect(Math.abs(at)).toBeCloseTo(Math.PI, 6);
+    for (const t of [1_000, 5_000, 60_000]) {
+      h.step(t);
+      expect(num(container)?.textContent).toBe("4s");
+      expect(angleOf(h.head()!)).toBeCloseTo(at, 6);
+    }
+    // A scrub to a new playhead re-anchors the clock there.
+    rerender(<TokenScope tokensPerSec={0} size="tile" state="rest" centerLabel="2s" centerUnit="resting" restEndMs={END} clockMs={END - 1_500} clockRate={0} />);
+    h.step(61_000);
+    expect(num(container)?.textContent).toBe("2s");
+  });
+
+  it("reduced motion: one still frame, the hand at the top, no trail or flare; the number is the caller's", () => {
+    const h = harness(true);
+    const { container, rerender } = render(
+      <TokenScope tokensPerSec={0} size="tile" state="rest" centerLabel="7s" centerUnit="resting" restEndMs={END} clockMs={END - 6_750} clockRate={1} />,
+    );
+    const top = h.head()!;
+    expect(top.x).toBeCloseTo(100, 6);
+    expect(top.y).toBeLessThan(100);
+    expect(h.ellipses()).toBe(0);
+    expect(num(container)?.textContent).toBe("7s");
+    rerender(<TokenScope tokensPerSec={0} size="tile" state="rest" centerLabel="6s" centerUnit="resting" restEndMs={END} clockMs={END - 5_750} clockRate={1} />);
+    expect(num(container)?.textContent).toBe("6s");
+    expect(num(container)?.getAttribute("data-flare")).toBeNull();
+  });
+
+  it("without an end time REST keeps the caller's number and the older drifting dot", () => {
+    const h = harness(false);
+    const { container } = render(<TokenScope tokensPerSec={0} size="tile" state="rest" centerLabel="3s" centerUnit="resting" />);
+    for (const t of [100, 200, 300]) h.step(t);
+    expect(num(container)?.textContent).toBe("3s");
+    expect(h.head()).toBeNull();
+    expect(h.ellipses()).toBe(0);
+  });
+});

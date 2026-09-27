@@ -5,6 +5,7 @@ import { getSource } from "./lib/source";
 import { useDay } from "./hooks/useDay";
 import { usePlaybackTransport, type PlaybackFocus } from "./hooks/usePlaybackTransport";
 import { SeekSignalContext } from "./lib/seekSignal";
+import { PageClockRateContext } from "./lib/pageClockRate";
 import { Scrubber } from "./lenses/catalog/Scrubber";
 import { useSyncHash, writeHash, canonicalHash } from "./lib/hashSync";
 import { MACHINE_NOT_FOUND_LABEL, decodeMachineKey, machineLabel } from "./lib/machineKey";
@@ -647,6 +648,11 @@ export function App() {
     // `useCountUp`/`useArrivalKeys` to read — see `SeekSignalContext`'s own
     // doc for why this replaces a per-caller `liveMode` gate.
     <SeekSignalContext.Provider value={transport.seekGen}>
+    {/* (#2961) How fast the playhead moves (recorded ms per wall ms), for an
+        animation that follows the page clock between the transport's ticks
+        (REST's seconds hand). 0 whenever the lenses are not on a moving
+        playhead. */}
+    <PageClockRateContext.Provider value={playhead !== null && transport.playing ? transport.speed : 0}>
     <div className="app-shell">
       {/* (Chrome packet) The masthead — brand, build chip, the catalog/
           liveness pill, refresh, topnav — moved out of this function into
@@ -900,6 +906,7 @@ export function App() {
         )}
       </div>
     </div>
+    </PageClockRateContext.Provider>
     </SeekSignalContext.Provider>
   );
 }
