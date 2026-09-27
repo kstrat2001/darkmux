@@ -1062,14 +1062,13 @@ impl DispatchSingleShotStepKind {
             };
             let reply = single_shot_chat_hosted(&req)
                 .with_context(|| format!("step `{}` dispatch.single_shot (hosted)", step.id))?;
-            crate::budget::settle_step(
+            crate::budget::settle_step_live(
                 &step_bucket,
                 max_tokens,
                 reply.total_tokens.unwrap_or(u64::from(max_tokens)),
                 1,
                 &step.id,
                 &budget_caller,
-                &crate::budget::LiveEnv,
             );
 
             // (#1412) Surface actual spend the same way `dispatch_remote`
@@ -2699,15 +2698,13 @@ fn map_hosted_item(
         match dispatch {
             Ok(reply) => {
                 calls.push(MapCall::from_reply(&reply));
-                crate::budget::settle_step(
+                crate::budget::settle_step_live(
                     bucket,
                     clamped,
                     conservative_hosted_spend(reply.total_tokens, clamped),
                     1,
                     step_label,
-                    caller,
-                    &crate::budget::LiveEnv,
-                );
+                    caller);
                 if let Some(t) = reply.total_tokens {
                     sum += t;
                     any_usage = true;
@@ -2758,7 +2755,7 @@ fn map_hosted_item(
             Err(e) => {
                 // Release the reservation — a dispatch-level error spent
                 // nothing (the pre-reserve accounting billed 0 here too).
-                crate::budget::settle_step(bucket, clamped, 0, 1, step_label, caller, &crate::budget::LiveEnv);
+                crate::budget::settle_step_live(bucket, clamped, 0, 1, step_label, caller);
                 if error_budget == 0 {
                     return MapItemResult {
                         index,
@@ -5075,7 +5072,114 @@ mod tests {
         });
         assert!(msg.contains("stopped waiting on endpoint `azure`'s budget"), "{msg}");
         assert!(!msg.contains("dispatch.single_shot (hosted)"), "nothing was sent: {msg}");
-        assert_eq!(env.actions(), vec![crate::budget::BUDGET_WAIT_ACTION.to_string()]);
+        assert_eq!(
+            env.actions(),
+            vec![crate::budget::BUDGET_WAIT_ACTION.to_string(), crate::budget::BUDGET_STOP_ACTION.to_string()],
+            "the ended wait is recorded as a stop"
+        );
+    }
+
+    /// A registry naming endpoint `azure` at `url` (no limits), returning
+    /// the tempdir guard and the registry path.
+    fn azure_registry(url: &str) -> (tempfile::TempDir, String) {
+        let reg = tempfile::TempDir::new().unwrap();
+        let pf = reg.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            json!({
+                "profiles": {"p": {"models": [{"id": "m", "n_ctx": 1}]}},
+                "endpoints": {"azure": {"url": url}},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let path = pf.to_str().unwrap().to_string();
+        (reg, path)
+    }
+
+    /// (#2902 step 5 review, 3rd pass MUST FIX 1) A hosted
+    /// `dispatch.single_shot` against a NAMED endpoint stamps that id on its
+    /// usage record (what the endpoint's window sums by), and settles the
+    /// REPLY's total into the per-step bucket: a 10-token cap and a
+    /// 12-token reply warn with `spent: 12`. Settling 0 (or the reservation)
+    /// would leave the bucket silent.
+    #[test]
+    #[serial_test::serial] // DARKMUX_REMOTE_MAX_TOKENS_PER_STEP
+    fn a_named_hosted_single_shot_stamps_its_endpoint_id_and_settles_the_reply() {
+        let server = httpmock::MockServer::start();
+        let mock = usage_mock(&server, true);
+        let (_reg, pf) = azure_registry(&format!("{}/v1", server.base_url()));
+        let s = step(
+            "s1",
+            "dispatch.single_shot",
+            json!({ "model": "gpt-5.1", "user": "hi", "endpoint": "azure", "config_path": pf, "max_tokens": 5 }),
+        );
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
+        let out = with_env(&[("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "10")], || {
+            crate::budget::with_test_env(env.clone(), || {
+                DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new())
+            })
+        })
+        .expect("mock answers");
+        mock.assert_hits(1);
+        let recs = as_values(&out.flow_records);
+        let rec = crate::usage::assert_one_usage_record(&recs, crate::usage::CallKind::SingleShot, "single_shot (named)");
+        assert_eq!(rec["payload"]["endpoint_id"], "azure", "{rec}");
+        assert_eq!(env.actions(), vec![crate::budget::BUDGET_WARN_ACTION.to_string()]);
+        let w = env.payload(crate::budget::BUDGET_WARN_ACTION);
+        assert_eq!(w["scope"], "step");
+        assert_eq!(w["spent"], 12, "the reply's total, not the 5-token grant: {w}");
+        assert_eq!(w["limit"], 10);
+    }
+
+    /// (#2902 step 5 review, zero doctrine) A per-step cap of 0 is NO cap:
+    /// a 12-token reply against `0` warns nothing and reports no budget,
+    /// where a real cap of 10 warns (the test above).
+    #[test]
+    #[serial_test::serial] // DARKMUX_REMOTE_MAX_TOKENS_PER_STEP
+    fn a_zero_step_cap_is_no_cap_and_never_warns() {
+        let server = httpmock::MockServer::start();
+        let _mock = usage_mock(&server, true);
+        let (_reg, pf) = azure_registry(&format!("{}/v1", server.base_url()));
+        let s = step(
+            "s1",
+            "dispatch.single_shot",
+            json!({ "model": "gpt-5.1", "user": "hi", "endpoint": "azure", "config_path": pf, "max_tokens": 5 }),
+        );
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
+        let out = with_env(&[("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "0")], || {
+            crate::budget::with_test_env(env.clone(), || {
+                DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new())
+            })
+        })
+        .expect("mock answers");
+        assert!(env.actions().is_empty(), "no cap, no warning: {:?}", env.actions());
+        let o: serde_json::Value = serde_json::from_str(&out.output).unwrap();
+        assert!(o["remote_max_tokens_per_execution"].is_null(), "no cap is reported: {o}");
+    }
+
+    /// (#2902 step 5 review, 3rd pass MUST FIX 1) A hosted `dispatch.map`
+    /// item against a NAMED endpoint stamps that id on its per-call usage
+    /// record.
+    #[test]
+    fn a_named_hosted_map_item_stamps_its_endpoint_id() {
+        let server = httpmock::MockServer::start();
+        let mock = usage_mock(&server, true);
+        let (_reg, pf) = azure_registry(&format!("{}/v1", server.base_url()));
+        let s = map_step(json!({
+            "model": "gpt-5.1", "user_template": "check {item}", "collection": ["a"],
+            "endpoint": "azure", "config_path": pf,
+        }));
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
+        let out = crate::budget::with_test_env(env.clone(), || {
+            DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new())
+        })
+        .expect("mock answers");
+        mock.assert_hits(1);
+        let recs = as_values(&out.flow_records);
+        let rec = crate::usage::assert_one_usage_record(&recs, crate::usage::CallKind::MapItem, "map item (named)");
+        assert_eq!(rec["payload"]["endpoint_id"], "azure", "{rec}");
+        assert_eq!(rec["payload"]["remote"], true);
     }
 
     #[test]
@@ -7035,10 +7139,11 @@ mod tests {
         out
     }
 
-    /// (#2902 step 5) A spent per-step cap (0) under the default `warn`
-    /// never refuses the hosted call: the call is ATTEMPTED (proven by the
-    /// hosted arm's own error context against an unroutable port), and the
-    /// error is the network's, never a budget refusal. Pre-4.0, 0 refused.
+    /// (#2902 step 5) A per-step cap of 0 is no cap (the zero doctrine:
+    /// a `0` on a darkmux bound means unbounded): the hosted call is
+    /// ATTEMPTED (proven by the hosted arm's own error context against an
+    /// unroutable port), and the error is the network's, never a budget
+    /// refusal. Pre-4.0, 0 refused.
     #[test]
     #[serial_test::serial]
     fn dispatch_single_shot_hosted_arm_under_warn_calls_even_with_a_zero_step_cap() {

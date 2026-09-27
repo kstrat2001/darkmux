@@ -288,7 +288,7 @@
         let endpoint_gate = body.find("crate::budget::admit_endpoint(ep,").expect("endpoint gate");
         let step_gate = body.find("crate::budget::admit_step(").expect("per-step reservation");
         let call = body.find("remote_chat_completion(").expect("the call");
-        let settle = body.find("crate::budget::settle_step(").expect("per-step settle");
+        let settle = body.find("crate::budget::settle_step_live(").expect("per-step settle");
         assert!(endpoint_gate < open && step_gate < open, "both run before the first record");
         assert!(settle > call, "the per-step cap is settled with the call's real spend");
         assert!(!src.contains("fn admit_remote_execution("), "the pre-4.0 zero-refusal gate is gone");
@@ -335,7 +335,11 @@
         }
         let err = format!("{:#}", result.expect_err("a stopped wait must not dispatch"));
         assert!(err.contains("stopped waiting on endpoint `azure`'s budget") && err.contains("nothing was sent"), "{err}");
-        assert_eq!(env.actions(), vec![crate::budget::BUDGET_WAIT_ACTION.to_string()]);
+        assert_eq!(
+            env.actions(),
+            vec![crate::budget::BUDGET_WAIT_ACTION.to_string(), crate::budget::BUDGET_STOP_ACTION.to_string()],
+            "the ended wait is recorded as a stop"
+        );
         assert!(rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(), "the endpoint received no request");
     }
 
@@ -383,7 +387,11 @@
         }
         let err = format!("{:#}", result.expect_err("a stopped wait must not start the container"));
         assert!(err.contains("stopped waiting on endpoint `azure`'s budget") && err.contains("nothing was sent"), "{err}");
-        assert_eq!(env.actions(), vec![crate::budget::BUDGET_WAIT_ACTION.to_string()]);
+        assert_eq!(
+            env.actions(),
+            vec![crate::budget::BUDGET_WAIT_ACTION.to_string(), crate::budget::BUDGET_STOP_ACTION.to_string()],
+            "the ended wait is recorded as a stop"
+        );
     }
 
     /// (#2902 step 5 review C-a, MF1) The sampler's pacer call, driven on
@@ -17507,6 +17515,115 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(p["total_tokens"], 130);
         assert_eq!(p["token_source"], "provider");
         assert!(p.get("reported_model").is_none(), "the event named no model: {p}");
+    }
+
+    /// (#2902 step 5 review, 3rd pass MUST FIX 1) The container path's
+    /// per-turn usage record carries the hosted brain's endpoint id, the key
+    /// an endpoint's window budget sums by.
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
+    fn usage_conformance_container_turn_stamps_the_endpoint_id() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            "sess-usage-epid".into(),
+            "coder".into(),
+            "gpt-hosted".into(),
+        )
+        .with_endpoint(Some("azure:gpt-hosted".into()))
+        .with_endpoint_id(Some("azure".into()));
+        state.handle_event(
+            r#"{"type":"model.completed","seq":1,"finish_reason":"stop","usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}"#,
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+        let records = drain_flow_records_for_session(tmp.path(), "sess-usage-epid");
+        let rec = crate::usage::assert_one_usage_record(&records, crate::usage::CallKind::Turn, "container turn (named)");
+        assert_eq!(rec["payload"]["endpoint_id"], "azure", "{rec}");
+    }
+
+    /// (#2902 step 5 review, 3rd pass MUST FIX 1) What `dispatch()` hands
+    /// the tailer as its endpoint id: the hosted brain's registry id when
+    /// named, nothing for an inline endpoint or a local brain.
+    #[test]
+    fn the_tailer_endpoint_id_is_the_hosted_brains_registry_id() {
+        let mut pm: darkmux_types::ProfileModel =
+            serde_json::from_str(r#"{"id":"gpt-remote","endpoint":{"url":"https://h.example/v1"}}"#).unwrap();
+        let inline = crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap();
+        assert_eq!(tailer_endpoint_id(Some(&inline)), None, "an inline endpoint has no id");
+        pm.endpoint.as_mut().unwrap().source = darkmux_types::EndpointSource::Named("azure".into());
+        let named = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
+        assert_eq!(tailer_endpoint_id(Some(&named)).as_deref(), Some("azure"));
+        assert_eq!(tailer_endpoint_id(None), None, "a local brain");
+    }
+
+    /// (#2902 step 5 review, 3rd pass MUST FIX 1) `dispatch_remote` against
+    /// a NAMED endpoint stamps its id on the usage record and settles the
+    /// REPLY's total into the per-step bucket: a 5-token cap and a 9-token
+    /// reply warn with `spent: 9` (settling 0 would stay silent).
+    #[test]
+    #[serial]
+    fn dispatch_remote_stamps_the_endpoint_id_and_settles_the_reply() {
+        let (base_url, rx) = one_shot_http_mock(
+            r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":6,"completion_tokens":3,"total_tokens":9}}"#,
+        );
+        let home = TempDir::new().unwrap();
+        let flows_dir = TempDir::new().unwrap();
+        let keys = ["DARKMUX_HOME", "DARKMUX_FLOWS_DIR", "DARKMUX_REDIS_URL", "DARKMUX_REMOTE_MAX_TOKENS_PER_STEP"];
+        let prev: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", "5");
+        }
+        let session = format!("budget-epid-remote-{}", std::process::id());
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "pr-reviewer".to_string();
+        opts.session_id = Some(session.clone());
+        opts.phase_id = None;
+        let mut pm: darkmux_types::ProfileModel =
+            serde_json::from_str(&format!(r#"{{"id":"gpt-remote","endpoint":{{"url":"{base_url}"}}}}"#)).unwrap();
+        pm.endpoint.as_mut().unwrap().source = darkmux_types::EndpointSource::Named("azure".into());
+        let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
+        let result = crate::budget::with_test_env(env.clone(), || {
+            dispatch_remote(
+                &opts,
+                &quarantine_test_role(),
+                "system prompt",
+                &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap(),
+            )
+        });
+        let records = drain_flow_records_for_session(flows_dir.path(), &session);
+        unsafe {
+            for (k, v) in keys.iter().zip(prev) {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        result.expect("the mock answers");
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(), "the endpoint was called");
+        let rec = crate::usage::assert_one_usage_record(&records, crate::usage::CallKind::SingleShot, "dispatch_remote (named)");
+        assert_eq!(rec["payload"]["endpoint_id"], "azure", "{rec}");
+        assert_eq!(env.actions(), vec![crate::budget::BUDGET_WARN_ACTION.to_string()]);
+        let w = env.payload(crate::budget::BUDGET_WARN_ACTION);
+        assert_eq!((w["scope"].as_str(), w["spent"].as_u64(), w["limit"].as_u64()), (Some("step"), Some(9), Some(5)), "{w}");
     }
 
     /// (#2902 step 1b) Drive the tailer with `events` and return its session's

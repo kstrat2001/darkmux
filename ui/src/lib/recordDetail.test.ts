@@ -459,6 +459,9 @@ describe("budget records (#2902 step 5)", () => {
       recordDetail(rec("budget.warn", { endpoint_id: "azure", spent: 2000000, limit: 2000000, metric: "tokens", period: "1d" })),
     ).toBe("azure: 2000000/2000000 tokens per 1d");
     expect(recordDetail(rec("budget.resume", { endpoint_id: "azure", waited_ms: 45000 }))).toBe("azure: resumed after 45s");
+    expect(recordDetail(rec("budget.stop", { endpoint_id: "azure", reason: "mission `m` is aborted" }))).toBe(
+      "azure: wait stopped (mission `m` is aborted)",
+    );
     expect(recordObject(rec("budget.wait", { endpoint_id: "azure", wait_seconds: 60 })).text).toBe(
       "azure: waiting 1m",
     );

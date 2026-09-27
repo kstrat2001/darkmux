@@ -86,7 +86,7 @@ impl FakeEnv {
     pub(crate) fn actions(&self) -> Vec<String> {
         self.emitted.borrow().iter().map(|r| r.action.clone()).collect()
     }
-    fn payload(&self, action: &str) -> serde_json::Value {
+    pub(crate) fn payload(&self, action: &str) -> serde_json::Value {
         self.emitted.borrow().iter().find(|r| r.action == action).and_then(|r| r.payload.clone()).unwrap()
     }
 }
@@ -310,6 +310,8 @@ fn two_breached_budgets_resume_at_the_later_time() {
     assert_eq!(resume_at, Some(T0 - 400 + DAY));
 }
 
+/// (Defensive: `limits.validate` refuses a zero window, so only a budget
+/// built directly reaches this.) No resume time exists for 0.
 #[test]
 fn a_zero_budget_waits_with_no_resume_time() {
     let b = budget(BudgetPolicy::Wait, Some(0), None, None);
@@ -327,6 +329,22 @@ fn warn_at_warns_early_and_is_never_guessed() {
     assert_eq!(evaluate(&without, &[(T0 - 1, 999)], T0), Verdict::Proceed, "no threshold picked by darkmux");
     let wait_early = budget(BudgetPolicy::Wait, Some(1_000), None, Some(0.8));
     assert!(matches!(evaluate(&wait_early, &[(T0 - 1, 900)], T0), Verdict::Warn(_)), "wait warns early, waits only at the limit");
+}
+
+/// (3rd review #2) The warning names the policy it runs under: an early
+/// warning under `wait` says the calls will wait at the limit, never
+/// "policy warn".
+#[test]
+fn the_warning_names_the_policy_it_runs_under() {
+    let env = FakeEnv::new(vec![(T0 - 60, 900)]);
+    admit_with(budget(BudgetPolicy::Wait, Some(1_000), None, Some(0.8)), &BudgetCaller::default(), &env).unwrap();
+    let said = env.said.borrow()[0].clone();
+    assert!(said.contains("policy wait: continuing; calls wait once the budget is reached"), "{said}");
+    assert!(!said.contains("policy warn"), "{said}");
+    assert_eq!(env.payload(BUDGET_WARN_ACTION)["policy"], "wait");
+    let env = FakeEnv::new(vec![(T0 - 60, 900)]);
+    admit_with(budget(BudgetPolicy::Warn, Some(1_000), None, Some(0.8)), &BudgetCaller::default(), &env).unwrap();
+    assert!(env.said.borrow()[0].contains("policy warn: continuing"), "{:?}", env.said.borrow());
 }
 
 #[test]
@@ -389,6 +407,9 @@ fn a_stopped_run_ends_a_wait_and_nothing_is_sent() {
     let err = admit_with(b, &BudgetCaller::default(), &env).unwrap_err().to_string();
     assert!(err.contains("mission `m` is aborted") && err.contains("nothing was sent"), "{err}");
     assert!(env.slept_ms.get() <= 2_500, "stopped within one slice: {}", env.slept_ms.get());
+    assert_eq!(env.actions(), vec![BUDGET_WAIT_ACTION, BUDGET_STOP_ACTION], "an announced wait records its stop");
+    let stop = env.payload(BUDGET_STOP_ACTION);
+    assert_eq!((stop["endpoint_id"].as_str(), stop["reason"].as_str()), (Some("azure"), Some("mission `m` is aborted")));
 }
 
 /// (review M1) The stop is read from DISK, where `darkmux mission abort`
@@ -428,6 +449,7 @@ fn an_aborted_mission_on_disk_stops_its_waiter_without_sending() {
     let err = res.unwrap_err().to_string();
     assert!(err.contains("mission `m1` is aborted") && err.contains("nothing was sent"), "{err}");
     assert_eq!(env.slept_ms.get(), 0, "already aborted: it never sleeps");
+    assert!(env.actions().is_empty(), "no wait was announced, so no stop is recorded: {:?}", env.actions());
     assert_eq!(live.as_deref(), Some("mission `m1` is aborted"), "LiveEnv reads the same disk");
 }
 
@@ -451,6 +473,21 @@ fn an_endpoint_removed_while_waiting_releases_it() {
     *env.reload_to.borrow_mut() = Some(None);
     admit_with(budget(BudgetPolicy::Wait, Some(1_000), None, None), &BudgetCaller::default(), &env).unwrap();
     assert_eq!(env.actions(), vec![BUDGET_WAIT_ACTION, BUDGET_RESUME_ACTION]);
+}
+
+/// (3rd review #3) The reload release point re-checks the stop: an abort
+/// and a budget removal landing in the same slice send nothing, and the
+/// ended wait is recorded as `budget.stop`, never `budget.resume`.
+#[test]
+fn an_abort_and_a_removal_in_one_slice_still_send_nothing() {
+    let env = FakeEnv::full_window().stopped_after(1, "mission `m` is aborted");
+    *env.reload_to.borrow_mut() = Some(None);
+    let err = admit_with(budget(BudgetPolicy::Wait, Some(1_000), None, None), &BudgetCaller::default(), &env)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("mission `m` is aborted") && err.contains("nothing was sent"), "{err}");
+    assert_eq!(env.actions(), vec![BUDGET_WAIT_ACTION, BUDGET_STOP_ACTION]);
+    assert_eq!(env.payload(BUDGET_STOP_ACTION)["reason"], "mission `m` is aborted");
 }
 
 /// (review C-i, C4) `LiveEnv::reload` reads the command's own registry: an
@@ -484,9 +521,11 @@ fn a_budget_switched_off_while_waiting_releases_it() {
     assert_eq!(env.actions(), vec![BUDGET_WAIT_ACTION, BUDGET_RESUME_ACTION]);
 }
 
-/// A zero budget under `wait` waits (it has no resume time) and polls.
+/// A zero budget cannot come from a registry (`limits.validate` refuses
+/// it: 0 is not a budget); built directly, the gate still stays sound: it
+/// waits with no resume time and polls until the budget is raised.
 #[test]
-fn a_zero_budget_waits_until_raised() {
+fn a_zero_budget_built_directly_waits_until_raised() {
     let env = FakeEnv::new(vec![]);
     *env.reload_to.borrow_mut() = Some(Some(budget(BudgetPolicy::Wait, Some(5), None, None)));
     admit_with(budget(BudgetPolicy::Wait, Some(0), None, None), &BudgetCaller::default(), &env).unwrap();
@@ -815,6 +854,42 @@ fn active_waits_lists_open_waits_from_live_processes_only() {
     let open = waits.iter().find(|w| w.session_id.as_deref() == Some("open")).unwrap();
     assert_eq!(open.resumes_in_secs, Some(600));
     assert_eq!(open.mission_id.as_deref(), Some("m-1"));
+}
+
+/// (3rd review #3) A wait whose run was stopped (its mission aborted on
+/// disk) is not listed, even while its process lives; an active mission's
+/// wait is.
+#[test]
+#[serial_test::serial]
+fn active_waits_skip_a_stopped_runs_wait() {
+    let crew = tempfile::tempdir().unwrap();
+    let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+    unsafe { std::env::set_var("DARKMUX_CREW_DIR", crew.path()) };
+    for (m, status) in [("m-live", "active"), ("m-gone", "aborted")] {
+        let path = crate::lifecycle::mission_path(m);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!(r#"{{"status":"{status}"}}"#)).unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let rec = |sid: &str, mission: &str| {
+        serde_json::json!({
+            "ts": darkmux_flow::ts_utc_at(T0 - 30), "action": BUDGET_WAIT_ACTION, "session_id": sid, "mission_id": mission,
+            "payload": {"scope": "endpoint", "endpoint_id": "azure", "pid": 1,
+                "resume_at": darkmux_flow::ts_utc_at(T0 + 600), "message": "m"}
+        })
+        .to_string()
+            + "\n"
+    };
+    append(dir.path(), T0, &(rec("s-live", "m-live") + &rec("s-gone", "m-gone")));
+    let waits = active_waits(dir.path(), T0, 86_400, &|_| true);
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+            None => std::env::remove_var("DARKMUX_CREW_DIR"),
+        }
+    }
+    let sessions: Vec<&str> = waits.iter().filter_map(|w| w.session_id.as_deref()).collect();
+    assert_eq!(sessions, vec!["s-live"]);
 }
 
 /// (review C2) A long window's wait was announced up to a window ago: it

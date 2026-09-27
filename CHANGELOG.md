@@ -90,7 +90,8 @@ darkmux release.
   `wait` is an endpoint budget's value) and `wait` there is refused at
   preflight. Before, a step that reached its cap skipped its remaining
   hosted calls, and each call's `max_tokens` was clamped to what was left;
-  neither happens now, and a cap of `0` is no longer a refusal. `init`
+  neither happens now. A cap of `0` is no cap (a `0` on a darkmux bound
+  means unbounded), where before it refused every hosted call. `init`
   writes both keys visibly as `null`. CONFIG 1.32. **Migration:** a
   `config.json` written by an earlier `init` carries
   `"max_tokens_per_execution": 500000` in its `remote` block; nothing reads
@@ -252,7 +253,8 @@ darkmux release.
   budget, `"limits": {"window": {"period": "1d", "tokens": 2000000}}`: the
   last 24 hours from now, counted from this machine's usage records, with
   no calendar reset (`tokens`, `calls`, or both; the period is `<n>m`,
-  `<n>h` or `<n>d`). `limits.policy` says what reaching it does: `warn`
+  `<n>h` or `<n>d`; `0` is not a budget and is refused: set `policy` to
+  `off` to turn one off). `limits.policy` says what reaching it does: `warn`
   (the default once a budget is set: a warning on the CLI, a Warn-level
   `budget.warn` flow record, and the work keeps going), `wait` (calls to
   that endpoint pause until enough of the window has expired to have room,
@@ -269,13 +271,15 @@ darkmux release.
   policy and the spend in its window. `darkmux mission abort` (or Ctrl-C)
   ends a wait without sending: the wait checks its mission's status on disk
   every half second, and an agentic-remote run the budget holds between
-  turns is ended rather than released (a `budget.stop` record). A misspelled
+  turns is ended rather than released; either way the ended wait is a
+  `budget.stop` record. The viewer reads a hosted call's wait as
+  `REST budget · <endpoint>` until it resumes. A misspelled
   key in `limits` (`windw`, `polcy`, `tokns`) is refused the same way,
   naming the nearest valid key. Budgets apply to
   calls darkmux sends to an endpoint it does not manage; `tokens_per_dispatch`
   and `concurrent_calls` are still shown and not enforced, and
   `remote.concurrent_cap` still applies. FLOW 1.64.0 (`endpoint_id` on usage
-  records, the three `budget.*` actions).
+  records, the four `budget.*` actions: warn, wait, resume, stop).
 
 - **`darkmux machine trust <name>` / `machine untrust <name>`** (#2916).
   Trust adds `fleet.accept_work.<name>` to THIS machine's config.json (and

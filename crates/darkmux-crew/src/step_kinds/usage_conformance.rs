@@ -395,7 +395,7 @@ fn every_hosted_call_site_passes_the_budget_gates() {
                 let call_at = at(call);
                 assert!(at("crate::budget::admit_endpoint(") < call_at, "{}: the endpoint gate runs before `{call}`", gate_in.1);
                 assert!(at("crate::budget::admit_step(") < call_at, "{}: the per-step reservation precedes `{call}`", gate_in.1);
-                assert!(at("crate::budget::settle_step(") > call_at, "{}: the per-step cap settles after `{call}`", gate_in.1);
+                assert!(at("crate::budget::settle_step_live(") > call_at, "{}: the per-step cap settles after `{call}`", gate_in.1);
                 checked += 1;
             }
             Budget::Transport => {}

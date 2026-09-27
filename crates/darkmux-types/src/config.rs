@@ -361,13 +361,6 @@ pub const RENAMED_SETTINGS: &[RenamedSetting] = &[
         advice: "delete it unless you chose that number (500000 was darkmux's old default); the 4.0 per-step \
                  cap is unset by default, set remote.max_tokens_per_step only if you want one",
     },
-    RenamedSetting {
-        old_key: "remote.stage_budget_policy",
-        old_env: "DARKMUX_REMOTE_STAGE_BUDGET_POLICY",
-        new_key: "remote.step_budget_policy",
-        new_env: "DARKMUX_REMOTE_STEP_BUDGET_POLICY",
-        advice: "rename it to remote.step_budget_policy (`off` or `warn`)",
-    },
 ];
 
 /// A leftover old key found in the config or the env.
@@ -2230,10 +2223,10 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert!(found[0].line.contains("config.json key `remote.max_tokens_per_execution` (500000) is ignored"), "{}", found[0].line);
         assert!(found[0].line.contains("renamed to `remote.max_tokens_per_step`") && found[0].line.contains("500000 was darkmux's old default"));
-        let env = |k: &str| (k == "DARKMUX_REMOTE_STAGE_BUDGET_POLICY").then(|| "warn".to_string());
+        let env = |k: &str| (k == "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION").then(|| "9".to_string());
         let found = renamed_leftovers(&DarkmuxConfig::default(), &env);
         assert_eq!(found.len(), 1);
-        assert!(found[0].line.contains("env var DARKMUX_REMOTE_STAGE_BUDGET_POLICY (warn) is ignored"));
+        assert!(found[0].line.contains("env var DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION (9) is ignored"));
         let new: DarkmuxConfig = serde_json::from_str(r#"{"remote":{"max_tokens_per_step":5}}"#).unwrap();
         assert!(renamed_leftovers(&new, &|_| None).is_empty());
         assert!(renamed_leftovers(&DarkmuxConfig::with_defaults(), &|_| None).is_empty());

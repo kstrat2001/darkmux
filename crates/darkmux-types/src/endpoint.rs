@@ -298,6 +298,16 @@ impl UsageLimits {
             }
         }
         if let Some(w) = &self.window {
+            // (zero doctrine) A `0` on a darkmux bound means unbounded,
+            // never "instantly"; a zero budget would be an eternal wait, so
+            // it is refused rather than read either way.
+            for (field, n) in [("tokens", w.tokens), ("calls", w.calls)] {
+                if n == Some(0) {
+                    return Err(format!(
+                        "limits.window.{field} is 0: 0 is not a budget; set policy off to turn it off"
+                    ));
+                }
+            }
             if !w.is_set() && w.period.is_some() {
                 return Err("limits.window sets neither `tokens` nor `calls`".to_string());
             }
@@ -981,6 +991,29 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(ok.validate(), Ok(()));
+    }
+
+    /// (#2902 step 5, zero doctrine) A window of 0 tokens or 0 calls is not
+    /// a budget: refused, naming the field and the way to turn a budget
+    /// off. Unset stays fine, and so does `policy: off` with a real number.
+    #[test]
+    fn a_zero_window_is_refused_and_names_policy_off() {
+        let with = |tokens: Option<u64>, calls: Option<u64>| ModelEndpoint {
+            url: Some("https://h/v1".into()),
+            limits: Some(
+                UsageLimits {
+                    window: Some(UsageWindow { period: Some("1d".into()), tokens, calls, ..Default::default() }),
+                    ..Default::default()
+                }
+                .into(),
+            ),
+            ..Default::default()
+        };
+        let t = with(Some(0), None).validate().unwrap_err();
+        assert!(t.contains("limits.window.tokens is 0") && t.contains("set policy off"), "{t}");
+        let c = with(None, Some(0)).validate().unwrap_err();
+        assert!(c.contains("limits.window.calls is 0") && c.contains("set policy off"), "{c}");
+        assert_eq!(with(Some(1), Some(1)).validate(), Ok(()));
     }
 
     #[test]

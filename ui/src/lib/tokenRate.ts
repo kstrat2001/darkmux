@@ -685,6 +685,27 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
       // before the start it ends (both can share one whole-second `ts`).
       const endedAt = num(fields(r).ended_at_ms);
       m = { atMs: Math.max(endedAt !== null && endedAt > 0 ? endedAt : atMs, marker.atMs), kind: "prompt" };
+    } else if (r.action === "budget.wait") {
+      // (#2902 step 5) A HOSTED call held by its endpoint's budget (a
+      // dispatch, a single-shot or map step): the host announces the wait
+      // once, with how long, and writes no `dispatch.rest` (there is no
+      // runtime to rest). It reads as the same REST an agentic run's budget
+      // pause does: "budget · <endpoint>", counting down to the resume time.
+      // A wait with no resume time has nothing to count and is not a rest
+      // reading.
+      const f = fields(r);
+      const secs = num(f.wait_seconds);
+      if (secs !== null && secs > 0) {
+        m = { atMs, kind: "rest", restMs: secs * 1000 };
+        const why = restReasonLabel("budget", typeof f.endpoint_id === "string" ? f.endpoint_id : undefined);
+        if (why !== null) {
+          m.restReason = why;
+          m.restReasonWord = restReasonWord("budget") ?? why;
+        }
+      }
+    } else if (r.action === "budget.resume" || r.action === "budget.stop") {
+      // The held call went ahead (or the run stopped): the wait is over.
+      m = { atMs, kind: "prompt" };
     } else if (r.action === "dispatch.rest") {
       // Only the completed-rest shape (`ms` present) counts — the
       // announce-only sibling (`pause: false, delay_ms`, no `ms`) is the
@@ -848,7 +869,10 @@ export function liveExecutions(perExecutionRecords: FlowRecord[][], nowMs: numbe
         r.action === "dispatch.turn.heartbeat" ||
         r.action === "dispatch.turn" ||
         r.action === "dispatch.tool" ||
-        r.action === "dispatch.rest"
+        r.action === "dispatch.rest" ||
+        // (#2902 step 5) A hosted call waiting on its budget is live work
+        // before its first bookend: the gate runs before `dispatch start`.
+        r.action === "budget.wait"
       ) {
         evidence = true;
       }

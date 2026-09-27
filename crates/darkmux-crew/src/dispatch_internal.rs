@@ -3453,6 +3453,21 @@ fn dispatch_remote(
     // room (the wait is reported and extends the run's wall-clock bound). A
     // wait whose run is stopped (Ctrl-C, `mission abort`) returns before
     // anything was sent.
+    // (#2344) Session-liveness heartbeat, opened BEFORE the budget gate
+    // (#2902 step 5 review): a call held by its endpoint's budget is live
+    // work, so the run shows on live surfaces while it waits, though no
+    // bookend opens until the model call itself (contract 2). The in-process
+    // twin of the container path's emitter (#638), keyed on the SAME
+    // `session_id` the bookends use. Self-disables when Redis is unset.
+    // Stopped explicitly before each terminal record below; for a `?`/panic
+    // in between (a stopped wait included), `SessionEmitter::drop` (#2344)
+    // removes the presence key itself.
+    let mut session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
+        session_id.clone(),
+        Some(opts.role_id.clone()),
+        Some(pm.id.clone()),
+        mission_id.clone(),
+    );
     let budget_caller = crate::budget::BudgetCaller {
         role_id: Some(&opts.role_id),
         session_id: Some(&session_id),
@@ -3539,13 +3554,6 @@ fn dispatch_remote(
     // (#2344) now removes the presence key itself (pre-claim + DEL), the same
     // teardown `stop()` runs, instead of only halting the beat thread and
     // leaving the TTL to age the key out.
-    let mut session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
-        session_id.clone(),
-        Some(opts.role_id.clone()),
-        Some(pm.id.clone()),
-        mission_id.clone(),
-    );
-
     let req_body = single_shot_body(
         target.dialect,
         &pm.id,
@@ -3619,7 +3627,7 @@ fn dispatch_remote(
             ep.named_id(),
         ),
     );
-    crate::budget::settle_step(&step_bucket, 0, ttok, 1, "dispatch", &budget_caller, &crate::budget::LiveEnv);
+    crate::budget::settle_step_live(&step_bucket, 0, ttok, 1, "dispatch", &budget_caller);
 
 
     let mut complete_payload = serde_json::json!({
@@ -4884,6 +4892,13 @@ pub(crate) fn resume_from_bare_hosted_refusal(role_id: &str) -> String {
     )
 }
 
+/// (#2902 step 5) The `endpoints` id a container dispatch's per-turn usage
+/// records carry: the hosted brain's, when it was named by id; `None` for a
+/// local brain. What an endpoint's window budget sums those turns by.
+fn tailer_endpoint_id(agentic: Option<&crate::target::Target>) -> Option<String> {
+    agentic.and_then(|t| t.endpoint.named_id().map(str::to_string))
+}
+
 /// The container path's session id: the caller's own, else
 /// `crew-dispatch-<role>-<unix_micros>-internal`, scoped to its mission run
 /// (#1918, see `dispatch`'s own comment at its use). One function so the
@@ -4991,6 +5006,16 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     if let Some(t) = &agentic_pm {
         let mission_id = crate::dispatch::resolve_mission_for_phase(opts.phase_id.as_deref());
         let session_id = internal_session_id(&opts, unix_micros, mission_id.as_deref());
+        // (#2902 step 5 review) A held start is live work: a heartbeat while
+        // the gate may wait (no bookend: contract 2 keeps those around model
+        // work). Dropped when the gate returns; the container path's own
+        // emitter takes over from there.
+        let _gate_beat = darkmux_flow::session_presence::spawn_session_emitter(
+            session_id.clone(),
+            Some(opts.role_id.clone()),
+            Some(t.model.id.clone()),
+            mission_id.clone(),
+        );
         crate::budget::admit_endpoint(
             &t.endpoint,
             &crate::budget::BudgetCaller {
@@ -5879,8 +5904,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // (`agentic_pm.is_some()`, i.e. this container's brain is a hosted
         // endpoint, not local LMStudio). The rest exists for GPU thermal /
         // power relief between LOCAL inference bursts; an endpoint has no
-        // GPU on this host to rest, and the per-execution remote allowance
-        // (`DARKMUX_REMOTE_MAX_TOKENS_PER_STEP`) should not pay
+        // GPU on this host to rest, and a hosted brain's spend (metered by
+        // its endpoint budget, `endpoints.<id>.limits`) should not pay
         // latency for a knob that does nothing for it. Forced to `0`
         // regardless of the operator's configured `turn_delay_ms` — see
         // the matching `dispatch_start_payload["turn_delay_ms"]` stamp
@@ -6101,7 +6126,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // (#2902 step 5) The `endpoints` id a hosted brain's turns go
         // through, stamped on each turn's usage record so the endpoint's
         // window budget sums them.
-        agentic_pm.as_ref().and_then(|t| t.endpoint.named_id().map(str::to_string)),
+        tailer_endpoint_id(agentic_pm.as_ref()),
         // (#2902 step 1b) The compactor's endpoint: always the LMStudio base,
         // hosted brain or not (the runtime never routes the compactor through
         // the hosted URL; `runtime/src/main.rs`, #1187).

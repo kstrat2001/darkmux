@@ -191,6 +191,21 @@ const STATES = [
     armed: why.reason.startsWith("thermal"),
     recs: (b, d) => [...b.prefix(d, {}, true, why.reason.startsWith("thermal")), b.rec(at(d, "12:00:08"), "dispatch.rest", { ms: 20000, turn: 1, ...why }), tick(d, "12:00:12")],
   })),
+  {
+    // (#2902 step 5) A HOSTED call held by its endpoint's budget: the host
+    // writes one `budget.wait` (how long, which endpoint) and no
+    // `dispatch.rest`; it reads as the same REST words as the agentic pause.
+    id: "rest-budget-hosted", date: "2026-07-30", now: "12:00:12",
+    runText: /run state: rest \d+s · budget · azure$/, noteText: /^budget · azure$/, rateText: /^budget · azure$/, rateTextPhone: /^budget$/,
+    recs: (b, d) => [
+      ...b.prefix(d),
+      b.rec(at(d, "12:00:08"), "budget.wait", {
+        scope: "endpoint", endpoint_id: "azure", policy: "wait", metric: "tokens", spent: 2000, limit: 2000,
+        wait_seconds: 20, resume_at: at(d, "12:00:28"), pid: 1, message: "darkmux: endpoint `azure` budget reached",
+      }, { category: "telemetry", source: "budget", level: "warn" }),
+      tick(d, "12:00:12"),
+    ],
+  },
   // (#2950) The same run config's non-rest states, so the thermal REST
   // states are measured against states of a run like theirs (armed), not
   // against a run whose ACTIVE TIME has no thermal line at all.

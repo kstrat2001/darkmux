@@ -106,7 +106,7 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.64.0";
 //           `tool_paths[k]` while the turn's k-th running call runs. A
 //           reader that does not know the keys sees 1.63.0 unchanged, and a
 //           pre-1.64.0 record never carries them.
-//   1.64.0 (#2902 step 5, budgets): additive, three actions and one usage
+//   1.64.0 (#2902 step 5, budgets): additive, four actions and one usage
 //           field.
 //
 //           USAGE: `telemetry.tokens.payload.endpoint_id`, the profile
@@ -143,10 +143,12 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.64.0";
 //           null when no per-step cap is set (no default since 4.0), and
 //           `max_tokens_sent` now always equals `max_tokens_requested` (no
 //           call is clamped). An older reader ignores all of it.
-//           `budget.stop` (level `warn`, endpoint scope): a budget wait's
-//           run was stopped (Ctrl-C, `mission abort`, an abandoned phase)
-//           while a container was held; the run is ended and nothing more
-//           is sent. Adds `reason`, `waited_ms`, `pid`.
+//           `budget.stop` (level `warn`, endpoint scope): a budget wait
+//           ended because its run was stopped (Ctrl-C, `mission abort`, an
+//           abandoned phase), closing its `budget.wait`. Written by a
+//           hosted call's gate (the call is never sent) and by the pacer
+//           holding an agentic-remote container (the run is ended). Adds
+//           `reason`, `waited_ms`, `pid`.
 //   1.63.0 (#2947): the degeneracy detector's policy vocabulary names the
 //           action, and one additive action.
 //

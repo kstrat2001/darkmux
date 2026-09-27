@@ -523,6 +523,10 @@ Two rules worth carrying without looking anything up:
   `test_command`, `procedural.shell`'s `command`), on whose expiry the
   command's whole process group is killed and the step reports the timeout.
   `darkmux doctor` prints the resolved value and which reading it got.
+  (#2902 step 5) `remote.max_tokens_per_step = 0` is no per-step cap (no
+  warning, nothing metered); an endpoint budget's `limits.window.tokens: 0`
+  (or `calls: 0`) is REFUSED ("0 is not a budget; set policy off to turn it
+  off"), because read either way it would be an eternal wait.
 - **Two concurrency caps, and they are not interchangeable (#2394).**
   `DARKMUX_REMOTE_CONCURRENT_CAP` → `remote.concurrent_cap` bounds HOSTED
   endpoint dispatches; `DARKMUX_DISPATCH_FREE_CONCURRENCY` →

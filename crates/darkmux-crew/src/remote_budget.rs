@@ -81,8 +81,11 @@ pub struct RemoteBudget {
 }
 
 impl RemoteBudget {
-    /// A bucket with no label ([`Self::record`] returns `None`).
+    /// A bucket with no label ([`Self::record`] returns `None`). A cap of
+    /// `0` is no cap (CLAUDE.md: a `0` on a darkmux bound means unbounded,
+    /// never "instantly").
     pub fn new(budget: Option<u64>, policy: StepBudgetPolicy) -> Self {
+        let budget = budget.filter(|n| *n > 0);
         Self { label: None, budget, policy, used: 0, settled: 0, calls: 0, surfaced: false }
     }
 
@@ -177,6 +180,13 @@ impl RemoteBudget {
 }
 
 #[cfg(test)]
+impl RemoteBudget {
+    fn with_stage_label_for_test(budget: Option<u64>) -> Self {
+        Self::labeled("s", budget, StepBudgetPolicy::Warn)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -240,14 +250,17 @@ mod tests {
         assert_eq!(b.take_breach(), Some(StepBreach { used: 10_100, budget: 10_000 }));
     }
 
-    /// A zero budget under `warn` surfaces the breach at once. (Pre-4.0, 0
-    /// was a hard refusal.)
+    /// (zero doctrine) A cap of 0 is NO cap: nothing is counted, nothing is
+    /// surfaced. (Pre-4.0, 0 was a hard refusal.)
     #[test]
-    fn a_zero_budget_warns_and_never_refuses() {
-        let mut n = RemoteBudget::new(Some(0), StepBudgetPolicy::Warn);
+    fn a_zero_cap_is_no_cap() {
+        let mut n = RemoteBudget::with_stage_label_for_test(Some(0));
         n.admit_reserve(10);
-        n.settle(10, 0, 1);
-        assert!(n.take_breach().is_some(), "0 settled reaches a cap of 0");
+        n.settle(10, 5_000, 1);
+        assert!(!n.counts() && !n.exhausted());
+        assert_eq!(n.take_breach(), None);
+        assert_eq!(n.budget(), None);
+        assert!(n.record().is_none(), "no cap, no row");
     }
 
     /// Concurrent siblings on one shared bucket: every call's reservation

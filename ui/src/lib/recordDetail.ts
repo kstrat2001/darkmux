@@ -117,6 +117,9 @@ function recordDetailRaw(r: FlowRecord): string {
         ? `${subject}: waiting ${spanWords(f.wait_seconds)}`
         : `${subject}: waiting until the budget is raised`;
     }
+    if (a === "budget.stop") {
+      return typeof f.reason === "string" ? `${subject}: wait stopped (${f.reason})` : `${subject}: wait stopped`;
+    }
     if (a === "budget.resume" && typeof f.waited_ms === "number") {
       return `${subject}: resumed after ${spanWords(f.waited_ms / 1000)}`;
     }

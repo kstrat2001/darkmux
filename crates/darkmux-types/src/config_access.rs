@@ -1089,7 +1089,8 @@ pub fn remote_max_tokens_per_step() -> Option<u64> {
     // (#2902 step 5) No built-in default: unset is no per-step cap. An
     // unparseable env value falls through to the config tier, the same
     // lenient rule every numeric accessor follows.
-    pick_parsed("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", cfg, None)
+    // (zero doctrine) `0` is no cap, the same as unset.
+    pick_parsed("DARKMUX_REMOTE_MAX_TOKENS_PER_STEP", cfg, None).filter(|n| *n > 0)
 }
 
 /// (#2902 step 5) What a step that reaches its per-step cap does: `off` or
@@ -1181,9 +1182,8 @@ pub fn radio_humor() -> u8 {
 /// above that the ceiling scales with the value (at `480`, 16 days).
 /// Resolves
 /// `env(DARKMUX_ACP_IDLE_EXIT_MINUTES) > config.runtime.acp_idle_exit_minutes > 30`.
-/// `0` disables self-exit entirely (an explicit opt-out, mirroring
-/// `remote.max_tokens_per_step`'s `0`-means-hard-off convention
-/// elsewhere in this file).
+/// `0` disables self-exit entirely (the "0 on a darkmux bound means
+/// unbounded" rule, CLAUDE.md).
 pub fn acp_idle_exit_minutes() -> u64 {
     let cfg = config().runtime.as_ref().and_then(|r| r.acp_idle_exit_minutes);
     pick_parsed("DARKMUX_ACP_IDLE_EXIT_MINUTES", cfg, Some(30)).unwrap()
@@ -1487,8 +1487,7 @@ pub fn turn_delay_ms_with_source() -> (u64, Source) {
 /// continuous host sampler (the machine stats drawer's live feed). Resolves
 /// `env(DARKMUX_HOST_SAMPLER_INTERVAL_MS) > config.runtime.
 /// host_sampler_interval_ms > 5000` — mirrors `turn_delay_ms`'s wiring
-/// exactly. `0` disables the sampler entirely (an explicit opt-out, same
-/// convention as `remote.max_tokens_per_step`'s `0`).
+/// exactly. `0` disables the sampler entirely (an explicit opt-out).
 pub fn host_sampler_interval_ms() -> u64 {
     let cfg = config().runtime.as_ref().and_then(|r| r.host_sampler_interval_ms);
     pick_parsed("DARKMUX_HOST_SAMPLER_INTERVAL_MS", cfg, Some(5000)).unwrap()

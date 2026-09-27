@@ -478,6 +478,22 @@ describe("deriveLiveState", () => {
     expect(deriveLiveState(recs, beatAtMs + STALL_AFTER_MS + 1_000)).toEqual({ state: "tools" });
   });
 
+  // (#2902 step 5) A hosted call held by its endpoint budget: no
+  // `dispatch.rest` is written, yet it reads REST "budget · <endpoint>",
+  // counting to the announced resume, and ends at `budget.resume`/`stop`.
+  it("reads a hosted budget wait as REST budget · <endpoint> until it resumes", () => {
+    const at = (ms: number) => new Date(ms).toISOString();
+    const wait = { ts: at(1_000), action: "budget.wait", session_id: SID, payload: { endpoint_id: "azure", wait_seconds: 60 } } as unknown as FlowRecord;
+    expect(deriveLiveState([wait], 11_000)).toEqual({
+      state: "rest", restSecondsLeft: 50, restEndMs: 61_000, restReason: "budget · azure", restReasonWord: "budget",
+    });
+    const resumed = { ts: at(20_000), action: "budget.resume", session_id: SID, payload: { endpoint_id: "azure" } } as unknown as FlowRecord;
+    expect(deriveLiveState([wait, resumed], 21_000).state).toBe("prompt");
+    const zero = { ts: at(1_000), action: "budget.wait", session_id: SID, payload: { endpoint_id: "azure", wait_seconds: null } } as unknown as FlowRecord;
+    expect(deriveLiveState([zero], 2_000).state).not.toBe("rest");
+    expect(aggregateLiveState([[wait]], 11_000)?.state).toBe("rest");
+  });
+
   it("is rest with a countdown while inside a reported rest's ms window, then falls to prompt once it elapses", () => {
     const recs = [tool(0), rest(1_000, 15_000)];
     // 1s into the 15s window → 14s left (ceil).

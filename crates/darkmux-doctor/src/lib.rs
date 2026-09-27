@@ -2732,10 +2732,10 @@ fn check_removed_telemetry_record_every_samples() -> Check {
 
 /// (#2902 step 5) Settings RENAMED in 4.0 with no alias
 /// (`darkmux_types::config::RENAMED_SETTINGS`: the per-step cap's
-/// `remote.max_tokens_per_execution` -> `remote.max_tokens_per_step`, and its
-/// policy key). A leftover old key in `config.json` lands in `remote.extras`
-/// and is read by nothing; a leftover old env var is read by nothing. Either
-/// is named with the exact rename. Warn, not Fail: nothing refuses to run.
+/// `remote.max_tokens_per_execution` -> `remote.max_tokens_per_step`). A
+/// leftover old key in `config.json` lands in `remote.extras` and is read by
+/// nothing; a leftover old env var is read by nothing. Either is named with
+/// the rename and what to do. Warn, not Fail: nothing refuses to run.
 fn check_renamed_budget_settings() -> Check {
     let cfg = darkmux_types::config::DarkmuxConfig::load_resolved();
     renamed_settings_status(&cfg, &|k| std::env::var(k).ok(), &resolved_config_path())
@@ -13388,6 +13388,15 @@ mod tests {
         let c = endpoints_status(&typo, &mut no_spend);
         assert_eq!(c.status, Status::Fail, "{}", c.message);
         assert!(c.message.contains("endpoints.e.limits") && c.message.contains("2M"), "{}", c.message);
+        // (zero doctrine) A zero window is not a budget: Fail, naming the
+        // field and `policy off` as the way to turn one off.
+        let zero = materialized(
+            r#"{"profiles":{"p":{"models":[{"id":"m","endpoint":"e"}]}},
+                "endpoints":{"e":{"url":"https://h.example/v1","limits":{"window":{"period":"1d","tokens":0}}}}}"#,
+        );
+        let c = endpoints_status(&zero, &mut |_| panic!("a refused budget must not read the window"));
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("limits.window.tokens is 0") && c.message.contains("set policy off"), "{}", c.message);
     }
 
     /// (#2902 step 4) An inline endpoint still works; doctor names the move.

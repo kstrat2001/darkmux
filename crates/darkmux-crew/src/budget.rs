@@ -623,11 +623,7 @@ pub fn admit_with(mut b: EndpointBudget, caller: &BudgetCaller<'_>, env: &dyn Bu
                 // (review C-b) Room returned, but the run was stopped while
                 // it waited (an abort in the wait's last slice): never send.
                 let why = env.stop_reason(caller).unwrap_or_default();
-                anyhow::bail!(
-                    "darkmux: stopped waiting on endpoint `{}`'s budget ({}): {why}; nothing was sent",
-                    b.endpoint_id,
-                    b.describe()
-                );
+                return Err(stopped_wait(&b, why, waited_ms, announced.is_some(), caller, env));
             }
             Verdict::Proceed => {
                 env.set_last_level(&key, None);
@@ -644,11 +640,7 @@ pub fn admit_with(mut b: EndpointBudget, caller: &BudgetCaller<'_>, env: &dyn Bu
             }
             Verdict::Wait { breach, resume_at } => {
                 if let Some(why) = env.stop_reason(caller) {
-                    anyhow::bail!(
-                        "darkmux: stopped waiting on endpoint `{}`'s budget ({}): {why}; nothing was sent",
-                        b.endpoint_id,
-                        b.describe()
-                    );
+                    return Err(stopped_wait(&b, why, waited_ms, announced.is_some(), caller, env));
                 }
                 if announced != Some(resume_at) {
                     announce_wait(&b, &breach, resume_at, now, caller, env);
@@ -672,10 +664,7 @@ pub fn admit_with(mut b: EndpointBudget, caller: &BudgetCaller<'_>, env: &dyn Bu
                         // stopped meanwhile: re-checked at the top of the
                         // loop, which evaluates nothing against no budget).
                         if let Some(why) = env.stop_reason(caller) {
-                            anyhow::bail!(
-                                "darkmux: stopped waiting on endpoint `{}`'s budget: {why}; nothing was sent",
-                                b.endpoint_id
-                            );
+                            return Err(stopped_wait(&b, why, waited_ms, announced.is_some(), caller, env));
                         }
                         resume_if_waited(&b, caller, env, waited_ms);
                         return Ok(());
@@ -685,6 +674,45 @@ pub fn admit_with(mut b: EndpointBudget, caller: &BudgetCaller<'_>, env: &dyn Bu
             }
         }
     }
+}
+
+/// A wait whose run was stopped: close it in the log (a `budget.stop`
+/// record, when a `budget.wait` was announced, so the wait is ended rather
+/// than inferred) and return the error. Nothing was sent.
+fn stopped_wait(
+    b: &EndpointBudget,
+    why: String,
+    waited_ms: u64,
+    announced: bool,
+    caller: &BudgetCaller<'_>,
+    env: &dyn BudgetEnv,
+) -> anyhow::Error {
+    let message = format!(
+        "darkmux: stopped waiting on endpoint `{}`'s budget ({}): {why}; nothing was sent",
+        b.endpoint_id,
+        b.describe()
+    );
+    if announced {
+        stop_record(&b.endpoint_id, &why, waited_ms, &message, caller, env);
+    }
+    anyhow::anyhow!(message)
+}
+
+/// The `budget.stop` record: a wait ended because its run was stopped.
+fn stop_record(endpoint_id: &str, reason: &str, waited_ms: u64, message: &str, caller: &BudgetCaller<'_>, env: &dyn BudgetEnv) {
+    env.emit(record(
+        darkmux_flow::Level::Warn,
+        BUDGET_STOP_ACTION,
+        caller,
+        serde_json::json!({
+            "scope": "endpoint",
+            "endpoint_id": endpoint_id,
+            "reason": reason,
+            "waited_ms": waited_ms,
+            "pid": std::process::id(),
+            "message": message,
+        }),
+    ));
 }
 
 /// Sleep `span` in [`WAIT_SLICE`]s, stopping early once the caller's run
@@ -750,12 +778,18 @@ fn warn(b: &EndpointBudget, br: &Breach, caller: &BudgetCaller<'_>, env: &dyn Bu
         BreachLevel::Early => format!("is at {}% of its budget", (br.spent.saturating_mul(100)) / br.limit.max(1)),
     };
     let message = format!(
-        "darkmux: ⚠ endpoint `{}` {what}: {} of {} {} in the last {} (policy warn: continuing)",
+        "darkmux: ⚠ endpoint `{}` {what}: {} of {} {} in the last {} ({})",
         b.endpoint_id,
         br.spent,
         br.limit,
         metric_word(br.metric),
-        b.period
+        b.period,
+        match b.policy {
+            // (review #2) An early warning under `wait` continues too: calls
+            // wait only once the budget is reached.
+            BudgetPolicy::Wait => "policy wait: continuing; calls wait once the budget is reached",
+            _ => "policy warn: continuing",
+        }
     );
     env.say(&message);
     env.emit(record(
@@ -1083,19 +1117,7 @@ impl BudgetPacer {
             self.budget.endpoint_id
         );
         env.say(&message);
-        env.emit(record(
-            darkmux_flow::Level::Warn,
-            BUDGET_STOP_ACTION,
-            caller,
-            serde_json::json!({
-                "scope": "endpoint",
-                "endpoint_id": self.budget.endpoint_id,
-                "reason": reason,
-                "waited_ms": self.waited_ms,
-                "pid": std::process::id(),
-                "message": message,
-            }),
-        ));
+        stop_record(&self.budget.endpoint_id, &reason, self.waited_ms, &message, caller, env);
         PacerEvent::Stopped { reason }
     }
 }
@@ -1108,6 +1130,20 @@ impl BudgetPacer {
 /// per-step cap has only `off` and `warn`.
 pub fn admit_step(bucket: &Mutex<crate::remote_budget::RemoteBudget>, requested: u32) {
     bucket.lock().unwrap_or_else(|p| p.into_inner()).admit_reserve(requested);
+}
+
+/// [`settle_step`] against the environment in effect on this thread (the
+/// live one, or a test's stand-in, [`with_env`]): what the production call
+/// sites use, so a behavioral test sees the settle they perform.
+pub fn settle_step_live(
+    bucket: &Mutex<crate::remote_budget::RemoteBudget>,
+    reserved: u32,
+    actual: u64,
+    calls: u32,
+    step: &str,
+    caller: &BudgetCaller<'_>,
+) {
+    with_env(|env| settle_step(bucket, reserved, actual, calls, step, caller, env))
 }
 
 /// Settle one call against a STEP bucket and surface the breach, once, if
