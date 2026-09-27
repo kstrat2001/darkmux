@@ -5,7 +5,7 @@
 [![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/kstrat2001/darkmux/badges/coverage.json)](https://github.com/kstrat2001/darkmux/actions/workflows/quality.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Own your AI workforce.** Run real engineering work on models you already have, on machines you already own. Off the meter.
+**Own your AI workforce.** Run real engineering work on models you already have, on machines you already own.
 
 darkmux turns a Mac (or a few of them on a tailnet) into a working local-AI fleet: config-defined **missions** run as live task graphs by a crew of role-staffed models. Every consequential step gates on your sign-off. Every dispatch leaves a record: which machine, which model, and why. Underneath it, a **lab** that measures what your hardware actually does, so your configuration rests on numbers, not vibes.
 
@@ -45,7 +45,7 @@ Every mission runs as a live task graph you can watch from any device on your ta
 - 🤝 **A crew, not a model.** Roles (coder, reviewer, judge, crawler), each staffed by the right local model, or by a hosted endpoint when a seat needs frontier weights. Your registry, your call.
 - 🔍 **PR review by local models.** `mission launch review` bundles the change, fans probe seats across it, double-confirms every finding with an independent judge, and posts an anchored review. darkmux [reviews its own PRs in public](.github/workflows/darkmux-review.yml) this way.
 - 🧪 **The lab.** `darkmux lab run <workload>` captures wall clock, trajectory, and verify outcome on *your* hardware: baseline, change one knob, measure again. The [published findings](https://darklyenergized.substack.com) are re-runnable claims, not anecdotes.
-- 📊 **A fleet you can see.** One live view across every machine: what's loaded, what's running, and what stayed off the meter. Phone-ready over your tailnet.
+- 📊 **A fleet you can see.** One live view across every machine: what's loaded, what's running, and how many tokens each endpoint and model used. Phone-ready over your tailnet.
 - 🔒 **Provenance by default.** Every dispatch emits a structured record (machine, model, role, mission). Opt-in BLAKE3 hash-chained audit log with edit detection, cron-friendly (`flow integrity-check` exits 2 on a chain break).
 - 🖥️ **Editor-embedded** *(ships in 2.6)*: darkmux as a Zed agent over ACP — slash-command reviews, sign-off dialogs in the editor, and RADIO, the free-text voice on the console.
 

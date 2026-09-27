@@ -495,7 +495,7 @@ const AGENTS_MD_FOOTER: &str = "<!-- darkmux:integration:agents:end -->";
 /// (#1449).
 const INTEGRATION_SECTION_BODY: &str = r#"# darkmux
 
-This project uses [darkmux](https://github.com/kstrat2001/darkmux), a mission orchestrator and lab for local AI. You dispatch roles and launch missions to a crew of local-AI seats; each seat runs local (your own models, off the meter) or cloud (a hosted endpoint when a role needs frontier weights). darkmux keeps the right models resident at the right context under your RAM budget — you don't manage residency by hand.
+This project uses [darkmux](https://github.com/kstrat2001/darkmux), a mission orchestrator and lab for local AI. You dispatch roles and launch missions to a crew of local-AI seats; each seat runs on the model its profile names: one of your own local models, or a hosted endpoint when a role needs frontier weights. darkmux keeps the right models resident at the right context under your RAM budget — you don't manage residency by hand.
 
 ## Available skills
 
