@@ -1738,7 +1738,7 @@ mod tests {
         // production cap by sending an oversize buffer.
         // The cap is 1 MiB; 1.5 MiB of `x` will trip it.
         let mut sse = b"data: ".to_vec();
-        sse.extend(std::iter::repeat(b'x').take(1_500_000));
+        sse.extend(std::iter::repeat_n(b'x', 1_500_000));
         // No newline — the iterator's read must error out.
         let mut iter = ChunkStream::new(&sse[..]);
         let first = iter.next();

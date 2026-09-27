@@ -118,7 +118,7 @@ impl LiveGate {
 
         let window_over = self
             .window_start
-            .map_or(true, |start| ts >= start.saturating_add(self.cadence_ms));
+            .is_none_or(|start| ts >= start.saturating_add(self.cadence_ms));
         if window_over {
             // A new window: this sample opens it. A held sample from the
             // closing window is superseded (steady state, same meaning) —

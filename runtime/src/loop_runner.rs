@@ -5580,7 +5580,7 @@ fn resolve_finish_reason(
 fn promote_terminal_reasoning(msg: &mut Message, finish_reason: &str) -> Option<String> {
     let captured_before_strip = msg.reasoning_content.clone();
     let has_tools = msg.tool_calls.as_ref().is_some_and(|t| !t.is_empty());
-    let content_empty = msg.content.as_deref().map_or(true, |c| c.trim().is_empty());
+    let content_empty = msg.content.as_deref().is_none_or(|c| c.trim().is_empty());
     if !has_tools && content_empty && finish_reason != "length" {
         if let Some(reasoning) = msg.reasoning_content.as_deref() {
             if !reasoning.trim().is_empty() {

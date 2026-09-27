@@ -111,7 +111,7 @@ impl LiveSample {
         }
         let short = |o: &Option<String>| {
             o.as_ref()
-                .map_or(true, |v| v.chars().count() <= MAX_FIELD_CHARS)
+                .is_none_or(|v| v.chars().count() <= MAX_FIELD_CHARS)
         };
         if !short(&s.session_id) || !short(&s.role) || !short(&s.model) {
             return None;
