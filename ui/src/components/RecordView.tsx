@@ -51,7 +51,7 @@ function grouped(n: number): string {
 }
 
 /** Middle-truncate. These ids share long PREFIXES
- *  (`crew-dispatch-coder-1786251936375019-0` vs `…-11db-0-step`), so cutting
+ *  (`<run>.adhoc.coder.1786251936375019-0` vs `<run>.step.s1`), so cutting
  *  the tail removes exactly the part that distinguishes two of them. */
 function midTruncate(s: string, max = 28): string {
   if (s.length <= max) return s;

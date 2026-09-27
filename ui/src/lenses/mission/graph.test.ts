@@ -397,14 +397,12 @@ describe("mergeGraphs", () => {
 });
 
 describe("indexGraph / recordInMission / stepForRecord", () => {
-  it("indexes phase/task/step ids and session correlation keys", () => {
+  it("indexes phase/task/step ids", () => {
     const idx = indexGraph(baseGraph());
     expect(idx.phaseIds.has("p1")).toBe(true);
     expect(idx.taskIds.has("a")).toBe(true);
     expect(idx.stepIds.has("a-step")).toBe(true);
     expect(idx.stepToTask["a-step"]).toBe("a");
-    expect(idx.sessionToStep["step-a-step"]).toBe("a-step");
-    expect(idx.sessions.has("task-a")).toBe(true);
   });
 
   it("recordInMission is authoritative on a present mission_id, even across a handle collision", () => {
@@ -416,38 +414,29 @@ describe("indexGraph / recordInMission / stepForRecord", () => {
   it("recordInMission falls back to proxy matching when mission_id is absent", () => {
     const idx = indexGraph(baseGraph());
     expect(recordInMission(rec({ handle: "a-step" }), idx, "m1")).toBe(true);
-    expect(recordInMission(rec({ session_id: "task-a" }), idx, "m1")).toBe(true);
+    // The session id is an opaque join key: the viewer never reads a step
+    // or task out of its spelling.
+    expect(recordInMission(rec({ session_id: "task-a" }), idx, "m1")).toBe(false);
     expect(recordInMission(rec({ payload: { step_id: "b-step" } }), idx, "m1")).toBe(true);
     expect(recordInMission(rec({ handle: "nope" }), idx, "m1")).toBe(false);
   });
 
-  it("stepForRecord tries payload.step_id, then session_id, then handle, in order", () => {
+  it("stepForRecord tries payload.step_id, then handle, in order", () => {
     const idx = indexGraph(baseGraph());
-    expect(stepForRecord(rec({ payload: { step_id: "b-step" } }), idx, "m1")).toBe("b-step");
-    expect(stepForRecord(rec({ session_id: "step-a-step" }), idx, "m1")).toBe("a-step");
+    expect(stepForRecord(rec({ payload: { step_id: "b-step" }, handle: "a-step" }), idx, "m1")).toBe("b-step");
     expect(stepForRecord(rec({ handle: "b-step" }), idx, "m1")).toBe("b-step");
     expect(stepForRecord(rec({ handle: "not-a-step" }), idx, "m1")).toBeNull();
   });
 
-  // (#1918 QA) The run-SCOPED spelling of correlation key 2. Since FLOW
-  // 1.43.0 a generic `mission launch <config>` step's own
-  // `dispatch complete` carries `session_id: "step-<id>-<missionId>"`
-  // (`session_id::scope_to_run`). That record has no `payload.step_id`
-  // (only the tailer's per-event records are step-stamped) and its
-  // `handle` is the ROLE id, so this key is the only one that can
-  // attribute it -- and `mission_id`, which the scoped record does carry,
-  // gates admission only, never step identity. Without the peel every
-  // completed step's token/turn meter reads 0 after a reload.
-  it("stepForRecord resolves the run-scoped session_id spelling too", () => {
+  // (4.0) A step's own session names its step on every record it emits
+  // (`payload.step_id`, stamped by the producer from the typed session), so
+  // the viewer never peels a step id out of a session-id spelling -- the
+  // pre-4.0 `step-<id>` / `step-<id>-<mission>` forms included.
+  it("stepForRecord never reads a step out of a session id", () => {
     const idx = indexGraph(baseGraph());
-    expect(stepForRecord(rec({ session_id: "step-a-step-m1", mission_id: "m1" }), idx, "m1")).toBe("a-step");
-    // Both spellings coexist in one day file across an upgrade.
-    expect(stepForRecord(rec({ session_id: "step-a-step" }), idx, "m1")).toBe("a-step");
-    // The peel must not invent a step this mission does not own.
-    expect(stepForRecord(rec({ session_id: "step-nope-m1", mission_id: "m1" }), idx, "m1")).toBeNull();
-    // Another mission's scoped session for the SAME step id -- the #1918
-    // collision itself -- stays rejected on `mission_id`.
-    expect(stepForRecord(rec({ session_id: "step-a-step-other", mission_id: "other" }), idx, "m1")).toBeNull();
+    expect(stepForRecord(rec({ session_id: "step-a-step" }), idx, "m1")).toBeNull();
+    expect(stepForRecord(rec({ session_id: "m1.step.a-step", mission_id: "m1" }), idx, "m1")).toBeNull();
+    expect(stepForRecord(rec({ session_id: "m1.step.a-step", mission_id: "m1", payload: { step_id: "a-step" } }), idx, "m1")).toBe("a-step");
   });
 
   it("stepForRecord returns null for a different mission's record", () => {
@@ -805,20 +794,19 @@ describe("isDispatchFamily (#2223): the evidence stepDispatchSessions keys on", 
 describe("stepDispatchSessions (#2223) — the step drill-in's route to the dispatch detail view", () => {
   const M = "m1";
 
-  it("maps a generic-launch step: the emitter-default `step-<id>` session IS the real dispatch", () => {
+  it("maps a generic-launch step: its own step session IS the real dispatch", () => {
     // The regression the adversarial review caught: a `dispatch.internal`
-    // step with no configured session dispatches under `session_id::step`,
-    // literally `step-<id>` (serve's runs.rs "join by session_id" doc). A
-    // prefix filter reads that as graph-minted and makes the drill-in
-    // inert on every generic `mission launch <config>` mission.
+    // step dispatches under its own step session. A filter on the session
+    // id's spelling would make the drill-in inert on every generic
+    // `mission launch <config>` mission; dispatch evidence is the key.
     const map = stepDispatchSessions(
       [
-        rec({ session_id: "step-s1", action: "dispatch.start", payload: { step_id: "s1" } }),
-        rec({ session_id: "step-s1", action: "dispatch.complete", payload: { step_id: "s1" } }),
+        rec({ session_id: "m1.step.s1", action: "dispatch.start", payload: { step_id: "s1" } }),
+        rec({ session_id: "m1.step.s1", action: "dispatch.complete", payload: { step_id: "s1" } }),
       ],
       M,
     );
-    expect(map.s1).toBe("step-s1");
+    expect(map.s1).toBe("m1.step.s1");
   });
 
   it("maps a crew-of-one step through its pinned crew-dispatch session", () => {
@@ -879,20 +867,6 @@ describe("stepDispatchSessions (#2223) — the step drill-in's route to the disp
       M,
     );
     expect(map.s1).toBe("crew-dispatch-ours-0");
-  });
-
-  it("within untagged records, the step's own emitter-default session beats a colliding foreign session", () => {
-    // Generic-launch records are null-mission (serve doc, gap 1/2), so the
-    // mission tier cannot separate ours from a leak. `step-<stepId>` is
-    // deterministic per step and cannot belong to a foreign step.
-    const map = stepDispatchSessions(
-      [
-        rec({ ts: "2026-08-19T09:00:00Z", session_id: "crawl-foreign-1", action: "dispatch.start", payload: { step_id: "s1" } }),
-        rec({ ts: "2026-08-19T08:00:00Z", session_id: "step-s1", action: "dispatch.start", payload: { step_id: "s1" } }),
-      ],
-      M,
-    );
-    expect(map.s1).toBe("step-s1");
   });
 
   it("excludes records positively tagged with a DIFFERENT mission (defense in depth under recordInMission)", () => {
