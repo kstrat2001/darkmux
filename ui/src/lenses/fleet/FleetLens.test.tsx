@@ -2373,6 +2373,9 @@ describe("(#2929) fleet-card links carry a machine key, never the hardware uid",
     fireEvent.click(count!);
     expect(window.location.hash).toBe(`#lens=runs&machine=unnamed-${machineKeyHash(UNNAMED_1).slice(0, 6)}`);
     expect(UUID_RE.test(window.location.hash)).toBe(false);
+  });
+});
+
 // (#2915) Utility work on the fleet card, over the real run: the work model's
 // tube reads "compacting" while its execution compacts, and the machine's
 // utility strip shows the job (a radio signal while routing, the generic
