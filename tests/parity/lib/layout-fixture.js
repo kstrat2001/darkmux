@@ -193,7 +193,7 @@ const STATES = [
     ["rest-unknown", "2026-09-20", { reason: "solar-flare" }, "solar-flare", "solar-flare"],
     // (#2902 step 5) A budget pause on an agentic-remote run: the budget
     // pacer writes `state` as the endpoint id.
-    ["rest-budget", "2026-09-26", { reason: "budget", state: "azure" }, "budget · azure", "budget"],
+    ["rest-budget", "2026-07-22", { reason: "budget", state: "azure" }, "budget · azure", "budget"],
   ].map(([id, date, why, words, phoneWords]) => ({
     id, date, now: "12:00:12",
     runText: new RegExp(`run state: rest \\d+s · ${words}$`),
@@ -214,10 +214,10 @@ const STATES = [
   ...[
     // A standalone `darkmux dispatch` to a hosted endpoint: the wait is the
     // session's first and only record.
-    { id: "rest-budget-hosted", date: "2026-07-30", endpoint: "azure", secs: 20, rest: "\\d+s", words: "budget · azure" },
+    { id: "rest-budget-hosted", date: "2026-07-20", endpoint: "azure", secs: 20, rest: "\\d+s", words: "budget · azure" },
     // (5th review C7) A day window and a long endpoint id: the countdown is
     // "23h 53m", and the id is trimmed so the line fits.
-    { id: "rest-budget-hosted-long", date: "2026-07-28", endpoint: "azure-openai-eastus2-prod", secs: 86_000, rest: "23h 53m", words: "budget · azure-opena…", tube: "23h 53m" },
+    { id: "rest-budget-hosted-long", date: "2026-07-18", endpoint: "azure-openai-eastus2-prod", secs: 86_000, rest: "23h 53m", words: "budget · azure-opena…", tube: "23h 53m" },
   ].map(({ id, date, endpoint, secs, rest, words, tube }) => ({
     id, date, now: "12:00:12", tubeText: tube,
     runText: new RegExp(`run state: rest ${rest} · ${words}$`), noteText: new RegExp(`^${words}$`), rateText: new RegExp(`^${words}$`), rateTextPhone: /^budget$/,
@@ -373,6 +373,15 @@ for (const s of [...STATES, ...HEROES]) {
 }
 
 const ALL = [...STATES, ...HEROES];
+// Each state owns its day: two states on one date would merge into one day's
+// records and measure neither (#2902 step 5: a rebase once put two there).
+{
+  const seen = new Map();
+  for (const s of ALL) {
+    if (seen.has(s.date)) throw new Error(`layout fixture: ${s.id} and ${seen.get(s.date)} share ${s.date}`);
+    seen.set(s.date, s.id);
+  }
+}
 const byDate = new Map(ALL.map((s) => [s.date, s.records]));
 
 /** A date well after every fixture day: a page pinned here reads each
