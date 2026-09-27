@@ -40,14 +40,19 @@ describe("parseRoute", () => {
     expect(parseRoute()).toEqual({ kind: "runs", runsKind: "all", run: null, machine: null });
   });
 
-  it("parses #lens=machine with no uid as the local machine (uid: null)", () => {
+  it("parses #lens=machine with no machine as the local machine (machine: null)", () => {
     setHash("#lens=machine");
-    expect(parseRoute()).toEqual({ kind: "machine", uid: null });
+    expect(parseRoute()).toEqual({ kind: "machine", machine: null });
   });
 
-  it("parses #lens=machine&uid=<uid> as a specific (possibly remote) machine drill-in", () => {
+  it("parses #lens=machine&machine=<key> as a specific (possibly remote) machine drill-in", () => {
+    setHash("#lens=machine&machine=studio");
+    expect(parseRoute()).toEqual({ kind: "machine", machine: "studio" });
+  });
+
+  it("(#2929) still parses an old #lens=machine&uid=<uid> link, into the same field (lenient read)", () => {
     setHash("#lens=machine&uid=some-remote-uid");
-    expect(parseRoute()).toEqual({ kind: "machine", uid: "some-remote-uid" });
+    expect(parseRoute()).toEqual({ kind: "machine", machine: "some-remote-uid" });
   });
 
   it("parses #lens=console&panel=<id>", () => {
@@ -211,7 +216,7 @@ describe("parseRoute", () => {
     expect(parseRoute()).toEqual({ kind: "runs", runsKind: "lab", run: null, machine: null });
 
     setHash("#lens=MACHINE");
-    expect(parseRoute()).toEqual({ kind: "machine", uid: null });
+    expect(parseRoute()).toEqual({ kind: "machine", machine: null });
 
     setHash("#lens=Console");
     expect(parseRoute()).toEqual({ kind: "console", panelId: "", opts: {} });
@@ -464,7 +469,7 @@ describe("isLiveRoute — a daemon-less build is never live, on any lens", () =>
   const liveKinds: Route[] = [
     { kind: "fleet" },
     { kind: "runs", runsKind: "all", run: null, machine: null },
-    { kind: "machine", uid: null },
+    { kind: "machine", machine: null },
     { kind: "console", panelId: "", opts: {} },
     { kind: "unknown", hash: "nonsense" },
   ];

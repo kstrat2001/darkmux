@@ -10,10 +10,11 @@ import { getSource, labRunsSrc, runsSrc } from "../../lib/source";
 import { useDay } from "../../hooks/useDay";
 import { RUNS_KINDS, type RunsKind } from "../../lib/route";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
-import { useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
-import { machineNames, displayNameOf } from "../../lib/flow";
+import { useDecodedMachineKey, useMachineKeyContext } from "../../hooks/useMachineKey";
+import { MACHINE_NOT_FOUND_LABEL, machineLabel } from "../../lib/machineKey";
+import { machineNames } from "../../lib/flow";
 import { LabRunDetail } from "./LabRunDetail";
-import type { RunsResponse, LabRunsResponse, MachineSpecs } from "../../types/handwritten";
+import type { RunsResponse, LabRunsResponse } from "../../types/handwritten";
 import type { Run } from "../../types/generated/Run";
 import {
   RUNS_CAP,
@@ -161,7 +162,7 @@ import {
 export function RunsBoard({
   initialKind,
   initialRun,
-  initialMachineUid,
+  initialMachineKey,
 }: {
   initialKind: RunsKind;
   initialRun: string | null;
@@ -171,13 +172,16 @@ export function RunsBoard({
    * than read live off the route on every render, for the same reason: the
    * kind chips already own a piece of state outside `Route` (see this
    * file's own module doc), and the machine pin composes with it the same
-   * way. */
-  initialMachineUid: string | null;
+   * way.
+   *
+   * (#2929) A machine KEY (`lib/machineKey.ts`), never the hardware uid —
+   * or, on an old link, the uid itself, resolved leniently and rewritten. */
+  initialMachineKey: string | null;
 }) {
   const [kind, setKind] = useState<RunsKind>(initialKind);
   const [showAll, setShowAll] = useState(false);
   const [rowClickNotice, setRowClickNotice] = useState<string | null>(null);
-  const [machineUid, setMachineUid] = useState<string | null>(initialMachineUid);
+  const [machineKey, setMachineKey] = useState<string | null>(initialMachineKey);
   // `state.labRunDir` (viewer.html) — which lab run (if any) this board is
   // showing the detail pane for. Seeded from `initialRun`, independent of
   // `kind` — a lab row (and so this drill-in) is reachable from BOTH
@@ -199,7 +203,7 @@ export function RunsBoard({
   function openLabRun(dir: string) {
     setLabRunDir(dir);
     setRowClickNotice(null);
-    writeHash(canonicalHash({ kind: "runs", runsKind: kind, run: dir, machine: machineUid }));
+    writeHash(canonicalHash({ kind: "runs", runsKind: kind, run: dir, machine: machineKey }));
   }
 
   // The lab-run detail's own "‹ runs" back link (viewer.html:4852/4862,
@@ -209,7 +213,7 @@ export function RunsBoard({
   // here, not a redundant re-fetch).
   function closeLabRun() {
     setLabRunDir(null);
-    writeHash(canonicalHash({ kind: "runs", runsKind: kind, run: null, machine: machineUid }));
+    writeHash(canonicalHash({ kind: "runs", runsKind: kind, run: null, machine: machineKey }));
   }
 
   // (drill-in packet) A one-shot suppression flag for the deep-link re-sync
@@ -257,7 +261,7 @@ export function RunsBoard({
         ? "run detail needs a running daemon — this static build lists runs without their per-run pipeline and event feed."
         : `couldn't open run "${dir}" — it may have been removed, or the link is stale. Showing the run list.`,
     );
-    writeHash(canonicalHash({ kind: "runs", runsKind: kind, run: null, machine: machineUid }));
+    writeHash(canonicalHash({ kind: "runs", runsKind: kind, run: null, machine: machineKey }));
   }
 
   // (#1809) Clears the machine pin — the "back to all machines" half of
@@ -265,7 +269,7 @@ export function RunsBoard({
   // kind filter/lab-run drill-in was active, matching `selectKind`'s own
   // "only the ONE thing that changed" discipline below.
   function clearMachinePin() {
-    setMachineUid(null);
+    setMachineKey(null);
     setShowAll(false);
     writeHash(canonicalHash({ kind: "runs", runsKind: kind, run: labRunDir, machine: null }));
   }
@@ -351,7 +355,7 @@ export function RunsBoard({
   // per click, breaking legacy's "lens hops must not spam history" contract
   // (`syncLabHash`'s own comment) — `replaceState` is the whole reason
   // legacy's mechanism exists.
-  // (#1809) `initialMachineUid` joins the same guard, same reasoning: a
+  // (#1809) `initialMachineKey` joins the same guard, same reasoning: a
   // genuine deep-link onto a DIFFERENT machine pin re-syncs local state;
   // this component's OWN `clearMachinePin`/machine-chip writes echo back
   // through `writeHash` without a `hashchange`, so without the guard they'd
@@ -367,15 +371,15 @@ export function RunsBoard({
       suppressResyncRef.current = false;
       return;
     }
-    const deepLinkUnchanged = initialKind === kind && initialRun === labRunDir && initialMachineUid === machineUid;
+    const deepLinkUnchanged = initialKind === kind && initialRun === labRunDir && initialMachineKey === machineKey;
     if (deepLinkUnchanged) return;
     setKind(initialKind);
     setShowAll(false);
     setRowClickNotice(null);
     setLabRunDir(initialRun);
-    setMachineUid(initialMachineUid);
+    setMachineKey(initialMachineKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialKind, initialRun, initialMachineUid]);
+  }, [initialKind, initialRun, initialMachineKey]);
 
   // These stay unconditional (React's rules-of-hooks — a hook can't sit
   // after the early return below) even though the lab-run-detail branch
@@ -411,18 +415,6 @@ export function RunsBoard({
     queryFn: () => fetchJson<LabRunsResponse>(labRunsSrc()),
     refetchInterval: daemonBacked ? PRESENCE_POLL_MS : false,
   });
-  // (#2921 follow-up) What the machine pin needs to name a machine the way
-  // its fleet card does: this daemon's own specs (the same cached query the
-  // app shell reads) and the declared roster (read once, no poller). Only
-  // while a machine is pinned, and only against a daemon.
-  const pinNeedsName = daemonBacked && machineUid != null;
-  const pinSpecsQuery = useQuery({
-    enabled: pinNeedsName,
-    queryKey: queryKeys.machineSpecs(),
-    queryFn: () => fetchJson<MachineSpecs>("/machine/specs"),
-  });
-  const pinSpecs = pinNeedsName && pinSpecsQuery.data?.ok ? pinSpecsQuery.data.data : null;
-  const { machines: pinRoster } = useFleetRoster(pinNeedsName, false);
 
   // (#2860) A `run=<dir>` deep link (bookmarks, and the retired series view
   // used to write these too) follows the SAME rule as a list-row click: a
@@ -452,7 +444,6 @@ export function RunsBoard({
   // has no `/fleet/machines/live` to poll.
   const nowMs = Date.now();
   const flowWindow = useFlowWindow(nowMs);
-  const liveMachines = useLiveMachines(daemonBacked);
 
   // (#2063) On a daemon-less static build BOTH of the above are gated off
   // (nothing to fetch), which left a machine pin with an EMPTY alias set:
@@ -474,13 +465,28 @@ export function RunsBoard({
   // read is cache reuse. That is a dependency, not a coincidence: if the
   // shell's call is ever route-gated, this board becomes the one that
   // downloads the multi-megabyte file on the runs route, and it would then
-  // want its own `machineUid !== null` gate back. Loading is not "empty": until the file
+  // want its own `machineKey !== null` gate back. Loading is not "empty": until the file
   // lands, an empty alias set would render the pre-#2063 symptom as a flash
   // ("no runs recorded yet" under a raw-uid chip); folded into the pending
   // branch below.
   const day = useDay(null);
   const pinRecords = daemonBacked ? flowWindow.data : (day.raw ?? []); // identity fields only; raw as before
-  const staticPinPending = !daemonBacked && machineUid !== null && day.loading;
+  const staticPinPending = !daemonBacked && machineKey !== null && day.loading;
+
+  // (#2929) The pin's key resolved back to the machine's uid, from the same
+  // inputs its fleet card was named from (presence, this daemon's specs, the
+  // roster — read only while a machine is pinned, and only against a
+  // daemon). An old link carrying the uid itself still resolves, and is
+  // rewritten to the key once those inputs have settled. A key that
+  // resolves to nothing, once they have, pins nothing: no rows, and the chip
+  // says "machine not found" rather than inventing a label no card shows.
+  const pinKey = useMachineKeyContext(pinRecords, daemonBacked ? flowWindow.settled : !day.loading, daemonBacked && machineKey != null);
+  const pinDecoded = useDecodedMachineKey(machineKey, pinKey.ctx, pinKey.settled, (k) => {
+    setMachineKey(k);
+    writeHash(canonicalHash({ kind: "runs", runsKind: kind, run: labRunDir, machine: k }));
+  });
+  const pinUid = pinDecoded?.uid ?? null;
+  const pinResolving = machineKey != null && pinUid == null && !pinKey.settled;
 
   // The lab-run detail pane is its own top-level render, reached without
   // waiting on the two queries above and independent of `kind` (see
@@ -517,7 +523,7 @@ export function RunsBoard({
   // has no honest guess for, and a bar of shimmered zeros would read the
   // same as #2817's "waiting is not zero" defect one level up (a filter
   // chip showing "0" before the count is known).
-  if (!runsQuery.data || !labRunsQuery.data || staticPinPending) {
+  if (!runsQuery.data || !labRunsQuery.data || staticPinPending || pinResolving) {
     return (
       <div data-state="pending" role="status" aria-label="Loading runs">
         <div className="stagehdr">runs</div>
@@ -559,14 +565,16 @@ export function RunsBoard({
   // exclusion it names.
   // (#2921) The shared machine label, with the same specs and roster the
   // machine's fleet card is named from, so the pin and the card agree.
-  const pinnedMachineName = machineUid != null ? displayNameOf(pinRecords, liveMachines, pinSpecs, machineUid, pinRoster) : null;
-  const scopedRuns = machineUid != null ? runsForMachine(runs, machineNames(pinRecords, liveMachines, machineUid)) : runs;
+  const pinNotFound = machineKey != null && pinUid == null;
+  const pinnedMachineName = machineKey == null ? null : pinUid == null ? MACHINE_NOT_FOUND_LABEL : machineLabel(pinKey.ctx, pinUid);
+  const scopedRuns =
+    machineKey == null ? runs : pinUid == null ? [] : runsForMachine(runs, machineNames(pinRecords, pinKey.ctx.liveMachines, pinUid));
 
   function selectKind(k: RunsKind) {
     setKind(k);
     setShowAll(false);
     setRowClickNotice(null);
-    writeHash(canonicalHash({ kind: "runs", runsKind: k, run: null, machine: machineUid }));
+    writeHash(canonicalHash({ kind: "runs", runsKind: k, run: null, machine: machineKey }));
   }
 
   // viewer.html: `labSourceNotice()`.
@@ -588,6 +596,7 @@ export function RunsBoard({
       kind={kind}
       onKind={selectKind}
       pinnedMachineName={pinnedMachineName}
+      pinNotFound={pinNotFound}
       onClearMachine={clearMachinePin}
     />
   );
@@ -660,6 +669,7 @@ function RunsBar({
   kind,
   onKind,
   pinnedMachineName,
+  pinNotFound = false,
   onClearMachine,
 }: {
   counts: Record<string, number>;
@@ -667,6 +677,8 @@ function RunsBar({
   onKind: (k: RunsKind) => void;
   /** `null` = no machine pin — the pre-existing "every machine" board. */
   pinnedMachineName: string | null;
+  /** (#2929) The pin's key names no machine: the chip says so, same slot. */
+  pinNotFound?: boolean;
   onClearMachine: () => void;
 }) {
   return (
@@ -695,7 +707,7 @@ function RunsBar({
           onKeyDown={onActivateKeyDown(onClearMachine)}
           title="clear the machine filter — show runs from every machine"
         >
-          machine: {pinnedMachineName} ✕
+          {pinNotFound ? MACHINE_NOT_FOUND_LABEL : `machine: ${pinnedMachineName}`} ✕
         </span>
       )}
     </div>

@@ -1,3 +1,4 @@
+import { machineKeyHash } from "../../lib/machineKey";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor, fireEvent, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -8,12 +9,12 @@ import { useHashRoute } from "../../lib/useHashRoute";
 function renderBoard(
   initialKind: "all" | "mission" | "dispatch" | "lab" = "all",
   initialRun: string | null = null,
-  initialMachineUid: string | null = null,
+  initialMachineKey: string | null = null,
 ) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <RunsBoard initialKind={initialKind} initialRun={initialRun} initialMachineUid={initialMachineUid} />
+      <RunsBoard initialKind={initialKind} initialRun={initialRun} initialMachineKey={initialMachineKey} />
     </QueryClientProvider>,
   );
 }
@@ -777,6 +778,151 @@ describe("RunsBoard — the machine pin (#1809)", () => {
     expect(document.body.textContent).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
   });
 
+  // (#2929) The pin rides in the address bar as a machine KEY, never the uid.
+  const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+  it("(#2929) an old link carrying the uid still pins the machine, and the hash is rewritten to its key without a history entry", async () => {
+    mockPinnedFetch({ flowToday: uidOnlyToday(), specs: { machine_id: "scratch-box", machine_uid: FAKE_UID } });
+    window.location.hash = `#lens=runs&machine=${FAKE_UID.toLowerCase()}`;
+    const before = window.history.length;
+    renderBoard("all", null, FAKE_UID.toLowerCase());
+    await waitFor(() => expect(screen.getByText(/machine: scratch-box/)).toBeInTheDocument());
+    await waitFor(() => expect(window.location.hash).toBe("#lens=runs&machine=scratch-box"));
+    expect(UUID_RE.test(window.location.hash)).toBe(false);
+    expect(window.history.length).toBe(before);
+  });
+
+  it("(#2929) an old uid link is not rewritten until the roster has landed — a roster name renumbers the unnamed", async () => {
+    // The roster answers late. Before it lands this uid-only machine reads as
+    // "unnamed machine" (key `unnamed-1`); after, it is "studio". Rewriting
+    // on the early answer would leave a key that stops resolving.
+    let releaseRoster: () => void = () => {};
+    const rosterGate = new Promise<void>((r) => {
+      releaseRoster = r;
+    });
+    mockPinnedFetch({ flowToday: uidOnlyToday() });
+    const base = vi.mocked(fetch).getMockImplementation()!;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) =>
+        String(url) === "/fleet/roster"
+          ? rosterGate.then(
+              () =>
+                new Response(JSON.stringify({ machines: [{ id: "studio", address: "a:1", added_unix_ms: 1, machine_uid: FAKE_UID }], error: null }), {
+                  status: 200,
+                }),
+            )
+          : base(url),
+      ),
+    );
+    window.location.hash = `#lens=runs&machine=${FAKE_UID}`;
+    renderBoard("all", null, FAKE_UID);
+    await waitFor(() => expect(screen.getByText(/machine: unnamed machine/)).toBeInTheDocument());
+    await new Promise((r) => setTimeout(r, 200));
+    expect(window.location.hash, "held until the roster settles").toBe(`#lens=runs&machine=${FAKE_UID}`);
+    releaseRoster();
+    await waitFor(() => expect(window.location.hash).toBe("#lens=runs&machine=studio"));
+    expect(screen.getByText(/machine: studio/)).toBeInTheDocument();
+  });
+
+  it("(#2929) a link shared with the earlier `~` separator opens its machine and is rewritten to the `_` form", async () => {
+    const TWIN = "1B2C3D4E-5F60-4172-9384-B5C6D7E8F9A0";
+    mockPinnedFetch({
+      flowToday: [
+        { ts: `${todayUTC()}T00:00:00Z`, machine_uid: FAKE_UID, machine_id: "MacBook-Pro" },
+        { ts: `${todayUTC()}T01:00:00Z`, machine_uid: TWIN, machine_id: "MacBook-Pro" },
+      ],
+    });
+    const hx = machineKeyHash(TWIN).slice(0, 6);
+    window.location.hash = `#lens=runs&machine=MacBook-Pro%7E${hx}`;
+    renderBoard("all", null, `MacBook-Pro~${hx}`);
+    await waitFor(() => expect(window.location.hash).toBe(`#lens=runs&machine=MacBook-Pro_${hx}`));
+    expect(screen.getByText(/machine: MacBook-Pro/)).toBeInTheDocument();
+  });
+
+  it("(#2929) a name key pins the machine it names", async () => {
+    mockPinnedFetch();
+    renderBoard("all", null, "MacBook-Pro");
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    expect(screen.getByText(/machine: MacBook-Pro/)).toBeInTheDocument();
+    expect(screen.queryByText("m2")).not.toBeInTheDocument();
+    // A key link is already canonical: nothing rewrites it.
+    fireEvent.click(document.querySelector('[data-arg="mission"]')!);
+    expect(window.location.hash).toBe("#lens=runs&kind=mission&machine=MacBook-Pro");
+  });
+
+  it("(#2929) two unnamed machines: the second's key pins the second one, not the first", async () => {
+    const OTHER = "1B2C3D4E-5F60-4172-9384-B5C6D7E8F9A0";
+    mockPinnedFetch({
+      flowToday: [
+        { ts: `${todayUTC()}T00:00:00Z`, machine_uid: FAKE_UID },
+        { ts: `${todayUTC()}T01:00:00Z`, machine_uid: OTHER },
+      ],
+    });
+    renderBoard("all", null, `unnamed-${machineKeyHash(OTHER).slice(0, 6)}`);
+    await waitFor(() => expect(screen.getByText(/machine: unnamed machine 2/)).toBeInTheDocument());
+    expect(window.location.hash).not.toMatch(UUID_RE);
+  });
+
+  it("(#2929) a key nothing resolves says 'machine not found' in the chip's slot, with no rows", async () => {
+    mockPinnedFetch();
+    const { container } = renderBoard("all", null, "no-such-machine");
+    await waitFor(() => expect(screen.getByText(/runs recorded yet/)).toBeInTheDocument());
+    const chip = container.querySelector('[data-act="clearmachine"]');
+    expect(chip?.textContent).toBe("machine not found ✕");
+    expect(container.textContent).not.toMatch(/unnamed machine/);
+    expect(screen.queryByText("m1")).not.toBeInTheDocument();
+    // A plain unknown key is left as typed: it identifies nothing.
+    expect(window.location.hash).not.toContain("not-found");
+  });
+
+  it("(#2929 C4) an old uid link that resolves to nothing is rewritten to the not-found marker once settled", async () => {
+    mockPinnedFetch();
+    const gone = "3D4E5F60-7182-4394-A5B6-D7E8F9A0B1C2".toLowerCase();
+    window.location.hash = `#lens=runs&machine=${gone}`;
+    const { container } = renderBoard("all", null, gone);
+    await waitFor(() => expect(window.location.hash).toBe("#lens=runs&machine=not-found"));
+    await waitFor(() => expect(container.querySelector('[data-act="clearmachine"]')?.textContent).toBe("machine not found ✕"));
+    expect(UUID_RE.test(window.location.hash)).toBe(false);
+  });
+
+  it("(#2929 C4) an old uid link to a roster-declared machine never seen opens its roster card by name", async () => {
+    const DECLARED = "4E5F6071-8293-44A5-B6C7-E8F9A0B1C2D3";
+    mockPinnedFetch({ roster: [{ id: "garage-mac", address: "a:1", added_unix_ms: 1, machine_uid: DECLARED }] });
+    window.location.hash = `#lens=runs&machine=${DECLARED}`;
+    const { container } = renderBoard("all", null, DECLARED);
+    await waitFor(() => expect(window.location.hash).toBe("#lens=runs&machine=garage-mac"));
+    // (C3) A roster-only card is labeled with its roster id.
+    await waitFor(() => expect(container.querySelector('[data-act="clearmachine"]')?.textContent).toBe("machine: garage-mac ✕"));
+  });
+
+  it("(#2929 C5) while the inputs are still landing, an unresolved key shows the loading rows, not 'machine not found'", async () => {
+    let releaseRoster: () => void = () => {};
+    const rosterGate = new Promise<void>((r) => {
+      releaseRoster = r;
+    });
+    mockPinnedFetch({ flowToday: uidOnlyToday() });
+    const base = vi.mocked(fetch).getMockImplementation()!;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) =>
+        String(url) === "/fleet/roster"
+          ? rosterGate.then(
+              () =>
+                new Response(JSON.stringify({ machines: [{ id: "studio", address: "a:1", added_unix_ms: 1, machine_uid: FAKE_UID }], error: null }), {
+                  status: 200,
+                }),
+            )
+          : base(url),
+      ),
+    );
+    const { container } = renderBoard("all", null, "studio");
+    await new Promise((r) => setTimeout(r, 300));
+    expect(container.querySelector('[data-state="pending"]')).not.toBeNull();
+    expect(container.textContent).not.toMatch(/not found/);
+    releaseRoster();
+    await waitFor(() => expect(container.querySelector('[data-act="clearmachine"]')?.textContent).toBe("machine: studio ✕"));
+  });
+
   it("filters the flat row list to the pinned machine's alias set", async () => {
     mockPinnedFetch();
     renderBoard("all", null, "u1");
@@ -836,7 +982,8 @@ describe("RunsBoard — the machine pin (#1809)", () => {
     fireEvent.click(document.querySelector('[data-arg="dispatch"]')!);
     await waitFor(() => expect(screen.queryByText("m1")).not.toBeInTheDocument());
     expect(screen.getByText("d1")).toBeInTheDocument();
-    expect(window.location.hash).toBe("#lens=runs&kind=dispatch&machine=u1");
+    // (#2929) The old uid link was rewritten to the machine's key.
+    expect(window.location.hash).toBe("#lens=runs&kind=dispatch&machine=MacBook-Pro");
   });
 
   // The regression this whole feature exists to avoid shipping: matching
@@ -861,7 +1008,7 @@ describe("RunsBoard — the machine pin (#1809)", () => {
 
 /**
  * (#1920) A harness that mirrors `App.tsx`'s ACTUAL `RunsBoard` wiring —
- * `initialKind`/`initialRun`/`initialMachineUid` re-derived from
+ * `initialKind`/`initialRun`/`initialMachineKey` re-derived from
  * `useHashRoute()` on every render (`App.tsx`'s `renderRoute`), not fixed
  * props handed to `RunsBoard` once at construction. Every other test in
  * this file uses `renderBoard()`, which constructs `RunsBoard` directly
@@ -875,7 +1022,7 @@ describe("RunsBoard — the machine pin (#1809)", () => {
 function AppLikeRunsHarness() {
   const route = useHashRoute();
   if (route.kind !== "runs") return null;
-  return <RunsBoard initialKind={route.runsKind} initialRun={route.run} initialMachineUid={route.machine} />;
+  return <RunsBoard initialKind={route.runsKind} initialRun={route.run} initialMachineKey={route.machine} />;
 }
 
 describe("RunsBoard — deep-link wiring parity with App.tsx (#1920)", () => {

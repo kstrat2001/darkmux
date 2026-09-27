@@ -97,34 +97,43 @@ export type Route =
    * (`#lens=runs`, `#lens=runs&kind=lab`, …) still parses to `machine:
    * null` and renders identically to before this field existed.
    *
-   * An open string, same precedent as `machine.uid` below and
-   * `dispatch.dispatchId` further down — machine uids are arbitrary
-   * hardware-derived identifiers with no closed set to validate against
-   * here (an unresolvable pin degrades gracefully: `RunsBoard` just shows
-   * zero rows for a uid nothing is filed under, same posture `MachineLens`
-   * already takes for a stale `machine.uid`). This is the runs-lens half of
+   * An open string, same precedent as the machine route's `machine` below
+   * and `dispatch.dispatchId` further down — there is no closed set of
+   * machines to validate against here (a key naming no machine degrades
+   * gracefully: `RunsBoard` shows "machine not found" and zero rows, and
+   * `MachineLens` names it the same way). This is the runs-lens half of
    * `MachineLens`'s `RUNS ON <MACHINE>` list moving out into a real lens —
    * see `MachineLens.tsx`'s own doc and #1508 step 2's commit message
    * (`d2041ae3`), which named this the deliberately-interim piece step 4
-   * was always going to replace. */
+   * was always going to replace.
+   *
+   * (#2929) The value is a machine KEY (`lib/machineKey.ts`: the machine's
+   * name, or `<name>~<hash>` / `unnamed-<hash>`), never the hardware uid — a uid in the address
+   * bar identifies the physical machine to anyone shown a screenshot or a
+   * link. The parser stays lenient: an old link's uid lands here verbatim,
+   * and `RunsBoard` resolves it and rewrites the hash to the key. */
   | { kind: "runs"; runsKind: RunsKind; run: string | null; machine: string | null }
-  /** `uid` — widened this packet (the drill-in packet) to carry a SPECIFIC
-   * machine uid: `null` for the nav-tab/deep-link entry (`goMachine` in
-   * legacy — always "the local machine"), a real uid for a fleet-card
-   * drill (`drillMachine(uid, false)` — local OR remote). Legacy itself has
-   * NO deep-link form for the remote-uid case (`syncLabHash`'s `inMachine`
-   * branch writes only `lens=machine`, never the drilled uid — a real gap,
-   * not a design this port narrows further) — the `uid=` param below is a
-   * genuine, deliberate WIDENING beyond legacy's own address-bar behavior,
-   * so a fleet-card drill into a remote machine is bookmarkable/pasteable
-   * (the hard deep-link requirement this packet's brief sets), where legacy
-   * would silently drop you back to the local machine on reload. `uid` is
-   * an open string (not from `PANEL_IDS`/`RUNS_KINDS`'s closed sets) —
-   * machine uids are arbitrary hardware-derived identifiers, matching
-   * `dispatch.dispatchId`'s existing open-string precedent below. An
-   * unrecognized/stale uid degrades gracefully (see `MachineLens`'s own
-   * doc) rather than needing its own validation here. */
-  | { kind: "machine"; uid: string | null }
+  /** `machine` (named `uid` before #2929) — widened in the drill-in packet
+   * to carry a SPECIFIC machine: `null` for the nav-tab/deep-link entry
+   * (`goMachine` in legacy — always "the local machine"), a machine key for
+   * a drill into one machine (`drillMachine(uid, false)` in legacy — local
+   * OR remote; legacy's argument was the uid, this port's is the key).
+   * Legacy itself has NO deep-link form for the remote case (`syncLabHash`'s
+   * `inMachine` branch writes only `lens=machine` — a real gap, not a design
+   * this port narrows further) — the `machine=` param below is a genuine,
+   * deliberate WIDENING beyond legacy's own address-bar behavior, so a drill
+   * into a remote machine is bookmarkable/pasteable, where legacy would
+   * silently drop you back to the local machine on reload. The value is an
+   * open string (not from `PANEL_IDS`/`RUNS_KINDS`'s closed sets), matching
+   * `dispatch.dispatchId`'s open-string precedent below. A key naming no
+   * machine degrades gracefully (`MachineLens` titles it "machine not
+   * found") rather than needing its own validation here.
+   *
+   * (#2929) Renamed `uid` -> `machine`, and the param with it: the value is
+   * a machine KEY (`lib/machineKey.ts`), never the hardware uid, written as
+   * `machine=<key>` like the runs lens's pin. An old `uid=<uid>` link still
+   * parses (into this same field) and `MachineLens` rewrites it to the key. */
+  | { kind: "machine"; machine: string | null }
   /** `panelId` is `""` for "no explicit panel requested" AND for "an
    * unrecognized id" — both parse the same way, matching legacy's
    * `consoleQuery()`: `PANELS.some(x=>x.id===id) ? id : ""`. The router
@@ -165,7 +174,7 @@ export type Route =
    * `dispatchId` is still the flow `session_id` on the wire — that FIELD
    * keeps its name (renaming it strands every archive, and #1974 demotes
    * "session" to an internal join key rather than deleting it). An open
-   * string, same precedent as `machine.uid` above. */
+   * string, same precedent as `machine.machine` above. */
   | { kind: "dispatch"; dispatchId: string }
   /** `#mission=<id>` — the mission-graph lens (#1868). A FULL NAVIGATION in
    * the LEGACY viewer (`location.href = "/mission/<id>/graph"`, a separate
@@ -183,7 +192,7 @@ export type Route =
    * selected", the pre-existing behavior: every `#mission=<id>` hash this
    * app already emits still parses to `stepId: null` and renders
    * identically to before this field existed. An open string, same
-   * precedent as `dispatch.dispatchId`/`machine.uid` above -- step ids are
+   * precedent as `dispatch.dispatchId`/`machine.machine` above -- step ids are
    * server-derived identifiers with no closed set to validate against
    * here; an unresolvable step degrades gracefully (the lens just never
    * finds a matching `GraphStep`), not validated at parse time. */
@@ -399,8 +408,9 @@ export function parseRoute(): Route {
   }
 
   if (lens === "machine") {
-    const uid = get("uid");
-    return { kind: "machine", uid: uid ? uid : null };
+    // (#2929) `machine=<key>` is canonical; `uid=` is an old link's spelling.
+    const machine = get("machine") || get("uid");
+    return { kind: "machine", machine: machine ? machine : null };
   }
 
   if (lens === "console") {

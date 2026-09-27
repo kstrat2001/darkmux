@@ -11,7 +11,7 @@ function renderMachine(uid: string | null) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <MachineLens uid={uid} />
+      <MachineLens machineKey={uid} />
     </QueryClientProvider>,
   );
 }

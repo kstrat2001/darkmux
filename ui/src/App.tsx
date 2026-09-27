@@ -7,6 +7,7 @@ import { usePlaybackTransport, type PlaybackFocus } from "./hooks/usePlaybackTra
 import { SeekSignalContext } from "./lib/seekSignal";
 import { Scrubber } from "./lenses/catalog/Scrubber";
 import { useSyncHash, writeHash, canonicalHash } from "./lib/hashSync";
+import { MACHINE_NOT_FOUND_LABEL, decodeMachineKey, machineLabel } from "./lib/machineKey";
 import { FleetLens } from "./lenses/fleet/FleetLens";
 import { LensPlaceholder } from "./components/LensPlaceholder";
 import { NavChrome } from "./components/NavChrome";
@@ -504,13 +505,21 @@ export function App() {
   // itself does for its header, not a second implementation.
   // (#2921 follow-up) The roster names a drilled machine nothing else does,
   // exactly as it names that machine's fleet card. Read once, no poller.
-  const { machines: roster } = useFleetRoster(isLiveRoute(route) && route.kind === "machine" && route.uid != null, false);
-  const targetMachineName =
-    route.kind === "machine"
-      ? route.uid != null
-        ? displayNameOf(flowWindow.data, liveMachines, specs, route.uid, roster)
-        : localName
-      : null;
+  const drilledKey = route.kind === "machine" ? route.machine : null;
+  const { machines: roster } = useFleetRoster(isLiveRoute(route) && drilledKey != null, false);
+  // (#2929) The route carries a machine KEY, not the uid; resolve it the way
+  // `MachineLens` does (an unresolved key names no machine, and labels as
+  // one nothing knows — the same not-found title an unknown uid got).
+  const drilledName = useMemo(() => {
+    if (drilledKey == null) return null;
+    const keyCtx = { data: flowWindow.data, liveMachines, specs, roster };
+    const uid = decodeMachineKey(keyCtx, drilledKey).uid;
+    // A key naming no machine says so once the window has landed, rather
+    // than inventing a label no card shows; blank while it is still loading.
+    if (uid == null) return flowWindow.settled ? MACHINE_NOT_FOUND_LABEL : "";
+    return machineLabel(keyCtx, uid);
+  }, [drilledKey, flowWindow.data, flowWindow.settled, liveMachines, specs, roster]);
+  const targetMachineName = route.kind === "machine" ? (drilledKey != null ? drilledName : localName) : null;
 
   // (#1800) `#meta` takes legacy's REPLAY branch on a replay. Until now it
   // computed from `flowWindow` (the live rolling window) on every route, so a
@@ -1056,9 +1065,9 @@ function renderRoute(
     case "fleet":
       return <FleetLens connected={connected} lastContactMs={routeLastContactMs} />;
     case "runs":
-      return <RunsBoard initialKind={route.runsKind} initialRun={route.run} initialMachineUid={route.machine} />;
+      return <RunsBoard initialKind={route.runsKind} initialRun={route.run} initialMachineKey={route.machine} />;
     case "machine":
-      return <MachineLens uid={route.uid} />;
+      return <MachineLens machineKey={route.machine} />;
     case "console":
       // (#1911) `route.opts` — already sanitized against the panel's own
       // table by `parseRoute` (or forced by `PANEL_ALIASES`) — seeds the

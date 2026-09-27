@@ -526,7 +526,7 @@ export function displayNameOf(
    *  a static build, a caller with no roster) skips that step. */
   roster: readonly RosterName[] = NO_ROSTER,
 ): string {
-  const own = ownName(data, liveMachines, specs, roster, m);
+  const own = ownMachineName(data, liveMachines, specs, roster, m);
   return own ?? unnamedLabel(data, liveMachines, specs, roster, m);
 }
 
@@ -542,7 +542,7 @@ export interface RosterName {
 /** A name `m` has of its own, in precedence order: an observed one
  *  (`nameOf`), this daemon's specs name when `m` is this daemon, the roster
  *  id declared for `m`. `null` when it has none. */
-function ownName(
+export function ownMachineName(
   data: FlowRecord[],
   liveMachines: Map<string, PresenceBeat>,
   specs: SelfIdentity | null,
@@ -565,7 +565,7 @@ function ownName(
  *  card and its activity lane — gives the same machine the same ordinal,
  *  and a machine appearing later takes a higher number rather than
  *  renumbering the ones already shown. Only machines with no name of their
- *  own (see `ownName`) take a number, and the number says nothing about the
+ *  own (see `ownMachineName`) take a number, and the number says nothing about the
  *  hardware. */
 function unnamedLabel(
   data: FlowRecord[],
@@ -615,7 +615,7 @@ function unnamedOrder(
   }
   for (const uid of liveMachines.keys()) if (!firstSeen.has(uid)) firstSeen.set(uid, Infinity);
   return [...firstSeen.entries()]
-    .filter(([uid]) => ownName(data, liveMachines, specs, roster, uid) === null)
+    .filter(([uid]) => ownMachineName(data, liveMachines, specs, roster, uid) === null)
     .sort(([ua, ta], [ub, tb]) => (ta !== tb ? (ta < tb ? -1 : 1) : ua < ub ? -1 : ua > ub ? 1 : 0))
     .map(([uid]) => uid);
 }
