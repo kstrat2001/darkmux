@@ -903,6 +903,27 @@ mod tests {
         assert_eq!(schedule.refusals, vec![]);
     }
 
+    #[test]
+    fn estimate_exactly_at_the_budget_headroom_is_not_refused() {
+        // Equality edges on both budget refusal halves: an estimate equal
+        // to the whole budget (flat half), and one equal to the headroom
+        // left atop an un-evictable darkmux base (fit half), both schedule.
+        let placements = vec![placement("devstral", 32_768)];
+        let schedule =
+            plan_waves(&placements, &budget_gb(26), &est_map(&[("devstral", 26 * GB)]), WaveMode::Auto)
+                .expect("only ForceParallel refuses the whole schedule");
+        assert_eq!((schedule.waves, schedule.refusals), (vec![placements.clone()], vec![]));
+
+        let facts = Facts {
+            residents: vec![resident("darkmux:other", "other", 8_000, Some(6 * GB))],
+            ..budget_gb(26)
+        };
+        let schedule =
+            plan_waves(&placements, &facts, &est_map(&[("devstral", 20 * GB)]), WaveMode::Auto)
+                .expect("only ForceParallel refuses the whole schedule");
+        assert_eq!((schedule.waves, schedule.refusals), (vec![placements], vec![]));
+    }
+
     // ── packing-rule rows ────────────────────────────────────────────────
 
     #[test]

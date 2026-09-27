@@ -555,17 +555,18 @@ impl<'a> Acquisition<'a> {
     }
 
     /// Serialize when the surviving loads exceed the headroom together but
-    /// there are several and each fits alone.
+    /// each fits alone (which takes at least two of them: one survivor that
+    /// fits alone cannot exceed the headroom by itself).
     fn serialize_if_each_fits_alone(&mut self, effective: u64) {
         if self.pending_sum() <= effective {
             return;
         }
-        let survivors: Vec<&Pending> = self
+        let each_fits_alone = self
             .pendings
             .iter()
             .filter(|p| is_load_like(&self.decisions[p.decision_idx].action))
-            .collect();
-        if survivors.len() > 1 && survivors.iter().all(|p| p.est.unwrap_or(0) <= effective) {
+            .all(|p| p.est.unwrap_or(0) <= effective);
+        if each_fits_alone {
             self.exec_hint = ExecHint::Sequential;
         }
     }
@@ -1891,6 +1892,34 @@ mod tests {
     }
 
     #[test]
+    fn budget_eviction_stops_once_the_load_fits_exactly() {
+        // Equality edge on the eviction walk: after evicting the first idle
+        // resident the pending load fits the budget EXACTLY, so the second
+        // idle resident stays. A `>=` flipped to `>` in the stop condition
+        // evicts it too while every wide-margin row stays green.
+        let f = Facts {
+            residents: vec![
+                resident("darkmux:idle1", "idle1", 8_000, Some(10 * GB)),
+                resident("darkmux:idle2", "idle2", 8_000, Some(10 * GB)),
+            ],
+            budget: Budget { max_darkmux_bytes: Some(30 * GB) },
+            ..Default::default()
+        };
+        let plan =
+            plan_acquire(&[placement("m", 8_000)], &f, additive_auto(), &est_map(&[("m", 20 * GB)]));
+        let unloaded: Vec<&str> = plan
+            .actions
+            .iter()
+            .filter_map(|a| match &a.action {
+                Action::Unload { target } => Some(target.identifier()),
+                Action::Load { .. } | Action::Reuse { .. } | Action::Block { .. } => None,
+            })
+            .collect();
+        assert_eq!(unloaded, vec!["darkmux:idle1"]);
+        assert_eq!(plan.actions.last().map(|a| &a.action), Some(&load_action("m", 8_000).action));
+    }
+
+    #[test]
     fn budget_operator_override_warns_1243() {
         // Same over-budget shape, operator-explicit: the Load survives, the
         // numbers are loud, nothing is evicted.
@@ -2893,6 +2922,9 @@ mod tests {
         let est = est_map(&[("a", 10 * GB), ("b", 6 * GB)]);
         let plan = plan_acquire(&desired, &f, additive_auto(), &est);
         assert_eq!(plan.actions, vec![load_action("b", 8_000), load_action("a", 8_000)]);
+        assert_eq!(plan.exec_hint, ExecHint::Sequential);
+        // Equality edge: a load exactly the size of the headroom fits alone.
+        let plan = plan_acquire(&desired, &f, additive_auto(), &est_map(&[("a", 12 * GB), ("b", 6 * GB)]));
         assert_eq!(plan.exec_hint, ExecHint::Sequential);
         // A single load over the headroom has nothing to serialize against.
         let plan = plan_acquire(&desired[1..], &Facts { pools: f.pools.clone(), ..Default::default() }, additive_auto(), &est_map(&[("a", 20 * GB)]));
