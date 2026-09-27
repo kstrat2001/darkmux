@@ -4546,7 +4546,7 @@
         // say whether its gate was armed is not comparable against one that
         // can.
         assert_eq!(argv[26], "-e");
-        assert_eq!(argv[27], "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=enforce");
+        assert_eq!(argv[27], "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=cut");
         // (#2846, review finding I2) The assertion above pins the DEFAULT, so
         // by itself it cannot tell "forwarded" from "hardcoded". Pin a
         // NON-default value too. (#2947) The argv builder forwards the
@@ -4561,7 +4561,7 @@
             };
             let argv2 = build_docker_run_argv(&observe);
             assert_eq!(
-                argv2[27], "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=observe",
+                argv2[27], "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=record",
                 "the forwarded value must track the RESOLVED policy, not a literal"
             );
         }
@@ -10028,10 +10028,8 @@
         assert_eq!(record["payload"]["policy"], "observe");
         assert_eq!(record["payload"]["acted"], false);
         let detail = record["payload"]["detail"].as_str().unwrap();
-        assert!(
-            detail.contains("observed") && detail.contains("not enforced"),
-            "got {detail:?}"
-        );
+        // (#2947) An archived pre-4.0 `observe` record reads as `record`.
+        assert!(detail.contains("recorded, not cut"), "got {detail:?}");
     }
 
     /// (#2887 F3/F4) `dispatch.gate.abort` forwards `policy`/`acted`
