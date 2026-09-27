@@ -2195,9 +2195,6 @@ fn model_ctx_label(m: &types::ProfileModel, registry: &darkmux_types::ProfileReg
 
 #[cfg(test)]
 mod tests {
-    /// (#2947 review C1) `mission dispatch` refuses bad enum config before
-    /// it looks up the mission or flips a phase: the dispatch-scope values
-    /// always, and the fleet-submission ones with `--machine`.
     /// (#2916 stage 2 review M3) `mission dispatch --no-wait` reports a
     /// queued phase as handed over, with the receiver's reason, never as a
     /// failure; a finished phase is judged by its exit code.
@@ -2222,6 +2219,9 @@ mod tests {
         assert!(matches!(super::phase_outcome(&failed, "p", "s", "m"), super::PhaseOutcome::Finished { ok: false, .. }));
     }
 
+    /// (#2947 review C1) `mission dispatch` refuses bad enum config before
+    /// it looks up the mission or flips a phase: the dispatch-scope values
+    /// always, and the fleet-submission ones with `--machine`.
     #[serial_test::serial]
     #[test]
     fn mission_dispatch_refuses_bad_enum_config_before_touching_the_mission() {

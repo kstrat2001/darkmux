@@ -32,6 +32,10 @@ axum = "0.7"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs", "io-util", "process", "time", "sync"] }
 tokio-stream = "0.1"
 futures = "0.3"
+# (#2916 stage 2) A fingerprint of the fleet token a queued job was
+# admitted with (never the token itself). Already in the tree via
+# darkmux-flow's audit sink.
+blake3 = "1.5"
 tower-http = { version = "0.5", features = ["cors", "timeout"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

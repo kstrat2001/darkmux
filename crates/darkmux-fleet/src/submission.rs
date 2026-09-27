@@ -322,12 +322,10 @@ impl Refusal {
 pub struct Admitted {
     /// The allow-list key (the peer's machine name).
     pub peer_name: String,
-    /// (#2916 stage 2) The node the network named, so a queued job can be
-    /// matched against the allow-list again when its seat frees
-    /// ([`match_entry`]). Never printed.
+    /// (#2916 stage 2) The node the network named, so a queued job can
+    /// require the SAME node when it passes [`admit`] again as its seat
+    /// frees. Never printed.
     pub node_id: String,
-    /// The node's name on the network, for the refusal text.
-    pub node_name: String,
     pub profiles: Vec<String>,
     pub roles: Vec<String>,
     pub images: Vec<String>,
@@ -373,10 +371,9 @@ pub fn admit(
 }
 
 /// The allow-list entry for the node `node_id` (named `node_name` on the
-/// network): exactly one entry must carry that node id. The one match rule
-/// [`admit`] uses, and what a queued job is checked against again when its
-/// seat frees, since `untrust` may have run while it waited.
-pub fn match_entry(
+/// network): exactly one entry must carry that node id. [`admit`]'s match
+/// rule.
+fn match_entry(
     node_id: &str,
     node_name: &str,
     allow: &BTreeMap<String, AcceptWorkEntry>,
@@ -390,7 +387,6 @@ pub fn match_entry(
         [(name, entry)] => Ok(Admitted {
             peer_name: (*name).clone(),
             node_id: node_id.to_string(),
-            node_name: node_name.to_string(),
             profiles: entry.profiles.clone().unwrap_or_default(),
             roles: entry.roles.clone().unwrap_or_default(),
             images: entry.images.clone().unwrap_or_default(),
@@ -602,6 +598,26 @@ fn read_reply(
     read_reply_lines(where_, code, std::io::Read::take(resp.into_reader(), MAX_REPLY_BYTES), on_progress)
 }
 
+/// (#2916 stage 2 review C6) A reply line this darkmux cannot read. A line
+/// with a `status` it does not know came from a darkmux listener, probably
+/// a newer one, which may have taken the job ([`AnswerLost`]); anything else
+/// is not a listener's reply.
+fn unreadable_line(where_: &str, line: &str, not_a_listener: &dyn Fn(&str) -> anyhow::Error) -> anyhow::Error {
+    let status = serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| v.get("status")?.as_str().map(str::to_string));
+    match status {
+        Some(st) => AnswerLost {
+            detail: format!(
+                "unknown reply status `{}` from {where_} (a newer darkmux?)",
+                sanitize_remote_line(&truncate_chars(&st, 40))
+            ),
+        }
+        .into(),
+        None => not_a_listener(line),
+    }
+}
+
 /// A transport failure: nothing was sent when the connection never opened;
 /// otherwise the answer was lost and the job may be running ([`AnswerLost`]).
 fn transport_failure(where_: &str, t: &ureq::Transport) -> anyhow::Error {
@@ -638,7 +654,7 @@ pub(crate) fn read_reply_lines(
         if line.is_empty() {
             continue;
         }
-        let reply: SubmissionReply = serde_json::from_str(line).map_err(|_| not_a_listener(line))?;
+        let reply: SubmissionReply = serde_json::from_str(line).map_err(|_| unreadable_line(where_, line, &not_a_listener))?;
         // Only a `queued` line may be followed by another.
         if last.take().is_some_and(|prev| prev.status != ReplyStatus::Queued) {
             return Err(not_a_listener(line));
@@ -1123,7 +1139,6 @@ mod tests {
 
         let admitted = Admitted {
             node_id: "nLAPTOP".into(),
-            node_name: "macbook-pro".into(),
             peer_name: "laptop".into(),
             profiles: vec!["host".into()],
             roles: vec!["radio-host".into()],
@@ -1151,7 +1166,6 @@ mod tests {
     fn scope_refuses_a_misaddressed_job_and_a_workdir_without_workspace() {
         let admitted = Admitted {
             node_id: "nLAPTOP".into(),
-            node_name: "macbook-pro".into(),
             peer_name: "macbook-pro".into(),
             profiles: vec!["host".into()],
             roles: vec!["radio-host".into()],
@@ -1383,5 +1397,10 @@ mod tests {
         assert!(read_reply_lines("x", 200, bad.as_bytes(), &mut |_| {}).is_err());
         assert!(read_reply_lines("x", 200, "".as_bytes(), &mut |_| {}).is_err(), "an empty body is not an answer");
         assert!(read_reply_lines("x", 200, "<html>".as_bytes(), &mut |_| {}).unwrap_err().to_string().contains("not as a darkmux fleet listener"));
+        // (#2916 stage 2 review C6) A status this darkmux does not know is a
+        // newer listener's answer, not a stranger's: the job may be running.
+        let newer = read_reply_lines("x", 200, "{\"status\":\"deferred\"}\n".as_bytes(), &mut |_| {}).unwrap_err();
+        assert!(newer.downcast_ref::<AnswerLost>().is_some(), "{newer}");
+        assert!(newer.to_string().contains("unknown reply status `deferred` from x (a newer darkmux?)"), "{newer}");
     }
 }

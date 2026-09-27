@@ -270,7 +270,7 @@ fn boot(busy_policy: &str) -> Fleet {
     std::fs::write(
         alpha.home.join("config.json"),
         serde_json::json!({
-            "schema_version": "1.32",
+            "schema_version": darkmux_types::config::CONFIG_SCHEMA_VERSION,
             "machine_id": "alpha",
             "fleet": {"identity": {"provider": "tailscale", "bin": alpha_tool}, "listener": {"enabled": false, "port": fleet_port}}
         })
@@ -290,7 +290,7 @@ fn boot(busy_policy: &str) -> Fleet {
     std::fs::write(
         beta.home.join("config.json"),
         serde_json::json!({
-            "schema_version": "1.32",
+            "schema_version": darkmux_types::config::CONFIG_SCHEMA_VERSION,
             "machine_id": "beta",
             "fleet": {
                 "identity": {"provider": "tailscale", "bin": beta_tool},
