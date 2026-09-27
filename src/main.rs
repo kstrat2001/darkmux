@@ -466,6 +466,18 @@ fn lessons_tier(global: bool) -> (std::path::PathBuf, &'static str) {
 /// Reads through `crew::corrections::scan`, the SAME definition the coder-brief
 /// injection reads, so `--mission` shows precisely the set that mission's next
 /// brief would carry — the verb can't drift from the behavior it reports on.
+/// The phase sessions `darkmux correction list --mission <mid>` scans: the
+/// coder runs of the mission's own phases.
+fn correction_phase_sessions(mid: &str) -> Result<crew::corrections::PhaseSessions> {
+    fleet::validate_identifier("mission", mid)?;
+    let missions = crew::loader::load_missions()?;
+    let m = missions
+        .iter()
+        .find(|m| m.id == mid)
+        .ok_or_else(|| anyhow::anyhow!("mission `{mid}` not found (check `darkmux mission status`)"))?;
+    Ok(crew::corrections::PhaseSessions::new(mid, m.phase_ids.iter().cloned()))
+}
+
 fn cmd_correction(sub: CorrectionCmd) -> Result<i32> {
     match sub {
         CorrectionCmd::List {
@@ -478,19 +490,7 @@ fn cmd_correction(sub: CorrectionCmd) -> Result<i32> {
             // runs (the same scope the brief uses — an exact phase match,
             // never a prefix, which would bleed a sibling mission whose id
             // is a hyphen-extension, #849).
-            let phases = match &mission {
-                Some(mid) => {
-                    fleet::validate_identifier("mission", mid)?;
-                    let missions = crew::loader::load_missions()?;
-                    let m = missions.iter().find(|m| &m.id == mid).ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "mission `{mid}` not found (check `darkmux mission status`)"
-                        )
-                    })?;
-                    Some(crew::corrections::PhaseSessions::new(mid, m.phase_ids.iter().cloned()))
-                }
-                None => None,
-            };
+            let phases = mission.as_deref().map(correction_phase_sessions).transpose()?;
             let scope = match (&phases, &session) {
                 (Some(p), _) => crew::corrections::Scope::Phases(p),
                 (None, Some(sid)) => crew::corrections::Scope::Session(sid),
@@ -946,6 +946,44 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
     }
 }
 
+/// One validated work job per started phase of `mission_id`, each its own
+/// ad-hoc dispatch of `role_id` in the mission's run, unique however often
+/// the phase is dispatched: `(phase id, session, job)`.
+fn build_phase_jobs(
+    mission_id: &str,
+    role_id: &str,
+    machine: &str,
+    timeout_seconds: u32,
+    started: &[&crew::types::Phase],
+) -> Result<Vec<(String, darkmux_types::session_id::SessionId, fleet::WorkJob)>> {
+    let local_machine = flow::resolve_machine_id();
+    let run = darkmux_types::session_id::RunId::mission(mission_id)?;
+    let mut jobs = Vec::with_capacity(started.len());
+    for phase in started {
+        let session_id = darkmux_types::session_id::SessionId::adhoc(
+            run.clone(),
+            role_id,
+            format!("{}-{}", phase.id, crew::dispatch::fresh_nonce()),
+        );
+        let job = fleet::build_work_job(
+            machine.to_string(),
+            role_id.to_string(),
+            phase.description.clone(),
+            session_id.clone(),
+            None, // profile: the receiver resolves the role's binding
+            None,
+            Some(phase.id.clone()),
+            None, // image (#703 Slice 4) — the receiver's default
+            timeout_seconds,
+            local_machine.clone(),
+        );
+        job.validate()
+            .with_context(|| format!("pre-submit validation failed for phase `{}`", phase.id))?;
+        jobs.push((phase.id.clone(), session_id, job));
+    }
+    Ok(jobs)
+}
+
 fn cmd_mission_dispatch(
     mission_id: &str,
     role_id: &str,
@@ -1081,33 +1119,7 @@ fn cmd_mission_dispatch(
     // 4. (#2916) Build + pre-validate every job BEFORE submitting any
     //    (all-or-nothing, HIGH-2 from the PR-D.1 review): an oversize
     //    description is found before anything leaves this machine.
-    let local_machine = flow::resolve_machine_id();
-    let run = darkmux_types::session_id::RunId::mission(mission_id)?;
-    let mut jobs: Vec<(String, darkmux_types::session_id::SessionId, fleet::WorkJob)> = Vec::new();
-    for phase in &started {
-        // One ad-hoc dispatch of the role per phase, unique however often the
-        // phase is dispatched.
-        let session_id = darkmux_types::session_id::SessionId::adhoc(
-            run.clone(),
-            role_id,
-            format!("{}-{}", phase.id, crew::dispatch::fresh_nonce()),
-        );
-        let job = fleet::build_work_job(
-            machine.to_string(),
-            role_id.to_string(),
-            phase.description.clone(),
-            session_id.clone(),
-            None, // profile: the receiver resolves the role's binding
-            None,
-            Some(phase.id.clone()),
-            None, // image (#703 Slice 4) — the receiver's default
-            timeout_seconds,
-            local_machine.clone(),
-        );
-        job.validate()
-            .with_context(|| format!("pre-submit validation failed for phase `{}`", phase.id))?;
-        jobs.push((phase.id.clone(), session_id, job));
-    }
+    let jobs = build_phase_jobs(mission_id, role_id, machine, timeout_seconds, &started)?;
 
     // 5. Submit, one phase at a time. The receiver answers each at once: it
     //    runs it, queues it behind a busy seat (its `fleet.busy_policy`), or

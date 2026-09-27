@@ -389,9 +389,12 @@ impl StepRunCtx {
 
     /// The session `kind`'s own dispatch records for `step` land under in
     /// this run: its declared [`StepKind::session_scope`], composed with
-    /// the run. `None` for a kind that never dispatches.
-    pub fn session(&self, kind: &dyn StepKind, step: &Step) -> Option<SessionId> {
-        kind.session_scope().session(&self.run, &step.task_id, &step.id)
+    /// the run. An error for a kind that never dispatches: only a
+    /// dispatching kind asks.
+    pub fn session(&self, kind: &dyn StepKind, step: &Step) -> Result<SessionId> {
+        kind.session_scope()
+            .session(&self.run, &step.task_id, &step.id)
+            .ok_or_else(|| anyhow::anyhow!("step `{}`: `{}` declares no session", step.id, kind.id()))
     }
 
     /// Emit one flow record LIVE through the scheduler's emission seam

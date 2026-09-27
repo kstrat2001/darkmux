@@ -240,6 +240,16 @@ impl SessionId {
     pub fn parse(wire: &str) -> Result<Self, IdError> {
         let bad = |why: &str| IdError(format!("session id {wire:?}: {why}"));
         let comps: Vec<&str> = wire.split('.').collect();
+        let (run, rest) = Self::parse_run(&comps, &bad)?;
+        let (tag, fields) = rest.split_first().ok_or_else(|| bad("it names no session kind"))?;
+        Self::parse_kind(run, tag, fields, &bad)
+    }
+
+    /// The run a wire string begins with, and the components after it.
+    fn parse_run<'a>(
+        comps: &'a [&'a str],
+        bad: &dyn Fn(&str) -> IdError,
+    ) -> Result<(RunId, &'a [&'a str]), IdError> {
         let run_id = unescape(comps[0]).ok_or_else(|| bad("its run is not escaped as written"))?;
         let (run_kind, rest) = match comps.get(1).copied() {
             Some("lab") => (RunKind::Lab, &comps[2..]),
@@ -247,26 +257,36 @@ impl SessionId {
             _ => (RunKind::Mission, &comps[1..]),
         };
         let run = RunId::new(run_kind, run_id).map_err(|e| bad(&e.0))?;
-        let (tag, fields) = rest.split_first().ok_or_else(|| bad("it names no session kind"))?;
-        let arity = |n: usize| if fields.len() == n { Ok(()) } else { Err(bad("wrong number of fields")) };
-        let field =
-            |i: usize| fields.get(i).and_then(|f| unescape(f)).ok_or_else(|| bad("a field is not escaped as written"));
-        match *tag {
-            "run" => arity(0).map(|_| SessionId::run(run)),
-            "phase" => arity(1).and_then(|_| Ok(SessionId::phase(run, field(0)?))),
-            "task" => arity(1).and_then(|_| Ok(SessionId::task(run, field(0)?))),
-            "step" => arity(1).and_then(|_| Ok(SessionId::step(run, field(0)?))),
-            "adhoc" => arity(2).and_then(|_| Ok(SessionId::adhoc(run, field(0)?, field(1)?))),
-            "relay" => {
-                arity(2)?;
-                let relay = SessionId::relay(SessionId::parse(&field(1)?)?, field(0)?);
+        Ok((run, rest))
+    }
+
+    /// The session within `run` that a kind `tag` and its escaped `fields`
+    /// name.
+    fn parse_kind(run: RunId, tag: &str, fields: &[&str], bad: &dyn Fn(&str) -> IdError) -> Result<Self, IdError> {
+        let tag = WireKind::parse(tag).ok_or_else(|| bad("unknown session kind"))?;
+        if fields.len() != tag.arity() {
+            return Err(bad("wrong number of fields"));
+        }
+        let f: Vec<String> = fields
+            .iter()
+            .map(|f| unescape(f))
+            .collect::<Option<_>>()
+            .ok_or_else(|| bad("a field is not escaped as written"))?;
+        let id = match tag {
+            WireKind::Run => SessionId::run(run),
+            WireKind::Phase => SessionId::phase(run, &f[0]),
+            WireKind::Task => SessionId::task(run, &f[0]),
+            WireKind::Step => SessionId::step(run, &f[0]),
+            WireKind::Adhoc => SessionId::adhoc(run, &f[0], &f[1]),
+            WireKind::Relay => {
+                let relay = SessionId::relay(SessionId::parse(&f[1])?, &f[0]);
                 if relay.run != run {
                     return Err(bad("a relay's run is not its sender's, standalone"));
                 }
-                Ok(relay)
+                relay
             }
-            _ => Err(bad("unknown session kind")),
-        }
+        };
+        Ok(id)
     }
 
     /// Read a session id from a record of ANY age, for attribution: a
@@ -303,6 +323,41 @@ impl SessionId {
             return Some(SessionId::step(run, unscoped(step)));
         }
         Some(SessionId::adhoc(run, "", wire))
+    }
+}
+
+/// A session kind's tag in the wire grammar (see the module doc), read once
+/// by [`SessionId::parse`].
+#[derive(Debug, Clone, Copy)]
+enum WireKind {
+    Run,
+    Phase,
+    Task,
+    Step,
+    Adhoc,
+    Relay,
+}
+
+impl WireKind {
+    fn parse(tag: &str) -> Option<Self> {
+        match tag {
+            "run" => Some(WireKind::Run),
+            "phase" => Some(WireKind::Phase),
+            "task" => Some(WireKind::Task),
+            "step" => Some(WireKind::Step),
+            "adhoc" => Some(WireKind::Adhoc),
+            "relay" => Some(WireKind::Relay),
+            _ => None,
+        }
+    }
+
+    /// How many escaped fields follow the tag.
+    fn arity(self) -> usize {
+        match self {
+            WireKind::Run => 0,
+            WireKind::Phase | WireKind::Task | WireKind::Step => 1,
+            WireKind::Adhoc | WireKind::Relay => 2,
+        }
     }
 }
 

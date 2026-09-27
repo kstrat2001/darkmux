@@ -83,6 +83,17 @@ fn local_dispatch_wire_model_id(step: &Step, model: &str) -> String {
         .unwrap_or_else(|| darkmux_gestalt::namespaced_identifier(model, None))
 }
 
+/// The identifier a single-shot or map step addresses: the bare `model` for
+/// a hosted step (an endpoint's deployment name, never loaded locally),
+/// else the local identifier [`local_dispatch_wire_model_id`] derives.
+fn step_wire_model<'a>(step: &Step, model: &'a str, is_hosted: bool) -> std::borrow::Cow<'a, str> {
+    if is_hosted {
+        std::borrow::Cow::Borrowed(model)
+    } else {
+        std::borrow::Cow::Owned(local_dispatch_wire_model_id(step, model))
+    }
+}
+
 /// (Also fix, #2570/#2240 class) A LOCAL step now addresses a darkmux-
 /// namespaced IDENTIFIER (`local_dispatch_wire_model_id`, above) rather
 /// than a bare model key. LMStudio 400s on an identifier it has no
@@ -425,9 +436,7 @@ pub(crate) fn dispatch_opts_for(
     let session = match step.config.get("session_id") {
         Some(v) => serde_json::from_value::<SessionId>(v.clone())
             .with_context(|| format!("step `{}`: config.session_id", step.id))?,
-        None => ctx
-            .session(&DispatchInternalStepKind, step)
-            .ok_or_else(|| anyhow!("step `{}`: `dispatch.internal` declares no session", step.id))?,
+        None => ctx.session(&DispatchInternalStepKind, step)?,
     };
     // (#1509) Additive, default-preserving config passthroughs — see
     // `DispatchInternalStepKind`'s doc. Every existing caller (mission
@@ -898,9 +907,7 @@ impl DispatchSingleShotStepKind {
         // Records go out live through the scheduler's emitter when there is
         // one, else batch into the outcome (see `StepBookend`).
         let ctx = run_ctx.live();
-        let session = &run_ctx
-            .session(self, step)
-            .ok_or_else(|| anyhow!("step `{}`: `dispatch.single_shot` declares no session", step.id))?;
+        let session = &run_ctx.session(self, step)?;
 
         let model = require_config_str(step, self.id(), "model")?;
         // (#2570) The identifier this step actually ADDRESSES: the bare
@@ -915,11 +922,7 @@ impl DispatchSingleShotStepKind {
         // dispatched.
         let endpoint = step_endpoint(step).with_context(|| format!("step `{}`: config.endpoint", step.id))?;
         let is_hosted = endpoint.is_some();
-        let wire_model: std::borrow::Cow<'_, str> = if is_hosted {
-            std::borrow::Cow::Borrowed(model)
-        } else {
-            std::borrow::Cow::Owned(local_dispatch_wire_model_id(step, model))
-        };
+        let wire_model = step_wire_model(step, model, is_hosted);
         let system = config_str(step, "system").unwrap_or("");
         let base_user = config_str(step, "user").unwrap_or_default();
         let user = compose_message(base_user, input);
@@ -1655,9 +1658,7 @@ impl DispatchMapStepKind {
         run_ctx: &StepRunCtx,
     ) -> Result<StepOutcome> {
         let ctx = run_ctx.live();
-        let session = &run_ctx
-            .session(self, step)
-            .ok_or_else(|| anyhow!("step `{}`: `dispatch.map` declares no session", step.id))?;
+        let session = &run_ctx.session(self, step)?;
         let items = resolve_map_collection(step, task, input)?;
         let mut batched: Vec<darkmux_flow::FlowRecord> = Vec::new();
         // Emit LIVE through the scheduler's seam when a ctx is present
@@ -1695,11 +1696,7 @@ impl DispatchMapStepKind {
         // dispatched.
         let endpoint = step_endpoint(step).with_context(|| format!("step `{}`: config.endpoint", step.id))?;
         let is_hosted = endpoint.is_some();
-        let wire_model: std::borrow::Cow<'_, str> = if is_hosted {
-            std::borrow::Cow::Borrowed(model)
-        } else {
-            std::borrow::Cow::Owned(local_dispatch_wire_model_id(step, model))
-        };
+        let wire_model = step_wire_model(step, model, is_hosted);
         let user_template = require_config_str(step, self.id(), "user_template")?;
         let system = config_str(step, "system").unwrap_or("");
         let max_tokens = step.config.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(4096) as u32;

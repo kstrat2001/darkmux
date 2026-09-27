@@ -154,20 +154,7 @@ pub(crate) fn dispatch_as_crew_of_one_with(
         darkmux_types::workdir::validate_workdir(workdir)?;
     }
 
-    let mission_id = opts
-        .session
-        .mission_id()
-        .ok_or_else(|| anyhow!("dispatch: a crew-of-one dispatch runs in a mission's own run, not in `{}`", opts.session))?
-        .to_string();
-    let mission_path = lifecycle::mission_path(&mission_id);
-    if mission_path.exists() {
-        bail!(
-            "dispatch: run id `{mission_id}` already exists on disk — this should be \
-             impossible (ids are minted uniquely per dispatch); if you're hitting this, it's \
-             either a genuine id collision or a re-run against a copied/restored `.darkmux` \
-             directory."
-        );
-    }
+    let mission_id = unminted_mission_id(&opts.session)?;
 
     let (mission, phase, task, step) = build_graph(&opts, &mission_id);
     let phase_id = phase.id.clone();
@@ -324,6 +311,24 @@ fn finalize(mission_id: &str, phase_id: &str, status: MissionOutcomeStatus, reas
 fn reconcile_on_error(mission_id: &str, phase_id: &str, reason: &str) {
     let _ = lifecycle::phase_abandon(phase_id);
     let _ = lifecycle::mission_close_with_reasoning(mission_id, Some(&format!("dispatch run errored: {reason}")));
+}
+
+/// The mission `session`'s run is, which this dispatch is about to mint:
+/// refused when the session is not in a mission run, or when a mission of
+/// that id already exists on disk.
+fn unminted_mission_id(session: &SessionId) -> Result<String> {
+    let mission_id = session
+        .mission_id()
+        .ok_or_else(|| anyhow!("dispatch: a crew-of-one dispatch runs in a mission's own run, not in `{session}`"))?;
+    if lifecycle::mission_path(mission_id).exists() {
+        bail!(
+            "dispatch: run id `{mission_id}` already exists on disk — this should be \
+             impossible (ids are minted uniquely per dispatch); if you're hitting this, it's \
+             either a genuine id collision or a re-run against a copied/restored `.darkmux` \
+             directory."
+        );
+    }
+    Ok(mission_id.to_string())
 }
 
 /// Build the (unsaved) Mission/Phase/Task/Step quadruple for one crew-of-one
@@ -1122,6 +1127,28 @@ mod tests {
     // bookends, which live inside `dispatch_internal::dispatch`, unchanged
     // by this PR) is exercised by the existing docker-gated
     // `mock_dispatch_proof.rs` harness and by live dogfood, not here.
+
+    /// The mission a crew-of-one dispatch mints is its session's run: a
+    /// session outside a mission run is refused, and so is a run whose
+    /// mission already exists on disk.
+    #[test]
+    #[serial_test::serial]
+    fn unminted_mission_id_refuses_a_non_mission_run_and_an_existing_mission() {
+        let _guard = RunGuard::new();
+        let lab = SessionId::adhoc(RunId::lab("lab-1").unwrap(), "coder", "n1");
+        let err = unminted_mission_id(&lab).expect_err("a lab run is not a mission to mint");
+        assert!(format!("{err}").contains("runs in a mission's own run"), "{err}");
+
+        let session = dispatch_session("coder", None);
+        let mid = unminted_mission_id(&session).expect("a freshly minted run has no mission on disk");
+        assert_eq!(Some(mid.as_str()), session.mission_id());
+
+        let path = lifecycle::mission_path(&mid);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{}").unwrap();
+        let err = unminted_mission_id(&session).expect_err("an existing mission is never re-minted");
+        assert!(format!("{err}").contains("already exists on disk"), "{err}");
+    }
 
     /// (#2947 review M1) A bad enum value refuses before a mission is
     /// minted, before the step runs, and before any host operation.
