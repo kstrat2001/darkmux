@@ -2344,8 +2344,9 @@ struct SessionAgg {
 impl SessionAgg {
     /// The attempt-scoped fields, from the current attempt.
     fn settle(&mut self) {
-        let latest = self.lifecycle.latest();
-        self.settle_from(latest);
+        self.lifecycle.seal();
+        let latest = self.lifecycle.latest().cloned();
+        self.settle_from(latest.as_ref());
     }
 
     /// This session as `mission` reads it: its attempt-scoped fields from
@@ -2356,12 +2357,12 @@ impl SessionAgg {
     /// so no other mission's activity or terminal reaches it.
     fn for_mission(&self, mission: &str) -> Option<SessionAgg> {
         let attempt = self.lifecycle.latest_of(mission)?;
-        let mut scoped = SessionAgg { lifecycle: crate::run_lifecycle::RunFold::default(), ..self.clone() };
+        let mut scoped = self.clone();
         scoped.settle_from(Some(attempt));
         Some(scoped)
     }
 
-    fn settle_from(&mut self, attempt: Option<crate::run_lifecycle::Attempt>) {
+    fn settle_from(&mut self, attempt: Option<&crate::run_lifecycle::Attempt>) {
         let Some(a) = attempt else { return };
         let ending = a.ending();
         self.has_start = a.has_start;

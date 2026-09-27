@@ -36,6 +36,7 @@
 
 use crate::runs::{AbandonReason, RunStatus};
 use darkmux_flow::FlowAction;
+use std::sync::Arc;
 
 /// How a closed attempt ended: its status, and why when abandoned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,49 +202,59 @@ fn place_orphans(attempts: &mut [Attempt], orphans: &[&Folded]) {
     }
 }
 
-/// A session's records, segmented on demand (rules 1 and 2).
+/// A session's records, kept as they are read, and segmented when sealed
+/// (`seal`, rules 1 and 2) rather than on every read. Both are shared, so a
+/// copy of a session (`SessionAgg::for_mission`) costs two reference
+/// counts, not a copy of its records or a re-fold.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RunFold {
-    records: Vec<Folded>,
+    records: Arc<Vec<Folded>>,
+    attempts: Arc<Vec<Attempt>>,
+}
+
+/// A session's records as its attempts, time order.
+fn segment(records: &[Folded]) -> Vec<Attempt> {
+    let mut order: Vec<&Folded> = records.iter().collect();
+    order.sort_by_key(|r| (r.at.is_none(), r.at));
+    let mut attempts: Vec<Attempt> = Vec::new();
+    let mut orphans: Vec<&Folded> = Vec::new();
+    for r in order {
+        let mut target = target_for(&attempts, r.mission.as_deref());
+        if r.action.as_ref().is_some_and(|a| opens(&attempts, target, a)) {
+            attempts.push(Attempt { mission: r.mission.clone(), ..Attempt::default() });
+            target = Some(attempts.len() - 1);
+        }
+        match target {
+            Some(i) => attempts[i].add(r),
+            None if r.ending().is_some() => orphans.push(r),
+            None => {}
+        }
+    }
+    place_orphans(&mut attempts, &orphans);
+    attempts
 }
 
 impl RunFold {
     /// Keep one record (`ts` in the flow schema's spelling).
     pub fn fold(&mut self, action: Option<&FlowAction>, mission: Option<&str>, ts: &str, v: &serde_json::Value) {
-        self.records.push(Folded::of(action, mission, ts, v));
+        Arc::make_mut(&mut self.records).push(Folded::of(action, mission, ts, v));
     }
 
-    /// The session's attempts in time order.
-    fn attempts(&self) -> Vec<Attempt> {
-        let mut order: Vec<&Folded> = self.records.iter().collect();
-        order.sort_by_key(|r| (r.at.is_none(), r.at));
-        let mut attempts: Vec<Attempt> = Vec::new();
-        let mut orphans: Vec<&Folded> = Vec::new();
-        for r in order {
-            let mut target = target_for(&attempts, r.mission.as_deref());
-            if r.action.as_ref().is_some_and(|a| opens(&attempts, target, a)) {
-                attempts.push(Attempt { mission: r.mission.clone(), ..Attempt::default() });
-                target = Some(attempts.len() - 1);
-            }
-            match target {
-                Some(i) => attempts[i].add(r),
-                None if r.ending().is_some() => orphans.push(r),
-                None => {}
-            }
-        }
-        place_orphans(&mut attempts, &orphans);
-        attempts
+    /// Segment the records kept so far into attempts, once the fold has
+    /// seen every record; reads until the next `seal` use these.
+    pub fn seal(&mut self) {
+        self.attempts = Arc::new(segment(&self.records));
     }
 
-    /// The session's current attempt, whatever its mission.
-    pub fn latest(&self) -> Option<Attempt> {
-        self.attempts().pop()
+    /// The session's current attempt, whatever its mission (as of `seal`).
+    pub fn latest(&self) -> Option<&Attempt> {
+        self.attempts.last()
     }
 
     /// `mission`'s latest attempt on this session: how the session reads
-    /// for that mission when several share it.
-    pub fn latest_of(&self, mission: &str) -> Option<Attempt> {
-        self.attempts().into_iter().rev().find(|a| a.mission.as_deref() == Some(mission))
+    /// for that mission when several share it (as of `seal`).
+    pub fn latest_of(&self, mission: &str) -> Option<&Attempt> {
+        self.attempts.iter().rev().find(|a| a.mission.as_deref() == Some(mission))
     }
 }
 
@@ -254,4 +265,37 @@ pub(crate) fn quiet_clock_live(last_activity_ts: Option<&str>, wait_until_ms: Op
     let last_ms = last_activity_ts.and_then(crate::runs::parse_flow_ts).map(|s| s.saturating_mul(1_000));
     let Some(quiet_from) = last_ms.max(wait_until_ms) else { return false };
     now_ms.saturating_sub(quiet_from) <= stale_after_ms
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fold(f: &mut RunFold, action: FlowAction, mission: &str, ts: &str) {
+        f.fold(Some(&action), Some(mission), ts, &serde_json::json!({}));
+    }
+
+    /// Reads use the attempts `seal` built: a record folded since is not
+    /// segmented again until the next `seal`.
+    #[test]
+    fn reads_use_the_sealed_attempts_without_refolding() {
+        let mut f = RunFold::default();
+        fold(&mut f, FlowAction::DispatchStart, "a", "2026-09-27T10:00:00Z");
+        f.seal();
+        fold(&mut f, FlowAction::DispatchComplete, "a", "2026-09-27T10:01:00Z");
+        assert!(f.latest().is_some_and(|a| a.close.is_none()), "unsealed records are not read");
+        f.seal();
+        assert!(f.latest().is_some_and(|a| a.close.is_some()), "a seal reads every record");
+    }
+
+    /// A copy of a sealed fold shares its records and attempts.
+    #[test]
+    fn a_copy_shares_records_and_attempts() {
+        let mut f = RunFold::default();
+        fold(&mut f, FlowAction::DispatchStart, "a", "2026-09-27T10:00:00Z");
+        f.seal();
+        let copy = f.clone();
+        assert!(Arc::ptr_eq(&f.records, &copy.records));
+        assert!(Arc::ptr_eq(&f.attempts, &copy.attempts));
+    }
 }
