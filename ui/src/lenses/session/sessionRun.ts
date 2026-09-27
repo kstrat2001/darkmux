@@ -481,7 +481,7 @@ function contextFigures(tel: readonly NormRecord[]): { samples: number; nctx: nu
  *  tokens never fold into a specialist's total.
  *
  *  KNOWN NARROWING, named rather than hidden: this walks by `session_id`,
- *  not by role EXECUTION. `session_id::task` is task-scoped, so a
+ *  not by role EXECUTION. a task session is task-scoped, so a
  *  `dispatch.map` fan-out mints ONE session_id shared by every sibling
  *  seat — this reads them as a single execution and sums their records
  *  together, the same simplification `runRegions`'s own single-session path

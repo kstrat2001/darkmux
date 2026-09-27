@@ -152,8 +152,8 @@ export function usageContribution(r: NormRecord, opts: SumOptions = {}): UsageAm
 }
 
 /** The identity of ONE RUN: `(session_id, mission_id)`. A bare session id
- *  is not one: `session_id::task`/`mission_run` are deterministic, so the
- *  same id recurs across unrelated runs (#2690/#2709). The legacy fallback
+ *  is not one: pre-4.0 task and mission-run ids were deterministic, so the
+ *  same id recurred across unrelated runs (#2690/#2709); archives keep them. The legacy fallback
  *  and the hero's run count both key on this. A sessionless record gets a
  *  composite of its own; `\u0000` cannot occur inside either id. */
 function runKey(r: NormRecord): string {

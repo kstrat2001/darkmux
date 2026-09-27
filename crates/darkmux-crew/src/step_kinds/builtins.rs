@@ -1769,7 +1769,7 @@ impl DispatchMapStepKind {
         // bookends (#1607, above) landed, and those are terminal-only, not a
         // liveness signal. Self-disables when `DARKMUX_REDIS_URL` is unset,
         // same gate the bookend's flow sink uses. Uses the SAME session id
-        // every record on this path uses (`session_id::task`), so a beat and
+        // every record on this path uses (the step's task session), so a beat and
         // its bookends key on the identical session. Stopped explicitly right
         // after the loop (below) on the clean path; `SessionEmitter::drop`
         // (#2344) is the backstop for a `?`/panic in between — same
@@ -1782,7 +1782,7 @@ impl DispatchMapStepKind {
         // has to be the one the RECORDS use, because the live view joins the
         // beat to the session the bookends and per-item records name — and
         // #1979 pins both this kind and `dispatch.single_shot` to
-        // `session_id::task` deliberately (sibling seats fanned out within
+        // the task session deliberately (sibling seats fanned out within
         // one task share a join key so a seat's tokens tie to its endpoint;
         // only `dispatch.internal`, a solo dispatch, is step-scoped). A beat
         // keyed on the step would be presence for a session no record names.
@@ -2123,8 +2123,8 @@ impl MapCall {
 ///
 /// (#2690, FLOW_SCHEMA_VERSION 1.49.0) `remote` and `index` are the SEAT's
 /// own identity, and they are here because the viewer could not otherwise
-/// recover it. `session_id` on this record is `session_id::task(&step.task_id)`
-/// (the emitter below), which sibling seats fanned out within ONE task SHARE
+/// recover it. `session_id` on this record is the step's task session
+/// (`SessionId::task(run, &step.task_id)`), which sibling seats fanned out within ONE task SHARE
 /// by construction — and `mission_id` is shared too, so the savings hero's
 /// `(session_id, mission_id)` run key cannot separate them either. The hero
 /// therefore fell back to a per-KEY rule: if ANY bookend under the key named
@@ -2160,7 +2160,7 @@ impl MapCall {
 /// declined twice. That figure measured the JOIN's reach across EVERY
 /// `telemetry.tokens` record. The DEFECT's population is narrower: only a
 /// record under a seat-SHARING session id can be misattributed, and
-/// `session_id::task` is minted by exactly two step kinds
+/// the task session is used by exactly two step kinds
 /// (`dispatch.single_shot` and `dispatch.map`). (#2902 step 1a: the
 /// single-shot kind now emits `telemetry.tokens` too, `call_kind:
 /// "single_shot"`; the hero still counts that kind from its own `dispatch
@@ -5204,7 +5204,7 @@ mod tests {
     }
 
     /// (#2690) The SEAT fields. `session_id` on a map item's
-    /// `telemetry.tokens` record is `session_id::task(&step.task_id)`, which
+    /// `telemetry.tokens` record is the step's task session, which
     /// sibling seats inside one task SHARE — and they share `mission_id`
     /// too, so the savings hero's `(session_id, mission_id)` run key cannot
     /// tell them apart. Without these two keys the hero falls back to a
