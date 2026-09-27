@@ -3032,20 +3032,19 @@ async fn machine_specs_handler() -> axum::Json<serde_json::Value> {
     // matches a loaded model by its namespaced identifier OR its bare model key
     // (utility_model_id may be stored either way). Best-effort — a profiles read
     // failure just yields `None`.
+    // (#2915) With the binding's declared window (`n_ctx`, `null` when the
+    // bare form declared none), which the machine page's Utility section shows.
     let utility_model = tokio::task::spawn_blocking(|| {
-        darkmux_profiles::profiles::load_registry(None)
-            .ok()
-            .and_then(|lr| lr.registry.utility_model_id().map(str::to_string))
+        darkmux_profiles::profiles::load_registry(None).ok().and_then(|lr| {
+            lr.registry
+                .utility_model_id()
+                .map(|id| (id.to_string(), lr.registry.utility_model_n_ctx()))
+        })
     })
     .await
     .ok()
     .flatten()
-    .map(|id| {
-        let loaded = loaded_models
-            .iter()
-            .any(|m| m.identifier == id || m.model == id);
-        serde_json::json!({ "id": id, "loaded": loaded })
-    });
+    .map(|(id, n_ctx)| utility_model_json(&id, n_ctx, &loaded_models));
 
     let generated_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3067,6 +3066,15 @@ async fn machine_specs_handler() -> axum::Json<serde_json::Value> {
         "redis_url_redacted": redis_url_redacted,
         "generated_at_ms": generated_at_ms,
     }))
+}
+
+/// (#1008, #2915) `/machine/specs`' `utility_model`: the machine's
+/// `internal.utility` binding, whether a loaded model matches it (by its
+/// namespaced identifier OR its bare model key, since the id may be stored
+/// either way), and its declared window (`null` when undeclared).
+fn utility_model_json(id: &str, n_ctx: Option<u32>, loaded_models: &[darkmux_types::LoadedModel]) -> serde_json::Value {
+    let loaded = loaded_models.iter().any(|m| m.identifier == id || m.model == id);
+    serde_json::json!({ "id": id, "loaded": loaded, "n_ctx": n_ctx })
 }
 
 /// Read total system RAM in bytes. macOS uses `sysctl hw.memsize` which

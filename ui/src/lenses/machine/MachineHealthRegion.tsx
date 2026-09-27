@@ -18,7 +18,6 @@ import {
   isEstimatedRow,
   isOverLimit,
   rowStateDiffers,
-  isUtilityTierRow,
   memStateCls,
   modelKvLine,
   odometerTiles,
@@ -445,20 +444,17 @@ function ModelRow({
   row,
   scale,
   nowMs,
-  utilityModelId,
   machineState,
 }: {
   row: ResidencyRowView;
   scale: number;
   nowMs: number;
-  utilityModelId: string | null;
   machineState: string | null | undefined;
 }) {
   const m: MachineResourcesModel = row.model;
   const isGhost = row.status === "ghost";
   const isNew = row.status === "new";
   const overHint = overPriceHint(m);
-  const isUtility = isUtilityTierRow(m.identifier, m.model_key, utilityModelId);
   const stateCls = memStateCls(m.state);
   const pot = m.potential_bytes != null ? Number(m.potential_bytes) : null;
   const cur = m.current_bytes != null ? Number(m.current_bytes) : null;
@@ -471,19 +467,9 @@ function ModelRow({
     <div className={rowCls}>
       <div className="mm-row-top">
         <span className="mm-row-name">{m.identifier || m.model_key}</span>
-        {/* Identity marker, not a health verdict — deliberately NO severity
-            class (green/amber/red): "which resident is the internal tier" is
-            identity, and this page spends color only on verified health.
-            This badge is ALL that remains of the `darkmux/utility` card that
-            used to sit on this page; see `isUtilityTierRow`'s doc for why
-            the card was config rather than machine state, and why matching
-            on the id alone is correct by construction. The title carries the
-            gloss the card used to spend three lines on. */}
-        {!isGhost && isUtility && (
-          <span className="mm-row-chip is-identity" title="darkmux's internal small-model tier — runs darkmux's own jobs: compaction · radio routing">
-            utility
-          </span>
-        )}
+        {/* (#2915) The `utility` identity badge that sat here is superseded
+            by the page's Utility section, which names this model, its
+            residency and footprint, and what it is doing. */}
         {isGhost && <span className="mm-row-chip is-warn">DEPARTED · last seen {new Date(row.lastSeenMs).toLocaleTimeString([], { hour12: false })}</span>}
         {isNew && <span className="mm-row-chip is-new">NEW · first seen {relAgoFrom(nowMs, row.firstSeenMs ?? row.lastSeenMs)}</span>}
         {!isGhost && pot == null && <span className="mm-row-chip is-warn">UNPRICED · potential unknown</span>}
@@ -582,12 +568,10 @@ function ModelRow({
 function ModelRows({
   rows,
   nowMs,
-  utilityModelId,
   machineState,
 }: {
   rows: ResidencyRowView[];
   nowMs: number;
-  utilityModelId: string | null;
   machineState: string | null | undefined;
 }) {
   const groups = groupResidencyRows(rows);
@@ -608,7 +592,7 @@ function ModelRows({
             {g.rows.some((r) => r.status === "ghost") ? ` (+${g.rows.filter((r) => r.status === "ghost").length} DEPARTED)` : ""}
           </div>
           {g.rows.map((r) => (
-            <ModelRow key={r.identifier} row={r} scale={scale} nowMs={nowMs} utilityModelId={utilityModelId} machineState={machineState} />
+            <ModelRow key={r.identifier} row={r} scale={scale} nowMs={nowMs} machineState={machineState} />
           ))}
         </div>
       ))}
@@ -626,14 +610,6 @@ export interface HealthRegionProps {
   residencyRows?: ResidencyRowView[];
   residencyChanged?: boolean;
   nowMs?: number;
-  /** The RESIDENT utility-tier model's id, or `null` — threaded explicitly
-   * from `MachineLens.tsx`'s own `utilityView()` call rather than this
-   * component reaching for `specs` itself (this region never otherwise
-   * touches `/machine/specs`). `null` covers every non-resident state
-   * (not configured, not reported, registered-but-not-loaded) uniformly —
-   * see `isUtilityTierRow`'s doc for why the caller pre-filters to just
-   * the resident case. */
-  utilityModelId?: string | null;
   /** (#2108, operator finding) Test-only override for the mobile/desktop
    * ledger-summary split below — production omits this and measures
    * `window.innerWidth` via `useIsMobile` (see that hook's own doc; the
@@ -650,7 +626,6 @@ export function MachineHealthRegion({
   residencyRows = [],
   residencyChanged = false,
   nowMs = Date.now(),
-  utilityModelId = null,
   isMobileOverride,
 }: HealthRegionProps) {
   const measuredIsMobile = useIsMobile();
@@ -903,7 +878,7 @@ export function MachineHealthRegion({
       {showMachineShrinkHint && <div className="mm-hint">↳ {machineShrinkHint}</div>}
 
       <div className={stale ? "is-stale" : ""}>
-        <ModelRows rows={residencyRows} nowMs={nowMs} utilityModelId={utilityModelId} machineState={b.machine.state} />
+        <ModelRows rows={residencyRows} nowMs={nowMs} machineState={b.machine.state} />
       </div>
 
       {/* #1821: `messages` replaces `warnings` — each entry carries a

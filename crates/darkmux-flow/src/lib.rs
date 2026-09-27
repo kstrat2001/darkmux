@@ -3248,7 +3248,10 @@ mod tests {
         //   1.60.0 — (#2914) utility jobs run lean: a usage record and no
         //            bookends/session (contract 2 amended); one utility
         //            seat tag on `telemetry.lms` (`compactor` retired).
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.60.0");
+        //   1.61.0 — (#2915) `utility.start` / `utility.error` markers and
+        //            `job` on utility usage records: utility work is
+        //            visible while it runs.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.61.0");
     }
 
     #[test]

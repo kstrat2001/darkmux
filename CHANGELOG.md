@@ -220,6 +220,20 @@ darkmux release.
   and whether it is online, and any profile in scope that cannot run here),
   and `retired work queue` when `darkmux:work` streams are still in Redis.
   No row prints a node id or the token.
+- **Utility work is visible** (#2915). A utility job (compaction, radio
+  routing) writes a lean `utility.start` record when it starts (the job, its
+  model, the execution it serves, its own stall bound); its usage record, now
+  carrying `job`, marks the end, and a failed routing call ends with
+  `utility.error`. While an execution compacts, the PROMPT lamp stays lit, the
+  scope reads "compacting" in a gray utility treatment and the status line
+  counts "compacting · 12s", where it used to read "processing prompt" for the
+  whole compaction. Each fleet card gets a utility strip at the end of its name
+  row (a radio signal while routing, a squeeze while compacting, a generic
+  pulse for any other job, stall color past the job's bound), and the machine
+  page gets a Utility section (model, declared window, residency and
+  footprint, the live job, each job's calls and tokens), replacing the
+  `utility` badge on the model's residency row. Neither changes any box's
+  size. FLOW schema 1.61.0.
 
 - **Endpoints are declared once and named by id** (#2902 step 4).
   `profiles.json` gains a top-level `endpoints` map; each entry has a

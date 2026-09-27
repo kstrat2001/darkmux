@@ -21,12 +21,14 @@
 //! activity, the status line's last dispatch) ever sees it; the fleet
 //! hero's plain sum still counts it, under its own utility chip.
 //!
-//! **The #2915 hook.** [`run_utility_single_shot`] is the ONE chokepoint a
+//! **Visible (#2915).** [`run_utility_single_shot`] is the ONE chokepoint a
 //! host-side utility job passes through, and [`UtilityJob::role_id`] names
-//! the job. #2915's visible utility state ("routing", "compacting") is
-//! emitted here, around the call, as its own marker vocabulary, and by the
-//! trajectory tailer from the runtime's `compaction.*` events for the
-//! container half; nothing in this module needs to change shape for that.
+//! the job ([`crate::usage::utility_job`] maps it to its
+//! [`crate::usage::UtilityJobKind`]). It writes a lean `utility.start`
+//! right before the model call; the usage record marks the end, or a
+//! `utility.error` when the call fails. The container half (compaction)
+//! gets the same `utility.start` from the trajectory tailer, mapped from
+//! the runtime's `compaction.start` event.
 //!
 //! **One instance, and the wait is accepted.** LM Studio serves one
 //! request per instance at a time, so a routing call fired during a long
@@ -98,11 +100,13 @@ pub(crate) fn utility_load_window(binding_id: &str, declared_n_ctx: Option<u32>,
 /// module doc for what lean means and why).
 ///
 /// Errors, with nothing recorded: no `internal.utility` binding (the fix
-/// is named), an unknown role, a role with no readable prompt, a residency
-/// load failure, or the model call itself failing (a vanished instance is
-/// re-worded by `residency_lost_detail`, as on the work path). The caller
-/// (radio's router) turns any error into a refusal; a failed job spent no
-/// countable tokens and leaves no record.
+/// is named), an unknown role, a role with no readable prompt, or a
+/// residency load failure. The model call itself failing (a vanished
+/// instance is re-worded by `residency_lost_detail`, as on the work path)
+/// happens after the job's `utility.start`, so it records the matching
+/// `utility.error` (#2915) and no usage record: a failed call spent no
+/// countable tokens. The caller (radio's router) turns any error into a
+/// refusal.
 pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
     let Some((binding_id, declared_n_ctx)) =
         crate::dispatch_internal::resolve_utility_model_internal(job.config_path)
@@ -176,9 +180,37 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
         max_tokens: job.max_tokens,
         timeout_seconds: job.timeout_seconds,
     };
+    // (#2915) The job is VISIBLE while it runs: one lean `utility.start`
+    // (no session) right before the call, so the viewer's fleet card shows
+    // the job from here until its usage record (or `utility.error`) lands.
+    // Emitted after residency on purpose: a job that failed to load never
+    // started, and must not leave a start with no end behind.
+    // (#2915 review) Its own job id, echoed by its end, and ms times.
+    let job_kind = crate::usage::utility_job(crate::usage::CallKind::SingleShot, Some(job.role_id));
+    let job_id = job_kind.map(crate::usage::mint_utility_job_id).unwrap_or_default();
+    let started_at_ms = crate::usage::unix_ms_now();
+    if let Some(kind) = job_kind {
+        let _ = darkmux_flow::record(crate::usage::utility_marker_record(
+            crate::usage::UTILITY_START_ACTION,
+            job.role_id,
+            &wire_model,
+            crate::usage::utility_start_payload(kind, &job_id, &wire_model, None, u64::from(job.timeout_seconds), started_at_ms),
+        ));
+    }
     let reply = match crate::single_shot::single_shot_chat(&req) {
         Ok(r) => r,
         Err(e) => {
+            // (#2915) The end of a started job that has no usage record.
+            if let Some(kind) = job_kind {
+                let mut payload = serde_json::json!({ "job": kind, "model": wire_model });
+                crate::usage::stamp_utility_end(&mut payload, &job_id, started_at_ms, crate::usage::unix_ms_now());
+                let _ = darkmux_flow::record(crate::usage::utility_marker_record(
+                    crate::usage::UTILITY_ERROR_ACTION,
+                    job.role_id,
+                    &wire_model,
+                    payload,
+                ));
+            }
             return Err(match crate::dispatch_internal::residency_lost_detail(&wire_model, &format!("{e:#}")) {
                 Some(msg) => e.context(msg),
                 None => e,
@@ -188,12 +220,15 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
 
     // The one record: the job's usage, attributed to the job's role, on the
     // utility model, with no session.
-    let payload = reply.usage_payload(
+    let mut payload = reply.usage_payload(
         crate::usage::CallKind::SingleShot,
         Some(job.role_id),
         &wire_model,
         &crate::usage::lmstudio_endpoint(job.base_url_override),
     );
+    if job_kind.is_some() {
+        crate::usage::stamp_utility_end(&mut payload, &job_id, started_at_ms, crate::usage::unix_ms_now());
+    }
     let _ = darkmux_flow::record(crate::usage::utility_usage_record(job.role_id, &wire_model, payload));
 
     Ok(UtilityReply { content: reply.content })

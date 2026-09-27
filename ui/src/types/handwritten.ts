@@ -132,6 +132,9 @@ export interface LoadedModel {
 export interface UtilityModel {
   id: string;
   loaded: boolean;
+  /** (#2915) The binding's declared window (`internal.utility.n_ctx`);
+   *  `null`/absent for a bare binding or an older daemon. */
+  n_ctx?: number | null;
 }
 
 export interface MachineSpecs {

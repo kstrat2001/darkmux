@@ -1222,3 +1222,106 @@ describe("(#2926) the stream-open chunk is not a rate", () => {
     expect(currentTokenRate([hbT(0, 0), hbT(1_000, 16)])).toBeNull();
   });
 });
+
+// (#2915) While the work model's execution is compacting, the PROMPT lamp
+// stays lit (operator, 2026-09-26) and the reading says "compacting", counting
+// like REST; the compaction's own usage record (or the execution moving on)
+// ends it; a compaction that never ends reads STALL after its own bound.
+describe("(#2915) compacting", () => {
+  const compactStart = (atMs: number, stallAfterSeconds?: number): FlowRecord =>
+    ({
+      ts: new Date(atMs).toISOString(),
+      action: "utility.start",
+      category: "telemetry",
+      source: "utility",
+      session_id: SID,
+      handle: "compactor",
+      payload: { job: "compaction", model: "u4b", serves: SID, ...(stallAfterSeconds != null ? { stall_after_seconds: stallAfterSeconds } : {}) },
+    }) as unknown as FlowRecord;
+  const compactUsage = (atMs: number, job: string | null = "compaction"): FlowRecord =>
+    ({
+      ts: new Date(atMs).toISOString(),
+      action: "telemetry.tokens",
+      category: "telemetry",
+      source: "tokens",
+      session_id: SID,
+      handle: "compactor",
+      payload: { call_kind: "compaction", purpose: "utility", ...(job ? { job } : {}), total_tokens: 100 },
+    }) as unknown as FlowRecord;
+  const routingStart = (atMs: number): FlowRecord =>
+    ({ ...compactStart(atMs), session_id: undefined, payload: { job: "radio_routing", model: "u4b", stall_after_seconds: 30 } }) as unknown as FlowRecord;
+
+  const toolAt = 1_000 + STALL_AFTER_MS + 200;
+  const before = [beat(0, 10), beat(1_000, 200), turnEnd(toolAt, 1), tool(toolAt)];
+
+  it("reads PROMPT with compacting and its seconds, from the start", () => {
+    const at = toolAt + 1_000;
+    expect(deriveLiveState([...before, compactStart(at, 600)], at + 12_400)).toEqual({ state: "prompt", compacting: true, compactingSeconds: 12 });
+  });
+
+  it("the compaction's usage record ends it: back to plain PROMPT", () => {
+    const at = toolAt + 1_000;
+    expect(deriveLiveState([...before, compactStart(at, 600), compactUsage(at + 9_000)], at + 12_000)).toEqual({ state: "prompt" });
+  });
+
+  it("a legacy compaction usage record (no job) also ends it", () => {
+    const at = toolAt + 1_000;
+    expect(deriveLiveState([...before, compactStart(at, 600), compactUsage(at + 9_000, null)], at + 12_000)).toEqual({ state: "prompt" });
+  });
+
+  it("the next turn's heartbeat ends it (a compaction whose calls all failed leaves no usage record)", () => {
+    const at = toolAt + 1_000;
+    const recs = [...before, compactStart(at, 600), beat(at + 3_000, 0), beat(at + 5_000, 40)];
+    expect(deriveLiveState(recs, at + 5_500)).toEqual({ state: "generating" });
+  });
+
+  it("a compaction usage record with no open compaction changes nothing (legacy runs keep their old reading)", () => {
+    const at = toolAt + 1_000;
+    expect(deriveLiveState([...before, compactUsage(at)], at + 2_000)).toEqual(deriveLiveState(before, at + 2_000));
+  });
+
+  it("reads STALL past its own bound with no end", () => {
+    const at = toolAt + 1_000;
+    expect(deriveLiveState([...before, compactStart(at, 60)], at + 59_000)).toMatchObject({ state: "prompt", compacting: true });
+    expect(deriveLiveState([...before, compactStart(at, 60)], at + 61_000)).toEqual({ state: "stalled" });
+  });
+
+  it("with no bound on the record, the default inactivity window applies", () => {
+    const at = toolAt + 1_000;
+    expect(deriveLiveState([...before, compactStart(at)], at + 599_000)).toMatchObject({ compacting: true });
+    expect(deriveLiveState([...before, compactStart(at)], at + 601_000)).toEqual({ state: "stalled" });
+  });
+
+  it("a routing job is not this execution's work: it never reads compacting", () => {
+    const at = toolAt + 1_000;
+    expect(deriveLiveState([...before, routingStart(at)], at + 2_000)).toEqual(deriveLiveState(before, at + 2_000));
+  });
+
+  it("(#2915 review, C4) counts from the start's own ms time, not its whole-second ts", () => {
+    const at = toolAt + 1_000;
+    const s = compactStart(at, 600);
+    (s as unknown as { payload: Record<string, unknown> }).payload.started_at_ms = at + 800;
+    expect(deriveLiveState([...before, s], at + 2_700)).toMatchObject({ compacting: true, compactingSeconds: 1 });
+  });
+
+  it("(#2915 review, C4) a sub-second compaction (start and end in one whole second) ends", () => {
+    const at = Math.floor((toolAt + 1_000) / 1000) * 1000;
+    const s = compactStart(at, 600);
+    (s as unknown as { payload: Record<string, unknown> }).payload.started_at_ms = at + 200;
+    const e = compactUsage(at);
+    (e as unknown as { payload: Record<string, unknown> }).payload.ended_at_ms = at + 900;
+    expect(deriveLiveState([...before, s, e], at + 1_500)).toEqual({ state: "prompt" });
+  });
+
+  it("labels as `compacting · Ns`, never `processing prompt`", () => {
+    expect(liveStateLabel({ state: "prompt", compacting: true, compactingSeconds: 7 })).toBe("compacting · 7s");
+    expect(liveStateLabel({ state: "prompt" })).toBe("processing prompt");
+  });
+
+  it("an execution's reading carries it, with no prompt size", () => {
+    const at = toolAt + 1_000;
+    const r = executionTokenReading([...before, compactStart(at, 600)], at + 4_000);
+    expect(r).toMatchObject({ state: "prompt", compacting: true, compactingSeconds: 4 });
+    expect(r.promptLabel).toBeUndefined();
+  });
+});

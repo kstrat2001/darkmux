@@ -24,7 +24,9 @@ const RUN = {
   lamps: ".session-run .modelbox__hero .scope-lamps",
   tube: ".session-run .modelbox__hero .token-scope-bezel",
 };
-const CARD = { card: ".mach", cardScope: ".mach-scope", rateLine: ".mach-scope__rate" };
+// (#2915) `util`: the utility strip at the end of the name row. It is always
+// there, so it too must keep one size whatever the machine's utility job.
+const CARD = { card: ".mach", cardScope: ".mach-scope", rateLine: ".mach-scope__rate", util: ".mach-util" };
 
 async function openState(browser, viewport, state, { mode, surface }) {
   const ctx = await browser.newContext({ viewport, timezoneId: "UTC", locale: "en-US" });
@@ -67,7 +69,7 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
       }
       // The readout under the lamps is present in the tool-gen states and
       // absent elsewhere; that is the case the layout must absorb.
-      expect(rows.map((r) => r.state)).toEqual(expect.arrayContaining(["toolgen-named", "finished"]));
+      expect(rows.map((r) => r.state)).toEqual(expect.arrayContaining(["toolgen-named", "finished", "compacting", "radio-routing"]));
     });
 
     test(`fleet card: one size across its running states (${vpName}, ${mode})`, async ({ browser }) => {
@@ -81,16 +83,22 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
         } else {
           await expect(page.locator(CARD.rateLine)).toHaveCount(0);
         }
+        // (#2915) The utility strip shows the state's job, or is quiet.
+        await expect(page.locator(CARD.util).first(), `${state.id}: the utility strip`).toHaveAttribute("data-visual", state.utilVisual ?? "quiet");
+        await expect(page.locator(CARD.util).first(), `${state.id}: the strip's stall`).toHaveAttribute("data-stalled", state.utilStalled ? "true" : "false");
         await page.waitForTimeout(400);
         rows.push({ state: state.id, running: !!state.rateText, ...(await measure(page, CARD)) });
         await ctx.close();
       }
+      expect(rows.map((r) => r.state)).toEqual(expect.arrayContaining(["compacting", "radio-routing", "utility-generic", "utility-stalled"]));
       const running = rows.filter((r) => r.running);
-      for (const key of ["card", "cardScope", "rateLine"]) {
+      for (const key of ["card", "cardScope", "rateLine", "util"]) {
         const groups = sizeGroups(running, key);
         expect(groups, `${key} changed size between running states (${vpName}, ${mode}):\n  ${groups.join("\n  ")}`).toHaveLength(1);
       }
       // On a phone the card is also the same size idle and running.
+      // (#2915) The strip is one size in EVERY state, idle included.
+      expect(sizeGroups(rows, "util"), `the utility strip changed size (${vpName}, ${mode})`).toHaveLength(1);
       if (vpName === "phone") {
         for (const key of ["card", "cardScope"]) {
           const groups = sizeGroups(rows, key);
@@ -108,3 +116,34 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
 // operator's design call (reserve the line on an idle card, or fold the rate
 // into an existing line), so it is recorded here, not decided here.
 test.fixme("fleet card: the same size idle and running on a desktop (owner: the operator's call on where the rate line lives)", async () => {});
+
+// (#2915 review, C7) The machine page's Utility section is ONE size whatever
+// the machine's utility jobs are doing: quiet, routing, compacting, a job
+// this build has no visual for, a stalled job, and pre-1.61.0 records that
+// name no job (folded into the fixed "other" row). Live only: the machine
+// page reads the page clock.
+const UTIL = { section: ".mm-utility", jobs: ".mm-utility__jobs", strip: ".mm-utility .mach-util" };
+for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
+  test(`machine page Utility section: one size in every utility state (${vpName})`, async ({ browser }) => {
+    const states = STATES.filter((s) => s.utilLive);
+    expect(states.map((s) => s.id)).toEqual(expect.arrayContaining(["prompt", "compacting", "radio-routing", "utility-generic", "utility-stalled", "utility-legacy"]));
+    const rows = [];
+    for (const state of states) {
+      const ctx = await browser.newContext({ viewport, timezoneId: "UTC", locale: "en-US" });
+      const page = await ctx.newPage();
+      await page.clock.setFixedTime(state.nowMs);
+      await installLayoutRoutes(page, { machineSpecs: true });
+      await page.goto("/index.html#lens=machine");
+      await expect(page.locator(".mm-utility__live"), `${state.id}: the live line`).toHaveText(state.utilLive);
+      await expect(page.locator(".mm-utility__job")).toHaveCount(3);
+      if (state.id === "utility-legacy") await expect(page.locator(".mm-utility__job").nth(2)).toContainText("1 call");
+      await page.waitForTimeout(300);
+      rows.push({ state: state.id, ...(await measure(page, UTIL)) });
+      await ctx.close();
+    }
+    for (const key of Object.keys(UTIL)) {
+      const groups = sizeGroups(rows, key);
+      expect(groups, `${key} changed size between utility states (${vpName}):\n  ${groups.join("\n  ")}`).toHaveLength(1);
+    }
+  });
+}
