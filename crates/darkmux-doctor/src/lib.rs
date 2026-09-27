@@ -8215,8 +8215,7 @@ mod tests {
         // char paragraph 15 times. Wrapping it faithfully filled fifty lines
         // of the operator's screen with a restatement of what the check line
         // below already says. A banner is a HEADLINE: one line, always.
-        let huge = std::iter::repeat("some very wordy finding text about a config")
-            .take(200)
+        let huge = std::iter::repeat_n("some very wordy finding text about a config", 200)
             .collect::<Vec<_>>()
             .join(" | ");
         let r = DoctorReport {

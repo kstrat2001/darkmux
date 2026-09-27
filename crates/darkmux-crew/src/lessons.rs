@@ -280,10 +280,10 @@ pub fn recall(conn: &Connection, term: Option<&str>, file: Option<&str>) -> Resu
     Ok(list(conn)?
         .into_iter()
         .filter(|l| {
-            let term_ok = term_lc.as_ref().map_or(true, |t| {
+            let term_ok = term_lc.as_ref().is_none_or(|t| {
                 l.title.to_lowercase().contains(t) || l.body.to_lowercase().contains(t)
             });
-            let file_ok = file.map_or(true, |f| l.file.as_deref() == Some(f));
+            let file_ok = file.is_none_or(|f| l.file.as_deref() == Some(f));
             term_ok && file_ok
         })
         .collect())
