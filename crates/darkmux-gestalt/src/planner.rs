@@ -437,15 +437,16 @@ impl<'a> Acquisition<'a> {
     /// count (#1243) — physical pressure cross-checks are doctor scope.
     ///
     /// The arm exists to make room for pending loads, so it runs only when
-    /// a load survived the flat refusals: a base already over budget with
-    /// nothing to load (nothing desired, everything reused, or every load
-    /// refused) evicts nothing and claims no override.
+    /// the loads that survived the flat refusals need bytes: a base already
+    /// over budget with nothing to add (nothing desired, everything reused,
+    /// every load refused, or only unpriced or zero-sized loads, which
+    /// count 0) evicts nothing and claims no override.
     fn budget_fit(&mut self, budget: u64, intent: CallerIntent) {
-        if !self.has_surviving_load() {
+        let need = self.pending_sum();
+        if need == 0 {
             return;
         }
         let base = resident_base(self.facts, &self.removed);
-        let need = self.pending_sum();
         if base + need <= budget {
             return;
         }
@@ -589,9 +590,6 @@ impl<'a> Acquisition<'a> {
         pending_sum(&self.decisions, &self.pendings)
     }
 
-    fn has_surviving_load(&self) -> bool {
-        self.pendings.iter().any(|p| is_load_like(&self.decisions[p.decision_idx].action))
-    }
 
     /// Assembly: refusals, then the free phase, then the rest.
     ///
@@ -1892,11 +1890,14 @@ mod tests {
             budget: Budget { max_darkmux_bytes: Some(15 * GB) },
             ..Default::default()
         };
-        let est = est_map(&[("huge", 16 * GB)]);
-        let cases: [(&str, Vec<Placement>); 3] = [
+        // "unpriced" has no estimate (counts 0); "empty" is priced at 0.
+        let est = est_map(&[("huge", 16 * GB), ("empty", 0)]);
+        let cases: [(&str, Vec<Placement>); 5] = [
             ("nothing desired", vec![]),
             ("reuse only", vec![placement("kept", 8_000)]),
             ("only load refused flat", vec![placement("huge", 8_000)]),
+            ("only load unpriced", vec![placement("unpriced", 8_000)]),
+            ("only load zero-sized", vec![placement("empty", 8_000)]),
         ];
         for (label, desired) in cases {
             for intent in [CallerIntent::Auto, CallerIntent::OperatorExplicit] {

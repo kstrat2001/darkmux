@@ -74,9 +74,10 @@ pub type Pools = BTreeMap<PoolId, PoolFact>;
 /// loads never count against the cap (cross-checking total physical pressure
 /// is a doctor/observability concern layered on top, never a core decision
 /// input). The core sees bytes; the caller resolves them. No caller sets a
-/// budget today: there is no config key for it yet, and every production
-/// path passes `None` (no budget configured), so the budget arms only run
-/// in tests.
+/// budget today: every production path passes `None` (no budget
+/// configured), so the budget arms only run in tests. The PLANNED config
+/// source is `runtime.max_model_ram_gb`, which does not exist yet (the
+/// model ledger's `budget_bytes` input names the same planned key).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Budget {
     pub max_darkmux_bytes: Option<u64>,
