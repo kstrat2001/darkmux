@@ -15356,11 +15356,21 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         // probe-confirmed kill for `ContainerKillGuard`'s single
         // fire-and-forget `docker kill`. This test proves the OPPOSITE:
         // with `watchdog_abandoned` guarded instead, a panic makes the real
-        // spawned `run_watchdog` thread run `watchdog_finalize_kill`
-        // PROMPTLY — well before the (deliberately far-future) inactivity
-        // deadline would ever fire — via the exact production function
-        // `dispatch()` calls (`spawn_guarded_watchdog`), no hand-rolled
-        // stand-in.
+        // spawned `run_watchdog` thread wake BECAUSE OF THE ABANDONMENT (not
+        // the far-future inactivity deadline) and run `watchdog_finalize_kill`,
+        // via the exact production function `dispatch()` calls
+        // (`spawn_guarded_watchdog`), no hand-rolled stand-in.
+        //
+        // (#2976) No wall-clock race. The test used to require the thread to
+        // exit within 5s, which failed under host load: exec'ing the freshly
+        // written fake `docker` alone took 2.4s on a loaded machine. Instead,
+        // once the guard has fired, the test moves the inactivity deadline
+        // into the past, so the thread exits whether or not the wiring holds,
+        // and asserts the CAUSE it reports. `wait_for_watchdog_wake` reads the
+        // deadline before the abandonment flag, so the cause is exact: a
+        // thread that cannot see the guard's flag reports `DeadlineExpired`
+        // within one 500ms poll, and the test fails in about a second rather
+        // than at a timeout.
         //
         // No real Docker daemon: `install_fake_docker` puts a script on
         // `PATH` that echoes its argv and exits 0 for anything, so the
@@ -15380,7 +15390,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
 
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let handle_holder: Arc<Mutex<Option<thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+        let handle_holder: Arc<Mutex<Option<thread::JoinHandle<WatchdogWake>>>> = Arc::new(Mutex::new(None));
         let handle_holder_for_closure = Arc::clone(&handle_holder);
         let watchdog_abandoned_for_closure = Arc::clone(&watchdog_abandoned);
         let inactivity_deadline_for_closure = Arc::clone(&inactivity_deadline);
@@ -15412,29 +15422,39 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
              the kill', which a panic never proves (MUST FIX 2)"
         );
 
-        // Bounded wait far shorter than the 600s inactivity deadline — if
-        // `run_watchdog` ever stopped checking `watchdog_abandoned` (or the
-        // guard construction inside `spawn_guarded_watchdog` were deleted),
-        // this thread would sit in its poll loop for the full deadline
-        // instead, and this bounded wait fails the test instead of hanging
-        // it.
+        // Only now that the guard has fired: expire the deadline, so every
+        // version of the thread exits and the cause it reports is the claim.
+        *inactivity_deadline.lock().unwrap() = Instant::now();
+
+        // The bound is a hang guard, not the claim: it only has to outlast
+        // the fake `docker kill` on a loaded host. A thread still running
+        // after it is stuck in its kill, which the assertion names.
         let handle = handle_holder
             .lock()
             .unwrap()
             .take()
             .expect("handle was captured before the panic");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !handle.is_finished() && Instant::now() < deadline {
+        let hang_bound = Instant::now() + Duration::from_secs(60);
+        while !handle.is_finished() && Instant::now() < hang_bound {
             thread::sleep(Duration::from_millis(50));
         }
         assert!(
             handle.is_finished(),
-            "the real watchdog thread spawned by spawn_guarded_watchdog must have run its \
-             persistent kill and exited within 5s of the panic, NOT waited out the 600s \
-             inactivity deadline — if it is still running, the abandonment check inside \
+            "the watchdog thread was still running 60s after its deadline expired: it is \
+             stuck in its kill, not waiting on the deadline"
+        );
+        let wake = handle.join().expect("the watchdog thread itself must not have panicked");
+        assert_eq!(
+            wake,
+            WatchdogWake::Abandoned,
+            "the watchdog must wake because the guard fired, not because the inactivity \
+             deadline passed — `DeadlineExpired` means the abandonment check inside \
              run_watchdog / spawn_guarded_watchdog is not actually wired"
         );
-        handle.join().expect("the watchdog thread itself must not have panicked");
+        assert!(
+            !timeout_fired.load(Ordering::SeqCst),
+            "an abandonment is not an inactivity timeout and must not be reported as one"
+        );
 
         restore_path(prev_path);
 
