@@ -938,11 +938,24 @@ fn lab_loop_rejects_an_out_of_range_compact_threshold_ratio() {
 #[test]
 fn mission_dispatch_names_an_unknown_mission_and_how_to_create_one() {
     darkmux_cmd()
-        .args(["mission", "dispatch", "no-such-mission", "--role", "coder"])
+        .args(["mission", "dispatch", "no-such-mission", "--role", "coder", "--machine", "studio"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("mission `no-such-mission` not found"))
         .stderr(predicate::str::contains("darkmux mission launch <config-id>"));
+}
+
+// (#2916) The shared fleet work queue is retired, so a phase goes to one
+// named machine: `mission dispatch` with no `--machine` refuses and says how
+// to run the phase here instead.
+#[test]
+fn mission_dispatch_without_a_machine_names_the_retired_queue_and_the_local_alternative() {
+    darkmux_cmd()
+        .args(["mission", "dispatch", "some-mission", "--role", "coder"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("mission dispatch needs --machine <id>"))
+        .stderr(predicate::str::contains("--phase-id <phase>"));
 }
 
 #[test]
