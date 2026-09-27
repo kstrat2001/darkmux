@@ -3,6 +3,7 @@
 //! Split by concern into submodules (#508); this file is the crate facade.
 
 mod identity;
+mod identity_knowledge;
 mod job;
 mod peer;
 mod roster;
@@ -12,6 +13,7 @@ mod seats;
 mod submission;
 
 pub use identity::*;
+pub use identity_knowledge::*;
 pub use job::*;
 pub use peer::*;
 pub use roster::*;

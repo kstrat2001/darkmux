@@ -17143,62 +17143,10 @@ pub struct RosterEntryView {
     pub loopback_intended: bool,
 }
 
-/// Whether live presence was read for this doctor run. Without it, a peer
-/// that is merely off and a name nothing ever used look the same.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum PresenceState {
-    /// No Redis is configured, so there is no presence to read.
-    #[default]
-    NotConfigured,
-    /// Redis is configured but the read failed.
-    Unreadable,
-    /// Presence beats were read (possibly none).
-    Read,
-}
-
-/// What this machine knows about fleet identity, gathered by the caller from
-/// its own resolution, presence beats, and a bounded window of local flow
-/// history.
-#[derive(Debug, Clone, Default)]
-pub struct FleetIdentityKnowledge {
-    /// Each known hardware uid -> the machine_id that machine goes by NOW:
-    /// this machine's own resolution, a live presence beat's `display_name`,
-    /// else the most recent name in flow history.
-    pub current_name_by_uid: std::collections::BTreeMap<String, String>,
-    /// Every name seen -> EVERY uid seen under it. A set, not a last-writer
-    /// map: one machine collects throwaway names (a `DARKMUX_MACHINE_ID` set
-    /// for one session), and two machines can once have shared a
-    /// hostname-derived id. A name traces to a machine only when it maps to
-    /// exactly one uid.
-    pub uids_by_name: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
-    /// machine_ids seen in flow history with no uid attached (records written
-    /// before flow records carried `machine_uid`). Known names whose machine
-    /// cannot be identified further.
-    pub uidless_names: std::collections::BTreeSet<String>,
-    /// This machine's own resolved machine_id, even when its hardware uid
-    /// could not be read (non-macOS, `ioreg` failing).
-    pub local_name: Option<String>,
-    /// Whether live presence was read.
-    pub presence: PresenceState,
-    /// This machine's hardware uid, when readable. A history-only trace to
-    /// it is weak: throwaway session names collect here.
-    pub local_uid: Option<String>,
-    /// uids whose current name came from a LIVE source (this machine, a
-    /// presence beat), not from history.
-    pub live_uids: std::collections::BTreeSet<String>,
-    /// True when `local_name` came from the `DARKMUX_MACHINE_ID` env tier
-    /// (a per-shell override), which is not evidence of the machine's name.
-    pub local_name_from_env: bool,
-    /// `Some(n)` when older flow files exist beyond the last `n` read.
-    pub history_truncated_to: Option<usize>,
-}
-
-impl FleetIdentityKnowledge {
-    /// True when some machine goes by `name` right now.
-    pub fn is_current_name(&self, name: &str) -> bool {
-        self.local_name.as_deref() == Some(name) || self.current_name_by_uid.values().any(|n| n == name)
-    }
-}
+/// (#2916 stage 2) Fleet identity knowledge moved to `darkmux-fleet`, where
+/// routing and the daemon can use it too; re-exported so doctor keeps its
+/// names.
+pub use darkmux_fleet::{FleetIdentityKnowledge, PresenceState};
 
 /// How strong the link is between a roster entry and the machine it is
 /// traced to. Only `DeclaredLive` licenses repairs that reuse the entry's
