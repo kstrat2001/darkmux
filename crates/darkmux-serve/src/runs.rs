@@ -2345,7 +2345,7 @@ impl SessionAgg {
     /// The attempt-scoped fields, from the current attempt.
     fn settle(&mut self) {
         self.lifecycle.seal();
-        let latest = self.lifecycle.latest().cloned();
+        let latest = self.lifecycle.latest().cloned().or_else(|| self.lifecycle.recorded_end(None));
         self.settle_from(latest.as_ref());
     }
 
@@ -2356,9 +2356,9 @@ impl SessionAgg {
     /// share (#1918), instead of refusing it: the attempts are per mission,
     /// so no other mission's activity or terminal reaches it.
     fn for_mission(&self, mission: &str) -> Option<SessionAgg> {
-        let attempt = self.lifecycle.latest_of(mission)?;
+        let attempt = self.lifecycle.latest_of(mission).cloned().or_else(|| self.lifecycle.recorded_end(Some(mission)))?;
         let mut scoped = self.clone();
-        scoped.settle_from(Some(attempt));
+        scoped.settle_from(Some(&attempt));
         Some(scoped)
     }
 
@@ -4611,13 +4611,19 @@ mod tests {
     /// attempt. The daemon has no `waiting` phase of its own (a held call is
     /// `Running`), so `open` and `waiting` both read `running` here.
     fn daemon_judgement(agg: &SessionAgg, opened: bool, now_ms: u64) -> (&'static str, RunStatus, Option<AbandonReason>) {
-        if let Some(status) = agg.terminal_status {
+        let ended = agg.terminal_status.map(|status| {
             let reason = (status == RunStatus::Abandoned)
                 .then_some(if agg.stopped_by_operator { AbandonReason::Aborted } else { AbandonReason::NoTerminal });
-            return ("closed", status, reason);
-        }
+            (status, reason)
+        });
+        // Nothing opened: not a run, though its session may have recorded
+        // its end (`RunFold::recorded_end`).
         if !opened {
-            return ("not_started", RunStatus::Planned, None);
+            let (status, reason) = ended.unwrap_or((RunStatus::Planned, None));
+            return ("not_started", status, reason);
+        }
+        if let Some((status, reason)) = ended {
+            return ("closed", status, reason);
         }
         if session_is_live(agg, now_ms) {
             return ("running", RunStatus::Running, None);
@@ -4670,7 +4676,7 @@ mod tests {
             let scoped = case["run"]["mission_id"].as_str().map(|m| agg.for_mission(m));
             let (phase, status, reason) = match &scoped {
                 Some(None) => ("not_started", RunStatus::Planned, None),
-                Some(Some(mine)) => daemon_judgement(mine, true, now_s * 1_000),
+                Some(Some(mine)) => daemon_judgement(mine, mine.lifecycle.latest_of(case["run"]["mission_id"].as_str().unwrap_or_default()).is_some(), now_s * 1_000),
                 None => daemon_judgement(agg, agg.lifecycle.latest().is_some(), now_s * 1_000),
             };
             let want_phase = match case["phase"].as_str().expect("phase") {

@@ -256,6 +256,24 @@ impl RunFold {
     pub fn latest_of(&self, mission: &str) -> Option<&Attempt> {
         self.attempts.iter().rev().find(|a| a.mission.as_deref() == Some(mission))
     }
+
+    /// How the session (`mission`'s records on it, when named) recorded its
+    /// end when nothing of it opened (rule 2): not a run, but a session that
+    /// recorded how it ended (the crash shape: the presence reconciler's
+    /// `session.end`, the opening records in an older day or never written).
+    /// An attempt holding only that close: its dispatch terminal when it has
+    /// one (rule 3), else its earliest closing record; `None` when nothing
+    /// closed. Read only where no attempt opened (`latest`/`latest_of` are
+    /// `None`): an opened session's closes are its attempts'.
+    pub fn recorded_end(&self, mission: Option<&str>) -> Option<Attempt> {
+        let mut closes: Vec<&Folded> =
+            self.records.iter().filter(|r| r.ending().is_some() && (mission.is_none() || r.mission.as_deref() == mission)).collect();
+        closes.sort_by_key(|r| (r.at.is_none(), r.at));
+        let record = closes.iter().find(|r| r.is_dispatch_terminal()).or(closes.first())?;
+        let mut end = Attempt { mission: record.mission.clone(), ..Attempt::default() };
+        end.add(record);
+        Some(end)
+    }
 }
 
 /// The one staleness rule: live while `now` is within the window of the
