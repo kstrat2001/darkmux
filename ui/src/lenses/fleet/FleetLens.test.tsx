@@ -1168,8 +1168,8 @@ describe("FleetLens pager (#2881)", () => {
     // countdown is counted against; the playback is not playing (no
     // transport in this render), so the clock stands still.
     const p = scopeProps();
-    expect(p.clockRate).toBe(0);
-    expect(Math.ceil((p.restEndMs - p.clockMs) / 1000)).toBe(13);
+    expect(p.clock.kind).toBe("frozen");
+    expect(Math.ceil((p.restEndMs - p.clock.tMs) / 1000)).toBe(13);
   });
 
   // (#2950) The card's status line says why it rests, from the rest record's
@@ -1970,8 +1970,8 @@ describe("(#2911) the fleet card ticks while an execution is live", () => {
     });
     expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("rest 17s");
     expect(latestTokenScopeProps()).toMatchObject({ state: "rest", centerLabel: "17s", centerUnit: "resting" });
-    // (#2961) Live: the rest's end and the wall clock, at rate 1.
-    expect(latestTokenScopeProps()).toMatchObject({ restEndMs: now + 20_000, clockMs: now + 3_000, clockRate: 1 });
+    // (#2961) Live: the rest's end and the wall clock, read per frame.
+    expect(latestTokenScopeProps()).toMatchObject({ restEndMs: now + 20_000, clock: { kind: "wall" } });
     r.unmount();
     expect(__clockDebug().running).toBe(false);
   });

@@ -99,6 +99,31 @@ describe("usePlaybackTransport", () => {
     expect([5, 30].map(speedLabel)).toEqual(["5s/s", "30s/s"]);
   });
 
+  // (#2961 review, M1) An animation extrapolating the playhead between ticks
+  // anchors on the moment the transport COMPUTED `t`, not on when a render
+  // landed: `tickWallMs` is that moment.
+  it("tickWallMs is the monotonic time each tick computed t at, and a seek's own time", () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() => usePlaybackTransport(DAY));
+    act(() => result.current.togglePlay());
+    for (let i = 0; i < 3; i++) {
+      act(() => {
+        vi.advanceTimersByTime(100);
+      });
+      // The fake clock's performance.now() at this tick: t - tMin elapsed
+      // since play began, which the transport measured with the same clock.
+      const started = result.current.tickWallMs - (result.current.t - result.current.tMin);
+      expect(started).toBeCloseTo(result.current.tickWallMs - 100 * (i + 1), 6);
+    }
+    const before = result.current.tickWallMs;
+    act(() => {
+      vi.advanceTimersByTime(40); // between ticks: t and its time stay put
+    });
+    expect(result.current.tickWallMs).toBe(before);
+    act(() => result.current.scrub(result.current.tMin + 5));
+    expect(result.current.tickWallMs).toBe(performance.now());
+  });
+
   it("speed is a real multiplier: at 1h/s one real second replays one recorded hour, at 1m/s one minute", () => {
     vi.useFakeTimers();
     const threeHours = [

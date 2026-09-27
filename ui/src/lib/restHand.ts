@@ -13,14 +13,23 @@
  * with). Both change at the same instant, when the seconds left cross a whole
  * number, and at that instant the angle is the top.
  *
- * **The page's clock, not the wall clock.** In playback the page's "now" is
- * the transport's playhead, which advances at the playback speed. The scope
- * redraws every animation frame, while the playhead only moves on the
- * transport's own tick (100 ms) and a live page re-renders once a second, so
- * the scope extrapolates the page clock between updates from an anchor: the
- * page time an update was taken at, the wall time (a monotonic
- * `performance.now()`) it arrived, and how many page ms pass per wall ms (1
- * live, the playback speed while playing, 0 when paused or frozen).
+ * **The page's clock, not the wall clock.** Live, the page's "now" is the
+ * wall clock, read per frame. In playback it is the transport's playhead,
+ * which advances at the playback speed on the transport's own 100 ms tick;
+ * the scope extrapolates between ticks from the playhead AND the moment the
+ * transport computed it (`PageClock`'s `wallMs`), never from when a render
+ * happened to land, so render jitter is not a jump in page time.
+ *
+ * **Monotonic within one rest.** Page time seen by the hand never moves
+ * backward within one rest unless the page SEEKS (a scrub, a rewind): a
+ * re-anchor that lands a little behind the extrapolation (a pause, a late
+ * tick) holds the hand where it was instead of climbing the countdown back
+ * (`stepRestHand`).
+ *
+ * **Effects follow ticks the scope saw.** The tick glow, the finished
+ * circle's fade and the number's flare start when the scope observes the
+ * number drop between two consecutive frames, never from the phase alone, so
+ * a seek or a resume that lands just after a whole second shows none of them.
  */
 
 /** Where 12 o'clock is, in canvas radians (0 is 3 o'clock, y points down). */
@@ -40,22 +49,32 @@ export const REST_TICK_GLOW_MS = 180;
  *  `token-scope-rest-tick` in `styles.css`). */
 export const REST_NUMBER_FLARE_MS = 260;
 
-/** The page's clock, anchored where an update arrived. */
-export interface PageClockAnchor {
-  /** The page's "now" (epoch ms) the update was derived at. */
-  pageMs: number;
-  /** The monotonic wall time (`performance.now()`) the anchor was taken. */
-  wallMs: number;
-  /** Page ms per wall ms: 1 live, the playback speed while playing, 0 when
-   *  paused or frozen. */
-  rate: number;
+/** Where the page's "now" comes from. */
+export type PageClock =
+  /** Live: the wall clock (`Date.now()`), read every frame. */
+  | { kind: "wall" }
+  /** A view that does not move (a finished or parked replay): `tMs`. */
+  | { kind: "frozen"; tMs: number }
+  /** The playback transport: its playhead `tMs`, the monotonic time
+   *  (`performance.now()`) the transport computed it at, and page ms per
+   *  wall ms (the speed while playing, 0 while paused). */
+  | { kind: "playback"; tMs: number; wallMs: number; rate: number };
+
+export const WALL_CLOCK: PageClock = { kind: "wall" };
+
+/** Page ms per wall ms: 1 live, the speed while playing, 0 otherwise. */
+export function pageClockRate(clock: PageClock): number {
+  if (clock.kind === "wall") return 1;
+  if (clock.kind === "frozen") return 0;
+  return Number.isFinite(clock.rate) && clock.rate > 0 ? clock.rate : 0;
 }
 
-/** The page's clock at monotonic wall time `wallMs`. Never runs backward
- *  from its anchor (a wall time before the anchor reads as the anchor). */
-export function pageNowAt(anchor: PageClockAnchor, wallMs: number): number {
-  const rate = Number.isFinite(anchor.rate) && anchor.rate > 0 ? anchor.rate : 0;
-  return anchor.pageMs + Math.max(0, wallMs - anchor.wallMs) * rate;
+/** The page's clock at monotonic time `perfMs` (and wall time `dateMs`, for
+ *  the live clock). Playback never extrapolates to before its own tick. */
+export function pageNowOf(clock: PageClock, perfMs: number, dateMs: number): number {
+  if (clock.kind === "wall") return dateMs;
+  if (clock.kind === "frozen") return clock.tMs;
+  return clock.tMs + Math.max(0, perfMs - clock.wallMs) * pageClockRate(clock);
 }
 
 /** Seconds left in the rest (fractional, never negative). */
@@ -117,45 +136,111 @@ export function restStrokeSegments(progress: number): RestStrokeSegment[] {
   return out;
 }
 
-/** What one frame of the hand draws. */
-export interface RestHandFrame {
+/** The geometry of one frame of the hand. */
+export interface RestHandGeometry {
   /** The dot's angle (canvas radians). */
   angle: number;
   /** The number the center shows (`ceil` of the seconds left). */
   shown: number;
   /** How much of this second's circle is drawn, in turns (0..1). */
   progress: number;
-  /** Draw this second's stroke (the rest is running and motion is allowed). */
+  /** Draw this second's stroke (the rest is still running). */
   stroke: boolean;
-  /** The tick glow at 12 o'clock, 0..1 (0 = none). */
+}
+
+/** The hand at page time `pageNowMs`: the dot `progress` of a turn past 12,
+ *  drawing this second's stroke while the rest runs. */
+export function restHandGeometry(restEndMs: number, pageNowMs: number): RestHandGeometry {
+  const shown = restShownSeconds(restEndMs, pageNowMs);
+  const progress = restHandProgress(restEndMs, pageNowMs);
+  const stroke = restSecondsLeftExact(restEndMs, pageNowMs) > 0;
+  return { angle: REST_HAND_TOP + 2 * Math.PI * progress, shown, progress, stroke };
+}
+
+/** How long each tick effect lasts at page rate `rate`, in wall ms: its own
+ *  duration, or 80% of a page second's wall time when that is shorter (fast
+ *  playback), so the ring clears between ticks at any speed. */
+export function restEffectMs(baseMs: number, rate: number): number {
+  if (!(rate > 0)) return baseMs;
+  return Math.min(baseMs, (0.8 * 1000) / rate);
+}
+
+/** What the hand carries from one frame to the next. */
+export interface RestHandState {
+  end: number;
+  /** The page's seek generation this state belongs to. */
+  seekGen: number;
+  /** The latest page time the hand has shown (it never moves backward within
+   *  one rest and seek generation). */
+  pageMs: number;
+  shown: number;
+  /** Monotonic wall time of the last tick the scope SAW, or null. */
+  tickWallMs: number | null;
+  /** How many ticks it has seen in this rest (the flare key). */
+  flares: number;
+}
+
+/** One frame of the hand. */
+export interface RestHandFrame extends RestHandGeometry {
+  /** The tick glow at 12 o'clock, 0..1. */
   glow: number;
-  /** The finished circle (the previous second's), fading out after the
-   *  tick: 1 at the tick, 0 after `REST_CLOSED_FADE_MS` of wall time. */
+  /** The finished circle, fading out after an observed tick, 0..1. */
   closedFade: number;
+  /** The number's flare duration for the current speed, in wall ms. */
+  flareMs: number;
+}
+
+export interface RestHandInput {
+  end: number;
+  /** The page time this frame reads (`pageNowOf`). */
+  pageMs: number;
+  /** Monotonic wall time of this frame (`performance.now()` timebase). */
+  wallMs: number;
+  /** Page ms per wall ms. */
+  rate: number;
+  seekGen: number;
 }
 
 /**
- * One frame of the hand at page time `pageNowMs`.
+ * Advance the hand by one frame.
  *
- * `rate` (page ms per wall ms) converts the page time since the last tick to
- * wall time for the glow and the finished circle's fade, which are visual
- * durations. While the page clock stands still (`rate` 0: paused, or a
- * frozen view) nothing fades, so neither shows. `reduced`
- * (prefers-reduced-motion): one still frame, the dot at 12 with no stroke,
- * glow or fade, like every other state's still frame; the number still
- * counts.
+ * Continuity (the same rest and seek generation as `prev`) makes page time
+ * monotonic and lets a drop of the number between the two frames count as a
+ * TICK: the tick's wall time is when the page clock crossed that whole
+ * second. The glow, the finished circle's fade and the flare run from it.
+ * Anything else (the first frame, a new rest, a seek) starts fresh with no
+ * tick seen, so nothing fades in from a tick the scope never showed. The
+ * final drop to 0 is a tick like any other: the last circle fades and the
+ * glow fires.
  */
-export function restHandFrame(restEndMs: number, pageNowMs: number, rate: number, reduced: boolean): RestHandFrame {
-  const shown = restShownSeconds(restEndMs, pageNowMs);
-  if (reduced) return { angle: REST_HAND_TOP, shown, progress: 0, stroke: false, glow: 0, closedFade: 0 };
-  const running = restSecondsLeftExact(restEndMs, pageNowMs) > 0;
-  const progress = restHandProgress(restEndMs, pageNowMs);
+export function stepRestHand(prev: RestHandState | null, input: RestHandInput): { state: RestHandState; frame: RestHandFrame } {
+  const continuous = prev !== null && prev.end === input.end && prev.seekGen === input.seekGen;
+  const pageMs = continuous ? Math.max(prev.pageMs, input.pageMs) : input.pageMs;
+  const geo = restHandGeometry(input.end, pageMs);
+  let tickWallMs = continuous ? prev.tickWallMs : null;
+  let flares = continuous ? prev.flares : 0;
+  if (continuous && geo.shown < prev.shown) {
+    // The page clock crossed `end − shown·1000` somewhere since the last
+    // frame; place the tick there in wall time (never after this frame).
+    const crossedPage = input.end - geo.shown * 1000;
+    const back = input.rate > 0 ? Math.max(0, (pageMs - crossedPage) / input.rate) : 0;
+    tickWallMs = input.wallMs - back;
+    flares += 1;
+  }
   let glow = 0;
   let closedFade = 0;
-  if (running && rate > 0) {
-    const wallSinceTick = (progress * 1000) / rate;
-    glow = Math.max(0, 1 - wallSinceTick / REST_TICK_GLOW_MS);
-    closedFade = Math.max(0, 1 - wallSinceTick / REST_CLOSED_FADE_MS);
+  if (tickWallMs !== null) {
+    const since = Math.max(0, input.wallMs - tickWallMs);
+    glow = Math.max(0, 1 - since / restEffectMs(REST_TICK_GLOW_MS, input.rate));
+    closedFade = Math.max(0, 1 - since / restEffectMs(REST_CLOSED_FADE_MS, input.rate));
   }
-  return { angle: REST_HAND_TOP + 2 * Math.PI * progress, shown, progress, stroke: running, glow, closedFade };
+  return {
+    state: { end: input.end, seekGen: input.seekGen, pageMs, shown: geo.shown, tickWallMs, flares },
+    frame: { ...geo, glow, closedFade, flareMs: restEffectMs(REST_NUMBER_FLARE_MS, input.rate) },
+  };
 }
+
+/** Reduced motion (prefers-reduced-motion): one still frame, the dot at 12
+ *  with no stroke, glow or fade, like every other state's still frame. The
+ *  number is the caller's. */
+export const REST_STILL_FRAME: RestHandFrame = { angle: REST_HAND_TOP, shown: 0, progress: 0, stroke: false, glow: 0, closedFade: 0, flareMs: 0 };

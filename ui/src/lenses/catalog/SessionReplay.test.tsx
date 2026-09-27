@@ -10,7 +10,7 @@ import path from "node:path";
 import { render, screen, waitFor, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ScopeLamps, SessionReplay, modelScopeHero } from "./SessionReplay";
-import { PageClockRateContext } from "../../lib/pageClockRate";
+import { PlaybackClockContext } from "../../lib/pageClockRate";
 import { PEPPER_SID, pepperAt, pepperRecords } from "../../testing/pepperGrinderRun";
 
 // (#2886 pass 5, MUST — fresh-reviewer finding F5) Several fixes here stayed
@@ -1523,17 +1523,14 @@ describe("(#2911) the MODEL section, ticking and wording", () => {
     });
     expect(probe()).toMatchObject({ centerLabel: "15s" });
     expect(screen.getByRole("status", { name: /run state/ }).getAttribute("aria-label")).toBe("run state: rest 15s");
-    // (#2961) The scope is handed the rest's end and the live wall clock it
-    // was read at (rate 1), to phase REST's seconds hand.
-    expect(probe()).toMatchObject({ restEndMs: t0 + 20_000, clockRate: 1 });
-    // The clock the reading was taken at (the page's ticking 1 s clock), the
-    // one its "15s" was counted against.
-    expect(Math.ceil((probe().restEndMs - probe().clockMs) / 1000)).toBe(15);
+    // (#2961) The scope is handed the rest's end and the live wall clock,
+    // which it reads itself every frame (never an anchor from a render).
+    expect(probe()).toMatchObject({ restEndMs: t0 + 20_000, clock: { kind: "wall" } });
   });
 
   // (#2961) In playback the hand follows the playhead at the transport's
   // speed, and stands still while it is paused.
-  it("playback: the scope gets the rest's end, the playhead as its clock, and the playback speed as its rate", async () => {
+  it("playback: the scope gets the rest's end and the transport's clock (playhead, when it was computed, speed; paused 0)", async () => {
     const t0 = 1_800_000_000_000;
     const records = [
       { ts: new Date(t0 - 30_000).toISOString(), action: "dispatch.start", session_id: "s-rest-pb", machine_id: "M", payload: { role: "coder" } },
@@ -1545,16 +1542,23 @@ describe("(#2911) the MODEL section, ticking and wording", () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const tree = (rate: number, playhead: number) => (
       <QueryClientProvider client={queryClient}>
-        <PageClockRateContext.Provider value={rate}>
+        <PlaybackClockContext.Provider value={{ kind: "playback", tMs: playhead, wallMs: 777, rate }}>
           <SessionReplay sessionId="s-rest-pb" playhead={playhead} />
-        </PageClockRateContext.Provider>
+        </PlaybackClockContext.Provider>
       </QueryClientProvider>
     );
     const r = render(tree(5, t0 - 2_500));
     await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
-    expect(probe()).toMatchObject({ state: "rest", centerLabel: "23s", restEndMs: t0 + 20_000, clockMs: t0 - 2_500, clockRate: 5 });
+    expect(probe()).toMatchObject({ state: "rest", centerLabel: "23s", restEndMs: t0 + 20_000, clock: { kind: "playback", tMs: t0 - 2_500, wallMs: 777, rate: 5 } });
     r.rerender(tree(0, t0 - 1_000));
-    expect(probe()).toMatchObject({ centerLabel: "21s", clockMs: t0 - 1_000, clockRate: 0 });
+    expect(probe()).toMatchObject({ centerLabel: "21s", clock: { kind: "playback", tMs: t0 - 1_000, rate: 0 } });
+    // No transport clock (a replay handed a playhead directly): frozen there.
+    r.rerender(
+      <QueryClientProvider client={queryClient}>
+        <SessionReplay sessionId="s-rest-pb" playhead={t0 - 500} />
+      </QueryClientProvider>,
+    );
+    expect(probe()).toMatchObject({ clock: { kind: "frozen", tMs: t0 - 500 } });
   });
 
   it("no model working (a mission between steps): the tube says so, the same phrase as the lamps' status", () => {

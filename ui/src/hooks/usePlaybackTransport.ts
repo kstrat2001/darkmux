@@ -142,6 +142,11 @@ export interface PlaybackTransport {
    * is true. */
   scrubbed: boolean;
   t: number;
+  /** (#2961) The monotonic time (`performance.now()`) `t` was computed at:
+   *  the play tick that last advanced it, or the seek/start that set it. An
+   *  animation that extrapolates the playhead between ticks anchors here,
+   *  never at whenever its own render happened to land. */
+  tickWallMs: number;
   tMin: number;
   tMax: number;
   playing: boolean;
@@ -194,6 +199,7 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null, focus: Pla
 
   const [t, setT] = useState<number | null>(null);
   const [playing, setPlaying] = useState(false);
+  const [tickWallMs, setTickWallMs] = useState(() => performance.now());
   const [speed, setSpeed] = useState<Speed>(DEFAULT_SPEED);
   useEffect(() => {
     setT(null);
@@ -288,13 +294,17 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null, focus: Pla
       lastTick.current = null;
       return;
     }
-    if (lastTick.current === null) lastTick.current = performance.now();
+    if (lastTick.current === null) {
+      lastTick.current = performance.now();
+      setTickWallMs(lastTick.current);
+    }
     const id = setInterval(() => {
       const now = performance.now();
       const dt = now - (lastTick.current ?? now);
       lastTick.current = now;
       const step = dt * speed; // recorded ms this tick
       setT((prev) => Math.min((prev ?? tMax) + step, tMax));
+      setTickWallMs(now);
     }, PLAY_TICK_MS);
     return () => clearInterval(id);
   }, [playing, dayIdentity, tMin, tMax, speed]);
@@ -317,12 +327,14 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null, focus: Pla
   const scrub = useCallback(
     (next: number) => {
       bumpSeek();
+      setTickWallMs(performance.now());
       setT(Math.min(tMax, Math.max(tMin, next)));
     },
     [tMin, tMax, bumpSeek],
   );
   const rewind = useCallback(() => {
     bumpSeek();
+    setTickWallMs(performance.now());
     setT(tMin);
   }, [tMin, bumpSeek]);
   const togglePlay = useCallback(() => {
@@ -348,6 +360,7 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null, focus: Pla
     active: records !== null,
     scrubbed: t !== null,
     t: playheadT,
+    tickWallMs,
     tMin,
     tMax,
     playing,

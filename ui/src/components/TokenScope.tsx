@@ -15,7 +15,8 @@ import { useCountUp } from "../hooks/useCountUp";
 import { usePrefersReducedMotion } from "../hooks/usePrefersReducedMotion";
 import { SWEEP_PER_PHASE, stepLobes, wavePhaseStep, type LobeBlend } from "../lib/scopeWave";
 import { ToolIcon } from "./ToolIcon";
-import { REST_HAND_TOP, pageNowAt, restHandFrame, restStrokeSegments, type PageClockAnchor, type RestHandFrame } from "../lib/restHand";
+import { REST_HAND_TOP, REST_STILL_FRAME, WALL_CLOCK, pageClockRate, pageNowOf, restStrokeSegments, stepRestHand, type PageClock, type RestHandFrame, type RestHandState } from "../lib/restHand";
+import { useSeekGeneration } from "../lib/seekSignal";
 import { BrainGlyph } from "./ActivityIcon";
 
 /**
@@ -119,19 +120,16 @@ export interface TokenScopeProps {
    *  state (`stateTone`). */
   tone?: ScopeTone;
   /** (#2961) While `state` is `"rest"`: when the rest ends, on the page
-   *  clock (`clockMs`). REST's dot becomes a seconds hand that loops once a
+   *  clock (`clock`). REST's dot becomes a seconds hand that loops once a
    *  second and reaches 12 o'clock exactly when the countdown drops; the
    *  scope then counts the center's number itself, from the same clock, so
    *  the two can never disagree (`lib/restHand.ts`). Absent: the older
    *  drifting dot and the caller's `centerLabel`. */
   restEndMs?: number;
-  /** (#2961) The page clock (epoch ms) the caller's reading was derived at:
-   *  the playhead in playback, the wall clock live. The scope extrapolates
-   *  from it between renders at `clockRate`. Defaults to `Date.now()`. */
-  clockMs?: number;
-  /** (#2961) Page ms per wall ms: 1 live, the playback speed while playing,
-   *  0 when paused or frozen. Defaults to 1. */
-  clockRate?: number;
+  /** (#2961) Where the page's "now" comes from (`lib/restHand.ts`'s
+   *  `PageClock`): the wall clock live (the default), the playback
+   *  transport's clock, or a frozen instant. */
+  clock?: PageClock;
 }
 
 /** The older props to a state, for a caller that does not pass `state`. */
@@ -522,8 +520,7 @@ export function TokenScope({
   className,
   tone = "generating",
   restEndMs,
-  clockMs,
-  clockRate = 1,
+  clock = WALL_CLOCK,
 }: TokenScopeProps) {
   const state: ScopeState = stateProp ?? legacyState(stalled, resting, tone);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -545,19 +542,17 @@ export function TokenScope({
   const restEnd = state === "rest" && restEndMs !== undefined && Number.isFinite(restEndMs) ? restEndMs : null;
   const targetRef = useRef<{ state: ScopeState; rate: number; rgb: Rgb; writing: boolean; thinking: boolean; restEnd: number | null }>({ state, rate, rgb: PHOSPHOR_FALLBACK, writing, thinking, restEnd });
   targetRef.current = { state, rate, rgb, writing, thinking, restEnd };
-  // (#2961) The page clock, anchored where the caller's reading arrived and
-  // extrapolated per frame at `clockRate` (`lib/restHand.ts`). Re-anchored
-  // only when the reading's clock or rate changes, so a re-render for any
-  // other reason does not move it.
-  const anchorKey = `${clockMs ?? "wall"}|${clockRate}`;
-  const anchorRef = useRef<{ key: string; anchor: PageClockAnchor } | null>(null);
-  if (anchorRef.current?.key !== anchorKey) {
-    anchorRef.current = { key: anchorKey, anchor: { pageMs: clockMs ?? Date.now(), wallMs: performance.now(), rate: clockRate } };
-  }
-  // (#2961) The number the scope counts itself while the hand runs, with the
-  // rest it belongs to and how many ticks it has flared on.
-  const [restNum, setRestNum] = useState<{ end: number; n: number; flares: number } | null>(null);
-  const lastShownRef = useRef<{ end: number; n: number; flares: number } | null>(null);
+  // (#2961) The page clock and the page's seek generation, read by the
+  // loop every frame (`lib/restHand.ts`: the clock carries the moment it was
+  // READ, so the loop never anchors on when a render landed).
+  const seekGen = useSeekGeneration();
+  const clockRef = useRef<{ clock: PageClock; seekGen: number }>({ clock, seekGen });
+  clockRef.current = { clock, seekGen };
+  // (#2961) What the hand carries from frame to frame (monotonic page time,
+  // the last tick it saw), and the number it counts itself, with the rest it
+  // belongs to, how many ticks it has flared on, and the flare's length.
+  const handStateRef = useRef<RestHandState | null>(null);
+  const [restNum, setRestNum] = useState<{ end: number; n: number; flares: number; flareMs: number } | null>(null);
   // Set by the effect: redraws one settled frame when motion is reduced.
   const staticRedrawRef = useRef<(() => void) | null>(null);
   // (#2911) Reactive, not read once at mount: a runtime change of the
@@ -576,9 +571,9 @@ export function TokenScope({
       const h = canvas!.clientHeight;
       const t = targetRef.current;
       const p = settleMorph(morphRef.current, t.state, t.rate, t.rgb, t.writing, t.thinking);
-      // (#2961) Reduced motion: the hand still, at the top; the number is
-      // the caller's own countdown.
-      const hand = t.restEnd !== null ? restHandFrame(t.restEnd, t.restEnd, 0, true) : null;
+      // (#2961) Reduced motion: the dot still at 12, no stroke, glow or fade;
+      // the number is the caller's own countdown.
+      const hand = t.restEnd !== null ? REST_STILL_FRAME : null;
       if (w && h) drawFrame(ctx!, w, h, p, clocksRef.current, morphRef.current.clock, 0, hand);
     }
 
@@ -619,26 +614,27 @@ export function TokenScope({
       const t = targetRef.current;
       const p = advanceMorph(morphRef.current, t.state, t.rate, t.rgb, dt, t.writing, t.thinking);
       let hand: RestHandFrame | null = null;
-      if (t.restEnd !== null && anchorRef.current) {
-        const anchor = anchorRef.current.anchor;
-        hand = restHandFrame(t.restEnd, pageNowAt(anchor, now), anchor.rate, false);
-        // (#2961) The number drops in the same frame the hand reaches the
-        // top: both come from `hand`. `flushSync` commits it before this
-        // frame paints (a plain update would land a frame late). It flares
-        // on a tick within one rest, never on the rest's first number or on
-        // the drop to 0 as the rest ends.
-        const last = lastShownRef.current;
-        if (!last || last.end !== t.restEnd || last.n !== hand.shown) {
-          const sameRest = last !== null && last.end === t.restEnd;
-          const flares = sameRest ? last.flares + (hand.shown < last.n && hand.stroke ? 1 : 0) : 0;
-          const next = { end: t.restEnd, n: hand.shown, flares };
-          lastShownRef.current = next;
+      if (t.restEnd !== null) {
+        const { clock: pc, seekGen: sg } = clockRef.current;
+        const stepped = stepRestHand(handStateRef.current, {
+          end: t.restEnd,
+          pageMs: pageNowOf(pc, now, Date.now()),
+          wallMs: now,
+          rate: pageClockRate(pc),
+          seekGen: sg,
+        });
+        const prev = handStateRef.current;
+        handStateRef.current = stepped.state;
+        hand = stepped.frame;
+        // (#2961) The number drops in the same frame the hand reaches 12:
+        // both come from `stepped`. `flushSync` commits it before this frame
+        // paints (a plain update would land a frame late).
+        if (!prev || prev.end !== stepped.state.end || prev.shown !== stepped.state.shown || prev.flares !== stepped.state.flares) {
+          const next = { end: stepped.state.end, n: stepped.state.shown, flares: stepped.state.flares, flareMs: hand.flareMs };
           flushSync(() => setRestNum(next));
         }
-        // The tick glow and the finished circle's fade belong to a tick seen
-        // in this rest: never on the rest's first second (there was no
-        // circle before it) or right after the scope mounts.
-        if ((lastShownRef.current?.flares ?? 0) === 0) hand = { ...hand, glow: 0, closedFade: 0 };
+      } else {
+        handStateRef.current = null;
       }
       if (w && h) drawFrame(ctx!, w, h, p, clocksRef.current, morphRef.current.clock, dt, hand);
       rafId = requestAnimationFrame(frame);
@@ -730,11 +726,13 @@ export function TokenScope({
       <div className="token-scope-center" data-state={state}>
         {centerLabel != null ? (
           <span
-            // (#2961) A new element per tick restarts the flare animation.
+            // (#2961) A new element per tick restarts the flare animation,
+            // shortened at fast playback so it ends before the next tick.
             key={handNum !== null ? `flare-${handNum.flares}` : "n"}
             className="token-scope-n"
             data-carried={centerCarried ? "true" : "false"}
             data-flare={handNum !== null && handNum.flares > 0 ? "true" : undefined}
+            style={handNum !== null && handNum.flares > 0 ? { animationDuration: `${Math.round(handNum.flareMs)}ms` } : undefined}
           >
             {shownLabel}
           </span>

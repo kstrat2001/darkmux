@@ -23,7 +23,8 @@ import { injectedPlaybackDate } from "../../lib/injectedMeta";
 export const STALE_AFTER_MS = 600_000;
 import { livenessState } from "../../components/LivenessPulse";
 import { TokenScope } from "../../components/TokenScope";
-import { usePlaybackClockRate } from "../../lib/pageClockRate";
+import { usePlaybackClock } from "../../lib/pageClockRate";
+import { WALL_CLOCK } from "../../lib/restHand";
 import { liveStateLabel, type LiveStateReading } from "../../lib/tokenRate";
 import { REPLAY_GRANULARITY_NOTE, useLiveOverlay } from "../../lib/liveChannel";
 import { scopeStateOf, type ScopeState } from "../../lib/scopeMorph";
@@ -641,8 +642,8 @@ export function SessionReplay({
   // reading only advanced when a new record happened to arrive.
   const ticking = plausiblyRunning && source.kind !== "static" && injectedPlaybackDate() == null && playhead === null;
   const nowMs = useNowMs(ticking);
-  // (#2961) How fast the playhead moves, for REST's seconds hand.
-  const playbackClockRate = usePlaybackClockRate();
+  // (#2961) The playhead's clock, for REST's seconds hand.
+  const playbackClock = usePlaybackClock();
   // (#2928) The live channel, on the same gate as the clock: the live edge
   // of a live route only, so a scrubbed or played-back run shows its
   // durable 2 s heartbeats and nothing else.
@@ -855,8 +856,13 @@ export function SessionReplay({
                       // while it plays, still while paused), the wall clock
                       // at a live edge, still when the view is frozen.
                       restEndMs={scopeHero.restEndMs}
-                      clockMs={scopeHero.clockMs}
-                      clockRate={playhead !== null ? playbackClockRate : ticking ? 1 : 0}
+                      clock={
+                        playhead !== null
+                          ? (playbackClock ?? { kind: "frozen", tMs: playhead })
+                          : ticking
+                            ? WALL_CLOCK
+                            : { kind: "frozen", tMs: scopeHero.clockMs ?? clockNow }
+                      }
                     />
                     {/* The lamps and, under them, a quiet readout line: "no
                         signal" when the page lost its connection (distinct
