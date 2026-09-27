@@ -15,7 +15,7 @@ const REC = {
   handle: "coder",
   session_id: "crew-dispatch-coder-1786251936375019-0",
   source: "crew_dispatch",
-  machine_uid: "F9ACF59C-0E8B-5092-A6B4-7C07070737D2",
+  machine_uid: "00000000-0000-4000-8000-000000000011",
   payload: { turn_seq: 73, finish_reason: "stop", tool_calls_count: 0, total_tokens: 33543 },
 };
 
@@ -31,7 +31,7 @@ describe("RecordView", () => {
     // records — machine_uid at exactly 1. Rendering them at full weight is
     // noise wearing signal's clothes.
     render(<RecordView record={REC} />);
-    expect(screen.queryByText("F9ACF59C-0E8B-5092-A6B4-7C07070737D2")).toBeNull();
+    expect(screen.queryByText("00000000-0000-4000-8000-000000000011")).toBeNull();
     expect(screen.getByText(/4 unchanging fields/)).toBeInTheDocument();
   });
 
@@ -73,7 +73,7 @@ describe("RecordView", () => {
   // lands in screenshots, so the inspector masks it everywhere it renders:
   // the unchanging-fields rows, a nested payload, and the raw JSON dump.
   it("never shows a full machine_uid, in the rows or the raw JSON", () => {
-    const FAKE_UID = "0A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
+    const FAKE_UID = "00000000-0000-4000-8000-000000000001";
     const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
     const { container } = render(<RecordView record={{ ...REC, machine_uid: FAKE_UID, payload: { ...REC.payload, peer: { machine_uid: FAKE_UID.toLowerCase() } } }} />);
     fireEvent.click(screen.getByText(/unchanging fields/));
@@ -210,7 +210,7 @@ const TELEMETRY_REC = {
   handle: "MacBook-Pro",
   source: "host",
   machine_id: "MacBook-Pro",
-  machine_uid: "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+  machine_uid: "00000000-0000-4000-8000-ABFCA7779F06",
   payload: {
     sampled_at_ms: 1790121627281,
     sampler_cost_ms: 11,

@@ -156,7 +156,7 @@ describe("MachineLens", () => {
   // (#2921 follow-up) A remote machine known only by its hardware uid: the
   // placeholder names it from the roster when it can, and otherwise says how
   // to name it; it never prints the uid.
-  const FAKE_UID = "0A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
+  const FAKE_UID = "00000000-0000-4000-8000-000000000001";
   const uidOnly = () => [{ ts: new Date(Date.now() - 60_000).toISOString(), action: "dispatch.turn", machine_uid: FAKE_UID }];
   const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
   it("(#2921) a uid-only remote machine with a roster entry is named by it", async () => {
@@ -265,14 +265,14 @@ describe("MachineLens", () => {
     mockMachineFetch({
       specs: {
         machine_id: "MacBook-Pro",
-        machine_uid: "F9ACF59C-0E8B-5092-A6B4-7C07070737D2",
+        machine_uid: "00000000-0000-4000-8000-000000000011",
         cpu_brand: "M5 Max",
         ram_total_bytes: 137438953472,
       },
     });
     renderMachine(null);
     await waitFor(() => expect(screen.getByText(/limit source/i)).toBeInTheDocument());
-    expect(document.body.textContent).not.toContain("F9ACF59C");
+    expect(document.body.textContent).not.toContain("DEADBEEF");
   });
 
   // Inverted, so the fix cannot be "treat every drilled uid as local": a

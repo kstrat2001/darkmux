@@ -24,7 +24,7 @@ const REPO_ROOT = path.resolve(__dirname, "../../..");
  * (public-repo scrub) The captured `machine_uid` and `workspace` temp path
  * named the real host that fetched this fixture — replaced with the
  * corpus's existing synthetic `machine_uid`
- * (`ABFCA777-9F06-A6BF-52CB-589A5D164929`, already used across
+ * (`00000000-0000-4000-8000-ABFCA7779F06`, already used across
  * `fleet-machines-live.json`/`flow-session-task-list.json`/`flow-today.json`
  * and others, paired with the same `machine_id: "MacBook-Pro"` this fixture
  * uses) and a neutral `/tmp/...` path. Every other field (the prompt, the

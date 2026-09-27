@@ -713,7 +713,7 @@
         let roster_path = tmp.path().join("fleet.json");
         fs::write(
             &roster_path,
-            r#"{"version":"2","machines":{"laptop":{"id":"laptop","address":"127.0.0.1:8765","added_unix_ms":1000,"machine_uid":"F9ACF59C-UID"}}}"#,
+            r#"{"version":"2","machines":{"laptop":{"id":"laptop","address":"127.0.0.1:8765","added_unix_ms":1000,"machine_uid":"DEADBEEF-UID"}}}"#,
         )
         .unwrap();
         let prev = std::env::var("DARKMUX_FLEET_FILE").ok();
@@ -736,7 +736,7 @@
         let machines = body["machines"].as_array().expect("machines must be an array");
         assert_eq!(machines.len(), 1);
         assert_eq!(machines[0]["id"], "laptop");
-        assert_eq!(machines[0]["machine_uid"], "F9ACF59C-UID");
+        assert_eq!(machines[0]["machine_uid"], "DEADBEEF-UID");
     }
 
     /// The inverted case: no roster file at all (the fresh-install/

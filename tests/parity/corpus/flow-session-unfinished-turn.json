@@ -14,7 +14,7 @@
       "model": "darkmux:qwen3-4b-instruct-2507",
       "mission_id": "dispatch-code-reviewer-1789963273-1082e-0",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06",
       "payload": {
         "runtime": "internal",
         "image": "darkmux-runtime:latest",
@@ -75,7 +75,7 @@
       "model": "darkmux:qwen3-4b-instruct-2507",
       "mission_id": "dispatch-code-reviewer-1789963273-1082e-0",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06",
       "payload": {
         "event": "load",
         "model": "qwen3-4b-instruct-2507",
@@ -98,7 +98,7 @@
       "model": "darkmux:qwen3-4b-instruct-2507",
       "mission_id": "dispatch-code-reviewer-1789963273-1082e-0",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06",
       "payload": {
         "runtime": "internal",
         "turn_seq": 1,
@@ -121,7 +121,7 @@
       "model": "darkmux:qwen3-4b-instruct-2507",
       "mission_id": "dispatch-code-reviewer-1789963273-1082e-0",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06",
       "payload": {
         "used": 4062,
         "max": 68000,
@@ -143,7 +143,7 @@
       "model": "darkmux:qwen3-4b-instruct-2507",
       "mission_id": "dispatch-code-reviewer-1789963273-1082e-0",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06",
       "payload": {
         "turn_seq": 1,
         "finish_reason": "tool_calls",
@@ -173,7 +173,7 @@
       "model": "darkmux:qwen3-4b-instruct-2507",
       "mission_id": "dispatch-code-reviewer-1789963273-1082e-0",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06",
       "payload": {
         "turn_seq": 1,
         "prompt_tokens": 4062,
@@ -198,7 +198,7 @@
       "model": "darkmux:qwen3-4b-instruct-2507",
       "mission_id": "dispatch-code-reviewer-1789963273-1082e-0",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06",
       "payload": {
         "tool_seq": 0,
         "tool_calls_so_far": 1,
@@ -230,7 +230,7 @@
       "model": "darkmux:qwen3-4b-instruct-2507",
       "mission_id": "dispatch-code-reviewer-1789963273-1082e-0",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06",
       "payload": {
         "used": 4129,
         "max": 68000,
@@ -252,7 +252,7 @@
       "model": "darkmux:qwen3-4b-instruct-2507",
       "mission_id": "dispatch-code-reviewer-1789963273-1082e-0",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06",
       "payload": {
         "turn_seq": 2,
         "finish_reason": "tool_calls",
@@ -282,7 +282,7 @@
       "model": "darkmux:qwen3-4b-instruct-2507",
       "mission_id": "dispatch-code-reviewer-1789963273-1082e-0",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06",
       "payload": {
         "turn_seq": 2,
         "prompt_tokens": 4129,
@@ -307,7 +307,7 @@
       "model": "darkmux:qwen3-4b-instruct-2507",
       "mission_id": "dispatch-code-reviewer-1789963273-1082e-0",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06",
       "payload": {
         "tool_seq": 0,
         "tool_calls_so_far": 2,
@@ -339,7 +339,7 @@
       "model": "darkmux:qwen3-4b-instruct-2507",
       "mission_id": "dispatch-code-reviewer-1789963273-1082e-0",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06",
       "payload": {
         "used": 4200,
         "max": 68000,
@@ -361,7 +361,7 @@
       "model": "darkmux:qwen3-4b-instruct-2507",
       "mission_id": "dispatch-code-reviewer-1789963273-1082e-0",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06",
       "payload": {
         "turn_seq": 3,
         "finish_reason": "tool_calls",
@@ -391,7 +391,7 @@
       "model": "darkmux:qwen3-4b-instruct-2507",
       "mission_id": "dispatch-code-reviewer-1789963273-1082e-0",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06",
       "payload": {
         "turn_seq": 3,
         "prompt_tokens": 4200,
@@ -416,7 +416,7 @@
       "model": "darkmux:qwen3-4b-instruct-2507",
       "mission_id": "dispatch-code-reviewer-1789963273-1082e-0",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06",
       "payload": {
         "tool_seq": 0,
         "tool_calls_so_far": 3,
@@ -448,7 +448,7 @@
       "model": "darkmux:qwen3-4b-instruct-2507",
       "mission_id": "dispatch-code-reviewer-1789963273-1082e-0",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06",
       "payload": {
         "runtime": "internal",
         "turn_seq": 4,
@@ -471,7 +471,7 @@
       "model": "darkmux:qwen3-4b-instruct-2507",
       "mission_id": "dispatch-code-reviewer-1789963273-1082e-0",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06",
       "payload": {
         "turn_seq": 4,
         "checkpoint": 1,
@@ -500,7 +500,7 @@
       "model": "darkmux:qwen3-4b-instruct-2507",
       "mission_id": "dispatch-code-reviewer-1789963273-1082e-0",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06",
       "payload": {
         "kind": "escalation",
         "severity": "warn",
@@ -525,7 +525,7 @@
       "model": "darkmux:qwen3-4b-instruct-2507",
       "mission_id": "dispatch-code-reviewer-1789963273-1082e-0",
       "machine_id": "MacBook-Pro",
-      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+      "machine_uid": "00000000-0000-4000-8000-ABFCA7779F06",
       "payload": {
         "runtime": "internal",
         "wall_ms": 27859,

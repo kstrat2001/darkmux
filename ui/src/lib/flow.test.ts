@@ -204,8 +204,8 @@ describe("machineNames / localMachineUid — identity is the uid, not the label"
   const beat = (uid: string, display: string): [string, never] =>
     [uid, { machine_uid: uid, display_name: display, schema_version: "1.19.0", beat_ts_ms: 1 } as never];
 
-  const UID = "F9ACF59C-0E8B-5092-A6B4-7C07070737D2";
-  const OTHER = "382A2016-41FD-5729-BF22-9C1A91F1BEDD";
+  const UID = "00000000-0000-4000-8000-000000000011";
+  const OTHER = "00000000-0000-4000-8000-000000000006";
 
   it("collects every alias a uid has used, across records and its presence beat", () => {
     const data = [rec(UID, "MacBook-Pro.local"), rec(UID, "MacBook-Pro"), rec(OTHER, "m1-max-32gb-studio")];
@@ -307,7 +307,7 @@ describe("machineNames / localMachineUid — identity is the uid, not the label"
 
 // ── nameOf resolves the CURRENT name, not the first one seen (#2030) ──────
 describe("nameOf recency", () => {
-  const UID = "F9ACF59C-0E8B-5092-A6B4-7C07070737D2";
+  const UID = "00000000-0000-4000-8000-000000000011";
   const rec = (ts: string, machine_id: string): FlowRecord =>
     ({ ts, machine_id, machine_uid: UID, action: "machine.online" }) as unknown as FlowRecord;
 
@@ -596,9 +596,9 @@ describe("(#2911) recordsAsOf: the window as of now, without a filter per tick",
 // tells two unnamed machines apart without identifying either.
 describe("displayNameOf: roster and unnamed ordinals", () => {
   // Fixture uids, not any real machine's.
-  const A = "0A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
-  const B = "1B2C3D4E-5F60-4182-93A4-B5C6D7E8F9A0";
-  const C = "2C3D4E5F-6071-4293-A4B5-C6D7E8F9A0B1";
+  const A = "00000000-0000-4000-8000-000000000001";
+  const B = "00000000-0000-4000-8000-000000000003";
+  const C = "00000000-0000-4000-8000-000000000005";
   const uidOnly = (uid: string, ts: string) => ({ ts, action: "dispatch.turn", machine_uid: uid }) as unknown as FlowRecord;
   const none = new Map();
 
@@ -634,8 +634,8 @@ describe("displayNameOf: roster and unnamed ordinals", () => {
     ];
     const roster = [{ id: "studio", machine_uid: A }];
     expect(displayNameOf(data, none, null, B, roster)).toBe("unnamed machine");
-    const live = new Map([["D0000000-0000-4000-8000-000000000000", {} as never]]);
+    const live = new Map([["00000000-0000-4000-8000-000000000010", {} as never]]);
     expect(displayNameOf(data, live, null, B)).toBe("unnamed machine 2");
-    expect(displayNameOf(data, live, null, "D0000000-0000-4000-8000-000000000000")).toBe("unnamed machine 3");
+    expect(displayNameOf(data, live, null, "00000000-0000-4000-8000-000000000010")).toBe("unnamed machine 3");
   });
 });

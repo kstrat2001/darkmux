@@ -162,6 +162,58 @@ def _is_permitted_tailnet(tailnet: str) -> bool:
     return t in EXAMPLE_TAILNETS or SYNTHETIC_TAILNET_RE.match(t) is not None
 
 
+# ── Hardware UIDs (#2957) ──────────────────────────────────────────────────
+#
+# A machine's hardware UUID (IOPlatformUUID, carried as `machine_uid` in flow
+# records, presence beats and the fleet roster) is a durable identifier of one
+# physical machine. It reached this repo as ordinary test data: a real laptop
+# uid in 7 UI test files, pasted from a live record because a realistic value
+# was the easiest thing to reach for. Like a tailnet name it spells no
+# sentinel word, so only a shape check can see it.
+#
+# Any UUID-shaped string is REFUSED unless it is a recognizable fake. The fake
+# form is `00000000-0000-4000-8000-<12 hex>`: hand-written fixtures number the
+# tail (`...-000000000001`), and the parity scrubber (`syntheticUuid` in
+# tests/parity/lib/sanitize.mjs) fills it from a digest. Matched
+# case-insensitively, because real uids arrive UPPERCASE from the hardware
+# probe and lowercase after a normalizing hop.
+#
+# The allow-list below is for UUID-shaped values that are not machine
+# identities at all. Keep it tiny and give every entry a reason. Before adding
+# one, prefer rewriting the value into the fake form: that is almost always
+# possible and it keeps this list from becoming the hole.
+#
+# No boundary assertions, on purpose: a uid glued to a key (`uid` ends in a hex
+# digit) or run into a longer hex token is still a uid, and over-matching only
+# ever errs toward refusing.
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+FAKE_UUID_RE = re.compile(r"^00000000-0000-4000-8000-[0-9a-f]{12}$", re.I)
+ALLOWED_UUIDS = {
+    "00000000-0000-0000-0000-000000000000": "the nil UUID: identifies nothing",
+}
+
+
+def _is_permitted_uuid(value: str) -> bool:
+    v = value.lower()
+    return FAKE_UUID_RE.match(v) is not None or v in ALLOWED_UUIDS
+
+
+def uuid_hits(line: str) -> bool:
+    """True when the line carries a UUID-shaped value that is not a known fake."""
+    return any(not _is_permitted_uuid(m.group(0)) for m in UUID_RE.finditer(line))
+
+
+def mask_refused_uuids(line: str) -> str:
+    """Never echo a refused uid: the report would republish what it caught.
+
+    The finding already names file and line, which is all a maintainer needs
+    to go and fix it. Permitted fakes are left readable.
+    """
+    return UUID_RE.sub(
+        lambda m: m.group(0) if _is_permitted_uuid(m.group(0)) else "<refused-uuid>", line
+    )
+
+
 def load_canaries() -> tuple[list[str], list[str]]:
     """Parse the `CANARIES` array out of the scrubber.
 
@@ -239,8 +291,9 @@ def main(scan_dir: Path | None = None) -> int:
                 word_re.search(line)
                 or any(r.search(line) for r in TICKET_RES)
                 or network_identifier_hits(line)
+                or uuid_hits(line)
             ):
-                findings.append((rel, n, line.strip()[:120]))
+                findings.append((rel, n, mask_refused_uuids(line.strip())[:120]))
 
     if delegated:
         print(f"note: {len(delegated)} bare tracker prefix(es) delegated to TICKET_RES: {delegated}")
@@ -254,7 +307,8 @@ def main(scan_dir: Path | None = None) -> int:
         print(
             f"\n{len(findings)} occurrence(s). Replace with a neutral placeholder "
             f"(this repo uses `example-*` for hosts and a `SAMPLE-` prefix for "
-            f"tracker keys), or — only if the file's PURPOSE is to name the "
+            f"tracker keys, and `00000000-0000-4000-8000-<12 hex>` for a machine "
+            f"uid, e.g. ...-000000000001), or — only if the file's PURPOSE is to name the "
             f"vocabulary — add it to ALLOWLIST. A word that is genuine darkmux "
             f"vocabulary goes in CANARY_EXCEPTIONS with a reason.\n"
             f"Vocabulary is owned by tests/parity/lib/sanitize.mjs (CANARIES)."
@@ -310,8 +364,39 @@ SELF_TEST_CASES = [
 ]
 
 
+# UUID cases, same discipline as above: every "must be caught" value is
+# INVENTED and ASSEMBLED, so no line of this file is a UUID-shaped literal the
+# guard would refuse in its own scan.
+_U = "-".join
+_INVENTED_UID = _U(["C0FFEE12", "3456", "789A", "BCDE", "F0123456789A"])
+
+UUID_SELF_TEST_CASES = [
+    (f'machine_uid: "{_INVENTED_UID}"', True, "a real-shaped UPPERCASE hardware uid"),
+    (f'machine_uid: "{_INVENTED_UID.lower()}"', True, "the same uid lowercased: matching is case-insensitive"),
+    (f"presence:{_INVENTED_UID}", True, "a uid embedded after a key prefix"),
+    (f"machineuid{_INVENTED_UID}", True, "a uid glued to a key ending in a hex digit"),
+    ('machine_uid: "' + _U(["00000000", "0000", "4000", "8000", "000000000001"]) + '"', False, "a hand-numbered fake"),
+    ('machine_uid: "' + _U(["00000000", "0000", "4000", "8000", "A1B2C3D4E5F6"]) + '"', False, "the parity scrubber's synthetic form"),
+    ('machine_uid: "' + _U(["00000000", "0000", "4000", "8000", "a1b2c3d4e5f6"]) + '"', False, "the fake form lowercased"),
+    ('nil: "' + _U(["00000000", "0000", "0000", "0000", "000000000000"]) + '"', False, "the allow-listed nil UUID"),
+    # The DISCRIMINATOR is the whole `00000000-0000-4000-8000-` prefix, not its
+    # leading zeros. A loosening to `startswith("00000000")` must go red here.
+    ('machine_uid: "' + _U(["00000000", "3456", "789A", "BCDE", "F0123456789A"]) + '"', True, "leading zeros alone are not the fake form"),
+    ('machine_uid: "' + _U(["00000000", "0000", "4000", "8001", "000000000001"]) + '"', True, "one nibble off the fake prefix"),
+    ("sha: " + "C0FFEE12" * 5, False, "a dashless hex run is not UUID-shaped"),
+]
+
+
 def self_test() -> int:
     failures = []
+    for line, should_flag, why in UUID_SELF_TEST_CASES:
+        got = uuid_hits(line)
+        if got != should_flag:
+            verb = "flagged" if got else "passed"
+            want = "flag" if should_flag else "pass"
+            failures.append(f"  {why}\n    {verb}, expected to {want}")
+    if "<refused-uuid>" not in mask_refused_uuids(UUID_SELF_TEST_CASES[0][0]):
+        failures.append("  a refused uid must be masked in the finding printout")
     for line, should_flag, why in SELF_TEST_CASES:
         got = network_identifier_hits(line)
         if got != should_flag:
@@ -319,9 +404,12 @@ def self_test() -> int:
             want = "flag" if should_flag else "pass"
             failures.append(f"  {line!r}\n    {verb}, expected to {want} ({why})")
     if failures:
-        print("network matcher self-test FAILED:\n" + "\n".join(failures))
+        print("matcher self-test FAILED:\n" + "\n".join(failures))
         return 1
-    print(f"network matcher self-test passed: {len(SELF_TEST_CASES)} cases")
+    print(
+        f"network matcher self-test passed: {len(SELF_TEST_CASES)} cases; "
+        f"uuid matcher: {len(UUID_SELF_TEST_CASES)} cases"
+    )
     return 0
 
 
