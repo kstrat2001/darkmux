@@ -102,9 +102,10 @@ fn pull_runtime_image(image: &str) -> Result<()> {
             "failed to pull the runtime image `{image}` from GHCR.\n\
              Options:\n  \
              - Check network / `docker login ghcr.io` if the package is private, OR\n  \
-             - Build it locally from a darkmux {version} source checkout:\n      \
-             docker build --build-arg DARKMUX_VERSION={version} -t {RUNTIME_IMAGE} runtime/",
+             - Build it locally from the root of a darkmux {version} source checkout:\n      \
+             {build}",
             version = env!("CARGO_PKG_VERSION"),
+            build = crate::runtime_image::rebuild_command(RUNTIME_IMAGE, env!("CARGO_PKG_VERSION")),
         );
     }
     Ok(())
