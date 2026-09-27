@@ -32,6 +32,14 @@ const NOTE = ".session-run .modelbox__hero .modelbox__note";
 // there, so it too must keep one size whatever the machine's utility job.
 const CARD = { card: ".mach", cardScope: ".mach-scope", rateLine: ".mach-scope__rate", util: ".mach-util" };
 
+// (#2950 review, CONSIDER 2) A REST reason must FIT its one-line slot, not
+// just be in it: `toHaveText` (inner text included) reads the whole string
+// even when `text-overflow: ellipsis` has cut it off on screen.
+async function expectFits(locator, what) {
+  const { sw, cw } = await locator.evaluate((e) => ({ sw: e.scrollWidth, cw: e.clientWidth }));
+  expect(sw, `${what}: the reason is clipped (scrollWidth ${sw} > clientWidth ${cw})`).toBeLessThanOrEqual(cw);
+}
+
 async function openState(browser, viewport, state, { mode, surface }) {
   const ctx = await browser.newContext({ viewport, timezoneId: "UTC", locale: "en-US" });
   const page = await ctx.newPage();
@@ -65,6 +73,7 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
         // (`null`) shows none.
         if (state.noteText === null) await expect(page.locator(NOTE), `${state.id}: no readout line`).toHaveCount(0);
         else if (state.noteText) await expect(page.locator(NOTE), `${state.id}: the readout line`).toHaveText(state.noteText);
+        if (state.rateTextPhone) await expectFits(page.locator(NOTE), `${state.id}: run page readout (${vpName}, ${mode})`);
         // Settle: the count-ups and the scope's morph run on timers, and a
         // size taken mid-frame would be a flake, not a finding.
         await page.waitForTimeout(400);
@@ -100,6 +109,7 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
           // form): with the state on a desktop card, without it on a phone.
           const want = vpName === "phone" ? state.rateTextPhone : state.rateText;
           await expect(page.locator(CARD.rateLine).first(), `${state.id}: the card's visible reason`).toHaveText(want, { useInnerText: true });
+          await expectFits(page.locator(CARD.rateLine).first(), `${state.id}: fleet card status line (${vpName}, ${mode})`);
         } else if (state.rateText) {
           await expect(page.locator(CARD.rateLine).first(), `${state.id}: the card must reach this state`).toHaveText(state.rateText instanceof RegExp ? state.rateText : new RegExp(state.rateText));
         } else {

@@ -663,6 +663,22 @@ describe("restReasonLabel", () => {
   });
 });
 
+// (#2950 review, CONSIDER 1) Two executions resting at once for different
+// reasons: the aggregate's reason and its countdown come from the SAME
+// execution, never one from each.
+describe("aggregateLiveState with two resting executions", () => {
+  const restOf = (sid: string, atMs: number, payload: Record<string, unknown>): FlowRecord =>
+    ({ ts: new Date(atMs).toISOString(), action: "dispatch.rest", session_id: sid, payload }) as unknown as FlowRecord;
+  const toolOf = (sid: string): FlowRecord =>
+    ({ ts: new Date(0).toISOString(), action: "dispatch.tool", session_id: sid, payload: { tool_name: "bash" } }) as unknown as FlowRecord;
+  const thermal = [toolOf("a"), restOf("a", 1_000, { ms: 15_000, reason: "thermal", state: "serious" })];
+  const battery = [toolOf("b"), restOf("b", 1_000, { ms: 5_000, reason: "battery", state: "18%" })];
+  it("keeps the winning execution's reason with its own countdown, in either order", () => {
+    expect(aggregateLiveState([thermal, battery], 2_000)).toEqual({ state: "rest", restSecondsLeft: 14, restReason: "thermal · serious", restReasonWord: "thermal" });
+    expect(aggregateLiveState([battery, thermal], 2_000)).toEqual({ state: "rest", restSecondsLeft: 4, restReason: "battery · 18%", restReasonWord: "battery" });
+  });
+});
+
 describe("the rest reading carries the rest record's own reason", () => {
   const restWith = (atMs: number, payload: Record<string, unknown>): FlowRecord =>
     ({ ts: new Date(atMs).toISOString(), action: "dispatch.rest", session_id: SID, payload }) as unknown as FlowRecord;

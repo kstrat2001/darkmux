@@ -1225,7 +1225,8 @@ describe("EventLogColumn — turns (#2863)", () => {
   it("a pacing-change record (no `ms`) reads as pacing, not a rest that happened", () => {
     const pacing = [
       ...records,
-      r(20, "dispatch.rest", { pause: false, delay_ms: 15000, state: "fair" }),
+      // The duty-cycle entry exactly as `emit_rest_with_extra` writes it.
+      r(20, "dispatch.rest", { reason: "thermal-duty-cycle", pause: false, delay_ms: 15000, state: "fair" }),
     ];
     render(<EventLogColumn scopeLabel="runs" records={pacing} visible />);
     const rests = document.querySelectorAll(".eventlog__rec--rest");
@@ -1233,8 +1234,15 @@ describe("EventLogColumn — turns (#2863)", () => {
     expect(rests[0].textContent).toBe("rest 15 s · thermal pacing · fair");
     const pacingRow = document.querySelector(".eventlog__rec--pacing")!;
     expect(pacingRow).not.toBeNull();
-    expect(pacingRow.textContent).toBe("pacing · 15 s between turns · thermal: fair");
+    expect(pacingRow.textContent).toBe("thermal pacing · fair · 15 s between turns");
     expect(pacingRow).toHaveAttribute("data-act", "rec");
+  });
+
+  // (#2950) A pacing record naming no reason says "pacing" and its state,
+  // and never guesses "thermal".
+  it("a pacing record with no reason keeps the verb and its bare state", () => {
+    render(<EventLogColumn scopeLabel="runs" records={[...records, r(20, "dispatch.rest", { pause: false, delay_ms: 15000, state: "fair" })]} visible />);
+    expect(document.querySelector(".eventlog__rec--pacing")!.textContent).toBe("pacing · fair · 15 s between turns");
   });
 
   // (#2863 review round 2, finding 3) Four MORE `dispatch.rest` shapes,
@@ -1249,13 +1257,13 @@ describe("EventLogColumn — turns (#2863)", () => {
     expect(document.querySelector(".eventlog__rec--pacing")).toBeNull();
     const row = document.querySelector(".eventlog__rec--paused")!;
     expect(row).not.toBeNull();
-    expect(row.textContent).toBe("paused · thermal: serious");
+    expect(row.textContent).toBe("paused · thermal · serious");
   });
 
   it("a thermal breaker trip reads as paused with the breaker's own reason", () => {
     const tripped = [...records, r(20, "dispatch.rest", { reason: "thermal-critical", state: "critical", pause: true })];
     render(<EventLogColumn scopeLabel="runs" records={tripped} visible />);
-    expect(document.querySelector(".eventlog__rec--paused")!.textContent).toBe("paused · thermal-critical: critical");
+    expect(document.querySelector(".eventlog__rec--paused")!.textContent).toBe("paused · thermal breaker · critical");
   });
 
   it("an operator hold (tier 4) reads as paused with its own reason, not pacing", () => {
@@ -1271,14 +1279,14 @@ describe("EventLogColumn — turns (#2863)", () => {
       }),
     ];
     render(<EventLogColumn scopeLabel="runs" records={held} visible />);
-    expect(document.querySelector(".eventlog__rec--paused")!.textContent).toBe("paused · thermal-episode-limit: serious");
+    expect(document.querySelector(".eventlog__rec--paused")!.textContent).toBe("paused · thermal hold · serious");
   });
 
   it("a battery pause reads as paused and does NOT say thermal", () => {
     const battery = [...records, r(20, "dispatch.rest", { reason: "battery", state: "12% (floor 20%)", pause: true })];
     render(<EventLogColumn scopeLabel="runs" records={battery} visible />);
     const row = document.querySelector(".eventlog__rec--paused")!;
-    expect(row.textContent).toBe("paused · battery: 12% (floor 20%)");
+    expect(row.textContent).toBe("paused · battery · 12% (floor 20%)");
     expect(row.textContent).not.toContain("thermal");
   });
 
@@ -1288,11 +1296,17 @@ describe("EventLogColumn — turns (#2863)", () => {
     const resumed = [...records, r(20, "dispatch.rest", { reason: "thermal-duty-cycle", state: "fair", pause: false })];
     render(<EventLogColumn scopeLabel="runs" records={resumed} visible />);
     expect(document.querySelector(".eventlog__rec--paused")).toBeNull();
-    const rows = [...document.querySelectorAll(".eventlog__rec")].filter((el) => el.textContent?.startsWith("resumed"));
+    // (#2950) The duty cycle's exit says the pacing ENDED; "resumed ·
+    // thermal pacing" read as the pacing starting again.
+    const rows = [...document.querySelectorAll(".eventlog__rec--pacing")];
     expect(rows).toHaveLength(1);
-    expect(rows[0].textContent).toBe("resumed · thermal-duty-cycle: fair");
-    expect(rows[0].textContent).not.toContain("pacing");
+    expect(rows[0].textContent).toBe("thermal pacing ended · fair");
     expect(rows[0].textContent).not.toContain("between turns");
+  });
+
+  it("a thermal resume (the pause's own reason, pause:false) reads as resumed, in the scope's words", () => {
+    render(<EventLogColumn scopeLabel="runs" records={[...records, r(20, "dispatch.rest", { reason: "thermal", state: "nominal", pause: false })]} visible />);
+    expect(document.querySelector(".eventlog__rec--pacing")!.textContent).toBe("resumed · thermal · nominal");
   });
 
   it("a list mixing sessions shows no turn headers", () => {
