@@ -584,6 +584,10 @@ pub(crate) const NON_PRODUCER_SOURCE_PATHS: &[(&str, &str)] = &[
         "consumer: the runs board matches on action strings, builds nothing",
     ),
     (
+        "crates/darkmux-serve/src/run_lifecycle.rs",
+        "consumer: folds a session's records into its run attempts, builds none",
+    ),
+    (
         "crates/darkmux-crew/src/dispatch_internal_tests.rs",
         "tests for a scanned producer, in a sibling file rather than behind the `#[cfg(test)]` \
          marker the scanner cuts at",
