@@ -40,6 +40,10 @@ describe("activityOf", () => {
     expect(activityOf(rec({ action: undefined, source: "adjudication" }))).toBe("note");
   });
 
+  it("(#2983) a non-note record tagged `source: orchestrator` files under its own action", () => {
+    expect(activityOf(rec({ action: "catch", source: "orchestrator" }))).toBe("catch");
+  });
+
   it("(#2413) machine.telemetry maps to the same 'host telemetry' facet as the retired telemetry.process", () => {
     expect(activityOf(rec({ action: "machine.telemetry", category: "machinery", source: "host" }))).toBe(
       "host telemetry",

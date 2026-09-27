@@ -25,6 +25,8 @@ darkmux release.
   flow archives still read, and `--session-id <sid> --source adjudication`
   notes keep feeding coder briefs, `darkmux memory correction list`, and
   `mission debrief` unchanged.
+  A non-note record tagged `--source orchestrator` (a `flow catch`, say) now
+  files under its own action in the event log, not under "note".
 
 - **`radio.router_profile`, `DARKMUX_RADIO_ROUTER_PROFILE`, and the
   `role_profiles.radio-router` binding** (#2914). The radio routing seat
