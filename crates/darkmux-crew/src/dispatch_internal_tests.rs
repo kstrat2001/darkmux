@@ -292,6 +292,26 @@
         assert!(endpoint_gate < open && step_gate < open, "both run before the first record");
         assert!(settle > call, "the per-step cap is settled with the call's real spend");
         assert!(!src.contains("fn admit_remote_execution("), "the pre-4.0 zero-refusal gate is gone");
+        // (3rd review #4) A call the gate holds is live work: the presence
+        // heartbeat starts before the gate, the bookend only after it.
+        let beat = body.find("session_presence::spawn_session_emitter(").expect("heartbeat");
+        assert!(beat < endpoint_gate, "the heartbeat runs through a budget wait");
+    }
+
+    /// (3rd review #4) The agentic pre-start gate holds a start behind a
+    /// heartbeat, so the held run is live on the fleet's presence.
+    #[test]
+    fn the_agentic_prestart_gate_runs_under_a_heartbeat() {
+        let src: String = include_str!("dispatch_internal.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let from = src.find("if let Some(t) = &agentic_pm {").expect("the pre-start gate block");
+        let block = &src[from..];
+        let gate = block.find("crate::budget::admit_endpoint(").expect("the gate");
+        let beat = block.find("let _gate_beat = darkmux_flow::session_presence::spawn_session_emitter(").expect("heartbeat");
+        assert!(beat < gate, "the heartbeat is held across the gate");
     }
 
     /// (#2902 step 5 review C1, M1) The endpoint gate FIRES on
