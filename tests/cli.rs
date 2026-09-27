@@ -12695,7 +12695,7 @@ fn lab_run_dispatch_summary_and_exit_code() {
     let (stdout, stderr) = out_text(&out);
     assert_eq!(out.status.code(), Some(0), "{stdout} / {stderr}");
     let id = lab.run_ids().pop().unwrap();
-    assert!(stdout.contains(&format!("\n1 run(s) complete:\n  {id} — ")), "{stdout}");
+    assert!(stdout.contains(&format!("\n1 run(s): 1 completed, 0 errored\n  {id} — ")), "{stdout}");
 
     let out = lab
         .cmd()

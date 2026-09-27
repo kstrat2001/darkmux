@@ -74,6 +74,17 @@ impl RunOutcome {
     }
 }
 
+/// (#2986) The one-line count `lab run` prints over its per-run lines. An
+/// errored run is counted as errored, never as complete.
+pub fn batch_summary(outcomes: &[RunOutcome]) -> String {
+    let completed = outcomes.iter().filter(|o| o.completed()).count();
+    format!(
+        "{} run(s): {completed} completed, {} errored",
+        outcomes.len(),
+        outcomes.len() - completed
+    )
+}
+
 /// (#2494, #2982) The process exit code for every lab verb that runs
 /// workloads (`lab run`, `lab characterize`, `lab tune`): 0 when every run
 /// passed, 1 otherwise.

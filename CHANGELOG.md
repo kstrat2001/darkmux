@@ -91,9 +91,17 @@ darkmux release.
   discarded runs 1..k-1. Now the errored run is recorded (its lifecycle
   reads `error`, and stderr names it), returned as a failed outcome, and
   the batch goes on; only a signal stops it. The exit code is still 1.
-  `lab tune`'s stats cover the runs that completed, and it names each
-  errored run. **Migration:** a script that read "exit 1 with an error
-  message" as "nothing after this ran" should read the per-run lines.
+  `lab tune`'s stats cover the runs that completed, it names each errored
+  run, and its header reads `× N run(s), K completed`. `lab run`'s summary
+  line reads `N run(s): K completed, E errored` (it was `N run(s)
+  complete:`). `lab run inspect` on an errored run shows the error its
+  lifecycle recorded, which now keeps the whole cause chain. **Migration:**
+  a script that read "exit 1 with an error message" as "nothing after this
+  ran" should read the per-run lines, and one that matched `run(s)
+  complete:` should match the new summary.
+- **A prompt run's manifest records its verify, so `lab run list` shows a
+  failed one as `FAIL`** (#2494). It used to show a plain tick. A manifest
+  written before this reads as not checked (`—`), never as a pass.
 - **Two lab runs in the same second no longer share a run dir, so a run id
   can carry a claim suffix** (#2981). The second run used to overwrite the
   first's artifacts. A run whose `<workload>-<profile>-<epoch>-<n>`

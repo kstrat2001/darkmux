@@ -655,3 +655,21 @@ fn inspect_shows_an_errored_runs_recorded_error() {
     fs::create_dir_all(&bare).unwrap();
     assert!(crate::lab::inspect::lab_inspect("wx-bare").is_err());
 }
+
+/// (review of #2986) The `lab run` summary never calls an errored run
+/// complete: it counts the batch, the runs that completed, and those that
+/// errored.
+#[test]
+fn the_batch_summary_counts_completed_and_errored_runs() {
+    let o = |provider_error: Option<&str>| RunOutcome {
+        run_id: "r".into(),
+        run_dir: std::path::PathBuf::new(),
+        ok: provider_error.is_none(),
+        verify_passed: None,
+        duration_ms: 0,
+        notes: vec![],
+        provider_error: provider_error.map(str::to_string),
+    };
+    assert_eq!(batch_summary(&[o(None), o(Some("boom")), o(None)]), "3 run(s): 2 completed, 1 errored");
+    assert_eq!(batch_summary(&[o(None)]), "1 run(s): 1 completed, 0 errored");
+}

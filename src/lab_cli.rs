@@ -182,7 +182,7 @@ fn cmd_lab_run_dispatch(
         })
     })?;
     if !quiet {
-        println!("\n{} run(s) complete:", outcomes.len());
+        println!("\n{}", lab::run::batch_summary(&outcomes));
         for o in &outcomes {
             println!("  {} — {}", o.run_id, o.notes.join(" | "));
         }
