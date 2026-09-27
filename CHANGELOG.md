@@ -62,6 +62,61 @@ darkmux release.
   `compactor`/`utility` pair on `telemetry.lms` records. FLOW schema
   1.60.0.
 
+### Added
+
+- **`/machine-status` is a built-in advertised command** (#2918). "Which
+  models are loaded on this machine right now?" was refused: the catalog
+  radio's router (and the editor panel) route over had no machine command
+  in it, so the question fell through to the answering seat. The read-only
+  `darkmux machine status` verb now ships as a built-in mission config with
+  a `panel` block, advertised exactly the way an operator's own commands
+  are, so the router routes to it and the panel lists it. Read-only only:
+  `machine eject` stays un-advertised.
+
+### Fixed
+
+- **radio says the model is busy instead of queueing behind it** (#2917).
+  One LM Studio instance serves one request at a time, and darkmux caps
+  concurrency only within one process, so `darkmux radio` fired while a
+  coder ran queued inside LM Studio, silently, until the 300s ceiling. The
+  answering seat now checks the instance it would send to BEFORE sending:
+  if `lms ps` reports it reading a prompt, generating a reply or computing
+  embeddings, or another live darkmux process holds it loaded and in use
+  (the residency-lease registry), radio answers at once that the model is
+  busy and names the run when darkmux knows it (from the runs board), else
+  the darkmux process holding it by pid, else says what it checked: no
+  live run on it in the last day of darkmux's records, and no darkmux
+  process it can verify holding it (a run live for longer than a day may
+  not be named). Facts only, never a guess about whose work
+  it is; a hosted seat is not checked. The check is made just before the
+  send, so work that starts in between still queues the question. Same
+  copy on the CLI (exit 1: no answer was given) and in the editor panel.
+  The router still waits behind a compaction on the utility instance
+  (#2914's decision), but after 10s both surfaces say what LM Studio
+  reports: requests waiting on the utility model (`lms ps`'s `queued`,
+  which excludes the request being served), busy with nothing waiting (the
+  routing call itself), idle, or that darkmux cannot tell (an older `lms`
+  with no queue count, the model not listed, or `lms ps` unreadable). When
+  another darkmux process has the utility model loaded, it is named
+  alongside that reading; it says the call may be sharing the model only
+  when the queue count is unavailable. Then it keeps waiting to the
+  ceiling.
+- **A residency lease left by a crashed darkmux process no longer outlives
+  its pid being reused** (#2917). Leases now carry their writer's process
+  start time; a lease whose pid is alive but started at a different time
+  (a reboot, then a reused pid) is swept like a dead one, and only a
+  verified lease can make radio say a darkmux process is using a model.
+  The start time is read in a way that works for a process owned by any
+  user (on macOS, `sysctl`'s process record rather than `proc_pidinfo`,
+  which answers nothing across users), so an orphan whose pid now belongs
+  to launchd (pid 1) or a root daemon is swept too; the value and its unit
+  are unchanged, so leases written by the previous build still compare.
+  A lease that cannot be verified (no stamp, from an older build, or a
+  start time the platform will not report) still keeps its model pinned
+  but never backs a busy claim. The sweep deletes only the lease it
+  judged stale: if a new process wrote its own lease for the reused pid in
+  between, that lease is put back.
+
 ## [3.13.0] - 2026-09-25
 
 ### Added

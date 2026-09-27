@@ -1623,10 +1623,38 @@ pub fn dispatch_answerer_call_with(
     answer_text(&result.stdout, answer_token_cap())
 }
 
+/// (#2917) The local LM Studio instance the answering seat would send to
+/// under `overrides` — the SAME profile precedence [`dispatch_answerer_call_with`]
+/// dispatches on (picker > `radio.answerer_profile` > `role_profiles.
+/// radio-host` > `default_profile`), resolved through the SAME crew helper
+/// family `grounding_scope_for` uses, so the instance checked for busy is
+/// the instance sent to. `None` for a hosted seat (it queues on the
+/// provider's side, not on this machine's one instance) or an
+/// unresolvable one (the dispatch itself then says why).
+pub fn answering_seat_target(overrides: &AnswererOverrides) -> Option<crate::crew::dispatch::LocalTarget> {
+    let profile = resolved_answerer_profile(overrides);
+    crate::crew::dispatch::dispatch_local_target("radio-host", profile.as_deref(), None)
+}
+
+/// (#2917) What [`answer_live`] hands back: the seat's answer, or the fact
+/// that the seat's instance is busy — decided BEFORE anything is sent, so
+/// the request never queues inside LM Studio.
+#[derive(Debug, Clone)]
+pub enum LiveAnswer {
+    Answered(AnswerOutcome),
+    Busy(crate::radio_busy::BusyReport),
+}
+
 /// Convenience wrapper: [`answer`] wired to the production call, with
 /// optional session overrides (empty for the CLI verb, which has none) —
 /// the one call site both `src/acp.rs`'s no-slash channel and
 /// `src/radio_cli.rs`'s CLI refusal path use.
+///
+/// (#2917) Checks the seat's instance for busy FIRST — before the data
+/// boundary, before grounding is assembled — and returns
+/// [`LiveAnswer::Busy`] instead of dispatching when it is. See
+/// `crate::radio_busy`'s module doc for what counts as busy (facts from
+/// `lms ps` and the residency-lease registry, never a guess).
 pub fn answer_live(
     text: &str,
     catalog: &[CatalogEntry],
@@ -1634,7 +1662,10 @@ pub fn answer_live(
     cwd: &Path,
     overrides: &AnswererOverrides,
     surface: RadioSurface,
-) -> Result<AnswerOutcome> {
+) -> Result<LiveAnswer> {
+    if let Some(busy) = crate::radio_busy::answering_seat_busy(overrides) {
+        return Ok(LiveAnswer::Busy(busy));
+    }
     // (#1698 Packet B2 gate) The boundary is decided HERE, before assembly
     // — not inside the dispatch, which only ever sees the finished message.
     let scope = grounding_scope_for(overrides);
@@ -1648,6 +1679,7 @@ pub fn answer_live(
     answer(text, catalog, shelf, cwd, scope, surface, &mut |m: &str| {
         dispatch_answerer_call_with(m, overrides, surface)
     })
+    .map(LiveAnswer::Answered)
     .context("dispatching the radio answering seat")
 }
 

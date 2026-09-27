@@ -54,8 +54,8 @@ mod panel;
 mod peer_graph;
 mod runs;
 pub use runs::{
-    build_runs, build_runs_with_usage, local_dispatch_status, peer_mission_runs, AbandonReason,
-    DispatchSessionEvidence, Run, RunKind, RunStatus, RunsWithUsage,
+    build_runs, build_runs_with_usage, build_runs_within, local_dispatch_status, peer_mission_runs,
+    AbandonReason, DispatchSessionEvidence, Run, RunKind, RunStatus, RunsWithUsage,
 };
 pub mod source_state;
 /// (#2902 step 2b) The one token sum, shared by `run list` and `/runs` —

@@ -49,6 +49,7 @@
       <div class="cmd-out">radio: To inspect a specific past run, use <code>darkmux lab run inspect</code>. You'll need the run ID; if you don't have it handy, run <code>darkmux lab run list</code> to pull one from the recent history. If you just want a quick overview of what happened, append <code>--summary</code>.</div>
     </div>
     <p class="session-caption">Verbatim, captured 2026-08-28 on an M5 Max: qwen3.6-35b-a3b answering, qwen3-4b routing, humor at the shipped default of 50 unless shown otherwise.</p>
+    <p>Since 4.0 there is a command for that first question. <code>/machine-status</code> is a built-in advertised command that runs <code>darkmux machine status</code>, so a question like "which models are loaded?" has a command the router can send it to, and when it does, radio prints the loaded models instead of telling you which verb to run. Whether a given wording routes there is up to the routing model. It is read-only; nothing that unloads a model is advertised.</p>
   </div>
 </section>
 
@@ -68,6 +69,15 @@ Looked in:
 Run <code>darkmux init</code> to bootstrap one, or create it manually (see profiles.example.json in the darkmux repo).</div>
     </div>
     <p class="session-caption">Captured from a home directory with no <code>~/.darkmux</code> at all. Exit status 1.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>When the model is busy</h2>
+    <p>One LM Studio instance serves one request at a time. If the answering seat's model is the same instance a coder is using, a question asked mid-run would queue inside LM Studio, silently, until the call's 300-second ceiling. radio checks first. Just before sending, it reads what LM Studio reports for that instance (<code>lms ps</code>: idle, reading a prompt, generating a reply) and whether another darkmux process holds it in use. If either says busy, radio answers at once: which model, what LM Studio reports, and the run it is busy with when darkmux knows it, or the darkmux process holding it. When neither is found, radio says what it checked: no live run on that model in the last day of darkmux's records, and no darkmux process it can verify holding it. It does not guess whose work it is, and a run that has been going for longer than a day may not be named. The check reads facts, not timing, but it is a check made just before the send: work that starts on the instance in the moment between the two still makes the question wait. On the CLI the exit status is 1, since no answer was given; the same words appear in the editor panel.</p>
+    <p>The routing seat is the exception. It runs on the machine's utility model, which also compacts context for running workers, and a routing call that lands during a compaction waits behind it by design. After ten seconds of waiting radio says what LM Studio reports for the utility model, one of: other requests are waiting on it (for example a compaction), so the routing call is sharing it; it is busy with nothing waiting, which is the routing call itself; it is idle, so nothing is being served ahead of the call; or darkmux cannot tell (an older <code>lms</code> without a queue count, the model not listed, or <code>lms ps</code> unreadable). If another darkmux process has the utility model loaded, radio names it alongside that reading; having it loaded does not by itself put a request ahead of the routing call, so radio says the call may be sharing the model with that process only when LM Studio's queue count is not available. Then it keeps waiting. A seat on a hosted endpoint is not checked: the queue, if any, is on the provider's side.</p>
+    <p>Two ways around a busy answering seat: ask again when the run finishes, or point <code>radio.answerer_profile</code> at a profile whose model the run is not using.</p>
   </div>
 </section>
 
@@ -126,7 +136,7 @@ Run <code>darkmux init</code> to bootstrap one, or create it manually (see profi
 <section>
   <div class="wrap">
     <h2>Advertise your own commands</h2>
-    <p>radio only routes to what is advertised. A mission config in <code>~/.darkmux/mission-configs/</code> joins the catalog by carrying a <code>panel</code> block; its <code>description</code> is what the router reads. A step that changes state carries <code>"gate": "operator"</code> and waits for your confirmation, at the terminal or in the editor.</p>
+    <p>radio only routes to what is advertised. Two commands ship built in, <code>/review</code> and the read-only <code>/machine-status</code>; a mission config in <code>~/.darkmux/mission-configs/</code> joins the catalog by carrying a <code>panel</code> block, and its <code>description</code> is what the router reads. A step that changes state carries <code>"gate": "operator"</code> and waits for your confirmation, at the terminal or in the editor.</p>
     <pre><code>{
   "id": "pr-merge",
   "name": "PR Merge",

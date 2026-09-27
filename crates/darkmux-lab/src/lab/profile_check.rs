@@ -118,6 +118,7 @@ mod tests {
             status: "idle".to_string(),
             size: "1.00 GB".to_string(),
             context,
+            queued: None,
         }
     }
 

@@ -1080,6 +1080,7 @@ mod tests {
             status: "loaded".to_string(),
             size: "1 GB".to_string(),
             context: ctx,
+            queued: None,
         }
     }
 
@@ -1294,6 +1295,7 @@ mod tests {
             status: "loaded".to_string(),
             size: "1 GB".to_string(),
             context: 32000,
+            queued: None,
         }];
         let (residency, detail) = model_residency(&m, Ok(&loaded));
         assert_eq!(

@@ -5232,6 +5232,389 @@ fn run_radio_launch_to_completion(config_id: &str, dispatch_port: u16) -> (std::
     (output.status, home)
 }
 
+/// (#2918) A fake `lms` that records every argv it is called with to
+/// `argv_log` (one line per call) and answers `ps --json` with ONE
+/// darkmux-managed resident, whose `status` is `status`. Everything else
+/// exits 0 silently. The status word is a parameter because #2917's busy
+/// check reads exactly that field: `idle` is the resting shape, and the
+/// non-idle words are LM Studio's own (`generating`, `processingPrompt`).
+fn write_recording_fake_lms(dir: &std::path::Path, argv_log: &std::path::Path, status: &str) -> std::path::PathBuf {
+    let fake = dir.join("lms");
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> '{}'\n\
+             if [ \"$1\" = \"ps\" ]; then\n\
+             echo '[{{\"identifier\":\"darkmux:stub-worker\",\"modelKey\":\"stub-worker\",\"status\":\"{status}\",\"sizeBytes\":1000000000,\"contextLength\":8000,\"parallel\":1}}]'\n\
+             fi\n\
+             exit 0\n",
+            argv_log.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&fake).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake, perms).unwrap();
+    }
+    fake
+}
+
+/// (#2918) "Which models are loaded on this machine right now?" used to be
+/// REFUSED: the catalog radio hands its router had no machine command in it,
+/// so the question fell through to the answering seat. The built-in
+/// `machine-status` config is now advertised like any other panel command,
+/// and this proves the whole chain through the real binary: the router
+/// (mocked, answering `machine-status`) is OFFERED the command in its
+/// catalog, the routed command runs `darkmux machine status` in-process
+/// (procedural-only ⇒ ephemeral), and that verb reaches `lms ps --json` —
+/// the argv the fake `lms` records — whose one resident then renders in
+/// radio's own stdout. No model, no LM Studio, no Docker.
+#[test]
+fn radio_routes_a_loaded_models_question_to_machine_status_which_runs_lms_ps() {
+    let (route_port, router_requests) = start_capturing_route_decision_stub("machine-status");
+
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let os_home = TempDir::new().unwrap();
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(&profiles_path, utility_binding_profiles_json()).unwrap();
+    let argv_log = home.path().join("lms-argv.log");
+    let fake_lms = write_recording_fake_lms(home.path(), &argv_log, "idle");
+
+    let output = darkmux_std_cmd()
+        .env("HOME", os_home.path())
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_LMSTUDIO_URL", format!("http://127.0.0.1:{route_port}"))
+        .env("DARKMUX_LMS_BIN", &fake_lms)
+        .args(["radio", "which models are loaded on this machine right now?"])
+        .output()
+        .expect("running darkmux radio");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // The catalog OFFERED to the router carried the command — read off the
+    // router's own request body, not inferred from the route it returned
+    // (the stub answers `machine-status` whatever it is asked).
+    let offered = router_requests.lock().unwrap().join("\n");
+    assert!(
+        offered.contains("- machine-status:"),
+        "the router's catalog must list the built-in machine-status command (#2918):\n{offered}"
+    );
+
+    assert!(output.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("routing to /machine-status"), "{stdout}");
+    // `darkmux machine status` ran, against the fake: its ONE managed
+    // resident renders in radio's own output …
+    assert!(stdout.contains("darkmux-managed (1):"), "the routed `machine status` output must render:\n{stdout}");
+    assert!(stdout.contains("darkmux:stub-worker"), "{stdout}");
+    // … and the argv that produced it is the read-only listing, nothing
+    // that mutates: `machine eject` would call `lms unload`. (A `load
+    // stub-util …` line IS expected here — that is the ROUTER's own utility-
+    // model residency preflight, #2914, not the routed command.)
+    let argv = fs::read_to_string(&argv_log).expect("the fake lms must have been called");
+    assert!(argv.lines().any(|l| l.trim() == "ps --json"), "expected `lms ps --json` in the recorded argv:\n{argv}");
+    assert!(!argv.contains("unload"), "read-only only — nothing that unloads (#2918):\n{argv}");
+}
+
+/// (#2917) One LM Studio instance serves one request at a time, so a radio
+/// request from another process used to queue inside LM Studio, silently,
+/// until the 300s ceiling. Radio now checks the instance its ANSWERING seat
+/// would send to BEFORE sending: here the fake `lms ps --json` reports the
+/// seat's instance (`darkmux:stub-worker`, the default profile's model)
+/// `generating`, so radio answers at once that the model is busy, names
+/// what LM Studio reports, and never opens a connection for the answer —
+/// the stub sees exactly ONE request, the router's. No lease and no live
+/// run name the occupant, so the copy says the work is not darkmux's.
+/// Exit 1: the question was not answered, and a script must be able to
+/// tell that from an answer.
+#[test]
+fn radio_answers_at_once_that_the_answering_model_is_busy_instead_of_queueing() {
+    let (port, connections) = start_counting_refusal_stub();
+
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let os_home = TempDir::new().unwrap();
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(&profiles_path, utility_binding_profiles_json()).unwrap();
+    let argv_log = home.path().join("lms-argv.log");
+    let fake_lms = write_recording_fake_lms(home.path(), &argv_log, "generating");
+
+    let output = darkmux_std_cmd()
+        .env("HOME", os_home.path())
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_LMSTUDIO_URL", format!("http://127.0.0.1:{port}"))
+        .env("DARKMUX_LMS_BIN", &fake_lms)
+        .args(["radio", "what's the weather like on mars?"])
+        .output()
+        .expect("running darkmux radio");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        connections.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "only the ROUTER may reach the stub; a busy answering seat is never sent to (#2917)\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("busy"), "radio must say the model is busy:\n{stdout}\n{stderr}");
+    assert!(stdout.contains("darkmux:stub-worker"), "…naming the instance:\n{stdout}");
+    assert!(stdout.contains("generating"), "…with what LM Studio reports:\n{stdout}");
+    assert!(
+        stdout.contains(
+            "darkmux found no live run on it in the last day of its records, and no darkmux process it can verify holds it"
+        ),
+        "no lease and no live run name the occupant, so the copy says exactly that — and never claims whose \
+         work it is:\n{stdout}"
+    );
+    assert!(stdout.contains("generating a reply"), "LM Studio's word in plain English:\n{stdout}");
+    assert_eq!(output.status.code(), Some(1), "a busy answer is not an answer: exit 1\n{stdout}\n{stderr}");
+}
+
+/// (#2917) A fake `lms` whose `ps --json` prints `ps_json` verbatim —
+/// several residents, each with LM Studio's own `status` and `queued`.
+fn write_fake_lms_ps(dir: &std::path::Path, ps_json: &str) -> std::path::PathBuf {
+    let ps_file = dir.join("ps.json");
+    fs::write(&ps_file, ps_json).unwrap();
+    let fake = dir.join("lms");
+    fs::write(
+        &fake,
+        format!("#!/bin/sh\nif [ \"$1\" = \"ps\" ]; then cat '{}'; fi\nexit 0\n", ps_file.display()),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&fake).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake, perms).unwrap();
+    }
+    fake
+}
+
+/// (#2917 review C2) The busy check reads the instance the answering
+/// dispatch would ACTUALLY use. With `radio.answerer_profile` naming a
+/// second profile, only that profile's instance is busy (the default
+/// profile's model is idle), so radio must answer at once that
+/// `darkmux:stub-answer` is busy and never send: were the check to read the
+/// default profile's instance instead, it would find it idle and send.
+#[test]
+fn the_busy_check_reads_the_instance_radio_answerer_profile_points_at() {
+    let (port, connections) = start_counting_refusal_stub();
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let os_home = TempDir::new().unwrap();
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(
+        &profiles_path,
+        r#"{
+            "profiles": {
+                "work": { "models": [ {"id": "stub-worker", "n_ctx": 8000} ] },
+                "answer": { "models": [ {"id": "stub-answer", "n_ctx": 8000} ] }
+            },
+            "default_profile": "work",
+            "internal": { "utility": { "id": "stub-util", "n_ctx": 8000 } }
+        }"#,
+    )
+    .unwrap();
+    let fake_lms = write_fake_lms_ps(
+        home.path(),
+        r#"[{"identifier":"darkmux:stub-worker","modelKey":"stub-worker","status":"idle","queued":0,"sizeBytes":1,"contextLength":8000},
+            {"identifier":"darkmux:stub-answer","modelKey":"stub-answer","status":"generating","queued":0,"sizeBytes":1,"contextLength":8000},
+            {"identifier":"darkmux:stub-util","modelKey":"stub-util","status":"idle","queued":0,"sizeBytes":1,"contextLength":8000}]"#,
+    );
+    let output = darkmux_std_cmd()
+        .env("HOME", os_home.path())
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_LMSTUDIO_URL", format!("http://127.0.0.1:{port}"))
+        .env("DARKMUX_LMS_BIN", &fake_lms)
+        .env("DARKMUX_RADIO_ANSWERER_PROFILE", "answer")
+        .args(["radio", "what's the weather like on mars?"])
+        .output()
+        .expect("running darkmux radio");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("`darkmux:stub-answer`, is busy"), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        connections.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "only the router is sent to; the busy answering seat is not\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
+}
+
+/// (#2917 review M1 + C3) The router-wait notice on the CLI surface, the
+/// review's case A: the routing call is slow and the ONLY request on the
+/// utility instance is radio's own (LM Studio reports it generating,
+/// nothing queued). Past the notice bound (shortened by the test hook)
+/// radio says so on stderr — and says that no other request is ahead,
+/// never that the work is someone else's. The routing call still
+/// completes and radio carries on to an answer.
+#[test]
+fn a_slow_router_notice_on_the_cli_does_not_call_its_own_call_other_work() {
+    let (port, connections) = start_slow_first_refusal_stub(std::time::Duration::from_millis(1500));
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let os_home = TempDir::new().unwrap();
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(&profiles_path, utility_binding_profiles_json()).unwrap();
+    let fake_lms = write_fake_lms_ps(
+        home.path(),
+        r#"[{"identifier":"darkmux:stub-worker","modelKey":"stub-worker","status":"idle","queued":0,"sizeBytes":1,"contextLength":8000},
+            {"identifier":"darkmux:stub-util","modelKey":"stub-util","status":"generating","queued":0,"sizeBytes":1,"contextLength":8000}]"#,
+    );
+    let output = darkmux_std_cmd()
+        .env("HOME", os_home.path())
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_LMSTUDIO_URL", format!("http://127.0.0.1:{port}"))
+        .env("DARKMUX_LMS_BIN", &fake_lms)
+        .env("DARKMUX_TEST_RADIO_NOTICE_AFTER_MS", "100")
+        .args(["radio", "what's the weather like on mars?"])
+        .output()
+        .expect("running darkmux radio");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("radio: still routing after")
+            && stderr.contains("`darkmux:stub-util` generating a reply with nothing waiting, so no other request is ahead of this call"),
+        "the notice must print, and say only what LM Studio reported:\nstderr:\n{stderr}\nstdout:\n{stdout}"
+    );
+    assert!(!stderr.contains("did not start") && !stderr.contains("sharing"), "{stderr}");
+    assert!(!stdout.contains("still routing"), "the notice is stderr only; stdout carries the answer:\n{stdout}");
+    assert_eq!(
+        connections.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "router once, then the (idle) answering seat once\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// (#2917) [`start_counting_refusal_stub`] whose FIRST request (the
+/// router's) is held for `delay` before it answers.
+fn start_slow_first_refusal_stub(delay: std::time::Duration) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binding the slow refusal stub");
+    let port = listener.local_addr().unwrap().port();
+    let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = connections.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let nth = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut buf = vec![0u8; 64 * 1024];
+                let _ = stream.read(&mut buf);
+                if nth == 0 {
+                    std::thread::sleep(delay);
+                }
+                let body = serde_json::json!({
+                    "choices": [{ "message": { "content": "```json\n{\"refuse\": \"outside my scope\"}\n```" } }],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+                })
+                .to_string();
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = stream.flush();
+            });
+        }
+    });
+    (port, connections)
+}
+
+/// (#2917) A stub LM Studio whose every chat completion is a router-shaped
+/// REFUSAL (`{"refuse": …}`), counting the connections it accepts. Both
+/// seats share one `DARKMUX_LMSTUDIO_URL`, so the count is the number of
+/// model calls radio actually made: 1 = the router only; 2 = the answering
+/// seat was sent to as well.
+fn start_counting_refusal_stub() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binding the refusal stub");
+    let port = listener.local_addr().unwrap().port();
+    let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = connections.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut buf = vec![0u8; 64 * 1024];
+                let _ = stream.read(&mut buf);
+                let body = serde_json::json!({
+                    "choices": [{ "message": { "content": "```json\n{\"refuse\": \"outside my scope\"}\n```" } }],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+                })
+                .to_string();
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = stream.flush();
+            });
+        }
+    });
+    (port, connections)
+}
+
+/// (#2918) [`start_route_decision_stub`], additionally capturing every
+/// request body it receives so a test can assert on the CATALOG the router
+/// was offered (the `Available commands:` block of the user message), not
+/// only on the decision the stub hands back.
+fn start_capturing_route_decision_stub(command: &str) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binding the route-decision stub");
+    let port = listener.local_addr().unwrap().port();
+    let content = format!("```json\n{{\"command\": \"{command}\", \"args\": \"\"}}\n```");
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let requests_for_thread = requests.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let content = content.clone();
+            let requests = requests_for_thread.clone();
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut buf = vec![0u8; 64 * 1024];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                requests.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let body = serde_json::json!({
+                    "choices": [{ "message": { "content": content } }],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+                })
+                .to_string();
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = stream.flush();
+            });
+        }
+    });
+    (port, requests)
+}
+
 /// (#2477 review) Inverted-direction proof for the fix above: an
 /// UNSIGNALLED `darkmux radio` invocation whose launched child completes on
 /// its own must still return exactly the CHILD's exit code, unchanged by

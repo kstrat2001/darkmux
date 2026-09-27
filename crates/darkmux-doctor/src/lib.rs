@@ -13414,6 +13414,7 @@ mod tests {
             status: "loaded".into(),
             size: "3 GB".into(),
             context: 4096,
+            queued: None,
         }
     }
 

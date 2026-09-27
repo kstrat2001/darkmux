@@ -437,6 +437,7 @@ mod tests {
             status: "loaded".to_string(),
             size: size.to_string(),
             context: 32_768,
+            queued: None,
         }
     }
 

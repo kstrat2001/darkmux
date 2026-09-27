@@ -248,6 +248,86 @@ pub fn route_and_record(
     decision
 }
 
+/// (#2917) How long a routing call may run before the surface SAYS what is
+/// happening. The router waits behind whatever occupies the one utility
+/// instance (a compaction, by the operator's decision on #2914 — option
+/// A); this bound is where the wait stops being silent, not where it
+/// ends. Past it, `radio_cli.rs`/`acp.rs` print
+/// `crate::radio_busy::router_wait_notice_live` once and keep waiting to
+/// [`ROUTER_CALL_CEILING_SECONDS`].
+///
+/// **Why 10s.** A route alone measured 0.08s (#2914's table); a cold load
+/// of a 4B utility model at its window is a few seconds; a routing call
+/// queued behind a real compaction measured 13.9s live and 35–82s in the
+/// bench. Ten seconds sits above the cold-load case, so a first call after
+/// the utility model was unloaded never gets a false "busy" line, and
+/// well under the shortest measured queue, so a genuine wait is named
+/// early. **A constant, not a knob**, following this codebase's pattern for
+/// an ANNOUNCE point (`radio_cli::FORWARD_SIGNAL_GRACE`): the knobs in
+/// `docs/ENVIRONMENT.md` bound child processes (`DARKMUX_MODEL_LOAD_
+/// TIMEOUT_SECONDS`, `DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS`) and change
+/// what happens; this changes only when the operator is told.
+pub const ROUTER_SLOW_NOTICE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The notice bound the surfaces actually use: [`ROUTER_SLOW_NOTICE_AFTER`],
+/// unless the TEST hook `DARKMUX_TEST_RADIO_NOTICE_AFTER_MS` names a
+/// shorter one. Not an operator knob (see the constant's doc for why not):
+/// the hook exists so a CLI test can drive the real binary past the bound
+/// in well under a second instead of ten, the same pattern as the other
+/// `DARKMUX_TEST_*` hooks. An unparseable value is ignored.
+pub fn router_slow_notice_after() -> std::time::Duration {
+    std::env::var("DARKMUX_TEST_RADIO_NOTICE_AFTER_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(ROUTER_SLOW_NOTICE_AFTER)
+}
+
+/// The routing call's hard ceiling (the curl `-m`) — [`dispatch_router_call`]
+/// has always bounded the call here; named so the slow-notice copy can say
+/// how long "keep waiting" is.
+pub const ROUTER_CALL_CEILING_SECONDS: u32 = 300;
+
+/// (#2917) [`route_and_record_bounded`]'s answer: the decision, or — when
+/// the routing call is still running past the notice bound — the receiver
+/// it will arrive on, so the caller can say what is happening and then
+/// block on it.
+pub enum RouteWait {
+    Done(RouteDecision),
+    Slow(std::sync::mpsc::Receiver<RouteDecision>),
+}
+
+/// (#2917) [`route_and_record`] on its own thread, handing back either the
+/// decision (when it arrives within `notice_after`) or the still-pending
+/// receiver. The routing call itself is unchanged — same catalog, same
+/// record, same ceiling; only WHO waits moved, so the caller's thread is
+/// free to speak. A routing thread that ends without a decision (a panic
+/// inside the call) reads as [`RouteDecision::Unavailable`], never a hang:
+/// wall 6 holds on this path too.
+pub fn route_and_record_bounded(
+    text: String,
+    catalog: Vec<CatalogEntry>,
+    surface: RadioSurface,
+    call: impl Fn(&str) -> Result<String> + Send + 'static,
+    notice_after: std::time::Duration,
+) -> RouteWait {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let decision = route_and_record(&text, &catalog, surface, &mut |message: &str| call(message));
+        let _ = tx.send(decision);
+    });
+    match rx.recv_timeout(notice_after) {
+        Ok(decision) => RouteWait::Done(decision),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => RouteWait::Slow(rx),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => RouteWait::Done(routing_thread_ended_early()),
+    }
+}
+
+/// The decision a routing thread that died without sending one reads as.
+pub fn routing_thread_ended_early() -> RouteDecision {
+    RouteDecision::Unavailable { error: "the routing call ended without a decision".to_string() }
+}
+
 /// Build + write wall 4's flow record for one routed invocation. Best-
 /// effort — a flow-write failure (e.g. an unwritable flows dir) must never
 /// turn a successful route into a failed one, so the `Result` from
@@ -535,15 +615,16 @@ fn extract_fenced_json_block(raw: &str) -> Option<String> {
 /// operator's runs board in a day and let the routing seat be staffed on
 /// any model at all. Both knobs are gone; the binding is the staffing.
 ///
-/// `timeout_seconds: 300` — a deliberately BOUNDED ceiling for a
+/// [`ROUTER_CALL_CEILING_SECONDS`] — a deliberately BOUNDED ceiling for a
 /// bounded-classification call. A busy utility instance (a compaction in
 /// flight on it) makes this WAIT, by the operator's decision on the issue;
-/// #2915 shows why.
+/// #2915 shows why, and (#2917) past [`ROUTER_SLOW_NOTICE_AFTER`] the
+/// surfaces say so.
 pub fn dispatch_router_call(message: &str) -> Result<String> {
     let reply = crate::crew::utility::run_utility_single_shot(&crate::crew::utility::UtilityJob {
         role_id: crate::crew::loader::RADIO_ROUTER_ROLE_ID,
         message,
-        timeout_seconds: 300,
+        timeout_seconds: ROUTER_CALL_CEILING_SECONDS,
         // The routing seat answers with one small fenced JSON object; the
         // work single-shot primitive's 4096 default was never needed here.
         max_tokens: 1024,
@@ -939,6 +1020,114 @@ mod tests {
 
     // ── compile_catalog (registry fixture) ───────────────────────────────
 
+    /// (#2917) A routing call that outlives the notice bound hands back the
+    /// receiver — the caller's cue to say what is happening — and the
+    /// decision still arrives on it, unchanged. Wall-clock by construction
+    /// (`recv_timeout`), so the margins are wide: the call holds for 20x
+    /// the bound. No fixed timestamps anywhere: nothing here depends on
+    /// what day or hour the suite runs.
+    #[test]
+    #[serial_test::serial]
+    fn route_and_record_bounded_hands_back_the_receiver_when_the_call_outlives_the_bound() {
+        let flows = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", flows.path()) };
+
+        let catalog = fixture_catalog();
+        let slow = |_msg: &str| -> Result<String> {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            Ok("```json\n{\"command\": \"review\", \"args\": \"\"}\n```".to_string())
+        };
+        let wait = route_and_record_bounded(
+            "review this".to_string(),
+            catalog,
+            RadioSurface::Cli,
+            slow,
+            std::time::Duration::from_millis(20),
+        );
+        let RouteWait::Slow(rx) = wait else {
+            panic!("a call still running past the bound must hand back the receiver, not a decision");
+        };
+        assert_eq!(
+            rx.recv().expect("the decision still arrives"),
+            RouteDecision::Route { command: "review".to_string(), args: String::new() }
+        );
+
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+    }
+
+    /// (#2917) The inverse: a call that answers inside the bound is handed
+    /// back as the decision itself — no notice, no second wait. The bound
+    /// here is 5s against a call that returns at once.
+    #[test]
+    #[serial_test::serial]
+    fn route_and_record_bounded_hands_back_the_decision_when_the_call_is_prompt() {
+        let flows = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", flows.path()) };
+
+        let prompt = |_msg: &str| -> Result<String> { Ok("```json\n{\"refuse\": \"no\"}\n```".to_string()) };
+        let wait = route_and_record_bounded(
+            "hello".to_string(),
+            fixture_catalog(),
+            RadioSurface::Cli,
+            prompt,
+            std::time::Duration::from_secs(5),
+        );
+        let RouteWait::Done(decision) = wait else {
+            panic!("a prompt call must hand back its decision, not a receiver");
+        };
+        assert_eq!(decision, RouteDecision::Refuse { reason: "no".to_string() });
+
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+    }
+
+    /// (#2917) Wall 6 on the threaded path: a routing thread that dies
+    /// without a decision reads as `Unavailable`, never a hang on `recv`.
+    #[test]
+    #[serial_test::serial]
+    fn route_and_record_bounded_reads_a_dead_routing_thread_as_unavailable() {
+        let flows = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", flows.path()) };
+
+        let dies = |_msg: &str| -> Result<String> { panic!("the routing call blew up") };
+        let wait = route_and_record_bounded(
+            "hello".to_string(),
+            fixture_catalog(),
+            RadioSurface::Cli,
+            dies,
+            std::time::Duration::from_secs(5),
+        );
+        let RouteWait::Done(decision) = wait else {
+            panic!("a dead routing thread must resolve, not hand back a receiver nobody will send on");
+        };
+        assert!(matches!(decision, RouteDecision::Unavailable { .. }), "{decision:?}");
+
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn compile_catalog_advertises_panel_blocked_configs_sorted_with_the_panel_description() {
@@ -1014,6 +1203,42 @@ mod tests {
         let aaa_pos = ids.iter().position(|id| *id == "aaa-first").unwrap();
         let zzz_pos = ids.iter().position(|id| *id == "zzz-last").unwrap();
         assert!(aaa_pos < zzz_pos, "aaa-first must sort before zzz-last: {ids:?}");
+
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
+    }
+
+    /// (#2918) "Which models are loaded?" was refused because nothing in
+    /// the catalog answered it: `darkmux machine status` does, but it was
+    /// not an advertised command. The built-in `machine-status` config
+    /// (`templates/builtin/mission-configs/machine-status.json`) is merged
+    /// into every catalog the same way `review` is — through its `panel`
+    /// block, never a special case in the router prompt — so this holds
+    /// with NO user-tier configs at all.
+    #[test]
+    #[serial_test::serial]
+    fn compile_catalog_advertises_the_built_in_machine_status_command() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()) };
+
+        let catalog = compile_catalog();
+        let entry = catalog
+            .iter()
+            .find(|c| c.id == "machine-status")
+            .unwrap_or_else(|| panic!("the built-in machine-status command must be advertised (#2918): {catalog:?}"));
+        assert!(
+            entry.description.to_ascii_lowercase().contains("loaded"),
+            "the router reads the panel description, which must name the question it answers: {}",
+            entry.description
+        );
+        assert!(!entry.accepts_args, "`machine status` takes no arguments");
 
         // SAFETY: this test is #[serial_test::serial].
         unsafe {

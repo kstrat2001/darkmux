@@ -2751,6 +2751,45 @@ mod tests {
         }
     }
 
+    /// (#2918) The built-in `machine-status` command: what makes "which
+    /// models are loaded?" routable. It is advertised through the SAME
+    /// mechanism every operator command uses (a `panel` block on a mission
+    /// config), so the catalog `radio`/ACP hand the router never grows a
+    /// hand-injected special case. Pinned here: read-only (one
+    /// `procedural.shell` step that runs `darkmux machine status` through
+    /// `DARKMUX_BIN`, never `machine eject`), takes no arguments, and
+    /// validates with zero error findings so `run_ephemeral` accepts it.
+    #[test]
+    fn machine_status_builtin_is_a_read_only_procedural_command_the_panel_advertises() {
+        let cfg = embedded_config("machine-status");
+        assert_eq!(cfg.id, "machine-status");
+        let panel = cfg
+            .panel
+            .as_ref()
+            .expect("machine-status must carry a `panel` block, or radio cannot route to it (#2918)");
+        let description = panel.description.as_deref().unwrap_or("").to_ascii_lowercase();
+        assert!(description.contains("loaded"), "the router matches on the panel description: {description}");
+        assert_eq!(panel.accepts_args, Some(false), "`machine status` takes no text after its name");
+
+        let steps: Vec<&StepConfig> =
+            cfg.phases.iter().flat_map(|p| p.tasks.iter()).flat_map(|t| t.steps.iter()).collect();
+        assert_eq!(steps.len(), 1, "one read-only shell step: {steps:?}");
+        assert_eq!(steps[0].kind, "procedural.shell", "procedural-only, so the panel runs it ephemerally");
+        let command = steps[0].config["command"].as_str().expect("the shell step names its command");
+        assert!(command.contains("machine status"), "{command}");
+        assert!(
+            command.contains("\"${DARKMUX_BIN:-darkmux}\""),
+            "the step must call THIS darkmux (`DARKMUX_BIN`, #2310 P4e), not whatever is on PATH: {command}"
+        );
+        assert!(!command.contains("eject"), "read-only: nothing that mutates machine state (#2918): {command}");
+
+        let known = known_kinds();
+        let known_refs = known_kinds_refs(&known);
+        let errors: Vec<_> =
+            cfg.validate(&known_refs).into_iter().filter(|f| f.severity == FindingSeverity::Error).collect();
+        assert!(errors.is_empty(), "machine-status must validate clean: {errors:?}");
+    }
+
     #[test]
     fn both_builtins_round_trip_through_json() {
         for id in ["review", "coder-phase"] {
