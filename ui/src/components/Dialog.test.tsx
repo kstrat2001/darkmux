@@ -17,30 +17,29 @@ afterEach(() => {
  * module singleton that knows nothing about React's tree.
  */
 describe("Dialog lifecycle", () => {
-  /** `NotesDialog` lives inside `FleetLens`, which UNMOUNTS on a route change.
-   * Before the unmount effect, `openId` stayed set to a dialog that no longer
+  /** A host that UNMOUNTS takes the portal with it. Before the unmount effect, `openId` stayed set to a dialog that no longer
    * existed: every subsequent Escape anywhere on the page was silently
    * consumed closing it, and navigating back re-rendered the dialog OPEN with
    * no user action. */
   it("unmounting while open closes the dialog, so it cannot resurrect on remount", () => {
     const { unmount } = render(
-      <Dialog id="nmodalbg" titleId="t" title="notes">
+      <Dialog id="imodalbg" titleId="t" title="about">
         body
       </Dialog>,
     );
-    openModalEl("nmodalbg");
-    expect(getOpenId()).toBe("nmodalbg");
+    openModalEl("imodalbg");
+    expect(getOpenId()).toBe("imodalbg");
 
     unmount();
     expect(getOpenId()).toBeNull();
 
     // The resurrection itself: remounting must render CLOSED.
     render(
-      <Dialog id="nmodalbg" titleId="t" title="notes">
+      <Dialog id="imodalbg" titleId="t" title="about">
         body
       </Dialog>,
     );
-    expect(document.getElementById("nmodalbg")!.style.display).toBe("none");
+    expect(document.getElementById("imodalbg")!.style.display).toBe("none");
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 

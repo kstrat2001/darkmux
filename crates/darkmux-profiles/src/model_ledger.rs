@@ -875,7 +875,7 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
                 };
             ModelRow {
                 identifier: r.identifier.clone(),
-                owner: if crate::swap::is_darkmux_owned(&r.identifier) {
+                owner: if crate::ownership::is_darkmux_owned(&r.identifier) {
                     Owner::Darkmux
                 } else {
                     Owner::User

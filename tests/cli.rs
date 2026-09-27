@@ -1025,6 +1025,36 @@ fn retired_top_level_notebook_verb_is_unknown() {
         ));
 }
 
+/// (4.0) `mission migrate` (the pre-#148 flat-layout migration) is gone, with
+/// no alias: an operator on the flat layout runs it on 3.x before upgrading.
+#[test]
+fn retired_mission_migrate_verb_is_unknown() {
+    let tmp = TempDir::new().unwrap();
+    darkmux_cmd()
+        .env("DARKMUX_CREW_DIR", tmp.path())
+        .args(["mission", "migrate"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unrecognized subcommand 'migrate'"));
+}
+
+/// (4.0) `lab eval`'s `--k`, `--roster-profile`, `--exec-mode` and
+/// `--bundler` belonged to the deleted funnel mode (#2310 P4d): each was
+/// accepted and silently discarded. They are removed, so clap refuses them.
+/// `--help` after the flag keeps the pre-removal run of this test from
+/// dispatching anything: with the flag known, clap reaches `--help` and
+/// exits 0.
+#[test]
+fn lab_eval_dead_funnel_flags_are_removed() {
+    for (flag, value) in [("--k", "2"), ("--roster-profile", "p"), ("--exec-mode", "auto"), ("--bundler", "b")] {
+        darkmux_cmd()
+            .args(["lab", "eval", flag, value, "--help"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(format!("unexpected argument '{flag}'")));
+    }
+}
+
 /// (#1426 phase 2) The `skills` top-level verb retired — `init` is the one
 /// setup/refresh verb (it refreshes the bundled darkmux-* skills on re-run,
 /// and `darkmux doctor` flags stale ones). The spelling has NO compat alias,
@@ -1212,14 +1242,12 @@ fn lab_kind_families_carry_their_members() {
         assert!(fixture.contains(sub), "lab fixture --help keeps `{sub}`: {fixture}");
     }
 
-    // `lab eval` takes a role positional (default pr-reviewer) and the renamed
-    // roster flag.
+    // `lab eval` takes a role positional (default pr-reviewer). The retired
+    // `--crew` flag, and the `--roster-profile` it was renamed to (a dead
+    // funnel flag, removed in 4.0), must both be gone.
     let eval = help(&["lab", "eval"]);
     assert!(eval.to_lowercase().contains("role"), "lab eval --help names the role positional: {eval}");
-    assert!(eval.contains("--roster-profile"), "lab eval --help has --roster-profile: {eval}");
-    // The retired `--crew` flag must be gone. The word may still appear in the
-    // `--roster-profile` doc's "renamed from `--crew`" note, so assert the
-    // FLAG-DEFINITION form (`--crew <`) is absent, not the bare substring.
+    assert!(!eval.contains("--roster-profile"), "lab eval --help must not define --roster-profile: {eval}");
     assert!(!eval.contains("--crew <"), "lab eval --help must not define the retired --crew flag: {eval}");
 }
 
@@ -2322,125 +2350,6 @@ fn role_verbs_survive_a_leftover_role_naming_a_deleted_skill() {
         .success();
 }
 
-// ── mission migrate integration tests (#148 Task 8) ───────────────────────
-
-fn write_flat_mission_file(root: &std::path::Path, id: &str) {
-    let dir = root.join("missions");
-    fs::create_dir_all(&dir).unwrap();
-    let body = serde_json::json!({
-        "id": id,
-        "description": "test",
-        "phase_ids": [],
-        "created_ts": 1,
-    });
-    fs::write(
-        dir.join(format!("{id}.json")),
-        serde_json::to_string_pretty(&body).unwrap(),
-    )
-    .unwrap();
-}
-
-fn write_flat_phase_file(root: &std::path::Path, id: &str, mission_id: &str) {
-    let dir = root.join("phases");
-    fs::create_dir_all(&dir).unwrap();
-    let body = serde_json::json!({
-        "id": id,
-        "mission_id": mission_id,
-        "description": "test",
-        "depends_on": [],
-        "created_ts": 1,
-    });
-    fs::write(
-        dir.join(format!("{id}.json")),
-        serde_json::to_string_pretty(&body).unwrap(),
-    )
-    .unwrap();
-}
-
-/// Dry-run lists proposed moves but does NOT move files.
-#[test]
-fn mission_migrate_dry_run_shows_moves_without_moving() {
-    let tmp = TempDir::new().unwrap();
-    write_flat_mission_file(tmp.path(), "alpha");
-    write_flat_phase_file(tmp.path(), "s1", "alpha");
-
-    darkmux_cmd()
-        .env("DARKMUX_CREW_DIR", tmp.path())
-        .args(["mission", "migrate"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("alpha"))
-        .stdout(predicate::str::contains("s1"))
-        .stdout(predicate::str::contains("Re-run with --apply"));
-
-    // Files must NOT have been moved.
-    assert!(
-        tmp.path().join("missions/alpha.json").is_file(),
-        "dry-run must not move the flat mission file"
-    );
-    assert!(
-        tmp.path().join("phases/s1.json").is_file(),
-        "dry-run must not move the flat phase file"
-    );
-}
-
-/// `--apply` actually moves files to the per-mission nested layout.
-#[test]
-fn mission_migrate_apply_moves_files() {
-    let tmp = TempDir::new().unwrap();
-    write_flat_mission_file(tmp.path(), "alpha");
-    write_flat_phase_file(tmp.path(), "s1", "alpha");
-
-    darkmux_cmd()
-        .env("DARKMUX_CREW_DIR", tmp.path())
-        .args(["mission", "migrate", "--apply"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("applied"));
-
-    // New nested paths must exist.
-    assert!(
-        tmp.path().join("missions/alpha/mission.json").is_file(),
-        "mission.json should be at nested path after --apply"
-    );
-    assert!(
-        tmp.path().join("missions/alpha/phases/s1.json").is_file(),
-        "phase json should be at nested path after --apply"
-    );
-    // Old flat paths must be gone.
-    assert!(
-        !tmp.path().join("missions/alpha.json").exists(),
-        "flat mission file should be gone after --apply"
-    );
-    assert!(
-        !tmp.path().join("phases/s1.json").exists(),
-        "flat phase file should be gone after --apply"
-    );
-}
-
-/// Re-running `--apply` after a successful migration is a no-op (idempotent).
-#[test]
-fn mission_migrate_apply_is_idempotent() {
-    let tmp = TempDir::new().unwrap();
-    write_flat_mission_file(tmp.path(), "alpha");
-    write_flat_phase_file(tmp.path(), "s1", "alpha");
-
-    // First apply.
-    darkmux_cmd()
-        .env("DARKMUX_CREW_DIR", tmp.path())
-        .args(["mission", "migrate", "--apply"])
-        .assert()
-        .success();
-
-    // Second apply: must succeed and report nothing to do.
-    darkmux_cmd()
-        .env("DARKMUX_CREW_DIR", tmp.path())
-        .args(["mission", "migrate", "--apply"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("nothing to do"));
-}
-
 // ─── (#491) Phase 4 lab CLI verbs: register / unregister / fixtures / doctor ──
 
 /// Operator runs `dm lab fixture register <path>` against a fixture dir with
@@ -3215,7 +3124,7 @@ fn dispatch_refuses_a_record_ref_routed_to_another_machine() {
         .env("DARKMUX_FINDINGS_DIR", store.path())
         .env("DARKMUX_MACHINE_ID", "this-one")
         .args([
-            "dispatch", "health-research", "--finding", "sess-r/1", "--machine", "some-other-mac",
+            "dispatch", "health-research", "--finding", "sess-r/1", "--profile", "host@some-other-mac",
             "smoke",
         ])
         .assert()
@@ -3224,6 +3133,28 @@ fn dispatch_refuses_a_record_ref_routed_to_another_machine() {
             predicate::str::contains("cannot be routed to another machine")
                 .and(predicate::str::contains("requires operator acknowledgment").not()),
         );
+}
+
+/// (#2916 stage 2) `dispatch --machine` is gone, with no alias: the
+/// profile names its machine (`--profile <p>@<machine>`).
+#[test]
+fn dispatch_has_no_machine_flag() {
+    darkmux_cmd()
+        .args(["dispatch", "coder", "--machine", "studio", "hello"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument '--machine'"));
+}
+
+/// (#2916 stage 2) A malformed profile address is refused by name, before
+/// the message is read or anything is routed.
+#[test]
+fn dispatch_refuses_a_malformed_profile_address() {
+    darkmux_cmd()
+        .args(["dispatch", "coder", "--profile", "host@stu.dio", "hello"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("profile address `host@stu.dio`").and(predicate::str::contains("contains '.'")));
 }
 
 /// (#1426) The POSITIONAL message reaches the dispatch path. `health-research`
@@ -3828,15 +3759,13 @@ struct RespondingStubServer {
 
 impl RespondingStubServer {
     fn start() -> Self {
-        Self::start_with(std::time::Duration::ZERO, |_| "ack".to_string())
+        Self::start_with(|_| "ack".to_string())
     }
 
-    /// The same stub, replying after `delay` with the content `reply` picks
-    /// from the full request text (head and body). `lab loop --ab` uses
-    /// both: a delay so its two arms land in different second-stamped run
-    /// dirs, and a request-dependent reply so the injected context can move
-    /// the verdict.
-    fn start_with(delay: std::time::Duration, reply: fn(&str) -> String) -> Self {
+    /// The same stub, replying with the content `reply` picks from the full
+    /// request text (head and body). `lab loop --ab` uses it so the injected
+    /// context can move the verdict.
+    fn start_with(reply: fn(&str) -> String) -> Self {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("binding the stub listener");
         let port = listener.local_addr().unwrap().port();
@@ -3846,7 +3775,6 @@ impl RespondingStubServer {
                 std::thread::spawn(move || {
                     use std::io::Write;
                     let request = read_http_request(&mut stream);
-                    std::thread::sleep(delay);
                     let body = serde_json::json!({
                         "choices": [{ "message": { "content": reply(&request) } }],
                         "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
@@ -3947,14 +3875,16 @@ fn hanging_endpoint_profiles_json(port: u16) -> String {
 
 /// Assert that no `curl` spawned by the darkmux child `pid` outlives it.
 /// Polls the process table for that child's own `darkmux-remote-<pid>-`
-/// config-file marker (see `remote_chat_attempt`) for up to 2s: the OS
+/// config-file marker (see `remote_chat_attempt`) for up to 30s: the OS
 /// tears the table down asynchronously after SIGKILL, and instrumented
-/// (coverage) builds are slower than a fixed settle delay allows for.
+/// (coverage) builds and loaded hosts are slower than a fixed settle delay
+/// allows for. A clean table returns on the first poll, so the bound costs
+/// nothing unless a curl really survives (#2976).
 /// Scoped to `pid` so a sibling test's live curl is never mistaken for a
 /// survivor of this one.
 fn assert_no_surviving_remote_curl(pid: u32, label: &str) {
     let marker = format!("darkmux-remote-{pid}-");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let survivors = loop {
         let Ok(out) = std::process::Command::new("pgrep").args(["-f", &marker]).output() else {
             return; // no `pgrep` on this image — the socket-close proof already covers it
@@ -4238,7 +4168,11 @@ fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
         None,
         None,
         None,
-        60,
+        // (#2976) The job's own timeout (curl's `-m`) must far outlast
+        // FLEET_TEST_HANG_BOUND: a curl that gives up on its own also closes
+        // its connection, and the close-wait below could no longer tell a
+        // reaped child from a timed-out one.
+        600,
         None,
     );
     let url = format!("http://{fleet_addr}{}", darkmux_fleet::SUBMISSION_PATH);
@@ -4255,8 +4189,8 @@ fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
     // A REAL observable readiness signal, not a fixed sleep: the job's
     // dispatch `curl` has actually reached the hanging stub.
     assert!(
-        stub.wait_for_a_connection(std::time::Duration::from_secs(20)),
-        "the submitted job never reached a dispatch call to the stub server within 20s"
+        stub.wait_for_a_connection(FLEET_TEST_HANG_BOUND),
+        "the submitted job never reached a dispatch call to the stub server within {FLEET_TEST_HANG_BOUND:?}"
     );
 
     let kill_status = std::process::Command::new("kill")
@@ -4265,7 +4199,7 @@ fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
         .expect("running kill -TERM");
     assert!(kill_status.success(), "kill -TERM itself must succeed");
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + FLEET_TEST_HANG_BOUND;
     loop {
         if let Some(status) = serve_child.try_wait().expect("polling darkmux serve after SIGTERM") {
             eprintln!("darkmux serve exited with {status:?}");
@@ -4273,13 +4207,13 @@ fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "darkmux serve did not exit within 15s of SIGTERM (#2476 review round 2 regression)"
+            "darkmux serve did not exit within {FLEET_TEST_HANG_BOUND:?} of SIGTERM (#2476 review round 2 regression)"
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
     assert!(
-        stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(5)),
+        stub.wait_for_a_connection_to_close(FLEET_TEST_HANG_BOUND),
         "no curl connection to the stub server was ever torn down — the submitted job's dispatch \
          child survived the daemon's own exit (#2476 review round 2 regression)"
     );
@@ -4367,6 +4301,12 @@ struct FleetDaemon {
     fleet_addr: std::net::SocketAddr,
 }
 
+/// (#2976) The bound on every wait in the fleet-daemon tests below. Each is
+/// a polled condition that returns the moment it holds, so the bound only
+/// decides how long a REAL hang takes to fail; it is not the claim. The old
+/// 3s to 20s bounds failed on a loaded host with nothing wrong.
+const FLEET_TEST_HANG_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn spawn_fleet_daemon(profiles_json: &str, nofile: Option<u64>) -> Option<FleetDaemon> {
     // A UDP `connect` sends nothing; it only picks the outbound address.
     let lan_ip = std::net::UdpSocket::bind("0.0.0.0:0")
@@ -4399,6 +4339,12 @@ fn spawn_fleet_daemon(profiles_json: &str, nofile: Option<u64>) -> Option<FleetD
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
     }
+    // (#2976) Exec the fake tool once before the daemon can. On macOS the
+    // first exec of a freshly written executable can take tens of seconds on
+    // a loaded host (measured 2.4s to 32s; the second takes milliseconds),
+    // which would land inside the daemon's bounded identity lookup. An
+    // unknown subcommand is a side-effect-free `exit 2`.
+    let _ = std::process::Command::new(&tool).arg("warm-up").status();
     let path = format!(
         "{}:{}:{}",
         fake_bin.display(),
@@ -4439,9 +4385,11 @@ fn spawn_fleet_daemon(profiles_json: &str, nofile: Option<u64>) -> Option<FleetD
         }
     }
     let child = DirectChildGuard(cmd.spawn().expect("spawning darkmux serve"));
-    wait_for_serve_health(serve_port, std::time::Duration::from_secs(15));
+    // (#2976) Readiness waits are hang guards, sized for a loaded host: a
+    // freshly built binary's first exec alone can take seconds on a busy Mac.
+    wait_for_serve_health(serve_port, FLEET_TEST_HANG_BOUND);
     let fleet_addr = std::net::SocketAddr::new(lan_ip, fleet_port);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + FLEET_TEST_HANG_BOUND;
     while std::net::TcpStream::connect_timeout(&fleet_addr, std::time::Duration::from_millis(200)).is_err() {
         assert!(std::time::Instant::now() < deadline, "the fleet listener never came up on {fleet_addr}");
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -4511,7 +4459,7 @@ fn a_flooded_fleet_listener_leaves_the_viewer_answering() {
     };
     let mut held = Vec::new();
     for _ in 0..300 {
-        match std::net::TcpStream::connect_timeout(&daemon.fleet_addr, std::time::Duration::from_millis(500)) {
+        match std::net::TcpStream::connect_timeout(&daemon.fleet_addr, std::time::Duration::from_secs(5)) {
             Ok(mut s) => {
                 let _ = s.write_all(b"POST /fleet/work HTTP/1.1\r\nHost: x\r\n");
                 held.push(s);
@@ -4519,17 +4467,25 @@ fn a_flooded_fleet_listener_leaves_the_viewer_answering() {
             Err(_) => break,
         }
     }
-    // The viewer still answers while the flood is held open.
+    // The viewer still answers while the flood is held open. (#2976) "While"
+    // is checked as an ordering, not a 3s timeout that failed on a loaded
+    // host: the viewer answers, and only THEN is the first flood connection
+    // confirmed still open. A viewer that only answered once the header
+    // deadline had released the flood fails the second check.
     let health = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(3))
+        .timeout(FLEET_TEST_HANG_BOUND)
         .build()
         .get(&format!("http://127.0.0.1:{}/health", daemon.serve_port))
         .call();
     assert!(health.is_ok(), "the viewer's /health stopped answering under a listener flood: {health:?}");
+    held[0].set_nonblocking(true).unwrap();
+    let still_held = matches!(held[0].read(&mut [0u8; 1]), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock);
+    held[0].set_nonblocking(false).unwrap();
+    assert!(still_held, "the viewer answered only after the flood had already been released");
     // The first half-sent connection (holding a slot) is closed by the
     // header deadline (10s in production), not held forever.
     let first = &mut held[0];
-    first.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+    first.set_read_timeout(Some(FLEET_TEST_HANG_BOUND)).unwrap();
     let mut b = [0u8; 64];
     let closed = match first.read(&mut b) {
         Ok(0) => true,
@@ -6430,7 +6386,7 @@ fn integrity_check_never_claims_exit_zero_on_a_run_that_exits_nonzero() {
         std::fs::create_dir_all(&staging).unwrap();
         darkmux_cmd()
             .env("DARKMUX_AUDIT_DIR", &staging)
-            .args(["flow", "note", "--text", text, "--source", "orchestrator"])
+            .args(["flow", "note", "--text", text])
             .assert()
             .success();
         let produced = std::fs::read_dir(&staging)
@@ -12500,10 +12456,10 @@ fn lab_loop_every_flag_reaches_the_loop_config_in_order() {
             "context-window=16000",
         ])
     );
-    // A prompt workload with no verify spec still reports `verify_passed:
-    // true` to the loop classifier, so zero tool calls read as a false pass.
-    assert_eq!(report["verdict"], "inert-false-pass", "{stdout}");
-    assert_eq!(report["verify_passed"], true, "{stdout}");
+    // (#2982) A prompt workload with no verify spec checked nothing, so its
+    // verify is null and zero tool calls read as a failure, not a pass.
+    assert_eq!(report["verdict"], "failed", "{stdout}");
+    assert_eq!(report["verify_passed"], serde_json::Value::Null, "{stdout}");
     assert!(report["run_id"].as_str().unwrap().starts_with("labchar-stub-"), "{stdout}");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
 }
@@ -12626,9 +12582,7 @@ fn ack_only_without_lesson(request: &str) -> String {
 }
 
 fn run_ab(reply: fn(&str) -> String, json: bool) -> (std::process::Output, LabStub) {
-    // Over a second per reply, so the two sequential arms land in different
-    // second-stamped run dirs.
-    let stub = RespondingStubServer::start_with(std::time::Duration::from_millis(1100), reply);
+    let stub = RespondingStubServer::start_with(reply);
     let lab = LabStub::new(&stub);
     lab.record_lesson();
     let mut cmd = lab.cmd();
@@ -12700,7 +12654,7 @@ fn lab_run_dispatch_summary_and_exit_code() {
     let (stdout, stderr) = out_text(&out);
     assert_eq!(out.status.code(), Some(0), "{stdout} / {stderr}");
     let id = lab.run_ids().pop().unwrap();
-    assert!(stdout.contains(&format!("\n1 run(s) complete:\n  {id} — ")), "{stdout}");
+    assert!(stdout.contains(&format!("\n1 run(s): 1 completed, 0 errored\n  {id} — ")), "{stdout}");
 
     let out = lab
         .cmd()
@@ -12777,6 +12731,33 @@ fn lab_run_inspect_list_and_compare_render_recorded_runs() {
     assert!(!stdout.is_empty());
 }
 
+/// (#2986) A run whose provider errored is still inspectable: `lab run
+/// inspect` shows the error its lifecycle recorded, which is where the
+/// characterize and tune reports point.
+#[test]
+fn lab_run_inspect_shows_an_errored_runs_error() {
+    let lab = LabStub::new(&RespondingStubServer::start());
+    fs::write(
+        lab.home.path().join("workloads").join("labchar-noprov.json"),
+        r#"{"workload":{"id":"labchar-noprov","provider":"no-such-provider","prompt":"x"}}"#,
+    )
+    .unwrap();
+    let out = lab
+        .cmd()
+        .args(["lab", "run", "labchar-noprov", "--profile", "stub", "--profiles-file", lab.profiles()])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = out_text(&out);
+    assert_eq!(out.status.code(), Some(1), "{stdout} / {stderr}");
+    let id = lab.run_ids().pop().unwrap();
+    assert!(stderr.contains(&format!("[lab] run {id} failed: unknown workload provider")), "{stderr}");
+    let out = lab.cmd().args(["lab", "run", "inspect", &id]).output().unwrap();
+    let (stdout, stderr) = out_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(stdout.contains("verify:      not checked\n"), "{stdout}");
+    assert!(stdout.contains("  - status: error\n  - error: unknown workload provider: \"no-such-provider\""), "{stdout}");
+}
+
 /// `lab characterize` and `lab tune` print their reports and exit on the
 /// dispatch outcome.
 #[test]
@@ -12798,9 +12779,87 @@ fn lab_characterize_and_tune_run_and_report() {
     let (stdout, stderr) = out_text(&out);
     assert_eq!(out.status.code(), Some(0), "{stdout} / {stderr}");
     assert!(stdout.contains("│  total:  ") && stdout.contains("across 2 run(s)\n"), "{stdout}");
-    // Run ids are second-stamped, so the characterize run and tune's first
-    // run can share a dir; only "something was recorded" is stable here.
-    assert!(!lab.run_ids().is_empty());
+    // (#2981) Every run claims a dir of its own, even within one second.
+    assert_eq!(lab.run_ids().len(), 3, "{:?}", lab.run_ids());
+}
+
+/// (#2982) `lab characterize` and `lab tune` exit 1 on a failed verify,
+/// through the same gate as `lab run`, even though every dispatch completed.
+#[test]
+fn lab_characterize_and_tune_exit_1_on_a_failed_verify() {
+    let lab = LabStub::new(&RespondingStubServer::start());
+    for args in [
+        vec!["lab", "characterize", "labchar-fail"],
+        vec!["lab", "tune", "labchar-fail", "-n", "2"],
+    ] {
+        let out = lab
+            .cmd()
+            .args(&args)
+            .args(["--profile", "stub", "--profiles-file", lab.profiles()])
+            .output()
+            .unwrap();
+        let (stdout, stderr) = out_text(&out);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {stdout} / {stderr}");
+    }
+}
+
+/// (#2462, #2982) Every lab verb that runs a workload exits 130 on SIGTERM
+/// mid-dispatch, like `lab run`, so a wrapper can tell "stopped" from
+/// "failed".
+#[test]
+fn lab_verbs_exit_130_on_sigterm_mid_dispatch() {
+    for verb in [
+        vec!["characterize", "sigterm-verb-hang"],
+        vec!["tune", "sigterm-verb-hang", "-n", "2"],
+        vec!["loop", "sigterm-verb-hang"],
+    ] {
+        let stub = HangingStubServer::start();
+        let home = TempDir::new().unwrap();
+        let flows = TempDir::new().unwrap();
+        let os_home = TempDir::new().unwrap();
+        let profiles = home.path().join("profiles.json");
+        fs::write(&profiles, hanging_endpoint_profiles_json(stub.port)).unwrap();
+        fs::create_dir_all(home.path().join("workloads")).unwrap();
+        fs::write(
+            home.path().join("workloads").join("sigterm-verb-hang.json"),
+            r#"{"workload":{"id":"sigterm-verb-hang","provider":"prompt","role":"dialectic-judge","prompt":"hang"}}"#,
+        )
+        .unwrap();
+        let stderr_path = home.path().join("stderr.log");
+        let mut child = darkmux_std_cmd()
+            .env("HOME", os_home.path())
+            .env("DARKMUX_HOME", home.path())
+            .env("DARKMUX_FLOWS_DIR", flows.path())
+            .arg("lab")
+            .args(&verb)
+            .args(["--profile", "hang", "--profiles-file"])
+            .arg(&profiles)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(fs::File::create(&stderr_path).unwrap()))
+            .spawn()
+            .unwrap();
+        assert!(
+            stub.wait_for_a_connection(std::time::Duration::from_secs(20)),
+            "{verb:?}: never reached the stub: {}",
+            fs::read_to_string(&stderr_path).unwrap_or_default()
+        );
+        let pid = child.id().to_string();
+        assert!(std::process::Command::new("kill").args(["-TERM", &pid]).status().unwrap().success());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break st;
+            }
+            assert!(std::time::Instant::now() < deadline, "{verb:?} did not exit within 5s of SIGTERM");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert_eq!(
+            status.code(),
+            Some(130),
+            "{verb:?}: {}",
+            fs::read_to_string(&stderr_path).unwrap_or_default()
+        );
+    }
 }
 
 /// `lab workload list` prints one id per line, built-ins and user-tier.

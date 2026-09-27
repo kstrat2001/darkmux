@@ -161,7 +161,7 @@ export function labFeedLines(events: LabRunEvent[]): string[] {
  * 900-event run says "newest 500 of 900", not "900 records" above a list
  * holding 500. A truncation presented as a bare total is the one thing
  * CLAUDE.md's no-silent-caps rule forbids; every other cap in this codebase
- * (RUNS_CAP, RECENT_CAP, CATALOG_MISSION_CAP, the unfiltered-log 50)
+ * (RUNS_CAP, CATALOG_MISSION_CAP, the unfiltered-log 50)
  * already discloses this way. `totalEvents` is the FULL accumulated event
  * count (`events.length` in the caller), not the capped feed-line count. */
 export function labFeedCountText(totalEvents: number): string {
@@ -180,14 +180,23 @@ export function labFeedStatusSuffix(isFinished: boolean, unreachable: boolean): 
   return " — live, polling";
 }
 
-/** `labCliHint()` — viewer.html:4843-4847. `--workdirs`/the cases dir
- * aren't recorded in the artifact (a known gap the legacy comment names),
- * so those two stay explicit placeholders rather than a guess dressed up
- * as fact. */
-export function labCliHint(env: LabFunnelEnvelope | null, scores: LabScoresDoc | null): string {
-  const crew = env?.crew || scores?.crew || "<crew>";
-  const mode = env?.mode || scores?.exec_mode || "auto";
-  return `darkmux lab eval --funnel --roster-profile ${crew} --exec-mode ${mode} --workdirs <workdirs-root> <cases-dir>`;
+/** The "try it yourself" line: a `lab eval` invocation rebuilt from what
+ * `scores.json` records (`role`, `mode`, `provenance.profile`). The cases
+ * dir and `--workdirs` root are not recorded, so they stay explicit
+ * placeholders rather than a guess dressed up as fact. The experimental
+ * modes run fixed reviewer roles and refuse a named role, so they omit it.
+ * (4.0) This used to print the deleted funnel's `--roster-profile` and
+ * `--exec-mode`, flags `lab eval` rejects. */
+export function labCliHint(scores: LabScoresDoc | null): string {
+  const mode = scores?.mode ?? "strict";
+  const experimental = mode === "freeform" || mode === "agentic" || mode === "dialectic";
+  const parts = ["darkmux lab eval"];
+  if (!experimental) parts.push(scores?.role || "<role>");
+  parts.push("--cases-dir <cases-dir>");
+  if (scores?.provenance?.profile) parts.push(`--profile ${scores.provenance.profile}`);
+  if (mode === "freeform") parts.push("--freeform");
+  if (mode === "agentic" || mode === "dialectic") parts.push(`--${mode} --workdirs <workdirs-root>`);
+  return parts.join(" ");
 }
 
 /** `labBadge()` — viewer.html:4210-4214, text-only. `unreachable` is new

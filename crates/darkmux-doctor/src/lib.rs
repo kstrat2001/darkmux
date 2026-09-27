@@ -20,8 +20,13 @@ use anyhow::Result;
 // doctor check — see the module doc for why it shares `power_posture`'s
 // probe with the mission pre-flight rather than re-reading `pmset` itself.
 mod checks_power;
+// (#2093) The flow-record hook sink's rows — see the module doc.
+mod checks_hooks;
+use checks_hooks::check_hooks;
 mod fleet_submission;
-pub use fleet_submission::{fleet_submission_checks, FleetSubmissionFacts, ProviderReport, TrustView};
+pub use fleet_submission::{
+    fleet_submission_checks, BusyFacts, BusySettings, FleetSubmissionFacts, ProviderReport, TrustView,
+};
 use darkmux_eureka as eureka;
 use darkmux_hardware as hardware;
 use darkmux_heuristics as heuristics;
@@ -32,7 +37,9 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Ordered by severity (`Pass < Warn < Fail`), so the worst of several is
+/// their `max`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Status {
     Pass,
     Warn,
@@ -72,15 +79,7 @@ pub struct EmbeddedSkill {
 
 impl DoctorReport {
     pub fn worst_status(&self) -> Status {
-        let mut worst = Status::Pass;
-        for c in &self.checks {
-            match (c.status, worst) {
-                (Status::Fail, _) => return Status::Fail,
-                (Status::Warn, Status::Pass) => worst = Status::Warn,
-                _ => {}
-            }
-        }
-        worst
+        self.checks.iter().map(|c| c.status).max().unwrap_or(Status::Pass)
     }
 
     pub(crate) fn pass_count(&self) -> usize {
@@ -138,7 +137,6 @@ pub fn run() -> DoctorReport {
     let mut checks = vec![
         check_build_info(),
         check_profile_registry(),
-        check_crews_residue(),
         // (#2707) Read-only: counts what darkmux left in the temp root.
         check_temp_residue(),
         check_mission_config_registry(),
@@ -169,8 +167,6 @@ pub fn run() -> DoctorReport {
         check_openai_base_url_conflict(),
         check_redis_config(),
         check_gh_allowlist(),
-        check_removed_review_config_block(),
-        check_removed_telemetry_record_every_samples(),
         check_removed_radio_router_staffing(),
         check_removed_notebook_settings(),
         check_renamed_budget_settings(),
@@ -212,8 +208,7 @@ pub fn run() -> DoctorReport {
         check_role_profiles(),
         check_role_tool_vocab_typos(),
         check_beat33_legacy_crew_dir(),
-        check_legacy_mission_layout(),
-        check_legacy_compaction_extras(),
+        check_flat_mission_files(),
         check_mission_envelope_readability(),
     ]);
     let checks = [checks, check_enum_settings(), check_hooks(), eureka_checks()].concat();
@@ -398,118 +393,53 @@ fn installed_skill_content(targets: &[PathBuf], name: &str) -> Option<String> {
     None
 }
 
-/// Surface profiles whose `runtime.compaction.extras` map still carries
-/// legacy openclaw-shape passthrough keys that darkmux no longer consumes.
-/// The internal runtime now reads typed fields (`custom_instructions`,
-/// `threshold_ratio`, etc.) — legacy extras keys are silently ignored.
-///
-/// This is a Warn (not Fail) because darkmux's loader preserves
-/// back-compat parsing of the `extras` map (`serde_json::Map<String,
-/// Value>` via `#[serde(flatten)]`); the check only reads, never
-/// mutates. Operators who also use `~/.openclaw/openclaw.json` may still
-/// need those keys there — darkmux's default output stays neutral and
-/// internal-runtime-only. (#380)
-fn check_legacy_compaction_extras() -> Check {
-    let registry = match profiles::load_registry(None) {
-        Ok(r) => r,
-        Err(e) => {
-            return Check {
-                name: "legacy compaction extras".into(),
-                status: Status::Warn,
-                message: format!(
-                    "can't check compaction extras (profile registry load failed: {e})"
-                ),
-                hint: None,
-            };
-        }
-    };
-
-    let legacy_keys: std::collections::HashSet<&str> = [
-        "mode",
-        "maxHistoryShare",
-        "recentTurnsPreserve",
-        "customInstructions",
-    ]
-    .into_iter()
-    .collect();
-
-    let mut offending_profiles: Vec<(String, Vec<String>)> = Vec::new();
-
-    for (name, profile) in &registry.registry.profiles {
-        let extras = profile
-            .runtime
-            .as_ref()
-            .and_then(|r| r.compaction.as_ref())
-            .map(|c| &c.extras);
-
-        if let Some(extras) = extras {
-            let found: Vec<String> = legacy_keys
-                .iter()
-                .filter(|k| extras.contains_key(**k))
-                .map(|s| s.to_string())
-                .collect();
-
-            if !found.is_empty() {
-                offending_profiles.push((name.clone(), found));
+/// (4.0) Pre-#148 flat mission files: `<root>/missions/<id>.json` and
+/// `<root>/phases/<id>.json`. 4.0 deleted `mission migrate` and does not read
+/// them, so a leftover one is state the operator would otherwise lose
+/// silently. Fail, naming every file. Read-only: no migration logic here.
+fn check_flat_mission_files() -> Check {
+    let root = darkmux_crew::loader::user_state_root();
+    let mut found: Vec<String> = Vec::new();
+    for sub in ["missions", "phases"] {
+        let Ok(entries) = std::fs::read_dir(root.join(sub)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.extension().is_some_and(|e| e == "json") {
+                found.push(path.display().to_string());
             }
         }
     }
-
-    if offending_profiles.is_empty() {
-        Check {
-            name: "legacy compaction extras".into(),
+    found.sort();
+    if found.is_empty() {
+        return Check {
+            name: "flat mission files".into(),
             status: Status::Pass,
-            message: "no legacy compaction extras found".into(),
+            message: "no flat mission files".into(),
             hint: None,
-        }
-    } else {
-        let details = offending_profiles
-            .iter()
-            .map(|(name, keys)| {
-                let key_list = keys.join(", ");
-                format!(
-                    "profile `{name}` has fields not consumed by the internal runtime: {key_list}"
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-
-        // Tailored hint: name the typed migration target where one
-        // exists (customInstructions → custom_instructions, from
-        // PR #384); name "remove" for the three keys with no typed
-        // replacement (mode / maxHistoryShare / recentTurnsPreserve —
-        // darkmux's typed schema deliberately doesn't expose these;
-        // see DESIGN.md "Schema isolation: each runtime owns its own
-        // config"). Operators who hit the warning ONLY because of
-        // one of the three see "remove" not "migrate", which is the
-        // accurate guidance.
-        let any_has_custom = offending_profiles
-            .iter()
-            .any(|(_, keys)| keys.iter().any(|k| k == "customInstructions"));
-        let any_has_other = offending_profiles
-            .iter()
-            .any(|(_, keys)| keys.iter().any(|k| k != "customInstructions"));
-        let hint = match (any_has_custom, any_has_other) {
-            (true, true) => "Migrate `customInstructions` to typed `custom_instructions` field; remove `mode` / `maxHistoryShare` / `recentTurnsPreserve` (darkmux's typed schema doesn't expose these — see DESIGN.md Schema isolation).".to_string(),
-            (true, false) => "Migrate `customInstructions` to typed `custom_instructions` field (see PR #384).".to_string(),
-            (false, true) => "Remove `mode` / `maxHistoryShare` / `recentTurnsPreserve` from profile (darkmux's typed schema deliberately doesn't expose these — see DESIGN.md Schema isolation).".to_string(),
-            (false, false) => unreachable!("offending_profiles is non-empty by the outer if"),
         };
-
-        Check {
-            name: "legacy compaction extras".into(),
-            status: Status::Warn,
-            message: details,
-            hint: Some(hint),
-        }
+    }
+    Check {
+        name: "flat mission files".into(),
+        status: Status::Fail,
+        message: format!(
+            "{} pre-#148 flat mission file(s) that 4.0 no longer reads: {}",
+            found.len(),
+            found.join(", ")
+        ),
+        hint: Some(
+            "run `darkmux mission migrate --apply` on 3.x before upgrading, or delete them".into(),
+        ),
     }
 }
 
 /// Detect operators still on the pre-Beat-33 `<root>/crew/{roles,
 /// missions,phases,crews,skills,role-model-pins.json}` layout
-/// and emit an mv-script they can copy-paste to flatten. The loader's
-/// dual-read keeps the legacy layout working, so this is a Warn (not
-/// Fail) — operator-sovereignty: doctor proposes, operator runs.
+/// and emit an mv-script they can copy-paste to flatten. 4.0 no longer
+/// reads that layout (the loader resolves `<root>/<subdir>/` only), so
+/// state left there is invisible: a Fail. Operator-sovereignty still
+/// holds: doctor proposes, operator runs.
 ///
 /// The script writes to stderr-friendly stdout (the hint field), so a
 /// fresh-Claude session can read it back and offer to execute. Doctor
@@ -528,18 +458,33 @@ fn check_beat33_legacy_crew_dir() -> Check {
     }
 
     // Inventory what's actually under <root>/crew/ so the message is
-    // specific. We only care about the post-Beat-33 promoted subdirs +
-    // the pinned file; anything else under crew/ is operator-authored
-    // territory we won't recommend moving.
+    // specific. We only care about the post-Beat-33 promoted subdirs + the
+    // retired pins file; anything else under crew/ is operator-authored
+    // territory we won't recommend moving. The pins file is NOT promoted
+    // state: nothing reads it (the role-model-pins table retired), so it is
+    // only ever named for deletion, never moved.
     let promoted_subdirs = ["roles", "missions", "phases", "crews", "skills"];
-    let promoted_file = "role-model-pins.json";
+    let pins_file = "role-model-pins.json";
     let mut present_subdirs: Vec<&str> = promoted_subdirs
         .iter()
         .filter(|s| legacy_dir.join(s).is_dir())
         .copied()
         .collect();
-    let pins_present = legacy_dir.join(promoted_file).is_file();
+    let pins_present = legacy_dir.join(pins_file).is_file();
     present_subdirs.sort();
+    let pins_note = format!(
+        "{}/{pins_file}: delete it; nothing reads it (the role-model-pins table retired).",
+        legacy_dir.display()
+    );
+
+    if present_subdirs.is_empty() && pins_present {
+        return Check {
+            name: "beat-33 crew/ layout".into(),
+            status: Status::Warn,
+            message: format!("{}/{pins_file} is a retired file darkmux never reads", legacy_dir.display()),
+            hint: Some(pins_note),
+        };
+    }
 
     if present_subdirs.is_empty() && !pins_present {
         // <root>/crew/ exists but is empty / has no promoted content.
@@ -611,39 +556,25 @@ fn check_beat33_legacy_crew_dir() -> Check {
             ));
         }
     }
-    if pins_present {
-        script_lines.push(format!(
-            "mv -n \"{legacy}/{file}\" \"{root}/{file}\"",
-            legacy = legacy_dir.display(),
-            root = root.display(),
-            file = promoted_file
-        ));
-    }
     script_lines.push(format!(
         "rmdir \"{legacy}\" || echo \"note: {legacy} is not empty — whatever remains is either \
          operator-authored (darkmux never proposes moving that) or a LEFTOVERS line above\"",
         legacy = legacy_dir.display()
     ));
 
-    let mut listed = present_subdirs
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect::<Vec<_>>();
-    if pins_present {
-        listed.push(promoted_file.to_string());
-    }
-    let listed_str = listed.join(", ");
+    let listed_str = present_subdirs.join(", ");
+    let pins_hint = if pins_present { format!("\n\nAlso: {pins_note}") } else { String::new() };
 
     Check {
         name: "beat-33 crew/ layout".into(),
-        status: Status::Warn,
+        status: Status::Fail,
         message: format!(
-            "operator state still under {}/ (found: {listed_str}); flattening is recommended",
+            "operator state still under {}/ (found: {listed_str}); darkmux does not read it",
             legacy_dir.display()
         ),
         hint: Some(format!(
-            "darkmux still reads the legacy layout via the loader's dual-read fallback — no \
-             rush. When you're ready to flatten, copy-paste this — each line is state-checked \
+            "darkmux no longer reads the pre-flatten `crew/` layout, so the state listed above \
+             is invisible until it moves. Copy-paste this; each line is state-checked \
              against your actual destination (a plain `mv -n` for an absent destination, a \
              per-entry merge for one that already exists, never a directory nested into \
              another):\n\n{script}\n\n\
@@ -652,9 +583,8 @@ fn check_beat33_legacy_crew_dir() -> Check {
              `LEFTOVERS in ...` line naming the directory it stayed in — compare those two \
              copies yourself and delete the stale one. A clean run prints nothing.\n\n\
              Note: if you set DARKMUX_CREW_DIR explicitly, this check assumes the env var \
-             points at the post-flatten root (e.g. `~/.darkmux/`). If you instead set it \
-             at the legacy `crew/` dir (`~/.darkmux/crew/`), the dual-read keeps working \
-             but this script's paths are computed from the env var value as-given.",
+             points at the post-flatten root (e.g. `~/.darkmux/`), and this script's paths \
+             are computed from the env var value as-given.{pins_hint}",
             script = script_lines.join("\n")
         )),
     }
@@ -1404,7 +1334,7 @@ fn utility_in_profiles_status(registry: &darkmux_types::ProfileRegistry) -> Chec
     };
     // Match on the bare model key in either spelling, the same comparison
     // every utility-model check in darkmux-crew uses.
-    let bare = |id: &str| id.strip_prefix("darkmux:").unwrap_or(id).to_string();
+    let bare = |id: &str| darkmux_gestalt::bare_model_key(id).to_string();
     let utility_key = bare(utility);
     let mut offenders: Vec<(String, Option<u32>)> = registry
         .profiles
@@ -1469,8 +1399,8 @@ fn utility_in_profiles_status(registry: &darkmux_types::ProfileRegistry) -> Chec
 /// binding in the dynamic map), and the `DARKMUX_RADIO_ROUTER_PROFILE` env
 /// var. Routing runs on the machine's utility model now, so each of these
 /// is inert; `Warn` naming whichever are still set, with the one fix.
-/// Same shape as `check_removed_review_config_block` (the key is read off
-/// `radio.extras`, where the typed struct no longer has a field for it).
+/// The key is read off `radio.extras`, where the typed struct no longer has
+/// a field for it.
 fn check_removed_radio_router_staffing() -> Check {
     let cfg = darkmux_types::config::DarkmuxConfig::load_resolved();
     let router_profile_present = cfg.radio.as_ref().is_some_and(|r| r.extras.contains_key("router_profile"));
@@ -1600,7 +1530,7 @@ fn unpriceable_residents_status(models: &[darkmux_profiles::model_ledger::ModelR
 /// the issue's operator made by hand.
 ///
 /// "Addressable" means the resident's namespaced identifier
-/// (`darkmux_profiles::swap::namespaced_identifier`) matches either (a) some
+/// (`darkmux_profiles::ownership::namespaced_identifier`) matches either (a) some
 /// model entry in some profile in the registry, or (b) the machine's
 /// `internal.utility` binding (#590) — the ONE darkmux-owned identifier that
 /// is legitimately never listed in any profile's `models[]`. A non-namespaced
@@ -1654,7 +1584,7 @@ fn unreachable_residents_status(
     let mut addressable: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for profile in registry.profiles.values() {
         for m in &profile.models {
-            addressable.insert(darkmux_profiles::swap::namespaced_identifier(m));
+            addressable.insert(darkmux_profiles::ownership::namespaced_identifier(m));
         }
     }
     if let Some(util_id) = registry.utility_model_id() {
@@ -1665,12 +1595,12 @@ fn unreachable_residents_status(
         // profile loop above uses rather than adding a `darkmux-gestalt`
         // dependency just for its two-arg twin.
         let util_pm = darkmux_types::ProfileModel { id: util_id.to_string(), ..Default::default() };
-        addressable.insert(darkmux_profiles::swap::namespaced_identifier(&util_pm));
+        addressable.insert(darkmux_profiles::ownership::namespaced_identifier(&util_pm));
     }
 
     let unreachable: Vec<&str> = loaded
         .iter()
-        .filter(|l| darkmux_profiles::swap::is_darkmux_owned(&l.identifier))
+        .filter(|l| darkmux_profiles::ownership::is_darkmux_owned(&l.identifier))
         .filter(|l| !addressable.contains(&l.identifier))
         .map(|l| l.identifier.as_str())
         .collect();
@@ -2146,43 +2076,14 @@ fn check_gh_allowlist() -> Check {
     }
 }
 
-/// (#2093) Surface the flow-record hook sink's resolved state: whether it's
-/// enabled (with provenance), and — when it is — every configured rule's
-/// match + URL + undelivered-line count, flagging a rule whose match is
-/// empty (Warn — matches nothing, likely an operator forgot to fill it in)
-/// or whose URL isn't loopback (Fail — `HookSink::new` refuses the whole
-/// sink over this, so it's a hard block, not a suggestion).
-///
-/// (#2093 merge-gate finding 14) Returns ONE `Check` per flagged rule
-/// (`hooks.rule.<index>`), not a single aggregate — so a flag attaches
-/// to the rule it names in the checks list itself, the same shape
-/// `eureka_checks()` already established for a check family with more
-/// than one member. Provenance distinguishes `env` / `config.json` /
-/// `default` (mirrors `check_step_command_timeout`'s own three-way
-/// provenance) — previously any non-`env` case was reported as
-/// `config.json` even when NEITHER tier actually set it.
-fn check_hooks() -> Vec<Check> {
-    // (#2450 review) Provenance comes from `config_access`, which owns the
-    // `env > config.json > default` ladder for every setting. The local copy
-    // this replaces asked the config tier via `DarkmuxConfig::load_resolved()`,
-    // which has no #811 test seam and so read the operator's REAL config.json
-    // from inside the unit tests — see `hooks_enabled_provenance`'s own doc.
-    let provenance = darkmux_types::config_access::hooks_enabled_provenance();
-    let enabled = darkmux_types::config_access::hooks_enabled();
-    let rules = darkmux_types::config_access::hooks_rules();
-    let outbox_dir = darkmux_types::config_access::hooks_outbox_dir();
-    let today_actions = today_flow_actions();
-    build_hooks_check(enabled, provenance, &rules, &outbox_dir, &today_actions)
-}
-
 /// (silent-miss audit, 2026-09-06) Every DISTINCT `action` value present in
-/// today's flow day file — read once here so [`build_hooks_check`] can flag
+/// today's flow day file — read once here so the hooks check can flag
 /// a rule that has NEVER matched anything because its `match.action` names
 /// the OTHER bookend spelling from what today's records actually carry
 /// (`darkmux_flow::is_dispatch_start`/`is_dispatch_complete`/
 /// `is_dispatch_error` tolerate both spellings; a hook rule's own
-/// `HookMatch::action` glob does not — see `build_hooks_check`'s own
-/// comment on the check this feeds). Not a general flow reader: reads
+/// `HookMatch::action` glob does not — see `checks_hooks::never_matched_flag`,
+/// the check this feeds). Not a general flow reader: reads
 /// exactly one file (today's), and returns an empty set on any
 /// read/parse failure or a line that isn't a JSON object with a string
 /// `action` — the same descriptive-not-refusing posture the rest of
@@ -2216,518 +2117,12 @@ fn other_bookend_spelling(action: &str) -> Option<&'static str> {
     }
 }
 
-/// The literal `action=<value>` predicate from a `describe_match`
-/// rendering, when present — the same string-based extraction
-/// `hooks_match_risks_observing_the_observer` already performs against
-/// this rendered form (`HookRuleSummary` carries only the description,
-/// not the structured `HookMatch`; good enough for a doctor Warn, not a
-/// security boundary). `describe_match` always emits `action=...` FIRST
-/// when present, so a leading-prefix match is sufficient.
-fn action_from_match_desc(match_desc: &str) -> Option<&str> {
-    let rest = match_desc.strip_prefix("action=")?;
-    Some(rest.split(", ").next().unwrap_or(rest))
-}
-
-/// (#2093 merge-gate finding 17) True when a rule's match risks the
-/// observer joining the observed (this project's own doctrine,
-/// CLAUDE.md's "The observer must not join the observed") — matching
-/// `telemetry.*` / category `telemetry`, or a bare `*` action that
-/// (among everything else) would also catch every telemetry record.
-/// String-matching against `describe_match`'s rendered form since
-/// `HookRuleSummary` carries only the description, not the structured
-/// `HookMatch` — good enough for a doctor Warn, not a security boundary.
-fn hooks_match_risks_observing_the_observer(match_desc: &str) -> bool {
-    match_desc.contains("category=telemetry") || match_desc.contains("action=telemetry.") || match_desc == "action=*"
-}
-
-/// (#2093 merge-gate finding 15) `*.outbox.jsonl` files in `outbox_dir`
-/// whose key (the content-hash `rule_key` — see `darkmux_flow::hooks`'
-/// own doc) matches no CURRENTLY-configured rule. Belongs to a rule
-/// since removed from config (or edited enough to change its
-/// `match`/`http`) — the outbox still holds whatever was undelivered
-/// when that happened, and nothing will ever drain it again unless the
-/// rule comes back verbatim.
-/// (fix-round finding 6) One stray `*.outbox.jsonl` file — one whose
-/// owning rule no longer exists in current config — plus the detail an
-/// operator deciding "safe to delete?" actually needs: how many lines
-/// were never delivered, and which sibling sidecar files (all sharing
-/// the same content-hash key) go with it.
-struct StrayOutbox {
-    path: std::path::PathBuf,
-    undelivered: usize,
-    siblings: Vec<String>,
-}
-
-/// Sibling sidecar suffixes a stray outbox's key can carry — see
-/// `darkmux_flow::hooks`'s per-rule file layout (`outbox_paths`,
-/// `last_status_path`, `dropped_appends_path`, `receiver_rejected_path`,
-/// `drain_lock_path`, `quarantine_path`). This list is what an operator
-/// deciding "safe to delete?" reads, so a NEW per-rule sidecar belongs
-/// here in the same change that introduces it.
-const HOOK_SIDECAR_SUFFIXES: &[&str] =
-    &[".cursor", ".last", ".dropped", ".rejected", ".drain.lock", ".outbox.jsonl.quarantine"];
-
-fn stray_outbox_files(rules: &[darkmux_types::config::HookRule], outbox_dir: &std::path::Path) -> Vec<StrayOutbox> {
-    // (#2183) Reuse `summarize_configured_rules`'s OWN key derivation
-    // (`.key`) rather than recomputing `rule_key` by hand from `r.http`
-    // alone — a `file`-transport rule has no `http`, so hand-rolling this
-    // from `r.http.unwrap_or_default()` would key every `file` rule on
-    // the empty string and misreport its real outbox as stray.
-    let current_keys: std::collections::HashSet<String> =
-        darkmux_flow::hooks::summarize_configured_rules(rules, outbox_dir).into_iter().map(|s| s.key).collect();
-    let Ok(entries) = std::fs::read_dir(outbox_dir) else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter_map(|path| {
-            let name = path.file_name().and_then(|n| n.to_str())?;
-            let key = name.strip_suffix(".outbox.jsonl")?;
-            if current_keys.contains(key) {
-                return None;
-            }
-            // The stray file's own `.cursor` sidecar (if it survived
-            // alongside it) still names the true last-delivered offset;
-            // falling back to 0 (nothing ever delivered) only overcounts
-            // when that sidecar is itself missing.
-            let cursor = std::fs::read_to_string(outbox_dir.join(format!("{key}.cursor")))
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(0);
-            let undelivered = darkmux_flow::hooks::undelivered_line_count(&path, cursor);
-            let siblings: Vec<String> = HOOK_SIDECAR_SUFFIXES
-                .iter()
-                .map(|suffix| format!("{key}{suffix}"))
-                .filter(|sibling_name| outbox_dir.join(sibling_name).exists())
-                .collect();
-            Some(StrayOutbox { path, undelivered, siblings })
-        })
-        .collect()
-}
-
-/// The pure rollup `check_hooks()` delegates to — split out so it's testable
-/// against synthetic rules without the global config/env tier (#811 empties
-/// `config()` in test builds, so there's no way to inject `hooks.rules`
-/// through the real accessor path in a unit test).
-fn build_hooks_check(
-    enabled: bool,
-    provenance: &str,
-    rules: &[darkmux_types::config::HookRule],
-    outbox_dir: &std::path::Path,
-    today_actions: &std::collections::HashSet<String>,
-) -> Vec<Check> {
-    let name = "hooks";
-    if !enabled {
-        return vec![Check { name: name.into(), status: Status::Pass, message: format!("disabled ({provenance})"), hint: None }];
-    }
-    if rules.is_empty() {
-        return vec![Check {
-            name: name.into(),
-            status: Status::Warn,
-            message: format!("enabled ({provenance}) but no rules configured — outbox_dir={}", outbox_dir.display()),
-            hint: Some(
-                "Add a rule to config.json's `hooks.rules`, e.g. `darkmux config set hooks.rules \
-                 '[{\"match\":{\"action\":\"dispatch.tool\",\"payload.tool_name\":\"create_finding\",\
-                 \"payload.ok\":true},\"http\":\"http://127.0.0.1:8790/events\"}]'`."
-                    .into(),
-            ),
-        }];
-    }
-
-    let summaries = darkmux_flow::hooks::summarize_configured_rules(rules, outbox_dir);
-    let mut worst = Status::Pass;
-    let mut overview_lines = Vec::with_capacity(summaries.len());
-    let mut rule_checks = Vec::with_capacity(summaries.len());
-
-    for s in &summaries {
-        let mut flags = Vec::new();
-        // (#2196 fix-round 4, MUST FIX G at the doctor surface) The
-        // receiver's own reason text NEVER joins `message`. It rides
-        // these pre-bounded hint lines instead — see the `receiver_rejected_total`
-        // block below for why, and `darkmux_flow::hooks::rejection_reason_display_lines`
-        // for the budget.
-        let mut reason_hint_lines: Vec<String> = Vec::new();
-        let mut rule_status = Status::Pass;
-        if s.is_empty_match {
-            flags.push("EMPTY MATCH — matches nothing".to_string());
-            rule_status = Status::Warn;
-        }
-        // (#2135 option 2) A URL satisfying NEITHER the loopback nor the
-        // tailnet policy is what `HookSink::new` refuses the whole sink
-        // over — a valid tailnet rule (`is_tailnet: true`) is NOT this
-        // case and must not read as broken.
-        if s.is_refused {
-            flags.push("URL REFUSED — neither loopback nor a Tailscale address; refused at load".to_string());
-            rule_status = Status::Fail;
-        }
-        // (#2135 option 2) An unsigned TAILNET target is fine inside the
-        // tailnet (WireGuard already authenticates + encrypts the peer),
-        // but the receiver has no way to attribute the record's sender
-        // beyond the body itself — worth a Warn, not a Fail.
-        if s.is_tailnet && !s.signed {
-            flags.push(
-                "TAILNET TARGET, UNSIGNED — attribution is unsigned; fine inside the tailnet, required beyond it"
-                    .to_string(),
-            );
-            if rule_status == Status::Pass {
-                rule_status = Status::Warn;
-            }
-        }
-        // (#2093 merge-gate finding 9) A rule that's been dropping writes
-        // (over the outbox cap, or an append failure) is a Warn — not a
-        // Fail, since delivery for every OTHER pending line keeps working.
-        if s.dropped_appends > 0 {
-            flags.push(format!(
-                "{} write(s) dropped so far (over the outbox cap, or an append failure)",
-                s.dropped_appends
-            ));
-            if rule_status == Status::Pass {
-                rule_status = Status::Warn;
-            }
-        }
-        // (fix-round finding 1) A STALLED rule has stopped attempting
-        // deliveries entirely — surfaced loudly, same severity as the
-        // other operational (not config-validation) flags here.
-        if s.stalled {
-            flags.push(format!(
-                "STALLED — {} consecutive cursor-write failure(s); the drainer has stopped attempting new \
-                 deliveries for this rule until its cursor file becomes writable again",
-                s.cursor_write_failures
-            ));
-            if rule_status == Status::Pass {
-                rule_status = Status::Warn;
-            }
-        }
-        // (fix-round finding 7) Quarantined (invalid-JSON) lines are
-        // never redelivered — worth naming, same as a dropped append.
-        if s.quarantined_lines > 0 {
-            flags.push(format!("{} line(s) quarantined (invalid JSON — never redelivered)", s.quarantined_lines));
-            if rule_status == Status::Pass {
-                rule_status = Status::Warn;
-            }
-        }
-        // (#2273) The receiver accepted a delivery's HTTP request (2xx)
-        // but its own response body reported it rejected some or all of
-        // the record(s) inside it — a THIRD outcome, distinct from a
-        // transport failure and a clean accept. darkmux never retries
-        // this: a receiver-side content rejection is (per
-        // `DeliveryOutcome::Success`'s own doc) usually permanent, so
-        // retrying would just repeat it forever — the line is consumed
-        // same as a clean delivery. This is where an operator who missed
-        // the `hook.fired` flow record (now emitted at Warn, not Info,
-        // for exactly this case) still finds out it happened.
-        //
-        // (#2273 fix-round finding 1) Keyed on the CUMULATIVE
-        // `receiver_rejected_total`, never on `last_receiver_rejected`.
-        // The latter lives on the `.last` sidecar, which every terminal
-        // outcome truncate-replaces in full — so 400 rejections followed
-        // by ONE clean delivery leaves it `None`, and a check keyed on it
-        // reports the rule clean seconds after those losses. The total is
-        // a counter sidecar of its own (`<key>.rejected`), never reset —
-        // the same substrate `dropped_appends` uses, for the same reason.
-        // The last delivery's own count is still named when present, as
-        // context.
-        //
-        // Describing only, per this project's stance: names the count and
-        // the actor, never characterizes the receiver as misconfigured.
-        if s.receiver_rejected_total > 0 {
-            // (#2196) The receiver's own stated reason(s) for that last
-            // rejection, when its body carried any — the count alone
-            // tells an operator SOMETHING was thrown away, never WHY, so
-            // this is what saves a replay against a scratch receiver or a
-            // trip through the receiver's own log to find out.
-            //
-            // (#2196 fix-round 4, MUST FIX G at the doctor surface) The
-            // reason text is deliberately NOT interpolated into
-            // `message`, which is where it lived through fix-round 3.
-            // Two independent reasons, both structural:
-            //
-            //  * `message` is word-wrapped by `render_check_block` to
-            //    `output_width()` and its CONTINUATIONS are indented —
-            //    but `output_width()` reads `COLUMNS`, and `COLUMNS` is
-            //    not exported to child processes by zsh or bash
-            //    (measured). So doctor renders at its 100-column DEFAULT
-            //    however wide the operator's terminal really is, the
-            //    terminal re-wraps every line past its own width, and the
-            //    continuation lands at column 0 — where doctor's three
-            //    flush-left rows live (the `darkmux doctor — N checks`
-            //    header, the `●` verdict banner, and the summary). Proven
-            //    against the real renderer: a receiver could put
-            //    `● ok — every check passed` at column 0 of a 60-column
-            //    terminal, under a genuine `broken` banner.
-            //  * `verdict_banner_at` quotes the worst check's whole
-            //    `message` onto a FLUSH-LEFT line of its own. Anything in
-            //    `message` is one status away from being printed at
-            //    column 0 with no indent at all.
-            //
-            // The hint path has neither problem: every hint line is
-            // printed behind `"        → "` or ten spaces, and the lines
-            // below are pre-bounded so the finished row stays under the
-            // narrowest supported terminal width.
-            let last_clause = match s.last_receiver_rejected {
-                Some(n) if !s.last_receiver_rejected_reasons.is_empty() => {
-                    reason_hint_lines = darkmux_flow::hooks::rejection_reason_display_lines(
-                        &s.last_receiver_rejected_reasons,
-                        darkmux_flow::hooks::REJECTION_REASON_HINT_INDENT,
-                    );
-                    format!("; {n} on the last delivery — the receiver's reason(s) below")
-                }
-                Some(n) => format!("; {n} on the last delivery"),
-                None => String::new(),
-            };
-            flags.push(format!(
-                "{} record(s) reported rejected by the receiver so far (request accepted, content \
-                 rejected — consumed, not retried){last_clause}",
-                s.receiver_rejected_total
-            ));
-            if rule_status == Status::Pass {
-                rule_status = Status::Warn;
-            }
-        }
-        if hooks_match_risks_observing_the_observer(&s.match_desc) {
-            flags.push(
-                "matches telemetry / a bare `*` action — the observer must not join the observed".to_string(),
-            );
-            if rule_status == Status::Pass {
-                rule_status = Status::Warn;
-            }
-        }
-        // (silent-miss audit, 2026-09-06) A rule with ZERO deliveries ever
-        // (nothing currently undelivered, and no terminal outcome has ever
-        // landed) reads as merely quiet — a healthy rule waiting for a
-        // matching record is indistinguishable from one that has NEVER
-        // matched a single record because it was written against the
-        // wrong bookend spelling (`HookMatch::action` is a literal glob;
-        // it does NOT tolerate both spellings the way `darkmux_flow`'s
-        // shared matchers do). If today's flow day file holds at least
-        // one record carrying the OTHER spelling of this rule's configured
-        // action, that silence has an explanation worth naming instead of
-        // leaving the operator to notice only when nothing ever arrives.
-        if s.undelivered == 0 && s.last_delivery_ts.is_none() {
-            if let Some(configured) = action_from_match_desc(&s.match_desc) {
-                if let Some(other) = other_bookend_spelling(configured) {
-                    if today_actions.contains(other) {
-                        flags.push(format!(
-                            "NEVER MATCHED (zero deliveries) — configured for action=\"{configured}\", but \
-                             today's flow records use \"{other}\" instead; this looks like a bookend-spelling \
-                             mismatch, not a quiet rule"
-                        ));
-                        if rule_status == Status::Pass {
-                            rule_status = Status::Warn;
-                        }
-                    }
-                }
-            }
-        }
-        if worst == Status::Pass && rule_status != Status::Pass {
-            worst = rule_status;
-        } else if rule_status == Status::Fail {
-            worst = Status::Fail;
-        }
-
-        // (#2183) A `transform` that failed to load is a load-time
-        // refusal SCOPED TO THIS RULE (`HookSink::new` disables just this
-        // rule, the rest of the sink keeps running) — Fail here too, so
-        // the row that's actually broken is the one operator sees red,
-        // without the whole `hooks` check reading as catastrophic.
-        let transform_suffix = match (&s.transform_name, &s.transform_status) {
-            (Some(name), Some(Ok(hash))) => format!(", transform: {name} (sha256:{hash})"),
-            (Some(name), Some(Err(reason))) => {
-                flags.push(format!("TRANSFORM `{name}` FAILED TO LOAD — {reason}"));
-                rule_status = Status::Fail;
-                format!(", transform: {name} [FAILED]")
-            }
-            _ => String::new(),
-        };
-        if worst == Status::Pass && rule_status != Status::Pass {
-            worst = rule_status;
-        } else if rule_status == Status::Fail {
-            worst = Status::Fail;
-        }
-
-        let flag_str = if flags.is_empty() { String::new() } else { format!(" [{}]", flags.join("; ")) };
-        // (#2135 option 2) `loopback`/`tailnet`/`refused` + `signed`/
-        // `unsigned` — the visibility the operator's design asked for in
-        // place of a config gate: the URL is the decision, this row is
-        // what makes it legible. (#2183) `file` names the no-network
-        // testing-tier transport instead — there's no URL policy or
-        // signature to report for it.
-        let target_kind = if s.is_file {
-            "file"
-        } else if s.is_loopback {
-            "loopback"
-        } else if s.is_tailnet {
-            "tailnet"
-        } else {
-            "refused"
-        };
-        let signed = if s.is_file { "n/a" } else if s.signed { "signed" } else { "unsigned" };
-        let message = format!(
-            "{} -> {} [{target_kind}, {signed}]{transform_suffix} (undelivered: {}){flag_str}",
-            s.match_desc, s.url, s.undelivered
-        );
-        overview_lines.push(format!("  #{}: {message}", s.index));
-        rule_checks.push(Check {
-            name: format!("hooks.rule.{}", s.index),
-            status: rule_status,
-            message,
-            hint: {
-                // (#2196 fix-round 4) The receiver's quoted reason(s)
-                // ride here as their own lines, ahead of the config
-                // remedy — they are EVIDENCE, and an operator reading a
-                // rejection wants the receiver's words before any advice
-                // about the local config. Each line is already bounded so
-                // that doctor's hint prefix plus the line stays under the
-                // narrowest supported terminal width; doctor's own
-                // `wrap_hanging` only ever narrows a line further, so the
-                // bound survives whatever `output_width()` resolves to.
-                let mut hint_lines: Vec<String> = Vec::new();
-                if !reason_hint_lines.is_empty() {
-                    hint_lines.push("the receiver's stated reason(s) for the last rejection:".into());
-                    hint_lines.extend(reason_hint_lines.iter().cloned());
-                }
-                if !flags.is_empty() {
-                    hint_lines
-                        .push("Fix this rule in ~/.darkmux/config.json (or `darkmux config set hooks.rules ...`).".into());
-                }
-                if hint_lines.is_empty() {
-                    None
-                } else {
-                    Some(hint_lines.join("\n"))
-                }
-            },
-        });
-    }
-
-    let overview = Check {
-        name: name.into(),
-        status: worst,
-        message: format!(
-            "enabled ({provenance}) — {} rule(s), outbox_dir={}\n{}",
-            summaries.len(),
-            outbox_dir.display(),
-            overview_lines.join("\n")
-        ),
-        hint: if worst != Status::Pass {
-            Some("See the individual `hooks.rule.*` checks below for which rule(s).".into())
-        } else {
-            None
-        },
-    };
-    let mut out = vec![overview];
-    out.extend(rule_checks);
-
-    // (#2093 merge-gate finding 15) A file that belongs to no CURRENT
-    // rule — named so, rather than silently taking up disk forever.
-    let stray = stray_outbox_files(rules, outbox_dir);
-    if !stray.is_empty() {
-        // (fix-round finding 6) Name each stray file's undelivered line
-        // count and its sibling sidecars — an operator deciding whether
-        // it's "safe to delete" needs both, not just the outbox name.
-        let details: Vec<String> = stray
-            .iter()
-            .map(|s| {
-                let name = s.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let siblings =
-                    if s.siblings.is_empty() { String::new() } else { format!("; siblings: {}", s.siblings.join(", ")) };
-                format!("{name} ({} undelivered line(s){siblings})", s.undelivered)
-            })
-            .collect();
-        out.push(Check {
-            name: "hooks.stray".into(),
-            status: Status::Warn,
-            message: format!("{} outbox file(s) belong to no currently-configured rule: {}", stray.len(), details.join(", ")),
-            hint: Some(
-                "A rule was removed or edited since these were written. `darkmux flow drain --file <path> \
-                 --to <loopback url>` delivers a stray file's undelivered lines before you delete it; once \
-                 undelivered is 0, it (and its sibling sidecars) are safe to remove."
-                    .into(),
-            ),
-        });
-    }
-
-    out
-}
-
 /// The `config.json` that `DarkmuxConfig::load_resolved()` reads — the
 /// file a removed-key hint has to name. Honors `DARKMUX_HOME`, so an
 /// operator whose root is not `~/.darkmux` is told the file that actually
 /// holds the leftover key (#2913 review C4).
 fn resolved_config_path() -> std::path::PathBuf {
     darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config
-}
-
-/// (#1876/#1877; #2310 P4d; #2404 P4d round 3) The `review{}` config block
-/// (`judge_fail_on_any_skip` / `judge_concurrency`) was REMOVED from
-/// `DarkmuxConfig` in CONFIG_SCHEMA_VERSION 1.22 — the review funnel those
-/// knobs tuned was deleted in #2310 P4d, and darkmux is pre-1.0 (no
-/// deprecate-in-place; remove outright). Because the field is gone, a
-/// `config.json` still carrying a `review` key lands it in the top-level
-/// `extras` overflow (lenient-on-read) instead of a typed field — this
-/// check looks THERE, not at a typed accessor that no longer exists.
-///
-/// `Pass` when `extras` has no `review` key at all (the common case, and
-/// the case `DarkmuxConfig::with_defaults()` must produce — a regression
-/// here is exactly what let the round-2 field survive one review pass).
-/// `Warn`, naming the key, when an old config still has it.
-fn check_removed_review_config_block() -> Check {
-    let name = "review.judge_* (removed)";
-    let cfg = darkmux_types::config::DarkmuxConfig::load_resolved();
-    if !cfg.extras.contains_key("review") {
-        return Check {
-            name: name.into(),
-            status: Status::Pass,
-            message: "not present".into(),
-            hint: None,
-        };
-    }
-    Check {
-        name: name.into(),
-        status: Status::Warn,
-        // Hardcoded, not `CONFIG_SCHEMA_VERSION` — that constant marches
-        // forward with every future schema bump, but the `review` block
-        // was removed in ONE specific past version (1.22). Formatting the
-        // live constant here would make this message quietly lie about
-        // WHEN the removal happened the moment the schema bumps again.
-        message: "config.json has a `review` key — removed in CONFIG 1.22; delete it from config.json".into(),
-        hint: Some(format!(
-            "the review funnel this block configured was deleted in #2310 P4d; remove the \
-             `review` block from {} — it is read leniently but has no effect",
-            resolved_config_path().display()
-        )),
-    }
-}
-
-/// (#2413 M5) `runtime.telemetry_record_every_samples` is retired — the
-/// per-dispatch `machine.telemetry` curve it configured a downsample rate
-/// for is gone (one machine-scoped sampler now owns that emission). Same
-/// shape as `check_removed_review_config_block` just above: `Pass` when
-/// absent (including a fresh `with_defaults()` config), `Warn` naming the
-/// key and telling the operator to delete it when present.
-fn check_removed_telemetry_record_every_samples() -> Check {
-    let name = "runtime.telemetry_record_every_samples (removed)";
-    let cfg = darkmux_types::config::DarkmuxConfig::load_resolved();
-    let present = cfg
-        .runtime
-        .as_ref()
-        .is_some_and(|r| r.extras.contains_key("telemetry_record_every_samples"));
-    if !present {
-        return Check { name: name.into(), status: Status::Pass, message: "not present".into(), hint: None };
-    }
-    Check {
-        name: name.into(),
-        status: Status::Warn,
-        message: "config.json has `runtime.telemetry_record_every_samples` — retired in CONFIG 1.22; \
-                  delete it from config.json"
-            .into(),
-        hint: Some(
-            "the per-dispatch machine.telemetry curve it downsampled is gone (#2413) — remove \
-             `telemetry_record_every_samples` from the `runtime` block in ~/.darkmux/config.json; \
-             it is read leniently but has no effect"
-                .into(),
-        ),
-    }
 }
 
 /// (#2902 step 5) Settings RENAMED in 4.0 with no alias
@@ -5745,39 +5140,28 @@ fn loopback_http_body(host: &str, port: u16, path: &str) -> Option<String> {
     response.split_once("\r\n\r\n").map(|(_, b)| b.to_string())
 }
 
-/// What a running daemon told us about itself on `/health`.
+/// What a running daemon told us about itself on `/health` (#1461).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum DaemonBuild {
-    /// The daemon reports its full build identity (#1461+).
-    Modern {
-        /// `build` — package version PLUS git short SHA, so two daemons built
-        /// from different commits at the same package version are
-        /// distinguishable.
-        build: String,
-        /// `binary_mtime` — when the binary the daemon loaded was last written.
-        /// `None` from a daemon that couldn't stat its own exe.
-        binary_mtime: Option<u64>,
-    },
-    /// A daemon predating #1461 reports only `darkmux_version`. Comparing that
-    /// bare version against this binary's build-tagged one would not be an
-    /// apples-to-apples comparison — but no comparison is needed: a daemon
-    /// with no `build` field was necessarily compiled before this code existed,
-    /// so it is stale by construction.
-    Legacy(String),
+struct DaemonBuild {
+    /// `build` — package version PLUS git short SHA, so two daemons built
+    /// from different commits at the same package version are
+    /// distinguishable.
+    build: String,
+    /// `binary_mtime` — when the binary the daemon loaded was last written.
+    /// `None` from a daemon that couldn't stat its own exe.
+    binary_mtime: Option<u64>,
 }
 
-/// Pull the running daemon's build identity out of a `/health` body.
+/// Pull the running daemon's build identity out of a `/health` body. `None`
+/// when there is none to read, including a pre-#1461 daemon that reports no
+/// `build` field.
 fn parse_daemon_build(health_body: &str) -> Option<DaemonBuild> {
     let v: serde_json::Value = serde_json::from_str(health_body).ok()?;
-    if let Some(build) = v.get("build").and_then(|b| b.as_str()) {
-        return Some(DaemonBuild::Modern {
-            build: build.to_string(),
-            binary_mtime: v.get("binary_mtime").and_then(|m| m.as_u64()),
-        });
-    }
-    v.get("darkmux_version")
-        .and_then(|b| b.as_str())
-        .map(|s| DaemonBuild::Legacy(s.to_string()))
+    let build = v.get("build").and_then(|b| b.as_str())?;
+    Some(DaemonBuild {
+        build: build.to_string(),
+        binary_mtime: v.get("binary_mtime").and_then(|m| m.as_u64()),
+    })
 }
 
 /// Modification time of the darkmux binary doctor is running from, in whole
@@ -5861,9 +5245,11 @@ fn classify_daemon_freshness(
 ) -> Check {
     let Some(running) = running else {
         // No daemon is the common case — most users never run one. Silent.
+        // A pre-#1461 daemon (no build id) lands here too: the reachability
+        // check still reports that it answered.
         return not_applicable(
             DAEMON_FRESHNESS_CHECK_NAME,
-            "no darkmux serve daemon running on this machine",
+            "no darkmux serve daemon reporting a build id on this machine",
         );
     };
     let warn = |message: String| Check {
@@ -5873,12 +5259,7 @@ fn classify_daemon_freshness(
         hint: restart_daemon_hint(),
     };
     match running {
-        DaemonBuild::Legacy(v) => warn(format!(
-            "a darkmux serve daemon is running an OLDER build than this binary \
-             ({installed_build}) — it reports darkmux {v} with no build id, which only a daemon \
-             started before this check shipped does, so it cannot have your latest code"
-        )),
-        DaemonBuild::Modern { build, .. } if build != installed_build => warn(format!(
+        DaemonBuild { build, .. } if build != installed_build => warn(format!(
             "a darkmux serve daemon is running a DIFFERENT build ({build}) than this binary \
              ({installed_build}) — it serves its in-memory code until restarted, so anything you \
              verify against it is testing that build, not this one"
@@ -5887,7 +5268,7 @@ fn classify_daemon_freshness(
         // same commit-plus-dirty-marker before and after a reinstall from an
         // uncommitted tree, so the binary can have been replaced underneath a
         // still-running daemon without the tag moving at all.
-        DaemonBuild::Modern {
+        DaemonBuild {
             build,
             binary_mtime: Some(daemon_mtime),
         } if installed_mtime.is_some_and(|installed| installed != daemon_mtime) => {
@@ -5928,7 +5309,7 @@ fn classify_daemon_freshness(
                 }
             }
         }
-        DaemonBuild::Modern { build, .. } => Check {
+        DaemonBuild { build, .. } => Check {
             name: DAEMON_FRESHNESS_CHECK_NAME.into(),
             status: Status::Pass,
             message: format!("running daemon matches this binary ({build})"),
@@ -6351,55 +5732,6 @@ fn check_profile_registry() -> Check {
                 .to_string(),
             hint: Some("run `darkmux init` to create one".into()),
         },
-    }
-}
-
-/// (#1426 ship-2) The `crews` map retired from the profiles schema — a crew is
-/// now a DERIVED view of a mission's resourcing, staffed by
-/// `darkmux_crew::resourcing`, never declared. A profiles.json still carrying a
-/// `crews` key parses fine (the key overflows into `ProfileRegistry.extras`,
-/// lenient-on-read) and is harmless residue. This check just NOTES that residue
-/// so an operator upgrading from a pre-2.0 profiles.json knows the map no
-/// longer does anything and can delete it at leisure. Cheap: it inspects the
-/// already-parsed `extras`, no per-entry work.
-fn check_crews_residue() -> Check {
-    let registry = match profiles::load_registry(None) {
-        Ok(r) => r,
-        Err(e) => {
-            return Check {
-                name: "crews residue".into(),
-                status: Status::Warn,
-                message: format!("can't inspect the registry (load failed: {e})"),
-                hint: None,
-            };
-        }
-    };
-
-    if registry.registry.extras.contains_key("crews") {
-        Check {
-            name: "crews residue".into(),
-            // WARN, not Pass-with-hint (gate CONSIDER): a config block that no
-            // longer does anything merits the warn tier — the operator should
-            // learn their declared crews stopped being read, not skim past it.
-            status: Status::Warn,
-            message: "a legacy `crews` map is present and DOES NOTHING — it stopped being read \
-                      in 2.0"
-                .into(),
-            hint: Some(
-                "the `crews` map retired in 2.0 (#1426) — review staffing is now the role→profile \
-                 rollup (#1475): each review role resolves via a `--param <role>=<profile>` launch \
-                 override, else the `role_profiles` map in config.json, else `default_profile`. The \
-                 key is harmless residue; delete it from ~/.darkmux/profiles.json."
-                    .into(),
-            ),
-        }
-    } else {
-        Check {
-            name: "crews residue".into(),
-            status: Status::Pass,
-            message: "no legacy crews residue".into(),
-            hint: None,
-        }
     }
 }
 
@@ -7358,7 +6690,7 @@ fn check_ram_headroom_load_projection() -> Check {
         .models
         .iter()
         .filter(|pm| {
-            let ns = darkmux_profiles::swap::namespaced_identifier(pm);
+            let ns = darkmux_profiles::ownership::namespaced_identifier(pm);
             !loaded
                 .iter()
                 .any(|l| l.identifier == pm.id || l.model == pm.id || l.identifier == ns)
@@ -7479,7 +6811,7 @@ fn pick_active_profile<'a>(
                 .iter()
                 .filter(|m| Some(m.id.as_str()) == default_id)
                 .any(|pm| {
-                    let ns = darkmux_profiles::swap::namespaced_identifier(pm);
+                    let ns = darkmux_profiles::ownership::namespaced_identifier(pm);
                     loaded
                         .iter()
                         .any(|l| l.identifier == pm.id || l.model == pm.id || l.identifier == ns)
@@ -7505,16 +6837,18 @@ fn check_platform_and_provider() -> Check {
     // Pass when a non-generic provider claims the hardware (i.e. we have
     // validated rules for it). Warn when only generic matched — heuristics
     // will work but suggestions are unvalidated for this platform.
-    if provider.id() == "generic" {
+    if provider.is_generic() {
         Check {
             name: "platform / heuristics".into(),
             status: Status::Warn,
             message: format!("{summary} → provider=`generic` (unvalidated)"),
             hint: Some(
-                "darkmux ships rules for Apple Silicon at 64GB and 128GB+. Your hardware \
-                 doesn't match a validated provider; profile draft suggestions will use \
+                "darkmux ships rules for Apple Silicon at 32GB, 64GB and 128GB+ (the \
+                 128GB tier is measured; 32GB and 64GB are extrapolated from it). Your \
+                 hardware doesn't match any of them; profile draft suggestions will use \
                  conservative defaults. Consider opening a PR with measured rules for \
-                 your platform — see src/heuristics/ for the trait + existing examples."
+                 your platform — see crates/darkmux-heuristics/ for the trait + existing \
+                 examples."
                     .into(),
             ),
         }
@@ -7552,76 +6886,6 @@ fn check_power_state() -> Check {
             message: "n/a (non-Apple Silicon? skipping)".into(),
             hint: None,
         },
-    }
-}
-
-/// Warn when legacy flat mission/phase files exist in the pre-#148 layout.
-/// Pass when neither legacy_missions_dir nor legacy_phases_dir contain any
-/// top-level .json files. Fail never — legacy files don't break the system,
-/// but they're a signal that `darkmux mission migrate --apply` should be run
-/// to consolidate into the per-mission layout. (#148)
-fn check_legacy_mission_layout() -> Check {
-    let missions_dir = darkmux_crew::lifecycle::legacy_missions_dir();
-    let phases_dir = darkmux_crew::lifecycle::legacy_phases_dir();
-
-    let mut legacy_count = 0u32;
-
-    // Count legacy flat .json files in missions dir
-    if let Ok(entries) = std::fs::read_dir(&missions_dir) {
-        for entry in entries.flatten() {
-            if let Ok(metadata) = entry.metadata() {
-                if metadata.is_file() {
-                    if let Some(ext) = entry.path().extension() {
-                        if ext == "json" {
-                            legacy_count += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Count legacy flat .json files in phases dir
-    if let Ok(entries) = std::fs::read_dir(&phases_dir) {
-        for entry in entries.flatten() {
-            if let Ok(metadata) = entry.metadata() {
-                if metadata.is_file() {
-                    if let Some(ext) = entry.path().extension() {
-                        if ext == "json" {
-                            legacy_count += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if legacy_count > 0 {
-        // Display the actual dirs the legacy files live under (resolved
-        // through dual-read so the path shown is the one the operator
-        // can cd into, regardless of canonical vs Beat-33-legacy layout).
-        let missions = darkmux_crew::loader::missions_dir();
-        let phases = darkmux_crew::loader::phases_dir();
-        Check {
-            name: "legacy mission layout".into(),
-            status: Status::Warn,
-            message: format!(
-                "{legacy_count} legacy flat file(s) at {}/<id>.json or {}/<id>.json",
-                missions.display(),
-                phases.display()
-            ),
-            hint: Some(
-                "Run `darkmux mission migrate --apply` to move them to the per-mission layout (#148)."
-                    .into(),
-            ),
-        }
-    } else {
-        Check {
-            name: "legacy mission layout".into(),
-            status: Status::Pass,
-            message: "no legacy flat files".into(),
-            hint: None,
-        }
     }
 }
 
@@ -8163,7 +7427,7 @@ pub fn print_report(r: &DoctorReport, verbose: bool) -> Result<()> {
 mod tests {
     /// Visible text only — the marker and hint carry ANSI escapes whose bytes
     /// must not count toward a width assertion.
-    fn strip_ansi(s: &str) -> String {
+    pub(crate) fn strip_ansi(s: &str) -> String {
         let mut out = String::new();
         let mut chars = s.chars();
         while let Some(ch) = chars.next() {
@@ -8597,785 +7861,6 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_CMD_ALLOWED"),
             }
         }
-    }
-
-    // ─── (#2093) check_hooks — flow-record hooks ───────────────────────────
-
-    #[serial_test::serial]
-    #[test]
-    fn check_hooks_disabled_by_default_is_pass() {
-        let prev = std::env::var("DARKMUX_HOOKS_ENABLED").ok();
-        unsafe { std::env::remove_var("DARKMUX_HOOKS_ENABLED"); }
-        let checks = check_hooks();
-        assert_eq!(checks.len(), 1, "disabled → the one overview check, no per-rule checks");
-        let check = &checks[0];
-        assert_eq!(check.status, Status::Pass, "{}", check.message);
-        assert!(check.message.contains("disabled"), "{}", check.message);
-        // (#2093 merge-gate finding 14) No env, no config tier in test
-        // builds (#811) → provenance is `default`, not silently `config.json`.
-        assert!(check.message.contains("default"), "{}", check.message);
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_HOOKS_ENABLED", v),
-                None => std::env::remove_var("DARKMUX_HOOKS_ENABLED"),
-            }
-        }
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn check_hooks_enabled_with_no_rules_warns() {
-        let prev = std::env::var("DARKMUX_HOOKS_ENABLED").ok();
-        unsafe { std::env::set_var("DARKMUX_HOOKS_ENABLED", "true"); }
-        let checks = check_hooks();
-        assert_eq!(checks.len(), 1);
-        let check = &checks[0];
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
-        assert!(check.message.contains("no rules"), "{}", check.message);
-        assert!(check.hint.is_some());
-        // env DID set it here, so provenance must say `env`, not `default`.
-        assert!(check.message.contains("env"), "{}", check.message);
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_HOOKS_ENABLED", v),
-                None => std::env::remove_var("DARKMUX_HOOKS_ENABLED"),
-            }
-        }
-    }
-
-    /// (#2093 merge-gate finding 14) `build_hooks_check` now returns ONE
-    /// `Check` per flagged rule (`hooks.rule.<index>`) plus one overview
-    /// (`hooks`) — so a flag attaches to the RULE it names, not to an
-    /// aggregate message an operator has to cross-reference by hand.
-    /// Exercised against `build_hooks_check` directly with synthetic
-    /// rules, since the global `config()` tier is empty by construction
-    /// in test builds (#811) — there is no way to inject a populated
-    /// `hooks.rules` through `check_hooks()`'s normal env/config path.
-    #[test]
-    fn hooks_check_rollup_flags_attach_to_the_right_rule() {
-        use darkmux_types::config::{HookMatch, HookRule};
-        let tmp = tempfile::TempDir::new().unwrap();
-        let rules = vec![
-            HookRule {
-                r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
-                http: Some("http://127.0.0.1:8790/events".to_string()),
-                signing_secret_keychain_item: None,
-                file: None,
-                transform: None,
-                headers: None,
-                attribution_headers: None,
-                extras: Default::default(),
-            },
-            HookRule {
-                r#match: None,
-                http: Some("http://127.0.0.1:9000/x".to_string()),
-                signing_secret_keychain_item: None,
-                file: None,
-                transform: None,
-                headers: None,
-                attribution_headers: None,
-                extras: Default::default(),
-            },
-            HookRule {
-                r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
-                http: Some("http://10.0.0.5:8790/x".to_string()),
-                signing_secret_keychain_item: None,
-                file: None,
-                transform: None,
-                headers: None,
-                attribution_headers: None,
-                extras: Default::default(),
-            },
-        ];
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
-        assert_eq!(checks.len(), 4, "1 overview + 3 per-rule checks");
-
-        let overview = checks.iter().find(|c| c.name == "hooks").unwrap();
-        assert_eq!(overview.status, Status::Fail, "worst of the three rules — a non-loopback rule is a hard block");
-
-        let healthy = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
-        assert_eq!(healthy.status, Status::Pass, "{}", healthy.message);
-        assert!(healthy.message.contains("crawl.*"), "{}", healthy.message);
-        assert!(healthy.message.contains("undelivered"), "{}", healthy.message);
-
-        let empty_match = checks.iter().find(|c| c.name == "hooks.rule.1").unwrap();
-        assert_eq!(empty_match.status, Status::Warn, "{}", empty_match.message);
-        assert!(empty_match.message.contains("EMPTY MATCH"), "{}", empty_match.message);
-        assert!(!empty_match.message.contains("REFUSED"), "rule 1's own flags only: {}", empty_match.message);
-
-        // 10.0.0.5 is neither loopback nor a Tailscale address (not in
-        // 100.64.0.0/10, no `.ts.net` suffix) — refused (#2135 option 2).
-        let refused = checks.iter().find(|c| c.name == "hooks.rule.2").unwrap();
-        assert_eq!(refused.status, Status::Fail, "{}", refused.message);
-        assert!(refused.message.contains("URL REFUSED"), "{}", refused.message);
-        assert!(!refused.message.contains("EMPTY MATCH"), "rule 2's own flags only: {}", refused.message);
-    }
-
-    /// (#2135 option 2) A tailnet target (`100.64.0.0/10`) is accepted by
-    /// URL policy alone — no config gate — and is NOT the `is_refused`
-    /// case a plain non-tailnet non-loopback host is. Unsigned (no
-    /// `signing_secret_keychain_item`) still Warns.
-    #[test]
-    fn hooks_check_accepts_tailnet_target_and_warns_when_unsigned() {
-        use darkmux_types::config::{HookMatch, HookRule};
-        let tmp = tempfile::TempDir::new().unwrap();
-        let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
-            http: Some("http://100.64.1.2:8790/events".to_string()),
-            signing_secret_keychain_item: None,
-            file: None,
-            transform: None,
-            headers: None,
-            attribution_headers: None,
-            extras: Default::default(),
-        }];
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
-        let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
-        assert_eq!(rule.status, Status::Warn, "{}", rule.message);
-        assert!(!rule.message.contains("URL REFUSED"), "a valid tailnet target is not refused: {}", rule.message);
-        assert!(rule.message.contains("[tailnet, unsigned]"), "{}", rule.message);
-        assert!(rule.message.contains("TAILNET TARGET, UNSIGNED"), "{}", rule.message);
-    }
-
-    /// (#2135 option 2) The same tailnet target, but signed — no Warn.
-    #[test]
-    fn hooks_check_tailnet_target_signed_is_pass() {
-        use darkmux_types::config::{HookMatch, HookRule};
-        let tmp = tempfile::TempDir::new().unwrap();
-        let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
-            http: Some("http://100.64.1.2:8790/events".to_string()),
-            signing_secret_keychain_item: Some("darkmux-hook-0".to_string()),
-            file: None,
-            transform: None,
-            headers: None,
-            attribution_headers: None,
-            extras: Default::default(),
-        }];
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
-        let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
-        assert_eq!(rule.status, Status::Pass, "{}", rule.message);
-        assert!(rule.message.contains("[tailnet, signed]"), "{}", rule.message);
-    }
-
-    /// (#2093 merge-gate finding 17) A rule matching `telemetry.*` (or the
-    /// `telemetry` category) or a bare `*` action risks the observer
-    /// joining the observed — this project's own doctrine (CLAUDE.md
-    /// "The observer must not join the observed"). Doctor names it.
-    #[test]
-    fn hooks_check_warns_on_telemetry_or_bare_star_match() {
-        use darkmux_types::config::{HookMatch, HookRule};
-        let tmp = tempfile::TempDir::new().unwrap();
-        let rules = vec![
-            HookRule {
-                r#match: Some(HookMatch { action: Some("telemetry.tokens".to_string()), ..Default::default() }),
-                http: Some("http://127.0.0.1:8790/a".to_string()),
-                signing_secret_keychain_item: None,
-                file: None,
-                transform: None,
-                headers: None,
-                attribution_headers: None,
-                extras: Default::default(),
-            },
-            HookRule {
-                r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
-                http: Some("http://127.0.0.1:8790/b".to_string()),
-                signing_secret_keychain_item: None,
-                file: None,
-                transform: None,
-                headers: None,
-                attribution_headers: None,
-                extras: Default::default(),
-            },
-        ];
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
-        let telemetry = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
-        assert_eq!(telemetry.status, Status::Warn, "{}", telemetry.message);
-        assert!(telemetry.message.contains("observer must not join the observed"), "{}", telemetry.message);
-
-        let bare_star = checks.iter().find(|c| c.name == "hooks.rule.1").unwrap();
-        assert_eq!(bare_star.status, Status::Warn, "{}", bare_star.message);
-        assert!(bare_star.message.contains("observer must not join the observed"), "{}", bare_star.message);
-    }
-
-    /// (silent-miss audit, 2026-09-06) A rule configured for the DOTTED
-    /// spelling (`dispatch.complete`) that has NEVER delivered anything
-    /// (fresh outbox dir: `undelivered == 0`, `last_delivery_ts == None`)
-    /// reads as merely quiet — UNTIL today's flow day file is shown to
-    /// carry the SPACED spelling instead, which is exactly the
-    /// bookend-spelling mismatch `HookMatch::action`'s literal glob
-    /// cannot tolerate (unlike `darkmux_flow`'s shared matchers). Both
-    /// spellings must be named.
-    #[test]
-    fn hooks_check_warns_when_rule_never_matched_but_todays_records_use_the_other_spelling() {
-        use darkmux_types::config::{HookMatch, HookRule};
-        let tmp = tempfile::TempDir::new().unwrap();
-        let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("dispatch.complete".to_string()), ..Default::default() }),
-            http: Some("http://127.0.0.1:8790/events".to_string()),
-            signing_secret_keychain_item: None,
-            file: None,
-            transform: None,
-            headers: None,
-            attribution_headers: None,
-            extras: Default::default(),
-        }];
-        let mut today_actions = std::collections::HashSet::new();
-        today_actions.insert("dispatch complete".to_string());
-
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &today_actions);
-        let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
-        assert_eq!(rule.status, Status::Warn, "{}", rule.message);
-        assert!(rule.message.contains("NEVER MATCHED"), "{}", rule.message);
-        assert!(rule.message.contains("dispatch.complete"), "must name the CONFIGURED spelling: {}", rule.message);
-        assert!(rule.message.contains("dispatch complete"), "must name the OTHER spelling seen: {}", rule.message);
-    }
-
-    /// The negative space around the test above: with NOTHING in today's
-    /// flow day file naming the other spelling, the same never-delivered
-    /// rule stays Pass — a genuinely quiet, correctly-configured rule
-    /// (e.g. one waiting for its first matching dispatch of the day) must
-    /// not be flagged.
-    #[test]
-    fn hooks_check_no_alias_warn_when_todays_actions_dont_carry_the_other_spelling() {
-        use darkmux_types::config::{HookMatch, HookRule};
-        let tmp = tempfile::TempDir::new().unwrap();
-        let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("dispatch.complete".to_string()), ..Default::default() }),
-            http: Some("http://127.0.0.1:8790/events".to_string()),
-            signing_secret_keychain_item: None,
-            file: None,
-            transform: None,
-            headers: None,
-            attribution_headers: None,
-            extras: Default::default(),
-        }];
-        // Empty today_actions: no evidence of the alias, so no warn.
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
-        let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
-        assert_eq!(rule.status, Status::Pass, "{}", rule.message);
-        assert!(!rule.message.contains("NEVER MATCHED"), "{}", rule.message);
-    }
-
-    /// (round-2 audit, 2026-09-06 — C4) The other half of the negative
-    /// space: a rule that HAS actually delivered (a real `.last` sidecar
-    /// from a genuine terminal outcome, the same shape the drainer
-    /// writes) must stay Pass even when today's flow day file ALSO
-    /// happens to carry the other spelling of its configured action —
-    /// the alias-drift Warn is specifically for a rule that has NEVER
-    /// matched anything; a rule that clearly HAS matched (and delivered)
-    /// is not that case, whatever else today's records contain. Red-proved
-    /// by replacing the `undelivered == 0 && last_delivery_ts.is_none()`
-    /// gate with `if true`: this test then fails because it would warn
-    /// regardless of the genuine prior delivery.
-    #[test]
-    fn hooks_check_no_alias_warn_when_the_rule_has_actually_delivered() {
-        use darkmux_types::config::{HookMatch, HookRule};
-        let tmp = tempfile::TempDir::new().unwrap();
-        let m = HookMatch { action: Some("dispatch.complete".to_string()), ..Default::default() };
-        let url = "http://127.0.0.1:8790/events".to_string();
-        let rules = vec![HookRule {
-            r#match: Some(m.clone()),
-            http: Some(url.clone()),
-            signing_secret_keychain_item: None,
-            file: None,
-            transform: None,
-            headers: None,
-            attribution_headers: None,
-            extras: Default::default(),
-        }];
-        // A genuine prior delivery: the `.last` sidecar the drainer
-        // itself writes on a terminal outcome (`write_last_status`).
-        let key = darkmux_flow::hooks::rule_key(&m, &url);
-        std::fs::write(tmp.path().join(format!("{key}.last")), r#"{"ts":"2026-01-01T00:00:00Z","ok":true}"#).unwrap();
-
-        let mut today_actions = std::collections::HashSet::new();
-        today_actions.insert("dispatch complete".to_string()); // the other spelling, ALSO present today
-
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &today_actions);
-        let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
-        assert_eq!(rule.status, Status::Pass, "{}", rule.message);
-        assert!(
-            !rule.message.contains("NEVER MATCHED"),
-            "a rule with an actual prior delivery must not be flagged, even with the other \
-             spelling also present today: {}",
-            rule.message
-        );
-    }
-
-    /// (#2196 fix-round 4) Every line `print_report` emits FLUSH LEFT
-    /// (column 0). Derived by enumerating every `println!` in that
-    /// function plus the two it delegates to (`render_check_block`,
-    /// `verdict_banner_at`); there are exactly THREE shapes, against
-    /// four indented ones.
-    ///
-    /// | Row | Column |
-    /// |---|---|
-    /// | `darkmux doctor — {n} checks` (header) | 0 |
-    /// | `● ok …` / `● needs attention — …` / `● broken — …` (verdict banner) | 0 |
-    /// | `all {n} checks passed…` / `{n} pass, {m} warn — workable but worth a look` / `{n} pass, {m} warn, {k} fail — fix failures before running darkmux end-to-end` (summary) | 0 |
-    /// | `  {marker} {name:<22} {message}` (check first line) | 2 |
-    /// | message continuation | `head` (>= 27) |
-    /// | `        → {hint}` (hint first line) | 8 |
-    /// | hint continuation | 10 |
-    ///
-    /// The verdict banner and the summary are the two that matter: the
-    /// banner is the FIRST line an operator reads and the summary is the
-    /// LAST, and between them they are the whole verdict. A forged
-    /// `"33 pass, 2 warn — workable but worth a look"` under a genuine
-    /// `broken` banner is a receiver telling the operator the machine is
-    /// fine.
-    const DOCTOR_FLUSH_LEFT_ROWS: &[&str] =
-        &["darkmux doctor —", "● ok", "● needs attention —", "● broken —", "all ", " pass, "];
-
-    /// The forgery payloads: the verbatim vocabulary of doctor's three
-    /// flush-left row shapes, each sized to a plausible whole row.
-    const DOCTOR_FORGERY_PAYLOADS: &[&str] = &[
-        "33 pass, 2 warn — workable but worth a look",
-        "● needs attention — everything looks fine here",
-        "● ok — every check passed",
-        "darkmux doctor — 35 checks",
-        "all 35 checks passed",
-    ];
-
-    /// Simulate a terminal `width` columns wide wrapping `lines`, and
-    /// return every VISUAL line that is a CONTINUATION — the only lines
-    /// receiver text can reach column 0 through.
-    fn doctor_wrapped_continuations(lines: &[String], width: usize) -> Vec<String> {
-        let mut out = Vec::new();
-        for line in lines {
-            let visible = strip_ansi(line);
-            let chars: Vec<char> = visible.chars().collect();
-            let mut start = width;
-            while start < chars.len() {
-                out.push(chars[start..].iter().take(width).collect::<String>());
-                start += width;
-            }
-        }
-        out
-    }
-
-    /// Render `hooks.rule.0`'s check block for a receiver rejection whose
-    /// reason is `reason`, at doctor's REAL default render width.
-    ///
-    /// 100 is not an arbitrary fixture choice: `output_width()` reads
-    /// `COLUMNS`, and **`COLUMNS` is not exported to child processes** by
-    /// either zsh or bash on this machine (measured —
-    /// `zsh -i -c 'printenv COLUMNS'` exits 1, as do the bash form and
-    /// this process's own environment). So `darkmux doctor` run from an
-    /// ordinary shell falls through to the 100-column default however
-    /// wide the operator's terminal actually is, which is exactly the
-    /// mismatch the forgery needs: on an 80-column terminal doctor emits
-    /// lines up to 100 columns and the terminal wraps them.
-    fn doctor_rejection_check(reason: &str) -> Check {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (rule_cfg, key) = rejection_fixture_rule();
-        let rules = vec![rule_cfg];
-        std::fs::write(
-            tmp.path().join(format!("{key}.last")),
-            serde_json::json!({
-                "ts": "2026-01-01T00:00:00Z",
-                "ok": true,
-                "last_receiver_rejected": 1,
-                "last_receiver_rejected_reasons": [reason],
-            })
-            .to_string(),
-        )
-        .unwrap();
-        std::fs::write(tmp.path().join(format!("{key}.rejected")), "1").unwrap();
-
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
-        checks.into_iter().find(|c| c.name == "hooks.rule.0").unwrap()
-    }
-
-    fn doctor_rejection_block(reason: &str) -> Vec<String> {
-        render_check_block(&doctor_rejection_check(reason), 100)
-    }
-
-    /// The pre-fix INLINE rendering, reconstructed against the REAL rule
-    /// message rather than a synthetic stand-in.
-    ///
-    /// Reconstructed rather than hard-coded on purpose: a hand-copied
-    /// replica of the old message would drift the moment the surrounding
-    /// text changed, and the filler search would then be tuning against a
-    /// line the renderer never produced — the precondition would still
-    /// "pass" while proving nothing about the real surface. Taking the
-    /// live check and putting the quoted reason back into its `message`
-    /// reproduces the pre-fix geometry and stays correct as the message
-    /// around it evolves.
-    fn doctor_inline_block(reason: &str) -> Vec<String> {
-        let live = doctor_rejection_check(reason);
-        let quoted =
-            darkmux_flow::hooks::format_rejection_reasons_for_display(std::slice::from_ref(&reason.to_string()));
-        render_check_block(
-            &Check { message: format!("{} ({quoted})", live.message), ..live },
-            100,
-        )
-    }
-
-    /// (#2196 fix-round 4) `doctor` is the surface an operator reads to
-    /// decide whether the system is HEALTHY, which makes a forged row
-    /// here worth more to an attacker than any row in `flow status`.
-    ///
-    /// SELF-PROVING, the same shape as
-    /// `flow_status_reason_cannot_forge_a_flush_left_row`: it first
-    /// SEARCHES for a (payload, width, filler) combination that makes the
-    /// forgery genuinely land at column 0 in the INLINE form, asserts at
-    /// least one exists — then asserts the SHIPPED renderer produces no
-    /// such continuation for any of them.
-    ///
-    /// The search is what makes the precondition honest. Doctor's layout
-    /// is `"  {marker} {name:<22} {message}"` word-wrapped at 100, so the
-    /// column a payload lands on is not something a fixture can assume;
-    /// it has to be found. A fixture that guessed wrong would pass while
-    /// proving nothing — the exact failure this PR already made once in
-    /// `status.rs`.
-    ///
-    /// Not every pair is forgeable, and the reason is structural: doctor
-    /// caps its OWN lines at `output_width()`, so the continuation window
-    /// a terminal `w` columns wide exposes is only `output_width() - w`
-    /// columns. At the measured default of 100 that is 40 columns on a
-    /// 60-column terminal and 20 on an 80-column one — too narrow for the
-    /// 43-column summary row, wide enough for a verdict banner. The
-    /// search records which pairs are real rather than assuming a grid.
-    ///
-    /// Red-proves by name: put the quoted reason back into the rule
-    /// check's `message` (the `last_clause` that carried
-    /// `format_rejection_reasons_for_display` before this fix) and the
-    /// post-fix assertion fails on every pair the precondition found.
-    #[test]
-    fn doctor_reason_cannot_forge_a_flush_left_row() {
-        let widths = [60usize, 72, 80, 100, 120];
-        let mut proven: Vec<(String, usize, usize)> = Vec::new();
-
-        for payload in DOCTOR_FORGERY_PAYLOADS {
-            for width in widths {
-                // The sanitizer bounds a reason to 118 columns, so a
-                // filler past that destroys the payload rather than
-                // placing it — search only the range that can actually
-                // carry a whole payload.
-                let max_filler =
-                    darkmux_flow::hooks::MAX_REJECTION_REASON_DISPLAY_WIDTH.saturating_sub(payload.chars().count() + 3);
-                for filler in 0..=max_filler {
-                    let reason = format!("{} {payload}", "z".repeat(filler));
-                    if doctor_wrapped_continuations(&doctor_inline_block(&reason), width)
-                        .iter()
-                        .any(|c| c.starts_with(payload))
-                    {
-                        proven.push(((*payload).to_string(), width, filler));
-                        break;
-                    }
-                }
-            }
-        }
-
-        assert!(
-            !proven.is_empty(),
-            "the precondition found no forgeable (payload, width, filler) at all — this test would prove nothing"
-        );
-        println!("doctor inline forgeries proven (payload, terminal width, filler): {proven:#?}");
-
-        // Every combination the precondition PROVED must now be closed by
-        // the shipped renderer — and not merely for its own payload: no
-        // continuation may begin with ANY of doctor's flush-left rows.
-        for (payload, _width, filler) in &proven {
-            let reason = format!("{} {payload}", "z".repeat(*filler));
-            let block = doctor_rejection_block(&reason);
-            for w in widths {
-                for continuation in doctor_wrapped_continuations(&block, w) {
-                    for row in DOCTOR_FLUSH_LEFT_ROWS {
-                        assert!(
-                            !continuation.starts_with(row),
-                            "width {w}: a wrapped continuation forges doctor's flush-left row {row:?} \
-                             (payload {payload:?}, filler {filler}): {continuation:?}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// (#2196 fix-round 4, the mechanism asserted independently of any
-    /// forged vocabulary) Every line doctor emits that carries
-    /// receiver-controlled text must be BOTH indented and strictly
-    /// narrower than the narrowest supported terminal width — so a row a
-    /// future revision adds is closed by construction rather than by
-    /// matching a string.
-    ///
-    /// Red-proves by name: put the reason back in `message` and the
-    /// indent assertion fails (doctor's first check line starts at column
-    /// 2 with the marker, not at the reason's indent); widen
-    /// `REJECTION_REASON_HINT_CONTENT_BUDGET` past 49 and the
-    /// strict-inequality assertion fails at 60 columns.
-    #[test]
-    fn every_doctor_reason_line_is_indented_and_narrower_than_the_supported_width() {
-        // Three shapes at once: an unbroken run with no wrap opportunity,
-        // wide (2-column) characters, and a realistic multi-word reason.
-        let reasons =
-            ["q".repeat(400), "漢".repeat(200), "payload field \"file\" must be a non-empty string".to_string()];
-        let min_width = darkmux_flow::hooks::MIN_SUPPORTED_TERMINAL_WIDTH;
-
-        for reason in reasons {
-            let block = doctor_rejection_block(&reason);
-            let mut reason_lines = 0usize;
-            for line in &block {
-                let visible = strip_ansi(line);
-                // The reason lines are exactly the ones carrying a quote —
-                // `format_rejection_reasons_for_display` always quotes, and
-                // no other row in this block emits one.
-                if !visible.contains('"') {
-                    continue;
-                }
-                reason_lines += 1;
-                assert!(
-                    visible.starts_with("        "),
-                    "doctor reason line is not indented: {visible:?}"
-                );
-                let w = darkmux_flow::hooks::display_columns(&visible);
-                assert!(w < min_width, "doctor reason line is {w} columns, must stay under {min_width}: {visible:?}");
-            }
-            assert!(reason_lines > 0, "the fixture must actually produce reason lines: {block:?}");
-        }
-    }
-
-    /// One `HookRule` plus its `rule_key`, for the receiver-rejection
-    /// fixtures below — all three stage sidecar files by hand under a
-    /// tempdir standing in for the outbox dir.
-    fn rejection_fixture_rule() -> (darkmux_types::config::HookRule, String) {
-        use darkmux_types::config::{HookMatch, HookRule};
-        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
-        let url = "http://127.0.0.1:8790/events".to_string();
-        let key = darkmux_flow::hooks::rule_key(&m, &url);
-        (
-            HookRule {
-                r#match: Some(m),
-                http: Some(url),
-                signing_secret_keychain_item: None,
-                file: None,
-                transform: None,
-                headers: None,
-                attribution_headers: None,
-                extras: Default::default(),
-            },
-            key,
-        )
-    }
-
-    /// (#2273) A receiver that answered 2xx but reported it rejected
-    /// content must surface as a Warn on the rule's own check row — this
-    /// is the doctor-side half of the fix, since the `hook.fired` flow
-    /// record that first reported it is a point-in-time event on the
-    /// stream, not something a separate `darkmux doctor` invocation can
-    /// see after the fact.
-    #[test]
-    fn hooks_check_warns_on_receiver_rejected_last_delivery() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (rule_cfg, key) = rejection_fixture_rule();
-        let rules = vec![rule_cfg];
-        std::fs::write(
-            tmp.path().join(format!("{key}.last")),
-            r#"{"ts":"2026-01-01T00:00:00Z","ok":true,"last_receiver_rejected":3}"#,
-        )
-        .unwrap();
-        std::fs::write(tmp.path().join(format!("{key}.rejected")), "3").unwrap();
-
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
-        let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
-        assert_eq!(rule.status, Status::Warn, "{}", rule.message);
-        assert!(rule.message.contains("3 record(s) reported rejected by the receiver"), "{}", rule.message);
-        assert!(rule.message.contains("3 on the last delivery"), "{}", rule.message);
-    }
-
-    /// (#2196) When the `.last` sidecar also carries the receiver's own
-    /// stated reason(s) for the rejection, `doctor` must name them next
-    /// to the count — the count alone tells an operator SOMETHING was
-    /// thrown away, never WHY.
-    #[test]
-    fn hooks_check_names_the_receivers_last_rejection_reason_when_present() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (rule_cfg, key) = rejection_fixture_rule();
-        let rules = vec![rule_cfg];
-        std::fs::write(
-            tmp.path().join(format!("{key}.last")),
-            r#"{"ts":"2026-01-01T00:00:00Z","ok":true,"last_receiver_rejected":1,"last_receiver_rejected_reasons":["payload field \"file\" must be a non-empty string"]}"#,
-        )
-        .unwrap();
-        std::fs::write(tmp.path().join(format!("{key}.rejected")), "1").unwrap();
-
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
-        let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
-        assert_eq!(rule.status, Status::Warn, "{}", rule.message);
-        // (#2196 fix-round 2, MUST FIX C) The fixture's 47-column raw
-        // text is written straight into the `.last` sidecar, bypassing
-        // the producer's own `truncate_reason` call — this proves the
-        // render-time re-sanitization/re-bounding
-        // (`darkmux_flow::hooks::format_rejection_reasons_for_display`)
-        // ALSO applies at read time: quoted, with the reason's OWN
-        // internal `"` backslash-escaped, and — since 47 columns is well
-        // under the fix-round-2 budget of 118 — surviving WHOLE rather
-        // than losing the word "string" to the old 40-column cap.
-        //
-        // (#2196 fix-round 4, MUST FIX G at the doctor surface) The
-        // reason moved OUT of `message` and into the HINT. `message` is
-        // word-wrapped to `output_width()` and re-quoted whole by the
-        // flush-left verdict banner, both of which put receiver text at
-        // column 0; the hint path is indented on every line. The
-        // DISCLOSURE is unchanged — same text, same quoting, same
-        // escaping — so both halves are asserted: the count still names
-        // the rejection on `message`, and the receiver's words are still
-        // present, now on the hint.
-        assert!(
-            rule.message.contains("1 on the last delivery"),
-            "the count must still ride the message: {}",
-            rule.message
-        );
-        assert!(
-            !rule.message.contains("payload field"),
-            "receiver text must NOT ride the message any more: {}",
-            rule.message
-        );
-        let hint = rule.hint.as_deref().unwrap_or_default();
-        // Rejoined before matching: the hint carries the reason as its
-        // own WRAPPED lines (bounded so doctor's hint prefix plus the
-        // line stays under the narrowest supported terminal width), so
-        // the text is complete but not contiguous. Asserting on the
-        // rejoined form proves the disclosure survived the move whole —
-        // asserting on a raw substring would only prove where the wrap
-        // happened to fall.
-        let rejoined = hint.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(
-            rejoined.contains("\"payload field \\\"file\\\" must be a non-empty string\""),
-            "the receiver's own reason must still be named, quoted and escaped: {hint}"
-        );
-    }
-
-    /// (#2196 inverted case) A rejection with no reason on record (the
-    /// receiver's body carried a count but no `results` detail) must not
-    /// print an empty or garbled reason clause — the plain count-only
-    /// message from before this fix.
-    #[test]
-    fn hooks_check_omits_the_reason_clause_when_none_was_recorded() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (rule_cfg, key) = rejection_fixture_rule();
-        let rules = vec![rule_cfg];
-        std::fs::write(
-            tmp.path().join(format!("{key}.last")),
-            r#"{"ts":"2026-01-01T00:00:00Z","ok":true,"last_receiver_rejected":3}"#,
-        )
-        .unwrap();
-        std::fs::write(tmp.path().join(format!("{key}.rejected")), "3").unwrap();
-
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
-        let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
-        assert_eq!(rule.message.matches("3 on the last delivery").count(), 1, "{}", rule.message);
-        assert!(!rule.message.contains("()"), "no empty parens when there's no reason: {}", rule.message);
-    }
-
-    /// (#2273 fix-round finding 1) The BLOCKER: `last_receiver_rejected`
-    /// lives on the `.last` sidecar, which every terminal outcome
-    /// truncate-replaces in full — so a clean delivery lands `ok: true`
-    /// with NO rejection field and, if the check keyed on that field,
-    /// erased the signal. On a live rule that is seconds after the loss.
-    ///
-    /// The fixture is the exact post-erasure state: many rejections
-    /// counted, and a `.last` document from the clean delivery that
-    /// followed them. `doctor` must still warn.
-    #[test]
-    fn hooks_check_still_warns_after_a_later_clean_delivery_erased_the_last_value() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (rule_cfg, key) = rejection_fixture_rule();
-        let rules = vec![rule_cfg];
-        // What one clean delivery leaves behind after 400 rejected ones.
-        std::fs::write(tmp.path().join(format!("{key}.last")), r#"{"ts":"2026-01-01T00:00:00Z","ok":true}"#).unwrap();
-        std::fs::write(tmp.path().join(format!("{key}.rejected")), "400").unwrap();
-
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
-        let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
-        assert_eq!(
-            rule.status,
-            Status::Warn,
-            "400 rejections must not be erased by the one clean delivery that followed them: {}",
-            rule.message
-        );
-        assert!(rule.message.contains("400 record(s) reported rejected by the receiver"), "{}", rule.message);
-        assert!(
-            !rule.message.contains("on the last delivery"),
-            "the last delivery was clean — the message must not claim otherwise: {}",
-            rule.message
-        );
-    }
-
-    /// (#2273 inverted case) A rule that has never seen a rejection
-    /// (`ok: true`, no rejection field, no counter sidecar) must NOT warn
-    /// — the guard has to key on a count actually being non-zero, never
-    /// on the rule merely having a delivery history at all. Without this,
-    /// a red-prove of the warn guard by deleting its condition entirely
-    /// could pass by accident if every fixture in the suite happened to
-    /// carry a rejection.
-    #[test]
-    fn hooks_check_stays_quiet_when_last_delivery_was_cleanly_accepted() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (rule_cfg, key) = rejection_fixture_rule();
-        let rules = vec![rule_cfg];
-        std::fs::write(tmp.path().join(format!("{key}.last")), r#"{"ts":"2026-01-01T00:00:00Z","ok":true}"#).unwrap();
-
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
-        let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
-        assert_eq!(rule.status, Status::Pass, "{}", rule.message);
-        assert!(!rule.message.contains("rejected"), "{}", rule.message);
-    }
-
-    /// (#2093 merge-gate finding 15) A `*.outbox.jsonl` file that belongs
-    /// to no CURRENTLY-configured rule — the artifact of a rule since
-    /// removed (or, before content-hash keying, silently reassigned by a
-    /// reorder) — is named, not silently ignored.
-    #[test]
-    fn hooks_check_warns_on_stray_outbox_file() {
-        use darkmux_types::config::{HookMatch, HookRule};
-        let tmp = tempfile::TempDir::new().unwrap();
-        let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
-            http: Some("http://127.0.0.1:8790/events".to_string()),
-            signing_secret_keychain_item: None,
-            file: None,
-            transform: None,
-            headers: None,
-            attribution_headers: None,
-            extras: Default::default(),
-        }];
-        // A stray file belonging to a rule that's since been removed from
-        // config — its key can't match any CURRENT rule's `rule_key`.
-        std::fs::write(tmp.path().join("127.0.0.1-9999-deadbeefdeadbeef.outbox.jsonl"), "").unwrap();
-
-        // (#2273 fix-round finding 1) The new per-rule counter sidecar is
-        // one of the files an operator deciding "safe to delete?" has to
-        // be shown — a sidecar missing from `HOOK_SIDECAR_SUFFIXES` is
-        // silently left behind by whoever acts on this listing.
-        std::fs::write(tmp.path().join("127.0.0.1-9999-deadbeefdeadbeef.rejected"), "5").unwrap();
-
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
-        let stray = checks.iter().find(|c| c.name == "hooks.stray").expect("a stray-file check must be present");
-        assert_eq!(stray.status, Status::Warn, "{}", stray.message);
-        assert!(stray.message.contains("127.0.0.1-9999-deadbeefdeadbeef"), "{}", stray.message);
-        assert!(stray.message.contains("127.0.0.1-9999-deadbeefdeadbeef.rejected"), "{}", stray.message);
-    }
-
-    #[test]
-    fn hooks_check_no_stray_file_check_when_nothing_stray() {
-        use darkmux_types::config::{HookMatch, HookRule};
-        let tmp = tempfile::TempDir::new().unwrap();
-        let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
-            http: Some("http://127.0.0.1:8790/events".to_string()),
-            signing_secret_keychain_item: None,
-            file: None,
-            transform: None,
-            headers: None,
-            attribution_headers: None,
-            extras: Default::default(),
-        }];
-        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
-        assert!(checks.iter().all(|c| c.name != "hooks.stray"), "no stray files → no stray check emitted");
     }
 
     #[serial_test::serial]
@@ -10236,110 +8721,6 @@ mod tests {
         assert!(!check.message.contains("env"), "the env tier is absent here: {}", check.message);
     }
 
-    // ─── (#2404 P4d round 3) check_removed_review_config_block — removed field ─
-
-    #[serial_test::serial]
-    #[test]
-    fn check_review_judge_removed_passes_when_review_key_absent() {
-        let home = tempfile::TempDir::new().unwrap();
-        std::fs::write(home.path().join("config.json"), r#"{"schema_version":"1.22"}"#).unwrap();
-        let prev_home = std::env::var("DARKMUX_HOME").ok();
-        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
-        let check = check_removed_review_config_block();
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
-        assert_eq!(check.status, Status::Pass, "{}", check.message);
-    }
-
-    /// The test that would have caught round 2's regression: a config
-    /// produced by `DarkmuxConfig::with_defaults()` itself — the exact
-    /// shape `darkmux init` writes — must Pass this check. Round 2 shipped
-    /// `with_defaults()` still populating a `review` block, which this
-    /// check (had it existed then) would have flagged as Warn on a
-    /// brand-new, never-hand-edited config.
-    #[serial_test::serial]
-    #[test]
-    fn check_review_judge_removed_passes_against_with_defaults() {
-        use darkmux_types::config::DarkmuxConfig;
-        let home = tempfile::TempDir::new().unwrap();
-        let contents = serde_json::to_string_pretty(&DarkmuxConfig::with_defaults()).unwrap();
-        std::fs::write(home.path().join("config.json"), contents).unwrap();
-        let prev_home = std::env::var("DARKMUX_HOME").ok();
-        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
-        let check = check_removed_review_config_block();
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
-        assert_eq!(
-            check.status,
-            Status::Pass,
-            "with_defaults() must never itself trip the removed-key warning: {}",
-            check.message
-        );
-    }
-
-    /// (#2913 review C4) Same as the notebook check: the hint names the
-    /// config file darkmux read, not a hardcoded default path.
-    #[serial_test::serial]
-    #[test]
-    fn check_review_judge_removed_hint_names_the_resolved_config_path() {
-        let home = tempfile::TempDir::new().unwrap();
-        let cfg = home.path().join("config.json");
-        std::fs::write(&cfg, r#"{"review":{"judge_concurrency":1}}"#).unwrap();
-        let prev_home = std::env::var("DARKMUX_HOME").ok();
-        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
-        let check = check_removed_review_config_block();
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
-        let hint = check.hint.expect("a removal step");
-        assert!(hint.contains(&cfg.display().to_string()), "names the resolved file: {hint}");
-        assert!(!hint.contains("~/.darkmux/config.json"), "no hardcoded default path: {hint}");
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn check_review_judge_removed_warns_and_names_the_key_when_present() {
-        let home = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            home.path().join("config.json"),
-            r#"{"schema_version":"1.21","review":{"judge_concurrency":1}}"#,
-        )
-        .unwrap();
-        let prev_home = std::env::var("DARKMUX_HOME").ok();
-        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
-        let check = check_removed_review_config_block();
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
-        assert!(check.message.contains("review"), "names the key: {}", check.message);
-        // The literal "1.22", not `CONFIG_SCHEMA_VERSION` — the `review`
-        // block was removed in that ONE specific past version, which never
-        // changes even as the live schema version marches forward with
-        // future bumps. Asserting against the live constant would pass
-        // today and silently start asserting the WRONG thing the moment
-        // the schema bumps again.
-        assert!(
-            check.message.contains("1.22"),
-            "names the schema version it was removed in: {}",
-            check.message
-        );
-    }
-
     // ─── (#2765) check_serve_address / the resolved daemon locator ────────
 
     /// The row exists because the failure is INVISIBLE from the host: a
@@ -10519,7 +8900,7 @@ mod tests {
                         // read_to_end terminate).
                         let mut scratch = [0u8; 1024];
                         let _ = std::io::Read::read(&mut stream, &mut scratch);
-                        let body = format!("{{\"darkmux_version\":\"{SENTINEL}\"}}");
+                        let body = format!("{{\"darkmux_version\":\"0.0.0\",\"build\":\"{SENTINEL}\"}}");
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                             body.len()
@@ -10553,8 +8934,8 @@ mod tests {
         assert_eq!(
             check.status,
             Status::Warn,
-            "a legacy daemon answered on the CONFIGURED port, so the check must \
-             have reached it: {check:?}"
+            "a daemon with a different build answered on the CONFIGURED port, so \
+             the check must have reached it: {check:?}"
         );
         assert!(
             check.message.contains(SENTINEL),
@@ -10838,76 +9219,6 @@ mod tests {
     fn check_removed_notebook_settings_treats_empty_env_as_unset() {
         let check = notebook_settings_check(r#"{"schema_version":"1.22"}"#, Some("  "));
         assert_eq!(check.status, Status::Pass, "{}", check.message);
-    }
-
-    // ─── (#2413 M5) check_removed_telemetry_record_every_samples ──────────
-
-    #[serial_test::serial]
-    #[test]
-    fn check_telemetry_record_every_samples_removed_passes_when_absent() {
-        let home = tempfile::TempDir::new().unwrap();
-        std::fs::write(home.path().join("config.json"), r#"{"schema_version":"1.22"}"#).unwrap();
-        let prev_home = std::env::var("DARKMUX_HOME").ok();
-        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
-        let check = check_removed_telemetry_record_every_samples();
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
-        assert_eq!(check.status, Status::Pass, "{}", check.message);
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn check_telemetry_record_every_samples_removed_passes_against_with_defaults() {
-        use darkmux_types::config::DarkmuxConfig;
-        let home = tempfile::TempDir::new().unwrap();
-        let contents = serde_json::to_string_pretty(&DarkmuxConfig::with_defaults()).unwrap();
-        std::fs::write(home.path().join("config.json"), contents).unwrap();
-        let prev_home = std::env::var("DARKMUX_HOME").ok();
-        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
-        let check = check_removed_telemetry_record_every_samples();
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
-        assert_eq!(
-            check.status,
-            Status::Pass,
-            "with_defaults() must never itself trip the removed-key warning: {}",
-            check.message
-        );
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn check_telemetry_record_every_samples_warns_and_names_the_key_when_present() {
-        let home = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            home.path().join("config.json"),
-            r#"{"schema_version":"1.21","runtime":{"telemetry_record_every_samples":30}}"#,
-        )
-        .unwrap();
-        let prev_home = std::env::var("DARKMUX_HOME").ok();
-        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
-        let check = check_removed_telemetry_record_every_samples();
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
-        assert!(check.message.contains("telemetry_record_every_samples"), "names the key: {}", check.message);
-        assert!(
-            check.message.contains("1.22"),
-            "names the schema version it was retired in: {}",
-            check.message
-        );
     }
 
     // ─── (#2653) check_liveness_retention ───
@@ -12393,7 +10704,7 @@ mod tests {
 
     /// A daemon reporting `build` and the mtime of the binary it loaded.
     fn modern(build: &str, mtime: u64) -> Option<DaemonBuild> {
-        Some(DaemonBuild::Modern {
+        Some(DaemonBuild {
             build: build.into(),
             binary_mtime: Some(mtime),
         })
@@ -12474,7 +10785,7 @@ mod tests {
         // its own: fall back to the build tag alone rather than inventing a
         // finding out of a missing input.
         let c = classify_daemon_freshness(
-            Some(DaemonBuild::Modern {
+            Some(DaemonBuild {
                 build: "2.0.0 (a1b2c3d)".into(),
                 binary_mtime: None,
             }),
@@ -12485,22 +10796,6 @@ mod tests {
 
         let c = classify_daemon_freshness(modern("2.0.0 (a1b2c3d)", 1000), "2.0.0 (a1b2c3d)", None);
         assert_eq!(c.status, Status::Pass, "{}", c.message);
-    }
-
-    #[test]
-    fn daemon_freshness_warns_when_the_daemon_predates_the_build_field() {
-        // A daemon with no `build` field was compiled before this check shipped,
-        // so it is stale by construction — no version comparison needed (and
-        // none is made: a bare version vs a build-tagged one is not comparable).
-        let c = classify_daemon_freshness(
-            Some(DaemonBuild::Legacy("1.18.5".into())),
-            "2.0.0 (a1b2c3d)",
-            Some(1000),
-        );
-        assert_eq!(c.status, Status::Warn, "{}", c.message);
-        assert!(c.message.contains("1.18.5"), "{}", c.message);
-        assert!(c.message.contains("2.0.0 (a1b2c3d)"), "{}", c.message);
-        assert!(c.hint.as_deref().unwrap().contains("darkmux serve"));
     }
 
     #[test]
@@ -12527,7 +10822,7 @@ mod tests {
         let body = r#"{"darkmux_version":"2.0.0","build":"2.0.0 (a1b2c3d)","binary_mtime":1700}"#;
         assert_eq!(
             parse_daemon_build(body),
-            Some(DaemonBuild::Modern {
+            Some(DaemonBuild {
                 build: "2.0.0 (a1b2c3d)".into(),
                 binary_mtime: Some(1700)
             })
@@ -12537,11 +10832,11 @@ mod tests {
     #[test]
     fn daemon_build_tolerates_a_daemon_that_could_not_stat_its_own_exe() {
         // `binary_mtime: null` is a real shape the daemon emits — it must parse
-        // as Modern-without-mtime, not fall through to Legacy.
+        // as a build without an mtime, not as no build at all.
         let body = r#"{"darkmux_version":"2.0.0","build":"2.0.0 (a1b2c3d)","binary_mtime":null}"#;
         assert_eq!(
             parse_daemon_build(body),
-            Some(DaemonBuild::Modern {
+            Some(DaemonBuild {
                 build: "2.0.0 (a1b2c3d)".into(),
                 binary_mtime: None
             })
@@ -12549,14 +10844,12 @@ mod tests {
     }
 
     #[test]
-    fn daemon_build_reads_a_pre_build_field_daemon_as_legacy() {
-        // A daemon older than #1461 has no `build` field — classified as Legacy
-        // rather than silently compared against a build-tagged string.
+    fn daemon_build_is_none_without_a_build_field() {
+        // (4.0) A daemon older than #1461 reports no `build` field. There is
+        // no Legacy classification any more: without a build id there is
+        // nothing to compare, the same as no daemon at all.
         let body = r#"{"darkmux_version":"1.18.5","flow_schema_version":"1.4"}"#;
-        assert_eq!(
-            parse_daemon_build(body),
-            Some(DaemonBuild::Legacy("1.18.5".into()))
-        );
+        assert!(parse_daemon_build(body).is_none());
     }
 
     #[test]
@@ -12835,7 +11128,6 @@ mod tests {
             classify_daemon_freshness(modern("old", 1000), "new", Some(2000)),
             // Same build tag, reinstalled binary — the dev-box case.
             classify_daemon_freshness(modern("same", 1000), "same", Some(2000)),
-            classify_daemon_freshness(Some(DaemonBuild::Legacy("1.18.5".into())), "new", Some(1000)),
             classify_binary_vs_source(Some("0ldc0de"), Some("a1b2c3d")),
             classify_runtime_image_freshness(tags(&[("darkmux-runtime:latest", Some("1.0.0"))]), "2.0.0"),
             classify_runtime_binary_cache(true, Some(cache_stamp("1.0.0", None)), "2.0.0"),
@@ -13423,9 +11715,9 @@ mod tests {
         // crew-role-prompt-coverage [#141] + flow-sink-health [#170] +
         // machine_id [#167] + openai-base-url-conflict [#5] +
         // audit-integrity [#163] + utility-model-binding
-        // [#590] + legacy-mission-layout [#148] + beat-33-crew-dir [Beat 33
+        // [#590] + beat-33-crew-dir [Beat 33
         // directory flatten] + role-tool-vocab [#340] +
-        // legacy-compaction-extras [#380] + redis-config [#661] +
+        // redis-config [#661] +
         // remote-endpoint-credentials [#85/#91] + audit-write-drops [#877] +
         // serve-daemon-auth [#881] + fleet.mode [#933] + env-masks-config
         // [#934] + binary-split-brain [#934] + crew-validation [#1269] +
@@ -13433,10 +11725,8 @@ mod tests {
         // binary-vs-source + runtime-image-freshness [#1461] + role-profiles
         // [#1475] + cmd-gate-allowlist [#1685] + unpriceable-residents
         // [#1819] + unreachable-residents [#1944] +
-        // review-judge-exhaustion-policy [#1876/#1877] +
         // turn-delay [#2094] + reasoning-checkpoint-interval [#2165] +
         // host-sampler-interval [#2107, #1833] +
-        // telemetry-record-every-samples [#2111] +
         // generation-checkpoint-interval [#2171] +
         // thermal-governor [#2110/#2109] +
         // mission-envelope-readability [#1881] + hooks [#2093] +
@@ -13509,9 +11799,20 @@ mod tests {
         // `check_detection_policy` left the array for the generic
         // `check_enum_settings`, which contributes one row per registered
         // enum setting.
-        // (#2902 step 5) 68: `check_renamed_budget_settings` joined.
+        //
+        // (4.0 cleanup) 63: `check_flat_mission_files` joined (the Fail
+        // that replaced the `mission migrate` pointer). Before it, 62:
+        // `check_legacy_mission_layout` left with the
+        // `mission migrate` verb it pointed at,
+        // `check_legacy_compaction_extras` with the openclaw passthrough it
+        // warned about, and three residue checks for pre-3.x removals
+        // (`check_crews_residue`, `check_removed_review_config_block`,
+        // `check_removed_telemetry_record_every_samples`).
+        //
+        // (4.0 integration) 64: the cleanup's 63 plus
+        // `check_renamed_budget_settings` (#2902 step 5).
         let expected =
-            68 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            64 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -15399,6 +13700,41 @@ mod tests {
         assert!(hint.contains("delete"), "the fix: {hint}");
     }
 
+    // ─── (4.0) check_flat_mission_files ──────────────────────────────
+
+    #[serial_test::serial]
+    #[test]
+    fn flat_mission_files_fail_naming_each_file() {
+        let guard = CrewRootGuard::new();
+        std::fs::create_dir_all(guard.path().join("missions")).unwrap();
+        std::fs::create_dir_all(guard.path().join("phases")).unwrap();
+        std::fs::write(guard.path().join("missions").join("alpha.json"), "{}").unwrap();
+        std::fs::write(guard.path().join("phases").join("s1.json"), "{}").unwrap();
+        let check = check_flat_mission_files();
+        assert_eq!(check.status, Status::Fail, "{}", check.message);
+        assert!(check.message.contains("missions/alpha.json"), "{}", check.message);
+        assert!(check.message.contains("phases/s1.json"), "{}", check.message);
+        assert!(check.message.contains("4.0 no longer reads"), "{}", check.message);
+        let hint = check.hint.expect("names the fix");
+        assert!(hint.contains("darkmux mission migrate --apply"), "{hint}");
+        assert!(hint.contains("delete them"), "{hint}");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn flat_mission_files_pass_on_the_per_mission_layout() {
+        // A per-mission dir holding `mission.json` and its own `phases/` is
+        // the current layout, never a finding.
+        let guard = CrewRootGuard::new();
+        let m = guard.path().join("missions").join("alpha");
+        std::fs::create_dir_all(m.join("phases")).unwrap();
+        std::fs::write(m.join("mission.json"), "{}").unwrap();
+        std::fs::write(m.join("phases").join("s1.json"), "{}").unwrap();
+        let check = check_flat_mission_files();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("no flat mission files"), "{}", check.message);
+    }
+
     #[serial_test::serial]
     #[test]
     fn beat33_legacy_crew_dir_passes_when_no_crew_subdir_exists() {
@@ -15423,7 +13759,7 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn beat33_legacy_crew_dir_warns_with_mv_script_when_subdirs_present() {
+    fn beat33_legacy_crew_dir_fails_with_mv_script_when_subdirs_present() {
         let guard = CrewRootGuard::new();
         // Seed the legacy layout with the subdirs an upgrading operator
         // would actually have.
@@ -15432,28 +13768,49 @@ mod tests {
         std::fs::write(guard.path().join("crew").join("role-model-pins.json"), "{}").unwrap();
 
         let check = check_beat33_legacy_crew_dir();
-        assert_eq!(check.status, Status::Warn);
+        assert_eq!(check.status, Status::Fail);
         assert!(check.message.contains("operator state still under"));
         assert!(check.message.contains("missions"));
         assert!(check.message.contains("roles"));
-        assert!(check.message.contains("role-model-pins.json"));
+        // The Fail names what 4.0 stopped reading; the pins file never was
+        // read, so it rides in the hint as a deletion, not in the message.
+        assert!(!check.message.contains("role-model-pins.json"), "{}", check.message);
 
         let hint = check
             .hint
             .as_ref()
-            .expect("warn must carry an mv-script hint");
+            .expect("the failure must carry an mv-script hint");
         // Script must be operator-runnable: mv -n (no-clobber) for safety,
         // plus a final rmdir to clean up the now-empty parent.
         assert!(hint.contains("mv -n"));
         assert!(hint.contains("/crew/roles"));
         assert!(hint.contains("/crew/missions"));
-        assert!(hint.contains("/crew/role-model-pins.json"));
+        // Nothing reads the retired pins file, so the script never moves
+        // it; the hint says to delete it instead.
+        assert!(!hint.contains("role-model-pins.json\" \""), "no mv line for the pins file: {hint}");
+        assert!(hint.contains("role-model-pins.json") && hint.contains("nothing reads it"), "{hint}");
         assert!(hint.contains("rmdir"));
-        // Operator-sovereignty: the hint explicitly notes that nothing is
-        // urgent (loader's dual-read keeps the legacy layout working).
-        // Strip newlines before substring-match so rustfmt re-wrapping
-        // doesn't move the assertion's goalposts.
-        assert!(hint.replace('\n', " ").contains("no rush"));
+        // 4.0 dropped the dual read: the hint must say the legacy layout is
+        // no longer read, not that it keeps working. Strip newlines before
+        // substring-matching so rewrapping doesn't move the goalposts.
+        assert!(hint.replace('\n', " ").contains("darkmux no longer reads"));
+    }
+
+    /// (4.0) A `crew/` holding ONLY the retired `role-model-pins.json` is
+    /// not state darkmux stopped reading: nothing ever reads that file. Warn
+    /// and say to delete it, rather than Fail on a harmless leftover.
+    #[serial_test::serial]
+    #[test]
+    fn beat33_pins_only_warns_to_delete_the_unread_file() {
+        let guard = CrewRootGuard::new();
+        std::fs::create_dir_all(guard.path().join("crew")).unwrap();
+        std::fs::write(guard.path().join("crew").join("role-model-pins.json"), "{}").unwrap();
+        let check = check_beat33_legacy_crew_dir();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("role-model-pins.json"), "{}", check.message);
+        let hint = check.hint.expect("names the fix");
+        assert!(hint.contains("delete it; nothing reads it"), "{hint}");
+        assert!(!hint.contains("mv -n"), "nothing to move: {hint}");
     }
 
     #[serial_test::serial]
@@ -15466,7 +13823,7 @@ mod tests {
         std::fs::create_dir_all(guard.path().join("crew").join("operator-private-stuff")).unwrap();
 
         let check = check_beat33_legacy_crew_dir();
-        assert_eq!(check.status, Status::Warn);
+        assert_eq!(check.status, Status::Fail);
         assert!(check.message.contains("roles"));
         assert!(
             !check.message.contains("operator-private-stuff"),
@@ -15503,8 +13860,8 @@ mod tests {
         std::fs::write(guard.path().join("missions").join("m2.json"), "{}").unwrap();
 
         let check = check_beat33_legacy_crew_dir();
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
-        let hint = check.hint.expect("warn must carry an mv-script hint");
+        assert_eq!(check.status, Status::Fail, "{}", check.message);
+        let hint = check.hint.expect("the failure must carry an mv-script hint");
         let flat = hint.replace('\n', " ");
 
         // The corrupting line must NEVER appear when the destination
@@ -15583,8 +13940,8 @@ mod tests {
         std::fs::write(dest.join("collide.json"), r#"{"from":"already-flattened"}"#).unwrap();
 
         let check = check_beat33_legacy_crew_dir();
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
-        let hint = check.hint.expect("warn must carry an mv-script hint");
+        assert_eq!(check.status, Status::Fail, "{}", check.message);
+        let hint = check.hint.expect("the failure must carry an mv-script hint");
         let script = beat33_script_from_hint(&hint);
         assert!(
             script.contains("mv -n"),
@@ -15657,7 +14014,7 @@ mod tests {
         std::fs::write(dest.join("already-here.json"), "{}").unwrap();
 
         let check = check_beat33_legacy_crew_dir();
-        let hint = check.hint.expect("warn must carry an mv-script hint");
+        let hint = check.hint.expect("the failure must carry an mv-script hint");
         let script = beat33_script_from_hint(&hint);
         let out = std::process::Command::new("bash")
             .arg("-c")
@@ -15686,7 +14043,7 @@ mod tests {
         );
     }
 
-    // ─── #380: check_legacy_compaction_extras tests ─────────────
+    // ─── ConfigPathGuard ─────────────────────────────────────────
 
     /// Helper that points `DARKMUX_PROFILES` at a tempdir for the test's
     /// duration so `load_registry()` reads from a controlled path.
@@ -15720,167 +14077,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn check_legacy_compaction_extras_warns_when_present() {
-        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
-        // Write a profile with extras.customInstructions set
-        let registry_json = r#"{
-            "profiles": {
-                "test-profile": {
-                    "models": [{"id": "primary-x", "n_ctx": 100000, "role": "primary"}],
-                    "runtime": {
-                        "compaction": {
-                            "customInstructions": "some legacy value",
-                            "strategy": "narrative"
-                        }
-                    }
-                }
-            }
-        }"#;
-        std::fs::write(&config_path, registry_json).unwrap();
-
-        let check = check_legacy_compaction_extras();
-        assert_eq!(check.status, Status::Warn);
-        assert!(check.message.contains("test-profile"));
-        assert!(check.message.contains("customInstructions"));
-        let hint = check.hint.as_deref().unwrap_or("");
-        assert!(
-            hint.contains("custom_instructions"),
-            "hint must mention typed custom_instructions field"
-        );
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn check_legacy_compaction_extras_passes_when_absent() {
-        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
-        // Write a profile with empty/absent extras
-        let registry_json = r#"{
-            "profiles": {
-                "clean-profile": {
-                    "models": [{"id": "primary-x", "n_ctx": 100000, "role": "primary"}],
-                    "runtime": {
-                        "compaction": {}
-                    }
-                }
-            }
-        }"#;
-        std::fs::write(&config_path, registry_json).unwrap();
-
-        let check = check_legacy_compaction_extras();
-        assert_eq!(check.status, Status::Pass);
-        assert!(check.message.contains("no legacy compaction extras"));
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn check_legacy_compaction_extras_handles_multiple_keys() {
-        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
-        // Write a profile with multiple legacy keys
-        let registry_json = r#"{
-            "profiles": {
-                "multi-key-profile": {
-                    "models": [{"id": "primary-x", "n_ctx": 100000, "role": "primary"}],
-                    "runtime": {
-                        "compaction": {
-                            "mode": "balanced",
-                            "maxHistoryShare": 0.7,
-                            "customInstructions": "keep important stuff",
-                            "strategy": "narrative"
-                        }
-                    }
-                }
-            }
-        }"#;
-        std::fs::write(&config_path, registry_json).unwrap();
-
-        let check = check_legacy_compaction_extras();
-        assert_eq!(check.status, Status::Warn);
-        assert!(check.message.contains("multi-key-profile"));
-        // All four legacy keys should be listed
-        assert!(check.message.contains("mode"));
-        assert!(check.message.contains("maxHistoryShare"));
-        assert!(check.message.contains("customInstructions"));
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn check_legacy_compaction_extras_passes_when_no_runtime() {
-        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
-        // Write a profile without runtime section at all
-        let registry_json = r#"{
-            "profiles": {
-                "no-runtime-profile": {
-                    "models": [{"id": "primary-x", "n_ctx": 100000, "role": "primary"}]
-                }
-            }
-        }"#;
-        std::fs::write(&config_path, registry_json).unwrap();
-
-        let check = check_legacy_compaction_extras();
-        assert_eq!(check.status, Status::Pass);
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn check_legacy_compaction_extras_passes_when_no_compaction() {
-        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
-        // Write a profile with runtime but no compaction
-        let registry_json = r#"{
-            "profiles": {
-                "no-compaction-profile": {
-                    "models": [{"id": "primary-x", "n_ctx": 100000, "role": "primary"}],
-                    "runtime": {}
-                }
-            }
-        }"#;
-        std::fs::write(&config_path, registry_json).unwrap();
-
-        let check = check_legacy_compaction_extras();
-        assert_eq!(check.status, Status::Pass);
-    }
-
-    // ─── #1426 ship-2: check_crews_residue tests ─────────────────────
-
-    #[serial_test::serial]
-    #[test]
-    fn check_crews_residue_passes_clean_when_no_crews_key() {
-        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
-        std::fs::write(
-            &config_path,
-            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}}}"#,
-        )
-        .unwrap();
-
-        let check = check_crews_residue();
-        assert_eq!(check.status, Status::Pass);
-        assert!(check.message.contains("no legacy crews residue"));
-        assert!(check.hint.is_none());
-    }
-
-    /// A pre-2.0 profiles.json still carrying a `crews` map parses fine (the
-    /// key overflows into `extras`) and surfaces as a WARN — a config block
-    /// that no longer does anything merits the warn tier, so the operator
-    /// learns their declared crews stopped being read. Never an error (the
-    /// residue is harmless to every code path).
-    #[serial_test::serial]
-    #[test]
-    fn check_crews_residue_warns_on_legacy_crews_key() {
-        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
-        std::fs::write(
-            &config_path,
-            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
-                "crews":{"review-deep":{"seats":{"review-probe":[{"profile":"fast"}]}}}}"#,
-        )
-        .unwrap();
-
-        let check = check_crews_residue();
-        assert_eq!(check.status, Status::Warn);
-        assert!(check.message.contains("DOES NOTHING"), "got: {}", check.message);
-        assert!(check.hint.as_deref().unwrap().contains("retired in 2.0"));
     }
 
     // ─── #1284 Packet 1: check_mission_config_registry ───────────────
@@ -17143,62 +15339,10 @@ pub struct RosterEntryView {
     pub loopback_intended: bool,
 }
 
-/// Whether live presence was read for this doctor run. Without it, a peer
-/// that is merely off and a name nothing ever used look the same.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum PresenceState {
-    /// No Redis is configured, so there is no presence to read.
-    #[default]
-    NotConfigured,
-    /// Redis is configured but the read failed.
-    Unreadable,
-    /// Presence beats were read (possibly none).
-    Read,
-}
-
-/// What this machine knows about fleet identity, gathered by the caller from
-/// its own resolution, presence beats, and a bounded window of local flow
-/// history.
-#[derive(Debug, Clone, Default)]
-pub struct FleetIdentityKnowledge {
-    /// Each known hardware uid -> the machine_id that machine goes by NOW:
-    /// this machine's own resolution, a live presence beat's `display_name`,
-    /// else the most recent name in flow history.
-    pub current_name_by_uid: std::collections::BTreeMap<String, String>,
-    /// Every name seen -> EVERY uid seen under it. A set, not a last-writer
-    /// map: one machine collects throwaway names (a `DARKMUX_MACHINE_ID` set
-    /// for one session), and two machines can once have shared a
-    /// hostname-derived id. A name traces to a machine only when it maps to
-    /// exactly one uid.
-    pub uids_by_name: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
-    /// machine_ids seen in flow history with no uid attached (records written
-    /// before flow records carried `machine_uid`). Known names whose machine
-    /// cannot be identified further.
-    pub uidless_names: std::collections::BTreeSet<String>,
-    /// This machine's own resolved machine_id, even when its hardware uid
-    /// could not be read (non-macOS, `ioreg` failing).
-    pub local_name: Option<String>,
-    /// Whether live presence was read.
-    pub presence: PresenceState,
-    /// This machine's hardware uid, when readable. A history-only trace to
-    /// it is weak: throwaway session names collect here.
-    pub local_uid: Option<String>,
-    /// uids whose current name came from a LIVE source (this machine, a
-    /// presence beat), not from history.
-    pub live_uids: std::collections::BTreeSet<String>,
-    /// True when `local_name` came from the `DARKMUX_MACHINE_ID` env tier
-    /// (a per-shell override), which is not evidence of the machine's name.
-    pub local_name_from_env: bool,
-    /// `Some(n)` when older flow files exist beyond the last `n` read.
-    pub history_truncated_to: Option<usize>,
-}
-
-impl FleetIdentityKnowledge {
-    /// True when some machine goes by `name` right now.
-    pub fn is_current_name(&self, name: &str) -> bool {
-        self.local_name.as_deref() == Some(name) || self.current_name_by_uid.values().any(|n| n == name)
-    }
-}
+/// (#2916 stage 2) Fleet identity knowledge moved to `darkmux-fleet`, where
+/// routing and the daemon can use it too; re-exported so doctor keeps its
+/// names.
+pub use darkmux_fleet::{FleetIdentityKnowledge, PresenceState};
 
 /// How strong the link is between a roster entry and the machine it is
 /// traced to. Only `DeclaredLive` licenses repairs that reuse the entry's

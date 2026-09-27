@@ -1073,10 +1073,6 @@ edit loop detected on src/widget.rs in an earlier dispatch
         assert!(found, "the close nudge must emit a stage=debrief mission.debrief.prompt record");
     }
 
-    // (#1463) The `session_note_scan_matches_session_and_source` test retired
-    // with `session_has_orchestrator_note` — that scan only backed the retired
-    // `ship` verb's adjudication-note nudge.
-
     fn phase(id: &str, mission: &str, status: PhaseStatus) -> Phase {
         Phase {
             id: id.to_string(),
@@ -2277,4 +2273,25 @@ edit loop detected on src/widget.rs in an earlier dispatch
         // 3. Uncommitted change → unsaved (dirty tree), even when pushed.
         std::fs::write(rp.join("f.txt"), "two").unwrap();
         assert!(worktree_has_unsaved_work(rp), "uncommitted changes → unsaved");
+    }
+
+    /// (#2869) The workspace is model-writable: a caution's file that the
+    /// model replaced with a symlink to a host file reads as "unknown
+    /// freshness", never as the host file's hash.
+    #[test]
+    fn current_file_blake3_does_not_follow_a_workspace_symlink() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let host = tmp.path().join("host.rs");
+        std::fs::write(&host, b"fn host() {}").unwrap();
+        std::os::unix::fs::symlink(&host, ws.join("widget.rs")).unwrap();
+        assert_eq!(current_file_blake3(&ws, "widget.rs"), None, "the symlink was followed");
+
+        std::fs::remove_file(ws.join("widget.rs")).unwrap();
+        std::fs::write(ws.join("widget.rs"), b"fn host() {}").unwrap();
+        assert_eq!(
+            current_file_blake3(&ws, "widget.rs"),
+            Some(blake3::hash(b"fn host() {}").to_hex().to_string())
+        );
     }

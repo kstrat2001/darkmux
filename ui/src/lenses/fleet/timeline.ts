@@ -76,6 +76,7 @@ import {
 import type { RosterName, SelfIdentity } from "../../lib/flow";
 import { clkhm } from "../../lib/format";
 import type { FlowRecord, PresenceBeat } from "../../types/handwritten";
+import type { RunStatus } from "../../types/generated/RunStatus";
 
 /** The live-only window presets (#1151) — minutes, matching legacy's
  * `[{l:'10m',m:10},{l:'1h',m:60},{l:'4h',m:240},{l:'24h',m:1440}]` verbatim.
@@ -103,7 +104,8 @@ export interface TimelineBar {
   key: string;
   leftPct: number;
   widthPct: number;
-  cls: "run" | "done" | "canceled" | "err";
+  /** (#2813) The canonical run status: the bar's CSS class too (`.sbar.<status>`). */
+  status: RunStatus;
   title: string;
 }
 
@@ -206,7 +208,7 @@ export function buildActivityTimeline(
     // sharing one entry here would let `dispatchRec`/`dispatchEnd`/`sessEnd`
     // below (unscoped `Array.find`) pair one mission's start with a
     // DIFFERENT mission's terminal/abort — measured live as a single
-    // 20-hour "canceled" span for a mission that actually ran 23 minutes.
+    // 20-hour abandoned span for a mission that actually ran 23 minutes.
     // `missionId` threaded through every lookup below scopes each one to
     // its OWN mission's records; `undefined` (a session with no mission at
     // all) preserves the exact prior session-id-only behavior.
@@ -231,8 +233,8 @@ export function buildActivityTimeline(
       const errored = done && dispatchErrored(term);
       const killed = dispatchKilled(term);
       const clean = done && !!term && !dispatchErrored(term);
-      const lbl = statusLabel(runStateFrom({ open: !done, errored, killed, clean }));
-      const cls: TimelineBar["cls"] = !done ? "run" : errored ? "err" : clean ? "done" : "canceled";
+      const state = runStateFrom({ open: !done, errored, killed, clean });
+      const lbl = statusLabel(state);
       const end = !done ? playheadT : closeTs != null ? closeTs : lastTs(data, sid, missionId) || playheadT;
       if (end < tlMin) continue; // ended entirely before the window
       const cst = Math.max(T(s.ts), tlMin); // clip a straddling start to the window edge
@@ -240,7 +242,7 @@ export function buildActivityTimeline(
       const leftPct = Math.max(0, Math.min(pct(cst), 100 - widthPct)); // never spill past the right edge
       const role = (s.handle || "").replace(/^darkmux\//, "");
       const key = missionId ? `${sid}\x1f${missionId}` : sid;
-      bars.push({ sid, key, leftPct, widthPct, cls, title: `${role} · ${sid} · ${lbl}` });
+      bars.push({ sid, key, leftPct, widthPct, status: state.status, title: `${role} · ${sid} · ${lbl}` });
     }
     return { uid: m, name: displayNameOf(data, liveMachines, specs, m, roster), bars };
   });

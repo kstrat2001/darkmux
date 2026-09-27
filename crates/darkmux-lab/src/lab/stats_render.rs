@@ -28,17 +28,6 @@ fn sanitized_models(models: &[String]) -> String {
     models.iter().map(|m| sanitize_for_terminal(m)).collect::<Vec<_>>().join(", ")
 }
 
-/// `writeln!` into the output buffer. Writing to a `String` cannot fail.
-macro_rules! p {
-    ($o:expr) => {
-        $o.push('\n')
-    };
-    ($o:expr, $($t:tt)*) => {{
-        use std::fmt::Write as _;
-        let _ = writeln!($o, $($t)*);
-    }};
-}
-
 /// (#2855) The human read of a run's derived metrics.
 ///
 /// Two rules the layout exists to enforce. **Rest is printed beside wall and

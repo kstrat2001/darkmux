@@ -14,14 +14,12 @@
 //! (role × profile → model id) and gives the scoring engine a natural home
 //! that doesn't pile onto either struct's impl block.
 //!
-//! ## Why no fallback to `probe_loaded_model` here
+//! ## Why no fallback to "whatever LMStudio has loaded"
 //!
-//! Falling back to "whatever LMStudio happens to have loaded" is the
-//! anti-pattern documented in `feedback_model_unload_load_authority`
-//! (memory note from 2026-05-26 dispatch-contamination incident).
-//! `select_model` returns a clear error when no model is configured; the
-//! dispatch path decides whether back-compat fallback is acceptable, with a
-//! loud deprecation warning so the misconfiguration is operator-visible.
+//! That is the dispatch-contamination anti-pattern (a user-loaded model has
+//! unknown load configuration, the #1135 ghost). `select_model` returns a
+//! clear error when no model is configured, and the dispatch path surfaces
+//! it as a hard error.
 
 use crate::types::{Role, Skill};
 use anyhow::{anyhow, Result};
@@ -151,7 +149,7 @@ pub fn is_local_utility_model(model: &ProfileModel, utility_model: Option<&str>)
 /// `config.model` carries the namespaced wire id). The ONE comparison every
 /// utility-model check uses.
 pub fn names_utility_model(candidate: &str, utility_model: &str) -> bool {
-    let bare = crate::dispatch_internal::bare_model_key;
+    let bare = darkmux_gestalt::bare_model_key;
     bare(candidate) == bare(utility_model)
 }
 

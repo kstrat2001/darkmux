@@ -1,41 +1,18 @@
-//! darkmux's LMStudio namespace helpers — the ownership contract for loaded
-//! models (`darkmux:<model-id>` identifiers).
+//! darkmux's LMStudio ownership contract (#52, #1274): which loaded
+//! instances are darkmux's (`darkmux:<model-id>` identifiers), and the one
+//! sweep that unloads them.
 //!
-//! (#1426 phase 3) This module used to hold the `darkmux swap` stack-swap
-//! orchestration. That verb retired (gestalt is the one residency writer —
-//! a dispatch loads what its staffing needs), and the whole swap executor
-//! (`swap()`, `SwapOpts`/`SwapResult`, the desired-loads resolver, and the
-//! `RegistryHooks` pre/post-swap runner — the hooks retired WITH the verb,
-//! since swap was their only trigger) was deleted with it. What remains is
-//! the namespace vocabulary every production consumer still uses:
-//! [`DARKMUX_LMS_NAMESPACE`], [`namespaced_identifier`], and
-//! [`is_darkmux_owned`].
+//! The pure namespace vocabulary lives in `darkmux_gestalt::ownership`;
+//! this module adds the `&ProfileModel` form of [`namespaced_identifier`]
+//! and the `lms`-backed [`eject_all_managed`]. (Named `swap` until 4.0,
+//! after the retired stack-swap verb whose executor it once held.)
 
 use darkmux_types::ProfileModel;
 
-/// Prefix attached to identifiers darkmux uses for its own LMStudio loads.
-/// Anything visible via `lms ps` starting with this prefix is owned by darkmux
-/// and safe for darkmux to unload; anything else is user state and off-limits.
-///
-/// (#1230 Packet 1 cutover) Re-exported from `darkmux_gestalt::ownership`,
-/// which is now the canonical home for this constant — see that module's
-/// doc comment ("Packet 3 re-points swap.rs at this module"). Kept as a
-/// `pub const` alias here (not a bare re-export of a differently-named
-/// item) so every existing `swap::DARKMUX_LMS_NAMESPACE` call site keeps
-/// compiling unchanged.
-///
-/// See [issue #52](https://github.com/kstrat2001/darkmux/issues/52) for the
-/// design rationale (operator-sovereignty applied at model-state level —
-/// darkmux never touches state it didn't bring up).
-pub const DARKMUX_LMS_NAMESPACE: &str = darkmux_gestalt::DARKMUX_NAMESPACE;
+pub use darkmux_gestalt::is_darkmux_owned;
 
-/// Compute the darkmux-namespaced LMStudio identifier for a profile model.
-///
-/// (#1230 Packet 1 cutover) Thin delegating wrapper over
-/// `darkmux_gestalt::namespaced_identifier` — the `&ProfileModel` form this
-/// crate's callers use, feeding gestalt's two-explicit-parameter form (a
-/// bare `pub use` can't bridge the signature). ONE definition backs both
-/// this wrapper and the review's `LmsCycler`.
+/// Compute the darkmux-namespaced LMStudio identifier for a profile model:
+/// the `&ProfileModel` form of `darkmux_gestalt::namespaced_identifier`.
 ///
 /// If the profile sets an explicit `identifier`, it passes through as-is
 /// (the documented namespace opt-out). Otherwise the model id is wrapped
@@ -43,16 +20,6 @@ pub const DARKMUX_LMS_NAMESPACE: &str = darkmux_gestalt::DARKMUX_NAMESPACE;
 /// darkmux's loads from user-managed ones.
 pub fn namespaced_identifier(m: &ProfileModel) -> String {
     darkmux_gestalt::namespaced_identifier(&m.id, m.identifier.as_deref())
-}
-
-/// `true` if this identifier was minted by darkmux (begins with our
-/// namespace). Used to filter `lms ps` results into darkmux-managed vs
-/// user state (`machine status`/`machine eject`, dispatch preflight).
-///
-/// (#1230 Packet 1 cutover) Delegates to `darkmux_gestalt::is_darkmux_owned`
-/// — see `namespaced_identifier`'s doc above.
-pub fn is_darkmux_owned(identifier: &str) -> bool {
-    darkmux_gestalt::is_darkmux_owned(identifier)
 }
 
 /// (#2774 tier 5) One model this sweep ejected (or, under `dry_run`, would

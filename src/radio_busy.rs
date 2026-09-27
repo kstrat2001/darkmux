@@ -458,7 +458,7 @@ mod tests {
     fn resident_q(identifier: &str, status: &str, queued: Option<u64>) -> LoadedModel {
         LoadedModel {
             identifier: identifier.to_string(),
-            model: identifier.trim_start_matches("darkmux:").to_string(),
+            model: darkmux_gestalt::bare_model_key(identifier).to_string(),
             status: status.to_string(),
             size: "20.00 GB".to_string(),
             context: 100_000,

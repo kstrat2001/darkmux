@@ -37,7 +37,11 @@ describe("activityOf", () => {
     expect(activityOf(rec({ action: "note" }))).toBe("note");
     // (#2902 step 5) Budget records are their own facet, not generic telemetry.
     expect(activityOf(rec({ action: "budget.wait", category: "telemetry", source: "budget" }))).toBe("budget");
-    expect(activityOf(rec({ action: undefined, source: "orchestrator" }))).toBe("note");
+    expect(activityOf(rec({ action: undefined, source: "adjudication" }))).toBe("note");
+  });
+
+  it("(#2983) a non-note record tagged `source: orchestrator` files under its own action", () => {
+    expect(activityOf(rec({ action: "catch", source: "orchestrator" }))).toBe("catch");
   });
 
   it("(#2413) machine.telemetry maps to the same 'host telemetry' facet as the retired telemetry.process", () => {

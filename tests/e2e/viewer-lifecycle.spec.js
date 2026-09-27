@@ -42,21 +42,21 @@ test('activity lane brackets a session.end-only session as ended, not in-flight'
   await expect(
     page.locator('.sbar[title*="sess-ended-via-sessionend"]')
   ).toHaveCount(1);
-  // ...and is NOT marked running (class "run"; #1071 renamed the in-flight
-  // class from "a"). THE regression: pre-fix it was in-flight.
+  // ...and is NOT marked running (class "running", the canonical RunStatus
+  // word since #2813; #1071 renamed it from "a" to "run" before that). THE regression: pre-fix it was in-flight.
   await expect(
-    page.locator('.sbar.run[title*="sess-ended-via-sessionend"]')
+    page.locator('.sbar.running[title*="sess-ended-via-sessionend"]')
   ).toHaveCount(0);
 
   // Control: a clean dispatch.complete is also not in-flight.
   await expect(
-    page.locator('.sbar.run[title*="sess-clean-complete"]')
+    page.locator('.sbar.running[title*="sess-clean-complete"]')
   ).toHaveCount(0);
 
   // Control: a genuinely open session (dispatch.start, NO terminal at all)
   // DOES render in-flight — the fix must not over-close legitimate running work.
   await expect(
-    page.locator('.sbar.run[title*="sess-in-flight"]')
+    page.locator('.sbar.running[title*="sess-in-flight"]')
   ).toHaveCount(1);
 
   expect(pageErrors, `viewer threw: ${pageErrors.join('; ')}`).toHaveLength(0);
@@ -139,8 +139,9 @@ test('activity lane: drilling a session.end-only session does not throw', async 
   // the pre-React viewer invented for `abandoned` with no ending recorded.
   // `runStatusLabel` in the runs lens had been rendering that same state as
   // "no ending recorded" all along, so the session lens now agrees with it.
-  // The element's class is unchanged (`s-canceled`), which is why this is a
-  // rename and not a behavior change.
+  // The element's class moved with it (`s-canceled` → `s-abandoned`); the
+  // state is unchanged, which is why this is a rename and not a behavior
+  // change.
   //
   // This gate caught the rename when 1,800 unit tests did not — it is the
   // only check that reads the rendered page.

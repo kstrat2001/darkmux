@@ -56,13 +56,6 @@ import type { FlowRecordsResponse } from "../../types/handwritten";
  * exercises the populated branch — the empty branch is honest but
  * unexercised by this corpus).
  */
-/** The run detail's `PillCls` predates the shared chip; map it back to the
- * raw status word the chip's vocabulary reads. The visible text stays
- * `pillLabel` (pre-uppercased, golden-pinned). */
-function pillStatusWord(cls: "run" | "err" | "done" | "canceled"): string {
-  return cls === "run" ? "running" : cls === "err" ? "error" : cls === "done" ? "complete" : "canceled";
-}
-
 /** (#2878) A MODEL/SYSTEM metric tile's value (`.mv`), counting up/down
  * when it changes on a live run — TURNS, COMPACTIONS, a host CPU/RAM/GPU
  * percentage. `sessionRun.ts` hands this component an already-FORMATTED
@@ -815,7 +808,7 @@ export function SessionReplay({
             version added a second and CI caught `RUNNING  RUN ·`, which is
             invisible on screen and unmissable to the golden. */}
         <WorkStatus
-          status={pillStatusWord(view.header.pillCls)}
+          status={view.header.status}
           label={view.header.pillLabel}
           live={liveness.state}
           className="pill"

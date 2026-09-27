@@ -3372,3 +3372,27 @@ fn the_crawler_seat_stamp_names_the_selected_model() {
     assert_eq!(seat.locality, "local");
     assert_eq!(seat.profile_name.as_deref(), Some("mixed"));
 }
+
+// ── (#2869) out-dir reads refuse what the model could have planted ─────
+
+/// An out-dir whose `.darkmux-runtime/trajectory.jsonl` is a symlink to a
+/// host file holding one rejected `create_finding` line. Followed, the
+/// count would read 1.
+#[test]
+fn count_rejected_create_findings_refuses_a_symlinked_trajectory() {
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("out");
+    fs::create_dir_all(out.join(".darkmux-runtime")).unwrap();
+    let host = tmp.path().join("host-trajectory.jsonl");
+    let line = r#"{"type":"tool.completed","tool_name":"create_finding","ok":false,"seq":1}"#;
+    fs::write(&host, format!("{line}\n")).unwrap();
+    std::os::unix::fs::symlink(&host, out.join(".darkmux-runtime/trajectory.jsonl")).unwrap();
+
+    assert_eq!(count_rejected_create_findings(&out), 0, "the symlink was followed");
+    assert!(read_runtime_text(&out, "trajectory.jsonl").is_none());
+
+    // The same bytes as a regular file are read.
+    fs::remove_file(out.join(".darkmux-runtime/trajectory.jsonl")).unwrap();
+    fs::copy(&host, out.join(".darkmux-runtime/trajectory.jsonl")).unwrap();
+    assert_eq!(count_rejected_create_findings(&out), 1);
+}

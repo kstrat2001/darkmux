@@ -13,10 +13,7 @@
 //! handled there rather than falling through to `generic` (#906 doc-drift).
 
 use darkmux_hardware::{HardwareSpec, Platform, RamTier};
-use crate::{
-    Architecture, CompactorChoice, HeuristicsProvider, RuleResult, SizeBucket, TaskClass,
-    DEFAULT_COMPACTOR_ID,
-};
+use crate::{HeuristicsProvider, Rule, RulesTable};
 
 pub struct Provider;
 pub static PROVIDER: Provider = Provider;
@@ -26,135 +23,52 @@ const NOTE_DERIVED: &str =
      not independently measured. Treat n_ctx values as starting points; tune down \
      if you see swap pressure or load failures.";
 
+/// Rows are size buckets, columns Fast / Mid / Long.
+static RULES: RulesTable = RulesTable([
+    // Tiny — same as 128 tier; ctx isn't RAM-bound here.
+    [Rule::solo(32_000), Rule::solo(64_000), Rule::solo(131_072)],
+    // Small — same as 128 tier (fits cleanly).
+    [Rule::solo(32_000), Rule::solo(64_000), Rule::solo(131_072)],
+    // Medium — RAM gets tight. Drop bigctx; smaller compactor.
+    // 35B-A3B at MXFP4 ≈18GB; 4B compactor ≈2.5GB; KV cache scales
+    // with n_ctx. At 131K + 64K compactor we're roughly the same
+    // RAM envelope as 128-tier's 101K + 68K — fits 64GB safely.
+    [Rule::solo(32_000), Rule::paired(64_000, 32_000), Rule::paired(131_072, 64_000)],
+    // Large (50-100B) — RAM critical at 64GB. Best to drop the
+    // compactor entirely on Mid; on Long expect tightness.
+    [Rule::solo(32_000), Rule::solo(32_000), Rule::paired(64_000, 32_000)],
+    // XL (100B+) — does not fit reliably on 64GB. Allow Fast with
+    // a tight ctx; Mid/Long are likely OOM. The dispatcher's
+    // Large/XL warning note will fire on top of these.
+    [Rule::solo(16_000), Rule::solo(32_000), Rule::solo(32_000)],
+]);
+
 impl HeuristicsProvider for Provider {
     fn id(&self) -> &'static str {
         "m-series-64"
     }
-    fn description(&self) -> &'static str {
-        "Apple Silicon with 32-64 GB unified memory (M-series Pro tier). Rules derived from the 128GB tier; tighter n_ctx and smaller compactors to fit RAM."
+
+    fn is_generic(&self) -> bool {
+        false
     }
 
     fn matches(&self, hw: &HardwareSpec) -> bool {
         matches!(hw.platform, Platform::AppleSilicon) && matches!(hw.ram_tier(), RamTier::Medium)
     }
 
-    fn extra_notes(&self) -> &[&'static str] {
-        &[NOTE_DERIVED]
+    fn rules(&self) -> &'static RulesTable {
+        &RULES
     }
 
-    fn suggest(
-        &self,
-        bucket: SizeBucket,
-        _arch: Architecture,
-        task: TaskClass,
-        max_ctx: u32,
-    ) -> RuleResult {
-        let cap = |n: u32| -> u32 { n.min(max_ctx) };
-        let compactor = |n_ctx: u32| -> Option<CompactorChoice> {
-            Some(CompactorChoice {
-                model_id: DEFAULT_COMPACTOR_ID.to_string(),
-                n_ctx,
-            })
-        };
-
-        match (bucket, task) {
-            // Tiny — same as 128 tier; ctx isn't RAM-bound here.
-            (SizeBucket::Tiny, TaskClass::Fast) => RuleResult {
-                primary_n_ctx: cap(32_000),
-                compactor: None,
-                include_compaction_settings: false,
-            },
-            (SizeBucket::Tiny, TaskClass::Mid) => RuleResult {
-                primary_n_ctx: cap(64_000),
-                compactor: None,
-                include_compaction_settings: false,
-            },
-            (SizeBucket::Tiny, TaskClass::Long) => RuleResult {
-                primary_n_ctx: cap(131_072),
-                compactor: None,
-                include_compaction_settings: false,
-            },
-
-            // Small — same as 128 tier (fits cleanly).
-            (SizeBucket::Small, TaskClass::Fast) => RuleResult {
-                primary_n_ctx: cap(32_000),
-                compactor: None,
-                include_compaction_settings: false,
-            },
-            (SizeBucket::Small, TaskClass::Mid) => RuleResult {
-                primary_n_ctx: cap(64_000),
-                compactor: None,
-                include_compaction_settings: false,
-            },
-            (SizeBucket::Small, TaskClass::Long) => RuleResult {
-                primary_n_ctx: cap(131_072),
-                compactor: None,
-                include_compaction_settings: false,
-            },
-
-            // Medium — RAM gets tight. Drop bigctx; smaller compactor.
-            // 35B-A3B at MXFP4 ≈18GB; 4B compactor ≈2.5GB; KV cache scales
-            // with n_ctx. At 131K + 64K compactor we're roughly the same
-            // RAM envelope as 128-tier's 101K + 68K — fits 64GB safely.
-            (SizeBucket::Medium, TaskClass::Fast) => RuleResult {
-                primary_n_ctx: cap(32_000),
-                compactor: None,
-                include_compaction_settings: false,
-            },
-            (SizeBucket::Medium, TaskClass::Mid) => RuleResult {
-                primary_n_ctx: cap(64_000),
-                compactor: compactor(32_000),
-                include_compaction_settings: true,
-            },
-            (SizeBucket::Medium, TaskClass::Long) => RuleResult {
-                primary_n_ctx: cap(131_072),
-                compactor: compactor(64_000),
-                include_compaction_settings: true,
-            },
-
-            // Large (50-100B) — RAM critical at 64GB. Best to drop the
-            // compactor entirely on Mid; on Long expect tightness.
-            (SizeBucket::Large, TaskClass::Fast) => RuleResult {
-                primary_n_ctx: cap(32_000),
-                compactor: None,
-                include_compaction_settings: false,
-            },
-            (SizeBucket::Large, TaskClass::Mid) => RuleResult {
-                primary_n_ctx: cap(32_000),
-                compactor: None,
-                include_compaction_settings: false,
-            },
-            (SizeBucket::Large, TaskClass::Long) => RuleResult {
-                primary_n_ctx: cap(64_000),
-                compactor: compactor(32_000),
-                include_compaction_settings: true,
-            },
-
-            // XL (100B+) — does not fit reliably on 64GB. Allow Fast with
-            // a tight ctx; Mid/Long are likely OOM. The dispatcher's
-            // Large/XL warning note will fire on top of these.
-            (SizeBucket::Xl, TaskClass::Fast) => RuleResult {
-                primary_n_ctx: cap(16_000),
-                compactor: None,
-                include_compaction_settings: false,
-            },
-            (SizeBucket::Xl, TaskClass::Mid) => RuleResult {
-                primary_n_ctx: cap(32_000),
-                compactor: None,
-                include_compaction_settings: false,
-            },
-            (SizeBucket::Xl, TaskClass::Long) => RuleResult {
-                primary_n_ctx: cap(32_000),
-                compactor: None,
-                include_compaction_settings: false,
-            },
-        }
+    fn extra_notes(&self) -> &[&'static str] {
+        &[NOTE_DERIVED]
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{SizeBucket, TaskClass};
 
     fn hw_at(ram_gb: u32) -> HardwareSpec {
         HardwareSpec {
@@ -173,17 +87,12 @@ mod tests {
         assert!(PROVIDER.matches(&hw_at(64)));
         assert!(PROVIDER.matches(&hw_at(48)));
         assert!(!PROVIDER.matches(&hw_at(96))); // Large tier — 128 provider claims this
-        assert!(!PROVIDER.matches(&hw_at(16))); // Small tier — generic
+        assert!(!PROVIDER.matches(&hw_at(16))); // Small tier — m_series_32 claims this
     }
 
     #[test]
     fn medium_long_is_smaller_than_128_tier_bigctx() {
-        let r = PROVIDER.suggest(
-            SizeBucket::Medium,
-            Architecture::Moe,
-            TaskClass::Long,
-            262_144,
-        );
+        let r = PROVIDER.suggest(SizeBucket::Medium, TaskClass::Long, 262_144);
         // 131K (vs 262K on 128 tier) — RAM-conservative.
         assert_eq!(r.primary_n_ctx, 131_072);
         assert!(r.compactor.is_some());
@@ -193,7 +102,7 @@ mod tests {
     #[test]
     fn xl_long_keeps_ctx_minimal() {
         // Don't recommend big context on a 122B model at 64GB.
-        let r = PROVIDER.suggest(SizeBucket::Xl, Architecture::Moe, TaskClass::Long, 262_144);
+        let r = PROVIDER.suggest(SizeBucket::Xl, TaskClass::Long, 262_144);
         assert!(r.primary_n_ctx <= 32_000);
         assert!(r.compactor.is_none());
     }

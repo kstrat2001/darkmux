@@ -16,6 +16,18 @@ darkmux release.
 
 ### Removed (breaking, 4.0)
 
+- **The fleet page's orchestrator note** (#2983): the "Orchestrator note:"
+  line under the token panel, its `history →` list, and the stock sentence
+  it showed when no note existed. The panel is one line shorter; nothing
+  else on the page changed size. **Migration:** the fleet page no longer shows an
+  orchestrator note; `darkmux flow note --source orchestrator` is no longer
+  rendered anywhere. The verb still writes the record, old note records in
+  flow archives still read, and `--session-id <sid> --source adjudication`
+  notes keep feeding coder briefs, `darkmux memory correction list`, and
+  `mission debrief` unchanged.
+  A non-note record tagged `--source orchestrator` (a `flow catch`, say) now
+  files under its own action in the event log, not under "note".
+
 - **`radio.router_profile`, `DARKMUX_RADIO_ROUTER_PROFILE`, and the
   `role_profiles.radio-router` binding** (#2914). The radio routing seat
   now runs on the machine's one utility model (below), so there is no
@@ -69,9 +81,77 @@ darkmux release.
   is still set with the exact change to make. `darkmux config set
   dirs.notebook ...` now rejects the key. Existing entries on disk are
   untouched.
+- **`darkmux mission migrate` and the pre-#148 flat mission layout.**
+  Flat `<root>/missions/<id>.json` / `<root>/phases/<id>.json` files are
+  not read; `darkmux doctor` FAILS naming each one still present.
+  **Migration:** run `darkmux mission migrate --apply` on 3.x before
+  upgrading.
+- **The pre-Beat-33 `<root>/crew/{roles,missions,phases,crews,skills}`
+  fallback read.** User state resolves under `<root>/<subdir>/` only;
+  `darkmux doctor` now FAILS on a leftover `crew/` subdir and prints the
+  move script. **Migration:** run the script `darkmux doctor` prints.
+- **Dispatching with no resolvable profile no longer probes LMStudio's
+  first loaded model.** With no `--profile`, no `role_profiles.<role>`
+  binding and no `default_profile` (or a profile that selects no model for
+  the role), the dispatch now fails with an error naming the fix, where 3.x
+  printed a deprecation warning and ran against whatever was loaded.
+  **Migration:** set `"default_profile"` in `profiles.json`.
+- **`darkmux lab eval --k`, `--roster-profile`, `--exec-mode` and
+  `--bundler`.** They configured the funnel mode deleted in #2310 P4d and
+  were accepted and silently ignored since; `--k` claimed a value above 1
+  was a loud error, and it was not. **Migration:** drop the flags; they
+  never changed a run.
+- **Doctor's "legacy compaction extras" check.** The openclaw-shape keys
+  it warned about (`mode`, `maxHistoryShare`, `recentTurnsPreserve`,
+  `customInstructions` under `runtime.compaction`) now ride as ordinary
+  unrecognized extras: kept on round-trip, read by nothing. **Migration:**
+  none required; delete the keys if you like (`custom_instructions` is the
+  typed field).
+- **Doctor's residue checks for pre-3.x removals:** the `crews` map in
+  `profiles.json`, the `review{}` config block,
+  `runtime.telemetry_record_every_samples`, and the "daemon predates the
+  build field" verdict. Each key is still read leniently and ignored.
+  **Migration:** delete any of those keys still present (3.x's `darkmux
+  doctor` names them).
 
 ### Changed (breaking, 4.0)
 
+- **A lab run with no verify spec reports verify "not checked", not a pass**
+  (#2982). A `prompt` workload that declares no verify used to record
+  `verify=pass (no verify spec)`; its outcome is now no verify at all, so
+  `lab run` prints no verify note, `lab run inspect`'s note reads `verify:
+  not checked — no verify spec`, and `lab loop` reads such a run with no
+  tool calls as `failed` rather than `inert-false-pass` (both exit 1). **Migration:** a script that
+  grepped for `verify=pass` on a no-verify workload should key on the exit
+  code instead.
+- **`lab characterize` and `lab tune` exit 1 on a failed verify** (#2982),
+  through the same gate as `lab run`; they used to exit 0 whenever every
+  dispatch completed. They, and `lab loop`, also exit 130 when a signal
+  ends the run, as `lab run` already did. **Migration:** a script that
+  treated exit 0 from these verbs as "the dispatch ran" should expect 1
+  when the workload's verify fails.
+- **A provider error fails one lab run, not the batch** (#2986). When run
+  k of N errored, `lab run`, `lab characterize` and `lab tune` stopped and
+  discarded runs 1..k-1. Now the errored run is recorded (its lifecycle
+  reads `error`, and stderr names it), returned as a failed outcome, and
+  the batch goes on; only a signal stops it. The exit code is still 1.
+  `lab tune`'s stats cover the runs that completed, it names each errored
+  run, and its header reads `× N run(s), K completed`. `lab run`'s summary
+  line reads `N run(s): K completed, E errored` (it was `N run(s)
+  complete:`). `lab run inspect` on an errored run shows the error its
+  lifecycle recorded, which now keeps the whole cause chain. **Migration:**
+  a script that read "exit 1 with an error message" as "nothing after this
+  ran" should read the per-run lines, and one that matched `run(s)
+  complete:` should match the new summary.
+- **A prompt run's manifest records its verify, so `lab run list` shows a
+  failed one as `FAIL`** (#2494). It used to show a plain tick. A manifest
+  written before this reads as not checked (`—`), never as a pass.
+- **Two lab runs in the same second no longer share a run dir, so a run id
+  can carry a claim suffix** (#2981). The second run used to overwrite the
+  first's artifacts. A run whose `<workload>-<profile>-<epoch>-<n>`
+  directory already exists now claims
+  `<n>.2`, `<n>.3`, … instead of writing into it. **Migration:** a tool that
+  parses the last segment of a run id as an integer must accept `<n>.<k>`.
 - **The per-step cap on hosted tokens is renamed, has no default, and
   never stops a step: a step that used to stop at 500,000 hosted tokens now
   runs to completion unless you set a cap** (#2902 step 5).
@@ -98,6 +178,71 @@ darkmux release.
   it now, so it no longer caps anything. Delete it, or, to keep a cap, run
   `darkmux config set remote.max_tokens_per_step <n>` (and rename an
   exported `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`).
+
+- **A profile names the machine that runs it: `profile@machine`; `dispatch
+  --machine` is removed** (#2916 stage 2, no alias). `darkmux dispatch
+  <role> --profile host@studio` sends the dispatch to the studio's fleet
+  listener (stage 1's authenticated channel, below), and the studio resolves
+  `host` against its OWN registry and loads it; the sending machine needs no
+  profile of that name. An address naming this machine runs here, on the
+  bare name. The machine part is a `machine_id` (letters, digits, `-`,
+  `_`), resolved at dispatch time against this machine's roster,
+  case-insensitively. The receiver is the only judge of the profile: an
+  undefined name is refused by name, never replaced by its
+  `default_profile`. On a path that runs only on this machine (the lab, a
+  mission step, until mission steps route), an address is refused naming
+  it, never read as an undefined local name. The sender's `dispatch route`
+  record carries `profile_address`; tokens are counted once, by the machine
+  that runs the model, never on the sender's records. A profile name that
+  contains `@` cannot be addressed. **Migration:** `darkmux dispatch <role>
+  --machine <m> [--profile <p>]` becomes `darkmux dispatch <role> --profile
+  <p>@<m>`; name the profile on `<m>` that the job should run on (with no
+  `--profile`, the old form resolved the role's binding on `<m>`; name that
+  profile now). `darkmux mission dispatch` keeps its own `--machine` until
+  it is retired (#2954).
+
+- **`remote.concurrent_cap = 0` means unbounded everywhere** (#2916 stage 2).
+  The scheduler's hosted track used to clamp `0` to `1`, while the fleet
+  listener read `0` as no limit. Both now read it as no limit, the darkmux
+  bound convention. **Migration:** if you set `0` to mean "one at a time",
+  set `1`.
+
+- **Busy is decided per seat, and a receiver chooses refuse or queue**
+  (#2916 stage 2). A worker no longer runs one submitted job at a time. A
+  job on a LOCAL model holds that model for its run (LM Studio serves one
+  request at a time per instance), so a second job for the same model is
+  busy while a job for a different local model runs beside it; a job on a
+  HOSTED endpoint runs beside others up to the receiver's own
+  `remote.concurrent_cap`. Past either limit the receiver's new
+  `fleet.busy_policy` answers (CONFIG 1.33, `refuse` by default, written
+  visibly by `init`): `refuse` says `busy: <machine> is running other work
+  on that seat (...)` at once, naming what runs; `queue` holds the job
+  (first come, first served per seat; at most 4 queued per sending
+  machine) and tells the sender it is waiting, with a `queued` line every
+  20 seconds until it runs. A queued job passes every admission check
+  again when its seat frees (the fleet token in force against the one it
+  was admitted with, the sender's network identity, its allow-list entry,
+  the config preflight, the scope with its profile resolved afresh), so
+  `untrust` or removing the sender from the network also stops jobs
+  already waiting. Rotating or removing the fleet token takes effect when
+  the daemon restarts (it reads the token once), and a restart drops the
+  queue anyway. A sender that closes its connection
+  gives its place back and its job never runs; one that vanishes without
+  closing it (a laptop that sleeps) keeps its place until TCP gives up on
+  the connection. A waited-on job waits no longer than its connection
+  allows (worked out from its timeout, which a container-agentic run does
+  not enforce), and one queued without `--wait` at most 30 minutes (then
+  it is answered busy and never runs). A reply with a status this darkmux
+  does not know (a newer receiver) is reported as such, with the job
+  possibly still running. Only jobs from other machines count: this machine's own
+  dispatches are not seen by the listener. When a connection drops after
+  the receiver may have taken the job, the sender says the job may still be
+  running there and names the session to follow. The sender prints the
+  receiver's words verbatim. A bad value is refused at the listener's start and reported
+  Fail by `darkmux doctor` (#2947). The work-submission wire moves to
+  schema `6` (a reply body is newline-delimited: `queued` lines, then the
+  answer), so both machines must run the same darkmux; a mismatch is
+  refused naming both versions.
 
 - **The degeneracy detector's policy values name the action: `off`,
   `record`, `warn`, `conclude`** (#2947). `enforce` is now `conclude` (still
@@ -441,6 +586,25 @@ darkmux release.
 
 ### Fixed
 
+- **Model output can no longer reach host files through symlinks** (#2869).
+  Every host read or copy of a container-writable path (the out-dir,
+  `.darkmux-runtime/`, the resume checkpoint, the live trajectory tailer,
+  `mods.gate`'s scratch copy) now walks with no-follow at every component and
+  accepts regular files only, with a size cap. A refused file is named once in
+  a warning. `mods.gate` recreates a relative link only when it provably stays
+  inside the checkout; other links are skipped and named. The live tailer reads
+  in bounded chunks, so a huge sparse trajectory can't exhaust memory.
+- **`darkmux flow status` no longer reports every `file` hook rule as URL
+  REFUSED**, and doctor no longer contradicts itself on a rule that names both
+  `http` and `file` (or neither). Doctor, `flow status` and the hook engine share
+  one destination decision.
+- **Doctor warns when a hook rule's deliveries keep giving up**, naming the last
+  error in an indented, sanitized hint. Its remedy names the resolved
+  `config.json` (honoring `DARKMUX_HOME`), and delivery-side flags point at
+  `darkmux flow status` rather than the config.
+- **The residency planner no longer evicts when nothing needs the room** (an
+  unpriced or zero-sized load, or no surviving load). Latent today: no config
+  sets a model-RAM budget yet (#2987).
 - **The compaction window is the selected model's own** (#2902 step 3).
   With several models in a profile, a dispatch compacted at the profile's
   DEFAULT model's `n_ctx` even when capability selection picked another

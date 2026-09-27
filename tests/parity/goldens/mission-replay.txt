@@ -33,6 +33,5 @@ FRESH INPUT
 RE-READ
 0
 DISPATCHES
-Orchestrator note: going hybrid takes nerve. the fleet is ready when you are.
 waiting for the first flow record…
 

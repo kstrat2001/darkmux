@@ -257,7 +257,7 @@ pub struct ReviewBenchOpts {
     /// `pr-reviewer` (the original `review-bench` behavior). The scorer is
     /// role-agnostic (it matches the emitted `{verdict, findings}` JSON against
     /// the labels), so any role honoring that contract is a caller. The
-    /// experimental condition modes (`FreeForm`/`Agentic`/`Dialectic`/`Funnel`)
+    /// experimental condition modes (`FreeForm`/`Agentic`/`Dialectic`)
     /// dispatch fixed `pr-reviewer`-variant roles / pipelines and ignore this
     /// field — a follow-up moves those behind per-role config (#1465).
     pub role: String,
@@ -284,36 +284,6 @@ pub struct ReviewBenchOpts {
     pub prosecutor_profile: Option<String>,
     pub defender_profile: Option<String>,
     pub judge_profile: Option<String>,
-    /// (#1475) `Funnel` mode's ROSTER profile — the one profile the bench pins
-    /// EVERY review seat (probe / judge / verify) to for a controlled run, via
-    /// packet 3's per-run role→profile override. Falls back to `profile_name`,
-    /// else the registry's `default_profile`. (The `--roster-profile` flag;
-    /// renamed from `--crew` in #1465. The roster-scoring resolver it once fed
-    /// was deleted in #1475 packet 3 — the bench and the operator path now share
-    /// one resolver.)
-    pub roster_profile: Option<String>,
-    /// (#1222) `Funnel` mode's model-cycling mode override —
-    /// `"sequential"` | `"parallel"` | `"auto"` (default: `auto`, resolved
-    /// once against the local hardware tier — see `review::resolve_mode`).
-    pub exec_mode: Option<String>,
-    /// (#1222 / #1475, RETIRED #1512 / #1513 review) Historically the
-    /// `Funnel` mode probe draw-BREADTH knob, applied post-resolution to
-    /// every `review-probe` seat's `k`. Draw multiplication no longer
-    /// exists — one role is one task is one dispatch (#1512) — so this is
-    /// now a back-compat-only field: `None` or `Some(1)` are accepted as a
-    /// no-op; `resolve_funnel_ctx` REJECTS `Some(k)` where `k > 1` with a
-    /// named error rather than silently stamping a `k` the graph would
-    /// never honor (a `--k 3` run used to fire 3x the dispatches; today it
-    /// would fire the SAME one dispatch per role while claiming k=3 in the
-    /// artifact — a dishonest, unobservable self-description; #1513 review
-    /// M1). To sweep recall breadth, vary the SET of probe roles
-    /// review.json declares instead.
-    pub k_override: Option<u32>,
-    /// (#1222) `Funnel` mode's external bundler command
-    /// (`<cmd> --worktree <dir> --diff <file>`, `lab::bundle::external_bundles`'s
-    /// contract) — the built-in Rust bundler (`lab::bundle::build_bundles`)
-    /// runs when `None`.
-    pub bundler_cmd: Option<String>,
 }
 /// Where a bench run's artifacts land when the caller named no `--scores-out`.
 ///

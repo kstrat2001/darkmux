@@ -191,74 +191,34 @@
         assert_eq!(phases[0].id, "s-real");
     }
 
-    // ─── Beat-33 dual-read fallback tests ────────────────────────────────
+    // ─── 4.0: no pre-Beat-33 `<root>/crew/` dual read ────────────────────
     //
-    // `resolve_user_subdir` prefers the post-flatten canonical path
-    // (`<root>/<subdir>/`) and falls back to the legacy pre-flatten path
-    // (`<root>/crew/<subdir>/`) for operators who haven't migrated. These
-    // tests pin the resolution table so a regression that silently flips
-    // preference (e.g., always prefer legacy) fails loudly.
+    // User-state subdirs resolve to `<root>/<subdir>/` only. A leftover
+    // `<root>/crew/<subdir>/` is never read; `darkmux doctor` fails on it
+    // and prints the move script.
 
     #[serial]
     #[test]
-    fn resolve_user_subdir_prefers_canonical_when_only_canonical_exists() {
+    fn user_subdirs_resolve_to_the_flat_root() {
         let guard = TestCrewRoot::new();
-        let canonical = guard.path().join("roles");
-        std::fs::create_dir_all(&canonical).unwrap();
-        assert_eq!(roles_dir(), canonical);
+        assert_eq!(roles_dir(), guard.path().join("roles"));
+        assert_eq!(missions_dir(), guard.path().join("missions"));
+        assert_eq!(phases_dir(), guard.path().join("phases"));
     }
 
     #[serial]
     #[test]
-    fn resolve_user_subdir_falls_back_to_legacy_when_only_legacy_exists() {
-        let guard = TestCrewRoot::new();
-        let legacy = guard.path().join("crew").join("roles");
-        std::fs::create_dir_all(&legacy).unwrap();
-        assert_eq!(roles_dir(), legacy);
-    }
-
-    #[serial]
-    #[test]
-    fn resolve_user_subdir_prefers_canonical_when_both_exist() {
-        // Operator partway through a migration — canonical should win so
-        // future reads + writes consolidate at the new layout (legacy
-        // becomes operator-visible-but-not-touched, doctor PR-3b
-        // surfaces it for cleanup).
-        let guard = TestCrewRoot::new();
-        let canonical = guard.path().join("missions");
-        let legacy = guard.path().join("crew").join("missions");
-        std::fs::create_dir_all(&canonical).unwrap();
-        std::fs::create_dir_all(&legacy).unwrap();
-        assert_eq!(missions_dir(), canonical);
-    }
-
-    #[serial]
-    #[test]
-    fn resolve_user_subdir_returns_canonical_when_neither_exists() {
-        // Fresh install — neither layout exists. The canonical path is
-        // returned so a subsequent write creates the new layout
-        // (operator-sovereignty: no silent migration of legacy state).
-        let guard = TestCrewRoot::new();
-        let canonical = guard.path().join("phases");
-        assert!(!canonical.exists());
-        assert!(!guard.path().join("crew").join("phases").exists());
-        assert_eq!(phases_dir(), canonical);
-    }
-
-    #[serial]
-    #[test]
-    fn loader_finds_user_role_override_in_legacy_layout() {
-        // End-to-end: an operator with the legacy `<root>/crew/roles/`
-        // layout still gets their override picked up by load_roles().
+    fn a_legacy_crew_subdir_is_never_read() {
         let guard = TestCrewRoot::new();
         let legacy_roles = guard.path().join("crew").join("roles");
         std::fs::create_dir_all(&legacy_roles).unwrap();
         let user_json = r#"{"id":"coder","description":"legacy-layout override","skills":[],"tool_palette":{"allow":["read"],"deny":[]},"escalation_contract":"bail-with-explanation"}"#;
         std::fs::write(legacy_roles.join("coder.json"), user_json).unwrap();
 
+        assert_eq!(roles_dir(), guard.path().join("roles"));
         let roles = load_roles().unwrap();
-        let coder = roles.iter().find(|r| r.id == "coder").expect("coder must load");
-        assert_eq!(coder.description, "legacy-layout override");
+        let coder = roles.iter().find(|r| r.id == "coder").expect("builtin coder still loads");
+        assert_ne!(coder.description, "legacy-layout override");
     }
 
     // ─── #425: autonomous-dispatch preamble ─────────────────────────────

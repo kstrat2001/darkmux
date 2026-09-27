@@ -26,7 +26,7 @@ If you have more than one Mac, darkmux makes them work as a single development e
 
 Concretely, the capabilities the multi-machine substrate ships today:
 
-- **Machine-to-machine work submission (#2916).** `darkmux dispatch coder --machine <id>` sends the dispatch straight to that machine's fleet listener with the fleet token (the serve token). The receiver runs it only when the tailnet reports the sender as a node on its allow-list (`darkmux machine trust <sender> --profiles ...`) and the profile is in that entry's scope; otherwise it answers at once with the reason. The Redis work queue (`darkmux:work`) of earlier releases is retired. Profile-addressed routing (`profile@machine`) is the next stage.
+- **Machine-to-machine work submission (#2916).** `darkmux dispatch coder --profile <profile>@<machine>` sends the dispatch straight to that machine's fleet listener with the fleet token (the serve token); the machine resolves `<profile>` against its own registry. The receiver runs it only when the tailnet reports the sender as a node on its allow-list (`darkmux machine trust <sender> --profiles ...`) and the profile is in that entry's scope; otherwise it answers at once with the reason. Busy is per seat (one fleet job per local model, counting only jobs other machines send; hosted jobs up to the receiver's `remote.concurrent_cap`), and past that the receiver's `fleet.busy_policy` refuses or queues. The Redis work queue (`darkmux:work`) of earlier releases is retired, and so is `dispatch --machine`.
 - **Fleet status with specs.** `darkmux machine list --deep` fans out across every reachable peer's `/machine/specs` endpoint (RAM-free, loaded models, OS, darkmux version, redacted Redis URL) in one table (#275).
 - **Decentralized flow UI.** The daemon hosts the observability viewer at its own origin: `http://localhost:8765/` on every machine running `darkmux serve`. The viewer pulls from the daemon's `/flow/<date>` endpoint which aggregates events from every machine writing to the shared `darkmux:flow` Redis stream, so you see the fleet, not just the host (#270 + #554).
 - **`/darkmux-add-machine` skill.** Walkthrough for joining a new Mac to an existing fleet: env vars, roster setup, smoke test. Run `darkmux init` to install all skills locally (#176).
@@ -313,7 +313,7 @@ Cross-layer telemetry is always-on (#557): no flag, no sidecar file. The interna
 
 View it in the observability viewer the daemon serves: run `darkmux serve` and open `http://localhost:8765/`. The viewer reads live flow records straight from the daemon; there's nothing to drag and drop. A demo instance lives at [darkmux.com/demo](https://darkmux.com/demo).
 
-![The darkmux dashboard, fleet view: 6,029,666 tokens run locally against zero cloud tokens over 24 hours, broken into 269k generated, 364k fresh input and 5.7M re-read input across 10 dispatches on a three-Mac fleet, with an orchestrator note closing the day.](media/fleet.png)
+![The darkmux dashboard, fleet view: 6,029,666 tokens run locally against zero cloud tokens over 24 hours, broken into 269k generated, 364k fresh input and 5.7M re-read input across 10 dispatches on a three-Mac fleet.](media/fleet.png)
 
 ## Why this exists: empirical motivation
 
@@ -337,7 +337,7 @@ The case for darkmux: **once you accept that static configs leave performance on
 - ✅ Flow substrate: `LocalFileSink` (always) + `AuditFileSink` (BLAKE3 hash chain, verifiable via `flow integrity-check`; opt-in) + `RedisSink` (coordination; opt-in), composed via `TeeSink`
 - ✅ `darkmux flow status` + `darkmux flow integrity-check` diagnostic verbs
 - ✅ Observability daemon (`darkmux serve`) + `/flow` + `/lab` web viewers
-- ✅ Doctor: 30+ pre-flight checks with actionable hints, plus a legacy-extras warning that flags profiles still carrying pre-#380 compaction keys (`mode`, `maxHistoryShare`, …)
+- ✅ Doctor: 30+ pre-flight checks with actionable hints
 
 **On the roadmap (active):**
 

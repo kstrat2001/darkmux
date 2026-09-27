@@ -1,14 +1,14 @@
 /**
- * The single source of truth for "which of the app's three legacy-style
- * modal dialogs (Filters/Notes/About) is open" — ported from viewer.html's
+ * The single source of truth for "which of the app's modal dialogs
+ * (Filters/About) is open" — ported from viewer.html's
  * `openModalEl`/`closeOpenModal`/`restoreModalFocus`/`MODAL_IDS` (#1640).
  *
- * Three independent trigger components need this — the event log's Filters
- * button (`EventLogColumn.tsx`), the fleet hero's "history →" Notes link
- * (`FleetLens.tsx`), and the masthead's build chip (`Masthead.tsx`). Legacy
- * enforces "exactly one dialog open at a time" through a single set of
- * module-scoped globals; three independent React `useState`s could never
- * enforce that same invariant across three unrelated component subtrees, so
+ * Independent trigger components need this — the event log's Filters
+ * button (`EventLogColumn.tsx`) and the masthead's build chip
+ * (`Masthead.tsx`). Legacy enforces "exactly one dialog open at a time"
+ * through a single set of module-scoped globals; independent React
+ * `useState`s could never enforce that same invariant across unrelated
+ * component subtrees, so
  * this stays an external store (subscribed to via `useOpenModalId`,
  * `useSyncExternalStore`) rather than component-local state.
  *
@@ -36,8 +36,8 @@
  */
 import { useSyncExternalStore } from "react";
 
-export type ModalId = "modalbg" | "nmodalbg" | "imodalbg";
-export const MODAL_IDS: ModalId[] = ["modalbg", "nmodalbg", "imodalbg"];
+export type ModalId = "modalbg" | "imodalbg";
+export const MODAL_IDS: ModalId[] = ["modalbg", "imodalbg"];
 
 let openId: ModalId | null = null;
 let returnFocus: HTMLElement | null = null;

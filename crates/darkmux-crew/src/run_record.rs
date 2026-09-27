@@ -101,7 +101,7 @@
 //! two vocabularies apart.
 
 use crate::resourcing::{ResolvedSeatStaffing, StaffingProvenance};
-use darkmux_profiles::swap;
+use darkmux_profiles::ownership;
 use darkmux_types::{BundleSelector, ModelEndpoint, ProfileModel};
 use serde::{Deserialize, Serialize};
 
@@ -182,14 +182,14 @@ pub struct StepRecord {
 // ─── resolved staffing snapshot ──────────────────────────────────────────
 
 /// (#1260) The dispatch identity for one seat. LOCAL seats use the
-/// darkmux-namespaced LMStudio identifier (`swap::namespaced_identifier`);
+/// darkmux-namespaced LMStudio identifier (`ownership::namespaced_identifier`);
 /// REMOTE seats keep the profile's bare model id — nothing is loaded into
 /// LMStudio, so no `darkmux:` namespace entry is ever minted for them (the
 /// namespace marks darkmux-owned LOCAL residency, and a remote seat has
 /// none).
 pub fn seat_identifier(pm: &ProfileModel) -> String {
     if pm.is_managed() {
-        swap::namespaced_identifier(pm)
+        ownership::namespaced_identifier(pm)
     } else {
         pm.id.clone()
     }

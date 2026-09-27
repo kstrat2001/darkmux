@@ -15,6 +15,11 @@
 // Each variant first asserts which part lines it shows, so a fixture that
 // stopped reporting cached or utility tokens fails here rather than
 // measuring the plain hero four times.
+//
+// (#2983) `hero-notes` puts `note` records in the window, a long
+// mission-level orchestrator one included. The hero used to render the
+// latest as an "Orchestrator note:" line that wrapped to fit it, so the hero
+// grew with the note's length; it now renders none, at one height.
 const { test, expect } = require("@playwright/test");
 const { HEROES, PLAYBACK_NOW, VIEWPORTS, installLayoutRoutes, measure } = require("./lib/layout-fixture.js");
 
@@ -40,6 +45,9 @@ for (const [vpName, viewport] of Object.entries(WIDTHS)) {
         const want = [...(h.util ? ["utility"] : []), ...(h.cached ? ["cached"] : [])];
         await expect(parts, `${h.id}: the hero must show exactly these part lines`).toHaveCount(want.length);
         for (const w of want) await expect(parts.filter({ hasText: w })).toHaveCount(1);
+        // (#2983) The orchestrator note is gone: no line, no history link,
+        // no procedural stand-in, whatever `note` records the window holds.
+        await expect(page.locator(".savings"), `${h.id}: the hero renders no note line`).not.toContainText(/note|history/i);
         await page.waitForTimeout(400);
         rows.push({ id: h.id, ...(await measure(page, HERO)) });
         await ctx.close();

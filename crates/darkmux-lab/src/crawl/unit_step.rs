@@ -583,6 +583,32 @@ pub fn default_unit_max_turns(unit: &Unit) -> u32 {
     sites.saturating_mul(TURNS_PER_SITE).clamp(MIN_UNIT_MAX_TURNS, MAX_UNIT_MAX_TURNS)
 }
 
+/// (#2869) Read `<out_dir>/.darkmux-runtime/<name>` as text. The out-dir is
+/// writable by the model's tools, so this is a no-follow, regular-file-only
+/// read (`contained_file`): a planted symlink, FIFO or swapped directory is
+/// refused, never followed on the host. A refusal is warned on stderr and
+/// then treated like a missing file, which every caller here already
+/// handles; absence stays silent.
+pub(crate) fn read_runtime_text(out_dir: &Path, name: &str) -> Option<String> {
+    use darkmux_crew::contained_file::{read_contained_to_string, DEFAULT_MAX_BYTES};
+    let rel = Path::new(".darkmux-runtime").join(name);
+    match read_contained_to_string(out_dir, &rel, DEFAULT_MAX_BYTES) {
+        Ok(body) => Some(body),
+        Err(e) => {
+            if e.is_refused() {
+                eprintln!(
+                    "{}",
+                    darkmux_types::style::warn(&format!(
+                        "crawl.unit: {} not read — {e}",
+                        out_dir.join(&rel).display()
+                    ))
+                );
+            }
+            None
+        }
+    }
+}
+
 /// (#2193) Whether this unit's LAST `n` turns collectively made no
 /// progress: no `create_finding` ATTEMPT (accepted or rejected) and no
 /// path read that an earlier turn hadn't already read. Best-effort — a
@@ -594,7 +620,7 @@ pub fn unit_hit_no_progress_bound(out_dir: &Path, n: usize) -> bool {
     if n == 0 {
         return false;
     }
-    let Ok(body) = std::fs::read_to_string(out_dir.join(".darkmux-runtime").join("trajectory.jsonl")) else {
+    let Some(body) = read_runtime_text(out_dir, "trajectory.jsonl") else {
         return false;
     };
 
@@ -638,7 +664,7 @@ pub fn unit_hit_no_progress_bound(out_dir: &Path, n: usize) -> bool {
 /// skipped — this is a best-effort operator-facing count, never a
 /// correctness-bearing value.
 pub fn count_rejected_create_findings(out_dir: &Path) -> usize {
-    let Ok(body) = std::fs::read_to_string(out_dir.join(".darkmux-runtime").join("trajectory.jsonl")) else {
+    let Some(body) = read_runtime_text(out_dir, "trajectory.jsonl") else {
         return 0;
     };
     body.lines()
@@ -754,8 +780,7 @@ fn readback_findings(
     model: Option<&str>,
     session_id: &str,
 ) -> (usize, Vec<FindingRef>) {
-    let findings_path = out_dir.join(".darkmux-runtime").join("findings.jsonl");
-    let Ok(body) = std::fs::read_to_string(&findings_path) else {
+    let Some(body) = read_runtime_text(out_dir, "findings.jsonl") else {
         return (0, Vec::new());
     };
     // (#2302) A key's dispatch half becomes a path segment under the

@@ -196,19 +196,33 @@ describe("labFeedStatusSuffix", () => {
 });
 
 describe("labCliHint", () => {
-  it("prefers the envelope's crew/mode over the scores fallback", () => {
-    expect(
-      labCliHint({ crew: "reviewer", mode: "auto", confirmed: 0, needs_check: 0, archived: 0 }, { crew: "other", exec_mode: "manual" }),
-    ).toBe("darkmux lab eval --funnel --roster-profile reviewer --exec-mode auto --workdirs <workdirs-root> <cases-dir>");
+  // (4.0) The hint used to print `--funnel --roster-profile … --exec-mode …`,
+  // flags `lab eval` no longer has (clap rejects them). It is rebuilt from
+  // what `scores.json` actually records: `role`, `mode`, and the profile.
+  it("a strict run names its role, cases dir, and profile", () => {
+    expect(labCliHint({ role: "coder", mode: "strict", provenance: { profile: "fast" } })).toBe(
+      "darkmux lab eval coder --cases-dir <cases-dir> --profile fast",
+    );
   });
 
-  it("falls back to scores, then to the literal placeholders", () => {
-    expect(labCliHint(null, { crew: "reviewer", exec_mode: "manual" })).toBe(
-      "darkmux lab eval --funnel --roster-profile reviewer --exec-mode manual --workdirs <workdirs-root> <cases-dir>",
+  it("an experimental mode keeps the default role and adds its own flags", () => {
+    expect(labCliHint({ role: "pr-reviewer", mode: "agentic" })).toBe(
+      "darkmux lab eval --cases-dir <cases-dir> --agentic --workdirs <workdirs-root>",
     );
-    expect(labCliHint(null, null)).toBe(
-      "darkmux lab eval --funnel --roster-profile <crew> --exec-mode auto --workdirs <workdirs-root> <cases-dir>",
+    expect(labCliHint({ role: "pr-reviewer", mode: "dialectic" })).toBe(
+      "darkmux lab eval --cases-dir <cases-dir> --dialectic --workdirs <workdirs-root>",
     );
+    expect(labCliHint({ role: "pr-reviewer", mode: "freeform" })).toBe(
+      "darkmux lab eval --cases-dir <cases-dir> --freeform",
+    );
+  });
+
+  it("with no scores yet, placeholders only — and never a removed flag", () => {
+    const hint = labCliHint(null);
+    expect(hint).toBe("darkmux lab eval <role> --cases-dir <cases-dir>");
+    for (const gone of ["--funnel", "--roster-profile", "--exec-mode", "--k", "--bundler"]) {
+      expect(hint).not.toContain(gone);
+    }
   });
 });
 

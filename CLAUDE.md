@@ -214,8 +214,8 @@ vocabulary without the dispatch-liveness bookends (violated: running work is vis
 
 The contract registry (extend this list when a new cross-cutting invariant is born):
 
-1. **Profile uniformity** — a profile means the same thing to every consumer (swap, dispatch,
-   crews, benches). A consumer may not legislate which profiles are legal; it routes on what
+1. **Profile uniformity** — a profile means the same thing to every consumer (dispatch,
+   missions, benches). A consumer may not legislate which profiles are legal; it routes on what
    the profile declares (local vs endpoint → dialect, cycling, token accounting).
 2. **Dispatch liveness** — any production code path that performs a WORK execution emits
    `dispatch.start` and a terminal `dispatch.complete`/`dispatch.error` (RAII-guarded on all
@@ -457,7 +457,7 @@ darkmux's canonical config surface is **`~/.darkmux/config.json`** (#661), writt
 
 ```json
 {
-  "schema_version": "1.2",
+  "schema_version": "1.33",
   "machine_id": "studio",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
@@ -479,7 +479,7 @@ When proposing a config change to an operator, write the visible field; don't re
 
 **Schema is minor-bump + lenient on read** (all-`Option` + `#[serde(flatten)] extras` overflow): an older binary tolerates a newer config, and a partial/hand-edited/malformed config never bricks the CLI — loud validation belongs to `darkmux doctor`, not the hot load path. `CONFIG_SCHEMA_VERSION` lives in `darkmux-types/src/config.rs`.
 
-**Don't confuse `config.json` with the profiles registry.** `~/.darkmux/profiles.json` (the swap profiles) is a SEPARATE file, overridden by `--profiles-file` / `DARKMUX_PROFILES` — **renamed in #661 from the misleading `--config` / `DARKMUX_CONFIG`** (those names are retired, not reused, because a real `config.json` now exists).
+**Don't confuse `config.json` with the profiles registry.** `~/.darkmux/profiles.json` (the model profiles) is a SEPARATE file, overridden by `--profiles-file` / `DARKMUX_PROFILES` — **renamed in #661 from the misleading `--config` / `DARKMUX_CONFIG`** (those names are retired, not reused, because a real `config.json` now exists).
 
 ## Environment variables
 
@@ -528,14 +528,15 @@ Two rules worth carrying without looking anything up:
   (or `calls: 0`) is REFUSED ("0 is not a budget; set policy off to turn it
   off"), because read either way it would be an eternal wait.
 - **Two concurrency caps, and they are not interchangeable (#2394).**
-  `DARKMUX_REMOTE_CONCURRENT_CAP` → `remote.concurrent_cap` bounds HOSTED
-  endpoint dispatches; `DARKMUX_DISPATCH_FREE_CONCURRENCY` →
+  `DARKMUX_REMOTE_CONCURRENT_CAP` → `remote.concurrent_cap` (default `1`,
+  `0` = unbounded) bounds HOSTED endpoint dispatches, and on a fleet
+  receiver the hosted jobs other machines send; `DARKMUX_DISPATCH_FREE_CONCURRENCY` →
   `runtime.dispatch_free_concurrency` (default `8`) bounds steps that speak to
   no model at all (`procedural.shell`, `mods.gate`, `records.gather`,
   `deliver.github_review`). They were one cap only because a dispatch-free step
-  had no way to say what it consumed; a mission launch sets the remote cap to
-  1, so six independent shell waits ran strictly one at a time. See "Seat
-  classes" in `DESIGN.md`.
+  had no way to say what it consumed; a mission launch reads the remote cap
+  from config (default `1`, since #2681), so at the default six independent
+  shell waits ran strictly one at a time. See "Seat classes" in `DESIGN.md`.
 
 
 ## Where things live
@@ -562,7 +563,6 @@ src/                          CLI command layer (clap)
   config_cmd.rs               `config` get/set/list
   init.rs / skills.rs         `darkmux init` (idempotent setup + bundled-skill refresh) + skill installer
   conventions.rs              Shared CLI helpers
-  migrate.rs                  Storage-layout migrations
 crates/
   darkmux-types/              Profile / ProfileRegistry / config / flow record schemas + config_access
   darkmux-profiles/           Registry loader + lookup
@@ -629,21 +629,16 @@ crates/darkmux-crew/src/step_kinds/
     patterns/     — Tier 2: a genuinely new, reusable control-flow SHAPE,
                     with the domain-specific ALGORITHM plugged in as a
                     caller-supplied strategy (deliberately NO runtime
-                    name-keyed strategy registry yet; dedup.rs's module
-                    doc names the upgrade path for when a second strategy
-                    needs runtime selection). multi_pass_confirm.rs (the
-                    pass-1 → conditional confirmation passes → demote-on-
-                    disagreement shape, generalized from the PR-review
-                    judge; pass count + confirm rule are parameterized,
-                    the demotion rule is currently fixed — a known,
-                    documented narrowing of #1352's spec, widen when a
-                    consumer needs a different demotion). dedup.rs (the
-                    "scan for the first survivor a candidate collapses
-                    into, per a pluggable match/merge strategy" procedure,
-                    generalized from the PR-review dedup stage). Neither
-                    submodule depends on any mission's own types, which is
-                    what keeps a Tier 2 pattern actually reusable rather
-                    than one mission's code with extra ceremony.
+                    name-keyed strategy registry). plan_sites.rs (the
+                    "prefilter hits over a source, window each hit, pack
+                    windows into sizing-bounded units" procedure, shared
+                    by the crawl planner and the diff-scoped `plan.sites`
+                    step). Nothing here depends on any mission's own
+                    types, which is what keeps a Tier 2 pattern actually
+                    reusable rather than one mission's code with extra
+                    ceremony. (The funnel-era multi_pass_confirm.rs and
+                    dedup.rs were deleted in 4.0: their only consumer was
+                    the funnel #2310 P4d removed.)
     types.rs      — the StepKind trait itself.
     registry.rs   — StepKindRegistry.
 ```
@@ -689,7 +684,7 @@ If a user asks you to:
 | "make the build self-contained" | Already is — `include_str!` for embedded workloads, no external assets needed at runtime. |
 | "review the diff before commit" | Run the AREA you touched (`cargo t-review`, `cargo t-flow`, … — see "Testing — run the area, not the world"; `t-all` only for a cross-cutting change or a release), eyeball `git diff`, propose a commit message — but **do not commit unless explicitly asked**. |
 | "check the mission board / housekeeping" | `darkmux mission status` (#829) — the global mission-control read: every mission grouped by status with phase progress + the drift that needs attention (an open mission whose phases are all done; a stalled Active mission; a phase permanently blocked by an earlier abandoned one) + copy-pasteable reconcile commands. READ-ONLY — surfaces + suggests, never mutates; the operator/you run the suggested `mission finalize`/`mission abort` (#1463 — those two whole-mission terminals reconcile phases now, so a "Finalized mission with a non-terminal phase" is no longer a reachable drift). `--json` for programmatic consumption. **Run it as session-start housekeeping** (and before opening PRs / wrapping a work arc) so mission↔phase drift gets caught structurally rather than by memory — and so gh/jira stay reconciled off the same cue. The CLI twin of the viewer's missions lens (#827). |
-| "leave an orchestrator note on the dashboard" | `darkmux flow note --text "<note>" --source orchestrator` (#807) — the savings hero renders the latest tagged note verbatim as its "Orchestrator note:" conclusion (procedural template is the fallback), and `history →` lists the window's notes. **Voice (operator-specified): 1–2 upbeat, plain-language lines — what the crew got done + keep-going energy. No jargon, no file paths, no verdict prose. This is encouragement infrastructure, not a changelog.** Emit one after a mission ships or a work arc wraps. TOKENS-ONLY discipline applies (no currency). Technical gate reasoning goes to the SEPARATE audit-trail channel instead: `darkmux flow note --session-id <sid> --text "<verdict · what you overrode · why>" --source adjudication` (#817) — session-scoped, never rendered on the hero card. |
+| "record my adjudication of a dispatch" | `darkmux flow note --session-id <sid> --text "<verdict · what you overrode · why>" --source adjudication` (#817, #849) — the session-scoped audit trail for gate reasoning. Later coder briefs in the same mission carry these as `<prior-adjudication-corrections>`, `darkmux memory correction list` lists them, and `mission debrief` reviews them. Nothing renders notes on the dashboard (#2983). |
 
 ## Things to ASK before doing
 
@@ -779,15 +774,15 @@ When darkmux loads a model under `darkmux:<id>`, the underlying LMStudio model k
 
 When writing a new feature that mutates LMStudio state on the operator's behalf:
 
-1. **Generate the namespaced form** at the point of write. See `swap::namespaced_identifier`.
-2. **Filter on the namespace** at the point of read/cleanup. See `swap::is_darkmux_owned`.
+1. **Generate the namespaced form** at the point of write. See `darkmux_profiles::ownership::namespaced_identifier`.
+2. **Filter on the namespace** at the point of read/cleanup. See `darkmux_profiles::ownership::is_darkmux_owned`.
 3. **Pass-through explicit overrides** — if the operator sets an explicit identifier in their profile, don't override it. The namespace is the *default*; the operator can opt out.
 
 ### Operator-facing commands
 
 - `darkmux machine status` — list `lms ps` results grouped by ownership (darkmux-managed vs user state). Read-only.
 - `darkmux machine eject [--dry-run]` — unload everything in the `darkmux:` namespace; never touches user state. Use to release darkmux's RAM footprint without disturbing other tools.
-- `darkmux dispatch <role-id> <text>` — dispatch a single turn to the named role. Looks up the role manifest + `.md` system prompt, then runs the role through the **internal runtime** (per-dispatch `darkmux-runtime` Docker container, mounted workspace tempdir, in-house Rust agent loop with streamed flow records). Pass `--image <tag>` (#703) to dispatch into a specific environment. By default darkmux runs the slim (python + node) runtime image built for its own version: a local `darkmux-runtime:latest` only when its `org.opencontainers.image.version` label matches the binary, otherwise the version-pinned `ghcr.io/kstrat2001/darkmux-runtime:<version>`, pulled on first use, and never an unlabeled or mismatched image (#2923). Naming a `darkmux-runtime:<tag>` (or GHCR) image runs that image after the same check, refused on mismatch. Naming any OTHER Linux image (e.g. `rust:slim`, the operator's own CI image) makes darkmux **inject** its static runtime binary into that image (bind-mount + entrypoint override) so the coder runs in that environment and can `cargo check`/`test` in-sandbox — the inner verify loop. darkmux ships NO per-language images (it brings the agent; you bring the environment). The image needs `bash` + coreutils (debian/ubuntu-family work as-is; bare-alpine needs them added). **For Rust in-sandbox lint** (`cargo clippy`), name an image that includes the clippy component — `rust:latest` ships it; bare `rust:slim` may not, and a missing clippy slips lint to the frontier gate. The coder role makes one bounded `rustup component add clippy` attempt when cargo is present but clippy isn't (the single exception to its no-toolchain-setup rule), but the reliable fix is the operator's image choice — BYO-environment, so bring clippy if you want in-sandbox lint. Local dispatch only today (ignored on cross-machine `--machine`).
+- `darkmux dispatch <role-id> <text>` — dispatch a single turn to the named role. Looks up the role manifest + `.md` system prompt, then runs the role through the **internal runtime** (per-dispatch `darkmux-runtime` Docker container, mounted workspace tempdir, in-house Rust agent loop with streamed flow records). Pass `--image <tag>` (#703) to dispatch into a specific environment. By default darkmux runs the slim (python + node) runtime image built for its own version: a local `darkmux-runtime:latest` only when its `org.opencontainers.image.version` label matches the binary, otherwise the version-pinned `ghcr.io/kstrat2001/darkmux-runtime:<version>`, pulled on first use, and never an unlabeled or mismatched image (#2923). Naming a `darkmux-runtime:<tag>` (or GHCR) image runs that image after the same check, refused on mismatch. Naming any OTHER Linux image (e.g. `rust:slim`, the operator's own CI image) makes darkmux **inject** its static runtime binary into that image (bind-mount + entrypoint override) so the coder runs in that environment and can `cargo check`/`test` in-sandbox — the inner verify loop. darkmux ships NO per-language images (it brings the agent; you bring the environment). The image needs `bash` + coreutils (debian/ubuntu-family work as-is; bare-alpine needs them added). **For Rust in-sandbox lint** (`cargo clippy`), name an image that includes the clippy component — `rust:latest` ships it; bare `rust:slim` may not, and a missing clippy slips lint to the frontier gate. The coder role makes one bounded `rustup component add clippy` attempt when cargo is present but clippy isn't (the single exception to its no-toolchain-setup rule), but the reliable fix is the operator's image choice — BYO-environment, so bring clippy if you want in-sandbox lint. On a `--profile <p>@<machine>` dispatch the tag is sent along, and the other machine runs it only if its allow-list entry for this machine lists it.
 
 (A previous entry here, the `crew sync` verb — reconciling an openclaw agent registry with the crew role manifests — was removed along with the openclaw shell-out path in #1405; the internal runtime reads role manifests directly, so there is no registry left to sync.)
 

@@ -133,7 +133,7 @@
   /* (U2-3) IN-FLIGHT, and deliberately not `--warn`. There were three
      ambers outside this block: `#ffd166` (a session bar that is RUNNING,
      plus the mission lens's own `--ml-run`), `#ffb86b` (stale panels,
-     canceled bars, lab warnings) and `--warn` itself. The last two are the
+     abandoned bars, lab warnings) and `--warn` itself. The last two are the
      same concept and are now one; the first is not — a run in progress is
      not a warning, and collapsing it would say so on every fleet screen. */
   --run: #ffd166;
@@ -3504,34 +3504,6 @@ body {
   letter-spacing: 0.08em;
   margin-top: 3px;
 }
-.hybnote {
-  margin-top: 9px;
-  padding-top: 8px;
-  border-top: 1px solid var(--border);
-  font: calc(12px * var(--fs-scale)) var(--font-mono);
-  color: var(--good);
-}
-.hybnote .hybpre {
-  color: var(--fg);
-  font-weight: 700;
-}
-.hybts {
-  color: var(--dim);
-  font-size: calc(10px * var(--fs-scale));
-}
-.hyblink {
-  color: var(--accent);
-  cursor: pointer;
-  font-size: calc(11px * var(--fs-scale));
-  margin-left: 4px;
-}
-.hyblink:hover {
-  text-decoration: underline;
-}
-.hyblink:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
-}
 
 /* (#2881, operator 2026-09-25: "plenty of room to make these cards bigger so
    that 3 fit across") A grid, not a wrapping row of fixed 248px cards: each
@@ -4227,17 +4199,17 @@ body {
     min-width: 24px;
   }
 }
-.sbar.run {
+.sbar.running {
   background-color: var(--run);
   box-shadow: 0 0 6px var(--run);
 }
-.sbar.done {
+.sbar.complete {
   background-color: var(--good);
 }
-.sbar.canceled {
+.sbar.abandoned {
   background-color: var(--warn);
 }
-.sbar.err {
+.sbar.error {
   background-color: var(--error);
 }
 .tltrack .ph {
@@ -6242,12 +6214,12 @@ body {
   margin-top: 3px;
 }
 
-/* ── Modal dialogs (#1640) — Filters/Notes/About ─────────────────────────
-   viewer.html's `.modalbg`/`.modal`/`.mhd`/`.mx`/`.fgroup`/`.mft`/`.nmodal`/
+/* ── Modal dialogs (#1640) — Filters/About ───────────────────────────────
+   viewer.html's `.modalbg`/`.modal`/`.mhd`/`.mx`/`.fgroup`/`.mft`/
    `.rrdetail`/`.kv` block (viewer.html:649-663, 574, 510-513), ported under
    fresh `.dialog*` BEM names — the port is free to restyle (per the packet
    brief: "visual styling may differ, text content must match"); only the
-   element `id`s (`#modalbg`/`#nmodalbg`/`#imodalbg`) and `data-act` hooks
+   element `id`s (`#modalbg`/`#imodalbg`) and `data-act` hooks
    are required to match legacy/the e2e specs, not the class names. See
    `Dialog.tsx` for the shared shell these classes style. */
 .dialog-backdrop {
@@ -6277,12 +6249,8 @@ body {
      no persistent element required — is the simpler correct tool here. */
   animation: dialog-pop-in 160ms ease-out;
 }
-.dialog--wide {
-  width: 540px;
-}
-/* (#2116) Filters gets its own width rule rather than reusing
-   `.dialog--wide` — Notes' fixed 540px is tuned for prose; the activity
-   facet's grid below wants to actually USE the extra room a wider
+/* (#2116) Filters gets its own width rule rather than a fixed width: the
+   activity facet's grid below wants to actually USE the extra room a wider
    viewport offers, so this scales with the viewport instead of pinning a
    second fixed number. `max-width: 92vw` on the base `.dialog` rule above
    still applies (this is additive, not a full override), so a narrow
@@ -6435,27 +6403,6 @@ body {
   .dialog__fgroup label:hover {
     color: var(--accent);
   }
-}
-.dialog__none {
-  color: var(--dim);
-  font: calc(12px * var(--fs-scale)) var(--font-mono);
-}
-.dialog__nrow {
-  border-bottom: 1px solid var(--border);
-  padding: 9px 0;
-}
-.dialog__nrow:last-child {
-  border-bottom: none;
-}
-.dialog__nts {
-  font: calc(10px * var(--fs-scale)) var(--font-mono);
-  color: var(--accent-dim);
-}
-.dialog__ntext {
-  font: calc(12px * var(--fs-scale))/1.5 var(--font-mono);
-  color: var(--fg);
-  margin-top: 3px;
-  white-space: pre-wrap;
 }
 .dialog__rrdetail {
   color: var(--dim);

@@ -1842,13 +1842,8 @@
     #[test]
     fn resolve_dispatch_model_internal_hard_fails_on_malformed_registry_no_probe_fallback() {
         // A genuine registry-LOAD failure (malformed JSON, not a bad crew)
-        // must produce ONE clear, named hard error and never fall through to
-        // the deprecated `probe_loaded_model()` — routing a broken config
-        // file into an unrelated LMStudio probe just compounds the error.
-        // If this test somehow DID fall through to probe_loaded_model(), it
-        // would shell out to `curl`/LMStudio and either hang or fail in a
-        // way unrelated to the assertion below — the error text alone
-        // proves which path was taken.
+        // must produce ONE clear, named hard error: the load error itself,
+        // not a later one about a missing profile.
         let tmp = TempDir::new().unwrap();
         let pf = tmp.path().join("profiles.json");
         std::fs::write(&pf, "this is not valid json at all").unwrap();
@@ -1863,10 +1858,6 @@
         assert!(
             msg.contains("not loadable"),
             "expected the hard-stop registry-load error, got: {msg}"
-        );
-        assert!(
-            !msg.contains("falling back") && !msg.contains("probe_loaded_model()"),
-            "must NOT mention the deprecated probe fallback for a load failure: {msg}"
         );
     }
 
@@ -1955,13 +1946,10 @@
     }
 
     #[test]
-    fn resolve_dispatch_model_internal_bails_on_quarantined_default_profile_no_probe() {
-        // (#1282) A quarantined `default_profile` must hard-fail — pre-fix,
-        // `resolve_active` returned None and the code fell through to the
-        // deprecated `probe_loaded_model()`, dispatching against whatever
-        // LMStudio happened to have loaded. Same caveat as the malformed-
-        // registry test above: on regression this would shell out toward
-        // LMStudio; the error text proves the path.
+    fn resolve_dispatch_model_internal_bails_on_quarantined_default_profile() {
+        // (#1282) A quarantined `default_profile` must hard-fail with the
+        // entry's own quarantine error, not the generic "no profile
+        // resolves" one: the operator needs to know WHICH entry is broken.
         let tmp = TempDir::new().unwrap();
         let pf = tmp.path().join("profiles.json");
         std::fs::write(
@@ -1980,10 +1968,77 @@
         assert!(msg.contains("quarantined"), "got: {msg}");
         assert!(msg.contains("\"broken\""), "got: {msg}");
         assert!(msg.contains("darkmux doctor"), "got: {msg}");
-        assert!(
-            !msg.contains("falling back") && !msg.contains("probe_loaded_model()"),
-            "must NOT take the deprecated probe fallback for a quarantined default: {msg}"
-        );
+        assert!(!msg.contains("no profile resolves"), "the quarantine error, not the generic one: {msg}");
+    }
+
+    // ─── 4.0: no probe of "whatever LMStudio has loaded" ────────────
+
+    #[test]
+    fn resolve_dispatch_model_internal_hard_fails_when_no_profile_resolves() {
+        // A registry with profiles but no `default_profile`, no `--profile`
+        // and no `role_profiles` binding used to fall back to probing
+        // LMStudio's first loaded model. 4.0 refuses: the dispatch names no
+        // model, so there is nothing to dispatch to.
+        let tmp = TempDir::new().unwrap();
+        let pf = tmp.path().join("profiles.json");
+        std::fs::write(&pf, r#"{"profiles":{"fast":{"models":[{"id":"model-a","n_ctx":32000}]}}}"#).unwrap();
+
+        let err = resolve_dispatch_model_internal(&quarantine_test_role(), None, pf.to_str(), false, false)
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no profile resolves for role `r`"), "got: {msg}");
+        assert!(msg.contains("default_profile"), "names the fix: {msg}");
+    }
+
+    #[test]
+    fn resolve_dispatch_model_internal_names_an_undefined_requested_profile() {
+        // `--profile ghost` with ghost undefined falls to default_profile
+        // (#1054); with no default either, the error must say what was
+        // asked for, not claim no --profile was given.
+        let tmp = TempDir::new().unwrap();
+        let pf = tmp.path().join("profiles.json");
+        std::fs::write(&pf, r#"{"profiles":{"fast":{"models":[{"id":"model-a","n_ctx":32000}]}}}"#).unwrap();
+        let err = resolve_dispatch_model_internal(&quarantine_test_role(), Some("ghost"), pf.to_str(), false, false)
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("`--profile ghost` is not defined"), "got: {msg}");
+        assert!(!msg.contains("no --profile"), "a --profile WAS given: {msg}");
+        assert!(msg.contains("Set `\"default_profile\": \"<name>\"`"), "the one fix wording: {msg}");
+    }
+
+    #[test]
+    fn resolve_target_fails_early_when_no_profile_resolves() {
+        // (4.0) `resolve_target` runs at the top of `dispatch()`, ahead of
+        // the Docker preflight. No-profile is always fatal now, so it fails
+        // there instead of returning Ok(None) for the container path to
+        // discover after the preflight.
+        let tmp = TempDir::new().unwrap();
+        let pf = tmp.path().join("profiles.json");
+        std::fs::write(&pf, r#"{"profiles":{"fast":{"models":[{"id":"model-a","n_ctx":32000}]}}}"#).unwrap();
+        let err = super::resolve_target(&quarantine_test_role(), None, pf.to_str(), false).unwrap_err();
+        assert!(format!("{err:#}").contains("no profile resolves for role `r`"), "got: {err:#}");
+    }
+
+    #[test]
+    fn resolve_dispatch_model_internal_hard_fails_when_the_profile_selects_no_model() {
+        // The profile resolves, but its only model is the machine utility
+        // model, which work dispatches set aside (#2914), so `select_model`
+        // finds nothing. Pre-4.0 this also fell back to the loaded-model
+        // probe.
+        let tmp = TempDir::new().unwrap();
+        let pf = tmp.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"fast":{"models":[{"id":"util-4b","n_ctx":32000}]}},
+                "default_profile":"fast",
+                "internal":{"utility":{"id":"util-4b","n_ctx":32000}}}"#,
+        )
+        .unwrap();
+
+        let err = resolve_dispatch_model_internal(&quarantine_test_role(), None, pf.to_str(), false, false)
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("profile `fast` selects no model for role `r`"), "got: {msg}");
     }
 
     #[test]
@@ -12997,7 +13052,7 @@
     #[test]
     fn utility_residency_pm_namespaces_like_the_dispatch_model() {
         let pm = super::utility_residency_pm("util-4b", 68_000);
-        assert_eq!(darkmux_profiles::swap::namespaced_identifier(&pm), "darkmux:util-4b");
+        assert_eq!(darkmux_profiles::ownership::namespaced_identifier(&pm), "darkmux:util-4b");
     }
 
     /// Warn, don't abort HERE: a failed utility load yields a warning naming
@@ -13434,27 +13489,6 @@ fn with_both_copies_resident_only_the_darkmux_one_is_selected() {
         vec!["darkmux:qwen3-4b"],
         "exactly one target, and never the operator's — insertion order must not decide this"
     );
-}
-
-// ── (#1615) The namespace is a decoration on the identifier, never the key ───
-
-/// The strip itself, both directions. A bare key must survive untouched — the
-/// overwhelmingly common spelling — and a namespaced one must reduce to the key
-/// LMStudio actually publishes.
-#[test]
-fn bare_model_key_strips_only_the_namespace() {
-    assert_eq!(super::bare_model_key("qwen3-4b-instruct-2507"), "qwen3-4b-instruct-2507");
-    assert_eq!(
-        super::bare_model_key("darkmux:qwen3-4b-instruct-2507"),
-        "qwen3-4b-instruct-2507"
-    );
-    // Not a prefix match on anything shorter or adjacent — those are real keys.
-    assert_eq!(super::bare_model_key("dark:foo"), "dark:foo");
-    assert_eq!(super::bare_model_key("predarkmux:foo"), "predarkmux:foo");
-    // Idempotent: stripping an already-bare key is a no-op, so normalizing
-    // twice on a path that gains a second call site can never over-strip.
-    let once = super::bare_model_key("darkmux:foo");
-    assert_eq!(super::bare_model_key(once), once);
 }
 
 // ── (#1934) `tag_lms_role` — the `telemetry.lms` payload stamper ────────
@@ -14024,7 +14058,7 @@ fn normalizing_the_key_does_not_change_the_minted_identifier() {
         darkmux_gestalt::namespaced_identifier(super::bare_model_key("darkmux:qwen3-4b"), None);
     assert_eq!(from_bare, "darkmux:qwen3-4b");
     assert_eq!(from_bare, from_namespaced);
-    assert!(darkmux_profiles::swap::is_darkmux_owned(&from_namespaced));
+    assert!(darkmux_profiles::ownership::is_darkmux_owned(&from_namespaced));
 }
 
 // ---------------------------------------------------------------
@@ -14980,6 +15014,13 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             perms.set_mode(0o755);
             std::fs::set_permissions(&fake_docker_path, perms).unwrap();
         }
+        // (#2976) Exec it once so the call under test does not pay macOS's
+        // first-exec cost for a freshly written executable (measured 2.4s
+        // to 32s on a loaded host; the second exec takes milliseconds). The
+        // warm-up's own record line is removed, so the file holds only what
+        // the code under test ran.
+        std::process::Command::new(&fake_docker_path).arg("warm-up").status().unwrap();
+        std::fs::remove_file(&record_path).unwrap();
         let prev_path = std::env::var("PATH").ok();
         // SAFETY: every caller is `#[serial]`.
         unsafe {
@@ -15356,11 +15397,21 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         // probe-confirmed kill for `ContainerKillGuard`'s single
         // fire-and-forget `docker kill`. This test proves the OPPOSITE:
         // with `watchdog_abandoned` guarded instead, a panic makes the real
-        // spawned `run_watchdog` thread run `watchdog_finalize_kill`
-        // PROMPTLY — well before the (deliberately far-future) inactivity
-        // deadline would ever fire — via the exact production function
-        // `dispatch()` calls (`spawn_guarded_watchdog`), no hand-rolled
-        // stand-in.
+        // spawned `run_watchdog` thread wake BECAUSE OF THE ABANDONMENT (not
+        // the far-future inactivity deadline) and run `watchdog_finalize_kill`,
+        // via the exact production function `dispatch()` calls
+        // (`spawn_guarded_watchdog`), no hand-rolled stand-in.
+        //
+        // (#2976) No wall-clock race. The test used to require the thread to
+        // exit within 5s, which failed under host load: exec'ing the freshly
+        // written fake `docker` alone took 2.4s on a loaded machine. Instead,
+        // once the guard has fired, the test moves the inactivity deadline
+        // into the past, so the thread exits whether or not the wiring holds,
+        // and asserts the CAUSE it reports. `wait_for_watchdog_wake` reads the
+        // deadline before the abandonment flag, so the cause is exact: a
+        // thread that cannot see the guard's flag reports `DeadlineExpired`
+        // within one 500ms poll, and the test fails in about a second rather
+        // than at a timeout.
         //
         // No real Docker daemon: `install_fake_docker` puts a script on
         // `PATH` that echoes its argv and exits 0 for anything, so the
@@ -15380,7 +15431,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
 
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let handle_holder: Arc<Mutex<Option<thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+        let handle_holder: Arc<Mutex<Option<thread::JoinHandle<WatchdogWake>>>> = Arc::new(Mutex::new(None));
         let handle_holder_for_closure = Arc::clone(&handle_holder);
         let watchdog_abandoned_for_closure = Arc::clone(&watchdog_abandoned);
         let inactivity_deadline_for_closure = Arc::clone(&inactivity_deadline);
@@ -15412,29 +15463,39 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
              the kill', which a panic never proves (MUST FIX 2)"
         );
 
-        // Bounded wait far shorter than the 600s inactivity deadline — if
-        // `run_watchdog` ever stopped checking `watchdog_abandoned` (or the
-        // guard construction inside `spawn_guarded_watchdog` were deleted),
-        // this thread would sit in its poll loop for the full deadline
-        // instead, and this bounded wait fails the test instead of hanging
-        // it.
+        // Only now that the guard has fired: expire the deadline, so every
+        // version of the thread exits and the cause it reports is the claim.
+        *inactivity_deadline.lock().unwrap() = Instant::now();
+
+        // The bound is a hang guard, not the claim: it only has to outlast
+        // the fake `docker kill` on a loaded host. A thread still running
+        // after it is stuck in its kill, which the assertion names.
         let handle = handle_holder
             .lock()
             .unwrap()
             .take()
             .expect("handle was captured before the panic");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !handle.is_finished() && Instant::now() < deadline {
+        let hang_bound = Instant::now() + Duration::from_secs(60);
+        while !handle.is_finished() && Instant::now() < hang_bound {
             thread::sleep(Duration::from_millis(50));
         }
         assert!(
             handle.is_finished(),
-            "the real watchdog thread spawned by spawn_guarded_watchdog must have run its \
-             persistent kill and exited within 5s of the panic, NOT waited out the 600s \
-             inactivity deadline — if it is still running, the abandonment check inside \
+            "the watchdog thread was still running 60s after its deadline expired: it is \
+             stuck in its kill, not waiting on the deadline"
+        );
+        let wake = handle.join().expect("the watchdog thread itself must not have panicked");
+        assert_eq!(
+            wake,
+            WatchdogWake::Abandoned,
+            "the watchdog must wake because the guard fired, not because the inactivity \
+             deadline passed — `DeadlineExpired` means the abandonment check inside \
              run_watchdog / spawn_guarded_watchdog is not actually wired"
         );
-        handle.join().expect("the watchdog thread itself must not have panicked");
+        assert!(
+            !timeout_fired.load(Ordering::SeqCst),
+            "an abandonment is not an inactivity timeout and must not be reported as one"
+        );
 
         restore_path(prev_path);
 
@@ -18035,3 +18096,385 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(complete["payload"]["total_tokens"], 9);
         assert_eq!(rec["mission_id"], complete["mission_id"], "same run key as the terminal");
     }
+
+    // ── (#2869) host reads of the model-writable out-dir ──────────────
+
+    /// `.darkmux-runtime/<name>` in a fresh out-dir, as a symlink to a host
+    /// file outside it holding `body`.
+    fn out_dir_with_symlinked(name: &str, body: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let rt = tmp.path().join("out/.darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        let host = tmp.path().join(format!("host-{name}"));
+        fs::write(&host, body).unwrap();
+        std::os::unix::fs::symlink(&host, rt.join(name)).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn read_token_totals_refuses_a_symlinked_metrics_file() {
+        let tmp = out_dir_with_symlinked(
+            "metrics.json",
+            r#"{"total_prompt_tokens": 1200, "total_completion_tokens": 345}"#,
+        );
+        let t = read_token_totals(&tmp.path().join("out"));
+        assert_eq!(t.prompt, 0, "the symlinked host file was read");
+        assert_eq!(t.completion, 0);
+    }
+
+    #[test]
+    fn read_findings_summary_refuses_a_symlinked_findings_file() {
+        let tmp = out_dir_with_symlinked("findings.jsonl", "{\"a\":1}\n{\"b\":2}\n");
+        assert!(
+            read_findings_summary(&tmp.path().join("out")).is_none(),
+            "the symlinked host file was counted"
+        );
+    }
+
+    #[test]
+    fn read_rest_totals_refuses_a_symlinked_trajectory_fallback() {
+        let tmp = out_dir_with_symlinked(
+            "trajectory.jsonl",
+            "{\"type\":\"runtime.rest\",\"ms\":500}\n",
+        );
+        let r = read_rest_totals(&tmp.path().join("out"));
+        assert_eq!(r.rest_ms, 0, "the symlinked host trajectory was summed");
+    }
+
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record()
+    fn tailer_refuses_a_symlinked_trajectory_and_warns_once() {
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let tmp = out_dir_with_symlinked(
+            "trajectory.jsonl",
+            "{\"type\":\"compaction\",\"seq\":1,\"generation\":1,\"before_messages\":40,\"after_messages\":7,\"summary_chars\":1500}\n",
+        );
+        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let lines_c = lines.clone();
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("out/.darkmux-runtime/trajectory.jsonl"),
+            "sess-2869".into(),
+            "coder".into(),
+            "darkmux:m".into(),
+        );
+        state.warning_sink = Arc::new(move |l: &str| lines_c.lock().unwrap().push(l.to_string()));
+        state.poll_and_emit();
+        state.poll_and_emit();
+        assert_eq!(state.summary.compactions, 0, "the tailer followed the model's symlink");
+        let lines = lines.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "one warning, not one per poll: {lines:?}");
+        assert!(lines[0].contains("symlink"), "{lines:?}");
+
+        // The directory-swap case: `.darkmux-runtime` itself replaced with a
+        // link to a host directory holding a regular `trajectory.jsonl`.
+        // No-follow on the file alone would read it.
+        let swap = TempDir::new().unwrap();
+        let out = swap.path().join("out");
+        fs::create_dir_all(&out).unwrap();
+        let host_dir = swap.path().join("host-dir");
+        fs::create_dir_all(&host_dir).unwrap();
+        fs::write(
+            host_dir.join("trajectory.jsonl"),
+            "{\"type\":\"compaction\",\"seq\":1,\"generation\":1,\"before_messages\":40,\"after_messages\":7,\"summary_chars\":1500}\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&host_dir, out.join(".darkmux-runtime")).unwrap();
+        let swap_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let swap_c = swap_lines.clone();
+        let mut swapped = TailerState::new_for_test(
+            out.join(".darkmux-runtime/trajectory.jsonl"),
+            "sess-2869-swap".into(),
+            "coder".into(),
+            "darkmux:m".into(),
+        );
+        swapped.warning_sink = Arc::new(move |l: &str| swap_c.lock().unwrap().push(l.to_string()));
+        swapped.poll_and_emit();
+        assert_eq!(swapped.summary.compactions, 0, "the tailer followed a swapped .darkmux-runtime");
+        let swap_lines = swap_lines.lock().unwrap().clone();
+        assert_eq!(swap_lines.len(), 1, "{swap_lines:?}");
+        assert!(swap_lines[0].contains("symlink"), "{swap_lines:?}");
+    }
+
+    #[test]
+    fn resume_checkpoint_refuses_a_symlinked_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let resume_from = tmp.path().join("prior-out");
+        fs::create_dir_all(&resume_from).unwrap();
+        let host = tmp.path().join("host-checkpoint.json");
+        fs::write(&host, r#"{"schema_version":3,"messages":[],"role_id":"coder"}"#).unwrap();
+        std::os::unix::fs::symlink(&host, resume_from.join(CHECKPOINT_FILENAME)).unwrap();
+        let err = validate_resume_checkpoint_content(&resume_from, "coder")
+            .expect_err("a symlinked checkpoint must be refused, not followed");
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+    }
+
+    #[test]
+    fn resume_checkpoint_refuses_a_symlinked_origin_file() {
+        // What this pins is narrow: the origin file is read no-follow, so a
+        // symlink planted at it is refused rather than read. It does NOT
+        // make the origin file trustworthy — it sits in the same mounted,
+        // model-writable out-dir, so a model can write a forged REGULAR
+        // origin file directly, which this test does not (and cannot)
+        // catch. That gap is tracked separately.
+        let tmp = TempDir::new().unwrap();
+        let resume_from = tmp.path().join("prior-out");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&resume_from).unwrap();
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(
+            resume_from.join(CHECKPOINT_FILENAME),
+            r#"{"schema_version":3,"messages":[],"role_id":"coder"}"#,
+        )
+        .unwrap();
+        let forged = tmp.path().join("forged-origin.json");
+        let ws_canon = ws.canonicalize().unwrap();
+        fs::write(
+            &forged,
+            serde_json::json!({ "workspace": ws_canon.display().to_string(), "workspace_read_only": false })
+                .to_string(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&forged, resume_from.join(RESUME_ORIGIN_FILENAME)).unwrap();
+        let err = validate_resume_checkpoint(&resume_from, "coder", &ws_canon, false)
+            .expect_err("a symlinked origin file must be refused, not followed");
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+    }
+
+    /// A trajectory the model made huge and sparse (1 PiB of holes). The
+    /// tailer used to size one buffer from `fstat` and read to the end,
+    /// which aborts the host process on allocation. It must read a bounded
+    /// amount per poll, drop an unterminated line that outgrows its cap
+    /// with ONE warning, and keep the process alive.
+    #[test]
+    fn tailer_survives_a_huge_sparse_trajectory_with_one_warning() {
+        let tmp = TempDir::new().unwrap();
+        let rt = tmp.path().join("out/.darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        let f = fs::File::create(rt.join("trajectory.jsonl")).unwrap();
+        f.set_len(1u64 << 50).unwrap();
+        drop(f);
+        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let lines_c = lines.clone();
+        let mut state = TailerState::new_for_test(
+            rt.join("trajectory.jsonl"),
+            "sess-2869-sparse".into(),
+            "coder".into(),
+            "darkmux:m".into(),
+        );
+        state.warning_sink = Arc::new(move |l: &str| lines_c.lock().unwrap().push(l.to_string()));
+        for _ in 0..4 {
+            state.poll_and_emit();
+        }
+        assert!(state.offset > 0 && state.offset < (1u64 << 30), "offset {}", state.offset);
+        let lines = lines.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "exactly one overflow warning: {lines:?}");
+        assert!(lines[0].contains("exceeds"), "{lines:?}");
+    }
+
+    /// A legitimate trajectory far longer than one poll's read budget still
+    /// streams completely, across polls, with nothing dropped.
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record()
+    fn tailer_streams_a_long_trajectory_fully_across_bounded_polls() {
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let tmp = TempDir::new().unwrap();
+        let rt = tmp.path().join("out/.darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        let mut body = String::new();
+        for i in 1..=200 {
+            body.push_str(&format!(
+                "{{\"type\":\"compaction\",\"seq\":{i},\"generation\":{i},\"before_messages\":40,\"after_messages\":7,\"summary_chars\":1500}}\n"
+            ));
+        }
+        fs::write(rt.join("trajectory.jsonl"), &body).unwrap();
+        let mut state = TailerState::new_for_test(
+            rt.join("trajectory.jsonl"),
+            "sess-2869-long".into(),
+            "coder".into(),
+            "darkmux:m".into(),
+        );
+        // A read budget smaller than one line: every line spans polls.
+        state.max_poll_bytes = 64;
+        state.max_pending_bytes = 4096;
+        let mut polls = 0;
+        while state.offset < body.len() as u64 && polls < 100_000 {
+            state.poll_and_emit();
+            polls += 1;
+        }
+        assert_eq!(state.offset, body.len() as u64);
+        assert_eq!(state.summary.compactions, 200, "events were lost across bounded polls");
+        assert!(polls > 200, "the per-poll bound was not applied ({polls} polls)");
+    }
+
+    /// (#2869 fix pass) The four end-of-dispatch metric reads each hit the
+    /// same refused `metrics.json`; the operator hears about it once.
+    #[test]
+    fn read_out_dir_text_warns_once_per_refused_file() {
+        let tmp = out_dir_with_symlinked("metrics.json", "{}");
+        let out = tmp.path().join("out");
+        let lines: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        let sink = |l: &str| lines.borrow_mut().push(l.to_string());
+        for _ in 0..4 {
+            assert!(read_out_dir_text_with(&out, ".darkmux-runtime/metrics.json", &sink).is_none());
+        }
+        assert_eq!(lines.borrow().len(), 1, "{:?}", lines.borrow());
+        // A different refused file in the same dispatch still warns.
+        std::os::unix::fs::symlink("/etc/hosts", out.join(".darkmux-runtime/findings.jsonl")).unwrap();
+        assert!(read_out_dir_text_with(&out, ".darkmux-runtime/findings.jsonl", &sink).is_none());
+        assert_eq!(lines.borrow().len(), 2, "{:?}", lines.borrow());
+    }
+
+
+    /// An oversize line is dropped WHOLE: the part that arrives after the
+    /// cap tripped (here, a well-formed event the model appended to the
+    /// padding) must not be parsed as an event. Two oversize lines give one
+    /// warning, and a legitimate line after them still streams.
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record()
+    fn tailer_drops_an_oversize_line_whole_and_warns_once() {
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let tmp = TempDir::new().unwrap();
+        let rt = tmp.path().join("out/.darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        let ev = |seq: u32| {
+            format!(
+                "{{\"type\":\"compaction\",\"seq\":{seq},\"generation\":{seq},\"before_messages\":40,\"after_messages\":7,\"summary_chars\":1500}}"
+            )
+        };
+        // 272 = 17 polls of 16 bytes: the cap (256) trips exactly at the
+        // end of the padding, so the forged event starts a fresh poll.
+        let body = format!(
+            "{}{}\n{}\n{}\n",
+            "X".repeat(272),
+            ev(1),
+            "Y".repeat(600),
+            ev(2)
+        );
+        fs::write(rt.join("trajectory.jsonl"), &body).unwrap();
+        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let lines_c = lines.clone();
+        let mut state = TailerState::new_for_test(
+            rt.join("trajectory.jsonl"),
+            "sess-2869-oversize".into(),
+            "coder".into(),
+            "darkmux:m".into(),
+        );
+        state.warning_sink = Arc::new(move |l: &str| lines_c.lock().unwrap().push(l.to_string()));
+        state.max_poll_bytes = 16;
+        state.max_pending_bytes = 256;
+        let mut polls = 0;
+        while state.offset < body.len() as u64 && polls < 10_000 {
+            state.poll_and_emit();
+            polls += 1;
+        }
+        assert_eq!(state.summary.compactions, 1, "only the legitimate trailing event counts");
+        // Bind first: locking twice in one `assert_eq!` deadlocks on failure.
+        let lines = lines.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+    }
+
+    /// (#2869 C1) The stop path must drain the WHOLE backlog. A container
+    /// that wrote more than two polls' worth (16 MiB) before exiting lost
+    /// the tail: the loop polls once, sees `stop`, and flushed only once
+    /// more. Driven through `run_tailer` with the stop flag already set, the
+    /// production stop sequence.
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record()
+    fn run_tailer_final_flush_drains_a_backlog_larger_than_two_polls() {
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let tmp = TempDir::new().unwrap();
+        let rt = tmp.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        // 20 lines of ~1 MiB: over two polls' worth, few lines to parse.
+        let pad_line = format!("{{\"type\":\"noop.pad\",\"p\":\"{}\"}}\n", "x".repeat(1024 * 1024));
+        let mut body = pad_line.repeat(20);
+        body.push_str("{\"type\":\"compaction\",\"seq\":1,\"generation\":1,\"before_messages\":40,\"after_messages\":7,\"summary_chars\":1500}\n");
+        fs::write(rt.join("trajectory.jsonl"), &body).unwrap();
+        let stop = Arc::new(AtomicBool::new(true));
+        let summary = run_tailer(
+            tmp.path().to_path_buf(),
+            "sess-2869-drain".into(),
+            "coder".into(),
+            "darkmux:m".into(),
+            None,
+            None,
+            None,
+            stop,
+            Arc::new(Mutex::new(Instant::now() + Duration::from_secs(600))),
+            600,
+            None, // compaction threshold
+            None, // compactor model
+            None, // record context
+            None, // endpoint
+            None, // endpoint id
+            None, // compactor endpoint
+            None, // live sender
+        );
+        assert_eq!(summary.compactions, 1, "the event at the end of a 20 MiB backlog was dropped");
+    }
+
+    /// (#2869 C6) A truncation reset clears the discard state too: after an
+    /// oversize line was being skipped, a rewritten (truncated) file's first
+    /// event must be read, not swallowed as "the rest of the oversize line".
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record()
+    fn tailer_truncation_reset_clears_the_discard_state() {
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let tmp = TempDir::new().unwrap();
+        let rt = tmp.path().join("out/.darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        let path = rt.join("trajectory.jsonl");
+        fs::write(&path, "Z".repeat(400)).unwrap();
+        let mut state = TailerState::new_for_test(path.clone(), "sess-2869-trunc".into(), "coder".into(), "darkmux:m".into());
+        state.warning_sink = Arc::new(|_: &str| {});
+        state.max_poll_bytes = 64;
+        state.max_pending_bytes = 128;
+        for _ in 0..10 {
+            state.poll_and_emit();
+        }
+        assert!(state.discarding_line, "precondition: an oversize line is being discarded");
+        fs::write(&path, "{\"type\":\"compaction\",\"seq\":1,\"generation\":1,\"before_messages\":40,\"after_messages\":7,\"summary_chars\":1500}\n").unwrap();
+        for _ in 0..10 {
+            state.poll_and_emit();
+        }
+        assert_eq!(state.summary.compactions, 1, "the first event after truncation was discarded");
+    }
+
+    /// (#2869 C5) `metrics.json` is small by construction; a multi-MiB one
+    /// is refused under the small-file cap rather than read (the 1 GiB
+    /// default applied before).
+    #[test]
+    fn read_token_totals_refuses_an_oversize_metrics_file() {
+        let tmp = TempDir::new().unwrap();
+        let rt = tmp.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        let pad = "x".repeat(5 * 1024 * 1024);
+        fs::write(rt.join("metrics.json"), format!(r#"{{"total_prompt_tokens": 7, "pad": "{pad}"}}"#)).unwrap();
+        assert_eq!(read_token_totals(tmp.path()).prompt, 0, "a 5 MiB metrics.json was read");
+    }
+
+    #[test]
+    fn resume_checkpoint_refuses_an_oversize_origin_file() {
+        let tmp = TempDir::new().unwrap();
+        let resume_from = tmp.path().join("prior-out");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&resume_from).unwrap();
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(
+            resume_from.join(CHECKPOINT_FILENAME),
+            r#"{"schema_version":3,"messages":[],"role_id":"coder"}"#,
+        )
+        .unwrap();
+        let ws_canon = ws.canonicalize().unwrap();
+        let pad = "x".repeat(5 * 1024 * 1024);
+        fs::write(
+            resume_from.join(RESUME_ORIGIN_FILENAME),
+            serde_json::json!({ "workspace": ws_canon.display().to_string(), "workspace_read_only": false, "pad": pad })
+                .to_string(),
+        )
+        .unwrap();
+        let err = validate_resume_checkpoint(&resume_from, "coder", &ws_canon, false)
+            .expect_err("a 5 MiB origin file must be refused");
+        assert!(format!("{err:#}").contains("exceeds"), "{err:#}");
+    }
+

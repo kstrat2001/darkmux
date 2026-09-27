@@ -178,6 +178,11 @@ pub struct RunLifecycle {
     finished: bool,
 }
 
+/// The most bytes of error text a lifecycle record keeps. The record is read
+/// on every scan of the runs dir, so it holds a screenful of cause, not an
+/// unbounded dump.
+pub(crate) const ERROR_RECORD_MAX_BYTES: usize = 4096;
+
 impl RunLifecycle {
     /// Write the `running` bookend.
     ///
@@ -298,9 +303,11 @@ impl RunLifecycle {
         self.terminate(LifecycleStatus::Complete, None);
     }
 
-    /// The run ended with an error.
+    /// The run ended with an error. The record keeps the error's whole cause
+    /// chain (see [`error_summary`]): it is the only durable trace of why
+    /// this run failed.
     pub fn finish_error(mut self, error: impl std::fmt::Display) {
-        self.terminate(LifecycleStatus::Error, Some(error.to_string()));
+        self.terminate(LifecycleStatus::Error, Some(error_summary(&error)));
     }
 
     /// (#2462) The run ended because a caught SIGINT/SIGTERM/SIGHUP caused
@@ -313,19 +320,28 @@ impl RunLifecycle {
     /// `Error` here would archive an operator's Ctrl-C as "the endpoint
     /// broke" — exactly the misattribution #2462 is about.
     ///
-    /// Formats `error` with `{:#}` (alternate), not `{}` — unlike
-    /// `finish_error`'s plain `.to_string()`, this deliberately unwraps the
-    /// FULL `anyhow` cause chain. `run.rs`'s call site passes a
-    /// `.context("internal-runtime dispatch via lab harness")`-wrapped
-    /// error; a plain `{}` shows only that outer context and discards the
-    /// actual cause (`remote_chat_attempt`'s "hosted dispatch interrupted
-    /// by an operator signal..." message, which is the whole point of this
-    /// method existing) one level down. `finish_error` is left as `.to_
-    /// string()` deliberately — this is a targeted fix for the one field
-    /// #2462 is about, not a blanket change to every existing error record.
+    /// The record keeps the full cause chain ([`error_summary`]): the caller
+    /// passes a context-wrapped error whose cause one level down (the
+    /// "interrupted by an operator signal" message) is the whole point.
     pub fn finish_interrupted(mut self, error: impl std::fmt::Display) {
-        self.terminate(LifecycleStatus::Interrupted, Some(format!("{error:#}")));
+        self.terminate(LifecycleStatus::Interrupted, Some(error_summary(&error)));
     }
+}
+
+/// An error as one bounded line: the full cause chain (`{:#}`, so an
+/// `anyhow` context keeps the cause beneath it), every run of whitespace
+/// (newlines included) folded to one space, cut to
+/// [`ERROR_RECORD_MAX_BYTES`] on a char boundary with a trailing `…`.
+pub(crate) fn error_summary(error: &impl std::fmt::Display) -> String {
+    let line = format!("{error:#}").split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.len() <= ERROR_RECORD_MAX_BYTES {
+        return line;
+    }
+    let mut cut = ERROR_RECORD_MAX_BYTES - '…'.len_utf8();
+    while !line.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &line[..cut])
 }
 
 impl Drop for RunLifecycle {

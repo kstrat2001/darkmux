@@ -569,6 +569,11 @@ pub(crate) const NON_PRODUCER_SOURCE_PATHS: &[(&str, &str)] = &[
          fixtures; scanning it would classify the table as its own producer",
     ),
     (
+        "crates/darkmux-doctor/src/checks_hooks.rs",
+        "consumer: the hooks check probes each rule against the telemetry actions darkmux \
+         writes (`TELEMETRY_ACTIONS`), builds nothing",
+    ),
+    (
         "crates/darkmux-crew/src/records_emitted.rs",
         "consumer: filters a record stream on `action == \"machine.telemetry\"`, builds nothing",
     ),

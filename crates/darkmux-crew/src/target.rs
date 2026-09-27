@@ -78,13 +78,38 @@ pub fn endpoint_route_label(ep: &ModelEndpoint, model_id: &str) -> String {
 pub enum Resolution {
     Target(Box<Target>),
     /// No `--profile` match, no `role_profiles` binding and no usable
-    /// `default_profile`: the container path's `probe_loaded_model` fallback.
+    /// `default_profile`. The container path refuses to dispatch.
     NoProfile,
     /// A profile resolved but `select_model` returned no model.
     NoModel { profile_name: String, profile: Box<Profile>, error: String },
 }
 
 impl Resolution {
+    /// The target, or THE error for a resolution that selects nothing:
+    /// [`darkmux_profiles::profiles::no_profile_message`] for no profile, the
+    /// profile and `select_model`'s reason for no model. (4.0) Both are
+    /// fatal for a dispatch; there is no fallback model.
+    pub fn require(
+        self,
+        role_id: &str,
+        requested: Option<&str>,
+        registry_path: &std::path::Path,
+    ) -> Result<Target> {
+        match self {
+            Resolution::Target(t) => Ok(*t),
+            Resolution::NoProfile => bail!(darkmux_profiles::profiles::no_profile_message(
+                Some(role_id),
+                requested,
+                Some(registry_path),
+            )),
+            Resolution::NoModel { profile_name, error, .. } => bail!(
+                "profile `{profile_name}` selects no model for role `{role_id}` ({error}). Add a model \
+                 for it to profile `{profile_name}` in {}.",
+                registry_path.display()
+            ),
+        }
+    }
+
     pub fn target(self) -> Option<Target> {
         match self {
             Resolution::Target(t) => Some(*t),
@@ -144,6 +169,12 @@ pub fn resolve_in(
     allow_utility_model: bool,
 ) -> Result<Resolution> {
     if let Some(req) = profile_override {
+        // (#2916 stage 2) A `profile@machine` address reaching the local
+        // resolver is never read as an undefined local name: that would fall
+        // to `default_profile` (#1054) and run something else, here.
+        if let Some(msg) = darkmux_types::profile_address::local_only_refusal(req, "this dispatch path") {
+            bail!(msg);
+        }
         if let Some(msg) = registry.quarantine_error_for(req) {
             bail!(msg);
         }
@@ -283,6 +314,22 @@ mod resolve_tests {
         reg.materialize_endpoints();
         let err = super::resolve_in(&reg, &role(), None, None, false).unwrap_err();
         assert!(format!("{err:#}").contains("nope"), "{err:#}");
+    }
+
+    /// (#2916 stage 2) A `profile@machine` address that reaches the LOCAL
+    /// resolver (the lab, a mission step, anything that runs only here) is
+    /// refused naming it, never read as an undefined name that falls to
+    /// `default_profile` and runs the default model here.
+    #[test]
+    fn resolve_in_refuses_a_profile_address() {
+        let reg: darkmux_types::ProfileRegistry = serde_json::from_str(
+            r#"{"profiles":{"host":{"models":[{"id":"big","n_ctx":32000}]}},"default_profile":"host"}"#,
+        )
+        .unwrap();
+        let err = super::resolve_in(&reg, &role(), Some("host@studio"), None, false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("host@studio") && msg.contains("only on this machine"), "{msg}");
+        assert!(super::resolve_in(&reg, &role(), Some("host"), None, false).is_ok(), "a plain name still resolves");
     }
 }
 

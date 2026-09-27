@@ -7,7 +7,7 @@ use darkmux_types::Profile;
 use crate::workloads::types::{
     InspectionReport, LoadedWorkload, RunResult, VerifyOutcome, WorkloadProvider,
 };
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 #[cfg(test)]
 use std::env;
 use std::fs;
@@ -93,7 +93,11 @@ impl WorkloadProvider for PromptProvider {
         let manifest_json = serde_json::json!({
             // v2 added: run_id, profile (now the profile NAME), profile_description.
             // v1 had: session_id, profile (was the description text), workload, provider, duration_ms, ok.
-            "schema_version": 2,
+            // v5 added: verify, the same field and version as the coding-task
+            // manifest (#2494). `null` is "not checked": the workload declares
+            // no verify. Without it, `lab run list` read a failed verify as a
+            // plain tick.
+            "schema_version": 5,
             "run_id": run_id,
             "workload": loaded.manifest.workload.id,
             "provider": self.id(),
@@ -102,6 +106,10 @@ impl WorkloadProvider for PromptProvider {
             "duration_ms": duration_ms,
             "ok": ok,
             "session_id": session_id,
+            "verify": verify.as_ref().map(|v| serde_json::json!({
+                "passed": v.passed,
+                "details": v.details,
+            })),
         });
         fs::write(
             run_dir.join("manifest.json"),
@@ -113,7 +121,7 @@ impl WorkloadProvider for PromptProvider {
             duration_ms,
             payload_text: Some(reply),
             trajectory_path: None,
-            verify: Some(verify),
+            verify,
             error: if ok {
                 None
             } else {
@@ -159,32 +167,14 @@ impl WorkloadProvider for PromptProvider {
             tokens_before: vec![],
             summary_chars: vec![],
             mode: None,
-            // (#2494) This provider already had the outcome in hand and was
-            // only formatting it into a note string; the note stays (it is
-            // what the text view renders) and the typed field makes it
-            // machine-readable alongside it.
-            // (#2494, merge-gate finding 4) `run_verify` returns
-            // `passed: true, details: "no verify spec"` when the workload
-            // declares no verify at all — a sentinel, not a result. Mapping
-            // that to `Some(passed: true)` would render a bare `verify: ok`
-            // for a run NOTHING verified, defeating the tri-state at the
-            // producer and making `lab_cli`'s "not checked" arm unreachable
-            // for every prompt workload. Only a real verify spec yields
-            // `Some`.
-            verify: loaded.manifest.workload.verify.as_ref().map(|_| {
-                crate::workloads::types::VerifyReport {
-                    passed: verify_outcome.passed,
-                    details: verify_outcome.details.clone(),
-                }
+            // (#2494) The typed twin of the note below; `None` when the
+            // workload declares no verify, so a run nothing checked never
+            // renders as a pass.
+            verify: verify_outcome.as_ref().map(|v| crate::workloads::types::VerifyReport {
+                passed: v.passed,
+                details: v.details.clone(),
             }),
-            notes: vec![
-                format!("provider={}", self.id()),
-                format!(
-                    "verify: {} — {}",
-                    if verify_outcome.passed { "ok" } else { "fail" },
-                    verify_outcome.details
-                ),
-            ],
+            notes: vec![format!("provider={}", self.id()), verify_note(verify_outcome.as_ref())],
         })
     }
 }
@@ -319,16 +309,11 @@ pub(crate) fn extract_reply_text(stdout: &str) -> String {
     String::new()
 }
 
-pub(crate) fn run_verify(loaded: &LoadedWorkload, text: &str) -> VerifyOutcome {
-    let v = match loaded.manifest.workload.verify.as_ref() {
-        Some(v) => v,
-        None => {
-            return VerifyOutcome {
-                passed: true,
-                details: "no verify spec".into(),
-            };
-        }
-    };
+/// The workload's keyword verify over `text`. `None` when the workload
+/// declares no verify spec: nothing was checked, which is neither a pass nor
+/// a fail (#2982). This is the one place that decides it.
+pub(crate) fn run_verify(loaded: &LoadedWorkload, text: &str) -> Option<VerifyOutcome> {
+    let v = loaded.manifest.workload.verify.as_ref()?;
     // (#2493, corrected by frontier review) Case sensitivity is a property
     // of WHAT is being matched, never a blanket policy — the original fix
     // lowercased unconditionally, which silently re-scoped every workload
@@ -370,10 +355,10 @@ pub(crate) fn run_verify(loaded: &LoadedWorkload, text: &str) -> VerifyOutcome {
         .filter(|s| matches(text, s))
         .collect();
     if missing.is_empty() && present.is_empty() {
-        return VerifyOutcome {
+        return Some(VerifyOutcome {
             passed: true,
             details: "all keyword checks passed".into(),
-        };
+        });
     }
     let mut bits = Vec::new();
     if !missing.is_empty() {
@@ -396,19 +381,20 @@ pub(crate) fn run_verify(loaded: &LoadedWorkload, text: &str) -> VerifyOutcome {
                 .join(", ")
         ));
     }
-    VerifyOutcome {
+    Some(VerifyOutcome {
         passed: false,
         details: bits.join("; "),
-    }
+    })
 }
 
-// Suppress unused warnings until the lab subcommand calls run/inspect from main.
-#[allow(dead_code)]
-fn __compile_check(_: &dyn WorkloadProvider) {}
-
-#[allow(dead_code)]
-fn _bail_unused() -> Result<()> {
-    bail!("unused")
+/// The inspect note for a keyword verify outcome, shared by every provider
+/// that reports one.
+pub(crate) fn verify_note(verify: Option<&VerifyOutcome>) -> String {
+    match verify {
+        Some(v) if v.passed => format!("verify: ok — {}", v.details),
+        Some(v) => format!("verify: fail — {}", v.details),
+        None => "verify: not checked — no verify spec".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -559,12 +545,20 @@ mod tests {
     }
 
     #[test]
-    fn run_verify_passes_with_no_spec() {
+    fn run_verify_checks_nothing_without_a_spec() {
         let tmp = TempDir::new().unwrap();
         let loaded = make_loaded(spec_with_prompt("x"), tmp.path().to_path_buf());
-        let v = run_verify(&loaded, "anything");
-        assert!(v.passed);
-        assert!(v.details.contains("no verify"));
+        assert!(run_verify(&loaded, "anything").is_none());
+    }
+
+    /// Every verify state renders its own note; "nothing checked" never
+    /// reads as ok.
+    #[test]
+    fn verify_note_names_each_state() {
+        let v = |passed| VerifyOutcome { passed, details: "d".into() };
+        assert_eq!(verify_note(Some(&v(true))), "verify: ok — d");
+        assert_eq!(verify_note(Some(&v(false))), "verify: fail — d");
+        assert_eq!(verify_note(None), "verify: not checked — no verify spec");
     }
 
     #[test]
@@ -576,7 +570,7 @@ mod tests {
             ..Default::default()
         });
         let loaded = make_loaded(spec, tmp.path().to_path_buf());
-        let v = run_verify(&loaded, "we have alpha and beta here");
+        let v = run_verify(&loaded, "we have alpha and beta here").unwrap();
         assert!(v.passed);
     }
 
@@ -606,7 +600,7 @@ mod tests {
             "this is a form of sparse activation",
             "only a few parameters are active per forward pass",
         ] {
-            let v = run_verify(&loaded, reply);
+            let v = run_verify(&loaded, reply).unwrap();
             assert!(v.passed, "expected {reply:?} to pass a stemmed \"activ\" check, got {v:?}");
         }
     }
@@ -641,7 +635,7 @@ mod tests {
             "There is no observable difference between the two on Apple Silicon; both architectures activate the same number of parameters.",
         ];
         for reply in wrong_answers {
-            let v = run_verify(&loaded, reply);
+            let v = run_verify(&loaded, reply).unwrap();
             assert!(!v.passed, "expected a wrong answer to be REJECTED: {reply:?}, got {v:?}");
         }
     }
@@ -659,7 +653,7 @@ mod tests {
             ..Default::default()
         });
         let loaded = make_loaded(spec, tmp.path().to_path_buf());
-        let v = run_verify(&loaded, "Active parameters differ between the two.");
+        let v = run_verify(&loaded, "Active parameters differ between the two.").unwrap();
         assert!(v.passed, "expected a capitalized match to pass, got {v:?}");
     }
 
@@ -681,7 +675,7 @@ mod tests {
             ..Default::default()
         });
         let loaded = make_loaded(spec, tmp.path().to_path_buf());
-        let v = run_verify(&loaded, "I looked at the test file but never ran the suite.");
+        let v = run_verify(&loaded, "I looked at the test file but never ran the suite.").unwrap();
         assert!(
             !v.passed,
             "a lowercase 'ok' inside 'looked' must not satisfy a command-spec's must_contain: {v:?}"
@@ -704,7 +698,7 @@ mod tests {
             ..Default::default()
         });
         let loaded = make_loaded(spec, tmp.path().to_path_buf());
-        let v = run_verify(&loaded, "The suite failed before my fix; it passes now.");
+        let v = run_verify(&loaded, "The suite failed before my fix; it passes now.").unwrap();
         assert!(
             v.passed,
             "lowercase 'failed' narrating past tense must not trip a command-spec's must_not_contain: {v:?}"
@@ -720,7 +714,7 @@ mod tests {
             ..Default::default()
         });
         let loaded = make_loaded(spec, tmp.path().to_path_buf());
-        let v = run_verify(&loaded, "alpha here only");
+        let v = run_verify(&loaded, "alpha here only").unwrap();
         assert!(!v.passed);
         assert!(v.details.contains("missing"));
     }
@@ -734,7 +728,7 @@ mod tests {
             ..Default::default()
         });
         let loaded = make_loaded(spec, tmp.path().to_path_buf());
-        let v = run_verify(&loaded, "this contains forbidden text");
+        let v = run_verify(&loaded, "this contains forbidden text").unwrap();
         assert!(!v.passed);
         assert!(v.details.contains("disallowed"));
     }
@@ -749,7 +743,7 @@ mod tests {
             ..Default::default()
         });
         let loaded = make_loaded(spec, tmp.path().to_path_buf());
-        let v = run_verify(&loaded, "this has bad words but no required marker");
+        let v = run_verify(&loaded, "this has bad words but no required marker").unwrap();
         assert!(!v.passed);
         assert!(v.details.contains("missing"));
         assert!(v.details.contains("disallowed"));

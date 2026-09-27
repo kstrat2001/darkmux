@@ -641,7 +641,24 @@ pub(crate) fn validate_resume_checkpoint_content(
     expected_role_id: &str,
 ) -> Result<String> {
     let src = resume_from.join(CHECKPOINT_FILENAME);
-    if !src.is_file() {
+    // (#2869) `resume_from` is a prior dispatch's out-dir, which that
+    // dispatch's model could write. Read the checkpoint with no-follow and
+    // regular-file-only, so a planted `checkpoint.json -> <host file>` is
+    // refused here rather than read and staged into the new container.
+    let read = crate::contained_file::read_contained_to_string(
+        resume_from,
+        Path::new(CHECKPOINT_FILENAME),
+        crate::contained_file::DEFAULT_MAX_BYTES,
+    );
+    if let Err(e @ crate::contained_file::ContainedFileError::Refused(_)) = &read {
+        bail!(
+            "darkmux dispatch: RESUME CHECKPOINT REFUSED — {} was {e}; darkmux reads a \
+             checkpoint only as a regular file inside --resume-from {}",
+            src.display(),
+            resume_from.display()
+        );
+    }
+    if matches!(read, Err(crate::contained_file::ContainedFileError::NotFound)) {
         bail!(
             "darkmux dispatch: RESUME CHECKPOINT NOT FOUND — expected {} to \
              exist (no checkpoint.json under --resume-from {}); this \
@@ -653,7 +670,7 @@ pub(crate) fn validate_resume_checkpoint_content(
             resume_from.display()
         );
     }
-    let contents = fs::read_to_string(&src)
+    let contents = read
         .with_context(|| format!("reading resume checkpoint at {}", src.display()))?;
     let value: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
         anyhow!(
@@ -835,7 +852,14 @@ pub(crate) fn validate_resume_checkpoint(
     // (Security audit, #2114 resume follow-up) Workspace mount-mode + path
     // gate — see this fn's own doc for the escalation this closes.
     let origin_path = resume_from.join(RESUME_ORIGIN_FILENAME);
-    let origin_contents = fs::read_to_string(&origin_path).map_err(|e| {
+    // (#2869) Same no-follow read as the checkpoint: this file sits in the
+    // same model-writable out-dir.
+    let origin_contents = crate::contained_file::read_contained_to_string(
+        resume_from,
+        Path::new(RESUME_ORIGIN_FILENAME),
+        crate::contained_file::SMALL_FILE_MAX_BYTES,
+    )
+    .map_err(|e| {
         anyhow!(
             "darkmux dispatch: RESUME ORIGIN UNKNOWN — could not read {} ({e}); this host has \
              no record of the workspace mount mode/path the checkpoint at {} was written \
@@ -1012,9 +1036,7 @@ pub(crate) fn resume_hint_from_origin(
     role_id: &str,
     phase_id: Option<&str>,
 ) -> String {
-    let origin_path = host_out.join(RESUME_ORIGIN_FILENAME);
-    let origin = fs::read_to_string(&origin_path)
-        .ok()
+    let origin = read_out_dir_text(host_out, RESUME_ORIGIN_FILENAME)
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
     let Some(origin) = origin else {
         return format!(
@@ -2504,9 +2526,8 @@ fn write_remote_auth_header_stdin(
 //
 // When a dispatch's resolved model names a REMOTE OpenAI-compatible endpoint
 // (Azure OpenAI, OpenAI, a LiteLLM proxy), darkmux does NOT start the container
-// runtime. It makes ONE OpenAI chat-completions call — via `curl`, the same
-// convention `probe_loaded_model` uses, so no Rust HTTP-client dep is dragged
-// in — and emits the same flow records the container path does, so the run
+// runtime. It makes ONE OpenAI chat-completions call — via `curl`, so no Rust
+// HTTP-client dep is dragged in — and emits the same flow records the container path does, so the run
 // lands in the fleet viewer identically, distinguished only by its `endpoint`
 // (and by having no host-load, since the model computes off-fleet). The tier is
 // NOT inferred from remoteness: a dispatched model is a worker wherever it runs,
@@ -2524,13 +2545,12 @@ use crate::target::{resolve_role_aware_profile_with, role_profile_binding};
 /// Resolve the dispatch's [`crate::target::Target`] (the selected model with
 /// its own endpoint) WITHOUT loading anything in LMStudio — so `dispatch` can
 /// branch to the hosted path before the container/load machinery. `Ok(None)`
-/// ⇒ no profile model resolves (the local path's `probe_loaded_model`
-/// fallback + container path). `Err` ⇒ the requested (or default) profile is
-/// QUARANTINED (#1282), a `role_profiles` binding names an undefined profile,
-/// or the selected model names an undefined endpoint (#2902) — a hard stop:
-/// falling through here would re-resolve against a DIFFERENT profile
-/// (possibly routing a dispatch to the wrong endpoint) before the container
-/// path ever gets to raise the same error.
+/// ⇒ the registry did not load (the container path raises the named #1269
+/// error for it). `Err` ⇒ no profile resolves or it selects no model (4.0:
+/// always fatal, so it fails here, ahead of the Docker preflight), the
+/// requested (or default) profile is QUARANTINED (#1282), a `role_profiles`
+/// binding names an undefined profile, or the selected model names an
+/// undefined endpoint (#2902).
 fn resolve_target(
     role: &crate::types::Role,
     profile_override: Option<&str>,
@@ -2544,7 +2564,8 @@ fn resolve_target(
         return Ok(None);
     };
     let mapped = role_profile_binding(Some(&role.id), profile_override);
-    Ok(crate::target::resolve_in(&loaded.registry, role, profile_override, mapped, allow_utility_model)?.target())
+    let resolution = crate::target::resolve_in(&loaded.registry, role, profile_override, mapped, allow_utility_model)?;
+    Ok(Some(resolution.require(&role.id, profile_override, &loaded.path)?))
 }
 
 /// (#1187) True when a role's tool palette grants at least one tool — the
@@ -2712,10 +2733,11 @@ pub fn dispatch_resolves_remote(
             darkmux_types::EndpointKind::Unmanaged => true,
             darkmux_types::EndpointKind::Managed(_) => false,
         },
-        // No profile model resolves ⇒ the container path's local fallback.
+        // The registry did not load. The dispatch itself is about to hard-fail.
         Ok(None) => false,
-        // A quarantined profile (#1282) — the dispatch itself is about to
-        // hard-fail, but answer conservatively rather than assuming local.
+        // No profile resolves, or a quarantined profile (#1282): the dispatch
+        // itself is about to hard-fail, but answer conservatively rather than
+        // assuming local.
         Err(_) => true,
     }
 }
@@ -4575,12 +4597,30 @@ fn watchdog_finalize_kill(
     outcome.warning(container_name)
 }
 
+/// Why `run_watchdog` stopped waiting, and therefore what it did next. The
+/// thread returns it, so the cause of an exit is an asserted value rather
+/// than something inferred from how long the thread took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchdogWake {
+    /// `watchdog_done` was set: the main thread proved the wait is over.
+    /// No kill ran.
+    Done,
+    /// `watchdog_abandoned` was set: the scope holding the guard exited
+    /// without proving anything. The persistent kill ran; `timeout_fired`
+    /// was left alone.
+    Abandoned,
+    /// The inactivity deadline passed first. `timeout_fired` was set and
+    /// the persistent kill ran.
+    DeadlineExpired,
+}
+
 /// (#2641 follow-up review, MUST FIX 2) The inactivity watchdog's poll loop,
 /// extracted to a standalone function so `spawn_guarded_watchdog` can prove
 /// it's wired to a real thread (same reason `run_tailer` is standalone
 /// rather than inline in `spawn_guarded_tailer`'s closure).
 ///
-/// Two flags gate this loop, and they are NOT interchangeable:
+/// Two flags gate the wait (`wait_for_watchdog_wake`), and they are NOT
+/// interchangeable:
 ///
 /// - `watchdog_done` — set only by `dispatch()`'s own explicit
 ///   `.store(true, …)` calls on a normal-return path, once the main thread
@@ -4611,46 +4651,26 @@ fn run_watchdog(
     watchdog_abandoned: Arc<AtomicBool>,
     timeout_fired: Arc<AtomicBool>,
     kill_disposition: Arc<AtomicU8>,
-) {
-    // Poll every 500ms. Each iteration reads the CURRENT deadline (which
-    // the tailer may have just reset on a compaction event). When the main
-    // thread signals `watchdog_done`, exit promptly without firing the
-    // kill. When the main thread is instead GONE (panicked) —
-    // `watchdog_abandoned` — stop waiting on the deadline and go straight
-    // to the kill; see this function's own doc for why these are two
-    // separate flags with opposite failure directions.
-    loop {
-        if watchdog_done.load(Ordering::SeqCst) {
-            return;
-        }
-        if watchdog_abandoned.load(Ordering::SeqCst) {
-            break;
-        }
-        let now = Instant::now();
-        let deadline = *lock_deadline(&inactivity_deadline);
-        if now >= deadline {
-            break;
-        }
-        thread::sleep(Duration::from_millis(500));
-    }
-    // Race window: a natural exit can land in the final 500ms sleep above.
-    // Re-check before firing to avoid stamping a spurious timeout on a
+) -> WatchdogWake {
+    let wake = wait_for_watchdog_wake(&inactivity_deadline, &watchdog_done, &watchdog_abandoned);
+    // Race window: a natural exit can land in the final 500ms sleep of the
+    // wait. Re-check before firing to avoid stamping a spurious timeout on a
     // clean exit (QA finding 2026-05-25).
     if watchdog_done.load(Ordering::SeqCst) {
-        return;
+        return WatchdogWake::Done;
     }
-    // Only a genuine deadline expiry earns the "no proof-of-work signal"
-    // framing that `inactivity_timeout_stderr` builds from `timeout_fired`.
-    // An abandonment is a different cause (the main thread panicked, not
-    // that the dispatch stalled) — no in-process reader ever inspects
-    // `timeout_fired` on this path (the panicking function never resumes
-    // to read it), but this function's own behavior stays honest about
-    // WHY it is killing regardless of who, if anyone, later looks.
-    if !watchdog_abandoned.load(Ordering::SeqCst) {
-        // Deadline genuinely hit before the dispatch completed. Mark
-        // timeout BEFORE the kill so the post-wait detection sees the flag,
-        // then SIGKILL the container.
-        timeout_fired.store(true, Ordering::SeqCst);
+    match wake {
+        WatchdogWake::Done => return WatchdogWake::Done,
+        // Only a genuine deadline expiry earns the "no proof-of-work
+        // signal" framing that `inactivity_timeout_stderr` builds from
+        // `timeout_fired`. Mark it BEFORE the kill so the post-wait
+        // detection sees the flag.
+        WatchdogWake::DeadlineExpired => timeout_fired.store(true, Ordering::SeqCst),
+        // A different cause (the main thread panicked, not that the
+        // dispatch stalled). No in-process reader ever inspects
+        // `timeout_fired` on this path, but this function stays honest
+        // about WHY it is killing regardless of who, if anyone, later looks.
+        WatchdogWake::Abandoned => {}
     }
     // (#2232) PERSISTENT, not fire-and-forget. This thread stays alive
     // until the container is confirmed stopped or the attempts are
@@ -4667,7 +4687,7 @@ fn run_watchdog(
     // `watchdog_handle.join()` bounded WHENEVER THE DOCKER CLI RETURNS:
     // ~3.75s of backoff plus however long the subprocesses take, and only
     // on a dispatch that already timed out or was abandoned (a healthy one
-    // returns from the poll loop above without ever reaching this line).
+    // returns from the wait above without ever reaching this line).
     //
     // It is NOT a hard ceiling, and the ~3.75s figure covers only the
     // sleeps. Every attempt is a blocking `Command::output()` and the
@@ -4691,6 +4711,38 @@ fn run_watchdog(
     {
         eprintln!("{warning}");
     }
+    wake
+}
+
+/// `run_watchdog`'s wait: poll every 500ms until the main thread is done,
+/// the guard reports the scope abandoned, or the inactivity deadline passes.
+/// Each iteration reads the CURRENT deadline, which the tailer may have
+/// just reset on a compaction event.
+///
+/// The deadline is read BEFORE the abandonment flag, so an iteration that
+/// sees an expired deadline also sees any abandonment that happened before
+/// the deadline was last written, and abandonment wins the tie. That makes
+/// the returned cause exact rather than a race, which is what lets
+/// `spawn_guarded_watchdog_wiring_survives_a_real_thread_spawn` assert the
+/// cause instead of timing the thread.
+fn wait_for_watchdog_wake(
+    inactivity_deadline: &Mutex<Instant>,
+    watchdog_done: &AtomicBool,
+    watchdog_abandoned: &AtomicBool,
+) -> WatchdogWake {
+    loop {
+        if watchdog_done.load(Ordering::SeqCst) {
+            return WatchdogWake::Done;
+        }
+        let expired = Instant::now() >= *lock_deadline(inactivity_deadline);
+        if watchdog_abandoned.load(Ordering::SeqCst) {
+            return WatchdogWake::Abandoned;
+        }
+        if expired {
+            return WatchdogWake::DeadlineExpired;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
 }
 
 /// (#2641 follow-up review, MUST FIX 1) Construct the watchdog's panic-safe
@@ -4705,9 +4757,9 @@ fn run_watchdog(
 /// `spawn_guarded_watchdog_wiring_survives_a_real_thread_spawn` in the test
 /// module for the red-prove: it calls this function with an inactivity
 /// deadline far in the future, panics immediately after, and asserts the
-/// real spawned thread runs the persistent kill PROMPTLY (bounded wait, not
-/// the full deadline) — the specific regression MUST FIX 2 found and this
-/// shape closes.
+/// real spawned thread woke because of the abandonment (not the deadline)
+/// and ran the persistent kill — the specific regression MUST FIX 2 found
+/// and this shape closes.
 #[allow(clippy::too_many_arguments)]
 fn spawn_guarded_watchdog(
     watchdog_abandoned: &Arc<AtomicBool>,
@@ -4716,7 +4768,7 @@ fn spawn_guarded_watchdog(
     watchdog_done: Arc<AtomicBool>,
     timeout_fired: Arc<AtomicBool>,
     kill_disposition: Arc<AtomicU8>,
-) -> (StopFlagGuard, thread::JoinHandle<()>) {
+) -> (StopFlagGuard, thread::JoinHandle<WatchdogWake>) {
     // Armed the moment this function is called — see `StopFlagGuard`'s own
     // doc. The caller holds the returned guard to the natural end of its
     // own scope (never dropped early), so it backstops every panic between
@@ -5294,10 +5346,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //    the profile's candidate models; with no offer vectors it falls back
     //    to the profile's default model (ModelRole removed in #601).
     //    The profile is the `--profile` override when set (#549), else the
-    //    registry's `default_profile`. If no profile is configured (or has
-    //    no model), falls back to `probe_loaded_model()` with a deprecation
-    //    warning — back-compat for operators on the pre-refactor-1b config
-    //    shape; the warning surfaces the gap so they migrate.
+    //    registry's `default_profile`. If no profile is configured (or it
+    //    selects no model), the dispatch fails with an error naming the fix.
     //
     //    NOT the long-form probe-then-pin path documented in #408 —
     //    that's phase 2+ scope when the recommendation registry
@@ -5317,12 +5367,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             opts.model_base_url_override.is_some(),
             opts.allow_utility_model,
         )
-        .context(
-            "model selection failed. Ensure `~/.darkmux/profiles.json` has \
-             a profile with at least one model (the default model is \
-             `default_model` or the first model in `models`), or load a model in \
-             LMStudio (`lms load <id>`) as a fallback."
-        )?
+        .context("model selection failed")?
     };
     // (#1187 follow-up) Raw label (no eprintln prefix) — this is also the value
     // that must land in `dispatch_start_payload`'s `endpoint` field below, the
@@ -7118,6 +7163,57 @@ fn enrich_envelope_with_summary(
     serde_json::to_string(&v).unwrap_or(stdout)
 }
 
+/// (#2869) Read `<out_dir>/<rel>` as text with the no-follow,
+/// regular-file-only reader. The out-dir is mounted read-write into the
+/// container, so the model's tools can plant a symlink (or a FIFO, or swap
+/// `.darkmux-runtime` for a link to a host directory) at any file the host
+/// later reads from it. A refusal is warned on stderr and then treated as
+/// absent, which every caller already degrades on; absence stays silent.
+pub(crate) fn read_out_dir_text(out_dir: &Path, rel: &str) -> Option<String> {
+    read_out_dir_text_with(out_dir, rel, &stderr_warning_sink)
+}
+
+/// (#2869) The read cap for an out-dir file: the small cap for the files
+/// the host parses whole and that are a few hundred bytes when genuine
+/// (`metrics.json`, the resume origin file), the default for the streams
+/// (trajectory, findings).
+fn out_dir_read_cap(rel: &str) -> u64 {
+    let name = Path::new(rel).file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name == "metrics.json" || name == RESUME_ORIGIN_FILENAME {
+        crate::contained_file::SMALL_FILE_MAX_BYTES
+    } else {
+        crate::contained_file::DEFAULT_MAX_BYTES
+    }
+}
+
+/// (#2869) Whether this is the first refusal of `path` in this process.
+/// The end-of-dispatch reads open the same `metrics.json` up to four times;
+/// the operator hears about a refused file once. Out-dirs are unique per
+/// dispatch, so keying on the full path is "once per file per dispatch".
+/// The set grows only by refused files, which a normal run has none of.
+fn first_refusal_of(path: &Path) -> bool {
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+        .lock()
+        .map(|mut seen| seen.insert(path.to_path_buf()))
+        .unwrap_or(true)
+}
+
+/// [`read_out_dir_text`] with the warning sink injected (tests capture it).
+pub(crate) fn read_out_dir_text_with(out_dir: &Path, rel: &str, sink: &dyn Fn(&str)) -> Option<String> {
+    use crate::contained_file::read_contained_to_string;
+    match read_contained_to_string(out_dir, Path::new(rel), out_dir_read_cap(rel)) {
+        Ok(body) => Some(body),
+        Err(e) => {
+            let path = out_dir.join(rel);
+            if e.is_refused() && first_refusal_of(&path) {
+                sink(&format!("darkmux: {} not read — {e}", path.display()));
+            }
+            None
+        }
+    }
+}
+
 /// (#1959) Count what the crawler recorded, and say where it is.
 ///
 /// Deliberately a COUNT plus a PATH rather than the findings themselves: the
@@ -7127,7 +7223,7 @@ fn enrich_envelope_with_summary(
 /// path in an envelope is a path the caller cannot open.
 fn read_findings_summary(out_dir: &std::path::Path) -> Option<serde_json::Value> {
     let path = out_dir.join(".darkmux-runtime").join("findings.jsonl");
-    let body = std::fs::read_to_string(&path).ok()?;
+    let body = read_out_dir_text(out_dir, ".darkmux-runtime/findings.jsonl")?;
     // Count RECORDS, not lines: a trailing newline is not a finding, and a
     // count that says 4 when the file holds 3 is worse than no count.
     let count = body.lines().filter(|l| !l.trim().is_empty()).count();
@@ -7356,8 +7452,7 @@ impl TokenTotals {
 /// totals — this is an observability enrichment, never a dispatch
 /// failure. Same out-dir the trajectory tailer reads from.
 pub fn read_token_totals(out_dir: &Path) -> TokenTotals {
-    let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
-    let Ok(raw) = fs::read_to_string(&metrics_path) else {
+    let Some(raw) = read_out_dir_text(out_dir, ".darkmux-runtime/metrics.json") else {
         return TokenTotals::default();
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
@@ -7430,8 +7525,7 @@ pub struct CumulativeCounts {
 /// file degrades to zero — this is observability enrichment, never a
 /// dispatch-failing path.
 pub fn read_cumulative_counts(out_dir: &Path) -> CumulativeCounts {
-    let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
-    let Ok(raw) = fs::read_to_string(&metrics_path) else {
+    let Some(raw) = read_out_dir_text(out_dir, ".darkmux-runtime/metrics.json") else {
         return CumulativeCounts::default();
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
@@ -7488,9 +7582,7 @@ pub struct RestTotals {
 /// degrade to `RestTotals::default()` when neither is available —
 /// observability enrichment, never a dispatch failure.
 pub fn read_rest_totals(out_dir: &Path) -> RestTotals {
-    let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
-    let from_metrics = fs::read_to_string(&metrics_path)
-        .ok()
+    let from_metrics = read_out_dir_text(out_dir, ".darkmux-runtime/metrics.json")
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         .filter(|v| v.get("rest_ms").is_some());
     if let Some(v) = from_metrics {
@@ -7508,8 +7600,7 @@ pub fn read_rest_totals(out_dir: &Path) -> RestTotals {
 /// or unreadable lines are skipped rather than aborting the whole sum —
 /// the same lenient-on-read posture the live tailer uses on this file.
 fn sum_rest_totals_from_trajectory(out_dir: &Path) -> RestTotals {
-    let traj_path = out_dir.join(".darkmux-runtime").join("trajectory.jsonl");
-    let Ok(raw) = fs::read_to_string(&traj_path) else {
+    let Some(raw) = read_out_dir_text(out_dir, ".darkmux-runtime/trajectory.jsonl") else {
         return RestTotals::default();
     };
     let mut totals = RestTotals::default();
@@ -7573,9 +7664,7 @@ pub(crate) fn reconcile_rest_totals(from_metrics: RestTotals, from_tailer: RestT
 /// field's zero when there were also zero rests to derive an average
 /// from (a single-turn dispatch's honest `0`); otherwise fall through.
 pub fn read_turn_delay_effective_ms(out_dir: &Path, rest: RestTotals) -> Option<u64> {
-    let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
-    let from_metrics = fs::read_to_string(&metrics_path)
-        .ok()
+    let from_metrics = read_out_dir_text(out_dir, ".darkmux-runtime/metrics.json")
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         .and_then(|v| v.get("turn_delay_effective_ms").and_then(|n| n.as_u64()));
     if let Some(v) = from_metrics {
@@ -7925,8 +8014,10 @@ fn run_tailer(
         state.live_flush(crate::usage::unix_ms_now());
         if stop_flag.load(Ordering::SeqCst) {
             // Final flush — pick up anything written between the last
-            // sleep tick and the container's exit signal.
-            state.poll_and_emit();
+            // sleep tick and the container's exit signal. (#2869) One poll
+            // reads at most `max_poll_bytes`, so drain until a poll makes
+            // no progress (bounded), or a large backlog loses its tail.
+            state.drain_to_end();
             state.live_flush_final();
             break;
         }
@@ -7954,7 +8045,7 @@ fn run_tailer(
             // it away for free. The container is about to be killed
             // either way; that doesn't make the last poll tick's data
             // stale.
-            state.poll_and_emit();
+            state.drain_to_end();
             darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
             break;
         }
@@ -8344,7 +8435,7 @@ fn stamping_emitter<'a>(
 /// doc names: the breaker pauses the DISPATCH but "never kills the
 /// container," so the resident model that produced the heat keeps holding
 /// the GPU. This unloads every `darkmux:`-namespaced resident on this host
-/// (via [`darkmux_profiles::swap::eject_all_managed`] — the SAME mechanism
+/// (via [`darkmux_profiles::ownership::eject_all_managed`] — the SAME mechanism
 /// `darkmux machine eject` uses, not a second unloader) so the machine can
 /// actually cool.
 ///
@@ -8383,7 +8474,7 @@ fn tier5_eject_on_critical(host_out: &Path, trip_wall: SystemTime, emit: &dyn Fn
         }
         thread::sleep(POLL_INTERVAL);
     };
-    match darkmux_profiles::swap::eject_all_managed(false) {
+    match darkmux_profiles::ownership::eject_all_managed(false) {
         Ok(summary) => {
             let ejected: Vec<serde_json::Value> = summary
                 .ejected
@@ -9438,10 +9529,41 @@ fn merge_record_context(payload: &mut serde_json::Value, record_context: &Option
     }
 }
 
+/// (#2869) Most bytes one tailer poll reads. A long trajectory streams
+/// across polls; a sparse or runaway one cannot make the host allocate its
+/// whole claimed size.
+const TAILER_MAX_POLL_BYTES: u64 = 8 * 1024 * 1024;
+
+/// (#2869) Longest trajectory line the tailer will carry across polls.
+/// Real events are bounded far below this; a line past it is dropped.
+const TAILER_MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
+
+/// (#2869) Most polls the tailer's final drain makes after stop.
+const TAILER_MAX_DRAIN_POLLS: usize = 128;
+
 /// any partial-line tail bytes carried across polls, and the last
 /// heartbeat instant for rate limiting.
+///
+/// (#2869) The trajectory file is model-writable, so its size is not a
+/// number the host may trust: one poll reads at most
+/// [`TAILER_MAX_POLL_BYTES`], and an unterminated line longer than
+/// [`TAILER_MAX_PENDING_BYTES`] is dropped (one warning) rather than
+/// buffered without bound.
 struct TailerState {
     trajectory_path: PathBuf,
+    /// (#2869) Set once the tailer has warned that the trajectory file was
+    /// refused (a symlink, a non-regular file, a swapped directory), so a
+    /// 250ms poll loop warns once, not four times a second.
+    trajectory_refusal_warned: bool,
+    /// (#2869) Most bytes one poll reads (`TAILER_MAX_POLL_BYTES`).
+    max_poll_bytes: u64,
+    /// (#2869) Largest unterminated line the tailer carries across polls
+    /// (`TAILER_MAX_PENDING_BYTES`).
+    max_pending_bytes: usize,
+    /// (#2869) Skipping the remainder of an oversize line until its newline.
+    discarding_line: bool,
+    /// (#2869) The oversize-line warning has been given (once per tailer).
+    pending_overflow_warned: bool,
     offset: u64,
     /// Trailing partial line carried from one poll to the next when the
     /// file ends mid-line (a write was in progress at our read).
@@ -9656,6 +9778,11 @@ impl TailerState {
             compaction_attempts: 0,
             open_compaction: None,
             trajectory_path,
+            trajectory_refusal_warned: false,
+            max_poll_bytes: TAILER_MAX_POLL_BYTES,
+            max_pending_bytes: TAILER_MAX_PENDING_BYTES,
+            discarding_line: false,
+            pending_overflow_warned: false,
             offset: 0,
             pending: Vec::new(),
             last_counted_turn_seq: None,
@@ -9883,6 +10010,11 @@ impl TailerState {
             compaction_attempts: 0,
             open_compaction: None,
             trajectory_path,
+            trajectory_refusal_warned: false,
+            max_poll_bytes: TAILER_MAX_POLL_BYTES,
+            max_pending_bytes: TAILER_MAX_PENDING_BYTES,
+            discarding_line: false,
+            pending_overflow_warned: false,
             offset: 0,
             pending: Vec::new(),
             last_counted_turn_seq: None,
@@ -9913,43 +10045,112 @@ impl TailerState {
     /// One poll round: open the trajectory file, read new bytes since
     /// the previous offset, drain complete lines, dispatch each event.
     /// Silent on errors — file may not exist yet (container hasn't
-    /// written) and any IO hiccup is best-effort.
-    fn poll_and_emit(&mut self) {
+    /// written) and any IO hiccup is best-effort. The one exception is a
+    /// REFUSED open (#2869): the out-dir is model-writable, so the file is
+    /// opened with no-follow at `.darkmux-runtime/trajectory.jsonl` and
+    /// must be a regular file; a symlink or FIFO planted there is never
+    /// read, and the tailer says so once through its warning sink.
+    fn poll_and_emit(&mut self) -> u64 {
+        use crate::contained_file::{open_path_tail, ContainedFileError};
         use std::io::{Read, Seek, SeekFrom};
 
-        let mut file = match std::fs::File::open(&self.trajectory_path) {
+        let mut file = match open_path_tail(&self.trajectory_path, 2) {
             Ok(f) => f,
-            Err(_) => return,
+            Err(ContainedFileError::Refused(why)) => {
+                if !self.trajectory_refusal_warned {
+                    self.trajectory_refusal_warned = true;
+                    (self.warning_sink)(&format!(
+                        "darkmux: live trajectory {} not read — {why}; this dispatch's \
+                         live records and turn counts will be missing",
+                        self.trajectory_path.display()
+                    ));
+                }
+                return 0;
+            }
+            Err(_) => return 0,
         };
         let size = match file.metadata() {
             Ok(m) => m.len(),
-            Err(_) => return,
+            Err(_) => return 0,
         };
         // File truncated below our offset (shouldn't happen in practice
         // since the runtime writes append-only, but defensive): reset.
         if size < self.offset {
             self.offset = 0;
             self.pending.clear();
+            // (#2869) A rewritten file starts clean: the oversize line
+            // being skipped belonged to the old contents.
+            self.discarding_line = false;
         }
         if size <= self.offset {
-            return;
+            return 0;
         }
 
         if file.seek(SeekFrom::Start(self.offset)).is_err() {
-            return;
+            return 0;
         }
-        let mut buf = Vec::with_capacity((size - self.offset) as usize);
-        if file.read_to_end(&mut buf).is_err() {
-            return;
+        // (#2869) Bounded: never size a buffer from `fstat` (the model can
+        // make the file claim any size, e.g. a sparse petabyte, and a
+        // `with_capacity` of that aborts the host process). Read at most
+        // `max_poll_bytes` and advance by what was ACTUALLY read; the rest
+        // streams on later polls.
+        let budget = (size - self.offset).min(self.max_poll_bytes);
+        let mut buf = Vec::new();
+        if (&mut file).take(budget).read_to_end(&mut buf).is_err() {
+            return 0;
         }
-        self.offset = size;
+        let read = buf.len() as u64;
+        self.offset += read;
+
+        // (#2869) A line being discarded (it outgrew the cap) is skipped up
+        // to and including its newline.
+        let mut bytes: &[u8] = &buf;
+        if self.discarding_line {
+            match bytes.iter().position(|&b| b == b'\n') {
+                Some(i) => {
+                    self.discarding_line = false;
+                    bytes = &bytes[i + 1..];
+                }
+                None => return read,
+            }
+        }
 
         // Append raw bytes; decode happens per-line (after the
         // trailing newline arrives) so multi-byte UTF-8 chars that
         // straddle a poll boundary don't corrupt to U+FFFD (#329).
-        self.pending.extend_from_slice(&buf);
+        self.pending.extend_from_slice(bytes);
         for line in drain_complete_lines_from_bytes(&mut self.pending) {
             self.handle_event(&line);
+        }
+        // (#2869) What remains is one unterminated line. Past the cap it is
+        // dropped, not buffered without bound, and so is the rest of it.
+        if self.pending.len() > self.max_pending_bytes {
+            let dropped = self.pending.len();
+            self.pending = Vec::new();
+            self.discarding_line = true;
+            if !self.pending_overflow_warned {
+                self.pending_overflow_warned = true;
+                (self.warning_sink)(&format!(
+                    "darkmux: live trajectory {} has a line that exceeds the {}-byte cap \
+                     ({dropped} bytes so far with no newline); dropping it and any \
+                     further oversize lines",
+                    self.trajectory_path.display(),
+                    self.max_pending_bytes
+                ));
+            }
+        }
+        read
+    }
+
+    /// (#2869) Poll until a poll reads nothing, at most
+    /// [`TAILER_MAX_DRAIN_POLLS`] times (1 GiB at the default poll size), so
+    /// a stopped dispatch's whole backlog is read but a file still growing
+    /// under a runaway writer cannot hold the tailer forever.
+    fn drain_to_end(&mut self) {
+        for _ in 0..TAILER_MAX_DRAIN_POLLS {
+            if self.poll_and_emit() == 0 {
+                break;
+            }
         }
     }
 
@@ -12071,28 +12272,21 @@ fn preflight_result_for(status: DockerRuntimeStatus) -> Result<()> {
 ///    `registry.default_profile`. An override that ISN'T defined on this
 ///    machine falls back to `default_profile` (logged) rather than failing —
 ///    a machine-agnostic caller names the profile it wants and each machine
-///    maps it to a lab-validated model. When nothing resolves, fall back to
-///    `probe_loaded_model()`.
+///    maps it to a lab-validated model. When nothing resolves, a hard error
+///    naming the fix.
 /// 2. Look up the profile + call `select_model(role, profile, skill_lookup)`,
 ///    which capability-scores the role against the profile's models (#590),
 ///    falling back to the profile's default model when no vectors
 ///    are populated (ModelRole removed in #601).
 /// 3. On no-default / no-model failures (a registry that LOADED fine but has
-///    nothing usable), log a deprecation warning + fall back to
-///    `probe_loaded_model()`. Back-compat for pre-refactor-1b
-///    configurations; the warning points the operator at the migration.
-///
-/// The fallback is intentional but loud for those two cases. Per memory
-/// note `feedback_model_unload_load_authority`, silent reliance on
-/// "whatever LMStudio happens to have loaded" is the contaminating-dispatch
-/// anti-pattern. The deprecation warning makes the misconfiguration
-/// operator-visible while keeping pre-refactor-1b setups working.
+///    nothing usable), a hard error naming the profile and the fix. (4.0)
+///    There is no fallback to "whatever LMStudio happens to have loaded":
+///    that is the contaminating-dispatch anti-pattern (a user-loaded model
+///    has unknown load configuration, the #1135 ghost).
 ///
 /// (#1269) A registry-LOAD failure (step 1 itself erroring — malformed
-/// JSON, a bad profile) is a DIFFERENT failure class and does NOT fall
-/// through to `probe_loaded_model()`: routing a broken config file into an
-/// unrelated LMStudio probe just produces a second, more confusing error on
-/// top of the first. One config mistake gets ONE clear, named error.
+/// JSON, a bad profile) gets its own named error too: one config mistake,
+/// ONE clear error.
 ///
 /// `skip_lmstudio_residency`: mock-model harness escape hatch (real Docker
 /// dispatch, fake "model" — see `crates/darkmux-crew/tests/mock_dispatch_proof.rs`
@@ -12279,25 +12473,18 @@ fn resolve_dispatch_model_with_hosts(
     // names a profile NOT defined on this machine falls back to
     // `default_profile` (the machine-agnostic-caller contract — a workflow
     // names the profile it wants; each machine maps it to a lab-validated
-    // model or degrades to its default). When nothing resolves, probe.
+    // model or degrades to its default). When nothing resolves, a hard error.
     // (#1547) Role-aware: when no `--profile` override is given, this now
     // honors the `role_profiles.<role.id>` map before falling to
     // `default_profile` — the same precedence the review launcher already
     // applies to this map, now honored on the container dispatch path too.
-    let active_name = match &resolution {
-        crate::target::Resolution::Target(t) => t.profile_name.clone(),
-        crate::target::Resolution::NoModel { profile_name, .. } => profile_name.clone(),
-        crate::target::Resolution::NoProfile => {
-            // (#1282) A quarantined `default_profile` already hard-stopped in
-            // `resolve_in`, so this is genuinely "nothing configured".
-            eprintln!(
-                "darkmux dispatch: no usable profile (no --profile match and no \
-                 default_profile set/defined); falling back to probe_loaded_model() — \
-                 deprecated, set default_profile in ~/.darkmux/profiles.json. (#450 refactor 1b)"
-            );
-            return probe_loaded_model();
-        }
-    };
+    // (4.0) No profile, or a profile that selects no model, is a hard error
+    // with the one shared message; there is no fallback to whatever LMStudio
+    // has loaded (a user-loaded model has unknown load configuration, the
+    // #1135 ghost). A quarantined `default_profile` already hard-stopped in
+    // `resolve_in`.
+    let target = resolution.require(&role.id, profile_override, &loaded.path)?;
+    let active_name = target.profile_name.clone();
     // Surface the fallback so the operator isn't surprised which model ran:
     // an explicit `--profile X` that resolved to a different name means X
     // wasn't defined here.
@@ -12312,129 +12499,109 @@ fn resolve_dispatch_model_with_hosts(
         }
     }
 
-    match resolution {
-        crate::target::Resolution::Target(target) => {
-            let id = target.model.id.clone();
-            // (#2038) Before anything else: a placeholder id would reach
-            // LM Studio and come back as "model not found", which reads as
-            // an LM Studio problem. It is an unfilled blank from
-            // `darkmux init`, and the message has to say so. Unconditional,
-            // so a residency-skipping path cannot carry the placeholder on.
-            if is_placeholder_model_id(&id) {
-                bail!(placeholder_model_error(&active_name, &id, &loaded.path));
-            }
-            // (#1135) Load the selected model at the profile's DECLARED n_ctx
-            // before dispatch — and before the #408 cross-check below, which
-            // then finds it resident. Pre-#1135 the dispatch only resolved the
-            // model *id* and let LMStudio JIT-load it at the MODEL default
-            // (e.g. 4096 on devstral), silently truncating large inputs (a
-            // pr-review diff overflows 4096 → garbage review, no error). The
-            // profile *declares* the context; honor it.
-            //
-            // (#2240) `wire_id` starts as the bare selection and is upgraded
-            // below, only for a real LMStudio dispatch, to the SAME
-            // darkmux-namespaced identifier the JIT-load just created (or
-            // reused). Putting the bare key on the wire let a dispatch aimed
-            // at "foo" resolve to a co-resident user-loaded "foo" instead of
-            // darkmux's own instance — the namespace convention's registry
-            // item 4 is ABSOLUTE for model lifecycle (#1274): darkmux
-            // dispatches only TO `darkmux:*` instances, because a
-            // user-loaded copy of the right model has unknown load
-            // configuration (the #1135 ghost — a model silently JIT-loaded
-            // at LMStudio's 4096 default instead of the profile's n_ctx).
-            // This mirrors the identifier `ensure_model_resident` itself
-            // derives for the `lms load`/`lms ps` calls — see that
-            // function's `model_key`/`identifier` derivation — so the id
-            // this function hands back to the wire is byte-identical to the
-            // one that now answers for it.
-            let mut wire_id = id.clone();
-            if !skip_lmstudio_residency {
-                ensure_resident(&target.model)?;
-                wire_id = target.wire_model();
-            }
-            // (#450 review note / #408) Cross-check against actual
-            // LMStudio loaded models. Residents loaded for one profile (a
-            // prior dispatch, or a hand `lms load`) don't update
-            // `default_profile` in the registry — so this path could select
-            // `balanced`'s default model while LMStudio holds `fast`'s
-            // models. The dispatch would then fail at the LMStudio call
-            // (or worse, silently route to a different model if the id
-            // collides). Surfacing the mismatch here makes the
-            // misconfiguration operator-visible at dispatch time, not at
-            // LMStudio's cryptic "model not loaded" error.
-            if !skip_lmstudio_residency {
-                if let Ok(loaded_ids) = list_loaded() {
-                if !loaded_ids.is_empty() && !loaded_ids.iter().any(|m| m == &id) {
-                    let loaded = loaded_ids.join(", ");
-                    if strict_selection_enabled() {
-                        // (#408) Strict mode: a selected-vs-loaded
-                        // mismatch is the dispatch-contamination case from
-                        // the `feedback_model_unload_load_authority` memory
-                        // note — proceeding risks measuring or attributing
-                        // the wrong model, inheriting class-wide errors
-                        // into every downstream claim. In a methodology /
-                        // CI run the operator opts into hard-fail rather
-                        // than a silent route to whatever LMStudio has
-                        // loaded.
-                        bail!(
-                            "darkmux dispatch: profile `{active_name}` selects \
-                             `{id}`, but LMStudio has loaded [{loaded}] and \
-                             DARKMUX_STRICT_SELECTION is set — refusing to dispatch \
-                             against an unselected model. Fix: `lms load {id}` to load \
-                             the selected model, update `default_profile` to match \
-                             what's loaded, or unset DARKMUX_STRICT_SELECTION to \
-                             proceed anyway. (#408)"
-                        );
-                    }
-                    eprintln!(
-                        "darkmux dispatch: WARNING — profile `{active_name}` \
-                         selects `{id}`, but LMStudio has loaded [{loaded}]. \
-                         Residents loaded for another profile don't update \
-                         `default_profile` in the registry; your loaded model \
-                         won't match the selection. To fix: either `lms load {id}` \
-                         to align LMStudio with the registry's default, or update \
-                         `default_profile` to match what's loaded. Set \
-                         DARKMUX_STRICT_SELECTION=1 to make this mismatch fatal \
-                         instead of a warning. (#450 review note, #408)"
+        let id = target.model.id.clone();
+        // (#2038) Before anything else: a placeholder id would reach
+        // LM Studio and come back as "model not found", which reads as
+        // an LM Studio problem. It is an unfilled blank from
+        // `darkmux init`, and the message has to say so. Unconditional,
+        // so a residency-skipping path cannot carry the placeholder on.
+        if is_placeholder_model_id(&id) {
+            bail!(placeholder_model_error(&active_name, &id, &loaded.path));
+        }
+        // (#1135) Load the selected model at the profile's DECLARED n_ctx
+        // before dispatch — and before the #408 cross-check below, which
+        // then finds it resident. Pre-#1135 the dispatch only resolved the
+        // model *id* and let LMStudio JIT-load it at the MODEL default
+        // (e.g. 4096 on devstral), silently truncating large inputs (a
+        // pr-review diff overflows 4096 → garbage review, no error). The
+        // profile *declares* the context; honor it.
+        //
+        // (#2240) `wire_id` starts as the bare selection and is upgraded
+        // below, only for a real LMStudio dispatch, to the SAME
+        // darkmux-namespaced identifier the JIT-load just created (or
+        // reused). Putting the bare key on the wire let a dispatch aimed
+        // at "foo" resolve to a co-resident user-loaded "foo" instead of
+        // darkmux's own instance — the namespace convention's registry
+        // item 4 is ABSOLUTE for model lifecycle (#1274): darkmux
+        // dispatches only TO `darkmux:*` instances, because a
+        // user-loaded copy of the right model has unknown load
+        // configuration (the #1135 ghost — a model silently JIT-loaded
+        // at LMStudio's 4096 default instead of the profile's n_ctx).
+        // This mirrors the identifier `ensure_model_resident` itself
+        // derives for the `lms load`/`lms ps` calls — see that
+        // function's `model_key`/`identifier` derivation — so the id
+        // this function hands back to the wire is byte-identical to the
+        // one that now answers for it.
+        let mut wire_id = id.clone();
+        if !skip_lmstudio_residency {
+            ensure_resident(&target.model)?;
+            wire_id = target.wire_model();
+        }
+        // (#450 review note / #408) Cross-check against actual
+        // LMStudio loaded models. Residents loaded for one profile (a
+        // prior dispatch, or a hand `lms load`) don't update
+        // `default_profile` in the registry — so this path could select
+        // `balanced`'s default model while LMStudio holds `fast`'s
+        // models. The dispatch would then fail at the LMStudio call
+        // (or worse, silently route to a different model if the id
+        // collides). Surfacing the mismatch here makes the
+        // misconfiguration operator-visible at dispatch time, not at
+        // LMStudio's cryptic "model not loaded" error.
+        if !skip_lmstudio_residency {
+            if let Ok(loaded_ids) = list_loaded() {
+            if !loaded_ids.is_empty() && !loaded_ids.iter().any(|m| m == &id) {
+                let loaded = loaded_ids.join(", ");
+                if strict_selection_enabled() {
+                    // (#408) Strict mode: a selected-vs-loaded
+                    // mismatch is the dispatch-contamination case from
+                    // the `feedback_model_unload_load_authority` memory
+                    // note — proceeding risks measuring or attributing
+                    // the wrong model, inheriting class-wide errors
+                    // into every downstream claim. In a methodology /
+                    // CI run the operator opts into hard-fail rather
+                    // than a silent route to whatever LMStudio has
+                    // loaded.
+                    bail!(
+                        "darkmux dispatch: profile `{active_name}` selects \
+                         `{id}`, but LMStudio has loaded [{loaded}] and \
+                         DARKMUX_STRICT_SELECTION is set — refusing to dispatch \
+                         against an unselected model. Fix: `lms load {id}` to load \
+                         the selected model, update `default_profile` to match \
+                         what's loaded, or unset DARKMUX_STRICT_SELECTION to \
+                         proceed anyway. (#408)"
                     );
                 }
-                }
-            }
-            // (#2240 review) The #408 mismatch warning ~30 lines above names
-            // this model by its KEY (``selects `{id}` ``) and advises
-            // ``lms load {id}`` — `lms load` takes a KEY, never an
-            // identifier, so THAT remedy has to stay bare. Both lines can
-            // fire in one dispatch, so this one names the same key and then
-            // discloses the instance actually being dispatched against,
-            // rather than silently printing a second spelling of one model
-            // and leaving the operator to work out they are the same thing.
-            if wire_id == id {
-                eprintln!("darkmux dispatch: selected model `{id}` via profile `{active_name}`");
-            } else {
                 eprintln!(
-                    "darkmux dispatch: selected model `{id}` via profile `{active_name}`; \
-                     dispatching against darkmux's own resident instance `{wire_id}` (#2240)"
+                    "darkmux dispatch: WARNING — profile `{active_name}` \
+                     selects `{id}`, but LMStudio has loaded [{loaded}]. \
+                     Residents loaded for another profile don't update \
+                     `default_profile` in the registry; your loaded model \
+                     won't match the selection. To fix: either `lms load {id}` \
+                     to align LMStudio with the registry's default, or update \
+                     `default_profile` to match what's loaded. Set \
+                     DARKMUX_STRICT_SELECTION=1 to make this mismatch fatal \
+                     instead of a warning. (#450 review note, #408)"
                 );
             }
-            Ok(wire_id)
+            }
         }
-        // `NoProfile` returned above; kept exhaustive rather than panicking.
-        crate::target::Resolution::NoProfile => probe_loaded_model(),
-        crate::target::Resolution::NoModel { error: e, .. } => {
+        // (#2240 review) The #408 mismatch warning ~30 lines above names
+        // this model by its KEY (``selects `{id}` ``) and advises
+        // ``lms load {id}`` — `lms load` takes a KEY, never an
+        // identifier, so THAT remedy has to stay bare. Both lines can
+        // fire in one dispatch, so this one names the same key and then
+        // discloses the instance actually being dispatched against,
+        // rather than silently printing a second spelling of one model
+        // and leaving the operator to work out they are the same thing.
+        if wire_id == id {
+            eprintln!("darkmux dispatch: selected model `{id}` via profile `{active_name}`");
+        } else {
             eprintln!(
-                "darkmux dispatch: select_model error ({e}); falling back \
-                 to probe_loaded_model() — deprecated. Add a default \
-                 model to profile `{active_name}` to migrate. (#450 refactor 1b)"
+                "darkmux dispatch: selected model `{id}` via profile `{active_name}`; \
+                 dispatching against darkmux's own resident instance `{wire_id}` (#2240)"
             );
-            // TODO(#450 phase-1c): the selected-vs-loaded MISMATCH case
-            // now honors `DARKMUX_STRICT_SELECTION` (see the Ok branch
-            // above). This Err branch — no model configured at all —
-            // still warn-and-probes for back-compat with pre-refactor-1b
-            // configs. When phase-1c lands the two-instances-per-purpose
-            // policy, fold this fallback under strict mode too.
-            probe_loaded_model()
         }
-    }
+        Ok(wire_id)
 }
 
 /// (#590) Best-effort: the machine's registered utility model
@@ -12513,7 +12680,7 @@ fn resolve_dispatch_compaction(
 /// Delegates the derivation to `CompactionDispatchArgs::from_profile` so the
 /// default-model → `n_ctx` rule has a single source of truth. Returns
 /// `Ok(None)` when the registry/profile can't be resolved — the same edge
-/// cases that send model selection to `probe_loaded_model()` — and `Err`
+/// cases where model selection fails — and `Err`
 /// when the requested (or default) profile is QUARANTINED (#1282): the
 /// window must never silently come from a DIFFERENT profile than the one
 /// the dispatch names.
@@ -12652,9 +12819,8 @@ fn profile_context_window(profile: &darkmux_types::Profile) -> Option<u32> {
 /// came from a `role_profiles` mapping (#2905). Takes the binding explicitly
 /// (`mapped`) so a test can drive the mapped arm.
 ///
-/// When a profile resolves but no model is selectable (the dispatch then
-/// falls back to `probe_loaded_model`), the profile's default model's window
-/// is kept, as before. A registry that does not load is `Ok(None)`.
+/// When a profile resolves but no model is selectable (the dispatch itself
+/// then fails), the profile's default model's window is kept. A registry that does not load is `Ok(None)`.
 fn resolve_dispatch_windows_with(
     role: &crate::types::Role,
     profile_override: Option<&str>,
@@ -12952,21 +13118,9 @@ pub(crate) fn is_reloadable_target(
         && resident_identifier == darkmux_gestalt::namespaced_identifier(want, want_identifier)
 }
 
-/// (#1615) The LOADABLE model key for a value that may carry the darkmux
-/// namespace. A bare key passes through untouched; `darkmux:foo` becomes `foo`.
-///
-/// The namespace is a LOAD-TIME DECORATION, never part of the key: `lms ps`
-/// reports a darkmux load as `identifier=darkmux:foo, modelKey=foo`, so
-/// LMStudio has no key carrying the prefix and every comparison-or-load
-/// against a prefixed string is guaranteed to miss.
-///
-/// Pure and borrowing, so the strip is unit-testable without a live `lms` and
-/// costs no allocation on the hot path.
-pub(crate) fn bare_model_key(value: &str) -> &str {
-    value
-        .strip_prefix(darkmux_gestalt::DARKMUX_NAMESPACE)
-        .unwrap_or(value)
-}
+// The loadable model key is `darkmux_gestalt::bare_model_key` (#1615): the
+// namespace is a load-time decoration, never part of the key. One definition.
+use darkmux_gestalt::bare_model_key;
 
 /// (#2318) Serializes the residency preflight's check-then-load window inside
 /// this process.
@@ -13347,33 +13501,6 @@ fn probe_loaded_model_list() -> Result<Vec<String>> {
         }
     }
     Ok(ids)
-}
-
-/// return the first model id. Uses curl so we don't drag a Rust HTTP
-/// client dep into darkmux's main crate for one probe call.
-fn probe_loaded_model() -> Result<String> {
-    // env(DARKMUX_LMSTUDIO_URL) > config.lmstudio_url > http://localhost:1234,
-    // + the /v1/models path (#661 Slice 4 — the probe is now config-aware and
-    // shares the base URL with the phase chat narrator).
-    let url = format!("{}/v1/models", darkmux_types::config_access::lmstudio_url());
-    let output = Command::new("curl")
-        .args(["-sf", "-m", "5", &url])
-        .output()
-        .context("running curl to probe LMStudio")?;
-
-    if !output.status.success() {
-        bail!("LMStudio /v1/models probe failed (curl exit {})", output.status.code().unwrap_or(-1));
-    }
-
-    let body: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .context("parsing LMStudio /v1/models response as JSON")?;
-
-    body["data"]
-        .as_array()
-        .and_then(|arr| arr.first())
-        .and_then(|m| m["id"].as_str())
-        .map(String::from)
-        .ok_or_else(|| anyhow!("LMStudio /v1/models returned no models"))
 }
 
 // `first_user_symlink_in` and `is_macos_firmlink` moved to

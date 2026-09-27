@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn ingest_dedup_identifier_collision_model_entry_wins() {
-        // The swap.rs collision fixture: a declared model whose explicit
+        // The identifier-collision fixture: a declared model whose explicit
         // `identifier` equals the utility model's namespaced identifier
         // dedups to ONE placement (by identifier), and the declared entry
         // wins — the `darkmux:util-4b` slot carries the declared model's

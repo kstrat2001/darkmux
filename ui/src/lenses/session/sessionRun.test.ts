@@ -160,7 +160,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(view.header.pillLabel).toBe("COMPLETE");
-    expect(view.header.pillCls).toBe("done");
+    expect(view.header.status).toBe("complete");
     expect(view.header.role).toBe("CODER");
     expect(view.briefLines.map((e) => e.text)).toContain("route");
     expect(view.briefLines.map((e) => e.text)).toContain("LMStudio · local · this machine");
@@ -435,7 +435,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(view.header.pillLabel).toBe("ERRORED");
-    expect(view.header.pillCls).toBe("err");
+    expect(view.header.status).toBe("error");
     // (#2860) The figure alone in `value`, the outcome on the `sub` line: the
     // tile value is `nowrap` because it is contracted to be one short figure
     // (`styles.css`, `.session-run .mv`), and "3:38 · errored (exit 1)" ran

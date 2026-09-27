@@ -368,12 +368,18 @@ const MULTI = {
 };
 
 /** The fleet hero with and without its part lines: an idle machine whose
- *  usage records do or do not report cached tokens and a utility call. */
+ *  usage records do or do not report cached tokens and a utility call.
+ *  `hero-notes` carries `note` records the viewer no longer renders (#2983):
+ *  a long mission-level `source: "orchestrator"` one, as flow archives still
+ *  hold, and a session-scoped adjudication one. Neither may reach the hero. */
+const NOTE_WORDS =
+  "shipped the review path end to end on local models tonight, the crew caught four real findings and the report rendered cleanly on the phone";
 const HEROES = [
   { id: "hero-plain", date: "2026-08-23", cached: false, util: false },
   { id: "hero-cached", date: "2026-08-25", cached: true, util: false },
   { id: "hero-util", date: "2026-08-27", cached: false, util: true },
   { id: "hero-both", date: "2026-08-29", cached: true, util: true },
+  { id: "hero-notes", date: "2026-07-16", cached: false, util: false, notes: true },
 ].map((h) => ({
   ...h,
   now: "12:00:30",
@@ -382,6 +388,12 @@ const HEROES = [
     b.usage(at(d, "12:00:06"), { prompt: 4000, completion: 350, cached: h.cached ? 140 : undefined }),
     ...(h.util ? [b.usage(at(d, "12:00:08"), { prompt: 120, completion: 25, purpose: "utility", callKind: "compaction", handle: "compactor" })] : []),
     b.complete(d),
+    ...(h.notes
+      ? [
+          { ts: at(d, "12:00:10"), action: "note", category: "work", tier: "operator", source: "orchestrator", handle: NOTE_WORDS, ...MACHINE },
+          b.rec(at(d, "12:00:11"), "note", {}, { category: "work", tier: "operator", source: "adjudication", handle: "verdict: pass" }),
+        ]
+      : []),
   ],
 }));
 

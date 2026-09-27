@@ -32,10 +32,9 @@
 //!
 //! Absorption lineage: [`residency::decide_residency`] is a fact-typed port
 //! of the review's validated miniature (`darkmux-lab` review.rs,
-//! PR #1275); [`ownership`] duplicates `darkmux_profiles::swap`'s canonical
-//! ownership helpers under golden parity tests (the root-crate
-//! `tests/gestalt_parity.rs` guards the duplication window until packet 3
-//! re-points swap.rs at this crate — the #1271 one-definition discipline).
+//! PR #1275); [`ownership`] is the one definition of the ownership helpers
+//! (`darkmux_profiles::ownership` builds on it — the #1271 one-definition
+//! discipline).
 //!
 //! Namespace ownership is ABSOLUTE (operator decision, 2026-07-10, #1274):
 //! every planned load/unload/reconcile targets only `darkmux:*` instances
@@ -64,9 +63,11 @@ pub use estimator::{
     DEFAULT_TRANSIENT_MARGIN_BYTES,
 };
 pub use facts::{Budget, CallerIntent, CatalogFact, Facts, PoolFact, PoolId, Pools, ResidentFact};
-pub use ownership::{ctx_sufficient, is_darkmux_owned, namespaced_identifier, DARKMUX_NAMESPACE};
+pub use ownership::{
+    bare_model_key, ctx_sufficient, is_darkmux_owned, namespaced_identifier, DARKMUX_NAMESPACE,
+};
 pub use plan::{
-    Action, EvictionOrder, ExecHint, ForeignTargetError, OwnedTarget, Plan, PlannedAction,
+    Action, EvictionOrder, ForeignTargetError, OwnedTarget, Plan, PlannedAction,
     Precondition, Reason, Warning,
 };
 pub use planner::{plan_acquire, plan_release, AcquireOpts, AcquireScope};

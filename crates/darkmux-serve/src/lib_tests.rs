@@ -1843,6 +1843,62 @@
         assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// The `/health` body for a loopback request carrying `headers`,
+    /// through the real router and handler.
+    async fn loopback_health(headers: &[(&str, &str)]) -> serde_json::Value {
+        let app = build_router_local(PathBuf::new());
+        let mut b = Request::builder().uri("/health");
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let mut req = b.body(Body::empty()).unwrap();
+        req.extensions_mut().insert(loopback_peer());
+        let resp = app.oneshot(req).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// (#2916 stage 2 review C5) The `/health` fields for this machine only
+    /// are withheld from a loopback request that came through a reverse
+    /// proxy (`tailscale serve` puts every tailnet peer on loopback), and
+    /// shown to a plain loopback request. Drives the real handler.
+    #[tokio::test]
+    async fn health_withholds_this_machine_fields_from_a_proxied_loopback_request() {
+        *crate::fleet_listener::LISTENER_BUSY.lock().unwrap() =
+            Some((darkmux_types::config::BusyPolicy::Queue, 2));
+        let local = loopback_health(&[]).await;
+        assert!(local["open_file_limit"].is_number(), "this machine sees its own limit: {local}");
+        assert_eq!(local["fleet_busy"]["policy"], "queue", "{local}");
+        for proxied in [
+            ("X-Forwarded-For", "100.64.0.7"),
+            ("Tailscale-User-Login", "someone@example.com"),
+            ("Forwarded", "for=100.64.0.7"),
+        ] {
+            let v = loopback_health(&[proxied]).await;
+            assert!(v["open_file_limit"].is_null(), "{proxied:?} is a peer, not this machine: {v}");
+            assert!(v["fleet_busy"].is_null(), "{proxied:?}: {v}");
+        }
+        // Process-global: leave it as the process started.
+        *crate::fleet_listener::LISTENER_BUSY.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn is_local_request_needs_a_loopback_peer_and_no_proxy_header() {
+        let empty = axum::http::HeaderMap::new();
+        let lo: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let v6: SocketAddr = "[::1]:5000".parse().unwrap();
+        let remote: SocketAddr = "100.64.0.7:5000".parse().unwrap();
+        assert!(is_local_request(Some(lo), &empty));
+        assert!(is_local_request(Some(v6), &empty));
+        assert!(!is_local_request(Some(remote), &empty));
+        assert!(!is_local_request(None, &empty), "no address is not local");
+        for h in PROXY_HEADERS {
+            let mut hm = axum::http::HeaderMap::new();
+            hm.insert(*h, "x".parse().unwrap());
+            assert!(!is_local_request(Some(lo), &hm), "{h}");
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn health_exempt_from_remote_gate() {

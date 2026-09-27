@@ -1096,7 +1096,7 @@ pub fn compute_from_dir(run_dir: &Path, flows_dir: &Path) -> Result<RunStats> {
 /// from the right by position so a workload or profile name containing its
 /// own dashes (e.g. `long-agentic-balanced`) cannot be mistaken for the
 /// stamp. `None` for a name that doesn't have this shape at all.
-fn run_id_epoch_ms(run_id: &str) -> Option<u64> {
+pub(crate) fn run_id_epoch_ms(run_id: &str) -> Option<u64> {
     let mut parts = run_id.rsplit('-');
     let _index = parts.next()?;
     parts.next()?.parse::<u64>().ok().map(|secs| secs.saturating_mul(1000))

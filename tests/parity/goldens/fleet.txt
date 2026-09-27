@@ -27,7 +27,6 @@ INPUT
 GENERATED
 19
 DISPATCHES
-Orchestrator note: 19 dispatches done. The fleet is humming, keep it up.
 MacBook-Pro
 Apple M5 Max · 128 GB
 idle

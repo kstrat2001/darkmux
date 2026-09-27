@@ -93,7 +93,7 @@ pub enum Precondition {
 /// batch-level Unload. A reconcile is TWO actions — its Unload half rides
 /// the free phase and its Load half the load phase (both carrying
 /// [`Reason::InsufficientCtx`]) — so ALL frees precede ALL loads, the
-/// `swap::swap` RAM-headroom shape (see the [`Plan`] ordering contract).
+/// free-then-load RAM-headroom shape (see the [`Plan`] ordering contract).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum Action {
     Load { model_key: String, identifier: String, min_ctx: u32 },
@@ -230,35 +230,8 @@ impl fmt::Display for Reason {
                 foreign_bytes,
                 est_bytes,
                 limit_bytes,
-            } => {
-                match foreign_bytes {
-                    Some(b) => write!(
-                        f,
-                        "user-loaded instance \"{foreign_identifier}\" of the needed model occupies {}",
-                        gb(*b)
-                    )?,
-                    None => write!(
-                        f,
-                        "user-loaded instance \"{foreign_identifier}\" of the needed model occupies an unknown amount of memory"
-                    )?,
-                }
-                write!(
-                    f,
-                    "; eject it (`lms unload \"{foreign_identifier}\"`) or load it via darkmux — darkmux never touches user state (absolute namespace ownership, #1274), and its own estimated {} copy cannot fit alongside within the {} of pool headroom left after every planned free",
-                    gb(*est_bytes),
-                    gb(*limit_bytes)
-                )
-            }
-            Reason::UnknownModelKey { nearest } => {
-                write!(
-                    f,
-                    "the model key is not in the host catalog — refused before any load attempt could hang or prompt a download (#1276)"
-                )?;
-                if !nearest.is_empty() {
-                    write!(f, "; nearest catalog keys: {}", nearest.join(", "))?;
-                }
-                Ok(())
-            }
+            } => fmt_foreign_no_capacity(f, foreign_identifier, *foreign_bytes, *est_bytes, *limit_bytes),
+            Reason::UnknownModelKey { nearest } => fmt_unknown_model_key(f, nearest),
             Reason::NoLongerDesired => write!(
                 f,
                 "this darkmux-owned resident is not in the desired set — unloading (exclusive-scope reconciliation, pass 1)"
@@ -268,37 +241,95 @@ impl fmt::Display for Reason {
                 "every seat wanting this resident has released it (seats: {}) — unloading once (#1279 refcount)",
                 seats.join(", ")
             ),
-            Reason::BudgetEvict { freeing_bytes, need_bytes, budget_bytes, eviction_order } => {
-                let order = match eviction_order {
-                    EvictionOrder::HostReported => "host-reported order (no recency fact exists yet — this is not LRU)",
-                };
-                write!(
-                    f,
-                    "evicting an idle darkmux-owned resident in {order} to free {freeing_bytes} bytes toward {need_bytes} bytes of pending loads under a {budget_bytes}-byte limit (#1243/#1140)"
-                )
-            }
+            Reason::BudgetEvict { freeing_bytes, need_bytes, budget_bytes, eviction_order } => write!(
+                f,
+                "evicting an idle darkmux-owned resident in {} to free {freeing_bytes} bytes toward {need_bytes} bytes of pending loads under a {budget_bytes}-byte limit (#1243/#1140)",
+                eviction_order.describe()
+            ),
             Reason::BudgetRefuse { est_bytes, budget_bytes } => write!(
                 f,
                 "an estimated {est_bytes}-byte load cannot be satisfied within the {budget_bytes}-byte AI RAM budget by any eviction of darkmux-owned residents — refused (#1243, applies to every caller intent)"
             ),
             Reason::ClaimedResidentInsufficientCtx { identifier, resident_ctx, min_ctx, clearable } => {
-                write!(
-                    f,
-                    "\"{identifier}\" shares this model key but is resident at {resident_ctx} context, below the {min_ctx} this placement needs — it is already claimed"
-                )?;
-                if *clearable {
-                    write!(
-                        f,
-                        " (a live pinned dispatch, same-process or a concurrent darkmux command), so it is never unloaded to reconcile; wait for the claim to clear (a concurrent acquirer racing for this same identifier resolves this automatically once its own load lands — #2672), or lower this placement's own minimum context to {resident_ctx} or below so it reuses the resident as-is instead of reconciling — pointing it at a DIFFERENT identifier does NOT help: residency is decided by model key, not identifier, so an aliased placement collides with this identical claimed resident just the same (#2669)"
-                    )
-                } else {
-                    write!(
-                        f,
-                        " by ANOTHER placement already targeting it earlier in this SAME plan, so it is never unloaded to reconcile; this can never resolve by waiting — the plan is decided from one fixed snapshot, so retrying regenerates the identical collision every time (#2672) — lower this placement's own minimum context to {resident_ctx} or below so it reuses the resident as-is instead of reconciling"
-                    )
-                }
+                fmt_claimed_resident(f, identifier, *resident_ctx, *min_ctx, *clearable)
             }
         }
+    }
+}
+
+impl EvictionOrder {
+    fn describe(self) -> &'static str {
+        match self {
+            EvictionOrder::HostReported => {
+                "host-reported order (no recency fact exists yet — this is not LRU)"
+            }
+        }
+    }
+}
+
+/// [`Reason::ForeignDuplicateNoCapacity`]: names the blocking instance and
+/// its pool cost, then the eject-or-load-via-darkmux suggestion.
+fn fmt_foreign_no_capacity(
+    f: &mut fmt::Formatter<'_>,
+    foreign_identifier: &str,
+    foreign_bytes: Option<u64>,
+    est_bytes: u64,
+    limit_bytes: u64,
+) -> fmt::Result {
+    match foreign_bytes {
+        Some(b) => write!(
+            f,
+            "user-loaded instance \"{foreign_identifier}\" of the needed model occupies {}",
+            gb(b)
+        )?,
+        None => write!(
+            f,
+            "user-loaded instance \"{foreign_identifier}\" of the needed model occupies an unknown amount of memory"
+        )?,
+    }
+    write!(
+        f,
+        "; eject it (`lms unload \"{foreign_identifier}\"`) or load it via darkmux — darkmux never touches user state (absolute namespace ownership, #1274), and its own estimated {} copy cannot fit alongside within the {} of pool headroom left after every planned free",
+        gb(est_bytes),
+        gb(limit_bytes)
+    )
+}
+
+/// [`Reason::UnknownModelKey`], with the nearest catalog keys when any.
+fn fmt_unknown_model_key(f: &mut fmt::Formatter<'_>, nearest: &[String]) -> fmt::Result {
+    write!(
+        f,
+        "the model key is not in the host catalog — refused before any load attempt could hang or prompt a download (#1276)"
+    )?;
+    if !nearest.is_empty() {
+        write!(f, "; nearest catalog keys: {}", nearest.join(", "))?;
+    }
+    Ok(())
+}
+
+/// [`Reason::ClaimedResidentInsufficientCtx`]: the advice differs by
+/// whether waiting can ever clear the claim.
+fn fmt_claimed_resident(
+    f: &mut fmt::Formatter<'_>,
+    identifier: &str,
+    resident_ctx: u64,
+    min_ctx: u32,
+    clearable: bool,
+) -> fmt::Result {
+    write!(
+        f,
+        "\"{identifier}\" shares this model key but is resident at {resident_ctx} context, below the {min_ctx} this placement needs — it is already claimed"
+    )?;
+    if clearable {
+        write!(
+            f,
+            " (a live pinned dispatch, same-process or a concurrent darkmux command), so it is never unloaded to reconcile; wait for the claim to clear (a concurrent acquirer racing for this same identifier resolves this automatically once its own load lands — #2672), or lower this placement's own minimum context to {resident_ctx} or below so it reuses the resident as-is instead of reconciling — pointing it at a DIFFERENT identifier does NOT help: residency is decided by model key, not identifier, so an aliased placement collides with this identical claimed resident just the same (#2669)"
+        )
+    } else {
+        write!(
+            f,
+            " by ANOTHER placement already targeting it earlier in this SAME plan, so it is never unloaded to reconcile; this can never resolve by waiting — the plan is decided from one fixed snapshot, so retrying regenerates the identical collision every time (#2672) — lower this placement's own minimum context to {resident_ctx} or below so it reuses the resident as-is instead of reconciling"
+        )
     }
 }
 
@@ -341,15 +372,6 @@ pub enum Warning {
     LoadEstimateUnknown { model_key: String },
 }
 
-/// #1243 "serialize" arm: every pending load fits the limit alone but not
-/// together — the executor runs them one at a time, releasing between.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum ExecHint {
-    #[default]
-    Concurrent,
-    Sequential,
-}
-
 /// TOTAL-EQUALITY, DETERMINISTIC-ORDER plan. Ordering contract (tested):
 ///
 /// 0. REFUSAL phase (#2674): every [`Action::Block`], in desired-input
@@ -366,8 +388,8 @@ pub enum ExecHint {
 /// 2. LOAD phase: the surviving per-desired decisions (Load/Reuse), in
 ///    desired-input order
 ///
-/// ALL frees precede ALL loads — the RAM-headroom two-pass shape of
-/// `swap::swap` (free-then-load). An earlier draft claimed this parity while
+/// ALL frees precede ALL loads — the RAM-headroom two-pass shape
+/// (free-then-load). An earlier draft claimed this shape while
 /// carrying each reconcile's unload inside the load phase, interleaving a
 /// free after other loads; the reconcile split into a free-phase Unload +
 /// load-phase Load is the review MUST_FIX that restored the shape. Same
@@ -388,7 +410,6 @@ pub struct Plan {
     /// Emission order: per-desired decision warnings first (in desired-input
     /// order), then pass-1 warnings, then budget/headroom warnings.
     pub warnings: Vec<Warning>,
-    pub exec_hint: ExecHint,
 }
 
 #[cfg(test)]
@@ -534,6 +555,42 @@ mod tests {
                 .to_string()
                 .contains("qwen3-4b")
         );
+    }
+
+    #[test]
+    fn reason_display_propagates_a_failing_writer() {
+        // Every multi-part rendering stops at the first failed write and
+        // returns the error, rather than swallowing it.
+        struct Refuses;
+        impl fmt::Write for Refuses {
+            fn write_str(&mut self, _: &str) -> fmt::Result {
+                Err(fmt::Error)
+            }
+        }
+        let multi_part = [
+            Reason::ForeignDuplicateNoCapacity {
+                foreign_identifier: "m-manual".into(),
+                foreign_bytes: Some(1),
+                est_bytes: 2,
+                limit_bytes: 3,
+            },
+            Reason::ForeignDuplicateNoCapacity {
+                foreign_identifier: "m-manual".into(),
+                foreign_bytes: None,
+                est_bytes: 2,
+                limit_bytes: 3,
+            },
+            Reason::UnknownModelKey { nearest: vec!["k".into()] },
+            Reason::ClaimedResidentInsufficientCtx {
+                identifier: "darkmux:m".into(),
+                resident_ctx: 1,
+                min_ctx: 2,
+                clearable: true,
+            },
+        ];
+        for r in &multi_part {
+            assert!(fmt::write(&mut Refuses, format_args!("{r}")).is_err(), "{r:?}");
+        }
     }
 
     #[test]

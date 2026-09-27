@@ -11,7 +11,6 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { tokensOffMeter } from "./savings";
 import { hasAnyTokenCounts } from "../../lib/usageRecords";
-import { hybridNote } from "./hybridNote";
 import { isDispatchComplete, T } from "../../lib/flow";
 import type { FlowRecord } from "../../types/handwritten";
 
@@ -19,8 +18,8 @@ import type { FlowRecord } from "../../types/handwritten";
  * twins) name what `tokensOffMeter` can tell from a record's own bookends —
  * endpoint-less, endpoint-bearing, or no bookend either way. They are NOT a
  * cost tier: the hero withdrew that reading in #2834 (an endpoint's URL does
- * not say whether it is metered) and sums all three into one figure; the run
- * twins still feed `hybridNote`. Test names below use the field names for
+ * not say whether it is metered) and sums all three into one figure. Test
+ * names below use the field names for
  * what a record classifies as, never "free" or "off the meter". */
 function rec(overrides: Partial<FlowRecord>): FlowRecord {
   return { ts: "2026-08-08T00:00:00.000Z", ...overrides };
@@ -132,8 +131,6 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.total).toBe(970);
-    // A local direct run must not inflate the cloud run count — hybridNote
-    // (#2637) derives local runs as `t.runs - t.cloudRuns - t.unknownRuns`.
   });
 
   it("(#1853, inverted) a session with BOTH a telemetry family AND a token-bearing local dispatch.complete is not double-counted", () => {
@@ -222,11 +219,7 @@ describe("tokensOffMeter", () => {
   // (#2637) The issue's own reproduction shape: five sessions where only
   // one is POSITIVELY local, two are positively cloud, and two carry token
   // telemetry but no dispatch bookend at all (darkmux has no evidence
-  // either way). Before this fix, `hybridNote` read `runs - cloudRuns` and
-  // credited both unattributed sessions to "local" (reading "3 local + 2
-  // cloud" instead of the true "1 local + 2 cloud"). This test pins the
-  // run-count-level three-way split `tokensOffMeter` now exposes;
-  // hybridNote.test.ts pins the corrected rendered text.
+  // either way). This test pins the run count over that shape.
   it("(#2637) five sessions — one local, two cloud, two unattributed — unknownRuns separates them from local", () => {
     const data: FlowRecord[] = [
       rec({ session_id: "cloud1", action: "dispatch.start", handle: "reviewer", payload: { endpoint: "gemini" } }),
@@ -488,8 +481,6 @@ describe("tokensOffMeter", () => {
     // #2712).
     expect(t.runs).toBe(1);
     expect(t.total).toBe(100);
-    // And the sentence the operator reads is no longer "1 dispatch via cloud".
-    expect(hybridNote(data, t).text).toBe("1 dispatch done. The fleet is humming, keep it up.");
   });
 
   // (#2690, shape K1) The live rolling window's LEFT boundary is what makes
@@ -563,21 +554,6 @@ describe("tokensOffMeter", () => {
   // `epBySid` and showed LOCAL TOKENS 0 / CLOUD TOKENS 2,000 for the very
   // same session.
   //
-  // (fix-pass, CORRECTED twice) An earlier revision of this comment claimed
-  // "the screen is coherent because it no longer claims two LOCAL dispatches
-  // produced zero local tokens." Read the five assertions twenty lines
-  // below: `runs=2`, `cloudRuns=0`, `unknownRuns=0`, `local=0`, and a
-  // derived `localRuns=2`. That renders "2 local dispatches. The hybrid loop
-  // is humming, keep it up." beside LOCAL 0 / CLOUD 2,000 — which is
-  // VERBATIM the contradiction #2690 opens with, not its repair. The comment
-  // asserted the opposite of the code directly beneath it.
-  //
-  // That is the same failure class as round 1's MUST FIX 4, in a different
-  // comment, and it is how this class propagated across four PRs: the next
-  // author reasons from the prose, not from the assertions. So the rendered
-  // sentence is now PINNED as an assertion rather than described, and the
-  // test is named for what it actually demonstrates.
-  //
   // What this shape genuinely shows: for a record with NO seat on it, K2 is
   // unchanged. Sibling seats within one task share the session id AND the
   // mission id by construction, so the composite `runKey` cannot separate
@@ -606,10 +582,6 @@ describe("tokensOffMeter", () => {
     // be separated from it over-claims CLOUD (see K1 above).
     // THE CONTRADICTION, pinned rather than described: the derived local
     // dispatch count is 2 while the local token tile is 0.
-    // And the sentence an operator actually reads, beside CLOUD 2,000.
-    // This is the archived-record case and it stays this way: an
-    // append-only archive cannot grow a field it was written without.
-    expect(hybridNote(data, t).text).toBe("2 dispatches done. The fleet is humming, keep it up.");
   });
 
   // (#2690, K2 — the 1.49.0 wire.) The contradiction #2690 opens with, on
@@ -631,9 +603,6 @@ describe("tokensOffMeter", () => {
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(2);
     expect(t.total).toBe(2000);
-    // The two halves of the screen now agree: 2 local dispatches, 2,000
-    // local tokens.
-    expect(hybridNote(data, t).text).toBe("2 dispatches done. The fleet is humming, keep it up.");
   });
 
   // (#2690) The INVERTED case, which is the one this change may never get
@@ -1195,9 +1164,7 @@ describe("tokensOffMeter — run-scoped evidence (the recurring session id)", ()
    * verdicts sat in the local set and swallowed the hosted run's live
    * telemetry: 144,638 tokens of Azure spend rendered on the LOCAL TOKENS
    * tile for the 17m14s between the hosted start and its own completion,
-   * with `cloudRuns=0` — so `hybridNote` took its `lr && !cloudRuns` branch
-   * and the hero read "the hybrid loop is humming, keep it up" while an
-   * endpoint billed.
+   * with `cloudRuns=0`, while an endpoint billed.
    *
    * Keyed on `(session_id, mission_id)`, the stale verdicts live under
    * their own missions' keys and cannot be reached from here.
@@ -1228,28 +1195,6 @@ describe("tokensOffMeter — run-scoped evidence (the recurring session id)", ()
     // #2709's symptom (a), in miniature. Each is separated from the others
     // by `mission_id`, which is the whole point of `runKey`.
     expect(t.runs).toBe(4);
-
-    // The operator-visible surface, asserted directly rather than inferred
-    // from the struct — and pinned as a STRING so a future change has to
-    // look at it. What it says is true: three local dispatches did finish,
-    // and the 144,638 cloud tokens belong to a FOURTH run that has not.
-    // The note template has no way to mention an in-flight run (it omits
-    // `unknownRuns` by design, see hybridNote.ts), so an operator reading
-    // this line alone would not learn that a hosted dispatch is running.
-    // That is a hybridNote gap, not a miscount: nothing here reports the
-    // hosted run's work as local. Measured across every playhead of every
-    // committed corpus, there is NO position where this change makes the
-    // note claim local while main did not and cloud tokens are nonzero
-    // (0 of 657 + 1,416 + 3,648 + 2,073 + 709).
-    const note = hybridNote(data, t);
-    expect(note.text).toBe(// (#2834) FOUR, not three: three completed local runs plus the
-      // in-flight hosted one. The note counts dispatches, and the fourth is
-      // one. It used to be excluded because the line claimed LOCALITY and
-      // an in-flight run has no endpoint evidence yet; with the claim gone
-      // the exclusion has no purpose. The classification assertions above
-      // are unchanged — savings.ts still tracks the split, the UI just
-      // stopped rendering it as a cost claim.
-      "4 dispatches done. The fleet is humming, keep it up.");
   });
 
   /**
@@ -1443,8 +1388,6 @@ describe("tokensOffMeter — the three gaps #2701 pinned, now closed (#2709)", (
     // answers from the seat instead; this arrival sequence deliberately
     // keeps the older shape so the run-count assertions above are about
     // bookends alone.
-    // And the hero no longer reports the hosted seat's work as local.
-    expect(hybridNote(arrivals, t).text).toBe("2 dispatches done. The fleet is humming, keep it up.");
   });
 
   /**
@@ -1654,33 +1597,6 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(2);
     expect(t.total).toBe(5000);
-
-    // THE HERO LINE, pinned as a string rather than described — ACCEPTED, not
-    // fixed, and the distinction matters because it LOOKS like the K2
-    // contradiction pinned a few hundred lines above ("2 local dispatches"
-    // beside LOCAL TOKENS 0).
-    //
-    // K2 is an ATTRIBUTION error: local seats produced real local tokens and
-    // the split credited them to cloud because a `telemetry.tokens` record
-    // names no seat. Here there is nothing to attribute — a LOCAL
-    // `dispatch.map` step's aggregate bookend reports no token total at all
-    // (`stamp_remote_classification` runs only `if endpoint_label.is_some()`,
-    // `crates/darkmux-crew/src/step_kinds/builtins.rs`), so the record
-    // contains zero local tokens to place anywhere. The DISPATCHES line and
-    // the LOCAL TOKENS tile disagree because the PRODUCER emits one and not
-    // the other, not because this function guessed.
-    //
-    // Fixing it here is not available: the two alternatives are to stop
-    // counting the local run (which is the #2709 defect, restored) or to
-    // fabricate a token count (which this function must never do). The real
-    // fix is producer-side — a local map-step aggregate reporting its own
-    // token total — and it is named in savings.ts's module doc. Until then
-    // this under-reports LOCAL tokens, which is the direction this function
-    // is allowed to err in; it never credits hosted spend as local.
-    //
-    // When this assertion starts failing, that decision has changed — update
-    // it deliberately, don't delete it.
-    expect(hybridNote(data, t).text).toBe("2 dispatches done. The fleet is humming, keep it up.");
   });
 
   /** The mirror, so the two halves of the pair are visibly symmetric rather

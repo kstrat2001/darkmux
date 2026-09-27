@@ -123,3 +123,36 @@ impl std::error::Error for ProbeError {}
 pub trait ResourceProbe {
     fn pools(&mut self) -> Result<Pools, ProbeError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_and_probe_errors_render_their_fields() {
+        let cases = [
+            (
+                HostError::Timeout { phase: "load", waited: Duration::from_secs(3) },
+                "host call timed out (phase: load, waited 3s)",
+            ),
+            (HostError::UnknownModel { model_key: "m".into() }, "host does not know model \"m\""),
+            (
+                HostError::InsufficientResources { detail: "no RAM".into() },
+                "host refused: insufficient resources (no RAM)",
+            ),
+            (
+                HostError::NotResident { identifier: "darkmux:m".into() },
+                "\"darkmux:m\" is not resident — nothing to unload",
+            ),
+            (HostError::CommandFailed { detail: "exit 1".into() }, "host command failed: exit 1"),
+        ];
+        for (err, want) in cases {
+            assert_eq!(err.to_string(), want);
+        }
+        assert_eq!(
+            ProbeError::Unavailable { detail: "no vm_stat".into() }.to_string(),
+            "resource probe unavailable: no vm_stat"
+        );
+        assert_eq!(Deadline::from_secs(7), Deadline(Duration::from_secs(7)));
+    }
+}

@@ -11,23 +11,25 @@ use crate::WorkJob;
 use anyhow::{Context, Result};
 use darkmux_crew::dispatch::DispatchResult;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// (#2476 review round 2, MUST FIX 3) True while a submitted job is inside
 /// its one synchronous `dispatch_reconciled` call — the span that covers
 /// `dispatch_internal.rs`'s own post-wait interrupt check (the thing that
 /// actually issues `docker kill <container>`). The daemon's shutdown path
 /// polls [`dispatch_in_flight`], bounded, after signaling the interrupt, so
-/// that check gets a real window to run before the process exits. The
-/// listener runs at most one submitted job at a time, so a bare
-/// `AtomicBool` is sufficient.
-static RUNNER_DISPATCH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// that check gets a real window to run before the process exits.
+///
+/// (#2916 stage 2) A COUNT, not a flag: the listener now runs one job per
+/// local model and hosted jobs beside them, so several can be in flight, and
+/// the first to finish must not report the rest as done.
+static RUNNER_DISPATCH_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// True while a submitted job is inside `dispatch()` — see
 /// [`RUNNER_DISPATCH_IN_FLIGHT`]'s own doc. `darkmux-serve`'s shutdown path
 /// is the one caller.
 pub fn dispatch_in_flight() -> bool {
-    RUNNER_DISPATCH_IN_FLIGHT.load(Ordering::SeqCst)
+    RUNNER_DISPATCH_IN_FLIGHT.load(Ordering::SeqCst) > 0
 }
 
 /// RAII guard scoping [`RUNNER_DISPATCH_IN_FLIGHT`] to exactly the
@@ -36,14 +38,14 @@ struct DispatchInFlightGuard;
 
 impl DispatchInFlightGuard {
     fn new() -> Self {
-        RUNNER_DISPATCH_IN_FLIGHT.store(true, Ordering::SeqCst);
+        RUNNER_DISPATCH_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
         Self
     }
 }
 
 impl Drop for DispatchInFlightGuard {
     fn drop(&mut self) {
-        RUNNER_DISPATCH_IN_FLIGHT.store(false, Ordering::SeqCst);
+        RUNNER_DISPATCH_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -61,10 +63,13 @@ impl Drop for DispatchInFlightGuard {
 /// A dispatch that panics is caught and returned as an error, so one bad
 /// job cannot take the listener's worker down.
 pub fn execute_job(job: WorkJob, profile: String, origin: String) -> Result<DispatchResult> {
-    // (#2628) `dispatch_reconciled`, not the raw primitive: the listener runs
-    // one submitted job at a time, the single-writer shape its lease-write
-    // contract requires, so a submitted job gets the same Exclusive-reconcile
-    // + #1487 residency-lease protection a `darkmux dispatch` gets.
+    // (#2628) `dispatch_reconciled`, not the raw primitive, so a submitted
+    // job gets the same Exclusive-reconcile + #1487 residency-lease
+    // protection a `darkmux dispatch` gets. (#2916 stage 2) The listener may
+    // now run jobs on different local models at once, in one process;
+    // `dispatch_reconciled`'s lease is a per-guard union that pins every
+    // live same-process sibling's model (#2651, #2663), so one job's
+    // reconcile does not evict another's.
     execute_job_with(job, profile, origin, darkmux_crew::dispatch_reconciled::dispatch_reconciled)
 }
 
@@ -123,9 +128,9 @@ impl WorkJob {
             // versioned `WORK_JOB_SCHEMA_VERSION`), so a cross-machine
             // dispatch runs on the RUNNER's own
             // `env > config > 600` inactivity budget. Disclosed in the flag's
-            // own `--help` ("Local dispatch only: ignored on a cross-machine
-            // --machine dispatch"), the same way `--image` and
-            // `--max-completion-tokens` state their own cross-machine limits.
+            // own `--help` ("Local dispatch only: ignored on a `--profile
+            // <p>@<machine>` dispatch"), the same way `--max-completion-tokens`
+            // states its own cross-machine limit.
             // `self.timeout_seconds` below still crosses and still bounds the
             // tool-less hosted path's `curl -m`; only the container path's
             // inactivity override stops here.
@@ -240,6 +245,31 @@ mod tests {
         });
         assert!(r.is_ok());
         assert_eq!(seen, Some((Some("resolved-host".into()), Some("laptop".into()), None)));
+    }
+
+    /// (#2916 stage 2) Several jobs may run at once: in-flight stays true
+    /// until the LAST one ends, so the daemon's shutdown still waits for it.
+    #[test]
+    fn in_flight_counts_every_running_job() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let long = std::thread::spawn(move || {
+            execute_job_with(job(), "host".into(), "laptop".into(), |_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: "s".into(), out_dir: None })
+            })
+        });
+        started_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        // A second job starts and finishes while the first still runs.
+        let short = execute_job_with(job(), "host".into(), "laptop".into(), |_| {
+            Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: "s".into(), out_dir: None })
+        });
+        assert!(short.is_ok());
+        assert!(dispatch_in_flight(), "the first job is still running");
+        release_tx.send(()).unwrap();
+        long.join().unwrap().unwrap();
+        assert!(!dispatch_in_flight());
     }
 
     /// A panicking dispatch is caught, reported, and the in-flight flag clears.

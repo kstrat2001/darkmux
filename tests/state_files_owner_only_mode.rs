@@ -221,9 +221,8 @@ fn lifecycle_save_json_is_owner_only_mode() {
     // `darkmux mission start <id>`, which goes through save_json + flips
     // status to active.
     with_home(|home| {
-        let crew = home.join(".darkmux").join("crew");
         let mission_id = "test-mission-e11";
-        let mission_dir = crew.join("missions").join(mission_id);
+        let mission_dir = home.join(".darkmux").join("missions").join(mission_id);
         std::fs::create_dir_all(mission_dir.join("phases")).unwrap();
         let mission_path = mission_dir.join("mission.json");
         let now = std::time::SystemTime::now()

@@ -135,13 +135,16 @@ fn parse_compact_strategy(raw: &str) -> Result<darkmux_types::CompactionStrategy
 
 pub(super) fn cmd_lab_loop(args: LabLoopArgs) -> Result<i32> {
     // Armed once, ahead of both the single-run and the two-run `--ab` shape.
-    let _reap_watchdog = super::arm_signal_handling();
+    super::signal_aware(|| loop_verb(&args))
+}
+
+fn loop_verb(args: &LabLoopArgs) -> Result<i32> {
     let plan = args.plan()?;
     apply_caps(&plan.caps);
     if args.ab {
-        return run_ab_compare(&args, &plan);
+        return run_ab_compare(args, &plan);
     }
-    let report = run_arm(&args, &plan, None)?;
+    let report = run_arm(args, &plan, None)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -209,17 +212,6 @@ fn run_ab_compare(args: &LabLoopArgs, plan: &LoopPlan) -> Result<i32> {
         eprintln!("… A/B: treatment run (WITH {ctx_chars} chars of engagement-context)");
     }
     let with = run_arm(args, plan, Some(ctx))?;
-    // Run ids are second-stamped; the arms are sequential with a dispatch
-    // between, so they normally differ. A shared run dir would merge
-    // trajectories and confound the very comparison this makes, so a
-    // collision is surfaced, never silently trusted (#44).
-    anyhow::ensure!(
-        with.run_id != without.run_id,
-        "A/B run-id collision (`{}`): both arms wrote the same run dir, so the \
-         comparison would mix trajectories. Re-run `--ab` (the arms are sequential; \
-         a second-boundary collision won't recur).",
-        with.run_id
-    );
     print!("{}", render_ab(args.json, ctx_chars, &without, &with)?);
     Ok(ab_exit(&without, &with))
 }
