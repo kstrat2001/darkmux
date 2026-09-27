@@ -2426,7 +2426,7 @@ mod detection_policy_regression {
     #[test]
     fn a_valid_policy_value_is_preserved() {
         let raw = r#"{"machine_id":"laptop",
-            "runtime":{"detection":{"degeneracy":{"policy":"observe"}}}}"#;
+            "runtime":{"detection":{"degeneracy":{"policy":"record"}}}}"#;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         std::fs::write(&path, raw).unwrap();
@@ -2437,7 +2437,7 @@ mod detection_policy_regression {
                 .and_then(|r| r.detection.as_ref())
                 .and_then(|d| d.degeneracy.as_ref())
                 .and_then(|g| g.policy.as_deref()),
-            Some("observe")
+            Some("record")
         );
     }
 }

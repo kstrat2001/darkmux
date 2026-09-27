@@ -36,7 +36,7 @@
 //! [`config_enum!`], add an [`EnumSetting::of`] entry to [`ENUM_SETTINGS`],
 //! and write the typed accessor as a one-line call to
 //! `config_access::resolve_enum`. Nothing else. A budget `policy` of
-//! `off`/`observe`/`enforce` (#2902 step 5) would be exactly those three
+//! `off`/`warn`/`stop` (#2902 step 5) would be exactly those three
 //! lines plus a `Scope` list. The conformance tests below iterate the
 //! registry, so the new entry inherits the preflight/doctor/config-set/help
 //! assertions without a test of its own, and `every_enum_in_the_config_schema_is_registered`
