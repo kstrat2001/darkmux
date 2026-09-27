@@ -7,6 +7,7 @@ import { EventLogColumn, compactCountLabel, fmtTok, fmtTurnDuration } from "./Ev
 import { ingest, type NormRecord } from "../lib/ingest";
 import { norm, type RawRecord } from "../testing/records";
 import { closeOpenModal } from "../lib/dialogManager";
+import { PageJudgementContext } from "../hooks/useJudgement";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // `ui/src/components/` -> repo root is three levels up.
@@ -1196,6 +1197,51 @@ describe("EventLogColumn — turns (#2863)", () => {
     r(10, "dispatch.tool", { tool_name: "edit", args: '{"path":"/workspace/a.js"}', outcome: "ok" }),
     r(11, "dispatch.rest", { ms: 15000, reason: "thermal-duty-cycle", state: "fair" }),
   ];
+
+  // (N4) A turn header states whether its run ended, judged at the page's
+  // instant and presence: the playhead when one is parked, else now, ticking.
+  describe("an unfinished turn's header is judged at the page's instant", () => {
+    const T = Date.UTC(2026, 8, 23, 1, 9, 0);
+    const at = (sec: number) => new Date(T + sec * 1000).toISOString();
+    const open = [
+      rec({ ts: at(0), action: "dispatch.start", session_id: S, machine_id: "MacBook-Pro", payload: {} } as never),
+      rec({ ts: at(5), action: "dispatch.turn", session_id: S, machine_id: "MacBook-Pro", payload: { turn_seq: 1, finish_reason: "tool_calls", tool_calls_count: 1 } } as never),
+      rec({ ts: at(10), action: "dispatch.checkpoint", session_id: S, machine_id: "MacBook-Pro", payload: { turn_seq: 2, verdict: "continue" } } as never),
+    ];
+    const why2 = () => [...document.querySelectorAll(".eventlog__rec--turn")].find((h) => h.querySelector(".eventlog__turnname")?.textContent === "Turn 2")?.querySelector(".eventlog__turnwhy")?.textContent;
+    afterEach(() => vi.useRealTimers());
+
+    it("flips to did not finish once the clock passes the window, with no new record", async () => {
+      vi.useFakeTimers({ now: T + 11_000 });
+      render(<EventLogColumn scopeLabel="runs" records={open} visible />);
+      expect(why2()).toBe("in progress");
+      await act(async () => {
+        vi.setSystemTime(T + 10_000 + 21 * 60_000);
+        vi.advanceTimersByTime(2_000);
+      });
+      expect(why2()).toBe("did not finish");
+    });
+
+    it("reads a parked playhead's instant, not now", () => {
+      vi.useFakeTimers({ now: T + 10_000 + 60 * 60_000 });
+      render(
+        <PageJudgementContext.Provider value={{ playhead: T + 11_000, live: new Set() }}>
+          <EventLogColumn scopeLabel="runs" records={open} visible />
+        </PageJudgementContext.Provider>,
+      );
+      expect(why2()).toBe("in progress");
+    });
+
+    it("holds a silent run in progress while presence reports its session live", () => {
+      vi.useFakeTimers({ now: T + 10_000 + 60 * 60_000 });
+      render(
+        <PageJudgementContext.Provider value={{ playhead: null, live: new Set([S]) }}>
+          <EventLogColumn scopeLabel="runs" records={open} visible />
+        </PageJudgementContext.Provider>,
+      );
+      expect(why2()).toBe("in progress");
+    });
+  });
 
   it("a turn is a header row: its number, what it did, its time, and its context", () => {
     render(<EventLogColumn scopeLabel="runs" records={records} visible />);

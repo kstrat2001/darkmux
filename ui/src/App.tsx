@@ -15,6 +15,7 @@ import { NavChrome } from "./components/NavChrome";
 import { Masthead } from "./components/Masthead";
 import { MachineDrawer } from "./components/MachineDrawer";
 import { EventLogColumn } from "./components/EventLogColumn";
+import { PageJudgementProvider } from "./hooks/useJudgement";
 import { LensErrorBoundary } from "./components/LensErrorBoundary";
 import { MachineLens } from "./lenses/machine/MachineLens";
 import { RunsBoard } from "./lenses/runs/RunsBoard";
@@ -649,6 +650,7 @@ export function App() {
         it, how fast it runs), for an animation that follows the page clock
         between the transport's ticks (REST's seconds hand). */}
     <PlaybackClockContext.Provider value={playbackClockOf(transport, playhead)}>
+    <PageJudgementProvider playhead={playhead} live={isLiveRoute(route) && playhead === null}>
     <div className="app-shell">
       {/* (Chrome packet) The masthead — brand, build chip, the catalog/
           liveness pill, refresh, topnav — moved out of this function into
@@ -905,6 +907,7 @@ export function App() {
         )}
       </div>
     </div>
+    </PageJudgementProvider>
     </PlaybackClockContext.Provider>
     </SeekSignalContext.Provider>
   );

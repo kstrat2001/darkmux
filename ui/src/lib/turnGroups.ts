@@ -1,6 +1,6 @@
 import { ACTION, byTime, latestByTime, type NormRecord } from "./ingest";
 import { recordsOfGroup, runIndex } from "./runRef";
-import { DEFAULT_POLICY, isRunning, lifecycleAt, type LifecyclePolicy } from "./lifecycle";
+import { DEFAULT_POLICY, isRunning, lifecycleAt, NO_PRESENCE, type LifecyclePolicy, type Presence } from "./lifecycle";
 
 /** (#2863) A run's event list, grouped by the turn each event belongs to.
  *
@@ -70,12 +70,12 @@ function num(v: unknown): number | null {
  *  has no closing record) or "in progress" (the run has not ended yet, so
  *  "did not finish" would be a claim about the future). Read per RUN: a
  *  session two missions share is two runs. */
-function attemptEnded(all: readonly NormRecord[], rec: NormRecord, asOf: number, policy: LifecyclePolicy): boolean {
+function attemptEnded(all: readonly NormRecord[], rec: NormRecord, asOf: number, policy: LifecyclePolicy, presence: Presence): boolean {
   const group = runIndex(all).groupOf(rec);
   const attempt = group ? group.attempts.findIndex((a) => a.records.includes(rec)) : -1;
   if (!group || attempt < 0) return false;
   const run = recordsOfGroup(group, { sessionId: group.sessionId, missionId: group.missionId, attempt });
-  return !isRunning(lifecycleAt(run, asOf, policy));
+  return !isRunning(lifecycleAt(run, asOf, policy, presence));
 }
 
 /** Whether a list is one session's, with turns to group by. */
@@ -84,10 +84,16 @@ export function groupsByTurn(all: NormRecord[]): boolean {
   return sessions.size === 1 && all.some((r) => r.action === ACTION.DispatchTurn);
 }
 
-/** The instant a list is read at (by default its newest record's) and the
- *  policy it is judged by (by default the built-in one). */
-function readClock(all: readonly NormRecord[], asOf: number | undefined, policy: LifecyclePolicy | undefined): { asOf: number; policy: LifecyclePolicy } {
-  return { asOf: asOf ?? latestByTime(all)?.tMs ?? -Infinity, policy: policy ?? DEFAULT_POLICY };
+/** The instant a list is read at (by default its newest record's), the
+ *  policy it is judged by (by default the built-in one) and the presence
+ *  (by default none). */
+function readClock(
+  all: readonly NormRecord[],
+  asOf: number | undefined,
+  policy: LifecyclePolicy | undefined,
+  presence: Presence | undefined,
+): { asOf: number; policy: LifecyclePolicy; presence: Presence } {
+  return { asOf: asOf ?? latestByTime(all)?.tMs ?? -Infinity, policy: policy ?? DEFAULT_POLICY, presence: presence ?? NO_PRESENCE };
 }
 
 /**
@@ -97,9 +103,10 @@ function readClock(all: readonly NormRecord[], asOf: number | undefined, policy:
  * @param asOfArg the instant the list is read at; by default the newest
  *   record's
  * @param policyArg the lifecycle policy a turn's run is judged by
+ * @param presenceArg the sessions presence reports live at that instant
  */
-export function turnItems(visible: NormRecord[], all: NormRecord[], asOfArg?: number, policyArg?: LifecyclePolicy): TurnItem[] {
-  const { asOf, policy } = readClock(all, asOfArg, policyArg);
+export function turnItems(visible: NormRecord[], all: NormRecord[], asOfArg?: number, policyArg?: LifecyclePolicy, presenceArg?: Presence): TurnItem[] {
+  const { asOf, policy, presence } = readClock(all, asOfArg, policyArg, presenceArg);
   if (!groupsByTurn(all)) return visible.map((rec) => ({ kind: "rec", rec }));
 
   const ordered = [...all].sort(byTime);
@@ -239,7 +246,7 @@ export function turnItems(visible: NormRecord[], all: NormRecord[], asOfArg?: nu
         // about the PAST — the run ended and this turn has no closing
         // record. A checkpoint with no terminal record YET does not mean
         // the turn never will finish; it means the run is still going.
-        const finished = attemptEnded(all, anchor, asOf, policy);
+        const finished = attemptEnded(all, anchor, asOf, policy, presence);
         h = {
           kind: "turn",
           rec: anchor,

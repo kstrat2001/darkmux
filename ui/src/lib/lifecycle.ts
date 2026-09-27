@@ -116,6 +116,20 @@ export interface Lifecycle {
 export type Presence = ReadonlySet<string>;
 export const NO_PRESENCE: Presence = new Set<string>();
 
+/** The instant runs are judged at, and the presence they are judged with. */
+export interface Judgement {
+  readonly asOf: number;
+  readonly presence: Presence;
+}
+
+/** The one rule for what a page judges its runs at: a parked playhead's
+ *  instant, with no presence (presence is a fact about now); else now, with
+ *  the sessions presence reports live. The run page, the fleet lens and the
+ *  event log all read it. */
+export function judgementAt(playhead: number | null, now: number, live: Presence): Judgement {
+  return playhead === null ? { asOf: now, presence: live } : { asOf: playhead, presence: NO_PRESENCE };
+}
+
 /** One attempt of a run (rule 1). */
 export interface Attempt {
   /** The record that opened it. */

@@ -9,7 +9,7 @@ import { fetchJson, type FetchResult } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useSessionLiveness } from "../../hooks/useSessionLiveness";
 import { flowToRenderModel, type StatusClass } from "../../lib/flow";
-import { NO_PRESENCE, isRunning, lifecycleAt, type Presence } from "../../lib/lifecycle";
+import { NO_PRESENCE, isRunning, judgementAt, lifecycleAt, type Presence } from "../../lib/lifecycle";
 import { useLifecyclePolicy } from "../../hooks/useLifecyclePolicy";
 import { sessionRouteRecords, sessionRun } from "../../lib/runRef";
 import { ACTION, CATEGORY, ingest, recordsAsOf, type NormRecord } from "../../lib/ingest";
@@ -541,8 +541,9 @@ export function SessionReplay({
   const { isLive, shouldPoll, endedByPresence } = useSessionLiveness(sessionId, livenessMissionId);
   // Presence, as the lifecycle's additive input: it holds this run open
   // against the staleness clock, never against a record that closed it. It
-  // is a fact about NOW, so a parked playhead judges without it.
-  const presence = useMemo<Presence>(() => (isLive && playhead === null ? new Set([sessionId]) : NO_PRESENCE), [isLive, playhead, sessionId]);
+  // is a fact about NOW, so a parked playhead judges without it
+  // (`judgementAt`, below: the rule the event log beside this page reads).
+  const livePresence = useMemo<Presence>(() => (isLive ? new Set([sessionId]) : NO_PRESENCE), [isLive, sessionId]);
   const policy = useLifecyclePolicy();
 
   // (#2065) A static build has no `/flow-session/<id>` to reach — the demo's
@@ -699,7 +700,7 @@ export function SessionReplay({
   // does not itself drive a re-render; see `ticking`/`useNowMs` below for
   // what does, at the live edge only.
   const wallNow = Date.now();
-  const clockNow = playhead ?? wallNow;
+  const { asOf: clockNow, presence } = judgementAt(playhead, wallNow, livePresence);
   const pageRun = hasRecords ? sessionRun(data, sessionId, clockNow) : null;
   const plausiblyRunning =
     pageRun !== null && isRunning(lifecycleAt(pageRun, clockNow, policy, presence)) && !endedByPresence;
