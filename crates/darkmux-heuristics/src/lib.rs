@@ -120,7 +120,7 @@ pub const DEFAULT_COMPACTOR_ID: &str = "qwen3-4b-instruct-2507";
 /// #402 PR body has the numbers).
 ///
 /// Three guidance blocks, all generic across task shapes (works for
-/// coder, code-reviewer, analyst, scribe, mission-compiler, etc.):
+/// coder, code-reviewer, analyst, crawler, radio-router, etc.):
 /// 1. Per-slot framing for `active_files` — agent's working knowledge
 ///    of files/artifacts; prevents post-compaction re-read rampage
 /// 2. Per-slot framing for `verify_criteria` — operator-actionable

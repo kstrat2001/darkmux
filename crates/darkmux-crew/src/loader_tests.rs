@@ -644,15 +644,3 @@
         assert!(!content.is_empty());
     }
 
-    #[serial_test::serial]
-    #[test]
-    fn mission_compiler_role_loads_correctly() {
-        let _guard = CrewDirGuard::new(TempDir::new().unwrap());
-        // No user files written — loader should fall through to builtin mission-compiler.
-        let roles = load_roles().unwrap();
-        let mc = roles.iter().find(|r| r.id == "mission-compiler").expect("builtin mission-compiler should load");
-        assert_eq!(mc.id, "mission-compiler");
-        assert_eq!(mc.skills, vec!["mission-compiling".to_string()]);
-        assert_eq!(mc.tool_palette.allow, vec!["read".to_string()]);
-        assert_eq!(mc.tool_palette.deny, vec!["edit", "write", "exec", "process"]);
-    }

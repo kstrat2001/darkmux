@@ -461,7 +461,7 @@ mod tests {
     // (Issue #1698 test-plan note) `--dry-run` needs a real routing call,
     // which needs a live model — the CLI's own `run()` wires
     // `radio::dispatch_router_call` directly (no injection seam at the
-    // binary level, matching mission_propose.rs's own un-injected
+    // binary level, matching the retired `mission propose` verb's own un-injected
     // `dispatch_compiler` call). Per the task's own concession ("if the
     // binary-level test can't inject the model call, test the dry-run path
     // at the function level and say so"): the dry-run PRINTING logic is

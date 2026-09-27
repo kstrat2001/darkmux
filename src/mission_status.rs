@@ -1458,7 +1458,7 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
     // renderer — including the empty-board hint — wraps to the same width.
     let width = style::terminal_width();
     // (#1711) A peer mission means there IS something on the board, even
-    // with zero local missions — "no missions yet, propose one" would be
+    // with zero local missions — "no missions yet, launch one" would be
     // actively wrong advice while a peer's mission is running. Fall through
     // to the normal renderer instead, which prints an empty local section
     // set, the peer section, and the fleet-scoped rollup.
@@ -1467,10 +1467,11 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
         // suggestions follow, for the same reason — this is the one command a
         // brand-new operator will copy, and it is the worst possible one to
         // break across a line with an indent injected into the middle.
-        for line in wrap_indented("no missions yet — propose one with:", 2, width) {
+        for line in wrap_indented("no missions yet — launch one from a config with:", 2, width) {
             println!("{}", style::dim(&line));
         }
-        println!("  {} darkmux mission propose", style::dim("→"));
+        println!("  {} darkmux mission config list", style::dim("→"));
+        println!("  {} darkmux mission launch <config-id>", style::dim("→"));
         if let Some(note) = fleet_scope_note(&fleet.state) {
             println!();
             for line in wrap_indented(&note, 0, width) {

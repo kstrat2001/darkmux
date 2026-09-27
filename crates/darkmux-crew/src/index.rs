@@ -541,6 +541,47 @@ fn kind_to_dir(kind: &str) -> PathBuf {
     }
 }
 
+/// (#2912 review M1) A role's `skills` entry naming a skill no manifest
+/// (builtin or user tier) defines. Reachable on upgrade: 4.0 deleted the
+/// builtin `mission-compiling` skill, and a pre-4.0 user-tier
+/// `roles/mission-compiler.json` still names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DanglingSkillRef {
+    pub role_id: String,
+    pub skill_id: String,
+    /// The user-tier manifest declaring the role, when one exists (the file
+    /// the operator edits). `None` for a builtin role.
+    pub manifest: Option<PathBuf>,
+}
+
+/// The (role id, skill id) pairs whose skill is not in `skills`, in role
+/// then declaration order. Pure: `populate` and [`dangling_skill_refs`]
+/// share it so the index skip and the doctor report cannot disagree.
+fn dangling_pairs<'a>(roles: &'a [Role], skills: &[Skill]) -> Vec<(&'a str, &'a str)> {
+    let known: std::collections::HashSet<&str> = skills.iter().map(|s| s.id.as_str()).collect();
+    roles
+        .iter()
+        .flat_map(|r| r.skills.iter().map(move |s| (r.id.as_str(), s.as_str())))
+        .filter(|(_, s)| !known.contains(s))
+        .collect()
+}
+
+/// Every role → skill reference that resolves to no skill manifest, from
+/// the merged-effective role and skill sets. The index skips these links
+/// rather than failing the rebuild; `darkmux doctor` reports them.
+pub fn dangling_skill_refs() -> Result<Vec<DanglingSkillRef>> {
+    let roles = loader::load_roles()?;
+    let skills = loader::load_skills()?;
+    Ok(dangling_pairs(&roles, &skills)
+        .into_iter()
+        .map(|(role_id, skill_id)| DanglingSkillRef {
+            role_id: role_id.to_string(),
+            skill_id: skill_id.to_string(),
+            manifest: loader::user_role_manifest_path(role_id),
+        })
+        .collect())
+}
+
 /// Insert merged-effective entities into all derived tables, plus populate
 /// `source_files` with whichever user-side files exist on disk.
 fn populate(conn: &mut Connection) -> Result<()> {
@@ -597,6 +638,21 @@ fn populate(conn: &mut Connection) -> Result<()> {
         }
     }
 
+    // (#2912 review M1) A role naming a skill no manifest defines would fail
+    // the deferred `role_skills.skill_id` FK at COMMIT and roll back the
+    // WHOLE rebuild — every `role list`/`role show` then errors. Skip only
+    // the dangling link (the role itself still indexes) and warn;
+    // `darkmux doctor` names the manifest and the fix (lenient on read, loud
+    // in doctor — contract 7).
+    let dangling: std::collections::HashSet<(&str, &str)> =
+        dangling_pairs(&roles, &skills).into_iter().collect();
+    for (role_id, skill_id) in &dangling_pairs(&roles, &skills) {
+        eprintln!(
+            "warning: role '{role_id}' names skill '{skill_id}', which no skill manifest defines — \
+             link skipped; `darkmux doctor` names the file to fix"
+        );
+    }
+
     // Roles.
     for role in &roles {
         let tool_palette_json = serde_json::to_string(&role.tool_palette)?;
@@ -617,6 +673,9 @@ fn populate(conn: &mut Connection) -> Result<()> {
             )?;
         }
         for skill_id in &role.skills {
+            if dangling.contains(&(role.id.as_str(), skill_id.as_str())) {
+                continue;
+            }
             tx.execute(
                 "INSERT INTO role_skills (role_id, skill_id) VALUES (?1, ?2)",
                 params![role.id, skill_id],
@@ -1672,6 +1731,80 @@ mod tests {
             )
             .unwrap();
         assert_eq!(target, "coder");
+    }
+
+    /// (#2912 review M1) A role naming a skill no manifest defines — the
+    /// exact shape of a pre-4.0 user-tier `roles/mission-compiler.json`
+    /// naming the deleted builtin `mission-compiling` — must not take the
+    /// whole index down. Before the fix, the `role_skills` INSERT's deferred
+    /// FK failed at COMMIT (`FOREIGN KEY constraint failed`, code 787) and
+    /// every `role list` / `role show` errored. The role itself still indexes;
+    /// only the dangling link is skipped (lenient on read, loud in doctor).
+    #[serial_test::serial]
+    #[test]
+    fn rebuild_survives_a_role_naming_a_missing_skill() {
+        let guard = CrewDirGuard::new();
+        write_role(
+            guard.path(),
+            "mission-compiler",
+            "Leftover pre-4.0 role.",
+            &["mission-compiling", "analyzing"],
+            "bail-with-explanation",
+            None,
+        );
+        let idx = index_path(guard.path());
+        rebuild_at(&idx).expect("a dangling skill reference must not fail the rebuild");
+
+        let conn = open_index(&idx).unwrap();
+        let role_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM roles WHERE id = 'mission-compiler'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(role_rows, 1, "the role itself still indexes");
+        let mut stmt = conn
+            .prepare("SELECT skill_id FROM role_skills WHERE role_id = 'mission-compiler' ORDER BY skill_id")
+            .unwrap();
+        let linked: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(linked, vec!["analyzing".to_string()], "only the resolvable link is kept");
+    }
+
+    /// (#2912 review M1) The same dangling reference is reported by
+    /// `dangling_skill_refs`, naming the role, the missing skill, and the
+    /// user-tier manifest the operator has to edit.
+    #[serial_test::serial]
+    #[test]
+    fn dangling_skill_refs_names_role_skill_and_manifest() {
+        let guard = CrewDirGuard::new();
+        write_role(
+            guard.path(),
+            "mission-compiler",
+            "Leftover pre-4.0 role.",
+            &["mission-compiling", "analyzing"],
+            "bail-with-explanation",
+            None,
+        );
+        let refs = dangling_skill_refs().unwrap();
+        assert_eq!(refs.len(), 1, "exactly the one missing skill: {refs:?}");
+        assert_eq!(refs[0].role_id, "mission-compiler");
+        assert_eq!(refs[0].skill_id, "mission-compiling");
+        assert_eq!(
+            refs[0].manifest.as_deref(),
+            Some(guard.path().join("roles").join("mission-compiler.json").as_path()),
+        );
+    }
+
+    /// The inverted case: the builtin role set, with no user overrides,
+    /// has no dangling skill references. A regression here would mean a
+    /// shipped role names a skill the binary no longer embeds.
+    #[serial_test::serial]
+    #[test]
+    fn dangling_skill_refs_is_empty_for_the_builtin_set() {
+        let _guard = CrewDirGuard::new();
+        let refs = dangling_skill_refs().unwrap();
+        assert!(refs.is_empty(), "builtin roles must only name embedded skills: {refs:?}");
     }
 
     #[serial_test::serial]

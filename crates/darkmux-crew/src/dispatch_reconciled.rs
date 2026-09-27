@@ -16,7 +16,7 @@
 //!
 //! Several production callers dispatch WITHOUT going through either —
 //! `darkmux_fleet::routing::dispatch_routed`'s default `local_dispatch`
-//! (used by `mission propose`, `lab notebook draft`) and two direct
+//! (used by the retired `mission propose`/`lab notebook draft` verbs, #2912/#2913) and two direct
 //! `crate::dispatch::dispatch` callers (the fleet runner's claimed-job
 //! handler, `darkmux-lab`'s tool-bench provider) call the raw dispatch
 //! primitive with no acquire, no lease, no reconcile at all. A model these

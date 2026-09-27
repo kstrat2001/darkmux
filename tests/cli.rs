@@ -26,7 +26,7 @@ use tempfile::TempDir;
 // tier of `paths::resolve` (`crates/darkmux-types/src/paths.rs`);
 // without it the child resolves `./.darkmux` and then the developer's
 // actual `~/.darkmux`, and every accessor that has no test-build guard
-// of its own (`crew_dir_override`, `fleet_file`, `notebook_dir`,
+// of its own (`crew_dir_override`, `fleet_file`,
 // `identity_path_override`, `ack_dir_override`) then reads and WRITES
 // the operator's real state. Measured 2026-09-07 against this file's own
 // binary: with `DARKMUX_HOME` unset, `darkmux machine add` created
@@ -85,7 +85,7 @@ fn darkmux_bin_path() -> &'static str {
 /// redirects to `<test-isolated root>/...`. Nesting `DARKMUX_HOME`
 /// under `HOME` makes a properly isolated child look exactly like an
 /// un-isolated one to that check, and it fires: measured 2026-09-07,
-/// `lab notebook draft` then resolved its run dir to
+/// `lab notebook draft` (since retired, #2913) then resolved its run dir to
 /// `<test-isolated root>/runs` and could not see the fixture the
 /// test had just written. Sibling roots keep the two distinguishable.
 fn isolated_roots() -> (std::path::PathBuf, std::path::PathBuf) {
@@ -404,7 +404,7 @@ fn darkmux_cmd() -> Command {
 /// The one named override: a spawn scoped to a PROJECT-LOCAL darkmux
 /// root at `<dir>/.darkmux`, with `<dir>` as the child's cwd.
 ///
-/// The `lab fixture` / `lab doctor` / `lab notebook` / `lab run` tests
+/// The `lab fixture` / `lab doctor` / `lab run` tests
 /// below seed a tempdir, create `<tempdir>/.darkmux`, and then assert
 /// against that root (or run a SECOND command that has to see what the
 /// first one wrote). They cannot take `darkmux_cmd()`'s per-call root:
@@ -886,6 +886,29 @@ fn profile_list_lists_from_explicit_config() {
         .stdout(predicate::str::contains("(default)"));
 }
 
+// `mission dispatch` names an unknown mission and points at `mission
+// launch`, and rejects an id outside the identifier charset, both before
+// any fan-out. Runs without Redis or a model (the redis e2e twin of the
+// charset check skips on CI runners with no redis-server, #2938).
+#[test]
+fn mission_dispatch_names_an_unknown_mission_and_how_to_create_one() {
+    darkmux_cmd()
+        .args(["mission", "dispatch", "no-such-mission", "--role", "coder"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("mission `no-such-mission` not found"))
+        .stderr(predicate::str::contains("darkmux mission launch <config-id>"));
+}
+
+#[test]
+fn mission_dispatch_rejects_a_mission_id_outside_the_charset() {
+    darkmux_cmd()
+        .args(["mission", "dispatch", "../evil", "--role", "coder"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("mission_id contains invalid char"));
+}
+
 #[test]
 fn profile_list_errors_when_config_missing() {
     let mut cmd = darkmux_cmd();
@@ -1109,7 +1132,7 @@ fn lab_kind_families_carry_their_members() {
     };
 
     let lab = help(&["lab"]);
-    for family in ["run", "workload", "fixture", "notebook", "eval"] {
+    for family in ["run", "workload", "fixture", "eval"] {
         assert!(lab.contains(family), "lab --help lists `{family}`: {lab}");
     }
 
@@ -2100,106 +2123,8 @@ fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
     );
 }
 
-/// `notebook list` enumerates .md files and prints aligned columns.
-#[serial_test::serial]
-#[test]
-fn notebook_list_shows_entries() {
-    let tmp = TempDir::new().unwrap();
-    let nb_dir = tmp.path().join("notebook");
-    fs::create_dir_all(&nb_dir).unwrap();
-
-    // Create a few notebook entries.
-    fs::write(
-        nb_dir.join("2026-05-10-run-a.md"),
-        "<!-- darkmux:notebook-entry: run=abc123 machine=m5-home date=2026-05-10 -->\n\nContent A.",
-    )
-    .unwrap();
-    fs::write(
-        nb_dir.join("2026-05-11-run-b.md"),
-        "<!-- darkmux:notebook-entry: run=def456 machine=m3-laptop date=2026-05-11 -->\n\nContent B.",
-    )
-    .unwrap();
-
-    let mut cmd = darkmux_cmd();
-    // Set notebook dir via env var.
-    cmd.env("DARKMUX_NOTEBOOK_DIR", nb_dir.to_str().unwrap())
-        .arg("lab")
-        .arg("notebook")
-        .arg("list")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("2026-05-11"))
-        .stdout(predicate::str::contains("2026-05-10"))
-        .stdout(predicate::str::contains("def456"))
-        .stdout(predicate::str::contains("abc123"));
-}
-
-/// `notebook list --machine` filters entries.
-#[serial_test::serial]
-#[test]
-fn notebook_list_machine_filter() {
-    let tmp = TempDir::new().unwrap();
-    let nb_dir = tmp.path().join("notebook");
-    fs::create_dir_all(&nb_dir).unwrap();
-
-    fs::write(
-        nb_dir.join("e1.md"),
-        "<!-- darkmux:notebook-entry: run=r1 machine=m5-home date=2026-05-10 -->\n",
-    )
-    .unwrap();
-    fs::write(
-        nb_dir.join("e2.md"),
-        "<!-- darkmux:notebook-entry: run=r2 machine=m3-laptop date=2026-05-11 -->\n",
-    )
-    .unwrap();
-
-    // Filter to m5-home.
-    let mut cmd = darkmux_cmd();
-    cmd.env("DARKMUX_NOTEBOOK_DIR", nb_dir.to_str().unwrap())
-        .arg("lab")
-        .arg("notebook")
-        .arg("list")
-        .arg("--machine")
-        .arg("m5-home")
-        .assert()
-        .success()
-        // Assert on the machine name, NOT the 2-char run id: `notebook list`
-        // prints each entry's full file path (under a random TempDir), so a
-        // `contains("r2")` predicate spuriously fails whenever the tmp path
-        // happens to contain "r2". Machine names don't collide with paths.
-        .stdout(predicate::str::contains("m5-home"))
-        .stdout(predicate::str::contains("m3-laptop").not());
-
-    // Filter to nonexistent machine → no output.
-    let mut cmd2 = darkmux_cmd();
-    cmd2.env("DARKMUX_NOTEBOOK_DIR", nb_dir.to_str().unwrap())
-        .arg("lab")
-        .arg("notebook")
-        .arg("list")
-        .arg("--machine")
-        .arg("nonexistent")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("no notebook entries found"));
-}
-
-/// (#895) `lab notebook list` with an absent notebook dir exits 0 — "nothing
-/// to list" is success (fresh user / chaining), not an error. (#1426 — the
-/// notebook family folded into `lab`.)
-#[test]
-fn notebook_list_no_dir() {
-    let mut cmd = darkmux_cmd();
-    cmd.arg("lab")
-        .arg("notebook")
-        .arg("list")
-        .env("DARKMUX_NOTEBOOK_DIR", "/no/such/path/xyz")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("no notebook directory yet"));
-}
-
-/// (#1426) `external` retired entirely — the pipe is the interface (any text
-/// on stdin into `mission propose`). The old top-level verb now fails with an
+/// (#1426) `external` retired entirely — the pipe was the interface (any text
+/// on stdin). The old top-level verb now fails with an
 /// unknown-subcommand error (no compat alias — pre-2.0 clean removal).
 #[test]
 fn retired_top_level_external_verb_is_unknown() {
@@ -2212,6 +2137,83 @@ fn retired_top_level_external_verb_is_unknown() {
         .stderr(predicate::str::contains("unrecognized subcommand").or(
             predicate::str::contains("unexpected argument"),
         ));
+}
+
+/// (#2912, 4.0) `mission propose` retired outright with the mission-compiler
+/// role — no compat alias, so clap rejects `propose` as an unknown
+/// subcommand of `mission`.
+#[test]
+fn retired_mission_propose_is_unknown() {
+    let mut cmd = darkmux_cmd();
+    cmd.arg("mission")
+        .arg("propose")
+        .arg("plan a trip")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("propose").and(
+                predicate::str::contains("unrecognized subcommand")
+                    .or(predicate::str::contains("unexpected argument")),
+            ),
+        );
+}
+
+/// (#2913, 4.0) `lab notebook draft`/`list` retired outright with the scribe
+/// role; the bundled `darkmux-lab-notebook` skill replaces them. No compat
+/// alias, so clap rejects `notebook` as an unknown subcommand of `lab`.
+#[test]
+fn retired_lab_notebook_is_unknown() {
+    let mut cmd = darkmux_cmd();
+    cmd.arg("lab")
+        .arg("notebook")
+        .arg("list")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("notebook").and(
+                predicate::str::contains("unrecognized subcommand")
+                    .or(predicate::str::contains("unexpected argument")),
+            ),
+        );
+}
+
+/// (#2912 review M1) The upgrade repro: a pre-4.0 user-tier
+/// `roles/mission-compiler.json` names the `mission-compiling` skill 4.0
+/// deleted. Before the fix, the crew index rebuild failed its deferred FK at
+/// COMMIT and EVERY `role list` / `role show` exited with `FOREIGN KEY
+/// constraint failed`. Now the dangling link is skipped with a warning and
+/// both verbs work.
+#[test]
+fn role_verbs_survive_a_leftover_role_naming_a_deleted_skill() {
+    let tmp = TempDir::new().unwrap();
+    let roles = tmp.path().join(".darkmux").join("roles");
+    fs::create_dir_all(&roles).unwrap();
+    fs::write(
+        roles.join("mission-compiler.json"),
+        r#"{
+          "id": "mission-compiler",
+          "description": "Leftover pre-4.0 role.",
+          "skills": ["mission-compiling"],
+          "tool_palette": {"allow": ["read"], "deny": ["edit", "write", "exec", "process"]},
+          "escalation_contract": "bail-with-explanation",
+          "role_family": "utility"
+        }"#,
+    )
+    .unwrap();
+
+    darkmux_cmd_in_project(tmp.path())
+        .args(["role", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("coder"))
+        .stderr(
+            predicate::str::contains("mission-compiling")
+                .and(predicate::str::contains("FOREIGN KEY").not()),
+        );
+    darkmux_cmd_in_project(tmp.path())
+        .args(["role", "show", "coder"])
+        .assert()
+        .success();
 }
 
 // ── mission migrate integration tests (#148 Task 8) ───────────────────────
@@ -2331,75 +2333,6 @@ fn mission_migrate_apply_is_idempotent() {
         .assert()
         .success()
         .stdout(predicate::str::contains("nothing to do"));
-}
-
-/// Phase-H: `notebook draft --role <id>` is the new flag (renamed
-/// from `--agent` per Beat 36). The old `--agent` flag must NOT be
-/// accepted — clap should reject it as an unknown argument so
-/// operators with stale scripts get a loud failure instead of a
-/// silent mis-dispatch.
-#[test]
-fn notebook_draft_rejects_old_agent_flag() {
-    let tmp = TempDir::new().unwrap();
-    let mut cmd = darkmux_cmd_in_project(tmp.path());
-    let output = cmd
-        .args([
-            "lab",
-            "notebook",
-            "draft",
-            "nonexistent",
-            "--agent",
-            "main",
-            "--dry-run",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        !output.status.success(),
-        "expected --agent to be rejected by clap; got success: stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    // QA NIT 3: tighten to "unexpected argument" specifically — `agent`
-    // alone could appear in clap's help suggestion text and false-pass.
-    assert!(
-        stderr.contains("unexpected argument"),
-        "expected clap to flag `--agent` as unexpected argument; got: {stderr}"
-    );
-}
-
-/// Phase-H: `notebook draft --role <id>` accepts the new flag and
-/// proceeds. Uses --dry-run + an absolute manifest path so we don't
-/// need a real dispatch.
-#[test]
-fn notebook_draft_accepts_role_flag_under_dry_run() {
-    let tmp = TempDir::new().unwrap();
-    let darkmux = tmp.path().join(".darkmux");
-    let runs_dir = darkmux.join("runs/test-run-h");
-    fs::create_dir_all(&runs_dir).unwrap();
-    fs::write(
-        runs_dir.join("manifest.json"),
-        r#"{"workload":"quick-q","provider":"prompt","profile":"scribe","session_id":"s","duration_ms":5000,"ok":true}"#,
-    )
-    .unwrap();
-
-    let mut cmd = darkmux_cmd_in_project(tmp.path());
-    cmd.env("DARKMUX_NOTEBOOK_DIR", darkmux.join("notebook").to_str().unwrap());
-    cmd.args([
-        "lab",
-        "notebook",
-        "draft",
-        "test-run-h",
-        "--role",
-        "scribe",
-        "--dry-run",
-        "--slug",
-        "phase-h-test",
-    ])
-    .assert()
-    .success()
-    .stdout(predicate::str::contains("phase-h-test"));
 }
 
 // ─── (#491) Phase 4 lab CLI verbs: register / unregister / fixtures / doctor ──
@@ -4346,7 +4279,7 @@ impl Drop for DirectChildGuard {
 /// still holding the stub connection open. This is the launcher #2131's own
 /// issue named as having NO guard at all before this PR — a minimal
 /// user-tier config with a single `dispatch.internal` step exercises the
-/// SAME generic-graph path `coder-phase` and every `mission propose`-built
+/// SAME generic-graph path `coder-phase` and every hand-written
 /// config also run through.
 #[test]
 fn mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
@@ -4920,132 +4853,19 @@ fn lab_run_sigterm_mid_dispatch_finalizes_lifecycle_and_reaps_curl() {
     );
 }
 
-/// (#2463) `kill <pid>` (SIGTERM) on `darkmux mission propose` blocked
-/// mid-dispatch, BEFORE the operator ever sees a proposal to
-/// approve/reject/regenerate, must exit within 5s and leave no `curl`
-/// process still holding the stub connection open. This is the exact
-/// window #2463 named: `--start` only reaches `mission_launch::launch`
-/// (which arms ITS OWN guard) from `persist_and_maybe_start`, well AFTER
-/// this compiler dispatch has already run — so before this fix, a signal
-/// here (the dispatch itself, the interactive approve/reject/regenerate
-/// prompt, or any regenerate pass) killed the process outright with no
-/// guard installed at all, even on an invocation that would look fully
-/// guarded once `--start` eventually reached `launch()`.
-///
-/// `mission-compiler`'s real role manifest grants `tool_palette.allow:
-/// ["read"]`, which routes a remote-resolving dispatch through the
-/// agentic-remote CONTAINER path (#1187) rather than the light
-/// single-shot hosted `curl` path the other SIGTERM tests use — Docker +
-/// the runtime image are out of scope for a `cargo test` proof (the same
-/// reasoning the crawl-launcher note above gives for skipping ITS live
-/// test). So this test overrides the operator-role tier
-/// (`<DARKMUX_HOME>/roles/mission-compiler.json`) with a tool-LESS
-/// manifest — same id, same `role_family`/`escalation_contract`, empty
-/// `tool_palette.allow` — which `load_roles()`'s user-fills-first merge
-/// picks up ahead of the builtin, landing `dispatch_compiler`'s
-/// hardcoded `"mission-compiler"` dispatch on the SAME light single-shot
-/// hosted path `dialectic-judge` exercises above. No sibling `.md` file
-/// is written, so `load_role_prompt_for` falls back to the embedded
-/// `mission-compiler.md` prompt unchanged.
-///
-/// (#2463 review) **Name the divergence honestly: the tool grant is not an
-/// incidental field, it IS the path selector.** `role_wants_agentic_remote`
-/// (`dispatch_internal.rs`) forks on exactly `!tool_palette.allow.
-/// is_empty()`, so with the REAL manifest every production `mission
-/// propose` — local model or remote endpoint — takes the CONTAINER path,
-/// and this test takes the `curl` one. What this test therefore proves is
-/// that `arm()` + the reap watchdog are installed and load-bearing at this
-/// call site (both mutation-proven). The container half of the same call
-/// site is not proven HERE; it reduces to the trajectory tailer's
-/// `interrupt::is_set()` poll + `kill_all` (`dispatch_internal.rs`'s
-/// tailer loop), which #2131 pins for the launcher paths. A change to that
-/// tailer will not turn this test red.
-#[test]
-fn mission_propose_sigterm_before_the_operator_decision_reaps_curl() {
-    let stub = HangingStubServer::start();
-
-    let home = TempDir::new().unwrap();
-    let flows = TempDir::new().unwrap();
-    let os_home = TempDir::new().unwrap();
-
-    let profiles_path = home.path().join("profiles.json");
-    fs::write(&profiles_path, hanging_endpoint_profiles_json(stub.port)).unwrap();
-
-    let roles_dir = home.path().join("roles");
-    fs::create_dir_all(&roles_dir).unwrap();
-    let role_json = r#"{
-        "id": "mission-compiler",
-        "description": "test override (#2463): tool-less mission-compiler for the SIGTERM proof",
-        "tool_palette": { "allow": [], "deny": ["edit", "write", "exec", "process"] },
-        "escalation_contract": "bail-with-explanation",
-        "role_family": "utility"
-    }"#;
-    fs::write(roles_dir.join("mission-compiler.json"), role_json).unwrap();
-
-    let input_path = home.path().join("intent.txt");
-    fs::write(&input_path, "build a thing").unwrap();
-
-    let mut child = darkmux_std_cmd()
-        .env("HOME", os_home.path())
-        .env("DARKMUX_HOME", home.path())
-        .env("DARKMUX_FLOWS_DIR", flows.path())
-        .env("DARKMUX_PROFILES", &profiles_path)
-        .args(["mission", "propose", "--from-file"])
-        .arg(&input_path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawning darkmux mission propose");
-    let pid = child.id();
-
-    assert!(
-        stub.wait_for_a_connection(std::time::Duration::from_secs(20)),
-        "mission propose never reached a dispatch call to the stub server within 20s"
-    );
-    assert!(
-        child.try_wait().unwrap().is_none(),
-        "mission propose must still be running (blocked on the hanging compiler dispatch) before SIGTERM"
-    );
-
-    let kill_status =
-        std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status().expect("running kill -TERM");
-    assert!(kill_status.success(), "kill -TERM itself must succeed");
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let exit_status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "darkmux mission propose did not exit within 5s of SIGTERM (#2463 regression)"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    };
-    assert!(!exit_status.success(), "a signal-interrupted mission propose must not exit 0");
-
-    assert!(
-        stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(3)),
-        "no `curl` connection to the stub server was ever torn down — a child process survived \
-         the parent (#2463 regression)"
-    );
-
-    assert_no_surviving_remote_curl(child.id(), "mission-propose");
-}
-
 /// (#2463) `kill <pid>` (SIGTERM) on `darkmux radio "<text>"` blocked
 /// mid-dispatch (a real `curl` call to an endpoint that never answers)
 /// must: exit within 5s and leave no `curl` process still holding the
 /// stub connection open. `darkmux radio` is a genuinely different
-/// dispatch shape from `dispatch`/`lab run`/`mission propose` above: its
+/// dispatch shape from `dispatch`/`lab run` above: its
 /// routing seat (`radio::dispatch_router_call`) goes through
 /// `dispatch_local_single_shot` — the container-free direct-HTTP primitive
 /// (#1698 Packet B), not `crew::dispatch::dispatch`'s container-or-remote
 /// fork — which still falls through to the SAME `dispatch_remote` light
 /// single-shot hosted `curl` call when the resolved profile targets a
 /// remote endpoint (`radio-router`'s own role manifest is already
-/// tool-less, `tool_palette.allow: []`, so no role override is needed the
-/// way `mission_propose`'s test above needed one). Before #2463, this path
+/// tool-less, `tool_palette.allow: []`, so no role override is needed).
+/// Before #2463, this path
 /// had no signal handling at all — a caught SIGTERM here just killed the
 /// process outright (default disposition) and orphaned the `curl` child.
 #[test]
@@ -6231,10 +6051,10 @@ fn mission_launch_run_on_unknown_value_refused_before_minting() {
 // dispatched successfully and routed `"review this for me"` to `/review`
 // end-to-end — reassuring, but not something a test suite can rely on
 // being true on every machine/CI run). This mirrors the codebase's
-// existing precedent: `mission propose` (`src/mission_propose.rs`), the
-// other CLI verb built on the same `crate::fleet::dispatch_routed`
-// mechanism, likewise has no assert_cmd-level test of its own live
-// dispatch — only its pure parsing/validation functions are unit tested.
+// existing precedent: the other CLI verbs built on the same
+// `crate::fleet::dispatch_routed` mechanism likewise have no
+// assert_cmd-level test of their own live dispatch — only their pure
+// parsing/validation functions are unit tested.
 // `radio`'s full contract (catalog compilation, the frozen prompt
 // assembly, all five fail-closed validation paths, the dry-run decision
 // shape) is covered at the function level instead, with an injected

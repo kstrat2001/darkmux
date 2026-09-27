@@ -273,7 +273,7 @@ fn conventions_branch(
         }
         None => {
             eprintln!(
-                "darkmux: warning — conventions branch_template references {{ticket}} but mission `{}` has no ticket (set one: `mission propose --ticket <ID>`); using `{default}`",
+                "darkmux: warning — conventions branch_template references {{ticket}} but mission `{}` has no ticket (set one: a `ticket` key on the mission config); using `{default}`",
                 mission.id
             );
             default
@@ -1753,7 +1753,7 @@ fn resolve_phase(
 /// trimmed to a conventional ~72-char subject.
 /// (#815) The coder's dispatch brief: the phase's compiled description
 /// (the STRUCTURE) plus, when the mission carries it, the operator's
-/// verbatim `mission propose` input (the WORDS) under a provenance-tagged
+/// verbatim `source_input` (the WORDS) under a provenance-tagged
 /// block. The 2026-06-12 dogfood showed the compiler compressing exact
 /// strings + constraints out of the description — and since the description
 /// IS the brief, the constraints never reached the coder. The tagged block

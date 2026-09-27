@@ -42,7 +42,7 @@ Every mission runs as a live task graph you can watch from any device on your ta
 ## What you get
 
 - 🎯 **Missions, not chat.** Define work as config, launch it with one verb, watch it run as a task graph. Consequential steps stop and wait for your sign-off.
-- 🤝 **A crew, not a model.** Roles (coder, reviewer, judge, scribe), each staffed by the right local model, or by a hosted endpoint when a seat needs frontier weights. Your registry, your call.
+- 🤝 **A crew, not a model.** Roles (coder, reviewer, judge, crawler), each staffed by the right local model, or by a hosted endpoint when a seat needs frontier weights. Your registry, your call.
 - 🔍 **PR review by local models.** `mission launch review` bundles the change, fans probe seats across it, double-confirms every finding with an independent judge, and posts an anchored review. darkmux [reviews its own PRs in public](.github/workflows/darkmux-review.yml) this way.
 - 🧪 **The lab.** `darkmux lab run <workload>` captures wall clock, trajectory, and verify outcome on *your* hardware: baseline, change one knob, measure again. The [published findings](https://darklyenergized.substack.com) are re-runnable claims, not anecdotes.
 - 📊 **A fleet you can see.** One live view across every machine: what's loaded, what's running, and what stayed off the meter. Phone-ready over your tailnet.

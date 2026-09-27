@@ -3,7 +3,7 @@
 //!   1. ./.darkmux/         — project-local (preferred when present)
 //!   2. ~/.darkmux/         — cross-project user state (fallback)
 //!
-//! Lab runs, sandboxes, profiles, crews, and notebooks all live under one
+//! Lab runs, sandboxes, profiles, and crews all live under one
 //! of these. Relative paths only — never absolute paths in any shipped
 //! manifest.
 
@@ -36,7 +36,6 @@ pub struct DarkmuxPaths {
     pub(crate) runs: PathBuf,
     pub sandboxes: PathBuf,
     pub crew: PathBuf,
-    pub notebook: PathBuf,
     pub profiles: PathBuf,
     /// (#661) The config.json location (`<root>/config.json`). The config
     /// subsystem reads + `darkmux init` writes here.
@@ -46,8 +45,8 @@ pub struct DarkmuxPaths {
 
 /// `ForceProject` / `ForceUser` are used in tests (which the release-mode
 /// dead-code lint doesn't see) and reserved for explicit-override
-/// callers (e.g. an agent that wants to write a notebook entry into a
-/// specific scope regardless of the default Auto-resolve).
+/// callers (e.g. an agent that wants to resolve a specific scope
+/// regardless of the default Auto-resolve).
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default)]
 pub enum ResolveScope {
@@ -72,7 +71,6 @@ impl DarkmuxPaths {
             runs: root.join("runs"),
             sandboxes: root.join("sandboxes"),
             crew: root.join("crew"),
-            notebook: root.join("notebook"),
             profiles: root.join("profiles.json"),
             config: root.join("config.json"),
             scope: Scope::User,
@@ -218,26 +216,10 @@ pub fn resolve(scope: ResolveScope) -> DarkmuxPaths {
 /// env overrides. Shared by the `DARKMUX_HOME` override path and the normal
 /// project/user resolution so both stay in sync.
 fn paths_from_root(chosen: PathBuf, chosen_scope: Scope) -> DarkmuxPaths {
-    // The notebook dir can be overridden via DARKMUX_NOTEBOOK_DIR — useful
-    // for pointing notebook entries at an iCloud-synced (or otherwise
-    // shared) path so multiple machines write to the same notebook. When
-    // unset, falls back to the standard `<root>/notebook` location.
-    //
-    // Tilde expansion is supported for ergonomics — most operators write
-    // `~/Library/...` rather than the literal expanded path.
-    #[cfg(any(test, feature = "test-support"))]
-    crate::env_audit::audit_env_read("DARKMUX_NOTEBOOK_DIR");
-    let notebook = env::var("DARKMUX_NOTEBOOK_DIR")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| expand_tilde(&s))
-        .unwrap_or_else(|| chosen.join("notebook"));
-
     DarkmuxPaths {
         runs: chosen.join("runs"),
         sandboxes: chosen.join("sandboxes"),
         crew: chosen.join("crew"),
-        notebook,
         profiles: chosen.join("profiles.json"),
         config: chosen.join("config.json"),
         scope: chosen_scope,
@@ -269,7 +251,6 @@ pub fn ensure(paths: &DarkmuxPaths) -> Result<()> {
         &paths.runs,
         &paths.sandboxes,
         &paths.crew,
-        &paths.notebook,
     ] {
         if !p.exists() {
             fs::create_dir_all(p)
@@ -406,47 +387,6 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn resolve_honors_darkmux_notebook_dir_env_var() {
-        let tmp = TempDir::new().unwrap();
-        let custom = tmp.path().join("iCloud-Drive").join("darkmux-notebook");
-        let prev = env::var("DARKMUX_NOTEBOOK_DIR").ok();
-        unsafe { env::set_var("DARKMUX_NOTEBOOK_DIR", &custom); }
-
-        let paths = resolve(ResolveScope::ForceUser);
-        assert_eq!(paths.notebook, custom, "notebook dir should be the env-var value");
-        // Other paths still resolve to the user root, not the custom path.
-        assert!(paths.runs.ends_with("runs"));
-        assert!(!paths.runs.starts_with(tmp.path()));
-
-        unsafe {
-            match prev {
-                Some(v) => env::set_var("DARKMUX_NOTEBOOK_DIR", v),
-                None => env::remove_var("DARKMUX_NOTEBOOK_DIR"),
-            }
-        }
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn resolve_falls_back_when_env_var_empty() {
-        let prev = env::var("DARKMUX_NOTEBOOK_DIR").ok();
-        unsafe { env::set_var("DARKMUX_NOTEBOOK_DIR", ""); }
-
-        let paths = resolve(ResolveScope::ForceUser);
-        // Empty env var should NOT override; notebook stays at <root>/notebook.
-        assert!(paths.notebook.ends_with("notebook"));
-        assert!(paths.notebook.starts_with(&paths.root));
-
-        unsafe {
-            match prev {
-                Some(v) => env::set_var("DARKMUX_NOTEBOOK_DIR", v),
-                None => env::remove_var("DARKMUX_NOTEBOOK_DIR"),
-            }
-        }
-    }
-
-    #[serial_test::serial]
-    #[test]
     fn resolve_honors_darkmux_home_override() {
         let tmp = TempDir::new().unwrap();
         let custom_root = tmp.path().join("relocated-darkmux");
@@ -490,7 +430,6 @@ mod tests {
             runs: tmp.path().join(".darkmux/runs"),
             sandboxes: tmp.path().join(".darkmux/sandboxes"),
             crew: tmp.path().join(".darkmux/crew"),
-            notebook: tmp.path().join(".darkmux/notebook"),
             profiles: tmp.path().join(".darkmux/profiles.json"),
             config: tmp.path().join(".darkmux/config.json"),
             scope: Scope::Project,
@@ -500,7 +439,6 @@ mod tests {
         assert!(paths.runs.exists());
         assert!(paths.sandboxes.exists());
         assert!(paths.crew.exists());
-        assert!(paths.notebook.exists());
     }
 
     #[test]
@@ -511,7 +449,6 @@ mod tests {
             runs: tmp.path().join(".darkmux/runs"),
             sandboxes: tmp.path().join(".darkmux/sandboxes"),
             crew: tmp.path().join(".darkmux/crew"),
-            notebook: tmp.path().join(".darkmux/notebook"),
             profiles: tmp.path().join(".darkmux/profiles.json"),
             config: tmp.path().join(".darkmux/config.json"),
             scope: Scope::Project,

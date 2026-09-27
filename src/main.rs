@@ -34,7 +34,7 @@ pub use darkmux_doctor as doctor;
 // resolving for doctor/serve/lab.
 pub use darkmux_eureka as eureka;
 // #515 — fleet extracted (deps crew/flow/types all crates now). Re-export
-// keeps crate::fleet::* resolving for serve/phase_cli/notebook/mission_propose.
+// keeps crate::fleet::* resolving for serve/phase_cli.
 pub use darkmux_fleet as fleet;
 // (#2265) `darkmux finding` — the write-once finding store's read verbs plus
 // `sync`, the store's second producer after the live dispatch tailer.
@@ -56,14 +56,13 @@ pub use darkmux_hardware as hardware;
 pub use darkmux_heuristics as heuristics;
 mod init;
 // #515 — lab harness extracted (lab + workloads + providers). Re-exports keep
-// crate::{lab,workloads,providers}::* resolving for main + notebook.
+// crate::{lab,workloads,providers}::* resolving for main.
 pub use darkmux_lab::lab;
 // `darkmux lab` command handlers — split out of main.rs alongside cli/fleet_cli.
 mod lab_cli;
 mod migrate;
 mod config_cmd;
 mod conventions;
-mod mission_propose;
 mod mission_status;
 mod run_list;
 mod mission_config_cli;
@@ -82,7 +81,6 @@ mod mission_launch;
 // generic/coder-phase) — extracted from #2124/#2130's review-only
 // `review_finalize_guard.rs`, which this replaces.
 mod launch_guard;
-mod notebook;
 pub use darkmux_lab::providers;
 // (#1698 Packet A) The radio interpreter core (catalog compiler, closed-set
 // router, frozen prompt assembly) — surface-neutral engine capability. See
@@ -555,71 +553,6 @@ fn print_lessons_tier(label: &str, entries: &[darkmux_crew::lessons::Lesson]) {
     }
 }
 
-// (#1426) `pub(crate)` so `lab_cli::cmd_lab` can dispatch `lab notebook …`
-// — the notebook family folded into `lab` (the retired top-level `notebook`
-// verb).
-pub(crate) fn cmd_notebook(sub: NotebookCmd) -> Result<i32> {
-    match sub {
-        NotebookCmd::Draft {
-            run_id,
-            role,
-            slug,
-            dry_run,
-            machine,
-        } => {
-            let report = notebook::draft_entry(&notebook::DraftOptions {
-                run_id,
-                role,
-                slug,
-                dry_run,
-                machine_override: machine,
-            })?;
-            println!("source run: {}", report.run_dir.display());
-            println!("entry path: {}", report.entry_path.display());
-            println!("prompt chars: {}", report.prompt_chars);
-            println!("reply chars:  {}", report.reply_chars);
-            if dry_run {
-                println!("[DRY RUN — nothing was written]");
-            }
-            Ok(0)
-        }
-        NotebookCmd::List { machine } => {
-            // env > config.dirs.notebook > <root>/notebook (#661 Slice 3).
-            let notebook_dir = darkmux_types::config_access::notebook_dir();
-            if !notebook_dir.exists() {
-                // (#895) An absent notebook dir is "nothing to list", not an
-                // error — a fresh user, or `notebook list && …` chaining,
-                // must not see a false failure. Mirrors the empty-dir case
-                // below (also Ok(0)).
-                println!("no notebook directory yet: {}", notebook_dir.display());
-                return Ok(0);
-            }
-            let entries = notebook::list_entries(&notebook_dir, machine.as_deref())?;
-            if entries.is_empty() {
-                println!("no notebook entries found");
-                return Ok(0);
-            }
-            // Column widths (dynamic based on longest value).
-            let max_date: usize = entries.iter().map(|e| e.date.len()).max().unwrap_or(10);
-            let max_machine: usize = entries.iter().map(|e| e.machine.len()).max().unwrap_or(10);
-            let max_run: usize = entries.iter().map(|e| e.run.len()).max().unwrap_or(12);
-            for entry in &entries {
-                println!(
-                    "{date:<width_date$}  {machine:<width_machine$}  {run:<width_run$}  {path}",
-                    date = entry.date,
-                    width_date = max_date.max(4),
-                    machine = entry.machine,
-                    width_machine = max_machine.max(8),
-                    run = entry.run,
-                    width_run = max_run.max(4),
-                    path = entry.path.display(),
-                );
-            }
-            Ok(0)
-        }
-    }
-}
-
 fn cmd_doctor(verbose: bool, probe: bool) -> Result<i32> {
     let mut report = doctor::run();
 
@@ -944,13 +877,6 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             );
             Ok(0)
         }
-        MissionCmd::Propose {
-            from_stdin,
-            from_file,
-            yes,
-            start,
-            ticket,
-        } => mission_propose::propose(from_stdin, from_file.as_deref(), yes, start, ticket.as_deref()),
         MissionCmd::Launch { config_id, input, params, timeout, dry_run, force } => {
             // (#1959) `--dry-run` reaches every launch path (crawl,
             // review, generic step-graph) the SAME way any other input
@@ -1054,7 +980,7 @@ fn cmd_mission_dispatch(
         .find(|m| m.id == mission_id)
         .ok_or_else(|| {
             anyhow::anyhow!(
-            "mission `{mission_id}` not found. Run `darkmux mission propose` then `darkmux mission launch <config-id>` first, or check the id."
+            "mission `{mission_id}` not found. Run `darkmux mission launch <config-id>` first (`darkmux mission config list` shows the configs), or check the id."
         )
         })?;
     if !matches!(mission.status, crew::types::MissionStatus::Active) {

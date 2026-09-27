@@ -45,6 +45,9 @@ RETIRED_COMMAND_PHRASES = [
     "doctor --fix",      # doctor is read-only; no --fix
     "lab review-bench",  # -> `lab eval <role>` (#1465)
     "pr-review run",     # -> `mission launch review` (#1426)
+    "mission propose",   # removed in 4.0; write the config by hand, then `mission launch` (#2912)
+    "notebook draft",    # removed in 4.0; the darkmux-lab-notebook skill (#2913)
+    "notebook list",     # removed in 4.0; the darkmux-lab-notebook skill (#2913)
 ]
 
 # Single-word retired verbs: matched ONLY in the `darkmux <verb>` form so common

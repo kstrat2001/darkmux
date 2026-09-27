@@ -718,57 +718,6 @@ pub(crate) enum MissionCmd {
         #[arg(long)]
         reasoning: Option<String>,
     },
-    /// Propose a Mission + Phases from unstructured input (#113 Phase 3).
-    /// Dispatches the `mission-compiler` utility agent against the input,
-    /// renders the proposal to the operator for approve/edit/reject/regen,
-    /// and writes the JSONs only after approval. The operator approval
-    /// gate is non-negotiable per operator-sovereignty (#44).
-    ///
-    /// Engagement context is intentionally NOT a CLI arg here — see
-    /// CLAUDE.md's "Engagements (operator-defined dreamscapes)" section
-    /// for doctrine. Operators carry engagement nuance into the input
-    /// text itself (where the frontier orchestrator can thread it
-    /// natively); the mission-compiler structures whatever's in the
-    /// input without needing to interpret engagement.
-    ///
-    /// The input is any text on stdin — the pipe IS the interface, so the
-    /// tools that already exist (gh, curl, cat) are the source adapters
-    /// (#1426 — this retired the bespoke `darkmux external pull` wrapper):
-    ///
-    ///   gh issue view 42 | darkmux mission propose --from-stdin
-    ///   curl -s <url>    | darkmux mission propose --from-stdin
-    ///   cat notes.md     | darkmux mission propose --from-stdin
-    #[command(group(
-        clap::ArgGroup::new("input_source").required(true).multiple(false)
-    ))]
-    Propose {
-        /// Read the unstructured input from stdin. Useful for piping:
-        /// `pbpaste | darkmux mission propose --from-stdin`.
-        #[arg(long, group = "input_source")]
-        from_stdin: bool,
-        /// Read the unstructured input from a file path.
-        #[arg(long, group = "input_source", value_name = "PATH")]
-        from_file: Option<std::path::PathBuf>,
-        /// Bypass the interactive approval flow and accept the first
-        /// proposal as-is. Defaults to false — operator-approval gate
-        /// is mandatory by default. Provided for non-interactive
-        /// pipelines and tests.
-        #[arg(long)]
-        yes: bool,
-        /// After approval, immediately invoke `darkmux mission launch <id>`
-        /// on the newly-persisted mission config. Skips the manual
-        /// two-step. Defaults to false — operators who want to inspect the
-        /// persisted config before launching can omit this flag.
-        #[arg(long)]
-        start: bool,
-        /// Work-item / ticket id this mission realizes (e.g. `SAMPLE-4101`).
-        /// Stamped into the config draft and, at `mission launch`, onto the
-        /// launched mission record; referenced as `{ticket}` by the repo's
-        /// `.darkmux/conventions.json` templates (#816) for branch names,
-        /// commit subjects, and PR titles.
-        #[arg(long, value_name = "ID")]
-        ticket: Option<String>,
-    },
     /// Launch a named mission CONFIG into a brand-new mission RUN (#1284
     /// Packet 4a; run-identity fixed in #1503). Resolves `<config-id>`
     /// through the mission-config registry (user → on-disk → embedded — see
@@ -824,7 +773,7 @@ pub(crate) enum MissionCmd {
     /// shared guard.
     Launch {
         /// Mission config id to launch — a built-in (e.g. `coder-phase`)
-        /// or a `darkmux mission propose`-drafted user-tier config.
+        /// or a hand-written user-tier config.
         config_id: String,
         /// JSON file supplying the config's declared inputs (a flat
         /// object: input name → value).
@@ -1308,38 +1257,6 @@ pub(crate) enum ProfileCmd {
         /// 32K default. Pair with --params for tight heuristics.
         #[arg(long)]
         max_ctx: Option<u32>,
-    },
-}
-
-#[derive(Subcommand)]
-pub(crate) enum NotebookCmd {
-    /// Draft a notebook entry from a recorded run via the active role.
-    Draft {
-        run_id: String,
-        /// DM role id to dispatch the drafting prompt through. Resolves
-        /// through `templates/builtin/roles/<role>.{json,md}` under the
-        /// in-house container-bounded runtime.
-        #[arg(long, default_value = "scribe")]
-        role: String,
-        /// Override the entry's filename slug (default derived from workload + run id).
-        #[arg(long)]
-        slug: Option<String>,
-        /// Build the prompt and target filename without dispatching the role.
-        #[arg(long, short = 'n')]
-        dry_run: bool,
-        /// Override the machine id (overrides DARKMUX_MACHINE_ID env var).
-        #[arg(long)]
-        machine: Option<String>,
-    },
-    /// List notebook entries (parsed from entry headers).
-    ///
-    /// Enumerates .md files in the notebook directory, reads each entry's
-    /// `<!-- darkmux:notebook-entry: run=X machine=Y date=Z -->` header,
-    /// and prints a summary table.  Optionally filter entries by machine.
-    List {
-        /// Only show entries from this machine (optional).
-        #[arg(long)]
-        machine: Option<String>,
     },
 }
 
@@ -1836,12 +1753,4 @@ pub(crate) enum LabCmd {
     /// no dispatches, no network. Doctor is the discoverability layer
     /// for the lab subsystem.
     Doctor,
-    /// Notebook — agent-as-scribe for lab notebook entries. A lab HAS a
-    /// notebook: `lab notebook draft <run-id>` authors an entry from a run's
-    /// artifacts, `lab notebook list` enumerates recorded entries. (#1426 —
-    /// the retired top-level `darkmux notebook` verb; now under `lab`.)
-    Notebook {
-        #[command(subcommand)]
-        sub: NotebookCmd,
-    },
 }

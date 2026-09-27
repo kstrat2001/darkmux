@@ -425,7 +425,7 @@ pub fn envelope_candidate(stdout: &str) -> &str {
 /// a dispatch's stdout into text.
 ///
 /// Callers: `providers::tool_bench`, `lab::review_bench`, `lab::dialectic`'s
-/// three seats, and the root crate's `notebook draft` (which is why this is
+/// three seats, and the retired `notebook draft` verb (which is why this is
 /// `pub`). A mutation of [`envelope_candidate`] turns a guard red in each.
 ///
 /// # This is for dispatch STDOUT, and only for dispatch stdout

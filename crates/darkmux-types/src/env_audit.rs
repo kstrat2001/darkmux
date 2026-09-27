@@ -58,8 +58,7 @@
 //!   these accessors rather than raw `std::env::var`).
 //! - `paths::resolve` — `DARKMUX_HOME` (the bootstrap pointer, which can't
 //!   live inside the config it locates), read directly in `resolve`
-//!   itself. `paths::paths_from_root` (called by `resolve`, and shared by
-//!   every scope it resolves) additionally reads `DARKMUX_NOTEBOOK_DIR`.
+//!   itself.
 //! - `dispatch_liveness::liveness_dir` — a direct `DARKMUX_HOME` read
 //!   outside both chokepoints above.
 //! - `residency_lease::residency_dir` — a second direct `DARKMUX_HOME`
@@ -131,7 +130,7 @@
 //! unattributable bucket (measured on the merged 4-crate sweep, NOT the
 //! crew-only number the original #2632/#2643 passes measured) down to 7.
 //!
-//! The residual 7 (`DARKMUX_HOME`: 3, `DARKMUX_NOTEBOOK_DIR`: 3,
+//! The residual 7 (`DARKMUX_HOME`: 3, `DARKMUX_NOTEBOOK_DIR` (since removed, #2913): 3,
 //! `DARKMUX_LAB_DIR`: 1) is a DIFFERENT, newly-visible source — all seven
 //! bracket `darkmux-lab`'s own `lab::run::tests::lab_run_wires_the_
 //! session_id_before_the_simulated_dispatch_completes_not_after`, whose

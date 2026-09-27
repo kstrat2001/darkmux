@@ -171,6 +171,9 @@ pub fn run() -> DoctorReport {
         check_removed_review_config_block(),
         check_removed_telemetry_record_every_samples(),
         check_removed_radio_router_staffing(),
+        check_removed_notebook_settings(),
+        check_retired_role_leftovers(),
+        check_role_skill_references(),
         check_step_command_timeout(),
         check_dispatch_free_concurrency(),
         check_turn_delay(),
@@ -1336,10 +1339,10 @@ fn utility_binding_status(
                     // utility-agent verbs". `utility_model_id()` has exactly
                     // three consumers — this check, a serve-side display read,
                     // and `apply_utility_model`, which sets `compactor_model`.
-                    // That is ALL the binding does. `mission propose` and
-                    // `lab notebook draft` resolve their own model from the
-                    // profile and reach the SAME self-loading dispatch path,
-                    // so no verb needs this resident first.
+                    // That is ALL the binding does. Every other verb resolves
+                    // its own model from the profile and reaches the SAME
+                    // self-loading dispatch path, so no verb needs this
+                    // resident first.
                     //
                     // What remains true is only that a hand-load moves the
                     // cost earlier. Say that and nothing more.
@@ -2606,6 +2609,14 @@ fn build_hooks_check(
     out
 }
 
+/// The `config.json` that `DarkmuxConfig::load_resolved()` reads — the
+/// file a removed-key hint has to name. Honors `DARKMUX_HOME`, so an
+/// operator whose root is not `~/.darkmux` is told the file that actually
+/// holds the leftover key (#2913 review C4).
+fn resolved_config_path() -> std::path::PathBuf {
+    darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config
+}
+
 /// (#1876/#1877; #2310 P4d; #2404 P4d round 3) The `review{}` config block
 /// (`judge_fail_on_any_skip` / `judge_concurrency`) was REMOVED from
 /// `DarkmuxConfig` in CONFIG_SCHEMA_VERSION 1.22 — the review funnel those
@@ -2639,11 +2650,11 @@ fn check_removed_review_config_block() -> Check {
         // live constant here would make this message quietly lie about
         // WHEN the removal happened the moment the schema bumps again.
         message: "config.json has a `review` key — removed in CONFIG 1.22; delete it from config.json".into(),
-        hint: Some(
+        hint: Some(format!(
             "the review funnel this block configured was deleted in #2310 P4d; remove the \
-             `review` block from ~/.darkmux/config.json — it is read leniently but has no effect"
-                .into(),
-        ),
+             `review` block from {} — it is read leniently but has no effect",
+            resolved_config_path().display()
+        )),
     }
 }
 
@@ -2675,6 +2686,157 @@ fn check_removed_telemetry_record_every_samples() -> Check {
              it is read leniently but has no effect"
                 .into(),
         ),
+    }
+}
+
+/// (#2913, 4.0) `dirs.notebook` and `DARKMUX_NOTEBOOK_DIR` are removed —
+/// `lab notebook draft`/`list` retired outright in 4.0 (no deprecation
+/// release, no compatibility read), replaced by the bundled
+/// `darkmux-lab-notebook` skill, which writes the entry wherever the
+/// operator's own instructions say. Because the `DirsConfig` field is gone,
+/// a `config.json` still carrying `dirs.notebook` is read leniently (serde
+/// ignores the unknown key) and has no effect; the env var is read by
+/// nothing at all. Both are silent by construction, so this is the ONE
+/// place an operator learns the setting is dead and what to change.
+///
+/// `Pass` when neither tier is set (including a fresh `with_defaults()`
+/// config); `Warn` naming exactly the tier(s) that are set, with the exact
+/// removal step for each. An empty env value reads as unset, matching every
+/// other env-tier accessor.
+fn check_removed_notebook_settings() -> Check {
+    let name = "dirs.notebook / DARKMUX_NOTEBOOK_DIR (removed)";
+    let cfg = darkmux_types::config::DarkmuxConfig::load_resolved();
+    // The typed field is gone, so a leftover key lands in `DirsConfig`'s
+    // flattened `extras` overflow — the same place the other removed-key
+    // checks above look.
+    let config_set = cfg.dirs.as_ref().is_some_and(|d| d.extras.contains_key("notebook"));
+    let env_set = std::env::var("DARKMUX_NOTEBOOK_DIR")
+        .ok()
+        .is_some_and(|s| !s.trim().is_empty());
+    if !config_set && !env_set {
+        return Check { name: name.into(), status: Status::Pass, message: "not present".into(), hint: None };
+    }
+    let mut found: Vec<&str> = Vec::new();
+    let mut steps: Vec<String> = Vec::new();
+    if config_set {
+        found.push("config.json sets `dirs.notebook`");
+        steps.push(format!(
+            "delete `dirs.notebook` from the `dirs` block in {}",
+            resolved_config_path().display()
+        ));
+    }
+    if env_set {
+        found.push("`DARKMUX_NOTEBOOK_DIR` is exported");
+        steps.push("unset DARKMUX_NOTEBOOK_DIR (remove the export from your shell rc)".into());
+    }
+    Check {
+        name: name.into(),
+        status: Status::Warn,
+        message: format!("{} — removed in 4.0 (#2913); nothing reads it", found.join("; ")),
+        hint: Some(format!(
+            "{}. The notebook verbs retired in 4.0; the bundled `darkmux-lab-notebook` skill \
+             (installed by `darkmux init`) drafts an entry from `darkmux lab run stats <run-id> --json` \
+             and writes it wherever your own instructions say",
+            steps.join("; ")
+        )),
+    }
+}
+
+/// (#2912 review M1) Every role → skill reference resolves to a skill
+/// manifest. A dangling one is reachable on upgrade: 4.0 deleted the builtin
+/// `mission-compiling` skill, and a pre-4.0 user-tier
+/// `roles/mission-compiler.json` still names it. The crew index skips such a
+/// link (and warns once, on the rebuild) rather than failing — this check is
+/// the persistent surface that names the file, the missing skill, and the
+/// edit (lenient on read, loud in doctor — contract 7).
+fn check_role_skill_references() -> Check {
+    let name = "role skill references";
+    let refs = match darkmux_crew::index::dangling_skill_refs() {
+        Ok(r) => r,
+        Err(e) => {
+            return Check {
+                name: name.into(),
+                status: Status::Warn,
+                message: format!("could not load the role/skill manifests: {e:#}"),
+                hint: None,
+            }
+        }
+    };
+    if refs.is_empty() {
+        return Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: "every role's skills resolve to a skill manifest".into(),
+            hint: None,
+        };
+    }
+    let found: Vec<String> = refs
+        .iter()
+        .map(|r| match &r.manifest {
+            Some(p) => format!(
+                "role `{}` ({}) names skill `{}`",
+                r.role_id,
+                p.display(),
+                r.skill_id
+            ),
+            None => format!("builtin role `{}` names skill `{}`", r.role_id, r.skill_id),
+        })
+        .collect();
+    let steps: Vec<String> = refs
+        .iter()
+        .map(|r| match &r.manifest {
+            Some(p) => format!(
+                "remove `{}` from the `skills` list in {} (or delete the file if it is a retired role you \
+                 never customized)",
+                r.skill_id,
+                p.display()
+            ),
+            None => format!(
+                "builtin role `{}` names a skill this binary does not embed; please file an issue",
+                r.role_id
+            ),
+        })
+        .collect();
+    Check {
+        name: name.into(),
+        status: Status::Warn,
+        message: format!(
+            "{} — no skill manifest defines it; the crew index skips that link",
+            found.join("; ")
+        ),
+        hint: Some(steps.join("; ")),
+    }
+}
+
+/// (#2912/#2913, 4.0) The `mission-compiler` and `scribe` builtin roles
+/// retired with `mission propose` and `lab notebook`. A user-tier copy of
+/// either (a `.json` override or a `.md` prompt left in `<root>/roles/`) is
+/// not inert: the `.json` still loads as a user role and shows in `darkmux
+/// role list`, though nothing in darkmux dispatches it. Same shape as
+/// `check_removed_notebook_settings`: `Pass` when none is present, `Warn`
+/// naming each file with the removal step.
+fn check_retired_role_leftovers() -> Check {
+    let name = "retired roles (mission-compiler, scribe)";
+    let dir = darkmux_crew::loader::user_roles_dir();
+    let present: Vec<std::path::PathBuf> = ["mission-compiler", "scribe"]
+        .iter()
+        .flat_map(|id| ["json", "md"].map(|ext| dir.join(format!("{id}.{ext}"))))
+        .filter(|p| p.is_file())
+        .collect();
+    if present.is_empty() {
+        return Check { name: name.into(), status: Status::Pass, message: "not present".into(), hint: None };
+    }
+    let list: Vec<String> = present.iter().map(|p| p.display().to_string()).collect();
+    Check {
+        name: name.into(),
+        status: Status::Warn,
+        message: format!("retired-role file(s) left in the user tier: {}", list.join(", ")),
+        hint: Some(format!(
+            "delete {} — `mission-compiler` retired with `mission propose` (#2912) and `scribe` with \
+             `lab notebook` (#2913) in 4.0; a leftover `.json` still loads as a user role and appears in \
+             `darkmux role list`, but nothing dispatches it",
+            list.join(" and ")
+        )),
     }
 }
 
@@ -9665,6 +9827,28 @@ mod tests {
         );
     }
 
+    /// (#2913 review C4) Same as the notebook check: the hint names the
+    /// config file darkmux read, not a hardcoded default path.
+    #[serial_test::serial]
+    #[test]
+    fn check_review_judge_removed_hint_names_the_resolved_config_path() {
+        let home = tempfile::TempDir::new().unwrap();
+        let cfg = home.path().join("config.json");
+        std::fs::write(&cfg, r#"{"review":{"judge_concurrency":1}}"#).unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let check = check_removed_review_config_block();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        let hint = check.hint.expect("a removal step");
+        assert!(hint.contains(&cfg.display().to_string()), "names the resolved file: {hint}");
+        assert!(!hint.contains("~/.darkmux/config.json"), "no hardcoded default path: {hint}");
+    }
+
     #[serial_test::serial]
     #[test]
     fn check_review_judge_removed_warns_and_names_the_key_when_present() {
@@ -10073,6 +10257,129 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS"),
             }
         }
+    }
+
+    // ─── (#2913, 4.0) check_removed_notebook_settings — removed dirs.notebook + env ─
+
+    /// Runs `check_removed_notebook_settings` against one config.json body
+    /// and one `DARKMUX_NOTEBOOK_DIR` value, with both tiers pinned and
+    /// restored around the call.
+    fn notebook_settings_check(config_body: &str, env_value: Option<&str>) -> Check {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::write(home.path().join("config.json"), config_body).unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_nb = std::env::var("DARKMUX_NOTEBOOK_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            match env_value {
+                Some(v) => std::env::set_var("DARKMUX_NOTEBOOK_DIR", v),
+                None => std::env::remove_var("DARKMUX_NOTEBOOK_DIR"),
+            }
+        }
+        let check = check_removed_notebook_settings();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_nb {
+                Some(v) => std::env::set_var("DARKMUX_NOTEBOOK_DIR", v),
+                None => std::env::remove_var("DARKMUX_NOTEBOOK_DIR"),
+            }
+        }
+        check
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_removed_notebook_settings_passes_when_neither_tier_is_set() {
+        let check = notebook_settings_check(r#"{"schema_version":"1.22","dirs":{"lab":"~/runs"}}"#, None);
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_removed_notebook_settings_passes_against_with_defaults() {
+        use darkmux_types::config::DarkmuxConfig;
+        let contents = serde_json::to_string_pretty(&DarkmuxConfig::with_defaults()).unwrap();
+        let check = notebook_settings_check(&contents, None);
+        assert_eq!(check.status, Status::Pass, "with_defaults() must never trip this: {}", check.message);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_removed_notebook_settings_warns_on_leftover_config_key() {
+        let check = notebook_settings_check(
+            r#"{"schema_version":"1.22","dirs":{"notebook":"~/nb","lab":"~/runs"}}"#,
+            None,
+        );
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("dirs.notebook"), "names the key: {}", check.message);
+        assert!(!check.message.contains("DARKMUX_NOTEBOOK_DIR"), "env is not set: {}", check.message);
+        let hint = check.hint.expect("a removal step");
+        assert!(hint.contains("delete `dirs.notebook`"), "the exact change: {hint}");
+        assert!(hint.contains("darkmux-lab-notebook"), "names the replacement: {hint}");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_removed_notebook_settings_warns_on_leftover_env_var() {
+        let check = notebook_settings_check(r#"{"schema_version":"1.22"}"#, Some("/tmp/nb"));
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("DARKMUX_NOTEBOOK_DIR"), "names the var: {}", check.message);
+        assert!(!check.message.contains("dirs.notebook"), "config key is absent: {}", check.message);
+        let hint = check.hint.expect("a removal step");
+        assert!(hint.contains("unset DARKMUX_NOTEBOOK_DIR"), "the exact change: {hint}");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_removed_notebook_settings_names_both_when_both_are_set() {
+        let check = notebook_settings_check(r#"{"dirs":{"notebook":"~/nb"}}"#, Some("/tmp/nb"));
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("dirs.notebook") && check.message.contains("DARKMUX_NOTEBOOK_DIR"));
+        let hint = check.hint.expect("a removal step");
+        assert!(hint.contains("delete `dirs.notebook`") && hint.contains("unset DARKMUX_NOTEBOOK_DIR"));
+    }
+
+    /// (#2913 review C4) The removal step names the config file darkmux
+    /// actually read, not a hardcoded `~/.darkmux/config.json`: under
+    /// `DARKMUX_HOME=/x` the leftover key lives in `/x/config.json`.
+    #[serial_test::serial]
+    #[test]
+    fn check_removed_notebook_settings_hint_names_the_resolved_config_path() {
+        let home = tempfile::TempDir::new().unwrap();
+        let cfg = home.path().join("config.json");
+        std::fs::write(&cfg, r#"{"dirs":{"notebook":"~/nb"}}"#).unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_nb = std::env::var("DARKMUX_NOTEBOOK_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::remove_var("DARKMUX_NOTEBOOK_DIR");
+        }
+        let check = check_removed_notebook_settings();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            if let Some(v) = prev_nb {
+                std::env::set_var("DARKMUX_NOTEBOOK_DIR", v);
+            }
+        }
+        let hint = check.hint.expect("a removal step");
+        assert!(hint.contains(&cfg.display().to_string()), "names the resolved file: {hint}");
+        assert!(!hint.contains("~/.darkmux/config.json"), "no hardcoded default path: {hint}");
+    }
+
+    /// An empty env value is "unset", the same reading every other env-tier
+    /// accessor gives it — a stale `export DARKMUX_NOTEBOOK_DIR=` must not
+    /// warn.
+    #[serial_test::serial]
+    #[test]
+    fn check_removed_notebook_settings_treats_empty_env_as_unset() {
+        let check = notebook_settings_check(r#"{"schema_version":"1.22"}"#, Some("  "));
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
     }
 
     // ─── (#2413 M5) check_removed_telemetry_record_every_samples ──────────
@@ -12589,7 +12896,10 @@ mod tests {
         //
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 64 + darkmux_eureka::all_rules().len();
+        // 64 on main, plus three 4.0 retirement checks: (#2913)
+        // `check_removed_notebook_settings`, and (#2912/#2913 review)
+        // `check_retired_role_leftovers` and `check_role_skill_references`.
+        let expected = 67 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -13158,7 +13468,7 @@ mod tests {
         /// crude, but it is the only thing that goes red when an entry
         /// the membership test cannot see is dropped. Bump it — in the
         /// same commit as the entry — when a real destination is added.
-        const RESOLVED_DESTINATION_COUNT: usize = 21;
+        const RESOLVED_DESTINATION_COUNT: usize = 20;
 
         let state = darkmux_types::test_isolation::IsolatedState::new();
 
@@ -13184,7 +13494,6 @@ mod tests {
             ("mods", ca::mods_dir()),
             ("flow records", ca::flows_dir()),
             ("lab runs", ca::lab_dir()),
-            ("notebook", ca::notebook_dir()),
             // ── override-or-caller-default accessors ──
             (
                 "audit chain",
@@ -13377,7 +13686,6 @@ mod tests {
             let _ = ca::mods_dir();
             let _ = ca::flows_dir();
             let _ = ca::lab_dir();
-            let _ = ca::notebook_dir();
             let _ = ca::audit_dir_override();
             let _ = ca::ack_dir_override();
             let _ = ca::identity_path_override();
@@ -13692,16 +14000,9 @@ mod tests {
             hint.contains("--context-length"),
             "and the declared context, or the hand-load lands at the model default: {hint}"
         );
-        // The hint must not resurrect the false contrast that replaced the
-        // original false claim: `utility_model_id()` only ever names the
-        // compactor, and `mission propose` / `lab notebook draft` reach the
-        // same self-loading path as every other verb.
-        for verb in ["mission propose", "lab notebook draft"] {
-            assert!(
-                !hint.contains(verb),
-                "no verb needs this resident first — naming {verb:?} implies one does: {hint}"
-            );
-        }
+        // (#2912/#2913) A third assertion used to pin that the hint named no
+        // verb as needing this resident first; the two verbs it named are
+        // gone, and `utility_model_id()` still only ever names the compactor.
     }
 
     // ─── check_unpriceable_residents (#1819) ──────────────────────────────
@@ -13946,7 +14247,7 @@ mod tests {
     // is testable with no config.json / registry / role library on disk. A
     // dangling binding (role -> undefined profile, or an unknown role id)
     // WARNs; an all-resolving map (and the empty map) Pass. Bindings use REAL
-    // role ids (`dialectic-judge`, `code-reviewer`, `analyst`, `scribe`) —
+    // role ids (`dialectic-judge`, `code-reviewer`, `analyst`, `crawler`) —
     // the bare `judge`/`verify`/`probe-high` this suite used pre-#1547 are
     // not real role ids and were themselves an instance of the trap #1547
     // fixes (a doc/test example that reads as live but no-ops). (#2418: the
@@ -13969,7 +14270,7 @@ mod tests {
     fn roles(ids: &[&str]) -> std::collections::BTreeSet<String> {
         ids.iter().map(|n| n.to_string()).collect()
     }
-    const REAL_ROLES: &[&str] = &["dialectic-judge", "code-reviewer", "analyst", "scribe"];
+    const REAL_ROLES: &[&str] = &["dialectic-judge", "code-reviewer", "analyst", "crawler"];
 
     #[test]
     fn role_profiles_empty_map_passes() {
@@ -13983,7 +14284,7 @@ mod tests {
         let map = bindings(&[
             ("dialectic-judge", "qwen35b"),
             ("code-reviewer", "qwen35b"),
-            ("scribe", "qwen4b"),
+            ("crawler", "qwen4b"),
         ]);
         let c = super::role_profiles_status(&map, &known(&["qwen35b", "qwen4b"]), &quarantined(&[]), &roles(REAL_ROLES));
         assert_eq!(c.status, Status::Pass);
@@ -14389,6 +14690,83 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ─── (#2912 review M1) role skill references + retired-role leftovers ──
+
+    /// The pre-4.0 builtin `mission-compiler` manifest, byte-for-byte the
+    /// shape an upgrading operator's user tier can hold (it names the
+    /// `mission-compiling` skill 4.0 deleted).
+    const LEFTOVER_MISSION_COMPILER: &str = r#"{
+      "id": "mission-compiler",
+      "description": "Utility-family role that takes unstructured intent.",
+      "skills": ["mission-compiling"],
+      "tool_palette": {"allow": ["read"], "deny": ["edit", "write", "exec", "process"]},
+      "escalation_contract": "bail-with-explanation",
+      "role_family": "utility"
+    }"#;
+
+    #[serial_test::serial]
+    #[test]
+    fn role_skill_references_pass_for_the_builtin_set() {
+        let _guard = CrewRootGuard::new();
+        let check = check_role_skill_references();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn role_skill_references_warn_naming_file_skill_and_fix() {
+        let guard = CrewRootGuard::new();
+        let roles = guard.path().join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        let file = roles.join("mission-compiler.json");
+        std::fs::write(&file, LEFTOVER_MISSION_COMPILER).unwrap();
+        let check = check_role_skill_references();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("mission-compiler"), "names the role: {}", check.message);
+        assert!(check.message.contains("mission-compiling"), "names the skill: {}", check.message);
+        assert!(
+            check.message.contains(&file.display().to_string()),
+            "names the file: {}",
+            check.message
+        );
+        let hint = check.hint.expect("a fix");
+        assert!(hint.contains("remove `mission-compiling`"), "the exact edit: {hint}");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn retired_role_leftovers_pass_when_none_present() {
+        let guard = CrewRootGuard::new();
+        // A live user-tier role override is not a leftover.
+        let roles = guard.path().join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        std::fs::write(roles.join("coder.md"), "custom prompt").unwrap();
+        let check = check_retired_role_leftovers();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn retired_role_leftovers_warn_naming_each_file() {
+        let guard = CrewRootGuard::new();
+        let roles = guard.path().join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        std::fs::write(roles.join("mission-compiler.json"), LEFTOVER_MISSION_COMPILER).unwrap();
+        std::fs::write(roles.join("scribe.md"), "old scribe prompt").unwrap();
+        let check = check_retired_role_leftovers();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        for f in ["mission-compiler.json", "scribe.md"] {
+            assert!(
+                check.message.contains(&roles.join(f).display().to_string()),
+                "names {f}: {}",
+                check.message
+            );
+        }
+        assert!(!check.message.contains("scribe.json"), "only files that exist: {}", check.message);
+        let hint = check.hint.expect("a fix");
+        assert!(hint.contains("delete"), "the fix: {hint}");
     }
 
     #[serial_test::serial]

@@ -82,7 +82,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// optional `panel` field ([`PanelConfig`]). Presence of the block is what
 /// makes `darkmux acp` advertise this config as a slash command in the
 /// editor's agent panel — absence means the config stays launch-only
-/// (`darkmux mission launch <id>`/`darkmux mission propose`), never
+/// (`darkmux mission launch <id>`), never
 /// panel-visible. `PanelConfig` itself carries `#[serde(flatten)] extras`
 /// overflow (contract 7), so a future sub-field is safe to add without
 /// another schema bump.
