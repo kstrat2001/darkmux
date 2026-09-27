@@ -1787,6 +1787,93 @@ describe("App — presence coverage on the masthead", () => {
     expect(screen.queryByText(/waiting for a machine/i), "no claim beats a false one").not.toBeInTheDocument();
   });
 
+  // (#2965) A failed `/flow/<day>` read has its own notice, in the same
+  // app-level notice row: the cards and the machine page hold "no signal"
+  // for it, and this says why. Presence is healthy here, so the only notice
+  // on the page is the flow one.
+  it("shows the flow-read notice when a flow read fails, and names the failure", async () => {
+    mockPresence({ machines: [BEAT("a")], meta: { sources: { fleet: { state: "ok" } }, complete: true } });
+    const presenceFetch = vi.mocked(fetch).getMockImplementation()!;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) =>
+        String(url).startsWith("/flow/") && !String(url).includes("/stream")
+          ? Promise.resolve(new Response("boom", { status: 500, statusText: "Internal Server Error" }))
+          : presenceFetch(url),
+      ),
+    );
+    const { container } = renderApp();
+    await waitFor(() => expect(container.querySelector('.fleetcov[data-state="flow-unreadable"]')).toBeTruthy());
+    const notice = container.querySelector('.fleetcov[data-state="flow-unreadable"]')!;
+    expect(notice.getAttribute("role")).toBe("status");
+    expect(notice.textContent).toContain("500 Internal Server Error");
+    expect(container.querySelectorAll(".fleetcov")).toHaveLength(1);
+  });
+
+  it("shows no flow-read notice on a replay, whose records are its own day's, not the live window's", async () => {
+    window.location.hash = "#2026-08-07";
+    mockPresence({ machines: [], meta: { sources: { fleet: { state: "ok" } }, complete: true } });
+    const presenceFetch = vi.mocked(fetch).getMockImplementation()!;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) =>
+        String(url).startsWith("/flow/") && String(url) !== "/flow/2026-08-07"
+          ? Promise.resolve(new Response("boom", { status: 500, statusText: "Internal Server Error" }))
+          : presenceFetch(url),
+      ),
+    );
+    const { container } = renderApp();
+    // The live window's reads really were made, and really failed.
+    await waitFor(() =>
+      expect(vi.mocked(fetch).mock.calls.filter(([u]) => /^\/flow\/\d{4}-\d{2}-\d{2}$/.test(String(u)) && String(u) !== "/flow/2026-08-07").length).toBe(2),
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    expect(container.querySelector('.fleetcov[data-state="flow-unreadable"]')).toBeNull();
+  });
+
+  // (#2965 review) The failure is not sticky. Nothing else refetches a
+  // `flowDate` key (the live tail writes `flowTail`), so a failed day has to
+  // retry itself: one blip, and the page heals at the next retry instead of
+  // holding "no signal" until a reload.
+  it("clears the notice and the card's 'no signal' once a failed read succeeds on retry", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    try {
+      mockPresence({ machines: [BEAT("a")], meta: { sources: { fleet: { state: "ok" } }, complete: true } });
+      const presenceFetch = vi.mocked(fetch).getMockImplementation()!;
+      const failedOnce = new Set<string>();
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((url: string) => {
+          const u = String(url);
+          if (/^\/flow\/\d{4}-\d{2}-\d{2}$/.test(u) && !failedOnce.has(u)) {
+            failedOnce.add(u);
+            return Promise.resolve(new Response("boom", { status: 502, statusText: "Bad Gateway" }));
+          }
+          return presenceFetch(url);
+        }),
+      );
+      const { container } = renderApp();
+      await waitFor(() => expect(container.querySelector('.fleetcov[data-state="flow-unreadable"]')).toBeTruthy());
+      await waitFor(() => expect(container.querySelector(".mach .stat")?.textContent).toBe("no signal"));
+      await act(async () => {
+        vi.advanceTimersByTime(21_000);
+      });
+      await waitFor(() => expect(container.querySelector('.fleetcov[data-state="flow-unreadable"]')).toBeNull());
+      await waitFor(() => expect(container.querySelector(".mach .stat")?.textContent).toBe("idle"));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows no flow-read notice when the flow reads succeed — the inverted case", async () => {
+    mockPresence({ machines: [BEAT("a")], meta: { sources: { fleet: { state: "ok" } }, complete: true } });
+    const { container } = renderApp();
+    await waitFor(() => expect(container.querySelector(".mco")).toBeTruthy());
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([u]) => String(u).startsWith("/flow/"))).toBe(true));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(container.querySelector('.fleetcov[data-state="flow-unreadable"]')).toBeNull();
+  });
+
   it("still says 'waiting for a machine' on a healthy but EMPTY fleet — the inverted case", async () => {
     // A daemon that answers cleanly with nobody beating is a real, correct
     // state (a fresh install, every machine off). Suppressing the idle line
@@ -1839,6 +1926,31 @@ describe("(#2921) machine route chrome names a uid-only machine", () => {
     // Rewritten in place: the title still names the same machine.
     expect(document.getElementById("logscope")?.textContent).toBe("unnamed machine");
   });
+  // (#2965 review) A machine known only from flow records cannot be told
+  // from an unknown key while the flow read is failing: "machine not found"
+  // would be a claim nothing read. Both the route title and the page hold.
+  it("(#2965) a machine known only from flow records is not 'machine not found' while the flow read fails", async () => {
+    window.location.hash = `#lens=machine&machine=unnamed-${machineKeyHash(FAKE_UID).slice(0, 6)}`;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        const path = String(url);
+        if (/^\/flow\/\d{4}-\d{2}-\d{2}$/.test(path)) return Promise.resolve(new Response("boom", { status: 500, statusText: "Internal Server Error" }));
+        if (path === "/fleet/roster") return Promise.resolve(new Response(JSON.stringify({ machines: [], error: null }), { status: 200 }));
+        return Promise.resolve(new Response("[]", { status: 200 }));
+      }),
+    );
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <App />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector('.fleetcov[data-state="flow-unreadable"]')).toBeTruthy());
+    await new Promise((r) => setTimeout(r, 50));
+    expect(document.getElementById("logscope")?.textContent).not.toBe("machine not found");
+    expect(document.body.textContent).not.toContain("machine not found");
+  });
+
   it("(#2929 C3) a machine key naming no machine titles the route 'machine not found'", async () => {
     mount([]);
     window.location.hash = "#lens=machine&machine=no-such-machine";

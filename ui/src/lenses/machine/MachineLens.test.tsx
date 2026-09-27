@@ -91,6 +91,8 @@ function mockMachineFetch(opts: {
   holdFlow?: boolean | Promise<void>;
   /** (#2958) Paths whose answer waits on the given promise. */
   hold?: Record<string, Promise<void>>;
+  /** (#2965) Both `/flow/<day>` reads answer with this HTTP error status. */
+  failFlow?: number;
 } = {}) {
   const today = todayUTC();
   const yesterday = prevDateUTC(today);
@@ -112,6 +114,9 @@ function mockMachineFetch(opts: {
     if (path === "/machine/resources") {
       resourcesCalled.value = true;
       return Promise.resolve(new Response(JSON.stringify(opts.resources ?? RESOURCES), { status: 200 }));
+    }
+    if (opts.failFlow && (path === `/flow/${today}` || path === `/flow/${yesterday}`)) {
+      return Promise.resolve(new Response("boom", { status: opts.failFlow, statusText: "Internal Server Error" }));
     }
     if (opts.holdFlow && (path === `/flow/${today}` || path === `/flow/${yesterday}`)) {
       if (opts.holdFlow === true) return new Promise<Response>(() => {});
@@ -559,6 +564,43 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
     open();
     await waitFor(() => expect(container.querySelector(".machine-drawer__idle-line")!.textContent).toBe("idle · no samples in the last 10 min"));
     expect(section.querySelector(".mm-utility__id")?.textContent).toBe("no utility model seen");
+  });
+
+  // (#2965) A failed flow read settles the window, but it is not an answer
+  // that nothing happened: the page's "idle" lines are negative claims about
+  // exactly the records that are missing. They hold "no signal", as on the
+  // fleet page, and the app-level `FlowReadNotice` names the failure.
+  it("(#2965) a remote machine page says no signal, not idle, when the flow read fails", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" },
+      liveMachines: [{ machine_uid: "remote-uid", display_name: "studio", schema_version: "1", beat_ts_ms: 1, specs: "M1 Max · 32 GB" }],
+      failFlow: 500,
+    });
+    const { container } = renderMachine("remote-uid");
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([u]) => String(u) === `/flow/${todayUTC()}`)).toBe(true));
+    await waitFor(() => expect(container.querySelector(".machine-drawer__idle-line")).not.toBeNull());
+    // Let every read settle before judging the page: the failure is an answer.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
+    expect(container.querySelector(".machine-drawer__idle-line")!.textContent).toBe("no signal");
+    const section = container.querySelector('[data-testid="machine-utility"]')!;
+    expect(section.querySelector(".mm-utility__live")?.textContent).toBe("no signal");
+  });
+
+  it("(#2965) this machine's Utility section says no signal, not idle, when the flow read fails", async () => {
+    mockMachineFetch({ ...withUtility, failFlow: 500 });
+    const { container } = renderMachine(null);
+    const section = await waitFor(() => {
+      const el = container.querySelector('[data-testid="machine-utility"]');
+      expect(el).toBeTruthy();
+      return el as HTMLElement;
+    });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
+    expect(section.querySelector(".mm-utility__live")?.textContent).toBe("no signal");
+    expect([...section.querySelectorAll(".mm-utility__job")].map((r) => r.textContent)).toEqual(["compacting——", "radio routing——", "other——"]);
   });
 
   // (#2958 second review, point 2) Only the FIRST answer counts, as on the

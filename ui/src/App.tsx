@@ -33,6 +33,7 @@ import { computeMetaLines, readyParts } from "./lib/metaLine";
 import { replayMetaLines, replayMetaParts } from "./lib/replayMeta";
 import { ReadyHeadline } from "./components/ReadyHeadline";
 import { FleetCoverageNotice, useDegradedFleetSource } from "./components/FleetCoverageNotice";
+import { FlowReadNotice } from "./components/FlowReadNotice";
 import { T, asRecordArray, displayNameOf, earliestRecordDate, firstRecordDate, isDispatchTerminal, localMachineUid, missionReplayDate, todayUTC } from "./lib/flow";
 import { isLiveRoute, showsEventLog, tokRateConnectionEvidence } from "./lib/route";
 import { useQuery } from "@tanstack/react-query";
@@ -517,9 +518,11 @@ export function App() {
     const uid = decodeMachineKey(keyCtx, drilledKey).uid;
     // A key naming no machine says so once the window has landed, rather
     // than inventing a label no card shows; blank while it is still loading.
-    if (uid == null) return flowWindow.settled ? MACHINE_NOT_FOUND_LABEL : "";
+    // (#2965) Not while a flow read is failing: a machine known only from
+    // flow records is indistinguishable from an unknown key until it reads.
+    if (uid == null) return flowWindow.settled && flowWindow.failure === null ? MACHINE_NOT_FOUND_LABEL : "";
     return machineLabel(keyCtx, uid);
-  }, [drilledKey, flowWindow.data, flowWindow.settled, liveMachines, specs, roster]);
+  }, [drilledKey, flowWindow.data, flowWindow.settled, flowWindow.failure, liveMachines, specs, roster]);
   const targetMachineName = route.kind === "machine" ? (drilledKey != null ? drilledName : localName) : null;
 
   // (#1800) `#meta` takes legacy's REPLAY branch on a replay. Until now it
@@ -873,6 +876,9 @@ export function App() {
           padded row for a notice that renders nothing — see `styles.css`. */}
       <div className="app-shell__notices">
         <FleetCoverageNotice historical={!isLiveRoute(route)} />
+        {/* (#2965) A failed `/flow/<day>` read. Live routes only: a replay
+            reads its own day's records, not this window. */}
+        <FlowReadNotice failure={isLiveRoute(route) ? flowWindow.failure : null} />
       </div>
       <div className="app-shell__content">
         <main className="app-shell__stage" id="stage">

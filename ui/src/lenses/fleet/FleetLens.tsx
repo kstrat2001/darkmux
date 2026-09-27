@@ -617,7 +617,7 @@ export function FleetLens({
   }, []);
   const liveWindow = useFlowWindow(wallNow);
   const flowWindow = records !== undefined
-    ? { data: records, tMax: tMax ?? 0, settled: true }
+    ? { data: records, tMax: tMax ?? 0, settled: true, failure: null }
     : liveWindow;
   // (Playback parity, Change A — "one clock") The clock every bracketing
   // derivation below reads: the playhead when scrubbed, the real wall
@@ -767,9 +767,15 @@ export function FleetLens({
   // `/machine/specs` is live-only (see `specsQuery`); a replay has no self
   // identity to wait for.
   const specsAnswered = useLatch(!livePolling || specsQuery.status !== "pending");
+  // (#2965) A failed flow read settles the window with no records, which
+  // is what a quiet window looks like: the flow source has not answered
+  // while its read is failing, so the claims it backs hold "no signal".
+  // `FlowReadNotice` (app-level) says why. The latch still covers the
+  // midnight rollover: a new day's PENDING key is not a failure.
+  const flowKnown = flowAnswered && flowWindow.failure === null;
   const answered = useMemo<CardSourcesAnswered>(
-    () => ({ flow: flowAnswered, presence: presenceAnswered, sessions: sessionsAnswered, runs: runsAnswered, specs: specsAnswered }),
-    [flowAnswered, presenceAnswered, sessionsAnswered, runsAnswered, specsAnswered],
+    () => ({ flow: flowKnown, presence: presenceAnswered, sessions: sessionsAnswered, runs: runsAnswered, specs: specsAnswered }),
+    [flowKnown, presenceAnswered, sessionsAnswered, runsAnswered, specsAnswered],
   );
 
 
@@ -999,7 +1005,9 @@ export function FleetLens({
         // reads no live sample, and a precise clock re-rendered it per
         // sample.
         nowMs={playhead == null ? liveEdgeClock * 1000 : playheadT}
-        settled={flowWindow.settled}
+        // (#2965) Its zeros are a negative claim off the same read: a failed
+        // one keeps the loading silhouette rather than counting up to "0".
+        settled={flowWindow.settled && flowWindow.failure === null}
       />
       <RunsUnreadableNotice unreadable={runsUnreadable} message={runsErrorMessage} />
       <RosterUnreadableNotice error={rosterError} />

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { skipToken, useQueries, useQuery } from "@tanstack/react-query";
-import { fetchJson } from "../lib/fetcher";
-import { DATE_ROLLOVER_CHECK_MS, queryKeys } from "../lib/queryKeys";
+import { fetchJson, type FetchResult } from "../lib/fetcher";
+import { DATE_ROLLOVER_CHECK_MS, RECONCILE_BACKSTOP_MS, queryKeys } from "../lib/queryKeys";
 import { asRecordArray, buildFlowWindow, computeTMax, prevDateUTC, todayUTC } from "../lib/flow";
 import { getSource } from "../lib/source";
 import type { FlowRecord } from "../types/handwritten";
@@ -12,6 +12,23 @@ export interface FlowWindowResult {
   settled: boolean;
   data: FlowRecord[];
   tMax: number;
+  /** (#2965) A day's read failed, or `null` when every day answered. A
+   *  failed day settles the window and contributes no records, exactly as a
+   *  quiet day does, so this is the only thing that tells the two apart: a
+   *  negative claim ("idle") backed by a failed read is a claim nothing read.
+   *  A day with no file is not a failure (the daemon answers it `200 []`).
+   *  Current, not latched: a failed day retries every
+   *  `RECONCILE_BACKSTOP_MS`, and its first success clears this. */
+  failure: FlowReadFailure | null;
+}
+
+/** (#2965) What failed: the first failed day's status and message, and which
+ *  of the window's two days failed. */
+export interface FlowReadFailure {
+  status: number | null;
+  message: string;
+  today: boolean;
+  yesterday: boolean;
 }
 
 /** (#2911) How finely the flow window's trailing edge follows the clock. */
@@ -87,17 +104,26 @@ export function useFlowWindow(nowMs: number): FlowWindowResult {
   // question of route-gating this window is tracked separately as #1805.
   const daemonBacked = getSource().kind === "daemon";
 
+  // (#2965 review) A failed day retries itself. Nothing else refetches a
+  // `flowDate` key: the live tail writes `flowTail`, focus refetch is off,
+  // and `fetchJson` never throws, so TanStack's own retry never fires. Without
+  // this a single failed read held the page at "no signal" until a reload.
+  // A healthy day is never polled (`false`): the tail keeps it current.
+  const retryFailed = (q: { state: { data?: FetchResult<unknown> } }) =>
+    q.state.data && !q.state.data.ok ? RECONCILE_BACKSTOP_MS : false;
   const results = useQueries({
     queries: [
       {
         queryKey: queryKeys.flowDate(yesterday),
         queryFn: () => fetchJson<unknown>(`/flow/${yesterday}`),
         enabled: daemonBacked,
+        refetchInterval: retryFailed,
       },
       {
         queryKey: queryKeys.flowDate(today),
         queryFn: () => fetchJson<unknown>(`/flow/${today}`),
         enabled: daemonBacked,
+        refetchInterval: retryFailed,
       },
     ],
   });
@@ -131,5 +157,16 @@ export function useFlowWindow(nowMs: number): FlowWindowResult {
 
   const tMax = useMemo(() => computeTMax(data), [data]);
 
-  return { settled, data, tMax };
+  // (#2965) `fetchJson` never throws, so a failed read is a SUCCESSFUL query
+  // carrying `ok: false`, the same shape `RunsBoard` and the presence
+  // coverage read.
+  const yFail = yQuery.data && !yQuery.data.ok ? yQuery.data : null;
+  const tFail = tQuery.data && !tQuery.data.ok ? tQuery.data : null;
+  const first = tFail ?? yFail;
+  const failure = useMemo<FlowReadFailure | null>(
+    () => (first ? { status: first.status, message: first.message, today: tFail !== null, yesterday: yFail !== null } : null),
+    [first, tFail, yFail],
+  );
+
+  return { settled, data, tMax, failure };
 }

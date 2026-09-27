@@ -19,6 +19,7 @@ import type { FlowWindowResult } from "./useFlowWindow";
 const LIVE: FlowWindowResult = {
   settled: true,
   tMax: 0,
+  failure: null,
   data: [{ action: "LIVE-RECORD" }] as never,
 };
 
@@ -62,6 +63,18 @@ describe("useRouteRecords", () => {
     const { result } = renderHook(() => useRouteRecords(route, LIVE), { wrapper: wrapper() });
     expect(result.current.records).toEqual(LIVE.data);
     expect(result.current.historical).toBe(false);
+  });
+
+  // (#2965) A live route's log is the live window, so a failed day read is
+  // its error too: without it the log says "no events yet" off a read that
+  // never happened.
+  it("gives a LIVE route the window's failed read as its error", () => {
+    const route: Route = { kind: "fleet" } as Route;
+    const failed: FlowWindowResult = { ...LIVE, failure: { status: 500, message: "500 Internal Server Error", today: true, yesterday: false } };
+    const { result } = renderHook(() => useRouteRecords(route, failed), { wrapper: wrapper() });
+    expect(result.current.error).toEqual({ status: 500, message: "500 Internal Server Error" });
+    const { result: healthy } = renderHook(() => useRouteRecords(route, LIVE), { wrapper: wrapper() });
+    expect(healthy.current.error).toBeNull();
   });
 
   it("gives a SESSION route that session's records, never the live window", async () => {
