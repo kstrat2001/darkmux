@@ -6582,9 +6582,9 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         stderr,
         session_id,
         // Host path where the runtime's `.darkmux-runtime/` bookkeeping
-        // landed (mounted at `/darkmux-out` in the container). Threaded
-        // to coding_task so it reads the trajectory from here rather than
-        // from the sandbox.
+        // landed (mounted at `/darkmux-out` in the container). Callers
+        // that keep the run's artifacts (coding_task) copy them out of it
+        // with the contained copier; counts come from `trajectory` below.
         out_dir: Some(host_out),
         trajectory: Some(trajectory_summary.fold),
     })
