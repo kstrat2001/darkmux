@@ -1056,6 +1056,7 @@ mod tests {
             ("RunKind", "a session's run kind (`session_id`), never a setting"),
             ("SessionKind", "a session's kind within its run (`session_id`), never a setting"),
             ("SessionScope", "what a step kind declares about its sessions (`session_id`), never a setting"),
+            ("WireKind", "a session kind's tag in the session id wire grammar (`session_id`), never a setting"),
             ("EndpointKind", "derived from `managed` + `url`, never written"),
             ("Lenient", "the lenient-read wrapper itself"),
             ("EndpointSource", "runtime-only provenance, never serialized"),
