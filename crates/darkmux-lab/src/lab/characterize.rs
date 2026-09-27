@@ -47,56 +47,58 @@ pub fn characterize(opts: &CharacterizeOpts) -> Result<CharacterizeReport> {
 }
 
 pub fn print_report(r: &CharacterizeReport) {
-    println!("darkmux characterize — workload `{}`", r.workload);
-    println!();
+    print!("{}", render_report(r));
+}
+
+/// The text `lab characterize` prints.
+pub(crate) fn render_report(r: &CharacterizeReport) -> String {
+    let mut out = String::new();
+    p!(out, "darkmux characterize — workload `{}`", r.workload);
+    p!(out);
     for o in &r.outcomes {
         let status = if o.ok { "✓" } else { "✗" };
-        println!(
-            "  {} {} — {}",
-            status,
-            o.run_id,
-            format_seconds(o.duration_ms)
-        );
+        p!(out, "  {} {} — {}", status, o.run_id, format_seconds(o.duration_ms));
         for note in &o.notes {
-            println!("      {note}");
+            p!(out, "      {note}");
         }
     }
-    println!();
-    let wall_secs: Vec<u128> = r.outcomes.iter().map(|o| o.duration_ms / 1000).collect();
-    let any_dispatch_failed = r.outcomes.iter().any(|o| !o.ok);
-    let any_verify_failed = r
-        .outcomes
-        .iter()
-        .any(|o| matches!(o.verify_passed, Some(false)));
-
-    if any_dispatch_failed {
-        println!(
-            "verdict: at least one dispatch failed — inspect `darkmux lab run inspect <run-id>` \
-             and check `darkmux doctor` for setup problems"
-        );
-    } else if any_verify_failed {
-        let max = wall_secs.iter().max().copied().unwrap_or(0);
-        let timing = classify_wall_clock(max);
-        println!(
-            "verdict: dispatch succeeded ({timing}) BUT the workload's verify check failed — \
-             the model didn't produce the expected reply. This is normal for non-deterministic \
-             single-turn smoke prompts; re-run a few times for distribution. For tighter \
-             contracts, replace the keyword check with a coding-task workload (npm test etc.)"
-        );
-    } else if let Some(&max) = wall_secs.iter().max() {
-        let label = classify_wall_clock(max);
-        println!("verdict: {label}");
+    p!(out);
+    if let Some(v) = verdict(&r.outcomes) {
+        p!(out, "verdict: {v}");
     }
-    println!();
-    println!("Next steps:");
-    println!("  • `darkmux lab run inspect <run-id>` for the per-run breakdown");
+    p!(out);
+    p!(out, "Next steps:");
+    p!(out, "  • `darkmux lab run inspect <run-id>` for the per-run breakdown");
     if r.outcomes.len() == 1 {
-        println!(
+        p!(
+            out,
             "  • Re-run for distribution: `darkmux lab run {} --runs 5` then \
              `darkmux lab run compare <a> <b>` for variance",
             r.workload
         );
     }
+    out
+}
+
+/// The one-line verdict: a failed dispatch dominates a failed verify, which
+/// dominates the wall-clock read. `None` when there were no runs.
+fn verdict(outcomes: &[RunOutcome]) -> Option<String> {
+    let slowest = outcomes.iter().map(|o| o.duration_ms / 1000).max()?;
+    let timing = classify_wall_clock(slowest);
+    Some(if outcomes.iter().any(|o| !o.ok) {
+        "at least one dispatch failed — inspect `darkmux lab run inspect <run-id>` \
+         and check `darkmux doctor` for setup problems"
+            .to_string()
+    } else if outcomes.iter().any(RunOutcome::verify_failed) {
+        format!(
+            "dispatch succeeded ({timing}) BUT the workload's verify check failed — \
+             the model didn't produce the expected reply. This is normal for non-deterministic \
+             single-turn smoke prompts; re-run a few times for distribution. For tighter \
+             contracts, replace the keyword check with a coding-task workload (npm test etc.)"
+        )
+    } else {
+        timing.to_string()
+    })
 }
 
 fn format_seconds(duration_ms: u128) -> String {
@@ -136,6 +138,77 @@ mod tests {
         assert_eq!(format_seconds(60_000), "1m 0s");
         assert_eq!(format_seconds(125_000), "2m 5s");
         assert_eq!(format_seconds(3_600_000), "60m 0s");
+    }
+
+    fn outcome(id: &str, ok: bool, verify_passed: Option<bool>, secs: u128) -> RunOutcome {
+        RunOutcome {
+            run_id: id.into(),
+            run_dir: std::path::PathBuf::new(),
+            ok,
+            verify_passed,
+            duration_ms: secs * 1000,
+            notes: vec!["provider=stub".into()],
+        }
+    }
+
+    fn report(outcomes: Vec<RunOutcome>) -> CharacterizeReport {
+        CharacterizeReport { workload: "w".into(), outcomes }
+    }
+
+    /// The whole report for one passing run, byte for byte.
+    #[test]
+    fn a_passing_run_renders_the_full_report() {
+        let text = render_report(&report(vec![outcome("r1", true, None, 8)]));
+        assert_eq!(
+            text,
+            "darkmux characterize — workload `w`\n\n  ✓ r1 — 8s\n      provider=stub\n\n\
+             verdict: fast — single-turn dispatch in expected range for any modern Apple Silicon\n\n\
+             Next steps:\n  • `darkmux lab run inspect <run-id>` for the per-run breakdown\n\
+             \x20 • Re-run for distribution: `darkmux lab run w --runs 5` then \
+             `darkmux lab run compare <a> <b>` for variance\n"
+        );
+    }
+
+    /// A failed dispatch dominates a failed verify; a failed verify
+    /// dominates the timing read; a verify nothing declared is not a failure.
+    #[test]
+    fn the_verdict_names_the_worst_outcome() {
+        let v = |o: Vec<RunOutcome>| verdict(&o).unwrap();
+        assert!(v(vec![outcome("a", false, Some(false), 1)]).starts_with("at least one dispatch failed"));
+        let verify = v(vec![outcome("a", true, Some(true), 1), outcome("b", true, Some(false), 40)]);
+        assert!(verify.starts_with("dispatch succeeded (slow — "), "{verify}");
+        assert!(verify.contains("BUT the workload's verify check failed"), "{verify}");
+        assert!(v(vec![outcome("a", true, None, 20)]).starts_with("ok — "));
+        assert_eq!(verdict(&[]), None);
+    }
+
+    /// Several runs: a failed dispatch is marked, and there is no re-run
+    /// hint and no verdict line when there are no runs.
+    #[test]
+    fn the_report_marks_failures_and_drops_the_rerun_hint_for_several_runs() {
+        let text = render_report(&report(vec![outcome("a", false, None, 1), outcome("b", true, None, 1)]));
+        assert!(text.contains("  ✗ a — 1s\n") && text.contains("  ✓ b — 1s\n"), "{text}");
+        assert!(!text.contains("Re-run for distribution"), "{text}");
+        let empty = render_report(&report(vec![]));
+        assert!(!empty.contains("verdict:"), "{empty}");
+    }
+
+    /// `characterize` runs the workload once, quietly, through `lab_run`.
+    #[test]
+    #[serial_test::serial]
+    fn characterize_runs_the_workload_once() {
+        use crate::lab::run::run_tests::{script, Lab, Script};
+        let lab = Lab::scripted(&["wchar"]);
+        script(Script { ok: true, verify: Some(false), ..Default::default() });
+        let r = characterize(&CharacterizeOpts {
+            workload: "wchar".into(),
+            profile: None,
+            config: Some(lab.profiles.clone()),
+        })
+        .unwrap();
+        assert_eq!(r.workload, "wchar");
+        assert_eq!(r.outcomes.len(), 1);
+        assert_eq!(crate::lab::run::exit_code(&r.outcomes), 1, "a failed verify fails characterize");
     }
 
     #[test]

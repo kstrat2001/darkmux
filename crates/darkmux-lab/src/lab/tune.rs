@@ -171,78 +171,77 @@ fn cluster_stats(values: &[u128]) -> ClusterStats {
 }
 
 pub fn print_report(r: &TuneReport) {
-    println!(
+    print!("{}", render_report(r));
+}
+
+/// The text `lab tune` prints.
+pub(crate) fn render_report(r: &TuneReport) -> String {
+    let mut out = String::new();
+    p!(
+        out,
         "darkmux tune — workload `{}` profile `{}` × {} run(s)",
         r.workload,
         r.profile.as_deref().unwrap_or("(default)"),
         r.stats.n
     );
-    println!();
-
+    p!(out);
     let s = &r.stats;
     if s.n == 0 {
-        println!("(no runs completed)");
-        return;
+        p!(out, "(no runs completed)");
+        return out;
     }
+    render_wall_clock(&mut out, s);
+    p!(out);
+    render_failures(&mut out, &r.outcomes, s.n);
+    p!(out);
+    p!(out, "Next steps:");
+    p!(out, "  • `darkmux lab run inspect <run-id>` for any individual run");
+    if let [first, .., last] = r.outcomes.as_slice() {
+        p!(out, "  • `darkmux lab run compare {} {}` for a head-to-head diff", first.run_id, last.run_id);
+    }
+    if s.slow_cluster.count > 0 {
+        p!(out, "  • Slow cluster present — re-tune compaction knobs and re-run");
+    }
+    out
+}
 
-    println!("┌─ wall clock");
-    println!("│  range:  {}s – {}s", s.min_seconds, s.max_seconds);
-    println!("│  mean:   {}s", s.mean_seconds);
-    println!("│  total:  {}s across {} run(s)", s.total_seconds, s.n);
+fn render_wall_clock(out: &mut String, s: &DistributionStats) {
+    p!(out, "┌─ wall clock");
+    p!(out, "│  range:  {}s – {}s", s.min_seconds, s.max_seconds);
+    p!(out, "│  mean:   {}s", s.mean_seconds);
+    p!(out, "│  total:  {}s across {} run(s)", s.total_seconds, s.n);
     if s.slow_cluster.count == 0 {
-        println!("│  cluster: single (variance < 1.5×, no meaningful bimodal split)");
+        p!(out, "│  cluster: single (variance < 1.5×, no meaningful bimodal split)");
     } else {
-        let fc = &s.fast_cluster;
-        let sc = &s.slow_cluster;
-        println!(
-            "│  fast cluster: n={} mean={}s range={}s–{}s",
-            fc.count,
-            fc.mean_seconds.unwrap_or(0),
-            fc.min_seconds.unwrap_or(0),
-            fc.max_seconds.unwrap_or(0)
-        );
-        println!(
-            "│  slow cluster: n={} mean={}s range={}s–{}s",
-            sc.count,
-            sc.mean_seconds.unwrap_or(0),
-            sc.min_seconds.unwrap_or(0),
-            sc.max_seconds.unwrap_or(0)
-        );
-        println!("│  slow rate:   {:.0}%", s.slow_rate * 100.0);
+        p!(out, "│  fast cluster: {}", cluster_line(&s.fast_cluster));
+        p!(out, "│  slow cluster: {}", cluster_line(&s.slow_cluster));
+        p!(out, "│  slow rate:   {:.0}%", s.slow_rate * 100.0);
     }
-    println!("└─");
-    println!();
+    p!(out, "└─");
+}
 
-    let dispatch_failures = r.outcomes.iter().filter(|o| !o.ok).count();
-    let verify_failures = r
-        .outcomes
-        .iter()
-        .filter(|o| matches!(o.verify_passed, Some(false)))
-        .count();
+fn cluster_line(c: &ClusterStats) -> String {
+    format!(
+        "n={} mean={}s range={}s–{}s",
+        c.count,
+        c.mean_seconds.unwrap_or(0),
+        c.min_seconds.unwrap_or(0),
+        c.max_seconds.unwrap_or(0)
+    )
+}
+
+fn render_failures(out: &mut String, outcomes: &[RunOutcome], n: usize) {
+    let dispatch_failures = outcomes.iter().filter(|o| !o.ok).count();
+    let verify_failures = outcomes.iter().filter(|o| o.verify_failed()).count();
     if dispatch_failures > 0 {
-        println!(
-            "⚠ {} of {} dispatches failed (runtime non-zero exit) — check `darkmux doctor` and \
-             individual run dirs for the trace",
-            dispatch_failures, s.n
+        p!(
+            out,
+            "⚠ {dispatch_failures} of {n} dispatches failed (runtime non-zero exit) — check \
+             `darkmux doctor` and individual run dirs for the trace"
         );
     }
     if verify_failures > 0 {
-        println!(
-            "⚠ {} of {} runs failed verify (dispatch ok, output didn't match expected)",
-            verify_failures, s.n
-        );
-    }
-
-    println!();
-    println!("Next steps:");
-    println!("  • `darkmux lab run inspect <run-id>` for any individual run");
-    if r.outcomes.len() >= 2 {
-        let a = r.outcomes.first().map(|o| o.run_id.as_str()).unwrap_or("");
-        let b = r.outcomes.last().map(|o| o.run_id.as_str()).unwrap_or("");
-        println!("  • `darkmux lab run compare {a} {b}` for a head-to-head diff");
-    }
-    if s.slow_cluster.count > 0 {
-        println!("  • Slow cluster present — re-tune compaction knobs and re-run");
+        p!(out, "⚠ {verify_failures} of {n} runs failed verify (dispatch ok, output didn't match expected)");
     }
 }
 
@@ -260,6 +259,67 @@ mod tests {
             duration_ms: (secs as u128) * 1000,
             notes: vec![],
         }
+    }
+
+    fn tune_report(outcomes: Vec<RunOutcome>) -> TuneReport {
+        let stats = compute_stats(&outcomes);
+        TuneReport { workload: "w".into(), profile: None, outcomes, stats }
+    }
+
+    /// The whole report for a tight two-run set, byte for byte.
+    #[test]
+    fn a_single_cluster_set_renders_the_full_report() {
+        let text = render_report(&tune_report(vec![outcome(8), outcome(9)]));
+        assert_eq!(
+            text,
+            "darkmux tune — workload `w` profile `(default)` × 2 run(s)\n\n\
+             ┌─ wall clock\n│  range:  8s – 9s\n│  mean:   8s\n│  total:  17s across 2 run(s)\n\
+             │  cluster: single (variance < 1.5×, no meaningful bimodal split)\n└─\n\n\n\
+             Next steps:\n  • `darkmux lab run inspect <run-id>` for any individual run\n\
+             \x20 • `darkmux lab run compare test-8 test-9` for a head-to-head diff\n"
+        );
+    }
+
+    /// A bimodal set prints both clusters and the slow-cluster hint; failed
+    /// dispatches and failed verifies are each counted; a verify nothing
+    /// declared is not.
+    #[test]
+    fn a_bimodal_set_with_failures_renders_clusters_and_counts() {
+        let mut runs = vec![outcome(200), outcome(220), outcome(900)];
+        runs[0].ok = false;
+        runs[1].verify_passed = Some(false);
+        runs[2].verify_passed = None;
+        let text = render_report(&tune_report(runs));
+        assert!(text.contains("│  fast cluster: n=2 mean=210s range=200s–220s\n"), "{text}");
+        assert!(text.contains("│  slow cluster: n=1 mean=900s range=900s–900s\n"), "{text}");
+        assert!(text.contains("│  slow rate:   33%\n"), "{text}");
+        assert!(text.contains("⚠ 1 of 3 dispatches failed"), "{text}");
+        assert!(text.contains("⚠ 1 of 3 runs failed verify"), "{text}");
+        assert!(text.contains("Slow cluster present"), "{text}");
+    }
+
+    /// No runs: the header and the empty marker only; one run: no compare hint.
+    #[test]
+    fn empty_and_single_run_reports() {
+        let empty = render_report(&tune_report(vec![]));
+        assert_eq!(empty, "darkmux tune — workload `w` profile `(default)` × 0 run(s)\n\n(no runs completed)\n");
+        let one = render_report(&tune_report(vec![outcome(5)]));
+        assert!(!one.contains("lab run compare"), "{one}");
+        assert!(!one.contains("⚠"), "{one}");
+    }
+
+    /// `tune` runs the workload N times through `lab_run`.
+    #[test]
+    #[serial_test::serial]
+    fn tune_runs_the_workload_n_times() {
+        use crate::lab::run::run_tests::{script, Lab, Script};
+        let lab = Lab::scripted(&["wtune"]);
+        script(Script { ok: true, verify: Some(true), ..Default::default() });
+        let r = tune(&TuneOpts { workload: "wtune".into(), profile: None, runs: 2, config: Some(lab.profiles.clone()) })
+            .unwrap();
+        assert_eq!(r.outcomes.len(), 2);
+        assert_eq!(r.stats.n, 2);
+        assert_eq!(crate::lab::run::exit_code(&r.outcomes), 0);
     }
 
     #[test]
