@@ -2523,13 +2523,12 @@ use crate::target::{resolve_role_aware_profile_with, role_profile_binding};
 /// Resolve the dispatch's [`crate::target::Target`] (the selected model with
 /// its own endpoint) WITHOUT loading anything in LMStudio — so `dispatch` can
 /// branch to the hosted path before the container/load machinery. `Ok(None)`
-/// ⇒ no profile model resolves (the local path, whose own resolution then
-/// fails with the named error). `Err` ⇒ the requested (or default) profile is
-/// QUARANTINED (#1282), a `role_profiles` binding names an undefined profile,
-/// or the selected model names an undefined endpoint (#2902) — a hard stop:
-/// falling through here would re-resolve against a DIFFERENT profile
-/// (possibly routing a dispatch to the wrong endpoint) before the container
-/// path ever gets to raise the same error.
+/// ⇒ the registry did not load (the container path raises the named #1269
+/// error for it). `Err` ⇒ no profile resolves or it selects no model (4.0:
+/// always fatal, so it fails here, ahead of the Docker preflight), the
+/// requested (or default) profile is QUARANTINED (#1282), a `role_profiles`
+/// binding names an undefined profile, or the selected model names an
+/// undefined endpoint (#2902).
 fn resolve_target(
     role: &crate::types::Role,
     profile_override: Option<&str>,
@@ -2543,7 +2542,8 @@ fn resolve_target(
         return Ok(None);
     };
     let mapped = role_profile_binding(Some(&role.id), profile_override);
-    Ok(crate::target::resolve_in(&loaded.registry, role, profile_override, mapped, allow_utility_model)?.target())
+    let resolution = crate::target::resolve_in(&loaded.registry, role, profile_override, mapped, allow_utility_model)?;
+    Ok(Some(resolution.require(&role.id, profile_override, &loaded.path)?))
 }
 
 /// (#1187) True when a role's tool palette grants at least one tool — the
@@ -2748,10 +2748,11 @@ pub fn dispatch_resolves_remote(
             darkmux_types::EndpointKind::Unmanaged => true,
             darkmux_types::EndpointKind::Managed(_) => false,
         },
-        // No profile model resolves ⇒ the container path's local fallback.
+        // The registry did not load. The dispatch itself is about to hard-fail.
         Ok(None) => false,
-        // A quarantined profile (#1282) — the dispatch itself is about to
-        // hard-fail, but answer conservatively rather than assuming local.
+        // No profile resolves, or a quarantined profile (#1282): the dispatch
+        // itself is about to hard-fail, but answer conservatively rather than
+        // assuming local.
         Err(_) => true,
     }
 }
@@ -5273,12 +5274,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             opts.model_base_url_override.is_some(),
             opts.allow_utility_model,
         )
-        .context(
-            "model selection failed. Ensure `~/.darkmux/profiles.json` has \
-             a profile with at least one model (the default model is \
-             `default_model` or the first model in `models`), or load a model in \
-             LMStudio (`lms load <id>`) as a fallback."
-        )?
+        .context("model selection failed")?
     };
     // (#1187 follow-up) Raw label (no eprintln prefix) — this is also the value
     // that must land in `dispatch_start_payload`'s `endpoint` field below, the
@@ -12163,31 +12159,12 @@ fn resolve_dispatch_model_with_hosts(
     // honors the `role_profiles.<role.id>` map before falling to
     // `default_profile` — the same precedence the review launcher already
     // applies to this map, now honored on the container dispatch path too.
-    let target = match resolution {
-        crate::target::Resolution::Target(t) => t,
-        crate::target::Resolution::NoModel { profile_name, error, .. } => bail!(
-            "darkmux dispatch: profile `{profile_name}` selects no model for role `{}` ({error}). \
-             Add a model for it to profile `{profile_name}` in {}.",
-            role.id,
-            loaded.path.display()
-        ),
-        crate::target::Resolution::NoProfile => {
-            // (#1282) A quarantined `default_profile` already hard-stopped in
-            // `resolve_in`, so this is genuinely "nothing configured". (4.0)
-            // No fallback to whatever LMStudio has loaded: that model has
-            // unknown load configuration (the #1135 ghost).
-            bail!(
-                "darkmux dispatch: no profile resolves for role `{}` (no --profile, no \
-                 `role_profiles.{}` binding, and no default_profile in {}). Set one: \
-                 `\"default_profile\": \"<name>\"` in profiles.json, or `darkmux config set \
-                 role_profiles.{} <profile>`.",
-                role.id,
-                role.id,
-                loaded.path.display(),
-                role.id
-            );
-        }
-    };
+    // (4.0) No profile, or a profile that selects no model, is a hard error
+    // with the one shared message; there is no fallback to whatever LMStudio
+    // has loaded (a user-loaded model has unknown load configuration, the
+    // #1135 ghost). A quarantined `default_profile` already hard-stopped in
+    // `resolve_in`.
+    let target = resolution.require(&role.id, profile_override, &loaded.path)?;
     let active_name = target.profile_name.clone();
     // Surface the fallback so the operator isn't surprised which model ran:
     // an explicit `--profile X` that resolved to a different name means X

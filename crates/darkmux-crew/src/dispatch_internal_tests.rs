@@ -1803,6 +1803,35 @@
     }
 
     #[test]
+    fn resolve_dispatch_model_internal_names_an_undefined_requested_profile() {
+        // `--profile ghost` with ghost undefined falls to default_profile
+        // (#1054); with no default either, the error must say what was
+        // asked for, not claim no --profile was given.
+        let tmp = TempDir::new().unwrap();
+        let pf = tmp.path().join("profiles.json");
+        std::fs::write(&pf, r#"{"profiles":{"fast":{"models":[{"id":"model-a","n_ctx":32000}]}}}"#).unwrap();
+        let err = resolve_dispatch_model_internal(&quarantine_test_role(), Some("ghost"), pf.to_str(), false, false)
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("`--profile ghost` is not defined"), "got: {msg}");
+        assert!(!msg.contains("no --profile"), "a --profile WAS given: {msg}");
+        assert!(msg.contains("Set `\"default_profile\": \"<name>\"`"), "the one fix wording: {msg}");
+    }
+
+    #[test]
+    fn resolve_target_fails_early_when_no_profile_resolves() {
+        // (4.0) `resolve_target` runs at the top of `dispatch()`, ahead of
+        // the Docker preflight. No-profile is always fatal now, so it fails
+        // there instead of returning Ok(None) for the container path to
+        // discover after the preflight.
+        let tmp = TempDir::new().unwrap();
+        let pf = tmp.path().join("profiles.json");
+        std::fs::write(&pf, r#"{"profiles":{"fast":{"models":[{"id":"model-a","n_ctx":32000}]}}}"#).unwrap();
+        let err = super::resolve_target(&quarantine_test_role(), None, pf.to_str(), false).unwrap_err();
+        assert!(format!("{err:#}").contains("no profile resolves for role `r`"), "got: {err:#}");
+    }
+
+    #[test]
     fn resolve_dispatch_model_internal_hard_fails_when_the_profile_selects_no_model() {
         // The profile resolves, but its only model is the machine utility
         // model, which work dispatches set aside (#2914), so `select_model`

@@ -133,7 +133,13 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
     // default, a prompt workload's `runtime.default_role`, …).
     let run_role = workload_role(&loaded_workload);
     let mapped = run_role.as_deref().and_then(darkmux_types::config_access::role_profile);
-    let profile_name = run_profile_name(opts.profile_name.as_deref(), run_role.as_deref(), mapped, &registry_loaded.registry)?;
+    let profile_name = run_profile_name(
+        opts.profile_name.as_deref(),
+        run_role.as_deref(),
+        mapped,
+        &registry_loaded.registry,
+        &registry_loaded.path,
+    )?;
     let profile = get_profile(&registry_loaded.registry, &profile_name)?;
 
     // (#365/#544) Best-effort provenance guard: if the operator swapped a
@@ -649,6 +655,7 @@ fn run_profile_name(
     role: Option<&str>,
     mapped: Option<String>,
     registry: &darkmux_types::ProfileRegistry,
+    registry_path: &std::path::Path,
 ) -> Result<String> {
     if let Some(p) = requested {
         return Ok(p.to_string());
@@ -660,7 +667,12 @@ fn run_profile_name(
     registry
         .default_profile
         .clone()
-        .ok_or_else(|| anyhow!("no profile specified and no default_profile in registry"))
+        .ok_or_else(|| {
+            anyhow!(
+                "darkmux lab run: {}",
+                darkmux_profiles::profiles::no_profile_message(role, None, Some(registry_path))
+            )
+        })
 }
 
 #[cfg(test)]
@@ -786,7 +798,7 @@ mod tests {
         )
         .unwrap();
         let name = |req: Option<&str>, mapped: Option<&str>| {
-            super::run_profile_name(req, Some("coder"), mapped.map(str::to_string), &reg)
+            super::run_profile_name(req, Some("coder"), mapped.map(str::to_string), &reg, std::path::Path::new("profiles.json"))
         };
         assert_eq!(name(None, Some("big")).unwrap(), "big");
         assert_eq!(name(Some("fast"), Some("big")).unwrap(), "fast");
@@ -1793,7 +1805,8 @@ mod tests {
             inject_context: None,
         })
         .unwrap_err();
-        assert!(err.to_string().contains("default_profile"));
+        // The same fix wording `darkmux dispatch` gives (one builder).
+        assert!(err.to_string().contains("Set `\"default_profile\": \"<name>\"`"), "{err}");
     }
 
     /// (#2511) End-to-end wiring proof, with zero dispatch/docker/LMStudio

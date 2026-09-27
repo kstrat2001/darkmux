@@ -355,6 +355,30 @@ pub fn resolve_role_profile<'a>(
     resolve_role_profile_with(role_id, &binding, registry)
 }
 
+/// (4.0) THE message for "no profile resolves": no `--profile` match, no
+/// `role_profiles.<role>` binding, and no `default_profile`. One builder so
+/// `darkmux dispatch`, mission placement, `lab run` and the role-binding
+/// resolver all name the same fix. `requested` is a `--profile` that was
+/// given but is not defined (it falls to `default_profile`, #1054).
+/// `registry_path` names the file to edit when the caller knows it.
+pub fn no_profile_message(
+    role_id: Option<&str>,
+    requested: Option<&str>,
+    registry_path: Option<&std::path::Path>,
+) -> String {
+    let file = registry_path.map_or_else(|| "profiles.json".to_string(), |p| p.display().to_string());
+    let for_role = role_id.map(|r| format!(" for role `{r}`")).unwrap_or_default();
+    let cause = match (requested, role_id) {
+        (Some(req), _) => format!("`--profile {req}` is not defined in {file} and there is no default_profile to fall back to"),
+        (None, Some(r)) => format!("no --profile, no `role_profiles.{r}` binding, and no default_profile in {file}"),
+        (None, None) => format!("no --profile and no default_profile in {file}"),
+    };
+    let bind = role_id
+        .map(|r| format!(", or bind the role: `darkmux config set role_profiles.{r} <profile>`"))
+        .unwrap_or_default();
+    format!("no profile resolves{for_role} ({cause}). Set `\"default_profile\": \"<name>\"` in {file}{bind}.")
+}
+
 /// (#1475 packet 1/3) Pure core of [`resolve_role_profile`] — the binding is
 /// supplied explicitly ([`RoleBinding::Overridden`]/[`Mapped`](RoleBinding::Mapped)
 /// name the bound profile, [`Unmapped`](RoleBinding::Unmapped) falls through to
@@ -411,13 +435,10 @@ pub fn resolve_role_profile_with<'a>(
     }
 
     // Unmapped role → default_profile, silently (the fresh-user floor).
-    let default_name = registry.default_profile.as_deref().ok_or_else(|| {
-        anyhow!(
-            "darkmux: role \"{role_id}\" is not bound to a profile and the registry has no \
-             default_profile — bind it (`darkmux config set role_profiles.{role_id} <profile>`) \
-             or set a default_profile in profiles.json. (#1475)"
-        )
-    })?;
+    let default_name = registry
+        .default_profile
+        .as_deref()
+        .ok_or_else(|| anyhow!("darkmux: {}", no_profile_message(Some(role_id), None, None)))?;
     // Reuse get_profile so a dangling/quarantined default_profile fails with the
     // standard message shape rather than a bespoke one.
     let profile = get_profile(registry, default_name)?;
@@ -939,8 +960,9 @@ mod tests {
         )
         .unwrap();
         let err = resolve_role_profile_with("judge", &RoleBinding::Unmapped, &reg).unwrap_err().to_string();
-        assert!(err.contains("not bound"), "names the unbound role: {err}");
+        assert!(err.contains("no profile resolves for role `judge`"), "names the unbound role: {err}");
         assert!(err.contains("no default_profile"), "explains the missing floor: {err}");
+        assert!(err.contains("darkmux config set role_profiles.judge"), "names the fix: {err}");
     }
 
     #[test]

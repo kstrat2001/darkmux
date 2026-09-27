@@ -1987,7 +1987,7 @@ pub const SEAT_UNRESOLVED_ACTION: &str = "step seat unresolved";
 /// `Warn`, because it names a real lost guarantee rather than a preference:
 /// this dispatch meant to run a local model, so it SHOULD have had a #1487
 /// residency lease, and it does not. The `reason` is the resolver's own
-/// (`role \`x\` not found`, `no active profile`, `model \`m\` has no declared
+/// (`role \`x\` not found`, `no profile resolves for role \`x\``, `model \`m\` has no declared
 /// n_ctx`) — carried verbatim so the operator fixes the actual cause rather
 /// than guessing from a category.
 fn seat_unresolved_record(step: &Step, reason: &str) -> FlowRecord {
