@@ -415,7 +415,7 @@ mod tests {
             "DARKMUX_RUNTIME_MAX_TOKENS",
             "DARKMUX_INACTIVITY_TIMEOUT_SECONDS",
         ];
-        let prev: Vec<_> = vars.iter().map(|v| std::env::var_os(v)).collect();
+        let prev: Vec<_> = vars.iter().map(std::env::var_os).collect();
         let result = cmd_lab_loop(LabLoopArgs {
             workload: "no-such-wl".into(),
             profile: None,
@@ -429,7 +429,7 @@ mod tests {
                 None => std::env::remove_var(v),
             }
         }
-        let err = result.err().expect("an unknown workload must fail the dispatch").to_string();
+        let err = result.expect_err("an unknown workload must fail the dispatch").to_string();
         assert!(err.contains("no-such-wl"), "{err}");
         assert_eq!(got, [Some("7".into()), Some("900".into()), Some("33".into())]);
     }
