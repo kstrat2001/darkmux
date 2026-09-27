@@ -315,6 +315,26 @@ fn a_wait_on_a_partial_window_names_its_floor() {
     assert!(w["message"].as_str().unwrap().contains("at least 2000000 of 100000"), "{w}");
 }
 
+/// A call count is always exact, so "not fully metered" applies only to a
+/// token metric: a calls-only budget's early warning never says "at
+/// least", carries no unmetered count, and is not repeated when an
+/// unmetered call enters the window.
+#[test]
+fn a_calls_budget_is_never_unmetered() {
+    let env = FakeEnv::new(vec![(T0 - 60, 10), (T0 - 50, 10)]);
+    env.records.borrow_mut().push((T0 - 40, Spend::partial(0)));
+    let b = budget(BudgetPolicy::Warn, None, Some(5), Some(0.5));
+    let caller = BudgetCaller::default();
+    admit_with(b.clone(), &caller, &env).unwrap();
+    assert_eq!(env.actions().len(), 1, "3 of 5 calls: early");
+    let p = env.payload(darkmux_flow::FlowAction::BudgetWarn);
+    assert_eq!((p["metric"].as_str(), p["unmetered_calls"].as_u64()), (Some("calls"), Some(0)), "{p}");
+    assert!(!p["message"].as_str().unwrap().contains("at least"), "{p}");
+    env.records.borrow_mut().push((T0 - 30, Spend::partial(0)));
+    admit_with(b, &caller, &env).unwrap();
+    assert_eq!(env.actions().len(), 1, "another unmetered call is no news to a calls budget");
+}
+
 /// (re-review N4) The level (over the known spend) and the unmetered flag
 /// are independent: an early warning that arrives after an unmetered-only
 /// one is news and is said, and a newly unmetered window at the same level

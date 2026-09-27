@@ -299,6 +299,11 @@ pub fn evaluate(b: &EndpointBudget, entries: &[(i64, Spend)], now: i64) -> Verdi
     let mut early: Option<Breach> = None;
     for (metric, spent, limit) in measured {
         let Some(limit) = limit else { continue };
+        // A call count is always exact: only a token metric can be unmetered.
+        let unmetered = match metric {
+            Metric::Tokens => unmetered,
+            Metric::Calls => 0,
+        };
         if spent >= limit {
             at_limit.push(Breach { level: Some(BreachLevel::AtLimit), metric, spent, limit, unmetered });
         } else if let Some(f) = b.warn_at {
