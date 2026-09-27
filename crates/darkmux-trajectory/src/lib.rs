@@ -25,6 +25,19 @@ pub const TRAJECTORY_SUBDIR: &str = ".darkmux-runtime";
 /// The trajectory file inside [`TRAJECTORY_SUBDIR`].
 pub const TRAJECTORY_FILE: &str = "trajectory.jsonl";
 
+/// Uniqueness ratio below which a reasoning slice is degenerate: the
+/// threshold the runtime's detector judges with, and the one a reader
+/// re-derives a run's degenerate set from.
+///
+/// Deliberately far from BOTH measured clusters. Real productive reasoning
+/// (the 40,608-char pepper-grinder turn, its body alone, a resumed
+/// continuation, a checkpoint accumulation) all scored **1.000**; synthetic
+/// loops scored **0.013-0.015**. Anything in 0.1-0.8 separates them, so 0.25
+/// sits with margin on both sides. It is kept low because the costs are
+/// asymmetric: a false CLEAN costs one more checkpoint, while a false
+/// DEGENERATE destroys an analysis pass.
+pub const DEGENERATE_TAIL_RATIO: f64 = 0.25;
+
 /// The counters of a runtime checkpoint (`<out_dir>/checkpoint.json`) the
 /// host reads. The loop seeds its turn cap from them across a resume; the
 /// host adds what the resumed run recorded to report the whole task's

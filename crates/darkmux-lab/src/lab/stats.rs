@@ -64,16 +64,7 @@ use std::path::Path;
 /// Data-shape semver for [`RunStats`], per the repo's additive-minor rule.
 pub const RUN_STATS_SCHEMA_VERSION: &str = "2.0.0";
 
-/// Uniqueness ratio below which a slice is degenerate.
-///
-/// **Mirrors `runtime/src/reasoning_loop.rs`'s `DEGENERATE_TAIL_RATIO`**, and
-/// cannot import it — the runtime crate is not a workspace member. A copied
-/// constant drifts silently, so it is never trusted on its own: the
-/// [`RunChecks::verdict_matches_ratio`] check re-derives the degenerate set
-/// from this threshold and compares it against the runtime's OWN recorded
-/// judgment. False means this constant no longer matches the build that
-/// produced the run, and the derived set is the one to distrust.
-pub const DEGENERATE_TAIL_RATIO: f64 = 0.25;
+use darkmux_trajectory::DEGENERATE_TAIL_RATIO;
 
 /// GPU utilization at or above which a telemetry sample counts as BUSY.
 ///
@@ -189,8 +180,9 @@ pub struct RunChecks {
     pub have_telemetry_samples: bool,
     pub have_flow_records: bool,
     /// The runtime's own `would_conclude` verdicts and the threshold
-    /// comparison name the same turns. False = [`DEGENERATE_TAIL_RATIO`] here
-    /// does not match the build that produced the run.
+    /// comparison name the same turns. False = the run was recorded by a
+    /// runtime build judging with a different threshold than this build's
+    /// [`DEGENERATE_TAIL_RATIO`].
     pub verdict_matches_ratio: bool,
     /// Every stream returned a usage frame. False = `tok_per_s` is a rate
     /// over the BILLED subset only, and must be quoted with
