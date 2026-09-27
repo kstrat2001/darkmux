@@ -874,17 +874,14 @@ export interface LabFunnelEnvelope {
   archived: number;
 }
 
-/** The fields of `ScoresDoc.provenance` (`RunProvenance`,
- * `crates/darkmux-lab/src/lab/scores.rs`) `labCliHint()` reads
- * (`scores.crew`/`scores.exec_mode` in the legacy source — read off a
- * top-level `crew`/`exec_mode` the real `RunProvenance` doesn't actually
- * carry; see `lenses/runs/labRun.ts`'s own doc for why the legacy source
- * itself only ever hits the `env` half of this fallback in practice). Kept
- * minimal on purpose — `ScoresDoc.rows` (the real scoring output) is unread
- * by the lab-run-detail view this packet ports. */
+/** The fields of `ScoresDoc` (`crates/darkmux-lab/src/lab/scores.rs`)
+ * `labCliHint()` reads: the doc-level `role` and `mode` `lab eval` records
+ * (`write_scores_artifact`), and `provenance.profile`. Kept minimal on
+ * purpose — `rows` (the real scoring output) is unread by this view. */
 export interface LabScoresDoc {
-  crew?: string;
-  exec_mode?: string;
+  role?: string;
+  mode?: string;
+  provenance?: { profile?: string };
 }
 
 /** `GET /lab/run/detail?dir=` — the envelope(s) + scores content for one
