@@ -25,8 +25,8 @@ pub struct Provider;
 pub static PROVIDER: Provider = Provider;
 
 const NOTE_EXTRAPOLATED: &str =
-    "Provider `m-series-32` rules are extrapolated from the validated 64GB tier with further \
-     reductions for a ~32 GB unified memory budget. Compactor pairing is conservative (only \
+    "Provider `m-series-32` rules are extrapolated from the m-series-64 tier (itself derived from \
+     the validated 128GB tier) with further reductions for a ~32 GB unified memory budget. Compactor pairing is conservative (only \
      Medium Long); tune down `n_ctx` if you see swap pressure.";
 
 impl HeuristicsProvider for Provider {
@@ -255,6 +255,17 @@ mod tests {
             n.iter().any(|s| s.contains("extrapolated")),
             "expected extrapolation warning: {n:?}"
         );
+    }
+
+    #[test]
+    fn extra_notes_do_not_call_the_64gb_tier_validated() {
+        // The 64GB tier is itself extrapolated from the 128GB tier (its own
+        // note says "not independently measured"), so this tier's note must
+        // not present it as a validated baseline.
+        for n in PROVIDER.extra_notes() {
+            assert!(!n.contains("validated 64GB"), "note claims a validated 64GB tier: {n}");
+            assert!(n.contains("128GB"), "note should name the validated 128GB root: {n}");
+        }
     }
 
     #[test]
