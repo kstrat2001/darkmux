@@ -483,57 +483,6 @@ jobs:
   # beyond an artifact upload, so a red nightly would have gone unaddressed.
   # The gating work is tracked in #2600 — read it before re-adding this job.
 
-  # (4.0) The complexity ratchet: no new Rust function above cyclomatic
-  # complexity 15 and no function above its recorded baseline. A function
-  # that got simpler, or was split or removed, passes with a notice naming
-  # `--prune`. See the script's header for the measure and the two files it reads. rust-code-analysis
-  # reads sources, not a build, so this is ubuntu and about half a minute;
-  # the tool is compiled once and cached by version. The TypeScript half runs
-  # in the ui job.
-  complexity:
-    name: complexity ratchet (Rust)
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Detect Rust-relevant changes
-        uses: dorny/paths-filter@v3
-        id: filter
-        with:
-          filters: |
-            rust:
-              - '**/*.rs'
-              - 'scripts/complexity-ratchet.py'
-              - 'scripts/complexity-baseline.json'
-              - 'scripts/complexity-allowlist.json'
-              - 'scripts/rust_source.py'
-              - '.github/workflows/ci.yml'
-
-      - name: Ratchet self-test
-        run: python3 scripts/complexity-ratchet.py --self-test
-
-      - name: Cache rust-code-analysis
-        if: steps.filter.outputs.rust == 'true'
-        id: rca-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/rust-code-analysis-cli
-          key: rust-code-analysis-cli-0.0.25-${{ runner.os }}
-
-      - name: Install rust-code-analysis
-        if: steps.filter.outputs.rust == 'true' && steps.rca-cache.outputs.cache-hit != 'true'
-        run: cargo install rust-code-analysis-cli --version 0.0.25 --locked
-
-      - name: No Rust function above its complexity limit
-        if: steps.filter.outputs.rust == 'true'
-        run: python3 scripts/complexity-ratchet.py --lang rust
-
-      - name: No Rust-relevant changes — ratchet skipped
-        if: steps.filter.outputs.rust != 'true'
-        run: echo "No Rust changes; complexity ratchet skipped (reports green)."
-
   cargo-audit:
     name: cargo audit (RUSTSEC advisories)
     runs-on: ubuntu-latest
@@ -644,10 +593,16 @@ jobs:
         if: steps.filter.outputs.viewer != 'true'
         run: echo "No viewer / demo / fixture / e2e changes detected; viewer e2e skipped (reports green)."
 
+  # This job is the repo's static guards, and its check is a REQUIRED one on
+  # main. A guard that should block a merge lives here rather than in a job of
+  # its own, because a new job is not required until the ruleset names it; the
+  # Rust complexity ratchet below is here for that reason. The timeout covers
+  # the one cold compile of rust-code-analysis; with the tool cached the job
+  # takes about a minute.
   docs-drift:
     name: docs drift guard (retired terms)
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -900,6 +855,26 @@ jobs:
           tool: cargo-machete@0.9.2
       - name: No unused Rust dependencies
         run: cargo machete
+      # (4.0) The complexity ratchet, Rust half: no new function above
+      # cyclomatic complexity 15 and no function above its recorded baseline;
+      # a function that got simpler, or was split or removed, passes with a
+      # notice naming `--prune`. See the script's header for the measure and
+      # the two files it reads. rust-code-analysis reads sources, not a build;
+      # it is pinned and compiled once, then cached by version. The
+      # TypeScript half runs in the ui job.
+      - name: Complexity ratchet self-test
+        run: python3 scripts/complexity-ratchet.py --self-test
+      - name: Cache rust-code-analysis
+        id: rca-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/rust-code-analysis-cli
+          key: rust-code-analysis-cli-0.0.25-${{ runner.os }}
+      - name: Install rust-code-analysis
+        if: steps.rca-cache.outputs.cache-hit != 'true'
+        run: cargo install rust-code-analysis-cli --version 0.0.25 --locked
+      - name: No Rust function above its complexity limit
+        run: python3 scripts/complexity-ratchet.py --lang rust
       - name: No engagement-private identifiers (this repo is PUBLIC)
         # darkmux is public OSS developed alongside private client work, so an
         # employer name, a private repo, a hosted endpoint or a tracker key can
