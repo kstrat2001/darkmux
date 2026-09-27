@@ -15,8 +15,9 @@
 //!
 //! ## Adding a new provider
 //!
-//! 1. Add a file under `src/heuristics/` (e.g. `nvidia_24gb_vram.rs`)
-//! 2. Implement the `HeuristicsProvider` trait
+//! 1. Add a file under this crate's `src/` (e.g. `nvidia_24gb_vram.rs`)
+//! 2. Implement the `HeuristicsProvider` trait: `id`, `matches`, and a
+//!    `RulesTable` of data returned from `rules`
 //! 3. Add `pub mod <new>;` below
 //! 4. Append `&<new>::PROVIDER` to the `PROVIDERS` static array
 //!
@@ -64,6 +65,24 @@ impl TaskClass {
             TaskClass::Long => "long",
         }
     }
+
+    /// Column of this task class in a [`RulesTable`].
+    const fn column(self) -> usize {
+        match self {
+            TaskClass::Fast => 0,
+            TaskClass::Mid => 1,
+            TaskClass::Long => 2,
+        }
+    }
+
+    /// The phrase a drafted profile's description uses for this class.
+    fn description_label(self) -> &'static str {
+        match self {
+            TaskClass::Fast => "single-turn / fast tasks",
+            TaskClass::Mid => "mid-range / mixed tasks",
+            TaskClass::Long => "long agentic / multi-turn tasks",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +97,16 @@ pub enum Architecture {
     Unknown,
 }
 
+impl Architecture {
+    fn label(self) -> &'static str {
+        match self {
+            Architecture::Moe => "MoE",
+            Architecture::Dense => "dense",
+            Architecture::Unknown => "unknown-arch",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SizeBucket {
     Tiny,   // < 8B
@@ -85,6 +114,29 @@ pub enum SizeBucket {
     Medium, // 15 – 50B
     Large,  // 50 – 100B
     Xl,     // 100B+
+}
+
+impl SizeBucket {
+    /// Row of this bucket in a [`RulesTable`].
+    const fn row(self) -> usize {
+        match self {
+            SizeBucket::Tiny => 0,
+            SizeBucket::Small => 1,
+            SizeBucket::Medium => 2,
+            SizeBucket::Large => 3,
+            SizeBucket::Xl => 4,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SizeBucket::Tiny => "tiny",
+            SizeBucket::Small => "small",
+            SizeBucket::Medium => "medium",
+            SizeBucket::Large => "large",
+            SizeBucket::Xl => "XL",
+        }
+    }
 }
 
 /// Compactor pairing recommendation. `None` means no compactor — single-turn
@@ -99,8 +151,9 @@ pub struct CompactorChoice {
 pub struct ProfileSuggestion {
     pub primary_n_ctx: u32,
     pub context_tokens: u64,
+    /// The paired compactor, if any. A paired compactor is also what puts
+    /// a `runtime.compaction` block in the drafted profile.
     pub compactor: Option<CompactorChoice>,
-    pub include_compaction_settings: bool,
     pub description: String,
     /// Notes worth surfacing to the user about why this shape was picked
     /// (e.g., "context cut to 64K because RAM headroom on this model is
@@ -211,38 +264,73 @@ pub fn classify_architecture(meta: &ModelMeta) -> Architecture {
     }
 }
 
-/// One row in a provider's rules table. Pure data — the trait dispatch
-/// returns this and the parent module turns it into a `ProfileSuggestion`
-/// with shared post-processing (compactor clamp, notes, description).
+/// The looked-up cell of a provider's rules table, with the primary
+/// already capped at the model's max context. `suggest_profile_for` turns
+/// it into a `ProfileSuggestion` (compactor clamp, notes, description).
 pub struct RuleResult {
     pub primary_n_ctx: u32,
     pub compactor: Option<CompactorChoice>,
-    pub include_compaction_settings: bool,
+}
+
+/// One cell of a rules table: the primary's n_ctx before the model's
+/// max-context cap, and the paired compactor's n_ctx (`None` = no
+/// compactor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rule {
+    pub primary_n_ctx: u32,
+    pub compactor_n_ctx: Option<u32>,
+}
+
+impl Rule {
+    /// A primary with no compactor.
+    pub const fn solo(primary_n_ctx: u32) -> Self {
+        Rule { primary_n_ctx, compactor_n_ctx: None }
+    }
+
+    /// A primary paired with a `DEFAULT_COMPACTOR_ID` compactor.
+    pub const fn paired(primary_n_ctx: u32, compactor_n_ctx: u32) -> Self {
+        Rule { primary_n_ctx, compactor_n_ctx: Some(compactor_n_ctx) }
+    }
+}
+
+/// A provider's whole rules table as data: one row per [`SizeBucket`]
+/// (Tiny, Small, Medium, Large, Xl), one column per [`TaskClass`] (Fast,
+/// Mid, Long). Every provider is looked up through [`RulesTable::lookup`],
+/// the one implementation of the cap and the compactor pairing.
+pub struct RulesTable(pub [[Rule; 3]; 5]);
+
+impl RulesTable {
+    /// The `(bucket, task)` cell with the primary capped at `max_ctx`. The
+    /// compactor is NOT capped here — `suggest_profile_for` clamps it
+    /// against the capped primary.
+    pub fn lookup(&self, bucket: SizeBucket, task: TaskClass, max_ctx: u32) -> RuleResult {
+        let cell = self.0[bucket.row()][task.column()];
+        RuleResult {
+            primary_n_ctx: cell.primary_n_ctx.min(max_ctx),
+            compactor: cell.compactor_n_ctx.map(|n_ctx| CompactorChoice {
+                model_id: DEFAULT_COMPACTOR_ID.to_string(),
+                n_ctx,
+            }),
+        }
+    }
 }
 
 /// A pluggable rules table for a specific hardware shape. Providers are
 /// registered statically below and matched in order (first match wins);
 /// `generic` matches everything as a fallback. Each provider implements
-/// `matches` (claim a hardware shape) and `suggest` (the rules table).
-#[allow(dead_code)] // `description` is part of the public trait surface — providers
-// implement it; future surfaces (doctor verbose mode, scan output) consume it.
+/// `matches` (claim a hardware shape) and `rules` (its table, as data).
 pub trait HeuristicsProvider: Sync {
     /// Stable identifier used in `_notes` and doctor output.
     fn id(&self) -> &'static str;
-    /// One-line description for `darkmux doctor` and tooltips.
-    fn description(&self) -> &'static str;
     /// Return `true` if this provider's rules apply to the given hardware.
     fn matches(&self, hw: &HardwareSpec) -> bool;
-    /// Look up the rules row for `(bucket, arch, task)` capped at `max_ctx`.
-    /// Implementations don't need to clamp the compactor or set contextTokens
-    /// — the dispatcher does that uniformly.
-    fn suggest(
-        &self,
-        bucket: SizeBucket,
-        arch: Architecture,
-        task: TaskClass,
-        max_ctx: u32,
-    ) -> RuleResult;
+    /// This provider's rules table.
+    fn rules(&self) -> &'static RulesTable;
+    /// Look up the `(bucket, task)` cell, primary capped at `max_ctx`. The
+    /// compactor clamp and contextTokens are `suggest_profile_for`'s job.
+    fn suggest(&self, bucket: SizeBucket, task: TaskClass, max_ctx: u32) -> RuleResult {
+        self.rules().lookup(bucket, task, max_ctx)
+    }
     /// Optional extra notes to include in the suggestion's `_notes` field
     /// (e.g. "this provider's rules are extrapolated, not validated").
     fn extra_notes(&self) -> &[&'static str] {
@@ -295,11 +383,8 @@ pub fn suggest_profile_for(
     let max_ctx = meta.max_context_length.unwrap_or(32_000);
 
     let provider = active_provider(hw);
-    let RuleResult {
-        primary_n_ctx,
-        compactor: compactor_raw,
-        include_compaction_settings,
-    } = provider.suggest(bucket, arch, task, max_ctx);
+    let RuleResult { primary_n_ctx, compactor: compactor_raw } =
+        provider.suggest(bucket, task, max_ctx);
 
     // Clamp the compactor's n_ctx so it never exceeds the (capped) primary.
     // This matters when max_ctx forces the primary down — e.g., a Medium
@@ -347,15 +432,10 @@ pub fn suggest_profile_for(
         primary_n_ctx,
         context_tokens,
         compactor,
-        include_compaction_settings,
         description,
         notes,
     }
 }
-
-// Rules tables live in submodules — see `m_series_128.rs`, `m_series_64.rs`,
-// `generic.rs`. Constants needed across providers (compactor model id,
-// compaction instruction string) are defined above.
 
 fn format_description(
     meta: &ModelMeta,
@@ -363,30 +443,12 @@ fn format_description(
     arch: Architecture,
     task: TaskClass,
 ) -> String {
-    let arch_label = match arch {
-        Architecture::Moe => "MoE",
-        Architecture::Dense => "dense",
-        Architecture::Unknown => "unknown-arch",
-    };
-    let task_label = match task {
-        TaskClass::Fast => "single-turn / fast tasks",
-        TaskClass::Mid => "mid-range / mixed tasks",
-        TaskClass::Long => "long agentic / multi-turn tasks",
-    };
-    let size_label = match bucket {
-        SizeBucket::Tiny => "tiny",
-        SizeBucket::Small => "small",
-        SizeBucket::Medium => "medium",
-        SizeBucket::Large => "large",
-        SizeBucket::Xl => "XL",
-    };
-    let display = if meta.display_name.is_empty() {
-        meta.model_key.clone()
-    } else {
-        meta.display_name.clone()
-    };
+    let display = if meta.display_name.is_empty() { &meta.model_key } else { &meta.display_name };
     format!(
-        "{display} ({size_label} {arch_label}) tuned for {task_label}."
+        "{display} ({} {}) tuned for {}.",
+        bucket.label(),
+        arch.label(),
+        task.description_label()
     )
 }
 
@@ -419,16 +481,14 @@ pub fn suggestion_to_profile_json(
         "contextTokens".into(),
         serde_json::Value::Number(suggestion.context_tokens.into()),
     );
-    if suggestion.include_compaction_settings {
+    if let Some(c) = suggestion.compactor.as_ref() {
         let mut compaction = serde_json::Map::new();
-        // (#385) Drop dead-letter openclaw-shape fields per schema-isolation doctrine.
-        // Only darkmux-typed fields are written into heuristic-generated profiles.
-        if let Some(c) = suggestion.compactor.as_ref() {
-            compaction.insert(
-                "model".into(),
-                serde_json::Value::String(format!("lmstudio/{}", c.model_id)),
-            );
-        }
+        // (#385) Only darkmux-typed fields are written into heuristic-generated
+        // profiles.
+        compaction.insert(
+            "model".into(),
+            serde_json::Value::String(format!("lmstudio/{}", c.model_id)),
+        );
         compaction.insert(
             "custom_instructions".into(),
             serde_json::Value::String(DEFAULT_COMPACTION_INSTRUCTIONS.into()),
@@ -502,7 +562,7 @@ mod tests {
     /// data written independently of the tables themselves: `(primary
     /// n_ctx, compactor n_ctx)` per `[bucket][task]`, buckets Tiny..Xl,
     /// tasks Fast/Mid/Long. A compactor, when present, is always
-    /// `DEFAULT_COMPACTOR_ID` and always carries the compaction settings.
+    /// `DEFAULT_COMPACTOR_ID`.
     type Golden = [[(u32, Option<u32>); 3]; 5];
     const GOLDEN_128: Golden = [
         [(32_000, None), (64_000, None), (131_072, None)],
@@ -535,7 +595,6 @@ mod tests {
     const BUCKETS: [SizeBucket; 5] =
         [SizeBucket::Tiny, SizeBucket::Small, SizeBucket::Medium, SizeBucket::Large, SizeBucket::Xl];
     const TASKS: [TaskClass; 3] = [TaskClass::Fast, TaskClass::Mid, TaskClass::Long];
-    const ARCHS: [Architecture; 3] = [Architecture::Moe, Architecture::Dense, Architecture::Unknown];
 
     fn goldens() -> [(&'static dyn HeuristicsProvider, &'static Golden); 4] {
         [
@@ -554,19 +613,12 @@ mod tests {
                     let (want_ctx, want_compactor) = golden[b][t];
                     // The architecture is not an input to any table today:
                     // every arch must read the same cell.
-                    for arch in ARCHS {
-                        let r = provider.suggest(*bucket, arch, *task, u32::MAX);
-                        let at = format!("{} {bucket:?}/{task:?}/{arch:?}", provider.id());
-                        assert_eq!(r.primary_n_ctx, want_ctx, "{at}: primary n_ctx");
-                        assert_eq!(r.compactor.as_ref().map(|c| c.n_ctx), want_compactor, "{at}: compactor n_ctx");
-                        if let Some(c) = &r.compactor {
-                            assert_eq!(c.model_id, DEFAULT_COMPACTOR_ID, "{at}: compactor model");
-                        }
-                        assert_eq!(
-                            r.include_compaction_settings,
-                            want_compactor.is_some(),
-                            "{at}: compaction settings ride with the compactor"
-                        );
+                    let r = provider.suggest(*bucket, *task, u32::MAX);
+                    let at = format!("{} {bucket:?}/{task:?}", provider.id());
+                    assert_eq!(r.primary_n_ctx, want_ctx, "{at}: primary n_ctx");
+                    assert_eq!(r.compactor.as_ref().map(|c| c.n_ctx), want_compactor, "{at}: compactor n_ctx");
+                    if let Some(c) = &r.compactor {
+                        assert_eq!(c.model_id, DEFAULT_COMPACTOR_ID, "{at}: compactor model");
                     }
                 }
             }
@@ -581,7 +633,7 @@ mod tests {
         for (provider, golden) in goldens() {
             for (b, bucket) in BUCKETS.iter().enumerate() {
                 for (t, task) in TASKS.iter().enumerate() {
-                    let r = provider.suggest(*bucket, Architecture::Moe, *task, 1_000);
+                    let r = provider.suggest(*bucket, *task, 1_000);
                     let at = format!("{} {bucket:?}/{task:?}", provider.id());
                     assert_eq!(r.primary_n_ctx, 1_000, "{at}: primary capped");
                     assert_eq!(r.compactor.as_ref().map(|c| c.n_ctx), golden[b][t].1, "{at}: compactor uncapped");
@@ -683,9 +735,7 @@ mod tests {
         let m = meta("qwen3.6-35b-a3b", Some("35B"), Some("qwen3_5_moe"), 262_144, 0);
         let s = suggest_profile_for(&m, TaskClass::Long, &apple_silicon_128gb());
         assert_eq!(s.primary_n_ctx, 262_144);
-        assert!(s.compactor.is_some());
         assert_eq!(s.compactor.as_ref().unwrap().n_ctx, 120_000);
-        assert!(s.include_compaction_settings);
     }
 
     #[test]
@@ -703,7 +753,6 @@ mod tests {
             let m = meta("x", Some(params), Some("qwen3"), 32_000, 0);
             let s = suggest_profile(&m, TaskClass::Fast);
             assert!(s.compactor.is_none(), "fast w/ {params} got compactor");
-            assert!(!s.include_compaction_settings);
         }
     }
 

@@ -10,9 +10,7 @@
 //! suggestion is unvalidated for their platform.
 
 use darkmux_hardware::HardwareSpec;
-use crate::{
-    Architecture, HeuristicsProvider, RuleResult, SizeBucket, TaskClass,
-};
+use crate::{HeuristicsProvider, Rule, RulesTable};
 
 pub struct Provider;
 pub static PROVIDER: Provider = Provider;
@@ -23,61 +21,40 @@ const NOTE_UNVALIDATED: &str =
      Please tune n_ctx down if you see swap/OOM, and consider PR'ing a hardware-specific \
      provider with measured results back to https://github.com/kstrat2001/darkmux.";
 
+/// Rows are size buckets, columns Fast / Mid / Long. Conservative defaults
+/// — single-turn-only for big models, no compactor pairing
+/// (compactor-offload is an Apple-Silicon-shaped pattern and may not pay
+/// off on other platforms).
+static RULES: RulesTable = RulesTable([
+    [Rule::solo(32_000), Rule::solo(32_000), Rule::solo(64_000)],
+    [Rule::solo(32_000), Rule::solo(32_000), Rule::solo(64_000)],
+    [Rule::solo(16_000), Rule::solo(32_000), Rule::solo(64_000)],
+    [Rule::solo(8_000), Rule::solo(16_000), Rule::solo(32_000)],
+    [Rule::solo(8_000), Rule::solo(16_000), Rule::solo(32_000)],
+]);
+
 impl HeuristicsProvider for Provider {
     fn id(&self) -> &'static str {
         "generic"
-    }
-    fn description(&self) -> &'static str {
-        "Conservative fallback for unvalidated platforms (non-Apple-Silicon, low-RAM Macs, etc.). Suggestions are starting points only."
     }
 
     fn matches(&self, _hw: &HardwareSpec) -> bool {
         true
     }
 
-    fn extra_notes(&self) -> &[&'static str] {
-        &[NOTE_UNVALIDATED]
+    fn rules(&self) -> &'static RulesTable {
+        &RULES
     }
 
-    fn suggest(
-        &self,
-        bucket: SizeBucket,
-        _arch: Architecture,
-        task: TaskClass,
-        max_ctx: u32,
-    ) -> RuleResult {
-        let cap = |n: u32| -> u32 { n.min(max_ctx) };
-        // Conservative defaults — single-turn-only for big models, no
-        // compactor pairing (compactor-offload is an Apple-Silicon-shaped
-        // pattern and may not pay off on other platforms).
-        let primary_n_ctx = match (bucket, task) {
-            (SizeBucket::Tiny, TaskClass::Fast) => cap(32_000),
-            (SizeBucket::Tiny, TaskClass::Mid) => cap(32_000),
-            (SizeBucket::Tiny, TaskClass::Long) => cap(64_000),
-
-            (SizeBucket::Small, TaskClass::Fast) => cap(32_000),
-            (SizeBucket::Small, TaskClass::Mid) => cap(32_000),
-            (SizeBucket::Small, TaskClass::Long) => cap(64_000),
-
-            (SizeBucket::Medium, TaskClass::Fast) => cap(16_000),
-            (SizeBucket::Medium, TaskClass::Mid) => cap(32_000),
-            (SizeBucket::Medium, TaskClass::Long) => cap(64_000),
-
-            (SizeBucket::Large | SizeBucket::Xl, TaskClass::Fast) => cap(8_000),
-            (SizeBucket::Large | SizeBucket::Xl, TaskClass::Mid) => cap(16_000),
-            (SizeBucket::Large | SizeBucket::Xl, TaskClass::Long) => cap(32_000),
-        };
-        RuleResult {
-            primary_n_ctx,
-            compactor: None,
-            include_compaction_settings: false,
-        }
+    fn extra_notes(&self) -> &[&'static str] {
+        &[NOTE_UNVALIDATED]
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{SizeBucket, TaskClass};
     use darkmux_hardware::Platform;
 
     fn hw(plat: Platform, ram: u32) -> HardwareSpec {
@@ -110,12 +87,11 @@ mod tests {
             SizeBucket::Xl,
         ] {
             for task in [TaskClass::Fast, TaskClass::Mid, TaskClass::Long] {
-                let r = PROVIDER.suggest(bucket, Architecture::Dense, task, 100_000);
+                let r = PROVIDER.suggest(bucket, task, 100_000);
                 assert!(
                     r.compactor.is_none(),
                     "generic must not pair compactor; got one for {bucket:?}/{task:?}"
                 );
-                assert!(!r.include_compaction_settings);
             }
         }
     }
@@ -128,7 +104,7 @@ mod tests {
 
     #[test]
     fn xl_long_is_minimal_ctx() {
-        let r = PROVIDER.suggest(SizeBucket::Xl, Architecture::Dense, TaskClass::Long, 100_000);
+        let r = PROVIDER.suggest(SizeBucket::Xl, TaskClass::Long, 100_000);
         // Generic shouldn't recommend a wide ctx on a 122B model unmeasured.
         assert!(r.primary_n_ctx <= 32_000);
     }
