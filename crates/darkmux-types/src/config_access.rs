@@ -84,7 +84,7 @@ thread_local! {
 /// returned guard is alive. Isolation is unchanged for every test that does
 /// NOT opt in — the override defaults to unset (null), so `config()` falls
 /// straight back through to `EMPTY_CONFIG` exactly as before this existed.
-fn config() -> &'static DarkmuxConfig {
+pub(crate) fn config() -> &'static DarkmuxConfig {
     #[cfg(any(test, feature = "test-support"))]
     {
         let ptr = CONFIG_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst);
@@ -331,22 +331,44 @@ pub fn machine_id_with_source() -> (Option<String>, Source) {
     pick_string_with_source("DARKMUX_MACHINE_ID", config().machine_id.as_deref(), None)
 }
 
-// ── Fleet position (#933) ──
-/// The machine's declared fleet position as the RAW operator token, resolving
-/// `env(DARKMUX_FLEET_MODE) > config.fleet.mode > "standalone"`. An
-/// unrecognized value passes through unchanged so `darkmux doctor` can validate
-/// it against what the operator actually wrote (#934); typed callers use
-/// `fleet_mode()`.
-pub fn fleet_mode_raw() -> String {
-    let cfg = config().fleet.as_ref().and_then(|f| f.mode.as_deref());
-    pick_string("DARKMUX_FLEET_MODE", cfg, Some("standalone")).unwrap()
+// ── Enum-typed settings (#2947) ──
+/// Resolve a registered enum setting through the live tiers: `env >
+/// config.json > shipped`. An unregistered value at either written tier is
+/// a [`BadEnumValue`](crate::config_enum::BadEnumValue), never a fallback.
+/// The token is canonical (trimmed, lowercase). See `config_enum`.
+pub fn resolve_enum_token(
+    setting: &crate::config_enum::EnumSetting,
+) -> Result<(&'static str, Source), crate::config_enum::BadEnumValue> {
+    crate::config_enum::resolve_in(setting, config(), env_str)
 }
 
-/// The machine's declared fleet position, typed. An unrecognized token resolves
-/// to `Standalone` (the safe default — a single machine that coordinates
-/// nothing); `darkmux doctor` surfaces the raw typo separately (#934).
-pub fn fleet_mode() -> crate::config::FleetMode {
-    crate::config::FleetMode::parse(&fleet_mode_raw()).unwrap_or_default()
+/// [`resolve_enum_token`], typed. `T` must be the enum the entry was
+/// registered with ([`EnumSetting::of`](crate::config_enum::EnumSetting::of)
+/// takes the table from `T`, so a token that resolved is one `T` parses).
+pub fn resolve_enum<T: crate::config_enum::ConfigEnum>(
+    key: &str,
+) -> Result<(T, Source), crate::config_enum::BadEnumValue> {
+    let setting = crate::config_enum::setting(key)
+        .unwrap_or_else(|| panic!("`{key}` is not in config_enum::ENUM_SETTINGS (#2947)"));
+    assert_eq!(setting.rust_name, T::RUST_NAME, "`{key}` is registered as {}, not {}", setting.rust_name, T::RUST_NAME);
+    let (token, source) = resolve_enum_token(setting)?;
+    let value = T::from_token(token).expect("a resolved token is a token of the registered enum");
+    Ok((value, source))
+}
+
+// ── Fleet position (#933) ──
+/// The machine's declared fleet position,
+/// `env(DARKMUX_FLEET_MODE) > config.fleet.mode > standalone`. An
+/// unrecognized token is an error naming the value, where it was set, and
+/// the valid values (#2947); it is no longer read as `standalone`.
+pub fn fleet_mode() -> Result<crate::config::FleetMode, crate::config_enum::BadEnumValue> {
+    fleet_mode_with_source().map(|(v, _)| v)
+}
+
+/// [`fleet_mode`] plus WHICH tier resolved it.
+pub fn fleet_mode_with_source(
+) -> Result<(crate::config::FleetMode, Source), crate::config_enum::BadEnumValue> {
+    resolve_enum("fleet.mode")
 }
 
 // ── Fleet work submission (#2916) ──
@@ -357,19 +379,15 @@ pub const FLEET_IDENTITY_PROVIDER_DEFAULT: &str = "tailscale";
 /// 8765, which `tailscale serve` owns on the overlay side of a hub.
 pub const FLEET_LISTENER_PORT_DEFAULT: u16 = 8766;
 
-/// The identity provider VALUE, `config.fleet.identity.provider >
-/// "tailscale"`. Deliberately NO env tier: which network vouches for a
-/// connecting machine is security-bearing, and a per-shell override of it
-/// would be one more way to change the check without a trace in the file.
-/// An unrecognized value passes through; the provider factory refuses it,
-/// and no provider means every submission is refused.
-pub fn fleet_identity_provider() -> String {
-    config()
-        .fleet
-        .as_ref()
-        .and_then(|f| f.identity.as_ref())
-        .and_then(|i| i.provider.clone())
-        .unwrap_or_else(|| FLEET_IDENTITY_PROVIDER_DEFAULT.to_string())
+/// The identity provider, `config.fleet.identity.provider > "tailscale"`.
+/// Deliberately NO env tier: which network vouches for a connecting machine
+/// is security-bearing, and a per-shell override of it would be one more way
+/// to change the check without a trace in the file. An unrecognized value is
+/// an error (#2947); the provider factory refuses on it, and no provider
+/// means every submission is refused.
+pub fn fleet_identity_provider(
+) -> Result<crate::config::IdentityProvider, crate::config_enum::BadEnumValue> {
+    resolve_enum("fleet.identity.provider").map(|(v, _)| v)
 }
 
 /// The provider's command-line tool, `config.fleet.identity.bin`, when set.
@@ -1578,110 +1596,39 @@ pub fn thermal_enabled_with_source() -> (bool, Source) {
     }
 }
 
-/// (#2774 round-3 C4) Normalize a thermal-state token at RESOLUTION —
-/// trimmed and lowercased, the same canonical form `darkmux config set`'s
-/// `Ty::ThermalState` already stores.
-///
-/// This closes a proven split. `darkmux doctor` validated `pause_at` by
-/// LOWERCASING it before comparing against `THERMAL_STATES`, while
-/// the governor's then-current `severity()` helper compared the RAW string
-/// (today: `thermal_bands::ThermalBands`, which matches `THERMAL_STATES`
-/// exactly), and nothing in
-/// between normalized. So `pause_at = "Serious"` — a hand-edited config,
-/// or one written before `config set` validated the token — reached a
-/// doctor **Pass** whose message affirmatively claimed tier 4 was enabled,
-/// while the governor scored it as an UNKNOWN state (ranked worse than
-/// `critical`, per `severity`'s own deliberate reasoning) and tiers 2/3/4
-/// were silently inert: a `serious` reading produced no event and no pace
-/// file at all. One normalization, at the single place the precedence
-/// chain resolves, and every consumer agrees.
-fn normalize_thermal_state(raw: String) -> String {
-    raw.trim().to_ascii_lowercase()
-}
-
-/// OS thermal state at or above which the governor pauses. Default
-/// `"serious"`. Normalized — see [`normalize_thermal_state`].
 /// (#2846) Resolved policy for the repeated-output detector.
-/// `env(DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY) > config > Enforce`.
+/// `env(DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY) > config > enforce`.
 ///
-/// An unparseable value resolves to `Enforce` rather than failing, per
-/// contract 7 (config is lenient on read; loud validation belongs to
-/// `darkmux doctor`). The lenient direction is deliberately the ARMED one:
-/// a typo must never silently disarm a guard.
-pub fn detection_degeneracy_policy() -> crate::config::DetectionPolicy {
-    use crate::config::DetectionPolicy;
-    if let Some(raw) = env_str("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY") {
-        return DetectionPolicy::parse_lenient(&raw).unwrap_or(DetectionPolicy::Enforce);
-    }
-    config()
-        .runtime
-        .as_ref()
-        .and_then(|r| r.detection.as_ref())
-        .and_then(|d| d.degeneracy.as_ref())
-        .and_then(|g| g.policy.as_deref())
-        .and_then(DetectionPolicy::parse_lenient)
-        .unwrap_or(DetectionPolicy::Enforce)
+/// (#2947) An unrecognized value is an error naming it, where it was set
+/// and the valid values. It used to resolve to `enforce` (the armed
+/// direction) with a doctor Warn; the entry points now refuse at preflight
+/// instead, so no run ever executes under a policy nobody wrote.
+pub fn detection_degeneracy_policy(
+) -> Result<crate::config::DetectionPolicy, crate::config_enum::BadEnumValue> {
+    detection_degeneracy_policy_with_source().map(|(v, _)| v)
 }
 
 /// The same resolution, plus where the value came from, for `darkmux doctor`
 /// and for the `dispatch start.bounds` provenance stamp. A run that cannot
 /// say which detection regime it ran under is not a measurable run.
-pub fn detection_degeneracy_policy_with_source()
-    -> (crate::config::DetectionPolicy, &'static str) {
-    use crate::config::DetectionPolicy;
-    if let Some(raw) = env_str("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY") {
-        return match DetectionPolicy::parse_lenient(&raw) {
-            Some(p) => (p, "env"),
-            None => (DetectionPolicy::Enforce, "env-invalid"),
-        };
-    }
-    match config()
-        .runtime
-        .as_ref()
-        .and_then(|r| r.detection.as_ref())
-        .and_then(|d| d.degeneracy.as_ref())
-        .and_then(|g| g.policy.as_deref())
-    {
-        // A present-but-unparseable config value reports as `config-invalid`,
-        // the twin of `env-invalid` above, so the bounds stamp and `doctor`
-        // can both tell a typo from an absent key.
-        Some(raw) => match DetectionPolicy::parse_lenient(raw) {
-            Some(p) => (p, "config"),
-            None => (DetectionPolicy::Enforce, "config-invalid"),
-        },
-        None => (DetectionPolicy::Enforce, "built-in"),
-    }
+pub fn detection_degeneracy_policy_with_source(
+) -> Result<(crate::config::DetectionPolicy, Source), crate::config_enum::BadEnumValue> {
+    resolve_enum("runtime.detection.degeneracy.policy")
 }
 
-pub fn thermal_pause_at() -> String {
-    normalize_thermal_state(
-        env_str("DARKMUX_THERMAL_PAUSE_AT")
-            .or_else(|| {
-                config()
-                    .runtime
-                    .as_ref()
-                    .and_then(|r| r.thermal.as_ref())
-                    .and_then(|t| t.pause_at.clone())
-            })
-            .unwrap_or_else(|| "serious".to_string()),
-    )
+/// OS thermal state at or above which the governor pauses. Default
+/// `serious`. (#2947) An unrecognized state is an error: it used to pass
+/// through, and the governor disarmed its soft tiers on it, so a typo
+/// silently turned thermal throttling off.
+pub fn thermal_pause_at() -> Result<crate::config::ThermalState, crate::config_enum::BadEnumValue> {
+    resolve_enum("runtime.thermal.pause_at").map(|(v, _)| v)
 }
 
 /// OS thermal state at or below which the governor is eligible to resume
-/// (after `thermal_resume_hold_ms`). Default `"fair"`. Normalized — see
-/// [`normalize_thermal_state`].
-pub fn thermal_resume_at() -> String {
-    normalize_thermal_state(
-        env_str("DARKMUX_THERMAL_RESUME_AT")
-            .or_else(|| {
-                config()
-                    .runtime
-                    .as_ref()
-                    .and_then(|r| r.thermal.as_ref())
-                    .and_then(|t| t.resume_at.clone())
-            })
-            .unwrap_or_else(|| "fair".to_string()),
-    )
+/// (after `thermal_resume_hold_ms`). Default `fair`. An unrecognized state
+/// is an error, as for [`thermal_pause_at`].
+pub fn thermal_resume_at() -> Result<crate::config::ThermalState, crate::config_enum::BadEnumValue> {
+    resolve_enum("runtime.thermal.resume_at").map(|(v, _)| v)
 }
 
 /// How long (ms) the state must hold at/below `thermal_resume_at()` before
@@ -2547,17 +2494,16 @@ mod tests {
         let k = "DARKMUX_FLEET_MODE";
         unsafe { std::env::remove_var(k); }
         // No env + EMPTY test config → standalone default.
-        assert_eq!(fleet_mode_raw(), "standalone");
-        assert_eq!(fleet_mode(), FleetMode::Standalone);
-        // Env override wins, case-insensitive; the raw token is preserved.
+        assert_eq!(fleet_mode_with_source(), Ok((FleetMode::Standalone, Source::BuiltIn)));
+        // Env override wins, case-insensitive.
         unsafe { std::env::set_var(k, "HUB"); }
-        assert_eq!(fleet_mode_raw(), "HUB");
-        assert_eq!(fleet_mode(), FleetMode::Hub);
-        // An unrecognized token passes through raw but resolves typed→standalone
-        // (doctor flags the raw typo separately, #934).
+        assert_eq!(fleet_mode_with_source(), Ok((FleetMode::Hub, Source::Env)));
+        // (#2947) An unrecognized token is an error naming the raw value and
+        // the env var, never `standalone`.
         unsafe { std::env::set_var(k, "hubb"); }
-        assert_eq!(fleet_mode_raw(), "hubb");
-        assert_eq!(fleet_mode(), FleetMode::Standalone);
+        let err = fleet_mode().unwrap_err();
+        assert_eq!(err.raw, "hubb");
+        assert_eq!(err.set_in, crate::config_enum::SetIn::Env("DARKMUX_FLEET_MODE"));
         unsafe { std::env::remove_var(k); }
     }
 
@@ -4443,8 +4389,8 @@ mod tests {
             std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", " Serious ");
             std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "FAIR");
         }
-        assert_eq!(thermal_pause_at(), "serious");
-        assert_eq!(thermal_resume_at(), "fair");
+        assert_eq!(thermal_pause_at().unwrap().as_str(), "serious");
+        assert_eq!(thermal_resume_at().unwrap().as_str(), "fair");
         unsafe {
             match prev_p {
                 Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
@@ -4465,7 +4411,7 @@ mod tests {
     /// only. The config tier is correct by construction (the normalizer
     /// wraps the WHOLE precedence chain, not just the env branch) but
     /// nothing executed it, so a future edit that moved
-    /// `normalize_thermal_state` inside the `env_str(...)` arm would pass
+    /// the normalization inside the `env_str(...)` arm would pass
     /// both tests while restoring the exact defect.
     #[cfg(feature = "test-support")]
     #[serial_test::serial]
@@ -4493,17 +4439,17 @@ mod tests {
             };
             let _guard = set_config_for_test(cfg);
             assert_eq!(
-                thermal_pause_at(),
+                thermal_pause_at().unwrap().as_str(),
                 "serious",
                 "a hand-edited config.json token must reach consumers canonicalized"
             );
-            assert_eq!(thermal_resume_at(), "fair");
+            assert_eq!(thermal_resume_at().unwrap().as_str(), "fair");
         }
 
         // Guard dropped: back to the built-in defaults, which are already
         // canonical.
-        assert_eq!(thermal_pause_at(), "serious");
-        assert_eq!(thermal_resume_at(), "fair");
+        assert_eq!(thermal_pause_at().unwrap().as_str(), "serious");
+        assert_eq!(thermal_resume_at().unwrap().as_str(), "fair");
 
         unsafe {
             match prev_p {

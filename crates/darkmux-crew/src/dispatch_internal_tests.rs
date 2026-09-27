@@ -1177,7 +1177,7 @@
             None,
             None,
             &[],
-        );
+        ).unwrap();
 
         // The wiring itself: this key would be ABSENT entirely if the
         // `"bounds": resolved_runtime_bounds_json(is_agentic_remote)` line
@@ -1234,7 +1234,7 @@
             None,
             None,
             &[],
-        );
+        ).unwrap();
         assert_eq!(payload["bounds"]["turn_delay_ms"]["source"], serde_json::json!("forced-agentic-remote"));
         assert_eq!(payload["turn_delay_ms"], serde_json::json!(0), "the top-level stamp is also forced");
     }
@@ -1264,7 +1264,7 @@
         ] {
             unsafe { std::env::remove_var(k) };
         }
-        let bounds = resolved_runtime_bounds_json(false, None, None);
+        let bounds = resolved_runtime_bounds_json(false, None, None).unwrap();
         assert_eq!(
             bounds["max_tokens_per_call"],
             serde_json::json!({"value": null, "source": "built-in"}),
@@ -1300,7 +1300,7 @@
         ] {
             unsafe { std::env::remove_var(k) };
         }
-        let bounds = resolved_runtime_bounds_json(false, None, None);
+        let bounds = resolved_runtime_bounds_json(false, None, None).unwrap();
         assert_eq!(
             bounds["thermal_pacing_enabled"],
             serde_json::json!({"value": true, "source": "built-in"}),
@@ -1331,7 +1331,7 @@
         unsafe { std::env::set_var("DARKMUX_THERMAL_ENABLED", "false") };
         unsafe { std::env::set_var("DARKMUX_POWER_PAUSE_RUNNING_BELOW_MIN", "off") };
         unsafe { std::env::set_var("DARKMUX_POWER_MIN_BATTERY_PCT", "35") };
-        let bounds = resolved_runtime_bounds_json(false, None, None);
+        let bounds = resolved_runtime_bounds_json(false, None, None).unwrap();
         assert_eq!(bounds["thermal_pacing_enabled"], serde_json::json!({"value": false, "source": "env"}));
         assert_eq!(bounds["battery_pause_enabled"], serde_json::json!({"value": false, "source": "env"}));
         assert_eq!(bounds["battery_pause_floor_pct"], serde_json::json!({"value": 35, "source": "env"}));
@@ -1357,7 +1357,7 @@
         unsafe { std::env::set_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL", "4000") };
         unsafe { std::env::set_var("DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL", "500") };
         unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "120") };
-        let bounds = resolved_runtime_bounds_json(false, None, None);
+        let bounds = resolved_runtime_bounds_json(false, None, None).unwrap();
         assert_eq!(bounds["max_tokens_per_call"], serde_json::json!({"value": 4000, "source": "env"}));
         assert_eq!(
             bounds["reasoning_checkpoint_interval_tokens"],
@@ -1403,7 +1403,7 @@
     #[serial]
     fn resolved_runtime_bounds_json_max_turns_names_launcher_when_the_override_wins() {
         unsafe { std::env::remove_var("DARKMUX_RUNTIME_MAX_TURNS") };
-        let bounds = resolved_runtime_bounds_json(false, Some(15), None);
+        let bounds = resolved_runtime_bounds_json(false, Some(15), None).unwrap();
         assert_eq!(bounds["max_turns"], serde_json::json!({"value": 15, "source": "launcher"}));
     }
 
@@ -1411,7 +1411,7 @@
     #[serial]
     fn resolved_runtime_bounds_json_max_turns_names_env_when_the_operator_set_one() {
         unsafe { std::env::set_var("DARKMUX_RUNTIME_MAX_TURNS", "5") };
-        let bounds = resolved_runtime_bounds_json(false, Some(15), None);
+        let bounds = resolved_runtime_bounds_json(false, Some(15), None).unwrap();
         assert_eq!(
             bounds["max_turns"],
             serde_json::json!({"value": 5, "source": "env"}),
@@ -1502,7 +1502,7 @@
     fn resolved_runtime_bounds_json_inactivity_timeout_names_cli_when_the_override_wins() {
         let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
         unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "1200") };
-        let bounds = resolved_runtime_bounds_json(false, None, Some(30));
+        let bounds = resolved_runtime_bounds_json(false, None, Some(30)).unwrap();
         assert_eq!(
             bounds["inactivity_timeout_seconds"],
             serde_json::json!({"value": 30, "source": "cli"}),
@@ -1522,7 +1522,7 @@
     fn resolved_runtime_bounds_json_inactivity_timeout_passes_through_with_no_override() {
         let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
         unsafe { std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS") };
-        let bounds = resolved_runtime_bounds_json(false, None, None);
+        let bounds = resolved_runtime_bounds_json(false, None, None).unwrap();
         assert_eq!(
             bounds["inactivity_timeout_seconds"],
             serde_json::json!({"value": 600, "source": "built-in"})
@@ -1537,7 +1537,7 @@
     fn resolved_runtime_bounds_json_turn_delay_ms_passes_through_for_a_local_dispatch() {
         let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
         unsafe { std::env::set_var("DARKMUX_TURN_DELAY_MS", "3000") };
-        let bounds = resolved_runtime_bounds_json(false, None, None);
+        let bounds = resolved_runtime_bounds_json(false, None, None).unwrap();
         assert_eq!(
             bounds["turn_delay_ms"],
             serde_json::json!({"value": 3000, "source": "env"}),
@@ -1568,7 +1568,7 @@
     fn resolved_runtime_bounds_json_turn_delay_ms_is_self_explaining_when_forced_agentic_remote() {
         let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
         unsafe { std::env::set_var("DARKMUX_TURN_DELAY_MS", "5000") };
-        let bounds = resolved_runtime_bounds_json(true, None, None);
+        let bounds = resolved_runtime_bounds_json(true, None, None).unwrap();
         assert_eq!(
             bounds["turn_delay_ms"],
             serde_json::json!({
@@ -1595,7 +1595,7 @@
     fn resolved_runtime_bounds_json_turn_delay_ms_forced_shape_holds_even_at_the_default() {
         let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
         unsafe { std::env::remove_var("DARKMUX_TURN_DELAY_MS") };
-        let bounds = resolved_runtime_bounds_json(true, None, None);
+        let bounds = resolved_runtime_bounds_json(true, None, None).unwrap();
         assert_eq!(
             bounds["turn_delay_ms"],
             serde_json::json!({
@@ -4411,6 +4411,7 @@
             // (#2094) Nonzero here so the complete-vector assertion below
             // pins the forwarded `-e DARKMUX_TURN_DELAY_MS=<n>` pair too.
             turn_delay_ms: 3000,
+            detection_policy: darkmux_types::config::DetectionPolicy::Enforce,
             // (#2094 finding 1) A distinct, non-default value so the
             // complete-vector assertion below pins the forwarded
             // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<n>` pair too.
@@ -4509,19 +4510,18 @@
         assert_eq!(argv[26], "-e");
         assert_eq!(argv[27], "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=enforce");
         // (#2846, review finding I2) The assertion above pins the DEFAULT, so
-        // by itself it cannot tell "resolved correctly" from "hardcoded" —
-        // proven by mutation: replacing the resolution with a literal
-        // `"enforce"` kept all 2253 tests green. Pin a NON-default value too,
-        // the same discipline 5e below states for the timeout source.
+        // by itself it cannot tell "forwarded" from "hardcoded". Pin a
+        // NON-default value too. (#2947) The argv builder forwards the
+        // RESOLVED policy the dispatch hands it in `detection_policy`; the
+        // resolution itself (and its refusal of an unknown value) is
+        // `config_access::detection_degeneracy_policy`, tested in
+        // darkmux-types and by the dispatch preflight conformance test.
         {
-            unsafe {
-                std::env::set_var(
-                    "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY", "observe");
-            }
-            let argv2 = build_docker_run_argv(&config);
-            unsafe {
-                std::env::remove_var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY");
-            }
+            let observe = DockerRunConfig {
+                detection_policy: darkmux_types::config::DetectionPolicy::Observe,
+                ..config.clone()
+            };
+            let argv2 = build_docker_run_argv(&observe);
             assert_eq!(
                 argv2[27], "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=observe",
                 "the forwarded value must track the RESOLVED policy, not a literal"
@@ -4652,6 +4652,7 @@
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: false,
             turn_delay_ms: 0,
+            detection_policy: darkmux_types::config::DetectionPolicy::Enforce,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,
@@ -4882,6 +4883,7 @@
             // cover "both string forms" mattered.
             feedback_injection: false,
             turn_delay_ms: 0,
+            detection_policy: darkmux_types::config::DetectionPolicy::Enforce,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,
@@ -5006,6 +5008,7 @@
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: true,
             turn_delay_ms: 0,
+            detection_policy: darkmux_types::config::DetectionPolicy::Enforce,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,
@@ -5064,6 +5067,7 @@
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: true,
             turn_delay_ms: 0,
+            detection_policy: darkmux_types::config::DetectionPolicy::Enforce,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,
@@ -6289,6 +6293,7 @@
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: true,
             turn_delay_ms: 0,
+            detection_policy: darkmux_types::config::DetectionPolicy::Enforce,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,
@@ -8673,7 +8678,7 @@
         ];
         let with = dispatch_start_payload_json(
             "img", "msg", "sys", std::path::Path::new("/ws"), false, None, None, None, &refs,
-        );
+        ).unwrap();
         assert_eq!(
             with["brief_refs"],
             serde_json::json!([
@@ -8685,7 +8690,7 @@
         // absent key would be indistinguishable from an older writer's record.
         let without = dispatch_start_payload_json(
             "img", "msg", "sys", std::path::Path::new("/ws"), false, None, None, None, &[],
-        );
+        ).unwrap();
         assert_eq!(without["brief_refs"], serde_json::json!([]));
     }
 
@@ -12680,6 +12685,7 @@
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             feedback_injection: false,
             turn_delay_ms: 0,
+            detection_policy: darkmux_types::config::DetectionPolicy::Enforce,
             inactivity_timeout_seconds: 600,
             inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
                 darkmux_types::config_access::Source::BuiltIn,
@@ -14744,6 +14750,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 None,
                 host_out_for_closure,
                 None,
+                crate::thermal_governor::ThermalGovernorConfig::from_env().unwrap(),
             );
             *handle_holder_for_closure.lock().unwrap() = Some(handle);
             panic!("simulated panic between the sampler's spawn and dispatch()'s own stores");
@@ -16442,7 +16449,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
             None,
             &[],
-        );
+        ).unwrap();
         assert!(none["tools_requested"].is_null(), "{}", none);
         let names = vec!["read".to_string(), "search".to_string(), "bash".to_string(), "create_finding".to_string()];
         let some = dispatch_start_payload_json(
@@ -16455,7 +16462,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
             Some(&names),
             &[],
-        );
+        ).unwrap();
         assert_eq!(some["tools_requested"], serde_json::json!(["read", "search", "bash", "create_finding"]));
     }
 

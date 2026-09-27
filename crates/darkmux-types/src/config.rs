@@ -792,31 +792,20 @@ impl DetectionPolicy {
     pub fn acts(self) -> bool {
         matches!(self, DetectionPolicy::Enforce)
     }
-    /// Strict-but-non-fatal parse. Returns `None` for an unrecognized value,
-    /// kept distinct from `Some(Enforce)` so a caller (`darkmux doctor`,
-    /// `darkmux config set`) can flag the typo against the raw string rather
-    /// than silently coercing it — the same split [`FleetMode::parse`]
-    /// makes, and for the same reason.
-    ///
-    /// Callers that must produce a value resolve `None` to `Enforce`: the
-    /// ARMED direction on purpose, since a typo that disarmed a guard would
-    /// be silent.
-    pub fn parse_lenient(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "enforce" => Some(DetectionPolicy::Enforce),
-            "observe" => Some(DetectionPolicy::Observe),
-            "off" => Some(DetectionPolicy::Off),
-            _ => None,
-        }
-    }
     pub fn as_str(self) -> &'static str {
-        match self {
-            DetectionPolicy::Enforce => "enforce",
-            DetectionPolicy::Observe => "observe",
-            DetectionPolicy::Off => "off",
-        }
+        crate::config_enum::ConfigEnum::token(self)
     }
 }
+
+// (#2947) The value table: tokens, meanings, and (through the macro's
+// exhaustive match) the parser. An unknown value is refused at the accessor
+// (`config_access::detection_degeneracy_policy`), never resolved to
+// `enforce`: see `config_enum`'s module doc for the rule.
+crate::config_enum!(DetectionPolicy, "detection policy", [
+    Enforce = "enforce" => "detect and act on what is found (the shipped behavior)",
+    Observe = "observe" => "detect and record, never act; the record carries the counterfactual",
+    Off = "off" => "do not run the detector at all",
+]);
 
 /// (#2846) One detector's settings. Split per detector rather than one global
 /// policy because the detectors are independent: an engine whose reasoning
@@ -1588,26 +1577,61 @@ impl FleetMode {
     /// The canonical lowercase token — the `config.json` value and the
     /// `DARKMUX_FLEET_MODE` env token.
     pub fn as_str(self) -> &'static str {
-        match self {
-            FleetMode::Standalone => "standalone",
-            FleetMode::Hub => "hub",
-            FleetMode::Peer => "peer",
-        }
-    }
-
-    /// Parse an operator-declared token (trimmed, case-insensitive). Returns
-    /// `None` for an unrecognized value — kept distinct from "standalone" so a
-    /// caller (e.g. `darkmux doctor`, #934) can flag a typo against the raw
-    /// string rather than this silently coercing it.
-    pub fn parse(s: &str) -> Option<FleetMode> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "standalone" => Some(FleetMode::Standalone),
-            "hub" => Some(FleetMode::Hub),
-            "peer" => Some(FleetMode::Peer),
-            _ => None,
-        }
+        crate::config_enum::ConfigEnum::token(self)
     }
 }
+
+// (#2947) Parsing (trimmed, case-insensitive) comes from `ConfigEnum::parse`;
+// an unrecognized token is refused at `config_access::fleet_mode`, never
+// read as `standalone`.
+crate::config_enum!(FleetMode, "fleet position", [
+    Standalone = "standalone" => "a single machine that coordinates nothing",
+    Hub = "hub" => "the always-on coordinator",
+    Peer = "peer" => "a machine that points at a hub",
+]);
+
+/// (#2947) An OS thermal state, as `runtime.thermal.pause_at` / `resume_at`
+/// name one. Declared in severity order, mildest first: the governor ranks a
+/// state by its position (`darkmux_crew::host_probe::thermal::THERMAL_STATES`
+/// is this enum's token list), so the order is load-bearing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThermalState {
+    Nominal,
+    Fair,
+    Serious,
+    Critical,
+}
+
+impl ThermalState {
+    pub fn as_str(self) -> &'static str {
+        crate::config_enum::ConfigEnum::token(self)
+    }
+}
+
+crate::config_enum!(ThermalState, "thermal state", [
+    Nominal = "nominal" => "no thermal pressure",
+    Fair = "fair" => "slightly elevated; the OS may start to throttle",
+    Serious = "serious" => "high; the OS is throttling",
+    Critical = "critical" => "the OS is throttling hard; the breaker's own threshold",
+]);
+
+/// (#2947) The overlay network that verifies which machine is on the other
+/// end of a fleet connection (`fleet.identity.provider`). A VALUE, never a
+/// field or type name, per the no-vendor-names-in-identifiers rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityProvider {
+    Tailscale,
+}
+
+impl IdentityProvider {
+    pub fn as_str(self) -> &'static str {
+        crate::config_enum::ConfigEnum::token(self)
+    }
+}
+
+crate::config_enum!(IdentityProvider, "identity provider", [
+    Tailscale = "tailscale" => "the tailnet's own daemon answers who is connecting (`whois`)",
+]);
 
 impl DarkmuxConfig {
     /// The full, self-documenting default config that `darkmux init` writes —
@@ -1868,6 +1892,7 @@ impl DarkmuxConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config_enum::ConfigEnum;
 
     /// (#1323) The config seam's self-defending conformance test: a project-local
     /// `.darkmux/config.json` (created for missions/phases/lessons) must NEVER

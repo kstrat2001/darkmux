@@ -14,8 +14,12 @@
 //! power.
 
 /// `NSProcessInfoThermalState`'s four values, lowercased — the vocabulary the
-/// viewer's `ThermalState` union expects verbatim.
-pub const THERMAL_STATES: [&str; 4] = ["nominal", "fair", "serious", "critical"];
+/// viewer's `ThermalState` union expects verbatim. (#2947) The token list of
+/// `darkmux_types::config::ThermalState`, the enum `runtime.thermal.pause_at`
+/// / `resume_at` parse into, so the OS vocabulary and the settable values are
+/// one list. Severity order, mildest first (index = the OS's raw value).
+pub const THERMAL_STATES: &[&str] =
+    <darkmux_types::config::ThermalState as darkmux_types::config_enum::ConfigEnum>::TOKENS;
 
 /// Map the raw `NSProcessInfoThermalState` integer to its name. An
 /// out-of-range value (a state a future macOS adds) becomes

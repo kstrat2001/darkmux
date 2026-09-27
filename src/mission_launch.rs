@@ -369,6 +369,13 @@ pub fn launch(
     let run_started = std::time::Instant::now();
     fleet::validate_identifier("config_id", config_id)?;
 
+    // (#2947) Bad enum config refuses before anything is loaded or minted,
+    // and before the `--dry-run` short-circuit below: a dry run surfaces the
+    // same loud failures a real launch would, and a launch whose dispatches
+    // would each refuse is not worth planning. Not waived by `--force`,
+    // which overrides a thermal/battery READING, not a config value.
+    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::MissionLaunch)?;
+
     // (#2301) `crawl` used to be routed by literal id to a bespoke
     // launcher, BEFORE the config load below, because its Task/Step graph
     // was computed at run time and there was no document to execute. There

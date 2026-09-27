@@ -27,10 +27,12 @@ use std::net::IpAddr;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// The identity provider values this darkmux knows. `config set
-/// fleet.identity.provider` refuses anything else; a hand-edited unknown
-/// value resolves to no provider, which refuses every submission.
-pub const KNOWN_IDENTITY_PROVIDERS: &[&str] = &["tailscale"];
+/// The identity provider values this darkmux knows: the token list of
+/// `darkmux_types::config::IdentityProvider` (#2947), so `config set`, help,
+/// doctor and this factory share one list. A hand-edited unknown value is
+/// refused by the fleet-submission preflight in [`configured_provider`].
+pub const KNOWN_IDENTITY_PROVIDERS: &[&str] =
+    <darkmux_types::config::IdentityProvider as darkmux_types::config_enum::ConfigEnum>::TOKENS;
 
 /// How long one provider call may take before it counts as "cannot answer".
 /// Measured 2026-09-27 on the laptop: ~25 ms per call (10 runs, 25-41 ms).
@@ -141,10 +143,16 @@ fn default_tool_path(name: &str, known: &[&str], path_var: Option<&std::ffi::OsS
 }
 
 /// The configured provider: `fleet.identity.provider` + `fleet.identity.bin`.
+///
+/// (#2947) Runs the fleet-submission preflight first: a bad enum value
+/// refuses with the standard message (value, where it was set, valid
+/// values) before any provider is built. Both sides of a submission (the
+/// daemon's listener and the sender) build their provider here.
 pub fn configured_provider() -> Result<Box<dyn IdentityProvider>> {
-    let value = darkmux_types::config_access::fleet_identity_provider();
+    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::FleetSubmission)?;
+    let value = darkmux_types::config_access::fleet_identity_provider()?;
     let bin = darkmux_types::config_access::fleet_identity_bin();
-    provider_for(&value, bin.as_deref())
+    provider_for(value.as_str(), bin.as_deref())
 }
 
 /// A provider that asks the overlay network's command-line tool: `whois

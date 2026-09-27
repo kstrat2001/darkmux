@@ -1180,6 +1180,12 @@ struct DispatchInvocation {
 /// is a positional argument, falls back to stdin when omitted, and can still be
 /// read from a file via `--message-from-file`.
 fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
+    // (#2947) Bad enum config refuses first: before the message is read
+    // from stdin, before brief refs resolve, and before the crew-of-one
+    // mission is minted. `--skip-preflight` does not waive it: that flag
+    // skips the Docker/daemon probe, and a bad config value is not a probe
+    // result that could be stale or wrong.
+    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
     let DispatchInvocation {
         role,
         message,

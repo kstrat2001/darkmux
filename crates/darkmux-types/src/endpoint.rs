@@ -87,12 +87,35 @@ impl Dialect {
 
     /// The `serde` spelling, for messages and the runtime's `--dialect` flag.
     pub fn as_str(self) -> &'static str {
-        match self {
-            Dialect::ChatCompletions => "chat-completions",
-            Dialect::ChatCompletionsMaxTokens => "chat-completions-max-tokens",
-        }
+        crate::config_enum::ConfigEnum::token(self)
     }
 }
+
+/// (#2947) `"a"`, `"a" and "b"`, `"a", "b" and "c"`: a value list for an
+/// endpoint refusal, generated from the enum's own table.
+fn quoted_tokens<T: crate::config_enum::ConfigEnum>() -> String {
+    let q: Vec<String> = T::TOKENS.iter().map(|t| format!("\"{t}\"")).collect();
+    match q.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        Some((last, _)) => last.clone(),
+        None => String::new(),
+    }
+}
+
+// (#2947) The value tables for the two per-endpoint enums. They stay
+// `serde`-deserialized through `Lenient<T>` (an unknown value is kept and
+// refused by name at use); these give them the same token + meaning table
+// every config enum has, and `serde_spelling_matches_the_config_enum_token`
+// pins that `serde`'s spelling and the table cannot drift apart.
+crate::config_enum!(ManagedBackend, "managed backend", [
+    Lmstudio = "lmstudio" => "LM Studio, loaded and unloaded through `lms`",
+]);
+crate::config_enum!(Dialect, "endpoint dialect", [
+    ChatCompletions = "chat-completions" =>
+        "`max_completion_tokens` + optional `reasoning_effort`, no `temperature` (unmanaged default)",
+    ChatCompletionsMaxTokens = "chat-completions-max-tokens" =>
+        "`max_tokens` + `temperature`, no `reasoning_effort` (managed LM Studio default)",
+]);
 
 /// Standard usage limits for one endpoint (#2902 step 4: the SHAPE only).
 ///
@@ -328,8 +351,9 @@ impl ModelEndpoint {
             (Some(Lenient::Unrecognized(raw)), _) => {
                 return Err(EndpointError(format!(
                     "darkmux: endpoint `managed` is {raw}, which this darkmux does not know (it knows \
-                     \"lmstudio\", or no `managed` for an endpoint darkmux only sends requests to). \
-                     A newer darkmux may have written it; `darkmux doctor` names the entry. (#2902)"
+                     {}, or no `managed` for an endpoint darkmux only sends requests to). \
+                     A newer darkmux may have written it; `darkmux doctor` names the entry. (#2902)",
+                    quoted_tokens::<ManagedBackend>()
                 )))
             }
             (None, None) => EndpointKind::Managed(ManagedBackend::Lmstudio),
@@ -387,9 +411,8 @@ impl ModelEndpoint {
             Some(Lenient::Known(d)) => Ok(*d),
             Some(Lenient::Unrecognized(raw)) => Err(EndpointError(format!(
                 "darkmux: endpoint `dialect` is {raw}, which this darkmux does not know (it knows \
-                 \"{}\" and \"{}\"). (#2902)",
-                Dialect::ChatCompletions.as_str(),
-                Dialect::ChatCompletionsMaxTokens.as_str()
+                 {}). (#2902)",
+                quoted_tokens::<Dialect>()
             ))),
         }
     }
@@ -630,6 +653,24 @@ pub(crate) mod endpoint_field {
 
 #[cfg(test)]
 mod tests {
+
+    /// (#2947) `serde`'s spelling of each endpoint enum value and its
+    /// `ConfigEnum` token are the same string, for every variant, so the
+    /// help/doctor value list is exactly what the deserializer accepts.
+    #[test]
+    fn serde_spelling_matches_the_config_enum_token() {
+        use crate::config_enum::ConfigEnum;
+        fn check<T: ConfigEnum + serde::Serialize + serde::de::DeserializeOwned>() {
+            for t in T::TOKENS {
+                let v = T::from_token(t).unwrap();
+                assert_eq!(serde_json::to_value(v).unwrap(), serde_json::json!(t));
+                assert_eq!(serde_json::from_value::<T>(serde_json::json!(t)).unwrap(), v);
+            }
+        }
+        check::<ManagedBackend>();
+        check::<Dialect>();
+    }
+
     use super::*;
     use crate::ProfileModel;
 

@@ -1156,7 +1156,12 @@ pub(crate) fn fleet_submission_doctor_checks() -> Vec<crate::doctor::Check> {
     use crate::doctor::{FleetSubmissionFacts, ProviderReport, TrustView};
     let listener_enabled = darkmux_types::config_access::fleet_listener_enabled();
     let port = darkmux_types::config_access::fleet_listener_port();
-    let value = darkmux_types::config_access::fleet_identity_provider();
+    // (#2947) The raw value on a bad one, so the Unknown row names what was
+    // written; the generic enum-settings row carries the valid values.
+    let value = match darkmux_types::config_access::fleet_identity_provider() {
+        Ok(p) => p.as_str().to_string(),
+        Err(bad) => bad.raw,
+    };
     let (provider_report, nodes, local_addr) = match fleet::configured_provider() {
         Err(_) => (ProviderReport::Unknown { value: value.clone() }, None, None),
         Ok(p) => match p.local_node() {
