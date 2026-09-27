@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import { T } from "../lib/flow";
 import { clk, relAgoFrom } from "../lib/format";
 import { orchNotes } from "../lenses/fleet/hybridNote";
@@ -24,7 +25,9 @@ import { Dialog } from "./Dialog";
  * follow-up, not fixed here).
  */
 export function NotesDialog({ data, nowMs }: { data: FlowRecord[]; nowMs: number }) {
-  const notes = orchNotes(data).slice().reverse();
+  // (#2911) Memoized on the window: the fleet lens re-renders every second
+  // while an execution is live, and the notes only change with the records.
+  const notes = useMemo(() => orchNotes(data).slice().reverse(), [data]);
   return (
     <Dialog id="nmodalbg" titleId="notes-title" title="orchestrator notes" wide>
       <div id="notesbody">

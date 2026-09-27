@@ -22,7 +22,7 @@
  * honored for its own "hasn't started yet" guard; see its own doc.
  */
 
-import { uidOf, sessionsOn, sessionRunning, T } from "../../lib/flow";
+import { uidOf, sessionsOn, sessionRunning, sessionRecords, T } from "../../lib/flow";
 import {
   aggregateLiveState,
   aggregateTokenRate,
@@ -683,7 +683,7 @@ export function buildFleetCard(
   // would read heartbeats from AFTER the playhead too, inflating/changing
   // the rate a live viewer actually saw at `t` (measured: 122 tok/s off a
   // heartbeat 6h in the day's future vs the correct 95 tok/s as of `t`).
-  const liveTokRecordSets = runningSids.map((sid) => data.filter((r) => r.session_id === sid && T(r.ts) <= t));
+  const liveTokRecordSets = runningSids.map((sid) => sessionRecords(data, sid).filter((r) => T(r.ts) <= t));
   // (#2877 dogfood finding) A session can be `active` (no terminal record
   // yet — a mission genuinely stuck open, observed live: `status: "running"`
   // hours after its last real heartbeat) while its heartbeat stream has long

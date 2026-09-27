@@ -10,6 +10,7 @@ import path from "node:path";
 import { render, screen, waitFor, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ScopeLamps, SessionReplay, modelScopeHero } from "./SessionReplay";
+import { PEPPER_SID, pepperAt, pepperRecords } from "../../testing/pepperGrinderRun";
 
 // (#2886 pass 5, MUST — fresh-reviewer finding F5) Several fixes here stayed
 // green while broken in the actual render path — `effectiveConnected`/
@@ -1479,5 +1480,100 @@ describe("modelScopeHero (#2890)", () => {
 
   it("no model work: no hero", () => {
     expect(modelScopeHero({ liveTokScope: null, finishedTokRate: null })).toBeNull();
+  });
+});
+
+describe("(#2911) the MODEL section, ticking and wording", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+  const probe = () => JSON.parse(document.querySelector('[data-testid="run-token-scope"] [data-testid="token-scope-probe"]')!.getAttribute("data-props")!);
+
+  it("the REST countdown counts down every second with no new records", async () => {
+    vi.useFakeTimers();
+    const t0 = 1_800_000_000_000;
+    vi.setSystemTime(t0);
+    const records = [
+      { ts: new Date(t0 - 30_000).toISOString(), action: "dispatch.start", session_id: "s-rest", machine_id: "M", payload: { role: "coder" } },
+      { ts: new Date(t0 - 12_000).toISOString(), action: "dispatch.turn.heartbeat", session_id: "s-rest", machine_id: "M", payload: { sampled_at_ms: t0 - 12_000, generated_chars: 400 } },
+      { ts: new Date(t0 - 10_000).toISOString(), action: "dispatch.rest", session_id: "s-rest", machine_id: "M", payload: { ms: 30_000 } },
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    renderReplay("s-rest");
+    await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
+    expect(probe()).toMatchObject({ state: "rest", centerLabel: "20s", centerUnit: "resting" });
+    expect(screen.getByRole("status", { name: /run state/ }).getAttribute("aria-label")).toBe("run state: rest 20s");
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(probe()).toMatchObject({ centerLabel: "15s" });
+    expect(screen.getByRole("status", { name: /run state/ }).getAttribute("aria-label")).toBe("run state: rest 15s");
+  });
+
+  it("no model working (a mission between steps): the tube says so, the same phrase as the lamps' status", () => {
+    const live = { tokensPerSec: null, state: null, stalled: false, carried: false, noSignal: false } as unknown as NonNullable<Parameters<typeof modelScopeHero>[0]["liveTokScope"]>;
+    expect(modelScopeHero({ liveTokScope: live, finishedTokRate: null })).toMatchObject({ state: "idle", centerLabel: null, centerUnit: "no model working" });
+    const { container } = render(<ScopeLamps reading={{ state: null }} />);
+    expect(container.querySelector(".scope-lamps")!.getAttribute("aria-label")).toBe("run state: no model working");
+  });
+
+  it("the lit lamp says 'stalled', the same word as the fleet card's line", () => {
+    const { container } = render(<ScopeLamps reading={{ state: "stalled" }} />);
+    expect(container.querySelector('.scope-lamp[data-on="true"] .scope-lamp__label')!.textContent).toBe("stalled");
+    expect(container.querySelector(".scope-lamps")!.getAttribute("aria-label")).toBe("run state: stalled");
+  });
+});
+
+// (#2926) The operator's playback of a real run, at the moments the issue
+// names: a turn's stream-open chunk (THINK lit) and a tool being generated.
+// Rendered through the real run page with the playhead there; the scope is
+// the mock, the lamps and the readout line are real.
+describe("(#2926) run page: THINK opener and TOOL GEN, from the real run", () => {
+  async function renderAt(records: unknown[], playhead: number) {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <SessionReplay sessionId={PEPPER_SID} playhead={playhead} />
+      </QueryClientProvider>,
+    );
+    await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
+  }
+  const lit = () => document.querySelector('.scope-lamp[data-on="true"]');
+
+  it("turn 7's stream-open chunk: THINK lit, the previous turn's rate dimmed, never ~1 tok/s", async () => {
+    await renderAt(pepperRecords(), pepperAt("10:51:33"));
+    expect(lit()?.getAttribute("data-state")).toBe("generating");
+    expect(lit()?.querySelector(".scope-lamp__label")?.textContent).toBe("think");
+    const p = latestTokenScopeProps();
+    expect(p).toMatchObject({ state: "generating", thinking: true, centerCarried: true, centerUnit: "tok/s" });
+    expect(Number(p.centerLabel)).toBeGreaterThan(50);
+  });
+
+  it("the same opener on a session's first turn: THINK lit and no figure ('—')", async () => {
+    await renderAt(pepperRecords({ minTurn: 7 }), pepperAt("10:51:33"));
+    expect(lit()?.querySelector(".scope-lamp__label")?.textContent).toBe("think");
+    expect(latestTokenScopeProps()).toMatchObject({ state: "generating", thinking: true, centerLabel: "—", centerUnit: "tok/s" });
+  });
+
+  it("turn 10 writing a `write` call: 'tool gen · write · 18s' on the readout line, not in the lamp or the tube", async () => {
+    // The first writing heartbeat of the stretch is at 10:52:30.290.
+    await renderAt(pepperRecords(), pepperAt("10:52:48.500"));
+    expect(document.querySelector(".modelbox__note")?.textContent).toBe("tool gen · write · 18s");
+    expect(lit()?.getAttribute("data-state")).toBe("tools");
+    expect(lit()?.querySelector(".scope-lamp__label")?.textContent).toBe("tools");
+    expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolName: "write", toolWriting: true, centerLabel: null, centerUnit: "tool gen" });
+    expect(document.querySelector(".scope-lamps")?.getAttribute("aria-label")).toBe("run state: tool gen · write · 18s");
+  });
+
+  it("the tool-gen seconds follow the scrubber", async () => {
+    await renderAt(pepperRecords(), pepperAt("10:52:55.500"));
+    expect(document.querySelector(".modelbox__note")?.textContent).toBe("tool gen · write · 25s");
+  });
+
+  it("no readout line while darkmux runs the tool (no generation to report)", async () => {
+    // Turn 1 asked for five reads; four have completed by 10:51:08.5.
+    await renderAt(pepperRecords(), pepperAt("10:51:08.500"));
+    expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolName: "read", toolWriting: false });
+    expect(document.querySelector(".modelbox__note")).toBeNull();
   });
 });

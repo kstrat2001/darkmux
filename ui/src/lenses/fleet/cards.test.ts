@@ -397,6 +397,22 @@ describe("buildFleetCard", () => {
       expect(card.liveTokStalled).toBe(false);
     });
 
+    // (#2911) The card's per-session heartbeat reads go through the window's
+    // session index, not a whole-window scan. Instrumented by appending a
+    // heartbeat AFTER the index is built (a deliberate break of the
+    // never-mutated-after-read contract): the index cannot see it, a scan can.
+    it("reads a running session's heartbeats through the window's session index", () => {
+      const data: FlowRecord[] = [
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
+      ];
+      expect(buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX).liveTokRate).toBe(0);
+      data.push(rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 120 } }));
+      expect(buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX).liveTokRate).toBe(0);
+      // Control: a fresh array gets a fresh index and reads the rate.
+      expect(buildFleetCard([...data], new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX).liveTokRate).toBeCloseTo(10, 5);
+    });
+
     // (#2885) A short turn's lone first heartbeat carries the previous
     // turn's rate forward — marked `liveTokCarried` so the card can dim it.
     it("carries the last measured rate (marked liveTokCarried) into a new turn's lone first heartbeat", () => {

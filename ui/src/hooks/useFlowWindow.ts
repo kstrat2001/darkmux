@@ -14,6 +14,16 @@ export interface FlowWindowResult {
   tMax: number;
 }
 
+/** (#2911) How finely the flow window's trailing edge follows the clock. */
+export const FLOW_WINDOW_EDGE_GRAIN_MS = 60_000;
+
+/** The `nowMs` the window merge actually keys on: `nowMs` floored to
+ *  `FLOW_WINDOW_EDGE_GRAIN_MS`, so every render inside one grain reuses the
+ *  same merged array (see the `data` memo in `useFlowWindow`). */
+export function flowWindowEdgeMs(nowMs: number): number {
+  return Math.floor(nowMs / FLOW_WINDOW_EDGE_GRAIN_MS) * FLOW_WINDOW_EDGE_GRAIN_MS;
+}
+
 /** `loadLiveWindow()` (viewer.html:3497) as a query hook: fetches
  * `[prevDate, today]` (that exact order — see `lib/flow.ts`'s module doc
  * for the fetch-order subtlety that makes the two-day merge order
@@ -102,13 +112,22 @@ export function useFlowWindow(nowMs: number): FlowWindowResult {
   const yTailQuery = useQuery<FlowRecord[]>({ queryKey: queryKeys.flowTail(yesterday), queryFn: skipToken });
   const tTailQuery = useQuery<FlowRecord[]>({ queryKey: queryKeys.flowTail(today), queryFn: skipToken });
 
+  // (#2911) The merge keys on the window's trailing EDGE, not on `nowMs`
+  // itself. Callers pass a fresh `Date.now()` every render, and the fleet
+  // lens renders once a second while an execution is live, so keying on the
+  // raw value re-ran the copy + normalize + sort + dedup of the whole window
+  // every second for an edge nobody can see move: a 24h window's edge needs
+  // minute precision at most. Floored, so the window keeps a record up to
+  // one grain longer, never drops one early. A new record still lands at
+  // once: it arrives as new query data, which is a dependency here.
+  const windowEdgeMs = flowWindowEdgeMs(nowMs);
   const data = useMemo(() => {
     const yData = yQuery.data?.ok ? asRecordArray(yQuery.data.data) : [];
     const tData = tQuery.data?.ok ? asRecordArray(tQuery.data.data) : [];
     const yMerged = yTailQuery.data?.length ? [...yData, ...yTailQuery.data] : yData;
     const tMerged = tTailQuery.data?.length ? [...tData, ...tTailQuery.data] : tData;
-    return buildFlowWindow(yMerged, tMerged, nowMs);
-  }, [yQuery.data, tQuery.data, yTailQuery.data, tTailQuery.data, nowMs]);
+    return buildFlowWindow(yMerged, tMerged, windowEdgeMs);
+  }, [yQuery.data, tQuery.data, yTailQuery.data, tTailQuery.data, windowEdgeMs]);
 
   const tMax = useMemo(() => computeTMax(data), [data]);
 

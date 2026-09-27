@@ -612,13 +612,138 @@ export function sessionRunsOn(data: FlowRecord[], m: string): MachineSessionRun[
   return out;
 }
 
+/** (#2911) One window's records grouped by `session_id`, each group in the
+ * window's own order. Built once per window ARRAY (a `WeakMap` keyed on its
+ * identity) and reused by every per-session lookup below.
+ *
+ * Why it exists: those lookups (`dispatchRec`, `sessEnd`, `sessionRunning`)
+ * used to scan the whole window per session, and the fleet cards, the
+ * flow-derived liveness set and the activity timeline ask them for every
+ * session on every render. That was affordable while the lens only
+ * re-rendered on new records; once a live execution re-renders it every
+ * second (#2911's countdown tick) it was the bulk of a ~100 ms hitch per
+ * second on a busy day. The window array is stable across those ticks
+ * (`useFlowWindow` keys it on a coarse edge), so the index is built once
+ * per new window and each tick's lookups touch one session's records.
+ *
+ * The contract this relies on: a window array is never mutated after it is
+ * first read. Every producer builds a new array (`buildFlowWindow`, the
+ * playback slices), so that already holds; a caller that appended to an
+ * array in place after reading it would get the stale grouping. */
+const sessionIndexCache = new WeakMap<readonly FlowRecord[], Map<unknown, readonly FlowRecord[]>>();
+/** Returned on every miss, shared: typed `readonly` (as are the groups) so a
+ *  caller cannot `push` into it and corrupt every later lookup. */
+const NO_RECORDS: readonly FlowRecord[] = [];
+let sessionIndexBuilds = 0;
+
+/** Test-only: how many session indexes have been built. A test that ticks a
+ *  lens asserts this does NOT move, which pins that the window array stayed
+ *  the same object across the tick. It cannot see whether a lookup went
+ *  through the index (a whole-window scan builds nothing); the callers'
+ *  own tests pin that by reading from an index the array has outgrown. */
+export function __sessionIndexBuilds(): number {
+  return sessionIndexBuilds;
+}
+
+export function sessionRecords(data: readonly FlowRecord[], sid: string): readonly FlowRecord[] {
+  let index = sessionIndexCache.get(data);
+  if (!index) {
+    // Keyed on `session_id` exactly as the record carries it, whatever its
+    // type: the scans this replaces compared `r.session_id === sid`, and a
+    // `Map` key matches the same way (SameValueZero). Its one difference,
+    // `NaN` equal to itself, is answered below the way the scan answered it.
+    const groups = new Map<unknown, FlowRecord[]>();
+    for (const r of data) {
+      if (!r) continue;
+      const group = groups.get(r.session_id);
+      if (group) group.push(r);
+      else groups.set(r.session_id, [r]);
+    }
+    index = groups;
+    sessionIndexCache.set(data, index);
+    sessionIndexBuilds++;
+  }
+  if (Number.isNaN(sid)) return NO_RECORDS;
+  return index.get(sid) ?? NO_RECORDS;
+}
+
+/** (#2911) The window's latest timestamp, once per window ARRAY (same
+ * identity contract as `sessionRecords`' index). A record whose `ts` does not
+ * parse makes this `Infinity`: the filter in `recordsAsOf` excludes such a
+ * record (`NaN <= now` is false), so the "nothing is ahead of now" fast path
+ * must never apply to a window holding one. */
+const latestTsCache = new WeakMap<readonly FlowRecord[], number>();
+function latestTs(data: readonly FlowRecord[]): number {
+  let latest = latestTsCache.get(data);
+  if (latest === undefined) {
+    latest = -Infinity;
+    for (const r of data) {
+      const t = T(r.ts);
+      if (Number.isNaN(t)) {
+        latest = Infinity;
+        break;
+      }
+      if (t > latest) latest = t;
+    }
+    latestTsCache.set(data, latest);
+  }
+  return latest;
+}
+
+/** The last filtered result per window array, with the range of `now` it
+ * stays exact for: `now >= lo` (the latest record it includes) and
+ * `now < hi` (the earliest record it excludes). */
+const asOfCache = new WeakMap<readonly FlowRecord[], { out: FlowRecord[]; lo: number; hi: number }>();
+let asOfFilterRuns = 0;
+
+/** Test-only: how many times `recordsAsOf` has actually filtered a window. */
+export function __asOfFilterRuns(): number {
+  return asOfFilterRuns;
+}
+
+/** (#2911) `data.filter((r) => T(r.ts) <= now)`, without paying for it on
+ * every clock tick. The live fleet hero reads the window "as of now" (a
+ * record stamped after the viewer's own clock is not counted yet, matching
+ * the fleet cards), and the lens re-renders every second while an execution
+ * is live, so a plain filter re-ran over the whole window each second and
+ * handed the hero a new array, recomputing its token sums and note too.
+ *
+ * - Nothing in the window is later than `now` (the normal case): returns
+ *   `data` itself, the same reference on every tick. No filter runs.
+ * - Something is: filters once, and returns that same result on later calls
+ *   until the window array changes or `now` crosses the next excluded
+ *   record's timestamp.
+ *
+ * Same contract as `sessionRecords`: a window array is never mutated after
+ * it is first read. */
+export function recordsAsOf(data: FlowRecord[], now: number): FlowRecord[] {
+  if (latestTs(data) <= now) return data;
+  const cached = asOfCache.get(data);
+  if (cached && now >= cached.lo && now < cached.hi) return cached.out;
+  asOfFilterRuns++;
+  const out: FlowRecord[] = [];
+  let lo = -Infinity;
+  let hi = Infinity;
+  for (const r of data) {
+    const t = T(r.ts);
+    if (t <= now) {
+      out.push(r);
+      if (t > lo) lo = t;
+    } else if (t < hi) {
+      hi = t;
+    }
+  }
+  asOfCache.set(data, { out, lo, hi });
+  return out;
+}
+
 /** `dispatch()` — viewer.html:1125. `missionId` (#2125), when given, scopes
  * the match to records naming that mission — see `sessionRunsOn`'s own doc
  * for why a bare `session_id` match is unsafe for a review-shaped session.
  * `undefined` (every pre-existing caller) preserves the exact prior
  * session_id-only behavior. */
 export function dispatchRec(data: FlowRecord[], sid: string, act: string, missionId?: string): FlowRecord | undefined {
-  return data.find(
+  return sessionRecords(data, sid).find(
     (r) => r.session_id === sid && r.action === "dispatch." + act && (missionId === undefined || !r.mission_id || r.mission_id === missionId),
   );
 }
@@ -638,7 +763,7 @@ export const dispatchKilled = (rec: FlowRecord | undefined): boolean =>
 /** `sessEnd()` — viewer.html:1149. `missionId` (#2125) — see `dispatchRec`'s
  * own doc. */
 export function sessEnd(data: FlowRecord[], sid: string, missionId?: string): FlowRecord | undefined {
-  return data.find(
+  return sessionRecords(data, sid).find(
     (r) => r.session_id === sid && r.action === "session.end" && (missionId === undefined || !r.mission_id || r.mission_id === missionId),
   );
 }
@@ -701,9 +826,10 @@ export function sessionRunning(
   if (liveSet.has(sid)) return true;
   const close = sessionCloseEdge(data, sid, missionId);
   if (close && T(close.ts) <= t) return false;
-  const started = data.some((r) => r.session_id === sid && isDispatchStart(r.action) && T(r.ts) <= t);
+  const own = sessionRecords(data, sid);
+  const started = own.some((r) => isDispatchStart(r.action) && T(r.ts) <= t);
   if (!started) return false;
-  const activityTimes = data.filter((r) => r.session_id === sid && T(r.ts) <= t).map((r) => T(r.ts));
+  const activityTimes = own.filter((r) => T(r.ts) <= t).map((r) => T(r.ts));
   const lastActivity = activityTimes.length ? Math.max(...activityTimes) : -Infinity;
   return t - lastActivity <= FLOW_LIVE_TTL_MS;
 }
