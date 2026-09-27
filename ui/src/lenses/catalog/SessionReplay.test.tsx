@@ -1488,6 +1488,19 @@ describe("modelScopeHero (#2890)", () => {
     expect(modelScopeHero({ liveTokScope: none, finishedTokRate: null })?.note).toBeNull();
   });
 
+  // (#2963) The file a read/write/edit call named goes in the readout slot.
+  it("(#2963) tools with a file: the readout line names the action and the file", () => {
+    const base = { tokensPerSec: 0, state: "tools", stalled: false, carried: false, noSignal: false };
+    const live = (x: object) => ({ ...base, ...x }) as unknown as NonNullable<Parameters<typeof modelScopeHero>[0]["liveTokScope"]>;
+    const h = modelScopeHero({ liveTokScope: live({ toolName: "write", toolPath: "src/lib/tokenRate.ts" }), finishedTokRate: null });
+    expect(h).toMatchObject({ state: "tools", toolName: "write", note: "write · src/lib/tokenRate.ts", noteTool: { action: "write", path: "src/lib/tokenRate.ts" } });
+    // Another tool, or no file: no line, as before.
+    expect(modelScopeHero({ liveTokScope: live({ toolName: "bash", toolPath: "src/a.ts" }), finishedTokRate: null })?.note).toBeNull();
+    expect(modelScopeHero({ liveTokScope: live({ toolName: "write" }), finishedTokRate: null })?.note).toBeNull();
+    // TOOL GEN keeps its own words.
+    expect(modelScopeHero({ liveTokScope: live({ toolName: "write", toolPath: "src/a.ts", writing: true, writingSeconds: 4 }), finishedTokRate: null })?.note).toBe("tool gen · write · 4s");
+  });
+
   it("finished: the scope is driven by the average, so its wave matches the number", () => {
     expect(modelScopeHero({ liveTokScope: null, finishedTokRate: { average: "192", sub: null } })?.tokensPerSec).toBe(192);
     expect(modelScopeHero({ liveTokScope: null, finishedTokRate: { average: "—", sub: null } })?.tokensPerSec).toBe(0);
@@ -1619,6 +1632,29 @@ describe("(#2926) run page: THINK opener and TOOL GEN, from the real run", () =>
   it("the tool-gen seconds follow the scrubber", async () => {
     await renderAt(pepperRecords(), pepperAt("10:52:55.500"));
     expect(document.querySelector(".modelbox__note")?.textContent).toBe("tool gen · write · 25s");
+  });
+
+  // (#2963) A completed read/write/edit call's file, in the same slot: the
+  // action, then the file, trimmed from the LEFT (CSS) so the name stays.
+  it("(#2963) while darkmux runs the turn's tools: the named call's action and file on the readout line", async () => {
+    // Turn 1 asked for five reads; four have completed by 10:51:08.5. Give
+    // the completed reads the path argument a real record carries.
+    let n = 0;
+    const recs = pepperRecords().map((r) => {
+      const p = (r as unknown as { payload: Record<string, unknown> }).payload;
+      if (r.action !== "dispatch.tool" || p.tool_name !== "read") return r;
+      n += 1;
+      return { ...r, payload: { ...p, args: JSON.stringify({ path: `/workspace/src/deep/tree/file${n}.js`, offset: 1, limit: 200 }) } } as unknown as typeof r;
+    });
+    await renderAt(recs, pepperAt("10:51:08.500"));
+    expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolName: "read", toolWriting: false });
+    const note = document.querySelector(".modelbox__note");
+    expect(note?.textContent).toBe("read · src/deep/tree/file4.js");
+    // The file sits in its own left-trimming box; the whole line is the hover.
+    expect(note?.querySelector(".modelbox__note-path")?.textContent).toBe("src/deep/tree/file4.js");
+    expect(note?.getAttribute("title")).toBe("read · src/deep/tree/file4.js");
+    // The lamp keeps its one word; the file is the readout's alone.
+    expect(lit()?.querySelector(".scope-lamp__label")?.textContent).toBe("tools");
   });
 
   it("no readout line while darkmux runs the tool (no generation to report)", async () => {

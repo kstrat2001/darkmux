@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { escapeBidiControls, prettyArgs, recordDetail, recordObject } from "./recordDetail";
+import { escapeBidiControls, prettyArgs, recordDetail, recordObject, toolCallPath } from "./recordDetail";
 import type { FlowRecord } from "../types/handwritten";
 
 /** A `dispatch.tool` record shaped exactly like the ones a live crawl emits
@@ -389,5 +389,45 @@ describe("recordObject", () => {
   it("anything else keeps its existing one-line detail and no chip", () => {
     const r = { action: "dispatch start", fields: { prompt_chars: 3204 } } as never;
     expect(recordObject(r)).toEqual({ text: "start (prompt: 3204ch)", mono: false });
+  });
+});
+
+// (#2963) The file a completed read/write/edit call named, for the run page's
+// readout line ("write · src/lib/tokenRate.ts"). The SAME reading as the event
+// log's row (`recordObject`), so the two can never name different files.
+describe("toolCallPath (#2963)", () => {
+  it("reads the path argument, with the container prefix dropped", () => {
+    expect(toolCallPath({ tool_name: "write", args: '{"path":"/workspace/src/lib/tokenRate.ts","content":"x"}' })).toBe("src/lib/tokenRate.ts");
+    expect(toolCallPath({ tool_name: "read", args: '{"path":"README.md","offset":1,"limit":20}' })).toBe("README.md");
+  });
+
+  it("reads double-encoded and cut-short arguments", () => {
+    const dbl = JSON.stringify(JSON.stringify({ path: "/workspace/test/a.test.js", edits: [] }));
+    expect(toolCallPath({ tool_name: "edit", args: dbl })).toBe("test/a.test.js");
+    const cut = JSON.stringify({ path: "/workspace/src/big.rs", content: "y".repeat(900) }).slice(0, 512) + "…";
+    expect(toolCallPath({ tool_name: "write", args: cut })).toBe("src/big.rs");
+  });
+
+  it("falls back to a write's own result when the content ate the args cap", () => {
+    const args = JSON.stringify({ content: "x".repeat(600), path: "/workspace/src/late.ts" }).slice(0, 512) + "…";
+    expect(toolCallPath({ tool_name: "write", args, result: "Wrote 600 bytes to /workspace/src/late.ts" })).toBe("src/late.ts");
+    // Only `write` says that phrase; another tool's output never names a file.
+    expect(toolCallPath({ tool_name: "bash", args: '{"command":"echo"}', result: "Wrote 1 bytes to /workspace/x.ts" })).toBeNull();
+  });
+
+  it("is null when the call names no path", () => {
+    expect(toolCallPath({ tool_name: "bash", args: '{"command":"ls"}' })).toBeNull();
+    expect(toolCallPath({ tool_name: "read" })).toBeNull();
+    expect(toolCallPath({ tool_name: "read", args: '{"path":""}' })).toBeNull();
+  });
+
+  it("never reads a path out of a value, only the call's own key", () => {
+    const content = JSON.stringify({ path: "/workspace/decoy.ts" });
+    const args = JSON.stringify({ content, path: "/workspace/real.ts" });
+    expect(toolCallPath({ tool_name: "write", args })).toBe("real.ts");
+  });
+
+  it("escapes bidi and zero-width control characters in the path", () => {
+    expect(toolCallPath({ tool_name: "write", args: JSON.stringify({ path: "src/a\u202Egnp.ts" }) })).toBe("src/a⟨U+202E⟩gnp.ts");
   });
 });

@@ -22,6 +22,7 @@ import {
   liveStateLabel,
   liveStateWhileConnected,
   lastHeartbeatMs,
+  toolReadout,
 } from "./tokenRate";
 
 const SID = "darkmux-coder-1790125784225";
@@ -899,6 +900,31 @@ describe("tools vs reading prompt, from the tool COMPLETION records", () => {
     expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "read" });
   });
 
+  // (#2963) The run page's readout names the FILE of the call it names, so
+  // the path travels with the name: the same completed record, reset with it.
+  const pathTool = (atMs: number, name: string, path: string): FlowRecord =>
+    ({ ts: new Date(atMs).toISOString(), action: "dispatch.tool", session_id: SID, payload: { tool_name: name, args: JSON.stringify({ path, content: "x" }) } }) as unknown as FlowRecord;
+
+  it("(#2963) carries the named call's file beside its name", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 3), pathTool(5_000, "read", "/workspace/src/a.ts"), pathTool(6_000, "write", "/workspace/src/b.ts")];
+    expect(deriveLiveState(recs, 7_000)).toEqual({ state: "tools", toolName: "write", toolPath: "src/b.ts" });
+  });
+
+  it("(#2963) a later completion that names no file drops the earlier file", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 3), pathTool(5_000, "read", "src/a.ts"), namedTool(6_000, "bash")];
+    expect(deriveLiveState(recs, 7_000)).toEqual({ state: "tools", toolName: "bash" });
+  });
+
+  it("(#2963) never carries the previous turn's file into this one", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 1), pathTool(5_000, "read", "src/a.ts"), beat(6_000, 0), beat(8_000, 900), turn(9_000, 2, 2)];
+    expect(deriveLiveState(recs, 10_000)).toEqual({ state: "tools" });
+  });
+
+  it("(#2963) a file only in the past of a playback cut is not read", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 3), namedTool(5_000, "read"), pathTool(9_000, "write", "src/b.ts")];
+    expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "read" });
+  });
+
   it("carries the name through executionTokenReading and aggregateLiveState", () => {
     const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 3), namedTool(5_000, "search")];
     expect(executionTokenReading(recs, 6_000).toolName).toBe("search");
@@ -1403,5 +1429,24 @@ describe("(#2915) compacting", () => {
     const r = executionTokenReading([...before, compactStart(at, 600)], at + 4_000);
     expect(r).toMatchObject({ state: "prompt", compacting: true, compactingSeconds: 4 });
     expect(r.promptLabel).toBeUndefined();
+  });
+});
+
+// (#2963) The run page's readout line for a tool that takes a file: the
+// action and the file ("write · src/lib/tokenRate.ts"), for read, write and
+// edit only. Anything else, or no file, has no line.
+describe("toolReadout (#2963)", () => {
+  it("names the action and the file for read, write and edit", () => {
+    expect(toolReadout({ state: "tools", toolName: "write", toolPath: "src/lib/tokenRate.ts" })).toEqual({ action: "write", path: "src/lib/tokenRate.ts" });
+    expect(toolReadout({ state: "tools", toolName: "read", toolPath: "README.md" })).toEqual({ action: "read", path: "README.md" });
+    expect(toolReadout({ state: "tools", toolName: "edit", toolPath: "a/b.rs" })).toEqual({ action: "edit", path: "a/b.rs" });
+  });
+
+  it("has no line for another tool, a call with no file, or while the call is generated", () => {
+    expect(toolReadout({ state: "tools", toolName: "search", toolPath: "src" })).toBeNull();
+    expect(toolReadout({ state: "tools", toolName: "bash", toolPath: "src/a.ts" })).toBeNull();
+    expect(toolReadout({ state: "tools", toolName: "write" })).toBeNull();
+    expect(toolReadout({ state: "tools", toolName: "write", toolPath: "src/a.ts", writing: true, writingSeconds: 3 })).toBeNull();
+    expect(toolReadout({ state: "prompt", toolName: "write", toolPath: "src/a.ts" })).toBeNull();
   });
 });

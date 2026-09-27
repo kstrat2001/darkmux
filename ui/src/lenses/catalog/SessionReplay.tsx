@@ -25,7 +25,7 @@ import { livenessState } from "../../components/LivenessPulse";
 import { TokenScope } from "../../components/TokenScope";
 import { usePlaybackClock } from "../../lib/pageClockRate";
 import { WALL_CLOCK } from "../../lib/restHand";
-import { liveStateLabel, type LiveStateReading } from "../../lib/tokenRate";
+import { liveStateLabel, toolReadout, type LiveStateReading } from "../../lib/tokenRate";
 import { REPLAY_GRANULARITY_NOTE, useLiveOverlay } from "../../lib/liveChannel";
 import { scopeStateOf, type ScopeState } from "../../lib/scopeMorph";
 import { CLEAN_DETECTORS, runRegions } from "../session/sessionRun";
@@ -146,6 +146,25 @@ export function ScopeLamps({
   );
 }
 
+/** The readout line under the lamps (`.modelbox__note`): "no signal", a
+ *  finished average's qualifier, TOOL GEN, compacting, why REST rests, or
+ *  (#2963) the action and file of a read/write/edit darkmux is running. A
+ *  tool's line puts the file in its own box that trims from the LEFT, so a
+ *  long path loses its leading folders and keeps its file name; the whole
+ *  line is the hover. One line either way (`styles.css`). */
+export function ScopeNote({ note, tool }: { note: string | null; tool?: { action: string; path: string } }) {
+  if (!note) return null;
+  if (!tool) return <div className="modelbox__note">{note}</div>;
+  return (
+    <div className="modelbox__note modelbox__note--tool" title={note}>
+      <span className="modelbox__note-act">{`${tool.action} · `}</span>
+      <span className="modelbox__note-path">
+        <bdi>{tool.path}</bdi>
+      </span>
+    </div>
+  );
+}
+
 /** (#2890) What the MODEL hero's scope shows, from the one view derivation:
  *  the live reading while the run is going, the calm finished state with its
  *  average once it has ended, or nothing when the unit did no model work.
@@ -173,6 +192,9 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
   clockMs?: number;
   lamps: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; restReason?: string; toolName?: string; writing?: true; writingSeconds?: number; thinking?: boolean; compacting?: true; compactingSeconds?: number };
   note: string | null;
+  /** (#2963) Present when `note` is a tool's action and file: the two
+   *  parts, so the line can trim the file from the left (`ScopeNote`). */
+  noteTool?: { action: string; path: string };
 } | null {
   const live = view.liveTokScope;
   if (live) {
@@ -184,6 +206,12 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
     // (#2915) The execution is compacting: PROMPT stays lit, the tube reads
     // "compacting" with the utility treatment.
     const compacting = state === "prompt" && live.compacting === true;
+    // (#2963) darkmux running a read/write/edit whose file is known: the
+    // action and the file on the readout line ("write · src/a.ts").
+    const toolLine =
+      state === "tools" && !writing
+        ? toolReadout({ state: "tools", toolName: live.toolName, ...(live.toolPath !== undefined ? { toolPath: live.toolPath } : {}) })
+        : null;
     return {
       state,
       tokensPerSec: generating ? live.tokensPerSec : 0,
@@ -238,7 +266,10 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
                   // seconds are not, which is why its line carries them).
                   // Nothing when the record names no reason.
                   live.restReason
-                : null,
+                : toolLine
+                  ? `${toolLine.action} · ${toolLine.path}`
+                  : null,
+      ...(toolLine ? { noteTool: toolLine } : {}),
     };
   }
   const fin = view.finishedTokRate;
@@ -879,7 +910,7 @@ export function SessionReplay({
                         noSignal={scopeHero.state === "nosignal"}
                         finished={scopeHero.state === "finished"}
                       />
-                      {scopeHero.note && <div className="modelbox__note">{scopeHero.note}</div>}
+                      <ScopeNote note={scopeHero.note} tool={scopeHero.noteTool} />
                     </div>
                   </div>
                 )}
