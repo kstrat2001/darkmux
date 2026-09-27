@@ -57,7 +57,7 @@ The third one is opt-in (the daemon binds localhost by default for safety). To e
 |---|---|---|
 | **[LMStudio](https://lmstudio.ai/)** | Loads/unloads models. darkmux drives it via the `lms` CLI. | macOS / Windows / Linux installer |
 | **At least one model in LMStudio** | Nothing to dispatch to without one. | Download via the LMStudio UI; verify with `lms ls`. |
-| **[Docker](https://www.docker.com/products/docker-desktop)** | Hosts darkmux's internal Rust runtime, the default for `darkmux dispatch` and `darkmux lab run`. Each dispatch runs in a per-invocation `darkmux-runtime` container with kernel-enforced workspace isolation. darkmux pulls the image from GHCR on demand (or `docker build -t darkmux-runtime:latest runtime/` from a source checkout). **Required only for that dispatch + lab path:** the `machine` / `profile` read core needs only LMStudio + a model. | Docker Desktop or equivalent daemon |
+| **[Docker](https://www.docker.com/products/docker-desktop)** | Hosts darkmux's internal Rust runtime, the default for `darkmux dispatch` and `darkmux lab run`. Each dispatch runs in a per-invocation `darkmux-runtime` container with kernel-enforced workspace isolation. darkmux pulls the version-pinned image from GHCR on demand (or `docker build --build-arg DARKMUX_VERSION=<version> -t darkmux-runtime:latest runtime/` from a source checkout at that version; a local image whose version label does not match the binary is skipped, #2923). **Required only for that dispatch + lab path:** the `machine` / `profile` read core needs only LMStudio + a model. | Docker Desktop or equivalent daemon |
 
 > **`brew install` needs no toolchain.** Homebrew handles the build for you (and bottled binaries, once published, ship precompiled). The **Rust toolchain** is required only if you build from source (Option B below), which documents `rustup` at its first step.
 
@@ -102,8 +102,11 @@ git clone https://github.com/kstrat2001/darkmux
 cd darkmux
 cargo install --path .      # builds the self-contained binary, drops it on $PATH
 
-# 3. Build the internal-runtime container image (one-time, ~50 MB)
-docker build -t darkmux-runtime:latest runtime/
+# 3. Build the internal-runtime container image (one-time, ~50 MB). The
+#    build-arg stamps the version label; dispatch skips an image whose label
+#    does not match the installed binary (#2923).
+docker build --build-arg DARKMUX_VERSION="$(darkmux --version | awk '{print $2}')" \
+  -t darkmux-runtime:latest runtime/
 
 # 4. Bootstrap config + agent skills
 darkmux init                # writes ~/.darkmux/config.json + ~/.darkmux/profiles.json,
@@ -257,9 +260,26 @@ The `m-series-128` provider's rules are empirically validated against lab measur
 `darkmux dispatch` uses the **internal runtime** by default: an in-house Rust agent loop running inside a per-dispatch `darkmux-runtime` Docker container with a mounted workspace tempdir. Kernel-enforced workspace isolation, no cross-task context leak by construction. The image is small (~50 MB) and built once from `runtime/`:
 
 ```bash
-# build the image once from the darkmux repo root
-docker build -t darkmux-runtime:latest runtime/
+# build the image once from the darkmux repo root, stamped with the version
+docker build --build-arg DARKMUX_VERSION="$(darkmux --version | awk '{print $2}')" \
+  -t darkmux-runtime:latest runtime/
 ```
+
+**Which image runs (#2923).** Dispatch reads the image's
+`org.opencontainers.image.version` label with `docker image inspect` (nothing
+runs) and uses a local `darkmux-runtime:latest` only when the label equals the
+binary's version. Otherwise it runs the version-pinned
+`ghcr.io/kstrat2001/darkmux-runtime:<version>`, pulling it if absent, and
+prints which local image it skipped. An image with no label counts as a
+mismatch. `--image darkmux-runtime:<tag>` names darkmux's own image and is
+checked the same way: a mismatched or unlabeled one is refused before any
+container starts, with the rebuild command. The container runs by the
+checked image's id, so re-tagging during a dispatch cannot swap in another
+image. A development build (a git checkout; `darkmux --version` shows a SHA)
+shares its version number with the release, so when it falls back to the
+release image it says so and names the build command for a matching one.
+`darkmux doctor`'s `runtime image freshness` row shows what is on the
+machine.
 
 The `lab` subcommand mirrors `dispatch`'s contract: the internal runtime, no external agent runtime to install or configure. The `machine` / `profile` subcommands don't depend on any runtime at all. They read LMStudio and the registry directly.
 

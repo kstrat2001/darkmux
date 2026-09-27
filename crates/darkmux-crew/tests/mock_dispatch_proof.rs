@@ -21,7 +21,7 @@
 //! thing standing in for "the model" is the scripted mock-model process.
 //!
 //! **Requires Docker** (a running daemon + `darkmux-runtime:latest` built
-//! locally — `docker build -t darkmux-runtime:latest runtime/` from the
+//! locally — `docker build --build-arg DARKMUX_VERSION=<version> -t darkmux-runtime:latest runtime/` from the
 //! repo root) and a build of `tools/darkmux-mock-model` (built on demand
 //! below via `cargo build`, so the only manual precondition is Docker).
 //! `#[ignore]`d by default so `cargo test --workspace` never requires

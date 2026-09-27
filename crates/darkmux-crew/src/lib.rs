@@ -161,6 +161,9 @@ pub mod run_record;
 // a run's samples and `step result` records to its own lifetime. See the
 // module doc.
 pub mod run_obs;
+/// (#2923) Which runtime image a dispatch runs, and the check that it was
+/// built for this darkmux.
+pub mod runtime_image;
 pub mod select;
 // (#2112) The `PreventUserIdleSystemSleep` RAII assertion held for a
 // mission/crawl's life — see the module doc for why it does not override a

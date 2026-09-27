@@ -76,7 +76,7 @@ darkmux role show coder          <span class="comment"># full details for one ro
     <p>What happens (default runtime, internal):</p>
     <ol>
       <li>darkmux loads the role manifest + the <code>.md</code> system prompt.</li>
-      <li><strong>Pre-flight</strong>: verifies Docker is reachable and the <code>darkmux-runtime:latest</code> image is present locally. Bails loud with build instructions if either is missing.</li>
+      <li><strong>Pre-flight</strong>: verifies Docker is reachable and resolves a runtime image built for this darkmux: a local <code>darkmux-runtime:latest</code> only when its version label matches, otherwise the version-pinned GHCR image, pulled on first use. An image built for another version, or with no label, is never run; if nothing matching can be had, it refuses before starting a container and names the fix.</li>
       <li>Spins up a fresh <code>darkmux-runtime</code> container per dispatch with a mounted workspace tempdir: kernel-enforced isolation, no cross-task context leak by construction.</li>
       <li>Streams the model's reasoning and tool calls via the in-house Rust loop; emits <code>dispatch.turn</code>, <code>dispatch.tool</code>, and <code>dispatch.reasoning</code> flow records as they happen.</li>
       <li>Emits a final <code>dispatch complete</code> or <code>dispatch error</code> record.</li>

@@ -99,35 +99,73 @@ fn write_profiles_registry(dir: &Path) -> std::path::PathBuf {
     path
 }
 
-/// A fake `docker` that appends its own argv to `record` and exits, and a
-/// fake `lms` that answers `ps --json` with an empty resident set. Same
-/// idiom as `dispatch_internal_tests.rs`'s `install_fake_docker`.
-fn install_fake_docker_and_lms(dir: &Path, record: &Path, lms_ps_json: &str) -> std::path::PathBuf {
-    let fake_docker = dir.join("docker");
-    fs::write(
-        &fake_docker,
-        format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n", record.display()),
-    )
-    .expect("writing fake docker");
+/// Env vars the stable fakes read their per-call parameters from. The
+/// fakes inherit them from this process (set with [`EnvVarGuard`]).
+const RECORD_VAR: &str = "THERMAL_PROOF_DOCKER_RECORD";
+const LMS_PS_VAR: &str = "THERMAL_PROOF_LMS_PS_JSON";
 
-    let fake_lms = dir.join("lms");
-    fs::write(
-        &fake_lms,
-        format!("#!/bin/sh\nif [ \"$1\" = \"ps\" ]; then\necho '{lms_ps_json}'\nexit 0\nfi\nexit 0\n"),
-    )
-    .expect("writing fake lms");
+/// A fake `docker` that appends its own argv to `$THERMAL_PROOF_DOCKER_RECORD`
+/// and exits (answering `image inspect` with a runtime image built for this
+/// darkmux, so the dispatch's image gate passes and the `docker run` argv
+/// under test is reached), and a fake `lms` that answers `ps --json` with
+/// `$THERMAL_PROOF_LMS_PS_JSON`.
+///
+/// (#2923) The scripts are written ONCE per build, at a stable path, and
+/// parameterized through the environment, never rewritten per test. macOS
+/// runs an XProtect assessment on the first exec of every newly written
+/// executable, and those assessments serialize: measured on this machine,
+/// 48 concurrent first-execs of fresh scripts took up to 10.4s and 200 took
+/// up to 21.2s, while re-execs of an already-assessed script took 0.02s and
+/// `sh <fresh file>` (no exec of the new file) 0.05s. A per-test fresh fake
+/// therefore turned a loaded run into a 15s `docker image inspect` timeout
+/// (`runtime_image::INSPECT_TIMEOUT`) with an empty record. The bound is
+/// right for a real, long-installed `docker`; the fake was what was slow.
+fn stable_fake_bin() -> std::path::PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("thermal-proof-fake-bin");
+    fs::create_dir_all(&dir).expect("creating the fake bin dir");
+    let docker = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${RECORD_VAR}\"\n\
+         if [ \"$1\" = image ] && [ \"$2\" = inspect ]; then echo 'sha256:fake|{}'; fi\nexit 0\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    let lms = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"ps\" ]; then\nprintf '%s\\n' \"${LMS_PS_VAR}\"\nexit 0\nfi\nexit 0\n"
+    );
+    for (name, body) in [("docker", docker), ("lms", lms)] {
+        write_executable_once(&dir.join(name), &body);
+    }
+    dir
+}
 
+/// Write `body` to `path` as an executable ONLY when the file is absent or
+/// differs, via a same-directory temp file and an atomic rename, so parallel
+/// test processes never exec a half-written file and an unchanged fake is
+/// never re-created (a re-created file is a new file to XProtect).
+fn write_executable_once(path: &Path, body: &str) {
+    if fs::read_to_string(path).ok().as_deref() == Some(body) {
+        return;
+    }
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    fs::write(&tmp, body).expect("writing a fake");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        for p in [&fake_docker, &fake_lms] {
-            let mut perms = fs::metadata(p).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(p, perms).unwrap();
-        }
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
     }
+    fs::rename(&tmp, path).expect("publishing a fake");
+}
 
-    fake_lms
+/// Pins the #2923 fix: a second request for the fakes must not re-create
+/// them (a re-created file is re-assessed by XProtect on its next exec).
+#[test]
+fn the_fakes_are_written_once_not_per_test() {
+    let first = stable_fake_bin();
+    let modified = |d: &Path| fs::metadata(d.join("docker")).unwrap().modified().unwrap();
+    let before = modified(&first);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let second = stable_fake_bin();
+    assert_eq!(first, second, "one stable location");
+    assert_eq!(before, modified(&second), "an unchanged fake must not be rewritten");
 }
 
 /// Drive one `dispatch()` through the PATH-shimmed `docker` with
@@ -152,13 +190,15 @@ fn captured_docker_argv_with(
     let home_dir = tmp.path().join("home");
     let flows_dir = tmp.path().join("flows");
     let ack_dir = tmp.path().join("ack");
-    let fake_bin_dir = tmp.path().join("fake-bin");
-    for d in [&home_dir, &flows_dir, &ack_dir, &fake_bin_dir] {
+    for d in [&home_dir, &flows_dir, &ack_dir] {
         fs::create_dir_all(d).unwrap();
     }
     let record = tmp.path().join("docker-argv.txt");
     let profiles_path = write_profiles_registry(tmp.path());
-    let fake_lms = install_fake_docker_and_lms(&fake_bin_dir, &record, lms_ps_json);
+    let fake_bin_dir = stable_fake_bin();
+    let fake_lms = fake_bin_dir.join("lms");
+    let _record = EnvVarGuard::set(RECORD_VAR, &record);
+    let _lms_ps = EnvVarGuard::set(LMS_PS_VAR, lms_ps_json);
 
     let real_path = std::env::var("PATH").unwrap_or_default();
 
@@ -300,5 +340,22 @@ fn a_configured_lmstudio_url_reaches_the_container_translated_for_docker() {
     assert!(
         recorded.contains("--base-url http://host.docker.internal:4321/v1"),
         "the configured lmstudio_url must reach the container as its --base-url: {recorded}"
+    );
+}
+
+/// (#2923 review C6) The container runs by the content id the image gate
+/// checked, never by a tag that could be re-pointed between the check and
+/// `docker run`. The shim's `image inspect` answers `sha256:fake` for a
+/// matching `darkmux-runtime:latest`, so that id, and not the tag, must be
+/// the image `docker run` is handed.
+#[test]
+#[serial_test::serial] // mutates PATH, DARKMUX_HOME, DARKMUX_LMS_BIN and the thermal knob
+fn the_container_runs_by_the_checked_image_id_not_by_tag() {
+    let recorded = captured_docker_argv("1000");
+    let run_line = docker_run_line(&recorded);
+    assert!(run_line.contains(" -- sha256:fake "), "runs by id: {run_line}");
+    assert!(
+        !run_line.contains("darkmux-runtime:latest"),
+        "a tag can be re-pointed after the check: {run_line}"
     );
 }

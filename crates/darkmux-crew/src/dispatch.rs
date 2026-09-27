@@ -340,9 +340,12 @@ pub struct DispatchOpts {
     /// fairness bug masquerading as a capability gap.
     pub max_completion_tokens: Option<u32>,
     /// (#703) Override the Docker image the internal runtime dispatches
-    /// into. `None` → the default `darkmux-runtime:latest` (slim base, the
-    /// binary baked in). Set to ANY Linux image (e.g. `rust:slim`, the
-    /// operator's own CI image) and darkmux **injects** its static runtime
+    /// into. `None` → the darkmux runtime image built for this version (slim
+    /// base, the binary baked in): a local `darkmux-runtime:latest` whose
+    /// version label matches, else the version-pinned GHCR image (#2923,
+    /// `runtime_image`). A `darkmux-runtime:<tag>` or GHCR ref runs that
+    /// image after the same check. Set to any OTHER Linux image (e.g.
+    /// `rust:slim`, the operator's own CI image) and darkmux **injects** its static runtime
     /// binary into it (bind-mount + entrypoint override) so the coder runs
     /// in that environment and can compile/test in-sandbox — the inner
     /// verify loop. No per-language darkmux images. The image needs `bash`
