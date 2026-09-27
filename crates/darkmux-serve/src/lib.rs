@@ -3858,6 +3858,9 @@ async fn catalog_records_response(
             // response goes out, so the run-detail SYSTEM pane (which reads
             // this same session-scoped record set) doesn't have to learn a
             // second fetch.
+            if field == "mission_id" {
+                mission_graph::stamp_session_steps(&mut records, &id);
+            }
             let mut days_scanned = 0usize;
             if field == "session_id" {
                 let join_stats =

@@ -1418,6 +1418,20 @@
         assert_eq!(records[1]["ts"], "2026-05-14T09:00:00Z");
     }
 
+    /// A pre-4.0 mission's records reach the viewer with their step named
+    /// as `payload.step_id`, read from the old session string here, since
+    /// the viewer never parses a session id.
+    #[tokio::test]
+    async fn flow_mission_names_the_step_an_archived_session_meant() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("2026-05-12.jsonl"),
+            "{\"session_id\":\"step-judge-1\",\"mission_id\":\"m1\",\"ts\":\"2026-05-12T10:00:00Z\",\"payload\":{\"total_tokens\":5}}\n",
+        ).unwrap();
+        let json = get_json(&tmp, "/flow-mission/m1").await;
+        assert_eq!(json["records"][0]["payload"]["step_id"], "judge-1", "{json}");
+    }
+
     #[tokio::test]
     async fn flow_session_returns_only_that_sessions_records() {
         let tmp = TempDir::new().unwrap();

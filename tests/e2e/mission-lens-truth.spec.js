@@ -53,9 +53,9 @@ function graphSnapshot() {
 // The judge's run opens on its dispatch bookend, as a real seat's does: the
 // step meter is a projection of the step's run lifecycle, and a run with no
 // opening record has not started.
-const judgeStart = { ts: new Date(STARTED_SECS * 1000).toISOString(), action: 'dispatch.start', category: 'dispatch', source: 'crew', session_id: 'step-judge-1', level: 'info', payload: {} };
-const judgeTok = { ts: `${TODAY}T10:00:00Z`, action: 'telemetry.tokens', category: 'telemetry', source: 'tokens', session_id: 'step-judge-1', level: 'info', payload: { total_tokens: 5000 } };
-const verifyTok = { ts: `${TODAY}T10:00:01Z`, action: 'telemetry.tokens', category: 'telemetry', source: 'tokens', session_id: 'step-verify-1', level: 'info', payload: { total_tokens: 18000 } };
+const judgeStart = { ts: new Date(STARTED_SECS * 1000).toISOString(), action: 'dispatch.start', category: 'dispatch', source: 'crew', session_id: 'step-judge-1', level: 'info', payload: { step_id: 'judge-1' } };
+const judgeTok = { ts: `${TODAY}T10:00:00Z`, action: 'telemetry.tokens', category: 'telemetry', source: 'tokens', session_id: 'step-judge-1', level: 'info', payload: { step_id: 'judge-1', total_tokens: 5000 } };
+const verifyTok = { ts: `${TODAY}T10:00:01Z`, action: 'telemetry.tokens', category: 'telemetry', source: 'tokens', session_id: 'step-verify-1', level: 'info', payload: { step_id: 'verify-1', total_tokens: 18000 } };
 
 async function routeAll(page, streamRecords) {
   await page.route(`**/mission/${MISSION_ID}/graph.json`, (r) => r.fulfill({ contentType: 'application/json', body: JSON.stringify(graphSnapshot()) }));
@@ -128,7 +128,7 @@ test('a judge seat 1s under STALE_AFTER_MS still renders the generating meter', 
   const tok = {
     ts: new Date(FIXED_NOW_MS - (STALE_AFTER_MS - 1000)).toISOString(),
     action: 'telemetry.tokens', category: 'telemetry', source: 'tokens',
-    session_id: 'step-judge-1', level: 'info', payload: { total_tokens: 1000 },
+    session_id: 'step-judge-1', level: 'info', payload: { step_id: 'judge-1', total_tokens: 1000 },
   };
   await routeAll(page, [openedLongAgo, tok]);
   await page.goto(`/index-live.html#mission=${MISSION_ID}`);
@@ -151,7 +151,7 @@ test('a judge seat 1s past STALE_AFTER_MS renders no generating meter', async ({
   const tok = {
     ts: new Date(FIXED_NOW_MS - (STALE_AFTER_MS + 1000)).toISOString(),
     action: 'telemetry.tokens', category: 'telemetry', source: 'tokens',
-    session_id: 'step-judge-1', level: 'info', payload: { total_tokens: 1000 },
+    session_id: 'step-judge-1', level: 'info', payload: { step_id: 'judge-1', total_tokens: 1000 },
   };
   await routeAll(page, [openedLongAgo, tok]);
   await page.goto(`/index-live.html#mission=${MISSION_ID}`);

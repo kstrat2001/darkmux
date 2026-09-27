@@ -141,7 +141,7 @@ pub struct StepRow {
     /// honest "no data" rather than a wrong zero. MIXED-ERA also includes
     /// records from before the #1436 session-id rename: a colon-era
     /// `step:<id>` session id matches none of the fold's correlation keys
-    /// (which read the current `step-<id>` shape), so pre-rename steps stay
+    /// (which read the `step-<id>` and 4.0 shapes), so pre-rename steps stay
     /// honest-absent rather than mis-folding — pinned by
     /// `fold_finals_colon_era_session_ids_do_not_fold`. The SSE stream stays
     /// the LIVE-increment channel; these are only the terminal totals.
@@ -998,16 +998,8 @@ fn step_for_record<'a>(
             return Some(found.as_str());
         }
     }
-    // A step session of THIS mission names its step. An unstamped pre-4.0
-    // record is placed in this mission to read its old
-    // `step-<id>[-<mission>]` string; a current one names its own run, which
-    // must be this mission.
-    if let Some(session) = rec.get("session_id").and_then(|s| s.as_str()) {
-        let session = darkmux_types::session_id::SessionId::parse_legacy(session, Some(mission_id))
-            .filter(|s| s.mission_id() == Some(mission_id));
-        if let Some(found) = session.as_ref().and_then(|s| s.step_id()).and_then(|id| step_ids.get(id)) {
-            return Some(found.as_str());
-        }
+    if let Some(found) = session_step(rec, mission_id).and_then(|id| step_ids.get(&id)) {
+        return Some(found.as_str());
     }
     if let Some(handle) = rec.get("handle").and_then(|s| s.as_str()) {
         if let Some(found) = step_ids.get(handle) {
@@ -1015,6 +1007,39 @@ fn step_for_record<'a>(
         }
     }
     None
+}
+
+/// The step a record's own session names, when that session is a step of
+/// `mission_id`. An unstamped pre-4.0 record is placed in this mission to
+/// read its old `step-<id>[-<mission>]` string; a current one names its own
+/// run, which must be this mission.
+fn session_step(rec: &serde_json::Value, mission_id: &str) -> Option<String> {
+    let session = rec.get("session_id")?.as_str()?;
+    darkmux_types::session_id::SessionId::parse_legacy(session, Some(mission_id))
+        .filter(|s| s.mission_id() == Some(mission_id))?
+        .step_id()
+        .map(str::to_string)
+}
+
+/// Name each record's step as `payload.step_id` where only its session says
+/// it, so the viewer reads a typed field and never parses a session id. A
+/// producer's own `step_id` is kept; a payload that is not an object is left
+/// alone.
+pub fn stamp_session_steps(records: &mut [serde_json::Value], mission_id: &str) {
+    for rec in records {
+        if rec.pointer("/payload/step_id").is_some() {
+            continue;
+        }
+        let Some(step) = session_step(rec, mission_id) else { continue };
+        let Some(obj) = rec.as_object_mut() else { continue };
+        let payload = obj.entry("payload").or_insert_with(|| serde_json::json!({}));
+        if payload.is_null() {
+            *payload = serde_json::json!({});
+        }
+        if let Some(p) = payload.as_object_mut() {
+            p.insert("step_id".into(), serde_json::Value::String(step));
+        }
+    }
 }
 
 /// Pure: fold a stream of flow records into per-step FINALIZED totals.
@@ -1711,7 +1736,7 @@ mod tests {
 
     #[test]
     fn fold_finals_dispatch_complete_folds_tokens_turns_via_session_id() {
-        // Correlation key 2: session_id `step-<id>` (the dispatch.internal default).
+        // Correlation key 2: a pre-4.0 archive's step session `step-<id>`.
         let step_ids = ids(&["s1"]);
         let rec = serde_json::json!({
             "action": "dispatch.complete",
@@ -1757,6 +1782,32 @@ mod tests {
     /// by the `mission_id` admission gate, and a session whose suffix
     /// merely resembles this mission's id must not resolve to a step this
     /// mission doesn't own.
+    /// The viewer never parses a session id, so a record the daemon serves
+    /// for a mission names its step as `payload.step_id`: a pre-4.0 step
+    /// session gets one read from its string, here, and nothing else does.
+    #[test]
+    fn stamp_session_steps_names_the_step_a_legacy_session_meant() {
+        let mut recs = vec![
+            serde_json::json!({ "session_id": "step-judge-1", "mission_id": "m1", "payload": {} }),
+            serde_json::json!({ "session_id": "step-verify-1-m1", "mission_id": "m1" }),
+            serde_json::json!({ "session_id": "m1.step.s1", "mission_id": "m1", "payload": { "total_tokens": 3 } }),
+            serde_json::json!({ "session_id": "step-a", "mission_id": "m1", "payload": { "step_id": "kept" } }),
+            serde_json::json!({ "session_id": "mission-other.step.s1", "mission_id": "m1" }),
+            serde_json::json!({ "session_id": "task-t1", "mission_id": "m1" }),
+            serde_json::json!({ "session_id": "step-s1", "mission_id": "m1", "payload": "not an object" }),
+        ];
+        stamp_session_steps(&mut recs, "m1");
+        let step = |i: usize| recs[i].pointer("/payload/step_id").and_then(|v| v.as_str()).map(str::to_string);
+        assert_eq!(step(0).as_deref(), Some("judge-1"));
+        assert_eq!(step(1).as_deref(), Some("verify-1"), "the run-scoped spelling peels to its step");
+        assert_eq!(step(2).as_deref(), Some("s1"));
+        assert_eq!(recs[2]["payload"]["total_tokens"], 3, "the rest of the payload is kept");
+        assert_eq!(step(3).as_deref(), Some("kept"), "a producer's own step_id is never replaced");
+        assert_eq!(step(4), None, "another run's step session names no step of this mission");
+        assert_eq!(step(5), None, "a task session names no step");
+        assert_eq!(recs[6]["payload"], "not an object", "a payload that is not an object is left alone");
+    }
+
     #[test]
     fn fold_finals_scoped_peel_never_invents_a_foreign_step() {
         let step_ids = ids(&["s1"]);
