@@ -312,7 +312,18 @@ fn a_prompt_workload_reports_verify_none_without_a_spec_and_the_verdict_with_one
         let o = lab.run(id, 1).unwrap().remove(0);
         assert!(o.ok, "{id}: the stub dispatch must succeed: {:?}", o.notes);
         assert_eq!(o.verify_passed, want, "{id}: {:?}", o.notes);
+        // The manifest records the same tri-state, so `lab run list` reads
+        // a failed verify as FAIL rather than a plain tick.
+        let listed = crate::lab::list::list_runs(None).unwrap();
+        let row = listed.iter().find(|r| r.run_id == o.run_id).unwrap();
+        assert_eq!(row.verify_passed, want, "{id}: listed");
     }
+    // A manifest from before the field existed reads as not checked.
+    let old = darkmux_types::config_access::lab_dir().join("p2982-old-stub-1-1");
+    fs::create_dir_all(&old).unwrap();
+    fs::write(old.join("manifest.json"), r#"{"schema_version":2,"workload":"p2982-none","ok":true}"#).unwrap();
+    let listed = crate::lab::list::list_runs(None).unwrap();
+    assert_eq!(listed.iter().find(|r| r.run_id == "p2982-old-stub-1-1").unwrap().verify_passed, None);
 }
 /// (#2982b, #2494) ONE exit gate for every lab verb that runs a workload:
 /// a failed dispatch or a failed verify exits 1; a verify nothing declared

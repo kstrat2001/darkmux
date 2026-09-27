@@ -93,7 +93,11 @@ impl WorkloadProvider for PromptProvider {
         let manifest_json = serde_json::json!({
             // v2 added: run_id, profile (now the profile NAME), profile_description.
             // v1 had: session_id, profile (was the description text), workload, provider, duration_ms, ok.
-            "schema_version": 2,
+            // v5 added: verify, the same field and version as the coding-task
+            // manifest (#2494). `null` is "not checked": the workload declares
+            // no verify. Without it, `lab run list` read a failed verify as a
+            // plain tick.
+            "schema_version": 5,
             "run_id": run_id,
             "workload": loaded.manifest.workload.id,
             "provider": self.id(),
@@ -102,6 +106,10 @@ impl WorkloadProvider for PromptProvider {
             "duration_ms": duration_ms,
             "ok": ok,
             "session_id": session_id,
+            "verify": verify.as_ref().map(|v| serde_json::json!({
+                "passed": v.passed,
+                "details": v.details,
+            })),
         });
         fs::write(
             run_dir.join("manifest.json"),
