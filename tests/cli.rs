@@ -12150,3 +12150,27 @@ fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         }
     }
 }
+
+/// (#2947) The two runtime help surfaces, as an operator types them:
+/// `config list` prints every enum setting's values with their meanings (on
+/// stderr, so its stdout stays JSON), and `config set <key>` with no value
+/// prints that key's values with their meanings.
+#[test]
+fn config_list_and_bare_config_set_list_every_enum_value_with_its_meaning() {
+    use darkmux_types::config_enum::ENUM_SETTINGS;
+    let out = darkmux_cmd().args(["config", "list"]).output().unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for s in ENUM_SETTINGS {
+        assert!(stderr.contains(s.key), "`config list` does not list {}: {stderr}", s.key);
+        for (t, m) in s.values {
+            assert!(stderr.contains(t) && stderr.contains(m), "`config list` lacks {}={t}: {stderr}", s.key);
+        }
+        let out = darkmux_cmd().args(["config", "set", s.key]).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "`config set {}` with no value failed", s.key);
+        for (t, m) in s.values {
+            assert!(stdout.contains(t) && stdout.contains(m), "`config set {}` lacks {t}: {stdout}", s.key);
+        }
+    }
+}
