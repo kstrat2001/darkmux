@@ -230,35 +230,8 @@ impl fmt::Display for Reason {
                 foreign_bytes,
                 est_bytes,
                 limit_bytes,
-            } => {
-                match foreign_bytes {
-                    Some(b) => write!(
-                        f,
-                        "user-loaded instance \"{foreign_identifier}\" of the needed model occupies {}",
-                        gb(*b)
-                    )?,
-                    None => write!(
-                        f,
-                        "user-loaded instance \"{foreign_identifier}\" of the needed model occupies an unknown amount of memory"
-                    )?,
-                }
-                write!(
-                    f,
-                    "; eject it (`lms unload \"{foreign_identifier}\"`) or load it via darkmux — darkmux never touches user state (absolute namespace ownership, #1274), and its own estimated {} copy cannot fit alongside within the {} of pool headroom left after every planned free",
-                    gb(*est_bytes),
-                    gb(*limit_bytes)
-                )
-            }
-            Reason::UnknownModelKey { nearest } => {
-                write!(
-                    f,
-                    "the model key is not in the host catalog — refused before any load attempt could hang or prompt a download (#1276)"
-                )?;
-                if !nearest.is_empty() {
-                    write!(f, "; nearest catalog keys: {}", nearest.join(", "))?;
-                }
-                Ok(())
-            }
+            } => fmt_foreign_no_capacity(f, foreign_identifier, *foreign_bytes, *est_bytes, *limit_bytes),
+            Reason::UnknownModelKey { nearest } => fmt_unknown_model_key(f, nearest),
             Reason::NoLongerDesired => write!(
                 f,
                 "this darkmux-owned resident is not in the desired set — unloading (exclusive-scope reconciliation, pass 1)"
@@ -268,37 +241,95 @@ impl fmt::Display for Reason {
                 "every seat wanting this resident has released it (seats: {}) — unloading once (#1279 refcount)",
                 seats.join(", ")
             ),
-            Reason::BudgetEvict { freeing_bytes, need_bytes, budget_bytes, eviction_order } => {
-                let order = match eviction_order {
-                    EvictionOrder::HostReported => "host-reported order (no recency fact exists yet — this is not LRU)",
-                };
-                write!(
-                    f,
-                    "evicting an idle darkmux-owned resident in {order} to free {freeing_bytes} bytes toward {need_bytes} bytes of pending loads under a {budget_bytes}-byte limit (#1243/#1140)"
-                )
-            }
+            Reason::BudgetEvict { freeing_bytes, need_bytes, budget_bytes, eviction_order } => write!(
+                f,
+                "evicting an idle darkmux-owned resident in {} to free {freeing_bytes} bytes toward {need_bytes} bytes of pending loads under a {budget_bytes}-byte limit (#1243/#1140)",
+                eviction_order.describe()
+            ),
             Reason::BudgetRefuse { est_bytes, budget_bytes } => write!(
                 f,
                 "an estimated {est_bytes}-byte load cannot be satisfied within the {budget_bytes}-byte AI RAM budget by any eviction of darkmux-owned residents — refused (#1243, applies to every caller intent)"
             ),
             Reason::ClaimedResidentInsufficientCtx { identifier, resident_ctx, min_ctx, clearable } => {
-                write!(
-                    f,
-                    "\"{identifier}\" shares this model key but is resident at {resident_ctx} context, below the {min_ctx} this placement needs — it is already claimed"
-                )?;
-                if *clearable {
-                    write!(
-                        f,
-                        " (a live pinned dispatch, same-process or a concurrent darkmux command), so it is never unloaded to reconcile; wait for the claim to clear (a concurrent acquirer racing for this same identifier resolves this automatically once its own load lands — #2672), or lower this placement's own minimum context to {resident_ctx} or below so it reuses the resident as-is instead of reconciling — pointing it at a DIFFERENT identifier does NOT help: residency is decided by model key, not identifier, so an aliased placement collides with this identical claimed resident just the same (#2669)"
-                    )
-                } else {
-                    write!(
-                        f,
-                        " by ANOTHER placement already targeting it earlier in this SAME plan, so it is never unloaded to reconcile; this can never resolve by waiting — the plan is decided from one fixed snapshot, so retrying regenerates the identical collision every time (#2672) — lower this placement's own minimum context to {resident_ctx} or below so it reuses the resident as-is instead of reconciling"
-                    )
-                }
+                fmt_claimed_resident(f, identifier, *resident_ctx, *min_ctx, *clearable)
             }
         }
+    }
+}
+
+impl EvictionOrder {
+    fn describe(self) -> &'static str {
+        match self {
+            EvictionOrder::HostReported => {
+                "host-reported order (no recency fact exists yet — this is not LRU)"
+            }
+        }
+    }
+}
+
+/// [`Reason::ForeignDuplicateNoCapacity`]: names the blocking instance and
+/// its pool cost, then the eject-or-load-via-darkmux suggestion.
+fn fmt_foreign_no_capacity(
+    f: &mut fmt::Formatter<'_>,
+    foreign_identifier: &str,
+    foreign_bytes: Option<u64>,
+    est_bytes: u64,
+    limit_bytes: u64,
+) -> fmt::Result {
+    match foreign_bytes {
+        Some(b) => write!(
+            f,
+            "user-loaded instance \"{foreign_identifier}\" of the needed model occupies {}",
+            gb(b)
+        )?,
+        None => write!(
+            f,
+            "user-loaded instance \"{foreign_identifier}\" of the needed model occupies an unknown amount of memory"
+        )?,
+    }
+    write!(
+        f,
+        "; eject it (`lms unload \"{foreign_identifier}\"`) or load it via darkmux — darkmux never touches user state (absolute namespace ownership, #1274), and its own estimated {} copy cannot fit alongside within the {} of pool headroom left after every planned free",
+        gb(est_bytes),
+        gb(limit_bytes)
+    )
+}
+
+/// [`Reason::UnknownModelKey`], with the nearest catalog keys when any.
+fn fmt_unknown_model_key(f: &mut fmt::Formatter<'_>, nearest: &[String]) -> fmt::Result {
+    write!(
+        f,
+        "the model key is not in the host catalog — refused before any load attempt could hang or prompt a download (#1276)"
+    )?;
+    if !nearest.is_empty() {
+        write!(f, "; nearest catalog keys: {}", nearest.join(", "))?;
+    }
+    Ok(())
+}
+
+/// [`Reason::ClaimedResidentInsufficientCtx`]: the advice differs by
+/// whether waiting can ever clear the claim.
+fn fmt_claimed_resident(
+    f: &mut fmt::Formatter<'_>,
+    identifier: &str,
+    resident_ctx: u64,
+    min_ctx: u32,
+    clearable: bool,
+) -> fmt::Result {
+    write!(
+        f,
+        "\"{identifier}\" shares this model key but is resident at {resident_ctx} context, below the {min_ctx} this placement needs — it is already claimed"
+    )?;
+    if clearable {
+        write!(
+            f,
+            " (a live pinned dispatch, same-process or a concurrent darkmux command), so it is never unloaded to reconcile; wait for the claim to clear (a concurrent acquirer racing for this same identifier resolves this automatically once its own load lands — #2672), or lower this placement's own minimum context to {resident_ctx} or below so it reuses the resident as-is instead of reconciling — pointing it at a DIFFERENT identifier does NOT help: residency is decided by model key, not identifier, so an aliased placement collides with this identical claimed resident just the same (#2669)"
+        )
+    } else {
+        write!(
+            f,
+            " by ANOTHER placement already targeting it earlier in this SAME plan, so it is never unloaded to reconcile; this can never resolve by waiting — the plan is decided from one fixed snapshot, so retrying regenerates the identical collision every time (#2672) — lower this placement's own minimum context to {resident_ctx} or below so it reuses the resident as-is instead of reconciling"
+        )
     }
 }
 
