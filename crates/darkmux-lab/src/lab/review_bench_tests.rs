@@ -883,7 +883,7 @@
         assert_eq!(anchor.value, Some(1.0));
     }
 
-    fn funnel_case() -> Case {
+    fn one_case() -> Case {
         Case {
             id: "c1".into(),
             label: multi_lbl("bug", vec![ef("start.plus(30)", false)]),
@@ -891,23 +891,7 @@
         }
     }
 
-    // ── score() on a no-anchor Confirmed flag ("does score() treat it right?") ──
-
-    // ── LocalJsonlEmitter: file mechanics (#1247 review round) ──────────
-
-    //
-    // A killed 6-case bench must keep every COMPLETED case's envelope —
-    // `run_review_bench`'s per-case loop calls `write_funnels_snapshot`
-    // after every Funnel-mode case, not just at end-of-run. This exercises
-    // the durability contract directly: case 1's snapshot must survive on
-    // disk even when case 2 never gets a chance to write (simulating a
-    // crash/timeout/error between the two cases).
-
     // ── write_scores_artifact ──────────────────────────────────────────
-    //
-    // No test in this module previously constructed a full `ReviewBenchOpts`
-    // — `write_scores_artifact` (and its `debates.json`-first discipline)
-    // had zero direct coverage. These tests exercise it for `funnels.json`.
 
     // (#1465) `role` is now an operator knob (was a `pr-reviewer` constant),
     // so the artifact must snapshot it — otherwise `lab eval coder` and
@@ -922,7 +906,7 @@
             ..Default::default()
         };
         let s = score(&label, &r);
-        let case = funnel_case();
+        let case = one_case();
         let scored: Vec<(&Case, CaseScore)> = vec![(&case, s)];
         let meta = vec![EnvelopeMeta::default()];
         let debates: Vec<super::super::dialectic::DebateEnvelope> = Vec::new();

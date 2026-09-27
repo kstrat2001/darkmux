@@ -179,13 +179,12 @@ impl RemoteBudget {
     ///
     /// (#1610 / #1617 review) A grant too small to hold a reply is worse
     /// than no grant. The call "succeeds," the endpoint truncates mid-reply,
-    /// and the caller reads the debris as a result — silently. For the
-    /// judge bucket specifically, a cap like 60 tokens against a JSON-ruling
-    /// prompt truncated, parsed as `Unparsed`, classified as `Reject`, and
-    /// `multi_pass_confirm` archived the flag on pass 1 with an empty note
-    /// and no confirmation pass — a real finding deleted, and silently:
-    /// because the old code returned `Some`, `skipped` never incremented,
-    /// so no degraded gate fired and the run reported healthy. A flag (or
+    /// and the caller reads the debris as a result — silently. Measured on
+    /// the since-deleted review funnel: a 60-token cap against a JSON-ruling
+    /// prompt truncated, parsed as unparsed, and was read as a rejection —
+    /// a real finding deleted, and silently: because the old code returned
+    /// `Some`, `skipped` never incremented, so no degraded gate fired and
+    /// the run reported healthy. A flag (or
     /// item) that could not be judged must read as UNJUDGED, never as
     /// rejected — the whole point of the skip counter is that a run says
     /// when it did less than it claims.
