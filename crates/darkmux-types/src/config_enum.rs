@@ -2,7 +2,8 @@
 //!
 //! **The rule.** An unregistered value in an enum-typed setting is bad
 //! config. It is never resolved to a fallback, in either direction. Every
-//! entry point that would consume it refuses at preflight, naming the raw
+//! entry point that COULD consume it refuses at preflight (whether or not
+//! one particular run through it would read the value), naming the raw
 //! value, where it was set, and the valid values; `darkmux doctor` reports it
 //! as Fail; `darkmux config set` refuses it; and help lists the valid values
 //! with their meanings.
@@ -23,7 +24,7 @@
 //!    rather than drifting from the value list.
 //! 2. [`ENUM_SETTINGS`], the registry: each entry names the dotted
 //!    `config.json` key, the env var (if any), the enum, the shipped value,
-//!    and the entry-point [`Scope`]s that consume it.
+//!    and the entry-point [`Scope`]s that could consume it.
 //!
 //! From those two: the typed accessors (`config_access::fleet_mode` and
 //! friends) return the value or a [`BadEnumValue`]; [`preflight`] runs one
@@ -158,8 +159,9 @@ pub struct EnumSetting {
     /// The value an absent setting resolves to. A token of `values`
     /// (`every_shipped_value_is_a_registered_token` pins it).
     pub shipped: &'static str,
-    /// The entry points that consume this setting and refuse on a bad
-    /// value. Empty only with a `no_scope_reason`.
+    /// The entry points that could consume this setting, and so refuse on
+    /// a bad value, even for a run that would not read it (conservative on
+    /// purpose: bad config is bad config). Empty only with a `no_scope_reason`.
     pub scopes: &'static [Scope],
     /// Why no entry point preflights this setting, when `scopes` is empty.
     pub no_scope_reason: Option<&'static str>,

@@ -404,8 +404,11 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    Conformance: every detail hash route is named for the `RunKind` it opens.
 
 9. **Enum-valued settings** — an unregistered value in an enum-typed setting is bad config
-   (#2947). It is never resolved to a fallback, in either direction. Every entry point that
-   consumes it refuses at preflight, before minting anything, naming the raw value, where it was
+   (#2947). It is never resolved to a fallback, in either direction. Every entry point that COULD
+   consume it refuses at preflight, before minting anything, even when one particular run through
+   it would not read the value (a tool-less remote dispatch and the thermal ladder, say): bad
+   config is bad config, and a refusal must not depend on which code path a run happens to take.
+   The refusal names the raw value, where it was
    set (env var or `config.json` key) and the valid values; `darkmux doctor` reports it as Fail;
    `darkmux config set` refuses it; and help (`config set <key>` with no value, `config list`,
    `config set --help`) lists the valid values with their meanings. `--skip-preflight` does not

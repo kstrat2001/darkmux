@@ -48,8 +48,9 @@ pub enum ConfigCmd {
         key: String,
     },
     /// Print the full config.json (the durable settings on this machine),
-    /// then (on stderr, so the JSON on stdout stays parseable) every
-    /// enum-valued setting with its valid values and their meanings.
+    /// then, at a terminal (on stderr, so the JSON on stdout stays
+    /// parseable), every enum-valued setting with its valid values and
+    /// their meanings.
     #[command(after_long_help = config_enum::help_block())]
     List,
 }
@@ -264,7 +265,10 @@ const SECRET_KEYS: &[(&str, &str)] = &[
     ("runtime.serve_token", "darkmux-serve-token"),
 ];
 
-pub fn run(cmd: ConfigCmd) -> Result<()> {
+/// Returns the process exit code: `0`, or `2` for `config set <key>` with
+/// no value (it describes the key, and still fails a script that forgot the
+/// value, as the old missing-argument usage error did; #2947 review C7).
+pub fn run(cmd: ConfigCmd) -> Result<i32> {
     // (#1323) ForceUser, not Auto — `darkmux config get/set/list` operates on
     // the user-scope config.json, matching `DarkmuxConfig::load_resolved`. Under
     // Auto a stray project-local `.darkmux/` (missions/phases/lessons) would
@@ -278,17 +282,27 @@ pub fn run(cmd: ConfigCmd) -> Result<()> {
         }
         ConfigCmd::Set { key, value: None } => {
             println!("{}", describe_key_at(&path, &key)?);
+            eprintln!("darkmux config set: no value given for `{key}` (nothing was written)");
+            return Ok(2);
         }
         ConfigCmd::Get { key } => {
             println!("{}", get_at(&path, &key)?);
         }
         ConfigCmd::List => {
             println!("{}", list_at(&path)?);
-            // (#2947) stderr, so `darkmux config list | jq` still parses.
-            eprintln!("\n{}", config_enum::help_block());
+            // (#2947) stderr, so `darkmux config list | jq` still parses,
+            // and only for a person at a terminal: the serve daemon's
+            // config-list console panel keeps the last stderr lines and
+            // shows them as a warning (review C5).
+            if show_value_help_on_list(
+                std::io::IsTerminal::is_terminal(&std::io::stderr()),
+                std::env::var_os("DARKMUX_PANEL").is_some(),
+            ) {
+                eprintln!("\n{}", config_enum::help_block());
+            }
         }
     }
-    Ok(())
+    Ok(0)
 }
 
 /// Look up a key's type, or `None` if it isn't a known settable key. Static
@@ -309,6 +323,12 @@ fn key_type(key: &str) -> Option<Ty> {
     KEYS.iter().find(|(k, _)| *k == key).map(|(_, t)| *t)
 }
 
+/// (#2947 review C5) Whether `config list` prints the enum value help on
+/// stderr: only to a terminal, and never under a console panel.
+fn show_value_help_on_list(stderr_is_tty: bool, under_panel: bool) -> bool {
+    stderr_is_tty && !under_panel
+}
+
 /// Every statically settable key with its type: `KEYS` plus the enum
 /// settings the registry owns (#2947). The dynamic `role_profiles.<role>`
 /// map is not enumerable and is not included.
@@ -326,12 +346,19 @@ fn describe_key_at(path: &Path, key: &str) -> Result<String> {
     let Some(ty) = key_type(key) else {
         bail!("unknown config key `{key}`{}", suggestion(key));
     };
-    let stored = load_object(path)
-        .ok()
-        .and_then(|root| get_path(&root, key).map(|v| v.to_string()))
-        .unwrap_or_else(|| "(unset)".to_string());
+    let stored_value = load_object(path).ok().and_then(|root| get_path(&root, key).cloned());
+    let stored = stored_value.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "(unset)".to_string());
     Ok(match ty {
         Ty::Enum(s) => {
+            // (#2947 review C7) A stored value that is not one of the values
+            // is said to be so here, not just echoed.
+            let stored = match stored_value.as_ref() {
+                Some(Value::String(raw)) if s.canonical(raw).is_none() => {
+                    format!("{stored} - not a valid value; runs that read it refuse to start")
+                }
+                Some(v) if !v.is_string() => format!("{stored} - not a valid value (not a string)"),
+                _ => stored,
+            };
             let env = s.env.map(|e| format!("\n  env override: {e}")).unwrap_or_default();
             format!(
                 "`{key}` takes one of these values ({}):\n{}\n  stored in config.json: {stored}{env}\n  \
@@ -1126,17 +1153,23 @@ mod tests {
     ///
     /// - make `preflight(scope)` refuse for every scope the entry lists,
     ///   naming the raw value, where it was set, and every valid value (and
-    ///   leave every OTHER scope alone: a setting refuses only where it is
-    ///   consumed);
+    ///   leave every scope the entry does NOT list alone). A listed scope
+    ///   refuses even when one particular run through it would never read
+    ///   the setting (a tool-less remote dispatch and the thermal ladder,
+    ///   say): the scopes are where the setting COULD be consumed, and bad
+    ///   config is bad config;
     /// - make its `darkmux doctor` row Fail;
     /// - be refused by `darkmux config set`;
     /// - and the help block must list its values with their meanings.
     ///
     /// It iterates `ENUM_SETTINGS`, so a new enum setting is held to all of
     /// it by being registered. That the ENTRY POINTS call `preflight` is
-    /// proven separately, by spawning them (`tests/enum_config_preflight.rs`)
-    /// and by calling the primitives (darkmux-crew, darkmux-lab,
-    /// darkmux-fleet), since a direct `preflight` call cannot show that.
+    /// proven separately, by spawning them (`tests/cli.rs`,
+    /// `every_enum_setting_is_refused_by_every_cli_entry_point_that_consumes_it`
+    /// and `radio_refuses_bad_enum_config_before_routing`) and by calling
+    /// the primitives (darkmux-crew, darkmux-lab, darkmux-fleet,
+    /// darkmux-serve's listener), since a direct `preflight` call cannot
+    /// show that.
     #[serial_test::serial]
     #[test]
     fn every_enum_setting_obeys_the_rule_on_every_surface() {
@@ -1196,6 +1229,26 @@ mod tests {
                 assert!(preflight(scope).is_ok(), "{}: {scope:?} still refusing after cleanup", s.key);
             }
         }
+    }
+
+    /// (#2947 review C7) `config set <key>` with no value names a stored
+    /// invalid value as invalid.
+    #[test]
+    fn describe_names_a_stored_invalid_value_as_invalid() {
+        let f = tmp();
+        std::fs::write(f.path(), r#"{"fleet":{"mode":"hubb"}}"#).unwrap();
+        let out = describe_key_at(f.path(), "fleet.mode").unwrap();
+        assert!(out.contains("\"hubb\" - not a valid value"), "{out}");
+        std::fs::write(f.path(), r#"{"fleet":{"mode":"hub"}}"#).unwrap();
+        let out = describe_key_at(f.path(), "fleet.mode").unwrap();
+        assert!(!out.contains("not a valid value"), "{out}");
+    }
+
+    #[test]
+    fn config_list_value_help_is_for_a_terminal_only() {
+        assert!(show_value_help_on_list(true, false));
+        assert!(!show_value_help_on_list(false, false), "piped or captured stderr gets nothing");
+        assert!(!show_value_help_on_list(true, true), "a console panel gets nothing");
     }
 
     /// (#2947) Help lists every registered enum setting's values with their

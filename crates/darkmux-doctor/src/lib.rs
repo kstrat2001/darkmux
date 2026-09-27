@@ -135,7 +135,7 @@ fn check_build_info() -> Check {
 }
 
 pub fn run() -> DoctorReport {
-    let checks = vec![
+    let mut checks = vec![
         check_build_info(),
         check_profile_registry(),
         check_crews_residue(),
@@ -188,7 +188,11 @@ pub fn run() -> DoctorReport {
         check_host_sampler(),
         check_liveness_retention(),
         check_generation_checkpoint_interval(),
-        check_thermal_governor(),
+    ];
+    // (#2947) `None` when a thermal threshold is bad config; that value's
+    // own enum-settings row reports it.
+    checks.extend(check_thermal_governor());
+    checks.extend(vec![
         check_host_probe(),
         check_quarantined_mirrors(),
         checks_power::check_power_posture(),
@@ -210,7 +214,7 @@ pub fn run() -> DoctorReport {
         check_legacy_mission_layout(),
         check_legacy_compaction_extras(),
         check_mission_envelope_readability(),
-    ];
+    ]);
     let checks = [checks, check_enum_settings(), check_hooks(), eureka_checks()].concat();
     DoctorReport { checks }
 }
@@ -1979,7 +1983,17 @@ pub fn check_enum_settings() -> Vec<Check> {
             Err(bad) => Check {
                 name: s.key.into(),
                 status: Status::Fail,
-                message: format!("{}. Runs that read it refuse to start (#2947)", bad.summary()),
+                // (#2947 review C6) Say what actually happens: which entry
+                // points refuse, or, for a setting no work-starting entry
+                // point reads, the registry's own stated reason.
+                message: match s.no_scope_reason {
+                    None => format!(
+                        "{}. Refused at preflight by: {} (#2947)",
+                        bad.summary(),
+                        s.scopes.iter().map(|sc| sc.label()).collect::<Vec<_>>().join(", ")
+                    ),
+                    Some(reason) => format!("{}. Nothing refuses to start over it: {reason} (#2947)", bad.summary()),
+                },
                 hint: Some(format!("{}. {}", bad.valid_line(), bad.fix())),
             },
         })
@@ -3727,7 +3741,10 @@ fn check_generation_checkpoint_interval() -> Check {
 /// actually watches thermal samples lives in
 /// `darkmux_crew::thermal_governor` and is exercised by its own tests, not
 /// by doctor.
-fn check_thermal_governor() -> Check {
+/// (#2947) `None` when `pause_at`/`resume_at` is bad config: that value is
+/// reported ONCE, as Fail, by its generic enum-settings row, and there is no
+/// ladder to describe (every run refuses at preflight).
+fn check_thermal_governor() -> Option<Check> {
     let name = "runtime.thermal";
     let env_raw = std::env::var("DARKMUX_THERMAL_ENABLED")
         .ok()
@@ -3746,36 +3763,25 @@ fn check_thermal_governor() -> Check {
     };
     let enabled = darkmux_types::config_access::thermal_enabled();
     if !enabled {
-        return Check {
+        return Some(Check {
             name: name.into(),
             status: Status::Pass,
             message: format!("disabled ({provenance}) — no thermal pausing or breaking"),
             hint: None,
-        };
+        });
     }
-    // (#2947) A bad `pause_at`/`resume_at` is reported as Fail by the
-    // generic enum-settings row (`check_enum_settings`), which names the
+    // (#2947) A bad `pause_at`/`resume_at` is reported ONCE, as Fail, by
+    // its generic enum-settings row (`check_enum_settings`), which names the
     // value, where it was set and the valid values. This check describes
     // the ladder a VALID pair produces; with a bad one there is no ladder
-    // to describe, because every run refuses at preflight.
+    // to describe (every run refuses at preflight), so it adds no row.
     let (pause_at, resume_at) = match (
         darkmux_types::config_access::thermal_pause_at(),
         darkmux_types::config_access::thermal_resume_at(),
     ) {
         (Ok(p), Ok(r)) => (p.as_str().to_string(), r.as_str().to_string()),
-        (p, r) => {
-            let bad: Vec<String> = [p.err(), r.err()].into_iter().flatten().map(|b| b.summary()).collect();
-            return Check {
-                name: name.into(),
-                status: Status::Fail,
-                message: format!(
-                    "not evaluated: {}. Every dispatch, mission launch and lab run refuses until \
-                     it is fixed (#2947)",
-                    bad.join("; ")
-                ),
-                hint: Some("See the `runtime.thermal.*` row(s) for the valid values and the fix.".into()),
-            };
-        }
+        // One row per bad value (review): the enum-settings row is it.
+        _ => return None,
     };
     let resume_hold_ms = darkmux_types::config_access::thermal_resume_hold_ms();
     let max_pause_ms = darkmux_types::config_access::thermal_max_pause_ms();
@@ -4044,15 +4050,15 @@ fn check_thermal_governor() -> Check {
                 seen.push(remedy);
             }
         }
-        return Check {
+        return Some(Check {
             name: name.into(),
             status: Status::Warn,
             message: sentences.join(" "),
             hint: Some(seen.join(" ")),
-        };
+        });
     }
 
-    Check {
+    Some(Check {
         name: name.into(),
         status: Status::Pass,
         message: format!(
@@ -4071,7 +4077,7 @@ fn check_thermal_governor() -> Check {
             }
         ),
         hint: None,
-    }
+    })
 }
 
 /// (#2108) Which host-probe SOURCES actually resolved on this machine, and
@@ -9286,6 +9292,19 @@ mod tests {
                 assert_eq!(c.status, Status::Fail, "{}: {c:?}", s.key);
                 assert!(c.message.contains("`zz-unknown`") && c.message.contains(s.key), "{c:?}");
                 assert!(c.message.contains("config.json"), "names where it was set: {c:?}");
+                // (#2947 review C6) The row's claim matches the registry:
+                // the entry points that refuse, or the stated reason none do.
+                match s.no_scope_reason {
+                    None => {
+                        for sc in s.scopes {
+                            assert!(c.message.contains(sc.label()), "{}: row omits `{}`: {c:?}", s.key, sc.label());
+                        }
+                    }
+                    Some(reason) => {
+                        assert!(c.message.contains(reason), "{}: row omits the no-scope reason: {c:?}", s.key);
+                        assert!(!c.message.contains("Refused at preflight"), "{}: claims a refusal: {c:?}", s.key);
+                    }
+                }
                 let hint = c.hint.clone().unwrap_or_default();
                 for (t, _) in s.values {
                     assert!(hint.contains(t), "{}: valid value `{t}` missing from {hint}", s.key);
@@ -11377,7 +11396,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn thermal_governor_fails_on_unrecognized_pause_at() {
+    fn an_unrecognized_pause_at_is_one_fail_row_not_two() {
         // (#2110/#2109 review finding 6) A typo'd pause_at silently
         // inverted the governor's intent. (#2947) It is now bad config:
         // the thermal row does not describe a ladder that no run will get
@@ -11385,10 +11404,12 @@ mod tests {
         let prev = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
         unsafe { std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "seroius") };
 
-        let check = check_thermal_governor();
-        assert_eq!(check.status, Status::Fail);
-        assert!(check.message.contains("seroius"), "{}", check.message);
-        assert!(check.message.contains("DARKMUX_THERMAL_PAUSE_AT"), "{}", check.message);
+        // (#2947) One row per bad value: the thermal row steps aside and
+        // the generic `runtime.thermal.pause_at` row is the Fail.
+        assert!(check_thermal_governor().is_none(), "a second row for the same bad value");
+        let generic = check_enum_settings().into_iter().find(|c| c.name == "runtime.thermal.pause_at").unwrap();
+        assert_eq!(generic.status, Status::Fail);
+        assert!(generic.message.contains("seroius") && generic.message.contains("DARKMUX_THERMAL_PAUSE_AT"), "{}", generic.message);
 
         unsafe {
             match prev {
@@ -11408,7 +11429,7 @@ mod tests {
         let prev = std::env::var("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES").ok();
         unsafe { std::env::set_var("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES", "0") };
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Warn);
         assert!(check.message.contains("speed_limit_hold_samples"), "{}", check.message);
         assert!(check.message.contains("coerced to 1"), "{}", check.message);
@@ -11435,7 +11456,7 @@ mod tests {
             std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "fair");
         }
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("pause_at"), "{}", check.message);
         assert!(check.message.contains("resume_at"), "{}", check.message);
@@ -11458,7 +11479,7 @@ mod tests {
             std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "fair");
             std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "nominal");
         }
-        let nominal_resume = check_thermal_governor();
+        let nominal_resume = check_thermal_governor().expect("a thermal row");
         assert_eq!(
             nominal_resume.status,
             Status::Warn,
@@ -11476,7 +11497,7 @@ mod tests {
             std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "serious");
             std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "fair");
         }
-        let ok_check = check_thermal_governor();
+        let ok_check = check_thermal_governor().expect("a thermal row");
         assert_eq!(
             ok_check.status,
             Status::Pass,
@@ -11489,7 +11510,7 @@ mod tests {
             std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "fair");
             std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "serious");
         }
-        let inverted = check_thermal_governor();
+        let inverted = check_thermal_governor().expect("a thermal row");
         assert_eq!(inverted.status, Status::Warn, "{}", inverted.message);
 
         unsafe {
@@ -11517,7 +11538,7 @@ mod tests {
             std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "fair");
         }
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         let lower = check.message.to_ascii_lowercase();
         assert!(
@@ -11567,7 +11588,7 @@ mod tests {
             "the resolved value must be the canonical token the governor's band resolution \
              (thermal_bands::ThermalBands) matches against"
         );
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(
             check.message.contains("pause at `serious`"),
@@ -11593,7 +11614,7 @@ mod tests {
         let prev = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
         unsafe { std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "critical") };
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(
             check.message.contains("breaker"),
@@ -11639,7 +11660,7 @@ mod tests {
                 std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", pause_at);
                 std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "nominal");
             }
-            let check = check_thermal_governor();
+            let check = check_thermal_governor().expect("a thermal row");
             assert_eq!(
                 check.status,
                 Status::Warn,
@@ -11702,7 +11723,7 @@ mod tests {
             notes.disarm_notes()
         );
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         let hint = check.hint.clone().unwrap_or_default();
         for note in notes.disarm_notes() {
@@ -11771,7 +11792,7 @@ mod tests {
         let _resume = EnvGuard::set("DARKMUX_THERMAL_RESUME_AT", "fair");
         let _max = EnvGuard::set("DARKMUX_THERMAL_MAX_PAUSE_MS", "0");
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(
             !check.message.contains("after 0ms"),
@@ -11800,7 +11821,7 @@ mod tests {
         let _resume = EnvGuard::set("DARKMUX_THERMAL_RESUME_AT", "fair");
         let _floor = EnvGuard::set("DARKMUX_THERMAL_MIN_CPU_SPEED_LIMIT_PCT", "0");
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(
             !check.message.contains("< 0%"),
@@ -11837,7 +11858,7 @@ mod tests {
         let _floor = EnvGuard::set("DARKMUX_THERMAL_MIN_CPU_SPEED_LIMIT_PCT", "50");
         let _hold = EnvGuard::set("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES", "3");
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(
             check.message.contains("after 900000ms of one pause episode"),
@@ -11872,7 +11893,7 @@ mod tests {
 
         for value in ["101", "500"] {
             let _floor = EnvGuard::set("DARKMUX_THERMAL_MIN_CPU_SPEED_LIMIT_PCT", value);
-            let check = check_thermal_governor();
+            let check = check_thermal_governor().expect("a thermal row");
             assert_eq!(check.status, Status::Warn, "floor={value}: {}", check.message);
             assert!(
                 check.message.contains("min_cpu_speed_limit_pct") && check.message.contains(value),
@@ -11896,7 +11917,7 @@ mod tests {
         // with no cap recorded reads exactly 100, which is NOT below it.
         // Pinned so the guard above cannot drift down onto a real setting.
         let _floor = EnvGuard::set("DARKMUX_THERMAL_MIN_CPU_SPEED_LIMIT_PCT", "100");
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Pass, "floor=100: {}", check.message);
         assert!(
             check.message.contains("cpu_speed_limit_pct < 100%"),
@@ -11938,7 +11959,7 @@ mod tests {
             "this test needs a pair that DOES produce a disarm note"
         );
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         // Both verdicts, in one pass — neither hides the other.
         assert!(
@@ -11985,7 +12006,7 @@ mod tests {
         let _hold = EnvGuard::set("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES", "0");
         let _ratchet = EnvGuard::set("DARKMUX_THERMAL_RATCHET_FACTOR", "0");
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("DISARMED"), "{}", check.message);
         assert!(
@@ -12019,7 +12040,7 @@ mod tests {
         let _resume = EnvGuard::set("DARKMUX_THERMAL_RESUME_AT", "fair");
         let _hold = EnvGuard::set("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES", "0");
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(
             !check.message.contains("  "),
@@ -12049,7 +12070,7 @@ mod tests {
         let _duty = EnvGuard::set("DARKMUX_THERMAL_DUTY_DELAY_MS", "0");
         let _ratchet = EnvGuard::set("DARKMUX_THERMAL_RATCHET_FACTOR", "2");
 
-        let check = check_thermal_governor();
+        let check = check_thermal_governor().expect("a thermal row");
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(
             !check.message.contains("starts at 0ms"),
@@ -12066,7 +12087,7 @@ mod tests {
         // The non-degenerate rendering is pinned too, so the branch above
         // cannot be "fixed" by calling every duty delay inert.
         let _live = EnvGuard::set("DARKMUX_THERMAL_DUTY_DELAY_MS", "15000");
-        let live = check_thermal_governor();
+        let live = check_thermal_governor().expect("a thermal row");
         assert_eq!(live.status, Status::Pass, "{}", live.message);
         assert!(
             live.message.contains("starts at 15000ms and ratchets x2"),

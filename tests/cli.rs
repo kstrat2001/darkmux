@@ -12151,24 +12151,28 @@ fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-/// (#2947) The two runtime help surfaces, as an operator types them:
-/// `config list` prints every enum setting's values with their meanings (on
-/// stderr, so its stdout stays JSON), and `config set <key>` with no value
-/// prints that key's values with their meanings.
+/// (#2947) `config set <key>` with no value prints that key's values with
+/// their meanings (and exits 2, review C7: a forgotten value still fails a
+/// script). `config list` prints its value help only to a terminal, so a
+/// captured run (a pipe, or the daemon's config-list console panel, which
+/// shows stderr as a warning; review C5) has EMPTY stderr.
 #[test]
-fn config_list_and_bare_config_set_list_every_enum_value_with_its_meaning() {
+fn bare_config_set_lists_every_enum_value_and_config_list_keeps_captured_stderr_empty() {
     use darkmux_types::config_enum::ENUM_SETTINGS;
-    let out = darkmux_cmd().args(["config", "list"]).output().unwrap();
-    assert!(out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    for s in ENUM_SETTINGS {
-        assert!(stderr.contains(s.key), "`config list` does not list {}: {stderr}", s.key);
-        for (t, m) in s.values {
-            assert!(stderr.contains(t) && stderr.contains(m), "`config list` lacks {}={t}: {stderr}", s.key);
+    for panel in [None, Some("config-list")] {
+        let mut cmd = darkmux_cmd();
+        cmd.args(["config", "list"]);
+        if let Some(p) = panel {
+            cmd.env("DARKMUX_PANEL", p);
         }
+        let out = cmd.output().unwrap();
+        assert!(out.status.success());
+        assert!(out.stderr.is_empty(), "captured `config list` wrote stderr: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    for s in ENUM_SETTINGS {
         let out = darkmux_cmd().args(["config", "set", s.key]).output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(out.status.success(), "`config set {}` with no value failed", s.key);
+        assert_eq!(out.status.code(), Some(2), "`config set {}` with no value must exit 2", s.key);
         for (t, m) in s.values {
             assert!(stdout.contains(t) && stdout.contains(m), "`config set {}` lacks {t}: {stdout}", s.key);
         }

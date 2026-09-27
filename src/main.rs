@@ -195,10 +195,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             flow_cli::run(sub)?;
             Ok(0)
         }
-        Cmd::Config { sub } => {
-            config_cmd::run(sub)?;
-            Ok(0)
-        }
+        Cmd::Config { sub } => config_cmd::run(sub),
         Cmd::Init {
             with_hook,
             with_claude_md,
