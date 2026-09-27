@@ -87,6 +87,7 @@ use darkmux_crew::envelope::MissionOutcomeStatus;
 use darkmux_crew::step_kinds::StepKindRegistry;
 use darkmux_crew::types::{Mission, MissionStatus, Phase, PhaseStatus, Step, Task};
 use darkmux_flow::FlowAction;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path as StdPath, PathBuf};
 
@@ -831,7 +832,7 @@ fn flow_mission_to_run(
         .iter()
         .filter_map(|s| flow_index.get(s.as_str()).map(|a| (s.as_str(), a)))
         .collect();
-    let any_live = sessions.iter().any(|(_, s)| session_is_live(s, now_ms));
+    let any_live = mission_status_sessions(mission_id, &sessions).iter().any(|s| session_is_live(s, now_ms));
     let status = match (&agg.terminal_ts, agg.terminal_was_abort) {
         // #1627 again: abort is teardown, not success.
         (Some(_), true) => RunStatus::Abandoned,
@@ -1326,29 +1327,19 @@ fn mission_to_run(
         .finalized_ts
         .or_else(|| terminal_ts_str.as_deref().and_then(parse_flow_ts));
 
-    // (#1979 QA gate) STATUS is computed only over sessions this mission can
+    // (#1979 QA gate) STATUS is computed only over what this mission can
     // legitimately claim. A `session_id` whose records span more than one
-    // mission is corrupt for this purpose — `session_id::task` hashes only
-    // `task_id`, which comes straight out of a mission CONFIG
-    // (`crew::scheduler`'s own doc), so every run of `coder-phase.json`
-    // shares `task-build-coder`. Feeding such an agg into
-    // `mission_run_status` lets one mission read Running off ANOTHER
-    // mission's activity clock: the agg is permanently non-terminal (its
-    // records are `step start`/`step complete`, which
-    // `run_lifecycle.rs`'s `ending_of` maps to `None`), so it both disables the
-    // all-terminal branch and keeps `session_is_live` true. `is_ambiguous`
-    // is the detector that already exists for exactly this corruption.
-    // Membership (`sessions`) deliberately keeps them — claiming the
-    // session still suppresses a ghost row; only STATUS is narrowed.
-    //
-    // (#2487) Mapped off `unambiguous_sessions` rather than re-running the
-    // same `!is_ambiguous()` filter 130 lines below where it was already
-    // computed. The reason is the one `session_id`'s own doc gives above:
-    // two separately-written implementations of one guard can drift apart,
-    // and a drift here would silently split STATUS off from the attribute
-    // and ordering fields that are supposed to describe the same sessions.
-    let sessions_bare: Vec<&SessionAgg> =
-        unambiguous_sessions.iter().map(|(_, s)| *s).collect();
+    // mission is shared — `session_id::task` hashes only `task_id`, which
+    // comes straight out of a mission CONFIG (`crew::scheduler`'s own doc),
+    // so every run of `coder-phase.json` shares `task-build-coder` — and its
+    // settled fields are its CURRENT attempt's, possibly another mission's.
+    // Such a session is read through this mission's own attempts on it
+    // (`mission_status_sessions`), never refused: refusing it left a mission
+    // whose only session was shared reading Abandoned while it ran, and
+    // radio's busy check (`local_dispatch_status`, the same helper) missing
+    // that seat.
+    let status_sessions = mission_status_sessions(&mission.id, &sessions);
+    let sessions_bare: Vec<&SessionAgg> = status_sessions.iter().map(|s| s.as_ref()).collect();
     let status = mission_run_status(mission, &sessions_bare, now_ms);
     // (#1907) `mission_run_status` has exactly ONE arm that reaches
     // `Abandoned` via a deliberate teardown — `MissionStatus::Aborted =>
@@ -1443,6 +1434,19 @@ fn mission_to_run(
 /// is the activity anchor for that case.
 fn mission_run_status(mission: &Mission, sessions: &[&SessionAgg], now_ms: u64) -> RunStatus {
     mission_run_status_and_evidence(mission, sessions, now_ms).0
+}
+
+/// The sessions a mission's STATUS reads, each as that mission reads it:
+/// an unambiguous session as it is; one several missions share (#1918)
+/// through the mission's own attempts on it ([`SessionAgg::for_mission`]),
+/// dropped only when the mission has none there. Its attributes (role,
+/// model, machine, endpoint) stay refused: those are the whole session's,
+/// not per attempt.
+fn mission_status_sessions<'a>(mission_id: &str, sessions: &[(&str, &'a SessionAgg)]) -> Vec<Cow<'a, SessionAgg>> {
+    sessions
+        .iter()
+        .filter_map(|(_, s)| if s.is_ambiguous() { s.for_mission(mission_id).map(Cow::Owned) } else { Some(Cow::Borrowed(*s)) })
+        .collect()
 }
 
 /// (#2682 fix-pass) As [`mission_run_status`], but for the `Active`/`Paused`
@@ -1790,13 +1794,10 @@ pub fn local_dispatch_status(
             let step_sessions = collect_mission_step_sessions(mission);
             let candidates =
                 mission_candidate_sessions(mission, &step_sessions, &mission_id_index, &flow_index);
-            // (#2487) The SAME `!is_ambiguous()` filter `mission_to_run`
-            // applies before it ever calls `mission_run_status` — see that
-            // function's own comment for why an unfiltered pool would let
-            // a session shared across missions win a verdict it has no
-            // right to.
-            let sessions_bare: Vec<&SessionAgg> =
-                candidates.iter().filter(|(_, s)| !s.is_ambiguous()).map(|(_, s)| *s).collect();
+            // The SAME pool `mission_to_run` judges its row by, so radio's
+            // busy check and `/runs` never disagree about one mission.
+            let status_sessions = mission_status_sessions(&mission.id, &candidates);
+            let sessions_bare: Vec<&SessionAgg> = status_sessions.iter().map(|s| s.as_ref()).collect();
             let verdict = mission_run_status_and_evidence(mission, &sessions_bare, now_ms);
             (mission.id.clone(), verdict)
         })
@@ -2343,7 +2344,25 @@ struct SessionAgg {
 impl SessionAgg {
     /// The attempt-scoped fields, from the current attempt.
     fn settle(&mut self) {
-        let Some(a) = self.lifecycle.latest() else { return };
+        let latest = self.lifecycle.latest();
+        self.settle_from(latest);
+    }
+
+    /// This session as `mission` reads it: its attempt-scoped fields from
+    /// that mission's own latest attempt on it (`RunFold::latest_of`), every
+    /// other field as the session's. `None` when the mission has no attempt
+    /// here. What a mission's status reads off a session several missions
+    /// share (#1918), instead of refusing it: the attempts are per mission,
+    /// so no other mission's activity or terminal reaches it.
+    fn for_mission(&self, mission: &str) -> Option<SessionAgg> {
+        let attempt = self.lifecycle.latest_of(mission)?;
+        let mut scoped = SessionAgg { lifecycle: crate::run_lifecycle::RunFold::default(), ..self.clone() };
+        scoped.settle_from(Some(attempt));
+        Some(scoped)
+    }
+
+    fn settle_from(&mut self, attempt: Option<crate::run_lifecycle::Attempt>) {
+        let Some(a) = attempt else { return };
         let ending = a.ending();
         self.has_start = a.has_start;
         self.has_wait = a.waited;
@@ -3912,7 +3931,7 @@ mod tests {
     /// closes MUST FIX 2, exactly as the review predicted.
     #[test]
     #[serial_test::serial]
-    fn local_dispatch_status_ambiguous_session_reads_no_attributable_session_not_stale() {
+    fn local_dispatch_status_reads_a_shared_session_by_the_missions_own_attempts() {
         let _g = CrewGuard::new();
         // (MUST FIX 2) 60s knob → a 120s budget. Without this pin the
         // 90-minute distance below is measured against whatever
@@ -3929,10 +3948,10 @@ mod tests {
         darkmux_crew::lifecycle::save_mission(&m).unwrap();
 
         // Two DIFFERENT missions' records under the SAME session_id, both
-        // fresh (the review's "emitted AT THE CURRENT SECOND") — live work
-        // by the clock, but not ATTRIBUTABLE to `m` once ambiguity is
-        // refused.
-        let now_iso = format!("{}T00:00:00Z", today());
+        // fresh (the review's "emitted AT THE CURRENT SECOND"). The session
+        // is ambiguous, but its attempts are per mission, so `m` reads its
+        // OWN attempt on it: live work, never "no attributable session".
+        let now_iso = darkmux_flow::ts_utc_now();
         write_day_file(
             flows.path(),
             &today(),
@@ -3957,12 +3976,40 @@ mod tests {
         let status = local_dispatch_status(std::slice::from_ref(&m), flows.path(), &[]);
         let (verdict, evidence) =
             status.get(&m.id).copied().unwrap_or_else(|| panic!("no entry for {}", m.id));
-        assert_eq!(verdict, RunStatus::Abandoned, "unchanged by this fix — #1918 territory");
+        assert_eq!(verdict, RunStatus::Running, "m's own step started this second on the shared session");
+        assert_eq!(evidence, None, "a live mission names no abandonment evidence");
+        // `/runs` and radio's busy check read the same mission the same way.
+        let runs = build_runs(flows.path(), None, &[]);
+        let row = runs.iter().find(|r| r.id == m.id).unwrap_or_else(|| panic!("no row for {}: {runs:?}", m.id));
+        assert_eq!(row.status, verdict, "/runs disagreed with local_dispatch_status: {row:?}");
+    }
+
+    /// A session shared by two missions the mission store does not know
+    /// (rows built from the flow stream, `flow_mission_to_run`): each row
+    /// reads its OWN mission's attempt on the session, never the other's.
+    #[test]
+    #[serial_test::serial]
+    fn a_flow_mission_row_reads_its_own_attempt_on_a_shared_session() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let now = now_unix();
+        let at = |secs_ago: u64| darkmux_flow::ts_utc_at(now.saturating_sub(secs_ago) as i64);
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({ "ts": at(3600), "action": "dispatch start", "session_id": "task-shared-ghost", "mission_id": "ghost-a", "handle": "coder" }),
+                serde_json::json!({ "ts": at(20), "action": "dispatch start", "session_id": "task-shared-ghost", "mission_id": "ghost-b", "handle": "coder" }),
+                serde_json::json!({ "ts": at(5), "action": "dispatch turn", "session_id": "task-shared-ghost", "mission_id": "ghost-b" }),
+            ],
+        );
+        let runs = build_runs(flows.path(), None, &[]);
+        let row = |id: &str| runs.iter().find(|r| r.id == id).unwrap_or_else(|| panic!("no row for {id}: {runs:?}")).clone();
+        assert_eq!(row("ghost-b").status, RunStatus::Running, "ghost-b is mid-turn on the shared session");
         assert_eq!(
-            evidence,
-            Some(DispatchSessionEvidence::NoAttributableSession),
-            "an ambiguous, freshly-active session must never read as a STALE one — there is no \
-             attributable session here at all"
+            row("ghost-a").status,
+            RunStatus::Abandoned,
+            "ghost-a went silent an hour ago: ghost-b's turn on the shared session is not its activity"
         );
     }
 
@@ -4570,13 +4617,13 @@ mod tests {
     /// read exactly as `/runs` reads it: the settled session's current
     /// attempt. The daemon has no `waiting` phase of its own (a held call is
     /// `Running`), so `open` and `waiting` both read `running` here.
-    fn daemon_judgement(agg: &SessionAgg, now_ms: u64) -> (&'static str, RunStatus, Option<AbandonReason>) {
+    fn daemon_judgement(agg: &SessionAgg, opened: bool, now_ms: u64) -> (&'static str, RunStatus, Option<AbandonReason>) {
         if let Some(status) = agg.terminal_status {
             let reason = (status == RunStatus::Abandoned)
                 .then_some(if agg.stopped_by_operator { AbandonReason::Aborted } else { AbandonReason::NoTerminal });
             return ("closed", status, reason);
         }
-        if agg.lifecycle.latest().is_none() {
+        if !opened {
             return ("not_started", RunStatus::Planned, None);
         }
         if session_is_live(agg, now_ms) {
@@ -4587,7 +4634,9 @@ mod tests {
 
     /// `tests/lifecycle/cases.json`, asserted against the daemon's session
     /// fold (`run_lifecycle.rs`) and [`session_is_live`]: the same file the
-    /// viewer's `lifecycle.corpus.test.ts` asserts against `lifecycleAt`.
+    /// viewer's `lifecycle.corpus.test.ts` asserts against `lifecycleAt`. A
+    /// case naming its run's mission reads the session as that mission does
+    /// ([`SessionAgg::for_mission`]).
     /// Each case's records up to its instant (an unparsable `ts` is always
     /// in) are folded as `/runs` folds a day file; a case the daemon cannot
     /// judge names why (`server_skip_reason`); every other case must agree,
@@ -4623,10 +4672,14 @@ mod tests {
                 judged += 1;
                 continue;
             };
-            if let Some(m) = case["run"]["mission_id"].as_str() {
-                assert_eq!(agg.lifecycle.latest().and_then(|a| a.mission), Some(m.to_string()), "{name}: the daemon judges a session's current run");
-            }
-            let (phase, status, reason) = daemon_judgement(agg, now_s * 1_000);
+            // A case naming its run's mission is judged as `/runs` judges
+            // that mission's row: by its own attempts on the session.
+            let scoped = case["run"]["mission_id"].as_str().map(|m| agg.for_mission(m));
+            let (phase, status, reason) = match &scoped {
+                Some(None) => ("not_started", RunStatus::Planned, None),
+                Some(Some(mine)) => daemon_judgement(mine, true, now_s * 1_000),
+                None => daemon_judgement(agg, agg.lifecycle.latest().is_some(), now_s * 1_000),
+            };
             let want_phase = match case["phase"].as_str().expect("phase") {
                 "open" | "waiting" => "running",
                 other => other,

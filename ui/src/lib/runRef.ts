@@ -12,9 +12,11 @@
  *
  * Attribution. A record naming a `mission_id` belongs to that mission's
  * attempt. A record naming none (the presence reconciler's `session.end`,
- * some bookends) belongs to the attempt open, or latest opened, at its time:
- * in a session two missions share, a close with no mission closes the run
- * that was running, never a group of its own.
+ * some bookends) belongs to the latest attempt still open at its time, or
+ * the latest opened when none is: in a session two missions share, a close
+ * with no mission closes the run that was running, never a group of its own.
+ * Under two missions running at once on one session (#2125) a mission-less
+ * record cannot say which it belongs to, and joins the one opened last.
  *
  * The index is built once per window ARRAY (a `WeakMap` on its identity):
  * a window array is never mutated after it is first read, and every

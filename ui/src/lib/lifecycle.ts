@@ -20,10 +20,11 @@
  *    first opening record (a `dispatch.start`, a `budget.wait`, a
  *    `mission.start`, a `step.start`, or, when nothing opened yet, any
  *    turn, heartbeat, tool call or rest). A record naming a mission joins
- *    that mission's latest attempt; one naming none joins the attempt open
- *    at its time. A `dispatch.start` in an attempt that already has one, or
- *    any reopening record after the attempt closed, starts the next
- *    attempt (a relaunch under the same id). The attempt current as of t is
+ *    that mission's latest attempt; one naming none joins the latest
+ *    attempt still open at its time, or the latest opened when none is. A
+ *    `dispatch.start` in an attempt that already has one, or any reopening
+ *    record after the attempt closed, starts the next attempt (a relaunch
+ *    under the same id). The attempt current as of t is
  *    the latest one opened by t.
  * 2. Close. An attempt closes on its earliest closing record: a dispatch or
  *    step terminal, `session.end`, `budget.stop`, `mission.close` or
@@ -210,13 +211,20 @@ function latestOf(attempts: readonly Building[], m: string): Building | null {
   return null;
 }
 
+/** The latest attempt still open (no close yet), or `null`. */
+function latestOpen(attempts: readonly Building[]): Building | null {
+  for (let i = attempts.length - 1; i >= 0; i--) if (attempts[i].close === null) return attempts[i];
+  return null;
+}
+
 /** The attempt a record joins (rule 1): a record naming a mission joins
  *  that mission's latest attempt, or adopts the current attempt when that
- *  one names no mission yet; a record naming none joins the attempt open
- *  (or latest opened) at its time. `null`: it belongs to no attempt yet. */
+ *  one names no mission yet; a record naming none joins the latest attempt
+ *  still open at its time, or the latest opened when none is. `null`: it
+ *  belongs to no attempt yet. */
 function targetFor(attempts: readonly Building[], m: string | null): Building | null {
   const cur = attempts.at(-1) ?? null;
-  if (!m) return cur;
+  if (!m) return latestOpen(attempts) ?? cur;
   return latestOf(attempts, m) ?? (cur && cur.missionId === null ? cur : null);
 }
 
