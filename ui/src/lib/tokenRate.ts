@@ -483,12 +483,13 @@ export interface LiveStateReading {
   /** (#2950) Alongside `restReason`: the reason without its state
    *  (`restReasonWord`), for the phone-width fleet card. */
   restReasonWord?: string;
-  /** (#2890) Present only when `state === "tools"` and a tool of the CURRENT
-   *  turn has completed: the latest completed call's `tool_name`, which the
-   *  scope's TOOLS center draws as an icon. `dispatch.tool` is emitted on
-   *  completion, so before a turn's first completion there is no name yet
-   *  (the icon falls back to the gear). A previous turn's tool never carries
-   *  over. */
+  /** (#2890) Present only when `state === "tools"`: the tool of the call
+   *  RUNNING NOW, which the scope's TOOLS center draws as an icon and the
+   *  run page's readout names. (#2963) From the turn record's
+   *  `tool_names[k]` (FLOW 1.64.0), k = calls of this turn completed so far;
+   *  with no list, the writing heartbeat's name for a turn of one call until
+   *  it completes. Never a completed call's name: absent (the neutral TOOLS
+   *  state, the gear) whenever the running call's tool is unknown. */
   toolName?: string;
   /** (#2963) Present only when `state === "tools"` and the file of the call
    *  RUNNING NOW is known: the turn record's `tool_paths[k]` (FLOW 1.64.0),
@@ -595,15 +596,20 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
   // when the turn record does not say how many calls it made (older
   // records), and then a completion reads as TOOLS, the old behavior.
   let pendingTools: number | null = null;
-  // (#2890) The latest completed tool of the current turn, reset at each turn
-  // boundary so an earlier turn's tool never names this one.
+  // (#2963) With no `tool_names`, the only name that can be the RUNNING
+  // call's: the writing heartbeat's, for a turn of one call (with several,
+  // it names the last call written, not the first to run), and only until
+  // that call completes. A completed call's name is never shown: it is not
+  // the call running. Reset at each turn boundary.
   let turnToolName: string | null = null;
-  // (#2963) The turn's `tool_paths` (one per call, the model's order), how
-  // many of its calls have completed, and whether every completion so far
-  // agreed with the list. `null` list: the turn record carried none.
+  // (#2963) The turn's `tool_names` and `tool_paths` (FLOW 1.64.0; one entry
+  // per call, the model's order), how many of its calls have completed, and
+  // whether every completion so far agreed with them. A `null` list: the
+  // turn record carried none.
+  let turnNames: (string | null)[] | null = null;
   let turnPaths: (string | null)[] | null = null;
   let completedInTurn = 0;
-  let pathsInStep = true;
+  let listsInStep = true;
   // (#2889) The tool the model most recently WROTE (a writing heartbeat's
   // `tool_name`). At the turn's end it seeds `turnToolName`, so the tool
   // darkmux is about to run keeps its icon instead of dropping to the gear
@@ -620,33 +626,38 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
     } else if (isDispatchStart(r.action)) {
       pendingTools = null;
       turnToolName = null;
+      turnNames = null;
       turnPaths = null;
       completedInTurn = 0;
-      pathsInStep = true;
+      listsInStep = true;
       writtenTool = null;
       m = { atMs, kind: "prompt" };
     } else if (r.action === "dispatch.turn") {
       const calls = num(fields(r).tool_calls_count);
       pendingTools = calls;
-      turnToolName = writtenTool;
+      turnToolName = calls === null || calls === 1 ? writtenTool : null;
       writtenTool = null;
+      const named = fields(r).tool_names;
+      turnNames = Array.isArray(named) ? named.map((n) => (typeof n === "string" && n ? n : null)) : null;
       const listed = fields(r).tool_paths;
       turnPaths = Array.isArray(listed) ? listed.map((p) => cleanToolPath(p)) : null;
       completedInTurn = 0;
-      pathsInStep = true;
+      listsInStep = true;
       m = { atMs, kind: calls !== null && calls > 0 ? "tools" : "prompt" };
     } else if (r.action === "dispatch.tool") {
       if (pendingTools !== null && pendingTools > 0) pendingTools -= 1;
-      const name = fields(r).tool_name;
-      if (typeof name === "string" && name) turnToolName = name;
-      // (#2963) This completion is call `completedInTurn` of the list. When
-      // its own file is readable and is not the list's entry, the list and
+      // (#2963) This completion is call `completedInTurn` of the lists. When
+      // its own name or readable file is not the lists' entry, the lists and
       // the completions are out of step (a call the runtime discarded, say),
       // and no later index is trusted this turn.
-      if (turnPaths !== null && pathsInStep) {
+      const name = fields(r).tool_name;
+      if (listsInStep && turnNames !== null && typeof name === "string" && name && name !== (turnNames[completedInTurn] ?? null)) listsInStep = false;
+      if (listsInStep && turnPaths !== null) {
         const own = toolCallPath(fields(r));
-        if (own !== null && own !== (turnPaths[completedInTurn] ?? null)) pathsInStep = false;
+        if (own !== null && own !== (turnPaths[completedInTurn] ?? null)) listsInStep = false;
       }
+      // The call that completed is not the one running now.
+      turnToolName = null;
       completedInTurn += 1;
       m = { atMs, kind: pendingTools === null || pendingTools > 0 ? "tools" : "prompt" };
     } else if (isUtilityStart(r) && utilityJobOf(r) === UTILITY_JOB.compaction) {
@@ -735,11 +746,13 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
       return { state: "prompt", compacting: true, compactingSeconds: Math.max(0, Math.floor(elapsed / 1000)) };
     }
     if (found.kind === "tools") {
+      // (#2963) The running call's own tool and file, or none: never an
+      // earlier call's.
       const reading: LiveStateReading = { state: "tools" };
-      if (turnToolName !== null) reading.toolName = turnToolName;
-      // (#2963) The running call's own file, or none.
-      const running = turnPaths !== null && pathsInStep ? (turnPaths[completedInTurn] ?? null) : null;
-      if (running !== null) reading.toolPath = running;
+      const name = turnNames !== null ? (listsInStep ? (turnNames[completedInTurn] ?? null) : null) : turnToolName;
+      if (name !== null) reading.toolName = name;
+      const path = turnPaths !== null && listsInStep ? (turnPaths[completedInTurn] ?? null) : null;
+      if (path !== null) reading.toolPath = path;
       return reading;
     }
     if (found.kind === "prompt") return prompt();

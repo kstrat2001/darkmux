@@ -1390,14 +1390,31 @@ describe("SessionReplay MODEL section (#2890)", () => {
     expect(system).not.toContain("THERMAL REST");
   });
 
-  it("a live run in TOOLS hands the scope the tool for its icon, and no number", async () => {
-    // One of the turn's two calls has completed: still TOOLS, named by it.
+  it("a live run in TOOLS hands the scope the RUNNING call's tool for its icon, and no number (#2963)", async () => {
+    // The turn's first call (read) has completed; its second (edit) runs.
+    // The turn record names both (`tool_names`, FLOW 1.64.0).
+    const t0 = Date.parse(at(5)) + 500;
+    vi.useFakeTimers();
+    vi.setSystemTime(t0);
+    try {
+      const recs = finishedRun()
+        .filter((r) => Date.parse(r.ts) <= t0)
+        .map((r) => (r.action === "dispatch.turn" ? ({ ...r, payload: { ...(r as unknown as { payload: object }).payload, tool_names: ["read", "edit"] } } as unknown as typeof r) : r));
+      await renderRun(recs);
+      expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolName: "edit", centerLabel: null });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("with no tool_names, the completed call's tool is never the icon while the next runs (#2963)", async () => {
     const t0 = Date.parse(at(5)) + 500;
     vi.useFakeTimers();
     vi.setSystemTime(t0);
     try {
       await renderRun(finishedRun().filter((r) => Date.parse(r.ts) <= t0));
-      expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolName: "read", centerLabel: null });
+      expect(latestTokenScopeProps()).toMatchObject({ state: "tools", centerLabel: null });
+      expect(latestTokenScopeProps().toolName).toBeUndefined();
     } finally {
       vi.useRealTimers();
     }
@@ -1647,7 +1664,7 @@ describe("(#2926) run page: THINK opener and TOOL GEN, from the real run", () =>
     return pepperRecords().map((r) => {
       const p = (r as unknown as { payload: Record<string, unknown> }).payload;
       if (withPaths && r.action === "dispatch.turn" && p.turn_seq === 1) {
-        return { ...r, payload: { ...p, tool_paths: [1, 2, 3, 4, 5].map(files) } } as unknown as typeof r;
+        return { ...r, payload: { ...p, tool_names: ["read", "read", "read", "read", "read"], tool_paths: [1, 2, 3, 4, 5].map(files) } } as unknown as typeof r;
       }
       if (r.action !== "dispatch.tool" || p.tool_name !== "read") return r;
       n += 1;
@@ -1669,18 +1686,20 @@ describe("(#2926) run page: THINK opener and TOOL GEN, from the real run", () =>
     expect(lit()?.querySelector(".scope-lamp__label")?.textContent).toBe("tools");
   });
 
-  it("(#2963) a record set with no list (an older host): the action word alone, never the fourth read's file", async () => {
+  it("(#2963) a record set with no lists (an older host): the neutral TOOLS state, never the fourth read's word or file", async () => {
     await renderAt(readsWithFiles(false), pepperAt("10:51:08.500"));
-    const note = document.querySelector(".modelbox__note");
-    expect(note?.textContent).toBe("read");
-    expect(note?.querySelector(".modelbox__note-path")).toBeNull();
+    expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolWriting: false });
+    expect(latestTokenScopeProps().toolName).toBeUndefined();
+    expect(document.querySelector(".modelbox__note")).toBeNull();
   });
 
-  it("while darkmux runs a read: no generation to report, so no seconds; (#2963) the action word", async () => {
-    // Turn 1 asked for five reads; four have completed by 10:51:08.5.
+  it("while darkmux runs the turn's tools with no lists: no readout line, the neutral icon (#2963)", async () => {
+    // Turn 1 asked for five reads; four have completed by 10:51:08.5. The
+    // records carry no `tool_names`, so nothing says the fifth is a read.
     await renderAt(pepperRecords(), pepperAt("10:51:08.500"));
-    expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolName: "read", toolWriting: false });
-    expect(document.querySelector(".modelbox__note")?.textContent).toBe("read");
+    expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolWriting: false });
+    expect(latestTokenScopeProps().toolName).toBeUndefined();
+    expect(document.querySelector(".modelbox__note")).toBeNull();
   });
 });
 

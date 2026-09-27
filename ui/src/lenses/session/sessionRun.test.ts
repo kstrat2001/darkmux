@@ -2303,9 +2303,17 @@ describe("runRegions — MODEL section content (#2890)", () => {
     expect(done.liveTokScope).toBeNull();
   });
 
-  it("a live run in TOOLS names the tool for the scope's icon", () => {
-    const live = runRegions(flowToRenderModel(asOf("2026-01-01T00:00:06Z")), "s1", Date.parse("2026-01-01T00:00:06Z"));
-    expect(live.liveTokScope).toMatchObject({ state: "tools", toolName: "bash" });
+  it("a live run in TOOLS names the RUNNING call's tool for the scope's icon (#2963)", () => {
+    // read and bash have completed by 0:06; the third call, edit, runs.
+    const named = asOf("2026-01-01T00:00:06Z").map((r) =>
+      r.action === "dispatch.turn" ? ({ ...r, payload: { ...(r as unknown as { payload: object }).payload, tool_names: ["read", "bash", "edit"] } } as unknown as FlowRecord) : r,
+    );
+    const live = runRegions(flowToRenderModel(named), "s1", Date.parse("2026-01-01T00:00:06Z"));
+    expect(live.liveTokScope).toMatchObject({ state: "tools", toolName: "edit" });
+    // With no list, bash (completed) is never named while edit runs.
+    const unnamed = runRegions(flowToRenderModel(asOf("2026-01-01T00:00:06Z")), "s1", Date.parse("2026-01-01T00:00:06Z"));
+    expect(unnamed.liveTokScope).toMatchObject({ state: "tools" });
+    expect(unnamed.liveTokScope?.toolName).toBeUndefined();
   });
 
   it("a live run's active time counts up, still in MODEL", () => {
