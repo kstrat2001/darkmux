@@ -737,3 +737,149 @@ describe("(#2961) REST's seconds hand", () => {
     expect((num(container) as HTMLElement).style.animationDuration).toBe("160ms");
   });
 });
+
+// (#2962) Under reduced motion the scope paints one settled frame per
+// change, and that frame must show ONLY the current state. The background
+// fill is translucent (the animated path's afterglow), so without a clear
+// most of the previous frame stays visible under the new one: a ghost.
+describe("(#2962) reduced motion leaves no ghost of the previous state", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    delete (HTMLCanvasElement.prototype as unknown as Record<string, unknown>).clientWidth;
+    delete (HTMLCanvasElement.prototype as unknown as Record<string, unknown>).clientHeight;
+  });
+
+  // A 2D context that records calls and models how much of what was on the
+  // canvas before survives: a clear over the whole bitmap removes it, and a
+  // whole-canvas fill of alpha `a` (source-over) leaves `1 - a` of it.
+  function harness(DPR = 2) {
+    const CSS = 200;
+    let canvasEl: HTMLCanvasElement | null = null;
+    const sim = { carry: 1, backgroundFills: 0, clears: 0, ops: [] as string[] };
+    const state: Record<string | symbol, unknown> = { fillStyle: "#000", globalCompositeOperation: "source-over" };
+    // The current transform: [a, d, e, f] (no skew), or null once a
+    // translate/scale/rotate makes it something this model does not follow.
+    let tf: [number, number, number, number] | null = [1, 1, 0, 0];
+    const stack: [number, number, number, number][] = [];
+    const covers = (x: number, y: number, w: number, h: number) => {
+      if (!tf || !canvasEl) return false;
+      const [a, d, e, f] = tf;
+      return x * a + e <= 0 && y * d + f <= 0 && (x + w) * a + e >= canvasEl.width && (y + h) * d + f >= canvasEl.height;
+    };
+    const methods: Record<string, (...args: number[]) => void> = {
+      setTransform: (a, _b, _c, d, e, f) => { tf = [a, d, e, f]; },
+      resetTransform: () => { tf = [1, 1, 0, 0]; },
+      save: () => { if (tf) stack.push(tf); },
+      restore: () => { tf = stack.pop() ?? tf; },
+      translate: () => { tf = null; },
+      scale: () => { tf = null; },
+      rotate: () => { tf = null; },
+      transform: () => { tf = null; },
+      clearRect: (x, y, w, h) => {
+        sim.ops.push("clearRect");
+        if (covers(x, y, w, h)) { sim.carry = 0; sim.clears += 1; }
+      },
+      fillRect: (x, y, w, h) => {
+        if (!covers(x, y, w, h)) return;
+        sim.ops.push("fillRect");
+        sim.backgroundFills += 1;
+        const m = /^rgba\([^,]+,[^,]+,[^,]+,\s*([\d.]+)\)$/.exec(String(state.fillStyle));
+        const alpha = m ? Number(m[1]) : 1;
+        if (state.globalCompositeOperation === "source-over") sim.carry *= 1 - Math.min(1, alpha);
+      },
+    };
+    const ctx: unknown = new Proxy(state, {
+      get: (t, k) => (k in t ? t[k] : typeof k === "string" && k in methods ? (...a: number[]) => { methods[k](...a); return ctx; } : () => ctx),
+      set: (t, k, v) => { t[k] = v; return true; },
+    });
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(function (this: HTMLCanvasElement) {
+      canvasEl = this;
+      return ctx as CanvasRenderingContext2D;
+    } as unknown as HTMLCanvasElement["getContext"]);
+    vi.spyOn(HTMLCanvasElement.prototype, "getBoundingClientRect").mockReturnValue({ width: CSS, height: CSS, top: 0, left: 0, right: CSS, bottom: CSS, x: 0, y: 0, toJSON() {} } as DOMRect);
+    Object.defineProperties(HTMLCanvasElement.prototype, {
+      clientWidth: { configurable: true, get: () => CSS },
+      clientHeight: { configurable: true, get: () => CSS },
+    });
+    vi.stubGlobal("devicePixelRatio", DPR);
+    vi.spyOn(window, "matchMedia").mockImplementation(
+      (q: string) => ({ matches: true, media: q, addEventListener: () => {}, removeEventListener: () => {} }) as unknown as MediaQueryList,
+    );
+    const raf = vi.spyOn(window, "requestAnimationFrame").mockImplementation(() => 1);
+    const resize: { fire: (() => void) | null } = { fire: null };
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(cb: () => void) { resize.fire = cb; }
+        observe() {}
+        disconnect() {}
+        unobserve() {}
+      },
+    );
+    return { sim, raf, canvas: () => canvasEl, resize };
+  }
+
+  it("mounting paints exactly one settled frame, not two", () => {
+    const h = harness();
+    render(<TokenScope tokensPerSec={50} size="tile" state="generating" />);
+    expect(h.sim.backgroundFills).toBe(1);
+    expect(h.raf).not.toHaveBeenCalled();
+  });
+
+  it("a change of state paints exactly one frame, and none of the previous state survives it", () => {
+    const h = harness();
+    const r = render(<TokenScope tokensPerSec={50} size="tile" state="generating" />);
+    // The canvas is sized in device pixels, so the model checks the full bitmap.
+    expect(h.canvas()?.width).toBe(400);
+    expect(h.sim.backgroundFills).toBe(1);
+    // State A is on screen; change to state B.
+    h.sim.carry = 1;
+    h.sim.backgroundFills = 0;
+    r.rerender(<TokenScope tokensPerSec={0} size="tile" state="stalled" />);
+    expect(h.sim.backgroundFills).toBe(1);
+    expect(h.sim.carry).toBe(0);
+    expect(h.raf).not.toHaveBeenCalled();
+  });
+
+  it("a change of rate alone does the same: one frame, no ghost, never a loop", () => {
+    const h = harness();
+    const r = render(<TokenScope tokensPerSec={50} size="tile" state="generating" />);
+    h.sim.carry = 1;
+    h.sim.backgroundFills = 0;
+    r.rerender(<TokenScope tokensPerSec={5} size="tile" state="generating" />);
+    expect(h.sim.backgroundFills).toBe(1);
+    expect(h.sim.carry).toBe(0);
+    // Same props again: nothing is painted at all.
+    r.rerender(<TokenScope tokensPerSec={5} size="tile" state="generating" />);
+    expect(h.sim.backgroundFills).toBe(1);
+    expect(h.raf).not.toHaveBeenCalled();
+  });
+
+  it("the clear comes before the frame's own background, not after it", () => {
+    const h = harness();
+    const r = render(<TokenScope tokensPerSec={50} size="tile" state="generating" />);
+    h.sim.ops.length = 0;
+    r.rerender(<TokenScope tokensPerSec={0} size="tile" state="rest" />);
+    expect(h.sim.ops.slice(0, 2)).toEqual(["clearRect", "fillRect"]);
+  });
+
+  it("a resize repaints the one settled frame even though nothing else changed", () => {
+    const h = harness();
+    render(<TokenScope tokensPerSec={50} size="tile" state="generating" />);
+    h.sim.backgroundFills = 0;
+    act(() => { h.resize.fire?.(); });
+    // A resized canvas is blank, so the same state is painted again, once.
+    expect(h.sim.backgroundFills).toBe(1);
+    expect(h.raf).not.toHaveBeenCalled();
+  });
+
+  it("below a device pixel ratio of 1 (a zoomed-out page) the clear still covers the whole bitmap", () => {
+    const h = harness(0.5);
+    const r = render(<TokenScope tokensPerSec={50} size="tile" state="generating" />);
+    expect(h.canvas()?.width).toBe(100);
+    h.sim.carry = 1;
+    r.rerender(<TokenScope tokensPerSec={0} size="tile" state="stalled" />);
+    expect(h.sim.carry).toBe(0);
+  });
+});
