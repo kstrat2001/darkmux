@@ -398,3 +398,41 @@ fn a_misspelled_capability_is_an_unknown_key() {
     assert_eq!(paths(&keys), ["capabilities.reasonin"]);
     assert_eq!(closest_of(&keys[0]), Some("capabilities.reasoning"));
 }
+
+// ── (review C2) nothing from the file can forge an output line ──
+
+/// A key is printed through JSON escaping and a length cap: a newline and
+/// indentation inside it can never draw a fake line in preflight or doctor.
+#[test]
+fn a_key_cannot_forge_an_output_line() {
+    let forged = format!("\n  config ok{}", "x".repeat(300));
+    let keys = key_issues::<Probe>(&json!({ forged.clone(): 1, "redis": { forged: 1 } }), &no_retired);
+    assert_eq!(keys.len(), 2);
+    for k in &keys {
+        let msg = k.to_string();
+        assert!(!msg.contains('\n'), "a raw newline reached the message: {msg:?}");
+        assert!(msg.contains("\"\\n  config ok"), "the key is shown escaped and quoted: {msg}");
+        assert!(k.path.chars().count() < 100, "the key is capped: {}", k.path);
+    }
+    assert!(keys.iter().any(|k| k.path.starts_with("redis.\"")), "{keys:?}");
+}
+
+/// Bidi and other invisible format characters in a value or a key are shown
+/// as escapes, never passed to the terminal to reorder the line.
+#[test]
+fn bidi_and_format_characters_are_escaped() {
+    let keys = key_issues::<Probe>(&json!({"type": ["a\u{202e}b\u{200b}"], "ab\u{2066}c": 1}), &no_retired);
+    let text: String = keys.iter().map(ToString::to_string).collect();
+    for c in ['\u{202e}', '\u{200b}', '\u{2066}'] {
+        assert!(!text.contains(c), "{c:?} reached the message: {text:?}");
+    }
+    assert!(text.contains("\\u{202e}") && text.contains("\\u{2066}"), "{text}");
+}
+
+/// A file path is escaped the same way before it is printed.
+#[test]
+fn a_file_path_cannot_forge_an_output_line() {
+    let p = Path::new("/tmp/a\n  config ok.json");
+    let fp = check_text::<Probe>(UserFileKind::Role, p, "{\"rediss\": 1}", &no_retired).unwrap();
+    assert!(!fp.to_string().contains('\n'), "{:?}", fp.to_string());
+}

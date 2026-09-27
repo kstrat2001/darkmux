@@ -1973,7 +1973,9 @@ fn user_file_key_rows(problems: &[darkmux_types::user_files::FileProblem]) -> Ve
                 // message carries the full path.
                 name: format!(
                     "{USER_FILE_KEYS_CHECK_NAME}: {}",
-                    p.path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+                    darkmux_types::user_files::escape_text(
+                        &p.path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+                    )
                 ),
                 status: Status::Fail,
                 message: format!("{p}. {consequence}"),
@@ -16161,6 +16163,19 @@ mod user_file_key_tests {
         let rows = user_file_key_rows(&[problem]);
         assert_eq!(rows[0].status, Status::Fail);
         assert!(rows[0].message.contains("`redis.port` must be an integer from 0 to 65535, got \"x\""), "{}", rows[0].message);
+    }
+
+    /// (review C2) A file name cannot forge a doctor line either.
+    #[test]
+    fn a_file_name_cannot_forge_a_doctor_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a\n  \u{202e}ok.json");
+        std::fs::write(&path, r#"{"rediss": 1}"#).unwrap();
+        let problem = darkmux_types::user_files::config_json_problem_at(&path).unwrap();
+        let row = &user_file_key_rows(&[problem])[0];
+        for text in [&row.name, &row.message] {
+            assert!(!text.contains('\n') && !text.contains('\u{202e}'), "{text:?}");
+        }
     }
 
     /// Doctor runs to completion against a user file with a syntax error and

@@ -416,7 +416,7 @@ impl<'a> Walker<'a, '_> {
         if chosen.is_empty() {
             let mut expected: Vec<String> = nodes.iter().flat_map(|n| self.describe(n)).collect();
             expected.dedup();
-            let issue = Issue::WrongType { expected: expected.join(" or "), got: shorten(&doc.to_string()) };
+            let issue = Issue::WrongType { expected: expected.join(" or "), got: shorten(&escape_text(&doc.to_string())) };
             self.out.push(KeyIssue { path: path.to_string(), issue });
             return;
         }
@@ -440,10 +440,10 @@ impl<'a> Walker<'a, '_> {
         for r in shape.required.iter().filter(|r| !map.contains_key(**r)) {
             let expected = shape.named.get(r).map(|subs| subs.iter().flat_map(|n| self.describe(n)).collect::<Vec<_>>());
             let issue = Issue::Missing { expected: expected.unwrap_or_default().join(" or ") };
-            self.out.push(KeyIssue { path: join(path, r), issue });
+            self.out.push(KeyIssue { path: join_display(path, r), issue });
         }
         for (key, value) in map {
-            let p = join(path, key);
+            let p = join_display(path, key);
             match (shape.named.get(key.as_str()), &shape.others) {
                 (Some(subs), _) => self.walk(subs, value, &p, &join(bare, key)),
                 (None, Others::Map(_)) if !self.key_fits(&shape, key) => self.refuse_map_key(&shape, path, p, key),
@@ -475,7 +475,7 @@ impl<'a> Walker<'a, '_> {
             .filter_map(Value::as_str)
             .collect();
         let issue = Issue::Unknown {
-            closest: closest(key, tokens.iter().copied()).map(|c| join(parent, c)),
+            closest: closest(key, tokens.iter().copied()).map(|c| join_display(parent, c)),
             valid: tokens.iter().map(|t| t.to_string()).collect(),
         };
         self.out.push(KeyIssue { path, issue });
@@ -485,7 +485,7 @@ impl<'a> Walker<'a, '_> {
         let issue = match (self.retired)(bare) {
             Some(line) => Issue::Retired(line),
             None => Issue::Unknown {
-                closest: closest(key, shape.named.keys().copied()).map(|c| join(parent, c)),
+                closest: closest(key, shape.named.keys().copied()).map(|c| join_display(parent, c)),
                 valid: shape.named.keys().map(|k| k.to_string()).collect(),
             },
         };
@@ -586,7 +586,11 @@ fn type_words(t: &str, node: &Value) -> String {
 /// A value as JSON, cut to 60 characters so a pasted blob never floods the
 /// message.
 fn shorten(text: &str) -> String {
-    match text.char_indices().nth(60) {
+    shorten_to(text, 60)
+}
+
+fn shorten_to(text: &str, cap: usize) -> String {
+    match text.char_indices().nth(cap) {
         Some((cut, _)) => format!("{}…", &text[..cut]),
         None => text.to_string(),
     }
@@ -653,6 +657,47 @@ fn merge<'a>(mut a: ObjectShape<'a>, b: ObjectShape<'a>) -> ObjectShape<'a> {
     a
 }
 
+/// `parent.key` for a message: the key rendered by [`segment`].
+fn join_display(parent: &str, key: &str) -> String {
+    join(parent, &segment(key))
+}
+
+/// One key as a message shows it. A plain key (letters, digits, `_`, `-`)
+/// prints as is; any other is JSON-quoted with every control and invisible
+/// format character escaped, and capped at 48 characters, so a key can
+/// never break a line, indent a fake one, reorder text, or push the message
+/// off the screen.
+fn segment(key: &str) -> String {
+    const CAP: usize = 48;
+    if !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') && key.len() <= CAP {
+        return key.to_string();
+    }
+    let escaped = escape_text(&key.replace('\\', "\\\\").replace('"', "\\\""));
+    format!("\"{}\"", shorten_to(&escaped, CAP))
+}
+
+/// `text` with every control character and every invisible format
+/// character (bidi overrides and isolates, zero-width marks, line and
+/// paragraph separators) written as a `\u{..}` escape, so a terminal shows
+/// it instead of acting on it.
+pub fn escape_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() || is_invisible_format(c) => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Unicode format characters a terminal acts on without showing them.
+fn is_invisible_format(c: char) -> bool {
+    matches!(c as u32, 0xAD | 0x61C | 0x180E | 0x200B..=0x200F | 0x2028..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB)
+}
+
 fn join(parent: &str, key: &str) -> String {
     if parent.is_empty() { key.to_string() } else { format!("{parent}.{key}") }
 }
@@ -680,7 +725,7 @@ pub struct FileProblem {
 
 impl fmt::Display for FileProblem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}: ", self.kind.label(), self.path.display())?;
+        write!(f, "{} {}: ", self.kind.label(), escape_text(&self.path.display().to_string()))?;
         match &self.problem {
             Problem::Unreadable(e) => write!(f, "could not be read ({e})"),
             Problem::NotJson(e) => write!(f, "not valid JSON ({e})"),
