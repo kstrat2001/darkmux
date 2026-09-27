@@ -494,6 +494,7 @@ describe("deriveLiveState", () => {
     // (5th review C1) Stopped: the wait is over, and the execution is closed
     // (the call was never sent), never left reading PROMPT or live.
     const stopped = { ts: at(20_000), action: "budget.stop", session_id: SID, payload: { endpoint_id: "azure" } } as unknown as FlowRecord;
+    expect(deriveLiveState([wait, stopped], 21_000).state).toBe("prompt");
     expect(liveExecutions([[wait, stopped]], 21_000)).toEqual([]);
     expect(aggregateLiveState([[wait, stopped]], 21_000)).toBeNull();
   });
