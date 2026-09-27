@@ -72,6 +72,23 @@ darkmux release.
 
 ### Changed (breaking, 4.0)
 
+- **An unrecognized value in an enum-valued setting is refused, not
+  guessed** (#2947). `runtime.detection.degeneracy.policy` used to run as
+  `enforce`, `fleet.mode` used to read as `standalone`, and a typo in
+  `runtime.thermal.pause_at` / `resume_at` used to pass through and disarm
+  the thermal governor's soft tiers. Now `darkmux dispatch`, `mission
+  launch` (dry runs included) and `lab run` / `lab eval` refuse before
+  starting anything, naming the value, where it was set (env var or
+  `config.json` key) and the valid values; fleet work submission does the
+  same for `fleet.identity.provider`; `darkmux doctor` reports each as Fail.
+  `--skip-preflight` does not waive it. `darkmux config set <key>` with no
+  value, `config list` and `config set --help` list every valid value with
+  its meaning. Nothing on disk changed (no CONFIG bump): a config file with
+  a typo in one of these keys still loads, and now says what is wrong
+  instead of running on a value nobody wrote. **Migration:** run `darkmux
+  doctor`; fix any Fail row it names with the `darkmux config set` it
+  prints.
+
 - **Fleet work no longer travels through Redis; `--machine` submits
   straight to the target machine, which checks who is asking** (#2916,
   stage 1). The `darkmux:work` queue could not say who wrote an entry and

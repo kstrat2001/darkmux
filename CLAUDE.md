@@ -257,9 +257,12 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
 6. **Frozen model-facing text** — measured prompts/personas live in ONE artifact with golden
    tests generated from the reference implementation; assembly and request bodies are
    byte-locked (#1256). "Frozen" means one hash, not one intention.
-7. **Config leniency** — registries and config files are lenient-on-read; semantic validation
+7. **Config leniency** — registries and config files are lenient-on-read: one bad value never
+   fails the whole-file parse, so it can never discard the other settings. Semantic validation
    lives at resolution/consumption time and in `darkmux doctor`, never on the hot load path
-   (#1269).
+   (#1269). Lenient READING is not lenient CONSUMING: a value that fails validation is refused
+   where it is consumed and named by doctor, never quietly replaced by a default. For enum-valued
+   settings that rule is contract 9.
 8. **Work-unit vocabulary** — the four operator-visible work nouns each denote ONE grain,
    and every surface (CLI verb, hash route, wire type, UI label, doc) uses them at that grain
    (#1974). The containment ladder is **mission > phase > task > step > role execution**:
@@ -399,6 +402,29 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    information about the semantics.
 
    Conformance: every detail hash route is named for the `RunKind` it opens.
+
+9. **Enum-valued settings** — an unregistered value in an enum-typed setting is bad config
+   (#2947). It is never resolved to a fallback, in either direction. Every entry point that
+   consumes it refuses at preflight, before minting anything, naming the raw value, where it was
+   set (env var or `config.json` key) and the valid values; `darkmux doctor` reports it as Fail;
+   `darkmux config set` refuses it; and help (`config set <key>` with no value, `config list`,
+   `config set --help`) lists the valid values with their meanings. `--skip-preflight` does not
+   waive it: that flag skips a Docker probe, and a bad config value is not a probe result.
+
+   The mechanism is two declarations in `darkmux-types/src/config_enum.rs`, and everything else
+   derives from them with no per-setting code: a `ConfigEnum` (implemented with `config_enum!`,
+   one row per value, its token and one-line meaning, with an exhaustive `match` so the value
+   list cannot drift from the Rust enum) and an entry in `ENUM_SETTINGS` (key, env var, shipped
+   value, and the consuming `Scope`s: dispatch, mission launch, lab run, fleet submission).
+   Storage stays a string parsed at the accessor, so contract 7's lenient read holds. A new enum
+   setting is those two declarations plus a one-line accessor over `config_access::resolve_enum`.
+   Conformance: `config_cmd::every_enum_setting_obeys_the_rule_on_every_surface` iterates the
+   registry across preflight, doctor, `config set` and help; `tests/cli.rs`'s
+   `every_enum_setting_is_refused_by_every_cli_entry_point_that_consumes_it` spawns each entry
+   point; and `config_enum::every_enum_in_the_config_schema_is_registered` fails on an enum in the
+   config schema that is not registered. `docs/ENVIRONMENT.md`'s value lists are drift-tested
+   against the registry. Per-endpoint `profiles.json` enums (`managed`, `dialect`) share the
+   `ConfigEnum` value tables but keep their own refuse-at-use path through `Lenient<T>`.
 
 Enforcement is structural, not procedural: every contract gets a conformance test where one
 is expressible (golden files, emission-sequence assertions, boundary tests), and every review

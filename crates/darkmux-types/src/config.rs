@@ -245,7 +245,8 @@ use std::path::Path;
 //           config on one typo. Same reason `fleet.mode` is a string.
 //           Parsing happens at the accessor, which reports an
 //           unrecognized value as `config-invalid` rather than coercing
-//           it silently.
+//           it silently. (Superseded by the #2947 note below: an
+//           unrecognized value is now refused, not reported and armed.)
 //   1.28 (#2914, darkmux 4.0): REMOVED `radio.router_profile` (added in
 //           1.7). The radio ROUTING seat runs on the machine's one utility
 //           model (`internal.utility` in profiles.json) and is never staffed
@@ -995,9 +996,10 @@ pub struct FleetConfig {
 /// (#2916) The identity source for fleet work submission: the overlay
 /// network whose own daemon answers "which node is on the other end of this
 /// connection". `provider` is a VALUE (`"tailscale"` is the one this darkmux
-/// knows); an unknown value resolves to no provider, and no provider means
-/// every submission is refused (fail closed). Stored as a string, like
-/// `fleet.mode`, so a typo never fails the whole-config parse.
+/// knows); an unknown value is bad config (#2947): fleet work submission
+/// refuses it at preflight on both sides, and `darkmux doctor` reports
+/// Fail. Stored as a string, like `fleet.mode`, so a typo never fails the
+/// whole-config parse.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FleetIdentityConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub provider: Option<String>,
