@@ -63,9 +63,7 @@ There are four distinct files with overlapping but **non-identical** schemas. Mi
 | File | Path template | Authoritative for | NOT authoritative for |
 |---|---|---|---|
 | **Run manifest** | `~/.darkmux/runs/<run-id>/manifest.json` | host's view of the run: `run_id`, `workload`, `profile`, `provider`, `sandbox`, `ok`, `duration_ms`, `session_id`, `schema_version`. **schema_version 3+** adds `final_hash` (post-dispatch sandbox content hash, `blake3:<hex>`); **schema_version 4+** adds a `fixture` block (`source_path`, `baseline_hash`) for fixture-backed coding-task runs; **schema_version 5+** adds a `verify` object (`passed`, `details`) — the WORKLOAD's own result, which is NOT `ok` (that is the dispatch path's result; a run can dispatch cleanly and still fail its tests). A manifest with no `verify` key means "not checked", never "passed" — and note that a v4 manifest may predate `verify` entirely, so the version alone does not tell you a missing `verify` was a deliberate no-op | per-turn metrics; final assistant text; tool calls |
-| **QA reply** | `~/.darkmux/runs/<run-id>/qa-reply.json` | runtime's JSON envelope: `final_assistant` (string), `metrics.{turns, prompt_tokens, completion_tokens, compactions, wall_ms, total_messages}`, `result` ("stop"/"max_turns"/"escalation_*"/"error"), `trajectory_path` | per-turn breakdown; tool calls; reasoning |
-| **QA reply, this-run attribution** (#2263) | same `qa-reply.json`, nested at `metrics.this_run.{turns, prompt_tokens, completion_tokens, compactions}` | THIS invocation's own contribution — what to read next to `model` above when attributing cost to "which model produced this." On a never-resumed dispatch (the common case) it is byte-identical to the top-level `metrics.*` fields above; on a **resumed** dispatch (`darkmux dispatch --resume-from <checkpoint>`) the top-level `metrics.*` fields are the WHOLE-TASK cumulative total across every resume, seeded from the checkpoint — reading them next to `model` misattributes a prior invocation's (possibly different model's) turns/tokens to whichever model ran this resume. Absent entirely on a pre-#2263 runtime build — fall back to the top-level fields in that case. | per-turn breakdown; tool calls; reasoning; anything about a PRIOR invocation |
-| **Runtime metrics** | `<sandbox>/.darkmux-runtime/metrics.json` (sandbox path is in manifest.json's `.sandbox`) | aggregate totals using `total_prompt_tokens` / `total_completion_tokens` naming (DIFFERENT from qa-reply's nested `metrics.prompt_tokens`) | history; stale on watchdog-killed dispatches |
+| **QA reply** | `~/.darkmux/runs/<run-id>/qa-reply.json` | the dispatch envelope: `final_assistant` (string), `result` ("stop"/"max_turns"/"escalation_*"/"error"), `trajectory_path`, and a `metrics` block the host folds from THIS invocation's trajectory: `{model, wall_ms, turns, compactions, prompt_tokens, completion_tokens, total_tokens, reasoning_tokens, cached_tokens, rest_ms, rests, cumulative_turns, cumulative_compactions}`. Every figure is this invocation's own; only the two `cumulative_*` counts add a resumed dispatch's checkpoint seed. | per-turn breakdown; tool calls; reasoning |
 | **Pre-send bound** (#2792) | a `dispatch.pre_send_bound` line in the trajectory | the assembled prompt exceeded the profile's DECLARED context window before it was sent, and what darkmux did: `tokens_before` / `tokens_after` (both INCLUDING the tools schema, which `measure_request_context` alone omits), `declared_window`, `results_trimmed`, and `fits`. **`fits: false` means darkmux sent a request it had already computed was too big** — it is the record to look for when a dispatch dies on a provider 400. `results_trimmed: 0` with `fits: false` means no tool result was large enough to trim, NOT that the weight is elsewhere | whether the endpoint actually refused it |
 | **Trajectory** | `<sandbox>/.darkmux-runtime/trajectory.jsonl` | event-by-event ground truth. JSONL — one event per line. Source for all derived analyses. | aggregates (derive them yourself) |
 
@@ -227,17 +225,16 @@ These are the specific names where the schema has evolved or where similar conce
 | Wrong | Right | Where the right one lives |
 |---|---|---|
 | `before_count` / `after_count` (in compaction events) | `before_messages` / `after_messages` | trajectory.jsonl `compaction` event |
-| `total_prompt_tokens` (at qa-reply top level) | `metrics.prompt_tokens` (nested) | qa-reply.json envelope |
-| `metrics.prompt_tokens` (in runtime metrics.json) | `total_prompt_tokens` (top level) | runtime's `<sandbox>/.darkmux-runtime/metrics.json` — note this is the OPPOSITE nesting from qa-reply.json |
+| `total_prompt_tokens` (anywhere) | `metrics.prompt_tokens` (nested) | qa-reply.json envelope |
 | `tokens` (anywhere) | `prompt_tokens` + `completion_tokens` + `total_tokens` | always the three-way split; never a single "tokens" field |
-| `wall_ms` (in manifest.json) | `duration_ms` (in manifest.json) | manifest uses snake_case; runtime metrics + qa-reply use snake_case |
+| `wall_ms` (in manifest.json) | `duration_ms` (in manifest.json) | manifest uses snake_case; qa-reply uses snake_case |
 | `model.completed.usage.tokens` | `model.completed.usage.{prompt,completion,total}_tokens` | usage is always the three-field object |
-| `metrics.{turns,prompt_tokens,completion_tokens,compactions}` (top level, when the dispatch was RESUMED) | `metrics.this_run.{turns,prompt_tokens,completion_tokens,compactions}` | qa-reply.json envelope — (#2263) the top-level fields are the WHOLE-TASK cumulative total across every resume; reading them next to `model` on a resumed dispatch attributes a prior (possibly different-model) invocation's cost to this one. The host's `dispatch.complete` flow record carries the same split as `total_turns`/`prompt_tokens`/… (this invocation) vs `cumulative_turns`/`cumulative_prompt_tokens`/… (whole task) |
+| `metrics.this_run.*`, or `metrics.json` anywhere | `metrics.*` in qa-reply.json, or a fold of `trajectory.jsonl` | 4.0 retired `metrics.json` and `this_run`: the envelope's `metrics` block is already this invocation's own. For a resumed task's whole-task turns read `metrics.cumulative_turns`; its whole-task tokens are the sum of its `telemetry.tokens` usage records |
 
 If a query returns `null` for a field you expect populated:
 
 1. **First check that the field name exists in the schema** for the event type (use the per-event-type reference above).
-2. **Then check that you're querying the right file** (per-turn data only in trajectory; aggregates in metrics or qa-reply).
+2. **Then check that you're querying the right file** (per-turn data only in trajectory; aggregates in qa-reply's `metrics` block).
 3. **Then check that the dispatch ran with the relevant feature on** — e.g. `usage` requires `stream_options.include_usage` which was added in #362; old runs predating that won't have usage data even though the field is present in the schema.
 
 ## Diagnostic — "is the field really null, or am I querying wrong?"
@@ -353,6 +350,6 @@ Equal `baseline_hash` ⇒ both runs started from the same source state. Equal `f
 ## Notes
 
 - A run dir without `manifest.json` will error with "no run manifest" — that means the dispatch wasn't done via `darkmux lab run` (or was interrupted before writing).
-- A `<sandbox>/.darkmux-runtime/metrics.json` showing `turns: 0, total_prompt_tokens: 0` is almost always stale from a prior dispatch — the runtime overwrites it on clean exit only, so watchdog-killed dispatches leave the previous run's data in place. Trust the trajectory.jsonl for ground truth.
+- A `metrics.json` in an older run or sandbox is a pre-4.0 artifact and is never read: it was written on clean exit only, so a killed dispatch left a previous run's copy in place. Trust `trajectory.jsonl`.
 - For a side-by-side diff of two runs, use `darkmux-compare-runs` instead.
 - When in doubt, run the diagnostic two-line check (`.field` then `keys`) before assuming a feature is broken.

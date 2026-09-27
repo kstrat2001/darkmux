@@ -43,6 +43,14 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           names it. A consumer outside
 //           darkmux reads the dotted spellings; darkmux's own readers
 //           upgrade old archives.
+//
+//           Also removed (4.0, one token truth): `dispatch.complete`'s
+//           `cumulative_prompt_tokens` / `cumulative_completion_tokens`.
+//           Their only source was the runtime's `metrics.json`, which 4.0
+//           no longer writes; the task's token total is the sum of its
+//           `telemetry.tokens` usage records. `cumulative_turns` /
+//           `cumulative_compactions` stay, computed as the resume
+//           checkpoint's counters plus this invocation's trajectory fold.
 //   1.65.0 (#2902 step 5, budgets): additive, four actions and one usage
 //           field.
 //

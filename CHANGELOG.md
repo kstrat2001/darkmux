@@ -16,6 +16,38 @@ darkmux release.
 
 ### Removed (breaking, 4.0)
 
+- **`metrics.json`: the runtime no longer writes it, and nothing reads it.**
+  Every count (turns, compactions, tokens, rests) is now a fold of the
+  run's `trajectory.jsonl`, the one log the live tailer, `lab run stats`,
+  `lab run inspect` and `lab loop` all read (the new `darkmux-trajectory`
+  crate). The file was written only on a clean exit, so a killed run kept
+  whichever run's copy was there before: in one measured archive, 37 of
+  241 disagreed with their own trajectory, and every time the file was the
+  wrong one. The checks and flags that existed only to catch that
+  disagreement are gone with it: `RunChecks.tokens_reconcile`,
+  `turns_match_trajectory`, `rest_matches_trajectory`, `metrics_stale`,
+  `missing_required_events`, `checkpoint_parse_consistent` and
+  `checkpoint_events_seen`, and the `STALE-METRICS`, `TOKENS`, `PARSE` and
+  `COUNTS` flags (`RUN_STATS` 2.0.0). A lab run records no copy of the file
+  (coding-task manifest v7, tool-bench v3). **Migration:** read totals from
+  `darkmux lab run stats <run> --json` or the envelope's `metrics` block,
+  never from `metrics.json`; an old run directory still reports its totals
+  from its trajectory, and a leftover `metrics.json` in it is ignored.
+- **The runtime's own totals output.** Its plain-text summary is now a
+  `--- run ---` block (result, turns, compactions, tokens, rests, wall)
+  read from the trajectory, and its `--json` envelope carries no `metrics`
+  block: the host writes that block from the fold, so `darkmux dispatch
+  --json` still has one. `metrics.this_run` and `metrics.total_messages`
+  are gone: every figure in the block is this invocation's own, and only
+  `cumulative_turns`/`cumulative_compactions` add a resumed dispatch's
+  checkpoint seed. **Migration:** read `metrics.prompt_tokens` (and the
+  rest) where you read `metrics.this_run.*`.
+- **`dispatch.complete`'s `cumulative_prompt_tokens` /
+  `cumulative_completion_tokens`** (FLOW_SCHEMA 2.0.0). Their one source
+  was `metrics.json`. A usage record (`telemetry.tokens`) now omits a
+  count the provider did not report rather than writing 0. **Migration:**
+  a task's whole token total is the sum of its sessions' `telemetry.tokens`
+  records; `cumulative_turns`/`cumulative_compactions` stay.
 - **`radio.router_profile`, `DARKMUX_RADIO_ROUTER_PROFILE`, and the
   `role_profiles.radio-router` binding** (#2914). The radio routing seat
   now runs on the machine's one utility model (below), so there is no
