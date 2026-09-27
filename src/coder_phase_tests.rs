@@ -2278,3 +2278,24 @@ edit loop detected on src/widget.rs in an earlier dispatch
         std::fs::write(rp.join("f.txt"), "two").unwrap();
         assert!(worktree_has_unsaved_work(rp), "uncommitted changes → unsaved");
     }
+
+    /// (#2869) The workspace is model-writable: a caution's file that the
+    /// model replaced with a symlink to a host file reads as "unknown
+    /// freshness", never as the host file's hash.
+    #[test]
+    fn current_file_blake3_does_not_follow_a_workspace_symlink() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let host = tmp.path().join("host.rs");
+        std::fs::write(&host, b"fn host() {}").unwrap();
+        std::os::unix::fs::symlink(&host, ws.join("widget.rs")).unwrap();
+        assert_eq!(current_file_blake3(&ws, "widget.rs"), None, "the symlink was followed");
+
+        std::fs::remove_file(ws.join("widget.rs")).unwrap();
+        std::fs::write(ws.join("widget.rs"), b"fn host() {}").unwrap();
+        assert_eq!(
+            current_file_blake3(&ws, "widget.rs"),
+            Some(blake3::hash(b"fn host() {}").to_hex().to_string())
+        );
+    }

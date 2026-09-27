@@ -18117,3 +18117,385 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(complete["payload"]["total_tokens"], 9);
         assert_eq!(rec["mission_id"], complete["mission_id"], "same run key as the terminal");
     }
+
+    // ── (#2869) host reads of the model-writable out-dir ──────────────
+
+    /// `.darkmux-runtime/<name>` in a fresh out-dir, as a symlink to a host
+    /// file outside it holding `body`.
+    fn out_dir_with_symlinked(name: &str, body: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let rt = tmp.path().join("out/.darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        let host = tmp.path().join(format!("host-{name}"));
+        fs::write(&host, body).unwrap();
+        std::os::unix::fs::symlink(&host, rt.join(name)).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn read_token_totals_refuses_a_symlinked_metrics_file() {
+        let tmp = out_dir_with_symlinked(
+            "metrics.json",
+            r#"{"total_prompt_tokens": 1200, "total_completion_tokens": 345}"#,
+        );
+        let t = read_token_totals(&tmp.path().join("out"));
+        assert_eq!(t.prompt, 0, "the symlinked host file was read");
+        assert_eq!(t.completion, 0);
+    }
+
+    #[test]
+    fn read_findings_summary_refuses_a_symlinked_findings_file() {
+        let tmp = out_dir_with_symlinked("findings.jsonl", "{\"a\":1}\n{\"b\":2}\n");
+        assert!(
+            read_findings_summary(&tmp.path().join("out")).is_none(),
+            "the symlinked host file was counted"
+        );
+    }
+
+    #[test]
+    fn read_rest_totals_refuses_a_symlinked_trajectory_fallback() {
+        let tmp = out_dir_with_symlinked(
+            "trajectory.jsonl",
+            "{\"type\":\"runtime.rest\",\"ms\":500}\n",
+        );
+        let r = read_rest_totals(&tmp.path().join("out"));
+        assert_eq!(r.rest_ms, 0, "the symlinked host trajectory was summed");
+    }
+
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record()
+    fn tailer_refuses_a_symlinked_trajectory_and_warns_once() {
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let tmp = out_dir_with_symlinked(
+            "trajectory.jsonl",
+            "{\"type\":\"compaction\",\"seq\":1,\"generation\":1,\"before_messages\":40,\"after_messages\":7,\"summary_chars\":1500}\n",
+        );
+        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let lines_c = lines.clone();
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("out/.darkmux-runtime/trajectory.jsonl"),
+            "sess-2869".into(),
+            "coder".into(),
+            "darkmux:m".into(),
+        );
+        state.warning_sink = Arc::new(move |l: &str| lines_c.lock().unwrap().push(l.to_string()));
+        state.poll_and_emit();
+        state.poll_and_emit();
+        assert_eq!(state.summary.compactions, 0, "the tailer followed the model's symlink");
+        let lines = lines.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "one warning, not one per poll: {lines:?}");
+        assert!(lines[0].contains("symlink"), "{lines:?}");
+
+        // The directory-swap case: `.darkmux-runtime` itself replaced with a
+        // link to a host directory holding a regular `trajectory.jsonl`.
+        // No-follow on the file alone would read it.
+        let swap = TempDir::new().unwrap();
+        let out = swap.path().join("out");
+        fs::create_dir_all(&out).unwrap();
+        let host_dir = swap.path().join("host-dir");
+        fs::create_dir_all(&host_dir).unwrap();
+        fs::write(
+            host_dir.join("trajectory.jsonl"),
+            "{\"type\":\"compaction\",\"seq\":1,\"generation\":1,\"before_messages\":40,\"after_messages\":7,\"summary_chars\":1500}\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&host_dir, out.join(".darkmux-runtime")).unwrap();
+        let swap_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let swap_c = swap_lines.clone();
+        let mut swapped = TailerState::new_for_test(
+            out.join(".darkmux-runtime/trajectory.jsonl"),
+            "sess-2869-swap".into(),
+            "coder".into(),
+            "darkmux:m".into(),
+        );
+        swapped.warning_sink = Arc::new(move |l: &str| swap_c.lock().unwrap().push(l.to_string()));
+        swapped.poll_and_emit();
+        assert_eq!(swapped.summary.compactions, 0, "the tailer followed a swapped .darkmux-runtime");
+        let swap_lines = swap_lines.lock().unwrap().clone();
+        assert_eq!(swap_lines.len(), 1, "{swap_lines:?}");
+        assert!(swap_lines[0].contains("symlink"), "{swap_lines:?}");
+    }
+
+    #[test]
+    fn resume_checkpoint_refuses_a_symlinked_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let resume_from = tmp.path().join("prior-out");
+        fs::create_dir_all(&resume_from).unwrap();
+        let host = tmp.path().join("host-checkpoint.json");
+        fs::write(&host, r#"{"schema_version":3,"messages":[],"role_id":"coder"}"#).unwrap();
+        std::os::unix::fs::symlink(&host, resume_from.join(CHECKPOINT_FILENAME)).unwrap();
+        let err = validate_resume_checkpoint_content(&resume_from, "coder")
+            .expect_err("a symlinked checkpoint must be refused, not followed");
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+    }
+
+    #[test]
+    fn resume_checkpoint_refuses_a_symlinked_origin_file() {
+        // What this pins is narrow: the origin file is read no-follow, so a
+        // symlink planted at it is refused rather than read. It does NOT
+        // make the origin file trustworthy — it sits in the same mounted,
+        // model-writable out-dir, so a model can write a forged REGULAR
+        // origin file directly, which this test does not (and cannot)
+        // catch. That gap is tracked separately.
+        let tmp = TempDir::new().unwrap();
+        let resume_from = tmp.path().join("prior-out");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&resume_from).unwrap();
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(
+            resume_from.join(CHECKPOINT_FILENAME),
+            r#"{"schema_version":3,"messages":[],"role_id":"coder"}"#,
+        )
+        .unwrap();
+        let forged = tmp.path().join("forged-origin.json");
+        let ws_canon = ws.canonicalize().unwrap();
+        fs::write(
+            &forged,
+            serde_json::json!({ "workspace": ws_canon.display().to_string(), "workspace_read_only": false })
+                .to_string(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&forged, resume_from.join(RESUME_ORIGIN_FILENAME)).unwrap();
+        let err = validate_resume_checkpoint(&resume_from, "coder", &ws_canon, false)
+            .expect_err("a symlinked origin file must be refused, not followed");
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+    }
+
+    /// A trajectory the model made huge and sparse (1 PiB of holes). The
+    /// tailer used to size one buffer from `fstat` and read to the end,
+    /// which aborts the host process on allocation. It must read a bounded
+    /// amount per poll, drop an unterminated line that outgrows its cap
+    /// with ONE warning, and keep the process alive.
+    #[test]
+    fn tailer_survives_a_huge_sparse_trajectory_with_one_warning() {
+        let tmp = TempDir::new().unwrap();
+        let rt = tmp.path().join("out/.darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        let f = fs::File::create(rt.join("trajectory.jsonl")).unwrap();
+        f.set_len(1u64 << 50).unwrap();
+        drop(f);
+        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let lines_c = lines.clone();
+        let mut state = TailerState::new_for_test(
+            rt.join("trajectory.jsonl"),
+            "sess-2869-sparse".into(),
+            "coder".into(),
+            "darkmux:m".into(),
+        );
+        state.warning_sink = Arc::new(move |l: &str| lines_c.lock().unwrap().push(l.to_string()));
+        for _ in 0..4 {
+            state.poll_and_emit();
+        }
+        assert!(state.offset > 0 && state.offset < (1u64 << 30), "offset {}", state.offset);
+        let lines = lines.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "exactly one overflow warning: {lines:?}");
+        assert!(lines[0].contains("exceeds"), "{lines:?}");
+    }
+
+    /// A legitimate trajectory far longer than one poll's read budget still
+    /// streams completely, across polls, with nothing dropped.
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record()
+    fn tailer_streams_a_long_trajectory_fully_across_bounded_polls() {
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let tmp = TempDir::new().unwrap();
+        let rt = tmp.path().join("out/.darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        let mut body = String::new();
+        for i in 1..=200 {
+            body.push_str(&format!(
+                "{{\"type\":\"compaction\",\"seq\":{i},\"generation\":{i},\"before_messages\":40,\"after_messages\":7,\"summary_chars\":1500}}\n"
+            ));
+        }
+        fs::write(rt.join("trajectory.jsonl"), &body).unwrap();
+        let mut state = TailerState::new_for_test(
+            rt.join("trajectory.jsonl"),
+            "sess-2869-long".into(),
+            "coder".into(),
+            "darkmux:m".into(),
+        );
+        // A read budget smaller than one line: every line spans polls.
+        state.max_poll_bytes = 64;
+        state.max_pending_bytes = 4096;
+        let mut polls = 0;
+        while state.offset < body.len() as u64 && polls < 100_000 {
+            state.poll_and_emit();
+            polls += 1;
+        }
+        assert_eq!(state.offset, body.len() as u64);
+        assert_eq!(state.summary.compactions, 200, "events were lost across bounded polls");
+        assert!(polls > 200, "the per-poll bound was not applied ({polls} polls)");
+    }
+
+    /// (#2869 fix pass) The four end-of-dispatch metric reads each hit the
+    /// same refused `metrics.json`; the operator hears about it once.
+    #[test]
+    fn read_out_dir_text_warns_once_per_refused_file() {
+        let tmp = out_dir_with_symlinked("metrics.json", "{}");
+        let out = tmp.path().join("out");
+        let lines: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        let sink = |l: &str| lines.borrow_mut().push(l.to_string());
+        for _ in 0..4 {
+            assert!(read_out_dir_text_with(&out, ".darkmux-runtime/metrics.json", &sink).is_none());
+        }
+        assert_eq!(lines.borrow().len(), 1, "{:?}", lines.borrow());
+        // A different refused file in the same dispatch still warns.
+        std::os::unix::fs::symlink("/etc/hosts", out.join(".darkmux-runtime/findings.jsonl")).unwrap();
+        assert!(read_out_dir_text_with(&out, ".darkmux-runtime/findings.jsonl", &sink).is_none());
+        assert_eq!(lines.borrow().len(), 2, "{:?}", lines.borrow());
+    }
+
+
+    /// An oversize line is dropped WHOLE: the part that arrives after the
+    /// cap tripped (here, a well-formed event the model appended to the
+    /// padding) must not be parsed as an event. Two oversize lines give one
+    /// warning, and a legitimate line after them still streams.
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record()
+    fn tailer_drops_an_oversize_line_whole_and_warns_once() {
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let tmp = TempDir::new().unwrap();
+        let rt = tmp.path().join("out/.darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        let ev = |seq: u32| {
+            format!(
+                "{{\"type\":\"compaction\",\"seq\":{seq},\"generation\":{seq},\"before_messages\":40,\"after_messages\":7,\"summary_chars\":1500}}"
+            )
+        };
+        // 272 = 17 polls of 16 bytes: the cap (256) trips exactly at the
+        // end of the padding, so the forged event starts a fresh poll.
+        let body = format!(
+            "{}{}\n{}\n{}\n",
+            "X".repeat(272),
+            ev(1),
+            "Y".repeat(600),
+            ev(2)
+        );
+        fs::write(rt.join("trajectory.jsonl"), &body).unwrap();
+        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let lines_c = lines.clone();
+        let mut state = TailerState::new_for_test(
+            rt.join("trajectory.jsonl"),
+            "sess-2869-oversize".into(),
+            "coder".into(),
+            "darkmux:m".into(),
+        );
+        state.warning_sink = Arc::new(move |l: &str| lines_c.lock().unwrap().push(l.to_string()));
+        state.max_poll_bytes = 16;
+        state.max_pending_bytes = 256;
+        let mut polls = 0;
+        while state.offset < body.len() as u64 && polls < 10_000 {
+            state.poll_and_emit();
+            polls += 1;
+        }
+        assert_eq!(state.summary.compactions, 1, "only the legitimate trailing event counts");
+        // Bind first: locking twice in one `assert_eq!` deadlocks on failure.
+        let lines = lines.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+    }
+
+    /// (#2869 C1) The stop path must drain the WHOLE backlog. A container
+    /// that wrote more than two polls' worth (16 MiB) before exiting lost
+    /// the tail: the loop polls once, sees `stop`, and flushed only once
+    /// more. Driven through `run_tailer` with the stop flag already set, the
+    /// production stop sequence.
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record()
+    fn run_tailer_final_flush_drains_a_backlog_larger_than_two_polls() {
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let tmp = TempDir::new().unwrap();
+        let rt = tmp.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        // 20 lines of ~1 MiB: over two polls' worth, few lines to parse.
+        let pad_line = format!("{{\"type\":\"noop.pad\",\"p\":\"{}\"}}\n", "x".repeat(1024 * 1024));
+        let mut body = pad_line.repeat(20);
+        body.push_str("{\"type\":\"compaction\",\"seq\":1,\"generation\":1,\"before_messages\":40,\"after_messages\":7,\"summary_chars\":1500}\n");
+        fs::write(rt.join("trajectory.jsonl"), &body).unwrap();
+        let stop = Arc::new(AtomicBool::new(true));
+        let summary = run_tailer(
+            tmp.path().to_path_buf(),
+            "sess-2869-drain".into(),
+            "coder".into(),
+            "darkmux:m".into(),
+            None,
+            None,
+            None,
+            stop,
+            Arc::new(Mutex::new(Instant::now() + Duration::from_secs(600))),
+            600,
+            None, // compaction threshold
+            None, // compactor model
+            None, // record context
+            None, // endpoint
+            None, // endpoint id
+            None, // compactor endpoint
+            None, // live sender
+        );
+        assert_eq!(summary.compactions, 1, "the event at the end of a 20 MiB backlog was dropped");
+    }
+
+    /// (#2869 C6) A truncation reset clears the discard state too: after an
+    /// oversize line was being skipped, a rewritten (truncated) file's first
+    /// event must be read, not swallowed as "the rest of the oversize line".
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record()
+    fn tailer_truncation_reset_clears_the_discard_state() {
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let tmp = TempDir::new().unwrap();
+        let rt = tmp.path().join("out/.darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        let path = rt.join("trajectory.jsonl");
+        fs::write(&path, "Z".repeat(400)).unwrap();
+        let mut state = TailerState::new_for_test(path.clone(), "sess-2869-trunc".into(), "coder".into(), "darkmux:m".into());
+        state.warning_sink = Arc::new(|_: &str| {});
+        state.max_poll_bytes = 64;
+        state.max_pending_bytes = 128;
+        for _ in 0..10 {
+            state.poll_and_emit();
+        }
+        assert!(state.discarding_line, "precondition: an oversize line is being discarded");
+        fs::write(&path, "{\"type\":\"compaction\",\"seq\":1,\"generation\":1,\"before_messages\":40,\"after_messages\":7,\"summary_chars\":1500}\n").unwrap();
+        for _ in 0..10 {
+            state.poll_and_emit();
+        }
+        assert_eq!(state.summary.compactions, 1, "the first event after truncation was discarded");
+    }
+
+    /// (#2869 C5) `metrics.json` is small by construction; a multi-MiB one
+    /// is refused under the small-file cap rather than read (the 1 GiB
+    /// default applied before).
+    #[test]
+    fn read_token_totals_refuses_an_oversize_metrics_file() {
+        let tmp = TempDir::new().unwrap();
+        let rt = tmp.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        let pad = "x".repeat(5 * 1024 * 1024);
+        fs::write(rt.join("metrics.json"), format!(r#"{{"total_prompt_tokens": 7, "pad": "{pad}"}}"#)).unwrap();
+        assert_eq!(read_token_totals(tmp.path()).prompt, 0, "a 5 MiB metrics.json was read");
+    }
+
+    #[test]
+    fn resume_checkpoint_refuses_an_oversize_origin_file() {
+        let tmp = TempDir::new().unwrap();
+        let resume_from = tmp.path().join("prior-out");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&resume_from).unwrap();
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(
+            resume_from.join(CHECKPOINT_FILENAME),
+            r#"{"schema_version":3,"messages":[],"role_id":"coder"}"#,
+        )
+        .unwrap();
+        let ws_canon = ws.canonicalize().unwrap();
+        let pad = "x".repeat(5 * 1024 * 1024);
+        fs::write(
+            resume_from.join(RESUME_ORIGIN_FILENAME),
+            serde_json::json!({ "workspace": ws_canon.display().to_string(), "workspace_read_only": false, "pad": pad })
+                .to_string(),
+        )
+        .unwrap();
+        let err = validate_resume_checkpoint(&resume_from, "coder", &ws_canon, false)
+            .expect_err("a 5 MiB origin file must be refused");
+        assert!(format!("{err:#}").contains("exceeds"), "{err:#}");
+    }
+

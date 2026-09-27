@@ -641,7 +641,24 @@ pub(crate) fn validate_resume_checkpoint_content(
     expected_role_id: &str,
 ) -> Result<String> {
     let src = resume_from.join(CHECKPOINT_FILENAME);
-    if !src.is_file() {
+    // (#2869) `resume_from` is a prior dispatch's out-dir, which that
+    // dispatch's model could write. Read the checkpoint with no-follow and
+    // regular-file-only, so a planted `checkpoint.json -> <host file>` is
+    // refused here rather than read and staged into the new container.
+    let read = crate::contained_file::read_contained_to_string(
+        resume_from,
+        Path::new(CHECKPOINT_FILENAME),
+        crate::contained_file::DEFAULT_MAX_BYTES,
+    );
+    if let Err(e @ crate::contained_file::ContainedFileError::Refused(_)) = &read {
+        bail!(
+            "darkmux dispatch: RESUME CHECKPOINT REFUSED — {} was {e}; darkmux reads a \
+             checkpoint only as a regular file inside --resume-from {}",
+            src.display(),
+            resume_from.display()
+        );
+    }
+    if matches!(read, Err(crate::contained_file::ContainedFileError::NotFound)) {
         bail!(
             "darkmux dispatch: RESUME CHECKPOINT NOT FOUND — expected {} to \
              exist (no checkpoint.json under --resume-from {}); this \
@@ -653,7 +670,7 @@ pub(crate) fn validate_resume_checkpoint_content(
             resume_from.display()
         );
     }
-    let contents = fs::read_to_string(&src)
+    let contents = read
         .with_context(|| format!("reading resume checkpoint at {}", src.display()))?;
     let value: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
         anyhow!(
@@ -835,7 +852,14 @@ pub(crate) fn validate_resume_checkpoint(
     // (Security audit, #2114 resume follow-up) Workspace mount-mode + path
     // gate — see this fn's own doc for the escalation this closes.
     let origin_path = resume_from.join(RESUME_ORIGIN_FILENAME);
-    let origin_contents = fs::read_to_string(&origin_path).map_err(|e| {
+    // (#2869) Same no-follow read as the checkpoint: this file sits in the
+    // same model-writable out-dir.
+    let origin_contents = crate::contained_file::read_contained_to_string(
+        resume_from,
+        Path::new(RESUME_ORIGIN_FILENAME),
+        crate::contained_file::SMALL_FILE_MAX_BYTES,
+    )
+    .map_err(|e| {
         anyhow!(
             "darkmux dispatch: RESUME ORIGIN UNKNOWN — could not read {} ({e}); this host has \
              no record of the workspace mount mode/path the checkpoint at {} was written \
@@ -1012,9 +1036,7 @@ pub(crate) fn resume_hint_from_origin(
     role_id: &str,
     phase_id: Option<&str>,
 ) -> String {
-    let origin_path = host_out.join(RESUME_ORIGIN_FILENAME);
-    let origin = fs::read_to_string(&origin_path)
-        .ok()
+    let origin = read_out_dir_text(host_out, RESUME_ORIGIN_FILENAME)
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
     let Some(origin) = origin else {
         return format!(
@@ -7141,6 +7163,57 @@ fn enrich_envelope_with_summary(
     serde_json::to_string(&v).unwrap_or(stdout)
 }
 
+/// (#2869) Read `<out_dir>/<rel>` as text with the no-follow,
+/// regular-file-only reader. The out-dir is mounted read-write into the
+/// container, so the model's tools can plant a symlink (or a FIFO, or swap
+/// `.darkmux-runtime` for a link to a host directory) at any file the host
+/// later reads from it. A refusal is warned on stderr and then treated as
+/// absent, which every caller already degrades on; absence stays silent.
+pub(crate) fn read_out_dir_text(out_dir: &Path, rel: &str) -> Option<String> {
+    read_out_dir_text_with(out_dir, rel, &stderr_warning_sink)
+}
+
+/// (#2869) The read cap for an out-dir file: the small cap for the files
+/// the host parses whole and that are a few hundred bytes when genuine
+/// (`metrics.json`, the resume origin file), the default for the streams
+/// (trajectory, findings).
+fn out_dir_read_cap(rel: &str) -> u64 {
+    let name = Path::new(rel).file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name == "metrics.json" || name == RESUME_ORIGIN_FILENAME {
+        crate::contained_file::SMALL_FILE_MAX_BYTES
+    } else {
+        crate::contained_file::DEFAULT_MAX_BYTES
+    }
+}
+
+/// (#2869) Whether this is the first refusal of `path` in this process.
+/// The end-of-dispatch reads open the same `metrics.json` up to four times;
+/// the operator hears about a refused file once. Out-dirs are unique per
+/// dispatch, so keying on the full path is "once per file per dispatch".
+/// The set grows only by refused files, which a normal run has none of.
+fn first_refusal_of(path: &Path) -> bool {
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+        .lock()
+        .map(|mut seen| seen.insert(path.to_path_buf()))
+        .unwrap_or(true)
+}
+
+/// [`read_out_dir_text`] with the warning sink injected (tests capture it).
+pub(crate) fn read_out_dir_text_with(out_dir: &Path, rel: &str, sink: &dyn Fn(&str)) -> Option<String> {
+    use crate::contained_file::read_contained_to_string;
+    match read_contained_to_string(out_dir, Path::new(rel), out_dir_read_cap(rel)) {
+        Ok(body) => Some(body),
+        Err(e) => {
+            let path = out_dir.join(rel);
+            if e.is_refused() && first_refusal_of(&path) {
+                sink(&format!("darkmux: {} not read — {e}", path.display()));
+            }
+            None
+        }
+    }
+}
+
 /// (#1959) Count what the crawler recorded, and say where it is.
 ///
 /// Deliberately a COUNT plus a PATH rather than the findings themselves: the
@@ -7150,7 +7223,7 @@ fn enrich_envelope_with_summary(
 /// path in an envelope is a path the caller cannot open.
 fn read_findings_summary(out_dir: &std::path::Path) -> Option<serde_json::Value> {
     let path = out_dir.join(".darkmux-runtime").join("findings.jsonl");
-    let body = std::fs::read_to_string(&path).ok()?;
+    let body = read_out_dir_text(out_dir, ".darkmux-runtime/findings.jsonl")?;
     // Count RECORDS, not lines: a trailing newline is not a finding, and a
     // count that says 4 when the file holds 3 is worse than no count.
     let count = body.lines().filter(|l| !l.trim().is_empty()).count();
@@ -7379,8 +7452,7 @@ impl TokenTotals {
 /// totals — this is an observability enrichment, never a dispatch
 /// failure. Same out-dir the trajectory tailer reads from.
 pub fn read_token_totals(out_dir: &Path) -> TokenTotals {
-    let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
-    let Ok(raw) = fs::read_to_string(&metrics_path) else {
+    let Some(raw) = read_out_dir_text(out_dir, ".darkmux-runtime/metrics.json") else {
         return TokenTotals::default();
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
@@ -7453,8 +7525,7 @@ pub struct CumulativeCounts {
 /// file degrades to zero — this is observability enrichment, never a
 /// dispatch-failing path.
 pub fn read_cumulative_counts(out_dir: &Path) -> CumulativeCounts {
-    let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
-    let Ok(raw) = fs::read_to_string(&metrics_path) else {
+    let Some(raw) = read_out_dir_text(out_dir, ".darkmux-runtime/metrics.json") else {
         return CumulativeCounts::default();
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
@@ -7511,9 +7582,7 @@ pub struct RestTotals {
 /// degrade to `RestTotals::default()` when neither is available —
 /// observability enrichment, never a dispatch failure.
 pub fn read_rest_totals(out_dir: &Path) -> RestTotals {
-    let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
-    let from_metrics = fs::read_to_string(&metrics_path)
-        .ok()
+    let from_metrics = read_out_dir_text(out_dir, ".darkmux-runtime/metrics.json")
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         .filter(|v| v.get("rest_ms").is_some());
     if let Some(v) = from_metrics {
@@ -7531,8 +7600,7 @@ pub fn read_rest_totals(out_dir: &Path) -> RestTotals {
 /// or unreadable lines are skipped rather than aborting the whole sum —
 /// the same lenient-on-read posture the live tailer uses on this file.
 fn sum_rest_totals_from_trajectory(out_dir: &Path) -> RestTotals {
-    let traj_path = out_dir.join(".darkmux-runtime").join("trajectory.jsonl");
-    let Ok(raw) = fs::read_to_string(&traj_path) else {
+    let Some(raw) = read_out_dir_text(out_dir, ".darkmux-runtime/trajectory.jsonl") else {
         return RestTotals::default();
     };
     let mut totals = RestTotals::default();
@@ -7596,9 +7664,7 @@ pub(crate) fn reconcile_rest_totals(from_metrics: RestTotals, from_tailer: RestT
 /// field's zero when there were also zero rests to derive an average
 /// from (a single-turn dispatch's honest `0`); otherwise fall through.
 pub fn read_turn_delay_effective_ms(out_dir: &Path, rest: RestTotals) -> Option<u64> {
-    let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
-    let from_metrics = fs::read_to_string(&metrics_path)
-        .ok()
+    let from_metrics = read_out_dir_text(out_dir, ".darkmux-runtime/metrics.json")
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         .and_then(|v| v.get("turn_delay_effective_ms").and_then(|n| n.as_u64()));
     if let Some(v) = from_metrics {
@@ -7948,8 +8014,10 @@ fn run_tailer(
         state.live_flush(crate::usage::unix_ms_now());
         if stop_flag.load(Ordering::SeqCst) {
             // Final flush — pick up anything written between the last
-            // sleep tick and the container's exit signal.
-            state.poll_and_emit();
+            // sleep tick and the container's exit signal. (#2869) One poll
+            // reads at most `max_poll_bytes`, so drain until a poll makes
+            // no progress (bounded), or a large backlog loses its tail.
+            state.drain_to_end();
             state.live_flush_final();
             break;
         }
@@ -7977,7 +8045,7 @@ fn run_tailer(
             // it away for free. The container is about to be killed
             // either way; that doesn't make the last poll tick's data
             // stale.
-            state.poll_and_emit();
+            state.drain_to_end();
             darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
             break;
         }
@@ -9461,10 +9529,41 @@ fn merge_record_context(payload: &mut serde_json::Value, record_context: &Option
     }
 }
 
+/// (#2869) Most bytes one tailer poll reads. A long trajectory streams
+/// across polls; a sparse or runaway one cannot make the host allocate its
+/// whole claimed size.
+const TAILER_MAX_POLL_BYTES: u64 = 8 * 1024 * 1024;
+
+/// (#2869) Longest trajectory line the tailer will carry across polls.
+/// Real events are bounded far below this; a line past it is dropped.
+const TAILER_MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
+
+/// (#2869) Most polls the tailer's final drain makes after stop.
+const TAILER_MAX_DRAIN_POLLS: usize = 128;
+
 /// any partial-line tail bytes carried across polls, and the last
 /// heartbeat instant for rate limiting.
+///
+/// (#2869) The trajectory file is model-writable, so its size is not a
+/// number the host may trust: one poll reads at most
+/// [`TAILER_MAX_POLL_BYTES`], and an unterminated line longer than
+/// [`TAILER_MAX_PENDING_BYTES`] is dropped (one warning) rather than
+/// buffered without bound.
 struct TailerState {
     trajectory_path: PathBuf,
+    /// (#2869) Set once the tailer has warned that the trajectory file was
+    /// refused (a symlink, a non-regular file, a swapped directory), so a
+    /// 250ms poll loop warns once, not four times a second.
+    trajectory_refusal_warned: bool,
+    /// (#2869) Most bytes one poll reads (`TAILER_MAX_POLL_BYTES`).
+    max_poll_bytes: u64,
+    /// (#2869) Largest unterminated line the tailer carries across polls
+    /// (`TAILER_MAX_PENDING_BYTES`).
+    max_pending_bytes: usize,
+    /// (#2869) Skipping the remainder of an oversize line until its newline.
+    discarding_line: bool,
+    /// (#2869) The oversize-line warning has been given (once per tailer).
+    pending_overflow_warned: bool,
     offset: u64,
     /// Trailing partial line carried from one poll to the next when the
     /// file ends mid-line (a write was in progress at our read).
@@ -9679,6 +9778,11 @@ impl TailerState {
             compaction_attempts: 0,
             open_compaction: None,
             trajectory_path,
+            trajectory_refusal_warned: false,
+            max_poll_bytes: TAILER_MAX_POLL_BYTES,
+            max_pending_bytes: TAILER_MAX_PENDING_BYTES,
+            discarding_line: false,
+            pending_overflow_warned: false,
             offset: 0,
             pending: Vec::new(),
             last_counted_turn_seq: None,
@@ -9906,6 +10010,11 @@ impl TailerState {
             compaction_attempts: 0,
             open_compaction: None,
             trajectory_path,
+            trajectory_refusal_warned: false,
+            max_poll_bytes: TAILER_MAX_POLL_BYTES,
+            max_pending_bytes: TAILER_MAX_PENDING_BYTES,
+            discarding_line: false,
+            pending_overflow_warned: false,
             offset: 0,
             pending: Vec::new(),
             last_counted_turn_seq: None,
@@ -9936,43 +10045,112 @@ impl TailerState {
     /// One poll round: open the trajectory file, read new bytes since
     /// the previous offset, drain complete lines, dispatch each event.
     /// Silent on errors — file may not exist yet (container hasn't
-    /// written) and any IO hiccup is best-effort.
-    fn poll_and_emit(&mut self) {
+    /// written) and any IO hiccup is best-effort. The one exception is a
+    /// REFUSED open (#2869): the out-dir is model-writable, so the file is
+    /// opened with no-follow at `.darkmux-runtime/trajectory.jsonl` and
+    /// must be a regular file; a symlink or FIFO planted there is never
+    /// read, and the tailer says so once through its warning sink.
+    fn poll_and_emit(&mut self) -> u64 {
+        use crate::contained_file::{open_path_tail, ContainedFileError};
         use std::io::{Read, Seek, SeekFrom};
 
-        let mut file = match std::fs::File::open(&self.trajectory_path) {
+        let mut file = match open_path_tail(&self.trajectory_path, 2) {
             Ok(f) => f,
-            Err(_) => return,
+            Err(ContainedFileError::Refused(why)) => {
+                if !self.trajectory_refusal_warned {
+                    self.trajectory_refusal_warned = true;
+                    (self.warning_sink)(&format!(
+                        "darkmux: live trajectory {} not read — {why}; this dispatch's \
+                         live records and turn counts will be missing",
+                        self.trajectory_path.display()
+                    ));
+                }
+                return 0;
+            }
+            Err(_) => return 0,
         };
         let size = match file.metadata() {
             Ok(m) => m.len(),
-            Err(_) => return,
+            Err(_) => return 0,
         };
         // File truncated below our offset (shouldn't happen in practice
         // since the runtime writes append-only, but defensive): reset.
         if size < self.offset {
             self.offset = 0;
             self.pending.clear();
+            // (#2869) A rewritten file starts clean: the oversize line
+            // being skipped belonged to the old contents.
+            self.discarding_line = false;
         }
         if size <= self.offset {
-            return;
+            return 0;
         }
 
         if file.seek(SeekFrom::Start(self.offset)).is_err() {
-            return;
+            return 0;
         }
-        let mut buf = Vec::with_capacity((size - self.offset) as usize);
-        if file.read_to_end(&mut buf).is_err() {
-            return;
+        // (#2869) Bounded: never size a buffer from `fstat` (the model can
+        // make the file claim any size, e.g. a sparse petabyte, and a
+        // `with_capacity` of that aborts the host process). Read at most
+        // `max_poll_bytes` and advance by what was ACTUALLY read; the rest
+        // streams on later polls.
+        let budget = (size - self.offset).min(self.max_poll_bytes);
+        let mut buf = Vec::new();
+        if (&mut file).take(budget).read_to_end(&mut buf).is_err() {
+            return 0;
         }
-        self.offset = size;
+        let read = buf.len() as u64;
+        self.offset += read;
+
+        // (#2869) A line being discarded (it outgrew the cap) is skipped up
+        // to and including its newline.
+        let mut bytes: &[u8] = &buf;
+        if self.discarding_line {
+            match bytes.iter().position(|&b| b == b'\n') {
+                Some(i) => {
+                    self.discarding_line = false;
+                    bytes = &bytes[i + 1..];
+                }
+                None => return read,
+            }
+        }
 
         // Append raw bytes; decode happens per-line (after the
         // trailing newline arrives) so multi-byte UTF-8 chars that
         // straddle a poll boundary don't corrupt to U+FFFD (#329).
-        self.pending.extend_from_slice(&buf);
+        self.pending.extend_from_slice(bytes);
         for line in drain_complete_lines_from_bytes(&mut self.pending) {
             self.handle_event(&line);
+        }
+        // (#2869) What remains is one unterminated line. Past the cap it is
+        // dropped, not buffered without bound, and so is the rest of it.
+        if self.pending.len() > self.max_pending_bytes {
+            let dropped = self.pending.len();
+            self.pending = Vec::new();
+            self.discarding_line = true;
+            if !self.pending_overflow_warned {
+                self.pending_overflow_warned = true;
+                (self.warning_sink)(&format!(
+                    "darkmux: live trajectory {} has a line that exceeds the {}-byte cap \
+                     ({dropped} bytes so far with no newline); dropping it and any \
+                     further oversize lines",
+                    self.trajectory_path.display(),
+                    self.max_pending_bytes
+                ));
+            }
+        }
+        read
+    }
+
+    /// (#2869) Poll until a poll reads nothing, at most
+    /// [`TAILER_MAX_DRAIN_POLLS`] times (1 GiB at the default poll size), so
+    /// a stopped dispatch's whole backlog is read but a file still growing
+    /// under a runaway writer cannot hold the tailer forever.
+    fn drain_to_end(&mut self) {
+        for _ in 0..TAILER_MAX_DRAIN_POLLS {
+            if self.poll_and_emit() == 0 {
+                break;
+            }
         }
     }
 

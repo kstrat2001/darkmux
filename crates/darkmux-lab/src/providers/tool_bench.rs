@@ -1174,6 +1174,9 @@ impl WorkloadProvider for ToolBenchProvider {
 
         let started = std::time::Instant::now();
         let mut owned_trials: Vec<(usize, u32, TaskScore, TrajStats, Option<u64>)> = Vec::new();
+        // (#2869) Runtime files the copy-out refused, across every trial;
+        // recorded in the run manifest.
+        let mut refused_artifacts: Vec<crate::providers::coding_task::RefusedArtifact> = Vec::new();
         let mut envelope_model: Option<String> = None;
 
         for (ti, task) in tasks.iter().enumerate() {
@@ -1225,15 +1228,20 @@ impl WorkloadProvider for ToolBenchProvider {
                 // the next dispatch of this workload (#364 lesson).
                 let mut traj_text = String::new();
                 if let Some(out) = out_dir.as_deref() {
-                    let rt = out.join(".darkmux-runtime");
-                    for name in ["trajectory.jsonl", "metrics.json"] {
-                        let src = rt.join(name);
-                        if src.exists() {
-                            if let Err(e) = fs::copy(&src, trial_dir.join(name)) {
-                                eprintln!("darkmux: warn — copying runtime {name}: {e}");
-                            }
-                        }
-                    }
+                    // (#2869) No-follow, regular-file-only copy: the out-dir
+                    // is model-writable, and `fs::copy` follows symlinks.
+                    let preserved = crate::providers::coding_task::preserve_runtime_artifacts(
+                        out,
+                        &trial_dir,
+                        &["trajectory.jsonl", "metrics.json"],
+                    );
+                    let trial_rel = format!("tasks/{}-t{trial}", task.id);
+                    refused_artifacts.extend(preserved.refused.into_iter().map(|mut r| {
+                        r.file = format!("{trial_rel}/{}", r.file);
+                        r
+                    }));
+                    // `trial_dir` is host-owned and the copy above wrote only
+                    // a regular file, so this read follows nothing.
                     traj_text = fs::read_to_string(trial_dir.join("trajectory.jsonl"))
                         .unwrap_or_default();
                 }
@@ -1311,9 +1319,7 @@ impl WorkloadProvider for ToolBenchProvider {
         let summary = render_summary(&trial_refs, trials_per_task, &scores_path);
         println!("{summary}");
 
-        fs::write(
-            run_dir.join("manifest.json"),
-            serde_json::to_string_pretty(&serde_json::json!({
+        let mut manifest_json = serde_json::json!({
                 "schema_version": 2,
                 "run_id": run_id,
                 "workload": wl.id,
@@ -1323,7 +1329,11 @@ impl WorkloadProvider for ToolBenchProvider {
                 "duration_ms": duration_ms,
                 "ok": true,
                 "session_id": darkmux_types::session_id::session_id("darkmux-toolbench", &now_ms.to_string(), ""),
-            }))?,
+            });
+        crate::providers::coding_task::record_refused_artifacts(&mut manifest_json, &refused_artifacts);
+        fs::write(
+            run_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest_json)?,
         )?;
 
         let infra = trial_refs.iter().filter(|t| t.score.infra_fail).count();
