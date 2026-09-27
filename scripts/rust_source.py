@@ -61,3 +61,31 @@ def test_lines(text):
         last = text.count("\n", 0, block_end(text, m.end()))
         lines.update(range(first, last + 1))
     return lines
+
+
+MOD_BLOCK = re.compile(r"^[ \t]*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*\{", re.M)
+CFG_ATTR = re.compile(r"^#\[cfg\((.*)\)\]$")
+
+
+def mod_blocks(text):
+    """(name, first line, last line) of every inline `mod name { ... }`,
+    0-based, found by the same brace matching as `test_lines`."""
+    out = []
+    for m in MOD_BLOCK.finditer(text):
+        first = text.count("\n", 0, m.start())
+        last = text.count("\n", 0, block_end(text, m.end()))
+        out.append((m.group(1), first, last))
+    return out
+
+
+def cfgs_above(lines, idx):
+    """The `#[cfg(...)]` attributes on the item at 0-based line `idx`, read
+    upward through its other attributes and doc comments, whitespace dropped."""
+    cfgs = []
+    j = idx - 1
+    while j >= 0 and lines[j].strip().startswith(("#[", "///", "//")):
+        m = CFG_ATTR.match(lines[j].strip())
+        if m:
+            cfgs.insert(0, re.sub(r"\s+", "", m.group(1)))
+        j -= 1
+    return cfgs

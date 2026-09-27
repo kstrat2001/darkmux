@@ -983,6 +983,8 @@ jobs:
               - 'scripts/complexity-ratchet.py'
               - 'scripts/complexity-baseline.json'
               - 'scripts/complexity-allowlist.json'
+              - 'scripts/ts-function-key.mjs'
+              - 'scripts/ts-function-key.test.mjs'
 
       - name: Install bun
         if: steps.filter.outputs.ui == 'true'
@@ -1046,6 +1048,7 @@ jobs:
         if: steps.filter.outputs.ui == 'true'
         run: |
           python3 scripts/complexity-ratchet.py --self-test
+          node --test scripts/ts-function-key.test.mjs
           python3 scripts/complexity-ratchet.py --lang ts
 
       # (#2212) slop-chop's mechanical stages: the AST survey and the
