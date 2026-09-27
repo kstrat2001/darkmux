@@ -84,18 +84,22 @@ export function groupsByTurn(all: NormRecord[]): boolean {
   return sessions.size === 1 && all.some((r) => r.action === ACTION.DispatchTurn);
 }
 
+/** The instant a list is read at (by default its newest record's) and the
+ *  policy it is judged by (by default the built-in one). */
+function readClock(all: readonly NormRecord[], asOf: number | undefined, policy: LifecyclePolicy | undefined): { asOf: number; policy: LifecyclePolicy } {
+  return { asOf: asOf ?? latestByTime(all)?.tMs ?? -Infinity, policy: policy ?? DEFAULT_POLICY };
+}
+
 /**
  * @param visible the rows to show, NEWEST FIRST (as the list renders them)
  * @param all every record the list was given, so a hidden record (a
  *   heartbeat, a context reading) can still inform a turn's header
+ * @param asOfArg the instant the list is read at; by default the newest
+ *   record's
+ * @param policyArg the lifecycle policy a turn's run is judged by
  */
-export function turnItems(
-  visible: NormRecord[],
-  all: NormRecord[],
-  /** The instant the list is read at; by default the newest record's. */
-  asOf: number = latestByTime(all)?.tMs ?? -Infinity,
-  policy: LifecyclePolicy = DEFAULT_POLICY,
-): TurnItem[] {
+export function turnItems(visible: NormRecord[], all: NormRecord[], asOfArg?: number, policyArg?: LifecyclePolicy): TurnItem[] {
+  const { asOf, policy } = readClock(all, asOfArg, policyArg);
   if (!groupsByTurn(all)) return visible.map((rec) => ({ kind: "rec", rec }));
 
   const ordered = [...all].sort(byTime);
