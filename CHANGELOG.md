@@ -205,6 +205,20 @@ darkmux release.
 
 ### Added
 
+- **The run page's readout names the tool call running now and its file**
+  (#2963). While darkmux runs a `read`, `write` or `edit`, the line under
+  the scope's lamps reads the action and the file, e.g.
+  `write · src/lib/tokenRate.ts`; a long path is trimmed from the left so
+  the file name stays. The TOOLS icon names the same call. `write`'s icon is
+  now a plain file (it replaces the whole file; the old "+" read as "adds
+  lines"). FLOW 1.64.0: `dispatch.turn` carries `tool_names` and
+  `tool_paths`, one entry per call that RUNS, in run order (a call the
+  runtime refuses, ungranted, not a tool, or cut off mid-arguments, is not
+  in them). `tool_paths` holds only the path argument, never file content.
+  **One expected change:** records written before 1.64.0 carry no lists, so
+  in older archives (and in the demo until it is regenerated) the later
+  calls of a multi-call turn show the neutral TOOLS state (the gear, no
+  line) instead of the name of the call that had just finished.
 - **`darkmux machine trust <name>` / `machine untrust <name>`** (#2916).
   Trust adds `fleet.accept_work.<name>` to THIS machine's config.json (and
   touches nothing else): the peer's node is looked up through the identity
