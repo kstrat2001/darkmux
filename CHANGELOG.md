@@ -121,6 +121,12 @@ darkmux release.
   profile now). `darkmux mission dispatch` keeps its own `--machine` until
   it is retired (#2954).
 
+- **`remote.concurrent_cap = 0` means unbounded everywhere** (#2916 stage 2).
+  The scheduler's hosted track used to clamp `0` to `1`, while the fleet
+  listener read `0` as no limit. Both now read it as no limit, the darkmux
+  bound convention. **Migration:** if you set `0` to mean "one at a time",
+  set `1`.
+
 - **Busy is decided per seat, and a receiver chooses refuse or queue**
   (#2916 stage 2). A worker no longer runs one submitted job at a time. A
   job on a LOCAL model holds that model for its run (LM Studio serves one
@@ -133,7 +139,16 @@ darkmux release.
   on that seat (...)` at once, naming what runs; `queue` holds the job
   (first come, first served per seat; at most 4 queued per sending
   machine) and tells the sender it is waiting, with a `queued` line every
-  20 seconds until it runs. The sender prints the receiver's words
+  20 seconds until it runs. A queued job is checked again when its seat
+  frees (the allow-list entry, the scope with its profile resolved afresh,
+  the config preflight), so `untrust` also stops jobs already waiting; a
+  sender that hangs up gives its place back and its job never runs; a
+  waited-on job waits no longer than its connection allows, and one queued
+  without `--wait` at most 30 minutes (then it is answered busy and never
+  runs). Only jobs from other machines count: this machine's own
+  dispatches are not seen by the listener. When a connection drops after
+  the receiver may have taken the job, the sender says the job may still be
+  running there and names the session to follow. The sender prints the receiver's words
   verbatim. A bad value is refused at the listener's start and reported
   Fail by `darkmux doctor` (#2947). The work-submission wire moves to
   schema `6` (a reply body is newline-delimited: `queued` lines, then the

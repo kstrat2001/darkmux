@@ -83,7 +83,7 @@ darkmux does **not** ship a catalog of per-language images. Instead it **injects
 
 **Build cache:** `~/.darkmux/cache` is bind-mounted into every dispatch at `/darkmux-cache`, with `CARGO_HOME` / `npm_config_cache` / `PIP_CACHE_DIR` redirected into it — so the inner verify loop reuses downloaded deps across dispatches. The registry/download caches are concurrency-safe; each dispatch's `target/` stays in its own workspace, so concurrent dispatches don't contend on build artifacts.
 
-`--image` is local-dispatch only today — ignored on cross-machine `--machine` dispatch (the remote runner uses its own image; carrying the image through the fleet queue is a follow-on).
+On a `--profile <profile>@<machine>` dispatch, `--image` is sent to the other machine with the job, and that machine runs it only if its allow-list entry for the sender lists the image (its `--images` scope); otherwise it answers with the refusal. Without an image the job runs on the receiver's own runtime image.
 
 ## Environment variables
 
