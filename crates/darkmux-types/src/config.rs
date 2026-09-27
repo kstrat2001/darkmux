@@ -271,6 +271,13 @@ use std::path::Path;
 //           `init` writes `identity` and `listener` visibly (`enabled:
 //           false`) and `accept_work` empty. Lenient-on-read as always: an
 //           older binary ignores all three into `fleet.extras`.
+//           Also recorded here, since it shipped in the same 4.0 cycle with
+//           no bump of its own: REMOVED `dirs.notebook` (#2913, with the
+//           `lab notebook` verb and the `scribe` role). `config set` rejects
+//           the key; a config still carrying it loads fine (serde drops the
+//           unknown key; `dirs` has no overflow map), has no effect, and
+//           `darkmux doctor` names it with the fix, alongside
+//           `DARKMUX_NOTEBOOK_DIR`.
 pub const CONFIG_SCHEMA_VERSION: &str = "1.29";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
