@@ -33,7 +33,7 @@ const SHOW_ALL_ACTIVITIES = [
   'dispatch start', 'dispatch end', 'dispatch error', 'feedback', 'routing',
   'compaction', 'note', 'machine online', 'machine offline', 'session end',
   'detector', 'runtime', 'tokens', 'lms', 'host telemetry', 'telemetry',
-  'other', 'step complete',
+  'other', 'step.complete',
 ];
 
 test.beforeEach(async ({ page }) => {
@@ -85,13 +85,13 @@ async function open(page, records) {
 
 test("a record stamped for a DIFFERENT mission does not move this mission's step metrics or events", async ({ page }) => {
   const RECORDS = [
-    rec({ action: 'dispatch start', mission_id: MISSION_ID, payload: {} }),
+    rec({ action: 'dispatch.start', mission_id: MISSION_ID, payload: {} }),
     rec({ action: 'telemetry.tokens', category: 'telemetry', source: 'tokens', mission_id: MISSION_ID, payload: { total_tokens: 4000 } }),
     // The collision: same session_id/handle, a DIFFERENT mission_id — exactly
     // what a concurrent run of the same config emits.
     rec({ action: 'telemetry.tokens', category: 'telemetry', source: 'tokens', mission_id: OTHER_MISSION_ID, payload: { total_tokens: 9000 } }),
-    rec({ action: 'dispatch complete', mission_id: OTHER_MISSION_ID, payload: {} }),
-    rec({ action: 'dispatch complete', mission_id: MISSION_ID, payload: {} }),
+    rec({ action: 'dispatch.complete', mission_id: OTHER_MISSION_ID, payload: {} }),
+    rec({ action: 'dispatch.complete', mission_id: MISSION_ID, payload: {} }),
   ];
   const errors = await open(page, RECORDS);
 
@@ -110,11 +110,11 @@ test("a record stamped for a DIFFERENT mission does not move this mission's step
 
 test("a foreign step-lifecycle record does not flip this mission's step status", async ({ page }) => {
   const RECORDS = [
-    rec({ action: 'dispatch start', mission_id: MISSION_ID, payload: {} }),
+    rec({ action: 'dispatch.start', mission_id: MISSION_ID, payload: {} }),
     rec({ action: 'telemetry.tokens', category: 'telemetry', source: 'tokens', mission_id: MISSION_ID, payload: { total_tokens: 1000 } }),
     // Mission B finishes ITS copy of step s1 — stamped, foreign, and a real
     // status-transition action (`step complete` IS in STATUS_ACTIONS).
-    rec({ action: 'step complete', mission_id: OTHER_MISSION_ID, payload: {} }),
+    rec({ action: 'step.complete', mission_id: OTHER_MISSION_ID, payload: {} }),
   ];
   const errors = await open(page, RECORDS);
 
@@ -136,9 +136,9 @@ test("a foreign step-lifecycle record does not flip this mission's step status",
 
 test('a record with NO mission_id still correlates — the legacy path', async ({ page }) => {
   const RECORDS = [
-    rec({ action: 'dispatch start', payload: {} }),
+    rec({ action: 'dispatch.start', payload: {} }),
     rec({ action: 'telemetry.tokens', category: 'telemetry', source: 'tokens', payload: { total_tokens: 2500 } }),
-    rec({ action: 'dispatch complete', payload: {} }),
+    rec({ action: 'dispatch.complete', payload: {} }),
   ];
   const errors = await open(page, RECORDS);
 

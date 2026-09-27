@@ -6,7 +6,8 @@
 // after it, and not silent past its resume time) is live work.
 process.env.TZ = "UTC";
 import { describe, it, expect } from "vitest";
-import { normalizeRecords, sessionRunning, flowLiveSessions, openBudgetWait, BUDGET_WAIT_GRACE_MS, FLOW_LIVE_TTL_MS } from "./flow";
+import { shapeRecords, sessionRunning, flowLiveSessions, openBudgetWait, BUDGET_WAIT_GRACE_MS, FLOW_LIVE_TTL_MS } from "./flow";
+import { normAll } from "../testing/records";
 
 const t0 = Date.parse("2026-09-27T10:00:00Z");
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -23,7 +24,7 @@ describe("an open budget wait is live work", () => {
   // A day window: the wait is announced once, hours before the probe, far
   // past the flow TTL. Its announced resume time is what bounds it.
   const day = 23 * 3600 + 53 * 60;
-  const data = normalizeRecords([wait(t0, day)] as never);
+  const data = shapeRecords(normAll([wait(t0, day)]));
 
   it("reads running (replay: no presence) through a long wait, far past the flow TTL", () => {
     const probe = t0 + 3 * 3600_000;
@@ -38,8 +39,8 @@ describe("an open budget wait is live work", () => {
   });
 
   it("closes on budget.resume, budget.stop, or a terminal", () => {
-    for (const end of ["budget.resume", "budget.stop", "dispatch error"]) {
-      const d = normalizeRecords([wait(t0, 600), rec(t0 + 60_000, end)] as never);
+    for (const end of ["budget.resume", "budget.stop", "dispatch.error"]) {
+      const d = shapeRecords(normAll([wait(t0, 600), rec(t0 + 60_000, end)]));
       expect(openBudgetWait(d, t0 + 61_000), end).toBeNull();
       expect(sessionRunning(d, new Set(), "s1", t0 + 61_000), end).toBe(false);
       expect(flowLiveSessions(d, t0 + 61_000, true).has("s1"), end).toBe(false);
@@ -47,7 +48,7 @@ describe("an open budget wait is live work", () => {
   });
 
   it("a waiter silent past its resume time plus the grace has died: not live", () => {
-    const d = normalizeRecords([wait(t0, 600)] as never);
+    const d = shapeRecords(normAll([wait(t0, 600)]));
     expect(sessionRunning(d, new Set(), "s1", t0 + 600_000 + BUDGET_WAIT_GRACE_MS - 1)).toBe(true);
     const after = t0 + 600_000 + BUDGET_WAIT_GRACE_MS + FLOW_LIVE_TTL_MS + 1;
     expect(openBudgetWait(d, t0 + 600_000 + BUDGET_WAIT_GRACE_MS + 1)).toBeNull();
@@ -56,7 +57,7 @@ describe("an open budget wait is live work", () => {
   });
 
   it("a re-announced wait (still full at its resume time) stays open to the NEW resume time", () => {
-    const d = normalizeRecords([wait(t0, 60), wait(t0 + 61_000, 600)] as never);
+    const d = shapeRecords(normAll([wait(t0, 60), wait(t0 + 61_000, 600)]));
     expect(openBudgetWait(d, t0 + 61_000 + 300_000)).not.toBeNull();
   });
 });

@@ -837,26 +837,13 @@ export interface DispatchStartPayload {
   };
 }
 
-/** One `funnel-events.jsonl` line — the lab-run detail's event feed +
- * pipeline-stage source (`viewer.html`'s `computeLabPipeline`/
- * `renderLabFeed`, ported in `lenses/runs/labRun.ts`). Loosely typed
- * (`payload` is `Record<string, unknown>`, same posture as `FlowRecord`
- * above) since its shape varies per `step_id`/`action` — the pure logic
- * narrows what it needs per case, matching legacy's own untyped JS access.
- * Source: `funnel-events.jsonl` lines, written by
- * `crates/darkmux-lab/src/lab/review.rs`'s event emitters. */
-export interface LabRunEvent {
-  ts: string;
-  action?: string;
-  category?: string;
-  source?: string;
-  payload?: Record<string, unknown>;
-}
-
 /** `GET /lab/run/events?dir=&offset=` — the poll-based tail response.
+ * `lines` are `funnel-events.jsonl` lines, flow-record-shaped (written by
+ * `crates/darkmux-lab/src/lab/review.rs`'s event emitters); the lab-run
+ * detail ingests them like any other record.
  * Source: `crates/darkmux-serve/src/lib.rs::LabRunEventsResponse`. */
 export interface LabRunEventsResponse {
-  lines: LabRunEvent[];
+  lines: FlowRecord[];
   next_offset: number;
   finished: boolean;
 }

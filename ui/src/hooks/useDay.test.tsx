@@ -3,13 +3,14 @@ import { renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { useDay } from "./useDay";
-import { normalizeRecords } from "../lib/flow";
+import { shapeRecords } from "../lib/flow";
+import { ACTION } from "../lib/ingest";
 
 // (#2377) Spy on the real implementation so other tests in this file keep
 // their actual behavior; only the call count is observed.
 vi.mock("../lib/flow", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/flow")>();
-  return { ...actual, normalizeRecords: vi.fn(actual.normalizeRecords) };
+  return { ...actual, shapeRecords: vi.fn(actual.shapeRecords) };
 });
 
 function wrapper() {
@@ -34,11 +35,11 @@ describe("useDay", () => {
     const fetch = vi.fn();
     vi.stubGlobal("fetch", fetch);
     const { result } = renderHook(() => useDay(null), { wrapper: wrapper() });
-    expect(result.current).toEqual({ records: null, raw: null, loading: false, date: null, error: null });
+    expect(result.current).toEqual({ records: null, ingested: null, loading: false, date: null, error: null });
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("a daemon playback route fetches /flow/<date> and normalizes it", async () => {
+  it("a daemon playback route fetches /flow/<date> and shapes it", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) => {
@@ -50,7 +51,7 @@ describe("useDay", () => {
     expect(result.current.loading).toBe(true);
     await waitFor(() => expect(result.current.loading).toBe(false));
     expect(result.current.date).toBe("2026-08-07");
-    expect(result.current.records?.some((r) => r.action === "dispatch.start")).toBe(true);
+    expect(result.current.records?.some((r) => r.action === ACTION.DispatchStart)).toBe(true);
     expect(result.current.error).toBeNull();
   });
 
@@ -90,17 +91,17 @@ describe("useDay", () => {
     expect(result.current.date).toBe("2026-08-09");
   });
 
-  it("exposes the RAW day beside the normalized one: normalized carries the synthetic runtime row, raw does not", async () => {
+  it("exposes the INGESTED day beside the shaped one: shaped carries the synthetic runtime row, ingested does not", async () => {
     injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(['{"ts":"2026-08-09T05:00:00Z","action":"dispatch.start","session_id":"s1"}', '{"ts":"2026-08-09T05:00:01Z","action":"dispatch.turn","session_id":"s1","payload":{"turn_seq":1}}'].join("\n") + "\n", { status: 200 }))));
     const { result } = renderHook(() => useDay(null), { wrapper: wrapper() });
     await waitFor(() => expect(result.current.loading).toBe(false));
     const runtime = (rs: { source?: string }[] | null) => (rs ?? []).filter((r) => r.source === "runtime").length;
-    expect(runtime(result.current.raw)).toBe(0);
+    expect(runtime(result.current.ingested)).toBe(0);
     expect(runtime(result.current.records)).toBe(1);
   });
 
-  it("does not re-normalize or return a new `records` array on a render the day did not change (#2377)", async () => {
+  it("does not re-shape or return a new `records` array on a render the day did not change (#2377)", async () => {
     injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
     injectMeta("darkmux-flow-date", "2026-08-26");
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response('{"ts":"2026-08-26T01:00:00Z","action":"dispatch.start","session_id":"s1"}\n', { status: 200 }))));
@@ -108,7 +109,7 @@ describe("useDay", () => {
     const { result, rerender } = renderHook(() => useDay(null), { wrapper: wrapper() });
     await waitFor(() => expect(result.current.loading).toBe(false));
 
-    const callsAfterLoad = vi.mocked(normalizeRecords).mock.calls.length;
+    const callsAfterLoad = vi.mocked(shapeRecords).mock.calls.length;
     const recordsAfterLoad = result.current.records;
     expect(callsAfterLoad).toBeGreaterThan(0);
 
@@ -120,7 +121,7 @@ describe("useDay", () => {
     rerender();
     rerender();
 
-    expect(vi.mocked(normalizeRecords).mock.calls.length).toBe(callsAfterLoad);
+    expect(vi.mocked(shapeRecords).mock.calls.length).toBe(callsAfterLoad);
     expect(result.current.records).toBe(recordsAfterLoad);
   });
 });

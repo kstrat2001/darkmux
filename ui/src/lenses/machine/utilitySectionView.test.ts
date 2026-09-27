@@ -1,6 +1,8 @@
 import { describe, expect, test } from "vitest";
-import type { FlowRecord, MachineResourcesModel, MachineSpecs } from "../../types/handwritten";
+import type { MachineResourcesModel, MachineSpecs } from "../../types/handwritten";
 import { utilitySectionView } from "./utilitySectionView";
+import type { NormRecord } from "../../lib/ingest";
+import { norm } from "../../testing/records";
 
 const U = "m1";
 const at = (s: number) => new Date(Date.UTC(2026, 8, 27, 9, 0, s)).toISOString();
@@ -8,9 +10,9 @@ const ms = (s: number) => Date.parse(at(s));
 const specs = (over: Partial<MachineSpecs["utility_model"]> | null): MachineSpecs =>
   ({ machine_id: "studio", machine_uid: U, utility_model: over === null ? null : { id: "darkmux:util-4b", loaded: true, n_ctx: 120000, ...over } }) as unknown as MachineSpecs;
 const usage = (s: number, job: string | null, tokens: number, extra: Record<string, unknown> = {}) =>
-  ({ ts: at(s), action: "telemetry.tokens", category: "telemetry", source: "tokens", machine_uid: U, payload: { purpose: "utility", call_kind: job === "compaction" ? "compaction" : "single_shot", ...(job ? { job } : {}), total_tokens: tokens, requested_model: "darkmux:util-4b" }, ...extra }) as unknown as FlowRecord;
+  norm({ ts: at(s), action: "telemetry.tokens", category: "telemetry", source: "tokens", machine_uid: U, payload: { purpose: "utility", call_kind: job === "compaction" ? "compaction" : "single_shot", ...(job ? { job } : {}), total_tokens: tokens, requested_model: "darkmux:util-4b" }, ...extra });
 const start = (s: number, job: string) =>
-  ({ ts: at(s), action: "utility.start", machine_uid: U, payload: { job, model: "darkmux:util-4b", stall_after_seconds: 30 } }) as unknown as FlowRecord;
+  norm({ ts: at(s), action: "utility.start", machine_uid: U, payload: { job, model: "darkmux:util-4b", stall_after_seconds: 30 } });
 const row = { current_bytes: 2 ** 30 * 14.61 } as unknown as MachineResourcesModel;
 
 describe("(#2915) the machine page's Utility section", () => {
@@ -85,7 +87,7 @@ describe("(#2915) the machine page's Utility section", () => {
   });
 
   test("(#2915 review, C7) a fixed set of rows: unknown and unnamed jobs fold into ONE 'other' row, always present", () => {
-    const rows = (data: FlowRecord[]) => utilitySectionView({ data, uid: U, nowMs: ms(60), specs: specs({}), isLocal: true, residentRow: null }).jobs;
+    const rows = (data: NormRecord[]) => utilitySectionView({ data, uid: U, nowMs: ms(60), specs: specs({}), isLocal: true, residentRow: null }).jobs;
     const none = rows([]);
     const many = rows([usage(1, "dream_job", 5), usage(2, "nightmare_job", 6), usage(3, null, 7)]);
     expect(none.map((r) => r.word)).toEqual(["compacting", "radio routing", "other"]);

@@ -60,7 +60,6 @@
  */
 
 import {
-  T,
   sessionRunsOn,
   dispatchRec,
   dispatchEnd,
@@ -75,8 +74,9 @@ import {
 } from "../../lib/flow";
 import type { RosterName, SelfIdentity } from "../../lib/flow";
 import { clkhm } from "../../lib/format";
-import type { FlowRecord, PresenceBeat } from "../../types/handwritten";
+import type { PresenceBeat } from "../../types/handwritten";
 import type { RunStatus } from "../../types/generated/RunStatus";
+import { isAsOf, timesOf, type NormRecord } from "../../lib/ingest";
 
 /** The live-only window presets (#1151) — minutes, matching legacy's
  * `[{l:'10m',m:10},{l:'1h',m:60},{l:'4h',m:240},{l:'24h',m:1440}]` verbatim.
@@ -134,13 +134,13 @@ export interface ActivityTimeline {
 /** `renderMachine()`'s lane-label width math (viewer.html:1733-1734) — sizes
  * the `.lname` column to the longest machine name so short names don't leave
  * a fixed gap. Visual-only (no text-parity effect). */
-function labelWidthPx(uids: string[], data: FlowRecord[], liveMachines: Map<string, PresenceBeat>, specs: SelfIdentity | null, roster: readonly RosterName[]): number {
+function labelWidthPx(uids: string[], data: NormRecord[], liveMachines: Map<string, PresenceBeat>, specs: SelfIdentity | null, roster: readonly RosterName[]): number {
   const maxLen = uids.length ? Math.max(...uids.map((m) => displayNameOf(data, liveMachines, specs, m, roster).length)) : 8;
   return Math.round(Math.min(170, Math.max(54, maxLen * 7.4 + 10)));
 }
 
 export function buildActivityTimeline(
-  data: FlowRecord[],
+  data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
   uids: string[],
   liveSet: Set<string>,
@@ -214,16 +214,16 @@ export function buildActivityTimeline(
     // all) preserves the exact prior session-id-only behavior.
     for (const { sessionId: sid, missionId } of sessionRunsOn(data, m)) {
       const s = dispatchRec(data, sid, "start", missionId);
-      // (#1869) `T(s.ts) > playheadT` — restores legacy's
+      // (#1869) The as-of cut at the playhead — restores legacy's
       // `if(!s||T(s.ts)>state.t)return"";`. A session that hasn't started
       // yet as of the PLAYHEAD (not the axis ceiling) must not draw a bar at
       // all; without it, `sessionRunning` finds no close-edge for it
       // (there's nothing to close) and defaults to "running", drawing a
       // phantom sliver at the track's right edge.
-      if (!s || T(s.ts) > playheadT) continue;
+      if (!s || !isAsOf(s, playheadT)) continue;
       const term = dispatchEnd(data, sid, missionId);
       const e = sessEnd(data, sid, missionId);
-      const closeCands = [term ? T(term.ts) : null, e ? T(e.ts) : null].filter((x): x is number => x != null);
+      const closeCands = timesOf([term, e].filter((x): x is NormRecord => x !== undefined));
       const closeTs = closeCands.length ? Math.min(...closeCands) : null;
       // (#857) `done` = not currently running, through the SHARED
       // `sessionRunning` — live keys on presence, replay on the close-edge at
@@ -237,7 +237,9 @@ export function buildActivityTimeline(
       const lbl = statusLabel(state);
       const end = !done ? playheadT : closeTs != null ? closeTs : lastTs(data, sid, missionId) || playheadT;
       if (end < tlMin) continue; // ended entirely before the window
-      const cst = Math.max(T(s.ts), tlMin); // clip a straddling start to the window edge
+      // Clip a straddling start to the window edge; an untimed start draws
+      // from the edge, visible rather than dropped.
+      const cst = Math.max(s.tMs ?? tlMin, tlMin);
       const widthPct = Math.max(0.6, pct(end) - pct(cst));
       const leftPct = Math.max(0, Math.min(pct(cst), 100 - widthPct)); // never spill past the right edge
       const role = (s.handle || "").replace(/^darkmux\//, "");

@@ -5,8 +5,10 @@
 // only by `lib/utilityJobs.ts` (`UTILITY_JOB`, checked against the generated
 // union by `satisfies`). Anything else keys a job through that map, so a
 // renamed or added variant is a type error or a generic indicator, never a
-// string that silently stops matching. Same for the two record actions the
-// module owns (`utility.start`, `utility.error`).
+// string that silently stops matching. The utility record actions
+// (`utility.start`, `utility.error`, and the live channel's `utility.end`)
+// are spelled once too, in `lib/ingest.ts`'s `ACTION`, the viewer's one
+// boundary for record strings.
 //
 // This scans the app's own non-test source for a quoted literal of any job
 // kind or action. `"compaction"` is also a word in three OTHER vocabularies
@@ -17,10 +19,18 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
-import { LIVE_UTILITY_END_ACTION, UTILITY_ERROR_ACTION, UTILITY_JOB, UTILITY_START_ACTION } from "./utilityJobs";
+import { UTILITY_JOB } from "./utilityJobs";
+import { ACTION, tagText } from "./ingest";
 
 const SRC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-const DEFINITION = path.join("lib", "utilityJobs.ts");
+const JOB_DEFINITION = path.join("lib", "utilityJobs.ts");
+const ACTION_DEFINITION = path.join("lib", "ingest.ts");
+
+/** Each spelled-once word, with the one file allowed to spell it. */
+const WORDS: [string, string][] = [
+  ...Object.values(UTILITY_JOB).map((w): [string, string] => [w, JOB_DEFINITION]),
+  ...[ACTION.UtilityStart, ACTION.UtilityError, ACTION.UtilityEnd].map((w): [string, string] => [tagText(w), ACTION_DEFINITION]),
+];
 
 function sourceFiles(dir: string): string[] {
   const out: string[] = [];
@@ -64,25 +74,25 @@ const OTHER_VOCABULARY: Record<string, Record<string, number>> = {
 describe("(#2915) utility job kinds are spelled once", () => {
   const files = sourceFiles(SRC_DIR).map((f) => ({ rel: f.slice(SRC_DIR.length + 1), text: readFileSync(f, "utf8") }));
 
-  test("the scan sees the app's source, and the definition itself", () => {
+  test("the scan sees the app's source, and each definition itself", () => {
     expect(files.length).toBeGreaterThan(50);
-    const def = files.find((f) => f.rel === DEFINITION);
-    expect(def, "lib/utilityJobs.ts must be scanned").toBeTruthy();
-    for (const word of [...Object.values(UTILITY_JOB), UTILITY_START_ACTION, UTILITY_ERROR_ACTION, LIVE_UTILITY_END_ACTION]) {
-      expect(literalCount(def!.text, word), `${word} is defined in ${DEFINITION}`).toBeGreaterThan(0);
+    for (const [word, definition] of WORDS) {
+      const def = files.find((f) => f.rel === definition);
+      expect(def, `${definition} must be scanned`).toBeTruthy();
+      expect(literalCount(def!.text, word), `${word} is defined in ${definition}`).toBeGreaterThan(0);
     }
   });
 
-  for (const word of [...Object.values(UTILITY_JOB), UTILITY_START_ACTION, UTILITY_ERROR_ACTION, LIVE_UTILITY_END_ACTION]) {
-    test(`no literal "${word}" outside ${DEFINITION}, beyond other vocabularies' pinned uses`, () => {
+  for (const [word, definition] of WORDS) {
+    test(`no literal "${word}" outside ${definition}, beyond other vocabularies' pinned uses`, () => {
       const allowed = OTHER_VOCABULARY[word] ?? {};
       const found: string[] = [];
       for (const f of files) {
-        if (f.rel === DEFINITION) continue;
+        if (f.rel === definition) continue;
         const n = literalCount(f.text, word);
         if (n !== (allowed[f.rel] ?? 0)) found.push(`${f.rel}: ${n} (pinned ${allowed[f.rel] ?? 0})`);
       }
-      expect(found, `key the job through UTILITY_JOB / the action constants in ${DEFINITION}`).toEqual([]);
+      expect(found, `key it through the constant in ${definition}`).toEqual([]);
     });
   }
 

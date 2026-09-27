@@ -13,7 +13,8 @@ import {
   labFeedStatusSuffix,
   labBadgeText,
 } from "./labRun";
-import type { LabRunDetailResponse, LabRunEvent, LabRunEventsResponse } from "../../types/handwritten";
+import type { LabRunDetailResponse, LabRunEventsResponse } from "../../types/handwritten";
+import { ingest, type NormRecord } from "../../lib/ingest";
 
 /**
  * Lab-run detail — `renderLabRun()` (viewer.html:4848-4869), reached by
@@ -88,7 +89,7 @@ export function LabRunDetail({
     queryFn: () => fetchJson<LabRunDetailResponse>(`/lab/run/detail?dir=${encodeURIComponent(dir)}`),
   });
 
-  const [events, setEvents] = useState<LabRunEvent[]>([]);
+  const [events, setEvents] = useState<NormRecord[]>([]);
   const [finished, setFinished] = useState(false);
   // Consecutive-failure signal for the events poll below — see this
   // component's own doc + `LAB_POLL_FAILURE_THRESHOLD`'s doc in
@@ -158,7 +159,8 @@ export function LabRunDetail({
         setPollUnreachable(false);
         const body = result.data;
         if (Array.isArray(body.lines) && body.lines.length) {
-          setEvents((prev) => prev.concat(body.lines));
+          const lines = ingest(body.lines);
+          setEvents((prev) => prev.concat(lines));
           gotLines = body.lines.length;
         }
         if (typeof body.next_offset === "number") offsetRef.current = body.next_offset;

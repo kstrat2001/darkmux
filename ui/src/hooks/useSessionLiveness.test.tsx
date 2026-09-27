@@ -7,6 +7,7 @@ import { TERMINAL_GRACE_MS, useSessionLiveness } from "./useSessionLiveness";
 import { PRESENCE_POLL_MS } from "../lib/queryKeys";
 import type { Route } from "../lib/route";
 import type { FlowWindowResult } from "./useFlowWindow";
+import { normAll } from "../testing/records";
 
 /**
  * (#2011) The live → done TRANSITION, which nothing covered.
@@ -114,7 +115,7 @@ describe("the live → done transition on a session route (#2011)", () => {
 
     const { result, rerender } = renderHook(() => useRouteRecords(ROUTE, LIVE), { wrapper: wrapper() });
 
-    await waitFor(() => expect(result.current.records).toEqual([START]));
+    await waitFor(() => expect(result.current.records).toEqual(normAll([START])));
     // Presence says live, so this is a moving feed, not a replay.
     expect(result.current.historical).toBe(false);
 
@@ -124,7 +125,7 @@ describe("the live → done transition on a session route (#2011)", () => {
 
     // Nothing but the transition itself can produce this: polling is off the
     // moment presence stops listing the session.
-    await waitFor(() => expect(result.current.records).toEqual([START, DONE]));
+    await waitFor(() => expect(result.current.records).toEqual(normAll([START, DONE])));
     expect(result.current.historical).toBe(true);
   });
 
@@ -169,7 +170,7 @@ describe("the live → done transition on a session route (#2011)", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
     });
-    expect(result.current.records).toEqual([START]);
+    expect(result.current.records).toEqual(normAll([START]));
 
     h.liveIds = new Set<string>();
     rerender();

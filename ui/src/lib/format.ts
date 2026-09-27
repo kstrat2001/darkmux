@@ -33,8 +33,8 @@ export const MISSING = "\u2014";
 export function fmtElapsed(ms: number): string {
   // (C4) A duration that could not be COMPUTED is not a duration of zero.
   // `NaN` reaches here from production: `lenses/session/sessionRun.ts`'s
-  // `runWallMs` falls back to `T(close.ts) - startTs`, and an unparsable
-  // `ts` subtracts to NaN — which used to render "0:00", asserting that a
+  // `runWallMs` is NaN when the terminal record has neither a `wall_ms` nor
+  // a parsed time (`tMs === null`) — which used to render "0:00", asserting that a
   // run took no time. The rest of that same tile row (TURNS, TOKENS IN,
   // CTX) already renders "—" for an absent number; this joins it.
   // A NEGATIVE duration still clamps to 0:00: it is computable, just skewed
@@ -55,6 +55,12 @@ export function fmtElapsed(ms: number): string {
  * as the legacy extraction, so both resolve identically under test). */
 export function clk(t: number): string {
   return new Date(t).toLocaleTimeString([], { hour12: false });
+}
+
+/** A record's time of day, from its parsed `tMs`: a record with no usable
+ *  timestamp reads as a same-width placeholder rather than "Invalid Date". */
+export function clkAt(t: number | null): string {
+  return t === null ? "--:--:--" : clk(t);
 }
 
 /** `clkhm()` — viewer.html:976. `HH:MM` local, no seconds — the fleet

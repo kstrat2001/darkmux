@@ -34,13 +34,14 @@ import { replayMetaLines, replayMetaParts } from "./lib/replayMeta";
 import { ReadyHeadline } from "./components/ReadyHeadline";
 import { FleetCoverageNotice, useDegradedFleetSource } from "./components/FleetCoverageNotice";
 import { FlowReadNotice } from "./components/FlowReadNotice";
-import { T, asRecordArray, displayNameOf, earliestRecordDate, firstRecordDate, isDispatchTerminal, localMachineUid, missionReplayDate, todayUTC } from "./lib/flow";
+import { displayNameOf, earliestRecordDate, firstRecordDate, localMachineUid, missionReplayDate, todayUTC } from "./lib/flow";
 import { isLiveRoute, showsEventLog, tokRateConnectionEvidence } from "./lib/route";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "./lib/fetcher";
 import { queryKeys } from "./lib/queryKeys";
-import type { FlowRecord, MachineSpecs } from "./types/handwritten";
+import type { MachineSpecs } from "./types/handwritten";
 import type { Route } from "./lib/route";
+import { ingest, isDispatchTerminal, recordsAsOf, type NormRecord } from "./lib/ingest";
 
 /**
  * The app shell. A `switch` over the parsed [[Route]] (see `lib/route.ts` for
@@ -119,7 +120,7 @@ import type { Route } from "./lib/route";
 // records of its own (harmless either way, since that hook's own memo keys
 // off a length+last-ts signature rather than array identity, but there is
 // no reason to allocate one per render when nothing needs it).
-const EMPTY_FLOW_RECORDS: FlowRecord[] = [];
+const EMPTY_FLOW_RECORDS: NormRecord[] = [];
 
 /** (#2346) The LATEST terminal record's own `wall_ms` payload — the SAME
  * field the run detail's own WALL CLOCK tile reads (`sessionRun.ts`'s
@@ -132,7 +133,7 @@ const EMPTY_FLOW_RECORDS: FlowRecord[] = [];
  * a second — small next to the bug this feature fixes (hours), but still
  * two clocks describing the same run differently, which is exactly what
  * this whole feature exists to stop doing. */
-function terminalWallMs(records: FlowRecord[]): number | null {
+function terminalWallMs(records: NormRecord[]): number | null {
   for (let i = records.length - 1; i >= 0; i--) {
     if (isDispatchTerminal(records[i].action)) {
       const wallMs = records[i].payload?.wall_ms;
@@ -227,6 +228,10 @@ export function App() {
     queryFn: () => fetchJson<unknown>(`/flow-mission/${encodeURIComponent(route.kind === "mission" ? route.missionId : "")}`),
     enabled: source.kind === "daemon" && route.kind === "mission",
   });
+  const missionRecords = useMemo(
+    () => (missionRecordsQuery.data?.ok ? ingest(missionRecordsQuery.data.data) : null),
+    [missionRecordsQuery.data],
+  );
   const replayDate = useMemo(() => {
     if (route.kind === "playback") return route.date;
     if (source.kind !== "daemon") return null;
@@ -236,9 +241,9 @@ export function App() {
     // A mission that is still RUNNING is live, not a replay (header owns
     // liveness): its day is decided by a terminal lifecycle record, not by
     // the mere presence of records from today.
-    if (route.kind === "mission") return missionRecordsQuery.data?.ok ? missionReplayDate(asRecordArray(missionRecordsQuery.data.data)) : null;
+    if (route.kind === "mission") return missionRecords ? missionReplayDate(missionRecords) : null;
     return null;
-  }, [route, source.kind, routeRecords.records, routeRecords.historical, missionRecordsQuery.data]);
+  }, [route, source.kind, routeRecords.records, routeRecords.historical, missionRecords]);
   const day = useDay(replayDate);
   const dayRecords = day.records;
   // (#2346, redesigned after a live-render finding) The transport's own
@@ -270,9 +275,7 @@ export function App() {
   const dispatchFocusRecords = route.kind === "dispatch" ? routeRecords.records : EMPTY_FLOW_RECORDS;
   const missionFocusRecords =
     route.kind === "mission"
-      ? missionRecordsQuery.data?.ok
-        ? asRecordArray(missionRecordsQuery.data.data)
-        : (dayRecords ?? []).filter((r) => r.mission_id === route.missionId)
+      ? (missionRecords ?? (dayRecords ?? []).filter((r) => r.mission_id === route.missionId))
       : EMPTY_FLOW_RECORDS;
   // A fresh object literal every render is fine: `usePlaybackTransport`
   // keys its own range memoization on the primitive `kind`+id plus a cheap
@@ -318,8 +321,8 @@ export function App() {
   // until the lens's first fold resolves (or whenever we're not even on a
   // mission route); the mainstay-column render sites below treat that the
   // same as "no records yet", never a thrown/undefined read.
-  const [missionEvents, setMissionEvents] = useState<{ records: FlowRecord[]; truncated: boolean } | null>(null);
-  const onMissionEvents = useCallback((records: FlowRecord[], truncated: boolean) => {
+  const [missionEvents, setMissionEvents] = useState<{ records: NormRecord[]; truncated: boolean } | null>(null);
+  const onMissionEvents = useCallback((records: NormRecord[], truncated: boolean) => {
     setMissionEvents({ records, truncated });
   }, []);
   // (#2223) The same records, held in a REF purely so `onSelectStep` can
@@ -328,7 +331,7 @@ export function App() {
   // canvas; depending on state that changes on every records fold would
   // give it a new identity on every fold, churning the canvas's renders
   // for a value only ever read INSIDE a click handler, long after render.
-  const missionRecordsRef = useRef<FlowRecord[]>([]);
+  const missionRecordsRef = useRef<NormRecord[]>([]);
   missionRecordsRef.current = missionEvents?.records ?? [];
   // (#2189, step drill-in) `route.stepId` — App.tsx owns the route/hash, so
   // the WRITE lives here too: a click on a node/row calls this, which
@@ -408,9 +411,7 @@ export function App() {
     // routes keep their own slice, scoped the same way.
     const own = route.kind === "playback" || route.kind === "dispatch" || source.kind === "daemon";
     const base = own ? routeRecords.records : (dayRecords ?? []);
-    // `!(ts > t)`, not `ts <= t`: a record with an unparseable `ts` stays
-    // in the log, as it did before the transport scoped every route.
-    return base.filter((r) => !(T(r.ts) > playhead));
+    return recordsAsOf(base, playhead);
   }, [route.kind, selectedMissionStepId, missionEvents, playhead, routeRecords.records, source.kind, dayRecords]);
   // (#2071) The sticky block's measured height feeds `--chrome-h`, the
   // offset the event log column sticks under on desktop. It used to be a
@@ -561,10 +562,10 @@ export function App() {
   // lens renders, whether the live tail runs, which fetch `PlaybackLens`
   // issues), so a still-loading static date never flips any of those.
   //
-  // Judgment call: `firstRecordDate` is documented against RAW file-order
-  // records (`records[0]`, matching legacy's un-sorted `RAW[0].ts` exactly,
-  // header-line quirk included), but `routeRecords.records` here has already
-  // been through `normalizeRecords` — sorted by ts, header line dropped. For
+  // Judgment call: `firstRecordDate` is documented against file-order
+  // records (`records[0]`, matching legacy's un-sorted `RAW[0].ts`), but
+  // `routeRecords.records` here has already been through `shapeRecords` —
+  // sorted by time. For
   // a flow file that is itself roughly chronological (the only kind
   // `build-demo.sh` ever commits), the two agree; a hand-edited or
   // deliberately-reordered fixture could show a different label than
@@ -1049,7 +1050,7 @@ function routeChrome(route: Route, targetMachineName: string | null): { crumb: s
 function renderRoute(
   route: Route,
   playhead: number | null,
-  onMissionEvents: (events: FlowRecord[], srvTruncated: boolean) => void,
+  onMissionEvents: (events: NormRecord[], srvTruncated: boolean) => void,
   onSelectStep: (stepId: string | null) => void,
   onStepHeader: (fields: StepHeaderField[] | null) => void,
   /** (#2886 pass 3, "STALL while disconnected") The SAME `useLiveTail`

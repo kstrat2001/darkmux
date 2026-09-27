@@ -8,7 +8,8 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson, type FetchResult } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useSessionLiveness } from "../../hooks/useSessionLiveness";
-import { T, flowToRenderModel, isDispatchStart } from "../../lib/flow";
+import { flowToRenderModel } from "../../lib/flow";
+import { ACTION, CATEGORY, ingest, recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { useNowMs } from "../../lib/clock";
 import { clkhm } from "../../lib/format";
 import { getSource } from "../../lib/source";
@@ -534,12 +535,11 @@ export function SessionReplay({
   // dispatch-row tap 404'd here. Read the committed file instead (the same
   // `queryKeys.staticFlowSrc` slot the playback lens and `useRouteRecords`
   // fill, so this is cache reuse) and slice this session out of it, shaped
-  // like the daemon's response so nothing below has to know. RAW records,
-  // not `normalizeRecords`: `/flow-session` hands back raw records too, and
-  // `flowToRenderModel` synthesizes the per-session runtime telemetry row
-  // itself — normalizing here would add a second copy the daemon path never
-  // has. The file's schema-header line carries no `session_id`, so the
-  // slice drops it on its own.
+  // like the daemon's response so nothing below has to know. The day as
+  // INGESTED, not shaped: `/flow-session` hands back no synthesized rows,
+  // and `flowToRenderModel` synthesizes the per-session runtime telemetry
+  // row itself — slicing the shaped day would add a second copy the daemon
+  // path never has.
   const source = getSource();
   const flowSrc = source.flow;
   const query = useQuery({
@@ -551,16 +551,20 @@ export function SessionReplay({
   // (#2086) The static day comes from the one resolver (the shell already
   // holds it for the transport; same cache slot, no second download).
   const day = useDay(null);
-  const staticSlice: FlowRecordsResponse | null = useMemo(() => {
-    // RAW, not `day.records`: `/flow-session` hands back raw records and
-    // `flowToRenderModel` synthesizes the runtime row itself; the normalized
-    // day already carries one, so slicing it would double the row.
-    if (flowSrc === null || day.raw === null) return null;
-    const recs = day.raw.filter((r) => r.session_id === sessionId);
-    return { records: recs, count: recs.length, truncated: false, generated_at_ms: 0 };
-  }, [flowSrc, day.raw, sessionId]);
-  const session: FetchResult<FlowRecordsResponse> | undefined =
-    flowSrc === null ? query.data : staticSlice === null ? undefined : { ok: true, data: staticSlice };
+  const staticSlice: NormRecord[] | null = useMemo(() => {
+    if (flowSrc === null || day.ingested === null) return null;
+    return day.ingested.filter((r) => r.session_id === sessionId);
+  }, [flowSrc, day.ingested, sessionId]);
+  const daemonSlice: NormRecord[] | null = useMemo(
+    () => (query.data?.ok ? ingest(query.data.data.records) : null),
+    [query.data],
+  );
+  const session: FetchResult<{ count: number }> | undefined =
+    flowSrc === null
+      ? query.data
+      : staticSlice === null
+        ? undefined
+        : { ok: true, data: { count: staticSlice.length } };
 
   // (#2759) A run's OWN top-level session (the run-grain `dispatch start`/
   // `dispatch complete`/`mission.grow` trio a mission mints for itself)
@@ -572,20 +576,19 @@ export function SessionReplay({
   // own dispatch directly) already has real telemetry and never pays for the
   // extra fetch.
   //
-  // Checked on RAW records (pre-`flowToRenderModel`): `category` is a
-  // first-class wire field on a real telemetry record, not something the
-  // frontend normalization pass invents (`flowToRenderModel` only fills in a
-  // DEFAULT when the field is absent) — so this reads reliably before that
-  // pass runs.
-  const ownRaw = session?.ok ? session.data.records : null;
+  // Checked before `flowToRenderModel`: `category` is a first-class wire
+  // field on a real telemetry record, not something that pass invents (it
+  // only fills in a DEFAULT when the field is absent) — so this reads
+  // reliably before that pass runs.
+  const ownRaw = flowSrc === null ? daemonSlice : staticSlice;
   const ownMissionId = useMemo(() => {
     if (!ownRaw) return null;
-    const start = ownRaw.find((r) => r.session_id === sessionId && isDispatchStart(r.action));
+    const start = ownRaw.find((r) => r.session_id === sessionId && r.action === ACTION.DispatchStart);
     return start?.mission_id ?? null;
   }, [ownRaw, sessionId]);
   useEffect(() => setLivenessMissionId(ownMissionId), [ownMissionId]);
   const ownHasTelemetry = useMemo(
-    () => (ownRaw ? ownRaw.some((r) => r.session_id === sessionId && r.category === "telemetry") : false),
+    () => (ownRaw ? ownRaw.some((r) => r.session_id === sessionId && r.category === CATEGORY.Telemetry) : false),
     [ownRaw, sessionId],
   );
   const missionQuery = useQuery({
@@ -603,12 +606,12 @@ export function SessionReplay({
   // Static builds get the same enrichment from the day's own committed file
   // (below, `staticMissionSlice`) rather than this query, which never runs
   // there (`enabled: flowSrc === null`).
-  const missionRaw = missionQuery.data?.ok ? missionQuery.data.data.records : null;
+  const missionRaw = useMemo(() => (missionQuery.data?.ok ? ingest(missionQuery.data.data.records) : null), [missionQuery.data]);
   const staticMissionSlice = useMemo(() => {
-    if (flowSrc === null || day.raw === null || ownHasTelemetry || ownMissionId == null) return null;
-    const recs = day.raw.filter((r) => r.mission_id === ownMissionId);
+    if (flowSrc === null || day.ingested === null || ownHasTelemetry || ownMissionId == null) return null;
+    const recs = day.ingested.filter((r) => r.mission_id === ownMissionId);
     return recs.length ? recs : null;
-  }, [flowSrc, day.raw, ownHasTelemetry, ownMissionId]);
+  }, [flowSrc, day.ingested, ownHasTelemetry, ownMissionId]);
   // A union of the two, each record once. Neither side covers the other: the
   // session fetch carries host samples the daemon attaches by time window
   // (no mission_id), and the two queries refresh separately, so the run's
@@ -643,7 +646,7 @@ export function SessionReplay({
   // (#2759) `enrichedRaw` is `ownRaw` (this session's own fetch) unless a
   // mission-wide fetch found MORE — see that computation's own doc above.
   const all = enrichedRaw;
-  const records = all && playhead !== null ? all.filter((r) => !(T(r.ts) > playhead)) : all;
+  const records = all && playhead !== null ? recordsAsOf(all, playhead) : all;
   const data = records ? flowToRenderModel(records) : [];
   const base = records && records.length ? runRegions(data, sessionId) : null;
   // Gated on PLAYBACK too, not just on the run's own liveness. A recorded

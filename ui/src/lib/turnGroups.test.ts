@@ -1,16 +1,17 @@
 import { describe, expect, it } from "vitest";
 import { groupsByTurn, turnItems } from "./turnGroups";
-import type { FlowRecord } from "../types/handwritten";
+import type { NormRecord } from "./ingest";
+import { norm } from "../testing/records";
 
 /** One session's records in the order the host emits them (measured on
  * `refresh-rotation-deep-1790125783-1`): reasoning(N), turn(N), N's tools,
  * a rest; heartbeats stream during the turn; a context reading per turn. */
 const S = "darkmux-coding-refresh-rotation-1790125784225";
 const at = (sec: number) => new Date(Date.UTC(2026, 8, 23, 1, 9, 0) + sec * 1000).toISOString();
-const r = (sec: number, action: string, payload: Record<string, unknown> = {}, session: string | undefined = S): FlowRecord =>
-  ({ ts: at(sec), action, session_id: session, machine_id: "MacBook-Pro", payload }) as unknown as FlowRecord;
+const r = (sec: number, action: string, payload: Record<string, unknown> = {}, session: string | undefined = S): NormRecord =>
+  norm({ ts: at(sec), action, session_id: session, machine_id: "MacBook-Pro", payload });
 
-const start = r(0, "dispatch start");
+const start = r(0, "dispatch.start");
 const beat1 = r(1, "dispatch.turn.heartbeat", { turn_seq: 1 });
 const think1 = r(8, "dispatch.reasoning", { turn_seq: 1, reasoning_text: "Let me read the files." });
 const turn1 = r(9, "dispatch.turn", {
@@ -44,7 +45,7 @@ describe("turnItems (#2863)", () => {
       "turn 1",
       "rec:dispatch.tool",
       "rec:dispatch.reasoning",
-      "rec:dispatch start",
+      "rec:dispatch.start",
     ]);
   });
 
@@ -89,14 +90,14 @@ describe("turnItems (#2863)", () => {
   });
 
   it("stays flat for one session with no turns (a mission's step records)", () => {
-    const steps = [r(0, "step start"), r(5, "step complete")];
+    const steps = [r(0, "step.start"), r(5, "step.complete")];
     expect(groupsByTurn(steps)).toBe(false);
   });
 
   it("records with no session (telemetry) do not make a one-session list mixed", () => {
     // Built without the helper: its default parameter would put the session
     // back and make this test vacuous (it was, until a mutation showed it).
-    const telem = { ts: at(20), action: "machine.telemetry", machine_id: "MacBook-Pro", payload: {} } as unknown as FlowRecord;
+    const telem = norm({ ts: at(20), action: "machine.telemetry", machine_id: "MacBook-Pro", payload: {} });
     expect(telem.session_id).toBeUndefined();
     expect(groupsByTurn([...ALL, telem])).toBe(true);
   });
@@ -132,10 +133,10 @@ describe("turnItems (#2863)", () => {
     // (#2863 review) A second `dispatch start` restarts turn_seq at 1; keyed
     // by the bare seq, one turn header overwrote the other and its output
     // summed both executions' calls.
-    const e1 = r(0, "dispatch start");
+    const e1 = r(0, "dispatch.start");
     const t1a = r(5, "dispatch.turn", { turn_seq: 1, finish_reason: "stop", usage: { prompt_tokens: 100 } });
     const k1a = r(5, "telemetry.tokens", { turn_seq: 1, completion_tokens: 10 });
-    const e2 = r(20, "dispatch start");
+    const e2 = r(20, "dispatch.start");
     const t1b = r(25, "dispatch.turn", { turn_seq: 1, finish_reason: "stop", usage: { prompt_tokens: 200 } });
     const k1b = r(25, "telemetry.tokens", { turn_seq: 1, completion_tokens: 30 });
     const all = [e1, t1a, k1a, e2, t1b, k1b];
@@ -154,12 +155,12 @@ describe("turnItems (#2863)", () => {
   // terminal error (which carries no `turn_seq` of its own) was misfiled
   // under the wrong turn.
   it("a turn that never finished still gets a header and its error, in time order", () => {
-    const e1 = r(0, "dispatch start");
+    const e1 = r(0, "dispatch.start");
     const t1 = r(5, "dispatch.turn", { turn_seq: 1, finish_reason: "tool_calls", tool_calls_count: 1, usage: { prompt_tokens: 100 } });
     const t2 = r(10, "dispatch.turn", { turn_seq: 2, finish_reason: "tool_calls", tool_calls_count: 1, usage: { prompt_tokens: 200 } });
     const t3 = r(15, "dispatch.turn", { turn_seq: 3, finish_reason: "tool_calls", tool_calls_count: 1, usage: { prompt_tokens: 300 } });
     const checkpoint4 = r(20, "dispatch.checkpoint", { turn_seq: 4 });
-    const err = r(21, "dispatch error", {}); // no turn_seq of its own
+    const err = r(21, "dispatch.error", {}); // no turn_seq of its own
     const all = [e1, t1, t2, t3, checkpoint4, err];
     const visible = [err, checkpoint4, t3, t2, t1, e1];
     const items = turnItems(visible, all);
@@ -168,12 +169,12 @@ describe("turnItems (#2863)", () => {
     // checkpoint sit under it, THEN turn 3 — not the other way around.
     expect(labels).toEqual([
       "turn 4",
-      "rec:dispatch error",
+      "rec:dispatch.error",
       "rec:dispatch.checkpoint",
       "turn 3",
       "turn 2",
       "turn 1",
-      "rec:dispatch start",
+      "rec:dispatch.start",
     ]);
     const head4 = items.find((i) => i.kind === "turn" && i.turn.seq === 4);
     expect(head4 && head4.kind === "turn" && head4.turn.why).toBe("did not finish");
@@ -193,7 +194,7 @@ describe("turnItems (#2863)", () => {
   // ended and this turn has no closing record); "in progress" is the
   // honest word while the execution has no terminal at all.
   it("a checkpoint with no terminal record yet reads as in progress, not did not finish", () => {
-    const e1 = r(0, "dispatch start");
+    const e1 = r(0, "dispatch.start");
     const t1 = r(5, "dispatch.turn", { turn_seq: 1, finish_reason: "tool_calls", tool_calls_count: 1, usage: { prompt_tokens: 100 } });
     const checkpoint2 = r(10, "dispatch.checkpoint", { turn_seq: 2, verdict: "continue" });
     const all = [e1, t1, checkpoint2];
@@ -209,15 +210,15 @@ describe("turnItems (#2863)", () => {
   // terminal error) belongs with the FURTHEST turn reached, not the stale
   // one.
   it("a stale (lower) turn_seq does not pull `current` backward", () => {
-    const e1 = r(0, "dispatch start");
+    const e1 = r(0, "dispatch.start");
     const turn3 = r(5, "dispatch.turn", { turn_seq: 3, finish_reason: "tool_calls", tool_calls_count: 1, usage: { prompt_tokens: 100 } });
     const checkpoint4 = r(7, "dispatch.checkpoint", { turn_seq: 4 });
     const staleTokens = r(7, "telemetry.tokens", { turn_seq: 3, completion_tokens: 5 });
-    const err = r(8, "dispatch error", {}); // no turn_seq of its own
+    const err = r(8, "dispatch.error", {}); // no turn_seq of its own
     const all = [e1, turn3, checkpoint4, staleTokens, err];
     const items = turnItems([err, staleTokens, checkpoint4, turn3, e1], all);
     const labels = items.map((i) => (i.kind === "turn" ? `turn ${i.turn.seq}` : `${i.kind}:${i.rec.action}`));
-    const errIdx = labels.indexOf("rec:dispatch error");
+    const errIdx = labels.indexOf("rec:dispatch.error");
     const turn4Idx = labels.indexOf("turn 4");
     const turn3Idx = labels.indexOf("turn 3");
     expect(turn4Idx).toBeLessThan(turn3Idx);
@@ -231,9 +232,9 @@ describe("turnItems (#2863)", () => {
   // second start, joining the FIRST execution's last turn instead of
   // starting fresh under the new execution.
   it("a second dispatch start resets which turn an un-seq'd record joins", () => {
-    const e1 = r(0, "dispatch start");
+    const e1 = r(0, "dispatch.start");
     const t1 = r(5, "dispatch.turn", { turn_seq: 1, finish_reason: "stop", usage: { prompt_tokens: 100 } });
-    const e2 = r(20, "dispatch start");
+    const e2 = r(20, "dispatch.start");
     const stray = r(21, "dispatch.tool", { tool_name: "read" }); // no turn_seq, right after the second start
     const all = [e1, t1, e2, stray];
     const items = turnItems([stray, e2, t1, e1], all);
@@ -251,7 +252,7 @@ describe("turnItems (#2863)", () => {
     // clocks, out-of-order delivery) must not render as a negative time.
     const late = r(12, "dispatch.turn.heartbeat", { turn_seq: 1 });
     const t = r(10, "dispatch.turn", { turn_seq: 1, finish_reason: "stop", usage: {} });
-    const [head] = turnItems([t], [r(0, "dispatch start"), t, late]);
+    const [head] = turnItems([t], [r(0, "dispatch.start"), t, late]);
     expect(head.kind === "turn" ? head.turn.durationMs : "not a turn").toBeNull();
   });
 });

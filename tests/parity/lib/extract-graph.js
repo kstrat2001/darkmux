@@ -294,8 +294,8 @@ function headerFactsOf(fullGoldenText) {
  *
  * 1. `activityOf()` (`lib/eventFilters.ts`) is a richer label mapping than
  *    the standalone page's raw `rec.action` display — but for every action
- *    this fixture's records carry ("mission start"/"phase start"/
- *    "phase complete"/"mission close"), `activityOf` has no explicit branch
+ *    this fixture's records carry ("mission.start"/"phase.start"/
+ *    "phase.complete"/"mission.close"), `activityOf` has no explicit branch
  *    and falls through to `a || "other"`, i.e. the RAW action string
  *    verbatim. So the two sides agree for this fixture's action vocabulary
  *    without any translation layer — a real property of the shared code,

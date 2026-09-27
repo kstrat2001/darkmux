@@ -8,7 +8,8 @@
 // before, A's `budget.stop` closed B's wait on every surface.
 process.env.TZ = "UTC";
 import { describe, it, expect } from "vitest";
-import { normalizeRecords, flowToRenderModel } from "./flow";
+import { shapeRecords, flowToRenderModel } from "./flow";
+import { normAll } from "../testing/records";
 import { runRegions } from "../lenses/session/sessionRun";
 import { buildFleetCardBase, withLiveReadings } from "../lenses/fleet/cards";
 
@@ -27,18 +28,18 @@ const wait = (at: number, m: string) =>
   });
 
 describe("a later mission's wait is not closed by an earlier mission's stop", () => {
-  const data = normalizeRecords([
-    rec(t0 - 20_000, "mission start", A, { mission_id: A, source: "mission" }),
-    rec(t0 - 19_000, "dispatch start", A, { mission_id: A, source: "mission" }),
-    rec(t0 - 15_000, "step start", taskOf(A), { mission_id: A, source: "scheduler", handle: "judge" }),
+  const data = shapeRecords(normAll([
+    rec(t0 - 20_000, "mission.start", A, { mission_id: A, source: "mission" }),
+    rec(t0 - 19_000, "dispatch.start", A, { mission_id: A, source: "mission" }),
+    rec(t0 - 15_000, "step.start", taskOf(A), { mission_id: A, source: "scheduler", handle: "judge" }),
     wait(t0 - 10_000, A),
     rec(t0 - 5_000, "budget.stop", taskOf(A), { mission_id: A, source: "budget", payload: { endpoint_id: "azure", reason: "mission `mission-A` is aborted" } }),
-    rec(t0 - 4_000, "dispatch error", A, { mission_id: A, source: "mission" }),
-    rec(t0, "mission start", B, { mission_id: B, source: "mission" }),
-    rec(t0 + 1_000, "dispatch start", B, { mission_id: B, source: "mission" }),
-    rec(t0 + 2_000, "step start", taskOf(B), { mission_id: B, source: "scheduler", handle: "judge" }),
+    rec(t0 - 4_000, "dispatch.error", A, { mission_id: A, source: "mission" }),
+    rec(t0, "mission.start", B, { mission_id: B, source: "mission" }),
+    rec(t0 + 1_000, "dispatch.start", B, { mission_id: B, source: "mission" }),
+    rec(t0 + 2_000, "step.start", taskOf(B), { mission_id: B, source: "scheduler", handle: "judge" }),
     wait(t0 + 3_000, B),
-  ] as never);
+  ]));
   const t = t0 + 3600_000;
 
   it("the fleet card reads REST budget · azure", () => {

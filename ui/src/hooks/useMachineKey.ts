@@ -3,8 +3,9 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../lib/fetcher";
 import { queryKeys } from "../lib/queryKeys";
 import { MACHINE_NOT_FOUND_KEY, UID_SHAPED, decodeMachineKey, type DecodedMachineKey, type MachineKeyContext } from "../lib/machineKey";
-import type { FleetMachinesLiveResponse, FleetRosterResponse, FlowRecord, MachineSpecs } from "../types/handwritten";
+import type { FleetMachinesLiveResponse, FleetRosterResponse, MachineSpecs } from "../types/handwritten";
 import { useFleetRoster, useLiveMachines } from "./useLiveMachines";
+import type { NormRecord } from "../lib/ingest";
 
 /** (#2929) What a page needs to resolve a hash machine key: the same four
  * inputs the fleet card that minted the key was labeled from — presence,
@@ -16,7 +17,7 @@ import { useFleetRoster, useLiveMachines } from "./useLiveMachines";
  * a moment earlier. So an old uid link is
  * rewritten to its key only once everything the key depends on is in. */
 export function useMachineKeyContext(
-  data: FlowRecord[],
+  data: NormRecord[],
   dataSettled: boolean,
   /** Live, daemon-backed page: read presence, specs and roster. `false` on a
    *  static build or a replay, where the key was minted without them. */

@@ -129,8 +129,8 @@ describe("SessionReplay — the run finishing while the page is open (#2011)", (
     vi.useFakeTimers();
     vi.setSystemTime(T0);
     const M = "m-2759";
-    const mStart = { ...START, action: "dispatch start", mission_id: M };
-    const mDone = { ...DONE, action: "dispatch complete", mission_id: M };
+    const mStart = { ...START, action: "dispatch.start", mission_id: M };
+    const mDone = { ...DONE, action: "dispatch.complete", mission_id: M };
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string) => {

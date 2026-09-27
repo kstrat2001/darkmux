@@ -23,13 +23,13 @@
  * disagreeing about what day the page was showing.
  */
 
-import { T, uidOf } from "./flow";
+import { computeTMax, computeTMin, uidOf } from "./flow";
 import { clk, clkrange, lday } from "./format";
-import type { FlowRecord } from "../types/handwritten";
+import type { NormRecord } from "./ingest";
 
 /** `missions` — `recompute()`, viewer.html:1052. Distinct `mission_id`s in
  * record order, which is timestamp order, so "first" means oldest. */
-export function missionIds(data: FlowRecord[]): string[] {
+export function missionIds(data: NormRecord[]): string[] {
   return [...new Set(data.filter((r) => r.mission_id).map((r) => r.mission_id as string))];
 }
 
@@ -43,13 +43,13 @@ export function missionIds(data: FlowRecord[]): string[] {
  * already have `metaLine.ts`; this module is only ever reached from a replay,
  * so the live arm is deliberately absent rather than reimplemented here.
  */
-export function replayMissions(data: FlowRecord[]): string[] {
+export function replayMissions(data: NormRecord[]): string[] {
   return missionIds(data);
 }
 
 /** `primaryMission()` — viewer.html:1216. The single mission the crumb
  * focuses on. */
-export function primaryReplayMission(data: FlowRecord[]): string | null {
+export function primaryReplayMission(data: NormRecord[]): string | null {
   const ms = replayMissions(data);
   return ms.length ? ms[0] : null;
 }
@@ -58,7 +58,7 @@ export function primaryReplayMission(data: FlowRecord[]): string | null {
  * a "+N more" so a busy day's headline cannot sprawl. `—` (an em dash) when
  * the day has no missions at all, which is a real state: a day of unscoped
  * `dispatch` calls has records and no mission ids. */
-export function replayMissionLabel(data: FlowRecord[]): string {
+export function replayMissionLabel(data: NormRecord[]): string {
   const ms = replayMissions(data);
   if (!ms.length) return "—";
   return ms.length > 2 ? `${ms.slice(0, 2).join(", ")} +${ms.length - 2} more` : ms.join(", ");
@@ -93,10 +93,9 @@ export interface ReplayMetaParts {
   census: string;
 }
 
-export function replayMetaParts(data: FlowRecord[], date: string): ReplayMetaParts {
-  const ts = data.map((r) => T(r.ts)).filter((n) => !Number.isNaN(n));
-  const tMin = ts.length ? Math.min(...ts) : Date.now();
-  const tMax = ts.length ? Math.max(...ts) : Date.now();
+export function replayMetaParts(data: NormRecord[], date: string): ReplayMetaParts {
+  const tMin = computeTMin(data);
+  const tMax = computeTMax(data);
   const machineCount = new Set(data.map(uidOf)).size;
   return {
     head: `◆ ${replayMissionLabel(data)}`,
@@ -108,7 +107,7 @@ export function replayMetaParts(data: FlowRecord[], date: string): ReplayMetaPar
   };
 }
 
-export function replayMetaLines(data: FlowRecord[], date: string): string[] {
+export function replayMetaLines(data: NormRecord[], date: string): string[] {
   const p = replayMetaParts(data, date);
   return [`${p.head} · ${p.source} · ${p.span}`, p.census];
 }
@@ -137,11 +136,11 @@ export function humanMissionLabel(id: string): string | null {
 /** (#2121) A REAL title for a mission, read straight off its own flow
  * records rather than any fetch — same "no network round trip" constraint
  * [[humanMissionLabel]] documents. Nothing in production writes this field
- * today (see `mission_title`'s own doc on `FlowRecord`); the demo world's
+ * today (see `mission_title`'s own doc on `NormRecord`); the demo world's
  * `import_mission.py --title` is the one writer, stamping it on every
  * record that carries the mission's id. `null` when no correlated record
  * carries one, which is every real dispatch until a future writer exists. */
-export function missionTitle(data: FlowRecord[], id: string): string | null {
+export function missionTitle(data: NormRecord[], id: string): string | null {
   const hit = data.find((r) => r.mission_id === id && r.mission_title);
   return hit?.mission_title ?? null;
 }
@@ -154,7 +153,7 @@ export function missionTitle(data: FlowRecord[], id: string): string | null {
  * `humanMissionLabel` alone did — the transport omits the label entirely
  * rather than fall all the way back to the raw id (#2120's own rule,
  * unchanged by this addition). */
-export function resolvedMissionLabel(data: FlowRecord[], id: string): string | null {
+export function resolvedMissionLabel(data: NormRecord[], id: string): string | null {
   return missionTitle(data, id) ?? humanMissionLabel(id);
 }
 
@@ -180,10 +179,9 @@ export function resolvedMissionLabel(data: FlowRecord[], id: string): string | n
  * so repeating it in the span would reproduce the exact duplication
  * #2120 was filed to remove from the sticky row.
  */
-export function replayPlaybackKvValue(data: FlowRecord[], date: string): string {
-  const ts = data.map((r) => T(r.ts)).filter((n) => !Number.isNaN(n));
-  const tMin = ts.length ? Math.min(...ts) : Date.now();
-  const tMax = ts.length ? Math.max(...ts) : Date.now();
+export function replayPlaybackKvValue(data: NormRecord[], date: string): string {
+  const tMin = computeTMin(data);
+  const tMax = computeTMax(data);
   const machineCount = new Set(data.map(uidOf)).size;
   const mission = primaryReplayMission(data);
   const reviewed = mission ? data.find((r) => r.mission_id === mission && r.mission_reviewed)?.mission_reviewed : null;

@@ -1,9 +1,9 @@
-import type { FlowRecord } from "../types/handwritten";
 import { isTurnUsage } from "./usageRecords";
-import { isDispatchStart, isDispatchTerminal, openBudgetWait } from "./flow";
+import { openBudgetWait } from "./flow";
 import { cleanToolPath, toolCallPath } from "./recordDetail";
 import { compactDuration } from "./format";
 import { UTILITY_JOB, UTILITY_JOB_DEFAULT_STALL_MS, isUtilityEnd, isUtilityStart, utilityJobOf } from "./utilityJobs";
+import { ACTION, byTime, isDispatchTerminal, recordsAsOf, type NormAction, type NormRecord } from "./ingest";
 
 /** (#2877) Live token-rate scope — pure derivation from flow records
  * already fetched for a session; zero model work, matches CLAUDE.md's "the
@@ -16,7 +16,7 @@ import { UTILITY_JOB, UTILITY_JOB_DEFAULT_STALL_MS, isUtilityEnd, isUtilityStart
  * own copy to match that existing convention. */
 type Fields = Record<string, unknown>;
 
-function fields(r: FlowRecord): Fields {
+function fields(r: NormRecord): Fields {
   return ((r as unknown as { fields?: Fields }).fields || (r as unknown as { payload?: Fields }).payload || {}) as Fields;
 }
 
@@ -76,11 +76,11 @@ export const WRITING_TOOL_CALL_PHASE = "writing_tool_call";
  * older runtime — so a session straddling an upgrade, or an old recorded
  * run, still estimates a rate rather than showing nothing. Never throws: a
  * heartbeat missing every usable field is simply skipped. */
-export function heartbeatSamples(records: FlowRecord[]): HeartbeatSample[] {
+export function heartbeatSamples(records: NormRecord[]): HeartbeatSample[] {
   const out: HeartbeatSample[] = [];
   const refreshes: { turn: unknown; stateAt: number; at: number }[] = [];
   for (const r of records) {
-    if (r.action !== "dispatch.turn.heartbeat") continue;
+    if (r.action !== ACTION.DispatchTurnHeartbeat) continue;
     const f = fields(r);
     // (#2928) A live refresh repeats a state; it only says the state still
     // holds. Collected apart and folded into `freshMs` below.
@@ -92,8 +92,8 @@ export function heartbeatSamples(records: FlowRecord[]): HeartbeatSample[] {
     }
     const chars = num(f.generated_chars) ?? num(f.cumulative_chars);
     if (chars === null) continue;
-    const atMs = num(f.sampled_at_ms) ?? Date.parse(r.ts);
-    if (!Number.isFinite(atMs)) continue;
+    const atMs = num(f.sampled_at_ms) ?? r.tMs;
+    if (atMs === null) continue;
     const sample: HeartbeatSample = { atMs, chars, turn: f.turn_seq };
     const visible = num(f.cumulative_chars);
     if (num(f.generated_chars) !== null && visible !== null) sample.visible = visible;
@@ -142,7 +142,7 @@ export function charsPerSecond(prev: HeartbeatSample, next: HeartbeatSample): nu
  * per-turn figure across — #2877's host-side scope is additive-only on the
  * heartbeat (`sampled_at_ms`, `generated_chars`). Falls back to
  * `DEFAULT_CHARS_PER_TOKEN` until the first turn's usage lands. */
-export function measuredCharsPerToken(records: FlowRecord[]): number {
+export function measuredCharsPerToken(records: NormRecord[]): number {
   // Paired PER TURN: `generated_chars` restarts every turn, and the turn in
   // flight has chars but no billed tokens yet. Dividing the largest chars
   // seen anywhere by the finished turns' tokens read a model generating ~50
@@ -152,10 +152,10 @@ export function measuredCharsPerToken(records: FlowRecord[]): number {
   const checkpointed = checkpointedTurns(records);
   for (const r of records) {
     const f = fields(r);
-    if (r.action === "dispatch.turn.heartbeat") {
+    if (r.action === ACTION.DispatchTurnHeartbeat) {
       const c = num(f.generated_chars) ?? num(f.cumulative_chars);
       if (c !== null) charsByTurn.set(f.turn_seq, Math.max(charsByTurn.get(f.turn_seq) ?? 0, c));
-    } else if (r.action === "telemetry.tokens" && isTurnUsage(f)) {
+    } else if (r.action === ACTION.TelemetryTokens && isTurnUsage(f)) {
       // (#2902 step 1a) Turn records only: a single-shot or map-item call
       // has no heartbeats to pair with and must not skew the calibration.
       const t = num(f.completion_tokens);
@@ -209,10 +209,10 @@ export function measuredCharsPerToken(records: FlowRecord[]): number {
  *
  *  Shared by `measuredCharsPerToken` and `averageGenerationRate` (#2886) so
  *  the two derivations can't disagree on what counts as checkpointed. */
-function checkpointedTurns(records: FlowRecord[]): Set<unknown> {
+function checkpointedTurns(records: NormRecord[]): Set<unknown> {
   const out = new Set<unknown>();
   for (const r of records) {
-    if (r.action === "dispatch.checkpoint" && fields(r).verdict === "conclude") out.add(fields(r).turn_seq);
+    if (r.action === ACTION.DispatchCheckpoint && fields(r).verdict === "conclude") out.add(fields(r).turn_seq);
   }
   return out;
 }
@@ -254,7 +254,7 @@ export interface GenerationRateReading {
  * checkpoint judged — dividing the two together reads a model generating
  * ~150 tok/s as ~34. Excluded the same way `measuredCharsPerToken` excludes
  * it: keyed on a `dispatch.checkpoint` record for the turn_seq. */
-export function averageGenerationRate(recordSets: FlowRecord[][]): GenerationRateReading | null {
+export function averageGenerationRate(recordSets: NormRecord[][]): GenerationRateReading | null {
   let tokens = 0;
   let ms = 0;
   let billedTurns = 0;
@@ -265,10 +265,10 @@ export function averageGenerationRate(recordSets: FlowRecord[][]): GenerationRat
     const checkpointed = checkpointedTurns(records);
     for (const r of records) {
       const f = fields(r);
-      if (r.action === "dispatch.turn") {
+      if (r.action === ACTION.DispatchTurn) {
         const g = num(f.generation_ms);
         if (g !== null && g > 0) genMs.set(f.turn_seq, g);
-      } else if (r.action === "telemetry.tokens" && isTurnUsage(f)) {
+      } else if (r.action === ACTION.TelemetryTokens && isTurnUsage(f)) {
         // (#2902 step 1a) Turn records only, as in `measuredCharsPerToken`.
         const t = num(f.completion_tokens);
         if (t !== null) tok.set(f.turn_seq, (tok.get(f.turn_seq) ?? 0) + t);
@@ -329,7 +329,7 @@ export interface TokenRateReading {
  * also a "nothing to read from THIS pair" case, same as the other two
  * branches above, so it falls back to the carry too instead of surfacing
  * `null` outright. */
-export function currentTokenRate(records: FlowRecord[]): TokenRateReading | null {
+export function currentTokenRate(records: NormRecord[]): TokenRateReading | null {
   const samples = heartbeatSamples(records);
   if (samples.length < 2) return carriedTokenRate(records, samples);
   const prev = samples[samples.length - 2];
@@ -411,7 +411,7 @@ function openerPairTrusted(prev: HeartbeatSample, next: HeartbeatSample): boolea
  *  found there can't disagree about which one gets to count. The scan keeps
  *  going past an untrusted one for the most recent pair with real
  *  progress. */
-function carriedTokenRate(records: FlowRecord[], samples: HeartbeatSample[]): TokenRateReading | null {
+function carriedTokenRate(records: NormRecord[], samples: HeartbeatSample[]): TokenRateReading | null {
   for (let i = samples.length - 1; i > 0; i--) {
     const next = samples[i];
     const prev = samples[i - 1];
@@ -446,7 +446,7 @@ export const STALL_AFTER_MS = 30_000;
  * within `STALL_AFTER_MS` of `nowMs`. `false` (not stalled) when there are
  * no heartbeats at all yet: "hasn't started producing" is a different
  * state from "was producing, then stopped". */
-export function isStalled(records: FlowRecord[], nowMs: number): boolean {
+export function isStalled(records: NormRecord[], nowMs: number): boolean {
   const samples = heartbeatSamples(records);
   if (samples.length === 0) return false;
   return nowMs - freshOf(samples[samples.length - 1]) > STALL_AFTER_MS;
@@ -576,17 +576,14 @@ interface StateMarker {
  * long as it waits on that call. So an endpoint that hangs after naming a
  * tool reads "tool gen · <tool> · Ns" until the host's inactivity watchdog ends the
  * dispatch (600 s by default), never STALL. */
-export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveStateReading {
+export function deriveLiveState(records: NormRecord[], nowMs: number): LiveStateReading {
   // Cut ONCE, up front — every downstream read (`heartbeatSamples`,
   // `isStalled`, the marker scan) then agrees on "as of `nowMs`" instead of
   // each re-deriving its own future-safe view (or, worse, some doing it and
   // some not, which is what produced the bug this comment is guarding
   // against in review: `isStalled` on the UNCUT array would pick up a
   // heartbeat from beyond `nowMs` as its "last sample").
-  const cut = records.filter((r) => {
-    const atMs = Date.parse(r.ts);
-    return !Number.isFinite(atMs) || atMs <= nowMs;
-  });
+  const cut = recordsAsOf(records, nowMs);
   const beats = heartbeatSamples(cut);
   const lastBeatAt = beats.length ? beats[beats.length - 1].atMs : null;
 
@@ -616,15 +613,15 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
   // darkmux is about to run keeps its icon instead of dropping to the gear
   // until its completion names it.
   let writtenTool: string | null = null;
-  const ordered = [...cut].sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
+  const ordered = [...cut].sort(byTime);
   for (const r of ordered) {
-    const atMs = Date.parse(r.ts);
-    if (!Number.isFinite(atMs)) continue;
+    const atMs = r.tMs;
+    if (atMs === null) continue;
     let m: StateMarker | null = null;
-    if (r.action === "dispatch.turn.heartbeat") {
+    if (r.action === ACTION.DispatchTurnHeartbeat) {
       const f = fields(r);
       if (f.phase === WRITING_TOOL_CALL_PHASE && typeof f.tool_name === "string" && f.tool_name) writtenTool = f.tool_name;
-    } else if (isDispatchStart(r.action)) {
+    } else if (r.action === ACTION.DispatchStart) {
       pendingTools = null;
       turnToolName = null;
       turnNames = null;
@@ -633,7 +630,7 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
       listsInStep = true;
       writtenTool = null;
       m = { atMs, kind: "prompt" };
-    } else if (r.action === "dispatch.turn") {
+    } else if (r.action === ACTION.DispatchTurn) {
       const calls = num(fields(r).tool_calls_count);
       turnToolName = calls === null || calls === 1 ? writtenTool : null;
       writtenTool = null;
@@ -649,7 +646,7 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
       // list, its length is how many completions end TOOLS.
       pendingTools = turnNames !== null ? turnNames.length : calls;
       m = { atMs, kind: pendingTools !== null && pendingTools > 0 ? "tools" : "prompt" };
-    } else if (r.action === "dispatch.tool") {
+    } else if (r.action === ACTION.DispatchTool) {
       if (pendingTools !== null && pendingTools > 0) pendingTools -= 1;
       // (#2963) This completion is call `completedInTurn` of the lists. When
       // its own name or readable file is not the lists' entry, the lists and
@@ -677,7 +674,7 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
       m = { atMs: startedAt !== null && startedAt > 0 ? startedAt : atMs, kind: "compacting", stallAfterMs: bound !== null && bound > 0 ? bound * 1000 : UTILITY_JOB_DEFAULT_STALL_MS };
     } else if (
       marker?.kind === "compacting" &&
-      ((isUtilityEnd(r) && utilityJobOf(r) === UTILITY_JOB.compaction) || r.action === "dispatch.compaction")
+      ((isUtilityEnd(r) && utilityJobOf(r) === UTILITY_JOB.compaction) || r.action === ACTION.DispatchCompaction)
     ) {
       // (#2915) The compaction ended; the runtime's next step is the next
       // prompt. Only ever ENDS a compaction: with none open, a compaction
@@ -686,7 +683,7 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
       // before the start it ends (both can share one whole-second `ts`).
       const endedAt = num(fields(r).ended_at_ms);
       m = { atMs: Math.max(endedAt !== null && endedAt > 0 ? endedAt : atMs, marker.atMs), kind: "prompt" };
-    } else if (r.action === "budget.wait") {
+    } else if (r.action === ACTION.BudgetWait) {
       // (#2902 step 5) A HOSTED call held by its endpoint's budget (a
       // dispatch, a single-shot or map step): the host announces the wait
       // once, with how long, and writes no `dispatch.rest` (there is no
@@ -702,10 +699,10 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
           m.restReasonWord = restReasonWord("budget") ?? why;
         }
       }
-    } else if (r.action === "budget.resume" || r.action === "budget.stop") {
+    } else if (r.action === ACTION.BudgetResume || r.action === ACTION.BudgetStop) {
       // The held call went ahead (or the run stopped): the wait is over.
       m = { atMs, kind: "prompt" };
-    } else if (r.action === "dispatch.rest") {
+    } else if (r.action === ACTION.DispatchRest) {
       // Only the completed-rest shape (`ms` present) counts — the
       // announce-only sibling (`pause: false, delay_ms`, no `ms`) is the
       // governor changing its PACING, not a rest (same filter
@@ -838,8 +835,15 @@ function isThinking(beats: HeartbeatSample[]): boolean {
 // (#2902 step 5, 5th review C1) `budget.stop`: a wait ended because its run
 // was stopped. A hosted call's gate writes it before any bookend (the call
 // is never sent), so it closes the execution the way a terminal does.
-const isCloseEdge = (a: string | undefined): boolean =>
-  isDispatchTerminal(a) || a === "session.end" || a === "budget.stop";
+const isCloseEdge = (a: NormAction | undefined): boolean =>
+  isDispatchTerminal(a) || a === ACTION.SessionEnd || a === ACTION.BudgetStop;
+
+const EXECUTION_EVIDENCE: ReadonlySet<NormAction> = new Set<NormAction>([
+  ACTION.DispatchTurnHeartbeat,
+  ACTION.DispatchTurn,
+  ACTION.DispatchTool,
+  ACTION.DispatchRest,
+]);
 
 /** The executions a live reading may come from, as of `nowMs`: not one that
  *  has already closed (its last rate and its last marker are history, and a
@@ -853,7 +857,7 @@ const isCloseEdge = (a: string | undefined): boolean =>
  *  archives are append-only (contract 8): readers stay bilingual. */
 const RETIRED_REVIEW_RUN_SOURCE = "review";
 
-export function liveExecutions(perExecutionRecords: FlowRecord[][], nowMs: number): FlowRecord[][] {
+export function liveExecutions(perExecutionRecords: NormRecord[][], nowMs: number): NormRecord[][] {
   return perExecutionRecords.filter((recs) => {
     let runGrain = false;
     // A set is an execution only if it carries execution evidence. A
@@ -861,20 +865,14 @@ export function liveExecutions(perExecutionRecords: FlowRecord[][], nowMs: numbe
     // scheduler task sessions (`step start`/`step complete`) carry none;
     // they read as PROMPT and outranked a real stall on every crawl.
     let evidence = false;
-    for (const r of recs) {
-      if (Date.parse(r.ts) > nowMs) continue;
+    for (const r of recordsAsOf(recs, nowMs)) {
       if (isCloseEdge(r.action)) return false;
-      if (isDispatchStart(r.action)) {
+      if (r.action === ACTION.DispatchStart) {
         evidence = true;
         if (r.source === "mission" || r.source === RETIRED_REVIEW_RUN_SOURCE) runGrain = true;
-      } else if (
-        r.action === "dispatch.turn.heartbeat" ||
-        r.action === "dispatch.turn" ||
-        r.action === "dispatch.tool" ||
-        r.action === "dispatch.rest"
-      ) {
+      } else if (r.action !== undefined && EXECUTION_EVIDENCE.has(r.action)) {
         evidence = true;
-      } else if (r.action === "budget.wait" && openBudgetWait(recs, nowMs)) {
+      } else if (r.action === ACTION.BudgetWait && openBudgetWait(recs, nowMs)) {
         // (#2902 step 5) A hosted call waiting on its budget is live work
         // before its first bookend (the gate runs before `dispatch start`),
         // while the wait is OPEN: a waiter silent past its resume time has
@@ -899,7 +897,7 @@ const STATE_PRIORITY: Record<LiveState, number> = { generating: 0, rest: 1, tool
  * card's `runningSessionIds`, or a mission's rolled-up sibling sessions) —
  * the best (lowest-`STATE_PRIORITY`) reading among them. `"prompt"` when
  * there are no executions at all, matching a fresh session's own default. */
-export function aggregateLiveState(perExecutionRecords: FlowRecord[][], nowMs: number): LiveStateReading | null {
+export function aggregateLiveState(perExecutionRecords: NormRecord[][], nowMs: number): LiveStateReading | null {
   let best: LiveStateReading | null = null;
   for (const recs of liveExecutions(perExecutionRecords, nowMs)) {
     const reading = deriveLiveState(recs, nowMs);
@@ -1061,7 +1059,7 @@ export interface AggregatedTokenRate {
  * it. Returns `null` only when NOT ONE execution has a reading, so the
  * caller can distinguish "genuinely 0 tok/s right now" reporting from
  * "nothing to report yet" (though today both render the same "0"). */
-export function aggregateTokenRate(perExecutionRecords: FlowRecord[][], nowMs: number): AggregatedTokenRate | null {
+export function aggregateTokenRate(perExecutionRecords: NormRecord[][], nowMs: number): AggregatedTokenRate | null {
   let any = false;
   let total = 0;
   let carried = false;
@@ -1070,7 +1068,7 @@ export function aggregateTokenRate(perExecutionRecords: FlowRecord[][], nowMs: n
     // or tool-running one still has a "last rate" from its last turn, and a
     // mission summed them (review: 350 tok/s with one execution at ~40).
     if (deriveLiveState(recs, nowMs).state !== "generating") continue;
-    const reading = currentTokenRate(recs.filter((r) => !(Date.parse(r.ts) > nowMs)));
+    const reading = currentTokenRate(recordsAsOf(recs, nowMs));
     if (reading) {
       total += reading.tokensPerSec;
       any = true;
@@ -1086,7 +1084,7 @@ export function aggregateTokenRate(perExecutionRecords: FlowRecord[][], nowMs: n
  *  `liveStateWhileConnected`'s half-open check compares the daemon's last
  *  confirmed contact against: the deadline a genuine stall claim needs
  *  contact evidence AFTER. */
-export function lastHeartbeatMs(perExecutionRecords: FlowRecord[][]): number | null {
+export function lastHeartbeatMs(perExecutionRecords: NormRecord[][]): number | null {
   let latest: number | null = null;
   for (const recs of perExecutionRecords) {
     const samples = heartbeatSamples(recs);
@@ -1160,16 +1158,15 @@ export function liveStateWhileConnected(
  *  own `handle` so an execution mid-stream, before its own start record has
  *  landed, still gets a label rather than "". Returns `""` when nothing in
  *  `records` carries a `handle` at all. */
-export function executionRole(records: FlowRecord[]): string {
+export function executionRole(records: NormRecord[]): string {
   let latestAtMs = -Infinity;
   let latestHandle: string | undefined;
   let fallback: string | undefined;
   for (const r of records) {
     if (fallback === undefined && r.handle) fallback = r.handle;
-    if (!isDispatchStart(r.action)) continue;
+    if (r.action !== ACTION.DispatchStart) continue;
     if (!r.handle) continue;
-    const atMs = Date.parse(r.ts);
-    const rank = Number.isFinite(atMs) ? atMs : -Infinity;
+    const rank = r.tMs ?? -Infinity;
     if (latestHandle === undefined || rank >= latestAtMs) {
       latestAtMs = rank;
       latestHandle = r.handle;
@@ -1235,7 +1232,7 @@ export interface ExecutionTokenReading {
 }
 
 export function executionTokenReading(
-  records: FlowRecord[],
+  records: NormRecord[],
   nowMs: number,
   connected = true,
   /** (#2886 pass 4 parity) The SAME half-open-connection evidence
@@ -1254,7 +1251,7 @@ export function executionTokenReading(
   // immediately before this same call — `records` is expected pre-cut by
   // the caller, but a caller handing over a raw array must not read a
   // heartbeat from beyond the page clock.
-  const reading = state === "generating" ? currentTokenRate(records.filter((r) => !(Date.parse(r.ts) > nowMs))) : null;
+  const reading = state === "generating" ? currentTokenRate(recordsAsOf(records, nowMs)) : null;
   return {
     sessionId: records.find((r) => r.session_id)?.session_id ?? "",
     role: executionRole(records),
@@ -1272,7 +1269,7 @@ export function executionTokenReading(
     ...(state === "prompt" && liveState?.compacting ? { compacting: true as const, compactingSeconds: liveState.compactingSeconds } : {}),
     ...(state === "prompt" && liveState?.promptChars !== undefined
       ? (() => {
-          const label = promptTokensLabel(liveState.promptChars, measuredCharsPerToken(records.filter((r) => !(Date.parse(r.ts) > nowMs))));
+          const label = promptTokensLabel(liveState.promptChars, measuredCharsPerToken(recordsAsOf(records, nowMs)));
           return label !== null ? { promptLabel: label } : {};
         })()
       : {}),

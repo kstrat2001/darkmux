@@ -3,7 +3,7 @@ import { getSource } from "../../lib/source";
 import { useDay } from "../../hooks/useDay";
 import { FleetLens } from "../fleet/FleetLens";
 import { Shimmer } from "../../components/Placeholder";
-import type { FlowRecord } from "../../types/handwritten";
+import type { NormRecord } from "../../lib/ingest";
 
 /** Legacy's own play-loop constants (viewer.html:2848-2860): a 100ms tick
  * advancing the playhead by the measured elapsed wall clock times the
@@ -73,7 +73,7 @@ export function PlaybackLens({ date, playhead = null }: { date: string | null; p
   }
   return renderTransportStage(records);
 
-  function renderTransportStage(dayRecords: FlowRecord[]) {
+  function renderTransportStage(dayRecords: NormRecord[]) {
     // (#2071) The transport itself lives in the app shell's sticky block
     // now (`App.tsx`, `usePlaybackTransport`); this lens is a controlled
     // stage: it renders the day at the playhead the shell hands it. `tMax`

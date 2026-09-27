@@ -58,15 +58,7 @@ import { isLiveRoute, type Route } from "../lib/route";
 import { useDaemonLoad } from "../hooks/useDaemonLoad";
 import { useCountUp } from "../hooks/useCountUp";
 import type { LiveTailStatus } from "../hooks/useLiveTail";
-import type {
-  BatteryHealth,
-  BatterySample,
-  FlowRecord,
-  MachineLoad,
-  MachineSpecs,
-  PresenceBeat,
-  ThermalState,
-} from "../types/handwritten";
+import type { BatteryHealth, BatterySample, MachineLoad, MachineSpecs, PresenceBeat, ThermalState } from "../types/handwritten";
 import {
   batteryAriaLabel,
   batteryFillWidth,
@@ -78,6 +70,7 @@ import {
   conditionRow,
   fmtOperatingHours,
 } from "../lib/battery";
+import type { NormRecord } from "../lib/ingest";
 
 /** Re-render on a light interval so the rolling 10-minute window keeps
  * aging samples out, and the compact line's live value stays current, even
@@ -708,8 +701,8 @@ export function daemonWindowLabel(spanMs: number): string {
 
 export interface MachineStatsInput {
   route: Route;
-  routeRecords: FlowRecord[];
-  flowWindow: FlowRecord[];
+  routeRecords: NormRecord[];
+  flowWindow: NormRecord[];
   localUid: string | null;
   liveMachines: Map<string, PresenceBeat>;
   specs: MachineSpecs | null;

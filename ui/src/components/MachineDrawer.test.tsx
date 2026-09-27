@@ -9,14 +9,15 @@ import {
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MachineDrawer } from "./MachineDrawer";
 import { closeOpenModal, openModalEl } from "../lib/dialogManager";
-import type { FlowRecord } from "../types/handwritten";
+import type { NormRecord } from "../lib/ingest";
+import { norm, normAll } from "../testing/records";
 
 const proc = (
   ts: string,
   cpu: number,
   gpu: number,
   mem: number,
-): FlowRecord => ({
+): NormRecord => norm({
   ts,
   category: "telemetry",
   source: "process",
@@ -31,7 +32,7 @@ const NOW = Date.parse("2026-01-01T00:20:00Z");
  * desktop-only test in this file, so a shared empty default keeps those
  * unchanged rather than repeating five extra props at every call site. */
 const EMPTY_EVENTLOG = {
-  eventLogRecords: [] as FlowRecord[],
+  eventLogRecords: [] as NormRecord[],
   eventLogScopeLabel: "fleet",
   eventLogVisible: true,
   eventLogLoading: false,
@@ -280,10 +281,10 @@ describe("MachineDrawer (#2107)", () => {
   // here stands in for what `App.tsx` hands down on a playback route — the
   // WHOLE loaded day, not a rolling window.
   it("(#2120) shows the `playback` row — day, span, census, and the raw mission id — on a playback route", () => {
-    const dayRecords: FlowRecord[] = [
-      { ts: "2026-08-26T01:08:17.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", mission_id: "demo-review-nameof-recency", session_id: "s1", action: "dispatch.start" } as FlowRecord,
-      { ts: "2026-08-26T14:13:01.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", mission_id: "demo-review-nameof-recency", session_id: "s1", action: "dispatch.complete" } as FlowRecord,
-    ];
+    const dayRecords: NormRecord[] = normAll([
+      { ts: "2026-08-26T01:08:17.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", mission_id: "demo-review-nameof-recency", session_id: "s1", action: "dispatch.start" },
+      { ts: "2026-08-26T14:13:01.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", mission_id: "demo-review-nameof-recency", session_id: "s1", action: "dispatch.complete" },
+    ]);
     render(
       <MachineDrawer
         route={{ kind: "playback", date: "2026-08-26" }}
@@ -329,13 +330,13 @@ describe("MachineDrawer (#2107)", () => {
     meta.name = "darkmux-version";
     meta.content = "3.3.0 (abc1234)";
     document.head.appendChild(meta);
-    const flowWindow = [
+    const flowWindow = normAll([
       {
         ts: "2026-01-01T00:00:00Z",
         machine_uid: "self-uid",
         machine_id: "MacBook-Pro",
       },
-    ];
+    ]);
     render(
       <MachineDrawer
         route={{ kind: "fleet" }}
@@ -504,13 +505,13 @@ describe("MachineDrawer — idle state (no samples)", () => {
   });
 
   it("shows the last known reading and its age when the window is empty but something was seen earlier", () => {
-    const oldSample: FlowRecord = {
+    const oldSample: NormRecord = norm({
       ts: new Date(NOW - 60 * 60_000).toISOString(), // 1h before NOW
       category: "telemetry",
       source: "process",
       action: "telemetry.process",
       payload: { cpu: 40, gpu: 55, mem: 30 },
-    };
+    });
     render(
       <MachineDrawer
         route={{ kind: "fleet" }}
@@ -618,7 +619,7 @@ describe("MachineDrawer — phone skin delegates to PhoneDrawer (isMobileOverrid
   });
 
   it("tapping the Events tab mounts the EventLogColumn with the records handed down from App", () => {
-    const records: FlowRecord[] = [
+    const records: NormRecord[] = normAll([
       {
         ts: "2026-01-01T00:00:00Z",
         // (#2416) `dispatch.reasoning` — the default event-filter view now
@@ -630,7 +631,7 @@ describe("MachineDrawer — phone skin delegates to PhoneDrawer (isMobileOverrid
         action: "dispatch.reasoning",
         handle: "hello",
       },
-    ];
+    ]);
     render(
       <MachineDrawer
         route={{ kind: "fleet" }}
@@ -1708,13 +1709,13 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
     meta.name = "darkmux-version";
     meta.content = "3.3.0 (ea3caf27)";
     document.head.appendChild(meta);
-    const flowWindow = [
+    const flowWindow = normAll([
       {
         ts: "2026-01-01T00:00:00Z",
         machine_uid: "self-uid",
         machine_id: "MacBook-Pro",
       },
-    ];
+    ]);
     render(
       <MachineDrawer
         route={{ kind: "fleet" }}
@@ -1768,9 +1769,9 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
     meta.name = "darkmux-version";
     meta.content = "3.3.0 (ea3caf27)";
     document.head.appendChild(meta);
-    const flowWindow = [
+    const flowWindow = normAll([
       { ts: "2026-01-01T00:00:00Z", machine_uid: "self-uid", machine_id: "MacBook-Pro" },
-    ];
+    ]);
     render(
       <MachineDrawer
         route={{ kind: "fleet" }}

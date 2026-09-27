@@ -39,7 +39,7 @@ function mockRunDetail(page) {
         body: JSON.stringify({
           lines: [{
             ts: '2026-01-01T00:00:00Z', level: 'info', category: 'work',
-            tier: 'local', stage: 'dispatch', action: 'step result',
+            tier: 'local', stage: 'dispatch', action: 'step.result',
             handle: 'bundle', session_id: 'demo-case-a', source: 'review',
             payload: { step_id: 'bundle', kind: 'review.bundle', items_out: 12 },
           }],

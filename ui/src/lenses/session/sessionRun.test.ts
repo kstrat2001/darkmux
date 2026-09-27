@@ -18,16 +18,20 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { CLEAN_DETECTORS, runRegions } from "./sessionRun";
-import { flowToRenderModel } from "../../lib/flow";
-import type { FlowRecord } from "../../types/handwritten";
+import { flowToRenderModel as shapeSession } from "../../lib/flow";
+import { normAll, type RawRecord, norm } from "../../testing/records";
+import { ACTION, recordsAsOf, type NormRecord } from "../../lib/ingest";
+
+/** Fixture records through the app's boundary, then the session shaping. */
+const flowToRenderModel = (records: readonly (RawRecord | NormRecord)[]) => shapeSession(normAll(records as readonly RawRecord[]));
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // `ui/src/lenses/session/` -> repo root is four levels up.
 const REPO_ROOT = path.resolve(__dirname, "../../../..");
 
-function readCorpus(name: string): FlowRecord[] {
+function readCorpus(name: string): RawRecord[] {
   const raw = JSON.parse(readFileSync(path.join(REPO_ROOT, "tests/parity/corpus", name), "utf8"));
-  return raw.records as FlowRecord[];
+  return raw.records as RawRecord[];
 }
 
 /** The `=== stage ===` section of a legacy golden, in the SAME normalized
@@ -129,7 +133,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   const BASE_TS = "2026-01-01T00:00:00Z";
 
   it("a clean, completed local dispatch: 'complete' pill, full brief, real metrics", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       {
         ts: BASE_TS,
         session_id: "s1",
@@ -188,7 +192,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   it("a run still in progress with two heartbeats gets a live scope reading, no TOK/S metric tile", () => {
     const beat1Ms = Date.parse("2026-01-01T00:00:01Z");
     const beat2Ms = Date.parse("2026-01-01T00:00:03Z");
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:00:01Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat1Ms, generated_chars: 40 } },
       { ts: "2026-01-01T00:00:03Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat2Ms, generated_chars: 120 } },
@@ -207,7 +211,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     const { LiveStore } = await import("../../lib/liveChannel");
     const beat1Ms = Date.parse("2026-01-01T00:00:01Z");
     const beat2Ms = Date.parse("2026-01-01T00:00:03Z");
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:00:01Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat1Ms, generated_chars: 40 } },
       { ts: "2026-01-01T00:00:03Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat2Ms, generated_chars: 120 } },
@@ -233,7 +237,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     const { LiveStore } = await import("../../lib/liveChannel");
     const beat1Ms = Date.parse("2026-01-01T00:00:01Z");
     const beat2Ms = Date.parse("2026-01-01T00:00:03Z");
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:00:01Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat1Ms, generated_chars: 40 } },
       { ts: "2026-01-01T00:00:03Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat2Ms, generated_chars: 120 } },
@@ -252,7 +256,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   it("a run with heartbeats but a long gap since the last one reads as stalled", () => {
     const beat1Ms = Date.parse("2026-01-01T00:00:01Z");
     const beat2Ms = Date.parse("2026-01-01T00:00:03Z");
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:00:01Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat1Ms, generated_chars: 40 } },
       { ts: "2026-01-01T00:00:03Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat2Ms, generated_chars: 120 } },
@@ -266,7 +270,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // (#2890) The finished average lives in the MODEL hero scope's center now,
   // not in a TOK/S tile; the labeling rules are unchanged.
   it("a FINISHED run gets its average rate (output tokens / wall clock) and no live scope", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
         ts: "2026-01-01T00:00:10Z",
@@ -286,7 +290,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   });
 
   it("a FINISHED run's TOK/S averages over GENERATION time when turns carry generation_ms, labeled avg", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "dispatch.turn", payload: { turn_seq: 1, generation_ms: 2_500 } },
       {
@@ -308,7 +312,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // (#2886) A checkpointed turn is excluded from the finished-run average,
   // and the tile says how many of the paired turns were billed.
   it("a FINISHED run's TOK/S excludes a checkpointed turn and labels 'avg · N of M turns'", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       // Turn 1: ordinary, billed. 20 tokens / 0.2s = 100 tok/s.
       { ts: "2026-01-01T00:00:00.200Z", session_id: "s1", action: "dispatch.turn", payload: { turn_seq: 1, generation_ms: 200 } },
@@ -325,7 +329,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   });
 
   it("a FINISHED run's TOK/S shows '—' (not a wrong number) when EVERY paired turn is checkpointed", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "dispatch.turn", payload: { turn_seq: 1, generation_ms: 220_000 } },
       { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "telemetry.tokens", payload: { turn_seq: 1, completion_tokens: 91 } },
@@ -343,7 +347,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     const beat2Ms = Date.parse("2026-01-01T00:00:02Z");
     const beat3Ms = Date.parse("2026-01-01T00:00:04Z");
     const beat4Ms = Date.parse("2026-01-01T00:00:22Z");
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       // Turn 1 opens at 0 (every turn does — #2886 pass 4 finding 2), then
       // two real-progress intervals (400 chars/s each) before turn 2's lone
@@ -367,7 +371,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   it("reads no live state (not stalled) when disconnected, even past STALL_AFTER_MS", () => {
     const beat1Ms = Date.parse("2026-01-01T00:00:01Z");
     const beat2Ms = Date.parse("2026-01-01T00:00:03Z");
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:00:01Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat1Ms, generated_chars: 40 } },
       { ts: "2026-01-01T00:00:03Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat2Ms, generated_chars: 120 } },
@@ -395,7 +399,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   it("downgrades a stall to no-signal via the half-open check even while connected=true", () => {
     const beat1Ms = Date.parse("2026-01-01T00:00:01Z");
     const beat2Ms = Date.parse("2026-01-01T00:00:03Z");
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:00:01Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat1Ms, generated_chars: 40 } },
       { ts: "2026-01-01T00:00:03Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat2Ms, generated_chars: 120 } },
@@ -421,7 +425,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // disconnected case above, for a wholly unrelated reason — and even
     // while `connected` is explicitly `false` here, `noSignal` must stay
     // `false`, since nothing about THIS null came from a connection problem.
-    const data: FlowRecord[] = [{ ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", source: "mission" }];
+    const data: RawRecord[] = [{ ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", source: "mission" }];
     const view = runRegions(flowToRenderModel(data), "s1", Date.parse(BASE_TS) + 1_000, false);
     expect(view.liveTokScope).not.toBeNull();
     expect(view.liveTokScope!.state).toBeNull();
@@ -429,7 +433,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   });
 
   it("an errored (non-killed) dispatch names the exit code and reads red", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "dispatch.error", payload: { exit_code: 1 } },
     ];
@@ -446,7 +450,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   });
 
   it("a watchdog-killed dispatch (exit 137) reads 'killed', not 'errored'", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "dispatch.error", payload: { exit_code: 137 } },
     ];
@@ -466,7 +470,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // make the two disagree by hours, so a test cannot pass on both.
 
   it("(#2011) takes WALL CLOCK from the terminal record's own wall_ms, not from a timestamp subtraction", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       // Two hours apart on the clock; the runtime measured 10:15.92 of work.
       // A subtraction says "120:00" — a plausible, wrong, unfalsifiable number.
@@ -484,7 +488,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // bracket) has NO payload at all, and older `dispatch complete` records
     // predate the field. The subtraction is still the best available answer
     // there — this is the inverted case, and it must keep working.
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:02:00Z", session_id: "s1", action: "session.end" },
     ];
@@ -516,7 +520,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       action: "dispatch.rest",
       payload: { ms: 15000, reason: "thermal-duty-cycle", state: "fair" },
     });
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       // A pacing CHANGE record (delay_ms, no ms) is not a rest and must not count.
       { ts: "2026-01-01T00:00:05Z", session_id: "s1", action: "dispatch.rest", payload: { delay_ms: 15000, reason: "thermal-duty-cycle", state: "fair", pause: false } },
@@ -527,7 +531,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
         action: "dispatch.complete",
         payload: { wall_ms: 243705, rest_ms: 90000, rests: 6, paced_rest_ms: 90000 },
       },
-    ] as FlowRecord[];
+    ] as RawRecord[];
     const view = runRegions(flowToRenderModel(data), "s1");
     // (#2890) The run time is the MODEL section's ACTIVE TIME cell now, and
     // the thermal rest it includes rides under it instead of a SYSTEM tile.
@@ -538,12 +542,12 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   });
 
   it("(rest-reason cards) mixed rest causes each get their own card", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:00:10Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 30000, reason: "turn_delay" } },
       { ts: "2026-01-01T00:00:50Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 60000, reason: "thermal-duty-cycle", state: "fair" } },
       { ts: "2026-01-01T00:04:03Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 243000, rest_ms: 90000, rests: 2, paced_rest_ms: 60000 } },
-    ] as FlowRecord[];
+    ] as RawRecord[];
     const view = runRegions(flowToRenderModel(data), "s1");
     // (#2890) Thermal under ACTIVE TIME; every other kind keeps its card.
     const delay = view.metrics.find((m) => m.label === "TURN DELAY");
@@ -555,12 +559,12 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   it("(rest-reason cards) a configured turn delay alone is named as such, never as thermal", () => {
     // The runtime writes `reason: "turn_delay"` for the operator's own
     // `turn_delay_ms` sleep (`runtime/src/trajectory.rs` `append_rest`).
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:00:10Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 45000, reason: "turn_delay" } },
       { ts: "2026-01-01T00:01:10Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 45000, reason: "turn_delay" } },
       { ts: "2026-01-01T00:04:03Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 243000, rest_ms: 90000, rests: 2, paced_rest_ms: 0 } },
-    ] as FlowRecord[];
+    ] as RawRecord[];
     const view = runRegions(flowToRenderModel(data), "s1");
     const delay = view.metrics.find((m) => m.label === "TURN DELAY");
     expect(delay?.value).toBe("1:30");
@@ -569,28 +573,28 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   });
 
   it("(rest-reason cards) pacing-change records (delay_ms, no ms) are never counted as rests", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:00:10Z", session_id: "s1", action: "dispatch.rest", payload: { delay_ms: 15000, reason: "thermal-duty-cycle", state: "fair", pause: false } },
       { ts: "2026-01-01T00:04:03Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 243000 } },
-    ] as FlowRecord[];
+    ] as RawRecord[];
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(view.metrics.find((m) => m.label === "THERMAL REST")).toBeUndefined();
   });
 
   it("(rest-reason cards) an old run with no bounds but thermal rests still shows the card", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:00:10Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 15000, reason: "thermal-duty-cycle" } },
       { ts: "2026-01-01T00:04:03Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 243000, rest_ms: 90000, rests: 6 } },
-    ] as FlowRecord[];
+    ] as RawRecord[];
     const view = runRegions(flowToRenderModel(data), "s1");
     const wall = view.metrics.find((m) => m.label === "ACTIVE TIME");
     expect(wall?.sub).toBe("0:15 thermal rest");
   });
 
   it("(rest-reason cards) rest with no per-rest records shows no card at all", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
         ts: "2026-01-01T00:04:03.705Z",
@@ -607,7 +611,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   });
 
   it("(rest-reason cards) a run with no rest gets no rest sub line and no cards", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:10:00Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 600000 } },
     ];
@@ -618,7 +622,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   });
 
   it("(rest-reason cards) an errored run's WALL CLOCK sub names only the outcome, not rest", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
         ts: "2026-01-01T00:01:00Z",
@@ -633,7 +637,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   });
 
   it("(rest-reason cards) thermal configured with 0 rests shows an armed-but-quiet card", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       {
         ts: BASE_TS,
         session_id: "s1",
@@ -642,7 +646,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
         payload: { bounds: { thermal_pacing_enabled: { value: true, source: "built-in" } } },
       },
       { ts: "2026-01-01T00:10:00Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 600000 } },
-    ] as FlowRecord[];
+    ] as RawRecord[];
     const view = runRegions(flowToRenderModel(data), "s1");
     // (#2890) Armed and quiet reads under ACTIVE TIME now.
     expect(view.metrics.find((m) => m.label === "ACTIVE TIME")?.sub).toBe("0:00 thermal rest");
@@ -650,7 +654,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   });
 
   it("(rest-reason cards) thermal NOT configured and no rests shows no card", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       {
         ts: BASE_TS,
         session_id: "s1",
@@ -659,13 +663,13 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
         payload: { bounds: { thermal_pacing_enabled: { value: false, source: "config" } } },
       },
       { ts: "2026-01-01T00:10:00Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 600000 } },
-    ] as FlowRecord[];
+    ] as RawRecord[];
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(view.metrics.find((m) => m.label === "THERMAL REST")).toBeUndefined();
   });
 
   it("(rest-reason cards) turn delay configured 15s with 3 rests reads '0:45' / '3 rests · 15 s each'", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       {
         ts: BASE_TS,
         session_id: "s1",
@@ -677,7 +681,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T00:00:40Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 15000, reason: "turn_delay" } },
       { ts: "2026-01-01T00:01:10Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 15000, reason: "turn_delay" } },
       { ts: "2026-01-01T00:02:00Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 120000 } },
-    ] as FlowRecord[];
+    ] as RawRecord[];
     const view = runRegions(flowToRenderModel(data), "s1");
     const delay = view.metrics.find((m) => m.label === "TURN DELAY");
     expect(delay?.value).toBe("0:45");
@@ -685,7 +689,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   });
 
   it("a remote (endpoint-served) run names the endpoint and omits the local model track", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "reviewer", payload: { endpoint: "azure:my-host/gpt-4o" } },
       { ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
     ];
@@ -705,7 +709,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // which is what a real swap looks like on the wire. The UNTAGGED version
     // of this same shape is covered by its own case further down, where the
     // answer is deliberately different.
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:00:10Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "a", gb: 10, role: "primary", baseline: true } },
       { ts: "2026-01-01T00:02:00Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "b", gb: 20, role: "resident" } },
@@ -738,7 +742,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // Mirrors the live #1934 report exactly: 3 models loaded in one run,
     // none of it a swap — primary, the declared compactor, and the
     // declared utility model, all resident from the sampler's first tick.
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", model: "primary-35b" },
       {
         ts: "2026-01-01T00:00:02Z",
@@ -769,7 +773,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   });
 
   it("(#1934) a resident leftover from an earlier session does NOT fire — this run never touched it", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", model: "primary-35b" },
       {
         ts: "2026-01-01T00:00:02Z",
@@ -795,7 +799,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   });
 
   it("(#1934) a real mid-run swap to a DIFFERENT specialist model still fires", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", model: "primary-35b" },
       {
         ts: "2026-01-01T00:00:02Z",
@@ -823,7 +827,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   });
 
   it("(#1934) the SAME primary model unloaded and reloaded mid-run still fires — the reload still stalls the dispatch", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", model: "primary-35b" },
       {
         ts: "2026-01-01T00:00:02Z",
@@ -864,7 +868,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // the primary's own seed load would then be admitted too. It proves the
     // role check is NECESSARY for a late compactor load, not that it is the
     // only check involved.)
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", model: "primary-35b" },
       {
         ts: "2026-01-01T00:00:02Z",
@@ -900,7 +904,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // count-based rule raised `jit-model-swap` here; the tagged rule cannot
     // apply at all. So: no warning, and an `info` that says what it could
     // not tell apart.
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", model: "primary-35b" },
       {
         ts: "2026-01-01T00:00:02Z",
@@ -933,7 +937,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // rule they were correctly silent; the presence gate admitted both loads
     // and rendered "X was unloaded mid-run" — a false factual claim, not
     // noise. Silence is the only correct output here.
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "scribe", model: "util-4b" },
       {
         ts: "2026-01-01T00:00:02Z",
@@ -960,7 +964,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // tagged half would look like "primary staffed, nothing else", and the
     // untagged record could be anything — including the swap. Judging the
     // subset would be judging an incomplete track.
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", model: "primary-35b" },
       {
         ts: "2026-01-01T00:00:02Z",
@@ -987,7 +991,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // The detail line must describe what the records say happened. Keying
     // the two branches on the model COUNT alone made a single-model,
     // load-only set render "was unloaded mid-run".
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", model: "primary-35b" },
       {
         ts: "2026-01-01T00:02:00Z",
@@ -1018,7 +1022,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       source: "process",
       fields: { cpu, mem, gpu },
     });
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       proc("2026-01-01T00:00:10Z", 30, 60, 20),
       proc("2026-01-01T00:00:20Z", 39, 68, 97),
@@ -1062,7 +1066,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // upgraded this further: silently omitting the tile read the same as
     // "this pane doesn't cover host stats" — an explicit "no host samples"
     // tile (matching the machine drawer's own wording) says so instead.
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
     ];
@@ -1084,7 +1088,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // shape, since this module's own tests exercise the CLIENT-side read
     // of it, not the server join itself (covered in darkmux-serve's Rust
     // tests).
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
         ts: "2026-01-01T00:00:30Z",
@@ -1093,7 +1097,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
         category: "machinery",
         source: "host",
         payload: { cpu_pct: 40, mem_pct: 60, gpu_pct: 10 },
-      } as unknown as FlowRecord,
+      } as unknown as RawRecord,
       { ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
@@ -1109,8 +1113,8 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // machine's day file) must not let this run's SYSTEM pane render
     // another machine's samples just because they land in the same time
     // window — only `machine_uid === this run's own machine_uid` counts.
-    const data: FlowRecord[] = [
-      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", machine_uid: "m-1" } as FlowRecord,
+    const data: RawRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", machine_uid: "m-1" } as RawRecord,
       {
         ts: "2026-01-01T00:00:30Z",
         action: "machine.telemetry",
@@ -1118,7 +1122,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
         category: "machinery",
         source: "host",
         payload: { cpu_pct: 40, mem_pct: 60, gpu_pct: 10 },
-      } as unknown as FlowRecord,
+      } as unknown as RawRecord,
       { ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
@@ -1134,9 +1138,9 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // zero asserts "this happened, none occurred" when the truth is "this
     // cannot happen here". The pane split exists to make the model half
     // ABSENT, and this is what uses it.
-    const data: FlowRecord[] = [
-      { ts: BASE_TS, session_id: "s1", action: "step start", handle: "build" },
-      { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "step complete", handle: "build" },
+    const data: RawRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "step.start", handle: "build" },
+      { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "step.complete", handle: "build" },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(view.hasModelWork).toBe(false);
@@ -1152,20 +1156,20 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // Its gate writes `budget.wait` before `dispatch start` (contract 2):
     // the MODEL pane (where REST reads "budget · <endpoint>") must be there
     // while it waits, not grow in when the call is finally sent.
-    const data: FlowRecord[] = [
-      { ts: BASE_TS, session_id: "s1", action: "budget.wait", handle: "coder", payload: { endpoint_id: "azure", wait_seconds: 600 } } as unknown as FlowRecord,
+    const data: NormRecord[] = [
+      norm({ ts: BASE_TS, session_id: "s1", action: "budget.wait", handle: "coder", payload: { endpoint_id: "azure", wait_seconds: 600 } }),
     ];
     expect(runRegions(flowToRenderModel(data), "s1").hasModelWork).toBe(true);
   });
 
   it("(#2902 step 5) a hosted wait stopped before its call closes the run; a later start reopens it", () => {
-    const wait = { ts: BASE_TS, session_id: "s1", action: "budget.wait", payload: { endpoint_id: "azure", wait_seconds: 86000 } } as unknown as FlowRecord;
-    const stop = { ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "budget.stop", payload: { endpoint_id: "azure", reason: "mission `m` is aborted" } } as unknown as FlowRecord;
+    const wait = norm({ ts: BASE_TS, session_id: "s1", action: "budget.wait", payload: { endpoint_id: "azure", wait_seconds: 86000 } });
+    const stop = norm({ ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "budget.stop", payload: { endpoint_id: "azure", reason: "mission `m` is aborted" } });
     const stopped = runRegions(flowToRenderModel([wait, stop]), "s1", Date.parse("2026-01-01T05:00:00Z"));
     expect(stopped.live).toBe(false);
     // Closed, but never a clean completion: the call was never sent.
     expect(JSON.stringify(stopped.header)).not.toMatch(/complete/i);
-    const start = { ts: "2026-01-01T00:02:00Z", session_id: "s1", action: "dispatch.start", payload: {} } as unknown as FlowRecord;
+    const start = norm({ ts: "2026-01-01T00:02:00Z", session_id: "s1", action: "dispatch.start", payload: {} });
     expect(runRegions(flowToRenderModel([wait, stop, start]), "s1", Date.parse("2026-01-01T00:03:00Z")).live).toBe(true);
   });
 
@@ -1174,7 +1178,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // numbers. A live dispatch whose first turn has not landed would
     // otherwise render no model metrics and then GROW a pane mid-run, which
     // is worse than showing em-dashes that are about to fill in.
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
@@ -1196,7 +1200,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // secondary model was FOR is unknowable until `telemetry.lms` carries the
     // declared role, and guessing by size or load order is exactly the
     // inference #1934 is about.
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", model: "big-specialist" },
       { ts: "2026-01-01T00:00:05Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "big-specialist", gb: 18 } },
       { ts: "2026-01-01T00:00:10Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "small-utility", gb: 2 } },
@@ -1215,7 +1219,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // (`darkmux:<key>`), while LM Studio's load telemetry reports the bare
     // key. Compared as-is they never matched, so on a real run every model,
     // including the one that did the work, read "also loaded".
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", model: "darkmux:big-specialist" },
       { ts: "2026-01-01T00:00:05Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "small-utility", gb: 2 } },
       { ts: "2026-01-01T00:00:10Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "big-specialist", gb: 18 } },
@@ -1235,7 +1239,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // Without `record.model` the only candidate is the FIRST-LOADED model,
     // which is a heuristic. Marking it "primary" would assert something the
     // data does not support; the list simply reports what was loaded.
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:00:05Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "a", gb: 10 } },
       { ts: "2026-01-01T00:00:10Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "b", gb: 2 } },
@@ -1245,7 +1249,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   });
 
   it("a real detector finding carries its severity/kind/detail, without a fix line", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
         ts: "2026-01-01T00:00:30Z",
@@ -1291,7 +1295,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // group heading — an operator scanning SIGNALS reads that as a finding
     // BY THAT NAME. A malformed payload must stay visible and be named
     // honestly, which is the discipline the severity field already had.
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       detRec({ severity: "warn", detail: "something fired" }),
     ];
@@ -1300,7 +1304,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   });
 
   it("(#1989) an empty-string `kind` is treated as missing, not as a blank heading", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       detRec({ severity: "warn", kind: "", detail: "d" }),
     ];
@@ -1312,7 +1316,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // The operator can act on a JSON blob and cannot act on `[object
     // Object]`. This is the case where a detector carried real diagnostic
     // data and the viewer threw it away.
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       detRec({ severity: "warn", kind: "structured", detail: { tool: "read_file", count: 4 } }),
     ];
@@ -1324,7 +1328,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   });
 
   it("(#1989) an absent `detail` says so rather than printing `undefined`", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       detRec({ severity: "warn", kind: "no-detail" }),
     ];
@@ -1335,7 +1339,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   it("(#1989) a circular `detail` degrades instead of throwing — a malformed signal must not take the page down", () => {
     const circular: Record<string, unknown> = { a: 1 };
     circular.self = circular;
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       detRec({ severity: "warn", kind: "circular", detail: circular }),
     ];
@@ -1347,7 +1351,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // against NaN is false — including `NaN <= nowMs`. One bad string used to
     // drop the start record, leave `startTs` as NaN, and make `inAttempt`
     // false for EVERY record including a perfectly good `dispatch.complete`.
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: "not-a-real-timestamp", session_id: "s1", action: "dispatch.start", handle: "coder", payload: { prompt: "the brief", workspace: "/tmp/wt" } },
       { ts: "2026-01-01T00:05:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
     ];
@@ -1359,7 +1363,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // The record serves two purposes: payload source and clock source. A bad
     // clock must not cost the payload — losing prompt, runtime, image,
     // workspace and model is what removed any way to diagnose the run.
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: "garbage", session_id: "s1", action: "dispatch.start", handle: "coder", payload: { prompt: "the brief", workspace: "/tmp/wt" } },
       { ts: "2026-01-01T00:05:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
     ];
@@ -1376,7 +1380,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // plausible. Walking outward for a usable clock is what prevents that,
     // and only an assertion on the CONTENT catches it — the close fallback
     // masks it from any assertion on `live`.
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: "not-a-timestamp", session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
         ts: "2026-01-01T00:00:30Z",
@@ -1397,7 +1401,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // clamp already anticipates. Guarding the elapsed-time arithmetic against
     // skew while leaving the terminal SELECTION exposed to it was the
     // inconsistency: a finished dispatch reported as perpetually in flight.
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: "2026-01-01T00:10:00Z", session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:09:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
     ];
@@ -1408,7 +1412,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   it("(#1988) ...and SAYS the timeline is unreliable rather than presenting a repair as fact", () => {
     // Honoring a skewed terminal is right; pretending the timeline is sound
     // is not. The reading is repaired AND the repair is disclosed.
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: "2026-01-01T00:10:00Z", session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:09:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
     ];
@@ -1418,7 +1422,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
 
   it("(#1988) a healthy run raises NO clock-skew signal", () => {
     // The guard against a warning that fires on every normal run.
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:05:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
     ];
@@ -1432,7 +1436,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // which reports that a stall RECOVERED. The old viewer dropped severity
     // entirely and prefixed every entry with `⚠`, so a successful recovery
     // looked exactly like a doom loop.
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
         ts: "2026-01-01T00:00:30Z",
@@ -1449,7 +1453,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   it("(#1973) an UNRECOGNIZED severity degrades to warn, never to info", () => {
     // A severity this build does not know is more likely to matter than not.
     // Degrading it to `info` is how a new detector ships invisible.
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
         ts: "2026-01-01T00:00:05Z",
@@ -1474,7 +1478,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       source: "detector",
       fields: { severity, kind, detail: `${kind} at ${ts}` },
     });
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       // The `info` one arrives LAST in time, so recency alone would float it.
       det("2026-01-01T00:00:10Z", "cycle", "warn"),
@@ -1492,9 +1496,9 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   });
 
   it("no dispatch.start at all falls back to the first record on the session, and reads 'no start'", () => {
-    const data: FlowRecord[] = [
-      { ts: BASE_TS, session_id: "s1", action: "step start", handle: "fetch-render" },
-      { ts: "2026-01-01T00:00:05Z", session_id: "s1", action: "step complete" },
+    const data: RawRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "step.start", handle: "fetch-render" },
+      { ts: "2026-01-01T00:00:05Z", session_id: "s1", action: "step.complete" },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(view.header.role).toBe("FETCH-RENDER");
@@ -1507,7 +1511,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // directly under a VALUE tile that already printed `19K` once. The
     // fixed anatomy: `label` names the number, `value` IS the number, `sub`
     // carries the window ceiling — and none of the three repeats another.
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:01:00Z", session_id: "s1", category: "telemetry", source: "context", fields: { max: 100000, used: 20000 } },
       { ts: "2026-01-01T00:02:00Z", session_id: "s1", category: "telemetry", source: "context", fields: { max: 100000, used: 45000 } },
@@ -1524,7 +1528,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   });
 
   it("(operator, 2026-09-05) a LIVE ctx tile names the current value, with the peak-so-far and the window in sub", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:01:00Z", session_id: "s1", category: "telemetry", source: "context", fields: { max: 262144, used: 20000 } },
       { ts: "2026-01-01T00:02:00Z", session_id: "s1", category: "telemetry", source: "context", fields: { max: 262144, used: 19000 } },
@@ -1544,7 +1548,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // OUT/WALL CLOCK/CTX are all populated with real values — not just CTX,
     // which is the one this quirk was found on but not the only one that
     // could grow the same defect.
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       {
         ts: BASE_TS,
         session_id: "s1",
@@ -1617,7 +1621,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // output shape (`category=telemetry, source=detector, action=telemetry.
   // detector, fields.kind="repetition"`).
   it("(#2887) a degenerate gate observation forwarded to flow makes the run NOT read CLEAN", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
         ts: "2026-01-01T00:01:00Z",
@@ -1649,7 +1653,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // flags (never CLEAN) but its wording says so was NOT enforced — the
   // operator-visible distinction the issue asks for.
   it("(#2887) an observe-policy gate finding reads 'recorded, not concluded', never CLEAN", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
         ts: "2026-01-01T00:01:00Z",
@@ -1683,7 +1687,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // keep going. `dispatch.checkpoint` DOES reach the flow stream already
   // (unlike the gate above); the defect here was that nothing counted it.
   it("(#2887) a would-conclude checkpoint under observe policy flags as repetition (observed)", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
         ts: "2026-01-01T00:01:00Z",
@@ -1710,7 +1714,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // `warn` reads "warned, not concluded" — never CLEAN, never "ended it".
   it("(#2947) record and warn policy checkpoints flag, worded by what the policy did", () => {
     for (const [policy, want] of [["record", /recorded, not concluded/], ["warn", /warned, not concluded/]] as const) {
-      const data: FlowRecord[] = [
+      const data: RawRecord[] = [
         { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
         {
           ts: "2026-01-01T00:01:00Z",
@@ -1740,7 +1744,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // exercising the `acted` branch of the checkpoint wording, not just the
   // observe branch above.
   it("(#2887) a concluded checkpoint under enforce policy flags as repetition, worded as acted (not observed)", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
         ts: "2026-01-01T00:01:00Z",
@@ -1768,7 +1772,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // (`would_conclude:false`) must NOT flag — otherwise every ordinary
   // checkpoint on a healthy run would light up the SIGNALS card.
   it("(#2887) a checkpoint with would_conclude:false does not flag", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
         ts: "2026-01-01T00:01:00Z",
@@ -1796,7 +1800,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // `would_conclude !== true` filter read every one of them as CLEAN with
   // "repetition" ticked.
   it("(#2887 F1) a historical checkpoint with verdict:conclude and NO would_conclude key still flags", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
         ts: "2026-01-01T00:01:00Z",
@@ -1825,7 +1829,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // investigation, a malformed fixture) must not manufacture a finding for
   // a detector that measured nothing.
   it("(#2887 F2) run-level policy 'off' suppresses repetition entirely and sets repetitionOff", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       {
         ts: BASE_TS,
         session_id: "s1",
@@ -1855,7 +1859,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // nothing" and "unknown", so a run with real findings under enforce must
   // not read as off.
   it("(#2887 F2) run-level policy 'enforce' does not set repetitionOff", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       {
         ts: BASE_TS,
         session_id: "s1",
@@ -1875,7 +1879,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // must still read as observed-not-enforced rather than falling through to
   // the bare "judged repeating" sentence.
   it("(#2887 F2) run-level policy fills in wording when the record's own policy is absent", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       {
         ts: BASE_TS,
         session_id: "s1",
@@ -1990,7 +1994,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       handle: "coder",
       fields: { turn_seq: turnSeq, verdict: "conclude", would_conclude: true, policy: "enforce" },
     });
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: new Date(1790241677181).toISOString(), session_id: "s1", action: "dispatch.start", handle: "coder" },
       // turn_seq 2: one cut. Real ts from the trajectory's own lines.
       gateRecord(2, 14, 1790241731958),
@@ -2069,7 +2073,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       handle: "coder",
       fields: { turn_seq: turnSeq, verdict: "conclude", would_conclude: true, policy: "enforce" },
     });
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: new Date(1790241677181).toISOString(), session_id: "s1", action: "dispatch.start", handle: "coder" },
       gateRecord(2, 14, 1790241731958),
       abortRecord(2, 14, 1790241731958),
@@ -2100,7 +2104,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // distinct executions were flagged. `handle` + `payload.step_id`
   // distinguish the seats even though `session_id` cannot.
   it("(#2887 N3) two sibling seats sharing a session each flag their own turn 2 as SEPARATE findings", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
         ts: "2026-01-01T00:01:00Z", session_id: "s1", category: "telemetry", source: "detector",
@@ -2125,7 +2129,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // still real evidence, and merging two unrelated ones would either lose
   // one entirely or falsely combine their gate-abort counts.
   it("(#2887 N3) records with no turn_seq stay as separate findings, not one shared 'turn ?' group", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
         ts: "2026-01-01T00:01:00Z", session_id: "s1", category: "telemetry", source: "detector",
@@ -2149,7 +2153,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // post-hoc judge (no gate-sourced record at all for that turn) must cite
   // #1221, not #2836 — the two are independent detectors.
   it("(#2887 N4) a checkpoint-only flag cites #1221, not the gate's #2836", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
         ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "dispatch.checkpoint", handle: "coder",
@@ -2167,7 +2171,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // `flow_schema` key at all (every run before this field existed). The
   // card must NOT claim the gate looked and found nothing.
   it("(#2887 N2) a run with no flow_schema on dispatch.start reads repetitionRecorded:false", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
@@ -2178,7 +2182,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // (#2887 N2) An explicit pre-1.56.0 flow_schema (not just absent) must
   // read the same way — "too old" and "absent" are the same case.
   it("(#2887 N2) a run with flow_schema below 1.56.0 reads repetitionRecorded:false", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       {
         ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder",
         fields: { flow_schema: "1.55.0" },
@@ -2191,7 +2195,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // (#2887 N2) A run recorded at 1.56.0 or later — the checklist may
   // legitimately claim the gate looked and found nothing.
   it("(#2887 N2) a run with flow_schema 1.56.0 or later reads repetitionRecorded:true", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       {
         ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder",
         fields: { flow_schema: "1.56.0" },
@@ -2200,7 +2204,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(view.repetitionRecorded).toBe(true);
 
-    const later: FlowRecord[] = [
+    const later: RawRecord[] = [
       {
         ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder",
         fields: { flow_schema: "1.60.2" },
@@ -2216,7 +2220,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // "5" < "9" puts 1.56.0 after 1.9.0 alphabetically despite 56 > 9
   // numerically) unless components are compared as numbers.
   it("(#2887 N2) version comparison is numeric per component, not lexicographic", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       {
         ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder",
         fields: { flow_schema: "1.9.0" },
@@ -2238,10 +2242,10 @@ describe("runRegions — MODEL section content (#2890)", () => {
   const BASE_TS = "2026-01-01T00:00:00Z";
   const labelsOf = (view: ReturnType<typeof runRegions>, scope: "model" | "system") =>
     view.metricScope[scope].map((i) => view.metrics[i].label);
-  const tool = (ts: string, name: string, extra: Record<string, unknown> = {}): FlowRecord =>
-    ({ ts, session_id: "s1", action: "dispatch.tool", payload: { tool_name: name, ok: true, outcome: "ok", ...extra } }) as unknown as FlowRecord;
+  const tool = (ts: string, name: string, extra: Record<string, unknown> = {}): RawRecord =>
+    ({ ts, session_id: "s1", action: "dispatch.tool", payload: { tool_name: name, ok: true, outcome: "ok", ...extra } }) as unknown as RawRecord;
 
-  const finishedRun = (): FlowRecord[] =>
+  const finishedRun = (): RawRecord[] =>
     [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", payload: { bounds: { thermal_pacing_enabled: { value: true } } } },
       { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "dispatch.turn", payload: { turn_seq: 1, tool_calls_count: 3, generation_ms: 2_500 } },
@@ -2254,11 +2258,11 @@ describe("runRegions — MODEL section content (#2890)", () => {
       { ts: "2026-01-01T00:00:20Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 45000, reason: "thermal-duty-cycle" } },
       { ts: "2026-01-01T00:01:10Z", session_id: "s1", category: "telemetry", source: "context", payload: { used: 12000, max: 100000 } },
       { ts: "2026-01-01T00:10:00Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 600000, prompt_tokens: 1000, completion_tokens: 200 } },
-    ] as FlowRecord[];
+    ] as RawRecord[];
 
   /** The run as of `iso`: records after it are not in the page's data yet
    *  (the caller cuts to its clock, live or playback). */
-  const asOf = (iso: string) => finishedRun().filter((r) => Date.parse(r.ts) <= Date.parse(iso));
+  const asOf = (iso: string) => recordsAsOf(normAll(finishedRun()), Date.parse(iso));
 
   it("orders the model cells turns, tool calls, active time, tokens in, tokens out, context", () => {
     const view = runRegions(flowToRenderModel(finishedRun()), "s1");
@@ -2280,7 +2284,7 @@ describe("runRegions — MODEL section content (#2890)", () => {
   });
 
   it("an armed thermal governor that never fired still says so under active time", () => {
-    const data = finishedRun().filter((r) => r.action !== "dispatch.rest");
+    const data = finishedRun().filter((r) => r.action !== ACTION.DispatchRest);
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(view.metrics.find((m) => m.label === "ACTIVE TIME")?.sub).toBe("0:00 thermal rest");
   });
@@ -2296,7 +2300,7 @@ describe("runRegions — MODEL section content (#2890)", () => {
   it("other rest kinds stay SYSTEM tiles", () => {
     const data = [
       ...finishedRun(),
-      { ts: "2026-01-01T00:02:00Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 30000, reason: "turn_delay" } } as unknown as FlowRecord,
+      { ts: "2026-01-01T00:02:00Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 30000, reason: "turn_delay" } } as unknown as RawRecord,
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(labelsOf(view, "system")).toContain("TURN DELAY");
@@ -2327,7 +2331,7 @@ describe("runRegions — MODEL section content (#2890)", () => {
   it("a live run in TOOLS names the RUNNING call's tool for the scope's icon (#2963)", () => {
     // read and bash have completed by 0:06; the third call, edit, runs.
     const named = asOf("2026-01-01T00:00:06Z").map((r) =>
-      r.action === "dispatch.turn" ? ({ ...r, payload: { ...(r as unknown as { payload: object }).payload, tool_names: ["read", "bash", "edit"] } } as unknown as FlowRecord) : r,
+      r.action === ACTION.DispatchTurn ? ({ ...r, payload: { ...(r as unknown as { payload: object }).payload, tool_names: ["read", "bash", "edit"] } } as unknown as RawRecord) : r,
     );
     const live = runRegions(flowToRenderModel(named), "s1", Date.parse("2026-01-01T00:00:06Z"));
     expect(live.liveTokScope).toMatchObject({ state: "tools", toolName: "edit" });
@@ -2345,10 +2349,10 @@ describe("runRegions — MODEL section content (#2890)", () => {
   });
 
   it("a unit with no model work keeps WALL CLOCK in SYSTEM", () => {
-    const data: FlowRecord[] = [
+    const data: RawRecord[] = [
       { ts: BASE_TS, session_id: "p1", action: "step.start" },
       { ts: "2026-01-01T00:00:30Z", session_id: "p1", action: "session.end" },
-    ] as FlowRecord[];
+    ] as RawRecord[];
     const view = runRegions(flowToRenderModel(data), "p1");
     expect(view.metricScope.model).toEqual([]);
     expect(labelsOf(view, "system")).toContain("WALL CLOCK");

@@ -1,6 +1,5 @@
 import { compactDuration } from "./format";
-import type { FlowRecord } from "../types/handwritten";
-import { isDispatchStart } from "./flow";
+import { ACTION, type NormAction, type NormRecord } from "./ingest";
 
 /**
  * The event-log row's trailing preview (`renderLog()`'s `detail`,
@@ -58,7 +57,7 @@ function firstLine(s: string, max: number): string {
 
 /** The row's trailing preview, or `""` when this record kind has none.
  * Branch-for-branch the legacy set. */
-export function recordDetail(r: FlowRecord): string {
+export function recordDetail(r: NormRecord): string {
   // (#2863 review round 2, finding 5) Escaped at the SOURCE, not only at
   // `recordObject()`'s fallback call site — `EventLogColumn.tsx`'s pushed-
   // detail strip calls this function DIRECTLY for its preview text, a
@@ -66,14 +65,17 @@ export function recordDetail(r: FlowRecord): string {
   return escapeBidiControls(recordDetailRaw(r));
 }
 
-function recordDetailRaw(r: FlowRecord): string {
-  const f = (r.fields || r.payload) as Record<string, unknown> | undefined;
-  const a = r.action || "";
+/** The budget records (#2902 step 5), which name their own subject in a row. */
+const BUDGET_ACTIONS: ReadonlySet<NormAction> = new Set<NormAction>([ACTION.BudgetWarn, ACTION.BudgetWait, ACTION.BudgetResume, ACTION.BudgetStop]);
 
-  if (a === "dispatch.reasoning" && typeof f?.reasoning_text === "string") {
+function recordDetailRaw(r: NormRecord): string {
+  const f = (r.fields || r.payload) as Record<string, unknown> | undefined;
+  const a = r.action;
+
+  if (a === ACTION.DispatchReasoning && typeof f?.reasoning_text === "string") {
     return `"${firstLine(f.reasoning_text, 60)}..."`;
   }
-  if (a === "dispatch.tool" && f) {
+  if (a === ACTION.DispatchTool && f) {
     // `args` absent on pre-1.16 records — fall back to its size, so an old
     // record degrades to what it can say rather than rendering a bare arrow.
     const args = f.args != null ? prettyArgs(f.args) : `${f.args_chars ?? 0}ch`;
@@ -95,34 +97,34 @@ function recordDetailRaw(r: FlowRecord): string {
     }
     return `${String(f.tool_name ?? "")} ${args} → ${f.result_chars ?? 0}ch${suffix}`;
   }
-  if (a === "dispatch.turn" && f) {
+  if (a === ACTION.DispatchTurn && f) {
     return `turn ${f.turn_seq ?? 0} (${String(f.finish_reason ?? "")})`;
   }
   // `reasoning` is a tier-decision-only top-level field absent from
-  // `FlowRecord`'s typed surface, so it is read defensively rather than added
+  // `NormRecord`'s typed surface, so it is read defensively rather than added
   // to the type for one branch.
   const reasoning = (r as unknown as { reasoning?: unknown }).reasoning;
-  if (a === "tier-decision" && typeof reasoning === "string") {
+  if (a === ACTION.TierDecision && typeof reasoning === "string") {
     return `"${firstLine(reasoning, 60)}..."`;
   }
-  if (isDispatchStart(a)) {
+  if (a === ACTION.DispatchStart) {
     return `start (prompt: ${f?.prompt_chars ?? 0}ch)`;
   }
   // (#2902 step 5) A budget record says in the row itself what it is about
   // and, for a wait, how long: the run page is one of the three places a
   // wait must say so (with the CLI and `mission status`).
-  if (a.startsWith("budget.") && f) {
+  if (a !== undefined && BUDGET_ACTIONS.has(a) && f) {
     const subject = String(f.endpoint_id ?? f.step ?? "budget");
-    if (a === "budget.wait") {
+    if (a === ACTION.BudgetWait) {
       return typeof f.wait_seconds === "number" ? `${subject}: waiting ${spanWords(f.wait_seconds)}` : `${subject}: waiting`;
     }
-    if (a === "budget.stop") {
+    if (a === ACTION.BudgetStop) {
       return typeof f.reason === "string" ? `${subject}: wait stopped (${f.reason})` : `${subject}: wait stopped`;
     }
-    if (a === "budget.resume" && typeof f.waited_ms === "number") {
+    if (a === ACTION.BudgetResume && typeof f.waited_ms === "number") {
       return `${subject}: resumed after ${spanWords(f.waited_ms / 1000)}`;
     }
-    if (a === "budget.warn" && typeof f.spent === "number" && typeof f.limit === "number") {
+    if (a === ACTION.BudgetWarn && typeof f.spent === "number" && typeof f.limit === "number") {
       const per = typeof f.period === "string" ? ` per ${f.period}` : "";
       return `${subject}: ${f.spent}/${f.limit} ${String(f.metric ?? "tokens")}${per}`;
     }
@@ -424,11 +426,11 @@ export function cleanToolPath(raw: unknown): string | null {
   return clean ? escapeBidiControls(clean) : null;
 }
 
-export function recordObject(r: FlowRecord): RecordObject {
+export function recordObject(r: NormRecord): RecordObject {
   const f = (r.fields || r.payload) as Record<string, unknown> | undefined;
-  const a = r.action || "";
+  const a = r.action;
 
-  if (a === "dispatch.tool" && f) {
+  if (a === ACTION.DispatchTool && f) {
     const args = parseToolArgs(f);
     let text = "";
     let mono = false;
@@ -467,7 +469,7 @@ export function recordObject(r: FlowRecord): RecordObject {
     if (outcome) o.outcome = outcome;
     return o;
   }
-  if (a === "dispatch.reasoning" && typeof f?.reasoning_text === "string") {
+  if (a === ACTION.DispatchReasoning && typeof f?.reasoning_text === "string") {
     const first = unquote(f.reasoning_text).split("\n").find((l) => l.trim()) ?? "";
     return { chip: "reasoning", kind: "think", text: escapeBidiControls(first.trim()) || "(no reasoning text)", mono: false };
   }

@@ -5,7 +5,7 @@ import React from "react";
 import { FLOW_WINDOW_EDGE_GRAIN_MS, flowWindowEdgeMs, useFlowWindow } from "./useFlowWindow";
 import { LIVE_WINDOW_MS, todayUTC } from "../lib/flow";
 import { queryKeys } from "../lib/queryKeys";
-import type { FlowRecord } from "../types/handwritten";
+import { normAll } from "../testing/records";
 
 // (#2911) The fleet lens re-renders once a second while an execution is live
 // and passes a fresh `Date.now()` each time. The window merge (copy,
@@ -28,10 +28,10 @@ describe("useFlowWindow — the window edge is coarse", () => {
     vi.setSystemTime(NOW);
     const today = todayUTC();
     // One record just inside the 24h edge, one fresh.
-    const records: FlowRecord[] = [
+    const records = [
       { ts: new Date(NOW - LIVE_WINDOW_MS + 20_000).toISOString(), session_id: "old", action: "dispatch.start" },
       { ts: new Date(NOW - 5_000).toISOString(), session_id: "new", action: "dispatch.start" },
-    ] as FlowRecord[];
+    ];
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) =>
@@ -69,9 +69,10 @@ describe("useFlowWindow — the window edge is coarse", () => {
     // A record arriving on the live tail lands at once, mid-grain.
     const today = todayUTC();
     act(() => {
-      qc.setQueryData(queryKeys.flowTail(today), [
+      // The tail cache holds ingested records (`lib/sse.ts` appends through `ingestRecord`).
+      qc.setQueryData(queryKeys.flowTail(today), normAll([
         { ts: new Date(NOW + 3_000).toISOString(), session_id: "tail", action: "dispatch.start" },
-      ]);
+      ]));
     });
     await waitFor(() => expect(result.current.data.map((r) => r.session_id)).toEqual(["old", "new", "tail"]));
 

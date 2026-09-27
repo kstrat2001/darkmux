@@ -187,7 +187,7 @@ test('a phase that legitimately regresses running->planned in a fresh reconcile 
   // BEFORE either snapshot's own `generated_at_ms` — the shape a real
   // mission produces: the event fires once, long before a later reconcile
   // poll correctly reads the phase back down to "planned".
-  const historical = [{ ts: new Date(now - 60_000).toISOString(), action: 'phase start', handle: 'phase-a', mission_id: missionId }];
+  const historical = [{ ts: new Date(now - 60_000).toISOString(), action: 'phase.start', handle: 'phase-a', mission_id: missionId }];
   await page.route(MISSION_RE, (r) => r.fulfill({ contentType: 'application/json', body: JSON.stringify({ records: historical, count: 1, truncated: false, generated_at_ms: 0 }) }));
   await page.route(BACKFILL_RE, (r) => r.fulfill({ contentType: 'application/json', body: '[]' }));
   await page.route(STREAM_RE, (r) => r.fulfill({ contentType: 'text/event-stream', body: '' }));

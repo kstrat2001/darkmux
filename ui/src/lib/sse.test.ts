@@ -74,12 +74,13 @@ describe("startFlowTail", () => {
     expect(MockEventSource.instances).toHaveLength(1);
     expect(MockEventSource.instances[0].url).toBe("/flow/2026-08-09/stream");
 
-    MockEventSource.instances[0].emit(JSON.stringify({ action: "dispatch start", ts: "2026-08-09T00:00:00Z" }));
-    MockEventSource.instances[0].emit(JSON.stringify({ action: "dispatch complete", ts: "2026-08-09T00:00:05Z" }));
+    MockEventSource.instances[0].emit(JSON.stringify({ action: "dispatch.start", ts: "2026-08-09T00:00:00Z" }));
+    MockEventSource.instances[0].emit(JSON.stringify({ action: "dispatch.complete", ts: "2026-08-09T00:00:05Z" }));
 
+    // Appended through the ingest boundary: each record carries its parsed time.
     expect(queryClient.getQueryData(queryKey)).toEqual([
-      { action: "dispatch start", ts: "2026-08-09T00:00:00Z" },
-      { action: "dispatch complete", ts: "2026-08-09T00:00:05Z" },
+      { action: "dispatch.start", ts: "2026-08-09T00:00:00Z", tMs: Date.parse("2026-08-09T00:00:00Z") },
+      { action: "dispatch.complete", ts: "2026-08-09T00:00:05Z", tMs: Date.parse("2026-08-09T00:00:05Z") },
     ]);
 
     handle.close();
@@ -92,6 +93,19 @@ describe("startFlowTail", () => {
     const handle = startFlowTail(queryClient, queryKey, "2026-08-09", (url) => new MockEventSource(url) as unknown as EventSource);
 
     expect(() => MockEventSource.instances[0].emit("{not json")).not.toThrow();
+    expect(queryClient.getQueryData(queryKey)).toBeUndefined();
+
+    handle.close();
+  });
+
+  it("appends nothing for a line that parses but is not a record (the schema header, a bare value)", () => {
+    const queryClient = new QueryClient();
+    const queryKey = ["flow", "2026-08-09", "tail"];
+
+    const handle = startFlowTail(queryClient, queryKey, "2026-08-09", (url) => new MockEventSource(url) as unknown as EventSource);
+
+    MockEventSource.instances[0].emit('{"_type":"schema"}');
+    MockEventSource.instances[0].emit("42");
     expect(queryClient.getQueryData(queryKey)).toBeUndefined();
 
     handle.close();

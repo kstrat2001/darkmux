@@ -110,14 +110,14 @@ const SHOW_ALL_ACTIVITIES = [
   'host telemetry',
   'telemetry',
   'other',
-  'step start',
-  'phase start',
-  'mission start',
-  'step complete',
-  'phase complete',
-  'mission close',
-  'step result',
-  'step timing',
+  'step.start',
+  'phase.start',
+  'mission.start',
+  'step.complete',
+  'phase.complete',
+  'mission.close',
+  'step.result',
+  'step.timing',
 ];
 test.beforeEach(async ({ page }) => {
   await page.addInitScript((acts: string[]) => {

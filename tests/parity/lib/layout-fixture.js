@@ -54,7 +54,7 @@ function build(sid) {
       // names its thermal rest from the run's start ("0 s thermal rest").
       rec(
         at(d, "12:00:00"),
-        "dispatch start",
+        "dispatch.start",
         { prompt_chars: 3000, ...(armed ? { bounds: { thermal_pacing_enabled: { value: true, source: "config" } } } : {}) },
         { source: "crew_dispatch", category: "work", model: "darkmux:qwen-layout" },
       ),
@@ -66,7 +66,7 @@ function build(sid) {
       rec(at(d, "12:00:07"), "dispatch.tool", { tool_name: "read" }),
     ].map((r) => ({ ...r, ...extra }));
   const opener = (d) => beat(d, "12:00:08", 2, 0, 0, { prompt_chars: 20000 });
-  const complete = (d) => rec(at(d, "12:00:09"), "dispatch complete", { completion_tokens: 350, prompt_tokens: 4000 });
+  const complete = (d) => rec(at(d, "12:00:09"), "dispatch.complete", { completion_tokens: 350, prompt_tokens: 4000 });
   const writing = (d, name) => {
     const out = [opener(d), beat(d, "12:00:10", 2, 500, 500)];
     for (let s = 12; s <= 30; s += 2) out.push(beat(d, `12:00:${String(s).padStart(2, "0")}`, 2, 800, 500, { phase: "writing_tool_call", ...(name ? { tool_name: name } : {}) }));
@@ -242,9 +242,9 @@ const STATES = [
       recs: (b, d) => {
         const m = { mission_id: mid };
         return [
-          { ts: at(d, "11:59:59"), action: "mission start", session_id: `layout-run-${id}`, ...m, ...MACHINE, payload: {} },
-          { ts: at(d, "11:59:59"), action: "dispatch start", source: "mission", session_id: `layout-run-${id}`, handle: "coder", ...m, ...MACHINE, payload: {} },
-          { ts: at(d, "12:00:01"), action: "step start", session_id: task, handle: "probe", ...m, ...MACHINE, payload: {} },
+          { ts: at(d, "11:59:59"), action: "mission.start", session_id: `layout-run-${id}`, ...m, ...MACHINE, payload: {} },
+          { ts: at(d, "11:59:59"), action: "dispatch.start", source: "mission", session_id: `layout-run-${id}`, handle: "coder", ...m, ...MACHINE, payload: {} },
+          { ts: at(d, "12:00:01"), action: "step.start", session_id: task, handle: "probe", ...m, ...MACHINE, payload: {} },
           { ...budgetWait(b, d, "azure", 20), session_id: task, handle: "probe", ...m },
           tick(d, "12:00:12"),
         ];
@@ -276,11 +276,11 @@ const STATES = [
     recs: (b, d) => {
       const m = { mission_id: MID };
       return [
-        { ts: at(d, "11:59:59"), action: "mission start", session_id: "layout-run", ...m, ...MACHINE, payload: {} },
-        { ts: at(d, "11:59:59"), action: "dispatch start", source: "mission", session_id: "layout-run", handle: "coder", ...m, ...MACHINE, payload: {} },
+        { ts: at(d, "11:59:59"), action: "mission.start", session_id: "layout-run", ...m, ...MACHINE, payload: {} },
+        { ts: at(d, "11:59:59"), action: "dispatch.start", source: "mission", session_id: "layout-run", handle: "coder", ...m, ...MACHINE, payload: {} },
         ...b.prefix(d, m),
         { ...b.complete(d), ...m },
-        { ts: at(d, "12:00:10"), action: "step complete", session_id: "layout-task", ...m, ...MACHINE, payload: {} },
+        { ts: at(d, "12:00:10"), action: "step.complete", session_id: "layout-task", ...m, ...MACHINE, payload: {} },
         tick(d, "12:00:20"),
       ];
     },
@@ -369,7 +369,7 @@ const MULTI = {
 
 /** The fleet hero with and without its part lines: an idle machine whose
  *  usage records do or do not report cached tokens and a utility call.
- *  `hero-notes` carries `note` records the viewer no longer renders (#2983):
+ *  `hero-notes` carries `operator.note` records the viewer no longer renders (#2983):
  *  a long mission-level `source: "orchestrator"` one, as flow archives still
  *  hold, and a session-scoped adjudication one. Neither may reach the hero. */
 const NOTE_WORDS =
@@ -390,8 +390,8 @@ const HEROES = [
     b.complete(d),
     ...(h.notes
       ? [
-          { ts: at(d, "12:00:10"), action: "note", category: "work", tier: "operator", source: "orchestrator", handle: NOTE_WORDS, ...MACHINE },
-          b.rec(at(d, "12:00:11"), "note", {}, { category: "work", tier: "operator", source: "adjudication", handle: "verdict: pass" }),
+          { ts: at(d, "12:00:10"), action: "operator.note", category: "work", tier: "operator", source: "orchestrator", handle: NOTE_WORDS, ...MACHINE },
+          b.rec(at(d, "12:00:11"), "operator.note", {}, { category: "work", tier: "operator", source: "adjudication", handle: "verdict: pass" }),
         ]
       : []),
   ],

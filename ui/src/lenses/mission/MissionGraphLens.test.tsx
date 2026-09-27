@@ -5,7 +5,8 @@ import { MissionGraphLens } from "./MissionGraphLens";
 import { todayUTC } from "../../lib/flow";
 import { queryKeys } from "../../lib/queryKeys";
 import type { MissionGraph } from "./graph";
-import type { FlowRecord } from "../../types/handwritten";
+import type { NormRecord } from "../../lib/ingest";
+import { normAll, type RawRecord } from "../../testing/records";
 
 /** Returns the `QueryClient` too (unused by most callers) so a test can
  *  seed a cache slot this component doesn't fetch into itself — the live
@@ -14,7 +15,7 @@ import type { FlowRecord } from "../../types/handwritten";
  *  would via `queryClient.setQueryData`. See the `.mproc` readout tests. */
 function renderLens(
   missionId = "m1",
-  onEvents?: (events: FlowRecord[], srvTruncated: boolean) => void,
+  onEvents?: (events: NormRecord[], srvTruncated: boolean) => void,
   opts: {
     selectedStepId?: string | null;
     onSelectStep?: (stepId: string) => void;
@@ -39,8 +40,8 @@ function renderLens(
 /** The last `onEvents(events, srvTruncated)` call — the lens fires it on
  * every fold change (see that prop's own doc), so tests that only care
  * about the SETTLED value read the most recent one rather than the first. */
-function lastEventsCall(spy: ReturnType<typeof vi.fn>): [FlowRecord[], boolean] | undefined {
-  return spy.mock.calls.at(-1) as [FlowRecord[], boolean] | undefined;
+function lastEventsCall(spy: ReturnType<typeof vi.fn>): [NormRecord[], boolean] | undefined {
+  return spy.mock.calls.at(-1) as [NormRecord[], boolean] | undefined;
 }
 
 /** Seeds the live-tail cache slot `useLiveTail` writes into — the SAME
@@ -48,9 +49,9 @@ function lastEventsCall(spy: ReturnType<typeof vi.fn>): [FlowRecord[], boolean] 
  *  (`mergeTailRecords`/`setQueryData`), without standing up a real
  *  `EventSource` (this component has no injectable `eventSourceFactory`
  *  seam of its own). */
-function seedLiveTail(queryClient: QueryClient, records: FlowRecord[]) {
+function seedLiveTail(queryClient: QueryClient, records: RawRecord[]) {
   act(() => {
-    queryClient.setQueryData(queryKeys.flowTail(todayUTC()), records);
+    queryClient.setQueryData(queryKeys.flowTail(todayUTC()), normAll(records));
   });
 }
 
@@ -164,14 +165,14 @@ describe("MissionGraphLens", () => {
     // and the scoped fold reaches the caller via `onEvents`.
     const onEvents = vi.fn();
     mockFetch({
-      flowMissionRecords: [{ ts: "2026-08-19T00:00:01Z", action: "mission start", handle: "m1", mission_id: "m1" }],
+      flowMissionRecords: [{ ts: "2026-08-19T00:00:01Z", action: "mission.start", handle: "m1", mission_id: "m1" }],
     });
     renderLens("m1", onEvents);
     await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
     expect(screen.queryByTitle("mission events")).toBeNull();
     expect(document.querySelector(".eventlog")).toBeNull();
     await waitFor(() => expect(lastEventsCall(onEvents)?.[0]).toHaveLength(1));
-    expect(lastEventsCall(onEvents)?.[0][0].action).toBe("mission start");
+    expect(lastEventsCall(onEvents)?.[0][0].action).toBe("mission.start");
     expect(lastEventsCall(onEvents)?.[1]).toBe(false);
   });
 
@@ -192,14 +193,14 @@ describe("MissionGraphLens", () => {
     const onEvents = vi.fn();
     mockFetch({
       flowMissionRecords: [
-        { ts: "2026-08-19T00:00:01Z", action: "mission start", handle: "m1", mission_id: "m1" },
-        { ts: "2026-08-19T00:00:02Z", action: "phase start", handle: "p1", mission_id: "m1" },
-        { ts: "2026-08-19T00:00:03Z", action: "mission close", handle: "m1", mission_id: "m1" },
+        { ts: "2026-08-19T00:00:01Z", action: "mission.start", handle: "m1", mission_id: "m1" },
+        { ts: "2026-08-19T00:00:02Z", action: "phase.start", handle: "p1", mission_id: "m1" },
+        { ts: "2026-08-19T00:00:03Z", action: "mission.close", handle: "m1", mission_id: "m1" },
       ],
     });
     renderLens("m1", onEvents);
     await waitFor(() => expect(lastEventsCall(onEvents)?.[0]).toHaveLength(3));
-    expect(lastEventsCall(onEvents)?.[0].map((r) => r.action)).toEqual(["mission start", "phase start", "mission close"]);
+    expect(lastEventsCall(onEvents)?.[0].map((r) => r.action)).toEqual(["mission.start", "phase.start", "mission.close"]);
   });
 
   it("preserves the ORIGINAL backfill order among same-timestamp events, matching legacy's stable descending sort", async () => {
@@ -218,10 +219,10 @@ describe("MissionGraphLens", () => {
     const onEvents = vi.fn();
     mockFetch({
       flowMissionRecords: [
-        { ts: "2026-08-19T00:00:01Z", action: "phase complete", handle: "investigate", mission_id: "m1" },
-        { ts: "2026-08-19T00:00:01Z", action: "phase complete", handle: "adjudicate", mission_id: "m1" },
-        { ts: "2026-08-19T00:00:01Z", action: "phase complete", handle: "report", mission_id: "m1" },
-        { ts: "2026-08-19T00:00:01Z", action: "mission close", handle: "m1", mission_id: "m1" },
+        { ts: "2026-08-19T00:00:01Z", action: "phase.complete", handle: "investigate", mission_id: "m1" },
+        { ts: "2026-08-19T00:00:01Z", action: "phase.complete", handle: "adjudicate", mission_id: "m1" },
+        { ts: "2026-08-19T00:00:01Z", action: "phase.complete", handle: "report", mission_id: "m1" },
+        { ts: "2026-08-19T00:00:01Z", action: "mission.close", handle: "m1", mission_id: "m1" },
       ],
     });
     renderLens("m1", onEvents);
@@ -242,8 +243,8 @@ describe("MissionGraphLens", () => {
     const onEvents = vi.fn();
     mockFetch({
       flowMissionRecords: [
-        { ts: "2026-08-19T00:00:01Z", action: "dispatch start", handle: "h", session_id: "step-a", mission_id: "m1", payload: {} },
-        { ts: "2026-08-19T00:00:01Z", action: "dispatch start", handle: "h", session_id: "step-b", mission_id: "m1", payload: {} },
+        { ts: "2026-08-19T00:00:01Z", action: "dispatch.start", handle: "h", session_id: "step-a", mission_id: "m1", payload: {} },
+        { ts: "2026-08-19T00:00:01Z", action: "dispatch.start", handle: "h", session_id: "step-b", mission_id: "m1", payload: {} },
       ],
     });
     renderLens("m1", onEvents);
@@ -405,7 +406,7 @@ describe("MissionGraphLens", () => {
     // earlier port silently dropped.
     const onEvents = vi.fn();
     mockFetch({
-      flowMissionRecords: [{ ts: "2026-08-19T00:00:01Z", action: "mission start", handle: "m1", mission_id: "m1" }],
+      flowMissionRecords: [{ ts: "2026-08-19T00:00:01Z", action: "mission.start", handle: "m1", mission_id: "m1" }],
       flowMissionTruncated: true,
     });
     renderLens("m1", onEvents);
@@ -416,7 +417,7 @@ describe("MissionGraphLens", () => {
   it("does NOT report a server-truncated flag when /flow-mission/:id reports truncated:false", async () => {
     const onEvents = vi.fn();
     mockFetch({
-      flowMissionRecords: [{ ts: "2026-08-19T00:00:01Z", action: "mission start", handle: "m1", mission_id: "m1" }],
+      flowMissionRecords: [{ ts: "2026-08-19T00:00:01Z", action: "mission.start", handle: "m1", mission_id: "m1" }],
       flowMissionTruncated: false,
     });
     renderLens("m1", onEvents);

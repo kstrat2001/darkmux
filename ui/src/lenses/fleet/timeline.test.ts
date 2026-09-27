@@ -1,10 +1,11 @@
 import { describe, it, expect } from "vitest";
 import { buildActivityTimeline } from "./timeline";
 import { clkhm } from "../../lib/format";
-import type { FlowRecord } from "../../types/handwritten";
+import type { NormRecord } from "../../lib/ingest";
+import { norm, type RawRecord } from "../../testing/records";
 
-function rec(overrides: Partial<FlowRecord>): FlowRecord {
-  return { ts: "2026-08-08T00:00:00.000Z", ...overrides };
+function rec(overrides: RawRecord): NormRecord {
+  return norm({ ts: "2026-08-08T00:00:00.000Z", ...overrides });
 }
 
 const TMAX = Date.parse("2026-08-08T16:40:59.000Z");
@@ -43,7 +44,7 @@ describe("buildActivityTimeline — header text", () => {
 describe("buildActivityTimeline — lanes and bars", () => {
   const uids = ["m1"];
   const liveSet = new Set(["s1"]);
-  const data: FlowRecord[] = [
+  const data: NormRecord[] = [
     // s1: still running (∈ liveSet) — open-ended bar.
     rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start", ts: iso(-30), handle: "coder" }),
     // s2: cleanly completed, not live — "complete".
@@ -104,7 +105,7 @@ describe("buildActivityTimeline — lanes and bars", () => {
   });
 
   it("clips a window-straddling bar's start to the window's left edge (never negative)", () => {
-    const straddling: FlowRecord[] = [
+    const straddling: NormRecord[] = [
       // Started well before the 1h window, still running.
       rec({ machine_uid: "m1", session_id: "s6", action: "dispatch.start", ts: iso(-300) }),
     ];
@@ -134,7 +135,7 @@ describe("buildActivityTimeline — lanes and bars", () => {
 describe("buildActivityTimeline — parity: liveMode no longer changes the window, header, or verdicts", () => {
   const TMIN = Date.parse("2026-08-08T02:09:42.000Z");
   const uids = ["m1"];
-  const day: FlowRecord[] = [
+  const day: NormRecord[] = [
     rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start", ts: new Date(TMIN).toISOString(), handle: "coder" }),
     rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.complete", ts: new Date(TMAX).toISOString() }),
   ];
@@ -160,7 +161,7 @@ describe("buildActivityTimeline — parity: liveMode no longer changes the windo
   });
 
   it("an UNCLOSED session, fresh as of the playhead, reads 'running' regardless of the liveMode flag", () => {
-    const open: FlowRecord[] = [
+    const open: NormRecord[] = [
       rec({ machine_uid: "m1", session_id: "s9", action: "dispatch.start", ts: new Date(TMIN).toISOString() }),
       rec({ machine_uid: "m1", session_id: "s9", action: "dispatch.turn", ts: new Date(TMAX).toISOString() }),
     ];
@@ -185,7 +186,7 @@ describe("buildActivityTimeline — parity: liveMode no longer changes the windo
   // (which is what `sessionRunning` finding no close-edge — because
   // there's nothing to close yet — would otherwise produce).
   it("a session that hasn't started yet as of the playhead draws no bar at all", () => {
-    const notYetStarted: FlowRecord[] = [
+    const notYetStarted: NormRecord[] = [
       rec({ machine_uid: "m1", session_id: "s-future", action: "dispatch.start", ts: new Date(TMAX + 60000).toISOString() }),
     ];
     const tl = buildActivityTimeline(notYetStarted, new Map(), uids, new Set(), TMAX, TMAX, 1440, false, TMIN);
@@ -226,7 +227,7 @@ describe("buildActivityTimeline — parity: liveMode no longer changes the windo
 describe("buildActivityTimeline — reused step session ids across missions (#2125)", () => {
   const uids = ["m1"];
   const REUSED_SID = "task-review-probe-low-task";
-  const data: FlowRecord[] = [
+  const data: NormRecord[] = [
     // Older mission (~17h ago): ran the SAME step id to a clean completion.
     rec({
       machine_uid: "m1",
@@ -284,7 +285,7 @@ describe("buildActivityTimeline — reused step session ids across missions (#21
   });
 
   it("a session with NO mission_id at all keeps its exact prior (unscoped) behavior", () => {
-    const bare: FlowRecord[] = [
+    const bare: NormRecord[] = [
       rec({ machine_uid: "m1", session_id: "bare-1", action: "dispatch.start", ts: iso(-10) }),
       rec({ machine_uid: "m1", session_id: "bare-1", action: "dispatch.complete", ts: iso(-5) }),
     ];
@@ -298,7 +299,7 @@ describe("(#2890) a replay's timeline spans the recording", () => {
   const t0 = Date.parse("2026-08-26T10:00:00.000Z");
   const t1 = Date.parse("2026-08-26T10:34:00.000Z");
   const rec = (ts: number, action: string) =>
-    ({ ts: new Date(ts).toISOString(), machine_uid: "u1", machine_id: "m5", session_id: "s1", action }) as unknown as FlowRecord;
+    norm({ ts: new Date(ts).toISOString(), machine_uid: "u1", machine_id: "m5", session_id: "s1", action });
   it("a fixed range sets the axis to the recording and starts a bar at the left edge", () => {
     const data = [rec(t0, "dispatch.start"), rec(t0 + 10 * 60_000, "dispatch.complete")];
     const tl = buildActivityTimeline(data, new Map(), ["u1"], new Set(), t1, t1, 60, false, t0, t1, [t0, t1]);

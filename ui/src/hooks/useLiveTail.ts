@@ -2,10 +2,10 @@ import { useEffect, useState } from "react";
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { fetchJson } from "../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS, LIVE_CONTACT_TIMEOUT_MS } from "../lib/queryKeys";
-import { asRecordArray, mergeTailRecords, prevDateUTC, todayUTC, LIVE_WINDOW_MS } from "../lib/flow";
+import { mergeTailRecords, prevDateUTC, todayUTC, LIVE_WINDOW_MS } from "../lib/flow";
 import { startFlowTail, type FlowTailHandle } from "../lib/sse";
 import { liveStore } from "../lib/liveChannel";
-import type { FlowRecord } from "../types/handwritten";
+import { ingest, timesOf, type NormRecord } from "../lib/ingest";
 
 /**
  * Port of `viewer.html`'s live-tail wiring — `startLiveTail` (3587-3627),
@@ -119,14 +119,10 @@ async function reconcile(
   for (const d of [prevDateUTC(date), date]) {
     const tailKey = queryKeys.flowTail(d);
     const dayKey = queryKeys.flowDate(d);
-    const existingTail = queryClient.getQueryData<FlowRecord[]>(tailKey) ?? [];
+    const existingTail = queryClient.getQueryData<NormRecord[]>(tailKey) ?? [];
     const dayResult = queryClient.getQueryData<{ ok: boolean; data?: unknown }>(dayKey);
-    const existingDay = dayResult && dayResult.ok ? asRecordArray(dayResult.data) : [];
-    const held = [...existingDay, ...existingTail];
-    const newest = held.reduce((m, r) => {
-      const t = r?.ts ? Date.parse(r.ts) : NaN;
-      return Number.isFinite(t) && t > m ? t : m;
-    }, 0);
+    const existingDay = dayResult && dayResult.ok ? ingest(dayResult.data) : [];
+    const newest = [...timesOf(existingDay), ...timesOf(existingTail)].reduce((m, t) => (t > m ? t : m), 0);
     const sinceMs = newest ? Math.max(cutMs, newest - RECONCILE_OVERLAP_MS) : cutMs;
     const sinceIso = new Date(sinceMs).toISOString().replace(/\.\d+Z$/, "Z");
     let res;
@@ -137,9 +133,9 @@ async function reconcile(
     }
     if (!res.ok) continue;
     contacted = true;
-    const recs = asRecordArray(res.data);
+    const recs = ingest(res.data);
     if (!recs.length) continue;
-    queryClient.setQueryData<FlowRecord[]>(tailKey, (prev) => mergeTailRecords(prev ?? [], recs, cutMs));
+    queryClient.setQueryData<NormRecord[]>(tailKey, (prev) => mergeTailRecords(prev ?? [], recs, cutMs));
   }
   return contacted;
 }

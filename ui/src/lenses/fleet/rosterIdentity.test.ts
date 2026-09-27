@@ -1,7 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { rosterOnlyEntries } from "./cards";
-import type { FlowRecord, PresenceBeat } from "../../types/handwritten";
+import type { PresenceBeat } from "../../types/handwritten";
 import type { RosterMachineEntry } from "../../types/handwritten";
+import type { NormRecord } from "../../lib/ingest";
+import { norm } from "../../testing/records";
 
 /**
  * (#2796) ROSTER-vs-IDENTITY CONSOLIDATION, as a fixture rather than as
@@ -39,14 +41,14 @@ function beat(uid: string, name: string): [string, PresenceBeat] {
   ];
 }
 
-function record(uid: string, machineId: string): FlowRecord {
-  return {
+function record(uid: string, machineId: string): NormRecord {
+  return norm({
     ts: "2026-09-19T10:00:00Z",
     machine_uid: uid,
     machine_id: machineId,
     session_id: `s-${machineId}`,
     action: "dispatch.start",
-  } as FlowRecord;
+  });
 }
 
 function entry(id: string, machineUid?: string): RosterMachineEntry {

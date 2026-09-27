@@ -14,7 +14,8 @@ import { render, act, cleanup } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { SessionReplay } from "./SessionReplay";
 import { buildFleetCard } from "../fleet/cards";
-import { liveSessionSet, T, normalizeRecords } from "../../lib/flow";
+import { liveSessionSet, shapeRecords } from "../../lib/flow";
+import { ACTION, ingest, isAsOf, timesOf } from "../../lib/ingest";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // `ui/src/lenses/catalog/` -> repo root is four levels up.
@@ -23,8 +24,12 @@ const SID = "darkmux-coding-refresh-rotation-1790218778756";
 const ALL = readFileSync(path.join(REPO_ROOT, "tests/parity/corpus/pepper.jsonl"), "utf8")
   .trim()
   .split("\n")
-  .map((l) => JSON.parse(l));
-const upTo = (x: number) => ALL.filter((r) => !(T(r.ts) > x));
+  .map((l) => JSON.parse(l) as Record<string, unknown>);
+// The same records through the boundary, index-aligned with `ALL` (the
+// fixture has no schema header, so `ingest` keeps every line).
+const ALLN = ingest(ALL);
+// The raw lines a fetch as of `x` would serve: the shared as-of cut.
+const upTo = (x: number) => ALL.filter((_, i) => isAsOf(ALLN[i], x));
 
 async function snap(records: unknown[], nowMs: number, playhead: number | null) {
   vi.useFakeTimers();
@@ -97,10 +102,10 @@ describe("parity: fleet card, live vs playback at the same recorded instant", ()
     const X = Date.parse("2026-09-24T03:00:20.500Z");
     const m = "unknown";
     // live: the window as received by X; presence lists the session; t = window tMax (FleetLens live arm)
-    const liveData = normalizeRecords(upTo(X));
-    const NALL = normalizeRecords(ALL);
+    const liveData = shapeRecords(ingest(upTo(X)));
+    const NALL = shapeRecords(ALLN);
     const liveSet = liveSessionSet(liveData, new Set([SID]), X, true);
-    const liveTMax = Math.max(...liveData.map((r) => T(r.ts)));
+    const liveTMax = Math.max(...timesOf(liveData));
     const live = buildFleetCard(liveData, new Map(), null, liveSet, false, m, true, liveTMax);
     // playback: the whole day, no presence, playhead X (PlaybackLens -> FleetLens historical)
     const playSet = liveSessionSet(NALL, new Set(), X + 6 * 3600_000, false);
@@ -129,7 +134,7 @@ describe("TOK/S tile: a state is a lit lamp under the tube, never text inside it
   // through the ring. The number is the reading and sits inside; a state is
   // a caption about the reading and sits under the tube.
   it("waiting for the first token: empty tube center, the PROMPT lamp lit and every other lamp off", async () => {
-    const start = T((ALL.find((r) => r.session_id === SID && /dispatch.start|dispatch start/.test(String(r.action))) as { ts: string }).ts);
+    const start = ALLN.find((r) => r.session_id === SID && r.action === ACTION.DispatchStart)!.tMs!;
     const at = start + 1_000;
     vi.useFakeTimers();
     vi.setSystemTime(at);

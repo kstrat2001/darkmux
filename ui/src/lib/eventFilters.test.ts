@@ -24,24 +24,26 @@ import {
 } from "./eventFilters";
 import type { Facets, StoredPicks } from "./eventFilters";
 import { onlyModelFacet } from "../components/FiltersDialog";
-import type { FlowRecord } from "../types/handwritten";
+import type { NormRecord } from "./ingest";
+import { norm, type RawRecord } from "../testing/records";
+import { ACTION } from "./ingest";
 
-function rec(overrides: Partial<FlowRecord>): FlowRecord {
-  return { ts: "2026-08-08T12:00:00.000Z", category: "work", action: "dispatch.reasoning", ...overrides };
+function rec(overrides: RawRecord): NormRecord {
+  return norm({ ts: "2026-08-08T12:00:00.000Z", category: "work", action: "dispatch.reasoning", ...overrides });
 }
 
 describe("activityOf", () => {
   it("maps the full legacy set, including branches the old row-label subset omitted", () => {
     expect(activityOf(rec({ action: "session.end" }))).toBe("session end");
     expect(activityOf(rec({ action: "machine.online" }))).toBe("machine online");
-    expect(activityOf(rec({ action: "note" }))).toBe("note");
+    expect(activityOf(rec({ action: "operator.note" }))).toBe("note");
     // (#2902 step 5) Budget records are their own facet, not generic telemetry.
     expect(activityOf(rec({ action: "budget.wait", category: "telemetry", source: "budget" }))).toBe("budget");
     expect(activityOf(rec({ action: undefined, source: "adjudication" }))).toBe("note");
   });
 
   it("(#2983) a non-note record tagged `source: orchestrator` files under its own action", () => {
-    expect(activityOf(rec({ action: "catch", source: "orchestrator" }))).toBe("catch");
+    expect(activityOf(rec({ action: "operator.catch", source: "orchestrator" }))).toBe("operator.catch");
   });
 
   it("(#2413) machine.telemetry maps to the same 'host telemetry' facet as the retired telemetry.process", () => {
@@ -53,24 +55,24 @@ describe("activityOf", () => {
     );
   });
 
-  // (silent-miss audit, 2026-09-06) `"step error"`/`"phase abandon"` have
+  // (silent-miss audit, 2026-09-06) `"step.error"`/`"phase.abandon"` have
   // no dedicated branch above — they fall through the literal `return a ||
   // "other"`, so `activityOf` hands them back UNCHANGED as the facet value.
   it("scheduler step/phase actions with no dedicated branch pass through verbatim", () => {
-    expect(activityOf(rec({ action: "step error" }))).toBe("step error");
-    expect(activityOf(rec({ action: "phase abandon" }))).toBe("phase abandon");
-    expect(activityOf(rec({ action: "step start" }))).toBe("step start");
+    expect(activityOf(rec({ action: "step.error" }))).toBe("step.error");
+    expect(activityOf(rec({ action: "phase.abandon" }))).toBe("phase.abandon");
+    expect(activityOf(rec({ action: "step.start" }))).toBe("step.start");
   });
 });
 
 describe("computeFacets / defaultFilterState", () => {
   it("derives facets from records, and defaultFilterState includes every one of them (a non-act facet)", () => {
-    const records = [rec({ tier: "local", source: "lms" }), rec({ tier: "cloud", category: "telemetry", source: "lms" })];
+    const records = [rec({ tier: "local", source: "lms" }), rec({ tier: "frontier", category: "telemetry", source: "lms" })];
     const facets = computeFacets(records);
-    expect(facets.tier.sort()).toEqual(["cloud", "local"]);
+    expect(facets.tier.sort()).toEqual(["frontier", "local"]);
     const filters = defaultFilterState(facets);
     expect(filters.tier.has("local")).toBe(true);
-    expect(filters.tier.has("cloud")).toBe(true);
+    expect(filters.tier.has("frontier")).toBe(true);
     expect(filters.q).toBe("");
   });
 
@@ -113,11 +115,11 @@ describe("computeFacets / defaultFilterState", () => {
 
 describe("matchesFilters", () => {
   it("excludes a record whose facet value is present but unchecked", () => {
-    const facets = computeFacets([rec({ tier: "local" }), rec({ tier: "cloud" })]);
+    const facets = computeFacets([rec({ tier: "local" }), rec({ tier: "frontier" })]);
     const filters = defaultFilterState(facets);
-    filters.tier.delete("cloud");
+    filters.tier.delete("frontier");
     expect(matchesFilters(rec({ tier: "local" }), filters)).toBe(true);
-    expect(matchesFilters(rec({ tier: "cloud" }), filters)).toBe(false);
+    expect(matchesFilters(rec({ tier: "frontier" }), filters)).toBe(false);
   });
 
   it("never excludes on a facet the record simply doesn't carry", () => {
@@ -156,7 +158,7 @@ describe("absorbNewFacetValues — viewer.html's absorbNewFilterValues()/SEEN (#
   // failed on the second `matchesFilters` assertion; restored afterward.
   //
   // (#2416) The new activity is "dispatch.tool" ("tool call"), not the
-  // original "flow.note" ("note") — "note" is outside `DEFAULT_ACTIVITIES`
+  // original "note" ("note") — "note" is outside `DEFAULT_ACTIVITIES`
   // and no longer absorbs on by default (see the dedicated #2416 describe
   // block below for that case). "tool call" IS in the allowlist, so this
   // keeps testing the SAME live-tail absorb-on-first-sight mechanism without
@@ -243,16 +245,16 @@ describe("'model only' over the PRODUCTION filter path", () => {
   // `onlyModelFacet`, and renaming the label `activityOf` returns so the set
   // member is dead. This test runs the real chain — activityOf -> computeFacets
   // -> onlyModelFacet -> matchesFilters — and dies under both.
-  const heartbeat: FlowRecord = {
+  const heartbeat: NormRecord = norm({
     ts: "2026-08-08T12:00:00.000Z",
     category: "work",
     action: "dispatch.turn.heartbeat",
-  } as FlowRecord;
-  const hostTelemetry: FlowRecord = {
+  });
+  const hostTelemetry: NormRecord = norm({
     ts: "2026-08-08T12:00:01.000Z",
     category: "telemetry",
     source: "process",
-  } as FlowRecord;
+  });
 
   // (#2416) This is the deliberate behavior change the fix accepts: a
   // first-turn session showing only heartbeats now reads as EMPTY under
@@ -428,24 +430,24 @@ describe("#2416 — act defaults to DEFAULT_ACTIVITIES, new values absorb off, p
     expect(filters.act.has("heartbeat")).toBe(false);
   });
 
-  // (silent-miss audit, 2026-09-06) `"step error"`/`"phase abandon"` are
+  // (silent-miss audit, 2026-09-06) `"step.error"`/`"phase.abandon"` are
   // NOT in the curated `DEFAULT_ACTIVITIES` allowlist (they weren't a
   // known value when it was written), but a failure/abandonment activity
   // must never default off — that's the exact "operator never sees it"
   // failure mode `DEFAULT_ACTIVITIES`'s own `dispatch error` entry exists
   // to prevent, just reached through an unanticipated VALUE this time.
-  // `"step start"` is the control: it names neither failure nor
+  // `"step.start"` is the control: it names neither failure nor
   // abandonment and must stay off, same as any other non-curated value.
   it("error/abandon-shaped activities default ON even when absent from DEFAULT_ACTIVITIES", () => {
     const facets = computeFacets([
-      rec({ action: "step error" }),
-      rec({ action: "phase abandon" }),
-      rec({ action: "step start" }),
+      rec({ action: "step.error" }),
+      rec({ action: "phase.abandon" }),
+      rec({ action: "step.start" }),
     ]);
     const filters = defaultFilterState(facets);
-    expect(filters.act.has("step error")).toBe(true);
-    expect(filters.act.has("phase abandon")).toBe(true);
-    expect(filters.act.has("step start")).toBe(false);
+    expect(filters.act.has("step.error")).toBe(true);
+    expect(filters.act.has("phase.abandon")).toBe(true);
+    expect(filters.act.has("step.start")).toBe(false);
   });
 
   // (b)
@@ -454,7 +456,7 @@ describe("#2416 — act defaults to DEFAULT_ACTIVITIES, new values absorb off, p
     const facets = computeFacets([
       rec({ action: "dispatch.turn.heartbeat" }),
       rec({ action: "dispatch.tool" }),
-      rec({ action: "flow.note" }), // "note" — outside DEFAULT_ACTIVITIES
+      rec({ action: "operator.note" }), // "note" — outside DEFAULT_ACTIVITIES
     ]);
     const overrides = createStoredPicks();
     overrides.act.include.add("note"); // the operator's own stored pick
@@ -493,7 +495,7 @@ describe("#2416 — act defaults to DEFAULT_ACTIVITIES, new values absorb off, p
   // because there is nowhere else for it to have landed.
   it("a pick made through one caller is visible to every other reader — one global store, no fork", () => {
     const s = mem();
-    const facets = computeFacets([rec({ action: "dispatch.reasoning" }), rec({ action: "flow.note" })]);
+    const facets = computeFacets([rec({ action: "dispatch.reasoning" }), rec({ action: "operator.note" })]);
     const state = defaultFilterState(facets);
     state.act.add("note"); // operator explicitly includes "note"
     persistFilterState(state, facets, s);
@@ -526,7 +528,7 @@ describe("#2416 — act defaults to DEFAULT_ACTIVITIES, new values absorb off, p
       // (#2863) a default too: the divider between a run's turns
       rec({ action: "dispatch.rest" }),
       rec({ action: "dispatch.turn.heartbeat" }),
-      rec({ action: "flow.note" }),
+      rec({ action: "operator.note" }),
     ]);
     const only = onlyModelFacet(facets);
     expect(only).toEqual(new Set(DEFAULT_ACTIVITIES));
@@ -537,7 +539,7 @@ describe("#2416 — act defaults to DEFAULT_ACTIVITIES, new values absorb off, p
     const facets = computeFacets([
       rec({ action: "dispatch.reasoning" }),
       rec({ action: "dispatch.turn.heartbeat" }),
-      rec({ action: "flow.note" }),
+      rec({ action: "operator.note" }),
       rec({ category: "telemetry", source: "process" }),
     ]);
     const filters = defaultFilterState(facets);
@@ -548,7 +550,7 @@ describe("#2416 — act defaults to DEFAULT_ACTIVITIES, new values absorb off, p
     const picks: StoredPicks = createStoredPicks();
     picks.act.exclude.add("reasoning");
     picks.act.include.add("note");
-    const facets = computeFacets([rec({ action: "dispatch.reasoning" }), rec({ action: "flow.note" }), rec({ action: "dispatch.turn" })]);
+    const facets = computeFacets([rec({ action: "dispatch.reasoning" }), rec({ action: "operator.note" }), rec({ action: "dispatch.turn" })]);
     const state = applyStoredPicks(picks, facets);
     expect(state.act.has("reasoning")).toBe(false); // explicit exclude wins
     expect(state.act.has("note")).toBe(true); // explicit include
@@ -695,7 +697,7 @@ describe("#2512 — the act default never turns on nothing for a corpus that has
 describe("#2770 — event log blanks when no offered activity is default-on AND the operator has unrelated history", () => {
   // The exact action kinds #2770 measured off a live busy fleet — none of
   // them map to a DEFAULT_ACTIVITIES value and none is failure-shaped.
-  const BUSY_NON_DEFAULT_ACTIONS = ["machine.telemetry", "dispatch.turn.heartbeat", "step start", "dispatch.start", "phase begin"];
+  const BUSY_NON_DEFAULT_ACTIONS = ["machine.telemetry", "dispatch.turn.heartbeat", "step.start", "dispatch.start", "phase.begin"];
 
   // (operator, 2026-09-23) `machine.telemetry` ("host telemetry") and
   // `dispatch.turn.heartbeat` ("heartbeat") are PERIODIC_SAMPLE_ACTIVITIES
@@ -825,9 +827,9 @@ describe("activitySectionOf / groupActivitiesBySections (#2450-ish, filter panel
     expect(activitySectionOf("hook.fired")).toBe("MISSION");
     expect(activitySectionOf("machine.thermal")).toBe("MACHINE");
     expect(activitySectionOf("mission.grow")).toBe("MISSION");
-    expect(activitySectionOf("mission close")).toBe("MISSION");
-    expect(activitySectionOf("phase abandon")).toBe("MISSION");
-    expect(activitySectionOf("step timing")).toBe("MISSION");
+    expect(activitySectionOf("mission.close")).toBe("MISSION");
+    expect(activitySectionOf("phase.abandon")).toBe("MISSION");
+    expect(activitySectionOf("step.timing")).toBe("MISSION");
     expect(activitySectionOf("zzz-unknown")).toBe("OTHER");
   });
 
@@ -867,11 +869,11 @@ describe("PERIODIC_SAMPLE_ACTIVITIES — the fallback shows lifecycle noise, nev
   it("battery health is a machine fact, not activity: off by default like the samplers", () => {
     // Operator, 2026-09-24: the machine lens's events list was all
     // `machine.battery_health` rows. The lens already shows the values.
-    const records = [rec({ action: "machine.battery_health" }), rec({ action: "machine.battery_health" }), rec({ action: "step complete" })];
+    const records = [rec({ action: "machine.battery_health" }), rec({ action: "machine.battery_health" }), rec({ action: "step.complete" })];
     const facets = computeFacets(records);
     const filters = defaultFilterState(facets);
     expect(filters.act.has("machine.battery_health")).toBe(false);
-    expect(filters.act.has("step complete")).toBe(true);
+    expect(filters.act.has("step.complete")).toBe(true);
   });
 
   it("telemetry plus dispatch start/step complete (no DEFAULT_ACTIVITIES member): the lifecycle rows show, telemetry does not", () => {
@@ -879,16 +881,16 @@ describe("PERIODIC_SAMPLE_ACTIVITIES — the fallback shows lifecycle noise, nev
       rec({ action: "machine.telemetry" }),
       rec({ action: "machine.telemetry" }),
       rec({ action: "dispatch.start" }),
-      rec({ action: "step complete" }),
+      rec({ action: "step.complete" }),
     ];
     const facets = computeFacets(records);
     const filters = defaultFilterState(facets);
     expect(filters.act.has("host telemetry")).toBe(false);
     expect(filters.act.has("dispatch start")).toBe(true);
-    expect(filters.act.has("step complete")).toBe(true);
+    expect(filters.act.has("step.complete")).toBe(true);
     const visible = records.filter((r) => matchesFilters(r, filters));
     expect(visible.length).toBe(2);
-    expect(visible.every((r) => r.action !== "machine.telemetry")).toBe(true);
+    expect(visible.every((r) => r.action !== ACTION.MachineTelemetry)).toBe(true);
     expect(isPeriodicOnlyWindow(facets)).toBe(false);
   });
 
@@ -942,11 +944,35 @@ describe("PERIODIC_SAMPLE_ACTIVITIES — the fallback shows lifecycle noise, nev
 describe("(#2915) utility facet", () => {
   it("utility.start and utility.error read as 'utility', under MACHINE", async () => {
     const { activityOf, activitySectionOf, ACT_ORDER } = await import("./eventFilters");
-    const { UTILITY_START_ACTION, UTILITY_ERROR_ACTION } = await import("./utilityJobs");
-    for (const action of [UTILITY_START_ACTION, UTILITY_ERROR_ACTION]) {
+    const { ACTION } = await import("./ingest");
+    for (const action of [ACTION.UtilityStart, ACTION.UtilityError]) {
       expect(activityOf({ ts: "2026-09-27T00:00:00Z", action, category: "telemetry", source: "utility" } as never)).toBe("utility");
     }
     expect(activitySectionOf("utility")).toBe("MACHINE");
     expect(ACT_ORDER).toContain("utility");
+  });
+});
+
+describe("activity sections and failures come from typed tables, not spelling", () => {
+  it("files every known action's own text by its table row", () => {
+    expect(activitySectionOf("hook.fired")).toBe("MISSION");
+    expect(activitySectionOf("machine.thermal")).toBe("MACHINE");
+    expect(activitySectionOf("dispatch.route")).toBe("DISPATCH");
+    expect(activitySectionOf("gh.verb.executed")).toBe("OTHER");
+  });
+
+  it("defaults a named failure ON, and an unknown value OFF whatever it ends with", () => {
+    const facets = computeFacets([
+      rec({ action: "step.error" }),
+      rec({ action: "phase.abandon" }),
+      rec({ action: "wibble.error" }),
+      rec({ action: "dispatch.reasoning" }),
+    ]);
+    const on = defaultFilterState(facets).act;
+    expect(on.has("step.error")).toBe(true);
+    expect(on.has("phase.abandon")).toBe(true);
+    expect(on.has("wibble.error")).toBe(false);
+    expect(activitySectionOf("wibble.error")).toBe("OTHER");
+    expect(activitySectionOf("mission-ish")).toBe("OTHER");
   });
 });

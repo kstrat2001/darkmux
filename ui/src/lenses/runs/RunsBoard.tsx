@@ -470,7 +470,7 @@ export function RunsBoard({
   // ("no runs recorded yet" under a raw-uid chip); folded into the pending
   // branch below.
   const day = useDay(null);
-  const pinRecords = daemonBacked ? flowWindow.data : (day.raw ?? []); // identity fields only; raw as before
+  const pinRecords = daemonBacked ? flowWindow.data : (day.ingested ?? []); // identity fields only
   const staticPinPending = !daemonBacked && machineKey !== null && day.loading;
 
   // (#2929) The pin's key resolved back to the machine's uid, from the same
