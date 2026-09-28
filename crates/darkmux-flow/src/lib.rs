@@ -801,14 +801,13 @@ fn keychain_serve_token() -> Option<String> {
 /// Resolve the serve-daemon bearer token, mirroring `redis_url`'s tiering:
 ///   1. `env(DARKMUX_SERVE_TOKEN)` verbatim (trimmed, empty-filtered) — the
 ///      portable/non-macOS path, no config gate (its presence is the opt-in);
-///   2. else config gate on (`runtime.daemon_auth_enabled`) + Keychain item
+///   2. else config gate on (`serve.token_keychain`) + Keychain item
 ///      `darkmux-serve-token`;
-///   3. else `None` (auth off — today's default).
+///   3. else `None` (no token — the default).
 ///
 /// Always a `RawServeToken`, so the secret reaches a comparison only via
-/// `expose_for_compare`. **Auth is "active" iff this returns `Some`** — the
-/// config flag alone never activates auth (a gate-on-but-no-token state would
-/// otherwise 401 every request with no way to pass). (#881)
+/// `expose_for_compare`. The token is the fleet's execution credential; the
+/// read surface needs it only when `serve.read_auth` is on (#2988). (#881)
 pub fn serve_token() -> Option<RawServeToken> {
     // (#2643) Same chokepoint-wiring reasoning as `redis_url` above.
     #[cfg(any(test, feature = "test-support"))]
@@ -822,7 +821,7 @@ pub fn serve_token() -> Option<RawServeToken> {
         return Some(RawServeToken::new(tok));
     }
     // Tier 2 — config gate on + Keychain item present.
-    if darkmux_types::config_access::serve_auth_config_enabled() {
+    if darkmux_types::config_access::serve_token_keychain() {
         if let Some(tok) = keychain_serve_token() {
             return Some(RawServeToken::new(tok));
         }
@@ -832,8 +831,8 @@ pub fn serve_token() -> Option<RawServeToken> {
 }
 
 /// Whether a serve-daemon bearer token is configured (env or gated-Keychain).
-/// Boolean ONLY — never the token. Drives the refuse-to-bind gate, the auth
-/// middleware toggle, the startup banner, and `darkmux doctor`. (#881)
+/// Boolean ONLY — never the token. Drives the serve startup preflight, the
+/// fleet listener, the startup banner, and `darkmux doctor`. (#881)
 pub fn serve_token_present() -> bool {
     serve_token().is_some()
 }

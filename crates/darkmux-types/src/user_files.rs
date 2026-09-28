@@ -888,7 +888,7 @@ pub fn open_objects<T: JsonSchema>() -> Vec<String> {
 
 /// `config.json`'s retired keys: a renamed setting names its new key, a
 /// removed one says so and what to do.
-fn config_retired(path: &str) -> Option<String> {
+pub fn config_retired(path: &str) -> Option<String> {
     crate::config::RENAMED_SETTINGS
         .iter()
         .find(|r| r.old_key == path)

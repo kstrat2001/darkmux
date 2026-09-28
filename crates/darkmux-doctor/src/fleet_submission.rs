@@ -158,7 +158,7 @@ fn token_row(f: &FleetSubmissionFacts) -> Check {
             Some(
                 "Store the fleet's one shared token (the serve token) in the Keychain: \
                  `security add-generic-password -U -a \"$USER\" -s darkmux-serve-token -w` and set \
-                 `darkmux config set runtime.daemon_auth_enabled true` (or export DARKMUX_SERVE_TOKEN). \
+                 `darkmux config set serve.token_keychain true` (or export DARKMUX_SERVE_TOKEN). \
                  Every machine holds the same value."
                     .into(),
             ),

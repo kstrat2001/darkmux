@@ -372,10 +372,11 @@ pub(crate) fn build_router_with_worktrees_base(
 /// #1247 Part 3 added the `/lab/*` group here rather than a parallel
 /// builder), so the auth layers below land in exactly one place.
 ///
-/// **Auth wiring (#881, narrowed #1387):** when a bearer token is configured
-/// (`darkmux_flow::serve_token_present()`), a **remote-only** gate (`auth_mw`)
-/// wraps the whole router — otherwise the router is byte-for-byte today's
-/// behavior (zero friction for the loopback-only default install). A request
+/// **Auth wiring (#881, narrowed #1387, split #2988):** when read auth is on
+/// (`serve.read_auth`), a **remote-only** gate (`auth_mw`) wraps the whole
+/// router — otherwise reads are open to whatever reaches the daemon, token
+/// or no token. Every route here is a GET read; nothing on this router
+/// starts work (the fleet listener is the execution surface). A request
 /// from this machine (`is_local_request`) passes; every other request,
 /// including one proxied to loopback, must present the token. `/health` is
 /// always exempt (doctor's reachability probe). Layered INNER of CORS so preflight is
@@ -406,7 +407,7 @@ pub(crate) fn build_router_full(
         panels: panel::PanelState::default(),
         live_ingest,
     };
-    let auth_on = darkmux_flow::serve_token_present();
+    let read_auth = darkmux_types::config_access::serve_read_auth();
 
     // (#925) Keep the long-lived SSE stream route SEPARATE so the per-route
     // request timeout below never applies to it (it's meant to stay open).
@@ -456,7 +457,9 @@ pub(crate) fn build_router_full(
 
     // Remote-only gate, added BEFORE the CORS layer so CORS ends up outermost
     // (handles preflight + sets headers first); the gate runs just inside it.
-    if auth_on {
+    // (#2988) Keyed on `serve.read_auth`, never on the token existing: the
+    // token is the fleet's execution credential and does not close reads.
+    if read_auth {
         router = router.layer(from_fn(auth_mw));
     }
 
@@ -500,9 +503,10 @@ async fn assume_loopback_peer(mut req: Request, next: Next) -> Response {
 /// (#1663) [`build_router`] plus the stated-loopback layer — the default for
 /// tests that are not themselves about auth.
 ///
-/// Why this exists: a serve token resolves from the process-global
-/// `DARKMUX_SERVE_TOKEN`, and `#[serial]` only excludes OTHER serial tests. So
-/// while one of the eleven token-setting tests holds that variable, every
+/// Why this exists: read auth resolves from the process-global
+/// `DARKMUX_SERVE_READ_AUTH` (and the token from `DARKMUX_SERVE_TOKEN`), and
+/// `#[serial]` only excludes OTHER serial tests. So while one of the
+/// auth-setting tests holds those variables, every
 /// concurrent non-serial test runs against an auth-on router — and once the
 /// gate fails closed, a peerless `oneshot` from an unrelated test gets a 401
 /// instead of its assertion. That is a harness defect, not a production one:
@@ -619,7 +623,7 @@ async fn auth_mw(req: Request, next: Next) -> Response {
     // `loopback_peer` and `build_router_local` — so the exemption is
     // something a test STATES rather than something it inherits by omission.
     //
-    // Same instinct `bind_requires_token` already applies just below: a bind
+    // Same instinct `serve_auth_preflight` applies: a bind
     // string that doesn't parse is treated as non-loopback, so a typo can't
     // sneak past the gate. Absence is not evidence of safety.
     let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|ci| ci.0);
@@ -670,28 +674,73 @@ pub(crate) fn is_local_request(peer: Option<SocketAddr>, headers: &axum::http::H
     peer.is_some_and(|p| p.ip().is_loopback()) && !PROXY_HEADERS.iter().any(|h| headers.contains_key(*h))
 }
 
-/// (#881) Refuse a non-loopback bind unless a token is configured. Pure +
-/// testable: parse `bind` to an `IpAddr`; a loopback address (127.0.0.0/8, ::1)
-/// is always allowed; any other parsed address (a LAN/Tailnet IP, or `0.0.0.0`)
-/// requires `token_present`. A bind string that doesn't parse as an IP is
-/// treated conservatively as non-loopback (so a typo can't sneak past the gate).
-fn bind_requires_token(bind: &str, token_present: bool) -> Result<(), String> {
-    let is_loopback = bind
-        .parse::<std::net::IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false);
-    if is_loopback || token_present {
-        Ok(())
+/// (#881, #2988) The startup banner's two auth lines: the read posture and
+/// the execution posture. `serve_auth_preflight` has already refused a
+/// posture reads could not be answered in, so these only describe.
+fn auth_banner_lines(auth: ServeAuth) -> [String; 2] {
+    let reads = if auth.read_auth {
+        "  reads:          token required unless from this machine (serve.read_auth on; proxied requests included)"
     } else {
-        Err(format!(
-            "refusing to bind the serve daemon to a non-loopback address ({bind}) without a token \
-configured — the daemon would expose flow records, machine specs, mission state, and worktree \
-what-changed summaries of in-flight dispatches to any reachable peer, unauthenticated.\n\
-  Fix: set a token — `security add-generic-password -U -a \"$USER\" -s darkmux-serve-token -w` (macOS) \
-plus `daemon_auth_enabled: true` in ~/.darkmux/config.json, OR export DARKMUX_SERVE_TOKEN=… — then \
-re-run. Or bind to 127.0.0.1 (the default) for a loopback-only daemon."
-        ))
+        "  reads:          open to whatever reaches this daemon (serve.read_auth off)"
+    };
+    let exec = if auth.token_present {
+        "  fleet work:     token set; the fleet listener requires it plus a verified sender".to_string()
+    } else {
+        format!("  fleet work:     {}", darkmux_types::style::dim("no serve token; this machine takes and sends no fleet work"))
+    };
+    [reads.to_string(), exec]
+}
+
+/// (#2988) The serve auth posture `darkmux serve` starts under: whether
+/// reads need the token (`serve.read_auth`), and whether one resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ServeAuth {
+    pub(crate) read_auth: bool,
+    pub(crate) token_present: bool,
+}
+
+impl ServeAuth {
+    /// The posture this process resolves now.
+    fn resolve() -> Self {
+        Self {
+            read_auth: darkmux_types::config_access::serve_read_auth(),
+            token_present: darkmux_flow::serve_token_present(),
+        }
     }
+}
+
+const TOKEN_REMEDY: &str = "store it: `security add-generic-password -U -a \"$USER\" -s darkmux-serve-token -w` \
+(macOS) plus `darkmux config set serve.token_keychain true`, OR export DARKMUX_SERVE_TOKEN=…";
+
+/// (#881, #2988) Refuse to start `serve` in a posture whose reads could not
+/// be answered as configured. Pure + testable.
+///
+/// - Read auth on with no token: every remote read would 401 with no way
+///   to pass.
+/// - A non-loopback bind (a LAN/tailnet IP, `0.0.0.0`, or anything that
+///   does not parse as an IP, so a typo can't sneak past) without read
+///   auth on and a token: it would expose flow records, machine specs,
+///   mission state and worktree summaries to any reachable peer
+///   unauthenticated. A fleet token alone does not close reads, so it is
+///   not enough.
+fn serve_auth_preflight(bind: &str, auth: ServeAuth) -> Result<(), String> {
+    if auth.read_auth && !auth.token_present {
+        return Err(format!(
+            "refusing to start the serve daemon: `serve.read_auth` is on but no serve token resolves, so \
+every read not from this machine would be refused with no way to pass.\n  Fix: {TOKEN_REMEDY}, or \
+`darkmux config set serve.read_auth false`."
+        ));
+    }
+    let is_loopback = bind.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    if is_loopback || auth.read_auth {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to bind the serve daemon to a non-loopback address ({bind}) with reads open — the daemon \
+would expose flow records, machine specs, mission state, and worktree what-changed summaries of in-flight \
+dispatches to any reachable peer, unauthenticated.\n  Fix: `darkmux config set serve.read_auth true` with a \
+serve token ({TOKEN_REMEDY}), or bind to 127.0.0.1 (the default) and reach it through `tailscale serve`."
+    ))
 }
 
 /// GET /fleet/machines/live — the machines present in the fleet RIGHT NOW
@@ -1162,27 +1211,9 @@ fn build_startup_banner(
         ));
     }
 
-    // (#881) Auth-state line — so the operator can see at a glance whether the
-    // bearer gate is active and (when bound non-loopback) that a token is set.
-    let token_present = darkmux_flow::serve_token_present();
-    let non_loopback = !addr.ip().is_loopback();
-    if token_present {
-        lines.push(format!(
-            "  auth:           {} (remote and proxied reads require a bearer token; this machine open)",
-            darkmux_types::style::success("token set")
-        ));
-    } else if non_loopback {
-        // Should be unreachable — `bind_requires_token` refuses this combination
-        // before bind — but surface it loudly if the bind path ever changes.
-        lines.push(darkmux_types::style::warn(
-            "  ! auth:         NO token set but bound non-loopback — the read surface is UNAUTHENTICATED",
-        ));
-    } else {
-        lines.push(
-            "  auth:           none (loopback-only; set DARKMUX_SERVE_TOKEN or daemon_auth_enabled + Keychain to bind non-loopback)"
-                .to_string(),
-        );
-    }
+    // (#881, #2988) Both auth postures, so the operator sees at a glance
+    // what reads need and what execution needs.
+    lines.extend(auth_banner_lines(ServeAuth::resolve()));
 
     if !flows_dir_exists {
         lines.push(darkmux_types::style::warn(
@@ -1257,7 +1288,7 @@ pub fn resolve_listen_addr(port: Option<u16>, bind: Option<String>) -> (u16, Str
 /// four #2782 surfaces rendered IPv6 as supported (`serve address` printing
 /// `[::]:8765`, `viewer_link_base` emitting `http://[::1]:8765/`, the
 /// tailnet matcher, and the tests asserting all three) and
-/// `bind_requires_token("::1", false)` returned `Ok`, i.e. the codebase
+/// the bind gate returned `Ok` for `::1`, i.e. the codebase
 /// already INTENDED v6 loopback to be legal. One bracketing rule keeps the
 /// address the daemon binds and the address doctor prints from disagreeing.
 ///
@@ -1296,11 +1327,9 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
 
     rt.block_on(async move {
         let addr = listen_socket_addr(&bind, port)?;
-        // (#881) Refuse a non-loopback bind without a configured token BEFORE we
-        // bind the socket — exposing the read surface unauthenticated is the
-        // vulnerability this gate closes.
-        bind_requires_token(&bind, darkmux_flow::serve_token_present())
-            .map_err(anyhow::Error::msg)?;
+        // (#881, #2988) Refuse a posture whose reads could not be answered as
+        // configured BEFORE we bind the socket.
+        serve_auth_preflight(&bind, ServeAuth::resolve()).map_err(anyhow::Error::msg)?;
         // (#2782) Name the address in the bind failure. The banner below holds
         // it, and only prints AFTER a successful bind — so a bare `io::Error`
         // here is the operator's entire stderr: `Error: Permission denied (os

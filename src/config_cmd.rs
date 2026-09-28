@@ -143,7 +143,6 @@ const KEYS: &[(&str, Ty)] = &[
     ("runtime.default_role", Ty::Str),
     ("runtime.check_updates", Ty::Bool),
     ("runtime.daemon_cors_origins", Ty::Str),
-    ("runtime.daemon_auth_enabled", Ty::Bool),
     ("runtime.injected_context_fraction", Ty::Float),
     // (#1698 Packet B2) The `darkmux acp` process's idle self-exit budget.
     ("runtime.acp_idle_exit_minutes", Ty::Uint),
@@ -252,6 +251,8 @@ const KEYS: &[(&str, Ty)] = &[
     // secret, and `SECRET_KEYS` above refuses it with the Keychain form.
     ("serve.port", Ty::Uint),
     ("serve.bind", Ty::Str),
+    ("serve.token_keychain", Ty::Bool),
+    ("serve.read_auth", Ty::Bool),
     // (#2775) The periodic machine-lens aggregate heartbeat.
     ("machine_rollup.enabled", Ty::Bool),
     ("machine_rollup.period_seconds", Ty::Uint),
@@ -406,6 +407,10 @@ fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
         bail!(
             "`{key}` was renamed to `{new_key}` in 4.0 (#2902): darkmux config set {new_key} {value}"
         );
+    }
+    // A retired key names what replaced it, never a near-miss guess.
+    if let Some(line) = darkmux_types::user_files::config_retired(key) {
+        bail!("`{key}`: {line}");
     }
     // (#2914) The one role id the dynamic map refuses: radio routing runs on
     // the machine's utility model (`internal.utility`), not on a profile, so
@@ -907,7 +912,7 @@ mod tests {
         let p = f.path();
         // flow-action-guard:allow — a retired config key, refused by name
         let err = set_at(p, "radio.router_profile", "radio").unwrap_err().to_string();
-        assert!(err.contains("unknown config key"), "{err}");
+        assert!(err.contains("removed") && err.contains("internal.utility"), "a retired key names its fix: {err}");
         let err = set_at(p, "role_profiles.radio-router", "radio").unwrap_err().to_string();
         assert!(err.contains("utility model") && err.contains("internal.utility"), "names the fix: {err}");
         // (C6) A leftover binding is removed by hand: no `config unset`
@@ -1251,6 +1256,22 @@ mod tests {
                 assert!(preflight(scope).is_ok(), "{}: {scope:?} still refusing after cleanup", s.key);
             }
         }
+    }
+
+    /// (#2988 follow-up) `config set` refuses a retired key with the line
+    /// naming its replacement, not a near-miss guess, and the two serve
+    /// auth switches are settable booleans.
+    #[test]
+    fn config_set_names_the_replacement_for_a_retired_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let err = set_at(&path, "runtime.daemon_auth_enabled", "true").unwrap_err().to_string();
+        assert!(err.contains("serve.token_keychain") && err.contains("serve.read_auth"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}", "nothing was written");
+        assert!(set_at(&path, "serve.token_keychain", "true").is_ok());
+        assert!(set_at(&path, "serve.read_auth", "true").is_ok());
+        assert!(set_at(&path, "serve.read_auth", "maybe").is_err());
     }
 
     /// (#2902 step 5) `config set` refuses a renamed budget key, naming the

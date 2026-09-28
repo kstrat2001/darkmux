@@ -1691,10 +1691,79 @@
 
     // ─── (#881) serve daemon auth ─────────────────────────────────────
     // Under test-support the config tier is empty (#811), so a serve token
-    // resolves ONLY from the DARKMUX_SERVE_TOKEN env var — set/scrub it,
-    // #[serial] to avoid racing other env-mutating tests.
+    // resolves ONLY from the DARKMUX_SERVE_TOKEN env var and read auth ONLY
+    // from DARKMUX_SERVE_READ_AUTH — set/scrub them, #[serial] to avoid
+    // racing other env-mutating tests.
 
     const TEST_TOKEN: &str = "sek-test-12345";
+
+    /// The serve auth environment a test runs under. (#2988 follow-up) The
+    /// serve token and read auth are separate switches: the token is the
+    /// execution credential, read auth decides whether READS need it.
+    #[derive(Clone, Copy, Debug)]
+    enum AuthEnv {
+        /// No token, read auth off: the default install.
+        Off,
+        /// A fleet token resolves, read auth off: reads stay open.
+        TokenOnly,
+        /// A token resolves and read auth is on.
+        ReadAuth,
+        /// Read auth on and no token resolves (`serve` refuses to start;
+        /// the gate itself must still fail closed).
+        ReadAuthNoToken,
+    }
+
+    fn apply_auth_env(a: AuthEnv) {
+        let (token, read) = match a {
+            AuthEnv::Off => (false, false),
+            AuthEnv::TokenOnly => (true, false),
+            AuthEnv::ReadAuth => (true, true),
+            AuthEnv::ReadAuthNoToken => (false, true),
+        };
+        unsafe {
+            if token {
+                std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN);
+            } else {
+                std::env::remove_var("DARKMUX_SERVE_TOKEN");
+            }
+            if read {
+                std::env::set_var("DARKMUX_SERVE_READ_AUTH", "on");
+            } else {
+                std::env::remove_var("DARKMUX_SERVE_READ_AUTH");
+            }
+        }
+    }
+
+    /// Token set AND read auth on: the posture every "requires the token
+    /// from a remote peer" test is about.
+    fn set_read_auth_env() {
+        apply_auth_env(AuthEnv::ReadAuth);
+    }
+
+    fn clear_auth_env() {
+        apply_auth_env(AuthEnv::Off);
+    }
+
+    /// Status of a GET `uri` from `peer` carrying `headers`, through the
+    /// real router, under `auth`.
+    async fn read_status(
+        auth: AuthEnv,
+        peer: ConnectInfo<SocketAddr>,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> StatusCode {
+        apply_auth_env(auth);
+        let app = build_router_local(PathBuf::new());
+        let mut b = Request::builder().uri(uri);
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let mut req = b.body(Body::empty()).unwrap();
+        req.extensions_mut().insert(peer);
+        let resp = app.oneshot(req).await.unwrap();
+        clear_auth_env();
+        resp.status()
+    }
     fn remote_peer() -> ConnectInfo<SocketAddr> {
         ConnectInfo("10.0.0.9:5555".parse::<SocketAddr>().unwrap())
     }
@@ -1719,7 +1788,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn worktree_summary_requires_token_from_remote_peer() {
-        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        set_read_auth_env();
         let app = build_router_local(PathBuf::new());
         let mut req = Request::builder()
             .uri("/worktree-summary/some-session")
@@ -1727,7 +1796,7 @@
             .unwrap();
         req.extensions_mut().insert(remote_peer());
         let resp = app.oneshot(req).await.unwrap();
-        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        clear_auth_env();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -1738,7 +1807,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn worktree_summary_open_on_loopback_even_with_token() {
-        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        set_read_auth_env();
         let app = build_router_local(PathBuf::new());
         // (#1663) Loopback stated, not inherited from an absent ConnectInfo.
         let mut req = Request::builder()
@@ -1747,7 +1816,7 @@
             .unwrap();
         req.extensions_mut().insert(loopback_peer());
         let resp = app.oneshot(req).await.unwrap();
-        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        clear_auth_env();
         assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -1758,12 +1827,12 @@
         // now INJECTED rather than implied by an absent `ConnectInfo` — the
         // exemption is a thing this test states, not one it inherits from a
         // fail-open default.
-        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        set_read_auth_env();
         let app = build_router_local(PathBuf::new());
         let mut req = Request::builder().uri("/flow-days").body(Body::empty()).unwrap();
         req.extensions_mut().insert(loopback_peer());
         let resp = app.oneshot(req).await.unwrap();
-        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        clear_auth_env();
         assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -1786,7 +1855,7 @@
         // Failing closed converts that silent, invisible hole into 401s on
         // the first remote request. This test pins the direction: no peer
         // information means no exemption.
-        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        set_read_auth_env();
         // The BARE router, deliberately — NOT `build_router_local`. This test
         // is about what happens when no peer is known, so the harness must not
         // supply one; with the loopback layer it would assert nothing.
@@ -1796,7 +1865,7 @@
             .oneshot(Request::builder().uri("/flow-days").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        clear_auth_env();
         assert_eq!(
             resp.status(),
             StatusCode::UNAUTHORIZED,
@@ -1810,7 +1879,7 @@
         // The control: failing closed must not break a legitimate remote
         // client. Unknown peer + valid token is still authorized, so this is
         // a gate, not a blanket refusal.
-        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        set_read_auth_env();
         // Bare router for the same reason as its sibling above: the absent
         // peer IS the condition under test.
         let app = build_router(PathBuf::new());
@@ -1824,19 +1893,19 @@
             )
             .await
             .unwrap();
-        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        clear_auth_env();
         assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn flow_requires_token_from_remote_peer() {
-        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        set_read_auth_env();
         let app = build_router_local(PathBuf::new());
         let mut req = Request::builder().uri("/flow-days").body(Body::empty()).unwrap();
         req.extensions_mut().insert(remote_peer());
         let resp = app.oneshot(req).await.unwrap();
-        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        clear_auth_env();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -1847,19 +1916,19 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn lab_runs_requires_token_from_remote_peer() {
-        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        set_read_auth_env();
         let app = build_router_local(PathBuf::new());
         let mut req = Request::builder().uri("/lab/runs").body(Body::empty()).unwrap();
         req.extensions_mut().insert(remote_peer());
         let resp = app.oneshot(req).await.unwrap();
-        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        clear_auth_env();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn flow_accepts_remote_peer_with_token() {
-        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        set_read_auth_env();
         let app = build_router_local(PathBuf::new());
         let mut req = Request::builder()
             .uri("/flow-days")
@@ -1868,34 +1937,19 @@
             .unwrap();
         req.extensions_mut().insert(remote_peer());
         let resp = app.oneshot(req).await.unwrap();
-        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        clear_auth_env();
         assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     // ─── (#2988) a proxied loopback request is not this machine ─────────
     // `tailscale serve` (the documented way a hub reaches the tailnet)
-    // proxies every tailnet peer to loopback. With auth on, the gate must
-    // ask `is_local_request` — loopback AND no proxy header — or every
+    // proxies every tailnet peer to loopback. With read auth on, the gate
+    // must ask `is_local_request` — loopback AND no proxy header — or every
     // peer behind the proxy reads the whole surface without the token.
 
-    /// Status of a loopback `/flow-days` request carrying `headers`,
-    /// through the real router, with the token env var set to `token_env`
-    /// for the duration (`None` = auth off).
-    async fn loopback_flow_status(token_env: Option<&str>, headers: &[(&str, &str)]) -> StatusCode {
-        match token_env {
-            Some(t) => unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", t) },
-            None => unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN") },
-        }
-        let app = build_router_local(PathBuf::new());
-        let mut b = Request::builder().uri("/flow-days");
-        for (k, v) in headers {
-            b = b.header(*k, *v);
-        }
-        let mut req = b.body(Body::empty()).unwrap();
-        req.extensions_mut().insert(loopback_peer());
-        let resp = app.oneshot(req).await.unwrap();
-        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
-        resp.status()
+    /// Status of a loopback `/flow-days` request carrying `headers`.
+    async fn loopback_flow_status(auth: AuthEnv, headers: &[(&str, &str)]) -> StatusCode {
+        read_status(auth, loopback_peer(), "/flow-days", headers).await
     }
 
     const BEARER: &str = "Bearer sek-test-12345";
@@ -1903,13 +1957,13 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn auth_on_plain_loopback_is_allowed_without_the_token() {
-        assert_ne!(loopback_flow_status(Some(TEST_TOKEN), &[]).await, StatusCode::UNAUTHORIZED);
+        assert_ne!(loopback_flow_status(AuthEnv::ReadAuth, &[]).await, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn auth_on_loopback_with_x_forwarded_for_and_no_token_is_refused() {
-        let status = loopback_flow_status(Some(TEST_TOKEN), &[("X-Forwarded-For", "100.64.0.7")]).await;
+        let status = loopback_flow_status(AuthEnv::ReadAuth, &[("X-Forwarded-For", "100.64.0.7")]).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "a tailnet peer behind `tailscale serve` is not loopback");
     }
 
@@ -1917,7 +1971,7 @@
     #[serial_test::serial]
     async fn auth_on_loopback_with_x_forwarded_for_and_the_token_is_allowed() {
         let status = loopback_flow_status(
-            Some(TEST_TOKEN),
+            AuthEnv::ReadAuth,
             &[("X-Forwarded-For", "100.64.0.7"), ("Authorization", BEARER)],
         )
         .await;
@@ -1928,14 +1982,14 @@
     #[serial_test::serial]
     async fn auth_on_loopback_with_tailscale_user_login_and_no_token_is_refused() {
         let status =
-            loopback_flow_status(Some(TEST_TOKEN), &[("Tailscale-User-Login", "someone@example.com")]).await;
+            loopback_flow_status(AuthEnv::ReadAuth, &[("Tailscale-User-Login", "someone@example.com")]).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn auth_on_loopback_with_forwarded_and_no_token_is_refused() {
-        let status = loopback_flow_status(Some(TEST_TOKEN), &[("Forwarded", "for=100.64.0.7")]).await;
+        let status = loopback_flow_status(AuthEnv::ReadAuth, &[("Forwarded", "for=100.64.0.7")]).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
@@ -1944,7 +1998,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn auth_on_proxied_loopback_worktree_summary_needs_the_token() {
-        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        set_read_auth_env();
         let app = build_router_local(PathBuf::new());
         let mut req = Request::builder()
             .uri("/worktree-summary/some-session")
@@ -1953,16 +2007,16 @@
             .unwrap();
         req.extensions_mut().insert(loopback_peer());
         let resp = app.oneshot(req).await.unwrap();
-        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        clear_auth_env();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// Auth OFF (no token resolves — the default): reads stay open to
-    /// everything, proxied or not. Pins that #2988 changed nothing there.
+    /// Auth OFF (no token resolves, read auth off — the default): reads
+    /// stay open to everything, proxied or not.
     #[tokio::test]
     #[serial_test::serial]
     async fn auth_off_every_loopback_shape_is_allowed() {
-        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        clear_auth_env();
         assert!(!darkmux_flow::serve_token_present(), "the default resolves no token");
         for headers in [
             &[][..],
@@ -1971,7 +2025,55 @@
             &[("Tailscale-User-Login", "someone@example.com")][..],
             &[("Forwarded", "for=100.64.0.7")][..],
         ] {
-            assert_ne!(loopback_flow_status(None, headers).await, StatusCode::UNAUTHORIZED, "{headers:?}");
+            assert_ne!(loopback_flow_status(AuthEnv::Off, headers).await, StatusCode::UNAUTHORIZED, "{headers:?}");
+        }
+    }
+
+    /// (#2988 follow-up) A fleet token is the EXECUTION credential; it no
+    /// longer closes the read surface. With a token present and read auth
+    /// off, a viewer load through `tailscale serve`, a JSON read and a
+    /// direct remote read all pass without the token.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_fleet_token_with_read_auth_off_leaves_reads_open() {
+        let proxied = [("X-Forwarded-For", "100.64.0.7"), ("Tailscale-User-Login", "someone@example.com")];
+        for uri in ["/", "/flow-days", "/runs", "/worktree-summary/some-session", "/mission/m/graph.json"] {
+            let s = read_status(AuthEnv::TokenOnly, loopback_peer(), uri, &proxied).await;
+            assert_ne!(s, StatusCode::UNAUTHORIZED, "proxied {uri}");
+            let s = read_status(AuthEnv::TokenOnly, remote_peer(), uri, &[]).await;
+            assert_ne!(s, StatusCode::UNAUTHORIZED, "remote {uri}");
+        }
+    }
+
+    /// Read auth on with no token resolvable: `serve` refuses to start
+    /// (`serve_auth_preflight`), and the gate itself still fails closed —
+    /// a remote or proxied read gets 401, this machine still reads.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn read_auth_on_without_a_token_fails_closed() {
+        let s = read_status(AuthEnv::ReadAuthNoToken, remote_peer(), "/flow-days", &[]).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        let s = read_status(AuthEnv::ReadAuthNoToken, loopback_peer(), "/flow-days", &[("X-Forwarded-For", "100.64.0.7")]).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        let s = read_status(AuthEnv::ReadAuthNoToken, loopback_peer(), "/flow-days", &[]).await;
+        assert_ne!(s, StatusCode::UNAUTHORIZED);
+    }
+
+    /// The read routes accept GET only: nothing on this router starts work.
+    /// A POST to a read route is 405, never a 2xx, under every posture.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_read_router_starts_no_work() {
+        for auth in [AuthEnv::Off, AuthEnv::TokenOnly] {
+            apply_auth_env(auth);
+            let app = build_router_local(PathBuf::new());
+            for uri in ["/", "/flow-days", "/runs", "/panel/doctor", "/worktree-summary/s"] {
+                let mut req = Request::builder().method("POST").uri(uri).body(Body::empty()).unwrap();
+                req.extensions_mut().insert(loopback_peer());
+                let resp = app.clone().oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED, "{auth:?} POST {uri}");
+            }
+            clear_auth_env();
         }
     }
 
@@ -2034,22 +2136,49 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn health_exempt_from_remote_gate() {
-        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        set_read_auth_env();
         let app = build_router_local(PathBuf::new());
         let mut req = Request::builder().uri("/health").body(Body::empty()).unwrap();
         req.extensions_mut().insert(remote_peer());
         let resp = app.oneshot(req).await.unwrap();
-        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        clear_auth_env();
         // /health must answer even an unauthenticated remote peer (doctor's
         // reachability probe + external liveness checks).
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    const NO_AUTH: ServeAuth = ServeAuth { read_auth: false, token_present: false };
+    const TOKEN_ONLY: ServeAuth = ServeAuth { read_auth: false, token_present: true };
+    const READ_AUTH: ServeAuth = ServeAuth { read_auth: true, token_present: true };
+    const READ_NO_TOKEN: ServeAuth = ServeAuth { read_auth: true, token_present: false };
+
+    /// (#2988 follow-up) A fleet token alone does not close the read
+    /// surface, so it no longer licenses a non-loopback bind: that needs
+    /// read auth on (and a token for it to check).
+    #[test]
+    fn a_non_loopback_bind_needs_read_auth_not_just_a_token() {
+        for bind in ["0.0.0.0", "100.64.0.5", "::", "garbage"] {
+            let err = serve_auth_preflight(bind, TOKEN_ONLY).unwrap_err();
+            assert!(err.contains("serve.read_auth"), "names the switch: {err}");
+        }
+        assert!(serve_auth_preflight("127.0.0.1", TOKEN_ONLY).is_ok(), "loopback + fleet token is the hub default");
+    }
+
+    /// Read auth on with no token to check would 401 every remote read with
+    /// no way to pass, so `serve` refuses to start, on any bind.
+    #[test]
+    fn read_auth_without_a_token_refuses_to_start() {
+        for bind in ["127.0.0.1", "::1", "100.64.0.5"] {
+            let err = serve_auth_preflight(bind, READ_NO_TOKEN).unwrap_err();
+            assert!(err.contains("serve.read_auth") && err.contains("darkmux-serve-token"), "{err}");
+        }
+    }
+
     #[test]
     fn bind_gate_allows_loopback_without_token() {
-        assert!(bind_requires_token("127.0.0.1", false).is_ok());
-        assert!(bind_requires_token("::1", false).is_ok());
-        assert!(bind_requires_token("127.0.0.5", false).is_ok());
+        assert!(serve_auth_preflight("127.0.0.1", NO_AUTH).is_ok());
+        assert!(serve_auth_preflight("::1", NO_AUTH).is_ok());
+        assert!(serve_auth_preflight("127.0.0.5", NO_AUTH).is_ok());
     }
 
     /// (#2782 C5) The gate above says v6 loopback is legal; before this the
@@ -2065,7 +2194,7 @@
         assert!(v6_loopback.is_ipv6() && v6_loopback.ip().is_loopback());
         // The gate that says this configuration is legal, restated against
         // the address actually computed for it.
-        assert!(bind_requires_token("::1", false).is_ok());
+        assert!(serve_auth_preflight("::1", NO_AUTH).is_ok());
 
         let v6_wildcard = listen_socket_addr("::", 8799).expect("`::` must bind");
         assert_eq!(v6_wildcard.port(), 8799);
@@ -2096,24 +2225,24 @@
 
     #[test]
     fn bind_gate_refuses_nonloopback_without_token() {
-        assert!(bind_requires_token("0.0.0.0", false).is_err());
-        assert!(bind_requires_token("100.64.0.5", false).is_err()); // a Tailnet IP
-        assert!(bind_requires_token("192.168.1.10", false).is_err());
-        assert!(bind_requires_token("::", false).is_err()); // IPv6 unspecified
-        assert!(bind_requires_token("2001:db8::1", false).is_err()); // global IPv6
+        assert!(serve_auth_preflight("0.0.0.0", NO_AUTH).is_err());
+        assert!(serve_auth_preflight("100.64.0.5", NO_AUTH).is_err()); // a Tailnet IP
+        assert!(serve_auth_preflight("192.168.1.10", NO_AUTH).is_err());
+        assert!(serve_auth_preflight("::", NO_AUTH).is_err()); // IPv6 unspecified
+        assert!(serve_auth_preflight("2001:db8::1", NO_AUTH).is_err()); // global IPv6
     }
 
     #[test]
     fn bind_gate_allows_nonloopback_with_token() {
-        assert!(bind_requires_token("0.0.0.0", true).is_ok());
-        assert!(bind_requires_token("100.64.0.5", true).is_ok());
+        assert!(serve_auth_preflight("0.0.0.0", READ_AUTH).is_ok());
+        assert!(serve_auth_preflight("100.64.0.5", READ_AUTH).is_ok());
     }
 
     #[test]
     fn bind_gate_treats_unparseable_as_nonloopback() {
         // A bind string that isn't an IP is conservatively non-loopback.
-        assert!(bind_requires_token("garbage", false).is_err());
-        assert!(bind_requires_token("garbage", true).is_ok());
+        assert!(serve_auth_preflight("garbage", NO_AUTH).is_err());
+        assert!(serve_auth_preflight("garbage", READ_AUTH).is_ok());
     }
 
     #[test]
@@ -5357,9 +5486,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn mission_graph_json_requires_token_from_remote_peer() {
-        unsafe {
-            std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN);
-        }
+        set_read_auth_env();
         let app = build_router_local(PathBuf::new());
         let mut req = Request::builder()
             .uri("/mission/some-mission/graph.json")
@@ -5367,9 +5494,7 @@
             .unwrap();
         req.extensions_mut().insert(remote_peer());
         let resp = app.oneshot(req).await.unwrap();
-        unsafe {
-            std::env::remove_var("DARKMUX_SERVE_TOKEN");
-        }
+        clear_auth_env();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -5382,9 +5507,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn mission_graph_html_requires_token_from_remote_peer() {
-        unsafe {
-            std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN);
-        }
+        set_read_auth_env();
         let app = build_router_local(PathBuf::new());
         let mut req = Request::builder()
             .uri("/mission/some-mission/graph")
@@ -5392,9 +5515,7 @@
             .unwrap();
         req.extensions_mut().insert(remote_peer());
         let resp = app.oneshot(req).await.unwrap();
-        unsafe {
-            std::env::remove_var("DARKMUX_SERVE_TOKEN");
-        }
+        clear_auth_env();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 

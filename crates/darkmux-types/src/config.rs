@@ -365,7 +365,11 @@ use std::path::Path;
 //           same way, naming the expected type and what it got: one such
 //           value used to fail the typed load and silently drop EVERY setting
 //           to its default (Redis and audit off). The breaking change is the
-//           reading rule, not the shape: no field changed.
+//           reading rule, not the shape.
+//           Also in 2.0 (#2988): `runtime.daemon_auth_enabled` is retired,
+//           replaced by `serve.token_keychain` (the same Keychain gate) and
+//           the new `serve.read_auth` (reads need the token, default off),
+//           both written visibly by `init` as `false`.
 pub const CONFIG_SCHEMA_VERSION: &str = "2.0";
 
 /// (#2902 step 5) A setting RENAMED in 4.0, with no alias. `config set`
@@ -449,6 +453,13 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         key: "review",
         line: "removed with the review funnel (#2310): `review` runs as a mission config now, and its judge knobs \
                went with the funnel. Delete the block",
+    },
+    RetiredSetting {
+        key: "runtime.daemon_auth_enabled",
+        line: "replaced in 4.0 (#2988) by `serve.token_keychain` (read the serve token from the Keychain; the \
+               fleet's execution credential) and `serve.read_auth` (whether reads from off this machine need \
+               it, default off). Move your value to `serve.token_keychain`, and set `serve.read_auth true` if \
+               you want reads closed",
     },
     RetiredSetting {
         key: "runtime.telemetry_record_every_samples",
@@ -779,10 +790,6 @@ pub struct RuntimeBehaviorConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub default_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub check_updates: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub daemon_cors_origins: Option<String>,
-    // (#881) Gate for reading the `darkmux-serve-token` Keychain item (the env
-    // token `DARKMUX_SERVE_TOKEN` needs no gate). Visible `false` so the
-    // security toggle is discoverable; the token itself is NEVER a config field.
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub daemon_auth_enabled: Option<bool>,
     // (#1011) Fraction (0–1) of the dispatch model's context window budgeted for
     // the injected-context blocks (detector cautions + authored lessons + prior
     // corrections) in the coder brief. A fraction auto-scales across profiles
@@ -1422,9 +1429,14 @@ pub struct RemoteConfig {
 ///
 /// **`serve.token` is deliberately absent.** The daemon's bearer token is a
 /// SECRET and lives in the macOS Keychain (item `darkmux-serve-token`); the
-/// non-secret gate for it is `runtime.daemon_auth_enabled`. `config set`
-/// refuses `serve.token` with the `security add-generic-password` form —
-/// that refusal predates this block and is unchanged by it.
+/// non-secret gate for reading it is `serve.token_keychain`. `config set`
+/// refuses `serve.token` with the `security add-generic-password` form.
+///
+/// **Two auth switches, two surfaces (#2988).** The token is the EXECUTION
+/// credential: the fleet listener requires it on every work submission,
+/// whatever `read_auth` says. `read_auth` alone decides whether READS (the
+/// viewer and every JSON route) need it from a request that is not from
+/// this machine.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ServeConfig {
     /// TCP port the daemon listens on. Built-in default `8765`. A
@@ -1432,9 +1444,21 @@ pub struct ServeConfig {
     /// CLI-beats-config convention every other flag here follows.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub port: Option<u16>,
     /// Address the daemon binds. Built-in default `127.0.0.1`
-    /// (loopback-only). A non-loopback bind is refused without a resolved
-    /// serve token — that gate is unchanged and lives in `darkmux-serve`.
+    /// (loopback-only). A non-loopback bind is refused unless `read_auth`
+    /// is on with a resolved serve token (`darkmux-serve`'s
+    /// `serve_auth_preflight`).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub bind: Option<String>,
+    /// Whether the daemon may read the serve token from the macOS Keychain
+    /// item `darkmux-serve-token`. Default `false`. The env token
+    /// `DARKMUX_SERVE_TOKEN` needs no gate (its presence is the opt-in).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub token_keychain: Option<bool>,
+    /// Whether a READ that is not from this machine needs the serve token.
+    /// Default `false`: reads are open to whatever reaches the daemon (the
+    /// tailnet, behind `tailscale serve`). When `true`, a request is exempt
+    /// only if it arrives on loopback with no reverse-proxy header, and
+    /// `darkmux serve` refuses to start unless a token resolves. A
+    /// non-loopback bind requires it. Never governs execution (#2988).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub read_auth: Option<bool>,
     #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -2012,7 +2036,6 @@ impl DarkmuxConfig {
                 default_role: None,
                 check_updates: Some(true),
                 daemon_cors_origins: None,
-                daemon_auth_enabled: Some(false),
                 injected_context_fraction: Some(0.15),
                 acp_idle_exit_minutes: Some(30),
                 // (#2094) Visible `0` — the pre-existing no-rest behavior,
@@ -2154,6 +2177,11 @@ impl DarkmuxConfig {
             serve: Some(ServeConfig {
                 port: Some(crate::config_access::SERVE_PORT_DEFAULT),
                 bind: Some(crate::config_access::SERVE_BIND_DEFAULT.to_string()),
+                // (#2988 follow-up) Both auth switches visible at `false`:
+                // no Keychain read, reads open to whatever reaches the
+                // daemon. One `config set` from on.
+                token_keychain: Some(false),
+                read_auth: Some(false),
                 extras: Default::default(),
             }),
             // (#2775) Written visible with `enabled: false` and the
@@ -2517,7 +2545,8 @@ mod tests {
             "lmstudio_url": "http://localhost:1234",
             "dirs": { "flows": "~/dm/flows", "audit": "~/dm/audit" },
             "redis": { "host": "100.64.0.2", "port": 6379, "stream": "darkmux:flow", "maxlen": 10000 },
-            "runtime": { "inactivity_timeout_seconds": 600, "max_turns": 40, "strict_selection": true, "daemon_auth_enabled": true }
+            "runtime": { "inactivity_timeout_seconds": 600, "max_turns": 40, "strict_selection": true },
+            "serve": { "token_keychain": true, "read_auth": true }
         }"#;
         let cfg: DarkmuxConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.machine_id.as_deref(), Some("studio"));
@@ -2526,8 +2555,9 @@ mod tests {
         assert_eq!(cfg.dirs.as_ref().unwrap().flows.as_deref(), Some("~/dm/flows"));
         assert_eq!(cfg.runtime.as_ref().unwrap().max_turns, Some(40));
         assert_eq!(cfg.runtime.as_ref().unwrap().strict_selection, Some(true));
-        // (#881) the daemon-auth gate deserializes from the config tier.
-        assert_eq!(cfg.runtime.as_ref().unwrap().daemon_auth_enabled, Some(true));
+        // (#881, #2988) the serve auth switches deserialize from the config tier.
+        assert_eq!(cfg.serve.as_ref().unwrap().token_keychain, Some(true));
+        assert_eq!(cfg.serve.as_ref().unwrap().read_auth, Some(true));
         // Re-serialize → parse → still equal on the load-bearing fields.
         let round = serde_json::to_string(&cfg).unwrap();
         let back: DarkmuxConfig = serde_json::from_str(&round).unwrap();

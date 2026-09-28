@@ -146,7 +146,7 @@ const PANEL_SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
 /// never opened on purpose.
 ///
 /// Bearer auth does not cover this: a request from this machine
-/// (`is_local_request`) is exempt by design, and with auth off every
+/// (`is_local_request`) is exempt by design, and with read auth off every
 /// tailnet peer behind the documented `tailscale serve` phone dashboard
 /// reads freely too.
 pub(crate) const PANEL_HEADER: &str = "x-darkmux-panel";

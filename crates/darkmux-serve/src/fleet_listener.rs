@@ -534,7 +534,7 @@ impl Worker {
     /// re-applied. Returns the entry as it stands now and the profile.
     ///
     /// In production the daemon reads the fleet token once
-    /// (`serve_token`'s Keychain tier and `daemon_auth_enabled` are cached
+    /// (`serve_token`'s Keychain tier and `serve.token_keychain` are cached
     /// for the process), so a rotated or removed token is seen only after a
     /// restart, which drops the queue anyway; the token check here holds
     /// for whatever `state.token` returns.
@@ -1906,24 +1906,20 @@ mod tests {
         assert!(r.reason.unwrap().contains("as many jobs queued"));
     }
 
-    /// A caller without the token is answered before the allow-list is
-    /// read or the provider runs.
-    #[test]
-    fn a_caller_without_the_token_reads_nothing() {
-        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let r = reads.clone();
-        let provider = StaticIdentityProvider {
-            local: test_node("nSTUDIO", "studio", "100.64.0.2"),
-            peers: vec![laptop()],
-            down: None,
-        };
-        let state = FleetListenerState {
+    /// A listener state whose allow-list read is counted in `reads` and
+    /// whose executor must never run: for tests about what the gate refuses.
+    fn gate_only_state(reads: Arc<std::sync::atomic::AtomicUsize>) -> FleetListenerState {
+        FleetListenerState {
             receiver: "studio".into(),
-            provider: Arc::new(provider),
+            provider: Arc::new(StaticIdentityProvider {
+                local: test_node("nSTUDIO", "studio", "100.64.0.2"),
+                peers: vec![laptop()],
+                down: None,
+            }),
             local_node_id: Some("nSTUDIO".into()),
             token: Arc::new(|| Some(TOKEN.to_string())),
             allow_list: Arc::new(move || {
-                r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(allow())
             }),
             resolve_profile: Arc::new(|_, _| test_resolution(None)),
@@ -1936,20 +1932,53 @@ mod tests {
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
             config_preflight: Arc::new(|| Ok(())),
-        };
+        }
+    }
+
+    /// Submit a job from a loopback peer carrying `headers`; returns the
+    /// status and how many times the allow-list was read.
+    fn submit_from_loopback(headers: &[(&str, &str)]) -> (StatusCode, usize) {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = gate_only_state(reads.clone());
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let resp = rt.block_on(async {
             use tower::ServiceExt;
             let body = serde_json::to_vec(&WorkSubmission::new(job("s", None), true)).unwrap();
-            let mut req = axum::http::Request::post(darkmux_fleet::SUBMISSION_PATH)
-                .header("Authorization", "Bearer wrong")
-                .body(axum::body::Body::from(body))
-                .unwrap();
+            let mut b = axum::http::Request::post(darkmux_fleet::SUBMISSION_PATH);
+            for (k, v) in headers {
+                b = b.header(*k, *v);
+            }
+            let mut req = b.body(axum::body::Body::from(body)).unwrap();
             req.extensions_mut().insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5000))));
             router(state).oneshot(req).await.unwrap()
         });
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0, "the allow-list was read for a caller without the token");
+        (resp.status(), reads.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// A caller without the token is answered before the allow-list is
+    /// read or the provider runs.
+    #[test]
+    fn a_caller_without_the_token_reads_nothing() {
+        let (status, reads) = submit_from_loopback(&[("Authorization", "Bearer wrong")]);
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(reads, 0, "the allow-list was read for a caller without the token");
+    }
+
+    /// (#2988 follow-up) Execution never inherits the read posture: a work
+    /// submission that arrives through a reverse proxy (`tailscale serve`'s
+    /// headers) with no token is refused before anything is read, whatever
+    /// `serve.read_auth` says. The fleet gate reads no read-auth switch.
+    #[test]
+    fn a_proxied_submission_without_the_token_is_refused() {
+        for proxied in [
+            ("X-Forwarded-For", "100.64.0.7"),
+            ("Tailscale-User-Login", "someone@example.com"),
+            ("Forwarded", "for=100.64.0.7"),
+        ] {
+            let (status, reads) = submit_from_loopback(&[proxied]);
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{proxied:?}");
+            assert_eq!(reads, 0, "{proxied:?}");
+        }
     }
 
     /// A request with no peer address is refused (fail closed), even with

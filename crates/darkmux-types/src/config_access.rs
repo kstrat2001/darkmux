@@ -717,7 +717,8 @@ pub fn hooks_jq_max_output_bytes() -> u64 {
 pub const SERVE_PORT_DEFAULT: u16 = 8765;
 
 /// The built-in daemon bind address: loopback only. A non-loopback bind is
-/// separately refused without a resolved serve token (`darkmux-serve`).
+/// separately refused unless `serve.read_auth` is on with a resolved serve
+/// token (`darkmux-serve`).
 pub const SERVE_BIND_DEFAULT: &str = "127.0.0.1";
 
 /// The resolved daemon port — `env(DARKMUX_SERVE_PORT) > config.serve.port >
@@ -1337,14 +1338,42 @@ pub fn daemon_cors_origins() -> Option<String> {
     pick_string("DARKMUX_DAEMON_CORS_ORIGINS", cfg, None)
 }
 /// (#881) Whether the serve daemon may read the `darkmux-serve-token` macOS
-/// Keychain item for bearer auth. Config-only gate (`config.runtime.
-/// daemon_auth_enabled`, default `false`) — the env token path
+/// Keychain item. Config-only gate (`serve.token_keychain`, default
+/// `false`) — the env token path
 /// `DARKMUX_SERVE_TOKEN` needs no gate (its presence is the opt-in). Consumed by
-/// `darkmux_flow::serve_token`'s tier-2; auth being *active* is decided by
-/// whether a token actually resolves (`serve_token_present`), never by this flag
-/// alone (a gate-on-but-no-token state must NOT 401 every request).
-pub fn serve_auth_config_enabled() -> bool {
-    config().runtime.as_ref().and_then(|r| r.daemon_auth_enabled).unwrap_or(false)
+/// `darkmux_flow::serve_token`'s tier-2; a token being *present* is decided by
+/// whether one actually resolves (`serve_token_present`), never by this flag.
+pub fn serve_token_keychain() -> bool {
+    serve_token_keychain_from(config())
+}
+
+fn serve_token_keychain_from(cfg: &crate::config::DarkmuxConfig) -> bool {
+    cfg.serve.as_ref().and_then(|s| s.token_keychain).unwrap_or(false)
+}
+
+/// (#2988) Whether a read that is not from this machine needs the serve
+/// token: `env(DARKMUX_SERVE_READ_AUTH) > serve.read_auth > false`. The
+/// execution surface (fleet work) never reads this; it always needs the token.
+pub fn serve_read_auth() -> bool {
+    serve_read_auth_with_source().0
+}
+
+/// [`serve_read_auth`] plus WHICH tier resolved it, for `darkmux doctor`.
+pub fn serve_read_auth_with_source() -> (bool, Source) {
+    resolve_serve_read_auth(env_str("DARKMUX_SERVE_READ_AUTH"), config().serve.as_ref().and_then(|s| s.read_auth))
+}
+
+/// The precedence of [`serve_read_auth_with_source`], pure. An env value that
+/// is not a boolean word resolves ON: a typo in a security switch fails
+/// toward requiring the token.
+fn resolve_serve_read_auth(env: Option<String>, cfg: Option<bool>) -> (bool, Source) {
+    if let Some(s) = env {
+        return (parse_bool_token(&s).unwrap_or(true), Source::Env);
+    }
+    match cfg {
+        Some(v) => (v, Source::Config),
+        None => (false, Source::BuiltIn),
+    }
 }
 /// (#1011) Fraction (0–1) of the dispatch model's context window budgeted for
 /// the coder brief's injected-context blocks (cautions + lessons + corrections).
@@ -4636,6 +4665,31 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    /// (#2988 follow-up) `serve.read_auth`: env beats config beats the
+    /// built-in `false`. An env value that is not a boolean word turns read
+    /// auth ON: a typo in a security switch fails toward requiring the
+    /// token, never toward open reads.
+    #[test]
+    fn serve_read_auth_env_beats_config_beats_default_and_fails_closed() {
+        assert_eq!(resolve_serve_read_auth(None, None), (false, Source::BuiltIn));
+        assert_eq!(resolve_serve_read_auth(None, Some(true)), (true, Source::Config));
+        assert_eq!(resolve_serve_read_auth(Some("off".into()), Some(true)), (false, Source::Env));
+        assert_eq!(resolve_serve_read_auth(Some("on".into()), Some(false)), (true, Source::Env));
+        assert_eq!(resolve_serve_read_auth(Some("of".into()), None), (true, Source::Env), "a typo fails closed");
+    }
+
+    /// (#2988 follow-up) `serve.token_keychain` is config-only, default
+    /// `false`.
+    #[test]
+    fn serve_token_keychain_reads_the_serve_block() {
+        let on = crate::config::DarkmuxConfig {
+            serve: Some(crate::config::ServeConfig { token_keychain: Some(true), ..Default::default() }),
+            ..Default::default()
+        };
+        assert!(serve_token_keychain_from(&on));
+        assert!(!serve_token_keychain_from(&crate::config::DarkmuxConfig::default()));
     }
 
     /// The CLIENT address is not simply `bind:port`. A wildcard bind is a
