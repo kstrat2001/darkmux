@@ -152,6 +152,24 @@ darkmux release.
 
 ### Changed (breaking, 4.0)
 
+- **Read auth and execution auth are separate switches** (#2988). A serve
+  token used to close the whole read surface to peers, so a hub that took
+  fleet work (which needs the token) could not also serve its viewer over
+  `tailscale serve`. Now fleet work submission always requires the token
+  plus a network-verified sender, unchanged, and READS are governed by the
+  new `serve.read_auth` (`DARKMUX_SERVE_READ_AUTH`), default `false`: the
+  viewer and every JSON route stay tailnet-open, token or no token. With it
+  on, a read not from this machine needs the token, proxied requests
+  included, so a browser viewer over the tailnet gets 401. `darkmux doctor`
+  shows both postures (`serve daemon token`, `serve reads`), and so does the
+  `serve` banner. `runtime.daemon_auth_enabled` is retired (CONFIG 2.0),
+  replaced by `serve.token_keychain`; `init` writes both new keys visibly
+  as `false`. **Migration:** move `runtime.daemon_auth_enabled` to
+  `darkmux config set serve.token_keychain <value>` (a leftover key is
+  refused, naming the replacement). If you relied on a token closing reads,
+  `darkmux config set serve.read_auth true`. A non-loopback `--bind` now
+  also requires `serve.read_auth true`: a token alone no longer licenses
+  it, and `serve` refuses to start with read auth on and no token.
 - **An unknown key in a user file is refused (CONFIG 2.0).** `config.json`,
   `profiles.json`, role, skill and crew manifests, mission configs, rule
   files, workload documents, lab fixture manifests and a crawl's workspace
@@ -508,7 +526,7 @@ darkmux release.
   `published_by_orchestrator` removed. **Migration:** on every machine
   that should take work, store the fleet token if it has none (`security
   add-generic-password -U -a "$USER" -s darkmux-serve-token -w`, same value
-  everywhere, plus `darkmux config set runtime.daemon_auth_enabled true`),
+  everywhere, plus `darkmux config set serve.token_keychain true`),
   trust each sender (`darkmux machine trust <sender> --profiles
   <profile>,... --roles <role>,...`), `darkmux config set fleet.listener.enabled true`, and
   restart `darkmux serve`. On the hub, delete the dead streams: `redis-cli
@@ -780,16 +798,13 @@ darkmux release.
 
 ### Fixed
 
-- **With serve auth on, a request proxied to loopback now needs the token**
+- **A request proxied to loopback no longer counts as this machine**
   (#2988). The daemon exempted any loopback connection from the bearer
   check, and `tailscale serve` (the documented way a hub reaches the
-  tailnet) delivers every tailnet peer on loopback, so remote reads were
-  served without the token. The gate now uses the same test `/health`
-  already did: loopback AND no reverse-proxy header (`X-Forwarded-For`,
-  `Forwarded`, `Tailscale-User-*` and the like). A request made on the hub
-  itself stays open. **Visible consequence:** with a token configured, the
-  viewer opened through `tailscale serve` in a browser now answers 401. With
-  auth off (no token, the default) nothing changes: reads stay tailnet-open.
+  tailnet) delivers every tailnet peer on loopback, so with a token set,
+  remote reads were served without it. With read auth on, the gate now uses
+  the same test `/health` already did: loopback AND no reverse-proxy header
+  (`X-Forwarded-For`, `Forwarded`, `Tailscale-User-*` and the like).
 - **Model output can no longer reach host files through symlinks** (#2869).
   Every host read or copy of a container-writable path (the out-dir,
   `.darkmux-runtime/`, the resume checkpoint, the live trajectory tailer,

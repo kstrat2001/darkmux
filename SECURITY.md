@@ -85,10 +85,14 @@ frame:
   *workspace* isolation — better than a bare directory, but Docker on macOS is
   a VM boundary, not a guarantee against a determined adversary. Run only on a
   machine where that risk is acceptable. (See [DISCLAIMER.md](./DISCLAIMER.md).)
-- **The daemon has no authentication.** Anyone who can reach the bind address
-  can read your flow records and drive the viewer. Keep it on loopback, or put
-  it behind your own authenticated reverse proxy / a private network
-  (Tailscale) — do not expose `darkmux serve` to the public internet.
+- **The daemon's reads are unauthenticated by default.** With `serve.read_auth`
+  off (the default), anyone who can reach the daemon, directly or through
+  `tailscale serve`, can read your flow records and load the viewer, whether or
+  not a fleet token is set. Turning it on requires the serve token for any read
+  not from this machine (a request proxied to loopback included). Fleet work
+  submission always requires the token plus a network-verified sender. Keep the
+  daemon on loopback, or behind a private network (Tailscale); do not expose
+  `darkmux serve` to the public internet.
 - **Flow records are not authenticated.** Any process that can write to the
   flows directory or the Redis stream can author records. The audit sink (below)
   makes *post-hoc tampering detectable*, but nothing makes the live stream
