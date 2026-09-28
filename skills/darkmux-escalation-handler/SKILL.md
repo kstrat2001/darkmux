@@ -97,15 +97,6 @@ Some operator-facing principles:
 - **Verify before declaring done.** Whatever the operator's `verify_criteria` was on the workload, run it (or have the operator run it) before reporting success.
 - **Preserve the escalation trail.** When the work is done, mention in your reply where the run-dir is and how the work post-escalation differed from what local-tier had done — this is the lab signal that future tuning depends on.
 
-## Pause-posture roles (escalation_posture: pause)
-
-A role manifest can declare `escalation_posture: "pause"` (instead of the default `"auto"`). Today the runtime treats both the same — it emits the EscalationTriggered terminal regardless. The host/skill layer is where the distinction kicks in:
-
-- **auto** (default): you should proceed with Step 4-5 above. The operator wanted automatic handoff; that's what they set the role up for.
-- **pause**: you should STOP at Step 4. Don't propose to continue. Just summarize what local tier did + what's left. The operator wants to make the next-step decision themselves. Wait for their signal.
-
-This is operator-sovereignty applied to the escalation hand-off: some work is too judgment-bearing to auto-continue (research roles, financial-decision roles, anything where the operator wants the explicit yes/no before more work happens).
-
 ## When the trail is cold
 
 If the run is hours-old (or days-old) and you have no fresh operator context:

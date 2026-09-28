@@ -150,6 +150,11 @@ darkmux release.
   (CONFIG 2.0, above). **Migration:** delete any of those keys still
   present (`darkmux doctor`'s `user file keys` rows name them).
 
+- **A role's `escalation_posture`.** Nothing read it: the runtime treated
+  `auto` and `pause` the same. A role manifest that still sets it is refused
+  like any retired key. **Migration:** delete `escalation_posture` from your
+  role manifests (`darkmux doctor`'s `user file keys` row names each file).
+
 ### Changed (breaking, 4.0)
 
 - **An unknown key in a user file is refused (CONFIG 2.0).** `config.json`,

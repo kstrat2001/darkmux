@@ -5964,7 +5964,6 @@
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             bail_after_compactions: None,
-            escalation_posture: None,
             role_family: None,
             feedback_templates: None,
         };
@@ -5983,7 +5982,6 @@
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             bail_after_compactions: None,
-            escalation_posture: None,
             role_family: None,
             feedback_templates: None,
         };
@@ -6495,7 +6493,6 @@
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             bail_after_compactions: Some(2), // role pin
-            escalation_posture: None,
             role_family: None,
             feedback_templates: None,
         };
@@ -6525,7 +6522,6 @@
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             bail_after_compactions: None, // role didn't pin
-            escalation_posture: None,
             role_family: None,
             feedback_templates: None,
         };

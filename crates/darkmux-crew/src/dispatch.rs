@@ -761,10 +761,6 @@ impl CompactionDispatchArgs {
     /// any dispatcher that knows which role is about to run; sites
     /// that don't have a role (phase_cli adhoc) can skip the call
     /// and the profile-level fallback applies.
-    ///
-    /// The role's `escalation_posture` field is parsed here too but
-    /// is currently informational only — the host/skill layer in
-    /// chunk 5 will branch on it when frontier handoff lands.
     pub fn apply_role_override(&mut self, role: &crate::types::Role) {
         if let Some(role_bail) = role.bail_after_compactions {
             self.bail_after_compactions = Some(role_bail);

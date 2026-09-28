@@ -389,7 +389,6 @@
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             bail_after_compactions: None,
-            escalation_posture: None,
             role_family: None,
             feedback_templates: None,
         };
@@ -407,7 +406,6 @@
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             bail_after_compactions: None,
-            escalation_posture: None,
             role_family: Some("utility".into()),
             feedback_templates: None,
         };
@@ -431,7 +429,6 @@
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             bail_after_compactions: None,
-            escalation_posture: None,
             role_family: Some("admin".into()),
             feedback_templates: None,
         };
@@ -453,7 +450,6 @@
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             bail_after_compactions: None,
-            escalation_posture: None,
             role_family: Some("specialist".into()),
             feedback_templates: None,
         };
@@ -515,7 +511,6 @@
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             bail_after_compactions: None,
-            escalation_posture: None,
             role_family: Some("admin".into()),
             feedback_templates: None,
         };
@@ -544,7 +539,6 @@
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             bail_after_compactions: None,
-            escalation_posture: None,
             role_family: Some("admin".into()),
             feedback_templates: None,
         };
@@ -567,7 +561,6 @@
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             bail_after_compactions: None,
-            escalation_posture: None,
             role_family: None,
             feedback_templates: None,
         };
@@ -595,7 +588,6 @@
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             bail_after_compactions: None,
-            escalation_posture: None,
             role_family: Some("worker".into()),
             feedback_templates: None,
         };
