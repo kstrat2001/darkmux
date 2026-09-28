@@ -406,12 +406,11 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    in test code, the viewer, docs, skills, templates and fixtures, on any string that looks
    like an action and is not a current one (an old spelling, or a made-up
    `<scope>.<event>`); recorded archives are exempt.
-   Hook rules written in an old exact spelling are read as the current action. The bookends
-   `dispatch.start`/`dispatch.complete` are still emitted at BOTH grains today (the whole
-   run, and an inner role execution); separating the run grain is the migration below. What
-   entry 8 fixes is the WORD used in code, docs and UI, where `dispatch` had come to mean
-   both ends of the ladder at once. Both contracts stand: contract 2 says liveness must be
-   visible, contract 8 says which noun means which grain.
+   Hook rules written in an old exact spelling are read as the current action. What entry 8
+   fixes is the WORD used in code, docs, UI and on the wire, where `dispatch` had come to
+   mean both ends of the ladder at once; the run grain now has its own bookends (below).
+   Both contracts stand: contract 2 says liveness must be visible, contract 8 says which
+   noun means which grain.
 
    Verified by enumerating every completion-endpoint (`chat/completions`) call site — five
    modules. Two host-side entry points bookend per execution and are correct:
@@ -438,29 +437,24 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
      `dispatch.single_shot` kind (`crates/darkmux-crew/src/step_kinds/builtins.rs:794`,
      hosted twin at `:738`) — not review-specific, and not used by `review.json`.
 
-   **Retiring the run-grain use is a CONSUMER MIGRATION, not a free deletion.** An earlier
-   draft of this entry claimed it "costs nothing in liveness" because the scheduler already
-   emits `step.start`/`step.complete`/`step.error` per step (`scheduler.rs`'s
-   `step_lifecycle_record`) under a `mission.start`. That is
-   true and irrelevant: the consumers key specifically on DISPATCH bookends at the session
-   grain, and step bookends do not feed any of them. The run lifecycle — ONE rule with two
-   executors judged by the same corpus (`tests/lifecycle/cases.json`): the viewer's
-   `ui/src/lib/lifecycle.ts` and the daemon's `crates/darkmux-serve/src/run_lifecycle.rs`
-   — opens an attempt on `dispatch.start` and takes its outcome from the dispatch terminal,
-   and every surface (fleet card, timeline, run page, runs board, radio's busy check) is a
-   projection of it. The runs board's representative-session pick prefers the whole-run
-   bookend (losing it already blanked role/model once), and the status line's last-dispatch
-   (`ui/src/lib/metaLine.ts`) reads `dispatch.start`. Delete the emission first and those
-   surfaces go dark.
-
-   Note also that #1899 PRESCRIBED the whole-run pair for every generic launch three days
-   before this entry was written (`src/mission_launch.rs:~684`: "telemetry + the whole-run
-   dispatch bookend are PRESCRIBED here, not opt-in"). This entry supersedes that
-   deliberately, and the supersession is the point: contract 8 wins on the NOUN, #1899 wins
-   on the MECHANISM. The run grain keeps its bookend and gets its own action vocabulary
-   (`run.start`/`run.complete`/`run.error`), so `dispatch.*` can mean one specialist
-   execution. Archives are append-only and are never rewritten, so the run-grain split
-   reaches old records through `darkmux_flow::legacy`, like every other retired spelling.
+   **The run grain has its own bookends (4.0).** A `mission launch` and an ACP panel run
+   open `run.start` on the run's own session and close it with `run.complete` or
+   `run.error` on every exit path (a `BookendGuard`: a panic or an early return still
+   writes `run.error`). The role executions inside it bookend as `dispatch.*`, so
+   `dispatch.*` means one role execution and nothing else. #1899 prescribed the whole-run
+   pair for every generic launch; that mechanism stands, only its noun changed. Which
+   actions are bookends, at which grain and edge, is declared once, on the action's row in
+   `action.rs` (`FlowAction::bookend`; the viewer's `bookendOf` mirrors it). The run
+   lifecycle — ONE rule with two executors judged by the same corpus
+   (`tests/lifecycle/cases.json`): the viewer's `ui/src/lib/lifecycle.ts` and the daemon's
+   `crates/darkmux-serve/src/run_lifecycle.rs` — opens an attempt on a bookend start at
+   either grain and takes its outcome from a bookend terminal. The runs board's
+   representative is the run session its `run.start` opened, the fleet card collapses a
+   mission onto its run-grain group, and the status line's last-dispatch counts role
+   executions only. A pre-4.0 archive's whole-run pair (`dispatch.*` with `source`
+   `mission`, or the retired review launcher's `review`) reads as `run.*` through
+   `darkmux_flow::legacy::run_grain_of`; no file is rewritten and no consumer reads
+   `source` to tell the grains apart.
 
    **"step" is a known-imperfect name, deliberately not being changed (operator, 2026-08-26.)**
    It implies plurality, so it reads badly for a single-step dispatch — but a task genuinely

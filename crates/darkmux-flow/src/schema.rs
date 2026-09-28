@@ -61,6 +61,20 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           of an archive reads an old id through
 //           `SessionId::parse_legacy` only.
 //
+//           Also (4.0, CLAUDE.md contract 8): the run grain has its own
+//           bookends. `run.start` / `run.complete` / `run.error` (category
+//           `work`, stage `dispatch`, on the run's own session
+//           `<run>.run`, `handle` the launched config id) bracket a whole
+//           `mission launch` or ACP panel run, on every exit path; the
+//           role executions inside it bookend as `dispatch.*`, which now
+//           means one role execution and nothing else. The run pair was
+//           written as `dispatch.*` with `source: "mission"` and
+//           `payload.runtime` (`mission` / `ephemeral`) before; neither is
+//           written now. A reader of a pre-4.0 archive reads a
+//           `dispatch.*` bookend whose `source` is `mission`, or `review`
+//           (the retired review launcher's), as `run.*`
+//           (`darkmux_flow::legacy::run_grain_of`); no file is rewritten.
+//
 //           Also removed (4.0, one token truth): `dispatch.complete`'s
 //           `cumulative_prompt_tokens` / `cumulative_completion_tokens`.
 //           Their only source was the runtime's `metrics.json`, which 4.0

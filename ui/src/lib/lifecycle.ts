@@ -17,27 +17,28 @@
  *
  * 1. Attempts. A session's records segment into attempts, every mission's
  *    together in time order (`segmentSession`). An attempt opens on its
- *    first opening record (a `dispatch.start`, a `budget.wait`, a
- *    `mission.start`, a `step.start`, or, when nothing opened yet, any
- *    turn, heartbeat, tool call or rest). A record naming a mission joins
- *    that mission's latest attempt; one naming none joins the latest
- *    attempt still open at its time, or the latest opened when none is. A
- *    `dispatch.start` in an attempt that already has one, or any reopening
- *    record after the attempt closed, starts the next attempt (a relaunch
- *    under the same id). The attempt current as of t is
- *    the latest one opened by t.
- * 2. Close. An attempt closes on its earliest closing record: a dispatch or
- *    step terminal, `session.end`, `budget.stop`, `mission.close` or
- *    `mission.abort`. A closing record timestamped before anything opened
+ *    first opening record (a bookend start, `run.start` or
+ *    `dispatch.start`; a `budget.wait`, a `mission.start`, a `step.start`;
+ *    or, when nothing opened yet, any turn, heartbeat, tool call or rest).
+ *    A record naming a mission joins that mission's latest attempt; one
+ *    naming none joins the latest attempt still open at its time, or the
+ *    latest opened when none is. A bookend start in an attempt that
+ *    already has one, or any reopening record after the attempt closed,
+ *    starts the next attempt (a relaunch under the same id). The attempt
+ *    current as of t is the latest one opened by t.
+ * 2. Close. An attempt closes on its earliest closing record: a bookend
+ *    terminal (a run's or an execution's), a step terminal, `session.end`,
+ *    `budget.stop`, `mission.close` or `mission.abort`. A closing record timestamped before anything opened
  *    (clock skew across machines, #1988) closes the first attempt left with
  *    no close of its own, and is marked `skewed`; with no attempt at all to
  *    close, it is not a run (phase `not_started`), but its session recorded
  *    its end, which the lifecycle carries as `close` and a status reads. A
  *    record with an unparsable `ts` is inside every as-of cut, so an untimed
  *    terminal still closes its run.
- * 3. Outcome. How it ended comes from the attempt's dispatch terminal when
+ * 3. Outcome. How it ended comes from the attempt's bookend terminal when
  *    it has one (a `session.end` that lands first does not erase a clean
- *    `dispatch.complete`), else from the closing record itself.
+ *    `run.complete` or `dispatch.complete`), else from the closing record
+ *    itself.
  * 4. Waiting. A `budget.wait` with no `budget.resume` or closing record
  *    after it holds the run `waiting` until its announced resume time plus
  *    `budgetWaitGraceMs`; past that the staleness clock runs from there.
@@ -46,12 +47,13 @@
  *    one of its mission superseded. Another mission's later attempt on the
  *    same session does not: missions launched from one config share a task
  *    session and run at once (#2125).
- * 6. A mission's whole-run bookend (`runRef.ts`'s `run` grain) never beats
- *    itself; its steps do. Its activity and its waits are its mission's
- *    other runs' too, so it is in flight while any of them is.
+ * 6. A mission's run session (`runRef.ts`'s `run` grain, opened by
+ *    `run.start`) never beats itself; its executions do. Its activity and
+ *    its waits are its mission's other runs' too, so it is in flight while
+ *    any of them is.
  */
 
-import { ACTION, byTime, isAsOf, isAtOrAfter, isDispatchTerminal, latestByTime, recordsAsOf, type NormAction, type NormRecord } from "./ingest";
+import { ACTION, byTime, isAsOf, isAtOrAfter, isBookendStart, isBookendTerminal, latestByTime, recordsAsOf, type NormAction, type NormRecord } from "./ingest";
 import type { RunState } from "./flow";
 import type { RunGroup, RunRecords } from "./runRef";
 import type { RunsPolicy } from "../types/generated/RunsPolicy";
@@ -104,7 +106,7 @@ export interface Close {
 
 export interface Lifecycle {
   readonly phase: LifecyclePhase;
-  /** The attempt's start: its `dispatch.start`'s time, else its opening
+  /** The attempt's start: its bookend start's time, else its opening
    *  record's, else its earliest timed record's. */
   readonly startMs: number | null;
   /** The attempt's latest timed record as of t. */
@@ -138,7 +140,8 @@ export function judgementAt(playhead: number | null, now: number, live: Presence
 export interface Attempt {
   /** The record that opened it. */
   readonly opening: NormRecord;
-  /** Its `dispatch.start`, when it has one (the brief's payload). */
+  /** Its bookend start (`run.start` or `dispatch.start`, the brief's
+   *  payload), when it has one. */
   readonly start: NormRecord | null;
   /** Its records, time order: from its opening (for the first attempt,
    *  from the run's first record) to the next attempt's opening. */
@@ -164,6 +167,7 @@ export interface SessionSegments {
 
 /** The records that open an attempt even after an earlier one closed. */
 const REOPENERS: ReadonlySet<NormAction> = new Set<NormAction>([
+  ACTION.RunStart,
   ACTION.DispatchStart,
   ACTION.BudgetWait,
   ACTION.MissionStart,
@@ -192,10 +196,12 @@ const hasReason = (r: NormRecord): boolean => {
 /** The edge a closing record implies; `null` for any other record. */
 function closeEdgeOf(r: NormRecord): CloseEdge | null {
   switch (r.action) {
+    case ACTION.RunComplete:
     case ACTION.DispatchComplete:
     case ACTION.StepComplete:
     case ACTION.MissionClose:
       return { kind: "complete" };
+    case ACTION.RunError:
     case ACTION.DispatchError:
       return { kind: "error", killed: exitCodeOf(r) === 137, exitCode: exitCodeOf(r) };
     case ACTION.StepError:
@@ -252,13 +258,13 @@ function opensAttempt(mine: Building | null, r: NormRecord): boolean {
   if (mine === null) return reopener || (r.action !== undefined && FIRST_OPENERS.has(r.action));
   if (!reopener) return false;
   if (mine.close !== null) return true;
-  return r.action === ACTION.DispatchStart && mine.start !== null;
+  return isBookendStart(r.action) && mine.start !== null;
 }
 
 function add(cur: Building, r: NormRecord, m: string | null): void {
   cur.records.push(r);
   if (cur.missionId === null && m) cur.missionId = m;
-  if (r.action === ACTION.DispatchStart && cur.start === null) cur.start = r;
+  if (isBookendStart(r.action) && cur.start === null) cur.start = r;
   if (cur.close === null && isClosing(r)) cur.close = r;
 }
 
@@ -316,14 +322,14 @@ export function segmentSession(records: readonly NormRecord[]): SessionSegments 
 function recordedEndAsOf(group: RunGroup, asOf: number): Close | null {
   if (group.attempts.length > 0) return null;
   const closes = group.records.filter((r) => isClosing(r) && isAsOf(r, asOf)).sort(byTime);
-  const record = closes.find((r) => isDispatchTerminal(r.action)) ?? closes[0];
+  const record = closes.find((r) => isBookendTerminal(r.action)) ?? closes[0];
   return record ? { edge: closeEdgeOf(record) ?? { kind: "session_end" }, atMs: record.tMs, skewed: false, record } : null;
 }
 
 /** The attempt's close as of `asOf` (rules 2 and 3), or `null`. */
 function closeAsOf(a: Attempt, asOf: number): Close | null {
   if (!a.close || !isAsOf(a.close, asOf)) return null;
-  const terminal = a.records.find((r) => isDispatchTerminal(r.action) && isAsOf(r, asOf));
+  const terminal = a.records.find((r) => isBookendTerminal(r.action) && isAsOf(r, asOf));
   const record = terminal ?? a.close;
   return { edge: closeEdgeOf(record) ?? { kind: "session_end" }, atMs: a.close.tMs, skewed: a.skewed, record };
 }
@@ -440,12 +446,12 @@ export function toRunState(l: Lifecycle): RunState {
 }
 
 /** (#2011, #2346) The run's own measured duration: the `wall_ms` its
- *  dispatch terminal carries (the runtime's sub-second measure, taken
+ *  bookend terminal carries (the runtime's sub-second measure, taken
  *  between its start and terminal writes), or `null` when it closed any
- *  other way or the record predates the field. The run page's run-time tile
- *  and playback's elapsed readout both read it, so the two agree. */
+ *  other way or the record carries none. The run page's run-time tile and
+ *  playback's elapsed readout both read it, so the two agree. */
 export function recordedWallMs(close: Close | null): number | null {
-  if (!close || !isDispatchTerminal(close.record.action)) return null;
+  if (!close || !isBookendTerminal(close.record.action)) return null;
   const w = (close.record.payload as { wall_ms?: unknown } | undefined)?.wall_ms;
   return typeof w === "number" && Number.isFinite(w) ? w : null;
 }

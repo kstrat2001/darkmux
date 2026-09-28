@@ -1327,6 +1327,180 @@
       "phase": "stale",
       "status": "abandoned",
       "abandoned_reason": "noterminal"
+    },
+    {
+      "name": "a run's own session is open from its run.start",
+      "as_of": "2026-09-27T10:01:00Z",
+      "run": {
+        "session_id": "m-run.run",
+        "mission_id": "m-run"
+      },
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "run.start",
+          "session_id": "m-run.run",
+          "mission_id": "m-run",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "review"
+        }
+      ],
+      "phase": "open",
+      "status": "running"
+    },
+    {
+      "name": "a run.complete closes the run as complete",
+      "as_of": "2026-09-27T10:30:00Z",
+      "run": {
+        "session_id": "m-run.run",
+        "mission_id": "m-run"
+      },
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "run.start",
+          "session_id": "m-run.run",
+          "mission_id": "m-run",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "review"
+        },
+        {
+          "ts": "2026-09-27T10:25:00Z",
+          "action": "run.complete",
+          "session_id": "m-run.run",
+          "mission_id": "m-run",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "review",
+          "payload": {
+            "result_class": "ok"
+          }
+        }
+      ],
+      "phase": "closed",
+      "status": "complete"
+    },
+    {
+      "name": "a run.error closes the run as an error",
+      "as_of": "2026-09-27T10:30:00Z",
+      "run": {
+        "session_id": "m-run.run",
+        "mission_id": "m-run"
+      },
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "run.start",
+          "session_id": "m-run.run",
+          "mission_id": "m-run",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "review"
+        },
+        {
+          "ts": "2026-09-27T10:25:00Z",
+          "action": "run.error",
+          "session_id": "m-run.run",
+          "mission_id": "m-run",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "review",
+          "payload": {
+            "result_class": "error"
+          }
+        }
+      ],
+      "phase": "closed",
+      "status": "error"
+    },
+    {
+      "name": "a run's own session silent past the window has stopped with no ending recorded",
+      "as_of": "2026-09-27T10:20:01Z",
+      "run": {
+        "session_id": "m-run.run",
+        "mission_id": "m-run"
+      },
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "run.start",
+          "session_id": "m-run.run",
+          "mission_id": "m-run",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "review"
+        }
+      ],
+      "phase": "stale",
+      "status": "abandoned",
+      "abandoned_reason": "noterminal"
+    },
+    {
+      "name": "a run terminal is the outcome even when a session.end closed the run first",
+      "as_of": "2026-09-27T10:30:00Z",
+      "run": {
+        "session_id": "m-run.run",
+        "mission_id": "m-run"
+      },
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "run.start",
+          "session_id": "m-run.run",
+          "mission_id": "m-run",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "review"
+        },
+        {
+          "ts": "2026-09-27T10:10:00Z",
+          "action": "session.end",
+          "session_id": "m-run.run",
+          "mission_id": "m-run",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        },
+        {
+          "ts": "2026-09-27T10:11:00Z",
+          "action": "run.complete",
+          "session_id": "m-run.run",
+          "mission_id": "m-run",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "review"
+        }
+      ],
+      "phase": "closed",
+      "status": "complete"
+    },
+    {
+      "name": "a second run.start on a run session after its close opens the next attempt",
+      "as_of": "2026-09-27T11:01:00Z",
+      "run": {
+        "session_id": "m-run.run",
+        "mission_id": "m-run"
+      },
+      "records": [
+        {
+          "ts": "2026-09-27T10:00:00Z",
+          "action": "run.start",
+          "session_id": "m-run.run",
+          "mission_id": "m-run",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "review"
+        },
+        {
+          "ts": "2026-09-27T10:10:00Z",
+          "action": "run.complete",
+          "session_id": "m-run.run",
+          "mission_id": "m-run",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "review"
+        },
+        {
+          "ts": "2026-09-27T11:00:00Z",
+          "action": "run.start",
+          "session_id": "m-run.run",
+          "mission_id": "m-run",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "review"
+        }
+      ],
+      "phase": "open",
+      "status": "running"
     }
   ]
 }

@@ -7,9 +7,11 @@
 //! segment is the variant's [`FlowScope`], declared beside the variant rather
 //! than split out of the string, and the unit tests pin the two together.
 //!
-//! The one list lives in the `flow_actions!` invocation below. A later typed
-//! payload per action attaches there: each row gains its payload type, and the
-//! macro grows one `match` that maps a variant to it.
+//! The one list lives in the `flow_actions!` invocation below. A liveness
+//! bookend declares its [`Grain`] and [`Edge`] on its row, and
+//! [`FlowAction::bookend`] reads them back, so "which actions open and close
+//! a run or an execution" has one answer. A later typed payload per action
+//! attaches there the same way.
 //!
 //! [`FlowAction::Retired`] is an action darkmux once wrote and retired with
 //! no current equivalent (`telemetry.process`, the pre-graph `funnel.*` and
@@ -59,6 +61,7 @@ flow_scopes! {
     Operator => "operator";
     Phase => "phase";
     Radio => "radio";
+    Run => "run";
     Session => "session";
     Step => "step";
     Stream => "stream";
@@ -79,8 +82,72 @@ impl UnknownAction {
     }
 }
 
+/// Which unit a liveness bookend brackets: CLAUDE.md contract 8's grains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Grain {
+    /// A whole run, the umbrella the operator started (`run.*`).
+    Run,
+    /// One role execution inside a run (`dispatch.*`).
+    Execution,
+}
+
+/// Which edge of its unit a bookend is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Edge {
+    Start,
+    Complete,
+    Error,
+}
+
+impl Edge {
+    /// Whether this edge ends its unit.
+    pub fn is_terminal(self) -> bool {
+        match self {
+            Edge::Start => false,
+            Edge::Complete | Edge::Error => true,
+        }
+    }
+}
+
+/// A liveness bookend (contract 2): the grain it brackets and its edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Bookend {
+    pub grain: Grain,
+    pub edge: Edge,
+}
+
+impl Bookend {
+    /// Whether this is a unit's start at `grain`.
+    pub fn starts(self, grain: Grain) -> bool {
+        self.grain == grain && self.edge == Edge::Start
+    }
+
+    /// The action that writes this bookend: the inverse of
+    /// [`FlowAction::bookend`].
+    pub fn action(self) -> FlowAction {
+        match (self.grain, self.edge) {
+            (Grain::Run, Edge::Start) => FlowAction::RunStart,
+            (Grain::Run, Edge::Complete) => FlowAction::RunComplete,
+            (Grain::Run, Edge::Error) => FlowAction::RunError,
+            (Grain::Execution, Edge::Start) => FlowAction::DispatchStart,
+            (Grain::Execution, Edge::Complete) => FlowAction::DispatchComplete,
+            (Grain::Execution, Edge::Error) => FlowAction::DispatchError,
+        }
+    }
+}
+
+/// A row's bookend, when the row declares one.
+macro_rules! flow_bookend {
+    () => {
+        None
+    };
+    ($grain:ident $edge:ident) => {
+        Some(Bookend { grain: Grain::$grain, edge: Edge::$edge })
+    };
+}
+
 macro_rules! flow_actions {
-    ( $( $(#[$meta:meta])* $variant:ident => $scope:ident, $wire:literal; )* ) => {
+    ( $( $(#[$meta:meta])* $variant:ident => $scope:ident, $wire:literal $(, $grain:ident $edge:ident)?; )* ) => {
         /// A flow record's action. See the module doc for the grammar.
         #[derive(Debug, Clone, PartialEq, Eq, Hash)]
         pub enum FlowAction {
@@ -109,6 +176,16 @@ macro_rules! flow_actions {
                     $( FlowAction::$variant => $wire, )*
                     FlowAction::Retired(r) => r.as_str(),
                     FlowAction::Other(u) => u.as_str(),
+                }
+            }
+
+            /// The liveness bookend this action is, when it is one: declared
+            /// on its row below, so which actions open and close a run or an
+            /// execution is said in exactly one place.
+            pub fn bookend(&self) -> Option<Bookend> {
+                match self {
+                    $( FlowAction::$variant => flow_bookend!($($grain $edge)?), )*
+                    FlowAction::Retired(_) | FlowAction::Other(_) => None,
                 }
             }
 
@@ -157,9 +234,9 @@ flow_actions! {
     BudgetResume => Budget, "budget.resume";
     /// A budget wait ended because its run was stopped; nothing was sent.
     BudgetStop => Budget, "budget.stop";
-    DispatchStart => Dispatch, "dispatch.start";
-    DispatchComplete => Dispatch, "dispatch.complete";
-    DispatchError => Dispatch, "dispatch.error";
+    DispatchStart => Dispatch, "dispatch.start", Execution Start;
+    DispatchComplete => Dispatch, "dispatch.complete", Execution Complete;
+    DispatchError => Dispatch, "dispatch.error", Execution Error;
     DispatchTurn => Dispatch, "dispatch.turn";
     DispatchTurnHeartbeat => Dispatch, "dispatch.turn.heartbeat";
     DispatchTool => Dispatch, "dispatch.tool";
@@ -204,6 +281,15 @@ flow_actions! {
     PhaseReviewFailed => Phase, "phase.review.failed";
     PhaseReviewVerdict => Phase, "phase.review.verdict";
     RadioRoute => Radio, "radio.route";
+    /// A run began: the whole-run bookend of a mission launch or an ACP
+    /// panel run, on the run's own session. Contract 8's run grain; the
+    /// executions inside it bookend as `dispatch.*`.
+    RunStart => Run, "run.start", Run Start;
+    /// A run finished and did what it was launched to do.
+    RunComplete => Run, "run.complete", Run Complete;
+    /// A run ended in an error, including an early return or a panic the
+    /// run's RAII guard caught.
+    RunError => Run, "run.error", Run Error;
     SessionEnd => Session, "session.end";
     StepStart => Step, "step.start";
     StepComplete => Step, "step.complete";
@@ -398,6 +484,28 @@ mod tests {
         assert!(serde_json::from_str::<FlowAction>("\"future.thing\"").is_err());
         assert!(serde_json::from_str::<FlowAction>("\"telemetry.process\"").is_err());
         assert_eq!(serde_json::from_str::<FlowAction>("\"dispatch start\"").unwrap(), FlowAction::DispatchStart);
+    }
+
+    /// Every bookend a row declares is the inverse of `Bookend::action`, and
+    /// each grain has exactly one start, complete and error.
+    #[test]
+    fn every_declared_bookend_round_trips_and_each_grain_has_all_three_edges() {
+        let mut seen = HashSet::new();
+        for wire in FlowAction::KNOWN_WIRE {
+            let action = FlowAction::from_wire(wire);
+            if let Some(b) = action.bookend() {
+                assert_eq!(b.action(), action, "{wire}");
+                assert!(seen.insert(b), "{wire}: a second action for {b:?}");
+            }
+        }
+        for grain in [Grain::Run, Grain::Execution] {
+            for edge in [Edge::Start, Edge::Complete, Edge::Error] {
+                assert!(seen.contains(&Bookend { grain, edge }), "{grain:?} {edge:?} has no action");
+            }
+        }
+        assert_eq!(FlowAction::RunStart.bookend(), Some(Bookend { grain: Grain::Run, edge: Edge::Start }));
+        assert_eq!(FlowAction::DispatchError.bookend(), Some(Bookend { grain: Grain::Execution, edge: Edge::Error }));
+        assert_eq!(FlowAction::StepStart.bookend(), None, "a step is covered by its scheduler records, not a bookend");
     }
 
     #[test]

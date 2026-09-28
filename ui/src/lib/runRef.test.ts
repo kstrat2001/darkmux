@@ -120,8 +120,9 @@ describe("attempts", () => {
 });
 
 describe("grainOf", () => {
-  it("a mission's whole-run bookend is run grain", () => {
-    expect(grainOf(normAll([rec(0, "dispatch.start", { source: "mission" })]))).toBe("run");
+  it("a run's own session (its run.start) is run grain", () => {
+    expect(grainOf(normAll([rec(0, "run.start")]))).toBe("run");
+    expect(grainOf(normAll([rec(0, "mission.start"), rec(1, "run.start")]))).toBe("run");
   });
   it("a dispatch, a budget wait or a heartbeat is execution grain", () => {
     expect(grainOf(normAll([rec(0, "dispatch.start", { source: "crew_dispatch" })]))).toBe("execution");
@@ -133,11 +134,11 @@ describe("grainOf", () => {
   });
 });
 
-describe("a mission's whole-run bookend (lifecycle rule 6)", () => {
-  // The bookend never beats; its step does, on its own session. The run is
-  // in flight while its step is, and waits while its step waits.
+describe("a mission's run session (lifecycle rule 6)", () => {
+  // The run session never beats; its step does, on its own session. The run
+  // is in flight while its step is, and waits while its step waits.
   const data = normAll([
-    rec(0, "dispatch.start", { session_id: "m1", mission_id: "m1", source: "mission" }),
+    rec(0, "run.start", { session_id: "m1", mission_id: "m1" }),
     rec(5, "step.start", { session_id: "task-probe-m1", mission_id: "m1" }),
     rec(10, "budget.wait", { session_id: "task-probe-m1", mission_id: "m1", payload: { wait_seconds: 86_000 } }),
   ]);

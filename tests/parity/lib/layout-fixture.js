@@ -243,7 +243,7 @@ const STATES = [
         const m = { mission_id: mid };
         return [
           { ts: at(d, "11:59:59"), action: "mission.start", session_id: `layout-run-${id}`, ...m, ...MACHINE, payload: {} },
-          { ts: at(d, "11:59:59"), action: "dispatch.start", source: "mission", session_id: `layout-run-${id}`, handle: "coder", ...m, ...MACHINE, payload: {} },
+          { ts: at(d, "11:59:59"), action: "run.start", session_id: `layout-run-${id}`, handle: "coder", ...m, ...MACHINE, payload: {} },
           { ts: at(d, "12:00:01"), action: "step.start", session_id: task, handle: "probe", ...m, ...MACHINE, payload: {} },
           { ...budgetWait(b, d, "azure", 20), session_id: task, handle: "probe", ...m },
           tick(d, "12:00:12"),
@@ -276,7 +276,7 @@ const STATES = [
       const m = { mission_id: MID };
       return [
         { ts: at(d, "11:59:59"), action: "mission.start", session_id: "layout-run", ...m, ...MACHINE, payload: {} },
-        { ts: at(d, "11:59:59"), action: "dispatch.start", source: "mission", session_id: "layout-run", handle: "coder", ...m, ...MACHINE, payload: {} },
+        { ts: at(d, "11:59:59"), action: "run.start", session_id: "layout-run", handle: "coder", ...m, ...MACHINE, payload: {} },
         ...b.prefix(d, m),
         { ...b.complete(d), ...m },
         { ts: at(d, "12:00:10"), action: "step.complete", session_id: "layout-task", ...m, ...MACHINE, payload: {} },

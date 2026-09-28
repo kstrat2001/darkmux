@@ -156,6 +156,9 @@ const ACTION_WIRE = {
   PhaseReviewFailed: "phase.review.failed",
   PhaseReviewVerdict: "phase.review.verdict",
   RadioRoute: "radio.route",
+  RunStart: "run.start",
+  RunComplete: "run.complete",
+  RunError: "run.error",
   SessionEnd: "session.end",
   StepStart: "step.start",
   StepComplete: "step.complete",
@@ -378,9 +381,38 @@ export function ingestJsonl(text: string): NormRecord[] {
 
 // ─── action predicates that need the text itself ──────────────────────────
 
-/** Either dispatch terminal: the "did this dispatch stop" question. */
-export const isDispatchTerminal = (a: NormAction | undefined): boolean =>
-  a === ACTION.DispatchComplete || a === ACTION.DispatchError;
+/** A liveness bookend: the unit it brackets (contract 8's grains: a whole
+ *  `run`, or one role `execution`) and its edge. The viewer's copy of
+ *  `darkmux_flow::FlowAction::bookend`, keyed by the actions it names. */
+export interface Bookend {
+  readonly grain: "run" | "execution";
+  readonly edge: "start" | "complete" | "error";
+}
+
+const BOOKENDS: ReadonlyMap<NormAction, Bookend> = new Map<NormAction, Bookend>([
+  [ACTION.RunStart, { grain: "run", edge: "start" }],
+  [ACTION.RunComplete, { grain: "run", edge: "complete" }],
+  [ACTION.RunError, { grain: "run", edge: "error" }],
+  [ACTION.DispatchStart, { grain: "execution", edge: "start" }],
+  [ACTION.DispatchComplete, { grain: "execution", edge: "complete" }],
+  [ACTION.DispatchError, { grain: "execution", edge: "error" }],
+]);
+
+/** The bookend an action is, or `null` when it is none. */
+export const bookendOf = (a: NormAction | undefined): Bookend | null => (a === undefined ? null : (BOOKENDS.get(a) ?? null));
+
+/** A bookend start, at either grain. */
+export const isBookendStart = (a: NormAction | undefined): boolean => bookendOf(a)?.edge === "start";
+
+/** A bookend terminal, at either grain: the "did this run or execution
+ *  stop" question. */
+export const isBookendTerminal = (a: NormAction | undefined): boolean => {
+  const edge = bookendOf(a)?.edge;
+  return edge === "complete" || edge === "error";
+};
+
+/** An execution's terminal: the "did this dispatch stop" question. */
+export const isDispatchTerminal = (a: NormAction | undefined): boolean => bookendOf(a)?.grain === "execution" && isBookendTerminal(a);
 
 /** Any `dispatch.*` action, known or not: evidence that model-dispatch work
  *  ran under a record's session. The one family test that must see an

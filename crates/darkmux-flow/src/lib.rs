@@ -23,7 +23,7 @@ mod integrity;
 mod schema;
 mod status;
 
-pub use action::{FlowAction, FlowScope, UnknownAction};
+pub use action::{Bookend, Edge, FlowAction, FlowScope, Grain, UnknownAction};
 pub use bookend::*;
 pub use integrity::*;
 pub use schema::*;

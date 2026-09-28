@@ -347,6 +347,21 @@ darkmux release.
   as `step.*`); one that would match more (`dispatch *`, `mission *`,
   `phase *`) matches nothing, and both `darkmux doctor` (`CANNOT MATCH`) and
   the hook sink at startup say so.
+- **A whole run has its own bookends: `run.start` / `run.complete` /
+  `run.error`** (FLOW 2.0.0, CLAUDE.md contract 8). `mission launch` and an
+  ACP panel run used to bracket the whole run in `dispatch.start` /
+  `complete` / `error` with `source: "mission"` and `payload.runtime`
+  (`mission` / `ephemeral`); they now write `run.*` on the run's own session
+  and neither field. `dispatch.*` means one role execution only. On the
+  viewer, the fleet card's DISPATCHES chip and the status line's "last
+  dispatch" no longer count a run as a dispatch, and the event log files the
+  run records as `run.start` / `run.complete` / `run.error` under MISSION.
+  darkmux's own readers read a pre-4.0 archive's whole-run pair (`source`
+  `mission`, or the retired review launcher's `review`) as `run.*`, and never
+  rewrite it. **Migration:** a hook rule or external reader that watched
+  `dispatch.complete` with `source: "mission"` to learn that a run ended
+  must match `run.complete` / `run.error` instead; one that counted
+  `dispatch.start` records as runs now counts role executions.
 - **Every machine in a fleet upgrades together** (FLOW 2.0.0). A 4.0 reader
   upgrades a 3.x peer's records, but a 3.x reader does not know the dotted
   spellings: a 3.x hub misreads a 4.0 peer's records (its missions never

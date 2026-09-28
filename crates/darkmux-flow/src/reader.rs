@@ -43,15 +43,15 @@ pub enum ActionRead {
 
 /// Rewrite a record's retired action spelling to its current one, in place.
 pub fn upgrade(record: &mut Value) -> ActionRead {
-    let Some(wire) = record.get("action").and_then(Value::as_str) else {
+    let Some(read) = action_of(record) else {
         return ActionRead::Absent;
     };
-    let read = crate::legacy::read_action(wire);
     match read {
         FlowAction::Other(_) => return ActionRead::Unknown,
         FlowAction::Retired(_) => return ActionRead::Retired,
         _ => {}
     }
+    let wire = record["action"].as_str().unwrap_or_default();
     if read.as_str() == wire {
         return ActionRead::Current;
     }
@@ -124,10 +124,12 @@ pub fn parse_record(line: &str) -> Option<FlowRecord> {
     Some(record)
 }
 
-/// The typed action of a JSON record, upgraded; `None` when the record has
-/// no string `action`.
+/// The typed action of a JSON record, upgraded (a pre-4.0 whole-run bookend
+/// reads as `run.*`, [`crate::legacy`]); `None` when the record has no
+/// string `action`.
 pub fn action_of(record: &Value) -> Option<FlowAction> {
-    record.get("action")?.as_str().map(crate::legacy::read_action)
+    let read = crate::legacy::read_action(record.get("action")?.as_str()?);
+    Some(crate::legacy::run_grain_of(&read, record).unwrap_or(read))
 }
 
 /// A tally of the unknown actions a read met, by name. Filled by
@@ -242,6 +244,53 @@ mod tests {
         assert_eq!(upgrade(&mut v), ActionRead::Upgraded);
         assert_eq!(v["action"], "dispatch.start");
         assert_eq!(v["handle"], "coder", "no other field is touched");
+    }
+
+    /// A pre-4.0 whole-run bookend reads as the run grain: each edge, from
+    /// each source that wrote one, spaced or dotted, typed or JSON.
+    #[test]
+    fn a_pre_4_0_whole_run_bookend_reads_as_the_run_grain() {
+        let edges = [
+            ("dispatch.start", "run.start"),
+            ("dispatch.complete", "run.complete"),
+            ("dispatch.error", "run.error"),
+            // flow-action-guard:allow — an old spelling is this test's input
+            ("dispatch start", "run.start"),
+            // flow-action-guard:allow — an old spelling is this test's input
+            ("dispatch complete", "run.complete"),
+            // flow-action-guard:allow — an old spelling is this test's input
+            ("dispatch error", "run.error"),
+        ];
+        for source in ["mission", "review"] {
+            for (old, new) in edges {
+                let mut v = json!({"action": old, "source": source, "handle": "review", "payload": {"runtime": source}});
+                assert_eq!(upgrade(&mut v), ActionRead::Upgraded, "{source} {old}");
+                assert_eq!(v["action"], new, "{source} {old}");
+                assert_eq!(v["source"], source, "no other field is touched");
+                let line = format!(r#"{{"ts":"t","level":"info","category":"work","tier":"local","stage":"dispatch","action":"{old}","handle":"h","source":"{source}"}}"#);
+                assert_eq!(parse_record(&line).unwrap().action.as_str(), new, "{source} {old}: typed read");
+            }
+        }
+    }
+
+    /// Only a bookend from a whole-run source is the run grain: an
+    /// execution's bookend, and a whole-run source's other records, keep
+    /// their action.
+    #[test]
+    fn an_execution_bookend_and_a_whole_run_sources_other_records_keep_their_action() {
+        for (action, source) in [
+            ("dispatch.start", "crew_dispatch"),
+            ("dispatch.complete", "scheduler"),
+            ("dispatch.error", "tokens"),
+            ("dispatch.turn", "mission"),
+            ("step.result", "review"),
+        ] {
+            let mut v = json!({"action": action, "source": source});
+            assert_eq!(upgrade(&mut v), ActionRead::Current, "{action} from {source}");
+            assert_eq!(v["action"], action);
+        }
+        let mut sourceless = json!({"action": "dispatch.start"});
+        assert_eq!(upgrade(&mut sourceless), ActionRead::Current);
     }
 
     #[test]

@@ -114,18 +114,16 @@ export function specOf(
 }
 
 /** (#2060) Collapse a machine's running runs down to TOP-LEVEL runs: a
- * mission's own whole-run session and its seat/step dispatches are one
- * mission, not one-run-per-seat.
+ * mission's own run session and its seat/step executions are one mission,
+ * not one-run-per-seat.
  *
- * The distinguishing shape (`src/mission_launch.rs::mission_bookend_record`):
- * a mission's OWN bookend stamps `session_id === mission_id` (the mission id
- * doubles as its own top-level session). A seat/step dispatch the mission
- * launches carries the SAME `mission_id` but its OWN, different
- * `session_id`. So: one run per mission, preferring the mission's own
- * top-level session as its representative (so a single-running-item
- * drill-in lands on the mission, not on whichever seat happened to be seen
- * first). A run with no mission (a standalone dispatch, a lab run) always
- * counts on its own. */
+ * A mission's own session is its `run` grain group (opened by `run.start`,
+ * `src/mission_launch.rs::run_bookend_record`); a seat/step execution the
+ * mission launches carries the SAME `mission_id` on its own session. So:
+ * one run per mission, preferring the run session as its representative (so
+ * a single-running-item drill-in lands on the mission, not on whichever seat
+ * happened to be seen first). A run with no mission (a standalone dispatch,
+ * a lab run) always counts on its own. */
 function topLevelRuns(runs: readonly RunGroup[]): RunGroup[] {
   const standalone: RunGroup[] = [];
   const repForMission = new Map<string, RunGroup>();
@@ -134,7 +132,7 @@ function topLevelRuns(runs: readonly RunGroup[]): RunGroup[] {
       standalone.push(g);
       continue;
     }
-    if (!repForMission.has(g.missionId) || g.sessionId === g.missionId) repForMission.set(g.missionId, g);
+    if (!repForMission.has(g.missionId) || g.grain === "run") repForMission.set(g.missionId, g);
   }
   return [...standalone, ...repForMission.values()];
 }

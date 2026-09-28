@@ -862,8 +862,8 @@ describe("lastHeartbeatMs", () => {
 // (pre-PR review, 2026-09-24) The findings below were each PROVEN on real
 // runs before these tests existed.
 describe("which executions count: live ones only", () => {
-  const rec = (sid: string, atMs: number, action: string, payload: Record<string, unknown> = {}, source?: string): NormRecord =>
-    norm({ ts: new Date(atMs).toISOString(), action, session_id: sid, ...(source ? { source } : {}), payload });
+  const rec = (sid: string, atMs: number, action: string, payload: Record<string, unknown> = {}): NormRecord =>
+    norm({ ts: new Date(atMs).toISOString(), action, session_id: sid, payload });
   const hb = (sid: string, atMs: number, chars: number, turn = 1) =>
     rec(sid, atMs, "dispatch.turn.heartbeat", { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turn });
 
@@ -880,8 +880,8 @@ describe("which executions count: live ones only", () => {
     expect(aggregateTokenRate([resting, live], 5_500)?.tokensPerSec).toBeCloseTo(100, 5);
   });
 
-  it("the mission's own run-grain session (a mission-sourced start) never reads as PROMPT over a stalled execution", () => {
-    const runGrain = [rec("m", 0, "dispatch.start", {}, "mission")];
+  it("the mission's own run-grain session (its run.start) never reads as PROMPT over a stalled execution", () => {
+    const runGrain = [rec("m", 0, "run.start")];
     const stalled = [rec("b", 0, "dispatch.start"), hb("b", 1_000, 0), hb("b", 3_000, 800)];
     expect(aggregateLiveState([runGrain, stalled], 3_000 + 60_000)?.state).toBe("stalled");
   });
@@ -898,7 +898,7 @@ describe("which executions count: live ones only", () => {
   });
 
   it("is null, not PROMPT, when no live execution exists (a mission between model steps)", () => {
-    const runGrain = [rec("m", 0, "dispatch.start", {}, "mission")];
+    const runGrain = [rec("m", 0, "run.start")];
     const finished = [rec("a", 0, "dispatch.start"), hb("a", 1_000, 0), rec("a", 2_000, "dispatch.complete")];
     const lifecycle = [rec("mission-m", 0, "mission.start")];
     expect(aggregateLiveState([runGrain, finished, lifecycle], 10_000)).toBeNull();

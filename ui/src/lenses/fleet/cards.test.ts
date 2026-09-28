@@ -318,22 +318,22 @@ describe("buildFleetCard", () => {
     expect(buildFleetCard(data, new Map(), null, new Set(), false, "u1", false, T_MAX).runsCount).toBe(0);
   });
 
-  // (#2060) A mission's own top-level session (`session_id === mission_id`,
-  // see `mission_bookend_record`) and a seat step's session it launched
+  // (#2060) A mission's own run session (opened by `run.start`, see
+  // `run_bookend_record`) and a seat step's session it launched
   // (`mission_id` set, `session_id` its own) are the SAME run at the fleet
   // card's grain — one mission dispatching one seat must read "1 running",
   // not "2 running".
   it("(#2060) a mission's own session collapses with its seat/step session into ONE running run", () => {
     const data: NormRecord[] = [
-      rec({ machine_uid: "u1", session_id: "mission-1", mission_id: "mission-1", action: "dispatch.start" }),
+      rec({ machine_uid: "u1", session_id: "mission-1.run", mission_id: "mission-1", action: "run.start" }),
       rec({ machine_uid: "u1", session_id: "seat-1", mission_id: "mission-1", action: "dispatch.start" }),
     ];
-    const card = buildFleetCard(data, new Map(), null, new Set(["mission-1", "seat-1"]), false, "u1", true, T_MAX);
+    const card = buildFleetCard(data, new Map(), null, new Set(["mission-1.run", "seat-1"]), false, "u1", true, T_MAX);
     expect(card.runsCount).toBe(1);
     expect(card.runsLabel).toBe("running");
     // The single "in flight" tap target must land on the MISSION's own
     // session, not whichever seat happened to be encountered first.
-    expect(card.runningSessionIds).toEqual(["mission-1"]);
+    expect(card.runningSessionIds).toEqual(["mission-1.run"]);
   });
 
   // (#2060 review) The INVERTED order, and the only case that actually pins
@@ -346,22 +346,22 @@ describe("buildFleetCard", () => {
   it("(#2060) the mission's own session wins the drill-in even when a seat's record comes FIRST", () => {
     const data: NormRecord[] = [
       rec({ machine_uid: "u1", session_id: "seat-1", mission_id: "mission-1", action: "dispatch.start" }),
-      rec({ machine_uid: "u1", session_id: "mission-1", mission_id: "mission-1", action: "dispatch.start" }),
+      rec({ machine_uid: "u1", session_id: "mission-1.run", mission_id: "mission-1", action: "run.start" }),
     ];
-    const card = buildFleetCard(data, new Map(), null, new Set(["mission-1", "seat-1"]), false, "u1", true, T_MAX);
+    const card = buildFleetCard(data, new Map(), null, new Set(["mission-1.run", "seat-1"]), false, "u1", true, T_MAX);
     expect(card.runsCount).toBe(1);
-    expect(card.runningSessionIds).toEqual(["mission-1"]);
+    expect(card.runningSessionIds).toEqual(["mission-1.run"]);
   });
 
   // (#2060) A concurrent STANDALONE dispatch (no `mission_id`) is genuinely
   // separate activity and must still count on its own alongside the mission.
   it("(#2060) a standalone dispatch beside a running mission still counts as a second run", () => {
     const data: NormRecord[] = [
-      rec({ machine_uid: "u1", session_id: "mission-1", mission_id: "mission-1", action: "dispatch.start" }),
+      rec({ machine_uid: "u1", session_id: "mission-1.run", mission_id: "mission-1", action: "run.start" }),
       rec({ machine_uid: "u1", session_id: "seat-1", mission_id: "mission-1", action: "dispatch.start" }),
       rec({ machine_uid: "u1", session_id: "solo-1", action: "dispatch.start" }),
     ];
-    const card = buildFleetCard(data, new Map(), null, new Set(["mission-1", "seat-1", "solo-1"]), false, "u1", true, T_MAX);
+    const card = buildFleetCard(data, new Map(), null, new Set(["mission-1.run", "seat-1", "solo-1"]), false, "u1", true, T_MAX);
     expect(card.runsCount).toBe(2);
   });
 
@@ -619,7 +619,7 @@ describe("buildFleetCard", () => {
       // mod wait, a test gate, delivery: no model is involved, so the card
       // must not say "processing prompt" or run a scope at 0.
       const data: NormRecord[] = [
-        rec({ machine_uid: "u1", session_id: "m1", action: "dispatch.start", source: "mission", mission_id: "m1" }),
+        rec({ machine_uid: "u1", session_id: "m1", action: "run.start", mission_id: "m1" }),
         rec({ machine_uid: "u1", session_id: "e1", action: "dispatch.start", mission_id: "m1" }),
         rec({ machine_uid: "u1", session_id: "e1", action: "dispatch.complete", mission_id: "m1" }),
       ];
@@ -628,14 +628,13 @@ describe("buildFleetCard", () => {
       expect(card.liveTokState ?? null).toBeNull();
     });
 
-    it("(#2881) a pre-#2310 review run's bookend (source \"review\") is a run, not a pager execution", () => {
+    it("(#2881) a pre-#2310 review run's bookend is a run, not a pager execution", () => {
       // Archives are append-only (contract 8): the retired review launcher
-      // bookended the WHOLE run with `source: "review"` and a crew-summary
-      // handle, and it never bookended a seat, so that record is run-grain
-      // exactly like today's `source: "mission"`. Paging it read as a second
+      // bookended the WHOLE run with a crew-summary handle, and the daemon
+      // serves that record as `run.start`. Paging it read as a second
       // execution labeled `deep+diff-review+probe-4b+probe-qwen38`.
       const data: NormRecord[] = [
-        rec({ ts: "2026-08-08T23:59:50.000Z", machine_uid: "u1", session_id: "m1", action: "dispatch.start", source: "review", handle: "deep+diff-review+probe-4b", mission_id: "m1" }),
+        rec({ ts: "2026-08-08T23:59:50.000Z", machine_uid: "u1", session_id: "m1", action: "run.start", handle: "deep+diff-review+probe-4b", mission_id: "m1" }),
         rec({ ts: "2026-08-08T23:59:58.000Z", machine_uid: "u1", session_id: "e1", action: "dispatch.start", handle: "reviewer", mission_id: "m1" }),
         rec({ ts: "2026-08-08T23:59:58.000Z", machine_uid: "u1", session_id: "e1", action: "dispatch.turn.heartbeat", payload: { cumulative_chars: 10 } }),
         rec({ ts: "2026-08-09T00:00:00.000Z", machine_uid: "u1", session_id: "e1", action: "dispatch.turn.heartbeat", payload: { cumulative_chars: 30 } }),

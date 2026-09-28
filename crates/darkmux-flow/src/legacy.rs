@@ -8,9 +8,12 @@
 //! ([`RetiredAction`]). [`upgrade_action`] maps one to its [`FlowAction`];
 //! [`FlowAction`]'s own deserializer and [`crate::reader`] both go through
 //! it (through [`read_action`]), so a record reads with one spelling per
-//! event whichever path read it.
+//! event whichever path read it. One upgrade needs the whole record, not
+//! just its action: a pre-4.0 whole-run bookend, spelled as an execution's
+//! and told apart by its `source`, reads as `run.*` ([`run_grain_of`],
+//! applied by [`crate::reader`]).
 
-use crate::FlowAction;
+use crate::{Bookend, FlowAction, Grain};
 
 /// Read one wire string as it appears in a record of ANY age: a current
 /// spelling, an old spelling of a current action (upgraded), a retired
@@ -144,6 +147,35 @@ pub fn upgrade_action(old: &str) -> Option<FlowAction> {
     }
     OLD_SPELLINGS.iter().find(|(spelling, _)| *spelling == old).map(|(_, action)| action.clone())
 }
+
+/// The run-grain action a pre-4.0 whole-run bookend now is; `None` for any
+/// other record.
+///
+/// Before the run grain had its own vocabulary (CLAUDE.md contract 8), a
+/// mission launch and an ACP panel run (`source: "mission"`, since #1877)
+/// and the retired review launcher (`source: "review"`) bracketed a whole
+/// run in the execution bookends, `dispatch.start` / `complete` / `error`,
+/// told apart from an execution only by `source`. Such a record reads as
+/// `run.*`; `action` is the record's action as [`read_action`] read it.
+pub(crate) fn run_grain_of(action: &FlowAction, record: &serde_json::Value) -> Option<FlowAction> {
+    let whole_run = matches!(
+        record.get("source").and_then(serde_json::Value::as_str),
+        Some(WHOLE_RUN_SOURCE_MISSION | WHOLE_RUN_SOURCE_REVIEW)
+    );
+    if !whole_run {
+        return None;
+    }
+    let Bookend { grain: Grain::Execution, edge } = action.bookend()? else {
+        return None;
+    };
+    Some(Bookend { grain: Grain::Run, edge }.action())
+}
+
+/// The `source` a pre-4.0 mission launch or ACP panel run stamped on its
+/// whole-run bookend.
+const WHOLE_RUN_SOURCE_MISSION: &str = "mission";
+/// The `source` the retired review launcher stamped on its whole-run bookend.
+const WHOLE_RUN_SOURCE_REVIEW: &str = "review";
 
 /// A retired spelling that carried a value INSIDE the action string
 /// (`verdict: clean`), and the payload key that value belongs under now.
