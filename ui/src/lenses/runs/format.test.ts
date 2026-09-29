@@ -76,6 +76,28 @@ describe("runSubtitle", () => {
   it("is empty when nothing applies", () => {
     expect(runSubtitle(run({ id: "a", kind: "mission", status: "complete", tracked: true }), false)).toBe("");
   });
+
+  // (#2494) A lab run that dispatched fine and failed its tests says so on its
+  // row, in three states; status stays the dispatch result.
+  describe("lab verify outcome", () => {
+    const lab = (extra: Partial<Run>) =>
+      run({ id: "l", kind: "lab", status: "complete", tracked: true, model: "darkmux:qwen3.6-35b-a3b", ...extra });
+    it("shows workload then verify FAIL / pass / — before the model", () => {
+      expect(runSubtitle(lab({ workload: "quick-coding", verify_passed: false }), false)).toBe(
+        "quick-coding · verify FAIL · qwen3.6-35b-a3b",
+      );
+      expect(runSubtitle(lab({ workload: "quick-coding", verify_passed: true }), false)).toBe(
+        "quick-coding · verify pass · qwen3.6-35b-a3b",
+      );
+      expect(runSubtitle(lab({ workload: "quick-coding" }), false)).toBe("quick-coding · verify — · qwen3.6-35b-a3b");
+    });
+    it("says nothing about verify for a run with no manifest yet, or for a non-lab row", () => {
+      expect(runSubtitle(lab({}), false)).toBe("qwen3.6-35b-a3b");
+      expect(
+        runSubtitle(run({ id: "m", kind: "mission", status: "complete", tracked: true, verify_passed: false }), false),
+      ).toBe("");
+    });
+  });
 });
 
 // (#1907) "abandoned" alone covers two different situations — a deliberate

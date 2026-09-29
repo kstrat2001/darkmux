@@ -15,6 +15,7 @@ import { MACHINE_NOT_FOUND_LABEL, machineLabel } from "../../lib/machineKey";
 import { machineNames } from "../../lib/flow";
 import { LabRunDetail } from "./LabRunDetail";
 import type { RunsResponse, LabRunsResponse } from "../../types/handwritten";
+import type { PendingMove } from "../../types/generated/PendingMove";
 import type { Run } from "../../types/generated/Run";
 import {
   RUNS_CAP,
@@ -46,7 +47,7 @@ import {
  * #2861 fixed the flat LIST's status by reading the shared run-status
  * derivation; the series view never got that fix and had no path to one
  * that wasn't itself a from-scratch stats view. Removed rather than
- * patched: `darkmux lab run stats --baseline` already covers run-over-run
+ * patched: `darkmux run stats --baseline` already covers run-over-run
  * comparison from real counters, and the flat list (with #2861's honest
  * status) covers browsing. See `format.ts`'s own former `labSeries`
  * re-exports for what else this removal touched.
@@ -556,6 +557,7 @@ export function RunsBoard({
   const labConfigured = labRunsQuery.data.ok ? labRunsQuery.data.data.configured !== false : false;
   const labDir = labRunsQuery.data.ok ? labRunsQuery.data.data.dir : null;
   const labDirExists = labRunsQuery.data.ok ? labRunsQuery.data.data.exists : null;
+  const labPendingMove = labRunsQuery.data.ok ? labRunsQuery.data.data.pending_move : undefined;
 
   // (#1809) The machine pin, applied ONCE here so every derivation below
   // (kind counts, the lab-source notice, `showMachine`, the flat row list)
@@ -578,16 +580,16 @@ export function RunsBoard({
   }
 
   // viewer.html: `labSourceNotice()`.
-  let notice: string | null = null;
-  if (kind === "lab" && !scopedRuns.some((r) => r.kind === "lab")) {
-    if (!labConfigured) {
-      notice = "this daemon has no lab-run source wired — darkmux doctor shows the resolved dirs.lab and where it came from.";
-    } else if (labDirExists === false) {
-      notice = `the configured lab dir does not exist yet${labDir ? ` (${labDir})` : ""} — it appears with the first run.`;
-    } else {
-      notice = `no lab runs found under the configured lab dir${labDir ? ` (${labDir})` : ""}.`;
-    }
-  }
+  const notice =
+    kind === "lab"
+      ? labSourceNotice({
+          hasLabRuns: scopedRuns.some((r) => r.kind === "lab"),
+          configured: labConfigured,
+          dir: labDir,
+          dirExists: labDirExists,
+          pendingMove: labPendingMove,
+        })
+      : null;
 
   const showMachine = runsMultiMachine(scopedRuns);
   const bar = (
@@ -643,6 +645,30 @@ export function RunsBoard({
       </div>
     </div>
   );
+}
+
+/** viewer.html: `labSourceNotice()`. The reasons the lab tab can be empty,
+ * each with a different remedy: runs left in the pre-4.0 dir (move them),
+ * no source wired, a dir not created yet, or a genuinely empty lab. A pending
+ * move is named even when other runs are listed, since the old ones are not
+ * being read. */
+function labSourceNotice(s: {
+  hasLabRuns: boolean;
+  configured: boolean;
+  dir: string | null;
+  dirExists: boolean | null;
+  pendingMove: PendingMove | undefined;
+}): string | null {
+  if (s.pendingMove) {
+    return `lab runs are still in ${s.pendingMove.from} (the pre-4.0 location), and 4.0 reads ${s.pendingMove.to}. darkmux does not move them itself; run: ${s.pendingMove.command}`;
+  }
+  if (s.hasLabRuns) return null;
+  const at = s.dir ? ` (${s.dir})` : "";
+  if (!s.configured) {
+    return "this daemon has no lab-run source wired — darkmux doctor shows the resolved dirs.lab and where it came from.";
+  }
+  if (s.dirExists === false) return `the configured lab dir does not exist yet${at} — it appears with the first run.`;
+  return `no lab runs found under the configured lab dir${at}.`;
 }
 
 function countsByKind(runs: Run[]): Record<string, number> {

@@ -325,6 +325,20 @@ pub struct Run {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional, type = "number"))]
     pub tokens: Option<u64>,
+    /// The workload a lab run dispatched (`manifest.json`'s `workload`).
+    /// Lab rows only; absent for a run with no manifest yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub workload: Option<String>,
+    /// Whether a lab run's workload verify passed (`manifest.json`'s
+    /// `verify.passed`). Deliberately NOT folded into `status`: `status` is
+    /// how the dispatch ended and this is what its tests said, and a run
+    /// that dispatched fine but failed its tests is exactly the case the two
+    /// must stay separable for (#2494). `None` is "not checked": the
+    /// workload declares no verify, or the run has no manifest yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub verify_passed: Option<bool>,
 }
 
 /// Build the full run union — the SAME `Vec<Run>` both `runs_handler`
@@ -842,6 +856,8 @@ fn flow_mission_to_run(
         session_id,
         abandoned_reason,
         tokens: None,
+        workload: None,
+        verify_passed: None,
     }
 }
 
@@ -1178,6 +1194,8 @@ fn mission_to_run(
         session_id,
         abandoned_reason,
         tokens: None,
+        workload: None,
+        verify_passed: None,
     }
 }
 
@@ -1728,6 +1746,8 @@ fn lab_summary_to_run(
         session_id: if summary.finished { None } else { summary.session_id.clone() },
         abandoned_reason,
         tokens: None,
+        workload: summary.workload.clone(),
+        verify_passed: summary.verify_passed,
     }
 }
 
@@ -2468,6 +2488,8 @@ fn ghost_runs(
             session_id: if agg.is_ambiguous() { None } else { Some(session_id.clone()) },
             abandoned_reason,
             tokens: None,
+            workload: None,
+            verify_passed: None,
         });
     }
     out
@@ -3920,6 +3942,8 @@ mod tests {
             has_events: true,
             session_id: None,
             run_ok: None,
+            workload: None,
+            verify_passed: None,
         }
     }
 
@@ -3941,6 +3965,24 @@ mod tests {
         assert_eq!(lab_run_status(&with_ok(Some(true)), now, None), RunStatus::Complete);
         // No manifest (a provider that writes none) is not evidence of failure.
         assert_eq!(lab_run_status(&with_ok(None), now, None), RunStatus::Complete);
+    }
+
+    /// (#2494) The verify outcome rides the row and NEVER changes `status`:
+    /// a run that dispatched fine and failed its tests stays `complete`, with
+    /// `verify_passed: Some(false)` beside it for the list to show.
+    #[test]
+    fn a_lab_row_carries_workload_and_verify_without_moving_status() {
+        use darkmux_lab::lab::lifecycle::LifecycleStatus as Lc;
+        let summary = LabRunSummary {
+            run_ok: Some(true),
+            workload: Some("quick-coding".into()),
+            verify_passed: Some(false),
+            ..lab_summary_with_lifecycle("d", true, false, Some(Lc::Complete))
+        };
+        let row = lab_summary_to_run(&summary, None, 1_700_000_000_000, None);
+        assert_eq!(row.verify_passed, Some(false));
+        assert_eq!(row.workload.as_deref(), Some("quick-coding"));
+        assert_eq!(row.status, RunStatus::Complete, "verify is not folded into status");
     }
 
     /// (#2860 review F4) A run from before `lifecycle.json` existed still has

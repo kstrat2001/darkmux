@@ -372,7 +372,7 @@ def replay(source, plan, machine, now_ms, session_id):
             if p.get("model") == source_primary:
                 p["model"] = plan["model"]
             if isinstance(p.get("workspace"), str):
-                p["workspace"] = f"/home/demo/.darkmux/runs/{plan['slug']}/sandbox"
+                p["workspace"] = f"/home/demo/.darkmux/lab/{plan['slug']}/sandbox"
         out.append(r)
     return out, start
 

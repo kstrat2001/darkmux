@@ -391,7 +391,7 @@ fn subtitle_with_machine(r: &Run) -> String {
     }
 }
 
-/// `[reason ·] role · model · via route` — the same fields, join and order
+/// `[reason ·] [workload ·] [verify ·] role · model · via route` — the same fields, join and order
 /// as `ui/src/lenses/runs/format.ts::runSubtitle`, including its
 /// `shortModel` treatment of the model id (see [`short_model`]).
 ///
@@ -422,6 +422,12 @@ fn subtitle_for(r: &Run) -> String {
             .to_string(),
         );
     }
+    if let Some(workload) = &r.workload {
+        bits.push(workload.clone());
+    }
+    if let Some(verify) = verify_label(r) {
+        bits.push(verify.to_string());
+    }
     if let Some(role) = &r.role {
         bits.push(role.clone());
     }
@@ -433,6 +439,25 @@ fn subtitle_for(r: &Run) -> String {
     }
     bits.join(" · ")
 }
+
+/// A lab row's verify outcome, in three states rather than two (#2494): what
+/// the workload's own tests said is a different fact from how the dispatch
+/// ended (`status`), and a failed verify has to be visible in this table.
+/// Missions and dispatches have no verify to report, and a lab run with no
+/// manifest yet (still running) has none either.
+fn verify_label(r: &Run) -> Option<&'static str> {
+    match (r.kind, r.verify_passed, r.workload.is_some()) {
+        (RunKind::Lab, Some(true), _) => Some("verify pass"),
+        (RunKind::Lab, Some(false), _) => Some(VERIFY_FAIL_LABEL),
+        // A manifest exists (it names the workload) and declares no verify.
+        (RunKind::Lab, None, true) => Some("verify \u{2014}"),
+        // No manifest yet, so nothing has been checked or declared.
+        (RunKind::Lab, None, false) => None,
+        (RunKind::Mission | RunKind::Dispatch, _, _) => None,
+    }
+}
+
+const VERIFY_FAIL_LABEL: &str = "verify FAIL";
 
 /// Column widths. The format strings in [`header_line`]/[`format_row`]
 /// take their widths FROM these consts (`{:<w$}`) rather than repeating
@@ -629,7 +654,16 @@ fn format_row(now: u64, r: &Run, id_w: usize, width: Option<usize>, machine_col:
     match width {
         None => full,
         Some(w) if full.chars().count() <= w => full,
-        Some(_) => base,
+        // A failed verify outlives the dropped subtitle: hiding it on a
+        // narrow terminal would bring back the tick #2494 removed.
+        Some(w) => {
+            let failed = format!("{base}  {VERIFY_FAIL_LABEL}");
+            if verify_label(r) == Some(VERIFY_FAIL_LABEL) && failed.chars().count() <= w {
+                failed
+            } else {
+                base
+            }
+        }
     }
 }
 
@@ -895,6 +929,8 @@ mod tests {
             // helper's rows are never `Abandoned` in the existing suite.
             abandoned_reason: None,
             tokens: None,
+            workload: None,
+            verify_passed: None,
         }
     }
 
@@ -1094,7 +1130,7 @@ mod tests {
         r.machine = Some("MacBook-Pro".to_string());
         assert!(header_line(20, true).contains("MACHINE"), "the column must be labelled");
         assert!(format_row(2, &r, 20, None, true).contains("MacBook-Pro"));
-        assert_eq!(subtitle_for(&r), "", "machine must no longer be a subtitle field");
+        assert!(!subtitle_for(&r).contains("MacBook-Pro"), "machine must no longer be a subtitle field");
     }
 
     #[test]
@@ -1113,7 +1149,7 @@ mod tests {
         assert!(show_machine_column(Some(200)));
         assert!(!show_machine_column(Some(54)), "a phone-width pane must shed it");
 
-        let mut r = mk_run("run-1", RunKind::Lab, RunStatus::Complete, 1);
+        let mut r = mk_run("run-1", RunKind::Dispatch, RunStatus::Complete, 1);
         r.machine = Some("MacBook-Pro".to_string());
         assert_eq!(subtitle_with_machine(&r), "MacBook-Pro", "shed means it rejoins the subtitle");
         r.role = Some("coder".to_string());
@@ -1318,6 +1354,57 @@ mod tests {
         assert!(!line.contains("a-role-name"), "subtitle should have been dropped whole: {line}");
         assert!(line.chars().count() <= 60);
         assert_eq!(line.lines().count(), 1, "a dropped subtitle must never become a second line");
+    }
+
+    /// (#2494) A run whose dispatch succeeded and whose tests failed must say
+    /// so on its row in the verb the operator reaches for first: three
+    /// states, never two. Verify rides the subtitle and never the STATUS
+    /// cell, so `status` keeps meaning how the dispatch ended.
+    #[test]
+    fn a_lab_row_shows_its_verify_outcome_in_three_states() {
+        let lab = |verify: Option<bool>| {
+            let mut r = mk_run("quick-coding-1", RunKind::Lab, RunStatus::Complete, 1);
+            r.workload = Some("quick-coding".to_string());
+            r.model = Some("darkmux:qwen3.6-35b-a3b".to_string());
+            r.verify_passed = verify;
+            r
+        };
+        assert_eq!(subtitle_for(&lab(Some(false))), "quick-coding \u{b7} verify FAIL \u{b7} qwen3.6-35b-a3b");
+        assert_eq!(subtitle_for(&lab(Some(true))), "quick-coding \u{b7} verify pass \u{b7} qwen3.6-35b-a3b");
+        assert_eq!(subtitle_for(&lab(None)), "quick-coding \u{b7} verify \u{2014} \u{b7} qwen3.6-35b-a3b");
+        let failed = format_row(2, &lab(Some(false)), 20, None, true);
+        assert!(failed.contains("verify FAIL"), "{failed}");
+        assert!(failed.contains("complete"), "the dispatch result is still shown as it was: {failed}");
+        // A run still in flight has no manifest, hence no workload and no verify.
+        let mut running = lab(None);
+        running.workload = None;
+        assert!(!subtitle_for(&running).contains("verify"), "{}", subtitle_for(&running));
+        // A mission or dispatch row has no verify to report.
+        let mut m = mk_run("m1", RunKind::Mission, RunStatus::Complete, 1);
+        m.verify_passed = Some(false);
+        assert!(!subtitle_for(&m).contains("verify"), "verify is a lab-row fact");
+    }
+
+    /// The subtitle is dropped whole when it does not fit, but a FAILED
+    /// verify must survive a narrow terminal: hiding it there would bring
+    /// back exactly what #2494 fixed.
+    #[test]
+    fn a_failed_verify_survives_a_terminal_too_narrow_for_the_subtitle() {
+        let mut r = mk_run("quick-coding-1", RunKind::Lab, RunStatus::Complete, 1);
+        r.workload = Some("quick-coding".to_string());
+        r.model = Some("qwen3.6-35b-a3b-with-a-long-name".to_string());
+        r.verify_passed = Some(false);
+        let base_len = format_row(2, &mk_run("quick-coding-1", RunKind::Mission, RunStatus::Complete, 1), 20, Some(200), false)
+            .chars()
+            .count();
+        let width = base_len + "  verify FAIL".chars().count();
+        let line = format_row(2, &r, 20, Some(width), false);
+        assert!(line.ends_with("verify FAIL"), "{line}");
+        assert!(line.chars().count() <= width, "still fits the width: {line}");
+        assert!(!line.contains("qwen3.6"), "the rest of the subtitle is still dropped: {line}");
+        // Passing and unchecked rows stay dropped-whole.
+        r.verify_passed = Some(true);
+        assert!(!format_row(2, &r, 20, Some(width), false).contains("verify"));
     }
 
     /// The `darkmux:` residency namespace is bookkeeping, not operator-

@@ -1,6 +1,6 @@
 ---
 name: darkmux-list-runs
-description: List recent darkmux lab run records in most-recent-first order. Use this to discover run IDs for 'darkmux-analyze-run' or 'darkmux-compare-runs'. Default shows the last 5 — pass --limit N for more, --all for everything.
+description: List recent darkmux lab run records in most-recent-first order. Use this to discover run IDs for 'darkmux-analyze-run' or 'darkmux-compare-runs'. Default shows the last 10 — pass --limit N for more, --all for everything.
 user_invocable: true
 allowed-tools: "Bash(darkmux:*)"
 ---
@@ -8,7 +8,7 @@ allowed-tools: "Bash(darkmux:*)"
 # List recent runs
 
 ARGUMENTS expected (all optional):
-- `--limit N`   show at most N runs (default 5)
+- `--limit N`   show at most N runs (default 10; `0` is no cap)
 - `--all`       show every run (overrides --limit)
 
 ## Step 1 — List
@@ -19,14 +19,14 @@ darkmux run list --kind lab $ARGUMENTS
 
 `$ARGUMENTS` passes through directly to the CLI, so any of these work:
 
-- `darkmux-list-runs` (default — last 5)
+- `darkmux-list-runs` (default — last 10)
 - `darkmux-list-runs --limit 10`
 - `darkmux-list-runs --all`
-- `darkmux-list-runs -l 20`
+- `darkmux-list-runs --limit 20`
 
 ## Step 2 — Output shape
 
-One row per run, most recent first: `KIND`, `STATUS`, `STARTED`, `DURATION`, `TOKENS`, `ID`, then a subtitle (role, model, workload). `--kind lab` keeps the lab rows; drop it (`darkmux run list`) to see mission and dispatch runs too. `--json` prints every row.
+One row per run, most recent first: `KIND`, `STATUS`, `STARTED`, `DURATION`, `TOKENS`, `ID`, then a subtitle (workload, verify outcome, role, model). The verify outcome reads `verify pass`, `verify FAIL` or `verify —` (not checked); a run can dispatch fine and still fail its verify. `--kind lab` keeps the lab rows; drop it (`darkmux run list`) to see mission and dispatch runs too. `--json` prints every row.
 
 ## Step 3 — Suggest follow-ups
 

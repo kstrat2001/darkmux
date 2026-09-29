@@ -13,6 +13,7 @@
  */
 
 import type { Run } from "./generated/Run";
+import type { PendingMove } from "./generated/PendingMove";
 
 /** `GET /runs` — the wrapper `runs_handler` builds around `Vec<Run>`.
  * Source: `crates/darkmux-serve/src/lib.rs::runs_handler`. */
@@ -283,6 +284,9 @@ export interface LabRunsResponse {
   dir: string | null;
   exists: boolean | null;
   runs: LabRun[];
+  /** Present while runs recorded before 4.0 still sit in the old lab dir:
+   * where they are, where 4.0 reads, and the command that moves them. */
+  pending_move?: PendingMove;
 }
 
 /** `GET /panel/:id` — an allowlisted CLI command's own rendered output,

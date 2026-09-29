@@ -70,9 +70,9 @@ fn lab_records_only(verb: &str, ids: &[&str]) -> Result<()> {
 }
 
 /// A lab run's record is a directory: a path the caller gave, or an id under
-/// the lab dir.
+/// the lab dir (the same resolution `inspect` reads through).
 fn is_lab_record(id: &str) -> bool {
-    std::path::Path::new(id).exists() || darkmux_types::config_access::lab_dir().join(id).exists()
+    lab::inspect::resolve_run_path(id).exists()
 }
 
 /// The refusal for a run of `kind`, or `None` for a lab run.
@@ -198,6 +198,28 @@ mod tests {
         assert_eq!(verify_line(Some(&v(true, "whatever"))), "ok");
         assert_eq!(verify_line(Some(&v(false, ""))), "FAILED");
         assert_eq!(verify_line(Some(&v(false, "missing ack"))), "FAILED — missing ack");
+    }
+
+    /// A bare run id names a run under the lab dir; a directory of that name
+    /// in the cwd is not a lab record. An explicit path (absolute) still is.
+    #[serial_test::serial]
+    #[test]
+    fn a_bare_id_is_resolved_against_the_lab_dir_not_the_cwd() {
+        let home = darkmux_types::test_isolation::IsolatedState::new();
+        let cwd = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(cwd.path().join("m-1")).unwrap();
+        std::fs::create_dir_all(home.join("lab").join("quick-q-1")).unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(cwd.path()).unwrap();
+        let (in_cwd_only, in_lab, absolute) = (
+            is_lab_record("m-1"),
+            is_lab_record("quick-q-1"),
+            is_lab_record(&cwd.path().join("m-1").display().to_string()),
+        );
+        std::env::set_current_dir(prev).unwrap();
+        assert!(!in_cwd_only, "a cwd dir named like a mission id is not a lab record");
+        assert!(in_lab, "an id under the lab dir is");
+        assert!(absolute, "an explicit path is taken as a path");
     }
 
     #[test]

@@ -135,4 +135,18 @@ abandoned_reason?: AbandonReason,
  * `0` for "unknown". Bounded by the same scan window as everything
  * else on the row.
  */
-tokens?: number, };
+tokens?: number, 
+/**
+ * The workload a lab run dispatched (`manifest.json`'s `workload`).
+ * Lab rows only; absent for a run with no manifest yet.
+ */
+workload?: string, 
+/**
+ * Whether a lab run's workload verify passed (`manifest.json`'s
+ * `verify.passed`). Deliberately NOT folded into `status`: `status` is
+ * how the dispatch ended and this is what its tests said, and a run
+ * that dispatched fine but failed its tests is exactly the case the two
+ * must stay separable for (#2494). `None` is "not checked": the
+ * workload declares no verify, or the run has no manifest yet.
+ */
+verify_passed?: boolean, };

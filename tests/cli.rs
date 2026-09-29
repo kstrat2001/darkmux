@@ -12121,6 +12121,72 @@ fn pre_4_0_lab_runs_dir_refuses_every_lab_verb_naming_the_mv_until_moved() {
     cmd().args(["run", "list", "--kind", "lab"]).assert().success();
 }
 
+/// A lab run dir the scanner recognizes: a lifecycle record (the marker) and a
+/// manifest carrying the given `verify`.
+fn lab_run_with_manifest(dir: &std::path::Path, workload: &str, verify: serde_json::Value) {
+    fs::create_dir_all(dir).unwrap();
+    let id = dir.file_name().unwrap().to_string_lossy().to_string();
+    let lifecycle = serde_json::json!({
+        "schema_version": "1.1", "run_id": id, "kind": "lab", "workload": workload,
+        "profile": "default", "started_at_ms": 1_700_000_000_000u64, "status": "complete",
+    });
+    fs::write(dir.join("lifecycle.json"), lifecycle.to_string()).unwrap();
+    let manifest = serde_json::json!({
+        "schema_version": 5, "run_id": id, "workload": workload, "ok": true, "verify": verify,
+    });
+    fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
+}
+
+/// (4.0) An EMPTY `lab/` beside a full `runs/` is a pending move, not a
+/// split: it used to skip the refusal and print "no recorded lab runs yet"
+/// with exit 0, hiding every old run. The command it prints removes the empty
+/// dir first, since a plain `mv` would nest the runs as `lab/runs`.
+#[test]
+fn an_empty_lab_dir_beside_a_full_runs_dir_still_refuses_and_the_printed_command_works() {
+    let home = tempfile::TempDir::new().unwrap();
+    let (old, new) = (home.path().join("runs"), home.path().join("lab"));
+    lab_run_with_manifest(&old.join("quick-q-1"), "quick-q", serde_json::Value::Null);
+    fs::create_dir_all(&new).unwrap();
+    let cmd = || {
+        let mut c = darkmux_cmd();
+        c.env("DARKMUX_HOME", home.path()).env("DARKMUX_FLOWS_DIR", home.path().join("flows"));
+        c
+    };
+    let want = format!("rmdir {} && mv {} {}", new.display(), old.display(), new.display());
+    cmd().args(["run", "list", "--kind", "lab"]).assert().failure().stderr(predicate::str::contains(&want));
+
+    let ran = std::process::Command::new("sh").arg("-c").arg(&want).status().unwrap();
+    assert!(ran.success());
+    assert!(new.join("quick-q-1").is_dir(), "the runs land at lab/<id>, not lab/runs/<id>");
+    cmd().args(["run", "list", "--kind", "lab"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("quick-q-1"));
+}
+
+/// (#2494) The verify outcome is visible in `run list` itself: a run that
+/// dispatched fine and failed its tests must not read as a clean one.
+#[test]
+fn run_list_shows_a_failed_verify_beside_a_good_dispatch() {
+    let home = tempfile::TempDir::new().unwrap();
+    let lab = home.path().join("lab");
+    let failed = serde_json::json!({"passed": false, "details": "2 tests failed"});
+    lab_run_with_manifest(&lab.join("quick-coding-1"), "quick-coding", failed);
+    lab_run_with_manifest(&lab.join("quick-q-1"), "quick-q", serde_json::Value::Null);
+    let out = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", home.path().join("flows"))
+        .args(["run", "list", "--kind", "lab"])
+        .assert()
+        .success();
+    let text = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    let line = |id: &str| text.lines().find(|l| l.contains(id)).unwrap_or_else(|| panic!("{id} listed: {text}")).to_string();
+    assert!(line("quick-coding-1").contains("verify FAIL"), "{text}");
+    assert!(line("quick-coding-1").contains("complete"), "status stays the dispatch result: {text}");
+    assert!(line("quick-q-1").contains("verify \u{2014}"), "not checked is not a pass: {text}");
+    assert!(!line("quick-q-1").contains("FAIL"), "{text}");
+}
+
 /// A set with a run that cannot be read fails, so a script cannot mistake a
 /// partial set for a whole one.
 #[test]

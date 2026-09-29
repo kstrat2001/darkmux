@@ -191,7 +191,7 @@
   "ui/src/lenses/mission/graph.ts::stepDispatchSessions": 23,
   "ui/src/lenses/mission/timeline.ts::groupTimeline": 17,
   "ui/src/lenses/mission/timeline.ts::taskAggMetrics": 18,
-  "ui/src/lenses/runs/RunsBoard.tsx::RunsBoard": 51,
+  "ui/src/lenses/runs/RunsBoard.tsx::RunsBoard": 47,
   "ui/src/lenses/session/sessionRun.ts::runRegions": 61,
   "ui/src/lib/eventFilters.ts::activityOf": 22,
   "ui/src/lib/hashSync.ts::canonicalHash": 18,

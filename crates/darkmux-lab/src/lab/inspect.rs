@@ -124,17 +124,15 @@ pub fn lab_inspect(run_path: &str) -> Result<InspectionReport> {
     Ok(report)
 }
 
+/// A run named by a path (it contains a `/`) is that path; a bare id is a run
+/// under the lab dir, never a same-named directory in the cwd. `lab_dir()`,
+/// not a second resolution of the lab root: inspect must look where `lab run`
+/// actually wrote (#1882).
 pub(crate) fn resolve_run_dir(path: &str) -> PathBuf {
-    if path.starts_with('/') || path.starts_with("./") || path.starts_with("../") || path.contains('/') {
+    if path.contains('/') {
         return PathBuf::from(path);
     }
-    // `lab_dir()`, not a second resolution of the runs root — inspect must look
-    // where `lab run` actually wrote (#1882).
-    let candidate = darkmux_types::config_access::lab_dir().join(path);
-    if candidate.exists() {
-        return candidate;
-    }
-    PathBuf::from(path)
+    darkmux_types::config_access::lab_dir().join(path)
 }
 
 #[cfg(test)]
@@ -269,11 +267,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_run_dir_id_falls_back_when_missing() {
+    fn resolve_run_dir_id_resolves_under_the_lab_dir_even_when_missing() {
         let p = resolve_run_dir("just-an-id");
-        // When the id doesn't exist under runs/, we return it as-is.
-        // The actual existence check happens later in lab_inspect.
-        assert!(p.to_str().unwrap().ends_with("just-an-id"));
+        // An id that doesn't exist under the lab dir still resolves there:
+        // the existence check happens later in lab_inspect, and its error
+        // names the place that was looked in.
+        assert_eq!(p, darkmux_types::config_access::lab_dir().join("just-an-id"));
     }
 
     #[test]

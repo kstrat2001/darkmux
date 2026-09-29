@@ -1110,6 +1110,7 @@ fn build_startup_banner(
     mission_count: usize,
     phase_count: usize,
     lab_dir: Option<&std::path::Path>,
+    pending_move: Option<&PendingMove>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     let version = env!("CARGO_PKG_VERSION");
@@ -1217,6 +1218,13 @@ fn build_startup_banner(
             "  lab dir:        none (pass --lab-dir <path> to enable the lab observer lens)"
                 .to_string(),
         ),
+    }
+
+    if let Some(m) = pending_move {
+        lines.push(darkmux_types::style::warn(&format!(
+            "  ! lab runs in {} are not read (4.0 reads {}); move them: {}",
+            m.from, m.to, m.command
+        )));
     }
 
     lines.push(darkmux_types::style::success("  ready — Ctrl-C to stop"));
@@ -1365,6 +1373,7 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
             mission_count,
             phase_count,
             lab_dir.as_deref(),
+            lab_dir.as_deref().and_then(pending_move_for).as_ref(),
         ) {
             println!("{line}");
         }
@@ -2306,6 +2315,35 @@ fn resolve_lab_run_dir(lab_dir: &StdPath, dir: &str) -> Option<PathBuf> {
     worktree_contained(&candidate, lab_dir).then_some(candidate)
 }
 
+/// A lab dir whose pre-4.0 runs have not been moved: where they are, where
+/// 4.0 reads, and the command that settles it. `darkmux serve` never moves
+/// them and never refuses to start over it; it says so in the startup banner
+/// and on `GET /lab/runs`, where the lab lens would otherwise show no runs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct PendingMove {
+    pub from: String,
+    pub to: String,
+    pub command: String,
+}
+
+/// The [`PendingMove`] for a served lab dir, or `None` when nothing waits to
+/// be moved.
+pub(crate) fn pending_move_for(lab_dir: &StdPath) -> Option<PendingMove> {
+    use darkmux_types::config_access::LabDirState;
+    let state = darkmux_types::config_access::lab_dir_state_for(lab_dir);
+    let command = state.command()?;
+    match state {
+        LabDirState::MovePending { from, to, .. } | LabDirState::Split { from, to } => Some(PendingMove {
+            from: from.display().to_string(),
+            to: to.display().to_string(),
+            command,
+        }),
+        LabDirState::Current => None,
+    }
+}
+
 /// One run cluster's summary row for `GET /lab/runs`.
 ///
 /// `pub(crate)` (was private until #1508 step 3): the `/runs` aggregator's
@@ -2354,6 +2392,14 @@ pub(crate) struct LabRunSummary {
     /// are the outcome. `None` when there is no manifest yet, or no `ok`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) run_ok: Option<bool>,
+    /// `manifest.json`'s `workload`: what the run dispatched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) workload: Option<String>,
+    /// `manifest.json`'s `verify.passed`: what the workload's own tests said,
+    /// which `run_ok` (the dispatch result) does not carry (#2494). `None`
+    /// when nothing was checked or there is no manifest yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) verify_passed: Option<bool>,
     /// (#2812) The lifecycle record's own `started_at_ms` — the run's real
     /// START, written before the provider is ever called. `LabRunSummary`
     /// carried no start timestamp at all before this, which is why
@@ -2441,16 +2487,23 @@ async fn lab_runs_handler(State(state): State<AppState>) -> impl IntoResponse {
     };
     let shown = lab_dir.display().to_string();
     let exists = lab_dir.is_dir();
-    let runs = tokio::task::spawn_blocking(move || scan_lab_runs(&lab_dir))
-        .await
-        .unwrap_or_default();
-    axum::Json(serde_json::json!({
+    let (runs, pending_move) = tokio::task::spawn_blocking(move || {
+        (scan_lab_runs(&lab_dir), pending_move_for(&lab_dir))
+    })
+    .await
+    .unwrap_or_default();
+    let mut body = serde_json::json!({
         "configured": true,
         "dir": shown,
         "exists": exists,
         "runs": runs,
-    }))
-    .into_response()
+    });
+    // Additive: present only while pre-4.0 runs wait to be moved, so the lab
+    // lens can say why it is empty. Serving never refuses over it.
+    if let Some(m) = pending_move {
+        body["pending_move"] = serde_json::json!(m);
+    }
+    axum::Json(body).into_response()
 }
 
 /// `pub(crate)` (was private until #1508 step 3) — the `/runs` aggregator
@@ -2522,6 +2575,12 @@ fn scan_lab_dir_rec(dir: &StdPath, lab_dir: &StdPath, depth: usize, out: &mut Ve
     for sub in subdirs {
         scan_lab_dir_rec(&sub, lab_dir, depth + 1, out);
     }
+}
+
+/// `verify.passed` from a run's manifest. `None` is "not checked": the
+/// manifest has `verify: null` (the workload declares none) or no such block.
+fn manifest_verify_passed(manifest: &serde_json::Value) -> Option<bool> {
+    manifest.get("verify")?.get("passed")?.as_bool()
 }
 
 fn build_lab_run_summary(
@@ -2738,6 +2797,10 @@ fn build_lab_run_summary(
         has_events,
         session_id,
         run_ok,
+        workload: manifest
+            .as_ref()
+            .and_then(|v| v.get("workload").and_then(|w| w.as_str()).map(str::to_string)),
+        verify_passed: manifest.as_ref().and_then(manifest_verify_passed),
     })
 }
 

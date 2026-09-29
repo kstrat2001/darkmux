@@ -87,8 +87,8 @@ impl WorkloadProvider for PromptProvider {
             // v1 had: session_id, profile (was the description text), workload, provider, duration_ms, ok.
             // v5 added: verify, the same field and version as the coding-task
             // manifest (#2494). `null` is "not checked": the workload declares
-            // no verify. Without it, `run list --kind lab` read a failed verify as a
-            // plain tick.
+            // no verify. `darkmux run list` and `/runs` read `verify.passed`
+            // from here to show a failed verify beside a good dispatch.
             "schema_version": 5,
             "run_id": run_id,
             "workload": loaded.manifest.workload.id,

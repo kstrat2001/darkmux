@@ -2188,7 +2188,14 @@ impl LabDirState {
 
 /// [`LabDirState`] for the lab dir this process resolves.
 pub fn lab_dir_state() -> LabDirState {
-    lab_dir_state_in(&lab_dir(), &lab_dir_default())
+    lab_dir_state_for(&lab_dir())
+}
+
+/// [`LabDirState`] for a lab dir the caller already resolved (`darkmux serve`
+/// resolves its own from `--lab-dir`, which a state read of the process-wide
+/// [`lab_dir`] would not see).
+pub fn lab_dir_state_for(lab: &std::path::Path) -> LabDirState {
+    lab_dir_state_in(lab, &lab_dir_default())
 }
 
 /// Pure half of [`lab_dir_state`]: `lab` is the resolved lab dir, `default`

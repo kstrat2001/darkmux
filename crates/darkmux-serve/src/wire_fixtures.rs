@@ -177,6 +177,10 @@ mod tests {
             abandoned_reason: None,
             // (#2902 step 2b) Populated, like every other optional field here.
             tokens: Some(48_120),
+            // Lab rows only (a mission has no workload or verify); the
+            // lab shape is covered by the `/runs` lab-row tests.
+            workload: None,
+            verify_passed: None,
         };
         golden("runs-row.json", &run);
     }

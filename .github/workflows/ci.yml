@@ -717,7 +717,8 @@ jobs:
           # role-scoped snowflake all retired into kind-families: `lab runs` ->
           # `lab run list`, `lab workloads` -> `lab workload list`, `lab
           # fixtures` -> `lab fixture list`, `lab inspect` -> `lab run inspect`,
-          # `lab compare` -> `lab run compare`, `lab register`/`lab unregister`
+          # `lab compare` -> `lab run compare` (4.0 then moved recorded runs
+          # to `run list|inspect|stats|compare`), `lab register`/`lab unregister`
           # -> `lab fixture register`/`unregister`, `lab review-bench` -> `lab
           # eval <role>`. Each retired spelling is anchored ADJACENT-two-word,
           # so the surviving forms don't trip: `lab run compare` does not
@@ -753,7 +754,7 @@ jobs:
           # emptiness test below; the FIRST grep's status is what gates, above.
           bad=$(printf '%s\n' "$raw" | grep -v '\*\*v[0-9]*\.' || true)
           if [ -n "$bad" ]; then
-            echo "::error::Retired verb spelling in user-facing docs (#1426/#1463/#1465/#2912/#2913) — use machine status / machine resources / machine list / machine add / profile list / profile scan / the darkmux-lab-notebook skill (not notebook or lab notebook) / mission launch review / dispatch (not crew dispatch; the crew family retired entirely) / init (not skills) / mission launch coder-phase (not mission run) / memory lesson (not lessons) / mission finalize (not mission close/ship — the frontier does git/gh by hand) / mission abort or mission finalize (not the retired phase family) / lab run list|inspect|compare (not lab runs/inspect/compare) / lab workload list (not lab workloads) / lab fixture list|register|unregister (not lab fixtures/register/unregister) / lab eval (not lab review-bench); swap + recommendations retired; mission propose + lab notebook removed in 4.0 (write the config by hand / the darkmux-lab-notebook skill):"
+            echo "::error::Retired verb spelling in user-facing docs (#1426/#1463/#1465/#2912/#2913) — use machine status / machine resources / machine list / machine add / profile list / profile scan / the darkmux-lab-notebook skill (not notebook or lab notebook) / mission launch review / dispatch (not crew dispatch; the crew family retired entirely) / init (not skills) / mission launch coder-phase (not mission run) / memory lesson (not lessons) / mission finalize (not mission close/ship — the frontier does git/gh by hand) / mission abort or mission finalize (not the retired phase family) / run list|inspect|stats|compare (not lab runs/inspect/compare, and not the lab run list|inspect|stats|compare spellings 4.0 retired) / lab workload list (not lab workloads) / lab fixture list|register|unregister (not lab fixtures/register/unregister) / lab eval (not lab review-bench); swap + recommendations retired; mission propose + lab notebook removed in 4.0 (write the config by hand / the darkmux-lab-notebook skill):"
             echo "$bad"
             exit 1
           fi
@@ -783,7 +784,7 @@ jobs:
           fi
           bad=$(printf '%s\n' "$raw" | grep -v '\*\*v[0-9]*\.' | grep -v -E '#291[23]' || true)
           if [ -n "$bad" ]; then
-            echo "::error::Removed-in-4.0 term in user-facing docs (#2912/#2913) — mission propose and the mission-compiler role are gone (write the mission config by hand, then mission launch); lab notebook draft/list are gone (the darkmux-lab-notebook skill drafts from lab run stats --json). A line that narrates the removal must cite #2912/#2913:"
+            echo "::error::Removed-in-4.0 term in user-facing docs (#2912/#2913) — mission propose and the mission-compiler role are gone (write the mission config by hand, then mission launch); lab notebook draft/list are gone (the darkmux-lab-notebook skill drafts from run stats --json). A line that narrates the removal must cite #2912/#2913:"
             echo "$bad"
             exit 1
           fi

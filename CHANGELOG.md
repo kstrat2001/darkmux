@@ -26,16 +26,25 @@ darkmux release.
   `--json` documents. The old spellings fail naming the replacement.
   `run inspect|stats|compare` read lab runs only and refuse a mission or
   dispatch run id, naming where to look. `darkmux lab run <workload>` is the
-  launcher only; the `--` escape for a workload named `list` is gone. The
+  launcher only; a workload named `list` still launches with the escape,
+  `darkmux lab run -- list`. The
   workload/profile/verify table `lab run list` printed is gone with it: the
-  `run list` rows carry kind, status, start, duration, tokens and id.
+  `run list` rows carry kind, status, start, duration, tokens and id; a lab
+  row's subtitle names the workload and its verify outcome (`verify pass`,
+  `verify FAIL`, `verify —` for not checked). A bare run id now resolves under
+  the lab dir only: a same-named directory in the cwd is no longer read (pass a
+  path to read one).
   **Migration (disk):** the lab-run root default moved from
   `~/.darkmux/runs/` to `~/.darkmux/lab/`. darkmux does not move your data.
   While the old directory holds runs and the new one does not exist, `darkmux
   doctor` fails and prints the exact command, and every lab verb (`lab run`,
   `lab eval`, `lab loop`, `run list --kind lab`, `run inspect|stats|compare`)
-  refuses, naming it: `mv ~/.darkmux/runs ~/.darkmux/lab`. If both hold runs,
-  doctor warns and prints a merge that never overwrites. An explicit
+  refuses, naming it: `mv ~/.darkmux/runs ~/.darkmux/lab` (`rmdir` the new dir
+  first when it already exists and is empty, which the printed command does).
+  `lab doctor` does not touch the lab dir and is not gated. `darkmux serve`
+  still starts: it names the move in its startup banner and on `GET /lab/runs`
+  (`pending_move`). If both hold runs, doctor warns and prints a merge that
+  never overwrites. An explicit
   `DARKMUX_LAB_DIR` / `dirs.lab` is untouched.
 - **The fleet page's orchestrator note** (#2983): the "Orchestrator note:"
   line under the token panel, its `history →` list, and the stock sentence
