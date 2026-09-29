@@ -1,4 +1,4 @@
-import { ACTION, byTime, latestByTime, type NormRecord } from "./ingest";
+import { ACTION, anyPayload, byTime, latestByTime, payloadOf, type NormRecord } from "./ingest";
 import { recordsOfGroup, runIndex } from "./runRef";
 import { DEFAULT_POLICY, isRunning, lifecycleAt, NO_PRESENCE, type LifecyclePolicy, type Presence } from "./lifecycle";
 
@@ -53,10 +53,10 @@ export type TurnItem =
   | { kind: "rest"; rec: NormRecord }
   | { kind: "rec"; rec: NormRecord };
 
-type Fields = Record<string, unknown>;
-
-function fields(r: NormRecord): Fields {
-  return ((r as unknown as { fields?: Fields }).fields || (r as unknown as { payload?: Fields }).payload || {}) as Fields;
+/** The turn a record names, for the actions whose payload carries one. */
+function turnSeqOf(r: NormRecord): number | null {
+  const p = anyPayload(r);
+  return p && "turn_seq" in p ? num(p.turn_seq) : null;
 }
 
 function num(v: unknown): number | null {
@@ -140,13 +140,12 @@ export function turnItems(visible: NormRecord[], all: NormRecord[], asOfArg?: nu
   // synthesize that group's header below.
   const seqForKey = new Map<string, number>();
   for (const r of ordered) {
-    const f = fields(r);
     if (r.action === ACTION.DispatchStart) {
       exec++;
       current = null;
       currentSeqNum = null;
     }
-    const seq = num(f.turn_seq);
+    const seq = turnSeqOf(r);
     const own = seq === null ? null : key(seq);
     // (#2863 review, finding 3) ANY record naming its own `turn_seq` advances
     // `current` — not just `dispatch.turn`/`dispatch.reasoning`. A turn that
@@ -175,34 +174,36 @@ export function turnItems(visible: NormRecord[], all: NormRecord[], asOfArg?: nu
       firstBeat.set(own, r.tMs);
     }
     if (r.action === ACTION.TelemetryTokens && own !== null) {
-      const out = num(f.completion_tokens);
-      const think = num(f.reasoning_tokens);
+      const usage = payloadOf(r, ACTION.TelemetryTokens);
+      const out = num(usage?.completion_tokens);
+      const think = num(usage?.reasoning_tokens);
       if (out !== null) callOut.set(own, (callOut.get(own) ?? 0) + out);
       if (think !== null) callThink.set(own, (callThink.get(own) ?? 0) + think);
     }
     if (r.action === ACTION.TelemetryContext) {
-      window = num(f.max) ?? window;
-      threshold = num(f.threshold) ?? threshold;
+      const context = payloadOf(r, ACTION.TelemetryContext);
+      window = num(context?.max) ?? window;
+      threshold = num(context?.threshold) ?? threshold;
     }
   }
 
   const info = (r: NormRecord): TurnInfo => {
-    const f = fields(r);
-    const seq = num(f.turn_seq) ?? 0;
+    const f = payloadOf(r, ACTION.DispatchTurn);
+    const seq = num(f?.turn_seq) ?? 0;
     const k = turnOf.get(r) ?? "";
-    const usage = (f.usage || {}) as Fields;
-    const exact = num(f.generation_ms);
+    const usage = f?.usage;
+    const exact = num(f?.generation_ms);
     const beat = firstBeat.get(k);
     const approxMs = beat !== undefined && r.tMs !== null ? r.tMs - beat : null;
-    const tools = num(f.tool_calls_count) ?? 0;
+    const tools = num(f?.tool_calls_count) ?? 0;
     return {
       seq,
-      why: f.finish_reason === "stop" ? "answered" : `${tools} tool${tools === 1 ? "" : "s"}`,
+      why: f?.finish_reason === "stop" ? "answered" : `${tools} tool${tools === 1 ? "" : "s"}`,
       durationMs: exact ?? (approxMs !== null && approxMs >= 0 ? approxMs : null),
       approx: exact === null,
-      inTok: num(usage.prompt_tokens),
-      outTok: callOut.get(k) ?? num(usage.completion_tokens),
-      thinkTok: callThink.get(k) ?? num(usage.reasoning_tokens),
+      inTok: num(usage?.prompt_tokens),
+      outTok: callOut.get(k) ?? num(usage?.completion_tokens),
+      thinkTok: callThink.get(k) ?? num(usage?.reasoning_tokens),
       window,
       threshold,
     };

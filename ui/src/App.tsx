@@ -42,7 +42,7 @@ import { fetchJson } from "./lib/fetcher";
 import { queryKeys } from "./lib/queryKeys";
 import type { MachineSpecsResponse } from "./types/generated/MachineSpecsResponse";
 import type { Route } from "./lib/route";
-import { ingest, recordsAsOf, type NormRecord } from "./lib/ingest";
+import { ingest, recordsAsOf, stepIdOf, type NormRecord } from "./lib/ingest";
 import { DEFAULT_POLICY, lifecycleAt, recordedWallMs } from "./lib/lifecycle";
 import { sessionRun } from "./lib/runRef";
 import type { FlowRecordsResponse } from "./types/generated/FlowRecordsResponse";
@@ -395,7 +395,7 @@ export function App() {
       // records when one is selected, never a re-fetch (one source of
       // records, filtered here, at the point they're handed to the
       // column — see #2189's own issue text).
-      return route.stepId ? all.filter((r) => r.payload && r.payload.step_id === route.stepId) : all;
+      return route.stepId ? all.filter((r) => stepIdOf(r) === route.stepId) : all;
     }
     if (playhead === null) return routeRecords.records;
     // A static build's runs/machine/console routes have no slice of their

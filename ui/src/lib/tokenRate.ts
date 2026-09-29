@@ -4,22 +4,17 @@ import { currentRun, groupOfRecords } from "./runRef";
 import { cleanToolPath, toolCallPath } from "./recordDetail";
 import { compactDuration } from "./format";
 import { UTILITY_JOB, UTILITY_JOB_DEFAULT_STALL_MS, isUtilityEnd, isUtilityStart, utilityJobOf } from "./utilityJobs";
-import { ACTION, byTime, isExecutionAction, isLegacyExecution, recordsAsOf, type NormRecord } from "./ingest";
+import type { DispatchHeartbeatPayload } from "../types/generated/DispatchHeartbeatPayload";
+import { ACTION, byTime, isExecutionAction, isLegacyExecution, payloadOf, recordsAsOf, type NormRecord } from "./ingest";
 
 /** (#2877) Live token-rate scope — pure derivation from flow records
  * already fetched for a session; zero model work, matches CLAUDE.md's "the
  * observer must not join the observed" (no dispatch, no extra fetch).
- *
- * A `dispatch.turn.heartbeat` record's type-specific data lives under
- * `fields` on the wire (schema 1.6+) and under `payload` on older/synthetic
- * records — same alias `lib/turnGroups.ts::fields()` reads locally rather
- * than importing (it is unexported there too), so this module keeps its
- * own copy to match that existing convention. */
-type Fields = Record<string, unknown>;
-
-function fields(r: NormRecord): Fields {
-  return ((r as unknown as { fields?: Fields }).fields || (r as unknown as { payload?: Fields }).payload || {}) as Fields;
-}
+ */
+/** A heartbeat as the live channel carries it: the flow payload, plus the
+ *  host-clock stamp a repeat of an unchanged silent state adds
+ *  (`live_gate.rs`'s `refresh_due`). Live only: no flow record carries it. */
+type LiveHeartbeat = DispatchHeartbeatPayload & { refreshed_at_ms?: number };
 
 function num(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
@@ -81,8 +76,8 @@ export function heartbeatSamples(records: NormRecord[]): HeartbeatSample[] {
   const out: HeartbeatSample[] = [];
   const refreshes: { turn: unknown; stateAt: number; at: number }[] = [];
   for (const r of records) {
-    if (r.action !== ACTION.DispatchTurnHeartbeat) continue;
-    const f = fields(r);
+    const f: LiveHeartbeat | undefined = payloadOf(r, ACTION.DispatchTurnHeartbeat);
+    if (!f) continue;
     // (#2928) A live refresh repeats a state; it only says the state still
     // holds. Collected apart and folded into `freshMs` below.
     const refreshedAt = num(f.refreshed_at_ms);
@@ -152,15 +147,16 @@ export function measuredCharsPerToken(records: NormRecord[]): number {
   const tokensByTurn = new Map<unknown, number>();
   const checkpointed = checkpointedTurns(records);
   for (const r of records) {
-    const f = fields(r);
-    if (r.action === ACTION.DispatchTurnHeartbeat) {
-      const c = num(f.generated_chars) ?? num(f.cumulative_chars);
-      if (c !== null) charsByTurn.set(f.turn_seq, Math.max(charsByTurn.get(f.turn_seq) ?? 0, c));
-    } else if (r.action === ACTION.TelemetryTokens && isTurnUsage(f)) {
+    const beat = payloadOf(r, ACTION.DispatchTurnHeartbeat);
+    const usage = payloadOf(r, ACTION.TelemetryTokens);
+    if (beat) {
+      const c = num(beat.generated_chars) ?? num(beat.cumulative_chars);
+      if (c !== null) charsByTurn.set(beat.turn_seq, Math.max(charsByTurn.get(beat.turn_seq) ?? 0, c));
+    } else if (usage && isTurnUsage(usage)) {
       // (#2902 step 1a) Turn records only: a single-shot or map-item call
       // has no heartbeats to pair with and must not skew the calibration.
-      const t = num(f.completion_tokens);
-      if (t !== null) tokensByTurn.set(f.turn_seq, (tokensByTurn.get(f.turn_seq) ?? 0) + t);
+      const t = num(usage.completion_tokens);
+      if (t !== null) tokensByTurn.set(usage.turn_seq, (tokensByTurn.get(usage.turn_seq) ?? 0) + t);
     }
   }
   let chars = 0;
@@ -213,7 +209,8 @@ export function measuredCharsPerToken(records: NormRecord[]): number {
 function checkpointedTurns(records: NormRecord[]): Set<unknown> {
   const out = new Set<unknown>();
   for (const r of records) {
-    if (r.action === ACTION.DispatchCheckpoint && fields(r).verdict === "conclude") out.add(fields(r).turn_seq);
+    const checkpoint = payloadOf(r, ACTION.DispatchCheckpoint);
+    if (checkpoint?.verdict === "conclude") out.add(checkpoint.turn_seq);
   }
   return out;
 }
@@ -265,14 +262,15 @@ export function averageGenerationRate(recordSets: NormRecord[][]): GenerationRat
     const tok = new Map<unknown, number>();
     const checkpointed = checkpointedTurns(records);
     for (const r of records) {
-      const f = fields(r);
-      if (r.action === ACTION.DispatchTurn) {
-        const g = num(f.generation_ms);
-        if (g !== null && g > 0) genMs.set(f.turn_seq, g);
-      } else if (r.action === ACTION.TelemetryTokens && isTurnUsage(f)) {
+      const turn = payloadOf(r, ACTION.DispatchTurn);
+      const usage = payloadOf(r, ACTION.TelemetryTokens);
+      if (turn) {
+        const g = num(turn.generation_ms);
+        if (g !== null && g > 0) genMs.set(turn.turn_seq, g);
+      } else if (usage && isTurnUsage(usage)) {
         // (#2902 step 1a) Turn records only, as in `measuredCharsPerToken`.
-        const t = num(f.completion_tokens);
-        if (t !== null) tok.set(f.turn_seq, (tok.get(f.turn_seq) ?? 0) + t);
+        const t = num(usage.completion_tokens);
+        if (t !== null) tok.set(usage.turn_seq, (tok.get(usage.turn_seq) ?? 0) + t);
       }
     }
     for (const [turn, g] of genMs) {
@@ -620,8 +618,8 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
     if (atMs === null) continue;
     let m: StateMarker | null = null;
     if (r.action === ACTION.DispatchTurnHeartbeat) {
-      const f = fields(r);
-      if (f.phase === WRITING_TOOL_CALL_PHASE && typeof f.tool_name === "string" && f.tool_name) writtenTool = f.tool_name;
+      const f = payloadOf(r, ACTION.DispatchTurnHeartbeat);
+      if (f?.phase === WRITING_TOOL_CALL_PHASE && typeof f.tool_name === "string" && f.tool_name) writtenTool = f.tool_name;
     } else if (r.action === ACTION.DispatchStart) {
       pendingTools = null;
       turnToolName = null;
@@ -632,12 +630,13 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
       writtenTool = null;
       m = { atMs, kind: "prompt" };
     } else if (r.action === ACTION.DispatchTurn) {
-      const calls = num(fields(r).tool_calls_count);
+      const turn = payloadOf(r, ACTION.DispatchTurn);
+      const calls = num(turn?.tool_calls_count);
       turnToolName = calls === null || calls === 1 ? writtenTool : null;
       writtenTool = null;
-      const named = fields(r).tool_names;
+      const named = turn?.tool_names;
       turnNames = Array.isArray(named) ? named.map((n) => (typeof n === "string" && n ? n : null)) : null;
-      const listed = fields(r).tool_paths;
+      const listed = turn?.tool_paths;
       turnPaths = Array.isArray(listed) ? listed.map((p) => cleanToolPath(p)) : null;
       completedInTurn = 0;
       listsInStep = true;
@@ -653,12 +652,13 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
       // its own name or readable file is not the lists' entry, the lists and
       // the completions are out of step (a call the runtime discarded, say),
       // and no later index is trusted this turn.
-      const name = fields(r).tool_name;
+      const call = payloadOf(r, ACTION.DispatchTool);
+      const name = call?.tool_name;
       if (listsInStep && turnNames !== null && typeof name === "string" && name && name !== (turnNames[completedInTurn] ?? null)) listsInStep = false;
       // (#2963 review, CONSIDER 4) Only a tool that takes a path is
       // compared on it: a stray `path` key on a bash call is not its file.
       if (listsInStep && turnPaths !== null && typeof name === "string" && PATH_TOOLS.has(name)) {
-        const own = toolCallPath(fields(r));
+        const own = call ? toolCallPath(call) : null;
         if (own !== null && own !== (turnPaths[completedInTurn] ?? null)) listsInStep = false;
       }
       // The call that completed is not the one running now.
@@ -669,9 +669,10 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
       // (#2915) This execution's compactor is running. A routing job (or any
       // other job that serves no execution) never lands here: it carries no
       // session, so it is not in an execution's records at all.
-      const bound = num(fields(r).stall_after_ms);
+      const start = payloadOf(r, ACTION.UtilityStart);
+      const bound = num(start?.stall_after_ms);
       // (#2915 review, C4) The start's own ms time counts the millisecond.
-      const startedAt = num(fields(r).started_at_ms);
+      const startedAt = num(start?.started_at_ms);
       m = { atMs: startedAt !== null && startedAt > 0 ? startedAt : atMs, kind: "compacting", stallAfterMs: bound !== null && bound > 0 ? bound : UTILITY_JOB_DEFAULT_STALL_MS };
     } else if (
       marker?.kind === "compacting" &&
@@ -682,7 +683,8 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
       // usage record is not a marker (a run from before 1.61.0 reads as it
       // always did). (#2915 review, C4) At its own ms end time, and never
       // before the start it ends (both can share one whole-second `ts`).
-      const endedAt = num(fields(r).ended_at_ms);
+      const ended = payloadOf(r, ACTION.UtilityError) ?? payloadOf(r, ACTION.TelemetryTokens);
+      const endedAt = num(ended?.ended_at_ms);
       m = { atMs: Math.max(endedAt !== null && endedAt > 0 ? endedAt : atMs, marker.atMs), kind: "prompt" };
     } else if (r.action === ACTION.BudgetWait) {
       // (#2902 step 5) A HOSTED call held by its endpoint's budget (a
@@ -690,9 +692,9 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
       // once, with how long, and writes no `dispatch.rest` (there is no
       // runtime to rest). It reads as the same REST an agentic run's budget
       // pause does: "budget · <endpoint>", counting down to the resume time.
-      const f = fields(r);
-      const waitMs = num(f.wait_ms);
-      if (waitMs !== null && waitMs > 0) {
+      const f = payloadOf(r, ACTION.BudgetWait);
+      const waitMs = num(f?.wait_ms);
+      if (f && waitMs !== null && waitMs > 0) {
         m = { atMs, kind: "rest", restMs: waitMs };
         const why = restReasonLabel("budget", typeof f.endpoint_id === "string" ? f.endpoint_id : undefined);
         if (why !== null) {
@@ -708,9 +710,9 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
       // announce-only sibling (`pause: false, delay_ms`, no `ms`) is the
       // governor changing its PACING, not a rest (same filter
       // `sessionRun.ts`'s REST tiles already apply).
-      const f = fields(r);
-      const ms = num(f.ms);
-      if (ms !== null && ms > 0) {
+      const f = payloadOf(r, ACTION.DispatchRest);
+      const ms = num(f?.ms);
+      if (f && ms !== null && ms > 0) {
         m = { atMs, kind: "rest", restMs: ms };
         const why = restReasonLabel(f.reason, f.state);
         if (why !== null) {

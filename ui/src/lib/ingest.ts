@@ -36,6 +36,7 @@ import type { FlowRecord } from "../types/generated/FlowRecord";
 import type { Category } from "../types/generated/Category";
 import type { ExecutionGrainAction } from "../types/generated/ExecutionGrainAction";
 import type { FlowAction } from "../types/generated/FlowAction";
+import type { DispatchEndPayload } from "../types/generated/DispatchEndPayload";
 import type { FlowPayloads } from "../types/generated/FlowPayloads";
 import type { FlowSource } from "../types/generated/FlowSource";
 import type { Level } from "../types/generated/Level";
@@ -117,10 +118,32 @@ export function tagText(v: Tag<string, string> | undefined): string {
  *  one whose payload is not its action's type (`UnreadPayload` in Rust) reads
  *  as whatever JSON it holds. */
 export function payloadOf<W extends keyof FlowPayloads>(
-  rec: { readonly action?: NormAction; readonly payload?: Record<string, unknown> },
+  rec: { readonly action?: NormAction; readonly payload?: Record<string, unknown> } | null | undefined,
   action: Tag<"action", W>,
 ): FlowPayloads[W] | undefined {
-  return rec.action === (action as unknown as NormAction) ? (rec.payload as FlowPayloads[W] | undefined) : undefined;
+  return rec?.action === (action as unknown as NormAction) ? (rec.payload as FlowPayloads[W] | undefined) : undefined;
+}
+
+/** The step a record's payload names, for the actions whose payload type has a
+ *  `step_id` (most of them): the one cross-action read of a payload. */
+export function stepIdOf(rec: { readonly payload?: Record<string, unknown> } | null | undefined): string | undefined {
+  const p = anyPayload(rec);
+  return p && "step_id" in p && typeof p.step_id === "string" ? p.step_id : undefined;
+}
+
+/** A record's payload as the union of every action's payload type: what a
+ *  reader that asks one question of many actions (which turn, which step) is
+ *  honestly holding. Narrow with `in`; ask `payloadOf` when the action is
+ *  known. */
+export function anyPayload(rec: { readonly payload?: Record<string, unknown> } | null | undefined): FlowPayloads[keyof FlowPayloads] | undefined {
+  const p = rec?.payload;
+  return p && typeof p === "object" ? (p as FlowPayloads[keyof FlowPayloads]) : undefined;
+}
+
+/** The payload of a role execution's terminal record: `dispatch.complete` and
+ *  `dispatch.error` share one type, so a reader of "how it ended" asks once. */
+export function endPayloadOf(rec: { readonly action?: NormAction; readonly payload?: Record<string, unknown> } | null | undefined): DispatchEndPayload | undefined {
+  return payloadOf(rec, ACTION.DispatchComplete) ?? payloadOf(rec, ACTION.DispatchError);
 }
 
 /** A constant table's wire strings, typed as tags of kind `K`. The one place
