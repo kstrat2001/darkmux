@@ -98,7 +98,13 @@ pub fn config_summary(config: &MissionConfig) -> String {
 /// uppercase letter). A config that cannot be launched is skipped with a
 /// stderr note, so it is never offered and one broken override never hides
 /// the rest.
-pub fn list_launchable() -> Vec<LaunchableConfig> {
+///
+/// `Err` is the refusal every launch runs first
+/// ([`crate::mission_launch::preflight_launch`], the SAME call): one stale
+/// user-tier file blocks every launch, so nothing is offered and the
+/// refusal text is the answer.
+pub fn list_launchable() -> Result<Vec<LaunchableConfig>> {
+    crate::mission_launch::preflight_launch()?;
     let mut out = Vec::new();
     for row in crate::mission_config_cli::build_list() {
         if let Some(err) = &row.error {
@@ -118,7 +124,7 @@ pub fn list_launchable() -> Vec<LaunchableConfig> {
             Err(e) => eprintln!("[darkmux-acp] skipping mission config \"{}\" while listing: {e:#}", row.id),
         }
     }
-    out
+    Ok(out)
 }
 
 /// What the panel does with `/mission`'s verb word.
@@ -193,7 +199,16 @@ pub fn command_listing() -> String {
     format!("Available commands: `/{MISSION_COMMAND}`. {MISSION_USAGE}")
 }
 
-/// `/mission list`, rendered: one line per launchable config.
+/// `/mission list`, rendered from [`list_launchable`]: the refusal text when
+/// launches are blocked, else one line per launchable config.
+pub fn mission_list_text() -> String {
+    match list_launchable() {
+        Ok(configs) => render_mission_list(&configs),
+        Err(refusal) => format!("No mission config can be launched right now.\n{refusal:#}"),
+    }
+}
+
+/// One line per launchable config.
 pub fn render_mission_list(configs: &[LaunchableConfig]) -> String {
     if configs.is_empty() {
         return "No mission configs are launchable (built-ins and ~/.darkmux/mission-configs/ are both empty).".to_string();
@@ -247,9 +262,9 @@ pub struct LaunchPlan {
     pub raw_args: String,
 }
 
-/// `true` iff `token` is `name=value` and the config declares an input `name`.
-fn is_declared_param(config: &MissionConfig, token: &str) -> bool {
-    token.split_once('=').is_some_and(|(name, _)| config.inputs.iter().any(|i| i.name == name))
+/// `true` iff the config declares an input `name`.
+fn is_declared_input(config: &MissionConfig, name: &str) -> bool {
+    config.inputs.iter().any(|i| i.name == name)
 }
 
 /// The refusal for free text sent to a config with nowhere to put it.
@@ -265,12 +280,63 @@ fn no_free_text_refusal(config: &MissionConfig, text: &str) -> String {
     )
 }
 
+/// One word of the text after a config id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Word {
+    /// `name=value` for a declared input, quotes around the value removed.
+    Param(String),
+    /// Anything else, verbatim.
+    Free(String),
+}
+
+/// Split `rest` on whitespace into [`Word`]s. A declared input's value may be
+/// quoted, `name="two words"` or `name='two words'`, so it can hold spaces;
+/// the quotes are removed and the closing quote ends the quoted part. Quotes
+/// anywhere else (an apostrophe in free text) are ordinary characters. `Err`
+/// names a declared input whose quote never closes.
+fn split_words(config: &MissionConfig, rest: &str) -> Result<Vec<Word>> {
+    let mut words = Vec::new();
+    let mut tail = rest.trim_start();
+    while !tail.is_empty() {
+        let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+        let token = &tail[..end];
+        let quoted = token
+            .split_once('=')
+            .filter(|(name, value)| is_declared_input(config, name) && value.starts_with(['"', '\'']));
+        let Some((name, value)) = quoted else {
+            let word = match token.split_once('=') {
+                Some((name, _)) if is_declared_input(config, name) => Word::Param(token.to_string()),
+                _ => Word::Free(token.to_string()),
+            };
+            words.push(word);
+            tail = tail[end..].trim_start();
+            continue;
+        };
+        let quote = value.chars().next().unwrap_or('"');
+        let value_start = name.len() + 2;
+        let Some(close) = tail[value_start..].find(quote) else {
+            bail!("`{name}=` opens a {quote} quote that never closes, so `{}` was not launched. Close the quote after the value.", config.id);
+        };
+        let quoted_value = &tail[value_start..value_start + close];
+        let after = value_start + close + 1;
+        let suffix_end = tail[after..].find(char::is_whitespace).map_or(tail.len(), |i| after + i);
+        words.push(Word::Param(format!("{name}={quoted_value}{}", &tail[after..suffix_end])));
+        tail = tail[suffix_end..].trim_start();
+    }
+    Ok(words)
+}
+
 /// Map the words after a config id onto its declared inputs, the way
 /// `mission launch --param` receives them (see the module doc).
 pub fn map_launch_args(config: &MissionConfig, rest: &str) -> Result<Vec<String>> {
-    let (declared, free): (Vec<&str>, Vec<&str>) =
-        rest.split_whitespace().partition(|t| is_declared_param(config, t));
-    let mut params: Vec<String> = declared.iter().map(|t| t.to_string()).collect();
+    let mut params = Vec::new();
+    let mut free = Vec::new();
+    for word in split_words(config, rest)? {
+        match word {
+            Word::Param(p) => params.push(p),
+            Word::Free(w) => free.push(w),
+        }
+    }
     if free.is_empty() {
         return Ok(params);
     }
@@ -311,6 +377,10 @@ pub enum Prepared {
     Nothing(String),
 }
 
+/// The inputs [`prepare_launch`] synthesizes from the cwd. The operator
+/// supplying any one of them means it synthesizes none.
+const SYNTHESIZED_INPUTS: [&str; 3] = ["diff_file", "workspace", "head_sha"];
+
 /// `true` iff the operator's params already name `key`.
 fn supplies(params: &[String], key: &str) -> bool {
     params.iter().any(|p| p.split_once('=').is_some_and(|(k, _)| k == key))
@@ -319,7 +389,7 @@ fn supplies(params: &[String], key: &str) -> bool {
 /// Add the inputs a panel invocation cannot type (see the module doc).
 /// `Err` only for genuine IO failures and a cwd that is not a git repo.
 pub fn prepare_launch(config: &MissionConfig, mut params: Vec<String>, cwd: &Path) -> Result<Prepared> {
-    if supplies(&params, "diff_file") {
+    if SYNTHESIZED_INPUTS.iter().any(|key| supplies(&params, key)) {
         return Ok(Prepared::Ready(PreparedLaunch { params, note: None, _synth: None }));
     }
     match synthesize_diff_launch_inputs(config, cwd)? {
@@ -409,7 +479,7 @@ pub fn synthesize_diff_launch_inputs(config: &MissionConfig, cwd: &Path) -> Resu
     let needs_diff = config
         .inputs
         .iter()
-        .any(|i| i.name == "diff_file" && i.required.unwrap_or(true));
+        .any(|i| i.name == "diff_file" && i.is_required_of_operator());
     if !needs_diff {
         return Ok(DiffLaunchInputs::NotNeeded);
     }
@@ -1331,6 +1401,36 @@ mod tests {
     }
 
     #[test]
+    fn a_quoted_declared_value_may_hold_spaces_and_loses_its_quotes() {
+        let cfg = config_with(&["test_command", "rules"], true);
+        assert_eq!(
+            map_launch_args(&cfg, r#"test_command="cargo test -p x" rules='a b' 42"#).unwrap(),
+            vec!["test_command=cargo test -p x".to_string(), "rules=a b".to_string(), "args=42".to_string()]
+        );
+        // The value itself may hold the other quote, and text may follow the close.
+        assert_eq!(
+            map_launch_args(&cfg, r#"test_command="echo 'hi there'"x"#).unwrap(),
+            vec!["test_command=echo 'hi there'x".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_unclosed_quote_on_a_declared_value_is_refused_naming_it() {
+        let cfg = config_with(&["test_command"], true);
+        let err = map_launch_args(&cfg, r#"test_command="cargo test"#).unwrap_err().to_string();
+        assert!(err.contains("`test_command=`") && err.contains("never closes"), "{err}");
+    }
+
+    /// The inverse: quotes outside a declared value are ordinary characters,
+    /// so an apostrophe in free text neither errors nor vanishes.
+    #[test]
+    fn quotes_in_free_text_or_an_undeclared_value_are_left_alone() {
+        let cfg = config_with(&["rules"], true);
+        assert_eq!(map_launch_args(&cfg, "fix don't crash").unwrap(), vec!["args=fix don't crash".to_string()]);
+        assert_eq!(map_launch_args(&cfg, r#"title="a b""#).unwrap(), vec![r#"args=title="a b""#.to_string()]);
+    }
+
+    #[test]
     fn an_undeclared_name_value_token_is_free_text_not_a_param() {
         // The inverse: a token that merely contains `=` is a param only when
         // the config declares that input, or free text with an `=` in it
@@ -1403,7 +1503,7 @@ mod tests {
         write_config(tmp.path(), "renamed", serde_json::json!({"id": "body-id-differs", "name": "Renamed", "phases": shell}));
         write_config(tmp.path(), "Upper-Case", serde_json::json!({"id": "Upper-Case", "name": "Upper", "phases": shell}));
 
-        let listed: Vec<String> = list_launchable().into_iter().map(|c| c.id).collect();
+        let listed: Vec<String> = list_launchable().unwrap().into_iter().map(|c| c.id).collect();
         for id in mission_config::list_ids() {
             let launchable = crate::mission_launch::resolve_config(&id).is_ok();
             assert_eq!(listed.contains(&id), launchable, "`{id}`: listed must equal launchable, listed = {listed:?}");
@@ -1464,6 +1564,44 @@ mod tests {
         );
         let err = format!("{:#}", plan_launch("old-style", "").map(|_| ()).expect_err("a panel block must be refused"));
         assert!(err.contains("/mission launch <id>"), "{err}");
+    }
+
+    /// THE PROMISE: `/mission list` and radio's catalog offer a config only
+    /// if a launch would get past its own first gate. One stale user-tier
+    /// file (a retired `panel` key) blocks every launch, so nothing is
+    /// offered and the refusal, word for word the launch's, is the answer.
+    #[test]
+    #[serial_test::serial]
+    fn a_stale_user_config_empties_the_listing_and_the_catalog_with_the_launch_refusal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        let shell = serde_json::json!([{"id": "p1", "tasks": [{"id": "t1", "steps": [
+            {"id": "s1", "kind": "procedural.shell", "config": {"command": "echo hi"}}]}]}]);
+        write_config(tmp.path(), "fine", serde_json::json!({"id": "fine", "name": "Fine", "phases": shell}));
+        write_config(
+            tmp.path(),
+            "old-style",
+            serde_json::json!({"id": "old-style", "name": "Old", "panel": {"description": "d"}, "phases": shell}),
+        );
+
+        let launch_refusal = format!("{:#}", crate::mission_launch::resolve_config("fine").map(|_| ()).expect_err("launch refuses"));
+        let listing_refusal = format!("{:#}", list_launchable().map(|_| ()).expect_err("the listing refuses too"));
+        assert_eq!(listing_refusal, launch_refusal, "one preflight, one text");
+        assert!(mission_list_text().contains(&launch_refusal), "{}", mission_list_text());
+        assert!(!mission_list_text().contains("`fine`"), "nothing is offered while launches are blocked");
+        assert!(crate::radio::compile_catalog().is_err(), "radio's catalog is empty for the same reason");
+    }
+
+    /// The recovery case: delete the stale file and the listing returns.
+    #[test]
+    #[serial_test::serial]
+    fn removing_the_stale_config_restores_the_listing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        write_config(tmp.path(), "old-style", serde_json::json!({"id": "old-style", "name": "Old", "panel": {}, "phases": []}));
+        assert!(list_launchable().is_err());
+        std::fs::remove_file(tmp.path().join("mission-configs/old-style.json")).unwrap();
+        assert!(list_launchable().unwrap().iter().any(|c| c.id == "review"));
     }
 
     // ── /mission list ───────────────────────────────────────────────────
@@ -1529,6 +1667,21 @@ mod tests {
         let given = vec!["diff_file=/tmp/mine.diff".to_string()];
         let prepared = ready(prepare_launch(&embedded_review(), given.clone(), not_a_repo.path()).unwrap());
         assert_eq!(prepared.params, given, "no synthesis, so a non-repo cwd is not even consulted");
+    }
+
+    /// The operator's own `workspace=` or `head_sha=` is never overridden by
+    /// the cwd's: supplying any one of the three synthesized inputs means
+    /// synthesizing none, and the launch's required-input refusal names what
+    /// is still missing.
+    #[test]
+    #[serial_test::serial]
+    fn any_supplied_synthesized_input_suppresses_all_synthesis() {
+        let repo = temp_repo(2);
+        for key in ["workspace", "head_sha", "diff_file"] {
+            let given = vec![format!("{key}=/mine")];
+            let prepared = ready(prepare_launch(&embedded_review(), given.clone(), repo.path()).unwrap());
+            assert_eq!(prepared.params, given, "`{key}` supplied: nothing may be appended after it");
+        }
     }
 
     #[test]

@@ -347,6 +347,16 @@ impl Drop for WatchdogStopGuard {
     }
 }
 
+/// The refusal every launch runs first: a stale or invalid user file the
+/// launch scope consumes (every effective user-tier mission config
+/// included) blocks ALL launches. [`resolve_config`] and the surfaces that
+/// list what can be launched (`/mission list`, radio's catalog) share this
+/// one call, so a list never offers what a launch would refuse.
+pub(crate) fn preflight_launch() -> Result<()> {
+    darkmux_crew::user_files::preflight(darkmux_types::config_enum::Scope::MissionLaunch)?;
+    Ok(())
+}
+
 /// Resolve a launchable config by id: the identifier check, the
 /// bad-enum-config refusal, and the registry load, with the refusal text a
 /// launch prints. `darkmux mission launch` and the editor panel's
@@ -360,7 +370,7 @@ impl Drop for WatchdogStopGuard {
 /// thermal/battery READING, not a config value.
 pub(crate) fn resolve_config(config_id: &str) -> Result<mission_config::LoadedMissionConfig> {
     fleet::validate_identifier("config_id", config_id)?;
-    darkmux_crew::user_files::preflight(darkmux_types::config_enum::Scope::MissionLaunch)?;
+    preflight_launch()?;
     mission_config::load(config_id).with_context(|| {
         format!(
             "loading mission config \"{config_id}\" — note: a user-tier copy \
@@ -2451,8 +2461,7 @@ fn missing_required_inputs<'a>(
     config
         .inputs
         .iter()
-        .filter(|i| i.name != "mission_id")
-        .filter(|i| i.required != Some(false))
+        .filter(|i| i.is_required_of_operator())
         .filter(|i| !collected.contains_key(&i.name))
         .collect()
 }

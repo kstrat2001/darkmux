@@ -88,7 +88,7 @@ fn shown_config(mission: &crew::types::Mission) -> Option<ShownConfig> {
             .config
             .inputs
             .iter()
-            .map(|i| ShownInput { name: i.name.clone(), required: i.required.unwrap_or(true) })
+            .map(|i| ShownInput { name: i.name.clone(), required: i.is_required_of_operator() })
             .collect(),
     })
 }
@@ -334,6 +334,22 @@ mod tests {
         let _iso = Isolated::new();
         let err = build("no-such-mission").unwrap_err().to_string();
         assert!(err.contains("no mission `no-such-mission`") && err.contains("mission status"), "{err}");
+    }
+
+    /// `mission_id` is filled by the launcher, so `mission show` must not
+    /// call it required; the genuinely required inputs stay marked.
+    #[test]
+    #[serial_test::serial]
+    fn a_launcher_supplied_input_is_not_listed_as_required() {
+        let _iso = Isolated::new();
+        save_mission("show-m4", Some("coder-phase"));
+        let show = build("show-m4").unwrap();
+        let inputs = &show.config.as_ref().unwrap().inputs;
+        let required = |name: &str| inputs.iter().find(|i| i.name == name).unwrap_or_else(|| panic!("no `{name}`: {inputs:?}")).required;
+        assert!(!required("mission_id"), "launch fills mission_id itself");
+        assert!(required("workdir"), "workdir is asked of the operator");
+        let text = render_text(&show);
+        assert!(!text.contains("mission_id (required)") && text.contains("workdir (required)"), "{text}");
     }
 
     /// The `--json` contract: the named keys a consumer reads.

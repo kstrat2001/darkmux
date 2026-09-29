@@ -245,8 +245,8 @@ const EXPAND_RETIRED: &str = "REMOVED in schema 2.0 (see MISSION_CONFIG_SCHEMA's
 /// Why a mission config's `panel` block is refused. One text for
 /// `MissionConfig::validate` and the unknown-key gate ([`retired_key`]).
 const PANEL_RETIRED: &str = "REMOVED: the editor panel no longer advertises one slash command per config. Every \
-     launchable config runs from the panel as `/mission launch <id>` (and `/mission list` lists them), so the block \
-     is ignored. Delete the `panel` key; to run this config from the panel, type `/mission launch <id>`";
+     launchable config runs from the panel as `/mission launch <id>` (and `/mission list` lists them), so a config \
+     carrying the block is refused. Delete the `panel` key; to run this config from the panel, type `/mission launch <id>`";
 
 /// A mission config's retired keys, by path (array indices dropped), for
 /// the unknown-key gate (`darkmux_types::user_files`).
@@ -539,6 +539,17 @@ pub struct MissionInput {
     #[serde(flatten)]
     #[schemars(skip)]
     pub extras: BTreeMap<String, serde_json::Value>,
+}
+
+impl MissionInput {
+    /// Whether a launch refuses to start until the operator supplies this
+    /// input. `mission_id` is filled by the launcher, so it is never asked
+    /// of the operator; an input whose `required` is absent counts as
+    /// required. The one predicate the launcher's missing-input refusal and
+    /// `mission show`'s listing both read.
+    pub fn is_required_of_operator(&self) -> bool {
+        self.name != "mission_id" && self.required != Some(false)
+    }
 }
 
 /// One phase, as data. `id` is a SUFFIX — the launcher composes the real

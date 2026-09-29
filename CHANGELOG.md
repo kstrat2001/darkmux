@@ -19,7 +19,9 @@ darkmux release.
 - **The per-config `panel` block, and the panel's per-config slash commands**
   (`/review`, `/machine-status`, `/pr-merge`, ...). The editor panel now has
   one command, `/mission`, with three verbs, and every config `darkmux mission
-  launch` accepts is listable and launchable through it. A mission config
+  launch` accepts is listable and launchable through it. `/mission list` and
+  radio's catalog run the same first check a launch does, so they list
+  configs exactly when a launch could start. A mission config
   carrying a `panel` key is refused by the user-file gate and by `mission
   config` validation, with a message naming `/mission launch <id>`.
   `mission config list --json` rows and `mission config show --json` lose
@@ -32,7 +34,17 @@ darkmux release.
   config's `description` (else its `name`) where it read `panel.description`,
   so a config you want routable should lead with one plain sentence. Panel
   ids are the ones `mission launch` accepts (lowercase), so a config whose
-  file name has an uppercase letter is not listed.
+  file name has an uppercase letter is not listed. **One stale user-tier
+  mission config blocks every launch** (a leftover `panel` key is enough):
+  `mission launch`, `/mission list` and radio all refuse with the same text
+  until the file is fixed, and `darkmux doctor` names it. A value with spaces
+  in the panel is written `name="two words"`.
+- **Radio asks before it runs anything it chose.** The router can now pick any
+  launchable config from free text, so `darkmux radio` prints the exact
+  `darkmux mission launch <id> --param ...` command and asks `Run it? [y/N]`
+  before running it. With no interactive terminal it prints the command and
+  exits 1 without running it. **Migration:** a script that relied on radio
+  running its pick unattended must run the printed command itself.
 - **`darkmux mission dispatch` and the hand-built mission verbs** (#2954).
   Missions now come only from mission configs. Removed with no alias:
   `mission dispatch`, `mission add-phase`, `mission start`,

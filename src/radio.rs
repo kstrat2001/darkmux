@@ -117,8 +117,10 @@ const NO_ARGUMENTS_HINT: &str = "(no arguments)";
 /// the SAME enumeration `/mission list` prints (single derivation of "what
 /// can be launched"). A pure `map`: no second registry load, no divergent
 /// filter. `list_launchable` sorts by id, and this preserves that order.
-pub fn compile_catalog() -> Vec<CatalogEntry> {
-    crate::acp_panel::list_launchable()
+/// `Err` is the launch refusal that empties the listing (one stale user-tier
+/// config blocks every launch): the catalog is empty and this is why.
+pub fn compile_catalog() -> Result<Vec<CatalogEntry>> {
+    Ok(crate::acp_panel::list_launchable()?
         .into_iter()
         .map(|config| CatalogEntry {
             id: config.id,
@@ -126,7 +128,7 @@ pub fn compile_catalog() -> Vec<CatalogEntry> {
             hint: (!config.accepts_args).then(|| NO_ARGUMENTS_HINT.to_string()),
             accepts_args: config.accepts_args,
         })
-        .collect()
+        .collect())
 }
 
 /// The routing seat's decision for one exchange — see this module's doc on
@@ -1154,7 +1156,7 @@ mod tests {
         )
         .unwrap();
 
-        let catalog = compile_catalog();
+        let catalog = compile_catalog().expect("no stale user files in this fixture");
         let ids: Vec<&str> = catalog.iter().map(|c| c.id.as_str()).collect();
         assert!(ids.is_sorted(), "catalog must be id-sorted: {ids:?}");
         for builtin in ["review", "machine-status"] {
@@ -1192,7 +1194,7 @@ mod tests {
         // SAFETY: this test is #[serial_test::serial].
         unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
 
-        let catalog = compile_catalog();
+        let catalog = compile_catalog().expect("no stale user files in this fixture");
         let entry = catalog
             .iter()
             .find(|c| c.id == "machine-status")
@@ -1229,7 +1231,7 @@ mod tests {
         )
         .unwrap();
 
-        let catalog = compile_catalog();
+        let catalog = compile_catalog().expect("no stale user files in this fixture");
         let found = catalog.iter().find(|c| c.id == "no-desc").expect("no-desc must be listed");
         assert_eq!(found.description, "No Desc");
 

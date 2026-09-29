@@ -1562,10 +1562,8 @@ async fn execute_mission_verb(
     use crate::acp_panel::MissionVerb;
     match verb {
         MissionVerb::List => {
-            let text = tokio::task::spawn_blocking(|| {
-                crate::acp_panel::render_mission_list(&crate::acp_panel::list_launchable())
-            })
-            .await
+            let text = tokio::task::spawn_blocking(crate::acp_panel::mission_list_text)
+                .await
             .context("joining the mission list task")?;
             Ok(cx.send_notification(agent_chunk(session_id, text))?)
         }
@@ -1688,10 +1686,16 @@ async fn run_no_slash_route(
     }
     let text_owned = text.to_string();
     let mut routing = tokio::task::spawn_blocking(move || {
-        let catalog = crate::radio::compile_catalog();
-        crate::radio::route_and_record(&text_owned, &catalog, crate::radio::RadioSurface::Panel, &mut |message: &str| {
-            (router_call)(message)
-        })
+        match crate::radio::compile_catalog() {
+            Ok(catalog) => {
+                crate::radio::route_and_record(&text_owned, &catalog, crate::radio::RadioSurface::Panel, &mut |message: &str| {
+                    (router_call)(message)
+                })
+            }
+            // Every launch is refused, so there is nothing to route to: the
+            // refusal is the reason, handed to the answering seat like any other.
+            Err(refusal) => crate::radio::RouteDecision::Refuse { reason: format!("{refusal:#}") },
+        }
     });
     // (#2917) The router waits behind whatever occupies the one utility
     // instance (a compaction, by decision), but past
@@ -1793,7 +1797,9 @@ async fn answer_no_slash_refusal(
     let text_owned = text.to_string();
     let cwd_owned = cwd.to_path_buf();
     let outcome = tokio::task::spawn_blocking(move || {
-        let catalog = crate::radio::compile_catalog();
+        // A launch refusal that empties the catalog is already the reason
+        // this turn is answering, so the answer is grounded on no commands.
+        let catalog = crate::radio::compile_catalog().unwrap_or_default();
         crate::radio_answer::answer(
             &text_owned,
             &catalog,

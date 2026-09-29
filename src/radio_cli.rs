@@ -52,7 +52,15 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
     // caught.
     crate::launch_guard::arm();
     let _reap_watchdog = crate::launch_guard::spawn_reap_watchdog();
-    let catalog = radio::compile_catalog();
+    let catalog = match radio::compile_catalog() {
+        Ok(catalog) => catalog,
+        // One stale user-tier file blocks every launch, so nothing is
+        // launchable: say why, and exit 1 (nothing was routed or run).
+        Err(refusal) => {
+            eprintln!("radio: no mission config can be launched right now.\n{refusal:#}");
+            return Ok(1);
+        }
+    };
     if catalog.is_empty() {
         println!(
             "radio: no mission config is launchable — the merged registry (built-ins + \
@@ -156,14 +164,99 @@ fn advertised_list_message(catalog: &[CatalogEntry]) -> String {
     format!("Available commands: {list}.")
 }
 
+/// The user's answer to "run this command?". The model's pick is never the
+/// consent: it is the command that is confirmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Consent {
+    Approved,
+    /// The user answered anything but yes.
+    Declined,
+    /// No answer could be asked for or read: no interactive terminal, or EOF
+    /// before an answer. Nothing runs, and the exit is 1 (a script can tell
+    /// "not run" from a run).
+    Unanswered,
+}
+
+/// `darkmux mission launch <id> --param k=v ...` as the user would type it,
+/// each param single-quoted when it needs it.
+fn launch_command_line(config_id: &str, params: &[String]) -> String {
+    let mut line = format!("darkmux mission launch {config_id}");
+    for param in params {
+        line.push_str(" --param ");
+        line.push_str(&shell_word(param));
+    }
+    line
+}
+
+/// `word` as one POSIX shell word: bare when it is plain, else single-quoted.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '=' | ',' | '@' | '+'));
+    if plain { word.to_string() } else { format!("'{}'", word.replace('\'', "'\\''")) }
+}
+
+/// Print `command_line`, then ask y/N on `reader`/`writer`. Without an
+/// interactive terminal nothing is asked: the command is printed, with the
+/// line saying it was not run, so the user can run it themselves. `y`/`yes`
+/// (case-insensitive) is the only approval.
+fn confirm_launch<R: std::io::BufRead, W: std::io::Write>(
+    mut reader: R,
+    mut writer: W,
+    interactive: bool,
+    command_line: &str,
+) -> Consent {
+    let _ = writeln!(writer, "radio: chose this command from your text:\n\n    {command_line}\n");
+    if !interactive {
+        let _ = writeln!(
+            writer,
+            "radio: not run: there is no interactive terminal to confirm on. Run the command above yourself to launch it."
+        );
+        return Consent::Unanswered;
+    }
+    let _ = write!(writer, "Run it? [y/N] ");
+    let _ = writer.flush();
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) | Err(_) => {
+            let _ = writeln!(writer, "\nradio: not run: no answer was read.");
+            Consent::Unanswered
+        }
+        Ok(_) if matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") => Consent::Approved,
+        Ok(_) => {
+            let _ = writeln!(writer, "radio: not run.");
+            Consent::Declined
+        }
+    }
+}
+
+/// [`confirm_launch`] against this process's stdin and stdout.
+fn confirm_on_terminal(command_line: &str) -> Consent {
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    confirm_launch(std::io::BufReader::new(std::io::stdin()), std::io::stdout(), interactive, command_line)
+}
+
+/// The exit code for a consent that did not approve.
+fn exit_for_unapproved(consent: Consent) -> Option<i32> {
+    match consent {
+        Consent::Approved => None,
+        Consent::Declined => Some(0),
+        Consent::Unanswered => Some(1),
+    }
+}
+
 /// Turn a routed command (a catalog config id) into an actual execution,
 /// through the SAME planning the editor panel's `/mission launch` uses
 /// ([`crate::acp_panel::plan_launch`] then [`crate::acp_panel::prepare_launch`]),
 /// so the two surfaces cannot drift: the same input mapping, the same
 /// refusals, the same diff synthesis from the cwd for a config that declares
-/// a required `diff_file`.
+/// a required `diff_file`. The user confirms the command first
+/// ([`confirm_on_terminal`]): the router could choose any config from free
+/// text, so its pick is never the consent.
 fn execute(command: &str, args: &str) -> Result<i32> {
     let plan = crate::acp_panel::plan_launch(command, args).with_context(|| format!("radio: routed command `{command}`"))?;
+    if let Some(code) = exit_for_unapproved(confirm_on_terminal(&launch_command_line(&plan.config_id, &plan.params))) {
+        return Ok(code);
+    }
     let cwd = std::env::current_dir().context("resolving current directory")?;
     let prepared = match crate::acp_panel::prepare_launch(&plan.config, plan.params.clone(), &cwd)? {
         crate::acp_panel::Prepared::Ready(prepared) => prepared,
@@ -464,6 +557,69 @@ mod tests {
         assert_eq!(
             decision,
             radio::RouteDecision::Route { command: "review".to_string(), args: "42".to_string() }
+        );
+    }
+
+    // ── consent before a routed launch ──────────────────────────────────
+
+    struct NoRead;
+    impl std::io::Read for NoRead {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("a non-interactive confirm must not read");
+        }
+    }
+
+    fn ask(input: &str, interactive: bool) -> (Consent, String) {
+        let mut out = Vec::new();
+        let consent = confirm_launch(input.as_bytes(), &mut out, interactive, "darkmux mission launch review");
+        (consent, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn a_yes_answer_approves_and_the_command_was_shown_first() {
+        for yes in ["y\n", "Y\n", "yes\n", "  YES \n"] {
+            let (consent, out) = ask(yes, true);
+            assert_eq!(consent, Consent::Approved, "{yes:?}");
+            assert!(out.contains("darkmux mission launch review") && out.contains("[y/N]"), "{out}");
+        }
+    }
+
+    #[test]
+    fn anything_but_yes_declines() {
+        for no in ["n\n", "\n", "no\n", "maybe\n", "yep\n"] {
+            assert_eq!(ask(no, true).0, Consent::Declined, "{no:?}");
+        }
+    }
+
+    #[test]
+    fn eof_is_never_consent() {
+        let (consent, out) = ask("", true);
+        assert_eq!(consent, Consent::Unanswered);
+        assert!(out.contains("not run"), "{out}");
+    }
+
+    #[test]
+    fn without_a_terminal_the_command_is_printed_and_nothing_is_read() {
+        let mut out = Vec::new();
+        let consent = confirm_launch(std::io::BufReader::new(NoRead), &mut out, false, "darkmux mission launch review");
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(consent, Consent::Unanswered);
+        assert!(out.contains("darkmux mission launch review") && out.contains("not run") && out.contains("no interactive terminal"), "{out}");
+    }
+
+    #[test]
+    fn only_an_approval_lets_the_launch_proceed_and_the_exits_differ() {
+        assert_eq!(exit_for_unapproved(Consent::Approved), None);
+        assert_eq!(exit_for_unapproved(Consent::Declined), Some(0));
+        assert_eq!(exit_for_unapproved(Consent::Unanswered), Some(1));
+    }
+
+    #[test]
+    fn the_printed_command_quotes_params_the_way_a_shell_needs() {
+        let params = vec!["rules=a,b".to_string(), "args=fix the bug".to_string(), "t=it's".to_string()];
+        assert_eq!(
+            launch_command_line("review", &params),
+            "darkmux mission launch review --param rules=a,b --param 'args=fix the bug' --param 't=it'\\''s'"
         );
     }
 
