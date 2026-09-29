@@ -718,7 +718,7 @@ fn battery_edge(
 // 3. The gatherer stamps its OWN cost (`gather_ms`, plus the ledger's own
 //    `residency.gather_ms` inside it), so "the observer was negligible"
 //    stays a verifiable claim in the artifact rather than an assumption.
-// 4. The cadence is a RECORDED knob: `period_seconds` (configured) and
+// 4. The cadence is a RECORDED knob: `period_ms` (configured) and
 //    `emitted_interval_ms` (measured) both ride in the payload, so a
 //    tightened debug cadence is visible in the data instead of inferred
 //    from row spacing.
@@ -787,7 +787,7 @@ fn build_machine_rollup_record(
     load: serde_json::Value,
     residency: Option<serde_json::Value>,
     previous_thermal_state: Option<&str>,
-    period_seconds: u64,
+    period_ms: u64,
     emitted_interval_ms: u64,
     gather_ms: u64,
     sampled_at_ms: u64,
@@ -796,7 +796,7 @@ fn build_machine_rollup_record(
         load,
         residency,
         previous_thermal_state,
-        period_seconds,
+        period_ms,
         emitted_interval_ms,
         gather_ms,
         sampled_at_ms,
@@ -823,7 +823,7 @@ fn build_machine_rollup_record_with(
     load: serde_json::Value,
     residency: Option<serde_json::Value>,
     previous_thermal_state: Option<&str>,
-    period_seconds: u64,
+    period_ms: u64,
     emitted_interval_ms: u64,
     gather_ms: u64,
     sampled_at_ms: u64,
@@ -831,7 +831,7 @@ fn build_machine_rollup_record_with(
 ) -> darkmux_flow::FlowRecord {
     let mut payload = serde_json::json!({
         // Constraint 4: the CONFIGURED cadence...
-        "period_seconds": period_seconds,
+        "period_ms": period_ms,
         // ...and the MEASURED gap since the previous emission. The same
         // rule `machine.telemetry` follows: a tick that ran late reports
         // what actually happened rather than restating the knob.
@@ -1158,7 +1158,7 @@ pub(crate) fn spawn(
                             load,
                             Some(residency),
                             previous_thermal_state.as_deref(),
-                            period_seconds,
+                            period_ms,
                             emitted_interval_ms,
                             gather_start.elapsed().as_millis() as u64,
                             at_ms,
@@ -1269,6 +1269,7 @@ pub(crate) fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use darkmux_crew::host_probe::battery::HOUR_MS;
     use darkmux_crew::host_probe::{CpuCluster, PowerSample, ThermalSample};
     use std::time::Instant;
     use tempfile::TempDir;
@@ -1473,14 +1474,14 @@ mod tests {
         // cycles, capacity and condition; those didn't move.
         let mut h = health_with(28);
         h.temperature_c = Some(30.77);
-        h.total_operating_time_hours = Some(5358);
-        h.time_at_soc_hours = Some(vec![0, 14, 1938]);
+        h.total_operating_ms = Some(5358 * HOUR_MS);
+        h.time_at_soc_ms = Some(vec![0, 14 * HOUR_MS, 1938 * HOUR_MS]);
         let (mut known, _) = battery_health_edge(None, Some(&h), 3_600_000, 0);
         for hour in 1..=24u64 {
             let mut later = h.clone();
             later.temperature_c = Some(30.0 + hour as f64 / 10.0);
-            later.total_operating_time_hours = Some(5358 + hour);
-            later.time_at_soc_hours = Some(vec![0, 14, 1938 + hour as u32]);
+            later.total_operating_ms = Some((5358 + hour) * HOUR_MS);
+            later.time_at_soc_ms = Some(vec![0, 14 * HOUR_MS, (1938 + hour) * HOUR_MS]);
             let (next, rec) = battery_health_edge(known.as_ref(), Some(&later), 3_600_000, hour * 3_600_000);
             known = next;
             assert!(rec.is_none(), "hour {hour}: only temperature/totals moved, which is not a health change");
@@ -2532,7 +2533,7 @@ mod tests {
             load,
             Some(serde_json::json!({ "models": [], "gather_ms": 3 })),
             Some("fair"),
-            60,
+            60_000,
             60_000,
             11,
             5_000,
@@ -2559,14 +2560,14 @@ mod tests {
             serde_json::json!({}),
             None,
             None,
-            60,
+            60_000,
             61_400,
             42,
             9_000,
         );
         let p = rec.payload.expect("payload");
         assert_eq!(p["gather_ms"], 42, "the observer's own cost must be in the artifact");
-        assert_eq!(p["period_seconds"], 60, "the configured knob");
+        assert_eq!(p["period_ms"], 60_000, "the configured knob");
         assert_eq!(
             p["emitted_interval_ms"], 61_400,
             "the MEASURED gap — a tick that ran late reports what happened"
@@ -2581,14 +2582,14 @@ mod tests {
     /// than guessing `nominal`.
     #[test]
     fn previous_thermal_state_is_null_until_a_transition_has_been_seen() {
-        let rec = build_machine_rollup_record(serde_json::json!({}), None, None, 60, 60_000, 1, 0);
+        let rec = build_machine_rollup_record(serde_json::json!({}), None, None, 60_000, 60_000, 1, 0);
         assert_eq!(rec.payload.unwrap()["previous_thermal_state"], serde_json::Value::Null);
 
         let rec = build_machine_rollup_record(
             serde_json::json!({}),
             None,
             Some("nominal"),
-            60,
+            60_000,
             60_000,
             1,
             0,
@@ -2614,7 +2615,7 @@ mod tests {
             },
         });
         let load = ring.snapshot().expect("one sample");
-        let rec = build_machine_rollup_record(load, None, Some("serious"), 60, 60_000, 1, 0);
+        let rec = build_machine_rollup_record(load, None, Some("serious"), 60_000, 60_000, 1, 0);
         assert!(matches!(rec.level, darkmux_flow::Level::Info));
     }
 
@@ -2642,7 +2643,7 @@ mod tests {
         // Real hardware first: the absence is what makes the presence below
         // mean something, and an explicit `null` would NOT do — the flow
         // records answer "were these real" by the key's absence.
-        let real = build_machine_rollup_record(load.clone(), None, None, 60, 60_000, 1, 0)
+        let real = build_machine_rollup_record(load.clone(), None, None, 60_000, 60_000, 1, 0)
             .payload
             .expect("payload");
         assert_eq!(real["now"]["thermal"]["state"], "critical", "the reading really is in there");
@@ -2673,7 +2674,7 @@ mod tests {
             load,
             None,
             None,
-            60,
+            60_000,
             60_000,
             1,
             0,
@@ -2727,7 +2728,7 @@ mod tests {
         assert_eq!(from_lens["level_entries"]["fair"], 1, "one arrival, not two samples");
         assert_eq!(from_lens["level_ms"]["fair"], 10_000);
 
-        let rec = build_machine_rollup_record(load, None, None, 60, 60_000, 1, 0);
+        let rec = build_machine_rollup_record(load, None, None, 60_000, 60_000, 1, 0);
         assert_eq!(
             rec.payload.unwrap()["window"]["thermal"],
             from_lens,
@@ -2879,7 +2880,7 @@ mod tests {
                 "the FIRST tick must emit rather than wait out the 5s period: {first_at:?}"
             );
             let payload = &recs[0]["payload"];
-            assert_eq!(payload["period_seconds"], 5, "the resolved period rides along");
+            assert_eq!(payload["period_ms"], 5_000, "the resolved period rides along");
             assert!(
                 payload["emitted_interval_ms"].is_u64(),
                 "cadence is a recorded knob: {payload}"

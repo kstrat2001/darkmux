@@ -216,8 +216,9 @@ pub struct BatteryHealth {
     /// `Temperature`, converted from the node's hundredths-of-a-degree
     /// units to degrees Celsius (`3094` -> `30.94`).
     pub temperature_c: Option<f64>,
-    /// The battery's OWN cumulative `TimeAtHighSoc` counters, in hours,
-    /// verbatim as a flat little-endian `u32` array.
+    /// The battery's OWN cumulative `TimeAtHighSoc` counters, in
+    /// milliseconds (the pack counts whole hours, [`HOUR_MS`] each), one per
+    /// bucket of the flat array it reports.
     ///
     /// **Read from the pack's lifetime counters, not accumulated by
     /// darkmux** — so it survives restarts and does not depend on the
@@ -232,11 +233,11 @@ pub struct BatteryHealth {
     /// presented as a reading. The UNIT is not a guess: the buckets summed
     /// to 5181 against a `TotalOperatingTime` of 5178 on the reference
     /// machine (2026-09-15), which is what establishes hours.
-    pub time_at_soc_hours: Option<Vec<u32>>,
-    /// `LifetimeData.TotalOperatingTime`, in hours — recorded beside the
-    /// buckets because it is the cross-check that gives them their unit
-    /// (see [`Self::time_at_soc_hours`]).
-    pub total_operating_time_hours: Option<u64>,
+    pub time_at_soc_ms: Option<Vec<u64>>,
+    /// `LifetimeData.TotalOperatingTime`, in milliseconds (the pack counts
+    /// whole hours) — recorded beside the buckets because it is the
+    /// cross-check that gives them their unit (see [`Self::time_at_soc_ms`]).
+    pub total_operating_ms: Option<u64>,
 }
 
 impl BatteryHealth {
@@ -354,6 +355,9 @@ pub fn minutes_to_empty_from(raw: Option<i64>, on_ac: bool, charging: bool) -> O
 /// `None` for an empty blob or one whose length is not a whole number of
 /// `u32`s — a shape this code does not recognize is reported as absent
 /// rather than parsed to whatever prefix happens to fit.
+/// One hour, the unit the battery's lifetime counters count in.
+pub const HOUR_MS: u64 = 3_600_000;
+
 pub fn parse_time_at_soc(bytes: &[u8]) -> Option<Vec<u32>> {
     if bytes.is_empty() || bytes.len() % 4 != 0 {
         return None;
@@ -540,13 +544,14 @@ mod imp {
                     // discard the way a negative cycle count would be).
                     permanent_failure_status: iokit::dict_i64(props, "PermanentFailureStatus"),
                     temperature_c: iokit::dict_i64(props, "Temperature").map(|n| n as f64 / 100.0),
-                    time_at_soc_hours: lifetime
+                    time_at_soc_ms: lifetime
                         .and_then(|ld| iokit::dict_bytes(ld, "TimeAtHighSoc"))
-                        .and_then(|b| super::parse_time_at_soc(&b)),
-                    total_operating_time_hours: lifetime
+                        .and_then(|b| super::parse_time_at_soc(&b))
+                        .map(|hours| hours.into_iter().map(|h| u64::from(h) * super::HOUR_MS).collect()),
+                    total_operating_ms: lifetime
                         .and_then(|ld| iokit::dict_i64(ld, "TotalOperatingTime"))
                         .filter(|n| *n >= 0)
-                        .map(|n| n as u64),
+                        .map(|hours| hours as u64 * super::HOUR_MS),
                 });
             }
         });
@@ -859,11 +864,11 @@ mod tests {
                  conversion is the thing to check"
             );
         }
-        if let Some(buckets) = &h.time_at_soc_hours {
-            let total: u64 = buckets.iter().map(|b| *b as u64).sum();
-            if let Some(op) = h.total_operating_time_hours {
+        if let Some(buckets) = &h.time_at_soc_ms {
+            let total: u64 = buckets.iter().sum();
+            if let Some(op) = h.total_operating_ms {
                 assert!(
-                    total.abs_diff(op) < op / 4 + 24,
+                    total.abs_diff(op) < op / 4 + 24 * HOUR_MS,
                     "the TimeAtHighSoc buckets ({total}) must reconcile with TotalOperatingTime \
                      ({op}) — that reconciliation is the ONLY grounding for the claim that these \
                      counters are in hours, so if it stops holding the doc is wrong, not the test"

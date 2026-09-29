@@ -1119,19 +1119,6 @@ fn gate_finals_by_started(started: bool, fin: Option<&StepFinals>) -> (Option<u6
     (fin.and_then(|f| f.tokens), fin.and_then(|f| f.turns))
 }
 
-/// Days since the Unix epoch for a civil calendar date (Howard Hinnant's
-/// `days_from_civil`) — lets the backfill compare a flow day file's
-/// `YYYY-MM-DD` stem against a mission's `created_ts` without a date crate.
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (i64::from(m) + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
-
 /// Parse a flow day-file stem (`YYYY-MM-DD`) into days since the epoch.
 /// `None` for anything that isn't a well-formed date stem — which also
 /// excludes non-day `.jsonl` files from the backfill scan, matching
@@ -1147,10 +1134,10 @@ fn day_stem_to_epoch_days(stem: &str) -> Option<i64> {
     if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return None;
     }
-    Some(days_from_civil(y, m, d))
+    Some(darkmux_flow::days_from_civil(y, i64::from(m), i64::from(d)))
 }
 
-/// The inverse of [`days_from_civil`] (Hinnant's `civil_from_days`), as a
+/// The inverse of `darkmux_flow::days_from_civil` (Hinnant's `civil_from_days`), as a
 /// `YYYY-MM-DD` stem. Test-only: lets tests name a flow day file for "today"
 /// without a date crate, so the route-level backfill tests aren't pinned to
 /// the date they were written on.
@@ -2017,7 +2004,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let step_ids = ids(&["s1"]);
         // Mission created on 2026-07-17; margin admits 2026-07-16.
-        let created_ts = (days_from_civil(2026, 7, 17) * 86400) as u64;
+        let created_ts = (darkmux_flow::days_from_civil(2026, 7, 17) * 86400) as u64;
         // OUT of window: a matching record that must NOT fold.
         write_day_file(tmp.path(), "2020-01-01", &[complete_rec("s1", 999_999)]);
         // Margin day (created minus one): folds.
@@ -2036,7 +2023,7 @@ mod tests {
     fn backfill_caps_total_records_parsed() {
         let tmp = tempfile::TempDir::new().unwrap();
         let step_ids = ids(&["s1"]);
-        let created_ts = (days_from_civil(2026, 7, 17) * 86400) as u64;
+        let created_ts = (darkmux_flow::days_from_civil(2026, 7, 17) * 86400) as u64;
         // Three finalized records, ascending; a cap of 1 keeps only the first.
         write_day_file(
             tmp.path(),
@@ -2055,7 +2042,7 @@ mod tests {
     #[test]
     fn a_spaced_archive_folds_like_its_dotted_twin() {
         let step_ids = ids(&["s1"]);
-        let created_ts = (days_from_civil(2026, 7, 17) * 86400) as u64;
+        let created_ts = (darkmux_flow::days_from_civil(2026, 7, 17) * 86400) as u64;
         let fold = |action: &str| {
             let tmp = tempfile::TempDir::new().unwrap();
             let rec = serde_json::json!({ "action": action, "handle": "s1", "payload": { "total_tokens": 4200 } });
@@ -2072,7 +2059,7 @@ mod tests {
     fn backfill_skips_malformed_lines() {
         let tmp = tempfile::TempDir::new().unwrap();
         let step_ids = ids(&["s1"]);
-        let created_ts = (days_from_civil(2026, 7, 17) * 86400) as u64;
+        let created_ts = (darkmux_flow::days_from_civil(2026, 7, 17) * 86400) as u64;
         let good = serde_json::to_string(&complete_rec("s1", 4200)).unwrap();
         std::fs::write(
             tmp.path().join("2026-07-17.jsonl"),

@@ -54,7 +54,9 @@ fn upgrade_noting_rewrite(record: &mut Value) -> (ActionRead, bool) {
     let Some(read) = action_of(record) else {
         return (ActionRead::Absent, false);
     };
-    let stamped = crate::legacy::stamp_execution(record, &read) | crate::legacy::upgrade_fields(record);
+    let stamped = crate::legacy::stamp_execution(record, &read)
+        | crate::legacy::upgrade_fields(record)
+        | crate::legacy::upgrade_payload(record, &read);
     match read {
         FlowAction::Other(_) => return (ActionRead::Unknown, stamped),
         FlowAction::Retired(_) => return (ActionRead::Retired, stamped),
@@ -404,6 +406,37 @@ mod tests {
         assert_eq!(v["source"], "funnel");
         let line = r#"{"ts":"t","level":"info","category":"work","tier":"darkmux","stage":"dispatch","action":"operator.note","handle":"h","source":"funnel"}"#;
         assert_eq!(parse_record(line).unwrap().source, Some(crate::FlowSource::Unknown));
+    }
+
+    /// A payload key renamed in 4.0 reads under its new name, its value
+    /// converted to milliseconds; a record already on the new key, and one
+    /// of another action, are left alone.
+    #[test]
+    fn old_payload_keys_are_renamed_and_converted_on_read() {
+        let read = |line: serde_json::Value| {
+            let mut v = line;
+            upgrade(&mut v);
+            v["payload"].clone()
+        };
+        let wait = read(json!({"action": "budget.wait", "payload": {
+            "wait_seconds": 90, "resume_at": "2026-01-01T00:01:30Z", "pid": 7}}));
+        assert_eq!(wait, json!({"wait_ms": 90_000, "resume_at_ms": 1_767_225_690_000_i64, "pid": 7}));
+        let start = read(json!({"action": "utility.start", "payload": {"stall_after_seconds": 30}}));
+        assert_eq!(start, json!({"stall_after_ms": 30_000}));
+        let rollup = read(json!({"action": "machine.rollup", "payload": {"period_seconds": 60}}));
+        assert_eq!(rollup, json!({"period_ms": 60_000}));
+        let complete = read(json!({"action": "dispatch.complete", "payload": {"live": {"sampler_us": 1500, "forward_us": 250}}}));
+        assert_eq!(complete, json!({"live": {"sampler_ms": 1.5, "forward_ms": 0.25}}));
+        let battery = read(json!({"action": "machine.battery_health", "payload": {
+            "total_operating_time_hours": 2, "time_at_soc_hours": [0, 1, null]}}));
+        assert_eq!(battery, json!({"total_operating_ms": 7_200_000, "time_at_soc_ms": [0, 3_600_000, null]}));
+
+        let current = json!({"wait_ms": 5, "wait_seconds": 1});
+        assert_eq!(read(json!({"action": "budget.wait", "payload": current.clone()}))["wait_ms"], 5, "the new key wins");
+        let other = json!({"wait_seconds": 1});
+        assert_eq!(read(json!({"action": "dispatch.start", "payload": other.clone()})), other, "another action's payload is untouched");
+        let unreadable = json!({"wait_seconds": "soon"});
+        assert_eq!(read(json!({"action": "budget.wait", "payload": unreadable.clone()})), unreadable, "no reading: kept as written");
     }
 
     #[test]

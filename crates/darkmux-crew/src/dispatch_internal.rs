@@ -6393,15 +6393,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         .join()
         .unwrap_or_else(|_| TrajectorySummary::default());
 
-    // (#2263) A resumed execution's whole-task counts come from the
-    // checkpoint it resumed from and what this run recorded
-    // (`CheckpointCounts::cumulative_turns`). The trajectory itself only
-    // ever holds this run's events (`host_out` is a fresh tempdir).
-    let resume_seed = resume_checkpoint_contents
-        .as_deref()
-        .map(darkmux_trajectory::CheckpointCounts::of)
-        .unwrap_or_default();
-
     // (#1955) The envelope is the orchestrator's only surface, so the
     // reduction lands here — after the tailer has finished and its
     // observations are final.
@@ -6409,7 +6400,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         stdout,
         &model,
         &trajectory_summary,
-        resume_seed,
         &host_stats,
         &host_extras,
         &host_out,
@@ -6436,7 +6426,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         &stderr,
         exit_code,
         &trajectory_summary,
-        resume_seed,
         remote_endpoint_raw_label.as_deref(),
         &host_stats,
         &host_extras,
@@ -6839,7 +6828,6 @@ fn enrich_envelope_with_summary(
     stdout: String,
     model: &str,
     summary: &TrajectorySummary,
-    resume_seed: darkmux_trajectory::CheckpointCounts,
     stats: &HostStats,
     extras: &HostExtras,
     out_dir: &std::path::Path,
@@ -6861,7 +6849,7 @@ fn enrich_envelope_with_summary(
     let Some(obj) = v.as_object_mut() else {
         return stdout;
     };
-    obj.insert("metrics".into(), envelope_metrics(&summary.fold, model, resume_seed));
+    obj.insert("metrics".into(), envelope_metrics(&summary.fold, model));
     // Always present, even when empty. An absent field is ambiguous between
     // "nothing fired" and "this build does not report it"; `[]` is not.
     obj.insert(
@@ -7035,7 +7023,6 @@ pub(crate) fn read_out_dir_text_with(out_dir: &Path, rel: &str, sink: &dyn Fn(&s
 fn envelope_metrics(
     fold: &darkmux_trajectory::TrajectoryFold,
     model: &str,
-    resume_seed: darkmux_trajectory::CheckpointCounts,
 ) -> serde_json::Value {
     serde_json::json!({
         "model": model,
@@ -7050,8 +7037,6 @@ fn envelope_metrics(
         "rest_ms": fold.rest_ms(),
         "rests": fold.rest_count(),
         "turn_delay_effective_ms": fold.complete.as_ref().and_then(|c| c.turn_delay_effective_ms),
-        "cumulative_turns": resume_seed.cumulative_turns(fold),
-        "cumulative_compactions": resume_seed.cumulative_compactions(fold),
     })
 }
 
@@ -7579,7 +7564,6 @@ fn build_dispatch_complete_payload(
     stderr: &str,
     exit_code: i32,
     summary: &TrajectorySummary,
-    resume_seed: darkmux_trajectory::CheckpointCounts,
     remote_endpoint_raw_label: Option<&str>,
     host_stats: &HostStats,
     host_extras: &HostExtras,
@@ -7640,14 +7624,6 @@ fn build_dispatch_complete_payload(
         // provider-scoped; consumers must not derive one from the other.
         "reasoning_tokens": fold.tokens.reasoning,
         "cached_tokens": fold.tokens.cached,
-        // (#2263) The WHOLE task's counts across every resume, by the one
-        // rule (`CheckpointCounts`): the turns are the later of the
-        // checkpoint's count and the last `seq` this run recorded (a
-        // max-of-seq, not a sum), the compactions the checkpoint's plus this
-        // run's. Equal to `total_turns`/`total_compactions` for a run that
-        // was never resumed.
-        "cumulative_turns": resume_seed.cumulative_turns(fold),
-        "cumulative_compactions": resume_seed.cumulative_compactions(fold),
     });
     // (#1187 follow-up) Same field, same reason as `dispatch_start_payload` —
     // parity with `dispatch_remote`'s completion record, and needed by any
@@ -9045,9 +9021,11 @@ struct LiveChannel {
 
 /// (#2928) The live channel's own cost for one execution, stamped on its
 /// `dispatch complete` record as `payload.live` so the observer's cost is a
-/// number in the artifact rather than an assumption. `sampler_us` is ALL the
+/// number in the artifact rather than an assumption. `sampler_ms` is ALL the
 /// time the channel spent on this execution (building each chunk's sample,
-/// the sampler's decision, and the sends); `forward_us` is the sends' share.
+/// the sampler's decision, and the sends); `forward_ms` is the sends' share.
+/// Both are counted in microseconds and written as fractional milliseconds,
+/// like every other duration on the wire.
 /// Drops are split by cause: `dropped_no_receiver` (no daemon, or a stale
 /// socket nobody reads) and `dropped_full` (a daemon too slow to drain).
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -9073,8 +9051,8 @@ impl LiveSummary {
             "samples_sent": self.samples_sent,
             "dropped_no_receiver": self.dropped_no_receiver,
             "dropped_full": self.dropped_full,
-            "sampler_us": self.sampler_us,
-            "forward_us": self.forward_us,
+            "sampler_ms": self.sampler_us as f64 / 1_000.0,
+            "forward_ms": self.forward_us as f64 / 1_000.0,
             "bytes": self.bytes,
         })
     }
@@ -9692,7 +9670,7 @@ impl TailerState {
             &job_id,
             &model,
             Some(&self.session.wire()),
-            self.inactivity_secs,
+            self.inactivity_secs.saturating_mul(1_000),
             c.ts,
         );
         payload["generation"] = serde_json::json!(c.generation);

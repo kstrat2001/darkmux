@@ -2094,7 +2094,7 @@ struct SessionAgg {
     /// budget before its first bookend is a run.
     has_wait: bool,
     /// When the session's open budget wait lapses (epoch ms: its `ts`, plus
-    /// its `wait_seconds`, plus [`BUDGET_WAIT_GRACE_MS`]); `None` while no
+    /// its `wait_ms`, plus [`BUDGET_WAIT_GRACE_MS`]); `None` while no
     /// wait is open.
     wait_until_ms: Option<u64>,
     /// The session's terminal was a `budget.stop` that names why.
@@ -2501,57 +2501,14 @@ fn cutoff_date_string(window_days: i64) -> String {
 
 // ─── Timestamp parsing ──────────────────────────────────────────────────────
 
-/// Parse a flow record's `ts` field (`YYYY-MM-DDTHH:MM:SSZ`, second
-/// precision — see `darkmux_flow::schema::ts_utc_now`) into Unix epoch
-/// seconds. Hand-rolled rather than pulling in `chrono`/`time` (CLAUDE.md's
-/// "don't add dependencies casually" — a 10-line inline module beats a
-/// crate for a one-off need) using the Howard Hinnant civil-calendar
-/// algorithm — the inverse of the SAME algorithm `darkmux-flow`'s own
-/// `epoch_to_yyyymmdd` uses in the forward direction (that function is
-/// `pub(crate)` to its own crate, not reachable from here, hence this
-/// independently-tested re-derivation rather than a shared dependency).
-/// Returns `None` on anything that doesn't match the exact fixed-width
-/// shape — a malformed/absent `ts` degrades to "no flow-derived timestamp",
-/// never a panic.
+/// A flow record's `ts` (`YYYY-MM-DDTHH:MM:SSZ`) as Unix epoch seconds, or
+/// `None` for anything else ([`darkmux_flow::parse_ts_utc`], the one
+/// parser). A `ts` before the epoch is `None` too: this side counts unsigned.
 pub(crate) fn parse_flow_ts(ts: &str) -> Option<u64> {
-    let b = ts.as_bytes();
-    if b.len() != 20
-        || b[4] != b'-'
-        || b[7] != b'-'
-        || b[10] != b'T'
-        || b[13] != b':'
-        || b[16] != b':'
-        || b[19] != b'Z'
-    {
-        return None;
-    }
-    let y: i64 = ts.get(0..4)?.parse().ok()?;
-    let mo: i64 = ts.get(5..7)?.parse().ok()?;
-    let d: i64 = ts.get(8..10)?.parse().ok()?;
-    let h: i64 = ts.get(11..13)?.parse().ok()?;
-    let mi: i64 = ts.get(14..16)?.parse().ok()?;
-    let s: i64 = ts.get(17..19)?.parse().ok()?;
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 60 {
-        return None;
-    }
-    let days = days_from_civil(y, mo, d);
-    let secs = days * 86_400 + h * 3600 + mi * 60 + s;
-    u64::try_from(secs).ok()
+    darkmux_flow::parse_ts_utc(ts).and_then(|secs| u64::try_from(secs).ok())
 }
 
-/// Days since the Unix epoch for a UTC civil date — Howard Hinnant's
-/// algorithm (public domain); see [`parse_flow_ts`]'s doc for why this is a
-/// local re-derivation rather than a shared crate dependency.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y / 400 } else { (y - 399) / 400 };
-    let yoe = y - era * 400; // [0, 399]
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    era * 146_097 + doe - 719_468
-}
-
-/// The inverse of [`days_from_civil`] — a UTC civil date from days since
+/// The inverse of `darkmux_flow::days_from_civil` — a UTC civil date from days since
 /// the Unix epoch (same Howard Hinnant algorithm, public domain). Used by
 /// [`cutoff_date_string`] to format the scan-window boundary as a
 /// `YYYY-MM-DD` day-file-name prefix, and by [`day_string_from_epoch_ms`]
@@ -2684,7 +2641,7 @@ mod tests {
     }
 
     #[test]
-    fn civil_from_days_is_the_exact_inverse_of_days_from_civil() {
+    fn civil_from_days_is_the_exact_inverse_of_flows_days_from_civil() {
         // Round-trip across a range spanning leap years, month-length
         // boundaries, and both eras (#1523 gate scale-cap knob's own
         // machinery) — every date must map to itself through both
@@ -2700,7 +2657,7 @@ mod tests {
             (2027, 1, 1),
         ];
         for &(y, m, d) in cases {
-            let days = days_from_civil(y, m, d);
+            let days = darkmux_flow::days_from_civil(y, m, d);
             let (ry, rm, rd) = civil_from_days(days);
             assert_eq!((ry, rm as i64, rd as i64), (y, m, d), "round-trip failed for {y:04}-{m:02}-{d:02}");
         }
@@ -4825,7 +4782,7 @@ mod tests {
     fn ghost_runs_a_budget_held_call_is_a_run_before_its_start() {
         let base_ts = "2000-01-01T00:00:00Z";
         let base_ms = parse_flow_ts(base_ts).unwrap() * 1_000;
-        let wait = serde_json::json!({ "ts": base_ts, "action": "budget.wait", "session_id": "held", "payload": { "wait_seconds": 86_000 } });
+        let wait = serde_json::json!({ "ts": base_ts, "action": "budget.wait", "session_id": "held", "payload": { "wait_ms": 86_000_000 } });
         let mut idx = HashMap::new();
         fold_session_record(&mut idx, &wait);
         settle_session_index(&mut idx);

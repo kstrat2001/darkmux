@@ -180,6 +180,153 @@ pub fn upgrade_action(old: &str) -> Option<FlowAction> {
     OLD_SPELLINGS.iter().find(|(spelling, _)| *spelling == old).map(|(_, action)| action.clone())
 }
 
+/// How an old payload value becomes the current one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ValueChange {
+    /// A number (or an array of numbers) times this factor: a duration in a
+    /// coarser or finer unit, now milliseconds.
+    Scale(f64),
+    /// An ISO `ts`-shaped string, now epoch milliseconds.
+    IsoToEpochMs,
+}
+
+/// One payload key an action's records spelled another way before 4.0. Time
+/// is `*_ms` for a duration and `*_at_ms` for an instant, in epoch
+/// milliseconds; these were the keys that used seconds, hours, microseconds
+/// or an ISO string.
+#[derive(Debug, Clone, Copy)]
+pub struct PayloadRename {
+    /// The actions whose payload carries the old key.
+    pub actions: &'static [FlowAction],
+    /// The object inside `payload` holding the key, when it is nested.
+    pub within: Option<&'static str>,
+    pub old: &'static str,
+    pub new: &'static str,
+    pub change: ValueChange,
+}
+
+const HOURS_TO_MS: f64 = 3_600_000.0;
+
+/// Every renamed payload key. An old key is renamed on read, its value
+/// converted; a record already carrying the new key is left as it is.
+pub const OLD_PAYLOAD_KEYS: &[PayloadRename] = &[
+    PayloadRename {
+        actions: &[FlowAction::BudgetWait],
+        within: None,
+        old: "wait_seconds",
+        new: "wait_ms",
+        change: ValueChange::Scale(1_000.0),
+    },
+    PayloadRename {
+        actions: &[FlowAction::BudgetWait],
+        within: None,
+        old: "resume_at",
+        new: "resume_at_ms",
+        change: ValueChange::IsoToEpochMs,
+    },
+    PayloadRename {
+        actions: &[FlowAction::UtilityStart],
+        within: None,
+        old: "stall_after_seconds",
+        new: "stall_after_ms",
+        change: ValueChange::Scale(1_000.0),
+    },
+    PayloadRename {
+        actions: &[FlowAction::MachineRollup],
+        within: None,
+        old: "period_seconds",
+        new: "period_ms",
+        change: ValueChange::Scale(1_000.0),
+    },
+    PayloadRename {
+        actions: &[FlowAction::DispatchComplete],
+        within: Some("live"),
+        old: "sampler_us",
+        new: "sampler_ms",
+        change: ValueChange::Scale(0.001),
+    },
+    PayloadRename {
+        actions: &[FlowAction::DispatchComplete],
+        within: Some("live"),
+        old: "forward_us",
+        new: "forward_ms",
+        change: ValueChange::Scale(0.001),
+    },
+    PayloadRename {
+        actions: &[FlowAction::MachineBatteryHealth],
+        within: None,
+        old: "total_operating_time_hours",
+        new: "total_operating_ms",
+        change: ValueChange::Scale(HOURS_TO_MS),
+    },
+    PayloadRename {
+        actions: &[FlowAction::MachineBatteryHealth],
+        within: None,
+        old: "time_at_soc_hours",
+        new: "time_at_soc_ms",
+        change: ValueChange::Scale(HOURS_TO_MS),
+    },
+];
+
+/// Rename the old payload keys of a record of `action`, in place. Returns
+/// whether it changed anything.
+pub(crate) fn upgrade_payload(record: &mut Value, action: &FlowAction) -> bool {
+    let Some(payload) = record.get_mut("payload") else { return false };
+    let mut changed = false;
+    for rename in OLD_PAYLOAD_KEYS.iter().filter(|r| r.actions.contains(action)) {
+        let holder = match rename.within {
+            Some(key) => payload.get_mut(key),
+            None => Some(&mut *payload),
+        };
+        if let Some(Value::Object(map)) = holder {
+            changed |= rename_key(map, rename);
+        }
+    }
+    changed
+}
+
+/// Move `rename.old` to `rename.new` in `map` with its value converted.
+/// Nothing moves when the new key is already there, or the value has no
+/// reading (it stays under its old key: an archive is not ours to discard).
+fn rename_key(map: &mut serde_json::Map<String, Value>, rename: &PayloadRename) -> bool {
+    if map.contains_key(rename.new) {
+        return false;
+    }
+    let Some(converted) = map.get(rename.old).and_then(|v| convert(v, rename.change)) else {
+        return false;
+    };
+    map.remove(rename.old);
+    map.insert(rename.new.to_string(), converted);
+    true
+}
+
+fn convert(value: &Value, change: ValueChange) -> Option<Value> {
+    match (change, value) {
+        (ValueChange::Scale(factor), Value::Array(items)) => {
+            items.iter().map(|v| scaled(v, factor)).collect::<Option<Vec<_>>>().map(Value::Array)
+        }
+        (ValueChange::Scale(factor), v) => scaled(v, factor),
+        (ValueChange::IsoToEpochMs, Value::String(iso)) => {
+            crate::parse_ts_utc(iso).map(|secs| Value::from(secs.saturating_mul(1_000)))
+        }
+        (ValueChange::IsoToEpochMs, _) => None,
+    }
+}
+
+/// A number times `factor`: an integer when the product is whole, else a
+/// float. `null` (an absent reading) stays `null`.
+fn scaled(value: &Value, factor: f64) -> Option<Value> {
+    if value.is_null() {
+        return Some(Value::Null);
+    }
+    let product = value.as_f64()? * factor;
+    if product.fract() == 0.0 && product.abs() < 9.0e15 {
+        Some(Value::from(product as i64))
+    } else {
+        serde_json::Number::from_f64(product).map(Value::Number)
+    }
+}
+
 /// The [`FlowSource`] a wire string is, current or old: a spelling that maps
 /// nowhere is [`FlowSource::Unknown`].
 pub fn read_source(wire: &str) -> FlowSource {

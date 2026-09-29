@@ -23,7 +23,7 @@ const rec = (at: number, action: string, sid: string, extra: Record<string, unkn
 const wait = (at: number, m: string) =>
   rec(at, "budget.wait", taskOf(m), {
     mission_id: m, category: "telemetry", source: "budget",
-    payload: { scope: "endpoint", endpoint_id: "azure", wait_seconds: 86_000, resume_at: iso(at + 86_000_000) },
+    payload: { scope: "endpoint", endpoint_id: "azure", wait_ms: 86000000, resume_at: iso(at + 86_000_000) },
   });
 
 describe("a later mission's wait is not closed by an earlier mission's stop", () => {

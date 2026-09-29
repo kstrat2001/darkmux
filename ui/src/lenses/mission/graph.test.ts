@@ -715,7 +715,7 @@ describe("stepMeterFor liveness", () => {
   });
 
   it("keeps generating through an announced budget wait, as the run page does", () => {
-    const records = [{ action: "dispatch.start", ts: iso(T0) }, { action: "budget.wait", ts: iso(T0 + 1_000), payload: { wait_seconds: 1800 } }];
+    const records = [{ action: "dispatch.start", ts: iso(T0) }, { action: "budget.wait", ts: iso(T0 + 1_000), payload: { wait_ms: 1800000 } }];
     expect(meterAt(records, T0 + 25 * 60_000).generating).toBe(true);
   });
 

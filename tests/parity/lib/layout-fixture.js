@@ -294,7 +294,7 @@ const STATES = [
     id: "compacting", date: "2026-08-31", now: "12:00:15", runText: /compacting · \d+s$/, rateText: /^compacting · \d+s$/, utilVisual: "compacting", utilLive: "compacting · 7s",
     recs: (b, d) => [
       ...b.prefix(d),
-      b.rec(at(d, "12:00:08"), "utility.start", { job: "compaction", model: "darkmux:util-layout", serves: b.sid, stall_after_seconds: 600 }, { category: "telemetry", source: "utility", handle: "compactor" }),
+      b.rec(at(d, "12:00:08"), "utility.start", { job: "compaction", model: "darkmux:util-layout", serves: b.sid, stall_after_ms: 600_000 }, { category: "telemetry", source: "utility", handle: "compactor" }),
       tick(d, "12:00:15"),
     ],
   },

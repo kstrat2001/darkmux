@@ -741,8 +741,8 @@ const LOAD_WITH_EXTRAS = {
     condition_word: "Normal",
     permanent_failure_status: 0,
     temperature_c: 31.0,
-    time_at_soc_hours: [10, 20, 40, 5],
-    total_operating_time_hours: 5368,
+    time_at_soc_ms: [36000000, 72000000, 144000000, 18000000],
+    total_operating_ms: 19324800000,
   },
 };
 
@@ -781,7 +781,7 @@ describe("MachineLens — battery surfaces (#2821, lens only)", () => {
     expect(screen.getByText("28")).toBeInTheDocument();
     expect(screen.getByText("31.0 °C")).toBeInTheDocument();
     // (#2821, operator, 2026-09-23) The per-bucket histogram was pulled —
-    // `time_at_soc_hours` is an undocumented flat array that likely
+    // `time_at_soc_ms` is an undocumented flat array that likely
     // collapses a 2D table, so a chart of it overclaims. Only the lifetime
     // cross-check total renders now.
     expect(screen.getByText("5,368 h")).toBeInTheDocument();

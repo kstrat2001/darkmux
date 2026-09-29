@@ -22,11 +22,9 @@
 //! This module follows the SAME day-file-scanning shape
 //! `darkmux-crew::index::derive_cautions` already established in this crate
 //! (walk `flows_dir()`, parse each line as a `FlowRecord`, skip anything that
-//! doesn't parse) — duplicated rather than shared, matching how
-//! `days_from_civil`/`parse_flow_ts` are already independently re-derived in
-//! both `darkmux-serve::mission_graph` and `darkmux-serve::runs` (see that
-//! module's own doc on why: no shared cross-crate day-file/timestamp API
-//! exists to call instead).
+//! doesn't parse) — duplicated rather than shared: no cross-crate day-file
+//! reader exists to call instead. Timestamps parse with
+//! `darkmux_flow::parse_ts_utc`.
 //!
 //! The counting logic itself ([`aggregate_records_emitted`]) is pure and
 //! disk-free — unit-testable without touching a filesystem — with a thin
@@ -134,40 +132,6 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Days since the Unix epoch for a UTC civil date — Howard Hinnant's
-/// algorithm (public domain). Independently re-derived here rather than
-/// shared cross-crate; see the module doc.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y / 400 } else { (y - 399) / 400 };
-    let yoe = y - era * 400; // [0, 399]
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    era * 146_097 + doe - 719_468
-}
-
-/// Parse a `FlowRecord.ts` string (`YYYY-MM-DDTHH:MM:SSZ`, fixed-width) into
-/// epoch seconds. `None` on anything that doesn't match the exact shape — a
-/// malformed/absent ts degrades to "no flow-derived timestamp", never a
-/// panic. Mirrors `darkmux-serve::runs::parse_flow_ts`.
-pub(crate) fn parse_ts_secs(ts: &str) -> Option<i64> {
-    let b = ts.as_bytes();
-    if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b[19] != b'Z'
-    {
-        return None;
-    }
-    let y: i64 = ts.get(0..4)?.parse().ok()?;
-    let mo: i64 = ts.get(5..7)?.parse().ok()?;
-    let d: i64 = ts.get(8..10)?.parse().ok()?;
-    let h: i64 = ts.get(11..13)?.parse().ok()?;
-    let mi: i64 = ts.get(14..16)?.parse().ok()?;
-    let s: i64 = ts.get(17..19)?.parse().ok()?;
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 60 {
-        return None;
-    }
-    Some(days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + s)
-}
-
 /// Parse a day-file stem (`YYYY-MM-DD`) into epoch days. `None` on anything
 /// that doesn't match the exact shape.
 fn day_stem_to_epoch_days(stem: &str) -> Option<i64> {
@@ -181,7 +145,7 @@ fn day_stem_to_epoch_days(stem: &str) -> Option<i64> {
     if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return None;
     }
-    Some(days_from_civil(y, m, d))
+    Some(darkmux_flow::days_from_civil(y, m, d))
 }
 
 /// One day of margin below `date(mission_created_ts)` on the day-file scan
@@ -246,7 +210,7 @@ pub fn aggregate_records_emitted(lines: &[(FlowRecord, u64)], mission_id: &str, 
         total_bytes += line_bytes;
         *by_action.entry(rec.action.to_string()).or_insert(0) += 1;
 
-        let ts = parse_ts_secs(&rec.ts);
+        let ts = darkmux_flow::parse_ts_utc(&rec.ts);
         if let Some(ts) = ts {
             first_ts = Some(first_ts.map_or(ts, |f| f.min(ts)));
             last_ts = Some(last_ts.map_or(ts, |l| l.max(ts)));
@@ -299,7 +263,7 @@ pub fn aggregate_records_emitted(lines: &[(FlowRecord, u64)], mission_id: &str, 
             if rec.machine_uid.as_deref() != Some(mu) {
                 continue;
             }
-            if let Some(ts) = parse_ts_secs(&rec.ts) {
+            if let Some(ts) = darkmux_flow::parse_ts_utc(&rec.ts) {
                 if ts >= f && ts <= l {
                     host_samples_in_window += 1;
                 }
@@ -517,7 +481,7 @@ mod tests {
     }
 
     fn parse_ts_secs_pub(ts: &str) -> i64 {
-        parse_ts_secs(ts).unwrap()
+        darkmux_flow::parse_ts_utc(ts).expect("a well-formed ts")
     }
 
     // ── the run bookend never pairs + repeated starts (#2426 round 2 MF1/(3)) ──
@@ -672,18 +636,7 @@ mod tests {
         assert_eq!(got, RecordsEmitted::default());
     }
 
-    // ── parse_ts_secs / day_stem_to_epoch_days — small parsers ──────────
-
-    #[test]
-    fn parse_ts_secs_epoch_zero() {
-        assert_eq!(parse_ts_secs("1970-01-01T00:00:00Z"), Some(0));
-    }
-
-    #[test]
-    fn parse_ts_secs_rejects_malformed() {
-        assert_eq!(parse_ts_secs("not-a-timestamp"), None);
-        assert_eq!(parse_ts_secs(""), None);
-    }
+    // ── day_stem_to_epoch_days — small parser ──────────────────────────
 
     #[test]
     fn day_stem_round_trips_a_known_date() {
@@ -734,8 +687,8 @@ mod tests {
         unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
         // created_ts on 2023-11-14; finalize_secs also on 2023-11-14 — the
         // 2023-11-20 file is 6 days in the future relative to finalize.
-        let created_ts = parse_ts_secs("2023-11-14T00:00:00Z").unwrap() as u64;
-        let finalize_secs = parse_ts_secs("2023-11-14T23:00:00Z").unwrap();
+        let created_ts = darkmux_flow::parse_ts_utc("2023-11-14T00:00:00Z").unwrap() as u64;
+        let finalize_secs = darkmux_flow::parse_ts_utc("2023-11-14T23:00:00Z").unwrap();
         let (emitted, searched) = records_emitted_for_mission("m1", created_ts, finalize_secs);
         unsafe {
             match prev {

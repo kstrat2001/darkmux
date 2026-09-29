@@ -355,9 +355,9 @@ function closeAsOf(a: Attempt, asOf: number): Close | null {
   return { edge: closeEdgeOf(record) ?? { kind: "session_end" }, atMs: a.close.tMs, skewed: a.skewed, record };
 }
 
-const waitSecondsOf = (r: NormRecord): number => {
-  const s = ((r.payload ?? r.fields) as { wait_seconds?: unknown } | undefined)?.wait_seconds;
-  return typeof s === "number" && Number.isFinite(s) ? Math.max(0, s) : 0;
+const waitMsOf = (r: NormRecord): number => {
+  const ms = ((r.payload ?? r.fields) as { wait_ms?: unknown } | undefined)?.wait_ms;
+  return typeof ms === "number" && Number.isFinite(ms) ? Math.max(0, ms) : 0;
 };
 
 /** When the attempt's open budget wait lapses (rule 4), or `null` when no
@@ -367,7 +367,7 @@ function openWaitUntil(recs: readonly NormRecord[], policy: LifecyclePolicy): nu
   if (!wait || wait.tMs === null) return null;
   const at = wait.tMs;
   const ended = recs.some((r) => r !== wait && isAtOrAfter(r, at) && (r.action === ACTION.BudgetResume || isClosing(r)));
-  return ended ? null : at + waitSecondsOf(wait) * 1000 + policy.budgetWaitGraceMs;
+  return ended ? null : at + waitMsOf(wait) + policy.budgetWaitGraceMs;
 }
 
 /** Whether `lastActivityMs` is more than the policy's window before `asOf`.

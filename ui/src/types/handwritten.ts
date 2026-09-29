@@ -597,7 +597,7 @@ export interface BatterySample {
  * raw figure as a second headline number, which read too much like macOS's
  * own single "Maximum Capacity" percentage.
  *
- * `time_at_soc_hours` is the battery's own 28-bucket lifetime counter
+ * `time_at_soc_ms` is the battery's own 28-bucket lifetime counter
  * (4 groups of 7 on the reference machine) — an undocumented FLAT array
  * whose real shape likely clusters like a 2D table (state-of-charge band
  * × something else) collapsed into one dimension. Apple documents neither
@@ -630,8 +630,8 @@ export interface BatteryHealth {
   condition_word: string | null;
   permanent_failure_status: number | null;
   temperature_c: number | null;
-  time_at_soc_hours: number[] | null;
-  total_operating_time_hours: number | null;
+  time_at_soc_ms: number[] | null;
+  total_operating_ms: number | null;
 }
 
 /** #2108 (host-sample-shape v2) — `GET /machine/resources`'s `load` block.

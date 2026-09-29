@@ -526,7 +526,7 @@ fn parse_entry(line: &[u8]) -> Option<(String, i64, Spend)> {
     let v = darkmux_flow::reader::parse_value(std::str::from_utf8(line).ok()?)?;
     let amount = crate::usage::usage_contribution(&v)?;
     let id = crate::usage::payload_of(&v).get("endpoint_id")?.as_str()?.to_string();
-    let ts = crate::records_emitted::parse_ts_secs(v.get("ts")?.as_str()?)?;
+    let ts = darkmux_flow::parse_ts_utc(v.get("ts")?.as_str()?)?;
     // `total` is the record's full total when known, else the halves it
     // reported; `spend` says which.
     Some((id, ts, Spend { known: amount.total, metered: amount.spend.is_some() }))
@@ -988,8 +988,8 @@ fn announce_wait(
             "limit": br.limit,
             "unmetered_calls": br.unmetered,
             "period": b.period,
-            "resume_at": resume_at.map(darkmux_flow::ts_utc_at),
-            "wait_seconds": resume_at.map(|r| (r - now).max(0)),
+            "resume_at_ms": resume_at.map(|r| r.saturating_mul(1_000)),
+            "wait_ms": resume_at.map(|r| (r - now).max(0).saturating_mul(1_000)),
             "pid": std::process::id(),
             "message": message,
         }),
@@ -1389,8 +1389,8 @@ pub fn active_waits(dir: &Path, now: i64, lookback_secs: u64, alive: &dyn Fn(u32
                 return None;
             }
             let p = crate::usage::payload_of(&v);
-            let resume_at = p.get("resume_at").and_then(|x| x.as_str()).map(str::to_string);
-            let resume_secs = resume_at.as_deref().and_then(crate::records_emitted::parse_ts_secs);
+            let resume_secs = p.get("resume_at_ms").and_then(|x| x.as_i64()).map(|ms| ms.div_euclid(1_000));
+            let resume_at = resume_secs.map(darkmux_flow::ts_utc_at);
             if resume_secs.is_some_and(|r| r + 1 < now) {
                 return None;
             }

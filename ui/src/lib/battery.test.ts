@@ -30,8 +30,8 @@ function health(over: Partial<BatteryHealth> = {}): BatteryHealth {
     condition_word: "Normal",
     permanent_failure_status: 0,
     temperature_c: 31.01,
-    time_at_soc_hours: null,
-    total_operating_time_hours: 5368,
+    time_at_soc_ms: null,
+    total_operating_ms: 19324800000,
     ...over,
   };
 }
@@ -156,7 +156,7 @@ describe("capacityLine", () => {
 
 describe("fmtOperatingHours", () => {
   it("formats with a thousands separator", () => {
-    expect(fmtOperatingHours(5368)).toBe("5,368 h");
+    expect(fmtOperatingHours(19_324_800_000)).toBe("5,368 h");
   });
   it("is null when unmeasured", () => {
     expect(fmtOperatingHours(null)).toBeNull();

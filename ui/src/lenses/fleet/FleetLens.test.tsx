@@ -1970,7 +1970,7 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
       flowToday: [
         ...gen("s1", "coder"),
         ...gen("s2", "reviewer"),
-        { ts: t("10:01:59"), machine_uid: "u1", machine_id: "MacBook-Pro", action: "utility.start", source: "utility", handle: "radio-router", payload: { job: "radio_routing", model: "darkmux:util-4b", stall_after_seconds: 30 } },
+        { ts: t("10:01:59"), machine_uid: "u1", machine_id: "MacBook-Pro", action: "utility.start", source: "utility", handle: "radio-router", payload: { job: "radio_routing", model: "darkmux:util-4b", stall_after_ms: 30000 } },
       ],
       runs: [],
       hold: { "/runs": runs.promise },
@@ -2880,9 +2880,9 @@ describe("(#2915) fleet card: utility work is visible", () => {
   const rec = (hms: string, action: string, payload: Record<string, unknown>, more: Record<string, unknown> = {}) =>
     norm({ ts: `2026-09-26T${hms}Z`, action, category: "telemetry", machine_uid: "u1", machine_id: "pepper", payload, ...more });
   // Turn 9's tool completes at 10:52:09; turn 10's opener is 10:52:22.
-  const compactStart = rec("10:52:10", "utility.start", { job: "compaction", model: "darkmux:util-4b", serves: SID, stall_after_seconds: 600 }, { session_id: SID, source: "utility", handle: "compactor" });
+  const compactStart = rec("10:52:10", "utility.start", { job: "compaction", model: "darkmux:util-4b", serves: SID, stall_after_ms: 600000 }, { session_id: SID, source: "utility", handle: "compactor" });
   const compactEnd = rec("10:52:20", "telemetry.tokens", { purpose: "utility", call_kind: "compaction", job: "compaction", total_tokens: 900 }, { session_id: SID, source: "tokens", handle: "compactor" });
-  const routeStart = (job: string) => rec("10:52:12", "utility.start", { job, model: "darkmux:util-4b", stall_after_seconds: 30 }, { source: "utility", handle: "radio-router" });
+  const routeStart = (job: string) => rec("10:52:12", "utility.start", { job, model: "darkmux:util-4b", stall_after_ms: 30000 }, { source: "utility", handle: "radio-router" });
   const routeEnd = rec("10:52:14", "telemetry.tokens", { purpose: "utility", call_kind: "single_shot", job: "radio_routing", total_tokens: 40 }, { source: "tokens", handle: "radio-router" });
   const rateLine = () =>
     waitFor(() => {

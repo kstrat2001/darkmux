@@ -1734,7 +1734,7 @@ describe("(#2915) run page: compacting", () => {
     source: "utility",
     session_id: PEPPER_SID,
     handle: "compactor",
-    payload: { job: "compaction", model: "darkmux:util-4b", serves: PEPPER_SID, stall_after_seconds: 600 },
+    payload: { job: "compaction", model: "darkmux:util-4b", serves: PEPPER_SID, stall_after_ms: 600000 },
   };
   const compactEnd = {
     ts: "2026-09-26T10:52:20Z",

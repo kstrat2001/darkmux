@@ -275,8 +275,8 @@ pub fn battery_health_json(h: &BatteryHealth) -> serde_json::Value {
         "condition_word": h.condition_word(),
         "permanent_failure_status": h.permanent_failure_status,
         "temperature_c": h.temperature_c,
-        "time_at_soc_hours": h.time_at_soc_hours,
-        "total_operating_time_hours": h.total_operating_time_hours,
+        "time_at_soc_ms": h.time_at_soc_ms,
+        "total_operating_ms": h.total_operating_ms,
     })
 }
 

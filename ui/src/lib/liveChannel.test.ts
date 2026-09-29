@@ -47,7 +47,7 @@ function wireUtility(atMs: number, edge: "start" | "end", jobId: string, extra: 
     model: "u4b",
     at_ms: atMs,
     cadence_ms: 250,
-    fields: { event: edge, job: UTILITY_JOB.radio_routing, job_id: jobId, stall_after_seconds: 30, ...extra },
+    fields: { event: edge, job: UTILITY_JOB.radio_routing, job_id: jobId, stall_after_ms: 30000, ...extra },
   });
 }
 
@@ -171,7 +171,7 @@ describe("the utility glyph shows a sub-second job live", () => {
     store.ingest(wireUtility(T0 + 300, "end", "r1"), T0 + 300);
     store.ingest(wireUtility(T0 + 500, "start", "r2"), T0 + 500);
     const durable = normAll([
-      { ts: new Date(T0).toISOString(), action: ACTION.UtilityStart, machine_uid: M, payload: { job: UTILITY_JOB.radio_routing, job_id: "r1", started_at_ms: T0, stall_after_seconds: 30 } },
+      { ts: new Date(T0).toISOString(), action: ACTION.UtilityStart, machine_uid: M, payload: { job: UTILITY_JOB.radio_routing, job_id: "r1", started_at_ms: T0, stall_after_ms: 30000 } },
       { ts: new Date(T0).toISOString(), action: "telemetry.tokens", machine_uid: M, payload: { purpose: "utility", job: UTILITY_JOB.radio_routing, job_id: "r1", ended_at_ms: T0 + 300 } },
     ]);
     const strip = utilityStrip(durable, M, T0 + 600, specsBinding, store.snapshot().utility);

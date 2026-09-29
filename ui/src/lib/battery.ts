@@ -204,7 +204,7 @@ export function capacityLine(h: BatteryHealth | null): CapacityDisplay | null {
 /** `5,368 h` — the lifetime cross-check total, formatted with the same
  * thousands separator the mAh figures use. `null` renders as `null`
  * (caller decides whether to hide the row). */
-export function fmtOperatingHours(hours: number | null): string | null {
-  if (hours == null) return null;
-  return `${hours.toLocaleString()} h`;
+export function fmtOperatingHours(ms: number | null): string | null {
+  if (ms == null) return null;
+  return `${Math.round(ms / 3_600_000).toLocaleString()} h`;
 }

@@ -113,7 +113,7 @@ describe("attempts", () => {
   });
 
   it("a wait before the start is the same attempt as the start", () => {
-    const waited = groupOfRecords(normAll([rec(0, "budget.wait", { payload: { wait_seconds: 30 } }), rec(40, "budget.resume"), rec(41, "dispatch.start")]));
+    const waited = groupOfRecords(normAll([rec(0, "budget.wait", { payload: { wait_ms: 30000 } }), rec(40, "budget.resume"), rec(41, "dispatch.start")]));
     expect(waited.attempts).toHaveLength(1);
     expect(waited.attempts[0].start?.tMs).toBe(Date.parse(at(41)));
   });
@@ -140,7 +140,7 @@ describe("a mission's run session (lifecycle rule 6)", () => {
   const data = normAll([
     rec(0, "run.start", { session_id: "m1", mission_id: "m1" }),
     rec(5, "step.start", { session_id: "task-probe-m1", mission_id: "m1" }),
-    rec(10, "budget.wait", { session_id: "task-probe-m1", mission_id: "m1", payload: { wait_seconds: 86_000 } }),
+    rec(10, "budget.wait", { session_id: "task-probe-m1", mission_id: "m1", payload: { wait_ms: 86000000 } }),
   ]);
   const bookend = runIndex(data).groupsOfSession("m1")[0];
 

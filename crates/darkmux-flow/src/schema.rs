@@ -2444,6 +2444,37 @@ pub fn ts_utc_at(secs: i64) -> String {
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s)
 }
 
+/// Days since the Unix epoch for a UTC civil date (Howard Hinnant's
+/// algorithm, public domain): the inverse of the calendar half of
+/// `epoch_to_yyyymmdd`.
+pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y / 400 } else { (y - 399) / 400 };
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The epoch second of a record-`ts`-shaped string (`YYYY-MM-DDTHH:MM:SSZ`,
+/// fixed width): the inverse of [`ts_utc_at`]. `None` for anything that is
+/// not exactly that shape, so a malformed `ts` degrades to "no timestamp"
+/// and never panics.
+pub fn parse_ts_utc(ts: &str) -> Option<i64> {
+    let b = ts.as_bytes();
+    if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b[19] != b'Z'
+    {
+        return None;
+    }
+    let field = |range: std::ops::Range<usize>| -> Option<i64> { ts.get(range)?.parse().ok() };
+    let (y, mo, d) = (field(0..4)?, field(5..7)?, field(8..10)?);
+    let (h, mi, s) = (field(11..13)?, field(14..16)?, field(17..19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 60 {
+        return None;
+    }
+    Some(days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + s)
+}
+
 pub(crate) fn current_epoch_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2550,6 +2581,23 @@ mod for_session_tests {
         assert_eq!((m.session_id.as_deref(), m.mission_id.as_deref()), (Some("m-1.task.t1"), Some("m-1")));
         let lab = rec(&SessionId::adhoc(RunId::lab("l-1").unwrap(), "coder", "n"));
         assert_eq!((lab.session_id.as_deref(), lab.mission_id), (Some("l-1.lab.adhoc.coder.n"), None));
+    }
+}
+
+#[cfg(test)]
+mod ts_parse_tests {
+    use super::*;
+
+    #[test]
+    fn parse_ts_utc_inverts_ts_utc_at_and_rejects_other_shapes() {
+        assert_eq!(parse_ts_utc("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_ts_utc("2000-01-01T00:00:00Z"), Some(946_684_800));
+        for secs in [0_i64, 951_782_400, 1_700_000_000, 4_102_444_799] {
+            assert_eq!(parse_ts_utc(&ts_utc_at(secs)), Some(secs));
+        }
+        for bad in ["", "not-a-timestamp", "2026-07-24T12:34:56", "2026-13-01T00:00:00Z", "2026-07-24 12:34:56Z"] {
+            assert_eq!(parse_ts_utc(bad), None, "{bad:?}");
+        }
     }
 }
 

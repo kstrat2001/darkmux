@@ -1421,8 +1421,8 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
           condition_word: "Normal",
           permanent_failure_status: 0,
           temperature_c: 31.0,
-          time_at_soc_hours: [10, 20, 40, 5],
-          total_operating_time_hours: 5368,
+          time_at_soc_ms: [36000000, 72000000, 144000000, 18000000],
+          total_operating_ms: 19324800000,
         },
       },
     });

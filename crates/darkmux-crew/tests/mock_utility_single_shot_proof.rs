@@ -155,7 +155,7 @@ fn a_utility_job_runs_on_the_binding_and_leaves_only_its_usage_record() {
     assert_eq!(start["payload"]["job"], "radio_routing", "{start}");
     assert_eq!(start["payload"]["model"], "mock-util", "{start}");
     assert!(start["payload"].get("serves").is_none(), "routing serves no execution: {start}");
-    assert_eq!(start["payload"]["stall_after_seconds"], 30, "the job's own bound: {start}");
+    assert_eq!(start["payload"]["stall_after_ms"], 30_000, "the job's own bound: {start}");
     assert_eq!(start["handle"], darkmux_crew::loader::RADIO_ROUTER_ROLE_ID);
     assert!(start["session_id"].is_null(), "a utility job mints no session: {start}");
     // (#2915 review, MUST 1 / C4) The start and its end share a job id, and

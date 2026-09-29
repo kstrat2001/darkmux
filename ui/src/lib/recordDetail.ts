@@ -116,7 +116,7 @@ function recordDetailRaw(r: NormRecord): string {
   if (a !== undefined && BUDGET_ACTIONS.has(a) && f) {
     const subject = String(f.endpoint_id ?? f.step ?? "budget");
     if (a === ACTION.BudgetWait) {
-      return typeof f.wait_seconds === "number" ? `${subject}: waiting ${spanWords(f.wait_seconds)}` : `${subject}: waiting`;
+      return typeof f.wait_ms === "number" ? `${subject}: waiting ${spanWords(f.wait_ms / 1000)}` : `${subject}: waiting`;
     }
     if (a === ACTION.BudgetStop) {
       return typeof f.reason === "string" ? `${subject}: wait stopped (${f.reason})` : `${subject}: wait stopped`;

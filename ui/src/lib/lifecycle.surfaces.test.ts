@@ -74,7 +74,7 @@ describe("every surface states the same lifecycle (the PR 4 promise)", () => {
   });
 
   it("a budget wait before any start: waiting on every surface, then closed by its stop", () => {
-    const wait = rec(0, "budget.wait", { category: "telemetry", source: "budget", payload: { endpoint_id: "azure", wait_seconds: 86_000 } });
+    const wait = rec(0, "budget.wait", { category: "telemetry", source: "budget", payload: { endpoint_id: "azure", wait_ms: 86000000 } });
     const data = normAll([wait]);
     expect(expectAgreement(data, "s1", T0 + 3 * 3600_000, "waiting").phase).toBe("waiting");
     const stopped = normAll([wait, rec(4 * 3600, "budget.stop", { payload: { reason: "mission `m` is aborted" } })]);

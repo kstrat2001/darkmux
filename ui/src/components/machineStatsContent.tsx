@@ -407,12 +407,12 @@ function HostExtras({ load }: { load: MachineLoad | null }) {
  * Studio, mini, Pro) gets `null`: absent, not an empty section.
  *
  * **No time-at-charge histogram (operator decision, 2026-09-23).** An
- * earlier revision drew `time_at_soc_hours` as a 28-bar chart, one bar per
+ * earlier revision drew `time_at_soc_ms` as a 28-bar chart, one bar per
  * bucket. `TimeAtHighSoc` is an undocumented FLAT `u32` array — the real
  * values cluster like a 2D table (state-of-charge band × something else)
  * that got flattened into one dimension, so a 28-bar chart implicitly
  * claims a per-bucket charge-distribution reading this data cannot back.
- * `time_at_soc_hours` is still RECORDED (probe + wire payload, unchanged —
+ * `time_at_soc_ms` is still RECORDED (probe + wire payload, unchanged —
  * record exhaustively, display selectively), just not rendered here. Do
  * not re-add a chart of it without first getting the layout documented (or
  * reverse-engineered with actual confidence) from Apple. */
@@ -537,7 +537,7 @@ function BatteryLensBlock({ sample, health }: { sample: BatterySample | null; he
   if (sample === null && health === null) return null;
   const cond = conditionRow(health);
   const capacity = capacityLine(health);
-  const operatingHours = fmtOperatingHours(health?.total_operating_time_hours ?? null);
+  const operatingHours = fmtOperatingHours(health?.total_operating_ms ?? null);
   const timeLeft = sample ? batteryTimeLeftText(sample) : null;
   return (
     <div className="battery-block hx-section">

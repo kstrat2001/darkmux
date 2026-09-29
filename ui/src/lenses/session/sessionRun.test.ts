@@ -1156,13 +1156,13 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // the MODEL pane (where REST reads "budget · <endpoint>") must be there
     // while it waits, not grow in when the call is finally sent.
     const data: NormRecord[] = [
-      norm({ ts: BASE_TS, session_id: "s1", action: "budget.wait", handle: "coder", payload: { endpoint_id: "azure", wait_seconds: 600 } }),
+      norm({ ts: BASE_TS, session_id: "s1", action: "budget.wait", handle: "coder", payload: { endpoint_id: "azure", wait_ms: 600000 } }),
     ];
     expect(runRegions(flowToRenderModel(data), "s1").hasModelWork).toBe(true);
   });
 
   it("(#2902 step 5) a hosted wait stopped before its call closes the run; a later start reopens it", () => {
-    const wait = norm({ ts: BASE_TS, session_id: "s1", action: "budget.wait", payload: { endpoint_id: "azure", wait_seconds: 86000 } });
+    const wait = norm({ ts: BASE_TS, session_id: "s1", action: "budget.wait", payload: { endpoint_id: "azure", wait_ms: 86000000 } });
     const stop = norm({ ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "budget.stop", payload: { endpoint_id: "azure", reason: "mission `m` is aborted" } });
     const stopped = runRegions(flowToRenderModel([wait, stop]), "s1", Date.parse("2026-01-01T05:00:00Z"));
     expect(stopped.live).toBe(false);

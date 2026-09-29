@@ -12,7 +12,7 @@ const specs = (over: Partial<MachineSpecs["utility_model"]> | null): MachineSpec
 const usage = (s: number, job: string | null, tokens: number, extra: Record<string, unknown> = {}) =>
   norm({ ts: at(s), action: "telemetry.tokens", category: "telemetry", source: "tokens", machine_uid: U, payload: { purpose: "utility", call_kind: job === "compaction" ? "compaction" : "single_shot", ...(job ? { job } : {}), total_tokens: tokens, requested_model: "darkmux:util-4b" }, ...extra });
 const start = (s: number, job: string) =>
-  norm({ ts: at(s), action: "utility.start", machine_uid: U, payload: { job, model: "darkmux:util-4b", stall_after_seconds: 30 } });
+  norm({ ts: at(s), action: "utility.start", machine_uid: U, payload: { job, model: "darkmux:util-4b", stall_after_ms: 30000 } });
 const row = { current_bytes: 2 ** 30 * 14.61 } as unknown as MachineResourcesModel;
 
 describe("(#2915) the machine page's Utility section", () => {
