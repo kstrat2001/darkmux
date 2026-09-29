@@ -318,7 +318,7 @@ test('viewer renders attacker-controlled flow records inertly across every view'
 // between the two; `[data-arg]` picks the card), including the machine
 // lens's direct deep-link entry point. Predates the full walk's restoration
 // (#1800) and is kept as its own test rather than folded in — it exercises
-// the deep-link path (`lens=machine&uid=...` typed/pasted directly) the
+// the deep-link path (`lens=machine&machine=...` typed/pasted directly) the
 // click-driven walk above doesn't cover.
 test('fleet + machine-drill render attacker-controlled records inertly', async ({ page }) => {
   const pageErrors = [];
@@ -334,7 +334,7 @@ test('fleet + machine-drill render attacker-controlled records inertly', async (
   // "inert" for a reason unrelated to escaping (nothing rendered at all).
   await expect(page.locator('[data-act="machine"][data-arg]')).toHaveCount(2);
 
-  const uid = await page.locator('[data-act="machine"][data-arg]').first().getAttribute('data-arg');
+  const machine = await page.locator('[data-act="machine"][data-arg]').first().getAttribute('data-arg');
 
   await page.locator('[data-act="machine"][data-arg]').first().click();
   await page.waitForSelector('.stagehdr');
@@ -345,15 +345,15 @@ test('fleet + machine-drill render attacker-controlled records inertly', async (
   // against) simply unknown — goes to the residency room instead, the
   // guess-that-admits-it's-guessing default (`FleetLens.tsx`'s own doc on
   // `machineDrillHash`). Verified live, not inferred from the doc alone:
-  // `location.hash` after this click reads `lens=machine&uid=<uid>`, not
+  // `location.hash` after this click reads `lens=machine&machine=<key>`, not
   // `lens=runs`. Real, current product behavior for a daemon-less build.
   await assertInert(page, 'machine (fleet-card drill destination)');
 
   // Deep-link straight into the machine lens too, so that entry point keeps
   // its own real coverage independent of the click above.
-  await page.evaluate((u) => {
-    location.hash = `lens=machine&uid=${encodeURIComponent(u)}`;
-  }, uid);
+  await page.evaluate((m) => {
+    location.hash = `lens=machine&machine=${encodeURIComponent(m)}`;
+  }, machine);
   await page.waitForSelector('.stagehdr');
   await assertInert(page, 'machine (direct deep-link)');
 

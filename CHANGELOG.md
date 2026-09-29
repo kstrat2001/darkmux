@@ -96,8 +96,9 @@ darkmux release.
   array now `dispatches` ("session" is an internal join key, contract 8).
   **Viewer links:** `#session=<id>` is `#dispatch=<id>`, `#lens=lab` is
   `#lens=runs&kind=lab`, `#lens=machine&uid=<uid>` is `#lens=machine&machine=<key>`
-  and `panel=mission-status-all` is `panel=mission-status&opt.all=all`; the old
-  spellings open the "Unknown route" page instead of being rewritten. `darkmux
+  and `panel=mission-status-all` is `panel=mission-status&opt.all=all`. The old
+  `#lens=` spellings open the "Unknown route" page instead of being rewritten;
+  a `#session=<id>` link names no route and opens the default fleet view. `darkmux
   mission status` now prints `#mission=<id>` and `opt.all=all` links (it printed
   the retired `/mission/<id>/graph` and `mission-status-all` forms).
   **Response shapes changed on the wire:** `GET /machine/resources` answers

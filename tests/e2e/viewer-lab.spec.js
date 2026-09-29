@@ -23,11 +23,9 @@ function mockRunDetail(page) {
         contentType: 'application/json',
         body: JSON.stringify({
           dir: 'demo-case/run2',
-          funnels: [{
+          reviews: [{
             case_id: 'demo-case-a', crew: 'demo-crew', mode: 'sequential',
-            members: [], steps: [], bundles: 12, raw_flags: 18, deduped_flags: 14,
-            flags: [], judged: [], confirmed: 5, needs_check: 2, archived: 7,
-            fingerprint: {},
+            confirmed: 5, needs_check: 2, archived: 7,
           }],
           scores: null,
         }),
@@ -40,7 +38,7 @@ function mockRunDetail(page) {
           lines: [{
             ts: '2026-01-01T00:00:00Z', level: 'info', category: 'work',
             tier: 'darkmux', stage: 'dispatch', action: 'step.result',
-            handle: 'bundle', session_id: 'demo-case-a', source: 'review',
+            handle: 'bundle', session_id: 'demo-case-a', source: 'scheduler',
             payload: { step_id: 'bundle', kind: 'review.bundle', items_out: 12 },
           }],
           next_offset: 100,
@@ -150,20 +148,21 @@ test('deep link #lens=runs boots directly into the runs lens', async ({ page }) 
   expect(pageErrors, `uncaught page errors: ${pageErrors.join(' | ')}`).toEqual([]);
 });
 
-test('a legacy #lens=lab bookmark still resolves, pre-filtered to Lab', async ({ page }) => {
+test('a retired #lens=lab bookmark opens the Unknown route page, not the runs lens', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(String(e)));
 
-  // (#1584) Every bookmark and phone shortcut minted while the lab tab
-  // existed must keep working — it lands on the same set of runs the old tab
-  // showed, and the address bar is upgraded to the current spelling so what
-  // the operator re-copies is the current form.
+  // (4.0) The lab tab's own bookmark spelling is gone with no alias: it names
+  // no route, so the page says so instead of guessing a lens. The current
+  // spelling is `#lens=runs&kind=lab`.
   await page.goto('/index-lab.html#lens=lab');
+  await expect(page.locator('.lens-placeholder__title')).toHaveText('Unknown route');
+  await expect(page.locator('#lens-runs')).not.toHaveClass(/\bon\b/);
+
+  await page.goto('/index-lab.html#lens=runs&kind=lab');
   await expect(page.locator('#lens-runs')).toHaveClass(/\bon\b/);
   await expect(page.locator('.labrunrow')).toHaveCount(3);
   await expect(page.locator('.runkind.lab')).toHaveCount(3);
-  await expect.poll(() => page.evaluate(() => location.hash)).toContain('lens=runs');
-  await expect.poll(() => page.evaluate(() => location.hash)).toContain('kind=lab');
 
   expect(pageErrors, `uncaught page errors: ${pageErrors.join(' | ')}`).toEqual([]);
 });

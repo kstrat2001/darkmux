@@ -224,20 +224,10 @@ test('a panel deep link carrying an opt switches in page and applies the opt (#1
   // fetch below proves the option landed.
   expect(asked).toContain('mission-status?opt.all=all');
 
-  // Same known harness gap `next-parity-console.spec.ts`'s "the REAL
-  // in-corpus OSC-8 deep link" test already documents for the SAME
-  // recorded link (verbatim comment there): `panel_deep_link` bakes an
-  // ABSOLUTE daemon URL whose pathname is "/" (the console is served at
-  // root in real production, `GET /`). In production the operator is
-  // ALREADY on that same root path, so following the href is a genuine
-  // same-document hash-only change. THIS harness serves the fixture at
-  // `/index-lab.html`, a path the recorded link was never baked against —
-  // a harness artifact, not a production behavior, and the reason this
-  // assertion checks the PATHNAME actually reached (root, matching the
-  // link) rather than asserting it stayed put. Before #1911 this never
-  // surfaced because the JS switch intercepted the click before the real
-  // href was ever followed at all.
-  expect(new URL(page.url()).pathname).toBe('/');
+  // The click is an in-page switch, not a navigation: the page stays on the
+  // path it booted on (this harness serves `/index-lab.html`, while the link's
+  // own baked pathname is the daemon's `/`).
+  expect(new URL(page.url()).pathname).toBe(new URL(before).pathname);
 });
 
 test('a manual panel stays unrun across leaving and re-entering the tab', async ({ page }) => {

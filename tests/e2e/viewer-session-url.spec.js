@@ -165,23 +165,14 @@ test('drilling into a session writes it to the address bar', async ({ page }) =>
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
-test('booting on the LEGACY #session= alias restores the dispatch view AND rewrites the URL to #dispatch= (#1974)', async ({ page }) => {
-  // Deliberately boots on the OLD spelling. This is the browser-level proof
-  // that the one-release alias in `route.ts` actually resolves for a real
-  // bookmark, and that `useSyncHash`'s write-back then rewrites the address
-  // bar to the canonical form — the two halves that together make the alias
-  // temporary rather than permanent. The unit tests cover each half in
-  // isolation (`route.test.ts`, `hashSync.test.ts`); only this one proves
-  // they compose across a real boot.
+test('booting on the retired #session= spelling opens the default fleet view, not a dispatch (#1974)', async ({ page }) => {
+  // The 4.0 break: `#session=<id>` names no route and has no alias, so the
+  // page falls through to the default fleet view rather than opening a dispatch. `#dispatch=<id>` (the
+  // test above and below) is the one spelling.
   await mockSession(page, 'sess-in-flight');
   const errors = await bootLive(page, '#session=sess-in-flight');
-  await expect(page.locator('.session-run')).toBeVisible();
-  // The fleet hero's own marker must NOT be on the page — booting on a
-  // dispatch must not ALSO render fleet underneath/instead of it.
-  await expect(page.locator('.fleet-lens')).toHaveCount(0);
-  await expect
-    .poll(() => hash(page), { message: 'a legacy #session= bookmark must be honored AND rewritten to #dispatch=' })
-    .toContain('dispatch=sess-in-flight');
+  await expect(page.locator('.fleet-lens')).toBeVisible();
+  await expect(page.locator('.session-run')).toHaveCount(0);
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
