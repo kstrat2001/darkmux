@@ -987,8 +987,9 @@ pub(crate) fn spawn_if_enabled(shutdown: tokio::sync::watch::Receiver<bool>) {
 
 async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<(), String> {
     if !darkmux_flow::serve_token_present() {
-        return Err("no fleet token (the serve token: Keychain item `darkmux-serve-token` or \
-                    DARKMUX_SERVE_TOKEN); a listener that cannot check a token takes no work"
+        return Err("no fleet token (the serve token: Keychain item `darkmux-serve-token`, read only \
+                    when `serve.token_keychain` is on, or DARKMUX_SERVE_TOKEN); a listener that cannot \
+                    check a token takes no work"
             .into());
     }
     let provider: Arc<dyn IdentityProvider> =
@@ -2313,6 +2314,18 @@ mod tests {
         set_state("listening", "listening on 100.64.0.2:8766");
         assert_eq!(listener_state(false).as_deref(), Some("listening"));
         assert_eq!(listener_state(true).as_deref(), Some("listening on 100.64.0.2:8766"));
+    }
+
+    /// (#2988 review) The listener's no-token reason names the switch that
+    /// reads the Keychain, so an operator with the item stored is not told it
+    /// is missing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_listener_without_a_token_names_the_keychain_switch() {
+        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN") };
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let said = run(rx).await.expect_err("no token, no listener");
+        assert!(said.contains("serve.token_keychain"), "{said}");
     }
 
     #[test]
