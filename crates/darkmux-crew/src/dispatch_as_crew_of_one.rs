@@ -46,7 +46,7 @@
 //! Step's `config.session_id`, rather than letting
 //! `DispatchInternalStepKind`'s own default (the step's session) apply —
 //! that default is right for a mission-graph step, wrong for a top-level
-//! dispatch, whose session the operator can name (`--session-id`).
+//! dispatch, whose session the operator can name (`--name`).
 
 use crate::dispatch::{DispatchOpts, DispatchResult};
 use darkmux_types::session_id::{RunId, SessionId};

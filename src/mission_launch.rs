@@ -2549,7 +2549,7 @@ fn undeclared_param_warning(config_id: &str, key: &str, config: &MissionConfig) 
 /// (`crates/darkmux-lab/src/lab/run.rs`: `<workload>-<profile>-<unix-secs>-
 /// <index>`) for mission↔lab consistency: `<config-id>-<unix-secs>-<6-hex
 /// token>`. The lab convention's own disambiguator is a batch-loop index
-/// (`--runs N`); `mission launch` has no such loop, so the token here is a
+/// (`--repeat N`); `mission launch` has no such loop, so the token here is a
 /// blake3 digest over (nanosecond time, pid, an in-process atomic counter)
 /// instead — robustly unique even for two launches within the same
 /// wall-clock second (the lab scheme is itself only second-granular).
@@ -3661,7 +3661,7 @@ fn coder_phase_gate_outcome(
         "{}",
         style::dim(&format!(
             "  record your adjudication (audit trail):  darkmux flow note \
-             --session-id {session_id} \
+             --execution {session_id} \
              --text \"<verdict · what you overrode · why>\" --source adjudication",
         ))
     );

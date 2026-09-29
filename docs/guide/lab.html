@@ -122,7 +122,7 @@ darkmux lab run pepper-grinder</code></pre>
   <div class="wrap">
     <h2>Tune: detect bimodal variance</h2>
     <p>Single runs lie about local-AI behavior. Wall-clock varies enough that one run isn't a reliable signal. <code>lab tune</code> dispatches N runs against the same workload and clusters the results, surfacing the bimodal "fast" vs "slow" mode shape if it's there.</p>
-    <pre><code>darkmux lab tune pepper-grinder --runs 6</code></pre>
+    <pre><code>darkmux lab tune pepper-grinder --repeat 6</code></pre>
     <p>Output: a per-run table + a cluster verdict ("looks bimodal at fast=&lt;mean&gt;s, slow=&lt;mean&gt;s" or "single-mode").</p>
     <p>Use this after changing a profile setting (context length, compaction mode, compactor model) to see whether the change actually shifted the distribution rather than just luck on a single run.</p>
   </div>

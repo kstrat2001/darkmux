@@ -855,6 +855,7 @@ version = "4.0.0-rc.1"
 dependencies = [
  "anyhow",
  "blake3",
+ "clap",
  "darkmux-crew",
  "darkmux-flow",
  "darkmux-gestalt",

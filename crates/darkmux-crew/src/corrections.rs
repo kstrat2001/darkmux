@@ -2,7 +2,7 @@
 //! kind, and the reader both consumers share.
 //!
 //! A correction is what the user's reviewer recorded when they adjudicated a
-//! dispatch's QA findings: `darkmux flow note --session-id <sid> --text
+//! dispatch's QA findings: `darkmux flow note --execution <id> --text
 //! "<verdict · what you overrode · why>" --source adjudication`. Unlike the
 //! authored [`crate::lessons`] store, corrections are never hand-authored as a
 //! memory entry — they are RECORDED BY THE REVIEW PATH as flow records, and the

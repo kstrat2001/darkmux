@@ -13115,7 +13115,7 @@ fn lab_eval_refuses_an_empty_or_missing_cases_dir() {
         )));
     let missing = lab.home.path().join("nope");
     lab.cmd()
-        .args(["lab", "eval", "--dialectic", "--cases-dir"])
+        .args(["lab", "eval", "--mode", "dialectic", "--cases-dir"])
         .arg(&missing)
         .assert()
         .failure()

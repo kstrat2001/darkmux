@@ -74,7 +74,7 @@ fn scan_exact_set_scopes_to_the_mission_family_and_excludes_siblings() {
 }
 
 /// `None` = unscoped: every adjudication note in the window, across missions.
-/// This is what `memory correction list` reads with no `--mission`/`--session`.
+/// This is what `memory correction list` reads with no `--mission`/`--execution`.
 #[test]
 #[serial_test::serial]
 fn scan_unscoped_reads_every_session() {

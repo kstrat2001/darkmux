@@ -263,7 +263,7 @@ pub(crate) fn reply_to_dispatch_result(
 ) -> DispatchResult {
     use crate::ReplyStatus;
     let session_id = reply.session_id.clone().unwrap_or_else(|| session_id.clone());
-    let follow = format!("Follow it with `darkmux flow tail --session {session_id}` or in the viewer.");
+    let follow = format!("Follow it with `darkmux flow tail --execution {session_id}` or in the viewer.");
     let stdout = match reply.status {
         // (#2916 stage 2) Queued without `--wait`: the receiver's own words,
         // verbatim (control characters removed), and how to follow it.

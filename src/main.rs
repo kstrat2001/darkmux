@@ -170,7 +170,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             finding,
             mod_key,
             profile,
-            session_id,
+            name,
             timeout,
             workdir,
             workspace_read_only,
@@ -187,7 +187,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             finding,
             mod_key,
             profile,
-            session_id,
+            name,
             timeout,
             workdir,
             workspace_read_only,
@@ -495,7 +495,7 @@ fn cmd_correction(sub: CorrectionCmd) -> Result<i32> {
     match sub {
         CorrectionCmd::List {
             mission,
-            session,
+            execution,
             days,
             json: cli::JsonFlagPlain { json },
         } => {
@@ -504,7 +504,7 @@ fn cmd_correction(sub: CorrectionCmd) -> Result<i32> {
             // never a prefix, which would bleed a sibling mission whose id
             // is a hyphen-extension, #849).
             let phases = mission.as_deref().map(correction_phase_sessions).transpose()?;
-            let scope = match (&phases, &session) {
+            let scope = match (&phases, &execution) {
                 (Some(p), _) => crew::corrections::Scope::Phases(p),
                 (None, Some(sid)) => crew::corrections::Scope::Session(sid),
                 (None, None) => crew::corrections::Scope::All,
@@ -517,16 +517,16 @@ fn cmd_correction(sub: CorrectionCmd) -> Result<i32> {
                 return Ok(0);
             }
             if found.is_empty() {
-                let scoped = match (&mission, &session) {
+                let scoped = match (&mission, &execution) {
                     (Some(m), _) => format!(" for mission `{m}`"),
-                    (None, Some(s)) => format!(" for session `{s}`"),
+                    (None, Some(s)) => format!(" for role execution `{s}`"),
                     (None, None) => String::new(),
                 };
                 println!(
                     "{}",
                     darkmux_types::style::dim(&format!(
                         "no adjudication corrections recorded{scoped} in the last {days} day(s) \
-                         — your reviewer records them with darkmux flow note --session-id <sid> \
+                         — your reviewer records them with darkmux flow note --execution <id> \
                          --text \"<verdict · what you overrode · why>\" --source adjudication"
                     ))
                 );
@@ -872,7 +872,7 @@ fn cmd_finding(sub: cli::FindingCmd) -> Result<i32> {
 
 fn cmd_mission(sub: MissionCmd) -> Result<i32> {
     match sub {
-        MissionCmd::Status { json, limit, all, missions } => mission_status::run(json, limit, all, missions),
+        MissionCmd::Status { json, limit, all, named } => mission_status::run(json, limit, all, named),
         MissionCmd::Debrief { id, json } => coder_phase::debrief(&id, json),
         MissionCmd::Finalize { id, reasoning } => {
             coder_phase::finalize(&id, reasoning.as_deref())
@@ -911,7 +911,7 @@ struct DispatchInvocation {
     finding: Vec<String>,
     mod_key: Vec<String>,
     profile: Option<String>,
-    session_id: Option<String>,
+    name: Option<String>,
     timeout: Option<u32>,
     workdir: Option<std::path::PathBuf>,
     workspace_read_only: bool,
@@ -942,7 +942,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         finding,
         mod_key,
         profile,
-        session_id,
+        name,
         timeout,
         workdir,
         workspace_read_only,
@@ -1077,8 +1077,8 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         record_context: None,
         // The crew-of-one run this dispatch is, minted here so the route
         // record, a fleet submission and the local run all carry it;
-        // `--session-id` names the dispatch within it.
-        session: crew::dispatch_as_crew_of_one::dispatch_session(&role, session_id),
+        // `--name` names the dispatch within it.
+        session: crew::dispatch_as_crew_of_one::dispatch_session(&role, name),
         role_id: role,
         message,
         brief_refs,
@@ -1212,10 +1212,10 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
     // consumer it was written for and serves well.
     let quiet = json && result.exit_code == 0;
     if !quiet {
-        // Announce the resolved session id on stderr so operators can
+        // Announce the resolved execution id on stderr so operators can
         // correlate this dispatch with the flow stream — without polluting the
         // --json envelope on stdout that orchestrators parse.
-        eprintln!("darkmux dispatch: session id `{}`", result.session_id);
+        eprintln!("darkmux dispatch: execution id `{}`", result.session_id);
     }
     print!("{}", result.stdout);
     if !quiet && !result.stderr.is_empty() {

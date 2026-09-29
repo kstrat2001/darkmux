@@ -195,8 +195,8 @@ export function labCliHint(scores: LabScoresDoc | null): string {
   if (!experimental) parts.push(scores?.role || "<role>");
   parts.push("--cases-dir <cases-dir>");
   if (scores?.provenance?.profile) parts.push(`--profile ${scores.provenance.profile}`);
-  if (mode === "freeform") parts.push("--freeform");
-  if (mode === "agentic" || mode === "dialectic") parts.push(`--${mode} --workdirs <workdirs-root>`);
+  if (mode === "freeform") parts.push("--mode freeform");
+  if (mode === "agentic" || mode === "dialectic") parts.push(`--mode ${mode} --workdirs <workdirs-root>`);
   return parts.join(" ");
 }
 

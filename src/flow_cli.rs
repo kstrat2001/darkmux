@@ -9,7 +9,7 @@ use clap::Subcommand;
 /// Top-level `flow` subcommand enum.
 #[derive(Subcommand)]
 pub enum FlowCmd {
-    /// Record an operator-narrative observation. With `--session-id <sid>
+    /// Record an operator-narrative observation. With `--execution <id>
     /// --source adjudication` it records a reviewer correction against a
     /// dispatch, which later coder briefs in that mission carry (#849).
     Note {
@@ -18,8 +18,8 @@ pub enum FlowCmd {
         /// Optional phase identifier.
         #[arg(long = "phase-id")]
         phase_id: Option<String>,
-        /// Optional session identifier.
-        #[arg(long = "session-id")]
+        /// Optional role execution id (the one `darkmux dispatch` prints).
+        #[arg(long = "execution")]
         session_id: Option<String>,
         /// Optional source label.
         #[arg(long)]
@@ -32,8 +32,8 @@ pub enum FlowCmd {
         /// Optional phase identifier.
         #[arg(long = "phase-id")]
         phase_id: Option<String>,
-        /// Optional session identifier.
-        #[arg(long = "session-id")]
+        /// Optional role execution id (the one `darkmux dispatch` prints).
+        #[arg(long = "execution")]
         session_id: Option<String>,
         /// Optional source label.
         #[arg(long)]
@@ -58,8 +58,8 @@ pub enum FlowCmd {
         /// Optional phase identifier.
         #[arg(long = "phase-id")]
         phase_id: Option<String>,
-        /// Optional session identifier.
-        #[arg(long = "session-id")]
+        /// Optional role execution id (the one `darkmux dispatch` prints).
+        #[arg(long = "execution")]
         session_id: Option<String>,
         /// Optional source label.
         #[arg(long)]
@@ -105,9 +105,9 @@ pub enum FlowCmd {
         /// Optional mission identifier this decision is scoped to.
         #[arg(long = "mission-id")]
         mission_id: Option<String>,
-        /// Optional session identifier (when the decision links to an
-        /// already-dispatched session — e.g., recorded after the fact).
-        #[arg(long = "session-id")]
+        /// Optional role execution id (when the decision links to an
+        /// already-dispatched execution — e.g., recorded after the fact).
+        #[arg(long = "execution")]
         session_id: Option<String>,
         /// Optional source label (e.g., `frontier`, `operator-manual`).
         #[arg(long)]
@@ -163,13 +163,13 @@ pub enum FlowCmd {
         #[arg(long)]
         strict: bool,
     },
-    /// Tail flow records, optionally filtered to one session, following new
+    /// Tail flow records, optionally filtered to one role execution, following new
     /// appends live (like `tail -f`). Ctrl-C to stop.
     #[command(name = "tail")]
     Tail {
-        /// Only show records for this session id.
-        #[arg(long = "session")]
-        session: Option<String>,
+        /// Only show records for this role execution id.
+        #[arg(long = "execution")]
+        execution: Option<String>,
         /// Emit raw JSON lines instead of a formatted one-line summary.
         #[arg(long)]
         json: bool,
@@ -222,7 +222,7 @@ pub fn run(cmd: FlowCmd) -> Result<()> {
         FlowCmd::IntegrityCheck { path, json, strict } => {
             return print_integrity_check(path, json, strict)
         }
-        FlowCmd::Tail { session, json } => return run_tail(session.as_deref(), json),
+        FlowCmd::Tail { execution, json } => return run_tail(execution.as_deref(), json),
         FlowCmd::Drain { file: Some(file), to: Some(to), json, .. } => return run_drain_file(&file, &to, json),
         FlowCmd::Drain { file: Some(_), to: None, .. } => bail!("--file requires --to"),
         FlowCmd::Drain { rule, max_seconds, json, .. } => return run_drain(rule, max_seconds, json),

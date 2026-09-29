@@ -34,10 +34,10 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
         LabCmd::Run {
             workload,
             profile,
-            runs,
+            repeat,
             profiles: ProfilesFileArg { profiles },
             quiet,
-        } => cmd_lab_run_dispatch(workload, profile, runs, profiles, quiet),
+        } => cmd_lab_run_dispatch(workload, profile, repeat, profiles, quiet),
         LabCmd::Eval {
             role,
             cases_dir,
@@ -45,9 +45,7 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
             profiles,
             timeout,
             scores_out,
-            freeform,
-            agentic,
-            dialectic,
+            mode,
             workdirs,
             prosecutor_profile,
             defender_profile,
@@ -59,7 +57,7 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
             config_path: profiles,
             timeout_seconds: timeout,
             scores_out,
-            mode: bench_mode(freeform, agentic, dialectic),
+            mode,
             workdirs,
             prosecutor_profile,
             defender_profile,
@@ -108,12 +106,12 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
         LabCmd::Tune {
             workload,
             profile,
-            runs,
+            repeat,
             profiles: ProfilesFileArg { profiles },
         } => cmd_lab_tune(lab::tune::TuneOpts {
             workload,
             profile,
-            runs,
+            runs: repeat,
             config: profiles,
         }),
         LabCmd::Fixture { sub } => cmd_lab_fixture(sub),
@@ -189,19 +187,19 @@ fn cmd_lab_run_dispatch(
     Ok(lab::run::exit_code(&outcomes))
 }
 
-/// `lab eval`'s condition flags, most specific first. clap already refuses
-/// the conflicting combinations; the order here only decides which flag a
-/// caller that bypasses clap would get.
-fn bench_mode(freeform: bool, agentic: bool, dialectic: bool) -> lab::review_bench::BenchMode {
-    use lab::review_bench::BenchMode;
-    if dialectic {
-        BenchMode::Dialectic
-    } else if agentic {
-        BenchMode::Agentic
-    } else if freeform {
-        BenchMode::FreeForm
-    } else {
-        BenchMode::Strict
+/// The per-seat profile overrides belong to the dialectic pipeline. Given
+/// under any other `--mode` they would do nothing, so they are refused
+/// rather than silently ignored.
+fn refuse_seat_profiles_outside_dialectic(
+    mode: lab::review_bench::BenchMode,
+    seats: [(&str, &Option<String>); 3],
+) -> Result<()> {
+    if mode == lab::review_bench::BenchMode::Dialectic {
+        return Ok(());
+    }
+    match seats.iter().find(|(_, profile)| profile.is_some()) {
+        Some((flag, _)) => anyhow::bail!("`--{flag}` applies only to `--mode dialectic`"),
+        None => Ok(()),
     }
 }
 
@@ -209,6 +207,14 @@ fn bench_mode(freeform: bool, agentic: bool, dialectic: bool) -> lab::review_ben
 /// only the cases not yet scored; `scores.json` is written when the loop
 /// completes.
 fn cmd_lab_eval(opts: lab::review_bench::ReviewBenchOpts) -> Result<i32> {
+    refuse_seat_profiles_outside_dialectic(
+        opts.mode,
+        [
+            ("prosecutor-profile", &opts.prosecutor_profile),
+            ("defender-profile", &opts.defender_profile),
+            ("judge-profile", &opts.judge_profile),
+        ],
+    )?;
     signal_aware(|| lab::review_bench::run_review_bench(opts))?;
     Ok(0)
 }
@@ -220,7 +226,7 @@ fn cmd_lab_characterize(opts: lab::characterize::CharacterizeOpts) -> Result<i32
     Ok(lab::run::exit_code(&report.outcomes))
 }
 
-/// `lab tune`: `lab_run` with `--runs N`, reported as a distribution.
+/// `lab tune`: `lab_run` with `--repeat N`, reported as a distribution.
 fn cmd_lab_tune(opts: lab::tune::TuneOpts) -> Result<i32> {
     let report = signal_aware(|| lab::tune::tune(&opts))?;
     lab::tune::print_report(&report);
@@ -301,13 +307,43 @@ mod tests {
         assert!(!touches_lab_dir(&LabCmd::Doctor), "fixture health check never touches the lab dir");
     }
 
+    fn parse_eval(extra: &[&str]) -> Result<LabCmd, clap::Error> {
+        use clap::Parser;
+        let mut argv = vec!["darkmux", "lab", "eval"];
+        argv.extend_from_slice(extra);
+        match crate::cli::Cli::try_parse_from(argv)?.command {
+            crate::cli::Cmd::Lab { sub } => Ok(sub),
+            _ => unreachable!("`lab eval` parses to a lab command"),
+        }
+    }
+
     #[test]
-    fn bench_mode_picks_the_most_specific_condition_flag() {
-        assert_eq!(bench_mode(false, false, false), BenchMode::Strict);
-        assert_eq!(bench_mode(true, false, false), BenchMode::FreeForm);
-        assert_eq!(bench_mode(false, true, false), BenchMode::Agentic);
-        assert_eq!(bench_mode(false, false, true), BenchMode::Dialectic);
-        assert_eq!(bench_mode(true, true, false), BenchMode::Agentic);
-        assert_eq!(bench_mode(true, true, true), BenchMode::Dialectic);
+    fn eval_mode_defaults_to_strict_and_parses_each_condition() {
+        for (arg, want) in [
+            (None, BenchMode::Strict),
+            (Some("strict"), BenchMode::Strict),
+            (Some("freeform"), BenchMode::FreeForm),
+            (Some("agentic"), BenchMode::Agentic),
+            (Some("dialectic"), BenchMode::Dialectic),
+        ] {
+            let extra: Vec<&str> = arg.map(|m| vec!["--mode", m]).unwrap_or_default();
+            let Ok(LabCmd::Eval { mode, .. }) = parse_eval(&extra) else { panic!("{extra:?} did not parse") };
+            assert_eq!(mode, want, "{extra:?}");
+        }
+        assert!(parse_eval(&["--mode", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn seat_profiles_are_refused_outside_dialectic_mode() {
+        let none = None;
+        let judge = Some("p".to_string());
+        let seats = [("prosecutor-profile", &none), ("defender-profile", &none), ("judge-profile", &judge)];
+        for mode in [BenchMode::Strict, BenchMode::FreeForm, BenchMode::Agentic] {
+            let err = refuse_seat_profiles_outside_dialectic(mode, seats).unwrap_err().to_string();
+            assert_eq!(err, "`--judge-profile` applies only to `--mode dialectic`");
+        }
+        assert!(refuse_seat_profiles_outside_dialectic(BenchMode::Dialectic, seats).is_ok());
+        let unset = [("prosecutor-profile", &none), ("defender-profile", &none), ("judge-profile", &none)];
+        assert!(refuse_seat_profiles_outside_dialectic(BenchMode::Strict, unset).is_ok());
     }
 }

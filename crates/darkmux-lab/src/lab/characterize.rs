@@ -72,7 +72,7 @@ pub(crate) fn render_report(r: &CharacterizeReport) -> String {
     if r.outcomes.len() == 1 {
         p!(
             out,
-            "  • Re-run for distribution: `darkmux lab run {} --runs 5` then \
+            "  • Re-run for distribution: `darkmux lab run {} --repeat 5` then \
              `darkmux run compare <a> <b>` for variance",
             r.workload
         );
@@ -172,7 +172,7 @@ mod tests {
             "darkmux characterize — workload `w`\n\n  ✓ r1 — 8s\n      provider=stub\n\n\
              verdict: fast — single-turn dispatch in expected range for any modern Apple Silicon\n\n\
              Next steps:\n  • `darkmux run inspect <run-id>` for the per-run breakdown\n\
-             \x20 • Re-run for distribution: `darkmux lab run w --runs 5` then \
+             \x20 • Re-run for distribution: `darkmux lab run w --repeat 5` then \
              `darkmux run compare <a> <b>` for variance\n"
         );
     }

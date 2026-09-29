@@ -57,6 +57,19 @@ RETIRED_COMMAND_PHRASES = [
     "lab run inspect",   # -> `run inspect` (4.0, one run noun)
     "lab run stats",     # -> `run stats` (4.0, one run noun)
     "lab run compare",   # -> `run compare` (4.0, one run noun)
+    "dispatch --session-id",      # -> `dispatch --name` (4.0, session is internal)
+    "flow note --session-id",     # -> `flow note --execution` (4.0)
+    "flow catch --session-id",    # -> `flow catch --execution` (4.0)
+    "flow record --session-id",   # -> `flow record --execution` (4.0)
+    "tier-decision --session-id", # -> `tier-decision --execution` (4.0)
+    "flow tail --session",        # -> `flow tail --execution` (4.0)
+    "correction list --session",  # -> `memory correction list --execution` (4.0)
+    "lab eval --freeform",        # -> `lab eval --mode freeform` (4.0)
+    "lab eval --agentic",         # -> `lab eval --mode agentic` (4.0)
+    "lab eval --dialectic",       # -> `lab eval --mode dialectic` (4.0)
+    "lab run --runs",             # -> `lab run --repeat` (4.0)
+    "lab tune --runs",            # -> `lab tune --repeat` (4.0)
+    "mission status --missions",  # -> `mission status --named` (4.0)
 ]
 
 # Retired phrases with an unrelated same-spelled use, as raw regexes. The

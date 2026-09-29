@@ -208,7 +208,8 @@ pub struct CaseScore {
 /// comparison reproducible). Scoring is identical either way: both modes
 /// reduce to the same `Review { verdict, findings }` shape and go through
 /// the same `score()`/`score_multi()` matcher.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[value(rename_all = "lower")]
 pub enum BenchMode {
     #[default]
     Strict,
@@ -368,7 +369,7 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
         }
     } else if opts.workdirs.is_some() {
         return Err(anyhow!(
-            "--workdirs only applies to --agentic / --dialectic (diff-only \
+            "--workdirs only applies to --mode agentic / --mode dialectic (diff-only \
              modes never read a repo tree; passing one would silently measure nothing)"
         ));
     }
