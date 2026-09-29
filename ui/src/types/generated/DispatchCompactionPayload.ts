@@ -11,7 +11,7 @@ compactor_model: string | null,
 /**
  * The specialist's model, which stays the record's `model`.
  */
-parent_model: string, 
+parent_model?: string, 
 /**
  * The graph step the record belongs to, when its session is a step's.
  */

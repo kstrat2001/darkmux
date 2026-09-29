@@ -3,4 +3,4 @@
 /**
  * The verdict of a `dispatch.route`.
  */
-export type RouteDecision = "pinned" | "local";
+export type RouteDecision = "pinned" | "local" | "unknown";

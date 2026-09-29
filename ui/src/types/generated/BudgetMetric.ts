@@ -3,4 +3,4 @@
 /**
  * What a breach was measured in.
  */
-export type BudgetMetric = "tokens" | "calls";
+export type BudgetMetric = "tokens" | "calls" | "unknown";

@@ -2016,7 +2016,7 @@ fn step_start_record(run: &RunId, step: &Step, seat: darkmux_flow::payload::Seat
             Level::Info,
             Category::Work,
             Stage::Dispatch,
-            darkmux_flow::Payload::StepStart(darkmux_flow::payload::StepStartPayload { seat_class: seat }),
+            darkmux_flow::Payload::StepStart(darkmux_flow::payload::StepStartPayload { seat_class: Some(seat) }),
             step.id.clone(),
         )
     }

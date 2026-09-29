@@ -5,4 +5,4 @@
  * payload's `call_kind` through serde (the variant names ARE the wire
  * spelling), and exported to the viewer as a generated TS type.
  */
-export type CallKind = "turn" | "single_shot" | "map_item" | "compaction";
+export type CallKind = "turn" | "single_shot" | "map_item" | "compaction" | "unknown";

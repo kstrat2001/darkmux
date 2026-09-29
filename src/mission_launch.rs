@@ -1411,7 +1411,7 @@ pub fn launch(
                         phase: event.phase.clone(),
                         task_template: event.task_template.clone(),
                         from: event.from.clone(),
-                        source: event.source.clone(),
+                        source: Some(event.source.clone()),
                         items: event.items as u64,
                         minted: event.minted.clone(),
                         reason: None,

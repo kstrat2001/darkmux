@@ -3,4 +3,4 @@
 /**
  * Where a resolved runtime knob's value came from.
  */
-export type KnobSource = "env" | "config" | "built-in" | "launcher" | "cli" | "forced-agentic-remote";
+export type KnobSource = "env" | "config" | "built-in" | "launcher" | "cli" | "forced-agentic-remote" | "unknown";

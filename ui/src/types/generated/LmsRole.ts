@@ -4,4 +4,4 @@
  * Which seat a resident model holds relative to the dispatch's own staffing, so the viewer can
  * tell "the primary changed" from "the utility model went resident, exactly as staffed".
  */
-export type LmsRole = "primary" | "utility" | "resident";
+export type LmsRole = "primary" | "utility" | "resident" | "unknown";

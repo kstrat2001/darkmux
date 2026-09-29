@@ -8255,7 +8255,7 @@ fn run_telemetry_sampler(
     let emit_rest_with_extra =
         |level: darkmux_flow::Level, reason: &str, state: &str, pause: bool, extra: RestExtra| {
             let mut payload = darkmux_flow::Payload::DispatchRest(DispatchRestPayload {
-                reason: reason.to_string(),
+                reason: Some(reason.to_string()),
                 state: Some(state.to_string()),
                 pause: Some(pause),
                 delay_ms: extra.delay_ms,
@@ -9095,7 +9095,7 @@ fn runtime_rest_payload(
         turn: Some(r.seq),
         rest_ms: Some(rest_ms),
         rests: Some(u64::from(rests)),
-        reason: String::from(r.reason.clone()),
+        reason: Some(String::from(r.reason.clone())),
         state: r.state.clone(),
         ..Default::default()
     });
@@ -9578,7 +9578,7 @@ impl TailerState {
                 // (#1483) The AUTHORITATIVE running turn count (monotonic,
                 // 1-based), so a viewer opened MID-dispatch reads the true
                 // count rather than counting from the tail it saw.
-                turns_so_far: self.summary.fold.turns() as u64,
+                turns_so_far: Some(self.summary.fold.turns() as u64),
                 // (#2863) The turn's model time (request sent to stream end),
                 // absent (not zero) when no stream was recorded, and reported
                 // once: a seq seen ending again never re-reports it.
@@ -9629,22 +9629,22 @@ impl TailerState {
             tool_seq: t.tool_seq,
             // (#1483) The AUTHORITATIVE running tool-call count (monotonic,
             // 1-based), same mid-dispatch robustness as `turns_so_far`.
-            tool_calls_so_far: self.summary.fold.tool_calls() as u64,
+            tool_calls_so_far: Some(self.summary.fold.tool_calls() as u64),
             tool_name: cap_str(&t.tool_name, MAX_TRAJ_FIELD_BYTES),
             // The arguments preview (search pattern / path / command), already
             // capped by the runtime, re-bound here for the flow record.
-            args: cap_str(&t.args, MAX_TRAJ_FIELD_BYTES),
-            args_chars: t.args_chars,
+            args: Some(cap_str(&t.args, MAX_TRAJ_FIELD_BYTES)),
+            args_chars: Some(t.args_chars),
             // (#2272) An accepted `create_finding`'s emission, whole (bounded
             // loudly), and its 1-based ordinal. `null` for every other call.
             // The crawl's product rides THIS, never the `args` preview.
             emitted: bounded_emission.clone(),
             emit_seq: t.emit_seq,
-            result_chars: t.result_chars,
+            result_chars: Some(t.result_chars),
             // (#2007) The result itself, bounded by eliding its middle; the
             // true length stays in `result_chars`.
-            result: cap_result_middle(&t.result, MAX_TOOL_RESULT_BYTES),
-            ok: t.ok,
+            result: Some(cap_result_middle(&t.result, MAX_TOOL_RESULT_BYTES)),
+            ok: Some(t.ok),
             // (#2008) The three-way outcome, forwarded as classified, so the
             // viewer can render "exit 1" rather than a bare cross.
             outcome: t.outcome.map(tool_outcome),
@@ -9755,7 +9755,7 @@ impl TailerState {
             after_messages: c.after_messages,
             summary_chars: c.summary_chars,
             compactor_model: self.compactor_model.clone(),
-            parent_model: self.model.clone(),
+            parent_model: Some(self.model.clone()),
             step_id: None,
             context: None,
         };
@@ -9804,8 +9804,8 @@ impl TailerState {
     /// collapse/expand block.
     fn on_reasoning(&mut self, r: &darkmux_trajectory::Reasoning) {
         let payload = DispatchReasoningPayload {
-            turn_seq: r.seq,
-            reasoning_chars: r.reasoning_chars,
+            turn_seq: Some(r.seq),
+            reasoning_chars: Some(r.reasoning_chars),
             reasoning_text: cap_str(&r.reasoning_text, MAX_REASONING_TEXT_BYTES),
             reasoning_format: r.reasoning_format.clone().unwrap_or_else(|| "inline-think-tags".to_string()),
             step_id: None,
@@ -10279,7 +10279,7 @@ fn heartbeat_payload(c: &Chunk<'_>) -> DispatchHeartbeatPayload {
         turn_seq: c.seq,
         partial_index: Some(c.partial_index),
         cumulative_chars: c.cumulative_chars,
-        sampled_at_ms: c.ts,
+        sampled_at_ms: Some(c.ts),
         generated_chars: c.generated_chars,
         prompt_chars: None,
         phase: c.phase.map(|phase| match phase {
@@ -10301,7 +10301,7 @@ fn opening_heartbeat_payload(s: &darkmux_trajectory::StreamingStart) -> Dispatch
         turn_seq: s.seq,
         partial_index: None,
         cumulative_chars: 0,
-        sampled_at_ms: s.ts,
+        sampled_at_ms: Some(s.ts),
         generated_chars: Some(0),
         prompt_chars: Some(s.system_chars.saturating_add(s.prompt_chars)),
         phase: None,

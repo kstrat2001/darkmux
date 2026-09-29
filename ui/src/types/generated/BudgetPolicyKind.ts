@@ -3,4 +3,4 @@
 /**
  * What a budget does on a breach.
  */
-export type BudgetPolicyKind = "off" | "warn" | "wait";
+export type BudgetPolicyKind = "off" | "warn" | "wait" | "unknown";

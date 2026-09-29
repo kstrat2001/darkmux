@@ -161,8 +161,48 @@ pub trait FlowSinkWrite {
 
 impl<S: FlowSink + ?Sized> FlowSinkWrite for S {
     fn write(&self, record: &FlowRecord) -> Result<()> {
-        self.persist(CheckedRecord::check(record)?)
+        match CheckedRecord::check(record) {
+            Ok(checked) => self.persist(checked),
+            Err(refusal) => {
+                report_refusal(&record.action, &refusal);
+                Err(refusal)
+            }
+        }
     }
+}
+
+/// True the first time `key` is seen in this process: a line that would repeat every poll of a
+/// wait, or on every record of a kind, is said once.
+pub fn first_refusal(key: &str) -> bool {
+    static SEEN: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key.to_string())
+}
+
+/// Say a refused write on stderr, once per action per process. Callers mostly discard the write's
+/// result (`let _ = record(..)`), and a refused liveness bookend would otherwise vanish without a
+/// trace.
+fn report_refusal(action: &FlowAction, refusal: &anyhow::Error) {
+    if !first_refusal(&format!("flow-write-refused:{}", action.as_str())) {
+        return;
+    }
+    let line = format!("darkmux: flow record refused ({refusal}); further refusals of `{}` are not repeated", action.as_str());
+    eprintln!("{line}");
+    #[cfg(test)]
+    REFUSALS_SAID.with(|said| said.borrow_mut().push(line));
+}
+
+#[cfg(test)]
+thread_local! {
+    static REFUSALS_SAID: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The refusal lines this test thread said.
+#[cfg(test)]
+pub(crate) fn refusals_said() -> Vec<String> {
+    REFUSALS_SAID.with(|said| said.borrow().clone())
 }
 
 /// File-based flow sink: appends to per-day JSONL files under
@@ -2068,6 +2108,38 @@ mod tests {
         assert_eq!(sink.0.load(std::sync::atomic::Ordering::Relaxed), 0, "no sink saw the unknown or retired action");
         assert!(record_via(&sink, &minimal_record()).is_ok());
         assert_eq!(sink.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// A refused record is said, not dropped: the write check names the action and the reason on
+    /// stderr, once per action per process, and still returns the error.
+    #[test]
+    fn a_refused_record_is_reported_once_per_action() {
+        struct Never;
+        impl FlowSink for Never {
+            fn persist(&self, _record: crate::CheckedRecord<'_>) -> Result<()> {
+                panic!("a refused record reached a sink")
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Never".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        let unread = |action: FlowAction| {
+            let mut r = minimal_record();
+            r.payload = Some(Payload::settle(&action, serde_json::json!({"items": "not a number"})));
+            r.action = action;
+            r
+        };
+        let grow = unread(FlowAction::MissionGrow);
+        assert!(record_via(&Never, &grow).is_err());
+        assert!(record_via(&Never, &grow).is_err());
+        let said = crate::refusals_said();
+        assert_eq!(said.len(), 1, "once per action: {said:?}");
+        assert!(said[0].contains("mission.grow") && said[0].contains("unread payload"), "{said:?}");
+
+        assert!(record_via(&Never, &unread(FlowAction::HookFired)).is_err());
+        let said = crate::refusals_said();
+        assert_eq!(said.len(), 2, "another action is said again: {said:?}");
+        assert!(said[1].contains("hook.fired"), "{said:?}");
     }
 
     /// The verbs behind `mission.pause`, `mission.resume` and `phase.added`

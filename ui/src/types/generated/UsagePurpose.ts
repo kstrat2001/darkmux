@@ -7,4 +7,4 @@
  * tiles, mission-graph step meter) exclude it (CLAUDE.md contract 8:
  * sub-executions are never blended into the primary).
  */
-export type UsagePurpose = "work" | "utility";
+export type UsagePurpose = "work" | "utility" | "unknown";

@@ -3,4 +3,4 @@
 /**
  * How far into a budget the known spend is.
  */
-export type BreachLevel = "early" | "at_limit";
+export type BreachLevel = "early" | "at_limit" | "unknown";

@@ -3,4 +3,4 @@
 /**
  * How a tool call ended.
  */
-export type ToolOutcome = "ok" | "reported" | "failed";
+export type ToolOutcome = "ok" | "reported" | "failed" | "unknown";

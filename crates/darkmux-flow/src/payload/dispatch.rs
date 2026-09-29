@@ -14,6 +14,10 @@ pub enum ResultClass {
     Ok,
     /// It failed, or was cut before completion.
     Error,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// How a tool call ended.
@@ -28,6 +32,10 @@ pub enum ToolOutcome {
     Reported,
     /// Did not run, or could not complete.
     Failed,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// What the model is doing mid-stream, when it is more than writing text.
@@ -38,6 +46,10 @@ pub enum ToolOutcome {
 pub enum StreamPhase {
     /// A tool call has been named and its arguments are being written.
     WritingToolCall,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// What a reasoning checkpoint decided.
@@ -50,6 +62,10 @@ pub enum CheckpointVerdict {
     Continue,
     /// Close the thought and ask for the answer.
     Conclude,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The verdict of a `dispatch.route`.
@@ -62,6 +78,10 @@ pub enum RouteDecision {
     Pinned,
     /// No machine was named; it runs here.
     Local,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Where a resolved runtime knob's value came from.
@@ -84,6 +104,10 @@ pub enum KnobSource {
     /// Forced by an agentic-remote dispatch, which takes no rest.
     #[serde(rename = "forced-agentic-remote")]
     ForcedAgenticRemote,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Which record store a brief ref's key addresses.
@@ -96,6 +120,10 @@ pub enum BriefRefKind {
     Finding,
     /// A mod: a change someone proposed.
     Mod,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// What a checkout's `.git` pointer is.
@@ -110,6 +138,10 @@ pub enum GitdirKind {
     Submodule,
     /// A separate git dir.
     Separate,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One record a dispatch's brief carries: a kind plus the key its store answers to.
@@ -491,8 +523,9 @@ pub struct DispatchTurnPayload {
     pub usage: Option<TurnUsage>,
     /// The authoritative running turn count (monotonic, 1-based), so a viewer opened mid-dispatch
     /// reads the true count.
-    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
-    pub turns_so_far: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
+    pub turns_so_far: Option<u64>,
     /// The turn's model time, request sent to stream end; absent when no stream was recorded, and
     /// reported once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -544,8 +577,9 @@ pub struct DispatchHeartbeatPayload {
     #[cfg_attr(feature = "ts-export", ts(type = "number"))]
     pub cumulative_chars: u64,
     /// The runtime's own millisecond clock.
-    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
-    pub sampled_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
+    pub sampled_at_ms: Option<u64>,
     /// Everything generated, reasoning and tool-call arguments included; `null` when the chunk did
     /// not say.
     #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
@@ -592,13 +626,17 @@ pub struct DispatchToolPayload {
     #[cfg_attr(feature = "ts-export", ts(type = "number"))]
     pub tool_seq: u64,
     /// The authoritative running tool-call count (monotonic, 1-based).
-    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
-    pub tool_calls_so_far: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
+    pub tool_calls_so_far: Option<u64>,
     pub tool_name: String,
     /// The arguments preview (search pattern, path, command), bounded.
-    pub args: String,
-    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
-    pub args_chars: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub args: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
+    pub args_chars: Option<u64>,
     /// An accepted `create_finding`'s emission, whole (bounded loudly): the model's own JSON,
     /// carried verbatim. `null` for every other call.
     #[cfg_attr(feature = "ts-export", ts(type = "unknown | null"))]
@@ -607,12 +645,17 @@ pub struct DispatchToolPayload {
     #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
     pub emit_seq: Option<u64>,
     /// The true result length.
-    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
-    pub result_chars: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
+    pub result_chars: Option<u64>,
     /// The result, bounded by eliding its middle.
-    pub result: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub result: Option<String>,
     /// Whether the tool did its job (true for a red test).
-    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub ok: Option<bool>,
     /// The three-way outcome as classified.
     pub outcome: Option<ToolOutcome>,
     #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
@@ -656,7 +699,9 @@ pub struct DispatchCompactionPayload {
     /// The utility model that did the work; `null` when none was bound.
     pub compactor_model: Option<String>,
     /// The specialist's model, which stays the record's `model`.
-    pub parent_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub parent_model: Option<String>,
     /// The graph step the record belongs to, when its session is a step's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
@@ -742,10 +787,12 @@ impl Attribution for DispatchCheckpointPayload {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct DispatchReasoningPayload {
-    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
-    pub turn_seq: u64,
-    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
-    pub reasoning_chars: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
+    pub turn_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
+    pub reasoning_chars: Option<u64>,
     pub reasoning_text: String,
     /// `inline-think-tags` or `separate-field`.
     pub reasoning_format: String,
@@ -813,7 +860,9 @@ impl Attribution for DispatchFeedbackPayload {
 pub struct DispatchRestPayload {
     /// Why the loop rested: `turn_delay`, or a paced reason (`thermal`, `thermal-critical`,
     /// `thermal-duty-cycle`, `thermal-episode-limit`, `battery`, `budget`).
-    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub reason: Option<String>,
     /// The pace file's own state, an OS thermal-state name when the governor wrote the pause;
     /// absent on a plain turn-delay rest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1029,6 +1078,7 @@ impl BriefRefKind {
         match self {
             BriefRefKind::Finding => "finding",
             BriefRefKind::Mod => "mod",
+            BriefRefKind::Unknown => "unknown",
         }
     }
 

@@ -302,7 +302,8 @@ pub fn evaluate(b: &EndpointBudget, entries: &[(i64, Spend)], now: i64) -> Verdi
         // A call count is always exact: only a token metric can be unmetered.
         let unmetered = match metric {
             Metric::Tokens => unmetered,
-            Metric::Calls => 0,
+            // `measured` above names only tokens and calls; `Unknown` is a reader's word.
+            Metric::Calls | Metric::Unknown => 0,
         };
         if spent >= limit {
             at_limit.push(Breach { level: Some(BreachLevel::AtLimit), metric, spent, limit, unmetered });
@@ -349,7 +350,7 @@ fn resume_at_for(inside: &[(i64, Spend)], br: &Breach, period: i64) -> Option<i6
     for (t, n) in inside {
         remaining = remaining.saturating_sub(match br.metric {
             Metric::Tokens => n.known,
-            Metric::Calls => 1,
+            Metric::Calls | Metric::Unknown => 1,
         });
         if remaining < br.limit {
             return Some(t + period);
@@ -590,15 +591,7 @@ pub(crate) fn refused_edit_line(endpoint_id: &str, why: &str) -> String {
     )
 }
 
-/// True the first time `line` is seen in this process: a refused edit is
-/// re-read every poll of a wait, and said once.
-pub(crate) fn first_refusal(line: &str) -> bool {
-    static SEEN: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
-    SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(line.to_string())
-}
+pub(crate) use darkmux_flow::first_refusal;
 
 /// The lowercase `status` of the JSON document at `path`, when it has one.
 fn status_at(path: &Path) -> Option<String> {
@@ -849,6 +842,7 @@ fn metric_word(m: Metric) -> &'static str {
     match m {
         Metric::Tokens => "tokens",
         Metric::Calls => "calls",
+        Metric::Unknown => "units",
     }
 }
 
@@ -914,6 +908,7 @@ fn warn(b: &EndpointBudget, br: &Breach, caller: &BudgetCaller<'_>, env: &dyn Bu
     let what = match br.level {
         Some(BreachLevel::AtLimit) => "has reached its budget".to_string(),
         Some(BreachLevel::Early) => format!("is at {}% of its budget", (br.spent.saturating_mul(100)) / br.limit.max(1)),
+        Some(BreachLevel::Unknown) => "is over a budget level this build does not name".to_string(),
         None => "is not fully metered".to_string(),
     };
     // (N4) Not fully metered is its own fact, said beside any level: the

@@ -132,6 +132,10 @@ fn resolve(r: &BriefRef, dirs: &StoreDirs) -> Result<(String, BriefRef)> {
             let canonical = BriefRef::mod_(record.key.clone());
             Ok((crate::mods::brief_block(&record, &mount), canonical))
         }
+        BriefRefKind::Unknown => anyhow::bail!(
+            "a brief ref of a kind this build does not know (key {:?}); a ref is a `finding` or a `mod`",
+            r.key
+        ),
     }
 }
 

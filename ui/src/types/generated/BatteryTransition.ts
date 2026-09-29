@@ -3,4 +3,4 @@
 /**
  * A battery transition worth a record, as a stable string a consumer can key on.
  */
-export type BatteryTransition = "to-battery" | "to-ac" | "below-floor" | "at-or-above-floor";
+export type BatteryTransition = "to-battery" | "to-ac" | "below-floor" | "at-or-above-floor" | "unknown";

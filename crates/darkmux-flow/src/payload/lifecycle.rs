@@ -21,6 +21,10 @@ pub enum SeatClass {
     /// A local model whose placement could not be resolved: it runs with no wave load and no
     /// residency lease.
     LocalModelUnresolved,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A step began: the payload of `step.start`, stamped with what the step consumes.
@@ -28,7 +32,9 @@ pub enum SeatClass {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct StepStartPayload {
-    pub seat_class: SeatClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub seat_class: Option<SeatClass>,
 }
 
 impl Attribution for StepStartPayload {}
@@ -304,6 +310,10 @@ pub enum GrowReason {
     ProducerErrored,
     /// The producer found zero items.
     GrewNothing,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A mission graph grew: the payload of `mission.grow`, the provenance of every task a `grow`
@@ -319,7 +329,9 @@ pub struct MissionGrowPayload {
     /// The producing task.
     pub from: String,
     /// The producing step.
-    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub source: Option<String>,
     /// How many items the producer's output held.
     #[cfg_attr(feature = "ts-export", ts(type = "number"))]
     pub items: u64,
@@ -395,6 +407,10 @@ pub enum ReviewVerdict {
     /// No findings and no clean marker: the reviewer may not have engaged with the format, so
     /// inspect manually.
     Indeterminate,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 
@@ -406,6 +422,7 @@ impl ReviewVerdict {
             ReviewVerdict::FlagsOnly => "flags-only",
             ReviewVerdict::Clean => "clean",
             ReviewVerdict::Indeterminate => "indeterminate",
+            ReviewVerdict::Unknown => "unknown",
         }
     }
 }
@@ -437,6 +454,10 @@ pub enum RadioSurface {
     Cli,
     /// The editor panel.
     Panel,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// What the radio's routing seat decided.
@@ -451,6 +472,10 @@ pub enum RadioDecision {
     Refuse,
     /// The routing call could not run.
     Unavailable,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One routed invocation of the radio: the payload of `radio.route`.
@@ -521,6 +546,10 @@ pub enum BudgetScope {
     Endpoint,
     /// A step's per-step cap.
     Step,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// What a budget does on a breach.
@@ -535,6 +564,10 @@ pub enum BudgetPolicyKind {
     Warn,
     /// Calls pause until the budget has room again.
     Wait,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// What a breach was measured in.
@@ -547,6 +580,10 @@ pub enum BudgetMetric {
     Tokens,
     /// Calls.
     Calls,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// How far into a budget the known spend is.
@@ -559,6 +596,10 @@ pub enum BreachLevel {
     Early,
     /// At or past the budget.
     AtLimit,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// An endpoint budget or a per-step cap acted: the payload of `budget.warn`, `budget.wait`,

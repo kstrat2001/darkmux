@@ -335,11 +335,21 @@ pub fn hook_match(m: &HookMatch, record: &FlowRecord) -> bool {
     let payload_json = record.payload.as_ref().and_then(|p| serde_json::to_value(p).ok());
     for (path, expected) in m.payload_predicates() {
         let actual = payload_json.as_ref().and_then(|p| payload_value_at(p, path));
-        if actual != Some(expected) {
+        if !predicate_holds(actual, expected, payload_json.is_some()) {
             return false;
         }
     }
     true
+}
+
+/// Whether one payload predicate holds. It holds on an exact match. An expected `null` also holds
+/// on an absent key of a record that has a payload: a payload key with no value is omitted from
+/// the wire now and was written as `null` in archives, and one rule must match both.
+fn predicate_holds(actual: Option<&serde_json::Value>, expected: &serde_json::Value, has_payload: bool) -> bool {
+    match actual {
+        Some(v) => v == expected,
+        None => expected.is_null() && has_payload,
+    }
 }
 
 /// Walk a dot-separated path (`"tool_name"`, `"detections.count"`) into a
@@ -3473,7 +3483,7 @@ fn emit_hook_record_with(
         // the wire as `X-Darkmux-Delivery` — lets a receiver (or an
         // operator reading flow) correlate the record here with the HTTP
         // request the receiver actually saw.
-        delivery_id: delivery_id.to_string(),
+        delivery_id: Some(delivery_id.to_string()),
         delivered_hash: hash,
         error: error.map(str::to_string),
         receiver_rejected: rejected_count,
@@ -4815,6 +4825,22 @@ mod tests {
         r.payload = Some(crate::Payload::settle(&r.action, serde_json::json!({"tool_name": "create_finding", "ok": false})));
         assert!(hook_match(&payload_match(&[("ok", serde_json::json!(false))]), &r));
         assert!(!hook_match(&payload_match(&[("ok", serde_json::json!(true))]), &r));
+    }
+
+    #[test]
+    fn a_null_predicate_matches_a_null_value_and_an_absent_key_alike() {
+        let mut r = record(crate::FlowAction::DispatchTool);
+        let m = payload_match(&[("failure_reason", serde_json::Value::Null)]);
+        // An archived record wrote the key as `null`; a current one omits it.
+        r.payload = Some(crate::Payload::settle(&r.action, serde_json::json!({"tool_name": "bash", "failure_reason": null})));
+        assert!(hook_match(&m, &r), "a null value");
+        r.payload = Some(crate::Payload::settle(&r.action, serde_json::json!({"tool_name": "bash"})));
+        assert!(hook_match(&m, &r), "an absent key");
+        // A key that holds a value is not null, and a record with no payload has no key to be null.
+        r.payload = Some(crate::Payload::settle(&r.action, serde_json::json!({"tool_name": "bash", "failure_reason": "boom"})));
+        assert!(!hook_match(&m, &r), "a present value");
+        r.payload = None;
+        assert!(!hook_match(&m, &r), "no payload at all");
     }
 
     #[test]
@@ -8749,15 +8775,15 @@ mod tests {
     fn create_finding_payload() -> crate::Payload {
         crate::Payload::DispatchTool(crate::payload::DispatchToolPayload {
             tool_seq: 1,
-            tool_calls_so_far: 1,
+            tool_calls_so_far: Some(1),
             tool_name: "create_finding".to_string(),
-            args: String::new(),
-            args_chars: 0,
+            args: Some(String::new()),
+            args_chars: Some(0),
             emitted: None,
             emit_seq: None,
-            result_chars: 0,
-            result: String::new(),
-            ok: true,
+            result_chars: Some(0),
+            result: Some(String::new()),
+            ok: Some(true),
             outcome: None,
             exit_code: None,
             failure_reason: None,

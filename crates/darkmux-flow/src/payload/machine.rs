@@ -224,6 +224,10 @@ pub enum BatteryTransition {
     /// Recovered to or above the floor.
     #[serde(rename = "at-or-above-floor")]
     AtOrAboveFloor,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The periodic full host reading: the payload of `machine.telemetry`. Machine-scoped: no dispatch,

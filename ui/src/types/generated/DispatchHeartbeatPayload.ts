@@ -17,7 +17,7 @@ cumulative_chars: number,
 /**
  * The runtime's own millisecond clock.
  */
-sampled_at_ms: number, 
+sampled_at_ms?: number, 
 /**
  * Everything generated, reasoning and tool-call arguments included; `null` when the chunk did
  * not say.

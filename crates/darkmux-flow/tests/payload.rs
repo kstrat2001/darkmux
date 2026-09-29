@@ -142,3 +142,63 @@ fn only_the_reader_settles_a_payload_from_json() {
     }
     assert!(offenders.is_empty(), "production code settling a payload from JSON: {offenders:?}");
 }
+
+/// One sanitized line per shape the operator's real archive holds that an earlier
+/// reader of these payloads would have dropped (a field a version never wrote, a
+/// `null` where a count belongs, a role or class spelled by a version this one
+/// does not know). Each must read as its action's typed payload.
+#[test]
+fn every_historical_archive_shape_reads_typed() {
+    let path = format!("{}/tests/fixtures/archive_shapes.jsonl", env!("CARGO_MANIFEST_DIR"));
+    let corpus = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let mut unread = Vec::new();
+    let mut lines = 0;
+    for line in corpus.lines() {
+        lines += 1;
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        let shape = v["archive_shape"].as_str().unwrap_or("?").to_string();
+        let record = darkmux_flow::reader::parse_record(line).unwrap_or_else(|| panic!("{shape}: not a flow record"));
+        match record.payload {
+            Some(darkmux_flow::Payload::Unread(_)) | None => unread.push(shape),
+            Some(_) => {}
+        }
+    }
+    assert!(lines >= 15, "the corpus is not empty");
+    assert!(unread.is_empty(), "shapes that read as Unread: {unread:?}");
+}
+
+/// The old `compactor` role is the utility seat (the `schema.rs` contract), not an
+/// unknown word; a word no build names reads as `Unknown` and keeps its record.
+#[test]
+fn the_compactor_role_is_the_utility_seat_and_an_unknown_word_is_unknown() {
+    use darkmux_flow::payload::{DetectorKind, LmsRole, ResultClass, SeatClass};
+    use darkmux_flow::Payload;
+    let path = format!("{}/tests/fixtures/archive_shapes.jsonl", env!("CARGO_MANIFEST_DIR"));
+    let corpus = std::fs::read_to_string(&path).unwrap();
+    let mut seen = 0;
+    for line in corpus.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        let shape = v["archive_shape"].as_str().unwrap();
+        let payload = darkmux_flow::reader::parse_record(line).unwrap().payload.unwrap();
+        match (shape, payload) {
+            ("telemetry.lms with the compactor role", Payload::TelemetryLms(p)) => {
+                assert_eq!(p.role, Some(LmsRole::Utility));
+                seen += 1;
+            }
+            ("dispatch.complete with an unknown result_class", Payload::DispatchComplete(p)) => {
+                assert_eq!(p.result_class, Some(ResultClass::Unknown));
+                seen += 1;
+            }
+            ("telemetry.detector with an unknown kind", Payload::TelemetryDetector(p)) => {
+                assert_eq!(p.kind, DetectorKind::Unknown);
+                seen += 1;
+            }
+            ("step.start with an unknown seat_class", Payload::StepStart(p)) => {
+                assert_eq!(p.seat_class, Some(SeatClass::Unknown));
+                seen += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(seen, 4);
+}

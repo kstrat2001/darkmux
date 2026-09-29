@@ -3,4 +3,4 @@
 /**
  * Whether the provider's reply carried a usage block.
  */
-export type TokenSource = "provider" | "absent";
+export type TokenSource = "provider" | "absent" | "unknown";

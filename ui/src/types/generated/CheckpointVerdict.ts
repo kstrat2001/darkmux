@@ -3,4 +3,4 @@
 /**
  * What a reasoning checkpoint decided.
  */
-export type CheckpointVerdict = "continue" | "conclude";
+export type CheckpointVerdict = "continue" | "conclude" | "unknown";

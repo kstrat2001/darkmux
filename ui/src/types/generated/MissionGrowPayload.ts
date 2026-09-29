@@ -18,7 +18,7 @@ from: string,
 /**
  * The producing step.
  */
-source: string, 
+source?: string, 
 /**
  * How many items the producer's output held.
  */

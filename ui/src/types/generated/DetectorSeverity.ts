@@ -3,4 +3,4 @@
 /**
  * How loudly a detector firing reads.
  */
-export type DetectorSeverity = "warn" | "info";
+export type DetectorSeverity = "warn" | "info" | "unknown";

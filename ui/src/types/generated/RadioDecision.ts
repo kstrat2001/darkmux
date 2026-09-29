@@ -3,4 +3,4 @@
 /**
  * What the radio's routing seat decided.
  */
-export type RadioDecision = "route" | "refuse" | "unavailable";
+export type RadioDecision = "route" | "refuse" | "unavailable" | "unknown";

@@ -3,4 +3,4 @@
 /**
  * What the model is doing mid-stream, when it is more than writing text.
  */
-export type StreamPhase = "writing_tool_call";
+export type StreamPhase = "writing_tool_call" | "unknown";

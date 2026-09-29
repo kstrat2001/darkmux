@@ -3,7 +3,7 @@
 /**
  * A turn's reasoning text, bounded: the payload of `dispatch.reasoning`.
  */
-export type DispatchReasoningPayload = { turn_seq: number, reasoning_chars: number, reasoning_text: string, 
+export type DispatchReasoningPayload = { turn_seq?: number, reasoning_chars?: number, reasoning_text: string, 
 /**
  * `inline-think-tags` or `separate-field`.
  */

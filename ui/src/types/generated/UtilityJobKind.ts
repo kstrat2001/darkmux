@@ -6,4 +6,4 @@
  * own visual by it, and gives a job it has no visual for a generic utility
  * indicator, so a new variant here is never silent there.
  */
-export type UtilityJobKind = "compaction" | "radio_routing";
+export type UtilityJobKind = "compaction" | "radio_routing" | "unknown";

@@ -18,7 +18,7 @@ usage: TurnUsage | null,
  * The authoritative running turn count (monotonic, 1-based), so a viewer opened mid-dispatch
  * reads the true count.
  */
-turns_so_far: number, 
+turns_so_far?: number, 
 /**
  * The turn's model time, request sent to stream end; absent when no stream was recorded, and
  * reported once.

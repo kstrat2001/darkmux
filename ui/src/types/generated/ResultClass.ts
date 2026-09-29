@@ -3,4 +3,4 @@
 /**
  * How a dispatch ended, as its terminal record classes it.
  */
-export type ResultClass = "ok" | "error";
+export type ResultClass = "ok" | "error" | "unknown";

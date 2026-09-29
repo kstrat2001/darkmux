@@ -3,4 +3,4 @@
 /**
  * A model became resident or stopped being.
  */
-export type LmsEvent = "load" | "unload";
+export type LmsEvent = "load" | "unload" | "unknown";

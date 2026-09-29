@@ -26,7 +26,7 @@ attempt: number,
  * The id this attempt sent as `X-Darkmux-Delivery`, so a receiver can correlate the record
  * with the request it saw.
  */
-delivery_id: string, 
+delivery_id?: string, 
 /**
  * The delivered line's chain hash, when it carried one.
  */

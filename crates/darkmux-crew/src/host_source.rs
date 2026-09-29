@@ -1189,7 +1189,7 @@ mod tests {
     /// A `dispatch.rest` payload to stamp: any host-derived record would do.
     fn rest_payload() -> darkmux_flow::Payload {
         darkmux_flow::Payload::DispatchRest(darkmux_flow::payload::DispatchRestPayload {
-            reason: "thermal".to_string(),
+            reason: Some("thermal".to_string()),
             state: Some("fair".to_string()),
             ..Default::default()
         })

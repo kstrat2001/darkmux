@@ -3,4 +3,4 @@
 /**
  * What a budget record is about.
  */
-export type BudgetScope = "endpoint" | "step";
+export type BudgetScope = "endpoint" | "step" | "unknown";

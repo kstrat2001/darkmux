@@ -21,6 +21,10 @@ pub enum CallKind {
     /// One runtime compactor call: a sub-execution of the utility role,
     /// attributed to it, never to the specialist.
     Compaction,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// WHOSE job a model call was: the operator's WORK, or one of darkmux's own
@@ -37,6 +41,10 @@ pub enum UsagePurpose {
     Work,
     /// darkmux's own job, run on the machine's utility model.
     Utility,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// WHICH of darkmux's utility jobs a call (or a `utility.start`) belongs to.
@@ -53,6 +61,10 @@ pub enum UtilityJobKind {
     Compaction,
     /// A radio routing call (host-side, serving no execution).
     RadioRouting,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Whether the provider's reply carried a usage block.
@@ -65,6 +77,10 @@ pub enum TokenSource {
     Provider,
     /// The reply carried none; the record has no counts.
     Absent,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One model call's usage: the payload of `telemetry.tokens`. The model CALL is darkmux's unit of

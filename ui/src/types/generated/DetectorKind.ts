@@ -3,4 +3,4 @@
 /**
  * Which detector fired.
  */
-export type DetectorKind = "cycle" | "reasoning-loop" | "tool-failure" | "intra-turn-stall" | "empty_tool_calls" | "per-turn-cap" | "discarded_tool_call" | "malformed_tool_names" | "escalation" | "repetition";
+export type DetectorKind = "cycle" | "reasoning-loop" | "tool-failure" | "intra-turn-stall" | "empty_tool_calls" | "per-turn-cap" | "discarded_tool_call" | "malformed_tool_names" | "escalation" | "repetition" | "unknown";

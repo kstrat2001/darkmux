@@ -3,4 +3,4 @@
 /**
  * What a checkout's `.git` pointer is.
  */
-export type GitdirKind = "worktree" | "submodule" | "separate";
+export type GitdirKind = "worktree" | "submodule" | "separate" | "unknown";

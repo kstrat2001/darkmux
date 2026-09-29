@@ -11,7 +11,7 @@ export type DispatchRestPayload = {
  * Why the loop rested: `turn_delay`, or a paced reason (`thermal`, `thermal-critical`,
  * `thermal-duty-cycle`, `thermal-episode-limit`, `battery`, `budget`).
  */
-reason: string, 
+reason?: string, 
 /**
  * The pace file's own state, an OS thermal-state name when the governor wrote the pause;
  * absent on a plain turn-delay rest.

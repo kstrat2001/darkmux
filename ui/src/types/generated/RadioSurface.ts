@@ -3,4 +3,4 @@
 /**
  * Where a radio request came from.
  */
-export type RadioSurface = "cli" | "panel";
+export type RadioSurface = "cli" | "panel" | "unknown";

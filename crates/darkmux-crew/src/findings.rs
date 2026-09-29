@@ -530,7 +530,7 @@ pub fn sync_at(flows_dir: &Path, store_root: &Path, since: Option<&str>) -> Resu
             let Some(darkmux_flow::Payload::DispatchTool(payload)) = darkmux_flow::reader::payload_of(&rec) else {
                 continue;
             };
-            if !is_finding_tool(&payload.tool_name) || !payload.ok {
+            if !is_finding_tool(&payload.tool_name) || payload.ok != Some(true) {
                 continue;
             }
             report.scanned += 1;

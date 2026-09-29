@@ -701,7 +701,9 @@ fn config_block() -> Option<String> {
 /// both ways rather than left to infer one from the other.
 fn render_surface_block(surface: RadioSurface) -> String {
     match surface {
-        RadioSurface::Cli => "Surface: command line (`darkmux radio`). There is no shell here \
+        // A surface this build does not name gets the command-line wording: it
+        // promises the user nothing that only a panel can run.
+        RadioSurface::Cli | RadioSurface::Unknown => "Surface: command line (`darkmux radio`). There is no shell here \
              that runs `/anything` — a catalog command is invoked by radio itself, never typed \
              by the user. Never write a bare `/id`, and never name a catalog command by its id \
              alone: `review` on its own is not something the user can run. Name a catalog \
@@ -724,7 +726,7 @@ fn render_surface_block(surface: RadioSurface) -> String {
 /// instruction drifting independently.
 fn surface_instructions(surface: RadioSurface) -> String {
     match surface {
-        RadioSurface::Cli => "on the command line, a catalog command is `darkmux mission launch \
+        RadioSurface::Cli | RadioSurface::Unknown => "on the command line, a catalog command is `darkmux mission launch \
              <id>` — never a bare `/id` and never the id on its own, since there is no shell \
              here that runs `/anything` and no such subcommand either; any other darkmux verb \
              is the full line from the command index (e.g. `darkmux machine status`)."

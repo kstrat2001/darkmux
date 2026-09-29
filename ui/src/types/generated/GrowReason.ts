@@ -3,4 +3,4 @@
 /**
  * Why a `grow` minted nothing.
  */
-export type GrowReason = "producer_errored" | "grew_nothing";
+export type GrowReason = "producer_errored" | "grew_nothing" | "unknown";

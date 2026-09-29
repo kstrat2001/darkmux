@@ -4,4 +4,4 @@ import type { SeatClass } from "./SeatClass";
 /**
  * A step began: the payload of `step.start`, stamped with what the step consumes.
  */
-export type StepStartPayload = { seat_class: SeatClass, };
+export type StepStartPayload = { seat_class?: SeatClass, };

@@ -318,11 +318,22 @@ darkmux release.
   `reasoning_tokens`, `cached_tokens`, `stderr_excerpt`, `turn_delay_effective_ms`,
   `policy`, `tail_ratio`, and the token counts of a call that reported none).
   `telemetry.tokens` and the `--json` envelope keep `null` for "not reported".
-  **Migration:** a hook rule or receiver that matched `payload.<key>: null`
-  matches on the key being absent instead.
+  **Migration:** a hook rule that matches `payload.<key>: null` keeps working:
+  an expected `null` matches both a `null` value (archived records) and an
+  absent key (current records). A receiver or `jq` filter that tests
+  `.payload.<key> == null` still holds, since a missing key reads as `null`
+  in `jq`; code that tests for the key's presence (`has("key")`, an
+  `"key" in payload` check) must accept absence.
 - **Archives still read.** A payload that does not parse as its action's type
   is kept as it was and never re-written. The retired review spelling `tokens`
-  reads as `total_tokens` on `dispatch.complete` and `step.result`. A
+  reads as `total_tokens` on `dispatch.complete` and `step.result`. A field
+  an older version never wrote (`sampled_at_ms`, `tool_calls_so_far`, `result`,
+  `turns_so_far`, `parent_model`, `reason`, `delivery_id`, `seat_class`, `source`),
+  or wrote as `null`, reads as absent, never as zero. The role `compactor` reads
+  as the utility seat, and a word in a closed set (a result class, a detector
+  kind, a seat class) that this build does not name reads as `unknown` instead
+  of dropping the record. A refused write of a flow record is now said once per
+  action on stderr. A
   `dispatch.start` `bounds` block from before the newer knobs existed reads with
   the knobs it has.
 

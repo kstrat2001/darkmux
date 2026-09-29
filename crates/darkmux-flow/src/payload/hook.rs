@@ -22,7 +22,9 @@ pub struct HookDeliveryPayload {
     pub attempt: u32,
     /// The id this attempt sent as `X-Darkmux-Delivery`, so a receiver can correlate the record
     /// with the request it saw.
-    pub delivery_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub delivery_id: Option<String>,
     /// The delivered line's chain hash, when it carried one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]

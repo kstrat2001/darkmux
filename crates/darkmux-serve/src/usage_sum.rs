@@ -313,7 +313,9 @@ impl UsageFold {
             utility: UsageSplit::default(),
         });
         match amount.purpose {
-            UsagePurpose::Work => g.work.add(amount),
+            // A purpose this build does not name is not known to be a utility job, and `Work` is
+            // "every call that is not a utility job": its tokens are counted, never dropped.
+            UsagePurpose::Work | UsagePurpose::Unknown => g.work.add(amount),
             UsagePurpose::Utility => g.utility.add(amount),
         }
     }

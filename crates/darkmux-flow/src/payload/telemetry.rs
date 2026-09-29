@@ -16,6 +16,10 @@ pub enum LmsEvent {
     Load,
     /// It was unloaded.
     Unload,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Which seat a resident model holds relative to the dispatch's own staffing, so the viewer can
@@ -27,10 +31,16 @@ pub enum LmsEvent {
 pub enum LmsRole {
     /// The dispatch's own model.
     Primary,
-    /// The machine's utility model.
+    /// The machine's utility model. Archives from before the utility seat was named spell it
+    /// `compactor`.
+    #[serde(alias = "compactor")]
     Utility,
     /// A model the dispatch did not declare: a leftover, or the operator's own use.
     Resident,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Which detector fired.
@@ -69,6 +79,10 @@ pub enum DetectorKind {
     /// The degeneracy gate judged the stream repeating.
     #[serde(rename = "repetition")]
     Repetition,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// How loudly a detector firing reads.
@@ -81,6 +95,10 @@ pub enum DetectorSeverity {
     Warn,
     /// Recovered; recorded for the run's account.
     Info,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Per-turn context-window occupancy: the payload of `telemetry.context`, the sawtooth the viewer
@@ -355,6 +373,7 @@ impl DetectorKind {
             DetectorKind::MalformedToolNames => "malformed_tool_names",
             DetectorKind::Escalation => "escalation",
             DetectorKind::Repetition => "repetition",
+            DetectorKind::Unknown => "unknown",
         }
     }
 }
@@ -365,6 +384,7 @@ impl DetectorSeverity {
         match self {
             DetectorSeverity::Warn => "warn",
             DetectorSeverity::Info => "info",
+            DetectorSeverity::Unknown => "unknown",
         }
     }
 }

@@ -3,4 +3,4 @@
 /**
  * Which record store a brief ref's key addresses.
  */
-export type BriefRefKind = "finding" | "mod";
+export type BriefRefKind = "finding" | "mod" | "unknown";

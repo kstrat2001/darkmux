@@ -8,11 +8,11 @@ export type DispatchToolPayload = { tool_seq: number,
 /**
  * The authoritative running tool-call count (monotonic, 1-based).
  */
-tool_calls_so_far: number, tool_name: string, 
+tool_calls_so_far?: number, tool_name: string, 
 /**
  * The arguments preview (search pattern, path, command), bounded.
  */
-args: string, args_chars: number, 
+args?: string, args_chars?: number, 
 /**
  * An accepted `create_finding`'s emission, whole (bounded loudly): the model's own JSON,
  * carried verbatim. `null` for every other call.
@@ -25,15 +25,15 @@ emit_seq: number | null,
 /**
  * The true result length.
  */
-result_chars: number, 
+result_chars?: number, 
 /**
  * The result, bounded by eliding its middle.
  */
-result: string, 
+result?: string, 
 /**
  * Whether the tool did its job (true for a red test).
  */
-ok: boolean, 
+ok?: boolean, 
 /**
  * The three-way outcome as classified.
  */

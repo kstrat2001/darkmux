@@ -3,4 +3,4 @@
 /**
  * A code review's verdict.
  */
-export type ReviewVerdict = "blockers" | "flags-only" | "clean" | "indeterminate";
+export type ReviewVerdict = "blockers" | "flags-only" | "clean" | "indeterminate" | "unknown";
