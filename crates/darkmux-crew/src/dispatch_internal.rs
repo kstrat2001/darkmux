@@ -9029,9 +9029,11 @@ struct TailerState {
     /// the SPECIALIST this dispatch is for. `None` when no compactor is bound.
     compactor_model: Option<String>,
     /// (#2915 review) Compaction attempts seen in this execution (the job
-    /// id's counter), and the one in flight: its job id and start ms.
+    /// id's counter), and the one in flight: its job id, start ms and the
+    /// execution it is (each attempt is a utility role's own role execution,
+    /// contract 8, never the specialist's).
     compaction_attempts: u64,
-    open_compaction: Option<(String, u64)>,
+    open_compaction: Option<(String, u64, ExecutionId)>,
     compaction_threshold: Option<u32>,
     /// (#2902 step 1a) The endpoint this dispatch's model calls went to, as
     /// a fact: the hosted label for an endpoint-staffed brain, else the
@@ -9712,7 +9714,8 @@ impl TailerState {
         // is the start time.
         self.compaction_attempts += 1;
         let job_id = format!("{}:compaction:{}", self.session, self.compaction_attempts);
-        self.open_compaction = Some((job_id.clone(), c.ts));
+        let execution = ExecutionId::mint();
+        self.open_compaction = Some((job_id.clone(), c.ts, execution.clone()));
         let mut payload = crate::usage::utility_start_payload(
             crate::usage::UtilityJobKind::Compaction,
             &job_id,
@@ -9730,6 +9733,7 @@ impl TailerState {
         live["serves"] = serde_json::json!(self.session.wire());
         self.live_utility(live, Some(&model));
         self.emit_telemetry_as(
+            &execution,
             COMPACTOR_ROLE,
             Some(&model).filter(|m| !m.is_empty()).map(String::as_str),
             crate::usage::UTILITY_SOURCE,
@@ -9752,7 +9756,9 @@ impl TailerState {
         );
         // (#2915 review) The attempt this call served: its job id and ms
         // times.
-        if let Some((job_id, started_at_ms)) = self.open_compaction.clone() {
+        let mut execution = None;
+        if let Some((job_id, started_at_ms, attempt)) = self.open_compaction.clone() {
+            execution = Some(attempt);
             crate::usage::stamp_utility_end(&mut payload, &job_id, started_at_ms, c.ts);
             // (#2928) The job's end on the live channel, at once.
             let live = serde_json::json!({
@@ -9766,7 +9772,11 @@ impl TailerState {
             self.live_utility(live, m.as_deref());
         }
         let model = payload["requested_model"].as_str().map(str::to_string);
+        // A call with no `compaction.start` before it is still its own
+        // execution.
+        let execution = execution.unwrap_or_else(ExecutionId::mint);
         self.emit_telemetry_as(
+            &execution,
             COMPACTOR_ROLE,
             model.as_deref(),
             crate::usage::USAGE_SOURCE,
@@ -10186,16 +10196,17 @@ impl TailerState {
     /// lands under `category=telemetry` with a caller-supplied `source`
     /// (`"detector"`, `"runtime"`, …) the observability viewer keys on.
     fn emit_telemetry(&self, source: &str, action: darkmux_flow::FlowAction, payload: serde_json::Value) {
-        self.emit_telemetry_as(&self.role_id, Some(&self.model), source, action, payload);
+        self.emit_telemetry_as(&self.execution, &self.role_id, Some(&self.model), source, action, payload);
     }
 
     /// (#2902 step 1b) `emit_telemetry` for a record whose work was done by
-    /// a SUB-EXECUTION: the record's `handle` and `model` name that
-    /// sub-execution's own role and model (CLAUDE.md contract 8), while the
-    /// session, mission, phase and step stay the parent's, so the record
-    /// still joins the run it happened in.
+    /// a SUB-EXECUTION: the record's `execution`, `handle` and `model` name
+    /// that sub-execution's own identity, role and model (CLAUDE.md contract
+    /// 8), while the session, mission, phase and step stay the parent's, so
+    /// the record still joins the run it happened in.
     fn emit_telemetry_as(
         &self,
+        execution: &ExecutionId,
         role_id: &str,
         model: Option<&str>,
         source: &str,
@@ -10210,7 +10221,7 @@ impl TailerState {
             source,
             role_id,
             &self.session,
-            &self.execution,
+            execution,
             model,
             self.phase_id.as_deref(),
             payload,

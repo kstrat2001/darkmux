@@ -17424,6 +17424,57 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(summary.fold.compactions(), 0, "a start is not an installed compaction");
     }
 
+    /// (#1974, contract 8) A compaction is a sub-execution: a utility role's
+    /// own role execution. Its `utility.start` and its call's usage record
+    /// name ONE execution of their own (never the specialist's), attributed
+    /// to the compactor's role and model; each attempt is its own; and the
+    /// compactor's tokens never enter the specialist's execution.
+    #[test]
+    #[serial]
+    fn a_compaction_is_its_own_execution_apart_from_the_specialists() {
+        let (records, summary) = tail_events_for_usage(
+            "sess-sub-exec",
+            &[
+                r#"{"type":"model.completed","seq":1,"finish_reason":"stop","usage":{"prompt_tokens":1000,"completion_tokens":50,"total_tokens":1050}}"#,
+                r#"{"type":"compaction.start","generation":1,"ts":1790000000100,"requested_model":"darkmux:compactor-4b"}"#,
+                r#"{"type":"compaction.call","generation":1,"ts":1790000004600,"requested_model":"darkmux:compactor-4b","usage":{"prompt_tokens":500,"completion_tokens":80,"total_tokens":580}}"#,
+                r#"{"type":"compaction.start","generation":2,"ts":1790000009100,"requested_model":"darkmux:compactor-4b"}"#,
+                r#"{"type":"compaction.call","generation":2,"ts":1790000010100,"requested_model":"darkmux:compactor-4b","usage":{"prompt_tokens":7,"completion_tokens":1,"total_tokens":8}}"#,
+            ],
+        );
+        let exec = |r: &serde_json::Value| r["execution_id"].as_str().unwrap_or_default().to_string();
+        let of_handle = |h: &str, action: &str| -> Vec<&serde_json::Value> {
+            records.iter().filter(|r| r["handle"] == h && r["action"] == action).collect()
+        };
+        let turn = of_handle("coder", "telemetry.tokens");
+        assert_eq!(turn.len(), 1, "{records:#?}");
+        let specialist = exec(turn[0]);
+        assert!(!specialist.is_empty());
+        let starts = of_handle("compactor", "utility.start");
+        let calls = of_handle("compactor", "telemetry.tokens");
+        assert_eq!((starts.len(), calls.len()), (2, 2), "{records:#?}");
+        for (i, (st, call)) in starts.iter().zip(&calls).enumerate() {
+            assert_eq!(exec(st), exec(call), "attempt {i}: the start and its call are one execution");
+            assert_ne!(exec(st), specialist, "attempt {i}: a compaction is not the specialist's execution");
+            assert_eq!(st["model"], "darkmux:compactor-4b");
+        }
+        assert_ne!(exec(starts[0]), exec(starts[1]), "each attempt is its own execution");
+        let mut distinct: std::collections::BTreeSet<String> = records
+            .iter()
+            .filter(|r| r["action"] == "telemetry.tokens" || r["action"] == "utility.start")
+            .map(exec)
+            .collect();
+        distinct.remove("");
+        assert_eq!(distinct.len(), 3, "the specialist plus two compaction executions: {distinct:?}");
+        let specialist_tokens: u64 = records
+            .iter()
+            .filter(|r| r["action"] == "telemetry.tokens" && exec(r) == specialist)
+            .map(|r| r["payload"]["total_tokens"].as_u64().unwrap_or(0))
+            .sum();
+        assert_eq!(specialist_tokens, 1050, "the compactor's 588 tokens are not summed into the specialist's execution");
+        assert_eq!(summary.fold.tokens.total, 1050);
+    }
+
     /// (#2915 review, MUST 1) Each compaction attempt in an execution gets
     /// its own job id, even when a refused attempt repeats a generation.
     #[test]
